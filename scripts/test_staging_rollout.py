@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import copy
 from datetime import datetime, timezone
+from email.message import Message
 import importlib.util
 import io
 import json
@@ -91,7 +92,7 @@ def date(offset=0):
 def receipts():
     return [
         {
-            "type": "wrangler-session", "version": 1, "wrangler_version": "4.156.0",
+            "type": "wrangler-session", "version": 1, "wrangler_version": "4.161.0",
             "command_line_args": ["deploy", "--config", "staging-deploy.json", "--env", "staging"],
         },
         {
@@ -104,7 +105,7 @@ def receipts():
 
 
 def real_shape_receipts():
-    """Record shapes written by Wrangler 4.156.0 when `wrangler-action` drives a deploy.
+    """Record shapes written by Wrangler 4.161.0 when `wrangler-action` drives a deploy.
 
     Field names follow workers-sdk `packages/wrangler/src/index.ts` (the `wrangler-session`
     entry, written for EVERY invocation) and its deploy output entry; values are
@@ -112,9 +113,9 @@ def real_shape_receipts():
     """
     log = "/home/runner/.config/.wrangler/logs/wrangler-2026-10-03_01-22-59_123.log"
     return [
-        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.156.0",
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.161.0",
          "command_line_args": ["--version"], "log_file_path": log, "timestamp": date()},
-        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.156.0",
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.161.0",
          "command_line_args": ["deploy", "--config", "/tmp/staging-deploy.json", "--env", "staging"],
          "log_file_path": log, "timestamp": date()},
         {"version": 1, "type": "deploy", "worker_name": "two-bot-next-staging",
@@ -297,7 +298,7 @@ class DeployReceiptTests(OfflineTestCase):
         for flag in ("--version", "-v"):
             with self.subTest(flag=flag):
                 probe = {"type": "wrangler-session", "version": 1,
-                         "wrangler_version": "4.156.0", "command_line_args": [flag]}
+                         "wrangler_version": "4.161.0", "command_line_args": [flag]}
                 self.assertEqual(rollout.deploy_version([probe] + receipts(), STARTED), VERSION)
                 self.assertEqual(rollout.deploy_version(receipts() + [probe], STARTED), VERSION)
 
@@ -311,7 +312,7 @@ class DeployReceiptTests(OfflineTestCase):
         bad_args = receipts()
         bad_args[0]["command_line_args"] = ["deploy", 1]
         probe = {"type": "wrangler-session", "version": 1,
-                 "wrangler_version": "4.156.0", "command_line_args": ["--version"]}
+                 "wrangler_version": "4.161.0", "command_line_args": ["--version"]}
         wrong_probe = dict(probe, wrangler_version="4.142.0")
         schema_probe = dict(probe, version=2)
         other_command = dict(probe, command_line_args=["secret", "put", "X"])
@@ -1343,6 +1344,162 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(evidence["rollout_id"], NEW_ROLLOUT)
         self.assert_no_secret_saved_or_printed()
 
+    def test_forward_mismatch_records_only_the_rejected_sample(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        status, headers, body = ready_response()
+        request_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        headers.update({"x-request-id": request_id, "authorization": SENTINEL})
+        report = json.loads(body)
+        report.update(build_id="987654-1", build_revision="f" * 40, detail=SENTINEL)
+        client = verify_client()
+        client.request_routes[URL + "/readyz"] = [(status, headers, json.dumps(report).encode())]
+        with patch.object(rollout.time, "time", side_effect=[STARTED + 1, STARTED + 2]):
+            self.assert_gate("serving_image_mismatch", rollout.verify, self.args, client)
+        self.assertEqual(client.calls, [
+            ("api", NAMESPACE_PATH), ("api", APP_PATH), ("api", ROWS_PATH),
+            ("api", DETAIL_PATH), ("api", DEPLOYMENTS_PATH), ("request", URL + "/readyz"),
+        ])
+        self.assertEqual(self.clock.sleeps, [])
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+        raw = (self.root / "evidence.readyz-mismatch.json").read_bytes()
+        self.assertLess(len(raw), 1024)
+        self.assertEqual(json.loads(raw), {
+            "error": "serving_image_mismatch", "readyz_status": 200,
+            "sample_received_at_utc": "2027-01-15T08:00:02.000+00:00",
+            "run_id": "123456", "run_attempt": "2", "request_id": request_id,
+            "expected": {"worker_version": VERSION, "build_revision": REVISION,
+                         "build_id": BUILD_ID, "deploy_id": DEPLOY_ID},
+            "observed": {"worker_version": VERSION, "build_revision": "f" * 40,
+                         "build_id": "987654-1", "deploy_id": DEPLOY_ID},
+            "control_plane": {"rollout_id": NEW_ROLLOUT, "target_version": 8,
+                              "rollout_completed_observed_at_utc": "2027-01-15T08:00:01.000+00:00",
+                              "target_image_digest": IMAGE.split("@")[1]},
+        })
+
+    def test_forward_missing_or_invalid_identity_stays_red_and_bounded(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        status, headers, body = ready_response()
+        headers["x-request-id"] = SENTINEL
+        report = json.loads(body)
+        del report["build_revision"]
+        report.update(build_id="9" * 100_000 + "-1", deploy_id=None)
+        client.request_routes[URL + "/readyz"] = [(status, headers, json.dumps(report).encode())]
+        os.environ.pop("GITHUB_RUN_ID")
+        os.environ["GITHUB_RUN_ATTEMPT"] = "9" * 100_000
+        self.assert_gate("serving_image_mismatch", rollout.verify, self.args, client)
+        raw = (self.root / "evidence.readyz-mismatch.json").read_bytes()
+        self.assertLess(len(raw), 1024)
+        record = json.loads(raw)
+        self.assertEqual(record["observed"], {"worker_version": VERSION, "build_revision": "absent",
+                                               "build_id": "invalid", "deploy_id": "invalid"})
+        self.assertEqual((record["run_id"], record["run_attempt"], record["request_id"]),
+                         ("absent", "invalid", "invalid"))
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_forward_mismatch_write_failure_keeps_original_worker_error(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        status, _, body = ready_response()
+        client.request_routes[URL + "/readyz"] = [(status, {}, body)]
+        before = set(self.root.iterdir())
+
+        def partial_write(path, _record):
+            Path(path).write_text('{"error":')
+            raise OSError(SENTINEL)
+
+        with patch.object(rollout, "save", side_effect=partial_write):
+            self.assert_gate("serving_worker_mismatch", rollout.verify, self.args, client)
+        self.assertEqual(set(self.root.iterdir()), before)
+        self.assertIn("readiness mismatch evidence could not be written", self.stdout.getvalue())
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_forward_mismatch_invalid_evidence_path_keeps_cli_verdict(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        status, _, body = ready_response()
+        client.request_routes[URL + "/readyz"] = [(status, {}, body)]
+        argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", "."]
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
+            self.assertEqual(rollout.main(), 1)
+        self.assertIn("staging rollout gate failed: serving_worker_mismatch", self.stdout.getvalue())
+        self.assertNotIn("invalid_local_receipt", self.stdout.getvalue())
+        self.assertEqual([call for call in client.calls if call[0] == "request"],
+                         [("request", URL + "/readyz")])
+
+    def test_forward_mismatch_preserves_both_verification_inputs(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        status, _, body = ready_response()
+        for arg in ("receipt", "output"):
+            original = Path(getattr(self.args, arg)).read_bytes()
+            for layout in ("same-path", "symlink", "hardlink"):
+                with self.subTest(arg=arg, layout=layout):
+                    evidence = self.root / f"{arg}-{layout}.json"
+                    sidecar = evidence.with_suffix(".readyz-mismatch.json")
+                    sidecar.write_bytes(original)
+                    input_path = sidecar if layout == "same-path" else sidecar.with_suffix(".input")
+                    if layout == "symlink":
+                        input_path.symlink_to(sidecar)
+                    elif layout == "hardlink":
+                        input_path.hardlink_to(sidecar)
+                    client = verify_client()
+                    client.request_routes[URL + "/readyz"] = [(status, {}, body)]
+                    args = argparse.Namespace(**(vars(self.args) | {arg: str(input_path), "evidence": str(evidence)}))
+                    inputs = {path: Path(path).read_bytes() for path in (args.receipt, args.output)}
+                    self.assert_gate("serving_worker_mismatch", rollout.verify, args, client)
+                    self.assertEqual({path: Path(path).read_bytes() for path in inputs}, inputs)
+                    self.assertEqual(sidecar.read_bytes(), original)
+                    self.assertFalse(evidence.exists())
+
+    def test_directory_alias_leaves_inputs_readable(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        evidence = Path(self.args.evidence)
+        sidecar = evidence.with_suffix(".readyz-mismatch.json")
+        sidecar.symlink_to(self.root, target_is_directory=True)
+        receipt = sidecar / Path(self.args.receipt).name
+        output = sidecar / Path(self.args.output).name
+        inputs = {path: path.read_bytes() for path in (receipt, output)}
+        self.args.receipt, self.args.output = str(receipt), str(output)
+        client = verify_client()
+        status, _, body = ready_response()
+        client.request_routes[URL + "/readyz"] = [(status, {}, body)]
+
+        self.assert_gate("serving_worker_mismatch", rollout.verify, self.args, client)
+        for path, original in inputs.items():
+            with self.subTest(input=path.name):
+                self.assertEqual(path.read_bytes(), original)
+        self.assertTrue(sidecar.is_symlink())
+        self.assert_no_evidence()
+
+    def test_forward_worker_mismatch_distinguishes_single_from_ambiguous_header(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        status, _, body = ready_response()
+        other_version = "87654321-1234-4234-8234-123456789abc"
+        for versions, observed in [([other_version], other_version), ([other_version, VERSION], "invalid")]:
+            with self.subTest(versions=versions):
+                headers = Message()
+                for version in versions:
+                    headers["X-Two-Worker-Version"] = version
+                client = verify_client()
+                client.request_routes[URL + "/readyz"] = [(status, headers, body)]
+                self.assert_gate("serving_worker_mismatch", rollout.verify, self.args, client)
+                record = json.loads((self.root / "evidence.readyz-mismatch.json").read_bytes())
+                self.assertEqual(record["error"], "serving_worker_mismatch")
+                self.assertEqual(record["expected"]["worker_version"], VERSION)
+                self.assertEqual(record["observed"]["worker_version"], observed)
+                self.assert_no_evidence()
+
     def test_success_exact_pinned_evidence_with_post_probe_rechecks(self):
         self.prepare_baseline()
         self.write_deploy_output()
@@ -1352,8 +1509,9 @@ class OrchestrationTests(OfflineTestCase):
             "worker_version": VERSION, "application_id": APPLICATION_ID,
             "rollout_id": NEW_ROLLOUT, "target_version": 8, "image": IMAGE,
             "revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
-            "readyz": 200, "health": 200,
+            "readyz": 200, "health": 200, "verification_elapsed_seconds": 0,
         })
+        self.assertFalse((self.root / "evidence.readyz-mismatch.json").exists())
         self.docker.assert_called_once_with(VERSION, REVISION, BUILD_ID, DEPLOY_ID)
         self.assertEqual(client.calls, [
             ("api", NAMESPACE_PATH), ("api", APP_PATH), ("api", ROWS_PATH),
@@ -1363,6 +1521,157 @@ class OrchestrationTests(OfflineTestCase):
         ])
         self.assertEqual(self.clock.sleeps, [])
         self.assert_no_secret_saved_or_printed()
+
+    def test_rollout_deadline_allows_slow_success_and_refuses_late_completion(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for duration, succeeds in ((390, True), (605, False)):
+            with self.subTest(duration=duration):
+                self.clock.now = 100
+                client = verify_client()
+                client.deadline = self.clock.now + rollout.VERIFY_TIMEOUT_SECONDS
+                original_api = client.api
+
+                def timed_api(path):
+                    result = original_api(path)
+                    if path == DETAIL_PATH and self.clock.now < 100 + duration:
+                        result["status"] = "progressing"
+                        result["health"]["instances"].update(active=0, healthy=0, starting=1)
+                        result["progress"]["updated_instances"] = 0
+                    return result
+
+                client.api = timed_api
+                if succeeds:
+                    rollout.verify(self.args, client)
+                    evidence = json.loads(Path(self.args.evidence).read_text())
+                    self.assertEqual(evidence["verification_elapsed_seconds"], duration)
+                    Path(self.args.evidence).unlink()
+                else:
+                    self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                    self.assert_no_evidence()
+
+    def test_final_control_plane_read_cannot_accept_after_deadline(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        original_api = client.api
+        app_reads = 0
+
+        def delayed_api(path):
+            nonlocal app_reads
+            result = original_api(path)
+            if path == APP_PATH:
+                app_reads += 1
+                if app_reads == 2:
+                    self.clock.now = client.deadline
+            return result
+
+        client.api = delayed_api
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assert_no_evidence()
+
+    def test_final_stale_listing_read_past_deadline_reports_drift(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+        original_api = client.api
+        rollout_reads = 0
+
+        def delayed_api(path):
+            nonlocal rollout_reads
+            result = original_api(path)
+            if path == ROWS_PATH:
+                rollout_reads += 1
+                if rollout_reads == 2:
+                    self.clock.now = client.deadline
+            return result
+
+        client.api = delayed_api
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        self.assertEqual(caught.exception.detail, "listing_image=baseline later_rollouts=0")
+        self.assert_no_evidence()
+
+    def test_final_stale_application_expiry_hits_request_budget_guard(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+        original_api = client.api
+        app_reads = 0
+        rollout_reads = 0
+
+        def delayed_api(path):
+            nonlocal app_reads, rollout_reads
+            if path == ROWS_PATH:
+                rollout_reads += 1
+                if rollout_reads == 2:
+                    rollout.Client.request(client, "https://example.invalid", authenticated=True)
+            result = original_api(path)
+            if path == APP_PATH:
+                app_reads += 1
+                if app_reads == 2:
+                    self.clock.now = client.deadline
+            return result
+
+        client.api = delayed_api
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        self.assertEqual(caught.exception.detail, "listing_image=baseline later_rollouts=0")
+        self.assert_no_evidence()
+
+    def test_final_control_plane_expiry_classifies_stale_listing(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for target in (DEPLOYMENTS_PATH, DETAIL_PATH, APP_PATH):
+            with self.subTest(target=target):
+                self.clock.now = 100
+                client = verify_client()
+                client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+                original_api = client.api
+                reads = 0
+
+                def delayed_api(path):
+                    nonlocal reads
+                    if path == target:
+                        reads += 1
+                        if reads == 2:
+                            self.clock.now = client.deadline
+                            rollout.Client.request(client, "https://example.invalid", authenticated=True)
+                    return original_api(path)
+
+                client.api = delayed_api
+                with self.assertRaises(rollout.GateError) as caught:
+                    rollout.verify(self.args, client)
+                self.assertEqual(str(caught.exception), "application_image_drift")
+                self.assertEqual(caught.exception.detail, "listing_image=baseline later_rollouts=0")
+                self.assert_no_evidence()
+
+    def test_final_control_plane_transport_failure_before_deadline_is_preserved(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for target in (DEPLOYMENTS_PATH, DETAIL_PATH, APP_PATH):
+            with self.subTest(target=target):
+                self.clock.now = 100
+                client = verify_client()
+                client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+                original_api = client.api
+                reads = 0
+
+                def failing_api(path):
+                    nonlocal reads
+                    if path == target:
+                        reads += 1
+                        if reads == 2:
+                            raise rollout.GateError("api_transport_failure")
+                    return original_api(path)
+
+                client.api = failing_api
+                self.assert_gate("api_transport_failure", rollout.verify, self.args, client)
+                self.assert_no_evidence()
 
     def lag_client(self, readyz_routes):
         lagged = lag_row()
@@ -1382,7 +1691,7 @@ class OrchestrationTests(OfflineTestCase):
             "rollout_id": NEW_ROLLOUT, "target_version": 8, "image": IMAGE,
             "revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
             "readyz": 200, "health": 200,
-            "active_lag": True,
+            "active_lag": True, "verification_elapsed_seconds": 5,
         })
         self.assertEqual(self.clock.sleeps, [5])
         self.assert_no_secret_saved_or_printed()
@@ -2676,7 +2985,7 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(self.stdout.getvalue().splitlines()[1:], [
             "staging rollout gate failed: wrong_wrangler_receipt",
             "staging rollout diagnostic: records deploy=1,wrangler-session=2; "
-            "sessions deploy=1,probe=0,other=1; v1/wrangler-4.142.0 v1/wrangler-4.156.0",
+            "sessions deploy=1,probe=0,other=1; v1/wrangler-4.142.0 v1/wrangler-4.161.0",
         ])
         self.assert_no_evidence()
         # The caller-owned NDJSON input legitimately holds the sentinel; only

@@ -31,6 +31,10 @@ on:
     # The test token crosses the boundary by name. The control token stays in
     # the separate staging-environment job and never enters the consumer.
     inputs:
+      deploy_staging_call:
+        type: boolean
+        required: false
+        default: false
       staging_use_expires_at:
         type: string
         required: true
@@ -54,17 +58,27 @@ permissions: {}
 # Standalone owns the global window; a called run must never wait on its
 # parent's lock. Inputs are workflow_call-only and come from deploy outputs.
 concurrency:
-  group: ${{ inputs.staging_use_expires_at != '' && format('staging-help-consumer-{0}', github.run_id) || 'staging-lifecycle' }}
+  group: ${{ (inputs.deploy_staging_call || inputs.staging_use_expires_at != '') && format('staging-help-consumer-{0}', github.run_id) || 'staging-lifecycle' }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
+  rerun-refusal:
+    needs: [staging-window, help-embed-smoke, staging-use-release]
+    if: always() && inputs.deploy_staging_call && (github.run_attempt > 1 || inputs.staging_use_expires_at == '' || inputs.staging_use_sha == '' || inputs.staging_use_deployment == '')
+    permissions: {}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: exit 1
+
   staging-window:
     name: authorize staging use before the consumer
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (!inputs.deploy_staging_call || (github.run_attempt == 1 && inputs.staging_use_expires_at != '' && inputs.staging_use_sha != '' && inputs.staging_use_deployment != ''))
     permissions:
       contents: read
     environment: staging
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'staging-window') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 8
     outputs:
       expires_at: ${{ steps.begin.outputs.expires_at }}
@@ -79,7 +93,7 @@ jobs:
           package-manager-cache: false
       - name: Acquire a finite standalone window and prove readiness
         id: begin
-        if: inputs.staging_use_expires_at == ''
+        if: inputs.staging_use_expires_at == '' && !inputs.deploy_staging_call
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
@@ -87,7 +101,7 @@ jobs:
           STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use.jsonl
         run: node wrangler/scripts/staging-use-pipeline.mjs begin
       - name: Assert the caller's exact window and readiness
-        if: inputs.staging_use_expires_at != ''
+        if: (inputs.deploy_staging_call || inputs.staging_use_expires_at != '')
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
@@ -109,11 +123,11 @@ jobs:
   # standalone begin, consumer and cleanup; native expiry covers runner loss.
   staging-use-release:
     needs: [staging-window, help-embed-smoke]
-    if: inputs.staging_use_expires_at == '' && always() && github.ref == 'refs/heads/main' && needs.staging-window.outputs.expires_at != ''
+    if: inputs.staging_use_expires_at == '' && !inputs.deploy_staging_call && always() && github.ref == 'refs/heads/main' && needs.staging-window.outputs.expires_at != ''
     permissions:
       contents: read
     environment: staging
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'staging-use-release') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -125,7 +139,7 @@ jobs:
           node-version: 22
           package-manager-cache: false
       - name: Release only this standalone run's window
-        if: inputs.staging_use_expires_at == ''
+        if: inputs.staging_use_expires_at == '' && !inputs.deploy_staging_call
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
@@ -146,10 +160,10 @@ jobs:
     needs: staging-window
     permissions:
       contents: read
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (!inputs.deploy_staging_call || github.run_attempt == 1)
     environment: voice-synthetic
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'help-embed-smoke') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -180,9 +194,11 @@ jobs:
           echo "configured=true" >> "$GITHUB_OUTPUT"
       - name: Install pinned Rust toolchain
         if: steps.gate.outputs.configured == 'true'
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.100.0" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: ""
+        run: bash .github/scripts/install-rust-toolchain.sh
       - name: Generate the help embed payloads from the Rust builders
         if: steps.gate.outputs.configured == 'true'
         run: |

@@ -326,13 +326,8 @@ async fn spawn_onboarding_with_store(
         .unwrap(),
     );
     let saved = load_boot_session(store).await.unwrap();
-    let config = crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), saved.as_ref());
-    let shard = Shard::with_config(
-        ShardId::ONE,
-        ConfigBuilder::from(config)
-            .proxy_url(url.to_owned())
-            .build(),
-    );
+    let shard = transport::test_shard(saved.as_ref(), url, None)
+        .expect("onboarding fixture uses a loopback gateway");
     // Both the runtime and cache are newly constructed, not reused at restart.
     let pipeline = Arc::new(build_pipeline(store.milestones().await.unwrap(), None));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
@@ -418,7 +413,7 @@ fn resumed(seq: u64) -> Value {
 
 fn component(seq: u64, id: &str, token: &str) -> Value {
     json!({"op":0,"s":seq,"t":"INTERACTION_CREATE","d":{
-        "application_id":"1111","authorizing_integration_owners":{"0":GUILD},
+        "application_id":"1111","attachment_size_limit":10485760,"authorizing_integration_owners":{"0":GUILD},
         "id":id,"token":token,"type":3,"version":1,"guild_id":GUILD,
         "member":{"user":{"id":"77","username":"mock-member","discriminator":"0"},
             "roles":[],"deaf":false,"mute":false,"flags":0},
@@ -1184,7 +1179,8 @@ async fn onboarding_gateway_interrupted_callback_is_token_free_and_requires_rese
 async fn onboarding_gateway_feature_pool_exhaustion_preserves_checkpoint_and_heartbeat() {
     let db = TestDb::with_pool_max(crate::gateway::FEATURE_POOL_MAX).await;
     let gateway_pool = db.independent_pool(crate::gateway::GATEWAY_POOL_MAX).await;
-    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0);
+    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0)
+        .with_resume_policy(db.store.resume_policy());
     let mock = discord(Arc::new(AtomicBool::new(false)), PauseAt::PermissionRead).await;
     let result = bounded(async {
         assert_eq!(
@@ -1261,7 +1257,8 @@ async fn onboarding_gateway_feature_pool_exhaustion_preserves_checkpoint_and_hea
 async fn onboarding_gateway_worker_admission_bounds_held_game_transactions() {
     let db = TestDb::with_pool_max(crate::gateway::FEATURE_POOL_MAX).await;
     let gateway_pool = db.independent_pool(crate::gateway::GATEWAY_POOL_MAX).await;
-    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0);
+    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0)
+        .with_resume_policy(db.store.resume_policy());
     let mock = discord(
         Arc::new(AtomicBool::new(true)),
         PauseAt::HeldGameTransaction,
@@ -1379,7 +1376,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
     let db = TestDb::new().await;
     let result = bounded(async {
         db.store
-            .commit_dispatch(&checkpoint(SESSION, 1, "ws://mock"), FunnelBatch::default())
+            .commit_dispatch(&checkpoint(SESSION, 1, RESUME_URL), FunnelBatch::default())
             .await
             .unwrap();
         let mut bad = event(EventType::FirstMessage, "2026-09-29T12:00:00.000Z");
@@ -1387,7 +1384,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
         assert!(db
             .store
             .commit_dispatch_with_job(
-                &checkpoint(SESSION, 2, "ws://mock"),
+                &checkpoint(SESSION, 2, RESUME_URL),
                 FunnelBatch {
                     events: vec![bad],
                     ..Default::default()
@@ -1407,7 +1404,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
         let (action, id) = db
             .store
             .commit_dispatch_with_job(
-                &checkpoint(SESSION, 2, "ws://mock"),
+                &checkpoint(SESSION, 2, RESUME_URL),
                 FunnelBatch {
                     events: vec![event(EventType::FirstMessage, "2026-09-29T12:00:00.000Z")],
                     ..Default::default()
@@ -1441,7 +1438,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
             let result = db
                 .store
                 .commit_dispatch_with_job(
-                    &checkpoint(SESSION, seq, "ws://mock"),
+                    &checkpoint(SESSION, seq, RESUME_URL),
                     FunnelBatch::default(),
                     Some(durable_welcome()),
                 )
@@ -1455,7 +1452,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
             assert_eq!(
                 db.store
                     .commit_dispatch_with_job(
-                        &checkpoint(SESSION, seq, "ws://mock"),
+                        &checkpoint(SESSION, seq, RESUME_URL),
                         FunnelBatch::default(),
                         Some(durable_welcome()),
                     )
@@ -1473,7 +1470,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
         assert!(
             db.store
                 .commit_dispatch_with_job(
-                    &checkpoint(SESSION, 34, "ws://mock"),
+                    &checkpoint(SESSION, 34, RESUME_URL),
                     FunnelBatch {
                         events: vec![event(EventType::SecondMessage, "2026-09-29T12:00:01.000Z")],
                         ..Default::default()
@@ -1496,7 +1493,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
         let result = db
             .store
             .commit_dispatch_with_job(
-                &checkpoint(SESSION, 34, "ws://mock"),
+                &checkpoint(SESSION, 34, RESUME_URL),
                 FunnelBatch::default(),
                 Some(durable_welcome()),
             )
@@ -1522,7 +1519,7 @@ async fn onboarding_gateway_outbox_recovery_stops_after_three_claims() {
         let (_, id) = db
             .store
             .commit_dispatch_with_job(
-                &checkpoint(SESSION, 1, "ws://mock"),
+                &checkpoint(SESSION, 1, RESUME_URL),
                 FunnelBatch::default(),
                 Some(durable_welcome()),
             )

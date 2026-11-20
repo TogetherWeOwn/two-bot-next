@@ -8,6 +8,8 @@
 //! Dropping the trigger and retrying is the success control in each test.
 #![cfg(feature = "db")]
 
+#[path = "common/attendance_reply.rs"]
+mod attendance_reply;
 #[allow(dead_code)]
 mod common;
 
@@ -16,7 +18,7 @@ use serde_json::{json, Value};
 use sqlx::{Pool, Postgres};
 use twilight_model::application::interaction::Interaction;
 use two_bot_core::{ClassifierConfig, InteractionRouter, RouterGates};
-use two_bot_discord::{interactions::InteractionRuntime, ActionExecutor};
+use two_bot_discord::{brand::EmbedKind, interactions::InteractionRuntime, ActionExecutor};
 use two_bot_testsupport::TestDatabase;
 
 const GUILD: &str = "1545644954272137297";
@@ -41,7 +43,7 @@ fn router() -> InteractionRouter {
 
 fn rsvp(id: u64, status: &str) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
+        "application_id": "1111", "attachment_size_limit": 10485760, "authorizing_integration_owners": {"0": GUILD},
         "id": id.to_string(), "token": "mock-rsvp-token", "type": 2,
         "version": 1, "guild_id": GUILD,
         "member": {"permissions": "0", "roles": [],
@@ -132,18 +134,20 @@ async fn run(pool: &Pool<Postgres>, mock: &MockRest, interaction: &Interaction) 
 }
 
 /// The user-visible text of the most recent deferred edit.
-fn last_edit_content(mock: &MockRest) -> String {
+fn last_edit_content(mock: &MockRest, kind: EmbedKind) -> String {
     let requests = mock.requests();
     let edit = requests
         .iter()
         .rev()
         .find(|request| request.method == "PATCH")
         .expect("a deferred edit reply");
+    assert_eq!(
+        edit.path,
+        "/api/v10/webhooks/1111/mock-rsvp-token/messages/@original"
+    );
     let body: Value = serde_json::from_slice(&edit.body).unwrap();
-    body["content"]
-        .as_str()
-        .expect("edit content is text")
-        .to_owned()
+    assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+    attendance_reply::deferred_text(&body, kind).to_owned()
 }
 
 /// A failed audit insert must surface one of the existing safe refusals:
@@ -230,7 +234,7 @@ async fn audit_insert_failure_on_first_rsvp_leaves_no_response_or_audit() {
     install_audit_fault(fixture.pool()).await;
     let mock = live_mock().await;
     run(fixture.pool(), &mock, &rsvp(900, "going")).await;
-    assert_safe_refusal(&last_edit_content(&mock));
+    assert_safe_refusal(&last_edit_content(&mock, EmbedKind::Danger));
     assert_eq!(stored_response(fixture.pool()).await, None);
     assert_eq!(stored_audits(fixture.pool()).await, Vec::<AuditRow>::new());
     assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
@@ -241,7 +245,10 @@ async fn audit_insert_failure_on_first_rsvp_leaves_no_response_or_audit() {
     remove_audit_fault(fixture.pool()).await;
     let mock = live_mock().await;
     run(fixture.pool(), &mock, &rsvp(901, "going")).await;
-    assert_eq!(last_edit_content(&mock), "RSVP saved: going.");
+    assert_eq!(
+        last_edit_content(&mock, EmbedKind::Ok),
+        "RSVP saved: going."
+    );
     let stored = stored_response(fixture.pool())
         .await
         .expect("the control write stored a response");
@@ -271,7 +278,10 @@ async fn audit_insert_failure_on_rsvp_rewrite_preserves_exact_prior_state() {
     // Establish the preceding response and audit through the live path.
     let mock = live_mock().await;
     run(fixture.pool(), &mock, &rsvp(910, "going")).await;
-    assert_eq!(last_edit_content(&mock), "RSVP saved: going.");
+    assert_eq!(
+        last_edit_content(&mock, EmbedKind::Ok),
+        "RSVP saved: going."
+    );
     mock.shutdown().await;
     let before_response = stored_response(fixture.pool())
         .await
@@ -284,7 +294,7 @@ async fn audit_insert_failure_on_rsvp_rewrite_preserves_exact_prior_state() {
     install_audit_fault(fixture.pool()).await;
     let mock = live_mock().await;
     run(fixture.pool(), &mock, &rsvp(911, "interested")).await;
-    assert_safe_refusal(&last_edit_content(&mock));
+    assert_safe_refusal(&last_edit_content(&mock, EmbedKind::Danger));
     // The exact prior response (status and timestamp) and the exact prior
     // audit history survive: no replacement was partially committed.
     assert_eq!(stored_response(fixture.pool()).await, Some(before_response));
@@ -299,7 +309,7 @@ async fn audit_insert_failure_on_rsvp_rewrite_preserves_exact_prior_state() {
     let mock = live_mock().await;
     run(fixture.pool(), &mock, &rsvp(912, "interested")).await;
     assert_eq!(
-        last_edit_content(&mock),
+        last_edit_content(&mock, EmbedKind::Ok),
         "RSVP saved: interested (changed from going)."
     );
     let stored = stored_response(fixture.pool())

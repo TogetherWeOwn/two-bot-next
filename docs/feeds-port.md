@@ -179,7 +179,14 @@ have no effects.
 
 ## Verification
 
+These commands describe hosted-CI coverage, not a local CI checklist. Push the
+PR branch and record exact-head Actions run/job links. Local execution is only
+for one failing test or crate under the
+[focused reproduction policy](../CONTRIBUTING.md#focused-failure-reproduction-only);
+heavy focused builds use guarded Boat, never heavy raw-host fallback.
+
 ```sh
+# Ephemeral hosted CI only.
 cargo fmt --all -- --check
 cargo clippy -p two-bot-core --all-targets --all-features --locked -- -D warnings
 cargo test -p two-bot-core --test feeds --locked

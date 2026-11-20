@@ -1,13 +1,14 @@
 //! `/lockdown-preview` slash state: bounded pending store, rate limiter and
 //! ephemeral render (`docs/lockdown-preview-spec.md` sections 3-6, option B,
-//! build slice 4).
+//! build slices 4-5).
 //!
 //! The preview slash (wired in `channel_moderation.rs`) renders the exact
-//! `@everyone` diff and arms one Confirm button. Confirm/cancel component
-//! presses arrive in a later slice; this module owns everything the slash
-//! needs: the in-memory pending map, the in-memory rate limiter, the fixed
-//! render, the button ids and the numbers-only audit metadata. Nothing here
-//! is published: the command definition, help and docs land in the
+//! `@everyone` diff and arms one Confirm button; the Confirm/Cancel component
+//! path consumes that entry and enters the existing lockdown mutation (spec
+//! section 3 steps 4-5). This module owns everything both halves need: the
+//! in-memory pending map, the in-memory rate limiter, the fixed render, the
+//! button ids and their parser, and the numbers-only audit metadata. Nothing
+//! here is published: the command definition, help and docs land in the
 //! publication slice. The pure planner (`two_bot_core::lockdown_preview`)
 //! owns the snapshot gates and the digest.
 //!
@@ -19,6 +20,7 @@ use std::collections::{HashMap, VecDeque};
 
 use two_bot_core::lockdown_preview::PreviewPlan;
 use two_bot_core::message_safety::neutralize_mentions;
+use two_bot_core::{LOCKDOWN_PREVIEW_CANCEL_PREFIX, LOCKDOWN_PREVIEW_CONFIRM_PREFIX};
 
 /// Seconds a rendered armed preview stays consumable (spec section 5).
 pub const PREVIEW_TTL_SECS: i64 = 300;
@@ -269,13 +271,81 @@ impl RateLimiter {
 /// a 20-digit actor (spec section 3 step 3: each id stays within 100).
 #[must_use]
 pub fn confirm_custom_id(actor: u64, digest32: &str) -> String {
-    format!("lockdown-preview:confirm:{actor}:{digest32}")
+    format!("{LOCKDOWN_PREVIEW_CONFIRM_PREFIX}{actor}:{digest32}")
 }
 
 /// `lockdown-preview:cancel:<actor>:<digest32>`, same bound as confirm.
 #[must_use]
 pub fn cancel_custom_id(actor: u64, digest32: &str) -> String {
-    format!("lockdown-preview:cancel:{actor}:{digest32}")
+    format!("{LOCKDOWN_PREVIEW_CANCEL_PREFIX}{actor}:{digest32}")
+}
+
+/// One parsed `/lockdown-preview` button press. `actor` is the button's named
+/// owner: the channel slice still requires it to equal the pressing member
+/// (spec section 8: actor equality from the authenticated interaction, never
+/// from the custom id alone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewPress {
+    Confirm { actor: u64, digest32: [u8; 32] },
+    Cancel { actor: u64, digest32: [u8; 32] },
+}
+
+impl PreviewPress {
+    /// The button's 32 hex characters as a printable key for the pending map.
+    #[must_use]
+    pub fn digest32(self) -> String {
+        let hex = match self {
+            Self::Confirm { digest32, .. } | Self::Cancel { digest32, .. } => digest32,
+        };
+        hex.iter().map(|byte| *byte as char).collect()
+    }
+
+    /// The button's named owner.
+    #[must_use]
+    pub fn actor(self) -> u64 {
+        match self {
+            Self::Confirm { actor, .. } | Self::Cancel { actor, .. } => actor,
+        }
+    }
+}
+
+/// Parse one `/lockdown-preview` button id. Anything else — a foreign prefix,
+/// a non-numeric actor, a digest that is not exactly 32 hex characters, or an
+/// id longer than the 100-unit component bound — is not ours: the caller
+/// answers the collapsed `PREVIEW_EXPIRED` reply without touching the pending
+/// set. The digest keeps its ASCII bytes so the pending lookup never
+/// re-encodes; [`PendingStore::take`] enforces the same 32-hex rule.
+#[must_use]
+pub fn parse_preview_custom_id(custom_id: &str) -> Option<PreviewPress> {
+    if custom_id.len() > 100 {
+        return None;
+    }
+    let (is_confirm, rest) =
+        if let Some(rest) = custom_id.strip_prefix(LOCKDOWN_PREVIEW_CONFIRM_PREFIX) {
+            (true, rest)
+        } else {
+            let rest = custom_id.strip_prefix(LOCKDOWN_PREVIEW_CANCEL_PREFIX)?;
+            (false, rest)
+        };
+    let (actor, digest32) = rest.split_once(':')?;
+    let actor: u64 = actor.parse().ok()?;
+    if actor == 0 || digest32.len() != 32 || !digest32.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let mut hex = [0u8; 32];
+    hex.copy_from_slice(digest32.as_bytes());
+    if is_confirm {
+        Some(PreviewPress::Confirm {
+            actor,
+            digest32: hex,
+        })
+    } else {
+        Some(PreviewPress::Cancel {
+            actor,
+            digest32: hex,
+        })
+    }
 }
 
 /// Numbers-only preview audit metadata (spec section 6). The ledger's
@@ -895,6 +965,76 @@ mod tests {
                 deny: u64::MAX,
             }],
         }
+    }
+
+    #[test]
+    fn button_ids_round_trip_through_the_press_parser() {
+        let digest = "ab12cd34ef56ab12cd34ef56ab12cd34";
+        let confirm = confirm_custom_id(333, digest);
+        let cancel = cancel_custom_id(333, digest);
+        assert_eq!(
+            parse_preview_custom_id(&confirm),
+            Some(PreviewPress::Confirm {
+                actor: 333,
+                digest32: *digest.as_bytes().first_chunk::<32>().unwrap(),
+            })
+        );
+        assert_eq!(
+            parse_preview_custom_id(&cancel),
+            Some(PreviewPress::Cancel {
+                actor: 333,
+                digest32: *digest.as_bytes().first_chunk::<32>().unwrap(),
+            })
+        );
+        let parsed = parse_preview_custom_id(&confirm).expect("parses");
+        assert_eq!(parsed.actor(), 333);
+        assert_eq!(parsed.digest32(), digest);
+    }
+
+    #[test]
+    fn press_parser_rejects_everything_that_is_not_ours() {
+        let digest = "ab12cd34ef56ab12cd34ef56ab12cd34";
+        // Foreign prefixes never route to the preview slice.
+        assert!(parse_preview_custom_id("gw:123").is_none());
+        assert!(parse_preview_custom_id("lockdown-preview:hold:333:").is_none());
+        // Non-numeric, zero and overflowing actors are not addressable.
+        assert!(
+            parse_preview_custom_id(&format!("{LOCKDOWN_PREVIEW_CONFIRM_PREFIX}abc:{digest}"))
+                .is_none()
+        );
+        assert!(
+            parse_preview_custom_id(&format!("{LOCKDOWN_PREVIEW_CONFIRM_PREFIX}0:{digest}"))
+                .is_none()
+        );
+        // The digest must be exactly 32 hex characters.
+        assert!(parse_preview_custom_id(&format!(
+            "{LOCKDOWN_PREVIEW_CONFIRM_PREFIX}333:{}",
+            &digest[..31]
+        ))
+        .is_none());
+        assert!(parse_preview_custom_id(&format!(
+            "{LOCKDOWN_PREVIEW_CONFIRM_PREFIX}333:{digest}00"
+        ))
+        .is_none());
+        assert!(parse_preview_custom_id(&format!(
+            "{LOCKDOWN_PREVIEW_CONFIRM_PREFIX}333:zz12cd34ef56ab12cd34ef56ab12cd34"
+        ))
+        .is_none());
+        // Uppercase hex still parses: the pending lookup is byte-exact.
+        assert!(parse_preview_custom_id(&format!(
+            "{LOCKDOWN_PREVIEW_CANCEL_PREFIX}333:{}",
+            digest.to_ascii_uppercase()
+        ))
+        .is_some());
+        // Past the 100-unit component bound the id cannot be a button.
+        let long = format!("{LOCKDOWN_PREVIEW_CONFIRM_PREFIX}333:{digest}extra-padding-to-overflow-the-bound-0123456789");
+        assert!(long.len() > 100);
+        assert!(parse_preview_custom_id(&long).is_none());
+        // Missing separator or empty id.
+        assert!(
+            parse_preview_custom_id(&format!("{LOCKDOWN_PREVIEW_CONFIRM_PREFIX}333")).is_none()
+        );
+        assert!(parse_preview_custom_id("").is_none());
     }
 
     #[test]

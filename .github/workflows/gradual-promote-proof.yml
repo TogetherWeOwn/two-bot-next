@@ -48,7 +48,7 @@ jobs:
     permissions:
       contents: read # checkout only; Cloudflare calls use the `staging` environment secrets
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'proof') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     environment: staging
     timeout-minutes: 30
     steps:
@@ -118,7 +118,7 @@ jobs:
       # with the synthetic fixture.
       - name: Gradual promotion via the pinned central action
         id: gradual
-        uses: TogetherWeOwn/.github/actions/gradual-promote@89c290be20c0044efaf6916f28341c76e75fff06
+        uses: TogetherWeOwn/.github/actions/gradual-promote@2ef8ad6447e11d019ac3098bcfd011193b75266a
         with:
           worker-name: two-bot-next-gradual-proof
           version-tag: ${{ inputs.candidate_tag }}

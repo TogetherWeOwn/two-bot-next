@@ -1,12 +1,15 @@
 # Custom commands: one bounded `{args}` substitution
 
-Status: **Built in this stack, merges pending** — containment was proved with the bounded §8 test plan,
-so the kill rule did not trigger. Both build slices are built here, stacked as
-slice 1 (core render, `MAX_ARGS_UNITS` bound and this-slice contract cases) under
-slice 2 (slash/prefix capture with the §5 corrections, the preview sample as preview
+Status: **Shipped (both build slices merged)** — containment was proved with the bounded §8 test plan,
+so the kill rule did not trigger. Both build slices merged:
+[slice 1 (PR #1970)](https://github.com/TogetherWeOwn/two-bot-next/pull/1970)
+(core render, `MAX_ARGS_UNITS` bound and this-slice contract cases) and
+[slice 2 (PR #1974)](https://github.com/TogetherWeOwn/two-bot-next/pull/1974)
+(slash/prefix capture with the §5 corrections, the preview sample as preview
 input, the published `arguments` option, and the run-path contract cases).
-Neither build PR has merged; this status becomes Shipped when both do.
-Shipping reverses the `{args}` refusal in `custom_commands.rs` and in [custom
+Shipped records the merged implementation only; it does not establish successful
+live deployment, staging acceptance or production promotion.
+The merged implementation reverses the `{args}` refusal in `custom_commands.rs` and in [custom
 responses](dashboard-custom-responses-spec.md), changed together in slice 1.
 Each build re-checked this spec's `file:line` seams on current `main` first. This
 acceptance was the owner intent review the original proposal waited for; its

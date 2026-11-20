@@ -56,7 +56,7 @@ copy layers and has no layer or size measurement yet; rows R1 and the
 | R1 | `FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792…` | 21 base layers, 29,128,192 bytes (27.78 MiB) as saved-tar blobs | Debian trust bundle plus 14 documented OS packages; no shell, package manager, or OpenSSL CLI |
 | R2 | `LABEL org.opencontainers.image.revision`, `com.togetherweown.build-id` | Metadata only | Non-secret build provenance; zero bytes |
 | R3 | `USER 65532:65532`, `WORKDIR /home/nonroot` | One empty layer (no tar entries), 1,024 bytes as saved-tar blob; `USER` is config-only | Config; the layer is empty because `/home/nonroot` already exists in base layer 7 |
-| R4 | `COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot` | Yes, one file layer, 16,065,536 bytes (15.32 MiB) as saved-tar blob; file itself 16,062,800 bytes (15.32 MiB) | The only added file content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 18 MiB per `scripts/container-smoke.py` (recalibrated 2026-10-24; the 2026-10-11 sample below predates it) |
+| R4 | `COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot` | Yes, one file layer, 16,065,536 bytes (15.32 MiB) as saved-tar blob; file itself 16,062,800 bytes (15.32 MiB) | The only added file content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 20 MiB per `scripts/container-smoke.py` (see the [calibration history](b1-baseline.md#rust-runtime-image-pr-gate); the 2026-10-11 sample predates it) |
 | R5 | `EXPOSE 8080`, `ENV LISTEN_ADDR=0.0.0.0:8080 LOG_FORMAT=json` | Metadata only | Liveness/readiness port, bind address and JSON log format |
 | R6 | `HEALTHCHECK CMD ["/home/nonroot/two-bot", "--healthcheck"]` | Metadata only | Exec-form probe; needs no shell |
 | R7 | `ENTRYPOINT ["/home/nonroot/two-bot"]` | Metadata only | Exec form so PID 1 receives SIGTERM |
@@ -190,8 +190,8 @@ Before the deployment digest is pinned:
    names, `SHA256SUMS`, and both gate results under the Releases receipt of
    the B4 evidence manifest (`docs/cutover.md` B4). That receipt does not list
    SBOMs yet, so add them there.
-3. Re-measure on the candidate's image ID, and confirm the 112 MiB / 18 MiB
-   budgets pass. CI keeps the candidate image only as the
+3. Re-measure on the candidate's image ID, and confirm the 112 MiB image and
+   20 MiB binary budgets pass. CI keeps the candidate image only as the
    `sbom-partial-<run_id>-<attempt>` artifact (`image.tar`, 1-day retention),
    so download it within that window. R1 and R4 are saved-tar layer-blob
    sizes: read them from the archive's `manifest.json` layers, not from

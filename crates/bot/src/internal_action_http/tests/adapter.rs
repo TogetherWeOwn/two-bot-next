@@ -155,7 +155,14 @@ async fn real_adapter_success_and_429_replay_preserve_cross_pool_shared_hold() {
             requests[0]["path"],
             "/api/v10/channels/333333333333333333/messages"
         );
-        assert_eq!(requests[0]["body"]["content"], "fixture announcement");
+        // Kit embed treatment: the validated text renders as one branded
+        // embed — ember default, Announcements surface footer — with no
+        // plain content (colour + footer are asserted discord-side).
+        assert!(requests[0]["body"].get("content").is_none());
+        assert_eq!(
+            requests[0]["body"]["embeds"][0]["title"],
+            "fixture announcement"
+        );
         assert_eq!(requests[0]["body"]["allowed_mentions"]["parse"], json!([]));
     }
     let (status, _, refused) = answer(

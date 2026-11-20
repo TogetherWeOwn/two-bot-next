@@ -9,7 +9,7 @@ use sqlx::{PgConnection, PgPool};
 use two_bot_core::analytics_family::{category_of_event, AnalyticsCategory};
 use two_bot_core::gateway_funnel::{FunnelBatch, SnapshotWrite};
 use two_bot_core::gateway_session::{
-    dispatch_action, BootDirective, DispatchAction, GatewaySession,
+    dispatch_action, BootDirective, DispatchAction, GatewaySession, ResumePolicy,
 };
 use two_bot_core::privacy::{inviter_in_metadata, scrubbed_member_join_metadata};
 use two_bot_core::{format_iso_millis, idempotency_key, EventType, FunnelEvent};
@@ -49,6 +49,7 @@ pub struct GatewaySessionStore {
     pool: PgPool,
     guild_id: String,
     shard_id: i32,
+    resume_policy: ResumePolicy,
 }
 
 impl GatewaySessionStore {
@@ -57,7 +58,17 @@ impl GatewaySessionStore {
             pool,
             guild_id,
             shard_id,
+            resume_policy: Default::default(),
         }
+    }
+
+    pub fn with_resume_policy(mut self, policy: ResumePolicy) -> Self {
+        self.resume_policy = policy;
+        self
+    }
+
+    pub fn resume_policy(&self) -> ResumePolicy {
+        self.resume_policy
     }
 
     /// Borrow the store's pool for serial lifecycle writes that must commit
@@ -539,7 +550,7 @@ impl GatewaySessionStore {
              session_id = EXCLUDED.session_id, seq = EXCLUDED.seq,
              resume_url = EXCLUDED.resume_url, updated_at = EXCLUDED.updated_at",
         ).bind(&self.guild_id).bind(self.shard_id).bind(&session.session_id)
-            .bind(sequence).bind(&session.resume_url).bind(session.updated_at_ms)
+            .bind(sequence).bind(self.resume_policy.normalize(&session.resume_url)).bind(session.updated_at_ms)
             .execute(&mut *tx).await?;
         tx.commit().await?;
         Ok((DispatchAction::Apply, job_id))

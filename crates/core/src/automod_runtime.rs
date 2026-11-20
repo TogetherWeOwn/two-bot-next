@@ -11,6 +11,7 @@ use crate::automod::{
     match_automod_with_clock, sanction_for, AutomodConfig, AutomodFilter, AutomodMessage,
     AutomodSanction, RepeatObservation, RepeatTracker, SanctionAction,
 };
+use crate::automod_preview::{preview_automod, PreviewVerdict};
 use crate::commands::PERM_MODERATE_MEMBERS;
 use crate::moderation::{
     moderation_target_protection, ModerationPolicy, ModerationTarget, TargetProtection,
@@ -227,6 +228,48 @@ impl AutomodRuntime {
     #[must_use]
     pub fn admits(&self, guild_id: Option<&str>) -> bool {
         self.config.enabled && guild_id.is_some_and(|guild_id| self.scope.permits(guild_id))
+    }
+
+    /// Clone the live effective config for one preview evaluation (automod
+    /// preview spec §5.0). The handler calls this under the runtime lock so
+    /// one evaluation sees one config; it must never call
+    /// `AutomodConfig::from_env` itself, which would miss live-snapshot
+    /// overlays and last-good-policy fallback and could contradict the next
+    /// real message.
+    #[must_use]
+    pub fn effective_config(&self) -> AutomodConfig {
+        self.config.clone()
+    }
+
+    /// Evaluate one synthetic preview message read-only (automod preview
+    /// spec §5.1): first-match verdict over the invoker's own live repeat
+    /// history, exactly as [`preview_automod`]. Never expires rows, never
+    /// advances `newest_observation_ms`, never inspects, claims, or plans —
+    /// the tracker is byte-identical afterwards, so a preview can neither
+    /// build nor break a real streak.
+    #[must_use]
+    pub fn preview(&self, message: &AutomodMessage, mention_count: usize) -> PreviewVerdict {
+        preview_automod(message, mention_count, &self.config, &self.repeats)
+    }
+
+    /// Freeze the invoker's history and policy before the audit wait, so a
+    /// later gateway event cannot evict a row relevant to the receipt clock.
+    #[must_use]
+    pub fn preview_snapshot(
+        &self,
+        guild_id: &str,
+        actor_id: &str,
+    ) -> Option<(
+        bool,
+        impl Fn(&AutomodMessage, usize) -> PreviewVerdict + use<>,
+    )> {
+        self.admits(Some(guild_id)).then(|| {
+            let config = self.effective_config();
+            let repeats = self.repeats.snapshot_for(guild_id, actor_id);
+            (config.dry_run, move |message: &AutomodMessage, mentions| {
+                preview_automod(message, mentions, &config, &repeats)
+            })
+        })
     }
 
     /// The shared maintenance tick can expire idle authors without receiving

@@ -10,15 +10,15 @@ before building or publishing anything.
 ## Approved scope: preview before you act (M2)
 
 Accepted 2026-11-01 by the owner. Each build re-checks the spec's
-`file:line` seams on current `main` first, and its own technical,
-publication and release gates still apply before any build PR merges.
+`file:line` seams on current `main` first. The spec's technical,
+publication and release gates still apply at their respective steps.
 
 | Item | Specification | Status of the spec | What remains |
 |---|---|---|---|
 | Lockdown preview | [Lockdown preview](../lockdown-preview-spec.md) | Implemented, dark and unpublished — planner, executor snapshot/roles reads and dark slash with pending store merged (#1920, #1925, #1929) | Publication/activation behind its gates (spec §8), plus the open confirm/cancel build step (#1938, open). Direct lockdown stays unchanged. |
 | Automod verdict preview | [Automod verdict preview](../automod-preview-spec.md) | Approved — private staff preview for synthetic input, no moderation effects | Build the dry-run preview command and its rate/audit limits. Not a member-facing oracle. |
 | Warning history | [Warning history](../warning-history-spec.md) | Approved — private, bounded, metadata-only staff read, reasons withheld | Independent history-read gates still open; no historical-data grant follows from acceptance alone. |
-| Custom-command arguments | [Custom-command arguments](../custom-command-args-spec.md) | Built in this stack — one literal, bounded, non-recursive `{args}` substitution with output-safety controls; build slices merged (#1970, #1974) | Gated release. The spec Status line still reads "merges pending"; open #2002 records it shipped. Not a general template language. |
+| Custom-command arguments | [Custom-command arguments](../custom-command-args-spec.md) | Implemented — one literal, bounded, non-recursive `{args}` substitution with output-safety controls; both build slices merged (#1970, #1974) | Gated release; the shipped spec status records the merges, not production activation. Not a general template language. |
 
 Acceptance of the intent is recorded in each spec's status header.
 Acceptance does not lift any no-build state inside the spec and does
@@ -51,10 +51,8 @@ it does not make a feature active.
   `{args}` build slices (#1970, #1974). A merged change is not by
   itself proof of production activation.
 - **Blocked on staging recovery:** automod preview (W3), warning
-  history (W4) and `{args}` (W5, built in a stack with merges pending
-  per its spec Status line; builds merged in #1970/#1974, status
-  correction open as #2002). See [handoff](../handoff.md) for the
-  current blocker and next step.
+  history (W4) and `{args}` gated release (W5; builds merged).
+  See [handoff](../handoff.md) for the blocker and next step at snapshot.
 - **Not started:** any commissioned M3 build, because M3 items are
   deferred and undecided, and later-milestone merges are gated on M2
   (see [ADR 0002](../adr/0002-m2-m3-sequencing.md)).
@@ -66,9 +64,10 @@ it does not make a feature active.
 - Before merging: run the pre-push checks in
   [`CONTRIBUTING.md`](../../CONTRIBUTING.md#pre-push-checklist), meet
   the applicable production merge requirements in
-  [`CONTRIBUTING.md`](../../CONTRIBUTING.md#production-merge-evidence)
-  (including Release Manager confirmation on the exact head, even for
-  docs-only changes), and link the exact-head CI results in the PR body.
+  [`CONTRIBUTING.md`](../../CONTRIBUTING.md#production-merge-evidence), and
+  link the exact-head CI results in the PR body. Require Release Manager
+  approval on the exact head if the merge would deploy to production or
+  if production deployment cannot be ruled out.
 - Before activating: stage, exercise the behavior once on staging and
   attach evidence.
   Deploy and rollback procedures live in the

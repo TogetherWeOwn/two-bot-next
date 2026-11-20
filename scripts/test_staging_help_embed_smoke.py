@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -23,9 +24,9 @@ STAGING_PRODUCT_APP = "1469137636663758888"
 OTHER_APP = "1111111111111111111"
 CHANNEL = "1546211377000000001"
 TOKEN = "RAW_SECRET_SENTINEL_never_disclose_bot_token"
-EXPECTED = {"color": 16715346, "footer_text": "Together We Own",
-            "icon_url": "https://raw.githubusercontent.com/TogetherWeOwn/"
-                        "two-bot-next/main/assets/brand/two-icon-1-dark-512.png"}
+EXPECTED = {"color": 0xFF9C36, "footer_text": "Together We Own",
+            "icon_url": "https://imagedelivery.net/cNVnKlHCCMxI9vqDkwBbUQ/"
+                        "two-icon1-dark512-4469ca165f03/public"}
 
 
 def embed(description):
@@ -170,10 +171,16 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         # The live payload file comes from brand.rs; pin this fixture to it
         # so a brand change that skips the fixture is visible offline.
         source = (ROOT / "crates/discord/src/brand.rs").read_text()
-        self.assertIn("BRAND_EMBED_COLOR: u32 = 0xFF0E52", source)
-        self.assertEqual(0xFF0E52, EXPECTED["color"])
+        tokens = (ROOT / "crates/discord/src/brand_tokens.rs").read_text()
+        default = re.search(
+            r"pub const BRAND_DISCORD_EMBED_DEFAULT: u32 = (0x[0-9A-F]+);", tokens
+        )
+        self.assertIsNotNone(default, "the generated kit must define the default embed colour")
+        self.assertEqual(int(default.group(1), 16), EXPECTED["color"])
+        self.assertIn("Self::Default => BRAND_DISCORD_EMBED_DEFAULT", source)
         self.assertIn(f'BRAND_FOOTER_TEXT: &str = "{EXPECTED["footer_text"]}"', source)
-        self.assertIn(f'BRAND_ICON_URL: &str = "{EXPECTED["icon_url"]}"', source)
+        self.assertRegex(
+            source, rf'BRAND_ICON_URL: &str =\s*"{re.escape(EXPECTED["icon_url"])}";')
 
     def test_both_embeds_post_read_back_assert_and_delete(self):
         fake = FakeDiscord()

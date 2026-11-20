@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
-"""Fail-closed staging gate for Wrangler 4.156.0's rolling Containers API.
+"""Fail-closed staging gate for Wrangler 4.161.0's rolling Containers API.
 
 Only allowlisted provenance is persisted/printed. API configurations and error
 bodies can contain secrets: never print them, including in exception messages.
 """
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import math
 import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import time
 import tomllib
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, HTTPRedirectHandler, build_opener
 
-from build_identity import is_deploy_id_shape, parse_deploy_id
+from build_identity import (UNSTAMPED, is_build_id_shape, is_build_revision_shape,
+                            is_deploy_id_shape, parse_deploy_id)
 
 WORKER = "two-bot-next-staging"
 APPLICATION = "two-bot-next-twobotcontainer-staging"
 CLASS = "TwoBotContainer"
-WRANGLER = "4.156.0"
+WRANGLER = "4.161.0"
 VERSION_PROBES = (["--version"], ["-v"])
 LIMIT = 100
 MAX_BODY = 2 * 1024 * 1024
@@ -40,9 +42,9 @@ ACTIVE_LAG_CONFIRMATIONS = 2
 # build is serving; otherwise persistent staleness fails as drift. A poll cycle
 # runs about 11s in CI (5s sleep plus the control-plane reads), so 24 polls is
 # roughly 4.5 minutes. Stale polls only count once the rollout completes while
-# the 300s verify deadline runs from the start, so the deadline usually ends a
-# mismatch that never clears before this cap does (see
-# `IMAGE_DRIFT_DIAGNOSTIC_SECONDS`). Twelve (about 2.5 minutes) sat in the middle
+# the verify deadline runs from the start; either the poll cap or the deadline
+# ends a mismatch that never clears (see `IMAGE_DRIFT_DIAGNOSTIC_SECONDS`).
+# Twelve (about 2.5 minutes) sat in the middle
 # of the observed lag: on 10-05..10-07 completed verify steps ran up to 192s while
 # eight runs with a healthy, exact-build container failed at 129-186s.
 APPLICATION_IMAGE_STALE_POLLS = 24
@@ -64,7 +66,7 @@ READINESS_TOKENS = frozenset({
     "shutdown_unconfirmed", "storage_unavailable", "storage_invalid",
     "deployment_id_missing", "operation_failed",
 })
-VERIFY_TIMEOUT_SECONDS = 300
+VERIFY_TIMEOUT_SECONDS = 600
 API_TRANSPORT_BACKOFF_SECONDS = (0.25, 0.5)
 MAX_TIMEOUT_DIAGNOSTIC_SECONDS = 3600
 TOKEN = re.compile(r"[a-z0-9_]{1,32}")
@@ -550,6 +552,69 @@ def runtime_ready(status, headers, body, version, revision, build_id, deploy_id)
                                    for part in components)
 
 
+def save_forward_mismatch(args, code, headers, body, version, baseline, pinned, image,
+                          rollout_observed_at, sample_received_at):
+    """Retain only bounded identities, never probe text or configurations."""
+    sidecar = Path(args.evidence).with_suffix(".readyz-mismatch.json")
+    # Replacing a directory symlink could break paths to both inputs.
+    if sidecar.is_symlink():
+        raise ValueError("mismatch evidence destination is a symlink")
+    if sidecar.exists() and any(sidecar.samefile(path) for path in (args.receipt, args.output)):
+        raise ValueError("mismatch evidence aliases a verification input")
+    missing = object()
+
+    def field(value, valid):
+        if value is missing:
+            return "absent"
+        return value if isinstance(value, str) and valid(value) else "invalid"
+
+    def singleton_header(name, valid):
+        if hasattr(headers, "get_all") and len(headers.get_all(name, [])) > 1:
+            return "invalid"
+        return field(headers.get(name, missing), valid)
+
+    def utc(seconds):
+        return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="milliseconds")
+
+    try:
+        report = mapping(decode(body))
+    except GateError:
+        # The Worker identity check can fail before the gate reads the body.
+        report = dict.fromkeys(("build_revision", "build_id", "deploy_id"), None)
+    compiled_fields = {
+        "build_revision": ("revision", is_build_revision_shape),
+        "build_id": ("build_id", is_build_id_shape),
+        "deploy_id": ("deploy_id", is_deploy_id_shape),
+    }
+    expected = {"worker_version": version}
+    observed = {"worker_version": singleton_header("x-two-worker-version", re.compile(UUID).fullmatch)}
+    for key, (baseline_key, valid) in compiled_fields.items():
+        expected[key] = field(baseline[baseline_key], valid)
+        observed[key] = field(report.get(key, missing), lambda value: value == UNSTAMPED or valid(value))
+
+    target_version = pinned["target_version"]  # already checked as a nonnegative int
+    record = {
+        "error": code, "readyz_status": 200, "sample_received_at_utc": utc(sample_received_at),
+        "run_id": field(os.environ.get("GITHUB_RUN_ID", missing), re.compile(r"[1-9][0-9]{0,19}").fullmatch),
+        "run_attempt": field(os.environ.get("GITHUB_RUN_ATTEMPT", missing),
+                             re.compile(r"[1-9][0-9]{0,19}").fullmatch),
+        # Match the existing Worker/Rust correlation ID contract; do not mint one.
+        "request_id": singleton_header("x-request-id", re.compile(r"[0-9A-HJKMNP-TV-Z]{26}").fullmatch),
+        "expected": expected, "observed": observed,
+        "control_plane": {
+            "rollout_id": pinned["id"],  # already shape- and length-checked
+            "rollout_completed_observed_at_utc": utc(rollout_observed_at),
+            "target_version": target_version if target_version < 2**64 else "invalid",
+            "target_image_digest": image.rsplit("@", 1)[1],  # checked by docker_image and the rollout gate
+        },
+    }
+    # Stage privately on the same filesystem; publish only a complete record.
+    with tempfile.TemporaryDirectory(dir=sidecar.parent, prefix=".readyz-mismatch-") as temporary:
+        staged = Path(temporary) / "record.json"
+        save(staged, record)
+        os.replace(staged, sidecar)
+
+
 def rollout_observation(row):
     # Fixed vocabulary and integers only; configurations never reach the log.
     status = row.get("status")
@@ -983,8 +1048,10 @@ def verify(args, client):
             # The pinned rollout plus exact-build /readyz and /health probes are
             # the acceptance evidence; keep polling those while the listing lags.
             if complete or lag:
+                rollout_observed_at = time.time()
                 active_worker(client, version)
                 status, headers, body = client.request(url + "/readyz")
+                sample_received_at = time.time()
                 probed = True
                 observed = "rollout=active_lag " if lag else "rollout=converged "
                 client.observation = observed + runtime_observation(
@@ -992,8 +1059,19 @@ def verify(args, client):
                     baseline["deploy_id"])
                 if stale:
                     client.observation += f" application_image=stale polls={image_stale}"
-                if runtime_ready(status, headers, body, version, baseline["revision"], baseline["build_id"],
-                                   baseline["deploy_id"]):
+                try:
+                    ready = runtime_ready(status, headers, body, version, baseline["revision"],
+                                          baseline["build_id"], baseline["deploy_id"])
+                except GateError as error:
+                    if str(error) in ("serving_worker_mismatch", "serving_image_mismatch"):
+                        try:
+                            save_forward_mismatch(args, str(error), headers, body, version, baseline,
+                                                  pinned, image, rollout_observed_at, sample_received_at)
+                        except Exception:
+                            # The optional sidecar must not replace the gate's verdict.
+                            print("staging rollout readiness mismatch evidence could not be written")
+                    raise
+                if ready:
                     health, health_headers, _ = client.request(url + "/health")
                     client.observation = f"{observed}readyz=200 health={health}"
                     if stale:
@@ -1001,8 +1079,12 @@ def verify(args, client):
                     if health == 200 and health_headers.get("x-two-worker-version") == version:
                         # Re-read control plane after the runtime probes; neither
                         # Worker activation nor container rollout is transactional.
-                        active_worker(client, version)
-                        final = client.api(f"/containers/applications/{app['id']}/rollouts/{pinned['id']}")
+                        deadline_aware_read(
+                            client, lambda: active_worker(client, version), app, row, image,
+                            drift_candidate, verification_started)
+                        final = deadline_aware_read(
+                            client, lambda: client.api(f"/containers/applications/{app['id']}/rollouts/{pinned['id']}"),
+                            app, row, image, drift_candidate, verification_started)
                         require(mapping(final).get("id") == pinned["id"], "rollout_identity_drift")
                         # The instance counters can wobble between the `converged`
                         # and lag shapes while the exact build keeps serving, so
@@ -1011,7 +1093,9 @@ def verify(args, client):
                         require(converged(final, image, pinned["target_version"])
                                 or active_lag(final, image, pinned["target_version"]),
                                 "rollout_not_converged")
-                        final_app = application(client)
+                        final_app = deadline_aware_read(
+                            client, lambda: application(client), app, final, image,
+                            drift_candidate, verification_started)
                         require(final_app["id"] == app["id"]
                                 and final_app["durable_objects"]["namespace_id"] == baseline["namespace_id"],
                                 "application_identity_drift")
@@ -1026,7 +1110,10 @@ def verify(args, client):
                         )
                         later_rollouts = []
                         if final_image != image and verified_previous_image and not listing_seen_target:
-                            later_rollouts = [mapping(item) for item in rollouts(client, app["id"])
+                            final_rollouts = deadline_aware_read(
+                                client, lambda: rollouts(client, app["id"]), final_app, final, image,
+                                True, verification_started)
+                            later_rollouts = [mapping(item) for item in final_rollouts
                                               if mapping(item).get("id") != pinned["id"]
                                               and timestamp(mapping(item).get("created_at"))
                                               > timestamp(pinned.get("created_at"))]
@@ -1036,7 +1123,11 @@ def verify(args, client):
                                             image_drift_detail(client, final_app, final, image))
                         listing_lag = final_image != image
                         if complete or lag_streak + 1 >= ACTIVE_LAG_CONFIRMATIONS:
-                            evidence = {"worker_version": version, "application_id": app["id"],
+                            deadline_aware_read(
+                                client, lambda: require(time.monotonic() < client.deadline, "rollout_timeout"),
+                                final_app, final, image, listing_lag, verification_started)
+                            evidence = {"verification_elapsed_seconds": round(time.monotonic() - verification_started, 3),
+                                        "worker_version": version, "application_id": app["id"],
                                         "rollout_id": pinned["id"],
                                         "target_version": pinned["target_version"],
                                         "image": image, "revision": baseline["revision"],
@@ -1099,6 +1190,8 @@ def main():
     parser.add_argument("--config", default="wrangler.toml")
     parser.add_argument("--deploy-config", default="staging-deploy.json")
     parser.add_argument("--evidence", default="staging-rollout-evidence.json")
+    parser.add_argument("--verify-timeout-seconds", type=int, default=VERIFY_TIMEOUT_SECONDS,
+                        help="verify deadline in seconds (1–600; default: 600)")
     parser.add_argument("--inject-gateway-failure", action="store_true",
                         help="prepare only: staging rollback drill — the generated "
                              "staging deploy config reports gateway not-ready")
@@ -1109,6 +1202,8 @@ def main():
                         help="prepare only: staging remediation drill — the generated "
                              "staging deploy config holds an unpaired disconnect")
     args = parser.parse_args()
+    if not 1 <= args.verify_timeout_seconds <= VERIFY_TIMEOUT_SECONDS:
+        parser.error("--verify-timeout-seconds must be between 1 and 600")
     if args.inject_gateway_failure and args.mode != "prepare":
         parser.error("--inject-gateway-failure is prepare-only")
     if args.inject_voice_stall and args.mode != "prepare":
@@ -1117,7 +1212,7 @@ def main():
         parser.error("--inject-unpaired-disconnect is prepare-only")
     client = None
     try:
-        deadline = time.monotonic() + VERIFY_TIMEOUT_SECONDS if args.mode == "verify" else None
+        deadline = time.monotonic() + args.verify_timeout_seconds if args.mode == "verify" else None
         # `receipt` only reads the local Wrangler NDJSON; it needs no Cloudflare credentials.
         client = None if args.mode == "receipt" else Client(
             os.environ.get("CLOUDFLARE_ACCOUNT_ID"), os.environ.get("CLOUDFLARE_API_TOKEN"), deadline)

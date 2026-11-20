@@ -2087,7 +2087,21 @@ export default {
         // A stale Worker sharing this namespace cannot impersonate the current
         // DO version; always overwrite untrusted ingress identity.
         forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
-        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+        const response = env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+        if (url.pathname !== STAGING_USE_PATH || request.method !== "GET") return await response;
+        // The DO can be unable to receive events during container startup. A
+        // timeout conveys unknown state, never ownership or confirmed cleanup.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          return await Promise.race([
+            response,
+            new Promise<Response>((resolve) => {
+              timer = setTimeout(() => resolve(new Response("staging_status_unknown", {
+                status: 503, headers: withSecurityHeaders({ "cache-control": "no-store" }),
+              })), 10_000);
+            }),
+          ]);
+        } finally { clearTimeout(timer); }
       } catch (error) { return refused(error); }
     }
 

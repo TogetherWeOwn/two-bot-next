@@ -28,35 +28,30 @@ disagree, the live queue wins and this file needs a dated update.
   the per-item table.
 - Five later-milestone ideas are retained but deferred, undecided
   (2026-11-10). No build is committed.
-- A public roadmap entry point is in review as a separate docs change
-  (#2021). This snapshot does not duplicate it; the approved-vs-proposed
-  summary above already names what counts as scope without relying on
-  that entry point.
+- For public direction, see the [roadmap](ROADMAP.md), which landed
+  after this snapshot in #2021. It summarizes direction without changing
+  the approved scope.
 - M2 state: lockdown preview merged slices are implemented, dark and
   unpublished (planner #1920, executor reads #1925, dark slash #1929);
-  the confirm/cancel build step #1938 remains open; `{args}`
-  build slices merged in #1970/#1974 (spec Status correction open as
-  #2002); automod preview slices #1959, #1961–#1965 are open; warning
-  history is spec-only. See the current-state plan for the per-item
-  table.
+  the confirm/cancel build step #1938 was open; `{args}` build slices
+  merged in #1970/#1974; automod preview slices #1959, #1961–#1965
+  were open; warning history was spec-only. See the current-state plan
+  for the per-item table.
 
 ## Relevant public PRs and branches
 
-- The roadmap entry-point PR is #2021, open and in review at snapshot.
-  Do not modify its pending review from a handoff; integrate it once
-  merged.
-- M2 build branches are the only build work in flight: automod
-  preview slices #1959, #1961–#1965 (open), lockdown confirm/cancel
-  #1938 (open), and the `{args}` status correction #2002 (open;
-  builds merged in #1970/#1974). No M3 build PR has been opened.
+- At snapshot, the in-flight M2 builds were automod preview slices
+  #1959, #1961–#1965 and lockdown confirm/cancel #1938. No M3 build
+  PR had been opened.
+- The `{args}` spec status correction #2002 landed after this snapshot.
+  It records the builds merged in #1970/#1974, not production activation.
 
 ## Blockers (public-safe summary)
 
-- **Blocked on staging recovery:** automod preview (W3), warning
-  history (W4) and `{args}` (W5, built in a stack with merges pending
-  per its spec Status line; builds merged in #1970/#1974, status
-  correction open as #2002). Staging recovery means database re-home,
-  then staging migrations, then the staging lifecycle drill. Details
+- **Blocked on staging recovery at snapshot:** automod preview (W3),
+  warning history (W4) and `{args}` gated release (W5). Staging recovery
+  means database re-home, then staging migrations, then the staging
+  lifecycle drill. Details
   live in the staging and cutover runbooks, not here; no incident
   internals are reproduced.
 - A production incident with a protective hold is in progress at
@@ -72,12 +67,11 @@ Follow the pre-push checklist in
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#pre-push-checklist). That file is
 the authoritative list; this handoff does not reproduce it.
 
-On the persistent controller, run compiling Cargo commands through
-`python3 scripts/cargo_cache.py run -- <check|test|clippy|build> ...`
-(see [build cache](build-cache.md)). Database tests run only against
-a disposable test database; see
-[`CONTRIBUTING.md`](../CONTRIBUTING.md#database-tests). Full suites
-run on GitHub Actions; record the exact-head run links in the PR body.
+Run full suites on GitHub Actions and record the exact-head run links in
+the PR body. Local compilation is for
+[focused failure reproduction](../CONTRIBUTING.md#focused-failure-reproduction-only)
+only; see the [build cache](build-cache.md) for permitted controller fallback.
+[Database tests](../CONTRIBUTING.md#database-tests) use only disposable databases.
 
 ## Last verification
 
@@ -99,11 +93,10 @@ run on GitHub Actions; record the exact-head run links in the PR body.
 
 Resume the three remaining M2 items once staging recovery lands:
 automod preview (W3) first, then warning history (W4), then `{args}`
-(W5) gated release — re-checking each spec's seams on current `main`
-first, building behind the spec's own gates and staging behavior
-evidence before any merge approval. The lockdown preview's merged slices
-are already implemented dark; publication/activation remains behind its
-own spec §8 gates, and the confirm/cancel build step remains open as
-#1938 (candidate accepts only application-command interactions).
-Until then, keep M3 deferred and keep release
-holds in force.
+(W5) gated release. Re-check each spec's seams on current `main`
+first, then follow the spec's gates and the current merge and staging
+requirements. The lockdown preview's merged slices are implemented
+but dark; publication and activation remain behind its spec §8 gates.
+At snapshot, the confirm/cancel build step (#1938) was still open
+and the candidate accepted only application-command interactions.
+Keep M3 deferred and leave release holds in force.

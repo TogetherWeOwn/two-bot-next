@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -54,6 +55,135 @@ class RevisionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual((self.root / "pipeline-benchmark-revision.txt").read_text(), "")
         self.assertFalse((self.root / "pipeline-benchmark-pr-head.txt").exists())
+
+    def job_blocks(self, workflow):
+        jobs = workflow.split("\njobs:\n", 1)[1]
+        headers = list(re.finditer(r"^  ([\w-]+):\n", jobs, re.MULTILINE))
+        return {match.group(1): jobs[match.start():headers[index + 1].start()
+                                   if index + 1 < len(headers) else len(jobs)]
+                for index, match in enumerate(headers)}
+
+    def assert_collector(self, workflow, job):
+        jobs = self.job_blocks(workflow)
+        self.assertIn(job, jobs)
+        block = jobs[job]
+        self.assertIn("    steps:\n", block, job)
+        service = block.split("    steps:\n", 1)[0]
+        self.assertIn("    services:\n", service, job)
+        service = service.split("    services:\n", 1)[1]
+        self.assertIn("POSTGRES_INITDB_ARGS:", service, job)
+        self.assertIn("-c logging_collector=on -c log_destination=jsonlog", service, job)
+        self.assertIn("-c log_rotation_age=0 -c log_rotation_size=0", service, job)
+        if job == "benchmark":
+            self.assertIn("-c autovacuum=off", service)
+            self.assertIn("-c log_min_duration_statement=0", service)
+        else:
+            self.assertNotIn("-c autovacuum=off", service)
+            self.assertNotIn("-c log_min_duration_statement=0", service)
+
+    def test_benchmark_and_normal_sweeps_provide_disposable_log_collectors(self):
+        for filename, job in [("pipeline-benchmark.yml", "benchmark"),
+                              ("check.yml", "rust-tests"), ("check.yml", "coverage-shard"),
+                              ("nightly.yml", "sweep-partition")]:
+            workflow = (ROOT / ".github/workflows" / filename).read_text()
+            with self.subTest(workflow=filename, job=job):
+                self.assert_collector(workflow, job)
+
+    def test_nightly_collectors_follow_guard_execution(self):
+        workflow = (ROOT / ".github/workflows/nightly.yml").read_text()
+        jobs = self.job_blocks(workflow)
+        execution_jobs = [job for job, block in jobs.items()
+                          if "    steps:\n" in block and any(
+                              command in block.split("    steps:\n", 1)[1]
+                              for command in ("nightly_partition.py run", "pipeline_integrity",
+                                              "pipeline_durability"))]
+        self.assertTrue(execution_jobs, "no nightly integrity guard execution lane found")
+        for job in execution_jobs:
+            with self.subTest(job=job):
+                self.assert_collector(workflow, job)
+        for job in ("sweep-plan", "sweep-guarded", "sweep-docs"):
+            with self.subTest(nonexecuting_job=job):
+                self.assertNotIn("POSTGRES_INITDB_ARGS", jobs[job])
+
+    def test_nightly_collector_rejection_controls(self):
+        workflow = (ROOT / ".github/workflows/nightly.yml").read_text()
+        jobs = self.job_blocks(workflow)
+        collector = (
+            "          # Only the log-reader regression's connection enables completions.\n"
+            "          POSTGRES_INITDB_ARGS: >-\n"
+            "            -c logging_collector=on -c log_destination=jsonlog\n"
+            "            -c log_rotation_age=0 -c log_rotation_size=0\n"
+        )
+        self.assertIn(collector, jobs["sweep-partition"])
+        removed = workflow.replace(jobs["sweep-partition"],
+                                   jobs["sweep-partition"].replace(collector, "", 1), 1)
+        moved = removed.replace(jobs["sweep-guarded"], jobs["sweep-guarded"].replace(
+            "          POSTGRES_HOST_AUTH_METHOD: trust\n",
+            "          POSTGRES_HOST_AUTH_METHOD: trust\n" + collector, 1), 1)
+        moved_partition = self.job_blocks(moved)["sweep-partition"]
+        service = moved_partition.split("    services:\n", 1)[1].split("    steps:\n", 1)[0]
+        no_service = moved.replace(moved_partition, moved_partition.replace(
+            "    services:\n" + service, "", 1), 1)
+        self.assertNotIn("    services:\n", self.job_blocks(no_service)["sweep-partition"])
+        self.assertIn(collector, self.job_blocks(no_service)["sweep-guarded"])
+        for name, candidate, job in [("removed", removed, "sweep-partition"),
+                                     ("moved", moved, "sweep-partition"),
+                                     ("later service", no_service, "sweep-partition"),
+                                     ("aggregate", workflow, "sweep")]:
+            with self.subTest(mutation=name), self.assertRaises(AssertionError):
+                self.assert_collector(candidate, job)
+
+    def test_pipeline_database_guards_run_without_ignored_test_opt_ins(self):
+        durability = (ROOT / "crates/cutover/tests/pipeline_durability.rs").read_text()
+        self.assertNotIn("#[ignore", durability)
+        self.assertNotIn('"--ignored"', durability)
+        integrity = (ROOT / "crates/testsupport/tests/pipeline_integrity.rs").read_text()
+        self.assertNotIn("#[ignore", integrity)
+        self.assertEqual(integrity.count("#[tokio::test]"), 3)
+        workflow = (ROOT / ".github/workflows/check.yml").read_text()
+        normal = workflow.split("  rust-tests:\n", 1)[1].split("  coverage-plan:\n", 1)[0]
+        self.assertIn("TWO_TEST_DATABASE_URL:", normal)
+        self.assertIn("cargo test --workspace --test '*'", normal)
+        benchmark = (ROOT / ".github/workflows/pipeline-benchmark.yml").read_text()
+        build = "cargo test -p two-bot-cutover --test pipeline_durability --locked --no-run"
+        run = "timeout 120s cargo test -p two-bot-cutover --test pipeline_durability --locked -- --test-threads=1"
+        self.assertIn(build, benchmark)
+        self.assertIn(run, benchmark)
+        self.assertLess(benchmark.index(build), benchmark.index(run))
+        self.assertIn("cargo test -p two-bot-testsupport --test pipeline_integrity --locked", benchmark)
+
+    def test_completion_log_processing_follows_historical_rss_sample(self):
+        driver = (ROOT / "crates/discord/examples/pipeline_bench.rs").read_text()
+        measure = driver.split("async fn measure(", 1)[1].split("#[tokio::main", 1)[0]
+        peak = measure.index("let peak = peak_rss_mib()?;")
+        # Keep all historical row/journal/checkpoint verification inside VmHWM.
+        for operation in ("SELECT count(*) FROM events", "SELECT count(*) FROM members",
+                          "SELECT count(*), count(DISTINCT e.id)",
+                          'checkpoint.sequence == sequence'):
+            self.assertLess(measure.index(operation), peak)
+        # JSON buffering/decoding can be as large as the 64 MiB log budget.
+        self.assertGreater(measure.index("completed_statement_profile("), peak)
+        self.assertGreater(measure.index("server.verify(config.events(), statements, commits)?;"), peak)
+        self.assertLess(peak, measure.index('"peak_rss_mib":peak'))
+
+    def test_only_new_key_oracle_is_excluded_from_handler_latency(self):
+        driver = (ROOT / "crates/discord/examples/pipeline_bench.rs").read_text()
+        commit = driver.split("async fn commit(", 1)[1].split("fn percentiles(", 1)[0]
+        oracle = commit.split("let oracle_started = Instant::now();", 1)[1]
+        oracle, persistence = oracle.split("let oracle_elapsed = oracle_started.elapsed();", 1)
+        self.assertEqual(oracle.strip(),
+                         "expected.extend(batch.events.iter().map(two_bot_core::idempotency_key));")
+        self.assertIn("pipeline.handle_at(", commit.split("let oracle_started", 1)[0])
+        self.assertIn("let checkpoint = GatewaySession", commit.split("let oracle_started", 1)[0])
+        self.assertIn("let batch = pipeline.handlers().store().take_batch();",
+                      commit.split("let oracle_started", 1)[0])
+        self.assertIn("store.commit_dispatch(&checkpoint, batch).await?", persistence)
+        self.assertIn("Ok(oracle_elapsed)", persistence)
+        timing = driver.split("let started = Instant::now();\n            let oracle_elapsed", 1)[1]
+        timing = timing.split("let profile = event_profile.entry", 1)[0]
+        self.assertIn("commit(&pipeline, &store, event, sequence, at_ms, &mut expected).await?;", timing)
+        self.assertIn("started.elapsed().saturating_sub(oracle_elapsed).as_secs_f64()",
+                      "".join(timing.split()))
 
     def test_workflow_runs_regressions_and_uploads_both_receipts(self):
         workflow = (ROOT / ".github/workflows/pipeline-benchmark.yml").read_text()

@@ -112,7 +112,15 @@ See the query pack.
   every load failure increments `two_bot_db_errors_total`. Worker tail is
   not Rust stdout.
 - Watch checkpoints: +15 min, +1 h, +6 h, +24 h, +48 h from `T_0`,
-  one GO / EXTEND / ROLLBACK row each on the execution card.
+  one GO / EXTEND / ROLLBACK row for each checkpoint due while the watch is
+  open on the execution card. Evidence-complete early closure requires all
+  prescribed timer/workload coverage and independent B2; record actual close
+  UTC and reason, marking later rows/comparisons N/A, not missing or PASS.
+  If still incomplete at +48 h, record INCOMPLETE; the cutover lead, Release
+  Manager and data lead decide hold / incident / rollback and record any
+  separately bounded continuation with owner, missing proof and deadline.
+  Closure does not disable normal monitoring or retire warm recovery resources;
+  thresholds, writer fences, permissions and rollback gates remain unchanged.
 
 ## 3. Paging path
 

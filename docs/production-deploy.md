@@ -55,13 +55,18 @@ names a missing Environment makes GitHub create it with no protection, so the
 guard checks before the deploy job can run. This repository is public, so
 required reviewers work on every plan; no Enterprise plan is needed.
 
-**Deploy.** Leave `sha` empty to promote the commit of the latest successful
-`deploy-staging` run on `main` (the normal case: merges keep superseding pending
-staging runs, so the newest `main` commit is often not staged). The guard then
-applies every rule below to that commit and refuses it if its `ci-ok` or
-`worker check` has not finished green. To deploy a specific commit, dispatch
-with `sha` set to a full 40-character commit (or an unambiguous 7-40 character hex prefix, which the guard resolves to the full commit via the commits API) that is on `main`. That commit needs successful, completed `ci-ok` and `worker check`
-runs from GitHub Actions and a successful `deploy-staging` run. `ci-ok` is the
+**Deploy.** Dispatch with `sha` set to the exact full SHA the Release Manager
+accepted; a different SHA needs fresh acceptance. The guard's empty-`sha` mode
+(Leave `sha` empty to promote the commit of the latest successful
+`deploy-staging` run on `main`) is not a release route: that commit can be newer
+than the accepted SHA. The newest `main` commit may not have a qualifying
+staging run. The guard applies every rule below to the selected
+commit and refuses it if its `ci-ok` or `worker check` has not finished green.
+The `sha` input takes a full 40-character
+commit (or an unambiguous 7-40 character hex prefix, which the guard resolves
+to the full commit via the commits API) that is on `main`. That commit needs
+successful, completed `ci-ok` and `worker check` runs from GitHub Actions and
+a successful `deploy-staging` run. `ci-ok` is the
 full verdict over lint, worker checks and every selected Rust/DB test lane;
 a green lint-only `check` job is not enough. The guard enumerates `check.yml`
 runs for the exact SHA without a success filter, selects the newest run number,
@@ -74,12 +79,11 @@ pagination and a run/attempt change during validation fail closed. If a partial
 rerun omits a required job from the current attempt, rerun **all jobs**; do not
 reuse the earlier attempt's receipt. The summary records the admitted run/attempt.
 Staging runs queue in a single concurrency group, so an intermediate commit may
-never stage; the empty-`sha` promotion picks the latest one that did. A push to `main` that touches only docs, root
-markdown or repository chrome (the `paths-ignore` list in `deploy-staging.yml`)
-starts no staging run either, so the newest `main` commit may have no
-`deploy-staging` run: pin the latest commit that changes runtime inputs, or
-dispatch `deploy-staging` for the head you need. Docs-only commits after a
-staged commit change nothing the Worker or container serves.
+never stage; the empty-`sha` promotion picks the latest one that did. A merge
+does not prove staging deployment or qualification. Consult `deploy-staging.yml`
+at the relevant ref for its triggers, and verify completed qualifying evidence
+for the intended exact `main` SHA. If evidence is absent, keep promotion held
+and follow the separately authorized [qualification/recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
 After the reviewer approves (or the automated approval passes), the job:
 
 1. checks out exactly that commit and re-verifies that it is on `origin/main`;
@@ -251,6 +255,7 @@ These skips keep it green while deploying nothing:
   (`staging-pending`): the staging completion promotes it;
 - `check.yml` is still running on the target (`ci-pending`): its completion
   promotes it (a completed red CI still refuses);
+- the dedicated automatic-promotion disable is set (see below);
 - the hold variable is still in the future (see below);
 - the target is already live: production `/readyz` already reports the SHA;
 - the live build already contains the target (`older-than-live`): an older
@@ -281,11 +286,25 @@ changing trigger routing. No staging-poll retry loop is needed.
 
 Otherwise the `soak` job takes the canonical `staging-lifecycle` lock,
 acquires a 40-minute run/attempt grant for the guarded SHA and proves readiness
-before the baseline. Automatic promotion measures a **fresh full 30 minutes**
-after that baseline, rechecking exact-build readiness at most every minute
+before the baseline. Automatic promotion and manual staged takeover measure a
+**fresh full 30 minutes** after that baseline, rechecking exact-build readiness at most every minute
 and at the boundaries. Historical staging-green age, runner queues and idle
 time supply no credit; the guard's historical remainder is advisory only.
-Manual ordinary deploys retain their no-delay policy but use the same finite
+The 30min interval is required continuous coverage on the same exact build and
+process incarnation, not an arbitrary wait; no shorter equivalent is supported.
+Required qualification for the earliest automatic exit is that coverage, at
+least 10 judged requests, the final pinned user-flow/readiness/original-grant
+proof and confirmed release. These are policy requirements, not a claim that
+the shipped gates enforce all of them.
+
+The production regression consumer refuses `insufficient_data`: the baseline
+and final counters must have a valid matching process identity, a consistent
+counter delta and at least ten judged requests in that delta. A measured
+post-restart regression still refuses. The separate diagnostic
+`wrangler/scripts/promotion-error-gate.mjs` retains its warning-only behavior;
+it cannot authorize production. A successful workflow alone is not release
+approval, and existing holds remain in force.
+Manual cutover-hold deploys retain their no-delay policy but use the same finite
 grant, baseline, final sample and release. Rollback and live-SHA cures skip
 the staging holder entirely. A superseded SHA refuses before acquisition;
 select the current verified candidate on the next promotion rather than
@@ -302,14 +321,19 @@ cap. Startup readiness can consume up to five minutes before the fresh
 before expiry. A slow/unhealthy candidate that exhausts the grant fails closed;
 the extra job time never authorizes more sampling or extends the grant. Native
 expiry remains necessary if setup/provider calls exhaust the job budget.
+Startup≤5min, original non-renewing grant≤40min and job≤50min are maxima, not
+additional runtime authorization. Insufficient count, reset/restart, no bearer,
+changed build or unknown release is not rate PASS. At grant/budget exhaustion,
+fail closed, retain evidence and safely release or expire; hold and route the
+missing proof rather than renew or promote. This holder does not authorize B2.
 Lifecycle NDJSON and available
 measurement JSON are always retained as
 `staging-soak-<run_id>-<run_attempt>` for seven days. The soak runs outside the
 `deploy-production` lane — only the `production` job holds it —
 so a staging wait never queues an operator production rollback behind it. The lane keeps the default single pending slot, so a `recheck`
-job waits for the soak and both gates, then re-reads the hold, the live
-revision and the active dispatches immediately before the deploy: a hold set,
-a target gone live or stale, or an operator dispatch queued, waiting or in
+job waits for the soak and both gates, then re-reads the disable, the hold,
+the live revision and the active dispatches immediately before the deploy: a
+disable set, a hold set, a target gone live or stale, or an operator dispatch queued, waiting or in
 progress while the gates built or the soak slept skips green instead of
 deploying through the incident — or entering the lane behind a recovery run
 and cancelling it. A failed soak fails closed into no deploy, an unreadable
@@ -330,6 +354,34 @@ decision first. After a manual rollback, set the hold until the incident is
 resolved: otherwise the next automatic run re-selects the staged build that
 was just rolled back and redeploys it (the live check only skips builds the
 live revision already contains, and a rolled-back target is newer than live).
+
+Non-expiring disable: the repository variable
+`PRODUCTION_AUTO_PROMOTE_DISABLED` is the durable replacement for an
+expiry-only hold. Only the exact value `true` disables automatic promotion;
+any other value (including unset/empty) is off. With it set, an automatic
+run that otherwise passes the guard — both the `workflow_run` completions
+(`deploy-staging`, `check`) and the daily schedule backstop — skips green
+before the soak with reason `auto-promote-disabled` (a guard refusal stays
+red and deploys nothing, as before), and the pre-deploy `recheck` re-reads
+it after the gates/soak so a disable set before that checkpoint still
+skips instead of deploying. The `production` job consumes the recheck
+outputs and does not re-read the variable: the residual window between the
+recheck checkpoint and production start is the same one the timed hold
+already has. The live `production` Environment currently has no
+`required_reviewers`, so there is no approval-wait window today; if
+reviewers are ever added, an automatic-only fresh re-read at production
+start must be added before relying on this control. The workflow and its triggers stay enabled (no scheduled/
+backstop entry point is removed, no shared credential is touched), and
+manual dispatches ignore the disable entirely: deploy, rollback and
+live-SHA takeover with `takeover` keep working, and every QA/RM and
+exact-SHA gate still applies to them. Re-enable only after a recorded RM
+rollback/S2 PASS and all remaining exact-SHA qualification/release/incident
+gates, separately controlled — never by automatic expiry. Do not use a
+far-future `PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL` timestamp as a surrogate:
+a date guard stops holding at its expiry even if PASS is absent. Setting
+or clearing `PRODUCTION_AUTO_PROMOTE_DISABLED` is an operator action
+(record the effective-setting readback and the `updated_at` timestamp);
+code alone does not flip the live setting.
 
 ## Rollback-target preflight
 
@@ -352,8 +404,8 @@ runs `scripts/rollback_target_preflight.py`, which refuses the promotion
 Its receipt (version, image, SHA, the migrations it checked, refusal codes)
 goes to the log and the run summary; it never carries SQL text or API
 bodies. A rollback and the live-SHA redeploy skip it: recovery never waits on
-it. The daily `staging-rollback-drill` keeps exercising the restore path
-itself on staging.
+it. The Release Manager exercises the restore path with the [on-demand staging proof](#on-demand-staging-proof)
+once per bot production release, after deploying the candidate to staging.
 
 ## Regression gate against production
 
@@ -363,8 +415,9 @@ soaked candidate on staging with production as it serves now:
 - The `soak` job acquires and readies the guarded SHA in its finite window,
   then records a soak-baseline `/ops/metrics` scrape
   (`wrangler/scripts/rest-5xx-counters.mjs`, same `staging` Environment
-  bearer). Automatic runs measure the full fresh interval with
-  `wrangler/scripts/staging-soak-window.mjs`; manual runs do not add a delay.
+  bearer). Automatic runs and manual staged takeovers measure the full fresh
+  interval with `wrangler/scripts/staging-soak-window.mjs`; a manual
+  cutover-hold deploy retains its distinct no-delay policy.
 - Under that same job's staging lock, it runs the final staging user-flow
   probe pinned to the guarded SHA and bound to
   the guarded run-attempt build (a same-SHA redeploy no longer proves the
@@ -391,9 +444,11 @@ soaked candidate on staging with production as it serves now:
   `scripts/promotion_regression_gate.py compare` refuses when a journey
   (`health`, `readyz`, `build`) passes on production but failed on staging,
   or when staging's REST 5xx ratio exceeds max(1.5 × production's ratio, 5%)
-  with at least 3 staging 5xx responses. Fewer than 10 judged staging
-  requests (or no bearer) records `insufficient_data` with a warning, never a
-  pass; a production baseline below 10 requests falls back to the 5% floor.
+  with at least 3 staging 5xx responses. A valid same-process counter delta
+  with fewer than 10 requests still refuses as `rest_5xx_regression` when it
+  meets that regression threshold; otherwise it refuses as `insufficient_data`.
+  Missing baseline or identity cannot produce a pass. A production baseline
+  below 10 requests falls back to the 5% floor.
 
 A failing production journey lowers the baseline, never the bar: the gate
 only asks that the candidate is no worse than what serves now. The
@@ -487,9 +542,14 @@ rollback proofs and an opted-out voice gate never certify. The diagnostic
 `staging-rollout-evidence` upload stays independent and still runs on failure.
 Packaging unsets `WRANGLER_OUTPUT_FILE_PATH`: Wrangler's dry run writes session
 and deploy records too, and must not contaminate the real deploy's single receipt.
-Only **Re-run all jobs** is supported for certification. A partial job rerun can
-reuse an earlier deploy attempt; certification intentionally refuses that old
-build evidence rather than relabeling it as the new current attempt.
+Neither **Re-run all jobs** nor **Re-run failed jobs** can certify: the
+deploy-called voice and help synthetics refuse every rerun, and a partial rerun
+can also reuse earlier deploy evidence. Subject to existing holds and
+authorization, follow the
+[staging qualification and recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
+for the intended exact `main` SHA. An older pin cannot certify a different
+workflow head. Wait for all qualifying jobs and release, and retain the fresh
+receipts.
 
 The certificate contains only a closed version-1 receipt and `modules/`: source
 repository/SHA/run/attempt, original compiled stamps, verified staging Worker and
@@ -555,7 +615,7 @@ verifies the saved module inventory and renders immutable inputs as described
 above. The legacy recovery invocation makes source/build paths absolute and
 sets `image_vars` on the single production container; existing protected tests
 still pin that legacy diff. The lockfile's Wrangler
-(4.156.0) runs the deploy: `wrangler-action` uses the installed version when
+(4.161.0) runs the deploy: `wrangler-action` uses the installed version when
 `wranglerVersion` is omitted, and the job runs `npm ci` first.
 
 The gate polls `/readyz` every 10 seconds for up to 30 attempts. In ordinary
@@ -607,24 +667,38 @@ policy pins this ordering, condition, local snapshot command and red outcome.
 Without a takeover or a successful deploy/snapshot the run fails for the
 operator; a failed restore is never a reason to wait for the next deployment.
 
-### Daily staging proof
+After the production rollback script posts a Worker restore once,
+it checks the current deployment immediately. A valid but nonmatching serving
+version allows up to six more readbacks, ten seconds apart. The target must serve
+100% of traffic before the image restore proceeds. Exhaustion fails with
+`rollback_not_active`; a readback error or split traffic still stops the restore.
+The confirmation never posts again.
 
-`staging-rollback-drill.yml` runs daily at **03:17 UTC** on `main`. With no manual
-`target_version`, its `proof` job calls `scripts/rollback_proof.py run`, which:
+<a id="daily-staging-proof"></a>
+### On-demand staging proof
+
+Dispatch `staging-rollback-drill.yml` on `main` with `target_version` empty
+and `sha` set to the full 40-character lowercase candidate commit.
 
 1. Dispatches only `deploy-staging.yml` on `main`, with the existing staging
-   error-rate gate rehearsal enabled. No production dispatch or traffic fault
-   is involved. The GitHub REST `2026-03-10` dispatch response provides the exact
+   error-rate gate rehearsal and explicit prior-SHA opt-in. No production dispatch
+   or traffic fault is involved. The GitHub REST `2026-03-10` dispatch response provides the exact
    child run ID; a missing ID refuses without redispatch or guessing "latest".
-2. Waits at most 70 minutes for that run. The snapshot, deploy and rollout
-   readiness steps must pass, the injected error-rate gate must fail, and the
-   in-job auto-rollback and evidence upload must succeed. The child **must remain
-   red**; a green child does not prove recovery.
+2. Waits up to 70 minutes for that run, including queue time. A timeout does
+   not cancel the child: inspect the exact `child_run_id` in the wrapper log
+   and its staging outcome without redispatching. The snapshot, deploy and
+   rollout readiness steps must pass, the injected error-rate gate must fail,
+   and the in-job auto-rollback and evidence upload must succeed. The child
+   **must remain red**; a green child does not prove recovery.
 3. Checks `staging-rollout-evidence`: the restore must name the exact pre-deploy
    Worker version and image digest, with takeover and the stable 200/gateway-ready
    gate. It uploads a sanitized `staging-rollback-proof` artifact (`proof.json`)
    containing the child run ID/SHA and restored members, retained for 14 days.
-   The wrapper is green only after that proof is validated and uploaded.
+   The deployed `child_sha` must equal the requested SHA; `workflow_sha` can differ.
+4. Requires a green `staging-use-release` job and ordered finish, status and stop
+   receipts in `staging-use-deploy-stop-<run>-1` for the same window and attempt.
+   Status and release must agree on the restored build; `not-owned` is not a stop.
+   The wrapper passes only after validation and artifact upload.
 
 The child is named `staging rollback proof`, not a staging certification run.
 Production excludes it from latest-certification history only after re-reading
@@ -638,37 +712,16 @@ build. Inspect the hold and resume the proof after the observation window;
 do not clear a hold to make a proof green. Explicit arm/disarm dispatches without
 the error-rate switch retain their exception.
 
-The wrapper uses separate `staging-rollback-proof-schedule` and
-`staging-rollback-proof-workflow_dispatch` groups, **not** `deploy-staging`:
-a later manual dispatch cannot replace the pending scheduled wrapper, and its
-child can acquire the staging deploy lane. The optional manual Worker-only
-drill still holds `deploy-staging` while it runs and now uploads its separate
-evidence artifact; it does not count as the daily automatic proof.
+The wrapper runs outside `staging-lifecycle` so its child can acquire that lane.
+At workflow admission, proofs and Worker-only drills still share a separate
+single-pending-slot queue: a new dispatch can replace a waiter there. The
+Worker-only drill gets the preserving queue only when its job reaches
+`staging-lifecycle`. Its separate evidence does not count as automatic proof.
 
-A failed wrapper opens (or comments on) the one `staging-rollback-proof`
-GitHub issue labelled `incident`; Paperclip turns it into an agent task. Independently, the **06:23 UTC** `daily-digest` workflow's
-`rollback-proof-watch` job checks the newest scheduled drill and its artifact,
-even if the digest fails. Missing, failed, cancelled, stuck, unreadable or
-older-than-30-hour proof alerts and fails the watcher. An older successful proof
-cannot hide a newer failed one. A healthy check comments on and closes any open issue
-with no activity since the graded proof completed. Every failed proof, scheduled
-or manual, alerts on that issue, so later activity holds it open until a newer
-scheduled proof passes. This independent
-schedule catches a missed drill trigger; an outage of GitHub Actions itself is
-outside these two scheduled checks.
-
-For a reviewed on-demand proof after a repair:
-
-```sh
-# No network, dispatch or mutation:
-python3 scripts/rollback_proof.py run --dry-run
-# Staging only; use the merged main workflow, never a production drill:
-gh workflow run staging-rollback-drill.yml --ref main
-```
-
-Inspect the exact child run and staging state before retrying a failed/timed-out
-proof. The dispatcher never cancels or blindly reruns a mutating child. A manual
-proof is useful evidence, but the freshness watcher requires a scheduled proof.
+Failures open or update the `staging-rollback-proof` incident; verify the exact
+wrapper, child and artifact before closing it. No scheduled watcher or dry run
+qualifies a proof. Wrapper reruns fail without dispatching: inspect the original
+child run and staging state before recovery.
 
 Both gate curls enforce `--max-filesize 65536` (64 KiB). Any transfer
 failure counts as `000`, even if curl reports HTTP 200 and leaves a valid
@@ -848,7 +901,23 @@ Read the variable and the Environment's reviewers again before each dispatch.
 The cutover executor records each checkpoint with
 `scripts/cutover_watch_checkpoint.py` — one checkpoint per call — and pastes
 the emitted row onto the execution card at `T_0` (first `/readyz` 200 on the
-production revision) through the watch deadline `T_0 + 48 h`:
+production revision) until evidence-complete closure or the maximum initial
+watch deadline `T_0 + 48 h`. The 48h bound is not mandatory idle calendar or
+automatic acceptance. Apply [cutover.md §48-hour watch](cutover.md#48-hour-watch):
+all approved checklist/feature/voice/production receipts, prescribed actual timer/
+workload coverage, independent B2, no unexplained loss/resource/recovery gaps,
+singleton/data/job writer fences, migration/watermark/permission/rollback proof
+and a warm reverse-reconciliation manifest are required. B2 is **NOT VERIFIED**,
+`T` **unset**, B4 **NO-GO** until those independent gates pass. This documentation
+does not supply numeric B2 resource criteria, a live producer/fixture executor
+or a long-use grant. Normal monitoring and warm Coolify/recovery points remain
+after closure; no retirement authority is implied.
+
+At `T_0+48h`, missing evidence stays **INCOMPLETE**: cutover lead, Release Manager
+and data lead decide hold/incident/rollback, with accountable owner, deadline
+and next action. No silent extension or pass by timeout.
+
+Checkpoint example (a point readiness observation, not B4 acceptance):
 
 ```sh
 python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
@@ -858,13 +927,14 @@ python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
 ```
 
 `--checkpoint` is one of the five labels `+15m`, `+1h`, `+6h`, `+24h`,
-`+48h`, matching the five checkpoint rows below; `--expected-sha` is the
+`+48h`, matching the five checkpoint rows below while the watch remains open; `--expected-sha` is the
 deployed commit from the watch header and `--expected-build-id` is that
 deploy run's `<run id>-<attempt>` from the run summary. The script is
 read-only: one GET to `/readyz`, no writes, migrates, or DB connections. It
 emits GO only on a 200 with every component ready and an exact
 revision/build-ID match; anything short of a full match is EXTEND, never
-GO, and a ROLLBACK decision stays human. Checkpoints follow
+GO. A point GO is not B4 sign-off or proof of timer/workload coverage; a
+ROLLBACK decision retains its separate authority. Checkpoints follow
 [cutover.md](cutover.md) §48-hour watch. Poll read-only on a short cadence
 (suggested 60 s); record findings, not every healthy poll.
 
@@ -933,8 +1003,11 @@ whole watch so the rollback dispatch never has to hunt for it.
 - `rollback-decision`: at each checkpoint record GO, EXTEND (with new
   deadline), or ROLLBACK. A ROLLBACK row must repeat the previous Worker
   version ID from the header — that is the `<version-id>` the rollback
-  dispatch needs. At +48 h record sign-off or extend the watch on the
-  execution card.
+  dispatch needs. Record evidence-complete closure as soon as every required
+  receipt is sufficient; later checkpoint labels impose no idle hold and must
+  not be fabricated. At +48 h incomplete remains INCOMPLETE; the cutover lead,
+  Release Manager and data lead decide hold/incident/rollback as above. EXTEND
+  is a recorded decision, never automatic additional runtime authority.
 
 ### Signal thresholds (budgets and rollback triggers)
 
@@ -970,7 +1043,7 @@ acceptance.
 
 ### Scheduled-job manual checkpoints
 
-At +15 min, +1 h, +6 h, +24 h and +48 h, inspect the current checkpoint's
+At +15 min, +1 h, +6 h, +24 h and +48 h while the watch is open, inspect the current checkpoint's
 container logs with these exact JSON-field filters (not the `msg` envelope):
 
 ```text

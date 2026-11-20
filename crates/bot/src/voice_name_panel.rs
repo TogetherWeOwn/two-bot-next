@@ -613,6 +613,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let rooms: Vec<VoiceRoom> = self.rooms.values().cloned().collect();
         for room in rooms {
             let room_id = room.channel_id;
+            let move_pending = {
+                let live = self.live.read_state();
+                self.moves.contains_key(&room_id)
+                    || self
+                        .uncertain_moves
+                        .get(&room_id)
+                        .is_some_and(|ticket| live.ticket_valid(*ticket))
+            };
             command.actor_id = room.owner_id;
             command.request = NameInteraction::Restore { room_id };
             // Playtime follows live presence, not automatic-name eligibility.
@@ -622,6 +630,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 facts.game_players,
                 (self.wall_clock)(),
             );
+            if move_pending {
+                // Known occupants still contribute playtime, but cached
+                // occupancy is not authoritative for naming until the move's
+                // gateway echo or a refresh. Do not publish an empty render
+                // or cache its signature.
+                self.name_inputs = None;
+                continue;
+            }
             // The status line follows the room whatever its name does: a
             // `/name` override, a blank name template or a name wait.
             self.refresh_voice_status(&room, &command);

@@ -151,8 +151,12 @@ class SecretScanSurfaceTests(unittest.TestCase):
         # Context values reach the shell as env vars, never interpolated into `run:`.
         self.assertIn("EVENT_NAME: ${{ github.event_name }}", scan)
         # base_ref is empty on merge_group; the queue target arrives as a full
-        # ref and the wrapper strips the prefix.
-        self.assertIn("BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}", scan)
+        # ref and the wrapper strips the prefix. Dispatch uses trusted main.
+        self.assertIn(
+            "BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref || "
+            "(github.event_name == 'workflow_dispatch' && 'refs/heads/main') }}",
+            scan,
+        )
         run_lines = [line for line in scan.splitlines() if line.strip().startswith("run:")]
         self.assertFalse(any("${{" in line for line in run_lines))
         self_test = self.gitleaks_step("Self-test the PR scan policy")
@@ -161,8 +165,9 @@ class SecretScanSurfaceTests(unittest.TestCase):
 
     def test_scan_wrapper_keeps_history_scan_and_ignores_pr_policy(self):
         script = SCAN_SCRIPT.read_text()
-        for flag in ("--redact", "--exit-code 1", "--log-opts=HEAD", "--ignore-gitleaks-allow",
-                     "--config", "--gitleaks-ignore-path"):
+        for flag in ("--redact", "--exit-code 1", '--log-opts="--text --diff-merges=remerge HEAD"',
+                     '--log-opts="--text --diff-merges=first-parent --min-parents=3 HEAD"',
+                     "--ignore-gitleaks-allow", "--config", "--gitleaks-ignore-path"):
             self.assertIn(flag, script)
         self.assertNotIn("--no-git", script)
         self.assertIn('== "pull_request"', script)

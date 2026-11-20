@@ -16,7 +16,7 @@ use two_bot_core::commands::{
     CustomCommand, GUILD_COMMAND_LIMIT,
 };
 
-use crate::brand::{BRAND_EMBED_COLOR, BRAND_FOOTER_TEXT, BRAND_ICON_URL};
+use crate::brand::{EmbedKind, BRAND_FOOTER_TEXT, BRAND_ICON_URL};
 use crate::interactions::{help_detail_response, help_response};
 
 /// Versioned payload schema the Python smoke refuses anything else under.
@@ -90,7 +90,7 @@ fn single_branded_embed(
     let [embed] = embeds.as_slice() else {
         return Err(code);
     };
-    if embed["color"].as_u64() != Some(u64::from(BRAND_EMBED_COLOR))
+    if embed["color"].as_u64() != Some(u64::from(EmbedKind::Default.color()))
         || embed["footer"]["text"] != BRAND_FOOTER_TEXT
         || embed["footer"]["icon_url"] != BRAND_ICON_URL
         || embed["description"].as_str().is_none_or(str::is_empty)
@@ -115,7 +115,7 @@ pub fn help_embed_smoke_payloads() -> Result<Value, &'static str> {
     Ok(json!({
         "schema": HELP_EMBED_SMOKE_SCHEMA,
         "expected": {
-            "color": BRAND_EMBED_COLOR,
+            "color": EmbedKind::Default.color(),
             "footer_text": BRAND_FOOTER_TEXT,
             "icon_url": BRAND_ICON_URL,
         },
@@ -137,16 +137,19 @@ mod help_embed_smoke_tests {
         assert_eq!(payloads["schema"], HELP_EMBED_SMOKE_SCHEMA);
         assert_eq!(
             payloads["expected"]["color"].as_u64(),
-            Some(u64::from(BRAND_EMBED_COLOR))
+            Some(u64::from(EmbedKind::Default.color()))
         );
-        assert_eq!(payloads["expected"]["color"], 16_715_346);
+        assert_eq!(
+            payloads["expected"]["color"],
+            crate::brand::brand_tokens::BRAND_DISCORD_EMBED_DEFAULT
+        );
         assert_eq!(payloads["expected"]["footer_text"], BRAND_FOOTER_TEXT);
         assert_eq!(payloads["expected"]["icon_url"], BRAND_ICON_URL);
         for key in ["help", "help_topic"] {
             let embed = &payloads["embeds"][key];
             assert_eq!(
                 embed["color"].as_u64(),
-                Some(u64::from(BRAND_EMBED_COLOR)),
+                Some(u64::from(EmbedKind::Default.color())),
                 "{key} embed carries the brand color"
             );
             assert_eq!(embed["footer"]["text"], BRAND_FOOTER_TEXT, "{key} footer");

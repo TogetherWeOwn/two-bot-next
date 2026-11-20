@@ -7,21 +7,40 @@ A fresh checkout intentionally has no generated reference.
 
 ## Read the reference
 
-For a local checkout, generate it explicitly before compiling workspace tests
-or all-targets Clippy:
+Open the [check workflow](https://github.com/TogetherWeOwn/two-bot-next/actions/workflows/check.yml),
+choose a Rust-selected run, and download its **command-reference** artifact.
+The artifact contains the rendered `commands.md` from the `check` job's checkout.
+For a PR run, verify that the run's full head SHA matches the PR head for CI
+association, then read the checkout step's logs for the tested source SHA.
+The default PR checkout is GitHub's synthetic merge commit, not the PR-head tree;
+its artifact can include base-branch command changes absent from that head.
+Record both SHAs and the run/job links when citing it. For a push run, likewise
+verify the checkout source SHA against the requested commit. The run head alone
+is not artifact-source proof. This is the normal reference path, including for
+readers with a local checkout; it requires no local generation.
 
-```sh
-python3 scripts/generate_command_reference.py
-cargo test -p two-bot-core --test reference_docs --locked
-```
+Docs-only changes may deselect Rust and produce no command-reference artifact.
+Use that exact head's `ci-ok`, selector results and selected jobs as CI evidence;
+do not generate locally to compensate. Another Rust-selected run's reference
+can be read as historical only: label it with its run/job links, PR head (if
+applicable) and checkout source SHA, not as evidence for the current head.
 
-On the persistent controller, bounded build admission applies automatically
-(`--controller` still forces it; `TWO_CARGO_CONTROLLER=0` forces plain cargo):
+CI runs `python3 scripts/generate_command_reference.py` before test-target
+compilation or all-targets Clippy, then runs read-only reference tests. These are
+Actions steps, not a local verification recipe. Full suites and CI gates stay
+on GitHub Actions under the
+[verification policy](../CONTRIBUTING.md#verification-on-github-actions).
 
-```sh
-python3 scripts/generate_command_reference.py --controller
-python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs
-```
+Local execution is allowed only to reproduce one failing test or crate under
+the [focused failure policy](../CONTRIBUTING.md#focused-failure-reproduction-only).
+Any heavy focused build uses the guarded `boat` PATH wrapper, sizing/budget/security
+controls, `--no-env`, a source-only export and verified cleanup. A permitted
+non-heavy controller reproduction/fallback uses the
+[bounded Cargo cache wrapper](build-cache.md); the generator's `--controller`
+option enforces that admission, not permission to mirror CI. Never disable
+controller admission, run a heavy raw-host build, or use a fallback to run a
+full suite/CI mirror. If these limits cannot be met, reproduce on Actions or
+route the actual prerequisite.
 
 The generator emits `command_reference.v1` JSON with the output path, or a
 nonzero error with `code`, `retryable` and `next_action`. It reuses the canonical
@@ -29,11 +48,6 @@ Rust renderer in `crates/core/tests/reference_docs.rs`. It validates the tracked
 configuration reference first and never rewrites it. The ordinary reference
 checks are read-only: missing, stale or invalid generated content fails until
 explicit regeneration. Do not run generation inside a comparison check.
-
-Without a checkout, open the [check workflow](https://github.com/TogetherWeOwn/two-bot-next/actions/workflows/check.yml),
-choose the run for the exact commit, and download its **command-reference**
-artifact. The artifact contains the rendered `commands.md`; match the run's SHA
-rather than treating a different run as current.
 
 ## What this reference does not prove
 

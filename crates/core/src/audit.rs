@@ -49,6 +49,20 @@ impl AuditKind {
             Self::ModerationAction => "moderation_action",
         }
     }
+
+    /// Severity word rendered into the Discord mirror line as text, so
+    /// severity reads with the colour bar hidden (kit Discord spec §1).
+    /// Enforcement is high, destructive or access-changing events are
+    /// medium, routine presence and edits are low. The word is the label —
+    /// the line never relies on channel alone to carry severity.
+    #[must_use]
+    pub fn severity_label(self) -> &'static str {
+        match self {
+            Self::ModerationAction => "high",
+            Self::MessageDelete | Self::MemberUpdate => "medium",
+            Self::MessageEdit | Self::VoiceJoin | Self::VoiceLeave | Self::VoiceMove => "low",
+        }
+    }
 }
 
 /// Which Discord mirror channel a row drains to. Mirrors the two-bot
@@ -143,20 +157,34 @@ pub fn has_audit_event_identity(content: &str, entry_id: &str) -> bool {
 }
 
 /// Render a row for its Discord mirror message (two-bot `formatAuditEvent`).
-/// Metadata arrays truncate: empty renders `none`, long ones keep a fitting
-/// prefix plus ` (+N omitted)` (scalar values truncate to 300 chars). Whole
-/// messages over 2000 chars truncate to 1996 + `...`.
+/// Stays a plain text line per the kit bot-log grammar (Discord spec §4:
+/// one record per line, no embed); the severity text label from
+/// [`AuditKind::severity_label`] follows the kind so severity is readable
+/// without colour, except for unban reversals, which have no severity label.
+/// Metadata arrays truncate: empty renders `none`, long
+/// ones keep a fitting prefix plus ` (+N omitted)` (scalar values truncate
+/// to 300 chars). Whole messages over 2000 chars truncate to 1996 + `...`.
 #[must_use]
 pub fn format_audit_event(event: &AuditEvent) -> String {
     let mut fields = vec![
         event.identity(),
         format!("**{}**", event.kind.as_str().replace('_', " ")),
+    ];
+    if !(event.kind == AuditKind::ModerationAction
+        && matches!(
+            event.action.as_deref(),
+            Some("member_unban" | "moderation.unban" | "moderation.unban_scheduled")
+        ))
+    {
+        fields.push(format!("severity `{}`", event.kind.severity_label()));
+    }
+    fields.extend([
         format!("at {}", event.occurred_at),
         format!(
             "target `{}`",
             event.target_id.as_deref().unwrap_or("unknown")
         ),
-    ];
+    ]);
     if let Some(actor) = event.actor_id.as_deref() {
         fields.push(format!("actor `{actor}`"));
     }
@@ -487,6 +515,10 @@ mod tests {
         let text = format_audit_event(&event);
         assert!(text.starts_with("audit-event:moderation-success:1:token;"));
         assert!(text.contains("**moderation action**"));
+        assert!(
+            text.contains("severity `high`"),
+            "moderation mirror lines carry a text severity label: {text}"
+        );
         assert!(text.contains("target `2`"));
         assert!(text.contains("actor `9`"));
         assert!(text.contains("action `moderation.ban`"));
@@ -500,6 +532,63 @@ mod tests {
             "audit-event:moderation-success:1:token;",
             "moderation-success:1:token"
         ));
+    }
+
+    #[test]
+    fn severity_labels_cover_every_kind() {
+        // Every kind renders its text label into the mirror line; enforcement
+        // is high, destructive/access-changing events medium, routine low.
+        for (kind, label) in [
+            (AuditKind::ModerationAction, "high"),
+            (AuditKind::MessageDelete, "medium"),
+            (AuditKind::MemberUpdate, "medium"),
+            (AuditKind::MessageEdit, "low"),
+            (AuditKind::VoiceJoin, "low"),
+            (AuditKind::VoiceLeave, "low"),
+            (AuditKind::VoiceMove, "low"),
+        ] {
+            assert_eq!(kind.severity_label(), label, "{kind:?}");
+            let event = AuditEvent::new("e".to_owned(), kind, "g".to_owned(), "T".to_owned());
+            assert!(
+                format_audit_event(&event).contains(&format!("severity `{label}`")),
+                "{kind:?} mirror line carries its severity label"
+            );
+        }
+    }
+
+    #[test]
+    fn unban_reversals_omit_severity_without_changing_other_actions() {
+        let mut event = AuditEvent::new(
+            "unban:1".into(),
+            AuditKind::ModerationAction,
+            "1".into(),
+            "AT".into(),
+        );
+        event.target_id = Some("2".into());
+        for action in [
+            "member_unban",
+            "moderation.unban",
+            "moderation.unban_scheduled",
+        ] {
+            event.action = Some(action.into());
+            let text = format_audit_event(&event);
+            assert!(has_audit_event_identity(&text, "unban:1"));
+            assert!(text.contains(&format!("action `{action}`")));
+            assert!(text.contains("target `2`"));
+            assert!(!text.contains("severity `"), "{text}");
+        }
+        for action in [
+            None,
+            Some("member_ban"),
+            Some("moderation.ban"),
+            Some("other"),
+        ] {
+            event.action = action.map(str::to_owned);
+            assert!(format_audit_event(&event).contains("severity `high`"));
+        }
+        event.kind = AuditKind::MemberUpdate;
+        event.action = Some("member_unban".into());
+        assert!(format_audit_event(&event).contains("severity `medium`"));
     }
 
     #[test]

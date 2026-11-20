@@ -54,18 +54,18 @@ jobs:
     environment:
       name: staging
       deployment: false
-    # Observe without the lifecycle lock: five-minute ticks must not replace
-    # pending deployments or promotion soaks in GitHub's single pending slot.
+    # Observe without the lifecycle lock: five-minute ticks must not queue
+    # alongside deployments and promotion soaks.
     concurrency:
       group: synthetic-user-flow-staging
       cancel-in-progress: false
     permissions:
-      actions: read
+      actions: read # Synthetic runner reads workflow-run evidence for the staging probe.
       contents: read
       issues: write # open, comment on and close this env's incident issue
     if: github.ref == 'refs/heads/main'
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'staging') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -142,12 +142,12 @@ jobs:
       group: synthetic-user-flow-production
       cancel-in-progress: false
     permissions:
-      actions: read
+      actions: read # Synthetic runner reads workflow-run evidence for the passive production probe.
       contents: read
       issues: write # open, comment on and close this env's incident issue
     if: github.ref == 'refs/heads/main'
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'prod-passive') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -1402,6 +1402,93 @@ impl<'a> GuildAddMemberRequest<'a> {
     }
 }
 
+/// Validated voice-move subject: one member and one target room. The trusted
+/// website signer must derive `discord_id` from its authenticated session,
+/// never browser input. This validator does not itself prove consent. Defining
+/// this contract does not enable or dispatch the action.
+#[derive(Debug, Clone, Copy)]
+pub struct VoiceMoveRequest<'a> {
+    discord_id: &'a str,
+    channel_id: &'a str,
+}
+
+impl<'a> VoiceMoveRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        Ok(Self {
+            discord_id: require_snowflake(body, "discord_id")?,
+            channel_id: require_snowflake(body, "channel_id")?,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
+
+    #[must_use]
+    pub fn channel_id(&self) -> &'a str {
+        self.channel_id
+    }
+}
+
+/// Closed result words for a future self-only voice move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceMoveOutcome {
+    Moved,
+    AlreadyInRoom,
+    NotConnected,
+    NotPermitted,
+    RoomFull,
+    RoomGone,
+    BotNotPermitted,
+    RateLimited,
+    DiscordUnavailable,
+}
+
+impl VoiceMoveOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Moved => "moved",
+            Self::AlreadyInRoom => "already_in_room",
+            Self::NotConnected => "not_connected",
+            Self::NotPermitted => "not_permitted",
+            Self::RoomFull => "room_full",
+            Self::RoomGone => "room_gone",
+            Self::BotNotPermitted => "bot_not_permitted",
+            Self::RateLimited => "rate_limited",
+            Self::DiscordUnavailable => "discord_unavailable",
+        }
+    }
+
+    #[must_use]
+    pub fn response_code(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate_limited",
+            Self::DiscordUnavailable => "discord_unavailable",
+            _ => "success",
+        }
+    }
+
+    #[must_use]
+    pub fn status(self) -> u16 {
+        match self {
+            Self::RateLimited => 429,
+            Self::DiscordUnavailable => 502,
+            _ => 200,
+        }
+    }
+
+    #[must_use]
+    pub fn affected(self) -> Option<i64> {
+        match self {
+            Self::Moved => Some(1),
+            Self::RateLimited | Self::DiscordUnavailable => None,
+            _ => Some(0),
+        }
+    }
+}
+
 /// `announcement.post` field validation: channel through the key map, body
 /// within Discord's ceiling. The message id comes back from Discord, so the
 /// stored idempotency result can still tell the website *which* message it has.
@@ -1456,6 +1543,129 @@ pub fn validate_event_key(body: &Map<String, Value>) -> Result<&str, ActionError
         ));
     }
     Ok(key)
+}
+
+/// Validated reminder facts. This type does not enable or dispatch the action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReminderSendRequest<'a> {
+    pub discord_id: &'a str,
+    pub event_key: &'a str,
+    pub starts_at: String,
+    pub event_name: &'a str,
+}
+
+impl<'a> ReminderSendRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        if body.contains_key("body") {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"body\" must not be present; the bot renders its own template",
+                "body_not_allowed",
+            ));
+        }
+        let discord_id = require_snowflake(body, "discord_id")?;
+        if discord_id.starts_with('0') || discord_id.parse::<u64>().is_err() {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"discord_id\" must be a canonical nonzero Discord id",
+                "bad_discord_id",
+            ));
+        }
+        let event_key = require_field_str(body, "event_key")?;
+        if event_key.len() > 64 || !valid_event_key(event_key) {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"event_key\" must be 1-64 characters of [A-Za-z0-9._:-]",
+                "bad_event_key",
+            ));
+        }
+        if require_field_str(body, "kind")? != "starting_soon" {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"kind\" must be \"starting_soon\"",
+                "bad_kind",
+            ));
+        }
+        let starts_at = require_timestamp(body, "starts_at")?;
+        let event_name = require_field_str(body, "event_name")?;
+        if utf16_len(event_name) > 100 {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"event_name\" is longer than 100 characters",
+                "event_name_too_long",
+            ));
+        }
+        Ok(Self {
+            discord_id,
+            event_key,
+            starts_at,
+            event_name,
+        })
+    }
+}
+
+/// Validated place-offer facts. This type does not enable or dispatch the action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceOfferSendRequest<'a> {
+    pub discord_id: &'a str,
+    pub event_key: &'a str,
+    pub event_name: &'a str,
+    pub expires_at: String,
+}
+
+impl<'a> PlaceOfferSendRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        if body.contains_key("body") {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"body\" must not be present; the bot renders its own template",
+                "body_not_allowed",
+            ));
+        }
+        if body.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "discord_id" | "event_key" | "event_name" | "expires_at"
+            )
+        }) {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "unknown place-offer field",
+                "unknown_field",
+            ));
+        }
+        let discord_id = require_snowflake(body, "discord_id")?;
+        if discord_id.starts_with('0') || discord_id.parse::<u64>().is_err() {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"discord_id\" must be a canonical nonzero Discord id",
+                "bad_discord_id",
+            ));
+        }
+        let event_key = require_field_str(body, "event_key")?;
+        if event_key.len() > 64 || !valid_event_key(event_key) {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"event_key\" must be 1-64 characters of [A-Za-z0-9._:-]",
+                "bad_event_key",
+            ));
+        }
+        let event_name = require_field_str(body, "event_name")?;
+        if utf16_len(event_name) > 100 {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"event_name\" is longer than 100 characters",
+                "event_name_too_long",
+            ));
+        }
+        let expires_at = require_timestamp(body, "expires_at")?;
+        Ok(Self {
+            discord_id,
+            event_key,
+            event_name,
+            expires_at,
+        })
+    }
 }
 
 /// Refusal for a well-formed key with no mapping in this guild (legacy
@@ -2409,6 +2619,61 @@ mod tests {
         ])
     }
 
+    #[test]
+    fn voice_move_request_names_one_member_and_one_room() {
+        let body = map(json!({
+            "discord_id": "123456789012345678",
+            "channel_id": "123456789012345679",
+        }));
+        let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+        assert_eq!(request.discord_id(), "123456789012345678");
+        assert_eq!(request.channel_id(), "123456789012345679");
+        for body in [
+            map(json!({})),
+            map(json!({"discord_id": "abc", "channel_id": "123456789012345679"})),
+            map(json!({"discord_id": "123456789012345678", "channel_id": "12"})),
+            map(json!({"discord_id": 123456789012345678u64, "channel_id": "123456789012345679"})),
+        ] {
+            assert_eq!(
+                VoiceMoveRequest::validate(&body).unwrap_err().code,
+                ErrorCode::Malformed
+            );
+        }
+    }
+
+    #[test]
+    fn voice_move_outcome_table() {
+        use VoiceMoveOutcome::*;
+        for (outcome, word, code, status, affected) in [
+            (Moved, "moved", "success", 200, Some(1)),
+            (AlreadyInRoom, "already_in_room", "success", 200, Some(0)),
+            (NotConnected, "not_connected", "success", 200, Some(0)),
+            (NotPermitted, "not_permitted", "success", 200, Some(0)),
+            (RoomFull, "room_full", "success", 200, Some(0)),
+            (RoomGone, "room_gone", "success", 200, Some(0)),
+            (
+                BotNotPermitted,
+                "bot_not_permitted",
+                "success",
+                200,
+                Some(0),
+            ),
+            (RateLimited, "rate_limited", "rate_limited", 429, None),
+            (
+                DiscordUnavailable,
+                "discord_unavailable",
+                "discord_unavailable",
+                502,
+                None,
+            ),
+        ] {
+            assert_eq!(outcome.as_str(), word);
+            assert_eq!(outcome.response_code(), code);
+            assert_eq!(outcome.status(), status);
+            assert_eq!(outcome.affected(), affected, "{word}");
+        }
+    }
+
     fn map(value: Value) -> Map<String, Value> {
         match value {
             Value::Object(m) => m,
@@ -2982,11 +3247,12 @@ mod tests {
         // slices add two env-only keys
         // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID). The
         // voice.snapshot read adds one env-only key
-        // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT).
+        // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT). The reserved member notification
+        // gate adds one env-only key without wiring notification delivery.
         for (class, expected) in [
             (SettingClass::Hot, 52),
             (SettingClass::Cold, 18),
-            (SettingClass::EnvOnly, 67),
+            (SettingClass::EnvOnly, 68),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
@@ -3328,6 +3594,149 @@ mod tests {
         let refused = unmapped_event_key("ghost:key");
         assert_eq!(refused.code, ErrorCode::ActionNotAllowed);
         assert_eq!(refused.log_reason, "event_key_unknown");
+    }
+
+    #[test]
+    fn reminder_facts_validate_without_enabling_delivery() {
+        let body = map(json!({
+            "discord_id": "18446744073709551615",
+            "event_key": "k".repeat(64),
+            "kind": "starting_soon",
+            "starts_at": "2026-11-04T18:00:00+01:00",
+            "event_name": "😀".repeat(50),
+            "future_field": true,
+        }));
+        let facts = ReminderSendRequest::validate(&body).expect("valid facts");
+        assert_eq!(facts.discord_id, "18446744073709551615");
+        assert_eq!(facts.event_key, "k".repeat(64));
+        assert_eq!(facts.starts_at, "2026-11-04T17:00:00.000Z");
+        assert_eq!(facts.event_name, "😀".repeat(50));
+        for action in ["reminder.send", "place_offer.send"] {
+            assert!(!is_implemented(action));
+            let error = assert_allowed(
+                action,
+                &InternalFlags::from_map(&HashMap::new()),
+                true,
+                true,
+            )
+            .expect_err("notification remains unavailable");
+            assert_eq!(error.code, ErrorCode::ActionNotAllowed);
+        }
+    }
+
+    #[test]
+    fn reminder_facts_refuse_malformed_inputs() {
+        let valid = || {
+            map(json!({
+                "discord_id": "123456789012345678",
+                "event_key": "launch:2026",
+                "kind": "starting_soon",
+                "starts_at": "2026-11-04T18:00:00Z",
+                "event_name": "Launch Night",
+            }))
+        };
+        for (field, value, reason) in [
+            ("discord_id", json!("0123456789012345678"), "bad_discord_id"),
+            (
+                "discord_id",
+                json!("18446744073709551616"),
+                "bad_discord_id",
+            ),
+            ("discord_id", json!(123), "missing_discord_id"),
+            ("event_key", json!("k".repeat(65)), "bad_event_key"),
+            ("event_key", json!("bad/key"), "bad_event_key"),
+            ("event_key", json!(""), "missing_event_key"),
+            ("kind", json!("other"), "bad_kind"),
+            ("kind", json!(null), "missing_kind"),
+            ("starts_at", json!("not a timestamp"), "bad_starts_at"),
+            (
+                "starts_at",
+                json!("9999-12-31T23:30:00-01:00"),
+                "bad_starts_at",
+            ),
+            ("event_name", json!("😀".repeat(51)), "event_name_too_long"),
+            ("event_name", json!(""), "missing_event_name"),
+            ("body", json!(null), "body_not_allowed"),
+        ] {
+            let mut body = valid();
+            body.insert(field.to_owned(), value);
+            let error = ReminderSendRequest::validate(&body).expect_err(reason);
+            assert_eq!(error.code, ErrorCode::Malformed, "{field}");
+            assert_eq!(error.log_reason, reason, "{field}");
+        }
+        for field in ["discord_id", "event_key", "kind", "starts_at", "event_name"] {
+            let mut body = valid();
+            body.remove(field);
+            assert!(ReminderSendRequest::validate(&body).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn place_offer_facts_validate_without_enabling_delivery() {
+        let body = map(json!({
+            "discord_id": "18446744073709551615",
+            "event_key": "k".repeat(64),
+            "event_name": "😀".repeat(50),
+            "expires_at": "2026-11-04T18:00:00+01:00",
+        }));
+        let facts = PlaceOfferSendRequest::validate(&body).expect("valid facts");
+        assert_eq!(facts.discord_id, "18446744073709551615");
+        assert_eq!(facts.event_key, "k".repeat(64));
+        assert_eq!(facts.event_name, "😀".repeat(50));
+        assert_eq!(facts.expires_at, "2026-11-04T17:00:00.000Z");
+        assert!(!is_implemented("place_offer.send"));
+        assert!(assert_allowed(
+            "place_offer.send",
+            &InternalFlags::from_map(&HashMap::new()),
+            true,
+            true
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn place_offer_facts_refuse_malformed_inputs() {
+        let valid = || {
+            map(json!({
+                "discord_id": "123456789012345678",
+                "event_key": "launch:2026",
+                "event_name": "Launch Night",
+                "expires_at": "2026-11-04T18:00:00Z",
+            }))
+        };
+        for (field, value, reason) in [
+            ("discord_id", json!("0123456789012345678"), "bad_discord_id"),
+            (
+                "discord_id",
+                json!("18446744073709551616"),
+                "bad_discord_id",
+            ),
+            ("discord_id", json!(123), "missing_discord_id"),
+            ("event_key", json!("k".repeat(65)), "bad_event_key"),
+            ("event_key", json!("bad/key"), "bad_event_key"),
+            ("event_key", json!(""), "missing_event_key"),
+            ("event_name", json!("😀".repeat(51)), "event_name_too_long"),
+            ("event_name", json!(""), "missing_event_name"),
+            ("expires_at", json!("not a timestamp"), "bad_expires_at"),
+            (
+                "expires_at",
+                json!("9999-12-31T23:30:00-01:00"),
+                "bad_expires_at",
+            ),
+            ("body", json!(null), "body_not_allowed"),
+            ("message", json!("free text"), "unknown_field"),
+        ] {
+            let mut body = valid();
+            body.insert(field.to_owned(), value);
+            let error = PlaceOfferSendRequest::validate(&body).expect_err(reason);
+            assert_eq!(error.code, ErrorCode::Malformed, "{field}");
+            assert_eq!(error.log_reason, reason, "{field}");
+        }
+        for field in ["discord_id", "event_key", "event_name", "expires_at"] {
+            let mut body = valid();
+            body.remove(field);
+            assert!(PlaceOfferSendRequest::validate(&body).is_err(), "{field}");
+        }
     }
 
     #[test]

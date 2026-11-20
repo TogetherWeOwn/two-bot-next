@@ -9,7 +9,18 @@ mod database_guard;
 mod common;
 use common::RestRequest;
 
-use std::{net::SocketAddr, panic::AssertUnwindSafe, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    any::Any,
+    cell::Cell,
+    net::SocketAddr,
+    panic::AssertUnwindSafe,
+    process::Stdio,
+    sync::{
+        atomic::{AtomicUsize, Ordering::SeqCst},
+        Arc,
+    },
+    time::Duration,
+};
 
 use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _};
 use serde_json::{json, Value};
@@ -41,6 +52,10 @@ struct TestDb {
 
 impl TestDb {
     async fn new() -> Self {
+        Self::new_with_claim_fault(Self::new_schema_name(), false).await
+    }
+
+    async fn new_with_claim_fault(schema: String, lose_commit_ack: bool) -> Self {
         let options = database_guard::test_options(); // Guard BEFORE any connection.
         let admin = PgPoolOptions::new()
             .max_connections(1)
@@ -48,18 +63,18 @@ impl TestDb {
             .connect_with(options.clone())
             .await
             .expect("disposable database connection");
-        let schema = format!(
-            "alive_test_{}_{}",
-            std::process::id(),
-            two_bot_core::funnel::now_millis_for_test()
-        );
-        assert!(schema
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-            .execute(&admin)
-            .await
-            .expect("isolated schema");
+        let created = Self::claim_schemas(&admin, &schema, lose_commit_ack).await;
+        if !matches!(created, Ok(Ok(()))) {
+            // A failed or timed-out COMMIT has an uncertain outcome. Do not
+            // drop either name without proof that this transaction committed.
+            eprintln!("schema setup failed or was uncertain; retain {schema} and its companion");
+            if matches!(created, Ok(Err(sqlx::Error::Protocol(ref message)))
+                if message == "injected lost commit acknowledgement")
+            {
+                panic!("injected lost commit acknowledgement after schema claim");
+            }
+            panic!("isolated schema creation failed");
+        }
         // sqlx's to_url_lossy does NOT serialize options. Explicitly put the
         // search_path in the URL so the harness migration bootstrap and the
         // child binary both stay inside our schema.
@@ -70,17 +85,45 @@ impl TestDb {
         // The gateway binary is DML-only and never migrates: the harness
         // performs the operator's migration step before spawning the child,
         // exactly like the documented production bootstrap.
-        two_bot_cutover::connect_with_tls(&child_url, 1, false, TlsPolicy::LocalOnly)
-            .await
-            .expect("operator-equivalent migration bootstrap")
-            .close()
-            .await;
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(STEP)
-            .connect(&child_url)
-            .await
-            .expect("schema-scoped observer");
+        // Bootstrap can fail after opening a connection, before returning its
+        // pool. Treat its whole lifetime as uncertain until close completes.
+        let mut migration_close_uncertain = true;
+        let setup = AssertUnwindSafe(async {
+            let migration_pool =
+                two_bot_cutover::connect_with_tls(&child_url, 1, false, TlsPolicy::LocalOnly)
+                    .await
+                    .expect("operator-equivalent migration bootstrap");
+            timeout(STEP, migration_pool.close())
+                .await
+                .expect("migration pool close deadline");
+            migration_close_uncertain = false;
+            PgPoolOptions::new()
+                .max_connections(2)
+                .acquire_timeout(STEP)
+                .connect(&child_url)
+                .await
+                .expect("schema-scoped observer")
+        })
+        .catch_unwind()
+        .await;
+        let pool = match setup {
+            Ok(pool) => pool,
+            Err(panic) => {
+                if migration_close_uncertain {
+                    eprintln!("migration pool did not close; retain {schema} and its companion");
+                    let _ = timeout(STEP, admin.close()).await;
+                    std::panic::resume_unwind(panic);
+                }
+                let cleanup_failed = Self::drop_schemas(&admin, &schema).await;
+                let admin_closed = timeout(STEP, admin.close()).await.is_ok();
+                assert!(!cleanup_failed, "drop schemas after setup failure");
+                assert!(
+                    admin_closed,
+                    "admin pool close deadline after setup failure"
+                );
+                std::panic::resume_unwind(panic);
+            }
+        };
         Self {
             admin,
             pool,
@@ -89,27 +132,85 @@ impl TestDb {
         }
     }
 
+    fn new_schema_name() -> String {
+        static NEXT_SCHEMA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        format!(
+            "alive_test_{}_{}_{}",
+            std::process::id(),
+            two_bot_core::funnel::now_millis_for_test(),
+            NEXT_SCHEMA.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    async fn claim_schemas(
+        admin: &PgPool,
+        schema: &str,
+        lose_commit_ack: bool,
+    ) -> Result<Result<(), sqlx::Error>, tokio::time::error::Elapsed> {
+        assert!(schema
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+        // Claim both names in one transaction; never drop names after an
+        // unsuccessful or uncertain claim.
+        timeout(STEP, async {
+            let mut transaction = admin.begin().await?;
+            for name in [schema, &format!("{schema}_web_v1")] {
+                sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {name}")))
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            transaction.commit().await?;
+            if lose_commit_ack {
+                return Err(sqlx::Error::Protocol(
+                    "injected lost commit acknowledgement".into(),
+                ));
+            }
+            Ok(())
+        })
+        .await
+    }
+
     fn store(&self) -> GatewaySessionStore {
         GatewaySessionStore::new(self.pool.clone(), GUILD.to_owned(), 0)
     }
 
     async fn close(self) {
-        self.pool.close().await;
+        if timeout(STEP, self.pool.close()).await.is_err() {
+            eprintln!(
+                "observer pool did not close; retain {} and its companion",
+                self.schema
+            );
+            let _ = timeout(STEP, self.admin.close()).await;
+            panic!("observer pool close deadline");
+        }
         // Website jobs apply the companion contract schema (`<schema>_web_v1`)
         // on first tick; drop both generated schemas so no companion schema
         // or helper functions leak. Companion may not exist if jobs never fired.
-        for schema in [&self.schema, &format!("{}_web_v1", self.schema)] {
+        let cleanup_failed = Self::drop_schemas(&self.admin, &self.schema).await;
+        let admin_closed = timeout(STEP, self.admin.close()).await.is_ok();
+        assert!(!cleanup_failed, "drop only our generated schemas");
+        assert!(admin_closed, "admin pool close deadline");
+    }
+
+    async fn drop_schemas(admin: &PgPool, schema: &str) -> bool {
+        let mut cleanup_failed = false;
+        for schema in [schema, &format!("{schema}_web_v1")] {
             assert!(schema
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DROP SCHEMA IF EXISTS {schema} CASCADE"
-            )))
-            .execute(&self.admin)
-            .await
-            .expect("drop only our generated schemas");
+            let dropped = timeout(
+                STEP,
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DROP SCHEMA IF EXISTS {schema} CASCADE"
+                )))
+                .execute(admin),
+            )
+            .await;
+            if !matches!(dropped, Ok(Ok(_))) {
+                cleanup_failed = true;
+            }
         }
-        self.admin.close().await;
+        cleanup_failed
     }
 }
 
@@ -119,16 +220,21 @@ struct Bot {
 }
 
 impl Bot {
-    fn spawn(db: &TestDb, addr: SocketAddr, gateway: &str, api: &str, logs: &Logs) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_two-bot"))
-            .env_clear()
+    fn spawn(db: &TestDb, addr: SocketAddr, gateway: Option<&str>, api: &str, logs: &Logs) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_two-bot"));
+        command.env_clear();
+        // No gateway override is a strict-boot probe: onboarding must reject.
+        match gateway {
+            Some(gateway) => command.env("DISCORD_GATEWAY_URL", gateway),
+            None => command.env("TWO_ONBOARDING_MODE", "invalid-probe"),
+        };
+        let mut child = command
             .env("LISTEN_ADDR", addr.to_string())
             .env("DISCORD_TOKEN", "alive-synthetic-token")
             .env("GUILD_ID", GUILD)
             .env("DATABASE_URL", &db.child_url)
             // Website jobs open the same CI-service URL through cutover.
             .env("TWO_DATABASE_TLS", "local-only")
-            .env("DISCORD_GATEWAY_URL", gateway)
             .env("DISCORD_API_BASE", api)
             .env("TWO_ANNOUNCEMENTS", "1")
             .env("TWO_COMMUNITY_SCORECARD", "1")
@@ -175,18 +281,37 @@ impl Bot {
         self.drain().await;
     }
 
-    async fn cleanup(&mut self) {
+    async fn cleanup(&mut self) -> bool {
         let _ = self.child.start_kill();
-        let _ = timeout(STEP, self.child.wait()).await;
-        self.drain().await;
+        let mut complete = matches!(timeout(STEP, self.child.wait()).await, Ok(Ok(_)));
+        let mut pending = Vec::new();
+        for mut reader in self.readers.drain(..) {
+            match timeout(STEP, &mut reader).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    eprintln!("child log reader failed: {error}");
+                    complete = false;
+                }
+                Err(_) => {
+                    complete = false;
+                    reader.abort();
+                    if timeout(STEP, &mut reader).await.is_err() {
+                        pending.push(reader);
+                    }
+                }
+            }
+        }
+        self.readers = pending;
+        complete
     }
 
     async fn drain(&mut self) {
-        for reader in self.readers.drain(..) {
-            timeout(STEP, reader)
+        while !self.readers.is_empty() {
+            let result = timeout(STEP, &mut self.readers[0])
                 .await
-                .expect("child log drain deadline")
-                .expect("log reader");
+                .expect("child log drain deadline");
+            drop(self.readers.remove(0));
+            result.expect("log reader");
         }
     }
 }
@@ -204,10 +329,13 @@ struct MockDiscord {
     url: String,
     api: String,
     auth: mpsc::Receiver<Value>,
+    handshakes: mpsc::Receiver<()>,
     release: mpsc::Sender<()>,
     rest_requests: Arc<Mutex<Vec<RestRequest>>>,
+    connections: Arc<AtomicUsize>,
     task: JoinHandle<()>,
     rest_task: JoinHandle<()>,
+    rest_handlers: Arc<Mutex<tokio::task::JoinSet<()>>>,
 }
 
 impl MockDiscord {
@@ -224,15 +352,20 @@ impl MockDiscord {
         let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", rest_listener.local_addr().unwrap());
         let (auth_tx, auth) = mpsc::channel(2);
+        let (handshake_tx, handshakes) = mpsc::channel(2);
         let (release, mut gates) = mpsc::channel(4);
         let resume_url = url.clone();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = connections.clone();
         let task = tokio::spawn(async move {
             for boot in 0..2 {
                 let (stream, _) = ws_listener.accept().await.unwrap();
+                accepted.fetch_add(1, SeqCst);
                 let (_, mut ws) = ServerBuilder::new()
                     .accept(stream)
                     .await
                     .expect("mock websocket");
+                handshake_tx.send(()).await.expect("handshake receiver");
                 gates.recv().await.expect("release HELLO");
                 ws.send(Message::text(
                     json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string(),
@@ -284,16 +417,45 @@ impl MockDiscord {
         // Dedicated REST double: records registry bodies and website-job
         // reads so both full publication and a first-boot tick are observable.
         let rest_requests: Arc<Mutex<Vec<RestRequest>>> = Arc::default();
-        let rest_task = tokio::spawn(serve_rest(rest_listener, rest_requests.clone()));
+        let rest_handlers = Arc::new(Mutex::new(tokio::task::JoinSet::new()));
+        let rest_task = tokio::spawn(serve_rest(
+            rest_listener,
+            rest_requests.clone(),
+            rest_handlers.clone(),
+        ));
         Self {
             url,
             api,
             auth,
+            handshakes,
             release,
             rest_requests,
+            connections,
             task,
             rest_task,
+            rest_handlers,
         }
+    }
+
+    async fn stop(self) -> bool {
+        let mut complete = true;
+        for task in [self.task, self.rest_task] {
+            task.abort();
+            complete &= match timeout(STEP, task).await {
+                Ok(Ok(())) => true,
+                Ok(Err(error)) => error.is_cancelled(),
+                Err(_) => false,
+            };
+        }
+        let mut handlers = self.rest_handlers.lock().await;
+        handlers.abort_all();
+        let joined = timeout(STEP, async {
+            while let Some(result) = handlers.join_next().await {
+                complete &= result.is_ok() || result.is_err_and(|error| error.is_cancelled());
+            }
+        })
+        .await;
+        complete && joined.is_ok()
     }
 
     async fn authentication(&mut self) -> Value {
@@ -308,13 +470,17 @@ impl MockDiscord {
 /// paced website-job reads by route, recording full request bodies. The gateway
 /// listener must never see plain HTTP — a queued job tick previously consumed
 /// its second accept slot and broke resume with `MissingHeader("Upgrade")`.
-async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<RestRequest>>>) {
+async fn serve_rest(
+    listener: TcpListener,
+    recorded: Arc<Mutex<Vec<RestRequest>>>,
+    handlers: Arc<Mutex<tokio::task::JoinSet<()>>>,
+) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             break;
         };
         let recorded = recorded.clone();
-        tokio::spawn(async move {
+        handlers.lock().await.spawn(async move {
             let mut chunk = [0u8; 4096];
             let mut head = Vec::new();
             loop {
@@ -518,7 +684,54 @@ fn assert_ready_correlation(logs: &str) {
     assert!(seen > 0, "expected at least one ready commit in logs");
 }
 
-async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, logs: &Logs) {
+async fn seed_raw(db: &TestDb, url: &str) {
+    sqlx::query("INSERT INTO gateway_sessions (guild_id, shard_id, session_id, seq, resume_url, updated_at) VALUES ($1,0,$2,42,$3,now()) ON CONFLICT (guild_id,shard_id) DO UPDATE SET resume_url=EXCLUDED.resume_url")
+        .bind(GUILD).bind(SESSION).bind(url).execute(&db.pool).await.unwrap();
+}
+
+async fn raw_url(db: &TestDb) -> Option<String> {
+    sqlx::query_scalar("SELECT resume_url FROM gateway_sessions WHERE guild_id=$1 AND shard_id=0")
+        .bind(GUILD)
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap()
+}
+
+async fn strict_boot_probes(db: &TestDb, api: &str, bots: &mut Vec<Bot>, logs: &Logs, saved: &str) {
+    for url in [saved, "wss://remote.invalid"] {
+        logs.lock().await.clear();
+        seed_raw(db, url).await;
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        bots.push(Bot::spawn(db, addr, None, api, logs));
+        let bot = bots.last_mut().unwrap();
+        timeout(STEP, async {
+            while !logs.lock().await.lines().any(|line| {
+                line.contains("\"error_class\":\"onboarding_gates_invalid\"")
+                    && line.contains("\"failed_step\":\"onboarding_gates\"")
+            }) {
+                bot.assert_alive();
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("positive post-load onboarding failure deadline");
+        assert!(db.store().load().await.unwrap().is_none());
+        assert_eq!(raw_url(db).await, None, "boot rejected raw checkpoint");
+        assert!(bot.cleanup().await, "probe teardown");
+    }
+}
+
+async fn lifecycle(
+    db: &TestDb,
+    discord: &mut MockDiscord,
+    bots: &mut Vec<Bot>,
+    logs: &Logs,
+    decoy: Option<&str>,
+) {
     let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = reserved.local_addr().unwrap();
     drop(reserved);
@@ -530,9 +743,9 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         let gateway = if boot == 0 {
             &discord.url
         } else {
-            "ws://127.0.0.1:1"
+            decoy.unwrap_or("ws://127.0.0.1:1")
         };
-        bots.push(Bot::spawn(db, addr, gateway, &discord.api, logs));
+        bots.push(Bot::spawn(db, addr, Some(gateway), &discord.api, logs));
         let bot = bots.last_mut().unwrap();
         let health = wait_http(bot, addr, "/healthz", 200).await;
         assert!(health.contains("\"status\":\"ok\""));
@@ -642,6 +855,11 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         );
         discord.release.send(()).await.unwrap();
         checkpoint(db, if boot == 0 { 2 } else { 3 }).await;
+        assert_eq!(
+            raw_url(db).await.as_deref(),
+            Some(&*discord.url),
+            "persist the actual admitted wire URL"
+        );
         let ready = wait_http(bot, addr, "/readyz", 200).await;
         assert!(ready.contains("\"gateway\",\"ready\""));
         if boot == 0 {
@@ -717,27 +935,58 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL; CI runs this under 60 seconds"]
 async fn real_binary_is_alive_and_resumes_after_sigterm() {
+    binary_lifecycle(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL; CI runs this under 60 seconds"]
+async fn real_binary_resumes_without_contacting_accepting_bootstrap_decoy() {
+    binary_lifecycle(true).await;
+}
+
+async fn binary_lifecycle(accepting_decoy: bool) {
     let started = Instant::now();
     let db = TestDb::new().await;
     let mut discord = MockDiscord::new().await;
     let logs = Logs::default();
     let mut bots = Vec::new();
-    let result = AssertUnwindSafe(timeout(
-        TOTAL,
-        lifecycle(&db, &mut discord, &mut bots, &logs),
-    ))
-    .catch_unwind()
-    .await;
+    let decoy = MockDiscord::new().await; // Accepting listener: any dial is counted.
+    let exercise = async {
+        strict_boot_probes(&db, &discord.api, &mut bots, &logs, &decoy.url).await;
+        let owned = discord.connections.load(SeqCst) + decoy.connections.load(SeqCst);
+        assert_eq!(owned, 0, "no override-absent listener connections");
+        logs.lock().await.clear();
+        discord.rest_requests.lock().await.clear();
+        // Inadmissible checkpoint under a checked local bootstrap must IDENTIFY.
+        seed_raw(&db, &format!("{}/invalid", decoy.url)).await;
+        let bootstrap = accepting_decoy.then_some(decoy.url.as_str());
+        lifecycle(&db, &mut discord, &mut bots, &logs, bootstrap).await;
+        assert_eq!(
+            decoy.connections.load(SeqCst),
+            0,
+            "no probe/decoy connections"
+        );
+    };
+    let result = AssertUnwindSafe(timeout(TOTAL, exercise))
+        .catch_unwind()
+        .await;
     // Retain ownership outside catch_unwind: reap BOTH subprocesses and drop
     // only this schema even when an assertion or the overall deadline fails.
+    let mut cleaned = true;
     for bot in &mut bots {
-        bot.cleanup().await;
+        cleaned &= bot.cleanup().await;
     }
-    discord.task.abort();
-    discord.rest_task.abort();
-    let _ = discord.task.await;
-    let _ = discord.rest_task.await;
-    db.close().await;
+    cleaned &= decoy.stop().await;
+    cleaned &= discord.stop().await;
+    if cleaned {
+        db.close().await;
+    } else {
+        eprintln!("uncertain child/task teardown; retain owned schemas");
+    }
+    if !cleaned {
+        eprintln!("captured child logs:\n{}", logs.lock().await);
+    }
+    assert!(cleaned, "all children reaped and log readers joined");
     match result {
         Ok(Ok(())) => eprintln!("real-binary lifecycle PASS in {:?}", started.elapsed()),
         other => {
@@ -752,4 +1001,258 @@ async fn real_binary_is_alive_and_resumes_after_sigterm() {
         }
     }
     assert!(started.elapsed() < Duration::from_secs(60));
+}
+
+#[test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+fn fixture_schema_collision_preserves_existing_companion() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("fixture runtime");
+    runtime.block_on(async {
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(STEP)
+            .connect_with(database_guard::test_options())
+            .await
+            .expect("disposable database connection");
+        let schema = TestDb::new_schema_name();
+        let companion = format!("{schema}_web_v1");
+        // Only remove this name if this test successfully created it.
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {companion}")))
+            .execute(&admin)
+            .await
+            .expect("create collision sentinel");
+        let setup = AssertUnwindSafe(TestDb::new_with_claim_fault(schema.clone(), false))
+            .catch_unwind()
+            .await;
+        let existing: Vec<String> = sqlx::query_scalar(
+            "SELECT nspname FROM pg_namespace WHERE nspname = $1 OR nspname = $2 ORDER BY nspname",
+        )
+        .bind(&schema)
+        .bind(&companion)
+        .fetch_all(&admin)
+        .await
+        .expect("inspect collision outcome");
+        // This test owns only the empty sentinel; never drop the primary name.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {companion}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("remove collision sentinel");
+        timeout(STEP, admin.close())
+            .await
+            .expect("admin close deadline");
+        let panic = match setup {
+            Err(panic) => panic,
+            Ok(_) => panic!("collision must reject fixture setup"),
+        };
+        assert_eq!(
+            panic.downcast_ref::<&str>().copied(),
+            Some("isolated schema creation failed")
+        );
+        assert_eq!(
+            existing,
+            vec![companion],
+            "claim must roll back the primary and preserve the sentinel"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+fn fixture_lost_commit_ack_retains_both_schemas() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("fixture runtime");
+    runtime.block_on(async {
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(STEP)
+            .connect_with(database_guard::test_options())
+            .await
+            .expect("disposable database connection");
+        let schema = TestDb::new_schema_name();
+        let setup = AssertUnwindSafe(TestDb::new_with_claim_fault(schema.clone(), true))
+            .catch_unwind()
+            .await;
+        // Only this injected panic proves that our transaction committed. Any
+        // other outcome leaves ownership uncertain and must not trigger cleanup.
+        let panic = match setup {
+            Err(panic) => panic,
+            Ok(_) => panic!("injected setup failure did not occur"),
+        };
+        assert_eq!(
+            panic.downcast_ref::<&str>().copied(),
+            Some("injected lost commit acknowledgement after schema claim")
+        );
+        let verifier = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(STEP)
+            .connect_with(database_guard::test_options())
+            .await
+            .expect("independent schema verifier");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_namespace WHERE nspname = $1 OR nspname = $2",
+        )
+        .bind(&schema)
+        .bind(format!("{schema}_web_v1"))
+        .fetch_one(&verifier)
+        .await
+        .expect("inspect uncertain claim");
+        assert_eq!(
+            count, 2,
+            "committed schemas must remain after a lost acknowledgement"
+        );
+        timeout(STEP, verifier.close())
+            .await
+            .expect("verifier close deadline");
+        assert!(
+            !TestDb::drop_schemas(&admin, &schema).await,
+            "remove test-owned schemas"
+        );
+        timeout(STEP, admin.close())
+            .await
+            .expect("admin close deadline");
+    });
+}
+
+fn is_injected_assertion(reached_outcome: bool, panic: &(dyn Any + Send)) -> bool {
+    reached_outcome && panic.downcast_ref::<&str>().copied() == Some("injected fixture assertion")
+}
+
+fn assert_injected_assertion_rejects_unrelated_panics() {
+    for (reached_outcome, message, expected) in [
+        (false, "child exited during startup", false),
+        (false, "injected fixture assertion", false),
+        (true, "unrelated panic", false),
+        (true, "injected fixture assertion", true),
+    ] {
+        let panic = std::panic::catch_unwind(|| std::panic::panic_any(message)).unwrap_err();
+        assert_eq!(is_injected_assertion(reached_outcome, &*panic), expected);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outcome() {
+    assert_injected_assertion_rejects_unrelated_panics();
+    for outcome in 0..6 {
+        let db = TestDb::new().await;
+        let mut discord = MockDiscord::new().await;
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let sockets = [
+            addr,
+            discord.url[5..].parse().unwrap(),
+            discord.api[7..].parse().unwrap(),
+        ];
+        let schema = db.schema.clone();
+        let logs = Logs::default();
+        let mut bot = Bot::spawn(&db, addr, Some(&discord.url), &discord.api, &logs);
+        let phase = Cell::new("health readiness");
+        let exercised = AssertUnwindSafe(timeout(STEP, async {
+            if outcome == 4 {
+                std::future::pending::<()>().await;
+            }
+            wait_http(&mut bot, addr, "/healthz", 200).await;
+            // Health precedes gateway initialization. Finish the upgrade before
+            // intentionally killing the child, but keep HELLO gated.
+            phase.set("gateway upgrade");
+            if outcome == 5 {
+                std::future::pending::<()>().await;
+            }
+            discord.handshakes.recv().await.expect("mock handshake");
+            phase.set("injected outcome");
+            match outcome {
+                1 => panic!("injected fixture assertion"),
+                2 => std::future::pending::<()>().await,
+                _ => {}
+            }
+        }))
+        .catch_unwind()
+        .await;
+        if outcome == 3 {
+            // The real capture future panics on invalid UTF-8 before cleanup joins it.
+            bot.readers
+                .insert(0, tokio::spawn(capture(&b"\xff\n"[..], logs.clone())));
+        }
+        let cleaned = bot.cleanup().await;
+        assert!(
+            discord.stop().await,
+            "mock tasks joined after reader failure"
+        );
+        assert!(bot.child.try_wait().unwrap().is_some(), "child was reaped");
+        assert!(bot.readers.is_empty(), "reader handles consumed");
+        if outcome == 3 {
+            assert!(!cleaned, "completed reader panic marks teardown incomplete");
+            let retained: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)")
+                    .bind(&schema)
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap();
+            assert!(retained, "incomplete cleanup retains its schema");
+            assert!(
+                bot.cleanup().await,
+                "completed handles are never polled again"
+            );
+        } else {
+            assert!(cleaned, "fixture cleanup after outcome {outcome}");
+        }
+        db.close().await;
+        assert_eq!(
+            exercised.is_err(),
+            outcome == 1,
+            "outcome {outcome}, phase {}",
+            phase.get()
+        );
+        match exercised {
+            Ok(result) => {
+                assert_eq!(
+                    result.is_err(),
+                    matches!(outcome, 2 | 4 | 5),
+                    "outcome {outcome}, phase {}",
+                    phase.get()
+                );
+                match outcome {
+                    2 => assert_eq!(phase.get(), "injected outcome", "timeout during startup"),
+                    4 => assert_eq!(phase.get(), "health readiness"),
+                    5 => assert_eq!(phase.get(), "gateway upgrade"),
+                    _ => {}
+                }
+            }
+            Err(panic) => assert!(
+                is_injected_assertion(phase.get() == "injected outcome", &*panic),
+                "expected the injected assertion after startup"
+            ),
+        }
+        for socket in sockets {
+            let rebound = TcpListener::bind(socket)
+                .await
+                .expect("owned socket released");
+            drop(rebound);
+        }
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(STEP)
+            .connect_with(database_guard::test_options())
+            .await
+            .unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pg_namespace WHERE nspname=$1 OR nspname=$2")
+                .bind(&schema)
+                .bind(format!("{schema}_web_v1"))
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+        timeout(STEP, admin.close()).await.unwrap();
+        assert_eq!(remaining, 0, "owned schemas released");
+    }
 }

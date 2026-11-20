@@ -26,18 +26,25 @@ Companions: [staging-soak.md](staging-soak.md) (lifecycle and acceptance),
 
 ## Gate 1 — container healthy at a pinned SHA
 
-The staging deployment is the `main` head it claims to be, and the process
-answers truthfully.
+The staging deployment serves the pinned `main` SHA, and the process answers
+truthfully. A merge does not prove staging deployment or qualification. Consult
+`deploy-staging.yml` at the relevant ref for its triggers. If qualifying evidence
+for the intended SHA is absent, keep the gate closed and promotion held. Follow
+only the separately authorized
+[qualification/recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
 
 | Check | Verification command | Expected value |
 |---|---|---|
-| Deploy green | `gh run list --workflow deploy-staging.yml --branch main --limit 1` | `conclusion: success`, head SHA recorded as the pinned SHA. Docs-only merges start no run, so `main` may be ahead of the pinned SHA by docs-only commits; confirm with `git diff --stat <pinned>..origin/main` that nothing outside the `deploy-staging.yml` `paths-ignore` list changed |
+| Deploy green | `gh run list --workflow deploy-staging.yml --branch main --commit <pinned> --limit 1 --json headSha,status,conclusion,url` | The latest run completed with `conclusion: success` on the pinned SHA; retain the exact-SHA rollout and qualification evidence. A newer merge or another SHA's run is not a substitute. |
 | Liveness | `curl -s -o /tmp/health.json -w '%{http_code}' "$STAGING_WORKER_URL/health"` | `200`, body `{"status":"ok"}` |
-| Readiness | `curl -s -o /tmp/readyz.json -w '%{http_code}' "$STAGING_WORKER_URL/readyz"` | `200` with `components` `[["process","ready"],["gateway","ready"],["database","ready"]]` (plus informational `jobs`) |
+| Readiness | `curl -s -o /tmp/readyz.json -w '%{http_code}' "$STAGING_WORKER_URL/readyz"` | `200` with `components` `[["process","ready"],["gateway","ready"],["database","ready"]]` (plus informational `jobs`) and `build_revision` exactly equal to the pinned SHA in the same response |
 
+A historical green run for the pin does not prove it is still serving. Use the
+existing reviewed staging readiness read path; a missing or mismatched live
+`build_revision` keeps the gate closed, even when both endpoints return `200`.
 `503` means the gateway is parked or starting — the gate is closed, not broken.
-Any other status (500/1101/…) means the deploy is broken: file a repair card,
-do not start the clock. `/health` 200 alone never passes this gate.
+Any other non-200 status (500/1101/…) means the deploy is broken: file a repair
+card, do not start the clock. `/health` 200 alone never passes this gate.
 
 ## Gate 2 — qualify entry (no passive wait)
 
@@ -48,16 +55,22 @@ build and health, current bindings, database identity, migration/ACL state, and
 an existing reviewed evidence path for joins, voice, messages and slash. A
 missing, failed or unknown fact keeps the gate closed and `T` unset.
 
-The approved policy does not operationally define an ACTIVE hour, the source or
-record shape for its required one-minute samples, or a sample cadence for hours
-1–2. The existing evidence seam is offline, is not wired into the running bot,
-and omits slash; no currently verified reviewed route supplies the required
-four-family live evidence and 120 samples. These terms and sources remain NOT
-VERIFIED, so this gate stays closed. The approved policy names no owner for
-defining or authorizing a live sample method. The separate existing
-technical-policy question remains pending with the CTO; the CEO-held fixture
-authorization is an execution hold, not a definition of the missing terms. No
-new owner or evidence method is assigned here.
+ACTIVE requires exact qualified build/process/environment identity and actual
+representative expected-versus-processed joins, voice, messages and slash with
+affirmative all-family coverage and zero loss, not empty/idle/health-only
+counts. The [B2 evidence contract](staging-soak.md#unresolved-acceptance-terms-and-evidence-gaps)
+requires one-minute sampling from entry through completion, including hours 1–2,
+and 120 distinct mature minute-spaced samples in hours 3–4. No rapid-poll
+substitution is allowed. Four ACTIVE hours remains the conservative envelope,
+not clock acceptance or a supported shorter alternative.
+
+The all-family live sample producer/fixture executor, numeric memory/RSS
+growth/headroom/error-spike criteria and separately authorized startup/cleanup-
+inclusive long-use grant remain unsupported. The offline seam omits slash and
+is not live qualification. B2 remains **NOT VERIFIED**, `T` **unset**, B4
+**NO-GO**. Engineering Lead owns technical disposition and Chief of Staff
+continuation, not a falsely appointed live qualification executor or an unnamed
+old CTO question. Preserve existing credential/rehome/incident holds.
 
 The fixed 60-minute spacing is retired; there is no elapsed-time requirement or
 replacement timed window. Preserve the former window's non-timing stability
@@ -67,7 +80,7 @@ checks between the Gate 1 readiness probe and the final pre-`T` probe:
 |---|---|---|
 | No readiness alerts | Worker-log query for `container_unready_alert` between the two probes | `0`; a `container_unready_recovery` without a preceding alert is fine |
 | No deployment | Existing authorized workflow execution-attempt verification for `main` over the recorded probe interval, including reruns and executions spanning either probe | `0` deployment executions; missing or incomplete attempt evidence closes the gate |
-| Final readiness | Same `/readyz` curl as Gate 1, before writing `T` | `200` with all three components `ready` |
+| Final readiness | Same `/readyz` curl as Gate 1, before writing `T` | Meets Gate 1 readiness expectations, including the pinned `build_revision` |
 
 Record the Gate 1 and final readiness probe timestamps as UTC in `GATE1_UTC`
 and `FINAL_UTC`. This paginated, explicitly read-only listing discovers
@@ -141,9 +154,15 @@ and historical records remain intact.
   as UTC in the existing approved soak record. The first `/readyz` 200, a
   passive wait or an elapsed-time calculation is not `T`; if any input is
   unknown, `T` remains unset.
-- The acceptance interval is **four ACTIVE hours**. Joins, voice, messages and
+- Predeclare the incomplete-attempt stop at `T+4h` only within a separately
+  authorized startup/cleanup-inclusive long-use grant; no grant means no start.
+  The 40min automatic holder cannot authorize B2. Gap, expiry or incomplete
+  evidence at the boundary means INSUFFICIENT/FAIL: safely release/expire, hold
+  and route exact missing proof; no silent reset or renewal.
+- The conservative acceptance envelope is **four ACTIVE hours**. Joins, voice, messages and
   slash remain required; zero missed events is required across the interval.
-- Hours 3–4 require **120 expected one-minute samples**, one for each minute
+- Sample every minute from entry through completion. Hours 3–4 require
+  **120 distinct mature minute-spaced temporal samples**, one for each minute
   across those two hours. These are required, not best-effort. Missing evidence
   yields NOT VERIFIED, never PASS; preserve failed/UNKNOWN intervals and all
   historical records without erasure or reclassification.
@@ -170,16 +189,15 @@ and historical records remain intact.
   it does not prove a deployed build, live event coverage or staging
   acceptance, so the Gate 5 recovery measurement stays NOT VERIFIED until a
   reviewed log source exists.
-- The staging deploy workflow documents a **95–139-second gateway drop per
-  deploy**, and a separate historical staging note records a **92–139-second
-  redeploy**. These are documented historical interruption ranges, not a
-  verified outage-start-to-recovery measurement; both exceed 60 seconds if a
-  planned redeploy is in scope. The approved policy does not classify planned
-  redeploys as actual outages or name an owner for that classification. The
-  existing technical-policy question remains pending with the CTO; the
-  CEO-held fixture authorization remains the separate execution hold. Until the
-  existing policy path resolves classification and an under-60-second recovery
-  is independently measured, these redeploy exercises cannot establish PASS.
+- A [historical staging workflow comment](https://github.com/TogetherWeOwn/two-bot-next/blob/057a4b2cc0d67439c92eded1d25421852d32840f/.github/workflows/deploy-staging.yml#L10-L12)
+  warns of a **95–139-second gateway drop per deploy**. A separate historical
+  staging note records a **92–139-second redeploy**
+  ([boot-window record](discord-send-admission.md#cancellation-crash-unavailable-storage-and-recovery)).
+  These ranges are not verified outage-start-to-recovery measurements.
+  Interrupting planned redeploys count as actual outages by default;
+  historical warnings are not waivers. These exercises cannot establish PASS
+  without independently measured under-60-second recovery and separately
+  authorized stop/restore and budgets.
 - Flat memory and no error spikes remain requirements. Numeric RSS/error
   definitions are unaccepted; the historical B1 RSS receipt is not a new B2
   numeric criterion.

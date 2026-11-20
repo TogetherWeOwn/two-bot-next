@@ -109,6 +109,46 @@ test("staging client: status is control-only and grants no readiness or authoriz
   assert.equal(h.calls[0].init.method, "GET");
 });
 
+test("staging client: bounded status retry never treats unknown as ownership or retries release", async () => {
+  const deadline = performance.now() + 30000;
+  const retry = responses([new Response(null, { status: 503 }), Response.json(state)]);
+  const pauses: number[] = [];
+  const status = await stagingUse({ ...args, action: "status", statusRetryDeadline: deadline }, retry.send,
+    async (ms: number) => { pauses.push(ms); }, clock);
+  assert.equal(status.use?.runId, args.runId);
+  assert.deepEqual(pauses, [5000]);
+  assert.equal(retry.calls.length, 2);
+
+  const exhausted = responses([new Response(null, { status: 503 })]);
+  await assert.rejects(stagingUse({ ...args, action: "status", statusRetryDeadline: performance.now() + 1000 },
+    exhausted.send, async () => assert.fail("no retry"), clock), /staging_control_refused/);
+  assert.equal(exhausted.calls.length, 1);
+
+  const release = responses([Response.json(state), new Response(null, { status: 503 })]);
+  await assert.rejects(stagingUse({ ...args, action: "release", statusRetryDeadline: deadline }, release.send,
+    async () => assert.fail("no POST retry"), clock), /staging_control_refused/);
+  assert.deepEqual(release.calls.map((call) => call.init.method), ["GET", "POST"]);
+});
+
+test("staging client: expiry during status retry cannot authorize restore but permits fenced cleanup", async () => {
+  let at = NOW;
+  const pause = async () => { at = args.expiresAt; };
+  const deadline = performance.now() + 30000;
+  const restore = responses([new Response(null, { status: 503 }), Response.json(state)]);
+  await assert.rejects(stagingUse({ ...args, action: "assert", statusRetryDeadline: deadline },
+    restore.send, pause, () => at), /staging_window_mismatch/);
+  assert.deepEqual(restore.calls.map((call) => call.init.method), ["GET", "GET"]);
+
+  at = NOW;
+  const released = { ...state, use: { ...use, phase: "released" } };
+  const cleanup = responses([new Response(null, { status: 503 }), Response.json(state), Response.json(released)]);
+  const result = await stagingUse({ ...args, action: "release", statusRetryDeadline: deadline },
+    cleanup.send, pause, () => at);
+  assert.equal(result.use?.expiresAt, args.expiresAt);
+  assert.deepEqual(cleanup.calls.map((call) => call.init.method), ["GET", "GET", "POST"]);
+  assert.equal(JSON.parse(String(cleanup.calls[2].init.body)).expiresAt, args.expiresAt);
+});
+
 test("staging client: periodic observation never starts or grants and distinguishes idle from health", async () => {
   const observer = { action: "observe", url: args.url, token: TOKEN };
   for (const value of [null, { ...use, phase: "released" }, { ...use, acquiredAt: NOW - 60000, expiresAt: NOW }]) {

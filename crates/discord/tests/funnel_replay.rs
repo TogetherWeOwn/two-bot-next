@@ -517,7 +517,7 @@ fn invite_snapshot(uses: u64) -> Vec<InviteState> {
 }
 
 fn message_event(member_id: u64, seq: u64, at: &str) -> Event {
-    Event::MessageCreate(Box::new(MessageCreate(Message {
+    let message = Message {
         activity: None,
         application: None,
         application_id: None,
@@ -555,7 +555,15 @@ fn message_event(member_id: u64, seq: u64, at: &str) -> Event {
         thread: None,
         tts: false,
         webhook_id: None,
-    })))
+    };
+    // Serialize the message alone so the fixture has no event-only channel_type.
+    let payload = serde_json::to_value(&message).expect("serialize fixture message");
+    let create: MessageCreate = serde_json::from_value(payload).expect("fixture MESSAGE_CREATE");
+    assert_eq!(
+        &*create, &message,
+        "message fixture survives wire round trip"
+    );
+    Event::MessageCreate(Box::new(create))
 }
 
 fn voice_event(member_id: u64, channel: Option<u64>) -> Event {

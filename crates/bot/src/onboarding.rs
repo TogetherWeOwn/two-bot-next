@@ -716,7 +716,7 @@ impl OnboardingRuntime {
             return Ok(());
         };
         if config.gates.mode == OnboardingMode::Anchor {
-            content = content.replace(SUNDAY_SQUAD.channel_id, &channel);
+            content = replace_anchor_channel(&content, &channel);
         }
         let Some(guard) = begin_prompt(&self.pool, &guild, &member)
             .await
@@ -1408,6 +1408,13 @@ fn reopen_kind(interaction: &Interaction) -> Option<PickerKind> {
     }
 }
 
+fn replace_anchor_channel(content: &str, channel: &str) -> String {
+    content.replace(
+        &format!("<#{}>", SUNDAY_SQUAD.channel_id),
+        &format!("<#{channel}>"),
+    )
+}
+
 /// Where-and-when for one game-picker submission, threaded to the
 /// partial-failure finisher as a single argument.
 struct GameSelectionTarget<'a> {
@@ -1490,6 +1497,44 @@ fn render_game_preview(additions: &[&str], removals: &[&str], unchanged: &[&str]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchor_channel_replacement_preserves_unrelated_ids_and_mentions() {
+        let anchor = SUNDAY_SQUAD.channel_id;
+        let controls = format!(
+            "bare {anchor}, longer 1{anchor} and {anchor}0, user <@{anchor}> and <@!{anchor}>, role <@&{anchor}>, channels <#1{anchor}> and <#{anchor}0>, correct <#66> — 🎮"
+        );
+        let content = format!("<#{}> {controls}\n<#{}>", anchor, anchor);
+        assert_eq!(
+            replace_anchor_channel(&content, "66"),
+            format!("<#66> {controls}\n<#66>")
+        );
+        assert_eq!(replace_anchor_channel(&controls, "66"), controls);
+    }
+
+    #[test]
+    fn anchor_channel_replacement_leaves_already_correct_content_unchanged() {
+        let content = "Welcome <@44>! Meet in <#66>.";
+        assert_eq!(replace_anchor_channel(content, "66"), content);
+        assert_eq!(replace_anchor_channel("", "66"), "");
+        let content = format!("Meet in <#{}>.", SUNDAY_SQUAD.channel_id);
+        assert_eq!(
+            replace_anchor_channel(&content, SUNDAY_SQUAD.channel_id),
+            content
+        );
+    }
+
+    #[test]
+    fn anchor_channel_replacement_renders_the_welcome_channel() {
+        let content = two_bot_core::onboarding::anchor_welcome_text(44, 0, SUNDAY_SQUAD);
+        let anchor = format!("<#{}>", SUNDAY_SQUAD.channel_id);
+        assert!(content.contains(&anchor));
+        let rendered = replace_anchor_channel(&content, "66");
+        assert!(rendered.contains("<#66>"));
+        assert!(!rendered.contains(&anchor));
+        assert!(rendered.contains("<@44>"));
+        assert_eq!(replace_anchor_channel(&rendered, "66"), rendered);
+    }
 
     /// The partial-failure reply names applied vs pending picks by label, and
     /// is never the generic role copy (which promises nothing was applied).

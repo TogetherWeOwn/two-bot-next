@@ -118,14 +118,26 @@ class Gate:
 
     def poll(self):
         """None while running; otherwise the window verdict (pass/fail/skip/insufficient_data/error)."""
-        if self.child is None or self.child.poll() is None:
+        if self.child is None:
+            return None
+        exit_code = self.child.poll()
+        if exit_code is None:
             return None
         self.child = None
         try:
-            verdict = json.loads(self.evidence.read_text()).get("verdict")
-        except (OSError, ValueError, AttributeError):
-            verdict = "error"
-        return verdict if verdict in ("pass", "fail", "skip", "insufficient_data") else "error"
+            receipt = json.loads(self.evidence.read_text(), object_pairs_hook=wcr._reject_duplicate_keys)
+            verdict = receipt.get("verdict")
+            if receipt.get("sha") != self.sha or receipt.get("mode") not in ("live", "skip"):
+                return "error"
+        except (OSError, ValueError, AttributeError, RecursionError):
+            return "error"
+        if verdict == "fail" and exit_code == 1 and receipt["mode"] == "live":
+            return verdict
+        if verdict in ("pass", "insufficient_data") and exit_code == 0 and receipt["mode"] == "live":
+            return verdict
+        if verdict == "skip" and exit_code == 0 and receipt["mode"] == "skip":
+            return verdict
+        return "error"
 
     def stop(self):
         if self.child is not None and self.child.poll() is None:

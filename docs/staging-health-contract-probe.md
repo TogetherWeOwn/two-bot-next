@@ -13,7 +13,7 @@ CI; the live run is manual-dispatch only.
 | Check | Probe | Pass shape |
 | --- | --- | --- |
 | `health` | `GET /health` | Exact 200 with `{"status":"ok"}` and no redirect target. Process liveness only: a 200 never claims readiness. |
-| `readyz` | `GET /readyz` | 200 or 503 with the bot's component breakdown (`process`, `gateway`, `database`, `token_invalid`, each `ready`/`starting`/`down`), the informational `jobs` object, and an optional `gateway_failure` in the fixed `durable_gateway` + 12-class vocabulary. Build identity is checked separately below. The code must equal 200 iff every component is ready. A shape-correct 503 is still a probe FAIL: a truthful parked process is never E2E approval. |
+| `readyz` | `GET /readyz` | 200 or 503 with the bot's component breakdown (`process`, `gateway`, `database`, `token_invalid`, each `ready`/`starting`/`down`), the informational `jobs` object, and an optional `gateway_failure` in the fixed `durable_gateway` + 12-class vocabulary. Build identity is checked separately below. The code must equal 200 iff every component is ready. A shape-correct 503 is still a probe FAIL: observed unready components are never E2E approval. |
 | `build` | readyz body | A canonical `build_revision` (40 lowercase hexadecimal characters) and `build_id` (`<run id>-<attempt>`, ASCII digits with each part 1–20 digits), or the exact unstamped pair `unknown`/`unknown`. With `--expected-sha` (or `$EXPECTED_SHA`), only a canonical stamped pair whose revision equals that SHA passes. |
 
 Identity shapes use the existing `scripts/build_identity.py` validators, as
@@ -31,6 +31,46 @@ metadata. Explicit local deployment pins can still produce a safe failed record.
 
 `/healthz` at the staging origin is the Worker's redirect probe (`ok`),
 covered by the redirect smoke — not this probe.
+
+## Diagnostic receipt (not a lifecycle diagnosis)
+
+The probe still makes exactly one `/health` request and one `/readyz` request,
+with no retry, sleep, polling or grace period. Every 503 exits nonzero; liveness
+cannot replace readiness. The additive `readiness` object records:
+
+- `http_status`: the observed readiness HTTP status, or `null` for a transport
+  failure without a response. A body-read transport failure after headers retains
+  the observed status but no partial body. Body-cap and duplicate-JSON refusals
+  also retain status.
+- `components`: all four fixed names and their validated public state enums,
+  including ready components when other components fail. A malformed or unknown
+  breakdown yields `{}`, never invented `down` or `ready` states. Validated
+  observations remain available even when the HTTP status contradicts them.
+- `failure_class`: `null` for accepted readiness, `unready` for a valid,
+  status-consistent 503, `contract_failure` for malformed JSON, unknown/missing
+  fields required by the contract, invalid types/enums, inconsistent status or
+  unexpected status, and `transport_failure` when the request fails.
+
+`build_failure_class` is separate: `build_mismatch`, `build_identity_invalid`,
+`build_identity_unavailable` (no validated readiness report), or
+`build_identity_unstamped` (the exact unknown pair with a required SHA).
+It is `null` when the existing build check passes. Unpinned, explicitly unstamped
+identity retains its existing semantics; it is not a matched deployment.
+
+A `gateway=starting` or `gateway=down` observation is not labeled "parked" and
+establishes no lifecycle cause. In particular, starting alone does not identify
+checkpoint work, and down alone does not prove a permanent disconnect. The
+existing `gateway_failure_class` retains only an exposed allowlisted enum, or
+`null` when none was observed; it never copies arbitrary remote diagnostics.
+Neither informational jobs, unknown fields, raw bodies, remote error strings,
+nor remote cause claims enter the receipt. Existing body and identity caps plus
+fixed component/enumeration keys keep output bounded.
+
+Receipts improve discrimination for future samples; they do not reconstruct a
+missing historical body, establish checkpoint causation or remediate readiness.
+The runtime schema, gateway state machine, checkpoint fences and Worker response
+path are unchanged. Pending checkpoint I/O intentionally remains starting/503;
+only successful I/O with unchanged generation/failure fences may restore readiness.
 
 ## Checkpoint-read assertion (not a root-cause diagnosis)
 
@@ -89,7 +129,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_staging_health_contract_probe_bui
 
 Fixtures cover: production/HTTP/credentialed/missing origins refusing
 before any request; the all-ready pass with build identity and evidence;
-`--expected-sha` match and mismatch; parked gateway as truthful-not-approval;
+`--expected-sha` match and mismatch; gateway starting/down, database and multiple
+component failures with exact retained states as truthful-not-approval;
 checkpoint-read failure without a root-cause assertion or migration advice;
 unreviewed remote causes/details dropped from output and evidence; unknown
 failure classes refused without echoing details; both contradictory
@@ -98,8 +139,9 @@ classification; an all-ready 200 with that class and no cause assertion;
 ownership refusals, short breakdowns and non-JSON bodies as
 not-the-bot; deeply nested bodies refused as malformed without a traceback;
 unhashable gateway-failure classes and non-string build identity refused
-without a traceback or echo; health 503 as not-liveness; transport failures by
-class; redirects observed, never followed.
+without a traceback or echo; health 503 as not-liveness; fixed transport failure
+classification without raw errors; single requests without retry/sleep; bounded
+receipts dropping secret-like extra fields; redirects observed, never followed.
 
 ## Not covered here
 

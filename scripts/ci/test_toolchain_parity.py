@@ -1,9 +1,12 @@
 """Guard Rust toolchain/image parity: one pin, every consumer.
 
 `rust-toolchain.toml` is the single source of truth (currently 1.99.1).
-Every `dtolnay/rust-toolchain` step in `check.yml`, `nightly.yml`,
+Every installer step in `check.yml`, `nightly.yml`,
 `pipeline-benchmark.yml` and `reusable-rust-nextest.yml` must request that
-exact channel (the fuzz-compile job alone uses pinned nightly), every covered
+exact channel. These workflows use the native installer
+(`bash .github/scripts/install-rust-toolchain.sh` with `RUST_TOOLCHAIN` in its
+env) and must not use the `dtolnay/rust-toolchain` action again. The fuzz-compile
+job alone uses pinned nightly. Every covered
 Dockerfile (`Dockerfile` and `crates/voice-probe/Dockerfile`) must build
 `FROM rust:<major>.<minor>-trixie`, and the selected workflow job containers
 must use the matching pinned Rust trixie image. Runs offline via the existing
@@ -22,6 +25,8 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ("check.yml", "nightly.yml", "pipeline-benchmark.yml", "reusable-rust-nextest.yml")
+NATIVE_WORKFLOWS = WORKFLOWS
+ACTION_WORKFLOWS = tuple(name for name in WORKFLOWS if name not in NATIVE_WORKFLOWS)
 CONTAINER_WORKFLOWS = {
     "deploy-staging.yml": ("schema-gate", "roles-gate"),
     "staging-migrate.yml": ("plan", "apply"),
@@ -55,6 +60,14 @@ def expected_image_tag(channel):
     return f"{major}.{minor}-trixie"
 
 
+NATIVE_INSTALLER_RUN = "bash .github/scripts/install-rust-toolchain.sh"
+ACTION_PREFIX = "dtolnay/rust-toolchain@"
+
+
+def is_native_installer(step):
+    return str(step.get("run", "")).strip() == NATIVE_INSTALLER_RUN
+
+
 def workflow_toolchain_errors(root):
     """Every installer step pins the channel, except fuzz-compile nightly."""
     errors = []
@@ -73,9 +86,20 @@ def workflow_toolchain_errors(root):
             continue
         for job_id, job in (workflow.get("jobs") or {}).items():
             for step in job.get("steps", []) or []:
-                if not str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@"):
+                if str(step.get("uses", "")).startswith(ACTION_PREFIX):
+                    if name in NATIVE_WORKFLOWS:
+                        errors.append(f"{name}#{job_id}: uses the {ACTION_PREFIX[:-1]} action, not the native installer")
+                        continue
+                    pinned = (step.get("with") or {}).get("toolchain")
+                elif is_native_installer(step):
+                    if step.get("shell") != "bash":
+                        errors.append(f"{name}#{job_id}: native installer must run under shell: bash")
+                    env = step.get("env") or {}
+                    if not isinstance(env.get("RUST_COMPONENTS"), str):
+                        errors.append(f"{name}#{job_id}: native installer must set RUST_COMPONENTS")
+                    pinned = env.get("RUST_TOOLCHAIN")
+                else:
                     continue
-                pinned = (step.get("with") or {}).get("toolchain")
                 if job_id == "fuzz-compile":
                     if pinned != FUZZ_TOOLCHAIN:
                         errors.append(f"{name}#{job_id}: expected {FUZZ_TOOLCHAIN}, got {pinned!r}")
@@ -347,10 +371,31 @@ jobs:
   job:
     runs-on: ubuntu-latest
     steps:
+      - shell: bash
+        env:
+          RUST_TOOLCHAIN: "{toolchain}" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: ""
+        run: bash .github/scripts/install-rust-toolchain.sh
+"""
+
+ACTION_PINNED_WORKFLOW = """\
+name: fixture
+on:
+  pull_request:
+jobs:
+  job:
+    runs-on: ubuntu-latest
+    steps:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "{toolchain}" # Match rust-toolchain.toml; floating stable can drift.
 """
+
+
+def pinned_workflow_text(name, toolchain):
+    template = PINNED_WORKFLOW if name in NATIVE_WORKFLOWS else ACTION_PINNED_WORKFLOW
+    return template.format(toolchain=toolchain)
+
 
 PINNED_DIGEST = "a" * 64
 PINNED_DOCKERFILE = "FROM rust:{tag}@sha256:{digest} AS builder\n"
@@ -365,7 +410,7 @@ def make_fixture_root(parent, channel="1.99.1", workflow_toolchain="1.99.1", doc
     )
     for name in WORKFLOWS:
         (root / ".github/workflows" / name).write_text(
-            PINNED_WORKFLOW.format(toolchain=workflow_toolchain)
+            pinned_workflow_text(name, workflow_toolchain)
         )
     for name, job_ids in CONTAINER_WORKFLOWS.items():
         path = root / ".github/workflows" / name
@@ -442,9 +487,10 @@ class ToolchainParityTests(unittest.TestCase):
                     root = make_fixture_root(scratch)
                     path = root / ".github/workflows" / drifted
                     original = path.read_text()
-                    scalar = 'toolchain: "1.99.1"'
+                    key = "RUST_TOOLCHAIN" if drifted in NATIVE_WORKFLOWS else "toolchain"
+                    scalar = f'{key}: "1.99.1"'
                     self.assertEqual(original.count(scalar), 1)
-                    path.write_text(original.replace(scalar, 'toolchain: "1.100.0"', 1))
+                    path.write_text(original.replace(scalar, f'{key}: "1.100.0"', 1))
                     errors = workflow_toolchain_errors(root)
                     self.assertEqual(len(errors), 1, errors)
                     self.assertIn(drifted, errors[0])
@@ -458,12 +504,8 @@ class ToolchainParityTests(unittest.TestCase):
             root = make_fixture_root(scratch)
             path = root / ".github/workflows/pipeline-benchmark.yml"
             original = path.read_text()
-            self.assertIn('toolchain: "1.99.1" # Match rust-toolchain.toml', original)
-            path.write_text(original + (
-                '      - uses: dtolnay/rust-toolchain@master\n'
-                '        with:\n'
-                '          toolchain: "1.98.0"\n'
-            ))
+            self.assertIn('RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml', original)
+            path.write_text(original + PINNED_WORKFLOW.split('    steps:\n', 1)[1].format(toolchain="1.98.0"))
             self.assertEqual(
                 toolchain_parity_errors(root),
                 ["pipeline-benchmark.yml#job: expected '1.99.1', got '1.98.0'"],
@@ -806,16 +848,38 @@ class ToolchainParityTests(unittest.TestCase):
             root = make_fixture_root(scratch, channel="1.99")
             self.assertTrue(toolchain_parity_errors(root), "a looser channel must fail")
 
+    def test_action_or_misshaped_native_installer_fails(self):
+        mutations = (
+            ("action step returns", "- shell: bash\n        env:",
+             "- uses: dtolnay/rust-toolchain@master\n        env:", "not the native installer"),
+            ("shell removed", "      - shell: bash\n", "      - name: install\n", "shell: bash"),
+            ("components removed", '          RUST_COMPONENTS: ""\n', "", "RUST_COMPONENTS"),
+        )
+        for label, old, new, expected in mutations:
+            with self.subTest(change=label):
+                with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+                    root = make_fixture_root(scratch)
+                    path = root / ".github/workflows/check.yml"
+                    original = path.read_text()
+                    self.assertEqual(original.count(old), 1)
+                    path.write_text(original.replace(old, new, 1))
+                    errors = workflow_toolchain_errors(root)
+                    self.assertEqual(len(errors), 1, errors)
+                    self.assertIn("check.yml#job", errors[0])
+                    self.assertIn(expected, errors[0])
+
     def test_pinned_workflows_carry_the_match_comment(self):
         channel = read_channel(ROOT)
         for name in WORKFLOWS:
             with self.subTest(workflow=name):
                 text = (ROOT / ".github/workflows" / name).read_text()
-                pinned = [line for line in text.splitlines() if f'toolchain: "{channel}"' in line]
+                key = "RUST_TOOLCHAIN" if name in NATIVE_WORKFLOWS else "toolchain"
+                pinned = [line for line in text.splitlines() if f'{key}: "{channel}"' in line]
                 self.assertTrue(pinned, f"{name} has no pinned toolchain line")
                 self.assertTrue(all(MATCH_COMMENT in line for line in pinned), f"{name} lost the match comment")
-        self.assertNotIn("toolchain: stable", "\n".join(
-            (ROOT / ".github/workflows" / name).read_text() for name in WORKFLOWS))
+        combined = "\n".join((ROOT / ".github/workflows" / name).read_text() for name in WORKFLOWS)
+        self.assertNotIn("toolchain: stable", combined)
+        self.assertNotIn("RUST_TOOLCHAIN: stable", combined)
 
 
 if __name__ == "__main__":

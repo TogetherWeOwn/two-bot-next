@@ -37,9 +37,17 @@ five-second step deadlines. Assertion failures print captured stdout/stderr.
 | Logging | Listener log precedes gateway initialization; committed-ready log on each boot |
 | JSON logging | Request `LOG_FORMAT=json` (the binary defaults to JSON: `crates/bot/src/logging.rs:28-32`); validate every emitted line as a JSON object with a string `msg` (`crates/bot/tests/alive.rs:678-689`) |
 
-The mock uses one stable endpoint across boots. The second child receives an
-unreachable bootstrap URL, proving that its unchanged persisted resume endpoint
-is actually selected. HELLO and READY/RESUMED are separately gated by the test.
+The mock uses one stable endpoint across boots. Separate tests restart with an
+unreachable bootstrap or a distinct accepting bootstrap decoy; both must RESUME
+at the unchanged persisted literal-loopback endpoint, with zero decoy connections.
+Raw SQL verifies the actual wire endpoint. Override-absent probes seed fresh
+literal-loopback and non-Discord rows, positively observe the post-load onboarding
+configuration failure, assert row deletion and zero owned gateway connections,
+and reap the children. These prove boot rejection, not a wire IDENTIFY. A separate
+checked-local-bootstrap boot over a non-Discord row must send opcode 2, not 6.
+HELLO and READY/RESUMED remain separately gated. Both default and all-feature
+executions run in the existing ignored-runtime Actions lane; execution evidence
+must name the exact integration head.
 
 ## Binary lifecycle seams
 
@@ -61,3 +69,8 @@ is actually selected. HELLO and READY/RESUMED are separately gated by the test.
   (`crates/bot/tests/alive.rs:136`) and requires every line to parse as JSON
   with a string `msg` (`crates/bot/tests/alive.rs:681-689`). Re-checked at
   `bce86a791`.
+
+The fixture teardown regression exercises success, caught assertion and deadline
+paths. It checks child reap, consumed readers, joined mock/request tasks, socket
+rebind and owned-schema absence. Uncertain cleanup retains schemas and fails;
+source assertions are not evidence that an Actions execution passed.

@@ -376,6 +376,9 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "backfill_history_counts",
     "member_catchup_cursors",
     "member_catchup_members",
+    // Short-lived derived voice calibration, not source data. Restore clears
+    // any target rows rather than mixing them with later observations.
+    "voice_heat_hours",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
     // manifest metadata only, never restored application data. The store
@@ -1300,15 +1303,29 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // Historical inventories are pinned by fixtures. Each old version waives
-    // only tables first covered by a later version. New v16 archives require
-    // the full inventory, including both guild counters (0441/0442/0446/0447),
-    // the epoch-claim guard (0450/0451), the delete tombstones (0452/0453),
-    // the token registry (0456/0457), the event voice pair (0455) and
-    // the starboard tables (0458/0459) and giveaways (0460/0461),
-    // and the event instance windows (0472).
     let version = obj.get("version").and_then(Value::as_u64);
-    let missing: Vec<&str> = DUMP_TABLES
+    let missing: Vec<&str> = required_manifest_tables(version)
+        .into_iter()
+        .filter(|name| !names.contains(*name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(refuse(format!(
+            "manifest is missing tables: {}",
+            missing.join(", ")
+        )));
+    }
+    serde_json::from_value(obj.clone()).map_err(|e| refuse(format!("manifest is malformed: {e}")))
+}
+
+// Historical inventories are pinned by fixtures. Each old version waives
+// only tables first covered by a later version. New v16 archives require
+// the full inventory, including both guild counters (0441/0442/0446/0447),
+// the epoch-claim guard (0450/0451), the delete tombstones (0452/0453),
+// the token registry (0456/0457), the event voice pair (0455) and
+// the starboard tables (0458/0459) and giveaways (0460/0461),
+// and the event instance windows (0472).
+fn required_manifest_tables(version: Option<u64>) -> Vec<&'static str> {
+    DUMP_TABLES
         .iter()
         .copied()
         .enumerate()
@@ -1390,15 +1407,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)
-        .filter(|name| !names.contains(*name))
-        .collect();
-    if !missing.is_empty() {
-        return Err(refuse(format!(
-            "manifest is missing tables: {}",
-            missing.join(", ")
-        )));
-    }
-    serde_json::from_value(obj.clone()).map_err(|e| refuse(format!("manifest is malformed: {e}")))
+        .collect()
 }
 
 /// Restore raises allocators to these marks, so a malformed one must refuse
@@ -1721,6 +1730,16 @@ mod tests {
             enc.write_all(&line).unwrap();
         }
         enc.finish().unwrap()
+    }
+
+    fn complete_current_manifest() -> Value {
+        let current = manifest(complete_tables(&BTreeMap::new()));
+        inspect_bytes(&gzip_lines(&[
+            current.clone(),
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("complete v16 archive inspects");
+        current
     }
 
     fn good_dump() -> Vec<Value> {
@@ -2318,6 +2337,44 @@ mod tests {
     }
 
     #[test]
+    fn manifest_inventory_requires_each_addition_at_its_version_boundary() {
+        for (introduced, tables) in [
+            (5, V5_ADDED_TABLES),
+            (6, V6_ADDED_TABLES),
+            (7, V7_ADDED_TABLES),
+            (8, V8_ADDED_TABLES),
+            (9, V9_ADDED_TABLES),
+            (10, V10_ADDED_TABLES),
+            (11, V11_ADDED_TABLES),
+            (12, V12_ADDED_TABLES),
+            (13, V13_ADDED_TABLES),
+            (14, V14_ADDED_TABLES),
+            (15, V15_ADDED_TABLES),
+            (16, V16_ADDED_TABLES),
+        ] {
+            for table in tables {
+                let mut objs = empty_dump();
+                objs[0]["tables"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|entry| entry["name"] != *table);
+                objs[0]["version"] = serde_json::json!(introduced - 1);
+                inspect_bytes(&gzip_lines(&objs)).expect("older version may omit the table");
+                objs[0]["version"] = serde_json::json!(introduced);
+                let err =
+                    inspect_bytes(&gzip_lines(&objs)).expect_err("new version requires table");
+                assert!(err.to_string().contains(*table), "{introduced}: {err}");
+            }
+        }
+        for (index, required) in [(21, true), (22, false)] {
+            let mut objs = empty_dump();
+            objs[0]["version"] = serde_json::json!(3);
+            objs[0]["tables"].as_array_mut().unwrap().remove(index);
+            assert_eq!(inspect_bytes(&gzip_lines(&objs)).is_err(), required);
+        }
+    }
+
+    #[test]
     fn refuses_a_manifest_missing_tables() {
         let tables =
             vec![serde_json::json!({"name":"events","columns":[],"column_types":[],"count":0})];
@@ -2906,12 +2963,7 @@ mod tests {
                 .contains("missing tables: events"));
         }
         assert_eq!(DUMP_VERSION, 16, "new dumps require both guild counters");
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v16 archive inspects");
+        let current = complete_current_manifest();
         for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -2982,12 +3034,7 @@ mod tests {
                 .contains("missing tables: events"));
         }
         assert_eq!(DUMP_VERSION, 16, "new dumps require the epoch-claim guard");
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v16 archive inspects");
+        let current = complete_current_manifest();
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -3112,12 +3159,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("scheduled_events_tombstone"));
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v16 archive inspects");
+        let current = complete_current_manifest();
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -3195,12 +3237,7 @@ mod tests {
             .to_string()
             .contains("admin_api_tokens"));
         assert_eq!(DUMP_VERSION, 16, "new dumps require the token registry");
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v16 archive inspects");
+        let current = complete_current_manifest();
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -3267,12 +3304,7 @@ mod tests {
                 .contains("missing tables: events"));
         }
         assert_eq!(DUMP_VERSION, 16, "new dumps require the event voice pair");
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v16 archive inspects");
+        let current = complete_current_manifest();
         for name in ["event_voice_channels", "event_voice_presence"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -3369,12 +3401,7 @@ mod tests {
                 "event_instance_windows"
             ]
         );
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v16 archive inspects");
+        let current = complete_current_manifest();
         for name in [
             "starboard_config",
             "starboard_starrers",
@@ -3565,6 +3592,50 @@ mod tests {
     }
 
     #[test]
+    fn released_v16_inventory_keeps_instance_windows_mandatory() {
+        // Extend the frozen v13 inventory with the literal v14–v16 additions;
+        // neither the current inventory nor version waivers define this fixture.
+        let tables: Vec<Value> = FROZEN_V13_TABLES
+            .iter()
+            .copied()
+            .chain([
+                "starboard_config",
+                "starboard_starrers",
+                "starboard_posts",
+                "giveaways",
+                "giveaway_entries",
+                "giveaway_draws",
+                "event_instance_windows",
+            ])
+            .map(|name| {
+                serde_json::json!({"name": name, "columns": [], "column_types": [], "count": 0})
+            })
+            .collect();
+        assert_eq!(tables.len(), 108);
+        assert_eq!(tables[107]["name"], "event_instance_windows");
+        let mut released = manifest(tables);
+        released["version"] = serde_json::json!(16);
+        let end = serde_json::json!({"kind": "end", "rows": 0});
+        let contents = inspect_bytes(&gzip_lines(&[released.clone(), end.clone()]))
+            .expect("released v16 inventory remains readable");
+        assert_eq!(contents.manifest.version, 16);
+        assert!(contents
+            .manifest
+            .tables
+            .iter()
+            .any(|table| table.name == "event_instance_windows"));
+
+        released["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|table| table["name"] != "event_instance_windows");
+        let error = inspect_bytes(&gzip_lines(&[released, end]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("event_instance_windows"), "{error}");
+    }
+
+    #[test]
     fn v15_archives_read_without_event_instance_windows_but_v16_requires_them() {
         assert_eq!(DUMP_VERSION, 16, "new dumps require the instance windows");
         assert_eq!(V16_ADDED_TABLES.to_vec(), ["event_instance_windows"]);
@@ -3688,12 +3759,7 @@ mod tests {
             assert!(error.contains(name), "{error}");
         }
         assert_eq!(DUMP_VERSION, 16, "new dumps require the giveaway tables");
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v16 archive inspects");
+        let current = complete_current_manifest();
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()

@@ -21,10 +21,12 @@ Two steps in deploy-production, both before any production mutation:
                 staging for the candidate, or
               - staging's REST 5xx ratio exceeds max(1.5 x production's
                 ratio, a 5% floor), with at least 3 staging 5xx responses.
-            Fewer than 10 judged staging REST requests (or no staging bearer)
-            records `insufficient_data`, never `pass`, mirroring the
-            promotion error-rate gate; a production baseline below 10
-            requests (or without a bearer) falls back to the floor alone.
+            A valid same-process delta with fewer than 10 requests still
+            refuses as `rest_5xx_regression` if it meets the regression
+            threshold above; otherwise it refuses as `insufficient_data`.
+            Missing continuous same-process evidence cannot produce a pass.
+            A production baseline below 10 requests (or without a bearer)
+            falls back to the floor alone.
             A process restart between the baseline and the post-soak sample
             (different `two_bot_process_incarnation`) breaks the cumulative
             window: a measured regression in the post-restart counters still
@@ -197,10 +199,10 @@ def soak_coverage(rest, base):
     baseline sample (the soak was already over before the run started, so
     the post-soak sample is the best window available).
     """
-    if base is None:
+    if base is None or counters({"available": True, **base}) is None:
         return "baseline_unavailable"
-    staging_inc = rest.get("incarnation") if rest else None
-    base_inc = base.get("incarnation")
+    staging_inc = incarnation_of(rest)
+    base_inc = incarnation_of(base)
     if staging_inc is None or base_inc is None:
         return "identity_unavailable"
     return "bookended" if staging_inc == base_inc else "incarnation_changed"
@@ -257,23 +259,34 @@ def compare(staging, prod_probe, prod_rest):
     staging_pair = counters({"available": True, **rest}) if rest else None
     prod_pair = counters(prod_rest)
     coverage = soak_coverage(rest, base)
+    if coverage == "bookended" and staging_pair is not None:
+        base_pair = counters({"available": True, **base})
+        delta = (staging_pair[0] - base_pair[0], staging_pair[1] - base_pair[1])
+        if not 0 <= delta[0] <= delta[1]:
+            coverage = "counters_inconsistent"
+            staging_pair = None
+        else:
+            staging_pair = delta
     prod_ratio = ratio(prod_pair) if prod_pair and prod_pair[1] >= MIN_REQUESTS else None
     threshold = max(RATIO_MARGIN * prod_ratio, FLOOR_RATIO) if prod_ratio is not None else FLOOR_RATIO
-    if staging_pair is None or staging_pair[1] < MIN_REQUESTS:
+    if (coverage == "bookended" and staging_pair is not None
+            and staging_pair[0] >= MIN_5XX and ratio(staging_pair) > threshold):
+        # A sparse but measurable regression must not be mistaken for a
+        # harmless lack of traffic if sparse deferral is introduced later.
+        rate_verdict = "fail"
+    elif staging_pair is None or staging_pair[1] < MIN_REQUESTS:
         rate_verdict = "insufficient_data"
     elif staging_pair[0] >= MIN_5XX and ratio(staging_pair) > threshold:
         # A measured regression refuses even across a restart: the
         # post-restart counters are themselves a valid window, and the
         # restart must not launder them.
         rate_verdict = "fail"
-    elif coverage == "incarnation_changed":
-        # The process restarted mid-soak and the post-restart window is
-        # clean or thin: the cumulative counts after the restart no longer
-        # cover the soak, so the ratio cannot be judged.
+    elif coverage != "bookended":
+        # A clean partial or unverified window cannot establish a clean soak.
         rate_verdict = "insufficient_data"
     else:
         rate_verdict = "pass"
-    failed = bool(regressions) or rate_verdict == "fail"
+    failed = bool(regressions) or rate_verdict != "pass"
     return {
         "sha": staging.get("sha"),
         "journeys": {"production": baseline, "staging": staged, "regressions": regressions,
@@ -290,7 +303,8 @@ def compare(staging, prod_probe, prod_rest):
         },
         "verdict": "fail" if failed else "pass",
         "code": ("journey_regression" if regressions
-                 else "rest_5xx_regression" if rate_verdict == "fail" else "no_regression"),
+                 else "rest_5xx_regression" if rate_verdict == "fail"
+                 else "insufficient_data" if rate_verdict == "insufficient_data" else "no_regression"),
     }
 
 
@@ -364,10 +378,8 @@ def main(argv=None):
     print("promotion regression gate: " + json.dumps(evidence, sort_keys=True))
     write_github("GITHUB_STEP_SUMMARY", summary_line(evidence))
     if evidence["verdict"] != "pass":
-        print(f"::error::Refusing promotion: the candidate regresses against production ({evidence['code']})")
+        print(f"::error::Refusing promotion: regression evidence did not pass ({evidence['code']})")
         return 1
-    if evidence["rest_5xx"]["verdict"] == "insufficient_data":
-        print("::warning::regression gate: too few staging REST requests to judge the 5xx ratio; not a pass")
     return 0
 
 

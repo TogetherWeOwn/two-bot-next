@@ -92,10 +92,17 @@ Before `T_0` the lead records: the watch lead for this window, the
 operator rotation contact, the external monitor name, and the monitoring
 receipts from the [checklist pre-watch
 check](watch-checklist.md#4-pre-watch-provisioning-check-names-only-never-values).
-At each checkpoint (`+15 min`, `+1 h`, `+6 h`, `+24 h`, `+48 h`) the lead
-records one GO / EXTEND / ROLLBACK row with open incidents listed by
-name. At `+48 h` record sign-off or extend the watch on the execution
-card.
+At each checkpoint (`+15 min`, `+1 h`, `+6 h`, `+24 h`, `+48 h`) due while
+the watch is open, the lead records one GO / EXTEND / ROLLBACK row with
+open incidents listed by name. Evidence-complete early closure still requires
+all prescribed timer/workload coverage and independent B2; record actual close
+UTC and reason, and mark later rows/comparisons N/A, not missing or PASS.
+If still incomplete at `+48 h`, record INCOMPLETE on the execution card; the
+cutover lead, Release Manager and data lead decide hold / incident / rollback
+and record any separately bounded continuation with owner, missing proof and
+deadline. Continuation is not successful closure or automatic extension.
+Normal monitoring, thresholds, writer fences, permissions, rollback gates and
+warm recovery resources remain required after closure.
 
 ## What this sheet does not do
 

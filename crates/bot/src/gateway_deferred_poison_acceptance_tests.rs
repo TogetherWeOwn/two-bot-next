@@ -35,7 +35,7 @@ fn checkpoint(sequence: u64) -> GatewaySession {
     GatewaySession {
         session_id: "fixture-session".into(),
         sequence,
-        resume_url: "wss://gateway.invalid".into(),
+        resume_url: "wss://gateway.discord.gg".into(),
         updated_at_ms: 1_792_497_600_000,
     }
 }

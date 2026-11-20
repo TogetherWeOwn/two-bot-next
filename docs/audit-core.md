@@ -107,7 +107,14 @@ None are included here.
 
 ## Verification
 
+These are hosted-CI coverage commands, not a local pre-push checklist. Push the
+PR branch and record exact-head Actions run/job links. Local execution is only
+for one failing test or crate under the
+[focused reproduction policy](../CONTRIBUTING.md#focused-failure-reproduction-only);
+heavy focused work uses guarded Boat, never a heavy raw-host fallback.
+
 ```sh
+# Ephemeral hosted CI only.
 cargo test -p two-bot-core --lib --locked -j 1
 cargo test -p two-bot-core --features db --test audit_service --locked -- --ignored
 cargo clippy -p two-bot-core --all-targets --locked -j 1 -- -D warnings
@@ -115,5 +122,5 @@ cargo fmt --all -- --check
 git diff --check
 ```
 
-The workspace-wide integration suite is delegated to CI; this slice only needs
-an incremental core build locally.
+The full suite is CI-owned. A local compile, skipped test or focused
+reproduction is not a replacement for the exact-head Actions verdict.

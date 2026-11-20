@@ -432,6 +432,7 @@ pub(crate) fn slash(
     Interaction {
         app_permissions: None,
         application_id: Id::new(1111),
+        attachment_size_limit: 10_485_760,
         authorizing_integration_owners: ApplicationIntegrationMap {
             guild: Some(AnonymizableId::Id(Id::new(GUILD))),
             user: None,
@@ -2050,7 +2051,13 @@ async fn a_completed_kick_replays_after_its_target_left_without_a_denial() {
         .collect();
     // The fixture interaction carries no resolved user block, so the reply
     // slot falls back to the raw target user id.
-    assert_eq!(replies, ["Kicked 3333.", "Kicked 3333. Already applied."]);
+    assert_eq!(
+        replies,
+        [
+            "Kicked 3333. Severity: medium.",
+            "Kicked 3333. Severity: medium. Already applied."
+        ]
+    );
     let kicks: Vec<_> = requests
         .iter()
         .filter(|r| r.method == "DELETE" && r.path.starts_with("/api/v10/guilds/"))
@@ -2213,7 +2220,10 @@ async fn sweep_tick_reports_a_failed_unban_as_a_rest_job_failure() {
         CommandOptionValue::Integer(3600),
     ));
     runtime.on_interaction(&interaction).await;
-    assert_eq!(mock.deferred_reply()["content"], "Temporarily banned 3333.");
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Temporarily banned 3333. Severity: high."
+    );
     // The successful PUT activates the row staged -> pending; the sweep
     // claims pending rows whose execute_at has passed.
     let scheduled: (String,) =
@@ -10867,12 +10877,10 @@ async fn self_role_reactions_have_their_own_bounded_lane() {
     // A reaction burst must not discard message automations: with the
     // reaction lane full, a message still admits on its own lane without
     // touching the reaction depth.
-    let message = Event::MessageCreate(Box::new(MessageCreate(message(
-        9,
-        100_000_000_000_000_007,
-        false,
-        Some(SR_GUILD),
-    ))));
+    let message = Event::MessageCreate(Box::new(MessageCreate {
+        channel_type: None,
+        message: message(9, 100_000_000_000_000_007, false, Some(SR_GUILD)),
+    }));
     assert!(
         runtime.dispatch(&message),
         "full reaction lane still admits messages"
@@ -11315,7 +11323,10 @@ async fn worker_trigger_gate_observes_sticky_http_and_state() {
             }))
             .expect("complete member facts"),
         );
-        Event::MessageCreate(Box::new(MessageCreate(msg)))
+        Event::MessageCreate(Box::new(MessageCreate {
+            channel_type: None,
+            message: msg,
+        }))
     };
     let dispatch = |event: &Event, verdict| {
         worker_prefix_trigger(Some(verdict), event, true)
@@ -11450,7 +11461,10 @@ async fn worker_verdict_drives_prefix_trigger_from_call_site() {
     }
 
     fn verdict_event(message: Message) -> Event {
-        Event::MessageCreate(Box::new(MessageCreate(message)))
+        Event::MessageCreate(Box::new(MessageCreate {
+            channel_type: None,
+            message,
+        }))
     }
 
     let db = TestDb::new().await;

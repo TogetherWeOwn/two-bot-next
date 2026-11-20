@@ -369,13 +369,32 @@ async fn twilight_posts_exact_mapped_route_and_mention_safe_payload() {
         requests[0].path,
         format!("/api/v10/channels/{CHANNEL}/messages")
     );
+    // Kit embed treatment (Discord spec §2–§3): the validated text renders
+    // as one branded embed — ember default, Announcements surface footer —
+    // with no plain content, mentions still suppressed and mass mentions
+    // neutralized inside the embed. The first line carries `<@` markup,
+    // which Discord does not render in titles, so the whole text is the
+    // description alone with no title.
+    assert!(requests[0].body.get("content").is_none());
+    let embed = &requests[0].body["embeds"][0];
+    assert!(embed.get("title").is_none());
     assert_eq!(
-        requests[0].body,
-        json!({
-            "content": "news é 🦀 می\u{200c}روم @\u{200b}everyone @\u{200b}here <@&123456789012345678> <@123456789012345678>",
-            "allowed_mentions": {"parse": []}
-        })
+        embed["description"],
+        json!("news é 🦀 می\u{200c}روم @\u{200b}everyone @\u{200b}here <@&123456789012345678> <@123456789012345678>")
     );
+    assert_eq!(
+        embed["color"].as_u64(),
+        Some(u64::from(EmbedKind::Default.color()))
+    );
+    assert_eq!(
+        embed["footer"]["text"],
+        json!("Together We Own · Announcements")
+    );
+    assert_eq!(
+        embed["footer"]["icon_url"],
+        json!(crate::brand::BRAND_ICON_URL)
+    );
+    assert_eq!(requests[0].body["allowed_mentions"], json!({"parse": []}));
     assert_eq!(body["body"], text);
     assert_eq!(
         serde_json::to_value(outcome).unwrap(),
@@ -980,4 +999,164 @@ async fn repeated_rate_limits_end_each_intent_and_feed_every_cooldown() {
         assert_eq!(mock.count(), round);
         advance(Duration::from_secs(1)).await;
     }
+}
+
+#[test]
+fn announcement_embed_uses_ember_default_and_announcements_footer() {
+    let embed = announcement_embed("Raid Night starts soon\nDoors open at 21:00 UTC.");
+    assert_eq!(embed.color, Some(EmbedKind::Default.color()));
+    assert_eq!(embed.title.as_deref(), Some("Raid Night starts soon"));
+    assert_eq!(
+        embed.description.as_deref(),
+        Some("Doors open at 21:00 UTC.")
+    );
+    let footer = embed.footer.expect("announcement embed has a footer");
+    assert_eq!(footer.text, "Together We Own · Announcements");
+    assert_eq!(
+        footer.icon_url.as_deref(),
+        Some(crate::brand::BRAND_ICON_URL)
+    );
+    assert!(embed.fields.is_empty());
+}
+
+#[test]
+fn announcement_embed_uses_violet_for_composed_echo_titles() {
+    let embed = announcement_embed(
+        "Echo · Raid Night\n18 of 21 came · 16 stayed to the end · 3 first-timers.",
+    );
+    assert_eq!(embed.color, Some(EmbedKind::Echo.color()));
+    assert_eq!(embed.title.as_deref(), Some("Echo · Raid Night"));
+    let footer = embed.footer.expect("Echo embed has a footer");
+    assert_eq!(footer.text, "Together We Own · Echo");
+    assert_eq!(
+        footer.icon_url.as_deref(),
+        Some(crate::brand::BRAND_ICON_URL)
+    );
+}
+
+#[test]
+fn announcement_embed_bounds_title_and_description() {
+    // A short first line promotes to the title and the remainder is the
+    // description, both within their ceilings.
+    let embed = announcement_embed("Raid Night starts soon\nDoors open at 21:00 UTC.");
+    assert_eq!(
+        two_bot_core::message_safety::text_len(embed.title.as_deref().unwrap()),
+        two_bot_core::message_safety::text_len("Raid Night starts soon")
+    );
+    assert!(
+        two_bot_core::message_safety::text_len(embed.description.as_deref().unwrap())
+            <= two_bot_core::message_safety::EMBED_DESCRIPTION_LIMIT
+    );
+}
+
+#[test]
+fn announcement_embed_long_single_line_keeps_every_character() {
+    // A single paragraph longer than the title ceiling must not lose its
+    // overflow: the whole text becomes the description with no title.
+    let body = "a".repeat(600);
+    let embed = announcement_embed(&body);
+    assert_eq!(embed.title, None);
+    assert_eq!(embed.description.as_deref(), Some(body.as_str()));
+    assert_eq!(embed.color, Some(EmbedKind::Default.color()));
+    let footer = embed.footer.expect("announcement embed has a footer");
+    assert_eq!(footer.text, "Together We Own · Announcements");
+}
+
+#[test]
+fn announcement_embed_long_first_line_with_body_keeps_every_character() {
+    // A first line over the title ceiling plus a body: nothing is cut
+    // into the title; the full text, both lines, is the description.
+    let title = "T".repeat(300);
+    let rest = "x".repeat(200);
+    let body = format!("{title}\n{rest}");
+    let embed = announcement_embed(&body);
+    assert_eq!(embed.title, None);
+    assert_eq!(embed.description.as_deref(), Some(body.as_str()));
+}
+
+#[test]
+fn announcement_embed_markup_first_line_falls_back_to_description() {
+    // Discord does not render mentions or masked links in titles, so a
+    // first line carrying them stays in the description where it renders.
+    for first in [
+        "Hello <@123456789012345678>",
+        "Hello <#123456789012345678>",
+        "Hello [label](https://example.com)",
+    ] {
+        let body = format!("{first}\nBody text.");
+        let embed = announcement_embed(&body);
+        assert_eq!(embed.title, None, "{first:?} must not become a title");
+        assert_eq!(embed.description.as_deref(), Some(body.as_str()));
+    }
+}
+
+#[test]
+fn announcement_embed_neutralizes_mass_mentions() {
+    let embed = announcement_embed("@everyone listen up\n@here also");
+    let rendered = format!(
+        "{} {}",
+        embed.title.unwrap_or_default(),
+        embed.description.unwrap_or_default()
+    );
+    assert!(!rendered.contains("@everyone") && !rendered.contains("@here"));
+    assert!(rendered.contains("@\u{200b}everyone"));
+}
+
+#[test]
+fn announcement_embed_single_line_body_is_a_title() {
+    let embed = announcement_embed("Hello, Discord.");
+    assert_eq!(embed.title.as_deref(), Some("Hello, Discord."));
+    assert_eq!(embed.description, None);
+    assert_eq!(embed.color, Some(EmbedKind::Default.color()));
+}
+
+#[test]
+fn announcement_embed_preserves_body_indentation() {
+    // A code block or list after the title line keeps its leading
+    // indentation; trimming it would destroy the block's structure.
+    let embed = announcement_embed("Example:\n    if ready:\n        start()");
+    assert_eq!(embed.title.as_deref(), Some("Example:"));
+    assert_eq!(
+        embed.description.as_deref(),
+        Some("    if ready:\n        start()")
+    );
+}
+
+#[test]
+fn announcement_embed_collapses_blank_separator_lines() {
+    // Blank lines between the title and the body still fold away, so the
+    // description starts at the first non-blank body line.
+    let embed = announcement_embed("Title\n\nBody text.");
+    assert_eq!(embed.title.as_deref(), Some("Title"));
+    assert_eq!(embed.description.as_deref(), Some("Body text."));
+}
+
+#[test]
+fn announcement_embed_boundary_body_survives_mention_neutralisation() {
+    // A body at the 2000-unit validation ceiling whose neutralisation
+    // grows it by one zero-width space must keep its final character:
+    // the embed description ceiling (4096), not the message ceiling,
+    // bounds the neutralised text.
+    let body = format!("@everyone{}Z", "x".repeat(1990));
+    assert_eq!(
+        two_bot_core::message_safety::text_len(&body),
+        two_bot_core::message_safety::CONTENT_LIMIT
+    );
+    let embed = announcement_embed(&body);
+    assert_eq!(embed.title, None);
+    let description = embed.description.expect("boundary body is a description");
+    assert!(
+        description.ends_with('Z'),
+        "final character must survive: {description:?}"
+    );
+}
+
+#[test]
+fn announcement_embed_opening_code_fence_stays_in_description() {
+    // An opening code fence is not a title: Discord renders code blocks
+    // only in descriptions, so the whole body stays there intact.
+    let body = "```rust\nlet ready = true;\n```";
+    let embed = announcement_embed(body);
+    assert_eq!(embed.title, None);
+    assert_eq!(embed.description.as_deref(), Some(body));
 }

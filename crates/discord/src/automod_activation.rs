@@ -143,6 +143,15 @@ impl<L: AutomodClaimLedger, F: AutomodFacts> AutomodActivation<L, F> {
         self.runtime().apply_live_config(config)
     }
 
+    /// Run one synchronous read against the shared runtime (automod preview
+    /// spec §5.0): the closure sees the live config and repeat history under
+    /// the same lock the gateway worker uses. The closure must be
+    /// synchronous — the lock is released when it returns, before any audit
+    /// I/O await, never held across one.
+    pub fn preview<R>(&self, f: impl FnOnce(&AutomodRuntime) -> R) -> R {
+        f(&self.runtime())
+    }
+
     /// Process one delivery. Callers serialize deliveries in gateway order so
     /// repeat history observes creates in order. `at_iso` stamps the ledger.
     pub async fn process(&self, delivery: MessageDelivery, at_iso: &str) -> Activation {

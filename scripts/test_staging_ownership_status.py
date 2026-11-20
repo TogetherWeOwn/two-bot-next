@@ -49,8 +49,10 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertIn("persist-credentials: false", self.text)
         self.assertIn("concurrency:\n  group: staging-ownership-status", self.text)
 
-    def test_runner_routing_and_pinned_actions(self):
-        self.assertIn("contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'status')", self.text)
+    def test_public_hosted_runner_and_pinned_actions(self):
+        self.assertIn("    runs-on: ubuntu-latest", self.text)
+        self.assertNotIn("CI_OVERFLOW_", self.code)
+        self.assertNotIn("self-hosted", self.code)
         self.assertIn("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", self.text)
         self.assertIn("actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1", self.text)
 

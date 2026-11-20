@@ -286,7 +286,7 @@ class SupplyChainTests(unittest.TestCase):
         self.assertEqual(len(images), 2)
         for image in images:
             self.assertRegex(image, r"@sha256:[0-9a-f]{64}$")
-        self.assertTrue(images[0].startswith("rust:1.99-trixie@"))
+        self.assertTrue(images[0].startswith("rust:1.100-trixie@"))
         self.assertTrue(images[1].startswith("gcr.io/distroless/base-nossl-debian13:nonroot@"))
         self.assertIn("package-ecosystem: docker", (ROOT / ".github/dependabot.yml").read_text())
 
@@ -349,14 +349,18 @@ class SupplyChainTests(unittest.TestCase):
         # the callers that reference it.
         for name in ["check", "release", "sbom", "supply-chain"]:
             path = ROOT / ".github/workflows" / f"{name}.yml"
-            # Comments may name the overflow example; no runs-on may use it.
+            workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            for job_id, job in workflow["jobs"].items():
+                if "uses" in job:
+                    self.assertNotIn("runs-on", job, f"{name}:{job_id}")
+                else:
+                    self.assertEqual(job["runs-on"], "ubuntu-latest", f"{name}:{job_id}")
             code = "\n".join(
                 line for line in path.read_text().splitlines()
                 if not line.lstrip().startswith("#")
             )
-            # Only the documented routing expression may name a hosted runner.
-            routed = "'[\"ubuntu-latest\"]'"
-            self.assertNotIn("ubuntu-latest", code.replace(routed, ""), str(path))
+            self.assertNotIn("CI_OVERFLOW_", code, str(path))
+            self.assertNotIn("self-hosted", code, str(path))
 
     def test_every_trivy_invocation_uses_the_official_database_source(self):
         supply = yaml.load((ROOT / ".github/workflows/sbom.yml").read_text(), Loader=yaml.BaseLoader)

@@ -25,10 +25,8 @@ name: dora-metrics
 # git config. A refused or conflicting push fails the run closed; the
 # compute artifact still preserves the numbers for that week.
 #
-# `ops/**` sits in deploy-staging's push ignore list, so any future main-side
-# delivery evidence restarts nothing: without that entry a metrics merge
-# would bounce the staging gateway and feed the production promotion queue a
-# no-op SHA. The weekly side-branch push itself triggers no deploys.
+# The weekly report stays on the automation branch. Publishing it does not
+# update main or trigger a deployment.
 #
 # Proof: dispatch with dry_run from any branch to run the real computation
 # against the live API and upload the files as an artifact without
@@ -59,7 +57,7 @@ jobs:
       actions: read # Verify the Actions run behind each recorded deploy.
     if: github.ref == 'refs/heads/main' || inputs.dry_run == true
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'metrics') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
       week: ${{ steps.metrics.outputs.week }}
@@ -91,7 +89,7 @@ jobs:
       contents: write # Commit the weekly JSON and summary to the automation branch.
     if: inputs.dry_run != true && github.ref == 'refs/heads/main'
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'publish') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

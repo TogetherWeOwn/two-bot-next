@@ -1,10 +1,9 @@
 # Docs map
 
-Run `python3 scripts/check_docs_index.py --json`.
-
 ## References
 
 - [Find a doc](README.md)
+- [Public direction](ROADMAP.md)
 - [Framework](adr/0001-discord-framework.md)
 - [Sequencing](adr/0002-m2-m3-sequencing.md)
 - [Deferred items](adr/0003-m3-deferred.md)
@@ -65,7 +64,7 @@ Run `python3 scripts/check_docs_index.py --json`.
 - [Audit domain](audit-core.md)
 - [Audit mirror](audit-service.md)
 - [Audit persistence](audit-store.md)
-- [Action signing v2](internal-action-signing-v2.md)
+- [Signing v2](internal-action-signing-v2.md)
 - [Action persistence](internal-action-store.md)
 - [Action ingress](internal-actions-receiver.md)
 - [Announcements](internal-action-executor.md)
@@ -74,6 +73,7 @@ Run `python3 scripts/check_docs_index.py --json`.
 - [Event executors](internal-event-executors.md)
 - [Member executors](internal-member-execution.md)
 - [Moderation executor](internal-member-moderation.md)
+- [Bot-site contract](bot-site-contract.md)
 
 ## Commands and moderation
 
@@ -182,13 +182,13 @@ Run `python3 scripts/check_docs_index.py --json`.
 - [Prefix seam](router-voice-prefix.md)
 - [Create plan](voice-room-creation-plan.md)
 - [Create admission](voice-create-admission-core.md)
-- [Ownership domain](voice-ownership-core.md)
+- [Ownership](voice-ownership-core.md)
 - [Room controls](voice-room-controls-core.md)
 - [Private rooms](voice-private-core.md)
-- [Room access gate](voice-access-core.md)
+- [Access gate](voice-access-core.md)
 - [Access corpus](voice-access-golden.md)
 - [Vote-kick](voice-vote-kick-core.md)
-- [Cooldown tests](voice-vote-cooldown-acceptance.md)
+- [Cooldown](voice-vote-cooldown-acceptance.md)
 - [Vote cooldown](voice-vote-kick-cooldown-checklist.md)
 - [Templates](voice-template-core.md)
 - [Template styling](voice-style-core.md)
@@ -226,10 +226,10 @@ Run `python3 scripts/check_docs_index.py --json`.
 - [Alert drill](voice-lifecycle-alert-drill.md)
 - [Cutover rehearsal](voice-cutover-rehearsal.md)
 - [Rollbacks](voice-cutover-rollback-triggers.md)
-- [Rollback tabletop](voice-rollback-trigger-drill.md)
+- [Rollback drill](voice-rollback-trigger-drill.md)
 - [Freeze](voice-t5-freeze-readback-receipt.md)
 - [Publish diff](voice/publish-diff-record-template.md)
-- [Music node spike](music-voice-node-spike.md)
+- [Music spike](music-voice-node-spike.md)
 
 ## Staging
 

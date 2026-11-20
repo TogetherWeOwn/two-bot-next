@@ -168,6 +168,24 @@ const NUMBER = "(?:[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?|N
 const SAMPLE = new RegExp(`^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\\{(.*)\\})?[ \\t]+(${NUMBER})(?:[ \\t]+[+-]?[0-9]+)?[ \\t]*$`);
 const LABEL = /([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\[\\"n])*)"(?:,|$)/y;
 
+// Check the decimal token before Number can round a fraction or underflow a negative.
+function nonnegativeIntegerToken(text: string): boolean {
+  const match = /^([+-]?)([0-9]*)(?:\.([0-9]*))?(?:[eE]([+-]?[0-9]+))?$/.exec(text);
+  if (!match) return false;
+  const fraction = match[3] ?? "";
+  const digits = match[2]! + fraction;
+  if (!/[1-9]/.test(digits)) return true;
+  if (match[1] === "-") return false;
+  const decimalShift = Number(match[4] ?? "0") - fraction.length;
+  if (decimalShift >= 0) return true;
+  const requiredZeros = -decimalShift;
+  if (requiredZeros > digits.length) return false;
+  for (let i = digits.length - 1; i >= digits.length - requiredZeros; i--) {
+    if (digits[i] !== "0") return false;
+  }
+  return true;
+}
+
 /** Reject partial or invalid scrapes before any baseline/streak/firing-state write. */
 export function parseAlertScrape(text: string): Sample[] | null {
   const samples: Sample[] = [];
@@ -189,6 +207,7 @@ export function parseAlertScrape(text: string): Sample[] | null {
       offset = LABEL.lastIndex;
     }
     const valueText = match[3]!;
+    if (name === "two_bot_rest_requests_total" && !nonnegativeIntegerToken(valueText)) return null;
     const value = valueText === "+Inf" || valueText === "Inf" ? Infinity : valueText === "-Inf" ? -Infinity : Number(valueText);
     const key = identity(name, labels);
     if (seen.has(key)) return null;

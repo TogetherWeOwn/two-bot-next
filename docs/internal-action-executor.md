@@ -38,11 +38,19 @@ snowflakes must additionally be canonical, nonzero, u64-representable Discord
 IDs. The adapter drops core `ActionError` text because an unknown key is echoed
 in that error. Only fixed refusal enums leave the adapter.
 
-Twilight `create_message(...).content(...).allowed_mentions(...)` builds and
+Twilight `create_message(...).embeds(...).allowed_mentions(...)` builds and
 validates the actual JSON POST to `/api/v10/channels/{mapped-id}/messages`.
-Allowed mentions are explicitly empty, overriding any client defaults. Text is
-preserved, but cannot ping users, roles or everyone through this endpoint.
-Arbitrary input fields, including OAuth material, are never forwarded.
+The validated `body` renders bot-side as the kit announcement/Echo embed
+(Discord spec §2–§3, §5): a short first line that fits the title ceiling
+and carries no mention/link markup is the title and the remainder the
+description; any longer or markup-carrying first line makes the whole
+text the description alone with no title, so no character is dropped.
+Ember default for announcements and violet Echo for a composed `Echo ·`
+title, both with the surface footer from `crate::brand`. No `content`
+is sent. Allowed mentions are explicitly empty, overriding any
+client defaults. Text is preserved, but cannot ping users, roles or everyone
+through this endpoint. Arbitrary input fields, including OAuth material, are
+never forwarded.
 
 ## Single attempt and safe results
 
