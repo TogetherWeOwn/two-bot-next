@@ -488,16 +488,21 @@ class RollbackRunTests(unittest.TestCase):
 
     def test_stable_gate_budget_starts_after_restore_steps(self):
         clock = Clock()
-        rb, _, _ = make_rollback({}, clock=clock)
+        rb, _, _ = make_rollback(self.routes(serving=GOOD_VERSION)[0], clock=clock)
+        restore = rb.restore_image
+
+        def restore_image(image):
+            clock.sleep(400)
+            return restore(image)
+
+        rb.restore_image = restore_image
         gate_started = []
-        rb.restore_image = lambda image: clock.sleep(400)
         rb.take_over = lambda version: clock.sleep(500)
         rb.wait_stable = lambda version, started: gate_started.append(started)
-        with mock.patch.object(rollback, "serving_version", return_value=GOOD_VERSION):
-            rb.run(GOOD_VERSION, good_image())
+        rb.run(GOOD_VERSION, good_image())
         self.assertEqual(gate_started, [900.0])
 
-    def routes(self, serving=BAD_VERSION, *, stale_reads=0):
+    def routes(self, serving=BAD_VERSION, *, stale_reads=0, listing_lag=False):
         prev = rollout_row("r-prev", good_image(), created="2026-10-14T00:00:00Z")
         created = {"n": 0}
 
@@ -510,6 +515,7 @@ class RollbackRunTests(unittest.TestCase):
             status = "completed" if created["n"] else "progressing"
             row = rollout_row("r-new", good_image(), created="2026-10-15T01:00:00Z",
                               status=status, target_version=9)
+            row["current_configuration"]["image"] = bad_image()
             return {"success": True, "result": row}
 
         def post_deployments(body):
@@ -538,7 +544,7 @@ class RollbackRunTests(unittest.TestCase):
             ("GET", "/containers/applications"): lambda: {
                 "success": True, "result": [{"id": APP_ID, "name": APPLICATION,
                                              "durable_objects": {"namespace_id": NAMESPACE},
-                                             "configuration": {"image": good_image()}}]},
+                                             "configuration": {"image": bad_image() if listing_lag else good_image()}}]},
             ("PROBE", "readyz"): handler,
             ("PROBE", "health"): health,
         }
@@ -570,9 +576,9 @@ class RollbackRunTests(unittest.TestCase):
         self.assertEqual(evidence["from_version"], BAD_VERSION)
         self.assertEqual(state["serving"], GOOD_VERSION)
 
-    def test_worker_restore_waits_through_stale_readback_before_image_restore(self):
+    def test_production_waits_through_stale_worker_readback_before_image_restore(self):
         routes, _ = self.routes(stale_reads=2)
-        rb, client, _ = make_rollback(routes)
+        rb, client, _ = make_rollback(routes, variant="production")
         evidence = rb.run(GOOD_VERSION, good_image())
         path = f"/workers/scripts/{WORKER}/deployments"
         rollout_path = f"/containers/applications/{APP_ID}/rollouts"
@@ -585,11 +591,11 @@ class RollbackRunTests(unittest.TestCase):
         self.assertEqual(evidence["restored_version"], GOOD_VERSION)
         self.assertEqual(evidence["gate"], "stable-200-gateway-ready")
 
-    def test_worker_restore_exhausts_readback_without_continuing(self):
+    def test_production_worker_restore_exhausts_readback_without_continuing(self):
         routes, _ = self.routes(stale_reads=100)
         clock = Clock()
         control, actions = control_stub()
-        rb, client, log = make_rollback(routes, clock=clock, control=control)
+        rb, client, log = make_rollback(routes, variant="production", clock=clock, control=control)
         with self.assertRaisesRegex(base.GateError, "^rollback_not_active$"):
             rb.run(GOOD_VERSION, good_image())
         path = f"/workers/scripts/{WORKER}/deployments"
@@ -617,11 +623,13 @@ class RollbackRunTests(unittest.TestCase):
                                   else {"version_id": "malformed"})
                     return payload
 
-                routes[("GET", path)] = readback
+                reads = iter((result, readback))
+                routes[("GET", path)] = lambda: next(reads)()
                 rb, client, log = make_rollback(routes)
                 with self.assertRaisesRegex(base.GateError, f"^{failure}$"):
-                    rb.restore_worker(GOOD_VERSION)
-                self.assertEqual([call[:2] for call in client.calls],
+                    rb.run(GOOD_VERSION, good_image())
+                calls = [call[:2] for call in client.calls]
+                self.assertEqual(calls[calls.index(("POST", path)):],
                                  [("POST", path), ("GET", path)])
                 self.assertNotIn("worker restored", log.getvalue())
 
@@ -629,18 +637,128 @@ class RollbackRunTests(unittest.TestCase):
         routes, _ = self.routes(serving=GOOD_VERSION)
         control, calls = control_stub()
         rb, client, _ = make_rollback(routes, control=control)
+        path = f"/containers/applications/{APP_ID}/rollouts"
+        post = routes[("POST", path)]
+
+        def post_while_fenced(body):
+            self.assertEqual([action for action, _, _ in calls], ["status", "fence"])
+            return post(body)
+
+        client.routes[("POST", path)] = post_while_fenced
         rb.run(GOOD_VERSION, good_image())
-        posts = [call for call in client.calls if call[0] == "POST"]
-        self.assertFalse(any("deployments" in path for _, path, _ in posts))
-        self.assertTrue(any("rollouts" in path for _, path, _ in posts))
+        self.assertEqual([call[:2] for call in client.calls if call[0] == "POST"],
+                         [("POST", path)])
+
+    def test_staging_polls_both_legs_despite_stale_worker_readback(self):
+        for drift in (False, True):
+            with self.subTest(drift=drift):
+                routes, _ = self.routes(stale_reads=rollback.WORKER_RESTORE_READS + int(drift))
+                path = f"/containers/applications/{APP_ID}/rollouts"
+                completed = routes[("GET", path + "/r-new")]
+                reads = iter(("progressing", "completed"))
+
+                def read_rollout():
+                    response = completed()
+                    response["result"]["status"] = next(reads, "completed")
+                    return response
+
+                routes[("GET", path + "/r-new")] = read_rollout
+                control, actions = control_stub()
+                rb, client, _ = make_rollback(routes, control=control)
+                if drift:
+                    with self.assertRaisesRegex(base.GateError, "^rollback_not_active$"):
+                        rb.run(GOOD_VERSION, good_image())
+                    self.assertEqual([action for action, _, _ in actions], ["status", "fence"])
+                else:
+                    evidence = rb.run(GOOD_VERSION, good_image())
+                    self.assertEqual(evidence["restored_rollout_id"], "r-new")
+                    self.assertEqual(evidence["gate"], "stable-200-gateway-ready")
+                worker_path = f"/workers/scripts/{WORKER}/deployments"
+                posts = [call for call in client.calls if call[0] == "POST"]
+                self.assertEqual([call[1] for call in posts], [worker_path, path])
+                self.assertNotIn("force", posts[0][2])
+                self.assertEqual(posts[1][2]["target_configuration"], {"image": good_image()})
+                rollout_read = ("GET", path + "/r-new")
+                self.assertEqual(client.calls.count(rollout_read), 2 if drift else 4)
+                settled = client.calls.index(rollout_read, client.calls.index(rollout_read) + 1)
+                worker_reads = [("GET", worker_path)] * rollback.WORKER_RESTORE_READS
+                image_reads = [rollout_read, ("GET", "/containers/applications"), ("GET", path + "?limit=100")]
+                self.assertEqual([call for call in client.calls[settled + 1:] if call[0] == "GET"],
+                                 worker_reads + ([] if drift else image_reads * 2))
+
+    def test_staging_keeps_fence_when_pinned_image_drifts_during_worker_wait(self):
+        worker = f"/workers/scripts/{WORKER}/deployments"
+        rollouts = f"/containers/applications/{APP_ID}/rollouts"
+        pinned = ("GET", rollouts + "/r-new")
+        for changes, failure in (
+            ({"status": "reverted"}, "rollout_replaced_or_reverted"),
+            ({"status": "replaced"}, "rollout_replaced_or_reverted"),
+            ({"status": "progressing"}, "image_rollout_not_converged"),
+            ({"health": {"instances": {"active": 0, "healthy": 0, "failed": 1,
+                                       "starting": 0, "scheduling": 0}}}, "image_rollout_not_converged"),
+            ({"id": "r-other"}, "rollout_identity_drift"),
+            ({"target_version": 10}, "rollout_identity_drift"),
+            ({"target_configuration": {"image": bad_image()}}, "rollout_identity_drift"),
+        ):
+            with self.subTest(changes=changes):
+                routes, _ = self.routes(stale_reads=2)
+                read_rollout = routes[pinned]
+                control, actions = control_stub()
+                rb, client, _ = make_rollback(routes, control=control)
+
+                def read_pinned():
+                    response = read_rollout()
+                    if pinned in client.calls[:-1]:
+                        response["result"].update(changes)
+                    return response
+                rb.staging_use = mock.Mock()
+                client.routes[pinned] = read_pinned
+                with self.assertRaisesRegex(base.GateError, f"^{failure}$"):
+                    rb.run(GOOD_VERSION, good_image())
+                calls = [call[:2] for call in client.calls]
+                self.assertEqual([call for call in calls if call[0] == "POST"],
+                                 [("POST", worker), ("POST", rollouts)])
+                self.assertEqual(calls[calls.index(pinned):],
+                                 [pinned, ("GET", worker), ("GET", worker), pinned])
+                self.assertEqual([action for action, _, _ in actions], ["status", "fence"])
+                rb.staging_use.assert_called_once_with("restore-check")
+                self.assertNotIn("restored_rollout_id", rb.evidence)
+
+    def test_staging_refuses_success_when_image_drifts_during_stable_probes(self):
+        path = f"/containers/applications/{APP_ID}/rollouts"
+        for drift in ("reverted", "superseded", "listing"):
+            with self.subTest(drift=drift):
+                routes, _ = self.routes()
+                rb, client, _ = make_rollback(routes)
+                routes = client.routes
+                probe = routes[("PROBE", "readyz")]
+
+                def readyz():
+                    if drift == "reverted":
+                        routes[("GET", path + "/r-new")] = lambda: {
+                            "success": True, "result": {"id": "r-new", "status": "reverted"}}
+                    elif drift == "superseded":
+                        routes[("GET", path + "?limit=100")] = lambda: {"success": True, "result": [
+                            rollout_row("r-later", bad_image(), created="2026-10-15T02:00:00Z")]}
+                    else:
+                        listing = ("GET", "/containers/applications")
+                        routes[listing] = self.routes(listing_lag=True)[0][listing]
+                    return probe()
+
+                routes[("PROBE", "readyz")] = readyz
+                failure = "rollout_replaced_or_reverted" if drift == "reverted" else "application_image_drift"
+                with self.assertRaisesRegex(base.GateError, f"^{failure}$"):
+                    rb.run(GOOD_VERSION, good_image())
+                self.assertNotIn("gate", rb.evidence)
+                self.assertEqual(sum(call[0] == "POST" for call in client.calls), 2)
 
     def test_image_restore_accepts_the_steady_state_lag_shape(self):
         # Under durable_object scheduling the completed rollout can read
         # active:1/healthy:0 while the exact build serves ready; staging
         # verify accepts that shape, so the restore must not time out on it.
-        routes, _ = self.routes()
-        lag = rollout_row("r-new", good_image(), created="2026-10-15T01:00:00Z",
-                          status="completed", target_version=9)
+        routes, _ = self.routes(listing_lag=True)
+        lag = routes[("GET", f"/containers/applications/{APP_ID}/rollouts/r-new")]()["result"]
+        lag["status"] = "completed"
         lag["health"]["instances"] = {"active": 1, "healthy": 0, "failed": 0,
                                       "starting": 0, "scheduling": 0}
         self.assertTrue(base.active_lag(lag, good_image(), 9))
@@ -1037,7 +1155,7 @@ class MainProvenanceTests(unittest.TestCase):
 
         def get_rollout():
             return {"success": True, "result": rollout_row(
-                "r-new", good_image(), created="2026-10-15T01:00:00Z",
+                "r-new", good_image(), created="2026-10-15T02:00:00Z",
                 status="completed", target_version=9)}
 
         deployments = [{"versions": [{"version_id": v, "percentage": 100}]}

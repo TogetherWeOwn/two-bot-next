@@ -67,12 +67,13 @@ def run(workflow=proof.WORKFLOW, event="workflow_dispatch", conclusion="failure"
 def files():
     return {"staging-rollback-snapshot.json": {
                 "worker": "two-bot-next-staging", "has_previous": True,
-                "serving_version": VERSION, "serving_image": "registry.example/image@" + DIGEST},
+                "serving_version": VERSION, "serving_image": "registry.example/image@" + DIGEST,
+                "serving_rollout_id": "r-before"},
             "auto-rollback-evidence.json": {"worker": "two-bot-next-staging", "variant": "staging",
-                "restored_version": VERSION, "restored_image_digest": DIGEST,
+                "restored_version": VERSION, "restored_image_digest": DIGEST, "restored_rollout_id": "r-new",
                 "gate": "stable-200-gateway-ready", "takeover": True},
             "error-rate-gate.json": {"mode": "rehearsal", "verdict": "fail", "firing": ["rest_5xx_rate"]},
-            "evidence.json": {"revision": "a" * 40},
+            "evidence.json": {"revision": "a" * 40, "rollout_id": "r-forward"},
             "staging-use.jsonl": [{"schema": "two-bot-staging-pipeline.v1", "action": "window",
                 "environment": "staging", "runId": "123", "runAttempt": 1, "expiresAt": 1000, "sha": "a" * 40}]}
 
@@ -232,7 +233,8 @@ class RollbackProofTests(unittest.TestCase):
 
     def test_deployed_sha_evidence_must_match_requested_commit(self):
         for candidate in (None, "b" * 40):
-            evidence = dict(files(), **{"evidence.json": {"revision": candidate}})
+            evidence = files()
+            evidence["evidence.json"]["revision"] = candidate
             with self.subTest(candidate=candidate), redirect_stdout(io.StringIO()), \
                     patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, run(), jobs()]), \
                     patch.object(proof, "artifact_files", side_effect=[evidence, stop_files()]):
@@ -356,6 +358,12 @@ class RollbackProofTests(unittest.TestCase):
             ("staging-rollback-snapshot.json", "serving_image", "unversioned:latest"),
             ("auto-rollback-evidence.json", "restored_version", "22222222-2222-2222-2222-222222222222"),
             ("auto-rollback-evidence.json", "restored_image_digest", "sha256:" + "b" * 64),
+            ("auto-rollback-evidence.json", "restored_rollout_id", None),
+            ("auto-rollback-evidence.json", "restored_rollout_id", "../invalid"),
+            ("auto-rollback-evidence.json", "restored_rollout_id", "r-forward"),
+            ("auto-rollback-evidence.json", "restored_rollout_id", "r-before"),
+            ("evidence.json", "rollout_id", None),
+            ("evidence.json", "rollout_id", "x" * 129),
             ("auto-rollback-evidence.json", "variant", "production"),
             ("auto-rollback-evidence.json", "takeover", False),
             ("auto-rollback-evidence.json", "gate", "ready-once"),
@@ -368,7 +376,9 @@ class RollbackProofTests(unittest.TestCase):
             evidence[file][key] = value
             with self.subTest(file=file, key=key), self.assertRaises(proof.ProofError):
                 proof.validate_evidence(evidence)
-        self.assertEqual(proof.validate_evidence(files())["gate"], "stable-200-gateway-ready")
+        restored = proof.validate_evidence(files())
+        self.assertEqual(restored["gate"], "stable-200-gateway-ready")
+        self.assertEqual(restored["restored_rollout_id"], "r-new")
 
     def test_artifact_is_exact_bounded_and_never_extracted(self):
         data = io.BytesIO()
