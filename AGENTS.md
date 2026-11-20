@@ -90,7 +90,7 @@ final approval (the author merges only without a review stage). While automatic
 production promotion is verified disabled, only promotion-path PRs (including
 production schema/data changes and edits to production-authorization guidance)
 need Release Manager exact-head confirmation before merge; a merge that would
-deploy, or whose deploy behaviour is unverified, follows the production route.
+deploy, or whose deploy behaviour is unverified, needs that confirmation too.
 See [`CONTRIBUTING.md`](CONTRIBUTING.md#production-merge-evidence).
 
 ## Definition of done

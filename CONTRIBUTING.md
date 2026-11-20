@@ -95,8 +95,8 @@ decision there when the Release Manager accepts the release candidate.
 
 The ordinary-PR exemption applies only while `PRODUCTION_AUTO_PROMOTE_DISABLED=true`
 is verified live, so a merge to `main` does not reach production on its own. A
-merge that would deploy, or whose deploy behaviour is unverified, follows the
-production approval route. Under that condition, ordinary PRs need **no per-PR
+merge that would deploy, or whose deploy behaviour is unverified, needs fresh
+exact-head Release Manager confirmation before merge, like a promotion-path PR. Under that condition, ordinary PRs need **no per-PR
 Release Manager confirmation**: required checks and the review stages suffice.
 Promotion-path PRs still need a fresh Release Manager `request_confirmation` on
 their exact head before merge: workflows, actions and tooling that qualify,
@@ -109,8 +109,8 @@ child task assigned and addressed to the Release Manager
 
 Production release acceptance binds to the exact full release SHA; dispatch
 production with that SHA ([production deploy](docs/production-deploy.md)). A
-different SHA needs fresh acceptance. A manual production dispatch or rollback
-needs its own Release Manager confirmation too.
+different SHA needs fresh acceptance. A production migration apply, manual
+production dispatch or rollback needs its own Release Manager confirmation too.
 
 For two-web-next and two-bot-next, staging qualification is the
 **post-merge, pre-production exact-main staging/e2e/soak gate** (owner decision
