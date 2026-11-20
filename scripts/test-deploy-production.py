@@ -437,7 +437,7 @@ class StaticGuardTests(unittest.TestCase):
 
     def test_actions_are_pinned_and_wrangler_matches_staging(self):
         uses = [line.split("uses:", 1)[1].strip() for line in LINES if "uses:" in line]
-        self.assertEqual(value(CALL["uses"]).split()[0], "./.github/workflows/staging-soak.yml")
+        self.assertEqual(value(CALL["uses"]).split()[0], "$/.github/workflows/staging-soak.yml")
         uses.remove(value(CALL["uses"]))
         self.assertTrue(uses)
         for ref in uses:

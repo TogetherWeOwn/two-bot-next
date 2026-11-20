@@ -310,8 +310,8 @@ the staging holder entirely. A superseded SHA refuses before acquisition;
 select the current verified candidate on the next promotion rather than
 starting a different build under the old candidate's authorization.
 
-The staging lock spans startup, baseline, measurement, final evidence and
-release in the reusable soak, including failed/cancelled cleanup. Native persisted expiry
+The non-cancelling `staging-lifecycle` lock spans startup, baseline, one inherited
+voice call, measurement, evidence and release across the reusable soak. Native persisted expiry
 is still required if the runner disappears; `always()` alone is not cleanup
 proof. The original absolute expiry never moves. The grant remains capped at
 40 minutes; the job has a 50-minute timeout, leaving ten minutes for
@@ -412,10 +412,10 @@ once per bot production release, after deploying the candidate to staging.
 Before any production mutation, every ordinary promotion compares the
 soaked candidate on staging with production as it serves now:
 
-- The reusable soak holds the non-cancelling `staging-lifecycle` queue across jobs,
-  readies the guarded SHA, then records a soak-baseline `/ops/metrics` scrape
+- The `soak` job acquires and readies the guarded SHA in its finite window,
+  then records a soak-baseline `/ops/metrics` scrape
   (`wrangler/scripts/rest-5xx-counters.mjs`, same `staging` Environment
-  bearer). After one inherited voice call, automatic runs and manual staged takeovers measure the full fresh
+  bearer). Automatic runs and manual staged takeovers measure the full fresh
   interval with `wrangler/scripts/staging-soak-window.mjs`; a manual
   cutover-hold deploy retains its distinct no-delay policy.
 - Under that same workflow's staging lock, it runs the final staging user-flow

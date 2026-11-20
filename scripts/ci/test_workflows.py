@@ -146,8 +146,8 @@ JOB_INVENTORY = {
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
 REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
-                   ("deploy-production.yml", "soak"): "./.github/workflows/staging-soak.yml",
-                   (STAGING_SOAK, "voice"): "./.github/workflows/voice-synthetic.yml",
+                   ("deploy-production.yml", "soak"): "$/.github/workflows/staging-soak.yml",
+                   (STAGING_SOAK, "voice"): "$/.github/workflows/voice-synthetic.yml",
                    ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
                    ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                    # After every staging deploy; its failure fails deploy-staging (promotion gate).
@@ -2933,7 +2933,7 @@ def production_errors(workflow):
     jobs = workflow.get("jobs", {})
     production, guard = jobs.get("production", {}), jobs.get("guard", {})
     soak, recheck = jobs.get("soak", {}), jobs.get("recheck", {})
-    if soak.get("uses") == "./.github/workflows/staging-soak.yml":
+    if soak.get("uses") == "$/.github/workflows/staging-soak.yml":
         soak = soak_view({**load_workflows(), name: workflow})
     needs = production.get("needs")
     needs = [needs] if isinstance(needs, str) else (needs or [])
@@ -8444,8 +8444,8 @@ class WorkflowTests(unittest.TestCase):
                                           ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
                                           ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                                           ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
-                                          ("deploy-production.yml", "soak"): "./.github/workflows/staging-soak.yml",
-                                          (STAGING_SOAK, "voice"): "./.github/workflows/voice-synthetic.yml",
+                                          ("deploy-production.yml", "soak"): "$/.github/workflows/staging-soak.yml",
+                                          (STAGING_SOAK, "voice"): "$/.github/workflows/voice-synthetic.yml",
                                           ("voice-rest-measurement.yml", "voice-first"): "./.github/workflows/voice-synthetic.yml",
                                           ("voice-rest-measurement.yml", "voice-second"): "./.github/workflows/voice-synthetic.yml",
                                           ("deploy-staging.yml", "help-embed-synthetic"): "./.github/workflows/help-embed-synthetic.yml",
@@ -8534,7 +8534,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(production_errors(workflow), label)
 
     def test_soak_rejects_unsafe_handoffs(self):
-        for job, key in (("begin", "outputs"), ("voice", "needs"), ("finish", "if"), ("finish", "steps")):
+        for job, key in (("begin", "outputs"), ("voice", "uses"), ("voice", "needs"), ("finish", "if"), ("finish", "steps")):
             changed = deepcopy(self.workflows)
             del changed[STAGING_SOAK]["jobs"][job][key]
             self.assertFalse(admitted_soak(changed), (job, key))

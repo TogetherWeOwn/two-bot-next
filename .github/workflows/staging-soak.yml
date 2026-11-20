@@ -1,13 +1,10 @@
 name: staging-soak
 on:
   workflow_call:
-    inputs:
-      sha: {type: string, required: true}
-      auto: {type: string, required: true}
-      full_soak: {type: boolean, required: true}
-      staging_run_id: {type: string, required: true}
-      staging_attempt: {type: string, required: true}
-    secrets: {STAGING_OWNERSHIP_CONTROL_TOKEN: {required: true}, TWO_VOICE_SYNTHETIC_BOT_TOKEN: {required: false}}
+    inputs: {sha: {type: string, required: true}, auto: {type: string, required: true}, full_soak: {type: boolean, required: true},
+             staging_run_id: {type: string, required: true}, staging_attempt: {type: string, required: true}}
+    # The scrape token is declared for actionlint; only the staging environment supplies it.
+    secrets: {STAGING_OWNERSHIP_CONTROL_TOKEN: {required: true}, TWO_VOICE_SYNTHETIC_BOT_TOKEN: {required: false}, STAGING_METRICS_SCRAPE_TOKEN: {required: false}}
     outputs: {skip: {value: "${{ jobs.finish.outputs.skip }}"}, evidence: {value: "${{ jobs.finish.outputs.evidence }}"}}
 permissions: {}
 # Called workflow, not the production caller or either individual job, owns staging.
@@ -53,7 +50,7 @@ jobs:
   voice:
     needs: begin
     permissions: {contents: read}
-    uses: ./.github/workflows/voice-synthetic.yml
+    uses: $/.github/workflows/voice-synthetic.yml
     with:
       deploy_staging_call: true
       artifact_invocation: soak

@@ -1049,7 +1049,8 @@ jobs:
 
   # One canonical staging lock spans startup, baseline, a fresh full live
   # interval, final regression evidence and release. Historical staging-green
-  # age is not live soak credit. The reusable soak leaves rollback independent.
+  # age is not live soak credit. Only this job holds staging: production and
+  # its rollback dispatch remain independent of the staging queue.
   soak:
     name: bounded live staging soak and regression evidence
     needs: guard
@@ -1057,16 +1058,15 @@ jobs:
     permissions:
       contents: read
       actions: read # deploy-staging runs: which build the serving revision still promotes
-    uses: ./.github/workflows/staging-soak.yml
+    uses: $/.github/workflows/staging-soak.yml
     with:
       sha: ${{ needs.guard.outputs.sha }}
       auto: ${{ needs.guard.outputs.auto }}
       full_soak: ${{ needs.guard.outputs.auto == 'true' || (github.event_name == 'workflow_dispatch' && needs.guard.outputs.takeover == 'true' && needs.guard.outputs.allow_unstaged != 'true') }}
       staging_run_id: ${{ needs.guard.outputs.staging_run_id }}
       staging_attempt: ${{ needs.guard.outputs.staging_attempt }}
-    secrets:
-      STAGING_OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
-      TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
+    secrets: {STAGING_OWNERSHIP_CONTROL_TOKEN: "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+              TWO_VOICE_SYNTHETIC_BOT_TOKEN: "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}
 
   # Publish only the completed bounded job's verdict; no live staging reads
   # can escape its lock. Failure, cancellation or unconfirmed release blocks it.

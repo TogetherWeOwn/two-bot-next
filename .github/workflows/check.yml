@@ -252,7 +252,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Keep the pinned release and backport only native queue validation.
+          # Keep the pinned release with native queue and same-commit call syntax support.
           tools=$(mktemp -d "$RUNNER_TEMP/actionlint.XXXXXX")
           trap 'rm -rf -- "$tools"' EXIT
           curl -fsSL -o "$tools/go.tgz" https://go.dev/dl/go1.26.11.linux-amd64.tar.gz

@@ -7,7 +7,7 @@
       "contents": "read",
       "actions": "read"
     },
-    "uses": "./.github/workflows/staging-soak.yml",
+    "uses": "$/.github/workflows/staging-soak.yml",
     "with": {
       "sha": "${{ needs.guard.outputs.sha }}",
       "auto": "${{ needs.guard.outputs.auto }}",
@@ -51,6 +51,9 @@
             "required": "true"
           },
           "TWO_VOICE_SYNTHETIC_BOT_TOKEN": {
+            "required": "false"
+          },
+          "STAGING_METRICS_SCRAPE_TOKEN": {
             "required": "false"
           }
         },
@@ -144,7 +147,7 @@
         "permissions": {
           "contents": "read"
         },
-        "uses": "./.github/workflows/voice-synthetic.yml",
+        "uses": "$/.github/workflows/voice-synthetic.yml",
         "with": {
           "deploy_staging_call": "true",
           "artifact_invocation": "soak",
