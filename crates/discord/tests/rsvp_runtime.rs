@@ -311,6 +311,7 @@ fn assert_reply_kind(mock: &MockRest, content: &str, deferred: bool, kind: Embed
             last.path,
             "/api/v10/webhooks/1111/mock-rsvp-token/messages/@original"
         );
+        assert_eq!(body["content"], "", "deferred reply must use an embed");
         // This fixture supplies a numeric event ID, not a pasted link; the
         // latter's appended event identity is covered by the link fixtures.
         assert_eq!(attendance_reply::deferred_text(&body, kind), content);
