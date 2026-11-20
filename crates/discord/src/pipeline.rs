@@ -100,10 +100,15 @@ pub trait AuditEntryObserver: Send + Sync {
 /// never witnesses a start; lifecycle resets invalidate pre-gap evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoiceTransitionObservation {
+    /// Observer generation captured before publishing this cache mutation.
+    pub generation: u64,
     pub guild_id: u64,
     pub member_id: u64,
     /// The channel the member left, if any (`None` on a fresh join).
     pub previous_channel_id: Option<u64>,
+    /// Whether a complete pre-update roster corroborated the previous channel.
+    /// A retained state used for legacy leave accounting is not proof.
+    pub previous_channel_confirmed: bool,
     /// The channel the member joined, if any (`None` on a leave).
     pub current_channel_id: Option<u64>,
     /// Known bots never contribute to human occupancy.
@@ -121,6 +126,10 @@ pub struct VoiceTransitionObservation {
 /// Receives voice session boundaries from the serial gateway writer.
 /// Implementations must not block or await: record the stamp and return.
 pub trait VoiceTransitionObserver: Send + Sync {
+    /// Capture the fence before cache publication. Release any observer lock
+    /// before returning; the writer still has to update the cache and funnel.
+    fn begin_voice_transition(&self) -> u64;
+
     fn observe_voice_transition(&self, transition: VoiceTransitionObservation);
 
     /// Forget evidence for all guilds (`None`), one guild, or one channel
@@ -1146,15 +1155,15 @@ impl<
                 // can retain an absent member's old state object. It cannot
                 // witness a move from that absent roster entry. A missing index
                 // or a real null frame keeps the legacy READY unknown-end path.
-                let absent_from_roster = self
+                let in_roster = self
                     .cache()
                     .guild_voice_states(guild_id_key(guild_id))
-                    .is_some_and(|members| !members.contains(&user_id_key(member_id)));
+                    .map(|members| members.contains(&user_id_key(member_id)));
                 let old_channel = self
                     .cache()
                     .voice_state(user_id_key(member_id), guild_id_key(guild_id))
                     .map(|v| v.channel_id().get())
-                    .filter(|_| new_channel.is_none() || !absent_from_roster);
+                    .filter(|_| new_channel.is_none() || in_roster != Some(false));
                 // Mute/deafen/camera frames are not session boundaries.
                 if old_channel == new_channel {
                     self.cache.update(event);
@@ -1165,6 +1174,16 @@ impl<
                 // treats a missing member as non-bot, so the fallback is a
                 // plain `false` with no cache read.
                 let is_bot = update.member.as_ref().is_some_and(|m| m.user.bot);
+                let observation = self.voice_transition_observer.get().map(|observer| {
+                    let previous_channel_confirmed = old_channel.is_some()
+                        && in_roster == Some(true)
+                        && self.cache.with_guild_snapshot(guild_id, |_| ()).is_some();
+                    (
+                        observer,
+                        observer.begin_voice_transition(),
+                        previous_channel_confirmed,
+                    )
+                });
                 self.cache.update(event);
                 // Per-member serial chain (TOG-5981): hold the member's
                 // mutex across end(A)→start(B) so the pair stays atomic for
@@ -1199,11 +1218,13 @@ impl<
                 // early above, so only witnessed session boundaries arrive.
                 // An unreadable receipt stamp travels as `None` so the clock
                 // drops the provable session instead of stamping a guess.
-                if let Some(observer) = self.voice_transition_observer.get() {
+                if let Some((observer, generation, previous_channel_confirmed)) = observation {
                     observer.observe_voice_transition(VoiceTransitionObservation {
+                        generation,
                         guild_id,
                         member_id,
                         previous_channel_id: old_channel,
+                        previous_channel_confirmed,
                         current_channel_id: new_channel,
                         is_bot: self
                             .cache()
@@ -1267,11 +1288,11 @@ impl<
     }
 }
 
-/// Default pipeline over in-memory seams (tests, replay harness).
-pub type MemPipeline = Pipeline<
+/// Pipeline over in-memory seams (tests, replay harness), optionally capturing facts.
+pub type MemPipeline<F = two_bot_core::NoopFacts> = Pipeline<
     two_bot_core::MemStore,
     two_bot_core::NoopLeveling,
-    two_bot_core::NoopFacts,
+    F,
     ScriptedInvites,
     NoClassification,
 >;
@@ -1540,11 +1561,16 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingVoiceObserver {
+        generation: std::sync::atomic::AtomicU64,
         transitions: Mutex<Vec<VoiceTransitionObservation>>,
         resets: Mutex<Vec<(Option<u64>, Option<u64>)>>,
     }
 
     impl VoiceTransitionObserver for RecordingVoiceObserver {
+        fn begin_voice_transition(&self) -> u64 {
+            self.generation.fetch_add(1, Ordering::Relaxed) + 1
+        }
+
         fn observe_voice_transition(&self, transition: VoiceTransitionObservation) {
             self.transitions
                 .lock()
@@ -1570,6 +1596,7 @@ mod tests {
         let p = MemPipeline::for_replay();
         let observer = Arc::new(RecordingVoiceObserver::default());
         p.set_voice_transition_observer(observer.clone());
+        p.handle_at(&lifecycle_available_guild(), "2026-10-19T11:59:00.000Z");
         p.handle_at(&lifecycle_voice(GUILD, 1, 10), "2026-10-19T12:00:00.000Z");
         // A mute frame on the same channel is not a session boundary: the
         // cache updates, but the observer hears nothing.
@@ -1581,9 +1608,11 @@ mod tests {
             *transitions,
             vec![
                 VoiceTransitionObservation {
+                    generation: 1,
                     guild_id: GUILD,
                     member_id: 1,
                     previous_channel_id: None,
+                    previous_channel_confirmed: false,
                     current_channel_id: Some(10),
                     is_bot: false,
                     previous_channel_members: vec![],
@@ -1591,9 +1620,11 @@ mod tests {
                     occurred_at_ms: stamp_ms("2026-10-19T12:00:00.000Z"),
                 },
                 VoiceTransitionObservation {
+                    generation: 2,
                     guild_id: GUILD,
                     member_id: 1,
                     previous_channel_id: Some(10),
+                    previous_channel_confirmed: true,
                     current_channel_id: Some(11),
                     is_bot: false,
                     previous_channel_members: vec![],
@@ -1601,9 +1632,11 @@ mod tests {
                     occurred_at_ms: stamp_ms("2026-10-19T12:00:10.000Z"),
                 },
                 VoiceTransitionObservation {
+                    generation: 3,
                     guild_id: GUILD,
                     member_id: 1,
                     previous_channel_id: Some(11),
+                    previous_channel_confirmed: true,
                     current_channel_id: None,
                     is_bot: false,
                     previous_channel_members: vec![],
