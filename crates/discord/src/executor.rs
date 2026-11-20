@@ -372,19 +372,22 @@ async fn complete_early_release(
     }
 }
 
-// Tokio's timeout polls work before its timer. Check before every poll and
-// reject ready results at or after the cutoff. Dropping work is not rollback.
-async fn poll_before<F: Future>(at: Instant, work: F) -> Option<F::Output> {
+// Tokio's timeout polls work before its timer. Never start another I/O poll
+// at the cutoff, but retain evidence obtained by a poll that started in time.
+async fn poll_until<F: Future>(at: Instant, work: F) -> Option<F::Output> {
     let mut work = std::pin::pin!(work);
     let guarded = std::future::poll_fn(|cx| {
         if Instant::now() >= at {
             return std::task::Poll::Ready(None);
         }
-        work.as_mut()
-            .poll(cx)
-            .map(|result| (Instant::now() < at).then_some(result))
+        work.as_mut().poll(cx).map(Some)
     });
     tokio::time::timeout_at(at, guarded).await.ok().flatten()
+}
+
+// Strict evidence also rejects late acknowledgement. Dropping is not rollback.
+async fn poll_before<F: Future>(at: Instant, work: F) -> Option<F::Output> {
+    poll_until(at, work).await.filter(|_| Instant::now() < at)
 }
 
 impl RawResponse {
@@ -790,18 +793,11 @@ impl HyperTransport {
             }
         };
         // A ready admission can win timeout_at even after the clock expires.
-        if deadline.is_some_and(|at| Instant::now() >= at) {
-            if strict {
-                return Err(StrictTransportError::PreWireDeadline);
-            }
-            if is_interaction_callback(request) {
-                if let Some(permit) = permit {
-                    complete_early_release(permit, "callback_deadline").await;
-                }
-                return Err(HEADER_TIMEOUT_MESSAGE.to_owned().into());
-            }
+        if strict && deadline.is_some_and(|at| Instant::now() >= at) {
+            return Err(StrictTransportError::PreWireDeadline);
         }
-        let mut attempt = crate::executor_metrics::Attempt::new(request);
+        let callback = !strict && is_interaction_callback(request);
+        let mut attempt = None;
         // Bound the header wait inside the permit scope so a stalled read
         // releases its lane instead of orphaning it: an outer cancellation
         // would drop the future with the permit already taken, leaving
@@ -810,20 +806,26 @@ impl HyperTransport {
         // caller's absolute deadline — so no outer backstop races it. A GET
         // cannot mutate, so release it here; other methods keep the permit
         // held by dropping it uncompleted (uncertain).
-        let request_fut = self.inner.request(hyper_req);
+        let request_fut = async {
+            attempt = Some(crate::executor_metrics::Attempt::new(request));
+            self.inner.request(hyper_req).await
+        };
         let response = match deadline {
-            None => Ok(request_fut.await),
-            Some(at) => tokio::time::timeout_at(at, request_fut).await,
+            None => Some(request_fut.await),
+            Some(at) if callback => poll_until(at, request_fut).await,
+            Some(at) => tokio::time::timeout_at(at, request_fut).await.ok(),
         };
         let response = match response {
-            Ok(Ok(response)) => response,
+            Some(Ok(response)) => response,
             failure => {
                 let (message, reason) = match failure {
-                    Ok(Err(error)) => (format!("transport: {error}"), "transport_error"),
-                    Err(_) => (HEADER_TIMEOUT_MESSAGE.to_owned(), "header_timeout"),
-                    Ok(Ok(_)) => unreachable!(),
+                    Some(Err(error)) => (format!("transport: {error}"), "transport_error"),
+                    None => (HEADER_TIMEOUT_MESSAGE.to_owned(), "header_timeout"),
+                    Some(Ok(_)) => unreachable!(),
                 };
-                if request.method() == Method::Get {
+                // An unpolled callback is known unsent; after the first poll,
+                // a timeout cannot tell whether Hyper already dispatched it.
+                if request.method() == Method::Get || (callback && attempt.is_none()) {
                     if let Some(permit) = permit {
                         let release = complete_early_release(permit, reason);
                         if let Some(at) = evidence_deadline {
@@ -851,7 +853,9 @@ impl HyperTransport {
         if status == 429 {
             accounting.track_bare_bucket(&route_key, response.headers());
         }
-        attempt.finish(Some(status));
+        if let Some(attempt) = &mut attempt {
+            attempt.finish(Some(status));
+        }
         // The 429 wait honors `retry-after` first, then the bucket
         // `reset-after` hint: on a 429 both name the same pause, and the reset
         // hint is the only timing when `retry-after` is absent (official
@@ -934,25 +938,10 @@ impl HyperTransport {
         request: &Request,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(RawResponse, bool), String> {
-        match deadline {
-            None => {
-                self.send_request_headers(request, None)
-                    .await?
-                    .collect()
-                    .await
-            }
-            Some(at) => {
-                let pending = self.send_request_headers(request, Some(at)).await?;
-                let remaining = at
-                    .checked_duration_since(tokio::time::Instant::now())
-                    .unwrap_or(Duration::ZERO);
-                // Body shares the attempt deadline: cap it at whatever is
-                // left, so headers-plus-body can never overrun the caller's
-                // absolute budget (the receipt/boot windows).
-                let body_budget = remaining.min(Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS));
-                pending.collect_with(body_budget).await
-            }
-        }
+        self.send_request_headers(request, deadline)
+            .await?
+            .collect_with(deadline)
+            .await
     }
 }
 
@@ -980,31 +969,30 @@ impl PendingHeaders<'_> {
     /// Collect the bounded body and settle guard/admission accounting exactly
     /// as the pre-split `send_request` always has.
     pub async fn collect(self) -> Result<(RawResponse, bool), String> {
-        self.collect_with(Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS))
-            .await
+        self.collect_with(None).await
     }
 
-    /// [`Self::collect`] with the caller's body allowance: budgeted wire
-    /// attempts pass what is left of their attempt deadline so a slow header
-    /// phase cannot push the body phase past it.
-    async fn collect_with(mut self, body_timeout: Duration) -> Result<(RawResponse, bool), String> {
+    async fn collect_with(
+        mut self,
+        deadline: Option<Instant>,
+    ) -> Result<(RawResponse, bool), String> {
         use http_body_util::BodyExt as _;
         let response = self.response.take().expect("pending headers");
         let status = self.status;
-        // Expiry drops accounting, resolving the pending header restriction to
-        // its header-anchored timing/fallback without opening admission early.
-        let collected = tokio::time::timeout(
-            body_timeout,
+        // Cap only body I/O, with the original attempt deadline intact.
+        let cap = Instant::now() + Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS);
+        let collected = poll_until(
+            deadline.map_or(cap, |at| at.min(cap)),
             http_body_util::Limited::new(response.into_body(), RESPONSE_BODY_LIMIT).collect(),
         )
         .await;
         let body = match collected {
-            Ok(Ok(body)) => body.to_bytes().to_vec(),
+            Some(Ok(body)) => body.to_bytes().to_vec(),
             // 429 is definitive no-effect even with a broken, oversized or
             // timed-out body. Missing timing installs an indefinite hold
             // instead of a default.
-            Err(_) | Ok(Err(_)) if status == 429 => Vec::new(),
-            Err(_) => {
+            None | Some(Err(_)) if status == 429 => Vec::new(),
+            None => {
                 // Headers arrived but the body stalled: a GET cannot mutate,
                 // so release the lane where the permit is in scope. Without
                 // this the retries are `Blocked` by this attempt's own
@@ -1017,7 +1005,7 @@ impl PendingHeaders<'_> {
                 }
                 return Err(BODY_TIMEOUT_MESSAGE.to_owned());
             }
-            Ok(Err(_)) => {
+            Some(Err(_)) => {
                 // Same orphan as a timed-out body: a truncated/errored body on
                 // a receipted read (every GET) must release the lane.
                 if self.complete_on_receipt {
@@ -5157,6 +5145,53 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn callback_send_does_not_poll_ready_connection_at_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let connect_then_send = std::future::poll_fn(|_| {
+            if Instant::now() >= deadline {
+                return std::task::Poll::Ready("dispatched");
+            }
+            std::task::Poll::Pending
+        });
+        let mut send = std::pin::pin!(poll_until(deadline, connect_then_send));
+        assert!(futures_util::poll!(&mut send).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(send.await, None);
+    }
+
+    #[tokio::test]
+    async fn callback_body_keeps_absolute_deadline_and_settles_rejection() {
+        use crate::strict_transport_fixture::Admission;
+        use twilight_http::request::RequestBuilder;
+
+        let token = "fixture-callback-body-deadline";
+        let gate = Arc::new(Admission::new(token, None, None));
+        let (transport, server) = strict_fixture_exchange(
+            token,
+            gate.clone(),
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .await;
+        let request = RequestBuilder::raw(Method::Post, "interactions/1/t/callback".to_owned())
+            .build()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pending = transport
+            .send_request_headers(&request, Some(deadline))
+            .await
+            .unwrap();
+        assert!(server.await.unwrap().starts_with(b"POST "));
+        tokio::time::pause();
+        tokio::time::advance(deadline - Instant::now()).await;
+        assert_eq!(
+            pending.collect_with(Some(deadline)).await.err().as_deref(),
+            Some(BODY_TIMEOUT_MESSAGE)
+        );
+        assert_eq!(Instant::now(), deadline);
+        assert_eq!(*gate.completed.lock().unwrap(), vec![None]);
     }
 
     #[tokio::test]
