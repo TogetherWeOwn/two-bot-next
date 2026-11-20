@@ -8348,8 +8348,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(staging["on"]), {"workflow_dispatch"})
         dispatch = staging["on"]["workflow_dispatch"]
         self.assertEqual(set(dispatch), {"inputs"})
-        self.assertEqual(len(dispatch["inputs"]), 6)
+        self.assertEqual(set(dispatch["inputs"]), {
+            "release_fence", "inject_gateway_failure", "inject_error_rate_spike",
+            "inject_voice_stall", "inject_unpaired_disconnect", "recover_prior_sha", "sha",
+        })
         self.assertEqual(dispatch["inputs"]["sha"]["default"], "")
+        self.assertEqual(dispatch["inputs"]["recover_prior_sha"]["default"], "false")
         self.assertEqual(staging_dispatch_errors(staging), [])
         mutations = {
             "push": lambda on: on.update({"push": {"branches": ["main"]}}),
@@ -8359,6 +8363,7 @@ class WorkflowTests(unittest.TestCase):
             "missing input": lambda on: on["workflow_dispatch"]["inputs"].pop("sha"),
             "extra dispatch field": lambda on: on["workflow_dispatch"].update({"other": True}),
             "required boolean": lambda on: on["workflow_dispatch"]["inputs"]["release_fence"].update({"required": True}),
+            "recovery by default": lambda on: on["workflow_dispatch"]["inputs"]["recover_prior_sha"].update({"default": "true"}),
             "extra sha field": lambda on: on["workflow_dispatch"]["inputs"]["sha"].update({"options": ["main"]}),
             "nonempty sha default": lambda on: on["workflow_dispatch"]["inputs"]["sha"].update({"default": "main"}),
         }
