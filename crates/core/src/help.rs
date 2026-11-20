@@ -236,23 +236,23 @@ pub struct HelpCatalog<'a> {
 #[must_use]
 pub fn help_catalog(defs: &[CommandDefinition]) -> HelpCatalog<'_> {
     let live: HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-    let mut rendered = HashSet::new();
+    let mut rendered: HashSet<&str> = HashSet::new();
     let mut sections = Vec::new();
     for group in HELP_GROUPS {
         if group.anchor.is_some_and(|anchor| !live.contains(anchor)) {
             continue;
         }
-        let commands: Vec<_> = group
+        let present: Vec<_> = group
             .commands
             .iter()
+            .filter(|name| live.contains(**name))
             .copied()
-            .filter(|name| live.contains(name))
             .collect();
-        if commands.is_empty() {
+        if present.is_empty() {
             continue;
         }
-        rendered.extend(commands.iter().copied());
-        let notes = if commands.contains(&"rsvp-attendance") {
+        rendered.extend(present.iter().copied());
+        let notes = if present.contains(&"rsvp-attendance") {
             RSVP_ATTENDANCE_NOTES
         } else {
             &[]
@@ -260,17 +260,19 @@ pub fn help_catalog(defs: &[CommandDefinition]) -> HelpCatalog<'_> {
         sections.push(HelpSection {
             title: group.title,
             requires: group.requires,
-            commands,
+            commands: present,
             notes,
         });
     }
-    // Future builtins and custom commands that have no active group still
-    // appear in discovery.
-    let custom: Vec<_> = defs
-        .iter()
-        .map(|def| def.name.as_str())
-        .filter(|name| !rendered.contains(name))
-        .collect();
+    // DB custom rows publish alongside the builtins; anything else ungrouped
+    // (a future builtin this table predates) still renders rather than
+    // vanishing from discovery.
+    let mut custom = Vec::new();
+    for def in defs {
+        if !rendered.contains(def.name.as_str()) {
+            custom.push(def.name.as_str());
+        }
+    }
     if !custom.is_empty() {
         sections.push(HelpSection {
             title: "Custom",
@@ -293,24 +295,13 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
     let catalog = help_catalog(defs);
     let mut out = catalog.heading;
     out.push('\n');
-    for section in catalog.sections {
-        out.push('\n');
-        match section.requires {
-            Some(perm) => {
-                let _ = writeln!(out, "**{}** — needs {perm}", section.title);
-            }
-            None => {
-                let _ = writeln!(out, "**{}**", section.title);
-            }
+    for group in catalog.sections {
+        let _ = write!(out, "\n**{}**", group.title);
+        if let Some(perm) = group.requires {
+            let _ = write!(out, " — needs {perm}");
         }
-        for (index, name) in section.commands.iter().enumerate() {
-            if index != 0 {
-                out.push_str(" · ");
-            }
-            let _ = write!(out, "/{name}");
-        }
-        out.push('\n');
-        for note in section.notes {
+        let _ = writeln!(out, "\n/{}", group.commands.join(" · /"));
+        for note in group.notes {
             let _ = writeln!(out, "{note}");
         }
     }
@@ -978,9 +969,10 @@ mod tests {
         use crate::commands::{CustomCommand, GUILD_COMMAND_LIMIT};
 
         let router = InteractionRouter::new(all_on());
-        let rows: Vec<_> = (0..GUILD_COMMAND_LIMIT)
+        let slots = GUILD_COMMAND_LIMIT - router.publish_set(&[]).unwrap().len();
+        let rows: Vec<_> = (0..slots)
             .map(|i| CustomCommand {
-                name: format!("{}-{i:02}", "界".repeat(29)),
+                name: format!("custom-{i:025}"),
                 description: "A test command".to_owned(),
                 enabled: true,
             })
@@ -998,13 +990,9 @@ mod tests {
         assert!(defs.iter().all(|def| rendered.contains(&def.name.as_str())));
         let custom = catalog.sections.last().expect("custom group");
         assert_eq!(custom.title, "Custom");
-        let expected: Vec<_> = defs
-            .iter()
-            .filter(|def| def.name.starts_with('界'))
-            .map(|def| def.name.as_str())
-            .collect();
-        assert!(!expected.is_empty());
-        assert_eq!(custom.commands, expected);
+        let expected = rows.iter().map(|row| row.name.as_str());
+        assert!(!rows.is_empty() && expected.clone().all(|name| name.len() == 32));
+        assert!(custom.commands.iter().copied().eq(expected));
     }
 
     #[test]

@@ -81,9 +81,7 @@ pub fn plan(blocks: &[Block<'_>], reserved: usize) -> Result<Vec<Page>, PlanErro
         }
         let mut rest = value.as_str();
         while !rest.is_empty() {
-            // Discord displays descriptions before fields, so a description
-            // that follows a field always starts on another page.
-            let page = pages.last_mut().expect("page exists");
+            // Descriptions cannot follow fields on the same page.
             let mut room = if page.fields.is_empty() {
                 desc_limit - used
             } else {
@@ -97,14 +95,24 @@ pub fn plan(blocks: &[Block<'_>], reserved: usize) -> Result<Vec<Page>, PlanErro
                 room -= ch.len_utf16();
                 end += ch.len_utf8();
             }
-            let (prefix, suffix) = rest.split_at(end);
-            page.description.push_str(prefix);
-            used = desc_limit - room;
-            if !suffix.is_empty() {
-                new_page(&mut pages)?;
+            // Carry the last visible scalar with a trailing whitespace-only suffix if both pages fit.
+            if end < rest.len() && rest[end..].trim().is_empty() {
+                end = rest[..end]
+                    .rfind(|ch: char| !ch.is_whitespace())
+                    .filter(|&last| {
+                        text_len(&rest[last..]) <= desc_limit
+                            && (!rest[..last].trim().is_empty()
+                                || !page.description.trim().is_empty())
+                    })
+                    .unwrap_or(end);
+            }
+            page.description.push_str(&rest[..end]);
+            used += text_len(&rest[..end]);
+            rest = &rest[end..];
+            if !rest.is_empty() {
+                page = new_page(&mut pages)?;
                 used = 0;
             }
-            rest = suffix;
         }
     }
     if pages
@@ -180,12 +188,29 @@ mod tests {
     }
 
     #[test]
+    fn keeps_trailing_whitespace_with_visible_text() {
+        for input in [
+            format!("{}\n", "a".repeat(4016)),
+            format!("{}🔥 \n", "a".repeat(4013)),
+        ] {
+            let pages = plan(&[Description(&input)], 80).unwrap();
+            assert_eq!(pages.len(), 2);
+            assert!(pages.iter().all(|p| text_len(&p.description) <= 4016));
+            assert_eq!(
+                pages.into_iter().map(|p| p.description).collect::<String>(),
+                input
+            );
+        }
+    }
+
+    #[test]
     fn rejects_a_whole_plan_when_bounds_are_exceeded() {
         assert_eq!(plan(&[], 80), Ok(vec![Page::default()]));
         assert_eq!(plan(&[], EMBED_DESCRIPTION_LIMIT), Err(PlanError));
         for input in [
             String::new(),
             " ".into(),
+            format!("a{}", " ".repeat(4016)),
             "a".repeat(SOURCE_UNITS + 1),
             "a".repeat(SOURCE_BYTES + 1),
         ] {
