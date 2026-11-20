@@ -125,8 +125,9 @@ restore clears it and never backfills liveness.
 
 The dormant attendance pair (`event_attendance_windows`, `event_voice_sessions`)
 and the session ID sequence use the reviewed table and sequence grants for
-backup and restore. Neither table is exposed to the web reader. There are no
-runtime attendance readers or writers in this schema increment.
+backup and restore. Neither table is exposed to the web reader. Member erasure
+removes that member's sessions in the guild; guild purge removes both tables'
+rows for the guild. This increment enables neither capture nor attendance reads.
 
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
