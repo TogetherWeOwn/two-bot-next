@@ -1343,6 +1343,75 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(evidence["rollout_id"], NEW_ROLLOUT)
         self.assert_no_secret_saved_or_printed()
 
+    def test_forward_mismatch_records_only_the_rejected_sample(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        status, headers, body = ready_response()
+        request_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        headers.update({"x-request-id": request_id, "authorization": SENTINEL})
+        report = json.loads(body)
+        report.update(build_id="987654-1", build_revision="f" * 40, detail=SENTINEL)
+        client = verify_client()
+        client.request_routes[URL + "/readyz"] = [(status, headers, json.dumps(report).encode())]
+        with patch.object(rollout.time, "time", side_effect=[STARTED + 1, STARTED + 2]):
+            self.assert_gate("serving_image_mismatch", rollout.verify, self.args, client)
+        self.assertEqual(client.calls, [
+            ("api", NAMESPACE_PATH), ("api", APP_PATH), ("api", ROWS_PATH),
+            ("api", DETAIL_PATH), ("api", DEPLOYMENTS_PATH), ("request", URL + "/readyz"),
+        ])
+        self.assertEqual(self.clock.sleeps, [])
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+        raw = (self.root / "evidence.readyz-mismatch.json").read_bytes()
+        self.assertLess(len(raw), 1024)
+        self.assertEqual(json.loads(raw), {
+            "error": "serving_image_mismatch", "readyz_status": 200,
+            "sample_received_at_utc": "2027-01-15T08:00:02.000+00:00",
+            "run_id": "123456", "run_attempt": "2", "request_id": request_id,
+            "expected": {"worker_version": VERSION, "build_revision": REVISION,
+                         "build_id": BUILD_ID, "deploy_id": DEPLOY_ID},
+            "observed": {"worker_version": VERSION, "build_revision": "f" * 40,
+                         "build_id": "987654-1", "deploy_id": DEPLOY_ID},
+            "control_plane": {"rollout_id": NEW_ROLLOUT, "target_version": 8,
+                              "rollout_completed_observed_at_utc": "2027-01-15T08:00:01.000+00:00",
+                              "target_image_digest": IMAGE.split("@")[1]},
+        })
+
+    def test_forward_missing_or_invalid_identity_stays_red_and_bounded(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        status, headers, body = ready_response()
+        headers["x-request-id"] = SENTINEL
+        report = json.loads(body)
+        del report["build_revision"]
+        report.update(build_id="9" * 100_000 + "-1", deploy_id=None)
+        client.request_routes[URL + "/readyz"] = [(status, headers, json.dumps(report).encode())]
+        os.environ.pop("GITHUB_RUN_ID")
+        os.environ["GITHUB_RUN_ATTEMPT"] = "9" * 100_000
+        self.assert_gate("serving_image_mismatch", rollout.verify, self.args, client)
+        raw = (self.root / "evidence.readyz-mismatch.json").read_bytes()
+        self.assertLess(len(raw), 1024)
+        record = json.loads(raw)
+        self.assertEqual(record["observed"], {"worker_version": VERSION, "build_revision": "absent",
+                                               "build_id": "invalid", "deploy_id": "invalid"})
+        self.assertEqual((record["run_id"], record["run_attempt"], record["request_id"]),
+                         ("absent", "invalid", "invalid"))
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_forward_mismatch_write_failure_keeps_original_worker_error(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        status, _, body = ready_response()
+        client.request_routes[URL + "/readyz"] = [(status, {}, body)]
+        with patch.object(rollout, "save", side_effect=OSError(SENTINEL)):
+            self.assert_gate("serving_worker_mismatch", rollout.verify, self.args, client)
+        self.assertIn("readiness mismatch evidence could not be written", self.stdout.getvalue())
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
     def test_success_exact_pinned_evidence_with_post_probe_rechecks(self):
         self.prepare_baseline()
         self.write_deploy_output()
@@ -1354,6 +1423,7 @@ class OrchestrationTests(OfflineTestCase):
             "revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
             "readyz": 200, "health": 200, "verification_elapsed_seconds": 0,
         })
+        self.assertFalse((self.root / "evidence.readyz-mismatch.json").exists())
         self.docker.assert_called_once_with(VERSION, REVISION, BUILD_ID, DEPLOY_ID)
         self.assertEqual(client.calls, [
             ("api", NAMESPACE_PATH), ("api", APP_PATH), ("api", ROWS_PATH),

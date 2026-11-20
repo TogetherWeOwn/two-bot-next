@@ -5,7 +5,7 @@ Only allowlisted provenance is persisted/printed. API configurations and error
 bodies can contain secrets: never print them, including in exception messages.
 """
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import math
 import os
@@ -17,7 +17,8 @@ import tomllib
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, HTTPRedirectHandler, build_opener
 
-from build_identity import is_deploy_id_shape, parse_deploy_id
+from build_identity import (UNSTAMPED, is_build_id_shape, is_build_revision_shape,
+                            is_deploy_id_shape, parse_deploy_id)
 
 WORKER = "two-bot-next-staging"
 APPLICATION = "two-bot-next-twobotcontainer-staging"
@@ -550,6 +551,61 @@ def runtime_ready(status, headers, body, version, revision, build_id, deploy_id)
                                    for part in components)
 
 
+def save_forward_mismatch(evidence, code, headers, body, version, baseline, pinned, image,
+                          rollout_observed_at, sample_received_at):
+    """Retain only bounded identities, never probe text or configurations."""
+    missing = object()
+
+    def field(value, valid):
+        if value is missing:
+            return "absent"
+        return value if isinstance(value, str) and valid(value) else "invalid"
+
+    def utc(seconds):
+        return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="milliseconds")
+
+    try:
+        report = mapping(decode(body))
+    except GateError:
+        # The Worker identity check can fail before the gate reads the body.
+        report = dict.fromkeys(("build_revision", "build_id", "deploy_id"), None)
+    compiled_fields = {
+        "build_revision": ("revision", is_build_revision_shape),
+        "build_id": ("build_id", is_build_id_shape),
+        "deploy_id": ("deploy_id", is_deploy_id_shape),
+    }
+    expected = {"worker_version": version}
+    observed = {"worker_version": field(headers.get("x-two-worker-version", missing),
+                                        re.compile(UUID).fullmatch)}
+    for key, (baseline_key, valid) in compiled_fields.items():
+        expected[key] = field(baseline[baseline_key], valid)
+        observed[key] = field(report.get(key, missing), lambda value: value == UNSTAMPED or valid(value))
+
+    request_id = headers.get("x-request-id", missing)
+    if hasattr(headers, "get_all") and len(headers.get_all("x-request-id", [])) > 1:
+        request_id = None
+    target_version = pinned["target_version"]  # already checked as a nonnegative int
+    record = {
+        "error": code, "readyz_status": 200, "sample_received_at_utc": utc(sample_received_at),
+        "run_id": field(os.environ.get("GITHUB_RUN_ID", missing), re.compile(r"[1-9][0-9]{0,19}").fullmatch),
+        "run_attempt": field(os.environ.get("GITHUB_RUN_ATTEMPT", missing),
+                             re.compile(r"[1-9][0-9]{0,19}").fullmatch),
+        # Match the existing Worker/Rust correlation ID contract; do not mint one.
+        "request_id": field(request_id, re.compile(r"[0-9A-HJKMNP-TV-Z]{26}").fullmatch),
+        "expected": expected, "observed": observed,
+        "control_plane": {
+            "rollout_id": pinned["id"],  # already shape- and length-checked
+            "rollout_completed_observed_at_utc": utc(rollout_observed_at),
+            "target_version": target_version if target_version < 2**64 else "invalid",
+            "target_image_digest": image.rsplit("@", 1)[1],  # checked by docker_image and the rollout gate
+        },
+    }
+    try:
+        save(Path(evidence).with_suffix(".readyz-mismatch.json"), record)
+    except OSError:
+        print("staging rollout readiness mismatch evidence could not be written")
+
+
 def rollout_observation(row):
     # Fixed vocabulary and integers only; configurations never reach the log.
     status = row.get("status")
@@ -983,8 +1039,10 @@ def verify(args, client):
             # The pinned rollout plus exact-build /readyz and /health probes are
             # the acceptance evidence; keep polling those while the listing lags.
             if complete or lag:
+                rollout_observed_at = time.time()
                 active_worker(client, version)
                 status, headers, body = client.request(url + "/readyz")
+                sample_received_at = time.time()
                 probed = True
                 observed = "rollout=active_lag " if lag else "rollout=converged "
                 client.observation = observed + runtime_observation(
@@ -992,8 +1050,15 @@ def verify(args, client):
                     baseline["deploy_id"])
                 if stale:
                     client.observation += f" application_image=stale polls={image_stale}"
-                if runtime_ready(status, headers, body, version, baseline["revision"], baseline["build_id"],
-                                   baseline["deploy_id"]):
+                try:
+                    ready = runtime_ready(status, headers, body, version, baseline["revision"],
+                                          baseline["build_id"], baseline["deploy_id"])
+                except GateError as error:
+                    if str(error) in ("serving_worker_mismatch", "serving_image_mismatch"):
+                        save_forward_mismatch(args.evidence, str(error), headers, body, version, baseline,
+                                              pinned, image, rollout_observed_at, sample_received_at)
+                    raise
+                if ready:
                     health, health_headers, _ = client.request(url + "/health")
                     client.observation = f"{observed}readyz=200 health={health}"
                     if stale:

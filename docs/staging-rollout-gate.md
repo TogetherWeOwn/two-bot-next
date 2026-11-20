@@ -35,6 +35,16 @@ ordered restore plan for a receipt without any mutation via
 `scripts/worker_container_rollback.py rollback ... --dry-run`, which validates
 the receipt identically to the live path and exits 0.
 
+If the forward gate rejects a `/readyz` 200 with `serving_worker_mismatch` or
+`serving_image_mismatch`, look for `evidence.readyz-mismatch.json` in the
+`staging-rollout-evidence` artifact. It records the child run/attempt, sample
+receipt time in UTC, and expected and observed identities (`absent` or
+`invalid` where applicable). `request_id` is the response's `x-request-id`
+only if it matches the existing format; the gate does not generate one.
+The control-plane timestamp is when the runner observed the completed rollout,
+not when it completed. Its target digest does not identify the serving image.
+This file is diagnostic only, not `evidence.json` or a qualification receipt.
+
 ## No-always-on staging rule and activation hold
 
 Idle staging/preview must carry **no recurring always-on runtime cost**. Start
