@@ -1,33 +1,31 @@
 //! Map Discord invocations and drive preview attempts. The router owns
 //! authorization and the caller owns ephemeral delivery and metric emission.
 
-#[cfg(feature = "db")]
-use std::sync::{Mutex, PoisonError};
-#[cfg(feature = "db")]
-use tokio::time::Instant;
 use twilight_model::application::interaction::{
     application_command::{CommandData, CommandOptionValue},
     Interaction,
 };
-#[cfg(feature = "db")]
-use twilight_model::application::interaction::{InteractionData, InteractionType};
 use two_bot_core::automod_preview_input::{
     decode_preview_input, DecodedPreviewInput, PreviewInputRefusal, PreviewOptionValue,
 };
-#[cfg(feature = "db")]
-use two_bot_core::{
-    automod_preview_attempt::{attempt_preview, AttemptContext, AttemptResult},
-    automod_preview_flow::{plan_pre_claim, PreClaimPlan},
-    automod_preview_input::build_preview_message,
-    automod_preview_limiter::PreviewRateLimiter,
-    automod_preview_report::{metric_unavailable, PREVIEW_UNAVAILABLE_REPLY},
-    automod_preview_store::SqlPreviewStore,
-    automod_runtime::AutomodClaimLedger,
-    funnel::format_iso_millis,
-};
 
 #[cfg(feature = "db")]
-use crate::automod_activation::{AutomodActivation, AutomodFacts};
+use {
+    crate::automod_activation::{AutomodActivation, AutomodFacts},
+    std::sync::{Mutex, PoisonError},
+    tokio::time::Instant,
+    twilight_model::application::interaction::{InteractionData, InteractionType},
+    two_bot_core::{
+        automod_preview_attempt::{attempt_preview, AttemptContext, AttemptResult},
+        automod_preview_flow::{plan_pre_claim, PreClaimPlan},
+        automod_preview_input::build_preview_message,
+        automod_preview_limiter::PreviewRateLimiter,
+        automod_preview_report::{metric_unavailable, PREVIEW_UNAVAILABLE_REPLY},
+        automod_preview_store::SqlPreviewStore,
+        automod_runtime::AutomodClaimLedger,
+        funnel::format_iso_millis,
+    },
+};
 
 /// The invoker's context only. A DM has no guild or roles and must still pass
 /// through the core scope gate, which refuses evaluation.
@@ -141,8 +139,7 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
         return unavailable(Some(dry_run));
     };
     let receipt_iso = format_iso_millis(i64::try_from(receipt_ms).unwrap_or(i64::MAX));
-    let actor_id = &request.actor_id;
-    let id = request.interaction_id;
+    let (actor_id, id) = (&request.actor_id, request.interaction_id);
     let context = AttemptContext {
         guild_id,
         actor_id,
@@ -150,19 +147,15 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
         receipt_iso: &receipt_iso,
         dry_run,
     };
-    attempt_preview(
-        plan,
-        context,
-        SqlPreviewStore::new(pool, deadline),
-        || {
-            limiter
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .admit_before(actor_id, guild_id, id, deadline)
-        },
-        || evaluate(&message, input.mention_count),
-    )
-    .await
+    let store = SqlPreviewStore::new(pool, deadline);
+    let admit = || {
+        limiter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .admit_before(actor_id, guild_id, id, deadline)
+    };
+    let evaluate = || evaluate(&message, input.mention_count);
+    attempt_preview(plan, context, store, admit, evaluate).await
 }
 
 #[cfg(feature = "db")]

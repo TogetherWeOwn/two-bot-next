@@ -1332,14 +1332,10 @@ mod preview_attempt_acceptance {
     use std::time::Duration;
     use tokio::time::Instant;
     use twilight_model::application::interaction::Interaction;
-    use two_bot_core::{
-        automod_preview_audit::lock_preview_attempt,
-        automod_preview_limiter::PreviewRateLimiter,
-        automod_preview_report::{
-            metric_not_evaluated, metric_unavailable, PREVIEW_NOT_EVALUATED_REPLY,
-            PREVIEW_UNAVAILABLE_REPLY,
-        },
-    };
+    use two_bot_core::automod_preview_audit::lock_preview_attempt;
+    use two_bot_core::automod_preview_input::PreviewInputRefusal;
+    use two_bot_core::automod_preview_limiter::PreviewRateLimiter;
+    use two_bot_core::automod_preview_report::*;
     use two_bot_discord::automod_preview_handler::handle_automod_preview;
     use two_bot_testsupport::TestDatabase;
 
@@ -1379,39 +1375,39 @@ mod preview_attempt_acceptance {
     }
 
     async fn verify_preview_attempts(pool: PgPool) -> Result<(), sqlx::Error> {
-        sqlx::raw_sql(include_str!(
-            "../../cutover/migrations/0130_custom_commands.sql"
-        ))
-        .execute(&pool)
-        .await?;
+        let schema = include_str!("../../cutover/migrations/0130_custom_commands.sql");
+        sqlx::raw_sql(schema).execute(&pool).await?;
         let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
-        let ledger = MemLedger::default();
-        let facts = StaticFacts::default();
-        let activation = AutomodActivation::new(
-            runtime(false),
-            ledger.clone(),
-            facts.clone(),
-            executor(&mock),
-        );
-        let limiter = Mutex::new(PreviewRateLimiter::new());
-        let sample = interaction("4242", STAGING_GUILD_ID, CANARY);
+        let (ledger, facts) = (MemLedger::default(), StaticFacts::default());
+        let rest = executor(&mock);
+        let activation =
+            AutomodActivation::new(runtime(false), ledger.clone(), facts.clone(), rest);
+        let active = Some(&activation);
+        let limiter = Mutex::default();
+        let sample = |id| interaction(id, STAGING_GUILD_ID, CANARY);
+        let request = sample("4242");
+        let blank = interaction("4242", STAGING_GUILD_ID, "");
         let outside = interaction("4242", "9876", CANARY);
-        let mut missing = sample.clone();
+        let mut missing = request.clone();
         missing.data = None;
-        let run = |limit, request, receipt| {
+        let run = |active, limit, request, receipt| {
             let deadline = Instant::now() + Duration::from_secs(5);
-            handle_automod_preview(Some(&activation), &pool, limit, request, receipt, deadline)
+            handle_automod_preview(active, &pool, limit, request, receipt, deadline)
         };
-        let count = || {
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM automation_audit_log")
-                .fetch_one(&pool)
-        };
-        let refused = run(&limiter, &outside, RECEIPT_MS).await;
-        assert_eq!(refused.reply, PREVIEW_NOT_EVALUATED_REPLY);
-        assert_eq!(refused.metric, Some(metric_not_evaluated()));
-        let malformed = run(&limiter, &missing, RECEIPT_MS).await;
-        assert_eq!(malformed.reply, PREVIEW_UNAVAILABLE_REPLY);
-        assert_eq!(malformed.metric, Some(metric_unavailable(None)));
+        let count_sql = "SELECT COUNT(*) FROM automation_audit_log";
+        let count = || sqlx::query_scalar::<_, i64>(count_sql).fetch_one(&pool);
+        let not_evaluated = (PREVIEW_NOT_EVALUATED_REPLY, Some(metric_not_evaluated()));
+        let unavailable = (PREVIEW_UNAVAILABLE_REPLY, Some(metric_unavailable(None)));
+        let text_bounds = (PreviewInputRefusal::TextBounds.message(), None);
+        for (activation, request, expected) in [
+            (None, &blank, text_bounds),
+            (None, &request, not_evaluated),
+            (active, &outside, not_evaluated),
+            (active, &missing, unavailable),
+        ] {
+            let result = run(activation, &limiter, request, RECEIPT_MS).await;
+            assert_eq!((result.reply.as_str(), result.metric), expected);
+        }
         assert_eq!(count().await?, 0);
 
         let _guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
@@ -1440,31 +1436,42 @@ mod preview_attempt_acceptance {
             assert!(activation.apply_live_config(&runtime(true).effective_config()));
             holder.rollback().await
         };
-        let (first, released) = tokio::join!(run(&limiter, &sample, RECEIPT_MS), release);
+        let (first, released) = tokio::join!(run(active, &limiter, &request, RECEIPT_MS), release);
         released?;
         assert!(first.reply.contains("TWO_AUTOMOD_REPEAT_COUNT"));
         assert!(!first.reply.contains(CANARY));
-        assert_eq!(first.metric.map(|m| m.result), Some("matched"));
+        let labels = |m: PreviewMetricLabels| (m.result, m.filter, m.mode);
+        let repeat_labels = ("matched", "repeated_message", "dry_run");
+        assert_eq!(first.metric.map(labels), Some(repeat_labels));
         let receipt = "2023-11-14 22:13:20.000000+00";
         assert!(first.reply.contains(receipt));
-        let audit: Vec<String> = sqlx::query_scalar(
-            "SELECT ARRAY[guild_id, actor_id, target_key, action, outcome, reason]
-             FROM automation_audit_log WHERE id = 'automod-preview:4242' AND created_at = $1::text::timestamptz",
-        ).bind(receipt).fetch_one(&pool).await?;
-        let reason = "filter=repeated_message;exemption=none;mode=dry_run;len=0_50";
-        let (identity, decision) = audit.split_at(4);
-        let expected = [STAGING_GUILD_ID, AUTHOR, CHANNEL, "automod.preview"];
-        assert_eq!(identity, expected);
-        assert_eq!(decision, ["matched", reason]);
-
         let closed = Mutex::new(PreviewRateLimiter::with_capacity(0));
-        let replay = run(&closed, &sample, RECEIPT_MS + 1).await;
+        let replay = run(active, &closed, &request, RECEIPT_MS + 1).await;
         assert_eq!((replay.reply, replay.metric), (first.reply, None));
         assert_eq!(count().await?, 1);
-        let fresh = interaction("4243", STAGING_GUILD_ID, CANARY);
-        let fresh = run(&Mutex::default(), &fresh, RECEIPT_MS).await;
-        assert_eq!(fresh.metric.map(|m| m.result), Some("no_match"));
-        assert_eq!(count().await?, 2);
+        let next = sample("4243");
+        let rate = run(active, &closed, &next, RECEIPT_MS).await;
+        assert_eq!(rate.reply, PREVIEW_RATE_LIMITED_REPLY);
+        assert_eq!(rate.metric, Some(metric_rate_limited(false)));
+        let sql = "SELECT ARRAY[id, outcome, reason] FROM automation_audit_log
+                   WHERE created_at = $1::text::timestamptz
+                   AND ARRAY[guild_id, actor_id, target_key, action] = $2 ORDER BY id";
+        let identity = [STAGING_GUILD_ID, AUTHOR, CHANNEL, "automod.preview"];
+        let rows = sqlx::query_scalar::<_, Vec<String>>(sql)
+            .bind(receipt)
+            .bind(&identity[..]);
+        let repeat_reason = "filter=repeated_message;exemption=none;mode=dry_run;len=0_50";
+        let rate_reason = "filter=none;exemption=none;mode=enforce;len=0_50";
+        let expected = [
+            ["automod-preview:4242", "matched", repeat_reason],
+            ["automod-preview:4243", "rate_limited", rate_reason],
+        ];
+        assert_eq!(rows.fetch_all(&pool).await?, expected);
+        let fresh = sample("4244");
+        let fresh = run(active, &Mutex::default(), &fresh, RECEIPT_MS).await;
+        let no_match_labels = ("no_match", "none", "enforce");
+        assert_eq!(fresh.metric.map(labels), Some(no_match_labels));
+        assert_eq!(count().await?, 3);
         assert_eq!(ledger.claims(), 3, "only the three gateway creates claim");
         assert_eq!(ledger.violations(), 0);
         assert_eq!(facts.target_calls(), 0);
