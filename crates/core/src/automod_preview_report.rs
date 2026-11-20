@@ -178,7 +178,7 @@ pub fn preview_mode_sentence(dry_run: bool) -> &'static str {
 
 /// Fixed caveats, same words every time (§3.2).
 pub const PREVIEW_CAVEATS: &str = "Caveats: first matching filter only. Preview recorded nothing; \
-    a real post would itself count toward repeat history, unless exempt or stopped by bad_words first. \
+    only repeat-eligible real posts count toward repeat history (not text that normalizes to empty). \
     Sanction and protection were not previewed.";
 
 /// Fixed sentence for the T19 `partial` shape (§3.2).

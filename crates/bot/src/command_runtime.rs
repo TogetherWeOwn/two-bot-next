@@ -2787,12 +2787,17 @@ impl CommandRuntime {
     ) {
         let deadline = receipt.received_at
             + Duration::from_millis(two_bot_discord::executor::RECEIPT_ADMISSION_BUDGET_MS);
-        if Instant::now() >= deadline
-            || tokio::time::timeout_at(deadline, self.answer(interaction, response))
-                .await
-                .is_err()
+        if let Err(err) = self
+            .executor
+            .answer_interaction_with_blocked_retry_before(
+                interaction.id.get(),
+                &interaction.token,
+                &response,
+                deadline,
+            )
+            .await
         {
-            warn!(interaction_id = %interaction.id.get(), "automod preview callback deadline elapsed");
+            warn!(interaction_id = %interaction.id.get(), reason = discord_class(&err), "automod preview callback failed");
         }
     }
 

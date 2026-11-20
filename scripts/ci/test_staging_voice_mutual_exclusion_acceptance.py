@@ -59,7 +59,10 @@ from unittest import mock
 
 import yaml
 
-from disabled_voice_measurement import WORKFLOW as DISABLED_MEASUREMENT, is_disabled_scaffold
+from voice_measurement_policy import (
+    CALLS as MEASUREMENT_CALLS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
+    WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github/workflows"
@@ -594,12 +597,9 @@ def repository_errors(wfs, canonical):
     callers = {f"./.github/workflows/{name}" for name in CHILDREN.values()}
     holders = set(STANDALONE_HOLDERS) | set(OBSERVERS)
     for file, workflow in wfs.items():
-        if file == DISABLED_MEASUREMENT and is_disabled_scaffold(workflow):
-            for job_id in ("voice-first", "voice-second"):
-                target = workflow["jobs"][job_id].get("uses")
-                if target != f"./.github/workflows/{VOICE}":
-                    errors.append(f"caller closure: disabled measurement {job_id} target changed")
-            continue
+        measurement = file == MEASUREMENT and is_measurement_caller(workflow, canonical)
+        if file == MEASUREMENT and not measurement:
+            errors.append(f"{file}: dispatch, canonical lock, guards or staging authority changed")
         triggers = tuple(t for t in events(workflow) if t != "workflow_call")
         nodes = [("workflow", workflow)] + list((workflow.get("jobs") or {}).items())
         for name, node in nodes:
@@ -608,11 +608,14 @@ def repository_errors(wfs, canonical):
                     errors.append(f"split lifecycle lock: {file} {name} holds {text}")
             if name == "workflow":
                 continue
-            if node.get("uses") in callers and (file != DEPLOY or name not in CHILDREN):
+            allowed_call = ((file == DEPLOY and name in CHILDREN)
+                            or (measurement and name in MEASUREMENT_CALLS))
+            if node.get("uses") in callers and not allowed_call:
                 errors.append(f"caller closure: {file} {name} calls a window consumer")
             env = str(node.get("environment") or "")
             touches = STAGING_TOUCH.search(str(node)) or "staging" in env
             classified = (file in (DEPLOY, *CONSUMERS) or (file, name) in holders
+                          or (measurement and (name in MEASUREMENT_STAGING_JOBS or name in MEASUREMENT_CALLS))
                           or (file, name) in EXEMPT)
             if touches and not classified:
                 errors.append(f"inventory: unclassified staging consumer {file} {name}")
@@ -866,6 +869,7 @@ def target_fixture(group=FIXTURE_GROUP):
     lock = {"group": group, "cancel-in-progress": "false", "queue": "max"}
     deploy = wfs[DEPLOY]
     deploy["concurrency"] = dict(lock)
+    wfs[MEASUREMENT]["concurrency"] = measurement_queue(group)
     jobs = deploy["jobs"]
     for workflow in (deploy, wfs[VOICE], wfs[HELP]):
         strip_staging_use(workflow)

@@ -191,6 +191,10 @@ A missing test alone is not a runtime bug. These are blocking findings:
   artifact jobs, verify keys, tokens, and secrets cannot reach uploaded artifacts
   or public output. Report a violation as Severe only with the exact job/line
   and failing path, subject to the existing severity and security-disclosure rules.
+  With `actions/upload-artifact` v4+, reruns may reuse artifact names. Flag
+  upload-name collisions within one attempt; `run_attempt` alone cannot prevent
+  them. Downloads that require current-attempt output must select it explicitly;
+  a shared name can match a prior attempt when no fresh upload exists.
 - **Gateway lifecycle** (`crates/bot/src/gateway*.rs`, `audit_gateway.rs`,
   `automod_gateway.rs`): session persistence and resume, duplicate-event
   deduplication keys, poison-event handling, and backoff that cannot spin or

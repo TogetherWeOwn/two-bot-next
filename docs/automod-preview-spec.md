@@ -386,11 +386,9 @@ publish globally.
 **Effective config source.** The preview runs against the same
 in-memory `AutomodRuntime` the gateway inspects with, after the same
 per-event live-snapshot refresh the delivery path performs
-(`crates/bot/src/automod_gateway.rs:187-240`, `:341-358`). Preview uses
-that resolver's policy and mode only in its own snapshot, falling back to
-the activation's last-good config when no overlay can be resolved. It must
-not apply the overlay to the shared runtime while enforcement is in flight.
-Each evaluation sees one config. It must not call
+(`crates/bot/src/automod_gateway.rs:187-240`, `:341-358`). Each preview uses
+one policy and mode snapshot with last-good fallback, without mutating the
+shared runtime. It must not call
 `AutomodConfig::from_env` itself: that would miss live-snapshot value
 overlays and last-good-policy fallback (§2) and could contradict the next
 real message. Neither reach nor clone exists today — the only config
@@ -439,15 +437,16 @@ Resolved semantics:
    equivalence cannot be shown for the cloned-CREATE reference, the
    fallback is to report the repeat filter as `indeterminate` and label
    the whole reply partial — never to silently fall through to
-   `no_match` or a later filter as if repeats were evaluated.
+   `no_match` or a later filter as if repeats were evaluated. Text that
+   normalizes to empty cannot repeat; a blank attachment-only or mention-only
+   sample does not need a history read to reach its later filters.
 3. **Previews never accumulate.** Because nothing is recorded, previewing
    the same text 3 times cannot manufacture a `repeated_message` verdict,
    and a preview between two real identical posts neither extends nor
    breaks the real streak. The fixed caveat says so: *preview recorded
-   nothing; a real post would itself count toward repeat history, unless
-   exempt or stopped by `bad_words` first* — mirroring live ordering,
-   where a `bad_words` preview must short-circuit before the repeat read
-   exactly as live short-circuits before the repeat write.
+   nothing; only repeat-eligible real posts count toward repeat history
+   (not text that normalizes to empty)*. Exemptions and `bad_words` still
+   short-circuit before preview reads or live writes repeat history.
 4. **Cross-member isolation.** The tracker key is `guild:author`
    (`crates/core/src/automod.rs:422`) and the synthetic author is the
    invoker (§3.1), so a preview can only ever read the invoker's own
