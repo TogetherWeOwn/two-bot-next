@@ -1402,13 +1402,8 @@ mod preview_attempt_acceptance {
             })
         };
         let run = |active, limit, request, receipt| {
-            run_until(
-                active,
-                limit,
-                request,
-                receipt,
-                Instant::now() + Duration::from_secs(5),
-            )
+            let deadline = Instant::now() + Duration::from_secs(5);
+            run_until(active, limit, request, receipt, deadline)
         };
         let count_sql = "SELECT COUNT(*) FROM automation_audit_log";
         let count = || sqlx::query_scalar::<_, i64>(count_sql).fetch_one(&pool);
@@ -1460,6 +1455,7 @@ mod preview_attempt_acceptance {
         assert_eq!(refreshes.load(Ordering::Relaxed), 1);
         released?;
         assert!(first.reply.contains("Repeat evaluation is indeterminate"));
+        assert!(first.reply.contains("not text that normalizes to empty"));
         assert!(!first.reply.contains(CANARY));
         let labels = |m: PreviewMetricLabels| (m.result, m.filter, m.mode);
         let partial_labels = ("partial", "none", "dry_run");

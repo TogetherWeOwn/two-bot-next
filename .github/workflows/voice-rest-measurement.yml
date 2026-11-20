@@ -1,21 +1,21 @@
 name: voice-rest-measurement
 
-# Inert scaffolding: every job remains hard-disabled until the complete
-# measurement and its refusal, evidence, and cleanup contracts are reviewed.
 on:
   workflow_dispatch:
 
 permissions: {}
 
-# Keep the canonical group unreachable until scheduling and activation are reviewed.
+# Hold the lifecycle lock through cleanup. Do not replace pending staging work.
+# Actions compares refs case-insensitively. Only main has branch protection.
+# Other refs and reruns use a separate queue for each attempt.
 concurrency:
-  group: ${{ false && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.run_attempt == 1 && 'staging-lifecycle' || format('voice-rest-measurement-disabled-{0}-{1}', github.run_id, github.run_attempt) }}
+  group: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && 'staging-lifecycle' || format('voice-rest-measurement-refused-{0}-{1}', github.run_id, github.run_attempt) }}
   cancel-in-progress: false
   queue: max
 
 jobs:
   staging-window:
-    if: ${{ false && github.ref == 'refs/heads/main' && github.run_attempt == 1 }}
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 }}
     permissions:
       contents: read
     environment: staging
@@ -54,7 +54,7 @@ jobs:
 
   measurement-before:
     needs: staging-window
-    if: ${{ false && github.ref == 'refs/heads/main' && github.run_attempt == 1 && needs.staging-window.result == 'success' }}
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && needs.staging-window.result == 'success' }}
     permissions:
       contents: read
     environment: staging
@@ -93,7 +93,7 @@ jobs:
 
   voice-first:
     needs: [staging-window, measurement-before]
-    if: ${{ false && github.ref == 'refs/heads/main' && github.run_attempt == 1 && needs.staging-window.result == 'success' && needs.measurement-before.result == 'success' }}
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && needs.staging-window.result == 'success' && needs.measurement-before.result == 'success' }}
     permissions:
       contents: read
     uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
@@ -109,7 +109,7 @@ jobs:
 
   measurement-after:
     needs: [staging-window, measurement-before, voice-first]
-    if: ${{ false && github.ref == 'refs/heads/main' && github.run_attempt == 1 && needs.voice-first.result == 'success' }}
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && needs.voice-first.result == 'success' }}
     outputs:
       second_required: ${{ steps.decision.outputs.second_required }}
     permissions:
@@ -169,7 +169,7 @@ jobs:
 
   voice-second:
     needs: [staging-window, measurement-after]
-    if: ${{ false && github.ref == 'refs/heads/main' && github.run_attempt == 1 && needs.measurement-after.result == 'success' && needs.measurement-after.outputs.second_required == 'true' }}
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && needs.measurement-after.result == 'success' && needs.measurement-after.outputs.second_required == 'true' }}
     permissions:
       contents: read
     uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
@@ -185,7 +185,7 @@ jobs:
 
   measurement-final:
     needs: [staging-window, measurement-after, voice-second]
-    if: ${{ false && github.ref == 'refs/heads/main' && github.run_attempt == 1 && needs.voice-second.result == 'success' }}
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && needs.voice-second.result == 'success' }}
     permissions:
       contents: read
     environment: staging
@@ -247,7 +247,7 @@ jobs:
 
   staging-use-release:
     needs: [staging-window, measurement-before, voice-first, measurement-after, voice-second, measurement-final]
-    if: ${{ false && always() && github.ref == 'refs/heads/main' && github.run_attempt == 1 && needs.staging-window.outputs.expires_at != '' }}
+    if: ${{ always() && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && needs.staging-window.outputs.expires_at != '' }}
     permissions:
       contents: read
     environment: staging
@@ -280,7 +280,7 @@ jobs:
 
   measurement-terminal:
     needs: [staging-window, measurement-before, voice-first, measurement-after, voice-second, measurement-final, staging-use-release]
-    if: ${{ false && always() && github.ref == 'refs/heads/main' && github.run_attempt == 1 }}
+    if: ${{ always() && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 }}
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -360,7 +360,7 @@ jobs:
 
   rerun-refusal:
     needs: measurement-terminal
-    if: ${{ false && always() && github.run_attempt != 1 }}
+    if: ${{ always() && !(github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1) }}
     permissions: {}
     runs-on: ubuntu-latest
     timeout-minutes: 1

@@ -17,7 +17,10 @@ from unittest.mock import patch
 
 import yaml
 
-from disabled_voice_measurement import WORKFLOW as DISABLED_MEASUREMENT, is_disabled_scaffold
+from voice_measurement_policy import (
+    CALLS as MEASUREMENT_CALLS, GUARDS as MEASUREMENT_GUARDS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
+    TARGET as MEASUREMENT_TARGET, WORKFLOW as MEASUREMENT, is_measurement_caller,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 _HISTORY_SPEC = importlib.util.spec_from_file_location(
@@ -97,6 +100,7 @@ JOB_INVENTORY = {
     "sbom.yml": {"image", "verify"},
     # Live staging voice synthetic (docs/voice-synthetic.md); pinned shape below.
     "voice-synthetic.yml": {"staging-window", "synthetic", "staging-use-release", "rerun-refusal"},
+    MEASUREMENT: set(MEASUREMENT_GUARDS),
     # Live staging /help embed smoke (docs/staging-help-embed-smoke.md);
     # pinned shape below.
     "help-embed-synthetic.yml": {"staging-window", "help-embed-smoke", "staging-use-release", "rerun-refusal"},
@@ -144,6 +148,7 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                    # After every staging deploy; its failure fails deploy-staging (promotion gate).
                    ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
+                   **{(MEASUREMENT, job): MEASUREMENT_TARGET for job in MEASUREMENT_CALLS},
                    # After every staging deploy; its failure fails deploy-staging (promotion gate).
                    ("deploy-staging.yml", "help-embed-synthetic"): "./.github/workflows/help-embed-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
@@ -4521,6 +4526,37 @@ def cloudflare_environment_errors(workflows):
     return errors
 
 
+def measurement_deploy_scan_text(job_id, job):
+    """Exclude only the reviewed step bindings and the literal capture invocation."""
+    index, capture = {"staging-window": (2, None), "staging-use-release": (2, None),
+                      "measurement-before": (2, "before"), "measurement-after": (5, "after"),
+                      "measurement-final": (6, "final")}[job_id]
+    steps = job.get("steps", [])
+    if not isinstance(steps, list) or len(steps) <= index or not isinstance(steps[index], dict):
+        return str(job).lower()
+    step = steps[index]
+    env, script = step.get("env", {}), step.get("run")
+    if not isinstance(env, dict) or not isinstance(script, str):
+        return str(job).lower()
+    lines = script.splitlines()
+    allowed = {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"}
+    if capture:
+        command = ('node wrangler/scripts/voice-rest-measurement.mjs capture --metadata "$RUNNER_TEMP/voice-metadata.json"'
+                   f' --metrics-url "$STAGING_WORKER_URL" --out "$RUNNER_TEMP/voice-{capture}.json"')
+        if command not in lines:
+            return str(job).lower()
+        lines.remove(command)
+        # The production origin is a refuse-list value, not a deploy target.
+        allowed["PRODUCTION_WORKER_URL"] = "${{ vars.PRODUCTION_WORKER_URL }}"
+    else:
+        phase = "begin" if job_id == "staging-window" else "finish"
+        if script != f"node wrangler/scripts/staging-use-pipeline.mjs {phase}":
+            return str(job).lower()
+    sanitized = dict(step, run="\n".join(lines),
+                     env={key: value for key, value in env.items() if (key, value) not in allowed.items()})
+    return str(dict(job, steps=[*steps[:index], sanitized, *steps[index + 1:]])).lower()
+
+
 def workflow_policy_errors(workflows):
     errors = []
     errors.extend(cloudflare_environment_errors(workflows))
@@ -4530,9 +4566,10 @@ def workflow_policy_errors(workflows):
     errors.extend(scheduled_binding_audit_errors(workflows))
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
     # An intentional addition needs an explicit policy change and independent review.
-    disabled = is_disabled_scaffold(workflows.get(DISABLED_MEASUREMENT))
-    inventory = set(JOB_INVENTORY) | ({DISABLED_MEASUREMENT} if disabled else set())
-    if set(workflows) != inventory:
+    measurement = is_measurement_caller(workflows.get(MEASUREMENT), STAGING_LIFECYCLE_GROUP)
+    if not measurement:
+        errors.append(f"{MEASUREMENT}: dispatch, lock, guards or staging authority changed")
+    if set(workflows) != set(JOB_INVENTORY):
         errors.append("workflow inventory changed")
     # Every allowed reusable call must still exist with its pinned ref:
     # converting a caller to an ordinary job keeps the inventory intact
@@ -4552,11 +4589,6 @@ def workflow_policy_errors(workflows):
             errors.append(f"{name}:{job_id}: PR-size activation condition changed")
     for name, workflow in workflows.items():
         jobs = workflow.get("jobs", {})
-        if name == DISABLED_MEASUREMENT and disabled:
-            for job_id in ("voice-first", "voice-second"):
-                if jobs[job_id].get("uses") != "./.github/workflows/voice-synthetic.yml":
-                    errors.append(f"{name}:{job_id}: reusable call missing or retargeted")
-            continue
         if set(jobs) != JOB_INVENTORY.get(name, set()):
             errors.append(f"{name}: job inventory changed")
         if name == "deploy-production.yml":
@@ -4698,9 +4730,10 @@ def workflow_policy_errors(workflows):
             else:
                 # Retargeting a known CI job must not create an unapproved
                 # deploy/probe route outside the deploy workflows.
-                text = str(job).lower()
                 uses = job.get("uses")
-                if ("environment" in job
+                measured_staging = name == MEASUREMENT and measurement and job_id in MEASUREMENT_STAGING_JOBS
+                text = measurement_deploy_scan_text(job_id, job) if measured_staging else str(job).lower()
+                if (("environment" in job and not measured_staging)
                         or (uses is not None and REUSABLE_CALLS.get((name, job_id)) != uses)
                         or any(marker in text for marker in DEPLOY_MARKERS)):
                     errors.append(f"{name}:{job_id}: deployment/probe alternative outside approved deploy workflows")
@@ -8397,6 +8430,8 @@ class WorkflowTests(unittest.TestCase):
                                           ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
                                           ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                                           ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
+                                          ("voice-rest-measurement.yml", "voice-first"): "./.github/workflows/voice-synthetic.yml",
+                                          ("voice-rest-measurement.yml", "voice-second"): "./.github/workflows/voice-synthetic.yml",
                                           ("deploy-staging.yml", "help-embed-synthetic"): "./.github/workflows/help-embed-synthetic.yml",
                                           ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
                                           ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
@@ -10237,16 +10272,14 @@ class WorkflowTests(unittest.TestCase):
 
     def test_public_hosted_runner_and_service_isolation(self):
         for name, workflow in self.workflows.items():
+            if name == MEASUREMENT:
+                self.assertTrue(is_measurement_caller(workflow, STAGING_LIFECYCLE_GROUP), name)
             for job_id, job in workflow["jobs"].items():
                 with self.subTest(workflow=name, job=job_id):
                     if "uses" in job:
                         # The called workflow's own jobs are checked here too.
                         self.assertNotIn("runs-on", job)
-                        if name == DISABLED_MEASUREMENT and job_id in ("voice-first", "voice-second"):
-                            self.assertTrue(is_disabled_scaffold(workflow))
-                            self.assertEqual(job["uses"], "./.github/workflows/voice-synthetic.yml")
-                        else:
-                            self.assertEqual(job["uses"], REUSABLE_CALLS[(name, job_id)])
+                        self.assertEqual(job["uses"], REUSABLE_CALLS[(name, job_id)])
                         continue
                     if (name, job_id) == ("deploy-staging.yml", "certify-promotion"):
                         # Artifact-only certification still uses the direct
