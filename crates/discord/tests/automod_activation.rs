@@ -1391,14 +1391,16 @@ mod preview_attempt_acceptance {
         let mut missing = request.clone();
         missing.data = None;
         let refreshes = AtomicUsize::new(0);
-        let preview_dry_run = AtomicBool::new(false);
+        let use_resolved_policy = AtomicBool::new(false);
         let run_until = |active, limit, request, receipt, deadline| {
             handle_automod_preview(active, &pool, limit, request, receipt, deadline, |guild| {
                 assert_eq!(guild, STAGING_GUILD_ID);
                 refreshes.fetch_add(1, Ordering::Relaxed);
-                preview_dry_run
-                    .load(Ordering::Relaxed)
-                    .then(|| runtime(false).effective_config())
+                use_resolved_policy.load(Ordering::Relaxed).then(|| {
+                    let mut config = runtime(false).effective_config();
+                    config.policy.bad_words = vec!["synthetic".to_owned()];
+                    config
+                })
             })
         };
         let run = |active, limit, request, receipt| {
@@ -1486,11 +1488,19 @@ mod preview_attempt_acceptance {
             ["automod-preview:4243", "rate_limited", rate_reason],
         ];
         assert_eq!(rows.fetch_all(&pool).await?, expected);
-        preview_dry_run.store(true, Ordering::Relaxed);
+        use_resolved_policy.store(true, Ordering::Relaxed);
         let fresh = sample("4244");
         let fresh = run(active, &Mutex::default(), &fresh, RECEIPT_MS).await;
-        assert!(!activation.preview(AutomodRuntime::dry_run));
-        assert_eq!(fresh.metric.map(labels), Some(partial_labels));
+        assert_eq!(
+            fresh.metric.map(labels),
+            Some(("matched", "bad_words", "dry_run"))
+        );
+        assert!(fresh.reply.contains("Deciding filter: bad_words."));
+        assert!(!fresh.reply.contains(CANARY));
+        assert_eq!(
+            activation.preview(AutomodRuntime::effective_config),
+            runtime(true).effective_config()
+        );
         assert_eq!(count().await?, 3);
         assert_eq!(ledger.claims(), 3, "only the three gateway creates claim");
         assert_eq!(ledger.violations(), 0);
