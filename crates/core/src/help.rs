@@ -25,6 +25,8 @@ use super::commands::{
 };
 use super::message_safety;
 
+pub mod pages;
+
 /// One `/help` group: commands that share an audience.
 struct HelpGroup {
     title: &'static str,
