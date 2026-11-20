@@ -1,12 +1,15 @@
 //! Payloads for the live staging `/help` embed smoke (offline half).
 //!
-//! Discord creates interactions only for real users. The smoke therefore
-//! posts the sanitized discovery and detail embeds as ordinary messages
-//! without callback flags or buttons, then reads them back. See
-//! docs/staging-help-embed-smoke.md for what this proves and does not.
+//! Discord creates interactions only for real users, so no bot token can
+//! invoke `/help` and capture its reply. The smoke therefore posts the exact
+//! embeds the two help builders produce, without callback flags or buttons,
+//! as ordinary channel messages and reads them back (scripts/staging_help_embed_smoke.py).
+//! This module emits those embeds after the same executor sanitizer the live
+//! reply path uses, together with the brand expectations the read-back must
+//! match, so the Python half never re-implements builder or brand logic.
+//! See docs/staging-help-embed-smoke.md for what this proves and does not.
 
 use serde_json::{json, Value};
-use twilight_model::http::interaction::InteractionResponse;
 use two_bot_core::commands::{
     merge_commands, CommandChoice, CommandDefinition, CommandOption, CommandOptionType,
     CustomCommand, GUILD_COMMAND_LIMIT,
@@ -43,7 +46,9 @@ fn maximal_registry() -> Result<Vec<CommandDefinition>, &'static str> {
     Ok(defs)
 }
 
-/// The widest supported option and choice counts exercise detail overflow.
+/// Render one wide topic detail through the real detail renderer: the
+/// 25-option/25-choice maximum definition is the widest shape the renderer
+/// accepts and exercises the overflow path.
 fn wide_detail_text() -> String {
     let options = (0..25)
         .map(|n| {
@@ -67,9 +72,12 @@ fn wide_detail_text() -> String {
         .help_detail_text()
 }
 
-/// Refuse a builder output that has lost its title, branding or description.
+/// Sanitize one builder response exactly as the executor does and return its
+/// single embed, refusing (with a fixed code) any non-embed shape so a
+/// builder change that drops the brand fails payload generation in CI
+/// instead of silently posting plain content.
 fn single_branded_embed(
-    response: &InteractionResponse,
+    response: &twilight_model::http::interaction::InteractionResponse,
     footer_text: &str,
     code: &'static str,
 ) -> Result<Value, &'static str> {
@@ -79,8 +87,8 @@ fn single_branded_embed(
     let [embed] = embeds.as_slice() else {
         return Err(code);
     };
-    if embed["title"] != HELP_TITLE
-        || embed["color"].as_u64() != Some(u64::from(EmbedKind::Default.color()))
+    if embed["color"].as_u64() != Some(u64::from(EmbedKind::Default.color()))
+        || embed["title"] != HELP_TITLE
         || embed["footer"]["text"] != footer_text
         || embed["footer"]["icon_url"] != BRAND_ICON_URL
         || embed["description"].as_str().is_none_or(str::is_empty)
@@ -143,11 +151,21 @@ mod help_embed_smoke_tests {
             );
             assert_eq!(expected["icon_url"], BRAND_ICON_URL);
             assert_eq!(embed["title"], HELP_TITLE);
-            assert_eq!(embed["color"], expected["color"]);
+            assert_eq!(
+                embed["color"].as_u64(),
+                Some(u64::from(EmbedKind::Default.color())),
+                "{key} embed carries the brand color"
+            );
             assert_eq!(embed["footer"]["text"], expected["footer_text"]);
-            assert_eq!(embed["footer"]["icon_url"], expected["icon_url"]);
+            assert_eq!(
+                embed["footer"]["icon_url"], BRAND_ICON_URL,
+                "{key} footer icon"
+            );
             let description = embed["description"].as_str().expect("description");
-            assert!(text_len(description) <= EMBED_DESCRIPTION_LIMIT);
+            assert!(
+                text_len(description) <= EMBED_DESCRIPTION_LIMIT,
+                "{key} description fits Discord's embed limit"
+            );
         }
         let help = &payloads["embeds"]["help"];
         assert!(help["footer"]["text"]

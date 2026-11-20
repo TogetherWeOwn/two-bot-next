@@ -3687,6 +3687,13 @@ fn help_focus_selector_rejects_duplicate_command_with_a_path() {
     assert_eq!(help_focus_selector(&root_only), HelpSubcommand::Absent);
 }
 
+fn help_embed_description(data: &serde_json::Value) -> &str {
+    assert!(data["content"].is_null());
+    let embeds = data["embeds"].as_array().expect("help embeds");
+    assert_eq!(embeds.len(), 1);
+    embeds[0]["description"].as_str().expect("help description")
+}
+
 #[tokio::test]
 async fn help_focused_dispatch_rejects_duplicate_roots_in_both_orders() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
@@ -3744,7 +3751,7 @@ async fn help_focused_dispatch_rejects_duplicate_roots_in_both_orders() {
             reply["data"]["allowed_mentions"]["parse"],
             serde_json::json!([])
         );
-        let content = reply["data"]["content"].as_str().expect("help content");
+        let content = help_embed_description(&reply["data"]);
         if roots.len() == 1 {
             assert!(
                 content.contains("Usage: /privacy deletion-status <request-id>"),

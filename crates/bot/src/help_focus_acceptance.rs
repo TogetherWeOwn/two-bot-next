@@ -171,7 +171,10 @@ fn focused_privacy_deletion_status(text: &str) {
             "128",
         ],
     );
-    let first = text.lines().next().expect("header line");
+    let detail = text
+        .strip_prefix("Together We Own help\n")
+        .expect("Help title");
+    let first = detail.lines().next().expect("header line");
     assert!(
         first.contains("deletion-status"),
         "header names the focused branch: {text}"

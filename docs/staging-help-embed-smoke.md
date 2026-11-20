@@ -7,17 +7,15 @@ staging deploy and can also be dispatched by hand.
 Discord creates slash-command interactions only for real users, so this smoke
 does not invoke `/help` and does not claim to prove gateway interaction
 delivery. It proves the rendered-message half that offline builder tests
-cannot: Discord returns the branding, title, description and ordered fields
-from the sanitized embed payloads. The smoke does not post buttons or test
-callback privacy, navigation, or recovery replies. The Rust fixtures cover
-those response shapes separately.
+cannot: Discord returns the sanitized embeds’ branding, title, description and
+ordered fields. It does not post buttons or verify callback behavior.
 
 ## Flow
 
 1. CI builds `help_embed_smoke_payloads`, a Rust example in the discord crate.
-   It builds page one with `DiscoveryPlan::first` and detail with
-   `help_detail_response`. It passes both replies through the executor
-   sanitizer and emits their single embeds with per-embed brand expectations.
+   It calls `DiscoveryPlan::first` and `help_detail_response`, passes both replies
+   through the executor sanitizer, and emits their single embeds plus the
+   expected brand values from `brand.rs`.
 2. `scripts/staging_help_embed_smoke.py` fences the run to the staging guild
    and to a dedicated test bot (TWO Voice Synthetic (staging)): the token
    must belong to a bot account that is none of the product applications and
@@ -31,7 +29,7 @@ those response shapes separately.
    - both colours match the generated kit ember default;
    - the discovery footer says `Together We Own · Help · Page 1 of N`,
      where `N` is the page count; the detail footer says `Together We Own · Help`;
-   - both footer icon URLs match `BRAND_ICON_URL`;
+   - `embeds[0].footer.icon_url == BRAND_ICON_URL`;
    - the title, description and ordered fields match the sanitized payload
      after trimming outer whitespace.
 4. It deletes both messages, pass or fail, and writes evidence containing
@@ -41,9 +39,9 @@ those response shapes separately.
    every newer test-bot message, so a committed-but-unseen post cannot be
    left behind by a later green run.
 
-The fixtures use a maximal command registry and a wide topic detail rather
-than staging's current registry. They exercise the pagination indicator and
-detail overflow. Short discovery and topic replies also use branded embeds.
+The payload deliberately uses the maximal command registry and a wide topic
+detail, matching the Rust builder tests. It exercises pagination and overflow
+rather than simulating staging's current registry size.
 
 ## Token source and updates
 
