@@ -16,7 +16,7 @@ use two_bot_core::CommandDefinition;
 use crate::brand::{brand_embed, brand_footer_for, EmbedKind, BRAND_KIT_TAG};
 
 pub const HELP_TITLE: &str = "Together We Own help";
-const HELP_SURFACE: &str = "Help";
+pub(crate) const HELP_SURFACE: &str = "Help";
 // Bump when page chrome, navigation labels, or control behavior changes.
 const RENDER_VERSION: &str = "discovery-v1";
 
@@ -92,6 +92,10 @@ impl DiscoveryPlan {
         let version = format!("{RENDER_VERSION}:{BRAND_KIT_TAG}");
         let revision = Revision::for_pages(guild, application, &version, &pages);
         Ok(Self { pages, revision })
+    }
+
+    pub(crate) fn page_count(&self) -> usize {
+        self.pages.len()
     }
 
     /// Render page one with an expiry fixed by the original help invocation.
@@ -236,7 +240,7 @@ impl HelpRecovery {
     }
 }
 
-fn help_callback(
+pub(crate) fn help_callback(
     kind: EmbedKind,
     title: &str,
     description: &str,

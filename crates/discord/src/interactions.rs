@@ -168,53 +168,28 @@ pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
     }
 }
 
-/// One immediate ephemeral detail reply for `/help command:name` (or its
-/// unknown-name correction). Short detail stays in content; longer detail
-/// moves to one embed description, truncated with an explicit notice past
-/// Discord's description ceiling. The executor sanitizer stays the final
-/// mention/length backstop.
+/// One immediate branded ephemeral detail or correction reply. Neutralize
+/// mentions before sizing so expansion cannot cut off the truncation notice.
 #[must_use]
 pub fn help_detail_response(detail: String) -> InteractionResponse {
-    if two_bot_core::message_safety::text_len(&detail)
-        <= two_bot_core::message_safety::CONTENT_LIMIT
-    {
-        return text_response(InteractionReply::new(detail, true));
+    use crate::help_navigation::{help_callback, HELP_SURFACE, HELP_TITLE};
+    use two_bot_core::message_safety::{
+        neutralize_mentions, text_len, truncate, EMBED_DESCRIPTION_LIMIT,
+    };
+
+    let mut description = neutralize_mentions(&detail);
+    if text_len(&description) > EMBED_DESCRIPTION_LIMIT {
+        const NOTICE: &str = "…(detail truncated for display.)";
+        description = truncate(&description, EMBED_DESCRIPTION_LIMIT - text_len(NOTICE)) + NOTICE;
     }
-    let mut description = detail;
-    if two_bot_core::message_safety::text_len(&description)
-        > two_bot_core::message_safety::EMBED_DESCRIPTION_LIMIT
-    {
-        description = two_bot_core::message_safety::truncate(
-            &description,
-            two_bot_core::message_safety::EMBED_DESCRIPTION_LIMIT - 64,
-        ) + "…(detail truncated for display.)";
-    }
-    InteractionResponse {
-        kind: InteractionResponseType::ChannelMessageWithSource,
-        data: Some(InteractionResponseData {
-            allowed_mentions: Some(Default::default()),
-            embeds: Some(vec![brand_embed(
-                EmbedKind::Default,
-                Embed {
-                    author: None,
-                    color: None,
-                    description: Some(description),
-                    fields: Vec::new(),
-                    footer: None,
-                    image: None,
-                    kind: "rich".to_owned(),
-                    provider: None,
-                    thumbnail: None,
-                    timestamp: None,
-                    title: None,
-                    url: None,
-                    video: None,
-                },
-            )]),
-            flags: Some(MessageFlags::EPHEMERAL),
-            ..Default::default()
-        }),
-    }
+    help_callback(
+        EmbedKind::Default,
+        HELP_TITLE,
+        &description,
+        Vec::new(),
+        crate::brand::brand_footer_for(HELP_SURFACE),
+        None,
+    )
 }
 
 #[must_use]
@@ -1345,7 +1320,7 @@ mod help_response_tests {
     }
 
     #[test]
-    fn short_detail_stays_in_ephemeral_content() {
+    fn short_detail_uses_the_branded_ephemeral_embed() {
         let detail = "/rank — Show your XP, level and server rank.\nUsage: /rank [member]\n";
         let wire =
             serde_json::to_value(help_detail_response(detail.to_owned())).expect("serializes");
@@ -1355,8 +1330,19 @@ mod help_response_tests {
             wire["data"]["allowed_mentions"]["parse"],
             serde_json::json!([])
         );
-        assert_eq!(wire["data"]["content"], detail);
-        assert!(wire["data"]["embeds"].is_null());
+        assert!(wire["data"]["content"].is_null());
+        let embed = &wire["data"]["embeds"][0];
+        assert_eq!(embed["description"], detail);
+        assert_eq!(embed["title"], "Together We Own help");
+        assert_eq!(
+            embed["color"].as_u64(),
+            Some(u64::from(EmbedKind::Default.color()))
+        );
+        assert_eq!(
+            embed["footer"]["text"],
+            crate::brand::brand_footer_for("Help").text
+        );
+        assert_eq!(embed["footer"]["icon_url"], crate::brand::BRAND_ICON_URL);
     }
 
     #[test]
@@ -1408,11 +1394,31 @@ mod help_response_tests {
                 Some(crate::brand::EmbedKind::Default.color() as u64),
                 "detail embed carries the brand color"
             );
+            assert_eq!(wire["data"]["embeds"][0]["title"], "Together We Own help");
+            assert_eq!(
+                wire["data"]["embeds"][0]["footer"]["text"],
+                crate::brand::brand_footer_for("Help").text
+            );
             assert_eq!(
                 wire["data"]["embeds"][0]["footer"]["icon_url"],
                 crate::brand::BRAND_ICON_URL
             );
         }
+    }
+
+    #[test]
+    fn detail_notice_survives_mention_neutralization_at_the_limit() {
+        let detail = "@everyone".repeat(EMBED_DESCRIPTION_LIMIT / 9);
+        assert!(text_len(&detail) <= EMBED_DESCRIPTION_LIMIT);
+        let safe = crate::message_safety::interaction_response(&help_detail_response(detail))
+            .expect("sanitized detail");
+        let wire = serde_json::to_value(safe).expect("serializes");
+        let description = wire["data"]["embeds"][0]["description"]
+            .as_str()
+            .expect("description");
+        assert!(text_len(description) <= EMBED_DESCRIPTION_LIMIT);
+        assert!(description.ends_with("…(detail truncated for display.)"));
+        assert!(!description.contains("@everyone"));
     }
 
     #[test]
