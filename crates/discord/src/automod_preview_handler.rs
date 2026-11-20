@@ -240,6 +240,7 @@ mod tests {
     fn deadline_reached_during_admission_skips_policy_resolution() {
         let now = std::cell::Cell::new(Instant::now());
         let deadline = now.get() + std::time::Duration::from_secs(1);
+        let resolver_called = std::cell::Cell::new(false);
         let result = resolve_admitted_policy(
             || {
                 assert!(now.get() < deadline);
@@ -248,11 +249,17 @@ mod tests {
             },
             deadline,
             || now.get(),
-            || panic!("expired preview must not resolve policy"),
+            || {
+                resolver_called.set(true);
+                AutomodConfig {
+                    enabled: true,
+                    dry_run: true,
+                    policy: Default::default(),
+                }
+            },
         );
-        let Err(result) = result else {
-            panic!("expired preview must return unavailable");
-        };
+        assert!(!resolver_called.get(), "expired preview resolved policy");
+        let result = result.expect_err("expired preview must return unavailable");
         assert_eq!(result.reply, PREVIEW_UNAVAILABLE_REPLY);
         assert_eq!(result.metric, Some(metric_unavailable(None)));
     }
