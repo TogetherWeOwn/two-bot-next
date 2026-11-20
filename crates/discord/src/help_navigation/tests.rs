@@ -144,6 +144,94 @@ fn following_primary_reaches_every_safe_command_with_the_original_expiry() {
     assert_eq!(actual, expected);
 }
 
+fn click_fixture() -> Value {
+    let pages: Vec<_> = (1..=2)
+        .map(|index| Page {
+            description: format!("Page {index}"),
+            fields: vec![],
+        })
+        .collect();
+    let revision = Revision::for_pages(1, 2, RENDER_VERSION, &pages);
+    let plan = DiscoveryPlan { pages, revision };
+    let response = wire(&plan.first(ACTOR, EXPIRY).expect("first page"));
+    let rows = &response["data"]["components"];
+    let actor = json!({"id": ACTOR.to_string(), "username": "actor", "discriminator": "0"});
+    json!({
+        "id": "100", "type": 3, "application_id": "2", "guild_id": "1",
+        "authorizing_integration_owners": {"0": "1"}, "entitlements": [], "token": "fixture",
+        "data": {"component_type": 2, "custom_id": rows[0]["components"][0]["custom_id"], "values": []},
+        "member": {"deaf": false, "mute": false, "flags": 0, "roles": [], "user": actor},
+        "message": {
+            "id": "98", "channel_id": "3", "guild_id": "1", "application_id": "2", "type": 20,
+            "author": {"id": "2", "username": "bot", "discriminator": "0", "bot": true},
+            "flags": response["data"]["flags"], "components": rows, "embeds": response["data"]["embeds"],
+            "interaction_metadata": {
+                "id": "99", "type": 2, "user": actor, "authorizing_integration_owners": {"0": "1"},
+                "original_response_message_id": null, "interacted_message_id": null
+            },
+            "attachments": [], "content": "", "mention_everyone": false, "mention_roles": [],
+            "mentions": [], "pinned": false, "timestamp": "2026-11-20T04:00:00.000000+00:00", "tts": false
+        }
+    })
+}
+
+#[test]
+fn initial_and_descendant_help_messages_belong_to_the_clicking_actor() {
+    let mut payload = click_fixture();
+    let expected =
+        Cursor::parse(payload["data"]["custom_id"].as_str().expect("button id")).expect("cursor");
+    for kind in [2, 3] {
+        payload["message"]["interaction_metadata"]["type"] = json!(kind);
+        if kind == 3 {
+            payload["message"]["interaction_metadata"]["interacted_message_id"] = json!("97");
+            // The attached message may omit scoping fields; the pinned bot
+            // author and the interaction itself still establish scope.
+            payload["message"]["application_id"] = Value::Null;
+            payload["message"]["guild_id"] = Value::Null;
+        }
+        let interaction = serde_json::from_value(payload.clone()).expect("click");
+        assert_eq!(source_cursor(&interaction, 2, 2), Some((expected, ACTOR)));
+    }
+}
+
+#[test]
+fn help_cursor_does_not_authorize_a_different_actor_or_source() {
+    for (path, value) in [
+        ("/application_id", json!("5")),
+        ("/guild_id", Value::Null),
+        ("/member/user", Value::Null),
+        ("/message", Value::Null),
+        ("/message/application_id", json!("5")),
+        ("/message/guild_id", json!("5")),
+        ("/message/author/bot", json!(false)),
+        ("/message/author/id", json!("5")),
+        ("/message/flags", json!(0)),
+        ("/message/interaction_metadata", Value::Null),
+        ("/message/interaction_metadata/user/id", json!("5")),
+        ("/message/interaction_metadata/type", json!(5)),
+        (
+            "/message/interaction_metadata/original_response_message_id",
+            json!("5"),
+        ),
+        ("/message/components", json!([])),
+        ("/data/component_type", json!(3)),
+        ("/data/values", json!(["unexpected"])),
+        ("/data/custom_id", json!("h1:malformed")),
+    ] {
+        let mut payload = click_fixture();
+        *payload.pointer_mut(path).expect("fixture path") = value;
+        let interaction = serde_json::from_value(payload).expect("click");
+        assert_eq!(source_cursor(&interaction, 2, 2), None, "{path}");
+    }
+    let mut payload = click_fixture();
+    // Even matching Discord actor metadata cannot authorize a cursor for
+    // someone else. Both the source and cursor must agree with the click.
+    payload["member"]["user"]["id"] = json!("5");
+    payload["message"]["interaction_metadata"]["user"]["id"] = json!("5");
+    let interaction = serde_json::from_value(payload).expect("click");
+    assert_eq!(source_cursor(&interaction, 2, 2), None);
+}
+
 #[test]
 fn private_recovery_replies_have_exact_copy_and_no_controls() {
     for (recovery, kind, title, description) in [

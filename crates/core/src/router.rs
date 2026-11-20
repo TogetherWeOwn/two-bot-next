@@ -185,6 +185,7 @@ pub enum ComponentHandler {
     /// the moderator gate runs in the channel slice, which re-runs the slash
     /// adjudication on the pressing member before any read.
     LockdownPreview,
+    HelpPage,
 }
 
 /// Contract feature slices implement so the router can hand a routed
@@ -997,6 +998,11 @@ impl InteractionRouter {
                 return ComponentOutcome::Ignore;
             }
             ComponentHandler::LockdownPreview
+        } else if crate::help::cursor::Cursor::is_help_control(custom_id) {
+            if !self.guild_ok(guild_id) {
+                return ComponentOutcome::Ignore;
+            }
+            ComponentHandler::HelpPage
         } else {
             return if self.guild_ok(guild_id) {
                 ComponentOutcome::Unknown
@@ -1011,7 +1017,12 @@ impl InteractionRouter {
     /// components. Unknown ids reply only inside the configured guild.
     #[must_use]
     pub fn route_modal(&self, custom_id: &str, guild_id: Option<u64>) -> ComponentOutcome {
-        self.route_component(custom_id, guild_id)
+        match self.route_component(custom_id, guild_id) {
+            ComponentOutcome::Handled {
+                handler: ComponentHandler::HelpPage,
+            } => ComponentOutcome::Unknown,
+            outcome => outcome,
+        }
     }
 
     /// Every built-in slash name the dispatch table recognizes, independent
@@ -1969,6 +1980,29 @@ mod tests {
                 SlashOutcome::Ignore
             );
             assert_eq!(r.route_slash(&ctx(name, None, None)), SlashOutcome::Ignore);
+        }
+    }
+
+    #[test]
+    fn help_controls_use_only_the_reserved_component_namespace_in_the_home_guild() {
+        let r = router();
+        let id = "h1:malformed";
+        assert_eq!(
+            r.route_component(id, Some(GUILD)),
+            ComponentOutcome::Handled {
+                handler: ComponentHandler::HelpPage,
+            }
+        );
+        assert_eq!(r.route_modal(id, Some(GUILD)), ComponentOutcome::Unknown);
+        for guild in [Some(GUILD + 1), None] {
+            assert_eq!(r.route_component(id, guild), ComponentOutcome::Ignore);
+            assert_eq!(r.route_modal(id, guild), ComponentOutcome::Ignore);
+        }
+        for id in ["h1", "h12:malformed", "h2:malformed"] {
+            assert_eq!(
+                r.route_component(id, Some(GUILD)),
+                ComponentOutcome::Unknown
+            );
         }
     }
 
