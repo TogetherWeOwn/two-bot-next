@@ -315,8 +315,19 @@ class OwnedRoomBindingTest(unittest.TestCase):
                  room_state(FOREIGN, name="kiln side room", position=64)]
         fake = make_fake(rooms=rooms, before=before, after=after,
                          creator_name=ORIGINAL_NAME)
-        code, _, _, evidence = run_with_fakes(
-            [], FakeSession(batches), fake)
+        session, now = FakeSession(batches), [0]
+        pump = session.pump
+
+        def after_grace(until, deadline):
+            if session.voices and session.voices[-1][1] is None:
+                now[0] += 180
+                self.assertGreater(deadline, now[0])
+            return pump(until, deadline)
+
+        session.pump = after_grace
+        with mock.patch.object(synth.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.dict(os.environ, {"VOICE_WORK_SECONDS": "300"}):
+            code, _, _, evidence = run_with_fakes(["--grace", "180"], session, fake)
         self.assertEqual(code, 0)
         self.assertEqual(evidence["room_id"], OWN)
         found = verdicts(evidence)
@@ -356,6 +367,25 @@ class OwnedRoomBindingTest(unittest.TestCase):
         self.assertEqual(verdicts(evidence)["create"], "FAIL")
         self.assertEqual(fake.patches, rename_cycle())
         self.assertEqual(fake.rooms[CREATOR]["name"], ORIGINAL_NAME)
+
+    def test_work_deadline_during_creator_restore_still_closes_session(self):
+        session = FakeSession([[GUILD_CREATE]])
+        fake = make_fake(rooms={}, before=[], after=[], creator_name=ORIGINAL_NAME)
+        read, now = fake.rest, [0]
+
+        def expire_during_restore(token, path):
+            if fake.gets_to(CREATOR) == 2:
+                now[0] = 181
+            return read(token, path)
+
+        fake.rest = expire_during_restore
+        with mock.patch.object(synth.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.dict(os.environ, {"VOICE_WORK_SECONDS": "180"}):
+            code, _, _, evidence = run_with_fakes([], session, fake)
+        self.assertEqual((code, verdicts(evidence).get("run")), (1, "FAIL"))
+        self.assertEqual(fake.patches, rename_cycle())
+        self.assertEqual(fake.rooms[CREATOR]["name"], ORIGINAL_NAME)
+        self.assertTrue(session.closed)
 
     def test_move_to_preexisting_room_refuses_before_any_patch(self):
         batches = [[GUILD_CREATE], [voice_update(PRE)]]

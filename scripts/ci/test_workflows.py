@@ -3776,7 +3776,10 @@ def staging_callee_window_errors(name, workflow, consumer):
     if "inputs." in body:
         errors.append(f"{name}:staging-use-release: must never touch the caller's grant inputs")
     # Control credentials and lifecycle commands stay out of the consumer.
+    grant_binding = "'grant_expires_at':'${{inputs.staging_use_expires_at||needs.staging-window.outputs.expires_at}}'"
     consumer_text = str(jobs[consumer]).lower().replace(" ", "")
+    if name == "voice-synthetic.yml":
+        consumer_text = consumer_text.replace(grant_binding, "", 1)
     for marker in ("staging_use", "staging-use", "ownership_control", "staging_ownership"):
         if marker in consumer_text:
             errors.append(f"{name}:{consumer}: must not contain {marker!r} (no control credential)")
@@ -3792,9 +3795,8 @@ def voice_synthetic_errors(workflow):
     `synthetic`, behind the pinned `staging-window` assert job (needs it) and
     the standalone `staging-use-release` job (staging_callee_window_errors),
     with the called-disjoint / standalone-canonical non-cancelling group and a
-    10 minute timeout. Exactly three steps: pinned checkout without persisted
-    credentials, one Run step (the only holder of the token) that runs the
-    reviewed script, and the evidence upload. No wrangler, no production path,
+    10 minute timeout. Record the job deadline before checkout, then run the
+    reviewed script (only this step holds the token) and upload the evidence. No wrangler, no production path,
     no staging Worker URL, no `set -x`.
     """
     name = "voice-synthetic.yml"
@@ -3825,10 +3827,16 @@ def voice_synthetic_errors(workflow):
         if key in job:
             errors.append(f"{name}:synthetic: must not set {key}")
     steps = job.get("steps") or []
-    runs = [step for step in steps if "run" in step]
-    if len(steps) != 3 or len(runs) != 1 or "scripts/staging_voice_synthetic.py" not in runs[0]["run"]:
+    runs = [step for step in steps[1:] if "run" in step]
+    deadline = 'printf \'VOICE_JOB_DEADLINE=%s\\n\' "$(( $(date +%s) + 540 ))" >> "$GITHUB_ENV"'
+    if not steps or set(steps[0]) != {"run"} or steps[0]["run"] != deadline:
+        errors.append(f"{name}:synthetic: must record the runner deadline before checkout")
+    if len(runs) == 1 and runs[0].get("env", {}).get("GRANT_EXPIRES_AT") != (
+            "${{ inputs.staging_use_expires_at || needs.staging-window.outputs.expires_at }}"):
+        errors.append(f"{name}:synthetic: must use the original staging grant deadline")
+    if len(steps) != 4 or len(runs) != 1 or "scripts/staging_voice_synthetic.py" not in runs[0]["run"]:
         errors.append(f"{name}:synthetic: must be checkout, one Run step of the reviewed script, evidence upload")
-    if len(steps) == 3 and steps[2].get("with", {}).get("name") != (
+    if len(steps) == 4 and steps[-1].get("with", {}).get("name") != (
             "voice-synthetic-${{ github.run_id }}"
             "${{ inputs.artifact_invocation != '' && format('-{0}', inputs.artifact_invocation) || '' }}"):
         errors.append(f"{name}:synthetic: evidence artifact must include the optional invocation suffix")
@@ -7098,12 +7106,14 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["synthetic"].pop("if"),
             lambda w: w["jobs"]["synthetic"].__setitem__("environment", "staging"),
             lambda w: w["on"].__setitem__("push", None),
-            lambda w: w["jobs"]["synthetic"]["steps"][1].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["synthetic"]["steps"][2].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["synthetic"]["steps"][0].update(run="true"),
+            lambda w: w["jobs"]["synthetic"]["steps"][2]["env"].pop("GRANT_EXPIRES_AT"),
             lambda w: w["jobs"]["synthetic"]["steps"][0].__setitem__("env", {"T": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}),
             lambda w: w["on"]["workflow_call"]["inputs"].pop("artifact_invocation"),
             lambda w: w["on"]["workflow_call"]["inputs"]["artifact_invocation"].update({"required": "true"}),
             lambda w: w["jobs"]["staging-window"]["steps"][4]["with"].update({"name": "collision"}),
-            lambda w: w["jobs"]["synthetic"]["steps"][2]["with"].update({"name": "collision"}),
+            lambda w: w["jobs"]["synthetic"]["steps"][-1]["with"].update({"name": "collision"}),
         ):
             changed = copy.deepcopy(synthetic)
             mutate(changed)
@@ -7120,7 +7130,7 @@ class WorkflowTests(unittest.TestCase):
             (lambda w: w["jobs"]["rerun-refusal"]["steps"][0].update({"run": "exit 0"}), "terminal failure sentinel"),
             (lambda w: w["jobs"]["rerun-refusal"]["needs"].remove("synthetic"), "terminal failure sentinel"),
             (lambda w: w["jobs"]["synthetic"]["steps"][0].update({"env": {"TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}}), "only the Run step may hold a secret"),
-            (lambda w: w["jobs"]["synthetic"]["steps"][1].update({"run": "wrangler deploy"}), "reviewed script"),
+            (lambda w: w["jobs"]["synthetic"]["steps"][2].update({"run": "wrangler deploy"}), "reviewed script"),
         )
         for mutate, diagnostic in mutations:
             changed = copy.deepcopy(workflow)
@@ -7304,6 +7314,23 @@ class WorkflowTests(unittest.TestCase):
                 self.fail(f"mutation {label!r} did not apply")
             with self.subTest(mutation=label):
                 self.assertTrue(staging_full_window_errors(changed))
+
+    def test_voice_workflow_refuses_attempts_without_cleanup_time(self):
+        voice = self.workflows["voice-synthetic.yml"]["jobs"]["synthetic"]["steps"][2]
+        fake = ('now=1000; date() { printf "%s\n" "$now"; }; '
+                'timeout() { printf "%s\n" "$3"; now=1080; return "$STATUS"; }; '
+                'sleep() { printf "pause\n"; now=$((now+$1)); };\n')
+        for grant, runner, status, attempts in ((999000, 1540, 0, []), (1451000, 1540, 0, []),
+                                               (1591000, 2000, 1, ["450s"]),
+                                               (4000000, 1591, 1, ["450s"]), (4000000, 1540, 0, ["450s"])):
+            with self.subTest(grant=grant, runner=runner, status=status):
+                result = subprocess.run(["bash", "-c", fake + voice["run"]], capture_output=True, text=True,
+                                        env={"TWO_VOICE_SYNTHETIC_BOT_TOKEN": "fixture", "GRANT_EXPIRES_AT": str(grant),
+                                             "VOICE_JOB_DEADLINE": str(runner), "VOICE_WORK_SECONDS": voice["env"]["VOICE_WORK_SECONDS"],
+                                             "STATUS": str(status), "RUN_ID": "1"})
+                self.assertEqual(result.returncode, status or int(not attempts), result.stderr)
+                self.assertEqual([line for line in result.stdout.splitlines() if line.endswith("s")], attempts)
+                self.assertNotIn("pause", result.stdout)
 
     def test_staging_deploy_gates_on_the_voice_synthetic(self):
         job = self.workflows["deploy-staging.yml"]["jobs"]["voice-synthetic"]

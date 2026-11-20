@@ -829,6 +829,7 @@ class Session:
         return None
 
     def voice(self, guild_id, channel_id):
+        self.ws.sock.settimeout(5)
         self.ws.send({"op": 4, "d": {"guild_id": guild_id, "channel_id": channel_id,
                                      "self_mute": True, "self_deaf": True}})
 
@@ -838,6 +839,26 @@ class Session:
 
 
 def run_live(args, token):
+    return _exercise(args, token, rest)
+
+
+def _exercise(args, token, restore_read):
+    deadline = time.monotonic() + float(os.environ.get("VOICE_WORK_SECONDS", "inf"))
+
+    def check_budget():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("voice synthetic work deadline reached")
+
+    # Work reads stop at the cutoff; restoration uses the original read.
+    def rest(token, path):
+        check_budget()
+        return restore_read(token, path)
+
+    def pump(until, until_at):
+        result = s.pump(until, min(deadline, until_at))
+        check_budget()
+        return result
+
     obs = {"grace_seconds": args.grace, "statuses": [], "deleted": False,
            "received_delta": None, "refused_delta": {}}
     before = metrics_value(args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
@@ -845,7 +866,8 @@ def run_live(args, token):
     s = Session(token)
     joined = False
     try:
-        if not s.pump(lambda e: e["t"] == "GUILD_CREATE" and e["d"]["id"] == args.guild, time.monotonic() + 30):
+        check_budget()
+        if not pump(lambda e: e["t"] == "GUILD_CREATE" and e["d"]["id"] == args.guild, time.monotonic() + 30):
             raise RuntimeError("the test bot is not in the staging guild (no GUILD_CREATE)")
         obs["me"] = s.me
         creator = rest(token, f"/channels/{args.creator}")
@@ -866,6 +888,7 @@ def run_live(args, token):
             obs["rename_note"] = ("creator already carries synthetic residue "
                                   f"({original_name!r}); rename skipped, restore it manually")
         else:
+            check_budget()
             obs["rename_attempted"] = True
             status, _ = rest_patch(token, f"/channels/{args.creator}", {"name": temp_name})
             if status == 403:
@@ -891,6 +914,7 @@ def run_live(args, token):
         obs["channels_before"] = rest(token, f"/guilds/{args.guild}/channels")
         pre_existing_ids = {c.get("id") for c in obs["channels_before"]
                             if isinstance(c.get("id"), str)}
+        check_budget()
         s.voice(args.guild, args.creator)
         joined = True
         mark = len(s.events)
@@ -914,11 +938,11 @@ def run_live(args, token):
                               and e["d"].get("user_id") == s.me
                               and e["d"].get("channel_id") not in (None, args.creator, *exclude))
 
-        moved = s.pump(landed(()), time.monotonic() + args.create_within)
+        moved = pump(landed(()), time.monotonic() + args.create_within)
         obs["moved_to"] = moved["d"]["channel_id"] if moved else None
         # Let the status line, any follow-up writes and a late CREATE land
         # before correlating: the create can arrive before or after our move.
-        s.pump(lambda e: False, time.monotonic() + args.settle)
+        pump(lambda e: False, time.monotonic() + args.settle)
         moved_to = obs["moved_to"]
         if moved_to is None or moved_to == args.creator or moved_to in pre_existing_ids:
             obs["room_created"] = None
@@ -965,7 +989,7 @@ def run_live(args, token):
                                              {"user_limit": initial})
                         if back is not None and 200 <= back < 300:
                             try:
-                                final = int(rest(token, f"/channels/{room_id}")
+                                final = int(restore_read(token, f"/channels/{room_id}")
                                             .get("user_limit") or 0)
                             except Exception:
                                 verified = False
@@ -983,6 +1007,7 @@ def run_live(args, token):
                             f"{probed}, original {initial}); restore "
                             f"user_limit to {initial} manually")
 
+                check_budget()
                 obs["limit_attempted"] = True
                 try:
                     status, _ = rest_patch(token, f"/channels/{room_id}",
@@ -1015,7 +1040,7 @@ def run_live(args, token):
                                 else:
                                     if back is not None and 200 <= back < 300:
                                         try:
-                                            final = int(rest(
+                                            final = int(restore_read(
                                                 token, f"/channels/{room_id}")
                                                 .get("user_limit") or 0)
                                         except Exception:
@@ -1061,8 +1086,9 @@ def run_live(args, token):
             # update, a move into a pre-existing room or an unrelated channel
             # without a CREATE never counts.
             rejoin_mark = len(s.events)
+            check_budget()
             s.voice(args.guild, args.creator)
-            again = s.pump(landed((room_id,)), time.monotonic() + args.create_within)
+            again = pump(landed((room_id,)), time.monotonic() + args.create_within)
             rejoin_to = again["d"]["channel_id"] if again else None
             if (rejoin_to is None or rejoin_to == args.creator
                     or rejoin_to == room_id or rejoin_to in pre_existing_ids):
@@ -1077,9 +1103,9 @@ def run_live(args, token):
         left = time.monotonic()
         if rooms:
             gone = set()
-            s.pump(lambda e: e["t"] == "CHANNEL_DELETE" and e["d"]["id"] in rooms
-                   and (gone.add(e["d"]["id"]) or gone >= set(rooms)),
-                   time.monotonic() + args.grace + args.delete_slack)
+            pump(lambda e: e["t"] == "CHANNEL_DELETE" and e["d"]["id"] in rooms
+                 and (gone.add(e["d"]["id"]) or gone >= set(rooms)),
+                 time.monotonic() + args.grace + args.delete_slack)
             gone |= {e["d"]["id"] for e in s.events if e["t"] == "CHANNEL_DELETE"}
             obs["deleted"] = set(rooms) <= gone
             obs["delete_seconds"] = round(time.monotonic() - left, 1)
@@ -1097,16 +1123,17 @@ def run_live(args, token):
         # was lost, which the old applied-only gate left as residue.
         if obs.get("rename_attempted") and not obs.get("rename_forbidden"):
             try:
-                seen_now = rest(token, f"/channels/{args.creator}")
+                seen_now = restore_read(token, f"/channels/{args.creator}")
                 if seen_now.get("name") != obs.get("rename_original", ""):
                     status, _ = rest_patch(token, f"/channels/{args.creator}",
                                            {"name": obs.get("rename_original", "")})
-                    seen = rest(token, f"/channels/{args.creator}")
+                    seen = restore_read(token, f"/channels/{args.creator}")
                     obs["rename_restored"] = (isinstance(status, int) and 200 <= status < 300
                                               and seen.get("name") == obs.get("rename_original"))
             except Exception:
                 obs["rename_restored"] = False
         s.close()
+    check_budget()
     after = metrics_value(args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
     obs["metrics_delta"] = None if before is None or after is None else int(after - before)
     received_before, refused_before = snap_before
@@ -1123,6 +1150,7 @@ def run_live(args, token):
         obs["refused_delta"] = delta
     obs.setdefault("creator", {"id": args.creator})
     obs.setdefault("channels", [])
+    check_budget()
     return obs
 
 

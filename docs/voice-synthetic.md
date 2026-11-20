@@ -124,10 +124,12 @@ no permanent staging keepalive, host timer or new always-on cost is authorized.
   PR's code is not deployed to staging before merge, so a live run would test
   main, not the PR.
 
-Each live run retries twice after 60 s; three failures fail it. The longer
-window covers the documented 95-139 s per-deploy gateway drop as well as a
-transient gateway/REST hiccup. Evidence JSON is
-uploaded as the `voice-synthetic-<run id>` artifact for 14 days. A reusable
+Each live run can retry up to twice after 60 s for a transient failure.
+The original staging grant and job deadline must both have room for the
+retry pause (if any), 300 seconds of work (including the 180-second grace),
+and 150 seconds for cleanup. The work cutoff does not interrupt restoration;
+a separate hard limit bounds the process. Evidence JSON is uploaded as the
+`voice-synthetic-<run id>` artifact for 14 days. A reusable
 workflow caller can provide the optional `artifact_invocation` label to append
 `-<label>` to that artifact and the `staging-use-voice-start-<run id>-<attempt>`
 receipt. An omitted or empty label preserves the original names. Callers with
