@@ -1323,4 +1323,204 @@ async fn preview_handle_reads_live_runtime_without_mutation() {
     });
     assert_eq!(second, first);
     assert_eq!(config.policy.bad_words, vec!["blocked".to_owned()]);
+
+    let mut refreshed = config.clone();
+    refreshed.policy.bad_words.clear();
+    refreshed.dry_run = false;
+    assert!(activation.apply_live_config(&refreshed));
+    activation.preview(|runtime| {
+        assert_ne!(runtime.preview(&message, 0), first);
+        assert_eq!(runtime.preview_with_config(&message, 0, &config), first);
+    });
+}
+
+#[cfg(feature = "db")]
+mod preview_attempt_acceptance {
+    use super::*;
+    use sqlx::{migrate::Migrator, PgPool};
+    use std::time::Duration;
+    use tokio::time::Instant;
+    use twilight_model::application::interaction::Interaction;
+    use two_bot_core::{
+        automod_preview_attempt::AttemptResult,
+        automod_preview_audit::load_preview_audit,
+        automod_preview_input::PreviewInputRefusal,
+        automod_preview_limiter::{PreviewRateLimiter, PREVIEW_MIN_INTERVAL_MS},
+        automod_preview_report::{
+            metric_not_evaluated, metric_rate_limited, metric_unavailable, PreviewMetricLabels,
+            PREVIEW_NOT_EVALUATED_REPLY, PREVIEW_RATE_LIMITED_REPLY, PREVIEW_UNAVAILABLE_REPLY,
+        },
+    };
+    use two_bot_discord::automod_preview_handler::handle_automod_preview;
+    use two_bot_testsupport::TestDatabase;
+
+    const RECEIPT_MS: u64 = 1_700_000_000_000;
+    const CANARY: &str = "synthetic blocked phrase";
+
+    fn interaction(id: &str, guild: &str, text: &str) -> Interaction {
+        serde_json::from_value(json!({
+            "id": id, "application_id": "1111", "type": 2,
+            "attachment_size_limit": 10_485_760, "guild_id": guild,
+            "channel": {"id": CHANNEL, "type": 0},
+            "data": {"id": "1", "type": 1, "name": "automod-preview",
+                "options": [{"name": "text", "type": 3, "value": text}]},
+            "member": {"user": {"id": AUTHOR, "username": "previewer", "discriminator": "0"},
+                "roles": [AUTHOR_ROLE], "flags": 0, "deaf": false, "mute": false},
+            "token": "synthetic-test-token", "version": 1,
+            "authorizing_integration_owners": {"0": guild}, "entitlements": []
+        }))
+        .expect("synthetic preview interaction")
+    }
+
+    async fn run(
+        activation: Option<&AutomodActivation<MemLedger, StaticFacts>>,
+        pool: &PgPool,
+        limiter: &Mutex<PreviewRateLimiter>,
+        interaction: &Interaction,
+        receipt_ms: u64,
+    ) -> AttemptResult {
+        handle_automod_preview(
+            activation,
+            pool,
+            limiter,
+            interaction,
+            receipt_ms,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+    }
+
+    async fn row_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM automation_audit_log")
+            .fetch_one(pool)
+            .await
+    }
+
+    #[tokio::test]
+    async fn discord_preview_refuses_before_claim_then_commits_and_replays(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url =
+            std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap required");
+        let db = TestDatabase::create(&url, &Migrator::DEFAULT).await?;
+        let proof = tokio::spawn(verify_preview_attempts(db.pool().clone())).await;
+        db.close().await?;
+        proof??;
+        Ok(())
+    }
+
+    async fn verify_preview_attempts(pool: PgPool) -> Result<(), sqlx::Error> {
+        sqlx::raw_sql(include_str!(
+            "../../cutover/migrations/0130_custom_commands.sql"
+        ))
+        .execute(&pool)
+        .await?;
+        let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+        let ledger = MemLedger::default();
+        let facts = StaticFacts::default();
+        let activation = AutomodActivation::new(
+            runtime(false),
+            ledger.clone(),
+            facts.clone(),
+            executor(&mock),
+        );
+        let limiter = Mutex::new(PreviewRateLimiter::new());
+        let sample = interaction("4242", STAGING_GUILD_ID, CANARY);
+        let blank = run(
+            None,
+            &pool,
+            &limiter,
+            &interaction("4242", STAGING_GUILD_ID, ""),
+            RECEIPT_MS,
+        )
+        .await;
+        assert_eq!(blank.reply, PreviewInputRefusal::TextBounds.message());
+        assert_eq!(blank.metric, None);
+        let outside = interaction("4242", "9876", CANARY);
+        for (active, request) in [(None, &sample), (Some(&activation), &outside)] {
+            let refused = run(active, &pool, &limiter, request, RECEIPT_MS).await;
+            assert_eq!(refused.reply, PREVIEW_NOT_EVALUATED_REPLY);
+            assert_eq!(refused.metric, Some(metric_not_evaluated()));
+        }
+        let mut missing = sample.clone();
+        missing.data = None;
+        let malformed = run(Some(&activation), &pool, &limiter, &missing, RECEIPT_MS).await;
+        assert_eq!(malformed.reply, PREVIEW_UNAVAILABLE_REPLY);
+        assert_eq!(malformed.metric, Some(metric_unavailable(None)));
+        assert_eq!(row_count(&pool).await?, 0);
+
+        let first = run(Some(&activation), &pool, &limiter, &sample, RECEIPT_MS).await;
+        assert!(first.reply.contains("TWO_AUTOMOD_BAD_WORDS"));
+        assert!(!first.reply.contains(CANARY));
+        assert_eq!(
+            first.metric,
+            Some(PreviewMetricLabels {
+                result: "matched",
+                filter: "bad_words",
+                mode: "dry_run",
+            })
+        );
+        let row = load_preview_audit(&pool, "automod-preview:4242")
+            .await?
+            .expect("the reply is backed by a committed audit row");
+        assert_eq!(row.outcome, "matched");
+        assert_eq!(
+            row.reason.as_deref(),
+            Some("filter=bad_words;exemption=none;mode=dry_run;len=0_50")
+        );
+        assert_eq!(row.created_at, "2023-11-14 22:13:20.000000+00");
+        assert!(first.reply.contains(&row.created_at));
+        assert_eq!(row_count(&pool).await?, 1);
+
+        let rate = run(
+            Some(&activation),
+            &pool,
+            &limiter,
+            &interaction("4243", STAGING_GUILD_ID, CANARY),
+            RECEIPT_MS,
+        )
+        .await;
+        assert_eq!(rate.reply, PREVIEW_RATE_LIMITED_REPLY);
+        assert_eq!(rate.metric, Some(metric_rate_limited(true)));
+        let row = load_preview_audit(&pool, "automod-preview:4243")
+            .await?
+            .expect("rate refusal commits");
+        assert_eq!(row.outcome, "rate_limited");
+        assert_eq!(
+            row.reason.as_deref(),
+            Some("filter=none;exemption=none;mode=dry_run;len=0_50")
+        );
+
+        let enforce = runtime(true).effective_config();
+        assert!(activation.apply_live_config(&enforce));
+        let restarted = Mutex::new(PreviewRateLimiter::new());
+        let later = RECEIPT_MS + PREVIEW_MIN_INTERVAL_MS;
+        let replay = run(Some(&activation), &pool, &restarted, &sample, later).await;
+        assert_eq!(replay.reply, first.reply);
+        assert_eq!(replay.metric, None);
+        assert_eq!(row_count(&pool).await?, 2);
+        let fresh = run(
+            Some(&activation),
+            &pool,
+            &restarted,
+            &interaction("4244", STAGING_GUILD_ID, CANARY),
+            later,
+        )
+        .await;
+        assert_eq!(
+            fresh.metric,
+            Some(PreviewMetricLabels {
+                result: "matched",
+                filter: "bad_words",
+                mode: "enforce",
+            }),
+            "replay must not charge the fresh limiter"
+        );
+        assert_eq!(row_count(&pool).await?, 3);
+        assert_eq!(ledger.claims(), 0);
+        assert_eq!(ledger.violations(), 0);
+        assert_eq!(facts.target_calls(), 0);
+        assert!(calls(&mock).is_empty());
+        mock.shutdown().await;
+        Ok(())
+    }
 }

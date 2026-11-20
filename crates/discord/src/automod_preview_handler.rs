@@ -1,13 +1,34 @@
-//! Discord invocation mapping for `/automod-preview`. The core decoder owns
-//! validation; this module does not authorize, evaluate, or send replies.
+//! Map Discord invocations and drive preview attempts. The router owns
+//! authorization and the caller owns ephemeral delivery and metric emission.
 
+#[cfg(feature = "db")]
+use std::sync::{Mutex, PoisonError};
+
+#[cfg(feature = "db")]
+use tokio::time::Instant;
 use twilight_model::application::interaction::{
     application_command::{CommandData, CommandOptionValue},
     Interaction,
 };
+#[cfg(feature = "db")]
+use twilight_model::application::interaction::{InteractionData, InteractionType};
 use two_bot_core::automod_preview_input::{
     decode_preview_input, DecodedPreviewInput, PreviewInputRefusal, PreviewOptionValue,
 };
+#[cfg(feature = "db")]
+use two_bot_core::{
+    automod_preview_attempt::{attempt_preview, AttemptContext, AttemptResult},
+    automod_preview_flow::{plan_pre_claim, PreClaimPlan},
+    automod_preview_input::build_preview_message,
+    automod_preview_limiter::PreviewRateLimiter,
+    automod_preview_report::{metric_unavailable, PREVIEW_UNAVAILABLE_REPLY},
+    automod_preview_store::SqlPreviewStore,
+    automod_runtime::AutomodClaimLedger,
+    funnel::format_iso_millis,
+};
+
+#[cfg(feature = "db")]
+use crate::automod_activation::{AutomodActivation, AutomodFacts};
 
 /// The invoker's context only. A DM has no guild or roles and must still pass
 /// through the core scope gate, which refuses evaluation.
@@ -69,6 +90,100 @@ pub fn decode_interaction_options(
     data: &CommandData,
 ) -> Result<DecodedPreviewInput, PreviewInputRefusal> {
     decode_preview_input(&map_preview_options(data))
+}
+
+/// Drive an already-authorized slash invocation without sending a reply.
+/// The caller refreshes the shared activation first and reserves time to send
+/// the ephemeral response after `deadline`. `receipt_ms` is captured on receipt,
+/// not after the claim wait. All limiter and runtime locks are synchronous.
+#[cfg(feature = "db")]
+pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
+    activation: Option<&AutomodActivation<L, F>>,
+    pool: &sqlx::PgPool,
+    limiter: &Mutex<PreviewRateLimiter>,
+    interaction: &Interaction,
+    receipt_ms: u64,
+    deadline: Instant,
+) -> AttemptResult {
+    let (InteractionType::ApplicationCommand, Some(InteractionData::ApplicationCommand(data))) =
+        (interaction.kind, interaction.data.as_ref())
+    else {
+        return unavailable(None);
+    };
+    let Some(request) = PreviewRequest::from_interaction(interaction) else {
+        return unavailable(None);
+    };
+    let decoded = decode_interaction_options(data);
+    let scoped = decoded.as_ref().ok().and_then(|input| {
+        let (active, guild) = activation.zip(request.guild_id.as_deref())?;
+        let config = active.preview(|runtime| {
+            runtime
+                .admits(Some(guild))
+                .then(|| runtime.effective_config())
+        })?;
+        Some((active, guild, input, config))
+    });
+    let plan = plan_pre_claim(
+        decoded.as_ref().map_err(|refusal| *refusal),
+        scoped.is_some(),
+        scoped.is_some(),
+        &request.interaction_id.to_string(),
+    );
+    if let PreClaimPlan::AnswerNow { reply, metric } = plan {
+        return AttemptResult { reply, metric };
+    }
+    let Some((active, guild_id, input, config)) = scoped else {
+        return unavailable(None);
+    };
+    let Ok(message) = build_preview_message(
+        input,
+        guild_id,
+        &request.channel_id,
+        &request.actor_id,
+        &request.role_ids,
+        request.interaction_id,
+        receipt_ms,
+    ) else {
+        return unavailable(Some(config.dry_run));
+    };
+    let receipt_iso = format_iso_millis(i64::try_from(receipt_ms).unwrap_or(i64::MAX));
+    let context = AttemptContext {
+        guild_id,
+        actor_id: &request.actor_id,
+        channel_id: &request.channel_id,
+        receipt_iso: &receipt_iso,
+        dry_run: config.dry_run,
+    };
+    attempt_preview(
+        plan,
+        context,
+        SqlPreviewStore::new(pool, deadline),
+        || {
+            limiter
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .check_and_admit(
+                    &request.actor_id,
+                    guild_id,
+                    request.interaction_id,
+                    receipt_ms,
+                )
+        },
+        || {
+            active.preview(|runtime| {
+                runtime.preview_with_config(&message, input.mention_count, &config)
+            })
+        },
+    )
+    .await
+}
+
+#[cfg(feature = "db")]
+fn unavailable(dry_run: Option<bool>) -> AttemptResult {
+    AttemptResult {
+        reply: PREVIEW_UNAVAILABLE_REPLY.to_owned(),
+        metric: Some(metric_unavailable(dry_run)),
+    }
 }
 
 #[cfg(test)]

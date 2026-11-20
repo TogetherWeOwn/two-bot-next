@@ -249,7 +249,20 @@ impl AutomodRuntime {
     /// build nor break a real streak.
     #[must_use]
     pub fn preview(&self, message: &AutomodMessage, mention_count: usize) -> PreviewVerdict {
-        preview_automod(message, mention_count, &self.config, &self.repeats)
+        self.preview_with_config(message, mention_count, &self.config)
+    }
+
+    /// Use the effective config captured at preview admission, even if the
+    /// live policy refreshed while the caller waited for the audit claim.
+    /// This still reads the same runtime's repeat history without mutating it.
+    #[must_use]
+    pub fn preview_with_config(
+        &self,
+        message: &AutomodMessage,
+        mention_count: usize,
+        config: &AutomodConfig,
+    ) -> PreviewVerdict {
+        preview_automod(message, mention_count, config, &self.repeats)
     }
 
     /// The shared maintenance tick can expire idle authors without receiving
