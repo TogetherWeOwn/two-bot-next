@@ -4310,6 +4310,45 @@ impl ActionExecutor {
         .await
     }
 
+    /// Complete a deferred interaction with one sanitized embed. Only admission
+    /// failures that did not reach Discord are retried.
+    pub async fn edit_interaction_response_embed_with_blocked_retry(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        embed: &twilight_model::channel::message::embed::Embed,
+    ) -> Result<(), DiscordError> {
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
+        let response = twilight_model::http::interaction::InteractionResponse {
+            kind: twilight_model::http::interaction::InteractionResponseType::UpdateMessage,
+            data: Some(twilight_model::http::interaction::InteractionResponseData {
+                embeds: Some(vec![embed.clone()]),
+                ..Default::default()
+            }),
+        };
+        let safe = crate::message_safety::interaction_response(&response)?;
+        let embeds = safe.data.and_then(|data| data.embeds).unwrap_or_default();
+        let mentions = AllowedMentions::default();
+        self.retry_admission_blocked(|_| async {
+            let req = Self::request_of(
+                self.inner
+                    .factory
+                    .interaction(application)
+                    .update_response(interaction_token)
+                    .content(Some(""))
+                    .embeds(Some(&embeds))
+                    .allowed_mentions(Some(&mentions)),
+            )?;
+            let req = Self::explicit_mentions(req, &mentions)?;
+            let mut res = self.call_once_raw(req, &[200]).await?;
+            mutation_receipt_id(&res.body)?;
+            res.complete().await;
+            Ok(())
+        })
+        .await
+    }
+
     /// [`ActionExecutor::edit_interaction_response_with_components`] with the
     /// same bounded contention tolerance as
     /// [`ActionExecutor::edit_interaction_response_with_blocked_retry`]:

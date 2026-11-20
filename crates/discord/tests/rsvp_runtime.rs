@@ -311,6 +311,7 @@ fn assert_reply_kind(mock: &MockRest, content: &str, deferred: bool, kind: Embed
             last.path,
             "/api/v10/webhooks/1111/mock-rsvp-token/messages/@original"
         );
+        assert_eq!(body["content"], "", "deferred reply must use an embed");
         // This fixture supplies a numeric event ID, not a pasted link; the
         // latter's appended event identity is covered by the link fixtures.
         assert_eq!(attendance_reply::deferred_text(&body, kind), content);
@@ -322,6 +323,19 @@ fn assert_reply_kind(mock: &MockRest, content: &str, deferred: bool, kind: Embed
         assert_eq!(body["data"]["flags"], 64);
         assert_eq!(body["data"]["content"], content);
     }
+}
+
+fn capture_reply(mock: &MockRest, filename: &str) {
+    let Some(directory) = std::env::var_os("RSVP_REPLY_CAPTURE_DIR").filter(|dir| !dir.is_empty())
+    else {
+        return;
+    };
+    let requests = mock.requests();
+    let reply = requests.last().expect("capture deferred RSVP reply");
+    assert_eq!(reply.method, "PATCH");
+    // Copy only the raw JSON body, never the token-bearing request path.
+    let file = std::path::PathBuf::from(directory).join(filename);
+    std::fs::write(file, &reply.body).expect("write synthetic RSVP reply body");
 }
 
 fn runtime(pool: &Pool<Postgres>, mock: &MockRest) -> InteractionRuntime {
@@ -487,6 +501,8 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
 
 #[tokio::test]
 async fn missing_cancelled_and_malformed_events_refuse_without_writes() {
+    const CANCELLED_REPLY: &str = "That scheduled event is cancelled.";
+
     let Some(fixture) = pool().await else {
         return;
     };
@@ -495,7 +511,7 @@ async fn missing_cancelled_and_malformed_events_refuse_without_writes() {
             ScriptedResponse::status(404),
             "No scheduled event with that id exists in this server.",
         ),
-        (event(4), "That scheduled event is cancelled."),
+        (event(4), CANCELLED_REPLY),
         (
             ScriptedResponse::json(200, json!({"id": EVENT, "guild_id": "999", "status": 1})),
             "Discord returned an invalid scheduled event status.",
@@ -541,6 +557,9 @@ async fn missing_cancelled_and_malformed_events_refuse_without_writes() {
         assert_reply(&mock, reply, true);
         assert_eq!(mock.requests().len(), 4);
         assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+        if reply == CANCELLED_REPLY {
+            capture_reply(&mock, "cancelled.json");
+        }
         mock.shutdown().await;
     }
     fixture.close().await;
@@ -629,10 +648,10 @@ async fn totals_remain_readable_without_live_event_access() {
     )
     .await
     .unwrap();
-    for unavailable in [
-        ScriptedResponse::status(404),
-        event(4),
-        ScriptedResponse::status(403),
+    for (unavailable, capture) in [
+        (ScriptedResponse::status(404), Some("historical.json")),
+        (event(4), None),
+        (ScriptedResponse::status(403), None),
     ] {
         let mock = MockRest::start(
             vec![
@@ -660,6 +679,9 @@ async fn totals_remain_readable_without_live_event_access() {
         assert_eq!(mock.requests().len(), 2);
         assert!(mock.requests().iter().all(|r| r.method != "GET"));
         assert_eq!(counts(fixture.pool()).await, (1, 0, 0));
+        if let Some(filename) = capture {
+            capture_reply(&mock, filename);
+        }
         mock.shutdown().await;
     }
     fixture.close().await;
@@ -1390,6 +1412,7 @@ async fn rsvp_refused_rewrite_restores_previous_response() {
     run(fixture.pool(), &saved, &rsvp(810, "going")).await;
     assert_success_reply(&saved, "RSVP saved: going.");
     assert_eq!(saved.requests().len(), 6);
+    capture_reply(&saved, "saved.json");
     saved.shutdown().await;
     let before: (String, String) = sqlx::query_as(
         "SELECT status, responded_at::text FROM event_rsvps WHERE guild_id=$1 AND event_id=$2 AND user_id=$3",

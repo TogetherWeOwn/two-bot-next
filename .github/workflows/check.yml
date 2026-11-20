@@ -252,11 +252,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL -o "$RUNNER_TEMP/actionlint.tgz" \
-            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
-          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
-          "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes=
+          # Keep the pinned release and backport only native queue validation.
+          tools=$(mktemp -d "$RUNNER_TEMP/actionlint.XXXXXX")
+          trap 'rm -rf -- "$tools"' EXIT
+          curl -fsSL -o "$tools/go.tgz" https://go.dev/dl/go1.26.11.linux-amd64.tar.gz
+          printf '%s  %s\n' 9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec "$tools/go.tgz" | sha256sum -c -
+          tar -xzf "$tools/go.tgz" -C "$tools"
+          curl -fsSL -o "$tools/source.zip" https://proxy.golang.org/github.com/rhysd/actionlint/@v/v1.7.12.zip
+          printf '%s  %s\n' d954c3f877cc5b98a10852bbb642c49758948d9527f1b588a544b6309d336ec2 "$tools/source.zip" | sha256sum -c -
+          python3 -I -m zipfile -e "$tools/source.zip" "$tools/src"
+          src="$tools/src/github.com/rhysd/actionlint@v1.7.12"
+          git -C "$src" apply --unidiff-zero "$GITHUB_WORKSPACE/scripts/ci/actionlint-queue.patch"
+          (
+            cd "$src"
+            export GOENV=off GOTOOLCHAIN=local GOWORK=off CGO_ENABLED=0 GOFLAGS=-mod=readonly
+            export GOCACHE="$tools/cache" GOMODCACHE="$tools/modules"
+            export GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org GOPRIVATE= GONOPROXY= GONOSUMDB=
+            sha256sum go.mod go.sum > "$tools/dependencies.sha256"
+            "$tools/go/bin/go" test -v -run '^TestLinterLintOK$/^concurrency_queue\.yaml$' .
+            "$tools/go/bin/go" test -v -run '^TestLinterLintError$/^err$/^(concurrency_queue|case_sensitive_keys|unexpected_keys)$' .
+            "$tools/go/bin/go" build -trimpath -buildvcs=false -o "$tools/actionlint" ./cmd/actionlint
+            sha256sum -c "$tools/dependencies.sha256"
+          )
+          "$tools/actionlint" -shellcheck= -pyflakes=
 
       - name: offline build-cache safety regressions
         run: |
@@ -920,6 +938,19 @@ jobs:
       - name: prepare gateway lifecycle acceptance
         run: python3 tests/gateway_lifecycle/prepare.py --prepare
 
+      - name: Prepare synthetic RSVP reply capture
+        id: rsvp_reply_capture
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          # The PR job can test a synthetic merge; record the actual source tree.
+          checkout=$(git rev-parse HEAD)
+          tree=$(git rev-parse 'HEAD^{tree}')
+          printf 'RSVP capture source: %s (tree %s)\n' "$checkout" "$tree"
+          directory=$(mktemp -d "$RUNNER_TEMP/rsvp-replies.XXXXXX")
+          printf 'directory=%s\n' "$directory" >> "$GITHUB_OUTPUT"
+          # Keep CI-only artifact output out of the mirrored DB step environment.
+          printf 'RSVP_REPLY_CAPTURE_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
+
       # The standalone backup fixture has its own scratch-only URL guard.
       # Supplying it here executes the round trip rather than its local skip.
       - name: cargo test (integration, including website acceptance and backup round trip)
@@ -945,6 +976,32 @@ jobs:
           --skip saturated_write_warns_with_identifiers_and_no_raw_counter
           --skip normal_uses_round_trip_byte_identical
           --skip exact_i32_max_writes_without_saturation_warn
+
+      - name: Verify synthetic RSVP reply capture
+        if: steps.rsvp_reply_capture.outputs.directory != ''
+        run: |
+          # Do not capture from any later test step in this job.
+          printf 'RSVP_REPLY_CAPTURE_DIR=\n' >> "$GITHUB_ENV"
+          for name in saved.json cancelled.json historical.json; do
+            file="${RSVP_REPLY_CAPTURE_DIR:?}/$name"
+            if [ -L "$file" ] || [ ! -f "$file" ] || [ ! -s "$file" ] ||
+              ! size=$(wc -c < "$file") || [ "$size" -gt 16384 ]; then
+              printf 'Missing or invalid synthetic RSVP capture: %s\n' "$name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload synthetic RSVP replies
+        if: steps.rsvp_reply_capture.outputs.directory != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: synthetic-rsvp-replies-${{ github.run_attempt }}
+          path: |
+            ${{ steps.rsvp_reply_capture.outputs.directory }}/saved.json
+            ${{ steps.rsvp_reply_capture.outputs.directory }}/cancelled.json
+            ${{ steps.rsvp_reply_capture.outputs.directory }}/historical.json
+          if-no-files-found: error
+          retention-days: 14
 
       # Invite saturation acceptance is DB-backed and racy under parallelism
       # (nanos+pid schema nonce; one head collided on CREATE SCHEMA with a

@@ -7418,6 +7418,17 @@ class WorkflowTests(unittest.TestCase):
         # The chain stays ordered: hold first, gates second, deploy third, synthetic last.
         self.assertEqual(staging["jobs"]["voice-synthetic"].get("needs"), "deploy")
 
+    def test_staging_ownership_preflight_guards_the_wrangler_deploy(self):
+        steps = self.workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
+        command = "node ../tooling/wrangler/scripts/ownership-control.mjs deployment-preflight"
+        preflights = [i for i, step in enumerate(steps) if step.get("run", "").strip() == command]
+        self.assertEqual(len(preflights), 1)
+        deploy = next(i for i, step in enumerate(steps) if step.get("id") == "deploy")
+        self.assertLess(preflights[0], deploy)
+        self.assertEqual(steps[preflights[0]].get("if"), "${{ !inputs.release_fence }}")
+        self.assertFalse(steps[preflights[0]].get("continue-on-error", False))
+        self.assertNotIn("if", steps[deploy])
+
     def test_staging_takeover_fence_hint_is_scoped_to_the_fenced_refusal(self):
         # Execute the actual workflow shell with a stub control client. This
         # catches swapped case bodies as well as an unscoped fence hint.

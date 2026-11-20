@@ -34,17 +34,22 @@ Retain exact-SHA receipts; this is not pre-merge staging or permission to act
 through a hold.
 
 Before merge, verify required GitHub Actions checks and Devin Review on the
-exact PR head, all applicable specialist and native review, and finding
-dispositions. Require fresh per-PR exact-head Release Manager acceptance with
-the migration ledger entry (or `no migration`) and rollback target. Preserve
-every incident/freeze/hold safeguard, identity/capability hold and red staging
-drill or other deterministic gate. A new head needs fresh review/check evidence
-and a new confirmation. Historical rejections are not retroactive approvals;
-their remaining conditions must be met before resubmission. The final-stage
-reviewer performs the SHA-pinned squash merge before final approval and records
-the squash SHA and decision in the release log; the author merges only without
-a review stage. This policy claims no staging pass or hold lift and authorizes
-no pipeline skip, no-op implementation, deployment or other production action.
+exact PR head, Security before QA where required, other applicable review, and
+finding dispositions. A verified non-deploying bot merge needs no standing
+Release Manager confirmation. If a merge would deploy production or deployment
+cannot be ruled out, require exact-head Release Manager approval on the source
+card, with the migration ledger entry (or `no migration`) and rollback target.
+Preserve all incident, freeze, identity/capability and other holds, red staging
+drills, and other deterministic gates. A new head needs fresh review and check
+evidence and, when required, fresh Release Manager approval. Historical
+rejections are not approvals; meet their remaining conditions before resubmitting.
+
+The final-stage reviewer performs the SHA-pinned squash merge before final
+approval and records the squash SHA and any applicable PR approval in the release
+log. The author merges only without a review stage. Record the production
+decision separately when the Release Manager accepts the full release SHA.
+This policy claims no staging pass or hold lift and authorizes no pipeline skip,
+no-op implementation, deployment or other production action.
 
 ## What merits a finding
 

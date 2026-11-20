@@ -1,0 +1,104 @@
+Backport rhysd/actionlint@644076a59742c2d1540ebd4686eab3c308f0e562 to v1.7.12.
+Remove once a pinned release ships queue syntax and the associated checks.
+
+diff --git a/ast.go b/ast.go
+--- a/ast.go
++++ b/ast.go
+@@ -402,0 +403,2 @@
++	// Queue is the queue strategy for pending workflow runs. Valid values are "single" (default) and "max".
++	Queue *String
+diff --git a/parse.go b/parse.go
+--- a/parse.go
++++ b/parse.go
+@@ -822,0 +823,10 @@
++		case "queue":
++			ret.Queue = p.parseString(e.val, false)
++			if ret.Queue != nil && !ret.Queue.ContainsExpression() {
++				switch ret.Queue.Value {
++				case "max", "single":
++					// ok
++				default:
++					p.errorf(e.val, "invalid value %q for \"queue\" in \"concurrency\" section. valid values are \"max\" and \"single\"", ret.Queue.Value)
++				}
++			}
+@@ -824 +834 @@
+-			p.unexpectedKey(e.key, "concurrency", []string{"group", "cancel-in-progress"})
++			p.unexpectedKey(e.key, "concurrency", []string{"cancel-in-progress", "group", "queue"})
+@@ -828,0 +839,3 @@
++	}
++	if ret.Queue != nil && ret.CancelInProgress != nil && !ret.Queue.ContainsExpression() && ret.Queue.Value == "max" && ret.CancelInProgress.Expression == nil && ret.CancelInProgress.Value {
++		p.errorfAt(ret.Queue.Pos, "\"queue: max\" cannot be combined with \"cancel-in-progress: true\" in \"concurrency\" section")
+diff --git a/rule_expression.go b/rule_expression.go
+--- a/rule_expression.go
++++ b/rule_expression.go
+@@ -511,0 +512 @@
++	rule.checkString(c.Queue, workflowKey)
+diff --git a/testdata/err/case_sensitive_keys.out b/testdata/err/case_sensitive_keys.out
+--- a/testdata/err/case_sensitive_keys.out
++++ b/testdata/err/case_sensitive_keys.out
+@@ -11 +11 @@
+-test.yaml:33:3: unexpected key "GROUP" for "concurrency" section. expected one of "cancel-in-progress", "group" [syntax-check]
++test.yaml:33:3: unexpected key "GROUP" for "concurrency" section. expected one of "cancel-in-progress", "group", "queue" [syntax-check]
+@@ -13 +13 @@
+-test.yaml:41:7: unexpected key "GROUP" for "concurrency" section. expected one of "cancel-in-progress", "group" [syntax-check]
++test.yaml:41:7: unexpected key "GROUP" for "concurrency" section. expected one of "cancel-in-progress", "group", "queue" [syntax-check]
+diff --git a/testdata/err/concurrency_queue.out b/testdata/err/concurrency_queue.out
+new file mode 100644
+--- /dev/null
++++ b/testdata/err/concurrency_queue.out
+@@ -0,0 +1,2 @@
++test.yaml:5:10: invalid value "invalid" for "queue" in "concurrency" section. valid values are "max" and "single" [syntax-check]
++test.yaml:13:14: "queue: max" cannot be combined with "cancel-in-progress: true" in "concurrency" section [syntax-check]
+diff --git a/testdata/err/concurrency_queue.yaml b/testdata/err/concurrency_queue.yaml
+new file mode 100644
+--- /dev/null
++++ b/testdata/err/concurrency_queue.yaml
+@@ -0,0 +1,15 @@
++on: push
++
++concurrency:
++  group: test
++  queue: invalid
++
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    concurrency:
++      group: job-test
++      cancel-in-progress: true
++      queue: max
++    steps:
++      - run: echo
+diff --git a/testdata/err/unexpected_keys.out b/testdata/err/unexpected_keys.out
+--- a/testdata/err/unexpected_keys.out
++++ b/testdata/err/unexpected_keys.out
+@@ -11 +11 @@
+-test.yaml:32:3: unexpected key "invalid_key" for "concurrency" section. expected one of "cancel-in-progress", "group" [syntax-check]
++test.yaml:32:3: unexpected key "invalid_key" for "concurrency" section. expected one of "cancel-in-progress", "group", "queue" [syntax-check]
+diff --git a/testdata/ok/concurrency_queue.yaml b/testdata/ok/concurrency_queue.yaml
+new file mode 100644
+--- /dev/null
++++ b/testdata/ok/concurrency_queue.yaml
+@@ -0,0 +1,22 @@
++on: push
++
++concurrency:
++  group: deploy-queue
++  queue: max
++
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    concurrency:
++      group: job-queue
++      cancel-in-progress: false
++      queue: max
++    steps:
++      - run: echo "deploy"
++  test2:
++    runs-on: ubuntu-latest
++    concurrency:
++      group: job-single
++      queue: single
++    steps:
++      - run: echo "single"
