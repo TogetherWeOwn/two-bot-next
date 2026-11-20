@@ -69,13 +69,14 @@ impl Cursor {
         )
     }
 
+    /// The wire target is one-based so it matches the button label.
     pub fn encode(self) -> String {
         format!(
             "{NAMESPACE}:{}:{}:{}:{}",
             hex::encode(self.revision.0),
             self.actor,
             self.expires_at,
-            self.page
+            self.page + 1
         )
     }
 
@@ -101,7 +102,10 @@ impl Cursor {
         hex::decode_to_slice(digest, &mut bytes).ok()?;
         let actor = decimal(parts.next()?, 20)?.parse().ok()?;
         let expires_at = decimal(parts.next()?, 10)?.parse().ok()?;
-        let page = decimal(parts.next()?, 3)?.parse().ok()?;
+        let page = decimal(parts.next()?, 3)?
+            .parse::<usize>()
+            .ok()?
+            .checked_sub(1)?;
         if parts.next().is_some() {
             return None;
         }
@@ -117,17 +121,14 @@ impl Cursor {
         current: Revision,
         page_count: usize,
     ) -> Result<(usize, u64), CursorError> {
-        if actor != self.actor || self.expires_at > now.saturating_add(LIFETIME_SECONDS) {
+        if actor != self.actor || self.page >= page_count {
             return Err(CursorError::Invalid);
-        }
-        if now >= self.expires_at {
-            return Err(CursorError::Expired);
         }
         if current != self.revision {
             return Err(CursorError::Stale);
         }
-        if self.page >= page_count {
-            return Err(CursorError::Invalid);
+        if now >= self.expires_at || self.expires_at > now.saturating_add(LIFETIME_SECONDS) {
+            return Err(CursorError::Expired);
         }
         Ok((self.page, self.expires_at))
     }
@@ -179,23 +180,26 @@ mod tests {
         .expect("largest cursor");
         let id = valid.encode();
         assert_eq!(id.len(), MAX_ID_BYTES);
+        assert!(id.ends_with(&format!(":{MAX_HELP_PAGES}")));
         assert_eq!(Cursor::parse(&id), Some(valid));
         for malformed in [
-            format!("h2:{digest}:1:2:0"),
-            format!("h1:{}:1:2:0", digest.to_uppercase()),
-            format!("h1:{}:1:2:0", "g".repeat(32)),
-            format!("h1:{}:1:2:0", &digest[1..]),
-            format!("h1:{digest}:18446744073709551616:2:0"),
-            format!("h1:{digest}:0:2:0"),
-            format!("h1:{digest}::2:0"),
-            format!("h1:{digest}:01:2:0"),
-            format!("h1:{digest}:1:+2:0"),
-            format!("h1:{digest}:1:0:0"),
-            format!("h1:{digest}:1:10000000000:0"),
+            format!("h2:{digest}:1:2:1"),
+            format!("h1:{}:1:2:1", digest.to_uppercase()),
+            format!("h1:{}:1:2:1", "g".repeat(32)),
+            format!("h1:{}:1:2:1", &digest[1..]),
+            format!("h1:{digest}:18446744073709551616:2:1"),
+            format!("h1:{digest}:0:2:1"),
+            format!("h1:{digest}::2:1"),
+            format!("h1:{digest}:01:2:1"),
+            format!("h1:{digest}:1:+2:1"),
+            format!("h1:{digest}:1:0:1"),
+            format!("h1:{digest}:1:10000000000:1"),
             format!("h1:{digest}:1:2"),
-            format!("h1:{digest}:1:2:0:"),
+            format!("h1:{digest}:1:2:1:"),
+            format!("h1:{digest}:1:2:0"),
+            format!("h1:{digest}:1:2:01"),
             format!("h1:{digest}:1:2:-1"),
-            format!("h1:{digest}:1:2:{MAX_HELP_PAGES}"),
+            format!("h1:{digest}:1:2:{}", MAX_HELP_PAGES + 1),
             format!("h1:{digest}:1:2:1111"),
             format!("{id}:trailing"),
         ] {
@@ -211,12 +215,16 @@ mod tests {
         let cursor = Cursor::new(revision, 42, expires_at, 8).expect("valid cursor");
         assert_eq!(cursor.target(42, now, revision, 9), Ok((8, expires_at)));
         assert_eq!(cursor.target(42, now + 1, revision, 9), Ok((8, expires_at)));
+        let changed = Revision([2; 16]);
         for (actor, time, current, count, error) in [
             (43, now, revision, 9, CursorError::Invalid),
-            (42, now - 1, revision, 9, CursorError::Invalid),
+            (43, expires_at, changed, 9, CursorError::Invalid),
+            (42, now - 1, revision, 9, CursorError::Expired),
             (42, expires_at, revision, 9, CursorError::Expired),
-            (42, now, Revision([2; 16]), 9, CursorError::Stale),
+            (42, now, changed, 9, CursorError::Stale),
+            (42, expires_at, changed, 9, CursorError::Stale),
             (42, now, revision, 8, CursorError::Invalid),
+            (42, expires_at, changed, 8, CursorError::Invalid),
         ] {
             assert_eq!(cursor.target(actor, time, current, count), Err(error));
         }
