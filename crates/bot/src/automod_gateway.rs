@@ -208,7 +208,7 @@ pub(crate) fn refresh_live<L: AutomodClaimLedger, F: AutomodFacts>(
 /// deployment environment is the base, the live snapshot overlays stored
 /// lists/thresholds. Parked or pre-first-poll readers layer nothing, so the
 /// rebuild is a no-op until the first publish moves.
-fn refresh_from_poller<L: AutomodClaimLedger, F: AutomodFacts>(
+pub(crate) fn refresh_from_poller<L: AutomodClaimLedger, F: AutomodFacts>(
     activation: &AutomodActivation<L, F>,
     guild_id: Option<&str>,
 ) {

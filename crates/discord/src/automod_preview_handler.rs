@@ -89,7 +89,8 @@ pub fn decode_interaction_options(
     decode_preview_input(&map_preview_options(data))
 }
 
-/// Drive an authorized invocation with a refreshed activation and its UTC receipt.
+/// Drive an authorized invocation with its UTC receipt. Refresh the shared
+/// activation after decode and scope, before capturing the preview snapshot.
 /// The caller owns ephemeral delivery and reserves time for it after `deadline`.
 #[cfg(feature = "db")]
 pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
@@ -99,6 +100,7 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     interaction: &Interaction,
     receipt_ms: u64,
     deadline: Instant,
+    refresh: impl FnOnce(&AutomodActivation<L, F>, &str),
 ) -> AttemptResult {
     let (InteractionType::ApplicationCommand, Some(InteractionData::ApplicationCommand(data))) =
         (interaction.kind, interaction.data.as_ref())
@@ -111,6 +113,10 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     let decoded = decode_interaction_options(data);
     let scoped = decoded.as_ref().ok().and_then(|input| {
         let (active, guild) = activation.zip(request.guild_id.as_deref())?;
+        if !active.preview(|runtime| runtime.admits(Some(guild))) {
+            return None;
+        }
+        refresh(active, guild);
         let snapshot =
             active.preview(|runtime| runtime.preview_snapshot(guild, &request.actor_id))?;
         Some((guild, input, snapshot))

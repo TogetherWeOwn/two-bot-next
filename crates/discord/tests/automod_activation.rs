@@ -1390,9 +1390,21 @@ mod preview_attempt_acceptance {
         let outside = interaction("4242", "9876", CANARY);
         let mut missing = request.clone();
         missing.data = None;
+        let refreshes = AtomicUsize::new(0);
         let run = |active, limit, request, receipt| {
             let deadline = Instant::now() + Duration::from_secs(5);
-            handle_automod_preview(active, &pool, limit, request, receipt, deadline)
+            handle_automod_preview(
+                active,
+                &pool,
+                limit,
+                request,
+                receipt,
+                deadline,
+                |_, guild| {
+                    assert_eq!(guild, STAGING_GUILD_ID);
+                    refreshes.fetch_add(1, Ordering::Relaxed);
+                },
+            )
         };
         let count_sql = "SELECT COUNT(*) FROM automation_audit_log";
         let count = || sqlx::query_scalar::<_, i64>(count_sql).fetch_one(&pool);
@@ -1401,6 +1413,7 @@ mod preview_attempt_acceptance {
         let text_bounds = (PreviewInputRefusal::TextBounds.message(), None);
         for (activation, request, expected) in [
             (None, &blank, text_bounds),
+            (active, &blank, text_bounds),
             (None, &request, not_evaluated),
             (active, &outside, not_evaluated),
             (active, &missing, unavailable),
@@ -1409,6 +1422,7 @@ mod preview_attempt_acceptance {
             assert_eq!((result.reply.as_str(), result.metric), expected);
         }
         assert_eq!(count().await?, 0);
+        assert_eq!(refreshes.load(Ordering::Relaxed), 0);
 
         let _guard = AUTOMOD_DECISION_SERIES_GUARD.lock().await;
         for (id, at) in [("4210", RECEIPT_MS - 30_000), ("4211", RECEIPT_MS - 1)] {
@@ -1437,6 +1451,7 @@ mod preview_attempt_acceptance {
             holder.rollback().await
         };
         let (first, released) = tokio::join!(run(active, &limiter, &request, RECEIPT_MS), release);
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
         released?;
         assert!(first.reply.contains("TWO_AUTOMOD_REPEAT_COUNT"));
         assert!(!first.reply.contains(CANARY));

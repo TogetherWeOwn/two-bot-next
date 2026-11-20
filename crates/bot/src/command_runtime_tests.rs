@@ -1527,6 +1527,82 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
+async fn automod_preview_router_refuses_before_decode_and_only_answers_privately() {
+    use two_bot_core::automod_preview_input::PreviewInputRefusal;
+    use two_bot_core::automod_preview_report::PREVIEW_NOT_EVALUATED_REPLY;
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let router_gates = RouterGates {
+        moderation: true,
+        ..gates(false, false)
+    };
+    let runtime = runtime_without_db(router_gates, false, origin);
+    let permission_reply = RouterRefusal::AutomodPreviewPermission.message();
+    let denied = permission_reply.as_str();
+    let cases = [
+        (Some(Permissions::empty()), "", denied),
+        (Some(Permissions::MANAGE_MESSAGES), "", denied),
+        (Some(Permissions::MODERATE_MEMBERS), "", denied),
+        (None, "", denied),
+        (
+            Some(Permissions::MANAGE_GUILD),
+            "",
+            PreviewInputRefusal::TextBounds.message(),
+        ),
+        (
+            Some(Permissions::MANAGE_GUILD),
+            "synthetic <@everyone> https://example.invalid",
+            PREVIEW_NOT_EVALUATED_REPLY,
+        ),
+    ];
+    for (permissions, text, _) in cases {
+        let mut interaction = slash(
+            "automod-preview",
+            Some(CHANNEL),
+            vec![option("text", CommandOptionValue::String(text.to_owned()))],
+        );
+        interaction
+            .member
+            .as_mut()
+            .expect("invoking member")
+            .permissions = permissions;
+        runtime.on_interaction(&interaction).await;
+    }
+    let mut dm = slash("automod-preview", Some(CHANNEL), Vec::new());
+    dm.guild_id = None;
+    dm.member = None;
+    if let Some(InteractionData::ApplicationCommand(command)) = dm.data.as_mut() {
+        command.guild_id = None;
+    }
+    runtime.on_interaction(&dm).await;
+
+    let requests = mock.requests();
+    let expected = cases
+        .map(|(_, _, reply)| reply)
+        .into_iter()
+        .chain([PREVIEW_NOT_EVALUATED_REPLY]);
+    assert_eq!(
+        requests.len(),
+        cases.len() + 1,
+        "only one callback per invocation"
+    );
+    for (request, expected) in requests.iter().zip(expected) {
+        assert_eq!(request.method, "POST");
+        assert!(request.path.ends_with("/callback"));
+        let reply: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("callback JSON");
+        assert_eq!(reply["type"], 4);
+        assert_eq!(reply["data"]["flags"], 64);
+        assert_eq!(reply["data"]["content"], expected);
+        assert_eq!(
+            reply["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn unconfirmed_help_does_not_invent_a_live_registry() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
