@@ -136,9 +136,12 @@ file paths, retries or staging ownership.
 
 ### REST counter measurement
 
-Use a **fresh** `voice-rest-measurement.yml` dispatch on `main` when staging
-serves that commit. Do not rerun an old attempt. The workflow holds the shared
-`staging-lifecycle` lock through cleanup and uses one 45-minute staging grant.
+Use a **fresh** `voice-rest-measurement.yml` dispatch on protected `main` when
+staging serves that commit. Keep case variants of `main` outside branch
+protection: Actions compares ref names case-insensitively, so the lock selector
+also requires `github.ref_protected`. Other refs and reruns fail without entering
+the staging queue. An admitted run holds the shared `staging-lifecycle` lock
+through cleanup and uses one 45-minute staging grant.
 It calls the voice synthetic once, and a second time only if the first valid
 all-label counter delta is below 10. It never renews the grant.
 

@@ -206,7 +206,7 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
                 "voice-before/voice-before.json", "voice-middle/voice-after.json", "voice-final.json")),
         }})
 
-    def test_only_fresh_main_dispatch_can_hold_the_grant(self):
+    def test_only_fresh_protected_main_dispatch_can_hold_the_grant(self):
         workflows = policy.load_workflows()
         workflow = workflows[WORKFLOW]
         self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
@@ -214,7 +214,7 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
         canonical = workflows[lifecycle.DEPLOY]["concurrency"]["group"]
         self.assertEqual(workflow["concurrency"], {
             "group": "${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
-            "&& github.run_attempt == 1 && '" + canonical + "' || "
+            "&& github.ref_protected && github.run_attempt == 1 && '" + canonical + "' || "
             "format('voice-rest-measurement-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
             "cancel-in-progress": "false", "queue": "max",
         })
@@ -230,7 +230,7 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
                     else:
                         self.assertNotIn("continue-on-error", step)
                     self.assertNotIn("shell", step)
-        first = "github.ref == 'refs/heads/main' && github.run_attempt == 1"
+        first = "github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1"
         guards = {
             "staging-window": first,
             "measurement-before": first + " && needs.staging-window.result == 'success'",
@@ -240,7 +240,7 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
             "measurement-final": first + " && needs.voice-second.result == 'success'",
             "staging-use-release": "always() && " + first + " && needs.staging-window.outputs.expires_at != ''",
             "measurement-terminal": "always() && " + first,
-            "rerun-refusal": "always() && github.run_attempt != 1",
+            "rerun-refusal": "always() && !(" + first + ")",
         }
         self.assertEqual({name: job["if"] for name, job in jobs.items()},
                          {name: "${{ " + guard + " }}" for name, guard in guards.items()})

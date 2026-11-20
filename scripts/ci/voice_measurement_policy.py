@@ -5,7 +5,7 @@ TARGET = "./.github/workflows/voice-synthetic.yml"
 CALLS = ("voice-first", "voice-second")
 STAGING_JOBS = {"staging-window", "measurement-before", "measurement-after",
                 "measurement-final", "staging-use-release"}
-FIRST = "github.ref == 'refs/heads/main' && github.run_attempt == 1"
+FIRST = "github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1"
 GUARDS = {name: "${{ " + condition + " }}" for name, condition in {
     "staging-window": FIRST,
     "measurement-before": FIRST + " && needs.staging-window.result == 'success'",
@@ -15,7 +15,7 @@ GUARDS = {name: "${{ " + condition + " }}" for name, condition in {
     "measurement-final": FIRST + " && needs.voice-second.result == 'success'",
     "staging-use-release": "always() && " + FIRST + " && needs.staging-window.outputs.expires_at != ''",
     "measurement-terminal": "always() && " + FIRST,
-    "rerun-refusal": "always() && github.run_attempt != 1",
+    "rerun-refusal": "always() && !(" + FIRST + ")",
 }.items()}
 
 

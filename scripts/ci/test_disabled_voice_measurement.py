@@ -13,7 +13,7 @@ class VoiceMeasurementPolicyTests(unittest.TestCase):
             "permissions": {},
             "concurrency": {
                 "group": "${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
-                "&& github.run_attempt == 1 && 'staging-lifecycle' || "
+                "&& github.ref_protected && github.run_attempt == 1 && 'staging-lifecycle' || "
                 "format('voice-rest-measurement-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
                 "cancel-in-progress": "false", "queue": "max",
             },
@@ -36,6 +36,8 @@ class VoiceMeasurementPolicyTests(unittest.TestCase):
                 changed = deepcopy(scaffold)
                 changed["jobs"][name]["if"] = "${{ true }}"
                 self.assertFalse(is_measurement_caller(changed, "staging-lifecycle"))
+                changed["jobs"][name]["if"] = GUARDS[name].replace("github.ref_protected && ", "")
+                self.assertFalse(is_measurement_caller(changed, "staging-lifecycle"))
         for change in ("job", "trigger", "queue", "permissions"):
             with self.subTest(change=change):
                 changed = deepcopy(scaffold)
@@ -50,7 +52,7 @@ class VoiceMeasurementPolicyTests(unittest.TestCase):
                 self.assertFalse(is_measurement_caller(changed, "staging-lifecycle"))
         queue = scaffold["concurrency"]
         for guard in ("github.event_name == 'workflow_dispatch'",
-                      "github.ref == 'refs/heads/main'", "github.run_attempt == 1"):
+                      "github.ref == 'refs/heads/main'", "github.ref_protected", "github.run_attempt == 1"):
             with self.subTest(lock_guard=guard):
                 changed = dict(scaffold, concurrency=dict(queue, group=queue["group"].replace(guard + " && ", "", 1)))
                 self.assertFalse(is_measurement_caller(changed, "staging-lifecycle"))
