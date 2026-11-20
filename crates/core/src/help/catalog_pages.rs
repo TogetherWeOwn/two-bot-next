@@ -4,39 +4,40 @@ use super::help_catalog;
 use super::pages::{plan, Block, Page, PlanError};
 use crate::commands::{CommandDefinition, GUILD_COMMAND_LIMIT};
 use crate::custom_commands::MAX_COMMAND_NAME_CHARS;
-use crate::message_safety::{neutralize_mentions, text_len, EMBED_FIELD_VALUE_LIMIT};
+use crate::message_safety::{
+    neutralize_mentions, text_len, EMBED_FIELD_VALUE_LIMIT, EMBED_TOTAL_LIMIT,
+};
 
 const COMMAND_SEPARATOR: &str = " · ";
 
-/// Plan discovery without clipping. `reserved` covers the caller's embed
-/// chrome and navigation text. Pass definitions from one confirmed snapshot.
+/// Plan one confirmed catalog, rejecting budgets that would split command fields.
+/// `reserved` covers the caller's embed chrome and navigation text.
 pub fn plan_discovery(defs: &[CommandDefinition], reserved: usize) -> Result<Vec<Page>, PlanError> {
-    // Bound formatting before allocating the catalog or joined commands.
+    let budget = EMBED_TOTAL_LIMIT.checked_sub(reserved).ok_or(PlanError)?;
     if defs.len() > GUILD_COMMAND_LIMIT
         || defs.iter().any(|def| {
-            def.name.is_empty()
-                || def.name.chars().take(MAX_COMMAND_NAME_CHARS + 1).count()
-                    > MAX_COMMAND_NAME_CHARS
+            def.name.is_empty() || def.name.chars().nth(MAX_COMMAND_NAME_CHARS).is_some()
         })
     {
         return Err(PlanError);
     }
     let catalog = help_catalog(defs);
-    let groups: Vec<_> = catalog
-        .sections
-        .iter()
-        .map(|section| {
-            let title = match section.requires {
-                Some(perm) => format!("{} — needs {perm}", section.title),
-                None => section.title.to_owned(),
-            };
-            (title, command_fields(&section.commands), section.notes)
-        })
-        .collect();
-
+    let mut groups = Vec::new();
+    for section in catalog.sections {
+        let title = match section.requires {
+            Some(perm) => format!("{} — needs {perm}", section.title),
+            None => section.title.to_owned(),
+        };
+        groups.push((title, command_fields(&section.commands), section.notes));
+    }
     let mut blocks = vec![Block::Description(&catalog.heading)];
     for (title, fields, notes) in &groups {
-        blocks.extend(fields.iter().map(|value| Block::Field(title, value)));
+        for value in fields {
+            if text_len(title) + text_len(value) > budget {
+                return Err(PlanError);
+            }
+            blocks.push(Block::Field(title, value));
+        }
         blocks.extend(notes.iter().copied().map(Block::Description));
     }
     blocks.push(Block::Description(catalog.closing_note));
@@ -44,17 +45,14 @@ pub fn plan_discovery(defs: &[CommandDefinition], reserved: usize) -> Result<Vec
 }
 
 fn command_fields(names: &[&str]) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut value = String::new();
-    let mut used = 0;
+    let (mut fields, mut value, mut used) = (Vec::new(), String::new(), 0);
     for name in names {
         let safe = neutralize_mentions(name);
         let units = 1 + text_len(&safe); // Include the slash.
         if used + text_len(COMMAND_SEPARATOR) + units > EMBED_FIELD_VALUE_LIMIT {
             fields.push(std::mem::take(&mut value));
             used = 0;
-        }
-        if used != 0 {
+        } else if used != 0 {
             value.push_str(COMMAND_SEPARATOR);
             used += text_len(COMMAND_SEPARATOR);
         }
@@ -95,11 +93,8 @@ mod tests {
                 Some(perm) => format!("{} — needs {perm}", group.title),
                 None => group.title.to_owned(),
             };
-            for name in &group.commands {
-                assert_eq!(
-                    actual.next(),
-                    Some((title.as_str(), format!("/{name}").as_str()))
-                );
+            for command in group.commands.iter().map(|name| format!("/{name}")) {
+                assert_eq!(actual.next(), Some((title.as_str(), command.as_str())));
             }
             for note in group.notes {
                 assert_eq!(actual.next(), Some(("", *note)));
@@ -119,16 +114,21 @@ mod tests {
             .collect();
         assert_eq!(help_catalog(&defs).sections.len(), HELP_GROUPS.len());
         let pages = plan_discovery(&defs, 150).expect("every group fits");
-        assert_eq!(
-            pages.iter().map(|page| page.fields.len()).sum::<usize>(),
-            HELP_GROUPS.len()
-        );
+        let field_count: usize = pages.iter().map(|page| page.fields.len()).sum();
+        assert_eq!(field_count, HELP_GROUPS.len());
         let empty = plan_discovery(&[], 150).expect("empty registry");
         assert_eq!(empty.len(), 1);
         assert!(empty[0].fields.is_empty());
         let catalog = help_catalog(&[]);
         let expected = format!("{}\n{}", catalog.heading, catalog.closing_note);
         assert_eq!(empty[0].description, expected);
+    }
+
+    #[test]
+    fn rejects_reservation_that_would_split_a_command() {
+        let def = CommandDefinition::new(&"x".repeat(MAX_COMMAND_NAME_CHARS), "A test command");
+        let reserved = EMBED_TOTAL_LIMIT - 20;
+        assert_eq!(plan_discovery(&[def], reserved), Err(PlanError));
     }
 
     #[test]
