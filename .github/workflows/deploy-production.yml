@@ -1065,9 +1065,8 @@ jobs:
       full_soak: ${{ needs.guard.outputs.auto == 'true' || (github.event_name == 'workflow_dispatch' && needs.guard.outputs.takeover == 'true' && needs.guard.outputs.allow_unstaged != 'true') }}
       staging_run_id: ${{ needs.guard.outputs.staging_run_id }}
       staging_attempt: ${{ needs.guard.outputs.staging_attempt }}
-    secrets: {STAGING_OWNERSHIP_CONTROL_TOKEN: "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
-              TWO_VOICE_SYNTHETIC_BOT_TOKEN: "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}",
-              STAGING_METRICS_SCRAPE_TOKEN: "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"}
+    secrets: {STAGING_OWNERSHIP_CONTROL_TOKEN: "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}", STAGING_METRICS_SCRAPE_TOKEN: "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}",
+              TWO_VOICE_SYNTHETIC_BOT_TOKEN: "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}
 
   # Publish only the completed bounded job's verdict; no live staging reads
   # can escape its lock. Failure, cancellation or unconfirmed release blocks it.
@@ -1358,7 +1357,7 @@ jobs:
     # must have succeeded or been skipped (a failed soak fails closed: no bake,
     # no deploy), and a skipped recheck counts only for manual runs — an
     # automatic run always needs a fresh recheck pass with no skip.
-    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (github.run_attempt == 1 && needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
+    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
     # The only job holding the deploy-production lane: only a running or
     # pending production job occupies it. The guard, gates, soak and recheck
     # jobs carry no concurrency, so recovery
@@ -1399,6 +1398,7 @@ jobs:
       run:
         working-directory: wrangler
     steps:
+      - {if: "github.run_attempt != 1 && env.MODE != 'rollback' && env.ALLOW_UNSTAGED != 'true'", working-directory: ., run: 'echo "::error::Staged production deploys require a fresh dispatch"; exit 1'}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Deploy exactly the guarded SHA, not a newer main head.

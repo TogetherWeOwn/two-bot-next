@@ -180,6 +180,7 @@ jobs:
           VOICE_SYNTHETIC_REQUIRED: ${{ vars.VOICE_SYNTHETIC_REQUIRED }}
           TWO_STAGING_EMPTY_GRACE_SECONDS: ${{ vars.STAGING_EMPTY_GRACE_SECONDS || '60' }}
           RUN_ID: ${{ github.run_id }}
+          INHERITED_EXPIRES_AT: ${{ inputs.staging_use_expires_at }}
         run: |
           set -euo pipefail
           if [ -z "${TWO_VOICE_SYNTHETIC_BOT_TOKEN:-}" ]; then
@@ -192,10 +193,17 @@ jobs:
           fi
           # Two retries absorb a transient gateway/REST hiccup and the documented
           # 95-139 s per-deploy gateway drop; three failures fail the run.
+          runner=() work=180 cleanup=120
           for attempt in 1 2 3; do
-            if python3 scripts/staging_voice_synthetic.py --evidence "voice-synthetic-$RUN_ID-$attempt.json"; then
+            if [[ -n "$INHERITED_EXPIRES_AT" ]]; then
+              now=$(date +%s); [[ "$INHERITED_EXPIRES_AT" =~ ^[1-9][0-9]{0,12}$ ]] && (( (now + work + cleanup + 2) * 1000 < INHERITED_EXPIRES_AT )) || {
+                echo '::error::not enough time on the inherited staging grant'; exit 1; }
+              runner=(timeout -s INT -k "${cleanup}s" "${work}s")
+            fi
+            if "${runner[@]}" python3 scripts/staging_voice_synthetic.py --evidence "voice-synthetic-$RUN_ID-$attempt.json"; then
               printf 'exercised=true\n' >> "$GITHUB_OUTPUT"
               exit 0
+            else case $? in 124|137) exit 1 ;; esac
             fi
             echo "::warning::voice synthetic attempt $attempt failed"
             [ "$attempt" = 3 ] || sleep 60

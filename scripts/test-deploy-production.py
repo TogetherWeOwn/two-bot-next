@@ -124,7 +124,8 @@ CALL = children(JOBS["soak"][1:], 4)
 FINISH_FIELDS = children(FINISH[1:], 4)
 GRANT_ENV = next(step[1:-1] for step in steps(FINISH) if "        env: &grant" in step)
 SOAK_BODY = "\n".join(sum(steps(BEGIN)[1:5] + steps(FINISH)[-5:], []))
-SOAK_BODY = (SOAK_BODY.replace("        env: *grant", "\n".join(GRANT_ENV))
+SOAK_BODY = SOAK_BODY.replace("        env: *grant", "\n".join(GRANT_ENV))
+SOAK_BODY = (re.sub(r': "(\$\{\{ [^"\n]+? \}\}(?:/staging-soak-use\.ndjson)?)"', r': \1', SOAK_BODY)
              .replace("inputs.full_soak", value(children(CALL["with"][1:], 6)["full_soak"])[4:-3])
              .replace("inputs.", "needs.guard.outputs.")
              .replace("needs.begin.outputs.", "steps.staging-use-begin.outputs."))
@@ -437,11 +438,9 @@ class StaticGuardTests(unittest.TestCase):
 
     def test_actions_are_pinned_and_wrangler_matches_staging(self):
         uses = [line.split("uses:", 1)[1].strip() for line in LINES if "uses:" in line]
-        self.assertEqual(value(CALL["uses"]).split()[0], "$/.github/workflows/staging-soak.yml")
-        uses.remove(value(CALL["uses"]))
         self.assertTrue(uses)
         for ref in uses:
-            self.assertRegex(ref, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}(?:,?\s|$)", ref)
+            self.assertRegex(ref, r"^(?:\$/\.github/workflows/staging-soak\.yml$|[\w.-]+/[\w.-]+@[0-9a-f]{40}(?:,?\s|$))", ref)
         staging = {
             line.split("uses:", 1)[1].split()[0]
             for line in STAGING.read_text().splitlines() if WRANGLER_ACTION in line
@@ -768,13 +767,13 @@ class StaticGuardTests(unittest.TestCase):
         # Release is unconditional on failure but only once a grant was published.
         release = self.soak_step(order[5])
         self.assertEqual([line.strip() for line in release if line.strip().startswith("if:")],
-                         ["if: always() && steps.staging-use-begin.outputs.expires_at != ''"])
+                         ["if: always() && steps.staging-use-begin.outputs.expires_at != '' && steps.admission.outcome == 'success'"])
         self.assertIn("node wrangler/scripts/staging-use-pipeline.mjs finish", "\n".join(release))
         # Lifecycle and measurement evidence is retained even on failure.
         upload = self.soak_step(order[6])
         upload_text = "\n".join(upload)
         self.assertEqual([line.strip() for line in upload if line.strip().startswith("if:")], ["if: always()"])
-        for needle in ("name: staging-soak-${{ github.run_id }}-${{ github.run_attempt }}",
+        for needle in ('name: "staging-soak-${{ github.run_id }}-${{ github.run_attempt }}"',
                        "${{ runner.temp }}/staging-soak-use.ndjson", "${{ runner.temp }}/staging-soak-*.json",
                        "if-no-files-found: error", "retention-days: 7"):
             self.assertIn(needle, upload_text)

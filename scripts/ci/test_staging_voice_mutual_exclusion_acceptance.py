@@ -446,8 +446,6 @@ def standalone_errors(wfs, canonical):
     for (file, job_name), job_level in STANDALONE_HOLDERS.items():
         workflow = wfs.get(file, {})
         job = (workflow.get("jobs") or {}).get(job_name)
-        if (file, job_name) == (PRODUCTION, SOAK) and admitted_soak(wfs):
-            job = soak_view(wfs)
         label = f"{file} {job_name}"
         if job is None:
             errors.append(f"{label}: standalone consumer missing")
@@ -605,7 +603,7 @@ def repository_errors(wfs, canonical):
     holders = set(STANDALONE_HOLDERS) | set(OBSERVERS)
     for file, workflow in wfs.items():
         if file == STAGING_SOAK and admitted_soak(wfs):
-            continue  # The exact graph pins the nested consumer and holder.
+            continue
         measurement = file == MEASUREMENT and is_measurement_caller(workflow, canonical)
         if file == MEASUREMENT and not measurement:
             errors.append(f"{file}: dispatch, canonical lock, guards or staging authority changed")
@@ -785,7 +783,7 @@ def promotion_soak_errors(wfs, canonical):
     for name, node in [("workflow", workflow)] + list(jobs.items()):
         if name != SOAK and may_hold(node, "standalone", triggers, canonical):
             errors.append(f"production coupling: {PRODUCTION} {name} can wait on staging")
-    soak = soak_view(wfs) if admitted_soak(wfs) else jobs.get(SOAK)
+    soak = jobs.get(SOAK)
     if soak is not None:
         if need_set(soak) != {"guard"}:
             errors.append("soak: must wait only on the guard, never a production-lane job")

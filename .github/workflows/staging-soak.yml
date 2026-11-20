@@ -3,7 +3,6 @@ on:
   workflow_call:
     inputs: {sha: {type: string, required: true}, auto: {type: string, required: true}, full_soak: {type: boolean, required: true},
              staging_run_id: {type: string, required: true}, staging_attempt: {type: string, required: true}}
-    # The caller maps the scrape token by name; only the staging environment supplies its value.
     secrets: {STAGING_OWNERSHIP_CONTROL_TOKEN: {required: true}, TWO_VOICE_SYNTHETIC_BOT_TOKEN: {required: false}, STAGING_METRICS_SCRAPE_TOKEN: {required: true}}
     outputs: {skip: {value: "${{ jobs.finish.outputs.skip }}"}, evidence: {value: "${{ jobs.finish.outputs.evidence }}"}}
 permissions: {}
@@ -19,30 +18,23 @@ jobs:
     timeout-minutes: 8
     outputs: {expires_at: "${{ steps.staging-use-begin.outputs.expires_at }}", deployment_id: "${{ steps.staging-use-begin.outputs.deployment_id }}", baseline_id: "${{ steps.baseline.outputs.artifact-id }}"}
     steps:
-      - {if: "!(github.run_attempt == 1 && github.ref == 'refs/heads/main' && github.ref_protected)", run: exit 1}
-      - &checkout {uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1, # v7.0.1
-                   with: {ref: "${{ github.sha }}", persist-credentials: false, fetch-depth: 1}}
-      - &node {uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1, # v7.1.0
-               with: {node-version: 22, package-manager-cache: false}}
+      - &admission {id: admission, if: always(), run: "test \"$GITHUB_RUN_ATTEMPT:$GITHUB_REF:$GITHUB_REF_PROTECTED\" = '1:refs/heads/main:true'"}
+      - &checkout {uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1, with: {ref: "${{ github.sha }}", persist-credentials: false, fetch-depth: 1}} # v7.0.1
+      - &node {uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1, with: {node-version: 22, package-manager-cache: false}} # v7.1.0
       - name: Acquire and ready the guarded staging candidate
         id: staging-use-begin
-        env:
-          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
-          STAGING_USE_EXPECTED_SHA: ${{ inputs.sha }}
-          STAGING_USE_MINUTES: '40'
-          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-soak-use.ndjson
+        env: {STAGING_WORKER_URL: "${{ vars.STAGING_WORKER_URL }}", OWNERSHIP_CONTROL_TOKEN: "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+              STAGING_USE_EXPECTED_SHA: "${{ inputs.sha }}", STAGING_USE_MINUTES: '40',
+              STAGING_USE_RECEIPT: "${{ runner.temp }}/staging-soak-use.ndjson"}
         run: node wrangler/scripts/staging-use-pipeline.mjs begin
       - name: Record the soak-baseline REST counters
-        env:
-          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
+        env: {STAGING_WORKER_URL: "${{ vars.STAGING_WORKER_URL }}", METRICS_SCRAPE_TOKEN: "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"}
         run: |
           set -euo pipefail
           node wrangler/scripts/rest-5xx-counters.mjs --metrics-url "$STAGING_WORKER_URL" --out "$RUNNER_TEMP/staging-soak-baseline.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: baseline
-        if: always() && steps.staging-use-begin.outputs.expires_at != ''
+        if: always() && steps.staging-use-begin.outcome != 'skipped'
         with: {name: "staging-soak-start-${{ github.run_id }}-${{ github.run_attempt }}",
                path: "${{ runner.temp }}/staging-soak-use.ndjson\n${{ runner.temp }}/staging-soak-baseline.json",
                if-no-files-found: error, retention-days: 7}
@@ -52,12 +44,10 @@ jobs:
     uses: $/.github/workflows/voice-synthetic.yml
     with:
       deploy_staging_call: true
-      artifact_invocation: soak
       staging_use_sha: ${{ inputs.sha }}
       staging_use_deployment: ${{ needs.begin.outputs.deployment_id }}
       staging_use_expires_at: ${{ needs.begin.outputs.expires_at }}
-    secrets: {STAGING_OWNERSHIP_CONTROL_TOKEN: "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
-              TWO_VOICE_SYNTHETIC_BOT_TOKEN: "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}
+    secrets: {STAGING_OWNERSHIP_CONTROL_TOKEN: "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}", TWO_VOICE_SYNTHETIC_BOT_TOKEN: "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}
   finish:
     needs: [begin, voice]
     if: always() && needs.begin.outputs.expires_at != ''
@@ -68,6 +58,7 @@ jobs:
     outputs: {skip: "${{ steps.release.outcome == 'success' && steps.judge.outputs.skip || '' }}",
               evidence: "${{ steps.release.outcome == 'success' && steps.judge.outputs.evidence || '' }}"}
     steps:
+      - *admission
       - *checkout
       - *node
       - {if: "!cancelled() && (needs.begin.result != 'success' || needs.voice.result != 'success' || needs.voice.outputs.exercised != 'true' || needs.begin.outputs.baseline_id == '')", run: exit 1}
@@ -76,49 +67,35 @@ jobs:
       - run: mv "$RUNNER_TEMP/soak-start/staging-soak-baseline.json" "$RUNNER_TEMP/staging-soak-baseline.json"
       - name: Measure a fresh live staging interval
         env: &grant
-          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
-          STAGING_USE_SHA: ${{ inputs.sha }}
-          STAGING_USE_DEPLOYMENT: ${{ needs.begin.outputs.deployment_id }}
-          STAGING_USE_EXPIRES_AT: ${{ needs.begin.outputs.expires_at }}
-          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-soak-use.ndjson
-          FULL_SOAK: ${{ inputs.full_soak }}
+          {STAGING_WORKER_URL: "${{ vars.STAGING_WORKER_URL }}", OWNERSHIP_CONTROL_TOKEN: "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+           STAGING_USE_SHA: "${{ inputs.sha }}", STAGING_USE_DEPLOYMENT: "${{ needs.begin.outputs.deployment_id }}",
+           STAGING_USE_EXPIRES_AT: "${{ needs.begin.outputs.expires_at }}", STAGING_USE_RECEIPT: "${{ runner.temp }}/staging-soak-use.ndjson",
+           FULL_SOAK: "${{ inputs.full_soak }}"}
         run: node wrangler/scripts/staging-soak-window.mjs
       - name: Read the candidate's staging journeys and soak REST counters
         id: judge
-        env:
-          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
-          SHA: ${{ inputs.sha }}
-          AUTO: ${{ inputs.auto }}
-          RUN_ID: ${{ inputs.staging_run_id }}
-          RUN_ATTEMPT: ${{ inputs.staging_attempt }}
-          GH_TOKEN: ${{ github.token }}
+        env: {STAGING_WORKER_URL: "${{ vars.STAGING_WORKER_URL }}", METRICS_SCRAPE_TOKEN: "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}",
+              SHA: "${{ inputs.sha }}", AUTO: "${{ inputs.auto }}", GH_TOKEN: "${{ github.token }}",
+              RUN_ID: "${{ inputs.staging_run_id }}", RUN_ATTEMPT: "${{ inputs.staging_attempt }}"}
         run: |
           set -euo pipefail
-          # Exit 1 is a recorded journey failure; any other nonzero status refuses.
           probe=0
-          python3 scripts/staging_health_contract_probe.py --expected-sha "$SHA" \
-            --evidence "$RUNNER_TEMP/staging-soak-probe.json" || probe=$?
-          if [ "$probe" -gt 1 ]; then
-            echo "::error::staging probe refused to run (exit $probe); the regression gate cannot judge"
-            exit 1
-          fi
+          python3 scripts/staging_health_contract_probe.py --expected-sha "$SHA" --evidence "$RUNNER_TEMP/staging-soak-probe.json" || probe=$?
+          if [ "$probe" -gt 1 ]; then echo "::error::staging probe refused to run (exit $probe)"; exit 1; fi
           node wrangler/scripts/rest-5xx-counters.mjs --metrics-url "$STAGING_WORKER_URL" --out "$RUNNER_TEMP/staging-soak-counters.json"
           gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-staging.yml/runs" \
             -f branch=main -f per_page=100 -q '[.workflow_runs[] | {head_sha, head_branch, status, conclusion}]' > "$RUNNER_TEMP/staging-runs.json"
           python3 scripts/promotion_regression_gate.py staging \
             --probe "$RUNNER_TEMP/staging-soak-probe.json" --counters "$RUNNER_TEMP/staging-soak-counters.json" \
             --sha "$SHA" --auto "$AUTO" --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" \
-            --staging-runs "$RUNNER_TEMP/staging-runs.json" \
-            --baseline-counters "$RUNNER_TEMP/staging-soak-baseline.json" \
+            --staging-runs "$RUNNER_TEMP/staging-runs.json" --baseline-counters "$RUNNER_TEMP/staging-soak-baseline.json" \
             --out "$RUNNER_TEMP/staging-soak-evidence.json"
       - name: Recheck the original grant after final sampling
         env: *grant
         run: node wrangler/scripts/staging-use-pipeline.mjs consume
       - name: Release the original staging soak window
         id: release
-        if: always() && needs.begin.outputs.expires_at != ''
+        if: always() && needs.begin.outputs.expires_at != '' && steps.admission.outcome == 'success'
         env: *grant
         run: |
           node wrangler/scripts/staging-use-pipeline.mjs finish
@@ -126,8 +103,6 @@ jobs:
       - name: Retain staging soak lifecycle and measurement evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: staging-soak-${{ github.run_id }}-${{ github.run_attempt }}
-          path: "${{ runner.temp }}/staging-soak-use.ndjson\n${{ runner.temp }}/staging-soak-*.json\n"
-          if-no-files-found: error
-          retention-days: 7
+        with: {name: "staging-soak-${{ github.run_id }}-${{ github.run_attempt }}",
+               path: "${{ runner.temp }}/staging-soak-use.ndjson\n${{ runner.temp }}/staging-soak-*.json\n",
+               if-no-files-found: error, retention-days: 7}

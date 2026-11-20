@@ -13,7 +13,6 @@ def admitted_soak(workflows):
 
 
 def soak_view(workflows):
-    """Expose the ordered lifecycle steps to the existing whole-window tests."""
     begin, finish = (workflows[SOAK]["jobs"][job] for job in ("begin", "finish"))
     caller = workflows[PRODUCTION]["jobs"]["soak"]
     local = lambda value: json.loads(json.dumps(value).replace("inputs.", "needs.guard.outputs.")

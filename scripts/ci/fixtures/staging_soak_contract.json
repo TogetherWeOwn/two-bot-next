@@ -17,8 +17,8 @@
     },
     "secrets": {
       "STAGING_OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
-      "TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}",
-      "STAGING_METRICS_SCRAPE_TOKEN": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"
+      "STAGING_METRICS_SCRAPE_TOKEN": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}",
+      "TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"
     }
   },
   "reusable": {
@@ -92,8 +92,9 @@
         },
         "steps": [
           {
-            "if": "!(github.run_attempt == 1 && github.ref == 'refs/heads/main' && github.ref_protected)",
-            "run": "exit 1"
+            "id": "admission",
+            "if": "always()",
+            "run": "test \"$GITHUB_RUN_ATTEMPT:$GITHUB_REF:$GITHUB_REF_PROTECTED\" = '1:refs/heads/main:true'"
           },
           {
             "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
@@ -133,7 +134,7 @@
           {
             "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
             "id": "baseline",
-            "if": "always() && steps.staging-use-begin.outputs.expires_at != ''",
+            "if": "always() && steps.staging-use-begin.outcome != 'skipped'",
             "with": {
               "name": "staging-soak-start-${{ github.run_id }}-${{ github.run_attempt }}",
               "path": "${{ runner.temp }}/staging-soak-use.ndjson\n${{ runner.temp }}/staging-soak-baseline.json",
@@ -151,7 +152,6 @@
         "uses": "$/.github/workflows/voice-synthetic.yml",
         "with": {
           "deploy_staging_call": "true",
-          "artifact_invocation": "soak",
           "staging_use_sha": "${{ inputs.sha }}",
           "staging_use_deployment": "${{ needs.begin.outputs.deployment_id }}",
           "staging_use_expires_at": "${{ needs.begin.outputs.expires_at }}"
@@ -182,6 +182,11 @@
           "evidence": "${{ steps.release.outcome == 'success' && steps.judge.outputs.evidence || '' }}"
         },
         "steps": [
+          {
+            "id": "admission",
+            "if": "always()",
+            "run": "test \"$GITHUB_RUN_ATTEMPT:$GITHUB_REF:$GITHUB_REF_PROTECTED\" = '1:refs/heads/main:true'"
+          },
           {
             "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
             "with": {
@@ -232,11 +237,11 @@
               "METRICS_SCRAPE_TOKEN": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}",
               "SHA": "${{ inputs.sha }}",
               "AUTO": "${{ inputs.auto }}",
+              "GH_TOKEN": "${{ github.token }}",
               "RUN_ID": "${{ inputs.staging_run_id }}",
-              "RUN_ATTEMPT": "${{ inputs.staging_attempt }}",
-              "GH_TOKEN": "${{ github.token }}"
+              "RUN_ATTEMPT": "${{ inputs.staging_attempt }}"
             },
-            "run": "set -euo pipefail\n# Exit 1 is a recorded journey failure; any other nonzero status refuses.\nprobe=0\npython3 scripts/staging_health_contract_probe.py --expected-sha \"$SHA\" \\\n  --evidence \"$RUNNER_TEMP/staging-soak-probe.json\" || probe=$?\nif [ \"$probe\" -gt 1 ]; then\n  echo \"::error::staging probe refused to run (exit $probe); the regression gate cannot judge\"\n  exit 1\nfi\nnode wrangler/scripts/rest-5xx-counters.mjs --metrics-url \"$STAGING_WORKER_URL\" --out \"$RUNNER_TEMP/staging-soak-counters.json\"\ngh api --method GET \"repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-staging.yml/runs\" \\\n  -f branch=main -f per_page=100 -q '[.workflow_runs[] | {head_sha, head_branch, status, conclusion}]' > \"$RUNNER_TEMP/staging-runs.json\"\npython3 scripts/promotion_regression_gate.py staging \\\n  --probe \"$RUNNER_TEMP/staging-soak-probe.json\" --counters \"$RUNNER_TEMP/staging-soak-counters.json\" \\\n  --sha \"$SHA\" --auto \"$AUTO\" --run-id \"$RUN_ID\" --attempt \"$RUN_ATTEMPT\" \\\n  --staging-runs \"$RUNNER_TEMP/staging-runs.json\" \\\n  --baseline-counters \"$RUNNER_TEMP/staging-soak-baseline.json\" \\\n  --out \"$RUNNER_TEMP/staging-soak-evidence.json\"\n"
+            "run": "set -euo pipefail\nprobe=0\npython3 scripts/staging_health_contract_probe.py --expected-sha \"$SHA\" --evidence \"$RUNNER_TEMP/staging-soak-probe.json\" || probe=$?\nif [ \"$probe\" -gt 1 ]; then echo \"::error::staging probe refused to run (exit $probe)\"; exit 1; fi\nnode wrangler/scripts/rest-5xx-counters.mjs --metrics-url \"$STAGING_WORKER_URL\" --out \"$RUNNER_TEMP/staging-soak-counters.json\"\ngh api --method GET \"repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-staging.yml/runs\" \\\n  -f branch=main -f per_page=100 -q '[.workflow_runs[] | {head_sha, head_branch, status, conclusion}]' > \"$RUNNER_TEMP/staging-runs.json\"\npython3 scripts/promotion_regression_gate.py staging \\\n  --probe \"$RUNNER_TEMP/staging-soak-probe.json\" --counters \"$RUNNER_TEMP/staging-soak-counters.json\" \\\n  --sha \"$SHA\" --auto \"$AUTO\" --run-id \"$RUN_ID\" --attempt \"$RUN_ATTEMPT\" \\\n  --staging-runs \"$RUNNER_TEMP/staging-runs.json\" --baseline-counters \"$RUNNER_TEMP/staging-soak-baseline.json\" \\\n  --out \"$RUNNER_TEMP/staging-soak-evidence.json\"\n"
           },
           {
             "name": "Recheck the original grant after final sampling",
@@ -254,7 +259,7 @@
           {
             "name": "Release the original staging soak window",
             "id": "release",
-            "if": "always() && needs.begin.outputs.expires_at != ''",
+            "if": "always() && needs.begin.outputs.expires_at != '' && steps.admission.outcome == 'success'",
             "env": {
               "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
               "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",

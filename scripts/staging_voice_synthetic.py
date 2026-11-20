@@ -1030,6 +1030,10 @@ def run_live(args, token):
                                         obs["limit_set_ok"] = True
                     else:
                         restore_uncertain_limit()
+            except KeyboardInterrupt:
+                if obs["limit_attempted"] and not obs["limit_restored"]:
+                    restore_uncertain_limit()
+                raise
             except Exception as exc:
                 if "limit_note" not in obs:
                     obs["limit_note"] = f"{type(exc).__name__} during the limit round-trip"

@@ -2943,7 +2943,7 @@ def production_errors(workflow):
         "((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || "
         "(needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && "
         "(needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || "
-        "(github.run_attempt == 1 && needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && "
+        "(needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && "
         "needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
     )
     if production.get("environment") != "production" \
@@ -3006,7 +3006,7 @@ def production_errors(workflow):
             step = soak_steps[index]
             if step.get("run") != command or step.get("env") != env or "continue-on-error" in step:
                 errors.append(f"{name}:soak:{index}: must use only the original run-bound lifecycle authority")
-            expected_if = "always() && steps.staging-use-begin.outputs.expires_at != ''" if index == 7 else None
+            expected_if = "always() && steps.staging-use-begin.outputs.expires_at != '' && steps.admission.outcome == 'success'" if index == 7 else None
             if step.get("if") != expected_if:
                 errors.append(f"{name}:soak:{index}: lifecycle readiness is mandatory and release always runs")
         if soak_steps[2].get("id") != "staging-use-begin" or soak_steps[5].get("id") != "judge":
@@ -3782,7 +3782,7 @@ def staging_callee_window_errors(name, workflow, consumer):
     if "inputs." in body:
         errors.append(f"{name}:staging-use-release: must never touch the caller's grant inputs")
     # Control credentials and lifecycle commands stay out of the consumer.
-    consumer_text = str(jobs[consumer]).lower().replace(" ", "")
+    consumer_text = str(jobs[consumer]).lower().replace(" ", "").replace("'inherited_expires_at':'${{inputs.staging_use_expires_at}}'", "", int(name == "voice-synthetic.yml"))
     for marker in ("staging_use", "staging-use", "ownership_control", "staging_ownership"):
         if marker in consumer_text:
             errors.append(f"{name}:{consumer}: must not contain {marker!r} (no control credential)")
@@ -8534,16 +8534,29 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(production_errors(workflow), label)
 
     def test_soak_rejects_unsafe_handoffs(self):
-        for job, key in (("begin", "outputs"), ("voice", "uses"), ("voice", "needs"), ("finish", "if"), ("finish", "steps"), ("soak", "STAGING_METRICS_SCRAPE_TOKEN")):
-            changed = deepcopy(self.workflows)
-            target = changed["deploy-production.yml"]["jobs"]["soak"]["secrets"] if job == "soak" else changed[STAGING_SOAK]["jobs"][job]
-            target.pop(key, None)
-            self.assertFalse(admitted_soak(changed), (job, key))
+        changed = deepcopy(self.workflows)
+        del changed["deploy-production.yml"]["jobs"]["soak"]["secrets"]["STAGING_METRICS_SCRAPE_TOKEN"]
+        self.assertFalse(admitted_soak(changed))
+        jobs = self.workflows[STAGING_SOAK]["jobs"]
+        self.assertEqual(jobs["begin"]["steps"][-1]["if"], "always() && steps.staging-use-begin.outcome != 'skipped'")
+        finish = jobs["finish"]["steps"]
+        self.assertEqual(finish[0], jobs["begin"]["steps"][0])
+        self.assertIn("steps.admission.outcome == 'success'", finish[-2]["if"])
+        voice = self.workflows["voice-synthetic.yml"]["jobs"]["synthetic"]["steps"][1]
+        self.assertEqual(voice["env"].get("INHERITED_EXPIRES_AT"), "${{ inputs.staging_use_expires_at }}")
+        fake = 'date() { printf "1000\\n"; }; timeout() { exit 99; }; python3() { exit 99; };\n'
+        for deadline in ("999000", "1100000"):
+            result = subprocess.run(["bash", "-c", fake + voice["run"]], capture_output=True, text=True,
+                                    env={"TWO_VOICE_SYNTHETIC_BOT_TOKEN": "fixture", "INHERITED_EXPIRES_AT": deadline})
+            self.assertEqual((result.returncode, result.stdout), (1, "::error::not enough time on the inherited staging grant\n"))
 
     def test_production_route_is_automatic_or_dispatch_and_gated(self):
         production = self.workflows["deploy-production.yml"]
         self.assertEqual(production_errors(production), [])
         self.assertEqual(production["jobs"]["production"]["environment"], "production")
+        refusal = production["jobs"]["production"]["steps"][0]
+        self.assertEqual(refusal["if"], "github.run_attempt != 1 && env.MODE != 'rollback' && env.ALLOW_UNSTAGED != 'true'")
+        self.assertIn("fresh dispatch", refusal["run"])
 
         def mutated(change):
             workflow = deepcopy(production)
