@@ -32,13 +32,13 @@ pub struct PlanError;
 /// Splittable content, including field fallbacks, must be plain text (cuts can break Markdown).
 pub fn plan(blocks: &[Block<'_>], outside: usize, inside: usize) -> Result<Vec<Page>, PlanError> {
     let charge = |budget: usize, cost| budget.checked_sub(cost).ok_or(PlanError);
-    let reserved = outside.checked_add(inside).ok_or(PlanError)?;
-    let total = charge(EMBED_TOTAL_LIMIT, reserved)?;
+    let total = charge(charge(EMBED_TOTAL_LIMIT, outside)?, inside)?;
     let desc_limit = charge(EMBED_DESCRIPTION_LIMIT, inside)?.min(total);
-    if blocks.is_empty() && reserved != 0 {
+    if blocks.is_empty() && total < EMBED_TOTAL_LIMIT {
         return Ok(vec![Page::default()]);
     }
     let (mut atoms, mut bytes, mut units) = (Vec::new(), SOURCE_BYTES, SOURCE_UNITS);
+    let mut join = None;
     for &block in blocks {
         let parts = match block {
             Block::Field("", "") => return Err(PlanError),
@@ -50,18 +50,17 @@ pub fn plan(blocks: &[Block<'_>], outside: usize, inside: usize) -> Result<Vec<P
         let [n, v] = [&name, &value].map(|s| text_len(s));
         let cost = n + v;
         units = charge(units, cost)?;
-        let fits = n <= EMBED_FIELD_NAME_LIMIT && v <= EMBED_FIELD_VALUE_LIMIT;
-        let nonempty = !name.trim().is_empty() && !value.trim().is_empty();
-        if fits && cost <= total && nonempty {
+        let fits = cost <= total && n <= EMBED_FIELD_NAME_LIMIT && v <= EMBED_FIELD_VALUE_LIMIT;
+        if fits && !name.trim().is_empty() && !value.trim().is_empty() {
             atoms.push(Atom::Field(name, value, cost));
+            join = None;
         } else {
             let name = (n != 0).then_some(name);
             let value = (v != 0 || matches!(block, Block::Description(_))).then_some(value);
             for part in [name, value].into_iter().flatten() {
-                let join = matches!(atoms.last(), Some(Atom::Text(_)));
-                units = charge(units, usize::from(join))?;
-                atoms.push(Atom::Text(join.then_some('\n'))); // Mark even empty runs.
-                atoms.extend(part.chars().map(|ch| Atom::Text(Some(ch))));
+                let separator = join.replace('\n'); // Remember even non-emitting parts.
+                units = charge(units, usize::from(separator.is_some()))?;
+                atoms.extend(separator.into_iter().chain(part.chars()).map(Atom::Text));
             }
         }
     }
@@ -69,19 +68,18 @@ pub fn plan(blocks: &[Block<'_>], outside: usize, inside: usize) -> Result<Vec<P
 }
 
 enum Atom {
-    Text(Option<char>),
+    Text(char),
     Field(String, String, usize),
 }
 
 fn pack(atoms: Vec<Atom>, total: usize, desc_limit: usize) -> Result<Vec<Page>, PlanError> {
     // Boundaries in reverse order: suffix total, description units, fields, score, next cut.
-    let mut suffix = vec![(0, 0, 0, 0, 0)];
+    let (mut suffix, mut ends) = (vec![(0, 0, 0, 0, 0)], VecDeque::<usize>::new());
     let (mut used, mut desc, mut fields, mut scanned, mut right_text) = (0, 0, 0, 0, false);
-    let mut ends = VecDeque::<usize>::new();
     let glyph = |ch: char| has_message_text(ch.encode_utf8(&mut [0; 4]));
     for atom in atoms.iter().rev() {
         let (d, f, visible) = match atom {
-            Atom::Text(ch) => (ch.map_or(0, char::len_utf16), 0, ch.is_some_and(glyph)),
+            Atom::Text(ch) => (ch.len_utf16(), 0, glyph(*ch)),
             Atom::Field(n, v, width) => (0, *width, has_message_text(n) || has_message_text(v)),
         };
         if f != 0 && right_text {
@@ -90,9 +88,7 @@ fn pack(atoms: Vec<Atom>, total: usize, desc_limit: usize) -> Result<Vec<Page>, 
             scanned = suffix.len() - 1;
         }
         right_text = f == 0;
-        used += d + f;
-        desc += d;
-        fields += usize::from(f != 0);
+        (used, desc, fields) = (used + d + f, desc + d, fields + usize::from(f != 0));
         // Admit ends after visible content, evict over-budget ends, and keep the furthest tie.
         if visible {
             for end in (scanned..suffix.len()).filter(|&i| suffix[i].3 != usize::MAX) {
@@ -114,18 +110,16 @@ fn pack(atoms: Vec<Atom>, total: usize, desc_limit: usize) -> Result<Vec<Page>, 
         let score = suffix.get(cut).map_or(usize::MAX, |end| end.3 + 1);
         suffix.push((used, desc, fields, score, cut));
     }
-    let mut start = atoms.len();
+    let (mut start, mut atoms) = (atoms.len(), atoms.into_iter());
     let count = suffix[start].3;
     if !(1..=MAX_HELP_PAGES).contains(&count) {
         return Err(PlanError);
     }
-    let mut atoms = atoms.into_iter();
     let pages = (0..count).map(|_| {
-        let end = suffix[start].4;
-        let mut page = Page::default();
+        let (end, mut page) = (suffix[start].4, Page::default());
         for atom in atoms.by_ref().take(start - end) {
             match atom {
-                Atom::Text(ch) => page.description.extend(ch),
+                Atom::Text(ch) => page.description.push(ch),
                 Atom::Field(name, value, _) => page.fields.push((name, value)),
             }
         }
@@ -148,8 +142,7 @@ mod tests {
         blocks.extend(["Overview", "", "Commands"].map(Description));
         blocks.extend([Field(z, "/a"), Field("End", z), Field("End", "")]);
         let pages = plan(&blocks, 80, 0).unwrap();
-        let notes = "Overview\n\nCommands";
-        let expected = [heading.as_str(), "Overview", notes, "End"];
+        let expected = [heading.as_str(), "Overview", "Overview\n\nCommands", "End"];
         assert!(pages.iter().map(|p| p.description.as_str()).eq(expected));
         assert!(pages.iter().map(|p| p.fields.len()).eq([1, 1, 2, 0]));
         assert!(field_pairs(&pages).eq([("Next", "/b"), (z, z), (z, "/a"), ("End", z)]));
@@ -157,6 +150,13 @@ mod tests {
         assert!(pages.iter().map(|p| p.description.as_str()).eq(["a", z]));
         assert!(pages.iter().map(|p| p.fields.len()).eq([0, 1]));
         assert!(field_pairs(&pages).eq([("Group", "/a")]));
+        let blocks = [Field("Group", "/a"), Description(""), Field("Next", "/b")];
+        let expected = [("Group", "/a"), ("Next", "/b")];
+        for count in 1..=2 {
+            let pages = plan(&blocks[..=count], 0, 0).unwrap();
+            assert!(pages.iter().map(|p| p.description.as_str()).eq([""]));
+            assert!(field_pairs(&pages).eq(expected[..count].iter().copied()));
+        }
     }
 
     fn field_pairs(pages: &[Page]) -> impl Iterator<Item = (&str, &str)> {
