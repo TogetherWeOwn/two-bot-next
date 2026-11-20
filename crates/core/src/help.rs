@@ -943,21 +943,14 @@ mod tests {
             ("Bans", Some("Ban Members"), ["ban"].as_slice()),
             ("Custom", None, ["ping", "faq"].as_slice()),
         ]));
-        assert_eq!(catalog.sections[0].notes, RSVP_ATTENDANCE_NOTES);
-        assert!(catalog.sections[1..]
-            .iter()
-            .all(|section| section.notes.is_empty()));
-        assert_eq!(
-            help_text(&defs),
-            concat!(
-                "**Server commands** (5 live)\n\n",
-                "**RSVPs**\n/rsvp · /rsvp-attendance\n",
-                "Paste the event id or link, e.g. https://discord.com/events/<server-id>/<event-id>.\n",
-                "Totals include your saved response and saved time; live event availability is not checked.\n\n",
-                "**Bans** — needs Ban Members\n/ban\n\n**Custom**\n/ping · /faq\n\n",
-                "This is the last confirmed command list. Your picker hides gated commands you cannot use.",
-            )
-        );
+        let notes = catalog.sections.iter().map(|s| s.notes);
+        assert!(notes.eq([RSVP_ATTENDANCE_NOTES, &[], &[]]));
+        let expected = "**Server commands** (5 live)\n\n**RSVPs**\n/rsvp · /rsvp-attendance\n\
+            Paste the event id or link, e.g. https://discord.com/events/<server-id>/<event-id>.\n\
+            Totals include your saved response and saved time; live event availability is not checked.\n\n\
+            **Bans** — needs Ban Members\n/ban\n\n**Custom**\n/ping · /faq\n\n\
+            This is the last confirmed command list. Your picker hides gated commands you cannot use.";
+        assert_eq!(help_text(&defs), expected);
     }
 
     #[test]
