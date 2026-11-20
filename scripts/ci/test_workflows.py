@@ -7226,7 +7226,8 @@ class WorkflowTests(unittest.TestCase):
                 "consumer waits for release": lambda w: w["jobs"][consumer].update({"needs": "staging-use-release"}),
                 "consumer re-holds the lock": lambda w: w["jobs"][consumer].update(
                     {"concurrency": {"group": "staging-lifecycle", "cancel-in-progress": "false"}}),
-                "consumer holds the control credential": lambda w: w["jobs"][consumer]["steps"][1]["env"].update(
+                "consumer holds the control credential": lambda w: next(
+                    step["env"] for step in w["jobs"][consumer]["steps"] if "env" in step).update(
                     {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
                 "release not main-only": lambda w: release(w).update(
                     {"if": release(w)["if"].replace("github.ref == 'refs/heads/main' && ", "")}),
