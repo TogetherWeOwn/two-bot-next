@@ -8537,10 +8537,9 @@ class WorkflowTests(unittest.TestCase):
         changed = deepcopy(self.workflows)
         del changed["deploy-production.yml"]["jobs"]["soak"]["secrets"]["STAGING_METRICS_SCRAPE_TOKEN"]
         self.assertFalse(admitted_soak(changed))
-        jobs = self.workflows[STAGING_SOAK]["jobs"]
-        self.assertEqual(jobs["begin"]["steps"][-1]["if"], "always() && steps.staging-use-begin.outcome != 'skipped'")
-        finish = jobs["finish"]["steps"]
-        self.assertEqual(finish[0], jobs["begin"]["steps"][0])
+        begin, finish = (self.workflows[STAGING_SOAK]["jobs"][job]["steps"] for job in ("begin", "finish"))
+        self.assertEqual(begin[-1]["if"], "always() && steps.staging-use-begin.outcome != 'skipped'")
+        self.assertEqual(finish[0], begin[0])
         self.assertIn("steps.admission.outcome == 'success'", finish[-2]["if"])
         voice = self.workflows["voice-synthetic.yml"]["jobs"]["synthetic"]["steps"][1]
         self.assertEqual(voice["env"].get("INHERITED_EXPIRES_AT"), "${{ inputs.staging_use_expires_at }}")

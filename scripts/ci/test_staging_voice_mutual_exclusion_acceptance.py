@@ -181,9 +181,9 @@ def _parsed(root):
             for path in sorted(root.glob("*.yml"))}
 
 
-def load_all(root=WORKFLOWS):
+def load_all(root=WORKFLOWS, *, workflows=None):
     # Parse once; callers may mutate their copy.
-    workflows = deepcopy(_parsed(root))
+    workflows = deepcopy(_parsed(root) if workflows is None else workflows)
     if admitted_soak(workflows):
         workflows[PRODUCTION]["jobs"][SOAK] = soak_view(workflows)
         del workflows[STAGING_SOAK]
@@ -602,8 +602,6 @@ def repository_errors(wfs, canonical):
     callers = {f"./.github/workflows/{name}" for name in CHILDREN.values()}
     holders = set(STANDALONE_HOLDERS) | set(OBSERVERS)
     for file, workflow in wfs.items():
-        if file == STAGING_SOAK and admitted_soak(wfs):
-            continue
         measurement = file == MEASUREMENT and is_measurement_caller(workflow, canonical)
         if file == MEASUREMENT and not measurement:
             errors.append(f"{file}: dispatch, canonical lock, guards or staging authority changed")
@@ -822,6 +820,8 @@ def promotion_soak_errors(wfs, canonical):
 
 
 def lifecycle_errors(wfs):
+    if STAGING_SOAK in wfs:
+        wfs = load_all(workflows=wfs)
     errors = []
     canonical = canonical_group(wfs.get(DEPLOY, {}), errors)
     if canonical is None:
