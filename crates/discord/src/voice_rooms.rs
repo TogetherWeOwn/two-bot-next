@@ -500,6 +500,16 @@ impl RoomHttp {
         Self::with_origin(token, "https://discord.com/api/v10".to_owned(), false)
     }
 
+    /// Run the real request builder and transport against an IPv4 loopback fixture.
+    #[cfg(feature = "test-support")]
+    pub fn for_loopback_test(port: u16) -> Result<Self, RoomHttpError> {
+        Self::with_origin(
+            "fixture".to_owned(),
+            format!("http://127.0.0.1:{port}/api/v10"),
+            true,
+        )
+    }
+
     /// Whether a 401 permanently latched this writer: every later write
     /// refuses immediately until a restart rebuilds the client, so a healthy
     /// store re-probe must never clear a halt this latch caused.

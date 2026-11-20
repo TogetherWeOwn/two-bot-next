@@ -5834,6 +5834,60 @@ fn interaction_latency_counts_from_the_snowflake_timestamp() {
     assert_eq!(interaction_latency_ms(u64::MAX, 0), 0);
 }
 
+// Run the already-asserted handler reply through the production completion
+// path. Only the serialized body (never the webhook path or headers) is evidence.
+async fn capture_utility_completion(
+    fixture: &str,
+    interaction: &Interaction,
+    response: InteractionResponse,
+) {
+    use axum::{body::Bytes, http::header::AUTHORIZATION, http::HeaderMap, routing::patch, Router};
+    use std::io::Write;
+
+    let embed = limit_completion_embed(interaction, &response).expect("utility completion embed");
+    let expected_description = embed.description.clone();
+    let expected_color = embed.color;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let app = Router::new().route(
+        "/api/v10/webhooks/{application}/{token}/messages/@original",
+        patch(move |headers: HeaderMap, body: Bytes| async move {
+            assert!(!headers.contains_key(AUTHORIZATION));
+            tx.try_send(body).expect("one completion body");
+            axum::http::StatusCode::NO_CONTENT
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let replies = RoomHttp::for_loopback_test(listener.local_addr().unwrap().port()).unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    replies.complete(interaction, response).await.unwrap();
+    server.abort();
+
+    let body = rx.try_recv().expect("serialized PATCH body");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("PATCH JSON");
+    assert_eq!(payload["content"], "");
+    assert_eq!(payload["allowed_mentions"]["parse"], json!([]));
+    let embeds = payload["embeds"].as_array().expect("PATCH embeds");
+    assert_eq!(embeds.len(), 1);
+    assert_eq!(embeds[0]["color"], json!(expected_color));
+    assert_eq!(embeds[0]["description"], json!(expected_description));
+    assert_eq!(embeds[0]["footer"]["text"], "Together We Own · Voice");
+    assert!(embeds[0]["footer"].get("icon_url").is_none());
+
+    // Emit only in rust-tests, where the default checkout matches GITHUB_SHA.
+    if std::env::var("GITHUB_JOB").as_deref() != Ok("rust-tests") {
+        return;
+    }
+    // A direct write bypasses libtest's capture without exposing other test output.
+    if let Ok(checkout) = std::env::var("GITHUB_SHA") {
+        let json = std::str::from_utf8(&body).expect("UTF-8 PATCH JSON");
+        writeln!(
+            std::io::stdout().lock(),
+            "VOICE_UTILITY_FIXTURE {checkout} {fixture} {json}"
+        )
+        .expect("write fixture JSON");
+    }
+}
+
 #[tokio::test]
 async fn ping_replies_ephemerally_without_touching_store_or_http() {
     let trace = Trace::default();
@@ -5846,6 +5900,7 @@ async fn ping_replies_ephemerally_without_touching_store_or_http() {
     assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Ok);
     assert!(limit_completion_embed(&interaction, &response).is_some());
     assert!(trace.lock().unwrap().is_empty());
+    capture_utility_completion("ping-ok", &interaction, response).await;
 }
 
 #[tokio::test]
@@ -5861,6 +5916,7 @@ async fn invite_renders_the_vanity_code_or_the_fixed_notice() {
         two_bot_core::voice_utilities::NO_INVITE_CONFIGURED
     );
     assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Warn);
+    capture_utility_completion("invite-not-configured-warn", &interaction, response).await;
     let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
     let writer = seen.clone();
     handle_voice_interaction_with(&runtime, &interaction, Some("abc-123"), None, |response| {
@@ -5896,6 +5952,12 @@ async fn invite_renders_the_vanity_code_or_the_fixed_notice() {
     );
     assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Danger);
     assert!(trace.lock().unwrap().is_empty());
+    capture_utility_completion(
+        "invite-invalid-input-fixture-danger",
+        &interaction,
+        response,
+    )
+    .await;
 }
 
 #[tokio::test]
