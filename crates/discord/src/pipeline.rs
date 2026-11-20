@@ -1559,16 +1559,34 @@ mod tests {
         ))
     }
 
-    #[derive(Default)]
     struct RecordingVoiceObserver {
-        generation: std::sync::atomic::AtomicU64,
+        cache: Arc<SharedCache>,
+        channels_at_capture: Mutex<Vec<Option<u64>>>,
         transitions: Mutex<Vec<VoiceTransitionObservation>>,
         resets: Mutex<Vec<(Option<u64>, Option<u64>)>>,
     }
 
+    impl RecordingVoiceObserver {
+        fn new(cache: Arc<SharedCache>) -> Self {
+            Self {
+                cache,
+                channels_at_capture: Mutex::default(),
+                transitions: Mutex::default(),
+                resets: Mutex::default(),
+            }
+        }
+    }
+
     impl VoiceTransitionObserver for RecordingVoiceObserver {
         fn begin_voice_transition(&self) -> u64 {
-            self.generation.fetch_add(1, Ordering::Relaxed) + 1
+            let mut channels = self.channels_at_capture.lock().expect("observer lock");
+            channels.push(
+                self.cache
+                    .inner
+                    .voice_state(user_id_key(1), guild_id_key(GUILD))
+                    .map(|state| state.channel_id().get()),
+            );
+            u64::try_from(channels.len()).expect("bounded fixture")
         }
 
         fn observe_voice_transition(&self, transition: VoiceTransitionObservation) {
@@ -1594,7 +1612,7 @@ mod tests {
     #[test]
     fn voice_transitions_reach_the_observer_with_stamps() {
         let p = MemPipeline::for_replay();
-        let observer = Arc::new(RecordingVoiceObserver::default());
+        let observer = Arc::new(RecordingVoiceObserver::new(p.cache.clone()));
         p.set_voice_transition_observer(observer.clone());
         p.handle_at(&lifecycle_available_guild(), "2026-10-19T11:59:00.000Z");
         p.handle_at(&lifecycle_voice(GUILD, 1, 10), "2026-10-19T12:00:00.000Z");
@@ -1603,6 +1621,11 @@ mod tests {
         p.handle_at(&lifecycle_mute(GUILD, 1, 10), "2026-10-19T12:00:05.000Z");
         p.handle_at(&lifecycle_voice(GUILD, 1, 11), "2026-10-19T12:00:10.000Z");
         p.handle_at(&lifecycle_leave(GUILD, 1), "2026-10-19T12:00:20.000Z");
+        assert_eq!(
+            *observer.channels_at_capture.lock().expect("observer lock"),
+            [None, Some(10), Some(11)],
+            "each generation must be captured while the previous state is still visible"
+        );
         let transitions = observer.transitions.lock().expect("observer lock");
         assert_eq!(
             *transitions,
@@ -1807,7 +1830,7 @@ mod tests {
             (lifecycle_delete(GUILD, Some(10)), (Some(GUILD), Some(10))),
         ] {
             let p = MemPipeline::for_replay();
-            let observer = Arc::new(RecordingVoiceObserver::default());
+            let observer = Arc::new(RecordingVoiceObserver::new(p.cache.clone()));
             p.set_voice_transition_observer(observer.clone());
             p.handle_at(&lifecycle_voice(GUILD, 1, 10), "2026-10-19T12:00:00.000Z");
             p.handle_at(&event, "2026-10-19T12:01:00.000Z");
