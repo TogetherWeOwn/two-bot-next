@@ -116,6 +116,7 @@ JOB_INVENTORY = {
     "test-guard.yml": {"test-guard"},
     # Advisory changed-file review rules; no deploy route or new required gate.
     "review-rules.yml": {"review-rules"},
+    "promotion-path.yml": {"label"},
     # TOG-21027: manual, bounded vote_kick libFuzzer smoke on a GitHub-hosted
     # runner. Read-only, no secrets, no deploy route: the generic
     # deployment/probe scan already passes, so only the inventory pin is needed.
@@ -10745,6 +10746,11 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "read", "actions": "read", "issues": "write"}
                     elif (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
+                    elif (name, job_id) == ("promotion-path.yml", "label"):
+                        expected["pull-requests"] = "write"  # Add/remove advisory labels only.
+                        self.assertEqual(set(workflow["on"]), {"pull_request_target"})
+                        self.assertEqual(job["if"], "github.ref == 'refs/heads/main'")
+                        self.assertEqual(job["steps"][0]["with"]["ref"], "${{ github.workflow_sha }}")
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
                         # Marker-label actor audit via the issue-events API.
                         expected["pull-requests"] = "read"

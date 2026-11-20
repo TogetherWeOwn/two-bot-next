@@ -93,15 +93,22 @@ no review stage. Pin the merge to that head SHA. At merge, record the squash SHA
 and any applicable PR confirmation in the release log; record the production
 decision there when the Release Manager accepts the release candidate.
 
-A bot merge verified not to deploy production needs **no standing per-PR
-Release Manager confirmation**. Verify live that
-`PRODUCTION_AUTO_PROMOTE_DISABLED=true` and check that the change does not
-introduce or re-enable a path from the merge to production. This rule also
-covers changes to promotion-path code or guidance when the merge itself is
-verified non-deploying. If the merge would deploy production or you cannot rule
-out deployment, require a Release Manager approval stage on the source card
-for the full, exact PR head SHA before merging. This rule does not waive any
-PR-specific direction.
+Verify live that `PRODUCTION_AUTO_PROMOTE_DISABLED=true` and check that the
+merge introduces or re-enables no path to production. For a verified non-deploying
+merge, add a final Release Manager approval stage on the source card for
+`promotion-path: yes`; do not add one for a verified `promotion-path: no` unless
+PR-specific direction requires it. If either the live switch or the absence of
+a deploying path cannot be verified, retain exact-head Release Manager routing
+regardless of the label. The final Release Manager stage is the exact full PR
+head SHA merge confirmation; do not request a second confirmation.
+
+Use the successful [Promotion path workflow](.github/workflows/promotion-path.yml)
+summary from `pull_request_target` to verify the PR number, current head, live
+base ref and SHA, and verdict against the PR. Its [path rules](.github/scripts/promotion_path.py)
+cover workflows/actions, deploy and binding configuration, qualification,
+promotion and rollback tooling, and the actual migration chains and their
+runners/guards. A missing or stale result, or a mutable label without matching
+trusted evidence, is not a waiver; keep conservative routing until verified.
 
 Production release acceptance binds to the exact full release SHA; dispatch
 production with that SHA ([production deploy](docs/production-deploy.md)). A
@@ -135,14 +142,11 @@ exact PR head, Security before QA where required by the review tiers, all other
 applicable review stages, and evidence-backed finding dispositions. Include the
 migration ledger entry (or `no migration`) and rollback target in the release
 decision and in any required approval for a deploying or unverified merge.
-Keep incident, freeze and hold safeguards, identity/capability holds and red
-staging-drill or other deterministic gates; this staging contract lifts none of
-them. A previous rejection remains a rejection, not retroactive approval.
-Resubmit only after its remaining conditions are met. A new PR head requires
-fresh review and check evidence, and fresh Release Manager approval if the merge
-would deploy or cannot be verified non-deploying, before the SHA-pinned squash
-merge. This documentation authorizes no pipeline skip/no-op implementation,
-hold lift, deployment or other production action.
+Production holds, identity/capability safeguards and staging-drill gates govern
+production operations, not verified non-deploying merges. Explicit merge freezes
+still apply. A previous rejection remains a rejection. A new PR head needs fresh
+review, check and routing evidence, and fresh Release Manager approval when
+routed there. This policy does not lift holds or authorize any production action.
 
 ### CI lanes
 

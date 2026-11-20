@@ -341,11 +341,9 @@ check above before dispatch; stop if the intended merged SHA no longer matches
 
 Keep exact-head Actions, Security then QA, fresh inventory of the actual
 database, shared policy and applied migration ledger, exact-head qualification,
-and the `t0`, pre-7-day and post-7-day evidence below. Verified non-deploying
-bot merges need no standing Release Manager confirmation. A merge that would
-deploy production or whose deployment cannot be ruled out needs exact-head
-Release Manager approval on the source card; see
-[production merge evidence](../CONTRIBUTING.md#production-merge-evidence).
+and the `t0`, pre-7-day and post-7-day evidence below. See
+[production merge evidence](../CONTRIBUTING.md#production-merge-evidence)
+for exact-head Release Manager routing; it does not change deploy admission.
 The bootstrap sequence is a technical recovery decision, not approval to merge,
 deploy production or waive missing qualification. Exact-SHA staging qualification
 and the rollback drill remain required live activation evidence; a merge does not

@@ -1,0 +1,33 @@
+name: Promotion path
+
+on:
+  pull_request_target:
+    # Edited includes base retargeting. Refresh from the live PR, not the event diff.
+    types: [opened, reopened, synchronize, edited]
+
+permissions: {}
+
+concurrency:
+  group: promotion-path-${{ github.event.number }}
+  cancel-in-progress: false
+
+jobs:
+  label:
+    # GitHub.com runs pull_request_target from the base repository's default branch.
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Classify and label the current diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.number }}
+          POLICY_SHA: ${{ github.workflow_sha }}
+        run: python3 -B .github/scripts/promotion_path.py
