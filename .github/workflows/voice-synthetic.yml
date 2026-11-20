@@ -169,6 +169,7 @@ jobs:
     timeout-minutes: 10
     outputs: {exercised: "${{ steps.voice.outputs.exercised }}"}
     steps:
+      - run: printf 'VOICE_JOB_DEADLINE=%s\n' "$(( $(date +%s) + 540 ))" >> "$GITHUB_ENV" # Leave one minute for runner overhead.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -180,7 +181,8 @@ jobs:
           VOICE_SYNTHETIC_REQUIRED: ${{ vars.VOICE_SYNTHETIC_REQUIRED }}
           TWO_STAGING_EMPTY_GRACE_SECONDS: ${{ vars.STAGING_EMPTY_GRACE_SECONDS || '60' }}
           RUN_ID: ${{ github.run_id }}
-          INHERITED_EXPIRES_AT: ${{ inputs.staging_use_expires_at }}
+          GRANT_EXPIRES_AT: ${{ inputs.staging_use_expires_at || needs.staging-window.outputs.expires_at }}
+          VOICE_WORK_SECONDS: ${{ inputs.artifact_invocation == 'soak' && '180' || '300' }}
         run: |
           set -euo pipefail
           if [ -z "${TWO_VOICE_SYNTHETIC_BOT_TOKEN:-}" ]; then
@@ -193,14 +195,13 @@ jobs:
           fi
           # Two retries absorb a transient gateway/REST hiccup and the documented
           # 95-139 s per-deploy gateway drop; three failures fail the run.
-          runner=() work=180 cleanup=120
+          budget=$((VOICE_WORK_SECONDS + 150)) # Hard ceiling; includes Discord restoration.
           for attempt in 1 2 3; do
-            if [[ -n "$INHERITED_EXPIRES_AT" ]]; then
-              now=$(date +%s); [[ "$INHERITED_EXPIRES_AT" =~ ^[1-9][0-9]{0,12}$ ]] && (( (now + work + cleanup + 2) * 1000 < INHERITED_EXPIRES_AT )) || {
-                echo '::error::not enough time on the inherited staging grant'; exit 1; }
-              runner=(timeout -s INT -k "${cleanup}s" "${work}s")
+            now=$(date +%s)
+            if [[ ! "$GRANT_EXPIRES_AT" =~ ^[1-9][0-9]{0,12}$ ]] || (( now + budget + 2 >= VOICE_JOB_DEADLINE || (now + budget + 2) * 1000 >= GRANT_EXPIRES_AT )); then
+              echo '::error::not enough runner or staging grant time for voice work and cleanup'; exit 1
             fi
-            if "${runner[@]}" python3 scripts/staging_voice_synthetic.py --evidence "voice-synthetic-$RUN_ID-$attempt.json"; then
+            if timeout -s KILL "${budget}s" python3 scripts/staging_voice_synthetic.py --evidence "voice-synthetic-$RUN_ID-$attempt.json"; then
               printf 'exercised=true\n' >> "$GITHUB_OUTPUT"
               exit 0
             else case $? in 124|137) exit 1 ;; esac

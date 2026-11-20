@@ -311,7 +311,7 @@ select the current verified candidate on the next promotion rather than
 starting a different build under the old candidate's authorization.
 
 The non-cancelling `staging-lifecycle` lock spans startup, baseline, voice
-(five minutes budgeted per attempt), measurement and release. Native persisted expiry
+(up to 330 seconds per attempt, including restoration), measurement and release. Native persisted expiry
 is still required if the runner disappears; `always()` alone is not cleanup
 proof. The original absolute expiry never moves. The grant remains capped at
 40 minutes; the 50-minute finish timeout is not a lock cap. It leaves time for

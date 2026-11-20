@@ -1366,7 +1366,7 @@ jobs:
     # so automatic runs recheck for an active operator dispatch first and skip
     # instead of entering the lane behind one.
     concurrency:
-      group: deploy-production
+      group: ${{ github.run_attempt != 1 && needs.guard.outputs.mode != 'rollback' && needs.guard.outputs.allow_unstaged != 'true' && format('deploy-production-refused-{0}-{1}', github.run_id, github.run_attempt) || 'deploy-production' }}
       cancel-in-progress: false
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ubuntu-latest

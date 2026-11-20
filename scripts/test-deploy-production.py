@@ -390,7 +390,7 @@ class StaticGuardTests(unittest.TestCase):
         # jobs are never cancelled (cancel-in-progress is false).
         self.assertNotIn("concurrency", TOP)
         conc = children(JOBS["production"][1:], 4).get("concurrency", [])
-        self.assertIn("group: deploy-production", "\n".join(conc))
+        self.assertIn("|| 'deploy-production' }}", "\n".join(conc))
         self.assertIn("cancel-in-progress: false", "\n".join(conc))
         for job in ("guard", "schema-gate", "roles-gate", "staging-soak-evidence", "recheck"):
             self.assertNotIn("concurrency", children(JOBS[job][1:], 4))

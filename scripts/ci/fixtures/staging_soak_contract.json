@@ -151,6 +151,7 @@
         },
         "uses": "$/.github/workflows/voice-synthetic.yml",
         "with": {
+          "artifact_invocation": "soak",
           "deploy_staging_call": "true",
           "staging_use_sha": "${{ inputs.sha }}",
           "staging_use_deployment": "${{ needs.begin.outputs.deployment_id }}",
