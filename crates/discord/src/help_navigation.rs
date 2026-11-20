@@ -251,6 +251,7 @@ fn help_callback(
             color: None,
             description: Some(description.to_owned()),
             fields,
+            flags: None,
             footer: None,
             image: None,
             kind: "rich".into(),

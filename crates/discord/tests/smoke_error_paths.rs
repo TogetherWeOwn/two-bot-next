@@ -96,6 +96,7 @@ fn slash(name: &str, permissions: Option<u64>) -> Interaction {
     Interaction {
         app_permissions: None,
         application_id: Id::new(APP_ID),
+        attachment_size_limit: 10_485_760,
         authorizing_integration_owners: ApplicationIntegrationMap {
             guild: Some(AnonymizableId::Id(Id::new(GUILD_ID))),
             user: None,

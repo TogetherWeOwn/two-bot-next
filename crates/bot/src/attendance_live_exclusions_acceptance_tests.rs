@@ -20,6 +20,7 @@ fn attendance(id: u64, actor: &str, occurrence: &str) -> Interaction {
     let user = json!({"id":actor,"username":"synthetic-human","discriminator":"0"});
     serde_json::from_value(json!({
         "application_id":"1111","authorizing_integration_owners":{"0":GUILD.to_string()},
+        "attachment_size_limit":10485760,
         "id":id.to_string(),"token":"synthetic-checkin-token","type":2,"version":1,
         "guild_id":GUILD.to_string(),
         "member":{"permissions":(1_u64 << 33).to_string(),"roles":[],"deaf":false,"mute":false,"flags":0,"user":user},
@@ -275,13 +276,36 @@ async fn live_attendance(path: CheckinPath) {
         36,
         "real membership and event pre/post fences remain exercised"
     );
-    for request in requests.iter().filter(|request| request.method == "PATCH") {
+    let replies: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == "PATCH")
+        .collect();
+    assert_eq!(replies.len(), 6, "one deferred reply per check-in");
+    for request in replies {
         let reply: Value = serde_json::from_slice(&request.body).expect("deferred reply JSON");
+        let content = reply["content"].as_str().expect("reply content");
+        let text = if content.is_empty() {
+            let embeds = reply["embeds"].as_array().expect("reply embeds");
+            assert_eq!(embeds.len(), 1, "exactly one event reply embed");
+            let embed = &embeds[0];
+            assert_eq!(embed["type"], "rich");
+            assert_eq!(
+                embed["color"],
+                two_bot_discord::brand::EmbedKind::Ok.color()
+            );
+            assert_eq!(embed["footer"]["text"], "Together We Own · Events");
+            assert!(embed["footer"]["icon_url"].is_null());
+            assert!(embed["title"].is_null());
+            embed["description"].as_str().expect("embed description")
+        } else {
+            assert!(reply["embeds"].is_null(), "text reply has no embeds");
+            content
+        };
+        assert_eq!(reply["allowed_mentions"]["parse"], json!([]));
+        assert_eq!(reply["allowed_mentions"]["users"], json!([]));
+        assert_eq!(reply["allowed_mentions"]["roles"], json!([]));
         assert!(
-            reply["content"]
-                .as_str()
-                .expect("reply content")
-                .starts_with("Recorded <@"),
+            text.starts_with("Recorded <@"),
             "successful execution, not a refusal: {reply}"
         );
     }

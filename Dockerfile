@@ -8,7 +8,7 @@
 # Multi-platform manifest digests keep tag names readable for Dependabot while
 # making both stages immutable. The builder and distroless runtime are both
 # Debian 13 (trixie), so the binary links against the same glibc it runs on.
-FROM rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137 AS builder
+FROM rust:1.100-trixie@sha256:e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31 AS builder
 
 WORKDIR /app
 
@@ -70,7 +70,7 @@ RUN . /etc/os-release && test "$VERSION_CODENAME" = trixie \
 
 # The base provides glibc, CA trust data and uid/gid 65532. Add only the
 # official libgcc library, copyright files and truthful status.d records.
-FROM gcr.io/distroless/base-nossl-debian13:nonroot@sha256:e6b0f82595aa1edde72c8054de7a9dca30f0f8f54820c37a167c0ddfc21c5c67 AS runtime
+FROM gcr.io/distroless/base-nossl-debian13:nonroot@sha256:89815d620ac01d8de13cdaf04d19ed874447ca2296d4985b14b818f6e5e47854 AS runtime
 
 # Non-secret build provenance (main #137/#156), recorded as image labels.
 ARG BOT_BUILD_REVISION=unknown

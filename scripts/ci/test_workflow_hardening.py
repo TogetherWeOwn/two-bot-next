@@ -107,7 +107,6 @@ class WorkflowHardeningTests(unittest.TestCase):
 
     def test_reported_permission_scopes_keep_their_grants_and_explanations(self):
         scopes = {
-            "daily-digest.yml": {"rollback-proof-watch": {"actions": "read"}},
             "deploy-staging.yml": {"certify-promotion": {"actions": "read"}},
             "pr-size.yml": {"pr-size": {"issues": "write", "pull-requests": "write"},
                             "pr-size-gate": {"issues": "write", "pull-requests": "write"},

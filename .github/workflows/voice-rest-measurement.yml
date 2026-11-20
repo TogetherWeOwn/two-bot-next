@@ -1,0 +1,368 @@
+name: voice-rest-measurement
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+# Hold the lifecycle lock through cleanup. Do not replace pending staging work.
+# Actions compares refs case-insensitively. Only main has branch protection.
+# Other refs and reruns use a separate queue for each attempt.
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && 'staging-lifecycle' || format('voice-rest-measurement-refused-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  staging-window:
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 }}
+    permissions:
+      contents: read
+    environment: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    outputs:
+      expires_at: ${{ steps.begin.outputs.expires_at }}
+      sha: ${{ steps.begin.outputs.sha }}
+      deployment_id: ${{ steps.begin.outputs.deployment_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Acquire the finite window and prove readiness
+        id: begin
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_EXPECTED_SHA: ${{ github.sha }}
+          STAGING_USE_MINUTES: '45'
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-measurement-start.jsonl
+        run: node wrangler/scripts/staging-use-pipeline.mjs begin
+      - name: Retain the acquisition receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-use-measurement-start-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-use-measurement-start.jsonl
+          if-no-files-found: error
+          retention-days: 14
+
+  measurement-before:
+    needs: staging-window
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && needs.staging-window.result == 'success' }}
+    permissions:
+      contents: read
+    environment: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Capture the initial sanitized receipt
+        env:
+          STAGING_USE_SHA: ${{ needs.staging-window.outputs.sha }}
+          STAGING_USE_DEPLOYMENT: ${{ needs.staging-window.outputs.deployment_id }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.staging-window.outputs.expires_at }}
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-measurement-before.jsonl
+        run: |
+          node wrangler/scripts/staging-use-pipeline.mjs consume
+          node wrangler/scripts/voice-measurement-metadata.mjs "$RUNNER_TEMP/voice-metadata.json"
+          node wrangler/scripts/voice-rest-measurement.mjs capture --metadata "$RUNNER_TEMP/voice-metadata.json" --metrics-url "$STAGING_WORKER_URL" --out "$RUNNER_TEMP/voice-before.json"
+          node wrangler/scripts/staging-use-pipeline.mjs consume
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: voice-measurement-before-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/voice-before.json
+          if-no-files-found: error
+          retention-days: 14
+
+  voice-first:
+    needs: [staging-window, measurement-before]
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && needs.staging-window.result == 'success' && needs.measurement-before.result == 'success' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    with:
+      artifact_invocation: first
+      deploy_staging_call: true
+      staging_use_expires_at: ${{ needs.staging-window.outputs.expires_at }}
+      staging_use_sha: ${{ needs.staging-window.outputs.sha }}
+      staging_use_deployment: ${{ needs.staging-window.outputs.deployment_id }}
+    secrets:
+      TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
+      STAGING_OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+
+  measurement-after:
+    needs: [staging-window, measurement-before, voice-first]
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && needs.voice-first.result == 'success' }}
+    outputs:
+      second_required: ${{ steps.decision.outputs.second_required }}
+    permissions:
+      contents: read
+    environment: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: voice-measurement-before-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/voice-before
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: voice-synthetic-${{ github.run_id }}-first
+          path: ${{ runner.temp }}/voice-first
+      - name: Validate the first lifecycle
+        run: python3 scripts/ci/voice_lifecycle_evidence.py "$RUNNER_TEMP/voice-first" "$GITHUB_RUN_ID" "$RUNNER_TEMP/voice-lifecycle-first.json"
+      - name: Capture and compare sanitized receipts
+        id: decision
+        env:
+          STAGING_USE_SHA: ${{ needs.staging-window.outputs.sha }}
+          STAGING_USE_DEPLOYMENT: ${{ needs.staging-window.outputs.deployment_id }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.staging-window.outputs.expires_at }}
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-measurement-after.jsonl
+        run: |
+          node wrangler/scripts/staging-use-pipeline.mjs consume
+          node wrangler/scripts/voice-measurement-metadata.mjs "$RUNNER_TEMP/voice-metadata.json"
+          node wrangler/scripts/voice-rest-measurement.mjs capture --metadata "$RUNNER_TEMP/voice-metadata.json" --metrics-url "$STAGING_WORKER_URL" --out "$RUNNER_TEMP/voice-after.json"
+          node wrangler/scripts/staging-use-pipeline.mjs consume
+          second_required=$(node wrangler/scripts/voice-measurement-decision.mjs "$RUNNER_TEMP/voice-before/voice-before.json" "$RUNNER_TEMP/voice-after.json" "$RUNNER_TEMP/voice-decision.json")
+          test -s "$RUNNER_TEMP/voice-lifecycle-first.json"
+          test -s "$RUNNER_TEMP/voice-decision.json"
+          printf 'second_required=%s\n' "$second_required" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: voice-measurement-${{ steps.decision.outputs.second_required == 'false' && 'candidate' || 'intermediate' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/voice-decision.json
+            ${{ runner.temp }}/voice-lifecycle-first.json
+            ${{ runner.temp }}/voice-before/voice-before.json
+            ${{ runner.temp }}/voice-after.json
+          if-no-files-found: error
+          retention-days: 14
+
+  voice-second:
+    needs: [staging-window, measurement-after]
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && needs.measurement-after.result == 'success' && needs.measurement-after.outputs.second_required == 'true' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    with:
+      artifact_invocation: second
+      deploy_staging_call: true
+      staging_use_expires_at: ${{ needs.staging-window.outputs.expires_at }}
+      staging_use_sha: ${{ needs.staging-window.outputs.sha }}
+      staging_use_deployment: ${{ needs.staging-window.outputs.deployment_id }}
+    secrets:
+      TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
+      STAGING_OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+
+  measurement-final:
+    needs: [staging-window, measurement-after, voice-second]
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && needs.voice-second.result == 'success' }}
+    permissions:
+      contents: read
+    environment: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: voice-measurement-before-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/voice-before
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: voice-measurement-intermediate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/voice-middle
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: voice-synthetic-${{ github.run_id }}-second
+          path: ${{ runner.temp }}/voice-second
+      - name: Validate the second lifecycle
+        run: python3 scripts/ci/voice_lifecycle_evidence.py "$RUNNER_TEMP/voice-second" "$GITHUB_RUN_ID" "$RUNNER_TEMP/voice-lifecycle-second.json"
+      - name: Capture and compare the final sanitized receipt
+        env:
+          STAGING_USE_SHA: ${{ needs.staging-window.outputs.sha }}
+          STAGING_USE_DEPLOYMENT: ${{ needs.staging-window.outputs.deployment_id }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.staging-window.outputs.expires_at }}
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-measurement-final.jsonl
+        run: |
+          node wrangler/scripts/staging-use-pipeline.mjs consume
+          node wrangler/scripts/voice-measurement-metadata.mjs "$RUNNER_TEMP/voice-metadata.json"
+          node wrangler/scripts/voice-rest-measurement.mjs capture --metadata "$RUNNER_TEMP/voice-metadata.json" --metrics-url "$STAGING_WORKER_URL" --out "$RUNNER_TEMP/voice-final.json"
+          node wrangler/scripts/staging-use-pipeline.mjs consume
+          test -s "$RUNNER_TEMP/voice-middle/voice-lifecycle-first.json"
+          test -s "$RUNNER_TEMP/voice-lifecycle-second.json"
+          node wrangler/scripts/voice-measurement-decision.mjs "$RUNNER_TEMP/voice-before/voice-before.json" "$RUNNER_TEMP/voice-middle/voice-after.json" "$RUNNER_TEMP/voice-final.json" "$RUNNER_TEMP/voice-combined.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: voice-measurement-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/voice-combined.json
+            ${{ runner.temp }}/voice-middle/voice-lifecycle-first.json
+            ${{ runner.temp }}/voice-lifecycle-second.json
+            ${{ runner.temp }}/voice-before/voice-before.json
+            ${{ runner.temp }}/voice-middle/voice-after.json
+            ${{ runner.temp }}/voice-final.json
+          if-no-files-found: error
+          retention-days: 14
+
+  staging-use-release:
+    needs: [staging-window, measurement-before, voice-first, measurement-after, voice-second, measurement-final]
+    if: ${{ always() && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && needs.staging-window.outputs.expires_at != '' }}
+    permissions:
+      contents: read
+    environment: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Release only this run's window
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.staging-window.outputs.expires_at }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-measurement-stop.jsonl
+        run: node wrangler/scripts/staging-use-pipeline.mjs finish
+      - name: Retain the cleanup receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-use-measurement-stop-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-use-measurement-stop.jsonl
+          if-no-files-found: error
+          retention-days: 14
+
+  measurement-terminal:
+    needs: [staging-window, measurement-before, voice-first, measurement-after, voice-second, measurement-final, staging-use-release]
+    if: ${{ always() && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      # Allow the verifier to record a refusal, not to accept partial downloads.
+      - id: cleanup
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: staging-use-measurement-stop-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/voice-evidence/cleanup
+      - id: candidate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: voice-measurement-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/voice-evidence/candidate
+      - id: first
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: voice-synthetic-${{ github.run_id }}-first
+          path: ${{ runner.temp }}/voice-evidence/first
+      - id: second
+        if: ${{ needs.measurement-after.outputs.second_required == 'true' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: voice-synthetic-${{ github.run_id }}-second
+          path: ${{ runner.temp }}/voice-evidence/second
+      - name: Reconstruct the original grant metadata
+        id: grant
+        continue-on-error: true
+        env:
+          STAGING_USE_SHA: ${{ needs.staging-window.outputs.sha }}
+          STAGING_USE_DEPLOYMENT: ${{ needs.staging-window.outputs.deployment_id }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.staging-window.outputs.expires_at }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/voice-evidence"
+          node wrangler/scripts/voice-measurement-metadata.mjs "$RUNNER_TEMP/voice-evidence/grant.json"
+      - name: Evaluate terminal evidence
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/voice-evidence
+          STAGING_USE_SHA: ${{ needs.staging-window.outputs.sha }}
+          STAGING_USE_DEPLOYMENT: ${{ needs.staging-window.outputs.deployment_id }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.staging-window.outputs.expires_at }}
+          SECOND_REQUIRED: >-
+            ${{ steps.cleanup.outcome == 'success' && steps.candidate.outcome == 'success' &&
+            steps.first.outcome == 'success' && steps.grant.outcome == 'success' &&
+            (needs.measurement-after.outputs.second_required == 'false' || steps.second.outcome == 'success') &&
+            needs.measurement-after.outputs.second_required || '' }}
+          RESULT_STAGING_WINDOW: ${{ needs.staging-window.result }}
+          RESULT_MEASUREMENT_BEFORE: ${{ needs.measurement-before.result }}
+          RESULT_VOICE_FIRST: ${{ needs.voice-first.result }}
+          RESULT_MEASUREMENT_AFTER: ${{ needs.measurement-after.result }}
+          RESULT_VOICE_SECOND: ${{ needs.voice-second.result }}
+          RESULT_MEASUREMENT_FINAL: ${{ needs.measurement-final.result }}
+          RESULT_STAGING_USE_RELEASE: ${{ needs.staging-use-release.result }}
+        run: python3 scripts/ci/voice_measurement_terminal.py "$RUNNER_TEMP/voice-terminal.json"
+      - name: Retain the terminal verdict
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: voice-measurement-terminal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/voice-terminal.json
+          if-no-files-found: error
+          retention-days: 14
+
+  rerun-refusal:
+    needs: measurement-terminal
+    if: ${{ always() && !(github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1) }}
+    permissions: {}
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - run: exit 1

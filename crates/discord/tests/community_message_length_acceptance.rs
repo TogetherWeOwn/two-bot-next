@@ -58,10 +58,7 @@ mod deferred_capture_compat;
 use deferred_capture_compat::Healthy;
 
 use serde_json::json;
-use twilight_model::{
-    channel::Message,
-    gateway::{event::Event, payload::incoming::MessageCreate},
-};
+use twilight_model::gateway::{event::Event, payload::incoming::MessageCreate};
 use two_bot_core::{ChannelClass, FactsSink, MemStore, MessageFact, NoopLeveling};
 use two_bot_discord::{DeferredCommunityFacts, NoClassification, Pipeline, ScriptedInvites};
 
@@ -145,7 +142,7 @@ fn message_event(message_id: u64, at: &str, content: &str) -> Event {
     // Deserialized like a gateway payload (the same fixture shape as the
     // automation-admission suite), so no struct literal has to name
     // twilight's deprecated `interaction` field.
-    let message: Message = serde_json::from_value(json!({
+    let create: MessageCreate = serde_json::from_value(json!({
         "id": message_id.to_string(),
         "guild_id": GUILD.to_string(),
         "channel_id": CHANNEL.to_string(),
@@ -157,8 +154,8 @@ fn message_event(message_id: u64, at: &str, content: &str) -> Event {
         "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
         "attachments": [], "embeds": [], "pinned": false
     }))
-    .expect("fixture message deserializes");
-    Event::MessageCreate(Box::new(MessageCreate(message)))
+    .expect("fixture MESSAGE_CREATE");
+    Event::MessageCreate(Box::new(create))
 }
 
 #[tokio::test]

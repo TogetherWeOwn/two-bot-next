@@ -10,6 +10,7 @@
 use super::*;
 use common::RestRequest;
 use two_bot_core::{put_rsvp, RsvpRecord, RsvpStatus};
+use two_bot_discord::brand::EmbedKind;
 
 const FOREIGN: &str = "1545644954272137001";
 const SECOND_EVENT: &str = "1546451670500642001";
@@ -98,22 +99,31 @@ async fn live_rest() -> MockRest {
     .await
 }
 
-/// Capture final wire text, not a private parser or a duplicated normalizer.
-fn reply(requests: &[RestRequest]) -> String {
+/// Capture final wire text, preserving the expected delivery and outcome.
+fn reply(requests: &[RestRequest], kind: Option<EmbedKind>) -> String {
     let last = requests.last().expect("a private reply");
     let body: Value = serde_json::from_slice(&last.body).expect("reply JSON");
-    if last.method == "PATCH" {
+    let text = if let Some(kind) = kind {
+        assert_eq!(last.method, "PATCH");
         assert!(last.path.ends_with("/messages/@original"));
-        assert_eq!(body["allowed_mentions"]["parse"], json!([]));
-        body["content"].as_str().expect("edit content").into()
+        assert_ne!(body["allowed_mentions"]["replied_user"], true);
+        attendance_reply::deferred_text(&body, kind)
     } else {
+        assert_eq!(last.method, "POST");
+        assert!(last.path.ends_with("/callback"));
         assert_eq!(body["type"], 4);
         assert_eq!(body["data"]["flags"], 64);
-        body["data"]["content"]
-            .as_str()
-            .expect("private refusal")
-            .into()
-    }
+        assert_eq!(body["data"]["allowed_mentions"]["parse"], json!([]));
+        for key in ["users", "roles"] {
+            let value = &body["data"]["allowed_mentions"][key];
+            assert!(value.is_null() || *value == json!([]));
+        }
+        assert_ne!(body["data"]["allowed_mentions"]["replied_user"], true);
+        assert!(body["data"]["embeds"].is_null());
+        body["data"]["content"].as_str().expect("private refusal")
+    };
+    assert!(!text.is_empty(), "reply must have visible text");
+    text.into()
 }
 
 fn private_effects_only(requests: &[RestRequest], allow_live_reads: bool) {
@@ -171,7 +181,7 @@ async fn rsvp_success(reference: &str, stable_confirmation: bool) {
     let requests = mock.requests();
     fixture.close().await;
     mock.shutdown().await;
-    let text = reply(&requests);
+    let text = reply(&requests, Some(EmbedKind::Ok));
     assert_eq!(
         rows,
         vec![(GUILD.into(), EVENT.into(), USER.into(), "going".into())],
@@ -265,7 +275,7 @@ async fn historical_totals(reference: &str) {
     );
     private_effects_only(&requests, false);
     assert_eq!(requests.len(), 2);
-    let text = reply(&requests);
+    let text = reply(&requests, Some(EmbedKind::Ok));
     assert!(text.contains(&format!("event `{EVENT}`")), "{text}");
     assert!(
         text.contains("Going: 1\nInterested: 0\nDeclined: 1"),
@@ -330,7 +340,7 @@ async fn checkin_success(reference: &str, target: &str, canonical: &str) {
         count,
         (0, 1, 1),
         "link aliases must share the existing replay fence: {}",
-        reply(&requests)
+        reply(&requests, Some(EmbedKind::Ok))
     );
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0].0, target);
@@ -342,7 +352,7 @@ async fn checkin_success(reference: &str, target: &str, canonical: &str) {
         json!({"eventOccurrenceId": canonical, "proof": "host_checkin"})
     );
     assert_eq!(audits, vec![format!("{canonical}:{target}")]);
-    let text = reply(&requests);
+    let text = reply(&requests, Some(EmbedKind::Ok));
     assert!(
         text.contains(canonical) && text.contains("already recorded"),
         "{text}"
@@ -451,7 +461,7 @@ async fn refusals(name: &str, values: Vec<String>) {
             "{name} changed rows for invalid reference {value:?}"
         );
         private_effects_only(&requests, false);
-        let text = reply(&requests);
+        let text = reply(&requests, Some(EmbedKind::Danger));
         assert!(
             !text.is_empty() && text.encode_utf16().count() <= 512,
             "bounded useful refusal: {text}"
@@ -550,7 +560,7 @@ async fn duplicate_and_wrong_type_options_refuse_before_any_live_lookup_or_write
     for (name, i, before, after, requests) in observations {
         assert_eq!(after, before, "{name} malformed option case {i} wrote rows");
         private_effects_only(&requests, false);
-        let text = reply(&requests);
+        let text = reply(&requests, Some(EmbedKind::Danger));
         assert!(
             text.to_lowercase().contains("option"),
             "useful option refusal for {name}/{i}: {text}"
@@ -579,7 +589,7 @@ async fn link_host_checkin_still_requires_manage_events_for_self_and_on_behalf()
     mock.shutdown().await;
     assert_eq!(count, (0, 0, 0));
     assert_eq!(requests.len(), 2);
-    assert!(reply(&requests).contains("Manage Events"));
+    assert!(reply(&requests, None).contains("Manage Events"));
     private_effects_only(&requests, false);
 }
 
@@ -624,7 +634,11 @@ async fn normalized_rsvp_still_checks_current_membership_and_live_event() {
         assert_eq!(count, (0, 0, 0));
         private_effects_only(&requests, true);
         assert_eq!(requests.iter().filter(|r| r.method == "GET").count(), gets);
-        assert!(reply(&requests).contains(expected), "{}", reply(&requests));
+        assert!(
+            reply(&requests, Some(EmbedKind::Danger)).contains(expected),
+            "{}",
+            reply(&requests, Some(EmbedKind::Danger))
+        );
     }
 }
 
@@ -664,7 +678,9 @@ async fn normalized_checkin_still_verifies_host_and_target_membership() {
             requests.iter().any(|r| r.path == guild_member_path(USER)),
             "host gate not reached"
         );
-        assert!(reply(&requests).to_lowercase().contains("member"));
+        assert!(reply(&requests, Some(EmbedKind::Danger))
+            .to_lowercase()
+            .contains("member"));
     }
 }
 
@@ -711,7 +727,7 @@ async fn normalized_rsvp_postwrite_loss_restores_exact_prior_response() {
         2,
         "normalization must reach the existing post-write compensation gate"
     );
-    assert!(reply(&requests).contains("No scheduled event"));
+    assert!(reply(&requests, Some(EmbedKind::Danger)).contains("No scheduled event"));
 }
 
 #[tokio::test]
@@ -748,7 +764,7 @@ async fn normalized_checkin_postwrite_loss_compensates_fact_and_audit() {
             .count(),
         2
     );
-    assert!(reply(&requests).contains("No scheduled event"));
+    assert!(reply(&requests, Some(EmbedKind::Danger)).contains("No scheduled event"));
 }
 
 #[test]

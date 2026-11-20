@@ -87,7 +87,7 @@ async fn seed(db: &TestDb) {
 fn slash(sequence: u64, id: u64) -> Value {
     json!({"op": 0, "s": sequence, "t": "INTERACTION_CREATE", "d": {
         "id": id.to_string(), "application_id": "1111", "type": 2,
-        "token": "custom-command-fixture", "version": 1,
+        "token": "custom-command-fixture", "version": 1, "attachment_size_limit": 10485760,
         "guild_id": GUILD, "channel": {"id": "4444", "type": 0, "name": "commands"},
         "authorizing_integration_owners": {"0": GUILD}, "entitlements": [],
         "member": {
@@ -650,6 +650,7 @@ async fn unavailable_automod_or_disabled_command_gates_capture_without_prefix_po
         assert_eq!(gateway.authentication().await["op"], 2);
         gateway.send(ready(&gateway.url, "gated-session")).await;
         wait_sequence(&db.store, 1).await;
+        wait_requests(&rest, 3).await;
         gateway.send(prefix(2, 54)).await;
         wait_sequence(&db.store, 2).await;
         wait_connected(&state).await;

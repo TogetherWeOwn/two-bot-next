@@ -86,9 +86,13 @@ all guards in [`CONTRIBUTING.md`](CONTRIBUTING.md#database-tests).
 Record the PR's full head SHA and matching Actions run/job URLs for reviewers
 and the Release Manager. Local transcripts are focused reproduction evidence,
 not CI evidence. The final-stage reviewer merges the pinned settled head before
-final approval (the author merges only without a review stage). A merge to
-`main`, including docs-only, needs Release Manager exact-head authorization on
-a child task assigned/addressed to it with `resolverPolicy: not_creator`.
+final approval (the author merges only without a review stage). Verified
+non-deploying bot merges need no standing Release Manager confirmation; all
+exact-head checks and required review stages, including Security before QA
+where applicable, still apply. If a merge would deploy production or deployment
+cannot be ruled out, require Release Manager approval on the source card for
+the full PR head SHA before merge. Production actions need separate approval.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md#production-merge-evidence).
 
 ## Definition of done
 

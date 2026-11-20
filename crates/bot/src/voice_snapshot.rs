@@ -1,8 +1,8 @@
 //! Keyless `voice.snapshot` projection over the shared gateway cache.
 //!
 //! The signed `POST /internal/actions` receiver serves this verb from the
-//! same [`DefaultInMemoryCache`] the gateway loop feeds through the
-//! pipeline: Discord exposes no REST voice-state list, so the live cache is
+//! same fenced [`two_bot_discord::SharedCache`] the gateway loop feeds through
+//! the pipeline: Discord exposes no REST voice-state list, so the live cache is
 //! the only source. A cache that cannot prove a complete guild view refuses
 //! with [`SnapshotRefusal::CacheIncomplete`] (the receiver answers
 //! `discord_unavailable`), never a partial listing and never invented data.
@@ -39,7 +39,7 @@ use twilight_model::id::{
     marker::{ChannelMarker, GuildMarker, UserMarker},
     Id,
 };
-use two_bot_core::Snowflake;
+use two_bot_core::{voice_move_holds::VoiceMoveHolds, Snowflake};
 
 /// Relayed-answer budget for the serialized `result` object. The Worker
 /// refuses to relay bodies over its 64 KiB bound
@@ -98,6 +98,9 @@ struct OccupiedRoom {
 #[derive(Debug, Default)]
 pub(crate) struct VoiceOccupancyClock {
     rooms: Mutex<HashMap<(Snowflake, Snowflake), OccupiedRoom>>,
+    // Reservation, completion and observations share this lock. Readiness
+    // and cache reseeds invalidate room intervals, not move holds.
+    move_holds: Mutex<VoiceMoveHolds>,
 }
 
 impl VoiceOccupancyClock {
@@ -150,7 +153,31 @@ impl VoiceOccupancyClock {
 }
 
 impl two_bot_discord::VoiceTransitionObserver for VoiceOccupancyClock {
+    fn begin_voice_transition(&self) -> u64 {
+        self.move_holds
+            .lock()
+            .expect("voice move holds")
+            .begin_transition()
+    }
+
     fn observe_voice_transition(&self, transition: two_bot_discord::VoiceTransitionObservation) {
+        {
+            let mut holds = self.move_holds.lock().expect("voice move holds");
+            holds.observe(
+                transition.member_id,
+                transition.current_channel_id,
+                transition.generation,
+            );
+            // A reseed can place the member in the target without settling.
+            // A later witnessed departure from it can settle the hold.
+            if transition.previous_channel_confirmed {
+                holds.observe(
+                    transition.member_id,
+                    transition.previous_channel_id,
+                    transition.generation,
+                );
+            }
+        }
         if transition.is_bot {
             return;
         }
@@ -204,17 +231,44 @@ impl two_bot_discord::VoiceTransitionObserver for VoiceOccupancyClock {
 /// occupancy readable, so callers gate on the supervisor's readiness first
 /// and only call this while the gateway is connected.
 pub(crate) fn read_voice_snapshot(
-    cache: &DefaultInMemoryCache,
+    cache: &two_bot_discord::SharedCache,
     clock: &VoiceOccupancyClock,
     guild_id: Snowflake,
     event_keys: &HashMap<Snowflake, String>,
 ) -> Result<Value, SnapshotRefusal> {
-    let mut rooms = collect_rooms(cache, guild_id).ok_or(SnapshotRefusal::CacheIncomplete)?;
+    let mut rooms = observe_rooms(cache, guild_id)?;
     clock.stamp_rooms(guild_id, &mut rooms);
     for room in &mut rooms {
         room.event_key = event_keys.get(&room.channel_id).cloned();
     }
     project(observed_at_now(), rooms)
+}
+
+/// Take one coherent observation before applying any wire-format limits.
+fn observe_rooms(
+    cache: &two_bot_discord::SharedCache,
+    guild_id: Snowflake,
+) -> Result<Vec<RoomDraft>, SnapshotRefusal> {
+    cache
+        .with_guild_snapshot(guild_id, |cache| collect_rooms(cache, guild_id))
+        .flatten()
+        .ok_or(SnapshotRefusal::CacheIncomplete)
+}
+
+fn total_in_voice(rooms: &[RoomDraft]) -> usize {
+    rooms
+        .iter()
+        .filter(|room| !room.afk)
+        .map(|room| room.member_ids.len())
+        .sum()
+}
+
+#[cfg(test)]
+pub(crate) fn read_voice_total(
+    cache: &two_bot_discord::SharedCache,
+    guild_id: Snowflake,
+) -> Result<usize, SnapshotRefusal> {
+    observe_rooms(cache, guild_id).map(|rooms| total_in_voice(&rooms))
 }
 
 /// Whole-second Zulu timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for `observed_at`.
@@ -260,8 +314,8 @@ fn format_whole_second_zulu_parts(
 
 /// Shared-cache handle constructor for the binary wiring (kept beside the
 /// reader so `main.rs` needs no twilight imports of its own).
-pub(crate) fn new_shared_cache() -> Arc<DefaultInMemoryCache> {
-    Arc::new(two_bot_discord::build_cache())
+pub(crate) fn new_shared_cache() -> Arc<two_bot_discord::SharedCache> {
+    Arc::new(two_bot_discord::SharedCache::default())
 }
 
 /// Collect every guild voice channel with its human occupants. Returns
@@ -275,12 +329,16 @@ pub(crate) fn new_shared_cache() -> Arc<DefaultInMemoryCache> {
 ///   built with voice states: Twilight drops the set when the last member
 ///   leaves and re-creates it on the next join, so for a held guild a
 ///   missing set means "nobody in voice", not "not loaded yet";
-/// - any listed occupant's voice state failing lookup → `None` (a leave
-///   racing the read; retryable, never a half-moved member).
+/// - any listed occupant's voice state failing lookup → `None` (an
+///   incomplete roster; retryable, never a half-moved member).
 fn collect_rooms(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Option<Vec<RoomDraft>> {
     let guild_key: Id<GuildMarker> = Id::new(guild_id);
     let guild = cache.guild(guild_key)?;
+    if guild.unavailable() == Some(true) {
+        return None;
+    }
     let afk_channel: Option<Id<ChannelMarker>> = guild.afk_channel_id();
+    drop(guild);
     let channel_ids: Vec<Id<ChannelMarker>> =
         cache.guild_channels(guild_key)?.iter().copied().collect();
     let mut rooms = Vec::new();
@@ -353,11 +411,7 @@ pub(crate) fn project(
             b.channel_id,
         ))
     });
-    let total_in_voice: usize = rooms
-        .iter()
-        .filter(|room| !room.afk)
-        .map(|room| room.member_ids.len())
-        .sum();
+    let total_in_voice = total_in_voice(&rooms);
     let wire_rooms: Vec<Value> = rooms
         .iter()
         .map(|room| {
@@ -398,6 +452,102 @@ pub(crate) fn project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guild_snapshot_eligibility_tracks_gateway_lifecycle() {
+        use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
+        let cache = new_shared_cache();
+        let clock = VoiceOccupancyClock::default();
+        let listing = || read_voice_snapshot(&cache, &clock, 100, &HashMap::new());
+        let scalar = || read_voice_total(&cache, 100);
+        // Ignore Twilight's contents so these assertions isolate admission.
+        let admitted = || cache.with_guild_snapshot(100, |_| ());
+        let assert_incomplete = || {
+            assert_eq!(listing(), Err(SnapshotRefusal::CacheIncomplete));
+            assert_eq!(scalar(), Err(SnapshotRefusal::CacheIncomplete));
+        };
+        assert_incomplete();
+        cache.update(&Event::Resumed);
+        assert_eq!(admitted(), None);
+        assert_incomplete();
+        cache.update(&pipeline_guild(&[42]));
+        assert_eq!(admitted(), Some(()));
+        assert_eq!(scalar(), Ok(1));
+        cache.update(&Event::Resumed);
+        assert_eq!(admitted(), Some(()));
+        assert_eq!(listing().expect("warm snapshot")["total_in_voice"], 1);
+        assert_eq!(scalar(), Ok(1));
+        cache.update(&pipeline_ready());
+        assert_eq!(admitted(), None);
+        assert_incomplete();
+        cache.update(&pipeline_guild(&[42]));
+        assert_eq!(admitted(), Some(()));
+        assert_eq!(listing().expect("full snapshot")["total_in_voice"], 1);
+        assert_eq!(scalar(), Ok(1));
+        cache.update(&Event::GuildCreate(Box::new(GuildCreate::Unavailable(
+            serde_json::from_value(json!({"id": "100", "unavailable": true}))
+                .expect("unavailable guild fixture"),
+        ))));
+        assert_eq!(admitted(), None);
+        assert_incomplete();
+        cache.update(&pipeline_guild(&[]));
+        assert_eq!(admitted(), Some(()));
+        assert_eq!(listing().expect("empty snapshot")["total_in_voice"], 0);
+        assert_eq!(scalar(), Ok(0));
+        for unavailable in [true, false] {
+            cache.update(&Event::GuildDelete(
+                serde_json::from_value(json!({"id": "100", "unavailable": unavailable}))
+                    .expect("deleted guild fixture"),
+            ));
+            cache.update(&Event::Resumed);
+            assert_eq!(admitted(), None);
+            assert_incomplete();
+            cache.update(&pipeline_guild(&[]));
+            assert_eq!(admitted(), Some(()));
+        }
+    }
+
+    #[test]
+    fn oversized_listing_still_yields_the_eligible_scalar() {
+        use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
+        let mut guild: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json"))
+                .expect("guild fixture");
+        guild["afk_channel_id"] = json!("201");
+        guild["channels"] = json!([200, 201, 202].map(|id| json!({
+            "id": id.to_string(), "guild_id": "100", "type": if id == 202 { 13 } else { 2 },
+            "name": "voice", "permission_overwrites": []
+        })));
+        // Unknown users count as humans. The fixture's known bot, the AFK
+        // member and the stage speaker must not contribute.
+        let humans = (1..=5000).map(|id| (100_000_000_000_000_000 + id, 200));
+        guild["voice_states"] = Value::Array(
+            humans
+                .chain([(999, 200), (43, 201), (44, 202)])
+                .map(|(member, room)| {
+                    let Event::VoiceStateUpdate(state) = pipeline_voice(member, Some(room)) else {
+                        unreachable!("voice fixture")
+                    };
+                    serde_json::to_value(state).expect("voice state")
+                })
+                .collect(),
+        );
+        let cache = new_shared_cache();
+        cache.update(&Event::GuildCreate(Box::new(GuildCreate::Available(
+            serde_json::from_value(guild).expect("crowded guild fixture"),
+        ))));
+        let rooms = observe_rooms(&cache, 100).expect("complete guild");
+        assert_eq!(total_in_voice(&rooms), 5000);
+        assert_eq!(
+            read_voice_snapshot(
+                &cache,
+                &VoiceOccupancyClock::default(),
+                100,
+                &HashMap::new()
+            ),
+            Err(SnapshotRefusal::OverBudget)
+        );
+    }
 
     fn draft(
         channel_id: Snowflake,
@@ -549,9 +699,11 @@ mod tests {
         occurred_at_ms: Option<u64>,
     ) -> two_bot_discord::VoiceTransitionObservation {
         two_bot_discord::VoiceTransitionObservation {
+            generation: 0,
             guild_id: 9,
             member_id,
             previous_channel_id: previous.map(|(channel, _)| channel),
+            previous_channel_confirmed: previous.is_some(),
             current_channel_id: current.map(|(channel, _)| channel),
             previous_channel_members: previous
                 .map(|(_, members)| members.to_vec())
@@ -773,6 +925,18 @@ mod tests {
         ))
     }
 
+    fn pipeline_ready() -> twilight_model::gateway::event::Event {
+        twilight_model::gateway::event::Event::Ready(
+            serde_json::from_value(json!({
+                "v": 10, "session_id": "fixture", "resume_gateway_url": "ws://fixture.invalid",
+                "application": {"id": "999", "flags": 0},
+                "user": {"id": "999", "username": "fixture", "discriminator": "0", "mfa_enabled": false},
+                "guilds": [{"id": "100", "unavailable": true}]
+            }))
+            .expect("ready fixture"),
+        )
+    }
+
     fn pipeline_guild(members: &[u64]) -> twilight_model::gateway::event::Event {
         use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
         let mut guild: Value =
@@ -798,15 +962,23 @@ mod tests {
     fn pipeline_clock_preserves_intervals_and_forgets_same_member_after_a_gap() {
         use twilight_model::gateway::event::Event;
         for reseed in [false, true] {
-            let pipeline = two_bot_discord::MemPipeline::for_replay();
+            let cache = new_shared_cache();
+            let pipeline = two_bot_discord::MemPipeline::with_shared_cache(
+                two_bot_core::MemStore::new(),
+                Some(two_bot_core::NoopLeveling),
+                Some(two_bot_core::NoopFacts),
+                two_bot_discord::ScriptedInvites::new(),
+                two_bot_discord::NoClassification,
+                two_bot_discord::PipelineSnapshots::new(),
+                cache.clone(),
+            );
             let clock = VoiceOccupancyClock::new();
             pipeline.set_voice_transition_observer(clock.clone());
             pipeline.handle_at(&pipeline_guild(&[]), "2026-11-03T09:59:00Z");
             pipeline.handle_at(&pipeline_voice(7, Some(200)), "2026-11-03T10:00:00Z");
             pipeline.handle_at(&pipeline_voice(8, Some(200)), "2026-11-03T10:01:00Z");
             let snapshot = || {
-                read_voice_snapshot(pipeline.cache(), &clock, 100, &HashMap::new())
-                    .expect("complete guild")
+                read_voice_snapshot(&cache, &clock, 100, &HashMap::new()).expect("complete guild")
             };
             for member in [99, 7] {
                 // An unrelated guild departure cannot erase this interval.
@@ -852,6 +1024,129 @@ mod tests {
                 json!("2026-11-03T10:07:00Z")
             );
         }
+    }
+
+    struct PauseVoiceStart {
+        published: std::sync::mpsc::SyncSender<()>,
+        resume: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl two_bot_core::FactsSink for PauseVoiceStart {
+        fn record_member_join(&self, _: two_bot_core::MemberJoinFact<'_>) {}
+        fn record_rules_accepted(&self, _: two_bot_core::RulesAcceptedFact<'_>) {}
+        fn record_message(&self, _: two_bot_core::MessageFact<'_>) {}
+        fn record_voice_ended(&self, _: two_bot_core::VoiceEndedFact<'_>) {}
+
+        fn record_voice_started(&self, fact: two_bot_core::VoiceStartedFact<'_>) -> Option<String> {
+            if fact.occurred_at == PAUSED_ARRIVAL {
+                self.published.send(()).expect("signal cache publication");
+                self.resume
+                    .lock()
+                    .expect("funnel pause lock")
+                    .recv_timeout(PIPELINE_TEST_TIMEOUT)
+                    .expect("complete attempt before delivering callback");
+            }
+            None
+        }
+    }
+
+    const PAUSED_ARRIVAL: &str = "2026-11-03T10:00:00Z";
+    const PIPELINE_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn pipeline_clock_fences_holds_at_cache_publication() {
+        use two_bot_core::voice_move_holds::HoldRefused;
+
+        let cache = new_shared_cache();
+        let (published, await_publication) = std::sync::mpsc::sync_channel(1);
+        let (resume, await_completion) = std::sync::mpsc::sync_channel(1);
+        let pipeline = two_bot_discord::MemPipeline::<PauseVoiceStart>::with_shared_cache(
+            two_bot_core::MemStore::new(),
+            Some(two_bot_core::NoopLeveling),
+            Some(PauseVoiceStart {
+                published,
+                resume: Mutex::new(await_completion),
+            }),
+            two_bot_discord::ScriptedInvites::new(),
+            two_bot_discord::NoClassification,
+            two_bot_discord::PipelineSnapshots::new(),
+            cache.clone(),
+        );
+        let clock = VoiceOccupancyClock::new();
+        pipeline.set_voice_transition_observer(clock.clone());
+        let handle = |event| pipeline.handle_at(&event, "2026-11-03T10:01:00Z");
+        let target_members = || {
+            let mut members = observe_rooms(&cache, 100)
+                .expect("complete guild")
+                .into_iter()
+                .find(|room| room.channel_id == 200)
+                .expect("target room")
+                .member_ids;
+            members.sort_unstable();
+            members
+        };
+        let assert_admission = |cached: &[u64], held: &[u64], released: &[u64]| {
+            assert_eq!(target_members(), cached);
+            let holds = clock.move_holds.lock().expect("voice move holds");
+            let cached = u32::try_from(cached.len()).expect("bounded fixture");
+            let seats = cached + u32::try_from(held.len()).expect("bounded fixture");
+            assert_eq!(holds.occupancy(99, 200, cached), Ok(seats));
+            for member in held {
+                assert_eq!(holds.occupancy(*member, 200, cached), Err(HoldRefused));
+            }
+            for member in released {
+                assert_eq!(holds.occupancy(*member, 200, cached), Ok(seats));
+            }
+        };
+
+        handle(pipeline_guild(&[]));
+        clock.move_holds.lock().unwrap().reserve(7, 200).unwrap();
+        assert_admission(&[], &[7], &[]);
+        std::thread::scope(|scope| {
+            let delivery =
+                scope.spawn(|| pipeline.handle_at(&pipeline_voice(7, Some(200)), PAUSED_ARRIVAL));
+            // Facts capture runs after the cache write but before the clock
+            // callback. The held seat still counts alongside the visible join.
+            await_publication
+                .recv_timeout(PIPELINE_TEST_TIMEOUT)
+                .expect("voice start reached funnel");
+            assert_admission(&[7], &[7], &[]);
+            clock.move_holds.lock().unwrap().complete(7);
+            resume.send(()).expect("resume funnel after completion");
+            delivery.join().expect("deliver older observation");
+        });
+        assert_admission(&[7], &[7], &[]);
+        handle(pipeline_voice(7, Some(200))); // Same cached channel is not evidence.
+        handle(twilight_model::gateway::event::Event::Resumed);
+        assert_admission(&[7], &[7], &[]);
+        handle(pipeline_voice(8, Some(200))); // Another member's fresh arrival.
+        assert_admission(&[7, 8], &[7], &[]);
+        handle(pipeline_ready());
+        assert_eq!(
+            observe_rooms(&cache, 100),
+            Err(SnapshotRefusal::CacheIncomplete)
+        );
+        handle(pipeline_voice(7, None)); // An ineligible pre-READY view is not proof.
+        handle(pipeline_guild(&[7, 8])); // A reseed that agrees with the target.
+        assert_admission(&[7, 8], &[7], &[]);
+        handle(pipeline_guild(&[8]));
+        handle(pipeline_voice(7, None)); // A retained state is not a rostered departure.
+        assert_admission(&[8], &[7], &[]);
+        handle(pipeline_voice(7, Some(200))); // A newer matching arrival settles.
+        assert_admission(&[7, 8], &[], &[7]);
+
+        {
+            let mut holds = clock.move_holds.lock().unwrap();
+            holds.reserve(9, 200).unwrap();
+            holds.reserve(10, 200).unwrap();
+            holds.complete(10);
+        }
+        handle(pipeline_guild(&[7, 8, 9, 10]));
+        assert_admission(&[7, 8, 9, 10], &[9, 10], &[7]);
+        handle(pipeline_voice(9, None)); // A witnessed departure cannot settle Pending.
+        assert_admission(&[7, 8, 10], &[9, 10], &[]);
+        handle(pipeline_voice(10, None)); // A witnessed departure after completion can.
+        assert_admission(&[7, 8], &[9], &[10]);
     }
 
     #[test]

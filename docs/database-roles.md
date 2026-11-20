@@ -40,10 +40,13 @@ read-only SELECT for the migrator-plan role, and rejects extra erase or public a
 Member erasure is the operator-only path that writes the migrator-only audit
 table, so it deletes reservation rows as the migrator, never as runtime.
 
-Two tables are migrator-only (`migrator` kind): `member_erasure_audit`
-(operator accountability written by the operator-only erasure path) and
-`invite_campaigns` (go.two.gg redirect store). They still have readers outside
-these three groups, so neither group receives a grant: `two-bot backup` reads
+`voice_heat_hours` is dormant and migrator-only (`migrator` kind). Restore
+can clear it; runtime, the website reader, and the read-only migrator gain
+no access. There is no heat view or change to the web contract version.
+
+Two other migrator-only tables, `member_erasure_audit` (operator
+accountability) and `invite_campaigns` (go.two.gg redirect store), have
+readers outside the service roles: `two-bot backup` reads
 both through `DUMP_TABLES` (`crates/core/src/backup/dump_file.rs`, via
 `dump.rs`; a runtime-group login cannot read them, so the nightly dump would
 abort), and the go.two.gg `REDIRECT_DB` connector reads `invite_campaigns`

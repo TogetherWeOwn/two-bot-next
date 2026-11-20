@@ -258,6 +258,7 @@ fn slash(name: &str, options: Vec<CommandDataOption>) -> Interaction {
     Interaction {
         app_permissions: None,
         application_id: Id::new(1111),
+        attachment_size_limit: 10_485_760,
         authorizing_integration_owners: ApplicationIntegrationMap {
             guild: Some(AnonymizableId::Id(Id::new(GUILD))),
             user: None,

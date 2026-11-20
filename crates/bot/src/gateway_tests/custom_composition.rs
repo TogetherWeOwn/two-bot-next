@@ -198,7 +198,7 @@ async fn spawn_governed_with_commands(
 
 fn rsvp_packet(sequence: u64, status: &str) -> Value {
     json!({"op":0,"s":sequence,"t":"INTERACTION_CREATE","d":{
-        "application_id":"1111", "authorizing_integration_owners":{"0":GUILD},
+        "application_id":"1111", "attachment_size_limit":10485760, "authorizing_integration_owners":{"0":GUILD},
         "id":sequence.to_string(), "token":format!("mock-rsvp-{sequence}"),
         "type":2, "version":1, "guild_id":GUILD,
         "member":{"permissions":"0", "roles":[], "deaf":false, "mute":false,
@@ -213,7 +213,7 @@ fn rsvp_packet(sequence: u64, status: &str) -> Value {
 fn faq_packet(sequence: u64, id: u64, token: &str) -> Value {
     json!({"op": 0, "s": sequence, "t": "INTERACTION_CREATE", "d": {
         "id": id.to_string(), "application_id": "1111", "type": 2,
-        "token": token, "version": 1,
+        "token": token, "version": 1, "attachment_size_limit": 10485760,
         "guild_id": GUILD, "channel": {"id": "4444", "type": 0, "name": "commands"},
         "authorizing_integration_owners": {"0": GUILD}, "entitlements": [],
         "member": {
@@ -491,10 +491,7 @@ async fn mixed_rsvp_custom_command_survives_brief_lane_contention() {
         .filter(|request| request.method == "PATCH" && request.path.contains("mock-rsvp-2"))
         .collect();
     assert_eq!(rsvp_edits.len(), 1);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&rsvp_edits[0].body).unwrap()["content"],
-        "RSVP saved: going."
-    );
+    super::backpressure_acceptance::assert_saved_reply(&rsvp_edits[0].body, "RSVP saved: going.");
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT status FROM event_rsvps")
             .fetch_one(&db.pool)

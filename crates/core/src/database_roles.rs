@@ -175,15 +175,12 @@ mod tests {
                         .trim_matches(|c| c == '"' || c == '(')
                         .trim_end_matches('(')
                         .to_owned();
-                    let kind = if matches!(
-                        name.as_str(),
-                        "discord_send_admission" | "voice_create_reservations"
-                    ) {
-                        "admission"
-                    } else if name == "member_erasure_audit" || name == "invite_campaigns" {
-                        "migrator"
-                    } else {
-                        "table"
+                    let kind = match name.as_str() {
+                        "discord_send_admission" | "voice_create_reservations" => "admission",
+                        "member_erasure_audit" | "invite_campaigns" | "voice_heat_hours" => {
+                            "migrator"
+                        }
+                        _ => "table",
                     };
                     assert!(
                         MATRIX.contains(&format!("'public', '{name}', '{kind}'")),

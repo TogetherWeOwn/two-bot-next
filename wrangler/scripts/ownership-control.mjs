@@ -69,7 +69,7 @@ export async function control({ action, url, token, actor, expectedEpoch, expect
     throw new ControlError("Expected the approved two-bot-next-staging workers.dev origin");
   }
   if (!token || token.length < 32) throw new ControlError("OWNERSHIP_CONTROL_TOKEN is missing or invalid; stop before deployment");
-  if (!["preflight", "status", "takeover", "fence", "deployment-takeover"].includes(action)) throw new ControlError("Unknown action");
+  if (!["preflight", "deployment-preflight", "status", "takeover", "fence", "deployment-takeover"].includes(action)) throw new ControlError("Unknown action");
   if (action === "preflight") return { configured: true };
   const endpoint = new URL("/internal/ownership", origin);
   const headers = { authorization: `Bearer ${token}` };
@@ -92,13 +92,17 @@ export async function control({ action, url, token, actor, expectedEpoch, expect
     attempts += 1;
     const current = await read({ method: "GET" });
     if (action === "status") return current;
-    if (!actor || !/^[a-zA-Z0-9_.:@/-]{1,128}$/.test(actor)) throw new ControlError("Explicit audit actor is required");
+    if (action !== "deployment-preflight" && (!actor || !/^[a-zA-Z0-9_.:@/-]{1,128}$/.test(actor))) {
+      throw new ControlError("Explicit audit actor is required");
+    }
+    // Refuse a routine deploy before it replaces either component when its
+    // later takeover cannot acquire the staging window needed for rollback.
+    if ((action === "deployment-preflight" || (action === "deployment-takeover" && !releaseFence))
+        && current.owner?.phase !== "active") {
+      throw new ControlError("Singleton is intentionally fenced or uninitialized; explicit staging release required");
+    }
+    if (action === "deployment-preflight") return { active: true };
     if (action === "deployment-takeover") {
-      // Routine deployments may hand off an active owner. A parked or pristine
-      // singleton needs an explicit workflow-dispatch release, never push/default.
-      if (current.owner?.phase !== "active" && !releaseFence) {
-        throw new ControlError("Singleton is intentionally fenced or uninitialized; explicit staging release required");
-      }
       // A 5xx after a committed takeover leaves the owner active at the posted epoch; confirm it without posting again.
       if (postedEpoch !== undefined && current.owner?.phase === "active" && current.owner.epoch === postedEpoch &&
           current.owner.deploymentId === current.deploymentId) {

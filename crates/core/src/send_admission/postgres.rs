@@ -4,6 +4,9 @@ use super::*;
 use crate::metrics;
 use sqlx::{PgPool, Row};
 
+#[path = "strict.rs"]
+mod strict;
+
 /// Every consumer of a credential must use the same authoritative database.
 /// Fully qualified table names prevent search_path from splitting a token lane.
 #[derive(Clone, Debug)]
@@ -100,6 +103,10 @@ impl SendAdmission for PgSendAdmission {
         &self.key
     }
 
+    fn admit_strict(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        self.claim_strict()
+    }
+
     fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
         Box::pin(async move {
             // One autocommitted statement, not a transaction held over HTTP.
@@ -164,6 +171,7 @@ impl SendAdmission for PgSendAdmission {
                    in_flight_since_ms = \
                      (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
                  WHERE token_key = $1 AND in_flight \
+                   AND to_jsonb(discord_send_admission)->>'pending_settlement_generation' IS NULL \
                    AND NOT indefinite \
                    AND hold_until_ms <= \
                      (extract(epoch FROM clock_timestamp()) * 1000)::bigint \

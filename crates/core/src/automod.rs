@@ -382,6 +382,17 @@ fn digest_content(normalized: &str) -> u64 {
 }
 
 impl RepeatTracker {
+    /// Copy only the invoker's bounded CREATE history for an admitted preview.
+    pub(crate) fn snapshot_for(&self, guild_id: &str, actor_id: &str) -> Self {
+        let key = format!("{guild_id}:{actor_id}");
+        Self {
+            rows: self
+                .rows
+                .get(&key)
+                .map_or_else(HashMap::new, |rows| HashMap::from([(key, rows.clone())])),
+        }
+    }
+
     /// Expire inactive authors as well as rows for the next observed author.
     /// The runtime calls this with the message/observation clock (never
     /// gateway receipt time); an adapter can also call it on its regular

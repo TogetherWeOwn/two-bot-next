@@ -698,7 +698,7 @@ class StaticGuardTests(unittest.TestCase):
                       "Wait out the remainder", "steps.baseline.outputs"):
             self.assertNotIn(stale, soak_job)
         self.assertEqual([line.strip() for line in job["concurrency"][1:]],
-                         ["group: staging-lifecycle", "cancel-in-progress: false"])
+                         ["group: staging-lifecycle", "cancel-in-progress: false", "queue: max"])
         self.assertEqual("\n".join(job["environment"]),
                          "    environment:\n      name: staging\n      deployment: false")
         self.assertEqual(set(children(job["permissions"][1:], 6)), {"contents", "actions"})

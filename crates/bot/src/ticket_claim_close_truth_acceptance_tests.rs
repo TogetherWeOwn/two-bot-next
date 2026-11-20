@@ -56,7 +56,7 @@ fn button(action: TicketAction, actor: &str, id: &str) -> Interaction {
     };
     serde_json::from_value(json!({
         "application_id":"400", "authorizing_integration_owners":{"0":"100"},
-        "id":id, "token":format!("ticket-test-{id}"), "type":3, "version":1,
+        "id":id, "token":format!("ticket-test-{id}"), "type":3, "version":1, "attachment_size_limit":10485760,
         "guild_id":"100", "channel":{"id":"600","type":0,"name":"ticket-member","permissions":"0"},
         "data":{"custom_id":custom_id,"component_type":2},
         "member":{

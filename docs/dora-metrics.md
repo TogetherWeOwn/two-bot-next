@@ -72,6 +72,5 @@ Every input ID (deployment IDs, SHAs, run IDs, verdicts) lands in the JSON
   week's report while preserving older weeks. A refused or conflicting push
   fails the run closed; the compute artifact still preserves that week's
   numbers.
-- The weekly side-branch push triggers no deploys; `ops/**` is also in
-  `deploy-staging`'s push ignore list, so any future main-side delivery
-  evidence restarts and promotes nothing.
+- The weekly push to `automation/dora-metrics` triggers no deployments. It
+  publishes delivery evidence on that branch without updating `main`.
