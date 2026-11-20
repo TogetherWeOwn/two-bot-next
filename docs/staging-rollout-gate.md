@@ -16,12 +16,17 @@ and `snapshot` steps succeeded and a later step fails (receipt validation,
 ownership takeover, `verify`, or the error-rate gate);
 `scripts/staging_rollout.py` itself performs
 no rollback. On success the pre-deploy Worker version **and** container image
-are restored (with takeover, which releases an intentional fence onto the
-restored version after a fenced takeover refusal), and the run still stays red — the restore
-recovers service, it never certifies the failed build. Without a successful
+are restored. The drill checks the new rollout ID as well as the snapshot's
+Worker version and image digest. Takeover releases the rollback's own fence
+only after both provider readbacks agree. The run stays red: the restore
+recovers service; it never certifies the failed build. Without a successful
 deploy and snapshot there is nothing to restore, so no rollback is attempted.
-The helper additionally requires a proven finite-policy target and the original
-run's grant. Receipt/takeover failures precede grant acquisition, so their
+Before replacing either component, a routine dispatch reads ownership and
+refuses if staging is already fenced or uninitialized. If that state is expected,
+use the separately authorized `release_fence` recovery path to establish a good
+staging baseline before running the drill. The rollback helper still requires
+both a proven finite-policy target and the original run's grant.
+Receipt/takeover failures precede grant acquisition, so their
 conditional rollback invocation refuses before mutation with
 `staging_restore_window_missing`. They do not restore the predecessor; reconcile
 serving version, rollout and ownership, then repair through roll-forward. A

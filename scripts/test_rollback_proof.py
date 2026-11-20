@@ -67,9 +67,11 @@ def run(workflow=proof.WORKFLOW, event="workflow_dispatch", conclusion="failure"
 def files():
     return {"staging-rollback-snapshot.json": {
                 "worker": "two-bot-next-staging", "has_previous": True,
-                "serving_version": VERSION, "serving_image": "registry.example/image@" + DIGEST},
+                "serving_version": VERSION, "serving_image": "registry.example/image@" + DIGEST,
+                "serving_rollout_id": "11111111-1111-4111-8111-111111111111"},
             "auto-rollback-evidence.json": {"worker": "two-bot-next-staging", "variant": "staging",
                 "restored_version": VERSION, "restored_image_digest": DIGEST,
+                "restored_rollout_id": "22222222-2222-4222-8222-222222222222",
                 "gate": "stable-200-gateway-ready", "takeover": True},
             "error-rate-gate.json": {"mode": "rehearsal", "verdict": "fail", "firing": ["rest_5xx_rate"]},
             "evidence.json": {"revision": "a" * 40},
@@ -356,6 +358,10 @@ class RollbackProofTests(unittest.TestCase):
             ("staging-rollback-snapshot.json", "serving_image", "unversioned:latest"),
             ("auto-rollback-evidence.json", "restored_version", "22222222-2222-2222-2222-222222222222"),
             ("auto-rollback-evidence.json", "restored_image_digest", "sha256:" + "b" * 64),
+            ("auto-rollback-evidence.json", "restored_rollout_id", None),
+            ("auto-rollback-evidence.json", "restored_rollout_id", "stale"),
+            ("auto-rollback-evidence.json", "restored_rollout_id",
+             files()["staging-rollback-snapshot.json"]["serving_rollout_id"]),
             ("auto-rollback-evidence.json", "variant", "production"),
             ("auto-rollback-evidence.json", "takeover", False),
             ("auto-rollback-evidence.json", "gate", "ready-once"),
@@ -368,7 +374,11 @@ class RollbackProofTests(unittest.TestCase):
             evidence[file][key] = value
             with self.subTest(file=file, key=key), self.assertRaises(proof.ProofError):
                 proof.validate_evidence(evidence)
-        self.assertEqual(proof.validate_evidence(files())["gate"], "stable-200-gateway-ready")
+        evidence = files()
+        accepted = proof.validate_evidence(evidence)
+        self.assertEqual(accepted["gate"], "stable-200-gateway-ready")
+        self.assertEqual(accepted["restored_rollout_id"],
+                         evidence["auto-rollback-evidence.json"]["restored_rollout_id"])
 
     def test_artifact_is_exact_bounded_and_never_extracted(self):
         data = io.BytesIO()

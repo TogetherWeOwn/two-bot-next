@@ -682,14 +682,22 @@ class Rollback:
             require(callable(self.staging_use), "staging_restore_window_missing")
             self.staging_use("restore-check")
             self.evidence["staging_use"] = "retained-window-checked"
-        started = self.stamp("rollback start")
+        self.stamp("rollback start")
         current = serving_version(self.client, self.worker)
-        if current != restore_version:
+        # A previous attempt can have restored the Worker but left the wrong
+        # image. Fence staging before changing the image in that case too.
+        if self.variant == "staging" or current != restore_version:
             self.take_over_fence_first()
+        if current != restore_version:
             self.restore_worker(restore_version)
         else:
             self.log("worker already serves the restore version; image leg only")
         self.restore_image(restore_image)
+        if self.variant == "staging":
+            # Image convergence can take minutes. Check that the Worker half
+            # of the pair still holds before releasing the rollback fence.
+            require(serving_version(self.client, self.worker) == restore_version,
+                    "rollback_not_active")
         self.take_over(restore_version)
         if self.variant == "staging":
             self.staging_use("rebind")

@@ -629,10 +629,50 @@ class RollbackRunTests(unittest.TestCase):
         routes, _ = self.routes(serving=GOOD_VERSION)
         control, calls = control_stub()
         rb, client, _ = make_rollback(routes, control=control)
+        path = f"/containers/applications/{APP_ID}/rollouts"
+        post = routes[("POST", path)]
+
+        def post_while_fenced(body):
+            self.assertEqual([action for action, _, _ in calls], ["status", "fence"])
+            return post(body)
+
+        client.routes[("POST", path)] = post_while_fenced
         rb.run(GOOD_VERSION, good_image())
-        posts = [call for call in client.calls if call[0] == "POST"]
-        self.assertFalse(any("deployments" in path for _, path, _ in posts))
-        self.assertTrue(any("rollouts" in path for _, path, _ in posts))
+        self.assertEqual([call[:2] for call in client.calls if call[0] == "POST"],
+                         [("POST", path)])
+
+    def test_staging_rechecks_worker_after_polling_the_pinned_image_rollout(self):
+        for drift in (False, True):
+            with self.subTest(drift=drift):
+                routes, state = self.routes(stale_reads=1)
+                path = f"/containers/applications/{APP_ID}/rollouts"
+                completed = routes[("GET", path + "/r-new")]
+                reads = iter(("progressing", "completed"))
+
+                def read_rollout():
+                    response = completed()
+                    row = response["result"]
+                    row["status"] = next(reads)
+                    if drift and row["status"] == "completed":
+                        state["serving"] = BAD_VERSION
+                    return response
+
+                routes[("GET", path + "/r-new")] = read_rollout
+                control, actions = control_stub()
+                rb, client, _ = make_rollback(routes, control=control)
+                if drift:
+                    with self.assertRaisesRegex(base.GateError, "^rollback_not_active$"):
+                        rb.run(GOOD_VERSION, good_image())
+                    self.assertEqual([action for action, _, _ in actions], ["status", "fence"])
+                else:
+                    evidence = rb.run(GOOD_VERSION, good_image())
+                    self.assertEqual(evidence["restored_rollout_id"], "r-new")
+                    self.assertEqual(evidence["gate"], "stable-200-gateway-ready")
+                posts = [call for call in client.calls if call[0] == "POST"]
+                self.assertEqual([call[1] for call in posts],
+                                 [f"/workers/scripts/{WORKER}/deployments", path])
+                self.assertEqual(posts[1][2]["target_configuration"], {"image": good_image()})
+                self.assertEqual(client.calls.count(("GET", path + "/r-new")), 2)
 
     def test_image_restore_accepts_the_steady_state_lag_shape(self):
         # Under durable_object scheduling the completed rollout can read
