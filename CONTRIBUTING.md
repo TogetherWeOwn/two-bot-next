@@ -92,12 +92,17 @@ finding is fixed or answered with evidence. The author merges only when there is
 no review stage. Pin the merge to that head SHA; record the squash SHA and the
 release decision in the release log.
 
-`main` can reach production through staging and automatic promotion. Staging
-trigger rules do not exempt a merge from production safeguards: even a docs-only
-PR needs a fresh, per-PR Release Manager `request_confirmation` on its exact
-head before merge. Put the confirmation on a child task assigned and
-addressed to the Release Manager (`resolverPolicy: not_creator`). A manual
-production dispatch or rollback needs its own Release Manager confirmation too.
+With `PRODUCTION_AUTO_PROMOTE_DISABLED=true`, a merge to `main` does not reach
+production on its own; production goes through Release Manager acceptance of a
+release. Ordinary PRs need **no per-PR Release Manager confirmation**: required
+checks and the review stages suffice. Promotion-path PRs still need a fresh
+Release Manager `request_confirmation` on their exact head before merge:
+workflows, actions and tooling that qualify, select, deploy or roll back a
+production candidate; deploy, Wrangler or binding config; and anything that
+changes `PRODUCTION_AUTO_PROMOTE_*` behaviour. Put the confirmation on a child
+task assigned and addressed to the Release Manager
+(`resolverPolicy: not_creator`). A production migration, manual production
+dispatch or rollback needs its own Release Manager confirmation too.
 
 For two-web-next and two-bot-next, staging qualification is the
 **post-merge, pre-production exact-main staging/e2e/soak gate** (owner decision
@@ -123,13 +128,15 @@ The pipeline's exact-SHA artifact and promotion evidence remains required.
 Before merge, retain required GitHub Actions checks and Devin Review on the
 exact PR head, all applicable specialist and native review, and evidence-backed
 finding dispositions. Include the migration ledger entry (or `no migration`)
-and rollback target in the fresh per-PR exact-head Release Manager decision.
+and rollback target in the release decision (and in the exact-head Release
+Manager confirmation for a promotion-path PR).
 Keep incident, freeze and hold safeguards, identity/capability holds and red
 staging-drill or other deterministic gates; this staging contract lifts none of
 them. A previous rejection remains a rejection, not retroactive approval. Submit
 a fresh confirmation only after its remaining conditions are met. Any new PR
-head requires fresh review/check evidence and Release Manager acceptance before
-the SHA-pinned squash merge and release-log recording. This documentation
+head requires fresh review/check evidence (and, for a promotion-path PR, fresh
+Release Manager confirmation) before the SHA-pinned squash merge and
+release-log recording. This documentation
 authorizes no pipeline skip/no-op implementation, hold lift, deployment or other
 production action.
 

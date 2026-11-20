@@ -320,7 +320,7 @@ check above before dispatch; stop if the intended merged SHA no longer matches
   restore gate still applies to it.
 
 Every gate in this document stays in force: exact-head Actions, Security then QA,
-separate per-PR exact-head Release Manager acceptance before merge, fresh inventory
+exact-head Release Manager confirmation before merging a promotion-path PR, fresh inventory
 of the actual database, shared policy and applied migration ledger, exact-head
 qualification, and the `t0`, pre-7-day and post-7-day evidence below. The bootstrap
 sequence is a technical recovery decision, not approval to merge, deploy production
