@@ -311,7 +311,7 @@ select the current verified candidate on the next promotion rather than
 starting a different build under the old candidate's authorization.
 
 The staging lock spans startup, baseline, measurement, final evidence and
-release in one job, including failed/cancelled cleanup. Native persisted expiry
+release in the reusable soak, including failed/cancelled cleanup. Native persisted expiry
 is still required if the runner disappears; `always()` alone is not cleanup
 proof. The original absolute expiry never moves. The grant remains capped at
 40 minutes; the job has a 50-minute timeout, leaving ten minutes for
@@ -326,7 +326,9 @@ additional runtime authorization. Insufficient count, reset/restart, no bearer,
 changed build or unknown release is not rate PASS. At grant/budget exhaustion,
 fail closed, retain evidence and safely release or expire; hold and route the
 missing proof rather than renew or promote. This holder does not authorize B2.
-Lifecycle NDJSON and measurement JSON are retained as `staging-soak[-start]-<run_id>-<run_attempt>` for seven days. The soak runs outside the
+Lifecycle NDJSON and available
+measurement JSON are always retained as
+`staging-soak[-start]-<run_id>-<run_attempt>` for seven days. The soak runs outside the
 `deploy-production` lane — only the `production` job holds it —
 so a staging wait never queues an operator production rollback behind it. The lane keeps the default single pending slot, so a `recheck`
 job waits for the soak and both gates, then re-reads the disable, the hold,
@@ -410,11 +412,10 @@ once per bot production release, after deploying the candidate to staging.
 Before any production mutation, every ordinary promotion compares the
 soaked candidate on staging with production as it serves now:
 
-- The reusable `staging-soak` workflow alone holds the non-cancelling `staging-lifecycle` queue
-  across begin, one inherited voice synthetic, sampling and release. Reruns cannot acquire or publish.
-  Begin readies the guarded SHA and records a soak-baseline `/ops/metrics` scrape
+- The reusable soak holds the non-cancelling `staging-lifecycle` queue across jobs,
+  readies the guarded SHA, then records a soak-baseline `/ops/metrics` scrape
   (`wrangler/scripts/rest-5xx-counters.mjs`, same `staging` Environment
-  bearer). After the disjoint, non-releasing voice call succeeds, automatic runs and manual staged takeovers measure the full fresh
+  bearer). After one inherited voice call, automatic runs and manual staged takeovers measure the full fresh
   interval with `wrangler/scripts/staging-soak-window.mjs`; a manual
   cutover-hold deploy retains its distinct no-delay policy.
 - Under that same workflow's staging lock, it runs the final staging user-flow

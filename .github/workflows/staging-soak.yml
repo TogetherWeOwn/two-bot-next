@@ -47,11 +47,9 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: baseline
         if: always() && steps.staging-use-begin.outputs.expires_at != ''
-        with:
-          name: staging-soak-start-${{ github.run_id }}-${{ github.run_attempt }}
-          path: "${{ runner.temp }}/staging-soak-use.ndjson\n${{ runner.temp }}/staging-soak-baseline.json"
-          if-no-files-found: error
-          retention-days: 7
+        with: {name: "staging-soak-start-${{ github.run_id }}-${{ github.run_attempt }}",
+               path: "${{ runner.temp }}/staging-soak-use.ndjson\n${{ runner.temp }}/staging-soak-baseline.json",
+               if-no-files-found: error, retention-days: 7}
   voice:
     needs: begin
     permissions: {contents: read}
@@ -69,9 +67,7 @@ jobs:
     if: always() && needs.begin.outputs.expires_at != ''
     runs-on: ubuntu-latest
     environment: {name: staging, deployment: false}
-    permissions:
-      contents: read
-      actions: read # deploy-staging runs: which build the serving revision still promotes
+    permissions: {contents: read, actions: read} # Lists deploy-staging runs for the judge.
     timeout-minutes: 50
     outputs: {skip: "${{ steps.release.outcome == 'success' && steps.judge.outputs.skip || '' }}",
               evidence: "${{ steps.release.outcome == 'success' && steps.judge.outputs.evidence || '' }}"}

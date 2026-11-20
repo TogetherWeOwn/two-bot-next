@@ -1047,14 +1047,16 @@ jobs:
             --expected-branch-id "$TWO_BOT_PRODUCTION_BRANCH_ID" \
             --mode "$MODE" --allow-unstaged "$ALLOW_UNSTAGED"
 
-  # Only the reusable soak queues on staging; rollback stays independent.
+  # One canonical staging lock spans startup, baseline, a fresh full live
+  # interval, final regression evidence and release. Historical staging-green
+  # age is not live soak credit. The reusable soak leaves rollback independent.
   soak:
     name: bounded live staging soak and regression evidence
     needs: guard
     if: needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'
     permissions:
       contents: read
-      actions: read
+      actions: read # deploy-staging runs: which build the serving revision still promotes
     uses: ./.github/workflows/staging-soak.yml
     with:
       sha: ${{ needs.guard.outputs.sha }}

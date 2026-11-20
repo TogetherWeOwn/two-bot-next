@@ -117,8 +117,7 @@ def run_blocks():
 
 TOP = children(LINES, 0)
 JOBS = children(TOP["jobs"][1:], 2)
-# Read the original lifecycle sequence across the split for these step-local
-# checks. The reusable graph itself is pinned by the workflow-policy tests.
+# Project the split sequence for step-local checks; the workflow-policy tests pin the actual graph.
 SOAK = children(WORKFLOW.with_name("staging-soak.yml").read_text().splitlines(), 0)
 BEGIN, FINISH = (children(SOAK["jobs"][1:], 2)[job] for job in ("begin", "finish"))
 CALL = children(JOBS["soak"][1:], 4)
@@ -129,7 +128,7 @@ SOAK_BODY = (SOAK_BODY.replace("        env: *grant", "\n".join(GRANT_ENV))
              .replace("inputs.full_soak", value(children(CALL["with"][1:], 6)["full_soak"])[4:-3])
              .replace("inputs.", "needs.guard.outputs.")
              .replace("needs.begin.outputs.", "steps.staging-use-begin.outputs."))
-JOBS["soak"] = (JOBS["soak"][:4] + FINISH_FIELDS["permissions"] + FINISH_FIELDS["runs-on"] + FINISH_FIELDS["timeout-minutes"]
+JOBS["soak"] = (JOBS["soak"][:4] + CALL["permissions"] + FINISH_FIELDS["runs-on"] + FINISH_FIELDS["timeout-minutes"]
                 + ["    environment:", "      name: staging", "      deployment: false", "    concurrency:"]
                 + ["      " + value for value in ("group: staging-lifecycle", "cancel-in-progress: false", "queue: max")]
                 + ["    outputs:", "      skip: ${{ steps.judge.outputs.skip }}", "      evidence: ${{ steps.judge.outputs.evidence }}",
@@ -438,9 +437,11 @@ class StaticGuardTests(unittest.TestCase):
 
     def test_actions_are_pinned_and_wrangler_matches_staging(self):
         uses = [line.split("uses:", 1)[1].strip() for line in LINES if "uses:" in line]
+        self.assertEqual(value(CALL["uses"]).split()[0], "./.github/workflows/staging-soak.yml")
+        uses.remove(value(CALL["uses"]))
         self.assertTrue(uses)
         for ref in uses:
-            self.assertRegex(ref, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}(\s|$)", ref)
+            self.assertRegex(ref, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}(?:,?\s|$)", ref)
         staging = {
             line.split("uses:", 1)[1].split()[0]
             for line in STAGING.read_text().splitlines() if WRANGLER_ACTION in line
