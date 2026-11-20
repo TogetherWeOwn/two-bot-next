@@ -5873,8 +5873,12 @@ async fn capture_utility_completion(
     assert_eq!(embeds[0]["footer"]["text"], "Together We Own · Voice");
     assert!(embeds[0]["footer"].get("icon_url").is_none());
 
+    // Emit only in rust-tests, where the default checkout matches GITHUB_SHA.
+    if std::env::var("GITHUB_JOB").as_deref() != Ok("rust-tests") {
+        return;
+    }
     // A direct write bypasses libtest's capture without exposing other test output.
-    if let Some(checkout) = option_env!("GITHUB_SHA") {
+    if let Ok(checkout) = std::env::var("GITHUB_SHA") {
         let json = std::str::from_utf8(&body).expect("UTF-8 PATCH JSON");
         writeln!(
             std::io::stdout().lock(),
