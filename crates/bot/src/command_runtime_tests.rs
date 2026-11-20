@@ -1577,9 +1577,8 @@ async fn automod_preview_router_refuses_before_decode_and_only_answers_privately
         .on_interaction(&slash("automod-preview", Some(CHANNEL), Vec::new()))
         .await;
 
-    let mut receipt = PreviewReceipt::now();
-    receipt.received_at -= Duration::from_secs(3);
-    runtime.on_interaction_at(&dm, None, receipt).await;
+    let expired = tokio::time::Instant::now() - Duration::from_secs(3);
+    runtime.on_interaction_received_at(&dm, expired).await;
 
     let requests = mock.requests();
     let expected = cases
@@ -1676,17 +1675,8 @@ async fn automod_preview_uses_attached_activation_and_fails_closed_without_audit
     .into_iter()
     .enumerate()
     {
-        interaction.id = Id::new(10 + index as u64);
-        interaction
-            .member
-            .as_mut()
-            .expect("invoking member")
-            .permissions = Some(permissions);
-        assert!(
-            runtime.dispatch(&Event::InteractionCreate(Box::new(InteractionCreate(
-                interaction.clone()
-            ))))
-        );
+        let invocation = from_member(interaction.clone(), 10 + index as u64, permissions);
+        assert!(runtime.dispatch(&interaction_event(invocation)));
         wait_for(|| mock.requests().len() > index, "preview callback").await;
         let requests = mock.requests();
         assert!(requests[index].path.ends_with("/callback"));

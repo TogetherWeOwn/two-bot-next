@@ -1453,6 +1453,13 @@ impl CommandRuntime {
             .await;
     }
 
+    #[cfg(test)]
+    pub(crate) async fn on_interaction_received_at(&self, interaction: &Interaction, at: Instant) {
+        let mut receipt = PreviewReceipt::now();
+        receipt.received_at = at;
+        self.on_interaction_at(interaction, None, receipt).await;
+    }
+
     async fn on_interaction_at(
         &self,
         interaction: &Interaction,
