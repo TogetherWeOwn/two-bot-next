@@ -1695,6 +1695,205 @@ async fn automod_preview_uses_attached_activation_and_fails_closed_without_audit
     mock.shutdown().await;
 }
 
+mod preview_callback_acceptance {
+    use super::*;
+    use tokio::time::Instant;
+    use two_bot_core::{
+        automod_preview_audit::{load_preview_audit, lock_preview_attempt, replay_preview_reply},
+        automod_runtime::STAGING_GUILD_ID,
+        send_admission::{
+            AdmissionError, AdmissionFuture, AdmissionPermit, PgSendAdmission, SendAdmission,
+            TokenKey,
+        },
+    };
+    use two_bot_discord::executor::RECEIPT_ADMISSION_BUDGET_MS;
+
+    const SAMPLE: &str = "syntheticpreviewcanary";
+
+    #[derive(Debug)]
+    struct ObservedAdmission {
+        inner: PgSendAdmission,
+        pool: PgPool,
+        saw_commit: std::sync::atomic::AtomicBool,
+        blocked: tokio::sync::Notify,
+    }
+
+    impl SendAdmission for ObservedAdmission {
+        fn token_key(&self) -> &TokenKey {
+            self.inner.token_key()
+        }
+
+        fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+            Box::pin(async {
+                let result = self.inner.admit().await;
+                match &result {
+                    Ok(_) => {
+                        let committed = load_preview_audit(&self.pool, "automod-preview:801")
+                            .await
+                            .is_ok_and(|row| row.is_some());
+                        self.saw_commit.store(committed, Ordering::Relaxed);
+                    }
+                    Err(AdmissionError::Blocked) => self.blocked.notify_one(),
+                    Err(_) => {}
+                }
+                result
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_callback_follows_commit_and_respects_receipt_under_contention(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = std::env::var("TWO_TEST_DATABASE_URL")?;
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await?;
+        let proof = tokio::spawn(verify_callbacks(db.pool().clone())).await;
+        db.close().await?;
+        proof??;
+        Ok(())
+    }
+
+    async fn verify_callbacks(
+        pool: PgPool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let guild = STAGING_GUILD_ID.parse::<u64>()?;
+        let (mock, origin) = MockRest::start(vec![204]).await;
+        let token = "preview-callback-test-token";
+        let admission = Arc::new(ObservedAdmission {
+            inner: PgSendAdmission::new(pool.clone(), token)?,
+            pool: pool.clone(),
+            saw_commit: std::sync::atomic::AtomicBool::new(false),
+            blocked: tokio::sync::Notify::new(),
+        });
+        let executor =
+            ActionExecutor::with_admission(token.to_owned(), Some(origin), admission.clone())
+                .expect("loopback executor");
+        let resolved = crate::automod_gateway::resolve(
+            &[
+                ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
+                (
+                    "TWO_OWEN_USER_ID".to_owned(),
+                    "123456789012345678".to_owned(),
+                ),
+                ("TWO_AUTOMOD_BAD_WORDS".to_owned(), SAMPLE.to_owned()),
+            ]
+            .into(),
+            guild,
+        )?
+        .expect("enabled policy");
+        let activation = crate::automod_gateway::build(resolved, pool.clone(), executor.clone());
+        let runtime = CommandRuntime::new(
+            pool.clone(),
+            executor,
+            router_with_commands(RouterGates {
+                moderation: true,
+                configured_guild: Some(guild),
+                ..gates(true, false)
+            }),
+            guild,
+            true,
+        );
+        runtime.set_automod(activation);
+        let _guard = runtime.dispatch_guard();
+        let preview = |id| {
+            let mut request = slash(
+                "automod-preview",
+                Some(CHANNEL),
+                vec![option(
+                    "text",
+                    CommandOptionValue::String(SAMPLE.to_owned()),
+                )],
+            );
+            set_guild(&mut request, Some(Id::new(guild)));
+            request.authorizing_integration_owners.guild = Some(AnonymizableId::Id(Id::new(guild)));
+            from_member(request, id, Permissions::MANAGE_GUILD)
+        };
+        assert!(runtime.dispatch(&interaction_event(preview(801))));
+        wait_for(|| !mock.requests().is_empty(), "audited callback").await;
+        assert!(admission.saw_commit.load(Ordering::Relaxed));
+        let row = load_preview_audit(&pool, "automod-preview:801")
+            .await?
+            .expect("committed before the callback");
+        assert_eq!(row.outcome, "matched");
+        let reason = row.reason.as_deref().expect("audit reason");
+        assert!(!reason.contains(SAMPLE));
+        let reply = replay_preview_reply(&row.outcome, Some(reason), &row.created_at)
+            .expect("stored verdict renders");
+        assert!(reply.contains("TWO_AUTOMOD_BAD_WORDS"));
+        assert!(!reply.contains(SAMPLE));
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].path.ends_with("/callback"));
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body)?;
+        assert_eq!(body["type"], 4);
+        assert_eq!(body["data"]["flags"], 64);
+        assert_eq!(
+            body["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert_eq!(body["data"]["content"], reply);
+
+        let lane = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match admission.inner.admit().await {
+                    Err(AdmissionError::Blocked) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await
+                    }
+                    result => break result,
+                }
+            }
+        })
+        .await??;
+        let mut audit = pool.begin().await?;
+        lock_preview_attempt(&mut audit, "802").await?;
+        let second = preview(802);
+        let received_at = Instant::now() - Duration::from_millis(750);
+        let deadline = received_at + Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS);
+        let attempt = runtime.on_interaction_received_at(&second, received_at);
+        tokio::pin!(attempt);
+        let contend = async {
+            // Prove this invocation actually waited on the audit claim before
+            // observing the independent occupied REST lane.
+            loop {
+                let waiting = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
+                     AND NOT granted AND pg_backend_pid() = ANY(pg_blocking_pids(pid)))",
+                )
+                .fetch_one(&mut *audit)
+                .await?;
+                if waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            audit.rollback().await?;
+            admission.blocked.notified().await;
+            Ok::<(), sqlx::Error>(())
+        };
+        tokio::select! {
+            result = tokio::time::timeout_at(deadline, contend) => result??,
+            () = &mut attempt => return Err("preview finished before exercising both waits".into()),
+        }
+        // Finish the remaining deadline deterministically; no database latch
+        // waits for virtual time. A fresh budget at REST entry would run longer.
+        tokio::time::pause();
+        let settled = tokio::time::timeout_at(deadline + Duration::from_millis(100), attempt).await;
+        tokio::time::resume();
+        lane.complete(None).await?;
+        settled.expect("callback attempt obeys the original receipt deadline");
+        let row = load_preview_audit(&pool, "automod-preview:802")
+            .await?
+            .expect("audit committed even though callback expired");
+        assert_eq!(row.outcome, "matched");
+        assert_eq!(mock.requests().len(), 1, "no late callback or follow-up");
+        mock.shutdown().await;
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn unconfirmed_help_does_not_invent_a_live_registry() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
