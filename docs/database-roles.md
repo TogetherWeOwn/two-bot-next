@@ -123,6 +123,11 @@ instance start, with no member column, so there is nothing to erase and no
 reader grant beyond the app pool. Backups archive it (v16); an old-format
 restore clears it and never backfills liveness.
 
+The dormant attendance pair (`event_attendance_windows`, `event_voice_sessions`)
+and the session ID sequence use the reviewed table and sequence grants for
+backup and restore. Neither table is exposed to the web reader. There are no
+runtime attendance readers or writers in this schema increment.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not
