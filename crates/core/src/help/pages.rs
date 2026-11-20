@@ -28,38 +28,32 @@ pub struct Page {
 #[derive(Debug, PartialEq, Eq)]
 pub struct PlanError;
 
-/// Pack all blocks or fail. `inside` reserves description units; `outside`
-/// reserves other embed text (e.g. title/footer). Both count against the total.
-/// Content that may split, including field fallbacks, must be plain text:
-/// scalar-safe cuts do not keep Markdown constructs intact across embeds.
+/// Pack all blocks or fail. Both reservations use the total; `inside` also uses the description.
+/// Splittable content, including field fallbacks, must be plain text (cuts can break Markdown).
 pub fn plan(blocks: &[Block<'_>], outside: usize, inside: usize) -> Result<Vec<Page>, PlanError> {
-    let total = EMBED_TOTAL_LIMIT.saturating_sub(outside.saturating_add(inside));
-    let desc_limit = EMBED_DESCRIPTION_LIMIT.saturating_sub(inside).min(total);
-    (desc_limit >= 2).then_some(()).ok_or(PlanError)?;
+    let charge = |budget: usize, cost| budget.checked_sub(cost).ok_or(PlanError);
+    let reserved = outside.checked_add(inside).ok_or(PlanError)?;
+    let total = charge(EMBED_TOTAL_LIMIT, reserved)?;
+    let desc_limit = charge(EMBED_DESCRIPTION_LIMIT, inside)?.min(total);
     let mut pages = vec![Page::default()];
-    let (mut bytes, mut units, mut used) = (0usize, SOURCE_UNITS, 0);
-    let mut run = String::new();
+    let (mut bytes, mut units, mut used) = (SOURCE_BYTES, SOURCE_UNITS, 0);
+    let mut run = None::<String>;
     for &block in blocks {
-        let (name, value) = match block {
-            Block::Description(value) => ("", value),
-            Block::Field(name, value) => (name, value),
+        let parts = match block {
+            Block::Field("", "") => return Err(PlanError),
+            Block::Field(name, value) => [name, value],
+            Block::Description(text) => ["", text],
         };
-        bytes = bytes.saturating_add(name.len()).saturating_add(value.len());
-        if bytes > SOURCE_BYTES || (name.is_empty() && value.is_empty()) {
-            return Err(PlanError);
-        }
-        let [name, value] = [name, value].map(neutralize_mentions);
-        let [name_units, value_units] = [&name, &value].map(|s| text_len(s));
-        let cost = name_units + value_units;
-        units = units.checked_sub(cost).ok_or(PlanError)?;
-        if name_units <= EMBED_FIELD_NAME_LIMIT
-            && value_units <= EMBED_FIELD_VALUE_LIMIT
-            && cost <= total
-            && [&name, &value].iter().all(|s| !s.trim().is_empty())
-            && (has_message_text(&name) || has_message_text(&value))
-        {
-            if !run.is_empty() {
-                used = flush(&mut pages, std::mem::take(&mut run), desc_limit)?;
+        bytes = charge(bytes, parts[0].len() + parts[1].len())?;
+        let [name, value] = parts.map(neutralize_mentions);
+        let [n, v] = [&name, &value].map(|s| text_len(s));
+        let cost = n + v;
+        units = charge(units, cost)?;
+        let fits = n <= EMBED_FIELD_NAME_LIMIT && v <= EMBED_FIELD_VALUE_LIMIT;
+        let nonempty = !name.trim().is_empty() && !value.trim().is_empty();
+        if fits && cost <= total && nonempty {
+            if let Some(text) = run.take() {
+                used = flush(&mut pages, text, desc_limit)?;
             }
             let mut page = pages.last_mut().expect("page exists");
             if page.fields.len() == FIELDS_PER_PAGE || used + cost > total {
@@ -69,19 +63,25 @@ pub fn plan(blocks: &[Block<'_>], outside: usize, inside: usize) -> Result<Vec<P
             page.fields.push((name, value));
             used += cost;
         } else {
-            for part in [name, value].into_iter().filter(|s| !s.is_empty()) {
-                if !run.is_empty() {
-                    units = units.checked_sub(1).ok_or(PlanError)?;
-                    run.push('\n');
-                }
-                run.push_str(&part);
+            let name = (n != 0).then_some(name);
+            let value = (v != 0 || matches!(block, Block::Description(_))).then_some(value);
+            for part in [name, value].into_iter().flatten() {
+                let sep = if run.is_some() { "\n" } else { "" };
+                units = charge(units, sep.len())?;
+                run.get_or_insert_default().extend([sep, part.as_str()]);
             }
         }
     }
-    if !run.is_empty() {
-        flush(&mut pages, run, desc_limit)?;
+    if let Some(text) = run {
+        flush(&mut pages, text, desc_limit)?;
     }
-    Ok(pages)
+    let visible = |p: &Page| {
+        let field = |(n, v): &(String, String)| has_message_text(n) || has_message_text(v);
+        has_message_text(&p.description) || p.fields.iter().any(field)
+    };
+    ((blocks.is_empty() && reserved != 0) || pages.iter().all(visible))
+        .then_some(pages)
+        .ok_or(PlanError)
 }
 
 fn flush(pages: &mut Vec<Page>, text: String, limit: usize) -> Result<usize, PlanError> {
@@ -91,7 +91,6 @@ fn flush(pages: &mut Vec<Page>, text: String, limit: usize) -> Result<usize, Pla
     }
     let width = text_len(&text);
     if width <= limit {
-        has_message_text(&text).then_some(()).ok_or(PlanError)?;
         page.description = text;
         return Ok(width);
     }
@@ -116,10 +115,8 @@ fn flush(pages: &mut Vec<Page>, text: String, limit: usize) -> Result<usize, Pla
         while ends.front().is_some_and(over_budget) {
             ends.pop_front();
         }
-        let (score, cut) = match ends.front() {
-            Some(&end) => (suffix[end].2 + 1, end),
-            None => (usize::MAX, usize::MAX),
-        };
+        let cut = ends.front().copied().unwrap_or(usize::MAX);
+        let score = suffix.get(cut).map_or(usize::MAX, |end| end.2 + 1);
         suffix.push((byte, units, score, cut));
     }
     let mut start = suffix.len() - 1;
@@ -149,37 +146,38 @@ mod tests {
 
     #[test]
     fn preserves_order_across_notes_and_group_breaks() {
-        let heading = "x".repeat(4050);
-        let notes = [heading.as_str(), "Note", "End"];
-        let [a, b, _] = notes.map(Description);
-        let end = Field("End", "");
-        let blocks = [a, Field("Group", "/a"), b, Field("Next", "/b"), end];
+        let (heading, z) = ("x".repeat(4050), "\u{200b}");
+        let mut blocks = vec![Description(&heading), Field("Next", "/b")];
+        blocks.extend([Description("Overview"), Field(z, z)]);
+        blocks.extend([Description(z), Field("Group", "/a")]);
+        blocks.extend(["Overview", "", "Commands"].map(Description));
+        blocks.extend([Field(z, "/a"), Field("End", z), Field("End", "")]);
         let pages = plan(&blocks, 80, 0).unwrap();
-        assert!(pages.iter().map(|p| p.description.as_str()).eq(notes));
-        assert_eq!(pages[0].fields, [("Group".to_owned(), "/a".to_owned())]);
-        assert_eq!(pages[1].fields, [("Next".to_owned(), "/b".to_owned())]);
-        let placeholders = [("\u{200b}", "/a"), ("End", "\u{200b}")];
-        let pages = plan(&placeholders.map(|(n, v)| Field(n, v)), 80, 0).unwrap();
-        let expected = placeholders.map(|(n, v)| (n.to_owned(), v.to_owned()));
-        assert_eq!(pages[0].fields, expected);
+        let notes = "Overview\n\nCommands";
+        let expected = [heading.as_str(), "Overview", z, notes, "End"];
+        assert!(pages.iter().map(|p| p.description.as_str()).eq(expected));
+        assert!(pages.iter().map(|p| p.fields.len()).eq([1, 1, 1, 2, 0]));
+        let pairs = pages.iter().flat_map(|p| &p.fields);
+        let actual = pairs.map(|(n, v)| (n.as_str(), v.as_str()));
+        let groups = [("Next", "/b"), (z, z), ("Group", "/a")].into_iter();
+        assert!(actual.eq(groups.chain([(z, "/a"), ("End", z)])));
     }
 
     #[test]
     fn keeps_every_field_past_five_pages() {
-        let name = "x".repeat(256);
-        let tail = "x".repeat(766);
-        let values: Vec<_> = (0..32).map(|i| format!("{i:02}{tail}")).collect();
+        let (name, note) = ("x".repeat(256), "x".repeat(1024));
+        let values: Vec<_> = (0..32).map(|i| format!("{i:0768}")).collect();
         let mut fields: Vec<_> = values.iter().map(|v| Field(&name, v)).collect();
         let pages = plan(&fields, 80, 0).unwrap(); // Exactly 32,768 source units.
         assert!(pages.len() > 5);
         assert_eq!(pages[0].fields.len(), 5); // Six would exceed the shared budget.
         let actual = pages.iter().flat_map(|p| &p.fields).map(|(_, v)| v);
         assert!(actual.eq(&values));
-        let note = "x".repeat(1024);
         fields[30] = Description(&note);
         let pages = plan(&fields, 80, 0).unwrap();
         assert_eq!(pages.last().unwrap().description, note);
-        assert_eq!(plan(&[Field("Group", "/a"); 7], 0, 0).unwrap().len(), 2);
+        let pages = plan(&[Field("Group", "/a"); 7], 0, EMBED_DESCRIPTION_LIMIT).unwrap();
+        assert!(pages.iter().map(|p| p.fields.len()).eq([6, 1]));
     }
 
     #[test]
@@ -210,21 +208,24 @@ mod tests {
     }
 
     fn assert_split(pages: Vec<Page>, input: &str, lengths: &[usize]) {
-        let actual: Vec<_> = pages.iter().map(|p| text_len(&p.description)).collect();
-        assert_eq!(actual, lengths);
-        for page in &pages {
-            assert!(page.fields.is_empty() && has_message_text(&page.description));
-        }
-        let joined: String = pages.into_iter().map(|p| p.description).collect();
-        assert_eq!(joined, input);
+        let parts = pages.iter().map(|p| p.description.as_str());
+        assert!(parts.clone().map(text_len).eq(lengths.iter().copied()));
+        assert!(pages.iter().all(|p| p.fields.is_empty()) && parts.clone().all(has_message_text));
+        assert_eq!(parts.collect::<String>(), input);
     }
 
     #[test]
     fn rejects_a_whole_plan_when_bounds_are_exceeded() {
-        assert_eq!(plan(&[], 80, 0), Ok(vec![Page::default()]));
-        assert_eq!(plan(&[], 0, EMBED_DESCRIPTION_LIMIT), Err(PlanError));
-        assert_eq!(plan(&[], EMBED_TOTAL_LIMIT, 1), Err(PlanError));
-        assert!(plan(&[Field("\u{200b}", "\u{200b}")], 0, 0).is_err());
+        let limit = EMBED_DESCRIPTION_LIMIT;
+        assert_split(plan(&[Description("A")], 0, limit - 1).unwrap(), "A", &[1]);
+        let empty = |outside, inside| plan(&[], outside, inside);
+        assert_eq!(empty(80, 0), Ok(vec![Page::default()]));
+        assert_eq!(empty(EMBED_TOTAL_LIMIT - limit, limit), empty(80, 0));
+        assert!(empty(0, 0).is_err() && empty(0, limit + 1).is_err());
+        assert!(empty(EMBED_TOTAL_LIMIT, 1).is_err() && empty(usize::MAX, 1).is_err());
+        let (z, group) = ("\u{200b}", Field("Group", "/a"));
+        assert!(plan(&[Field(z, z)], 0, 0).is_err());
+        assert!(plan(&[group, Description(z)], 0, 0).is_err());
         for input in [
             String::new(),
             " ".into(),
