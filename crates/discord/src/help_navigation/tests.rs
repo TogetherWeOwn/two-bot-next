@@ -15,6 +15,7 @@ fn wire(response: &InteractionResponse) -> Value {
     assert_eq!(wire["data"]["flags"], MessageFlags::EPHEMERAL.bits());
     assert_eq!(wire["data"]["allowed_mentions"], json!({"parse": []}));
     assert_eq!(wire["data"]["embeds"].as_array().expect("embeds").len(), 1);
+    assert!(wire["data"]["embeds"][0].get("flags").is_none());
     assert_eq!(
         wire["data"]["embeds"][0]["footer"]["icon_url"],
         BRAND_ICON_URL
