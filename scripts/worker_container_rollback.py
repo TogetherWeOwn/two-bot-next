@@ -556,8 +556,24 @@ class Rollback:
                 return
         raise GateError("rollback_not_active")
 
+    def read_image_rollout(self, rollout_id, image):
+        row = base.mapping(self.client.api(
+            f"/containers/applications/{base.identifier(self.app_id)}/rollouts/{rollout_id}"))
+        require(row.get("id") == rollout_id, "rollout_identity_drift")
+        status = row.get("status")
+        require(status not in ("replaced", "reverted"), "rollout_replaced_or_reverted")
+        require(status in ("pending", "progressing", "completed"), "unknown_rollout_status")
+        require(base.mapping(row.get("target_configuration")).get("image") == image,
+                "rollout_identity_drift")
+        return row
+
+    @staticmethod
+    def image_rollout_ready(row, image, target_version):
+        return (base.converged(row, image, target_version)
+                or base.active_lag(row, image, target_version))
+
     def restore_image(self, image):
-        """Roll the container image back with a single 100% rolling step."""
+        """Roll the image back with a single 100% step and return the rollout pin."""
         started = self.now()
         before = {base.identifier(base.mapping(row).get("id")) for row in
                   app_rollouts(self.client, self.app_id)}
@@ -571,14 +587,8 @@ class Rollback:
         deadline = started + ROLLOUT_TIMEOUT_SECONDS
         target_version = base.number(base.mapping(result).get("target_version", 0)) or None
         while True:
-            row = base.mapping(self.client.api(
-                f"/containers/applications/{base.identifier(self.app_id)}/rollouts/{rollout_id}"))
-            require(row.get("id") == rollout_id, "rollout_identity_drift")
+            row = self.read_image_rollout(rollout_id, image)
             status = row.get("status")
-            require(status not in ("replaced", "reverted"), "rollout_replaced_or_reverted")
-            require(status in ("pending", "progressing", "completed"), "unknown_rollout_status")
-            require(base.mapping(row.get("target_configuration")).get("image") == image,
-                    "rollout_identity_drift")
             if target_version is None:
                 try:
                     target_version = base.number(row.get("target_version"))
@@ -590,8 +600,7 @@ class Rollback:
             # and the unchanged stable runtime gate still have to pass next.
             # Production retains its separate application-listing requirement.
             ready = (target_version is not None
-                     and (base.converged(row, image, target_version)
-                          or base.active_lag(row, image, target_version)))
+                     and self.image_rollout_ready(row, image, target_version))
             if target_version is None:
                 waiting_for = "target_version"
             elif status != "completed":
@@ -605,9 +614,8 @@ class Rollback:
             if ready:
                 self.log(f"image rollout {status}")
                 self.evidence.pop("image_restore_wait", None)
-                self.evidence["restored_rollout_id"] = rollout_id
                 self.stamp("image restored")
-                return
+                return rollout_id, target_version
             self.evidence["image_restore_wait"] = waiting_for
             self.log(f"image rollout {status} waiting_for={waiting_for}")
             require(self.now() < deadline, "image_rollout_timeout",
@@ -701,9 +709,15 @@ class Rollback:
                 self.wait_worker_restore(restore_version)
         else:
             self.log("worker already serves the restore version; image leg only")
-        self.restore_image(restore_image)
+        rollout_id, target_version = self.restore_image(restore_image)
         if self.variant == "staging":
             self.wait_worker_restore(restore_version)
+            # The rollout may have changed during Worker convergence. Do not
+            # release the fence on the strength of the earlier image read.
+            row = self.read_image_rollout(rollout_id, restore_image)
+            require(self.image_rollout_ready(row, restore_image, target_version),
+                    "image_rollout_not_converged")
+        self.evidence["restored_rollout_id"] = rollout_id
         self.take_over(restore_version)
         if self.variant == "staging":
             self.staging_use("rebind")
