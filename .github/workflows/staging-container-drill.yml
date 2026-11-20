@@ -59,6 +59,7 @@ permissions: {}
 concurrency:
   group: staging-lifecycle
   cancel-in-progress: false
+  queue: max
 
 jobs:
   container-drill:

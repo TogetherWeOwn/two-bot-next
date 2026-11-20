@@ -681,13 +681,15 @@ Dispatch `staging-rollback-drill.yml` on `main` with `target_version` empty
 and `sha` set to the full 40-character lowercase candidate commit.
 
 1. Dispatches only `deploy-staging.yml` on `main`, with the existing staging
-   error-rate gate rehearsal enabled. No production dispatch or traffic fault
-   is involved. The GitHub REST `2026-03-10` dispatch response provides the exact
+   error-rate gate rehearsal and explicit prior-SHA opt-in. No production dispatch
+   or traffic fault is involved. The GitHub REST `2026-03-10` dispatch response provides the exact
    child run ID; a missing ID refuses without redispatch or guessing "latest".
-2. Waits at most 70 minutes for that run. The snapshot, deploy and rollout
-   readiness steps must pass, the injected error-rate gate must fail, and the
-   in-job auto-rollback and evidence upload must succeed. The child **must remain
-   red**; a green child does not prove recovery.
+2. Waits up to 70 minutes for that run, including queue time. A timeout does
+   not cancel the child: inspect the exact `child_run_id` in the wrapper log
+   and its staging outcome without redispatching. The snapshot, deploy and
+   rollout readiness steps must pass, the injected error-rate gate must fail,
+   and the in-job auto-rollback and evidence upload must succeed. The child
+   **must remain red**; a green child does not prove recovery.
 3. Checks `staging-rollout-evidence`: the restore must name the exact pre-deploy
    Worker version and image digest, with takeover and the stable 200/gateway-ready
    gate. It uploads a sanitized `staging-rollback-proof` artifact (`proof.json`)
@@ -711,8 +713,10 @@ do not clear a hold to make a proof green. Explicit arm/disarm dispatches withou
 the error-rate switch retain their exception.
 
 The wrapper runs outside `staging-lifecycle` so its child can acquire that lane.
-The Worker-only drill holds the lane and uploads separate evidence; it does not
-count as automatic proof.
+At workflow admission, proofs and Worker-only drills still share a separate
+single-pending-slot queue: a new dispatch can replace a waiter there. The
+Worker-only drill gets the preserving queue only when its job reaches
+`staging-lifecycle`. Its separate evidence does not count as automatic proof.
 
 Failures open or update the `staging-rollback-proof` incident; verify the exact
 wrapper, child and artifact before closing it. No scheduled watcher or dry run

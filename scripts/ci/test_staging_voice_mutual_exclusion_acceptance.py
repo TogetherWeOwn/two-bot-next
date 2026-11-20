@@ -15,8 +15,8 @@ point and its deletion budget are unchanged) and the exclusion window grows:
   no split lock survives a rename;
 * the five-minute user-flow staging probe is a read-only observer, not a
   holder: it never holds the lifecycle group (or a legacy alias, in any case
-  or expression form) at workflow or job level, so it cannot keep replacing a
-  pending deploy-staging or promotion soak run in GitHub's one-slot queue. It
+  or expression form) at workflow or job level, so its ticks never compete
+  with queued deploy-staging or promotion soak runs. It
   serializes on its own fixed, non-cancelling queue that no other workflow
   or job shares, runs only the ``observe`` lifecycle action (never acquire,
   ready/assert, release or extend), and reads staging only after the observer
@@ -42,8 +42,8 @@ point and its deletion budget are unchanged) and the exclusion window grows:
 Run with check.yml's scripts/ci unittest discovery. Only YAML and Python
 source are read; no workflow is dispatched and no Discord, database or deploy
 is used. Controls mutate in-memory copies only. These tests prove the
-declared lock scope, not GitHub scheduler execution, queue fairness (GitHub
-keeps one pending run per group and replaces it), runtime expiry, or that a
+declared lock scope and queue configuration, not GitHub scheduler execution,
+queue fairness, runtime expiry, or that a
 runtime deletion failure has been repaired.
 """
 
@@ -107,9 +107,8 @@ STANDALONE_HOLDERS = {(VOICE, "synthetic"): False,
                       (MCP, "proveout"): False,
                       (PRODUCTION, SOAK): True}
 # Periodic read-only observers of the staging window. They hold their own
-# exclusive job-level queue, never the lifecycle group: a */5 holder would
-# keep replacing pending deploy-staging and soak runs (one pending run per
-# group). Formerly a holder; reclassified, not exempted.
+# exclusive job-level queue, never the lifecycle group: a */5 holder must
+# not fill the queue for deploy-staging and soak runs.
 OBSERVERS = {(USER_FLOW, "staging"): "user-flow staging observer"}
 OBSERVE = "observe"
 # The observer's own step outputs that gate every live read on an active window.
@@ -254,6 +253,8 @@ def holds_exactly(node, context, triggers, canonical):
         return "lifecycle group must resolve to the fixed canonical group"
     if cancel != "false":
         return "lifecycle lock must explicitly preserve the running job"
+    if node["concurrency"].get("queue") != "max":
+        return "lifecycle lock must use queue: max"
     return None
 
 
@@ -271,6 +272,8 @@ def canonical_group(deploy, errors):
         return None
     if cancel != "false":
         errors.append("deploy-staging: full-window lock must explicitly preserve the running run")
+    if deploy["concurrency"].get("queue") != "max":
+        errors.append("deploy-staging: full-window lock must use queue: max")
     # GitHub concurrency group matching is case-insensitive, repository-scoped.
     return group.casefold()
 
@@ -860,7 +863,7 @@ def strip_staging_use(workflow):
 
 def target_fixture(group=FIXTURE_GROUP):
     wfs = load_all()
-    lock = {"group": group, "cancel-in-progress": "false"}
+    lock = {"group": group, "cancel-in-progress": "false", "queue": "max"}
     deploy = wfs[DEPLOY]
     deploy["concurrency"] = dict(lock)
     jobs = deploy["jobs"]
@@ -880,7 +883,7 @@ def target_fixture(group=FIXTURE_GROUP):
         "steps": [{"run": "node wrangler/scripts/staging-use.mjs release"}]}
     for name, prefix in ((VOICE, "staging-voice-consumer-"), (HELP, "staging-help-consumer-")):
         callee = wfs[name]
-        callee["concurrency"] = {"group": called_group(prefix, group), "cancel-in-progress": "false"}
+        callee["concurrency"] = dict(lock, group=called_group(prefix, group))
         callee["on"]["workflow_call"]["inputs"] = {
             input_name: {"type": "string", "required": "true"} for input_name in INHERITED}
         consumer_name, _ = CONSUMERS[name]
@@ -959,6 +962,18 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_checked_in_workflows_meet_the_full_window_contract(self):
         self.assertEqual(lifecycle_errors(load_all()), [])
+
+    def test_every_lifecycle_holder_must_keep_the_non_displacing_queue(self):
+        for (file, job), job_level in {(DEPLOY, "deploy"): False, **STANDALONE_HOLDERS}.items():
+            for mode in (None, "single"):
+                workflows = load_all()
+                lock = (workflows[file]["jobs"][job] if job_level else workflows[file])["concurrency"]
+                if mode is None:
+                    del lock["queue"]
+                else:
+                    lock["queue"] = mode
+                with self.subTest(file=file, mode=mode):
+                    self.assertTrue(any("queue: max" in error for error in lifecycle_errors(workflows)))
 
     def test_prepared_window_cannot_skip_an_unguarded_consumer(self):
         for callee, (job, _) in CONSUMERS.items():
