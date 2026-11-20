@@ -35,6 +35,21 @@ ordered restore plan for a receipt without any mutation via
 `scripts/worker_container_rollback.py rollback ... --dry-run`, which validates
 the receipt identically to the live path and exits 0.
 
+If the forward gate rejects a `/readyz` 200 with `serving_worker_mismatch` or
+`serving_image_mismatch`, the `staging-rollout-evidence` artifact may include
+`evidence.readyz-mismatch.json`. This sidecar is best-effort: a write failure
+never changes the original rejection. Pinned drills use the deployed commit's
+verifier, so older pins may not produce it.
+
+The sidecar records the child run/attempt, sample receipt time in UTC, and
+expected and observed identities (`absent` or `invalid` where applicable).
+Multiple Worker version headers are ambiguous and recorded as `invalid`.
+`request_id` is the response's `x-request-id` only if it matches the existing
+format; the gate does not generate one.
+The control-plane timestamp is when the runner observed the completed rollout,
+not when it completed. Its target digest does not identify the serving image.
+This file is diagnostic only, not `evidence.json` or a qualification receipt.
+
 ## No-always-on staging rule and activation hold
 
 Idle staging/preview must carry **no recurring always-on runtime cost**. Start
@@ -243,9 +258,12 @@ pre-dispatch check does not lock `main`. A mismatch is not qualification.
 **Queued staging work:** Every holder uses `queue: max` and preserves the
 running holder. The queue is bounded; admission order is not a freshness check.
 After acquiring the lock, `deploy-staging` rechecks the fetched main tip before
-changing staging. A superseded workflow head fails red; start a fresh dispatch
-only if the match above holds. To intentionally recover a prior main SHA,
-dispatch from current `main` with the full ancestor SHA and `recover_prior_sha: true`.
+changing staging. A superseded workflow head fails red. A stale repeat can
+become the newest outcome for the still-serving SHA and block promotion even
+with an older green run. Do not skip that failure; qualify current `main`
+with a fresh dispatch only if the match above holds. To intentionally recover a
+prior main SHA, dispatch from current `main` with the full ancestor SHA and
+`recover_prior_sha: true`.
 This does not qualify as staging history. Do not rerun old workflow revisions
 with the old single-slot policy; let existing holders and waiters settle before
 using the measurement caller. Wait for all five qualifying jobs plus release

@@ -109,13 +109,13 @@ async fn finish_fresh_attempt(
 }
 
 /// Proceed from the pre-claim plan. Only a successful locked miss can charge
-/// or evaluate. Acquire and release shared guards inside the synchronous
+/// or evaluate. Returning `None` from admission abandons the claim. Release guards inside the synchronous
 /// callbacks, so neither callback holds a guard during audit I/O.
 pub async fn attempt_preview(
     plan: PreClaimPlan,
     context: AttemptContext<'_>,
     mut store: impl PreviewAttemptStore,
-    admit: impl FnOnce() -> PreviewRateDecision,
+    admit: impl FnOnce() -> Option<PreviewRateDecision>,
     evaluate: impl FnOnce() -> PreviewVerdict,
 ) -> AttemptResult {
     let (audit_id, len) = match plan {
@@ -138,8 +138,11 @@ pub async fn attempt_preview(
         PostClaimPlan::Replay { reply: None } => return unavailable(context.dry_run),
         PostClaimPlan::Fresh => {}
     }
+    let Some(decision) = admit() else {
+        return unavailable(context.dry_run);
+    };
     finish_fresh_attempt(
-        plan_fresh(admit()),
+        plan_fresh(decision),
         context,
         &audit_id,
         len,
@@ -331,7 +334,7 @@ mod tests {
                 claim(),
                 CONTEXT,
                 store,
-                || PreviewRateDecision::ReplayDuplicate,
+                || Some(PreviewRateDecision::ReplayDuplicate),
                 verdict
             ));
             assert!(matches!(
@@ -387,11 +390,18 @@ mod tests {
             ),
             (
                 Ok(None),
+                PREVIEW_UNAVAILABLE_REPLY.into(),
+                Some(metric_unavailable(Some(true))),
+                true,
+            ),
+            (
+                Ok(None),
                 PREVIEW_RATE_LIMITED_REPLY.into(),
                 Some(metric_rate_limited(true)),
                 true,
             ),
         ] {
+            let rate_limited = expected == PREVIEW_RATE_LIMITED_REPLY;
             let (charged, evaluated, written) =
                 (Cell::new(false), Cell::new(false), Cell::new(false));
             let commit = |record: AuditRecord| {
@@ -401,7 +411,7 @@ mod tests {
             };
             let admit = || {
                 charged.set(true);
-                PreviewRateDecision::RateLimited
+                rate_limited.then_some(PreviewRateDecision::RateLimited)
             };
             let evaluate = || {
                 evaluated.set(true);
@@ -412,7 +422,7 @@ mod tests {
             assert_eq!((result.reply, result.metric), (expected, metric));
             assert_eq!(
                 (charged.get(), evaluated.get(), written.get()),
-                (fresh, false, fresh)
+                (fresh, false, rate_limited)
             );
         }
     }

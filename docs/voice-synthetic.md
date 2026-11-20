@@ -147,10 +147,10 @@ all-label counter delta is below 10. The deltas include all REST attempts
 recorded by the staging bot during the interval, not just voice requests.
 The caller never renews the grant.
 
-A queued measurement can be cancelled before it starts rather than displace
-ordinary staging work. Treat that, or any failed run or missing/refused verdict,
-as inconclusive. Read the per-label deltas from the matching
-`voice-measurement-candidate-<run id>-1` artifact **only** after the run succeeds
+The bounded `queue: max` preserves pending staging work. Let runs using the old
+single-slot policy settle before dispatching. Treat a cancelled or failed run,
+or a missing or refused verdict, as inconclusive. Read the per-label deltas from
+`voice-measurement-candidate-<run id>-1` **only** after the matching run succeeds
 and `voice-measurement-terminal-<run id>-1` reports `accepted`. The terminal
 verdict checks the same-grant bookends, lifecycle evidence and cleanup;
 a standalone synthetic or a candidate artifact alone is not a measurement.
