@@ -16,6 +16,7 @@ use {
     tokio::time::Instant,
     twilight_model::application::interaction::{InteractionData, InteractionType},
     two_bot_core::{
+        automod_preview::preview_automod_with_history,
         automod_preview_attempt::{attempt_preview, AttemptContext, AttemptResult},
         automod_preview_flow::{plan_pre_claim, PreClaimPlan},
         automod_preview_input::build_preview_message,
@@ -24,6 +25,7 @@ use {
         automod_preview_store::SqlPreviewStore,
         automod_runtime::AutomodClaimLedger,
         funnel::format_iso_millis,
+        AutomodConfig,
     },
 };
 
@@ -89,7 +91,8 @@ pub fn decode_interaction_options(
     decode_preview_input(&map_preview_options(data))
 }
 
-/// Drive an authorized invocation with a refreshed activation and its UTC receipt.
+/// Drive an authorized invocation with its UTC receipt. Resolve the preview
+/// policy after decode and scope, without changing the gateway activation.
 /// The caller owns ephemeral delivery and reserves time for it after `deadline`.
 #[cfg(feature = "db")]
 pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
@@ -99,7 +102,11 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     interaction: &Interaction,
     receipt_ms: u64,
     deadline: Instant,
+    resolve_live: impl FnOnce(&str) -> Option<AutomodConfig>,
 ) -> AttemptResult {
+    if Instant::now() >= deadline {
+        return unavailable(None);
+    }
     let (InteractionType::ApplicationCommand, Some(InteractionData::ApplicationCommand(data))) =
         (interaction.kind, interaction.data.as_ref())
     else {
@@ -111,9 +118,12 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     let decoded = decode_interaction_options(data);
     let scoped = decoded.as_ref().ok().and_then(|input| {
         let (active, guild) = activation.zip(request.guild_id.as_deref())?;
-        let snapshot =
-            active.preview(|runtime| runtime.preview_snapshot(guild, &request.actor_id))?;
-        Some((guild, input, snapshot))
+        if !active.preview(|runtime| runtime.admits(Some(guild))) {
+            return None;
+        }
+        let config = resolve_live(guild)
+            .unwrap_or_else(|| active.preview(|runtime| runtime.effective_config()));
+        Some((guild, input, config))
     });
     let plan = plan_pre_claim(
         decoded.as_ref().map_err(|refusal| *refusal),
@@ -124,9 +134,10 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     if let PreClaimPlan::AnswerNow { reply, metric } = plan {
         return AttemptResult { reply, metric };
     }
-    let Some((guild_id, input, (dry_run, evaluate))) = scoped else {
+    let Some((guild_id, input, config)) = scoped else {
         return unavailable(None);
     };
+    let dry_run = config.dry_run;
     let Ok(message) = build_preview_message(
         input,
         guild_id,
@@ -154,7 +165,8 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
             .unwrap_or_else(PoisonError::into_inner)
             .admit_before(actor_id, guild_id, id, deadline)
     };
-    let evaluate = || evaluate(&message, input.mention_count);
+    // Detached interactions can overtake earlier gateway CREATEs.
+    let evaluate = || preview_automod_with_history(&message, input.mention_count, &config, None);
     attempt_preview(plan, context, store, admit, evaluate).await
 }
 

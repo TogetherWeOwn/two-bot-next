@@ -222,12 +222,12 @@ input excerpt in success, refusal, or error shapes.
 | Deciding knob | setting *name(s)* from the table below, only for a match or exemption | Never a value: no bad word, no threshold number, no list size, no "4 of 5 mentions" near-miss; absent for `partial` |
 | Exemption class | `exempt_channel` / `bypass_role`, only for `exempt` | The invoker's own channel/roles; no ids printed; choose `exempt_channel` when both apply, matching the live exemption order (`crates/core/src/automod.rs:238-246`) |
 | Mode consequence | fixed sentence for `dry_run` or `enforce` | §5; a consequence statement, not a sanction prediction; absent for `not_evaluated`, which has no effective mode |
-| Config currency | `current at <UTC time>` | No hash/fingerprint of the policy (a digest of the word list is dictionary-confirmable offline), no revision contents; absent for `not_evaluated` |
+| Invocation receipt | `Invocation received at <UTC time>` | No hash/fingerprint of the policy (a digest of the word list is dictionary-confirmable offline), no revision contents; absent for `not_evaluated` |
 | Fixed caveats | first-match order; preview not recorded (§5.1); sanction/protection not previewed | Same words every time |
 
 For `partial`, the reply uses the fixed sentence *Repeat evaluation is
 indeterminate; no complete first-match verdict is available.* It includes
-mode and config currency, but no deciding filter or knob. It never reports
+mode and invocation receipt, but no deciding filter or knob. It never reports
 `no_match` or a later filter. An exemption or `bad_words` match still
 short-circuits before repeat evaluation and remains a complete result;
 `partial` applies only when execution reaches the unproven repeat check.
@@ -383,22 +383,12 @@ scope-conditioned without a large refactor, that is the same
 stop-and-redesign gate as the runtime handle below, not a reason to
 publish globally.
 
-**Effective config source.** The preview runs against the same
-in-memory `AutomodRuntime` the gateway inspects with, after the same
-per-event live-snapshot refresh the delivery path performs
-(`crates/bot/src/automod_gateway.rs:207-223`, `:323-341`), cloning the
-resulting config once so one evaluation sees one config. It must not call
-`AutomodConfig::from_env` itself: that would miss live-snapshot value
-overlays and last-good-policy fallback (§2) and could contradict the next
-real message. Neither reach nor clone exists today — the only config
-accessor is test-only (`crates/core/src/automod_runtime.rs:218-222`) and
-the activation's `runtime()` accessor is private
-(`crates/discord/src/automod_activation.rs:217-219`) — so slice 3 adds
-both a runtime handle and a config-clone API. If either cannot be added
-without a large refactor, that is a stop-and-redesign gate in slice 3,
-not license to build a parallel config path. A config change landing
-between preview and a real post can still change the real outcome; the
-`current at <UTC time>` field (§3.2) is the stated bound on the claim.
+**Effective config source.** Resolve the same store-first policy used for
+in-scope gateway delivery. If that overlay is unusable, use the activation's
+last-good policy for the admitted guild. Evaluate one owned policy and mode
+snapshot without mutating the shared runtime. The timestamp is the invocation
+receipt, not the time of policy resolution. A later settings update may affect
+the policy used for the preview or for a subsequent real post.
 
 ### 5.1 Repeat and mention state: read-only or explicitly indeterminate
 
@@ -443,10 +433,9 @@ Resolved semantics:
    the same text 3 times cannot manufacture a `repeated_message` verdict,
    and a preview between two real identical posts neither extends nor
    breaks the real streak. The fixed caveat says so: *preview recorded
-   nothing; a real post would itself count toward repeat history, unless
-   exempt or stopped by `bad_words` first* — mirroring live ordering,
-   where a `bad_words` preview must short-circuit before the repeat read
-   exactly as live short-circuits before the repeat write.
+   nothing; only repeat-eligible real posts count toward repeat history
+   (not text that normalizes to empty)*. Exemptions and `bad_words` still
+   short-circuit before preview reads or live writes repeat history.
 4. **Cross-member isolation.** The tracker key is `guild:author`
    (`crates/core/src/automod.rs:422`) and the synthetic author is the
    invoker (§3.1), so a preview can only ever read the invoker's own
@@ -579,7 +568,7 @@ target fetch, no `target_gate`, no `plan`, no executor call.
   canonical UTC rendering for the first reply after commit and every
   replay, including database timestamp precision. On the successful path,
   sequential and concurrent redeliveries evaluate once, charge once, and
-  render the committed row, including its config-currency time. If a
+  render the committed row, including its original invocation receipt time. If a
   failed uncommitted attempt is retried, only the eventual committed
   attempt's receipt time appears; no prior verdict was exposed.
 
@@ -618,7 +607,7 @@ target fetch, no `target_gate`, no `plan`, no executor call.
 | 6 | Enforce-mode rehearsal (test until a slur variant slips through, then post it) | This is the oracle's inherent dual use; contained by ManageGuild-only + audit + caps. A non-staff member gets no surface. If staff misuse is observed, §1 kill rule |
 | 7 | Oversized / pathological input (2,001st unit, surrogate pairs, 11 attachments, 100-mention spam, regex-bait URLs) | Hard option bounds (§3.1) refuse pre-evaluation; evaluation cost bounded by the same scan live pays, paced by §4.3 |
 | 8 | Mention/markdown injection via text (`<@everyone>`, links, formatting) | Reply interpolates no input; mentions closed; embeds suppressed |
-| 9 | Config race (hot settings change mid-preview or between preview and post) | One cloned config per evaluation (§5.0); `current at` timestamp bounds the claim; divergence disclosed, not hidden |
+| 9 | Config race (hot settings change mid-preview or between preview and post) | One cloned config per evaluation (§5.0); the receipt timestamp does not claim that the policy was current at receipt |
 | 10 | Live-config invalid value at preview time | Same last-good/boot fallback as the gateway (§2) because the same runtime answers; preview never parses config itself |
 | 11 | Audit/log leakage of tested phrases | Canary test over every sink incl. precomputable digests (§6); fail-closed audit (§6) |
 | 12 | Rate-limiter abuse to deny others | Per-actor buckets; guild daily cap is the only shared bucket and is sized well above legitimate staff use; refuse-new-actor (not evict) when full |
@@ -636,7 +625,7 @@ until slice 4. Each row names the proof, not a vague area.
 | T4 | Order masking | Text matching `bad_words` + invite + repeats → `bad_words` only; text matching mention + invite → `mention_spam` only |
 | T5 | Cross-author isolation | Author B's real repeat streak never affects author A's preview verdict |
 | T6 | Exemptions | Bypass role alone → `exempt` with `bypass_role` and `TWO_AUTOMOD_BYPASS_ROLE_IDS`; exempt channel alone or both exemptions → `exempt` with `exempt_channel` and `TWO_AUTOMOD_EXEMPT_CHANNEL_IDS`. Class + knob name only (no ids/values), no deciding filter, matcher not reached |
-| T7 | Scope/mode matrix | Disabled, out-of-scope guild, DM → identical `not_evaluated`, no audit row or mode/currency in reply, metric `result=not_evaluated,filter=none,mode=not_evaluated`; dry-run vs enforce → same filter, different consequence sentence |
+| T7 | Scope/mode matrix | Disabled, out-of-scope guild, DM → identical `not_evaluated`, no audit row or mode/receipt in reply, metric `result=not_evaluated,filter=none,mode=not_evaluated`; dry-run vs enforce → same filter, different consequence sentence |
 | T8 | Permission matrix | ManageGuild admitted; ManageMessages/ModerateMembers/everyone refused by router; picker default alone insufficient if bits absent |
 | T9 | Output disclosure | Verdict struct field inventory test; for a property set of inputs, replies contain no input substring and render no threshold value (only knob names) |
 | T10 | Canary | Raw/normalized sentinel and digests (SHA-256/MD5 hex plus actual matcher repeat digest, including decimal u64 Debug/Display and hex forms) absent from captured logs, audit rows, metrics, errors, and reply; independently, tracker rows unchanged (§6). Deliberately logging a computed repeat digest must fail the sink check even with an unchanged tracker |
@@ -647,7 +636,7 @@ until slice 4. Each row names the proof, not a vague area.
 | T14 | Audit fail-closed and abandoned claim | Inject insert failure, cancellation, and connection loss after lock acquisition and before commit: no verdict exposed, transaction/claim released, later delivery can retry, no permanent claimed-without-row state; ordinary errors return generic unavailable and increment metric. Lock/transaction timeout also fails closed; unknown commit outcome permits only a locked replay read, not an assumed rollback |
 | T15 | Config parity | Hot-changed word/threshold via live snapshot flips preview and next real delivery identically; invalid stored value keeps last-good in both |
 | T16 | Injection | Text with `<@everyone>`, markdown, URLs → reply byte-shape is a fixed template, `allowed_mentions` empty |
-| T17 | Redelivery and recovery | Successful non-exempt sequential/concurrent delivery: matcher call count 1, one audit row, one actor charge, one guild charge, both replies equal the committed row. Repeat all T6 exemption cases: matcher count 0, stored class/derived knob identical on replay even after config/roles change; no extra charges. Missing/invalid stored class → unavailable without evaluation. Advance the clock between receipt, insert, commit, and replay; replay read includes `created_at`, and first/replayed currency times equal the stored receipt timestamp at database precision. Crash/failure before commit then redelivery: retry succeeds without a stranded claim; failed evaluations disclose nothing; idempotent actor/guild charges do not double in the same limiter lifetime. Unknown commit outcome: replay if committed, retry only if the locked read proves no row (§6) |
+| T17 | Redelivery and recovery | Successful non-exempt sequential/concurrent delivery: matcher call count 1, one audit row, one actor charge, one guild charge, both replies equal the committed row. Repeat all T6 exemption cases: matcher count 0, stored class/derived knob identical on replay even after config/roles change; no extra charges. Missing/invalid stored class → unavailable without evaluation. Advance the clock between receipt, insert, commit, and replay; replay read includes `created_at`, and first/replayed invocation receipt times equal the stored receipt timestamp at database precision. Crash/failure before commit then redelivery: retry succeeds without a stranded claim; failed evaluations disclose nothing; idempotent actor/guild charges do not double in the same limiter lifetime. Unknown commit outcome: replay if committed, retry only if the locked read proves no row (§6) |
 | T18 | Registration scope | Publish set contains `automod-preview` only for the configured guild when the automod scope admits it; absent for the live guild without approval (§5.0) |
 | T19 | Unproven repeat equivalence | When repeat equivalence cannot be proven and execution reaches that check: repeat status `indeterminate`, reply result `partial` with fixed explanation and no deciding filter/knob; later filters not evaluated; audit `outcome=partial,filter=none` and effective mode/length; metric `result=partial,filter=none` and effective mode; redelivery renders the same partial reply. Earlier exemption/`bad_words` short-circuits remain complete |
 
