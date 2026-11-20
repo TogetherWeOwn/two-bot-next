@@ -1323,15 +1323,6 @@ async fn preview_handle_reads_live_runtime_without_mutation() {
     });
     assert_eq!(second, first);
     assert_eq!(config.policy.bad_words, vec!["blocked".to_owned()]);
-
-    let mut refreshed = config.clone();
-    refreshed.policy.bad_words.clear();
-    refreshed.dry_run = false;
-    assert!(activation.apply_live_config(&refreshed));
-    activation.preview(|runtime| {
-        assert_ne!(runtime.preview(&message, 0), first);
-        assert_eq!(runtime.preview_with_config(&message, 0, &config), first);
-    });
 }
 
 #[cfg(feature = "db")]

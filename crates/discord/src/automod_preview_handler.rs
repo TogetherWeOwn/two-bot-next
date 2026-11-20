@@ -116,12 +116,9 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     let decoded = decode_interaction_options(data);
     let scoped = decoded.as_ref().ok().and_then(|input| {
         let (active, guild) = activation.zip(request.guild_id.as_deref())?;
-        let config = active.preview(|runtime| {
-            runtime
-                .admits(Some(guild))
-                .then(|| runtime.effective_config())
-        })?;
-        Some((active, guild, input, config))
+        let snapshot =
+            active.preview(|runtime| runtime.preview_snapshot(guild, &request.actor_id))?;
+        Some((guild, input, snapshot))
     });
     let plan = plan_pre_claim(
         decoded.as_ref().map_err(|refusal| *refusal),
@@ -132,7 +129,7 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     if let PreClaimPlan::AnswerNow { reply, metric } = plan {
         return AttemptResult { reply, metric };
     }
-    let Some((active, guild_id, input, config)) = scoped else {
+    let Some((guild_id, input, snapshot)) = scoped else {
         return unavailable(None);
     };
     let Ok(message) = build_preview_message(
@@ -144,7 +141,7 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
         request.interaction_id,
         receipt_ms,
     ) else {
-        return unavailable(Some(config.dry_run));
+        return unavailable(Some(snapshot.dry_run()));
     };
     let receipt_iso = format_iso_millis(i64::try_from(receipt_ms).unwrap_or(i64::MAX));
     let context = AttemptContext {
@@ -152,7 +149,7 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
         actor_id: &request.actor_id,
         channel_id: &request.channel_id,
         receipt_iso: &receipt_iso,
-        dry_run: config.dry_run,
+        dry_run: snapshot.dry_run(),
     };
     attempt_preview(
         plan,
@@ -169,11 +166,7 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
                     receipt_ms,
                 )
         },
-        || {
-            active.preview(|runtime| {
-                runtime.preview_with_config(&message, input.mention_count, &config)
-            })
-        },
+        || snapshot.evaluate(&message, input.mention_count),
     )
     .await
 }

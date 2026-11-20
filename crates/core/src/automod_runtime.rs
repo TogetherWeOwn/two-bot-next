@@ -177,6 +177,25 @@ pub enum Inspection {
     Matched(AutomodMatch),
 }
 
+/// Effective policy and the invoker's bounded repeat history captured together.
+/// Keep this in memory until the attempt driver decides whether to evaluate.
+pub struct AutomodPreviewSnapshot {
+    config: AutomodConfig,
+    repeats: RepeatTracker,
+}
+
+impl AutomodPreviewSnapshot {
+    #[must_use]
+    pub fn dry_run(&self) -> bool {
+        self.config.dry_run
+    }
+
+    #[must_use]
+    pub fn evaluate(&self, message: &AutomodMessage, mention_count: usize) -> PreviewVerdict {
+        preview_automod(message, mention_count, &self.config, &self.repeats)
+    }
+}
+
 pub struct AutomodRuntime {
     config: AutomodConfig,
     scope: AutomodScope,
@@ -249,20 +268,21 @@ impl AutomodRuntime {
     /// build nor break a real streak.
     #[must_use]
     pub fn preview(&self, message: &AutomodMessage, mention_count: usize) -> PreviewVerdict {
-        self.preview_with_config(message, mention_count, &self.config)
+        preview_automod(message, mention_count, &self.config, &self.repeats)
     }
 
-    /// Use the effective config captured at preview admission, even if the
-    /// live policy refreshed while the caller waited for the audit claim.
-    /// This still reads the same runtime's repeat history without mutating it.
+    /// Freeze the invoker's history and policy before the audit wait, so a
+    /// later gateway event cannot evict a row relevant to the receipt clock.
     #[must_use]
-    pub fn preview_with_config(
+    pub fn preview_snapshot(
         &self,
-        message: &AutomodMessage,
-        mention_count: usize,
-        config: &AutomodConfig,
-    ) -> PreviewVerdict {
-        preview_automod(message, mention_count, config, &self.repeats)
+        guild_id: &str,
+        actor_id: &str,
+    ) -> Option<AutomodPreviewSnapshot> {
+        self.admits(Some(guild_id)).then(|| AutomodPreviewSnapshot {
+            config: self.effective_config(),
+            repeats: self.repeats.snapshot_for(guild_id, actor_id),
+        })
     }
 
     /// The shared maintenance tick can expire idle authors without receiving
