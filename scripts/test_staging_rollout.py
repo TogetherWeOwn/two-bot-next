@@ -1460,6 +1460,27 @@ class OrchestrationTests(OfflineTestCase):
                     self.assertEqual(sidecar.read_bytes(), original)
                     self.assertFalse(evidence.exists())
 
+    def test_directory_alias_leaves_inputs_readable(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        evidence = Path(self.args.evidence)
+        sidecar = evidence.with_suffix(".readyz-mismatch.json")
+        sidecar.symlink_to(self.root, target_is_directory=True)
+        receipt = sidecar / Path(self.args.receipt).name
+        output = sidecar / Path(self.args.output).name
+        inputs = {path: path.read_bytes() for path in (receipt, output)}
+        self.args.receipt, self.args.output = str(receipt), str(output)
+        client = verify_client()
+        status, _, body = ready_response()
+        client.request_routes[URL + "/readyz"] = [(status, {}, body)]
+
+        self.assert_gate("serving_worker_mismatch", rollout.verify, self.args, client)
+        for path, original in inputs.items():
+            with self.subTest(input=path.name):
+                self.assertEqual(path.read_bytes(), original)
+        self.assertTrue(sidecar.is_symlink())
+        self.assert_no_evidence()
+
     def test_forward_worker_mismatch_distinguishes_single_from_ambiguous_header(self):
         self.prepare_baseline()
         self.write_deploy_output()

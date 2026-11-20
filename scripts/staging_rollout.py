@@ -556,6 +556,9 @@ def save_forward_mismatch(args, code, headers, body, version, baseline, pinned, 
                           rollout_observed_at, sample_received_at):
     """Retain only bounded identities, never probe text or configurations."""
     sidecar = Path(args.evidence).with_suffix(".readyz-mismatch.json")
+    # Replacing a directory symlink could break paths to both inputs.
+    if sidecar.is_symlink():
+        raise ValueError("mismatch evidence destination is a symlink")
     if sidecar.exists() and any(sidecar.samefile(path) for path in (args.receipt, args.output)):
         raise ValueError("mismatch evidence aliases a verification input")
     missing = object()
