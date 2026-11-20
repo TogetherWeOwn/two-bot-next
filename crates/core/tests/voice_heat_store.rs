@@ -257,20 +257,21 @@ async fn flush_prunes_and_filters_with_the_same_strict_cutoff() {
         .unwrap();
     let cutoff = old_cutoff + Duration::microseconds(2);
     let stale = bucket(old_cutoff, 1, 10);
+    let nearest_expired = bucket(cutoff - Duration::microseconds(1), 1, 11);
     let boundary = bucket(cutoff, 1, 20);
     let fresh = bucket(cutoff + Duration::microseconds(1), 0, 0);
     seed_expired_hour(&pool, stale.hour_start).await;
 
-    // Advance the clock at sweep commit. A distinct seeded hour must be deleted
-    // by the flush itself, while the replay of the swept hour must be filtered.
+    // Advance the clock at sweep commit. The flush must delete the nearest
+    // expired hour itself and filter replays of both expired hours.
     let mut sweep = fixture.pool().begin().await.unwrap();
     assert_eq!(prune_voice_heat(&mut *sweep, 35).await.unwrap(), 1);
-    seed_expired_hour(&mut *sweep, old_cutoff + Duration::microseconds(1)).await;
+    seed_expired_hour(&mut *sweep, nearest_expired.hour_start).await;
     sqlx::query("UPDATE flush_test_clock.clock SET ts = ts + interval '2 microseconds'")
         .execute(&mut *sweep)
         .await
         .unwrap();
-    let buckets = [stale, boundary, fresh];
+    let buckets = [stale, nearest_expired, boundary, fresh];
     let (written, ()) = tokio::join!(flush_hour_buckets(&pool, &buckets), async {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !sqlx::query_scalar::<_, bool>(
