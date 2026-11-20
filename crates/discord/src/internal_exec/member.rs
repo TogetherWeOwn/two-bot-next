@@ -8,6 +8,7 @@ use super::{ActionExecutor, RawResponse};
 use crate::ratelimit_guard::GuardError;
 use serde::Deserialize;
 use std::time::Duration;
+use tokio::time::Instant;
 use twilight_http::request::{Request, TryIntoRequest};
 use twilight_model::id::{marker::GenericMarker, Id};
 use two_bot_core::internal_actions::{
@@ -21,6 +22,10 @@ pub mod store;
 #[path = "voice_move.rs"]
 pub mod voice_move;
 pub use voice_move::{VoiceMoveNotSent, VoiceMovePatch, VOICE_MOVE_TIMEOUT_MS};
+
+#[cfg(test)]
+#[path = "voice_move_adapter_tests.rs"]
+mod voice_move_adapter_tests;
 
 pub const ADD_MEMBER_TIMEOUT_MS: u64 = 1500;
 pub const ROLE_TIMEOUT_MS: u64 = 2000;
@@ -219,6 +224,82 @@ impl ActionExecutor {
         Ok(serde_json::from_slice::<Member>(&response.body)
             .ok()
             .map(|m| m.roles))
+    }
+
+    /// Send one bounded voice PATCH. Authorization and occupancy fencing belong
+    /// to the receiver; this adapter never retries.
+    pub async fn move_voice_member(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+        channel_id: &str,
+    ) -> Result<VoiceMovePatch, ActionError> {
+        let request =
+            voice_move::prepare_voice_move(&self.inner.factory, guild_id, member_id, channel_id)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(VOICE_MOVE_TIMEOUT_MS);
+        if !matches!(
+            tokio::time::timeout_at(deadline, self.admit(&request, Some(false))).await,
+            Ok(Ok(()))
+        ) {
+            return Ok(VoiceMovePatch::NotSent(VoiceMoveNotSent::Guard));
+        }
+        Ok(self.send_voice_move(&request, deadline).await)
+    }
+
+    async fn send_voice_move(&self, request: &Request, deadline: Instant) -> VoiceMovePatch {
+        use super::StrictSettlement;
+        use super::StrictTransportError::{Admission, PreWireDeadline};
+        use two_bot_core::send_admission::AdmissionError;
+
+        self.count();
+        let transport = &self.inner.transport;
+        let pending = match transport
+            .send_strict_evidence_headers(request, deadline)
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                return VoiceMovePatch::NotSent(match error {
+                    Admission(AdmissionError::Blocked) => VoiceMoveNotSent::Blocked,
+                    Admission(AdmissionError::Storage) => VoiceMoveNotSent::Storage,
+                    PreWireDeadline => VoiceMoveNotSent::Deadline,
+                    _ => return VoiceMovePatch::Unavailable,
+                })
+            }
+        };
+        let status = pending.status();
+        if let Some(refusal) = voice_move::header_refusal(status) {
+            pending.settle_rejection().await;
+            return refusal;
+        }
+        let success = (200..300).contains(&status);
+        let mut retry_after_ms = None;
+        let settlement = pending
+            .collect_validated_evidence(|evidence| {
+                if status == 429 {
+                    let header = evidence.retry_after_header.and_then(|s| s.parse().ok());
+                    let body = evidence.body.and_then(|body| {
+                        serde_json::from_slice::<serde_json::Value>(body)
+                            .ok()?
+                            .get("retry_after")?
+                            .as_f64()
+                    });
+                    retry_after_ms = voice_move::retry_delay_ms(header, body);
+                }
+                success && evidence.body.is_some()
+            })
+            .await;
+        let settlement_confirmed = settlement == StrictSettlement::Confirmed;
+        if status == 429 {
+            VoiceMovePatch::Limited {
+                retry_after_ms,
+                settlement_confirmed,
+            }
+        } else if success && settlement_confirmed {
+            VoiceMovePatch::Moved
+        } else {
+            VoiceMovePatch::Unavailable
+        }
     }
 
     /// PUT /guilds/{g}/members/{u}. The token is a function argument and wire

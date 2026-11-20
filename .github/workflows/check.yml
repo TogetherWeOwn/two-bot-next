@@ -2345,7 +2345,7 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: |
           cargo test -p two-bot-core --features db --test send_admission --locked -- --ignored
-          cargo test -p two-bot-discord --features db-tests --lib --locked admission_ -- --ignored
+          cargo test -p two-bot-discord --features db-tests --lib --locked admission_ -- --include-ignored
           cargo test -p two-bot-cutover --test send_admission --locked -- --ignored
 
       # Post-suite storage evidence: max_wal_size is a soft target, so the

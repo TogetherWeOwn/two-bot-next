@@ -1082,6 +1082,18 @@ impl Drop for PendingHeaders<'_> {
 }
 
 impl StrictEvidenceHeaders<'_> {
+    pub(crate) fn status(&self) -> u16 {
+        self.pending.status
+    }
+
+    /// Settle a definitive rejection within the original budget without reading
+    /// its body. Do not take this path for a 429, which can carry timing evidence.
+    pub(crate) async fn settle_rejection(self) {
+        if is_definitive_rejection(self.status()) {
+            let _ = poll_before(self.deadline, self.pending.settle_status()).await;
+        }
+    }
+
     /// Observe a bounded strict response without authority to confirm mutations.
     pub async fn collect_evidence(
         self,
