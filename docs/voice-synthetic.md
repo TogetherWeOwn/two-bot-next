@@ -143,7 +143,9 @@ also requires `github.ref_protected`. Other refs and reruns fail without enterin
 the staging queue. An admitted run holds the shared `staging-lifecycle` lock
 through cleanup and uses one 45-minute staging grant.
 It calls the voice synthetic once, and a second time only if the first valid
-all-label counter delta is below 10. It never renews the grant.
+all-label counter delta is below 10. The deltas include all REST attempts
+recorded by the staging bot during the interval, not just voice requests.
+The caller never renews the grant.
 
 A queued measurement can be cancelled before it starts rather than displace
 ordinary staging work. Treat that, or any failed run or missing/refused verdict,

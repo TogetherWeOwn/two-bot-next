@@ -85,6 +85,31 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
         self.assertTrue(policy.workflow_policy_errors(changed))
         self.assertTrue(lifecycle.repository_errors(changed, canonical))
 
+    def test_policy_rejects_unapproved_worker_url_bindings(self):
+        workflows = policy.load_workflows()
+        production = "${{ vars.PRODUCTION_WORKER_URL }}"
+        for job_id, step, field, value in (
+            ("staging-window", 2, "PRODUCTION_WORKER_URL", production),
+            ("staging-use-release", 2, "PRODUCTION_WORKER_URL", production),
+            ("measurement-before", 0, "PRODUCTION_WORKER_URL", production),
+            ("measurement-after", None, "STAGING_WORKER_URL", "${{ vars.STAGING_WORKER_URL }}"),
+            ("measurement-final", 6, "PRODUCTION_WORKER_URL", "${{ vars.STAGING_WORKER_URL }}"),
+        ):
+            with self.subTest(job=job_id, step=step, field=field):
+                changed = deepcopy(workflows)
+                job = changed[WORKFLOW]["jobs"][job_id]
+                target = job if step is None else job["steps"][step]
+                target.setdefault("env", {})[field] = value
+                self.assertIn(f"{WORKFLOW}:{job_id}: deployment/probe alternative outside approved deploy workflows",
+                              policy.workflow_policy_errors(changed))
+
+    def test_policy_keeps_scanning_the_capture_script(self):
+        workflows = policy.load_workflows()
+        step = workflows[WORKFLOW]["jobs"]["measurement-before"]["steps"][2]
+        step["run"] += 'test -n "$PRODUCTION_WORKER_URL"\n'
+        self.assertIn(f"{WORKFLOW}:measurement-before: deployment/probe alternative outside approved deploy workflows",
+                      policy.workflow_policy_errors(workflows))
+
     def test_capture_artifacts_and_fail_closed_steps(self):
         jobs = policy.load_workflows()[WORKFLOW]["jobs"]
         before = jobs["measurement-before"]["steps"]
@@ -288,6 +313,7 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
         self.assertEqual(set(jobs["measurement-final"]["needs"]), {"staging-window", "measurement-after", "voice-second"})
         self.assertEqual(set(release["needs"]), {"staging-window", "measurement-before", "voice-first", "measurement-after", "voice-second", "measurement-final"})
         finish = next(s for s in release["steps"] if s.get("name") == "Release only this run's window")
+        self.assertNotIn("if", finish)
         self.assertEqual(finish["run"], "node wrangler/scripts/staging-use-pipeline.mjs finish")
         self.assertEqual(finish["env"]["STAGING_USE_EXPIRES_AT"],
                          "${{ needs.staging-window.outputs.expires_at }}")

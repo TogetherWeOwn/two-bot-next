@@ -4522,6 +4522,37 @@ def cloudflare_environment_errors(workflows):
     return errors
 
 
+def measurement_deploy_scan_text(job_id, job):
+    """Exclude only the reviewed step bindings and the literal capture invocation."""
+    index, capture = {"staging-window": (2, None), "staging-use-release": (2, None),
+                      "measurement-before": (2, "before"), "measurement-after": (5, "after"),
+                      "measurement-final": (6, "final")}[job_id]
+    steps = job.get("steps", [])
+    if not isinstance(steps, list) or len(steps) <= index or not isinstance(steps[index], dict):
+        return str(job).lower()
+    step = steps[index]
+    env, script = step.get("env", {}), step.get("run")
+    if not isinstance(env, dict) or not isinstance(script, str):
+        return str(job).lower()
+    lines = script.splitlines()
+    allowed = {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"}
+    if capture:
+        command = ('node wrangler/scripts/voice-rest-measurement.mjs capture --metadata "$RUNNER_TEMP/voice-metadata.json"'
+                   f' --metrics-url "$STAGING_WORKER_URL" --out "$RUNNER_TEMP/voice-{capture}.json"')
+        if command not in lines:
+            return str(job).lower()
+        lines.remove(command)
+        # The production origin is a refuse-list value, not a deploy target.
+        allowed["PRODUCTION_WORKER_URL"] = "${{ vars.PRODUCTION_WORKER_URL }}"
+    else:
+        phase = "begin" if job_id == "staging-window" else "finish"
+        if script != f"node wrangler/scripts/staging-use-pipeline.mjs {phase}":
+            return str(job).lower()
+    sanitized = dict(step, run="\n".join(lines),
+                     env={key: value for key, value in env.items() if (key, value) not in allowed.items()})
+    return str(dict(job, steps=[*steps[:index], sanitized, *steps[index + 1:]])).lower()
+
+
 def workflow_policy_errors(workflows):
     errors = []
     errors.extend(cloudflare_environment_errors(workflows))
@@ -4695,16 +4726,12 @@ def workflow_policy_errors(workflows):
             else:
                 # Retargeting a known CI job must not create an unapproved
                 # deploy/probe route outside the deploy workflows.
-                text = str(job).lower()
                 uses = job.get("uses")
                 measured_staging = name == MEASUREMENT and measurement and job_id in MEASUREMENT_STAGING_JOBS
-                markers = DEPLOY_MARKERS
-                if measured_staging:
-                    # The production origin is a refuse-list value, not a deploy target.
-                    markers = tuple(m for m in markers if m not in ("staging_worker_url", "production_worker_url"))
+                text = measurement_deploy_scan_text(job_id, job) if measured_staging else str(job).lower()
                 if (("environment" in job and not measured_staging)
                         or (uses is not None and REUSABLE_CALLS.get((name, job_id)) != uses)
-                        or any(marker in text for marker in markers)):
+                        or any(marker in text for marker in DEPLOY_MARKERS)):
                     errors.append(f"{name}:{job_id}: deployment/probe alternative outside approved deploy workflows")
     return errors
 
