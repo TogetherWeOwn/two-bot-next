@@ -1,9 +1,9 @@
-"""Offline contract for the disabled staging measurement wrapper."""
+"""Offline contract for the staging measurement workflow."""
 
 from copy import deepcopy
 import unittest
 
-from disabled_voice_measurement import GUARDS, WORKFLOW
+from voice_measurement_policy import GUARDS, WORKFLOW
 import test_staging_voice_mutual_exclusion_acceptance as lifecycle
 import test_workflows as policy
 
@@ -58,7 +58,7 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
                      "path": "${{ runner.temp }}/voice-terminal.json", "if-no-files-found": "error", "retention-days": "14"},
         })
 
-    def test_both_policy_consumers_fail_closed_on_activation(self):
+    def test_both_policy_consumers_reject_lock_or_guard_drift(self):
         workflows = lifecycle.load_all()
         canonical = workflows[lifecycle.DEPLOY]["concurrency"]["group"].casefold()
         self.assertEqual(policy.workflow_policy_errors(workflows), [])
@@ -69,7 +69,7 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
             with self.subTest(job=name):
                 changed = deepcopy(workflows)
                 job = changed[WORKFLOW]["jobs"][name]
-                job["if"] = job["if"].replace("false && ", "", 1)
+                job["if"] = "${{ true }}"
                 self.assertTrue(policy.workflow_policy_errors(changed))
                 self.assertTrue(lifecycle.repository_errors(changed, canonical))
         queue = workflows[WORKFLOW]["concurrency"]
@@ -206,16 +206,16 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
                 "voice-before/voice-before.json", "voice-middle/voice-after.json", "voice-final.json")),
         }})
 
-    def test_every_job_is_hard_disabled_and_the_graph_keeps_ownership(self):
+    def test_only_fresh_main_dispatch_can_hold_the_grant(self):
         workflows = policy.load_workflows()
         workflow = workflows[WORKFLOW]
         self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
         self.assertEqual(workflow["permissions"], {})
         canonical = workflows[lifecycle.DEPLOY]["concurrency"]["group"]
         self.assertEqual(workflow["concurrency"], {
-            "group": "${{ false && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
+            "group": "${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
             "&& github.run_attempt == 1 && '" + canonical + "' || "
-            "format('voice-rest-measurement-disabled-{0}-{1}', github.run_id, github.run_attempt) }}",
+            "format('voice-rest-measurement-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
             "cancel-in-progress": "false", "queue": "max",
         })
         jobs = workflow["jobs"]
@@ -243,7 +243,7 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
             "rerun-refusal": "always() && github.run_attempt != 1",
         }
         self.assertEqual({name: job["if"] for name, job in jobs.items()},
-                         {name: "${{ false && " + guard + " }}" for name, guard in guards.items()})
+                         {name: "${{ " + guard + " }}" for name, guard in guards.items()})
         refusal = jobs["rerun-refusal"]
         self.assertEqual(refusal["needs"], "measurement-terminal")
         self.assertEqual(refusal["permissions"], {})

@@ -134,6 +134,22 @@ receipt. An omitted or empty label preserves the original names. Callers with
 multiple invocations must use distinct fixed labels; the label does not change
 file paths, retries or staging ownership.
 
+### REST counter measurement
+
+Use a **fresh** `voice-rest-measurement.yml` dispatch on `main` when staging
+serves that commit. Do not rerun an old attempt. The workflow holds the shared
+`staging-lifecycle` lock through cleanup and uses one 45-minute staging grant.
+It calls the voice synthetic once, and a second time only if the first valid
+all-label counter delta is below 10. It never renews the grant.
+
+A queued measurement can be cancelled before it starts rather than displace
+ordinary staging work. Treat that, or any failed run or missing/refused verdict,
+as inconclusive. Read the per-label deltas from the matching
+`voice-measurement-candidate-<run id>-1` artifact **only** after the run succeeds
+and `voice-measurement-terminal-<run id>-1` reports `accepted`. The terminal
+verdict checks the same-grant bookends, lifecycle evidence and cleanup;
+a standalone synthetic or a candidate artifact alone is not a measurement.
+
 ## Identity
 
 The test bot is a separate Discord application, **TWO Voice Synthetic
