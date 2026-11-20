@@ -55,11 +55,14 @@ names a missing Environment makes GitHub create it with no protection, so the
 guard checks before the deploy job can run. This repository is public, so
 required reviewers work on every plan; no Enterprise plan is needed.
 
-**Deploy.** Leave `sha` empty to promote the commit of the latest successful
-`deploy-staging` run on `main`. The newest `main` commit may not have a
-qualifying staging run. The guard applies every rule below to the selected
+**Deploy.** Dispatch with `sha` set to the exact full SHA the Release Manager
+accepted; a different SHA needs fresh acceptance. The guard's empty-`sha` mode
+(Leave `sha` empty to promote the commit of the latest successful
+`deploy-staging` run on `main`) is not a release route: that commit can be newer
+than the accepted SHA. The newest `main` commit may not have a qualifying
+staging run. The guard applies every rule below to the selected
 commit and refuses it if its `ci-ok` or `worker check` has not finished green.
-To deploy a specific commit, dispatch with `sha` set to a full 40-character
+The `sha` input takes a full 40-character
 commit (or an unambiguous 7-40 character hex prefix, which the guard resolves
 to the full commit via the commits API) that is on `main`. That commit needs
 successful, completed `ci-ok` and `worker check` runs from GitHub Actions and

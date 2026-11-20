@@ -203,8 +203,8 @@ for reviewers and the Release Manager. The single `ci-ok` aggregate in
 (including the runbook command-drift test).
 
 The final-stage reviewer squash-merges the pinned settled head before final
-approval; the author merges only without a review stage. Only promotion-path
-PRs need the Release Manager's exact-head confirmation before merge; production
+approval; the author merges only without a review stage. While automatic
+production promotion is verified disabled, only promotion-path PRs need the Release Manager's exact-head confirmation before merge; production
 needs Release Manager acceptance of the release. For web/bot, staging
 qualification is the **post-merge, pre-production exact-main staging/e2e/soak
 gate**, enforced by the promotion guard. Staging accepts only main-ancestor

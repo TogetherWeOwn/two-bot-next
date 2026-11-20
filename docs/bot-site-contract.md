@@ -209,7 +209,7 @@ Additions in v2:
 Per verb, in order: merge behind default-off flag → staging verification (voice verbs: the `docs/staging-voice-event-verification.md` pattern from the move-member branch) → operator forwards the flag deliberately through `container-env` (adding a secret is never enough) → production enable under the receiver doc's enable order and the §1 signing gate. Site degrades honestly at every step (§11), so bot and site releases are never coupled.
 
 - **Migration collision:** both in-flight branches (the move-member and member-notify branches) add `0471_*.sql` over main's `0470`. The second merger renumbers; reviewers check the ledger, not the card text.
-- **Production schema/data changes** (new bot tables in §5/§6, site bot-log/Echo/prefs tables) ride their own PRs and the Release Manager merge path per repo governance, as every default-branch merge already does. Nothing in this document pre-approves a migration.
+- **Production schema/data changes** (new bot tables in §5/§6, site bot-log/Echo/prefs tables) ride their own PRs and need exact-head Release Manager confirmation before merge per [production merge evidence](../CONTRIBUTING.md#production-merge-evidence). Nothing in this document pre-approves a migration.
 - **Move Members permission** on the production bot role is an operator rollout step with the §5-of-v1 preflight; Manage Roles is never requested.
 
 ## 13. Deltas to the Ember Hours design (the only ones)

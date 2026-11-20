@@ -89,20 +89,28 @@ head/base change; a stale check does not validate a new head.
 The final-stage reviewer squash-merges the settled, exact reviewed head in the
 same run as final approval, after all required checks pass and every review
 finding is fixed or answered with evidence. The author merges only when there is
-no review stage. Pin the merge to that head SHA; record the squash SHA and the
-release decision in the release log.
+no review stage. Pin the merge to that head SHA. At merge, record the squash SHA
+and any applicable PR confirmation in the release log; record the production
+decision there when the Release Manager accepts the release candidate.
 
-With `PRODUCTION_AUTO_PROMOTE_DISABLED=true`, a merge to `main` does not reach
-production on its own; production goes through Release Manager acceptance of a
-release. Ordinary PRs need **no per-PR Release Manager confirmation**: required
-checks and the review stages suffice. Promotion-path PRs still need a fresh
-Release Manager `request_confirmation` on their exact head before merge:
-workflows, actions and tooling that qualify, select, deploy or roll back a
-production candidate; deploy, Wrangler or binding config; and anything that
-changes `PRODUCTION_AUTO_PROMOTE_*` behaviour. Put the confirmation on a child
-task assigned and addressed to the Release Manager
-(`resolverPolicy: not_creator`). A production migration, manual production
-dispatch or rollback needs its own Release Manager confirmation too.
+The ordinary-PR exemption applies only while `PRODUCTION_AUTO_PROMOTE_DISABLED=true`
+is verified live, so a merge to `main` does not reach production on its own. A
+merge that would deploy, or whose deploy behaviour is unverified, follows the
+production approval route. Under that condition, ordinary PRs need **no per-PR
+Release Manager confirmation**: required checks and the review stages suffice.
+Promotion-path PRs still need a fresh Release Manager `request_confirmation` on
+their exact head before merge: workflows, actions and tooling that qualify,
+select, deploy or roll back a production candidate; deploy, Wrangler or binding
+config; production schema or data changes (migrations); anything that changes
+`PRODUCTION_AUTO_PROMOTE_*` behaviour; and edits to the production-authorization
+guidance in this section, `AGENTS.md` or `REVIEW.md`. Put the confirmation on a
+child task assigned and addressed to the Release Manager
+(`resolverPolicy: not_creator`).
+
+Production release acceptance binds to the exact full release SHA; dispatch
+production with that SHA ([production deploy](docs/production-deploy.md)). A
+different SHA needs fresh acceptance. A manual production dispatch or rollback
+needs its own Release Manager confirmation too.
 
 For two-web-next and two-bot-next, staging qualification is the
 **post-merge, pre-production exact-main staging/e2e/soak gate** (owner decision

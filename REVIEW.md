@@ -35,17 +35,20 @@ through a hold.
 
 Before merge, verify required GitHub Actions checks and Devin Review on the
 exact PR head, all applicable specialist and native review, and finding
-dispositions. For promotion-path PRs only, require fresh exact-head Release
-Manager confirmation with the migration ledger entry (or `no migration`) and
-rollback target. Preserve
+dispositions. For promotion-path PRs only, including production schema/data
+changes, as defined and conditioned in
+[`CONTRIBUTING.md`](CONTRIBUTING.md#production-merge-evidence), require fresh
+exact-head Release Manager confirmation before merge with the migration ledger
+entry (or `no migration`) and rollback target. Preserve
 every incident/freeze/hold safeguard, identity/capability hold and red staging
 drill or other deterministic gate. A new head needs fresh review/check evidence
 and, for a promotion-path PR, a new confirmation. Historical rejections are not
 retroactive approvals; their remaining conditions must be met before
 resubmission. The final-stage
 reviewer performs the SHA-pinned squash merge before final approval and records
-the squash SHA and decision in the release log; the author merges only without
-a review stage. This policy claims no staging pass or hold lift and authorizes
+the squash SHA and any applicable PR confirmation in the release log; the
+production decision is logged when the release candidate is accepted. The author
+merges only without a review stage. This policy claims no staging pass or hold lift and authorizes
 no pipeline skip, no-op implementation, deployment or other production action.
 
 ## What merits a finding
