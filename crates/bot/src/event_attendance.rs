@@ -202,12 +202,12 @@ mod tests {
     }
 
     #[test]
-    fn move_after_grace_closes_without_opening() {
+    fn move_after_grace_discovers_expired_key_without_opening() {
         let windows = [window("show", 0, 60 * MIN)];
-        let rows = [row(Some(7), 10 * MIN, "show")];
-        let plan = plan_transition(&windows, &rows, Some(7), Some(9), 75 * MIN);
-        assert_eq!(plan.closes[0].left_ms, 75 * MIN);
-        assert_eq!(plan.closes[0].tag_union, ["show"]);
+        let rows = [row(Some(7), 10 * MIN, "original")];
+        let plan = plan_transition(&windows, &rows, Some(7), Some(9), 80 * MIN);
+        assert_eq!(plan.closes[0].left_ms, 80 * MIN);
+        assert_eq!(plan.closes[0].tag_union, ["original", "show"]);
         assert_eq!(plan.open, None);
     }
 
@@ -220,14 +220,17 @@ mod tests {
     }
 
     #[test]
-    fn unproven_continuity_never_widens_a_close() {
-        let windows = [window("later", 30 * MIN, 120 * MIN)];
+    fn same_event_rejoin_does_not_prove_continuity() {
+        let windows = [
+            window("later", 30 * MIN, 120 * MIN),
+            window("original", 0, 60 * MIN),
+        ];
         for (stored, previous) in [(Some(7), None), (Some(7), Some(9)), (None, None)] {
-            let rows = [row(stored, 0, "original")];
+            let rows = [row(stored, 10 * MIN, "original")];
             let plan = plan_transition(&windows, &rows, previous, Some(7), 45 * MIN);
-            assert_eq!(plan.closes[0].left_ms, 0);
+            assert_eq!(plan.closes[0].left_ms, rows[0].joined_ms);
             assert_eq!(plan.closes[0].tag_union, ["original"]);
-            assert_eq!(plan.open.unwrap().tags, ["later"]);
+            assert_eq!(plan.open.unwrap().tags, ["later", "original"]);
         }
     }
 
