@@ -8534,9 +8534,10 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(production_errors(workflow), label)
 
     def test_soak_rejects_unsafe_handoffs(self):
-        for job, key in (("begin", "outputs"), ("voice", "uses"), ("voice", "needs"), ("finish", "if"), ("finish", "steps")):
+        for job, key in (("begin", "outputs"), ("voice", "uses"), ("voice", "needs"), ("finish", "if"), ("finish", "steps"), ("soak", "STAGING_METRICS_SCRAPE_TOKEN")):
             changed = deepcopy(self.workflows)
-            del changed[STAGING_SOAK]["jobs"][job][key]
+            target = changed["deploy-production.yml"]["jobs"]["soak"]["secrets"] if job == "soak" else changed[STAGING_SOAK]["jobs"][job]
+            target.pop(key, None)
             self.assertFalse(admitted_soak(changed), (job, key))
 
     def test_production_route_is_automatic_or_dispatch_and_gated(self):

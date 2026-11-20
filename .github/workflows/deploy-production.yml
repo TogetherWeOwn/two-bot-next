@@ -1066,7 +1066,8 @@ jobs:
       staging_run_id: ${{ needs.guard.outputs.staging_run_id }}
       staging_attempt: ${{ needs.guard.outputs.staging_attempt }}
     secrets: {STAGING_OWNERSHIP_CONTROL_TOKEN: "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
-              TWO_VOICE_SYNTHETIC_BOT_TOKEN: "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}
+              TWO_VOICE_SYNTHETIC_BOT_TOKEN: "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}",
+              STAGING_METRICS_SCRAPE_TOKEN: "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"}
 
   # Publish only the completed bounded job's verdict; no live staging reads
   # can escape its lock. Failure, cancellation or unconfirmed release blocks it.

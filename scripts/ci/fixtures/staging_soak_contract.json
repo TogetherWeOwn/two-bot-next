@@ -17,7 +17,8 @@
     },
     "secrets": {
       "STAGING_OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
-      "TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"
+      "TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}",
+      "STAGING_METRICS_SCRAPE_TOKEN": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"
     }
   },
   "reusable": {
@@ -54,7 +55,7 @@
             "required": "false"
           },
           "STAGING_METRICS_SCRAPE_TOKEN": {
-            "required": "false"
+            "required": "true"
           }
         },
         "outputs": {

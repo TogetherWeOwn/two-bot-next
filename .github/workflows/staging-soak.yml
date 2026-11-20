@@ -3,11 +3,10 @@ on:
   workflow_call:
     inputs: {sha: {type: string, required: true}, auto: {type: string, required: true}, full_soak: {type: boolean, required: true},
              staging_run_id: {type: string, required: true}, staging_attempt: {type: string, required: true}}
-    # The scrape token is declared for actionlint; only the staging environment supplies it.
-    secrets: {STAGING_OWNERSHIP_CONTROL_TOKEN: {required: true}, TWO_VOICE_SYNTHETIC_BOT_TOKEN: {required: false}, STAGING_METRICS_SCRAPE_TOKEN: {required: false}}
+    # The caller maps the scrape token by name; only the staging environment supplies its value.
+    secrets: {STAGING_OWNERSHIP_CONTROL_TOKEN: {required: true}, TWO_VOICE_SYNTHETIC_BOT_TOKEN: {required: false}, STAGING_METRICS_SCRAPE_TOKEN: {required: true}}
     outputs: {skip: {value: "${{ jobs.finish.outputs.skip }}"}, evidence: {value: "${{ jobs.finish.outputs.evidence }}"}}
 permissions: {}
-# Called workflow, not the production caller or either individual job, owns staging.
 concurrency:
   group: ${{ github.run_attempt == 1 && github.ref == 'refs/heads/main' && github.ref_protected && 'staging-lifecycle' || format('staging-soak-refused-{0}-{1}', github.run_id, github.run_attempt) }}
   cancel-in-progress: false
