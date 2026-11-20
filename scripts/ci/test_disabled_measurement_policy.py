@@ -1,11 +1,11 @@
-"""Exercise disabled measurement admission without creating or dispatching a workflow."""
+"""Exercise live measurement admission without creating or dispatching a workflow."""
 
 from copy import deepcopy
 import importlib.util
 from pathlib import Path
 import unittest
 
-from disabled_voice_measurement import GUARDS, QUEUE, WORKFLOW
+from voice_measurement_policy import GUARDS, WORKFLOW
 import test_workflows as policy
 import test_staging_voice_mutual_exclusion_acceptance as lifecycle
 
@@ -16,46 +16,36 @@ SPEC.loader.exec_module(runner)
 TARGET = "./.github/workflows/voice-synthetic.yml"
 
 
-def scaffold():
-    jobs = {name: {"if": guard} for name, guard in GUARDS.items()}
-    for name in ("staging-window", "measurement-before", "measurement-after", "measurement-final", "staging-use-release"):
-        jobs[name].update({"environment": "staging", "runs-on": "ubuntu-latest"})
-    for name in ("measurement-terminal", "rerun-refusal"):
-        jobs[name]["runs-on"] = "ubuntu-latest"
-    for name in ("voice-first", "voice-second"):
-        jobs[name]["uses"] = TARGET
-    return {"on": {"workflow_dispatch": ""}, "permissions": {},
-            "concurrency": QUEUE.copy(), "jobs": jobs}
-
-
-class DisabledMeasurementPolicyTests(unittest.TestCase):
+class VoiceMeasurementAdmissionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.workflows = policy.load_workflows()
 
-    def test_complete_scaffold_is_admitted_without_changing_existing_inventory(self):
-        wfs = deepcopy(self.workflows)
-        wfs[WORKFLOW] = scaffold()
-        self.assertEqual(policy.workflow_policy_errors(wfs), [])
-        self.assertEqual(lifecycle.lifecycle_errors(wfs), [])
+    def test_complete_caller_is_admitted_without_changing_other_routes(self):
+        self.assertEqual(policy.workflow_policy_errors(self.workflows), [])
+        self.assertEqual(lifecycle.lifecycle_errors(self.workflows), [])
 
     def test_mutations_do_not_bypass_inventory_or_lifecycle(self):
-        for mutation in ("activation", "queue", "job-lock", "rerun", "trigger", "permissions", "target"):
+        for mutation in ("guard", "queue", "job-lock", "rerun", "trigger", "permissions", "target", "environment", "grant"):
             with self.subTest(mutation=mutation):
                 wfs = deepcopy(self.workflows)
-                wfs[WORKFLOW] = candidate = scaffold()
-                if mutation == "activation":
+                candidate = wfs[WORKFLOW]
+                if mutation == "guard":
                     candidate["jobs"]["staging-window"]["if"] = "${{ true }}"
                 elif mutation == "queue":
                     candidate["concurrency"]["group"] = "staging-lifecycle"
                 elif mutation == "job-lock":
                     candidate["jobs"]["staging-window"]["concurrency"] = "staging-lifecycle"
                 elif mutation == "rerun":
-                    candidate["jobs"]["staging-window"]["if"] = "${{ false && github.ref == 'refs/heads/main' }}"
+                    candidate["jobs"]["staging-window"]["if"] = "${{ github.ref == 'refs/heads/main' }}"
                 elif mutation == "trigger":
                     candidate["on"]["push"] = ""
                 elif mutation == "permissions":
                     candidate["permissions"]["contents"] = "write"
+                elif mutation == "grant":
+                    candidate["jobs"]["voice-second"]["with"]["deploy_staging_call"] = "false"
+                elif mutation == "environment":
+                    candidate["jobs"]["staging-window"]["environment"] = "production"
                 else:
                     candidate["jobs"]["voice-first"]["uses"] = "./.github/workflows/other.yml"
                 self.assertTrue(policy.workflow_policy_errors(wfs))
@@ -65,24 +55,22 @@ class DisabledMeasurementPolicyTests(unittest.TestCase):
         for job in GUARDS:
             with self.subTest(job=job):
                 wfs = deepcopy(self.workflows)
-                wfs[WORKFLOW] = scaffold()
                 wfs[WORKFLOW]["jobs"][job]["if"] = "${{ true }}"
                 self.assertTrue(policy.workflow_policy_errors(wfs))
                 self.assertTrue(lifecycle.lifecycle_errors(wfs))
         wfs = deepcopy(self.workflows)
-        wfs[WORKFLOW] = scaffold()
         wfs["check.yml"]["jobs"]["unexpected-caller"] = {"uses": TARGET}
         self.assertTrue(policy.workflow_policy_errors(wfs))
         self.assertTrue(lifecycle.lifecycle_errors(wfs))
 
-    def test_repository_runner_policy_accepts_only_the_disabled_pinned_call(self):
+    def test_repository_runner_policy_accepts_only_the_pinned_call(self):
         check = policy.WorkflowTests("test_public_hosted_runner_and_service_isolation")
-        check.workflows = {WORKFLOW: scaffold()}
+        check.workflows = {WORKFLOW: deepcopy(self.workflows[WORKFLOW])}
         check.test_public_hosted_runner_and_service_isolation()
-        for mutation in ("activation", "target", "runner"):
+        for mutation in ("guard", "target", "runner"):
             with self.subTest(mutation=mutation):
-                candidate = scaffold()
-                if mutation == "activation":
+                candidate = deepcopy(self.workflows[WORKFLOW])
+                if mutation == "guard":
                     candidate["jobs"]["staging-window"]["if"] = "${{ true }}"
                 elif mutation == "target":
                     candidate["jobs"]["voice-first"]["uses"] = "./.github/workflows/other.yml"
@@ -97,7 +85,7 @@ class DisabledMeasurementPolicyTests(unittest.TestCase):
         check = policy.WorkflowTests("test_public_hosted_runner_and_service_isolation")
         for field, value in (("uses", other), ("runs-on", "ubuntu-latest"), ("if", "${{ true }}")):
             wfs = deepcopy(self.workflows)
-            wfs[WORKFLOW] = candidate = scaffold()
+            candidate = wfs[WORKFLOW]
             candidate["jobs"]["voice-second"][field] = value
             if field != "runs-on":
                 self.assertTrue(policy.workflow_policy_errors(wfs), field)
