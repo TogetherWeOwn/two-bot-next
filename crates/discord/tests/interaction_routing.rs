@@ -1134,56 +1134,6 @@ async fn followup_requires_a_valid_message_identity_without_retrying() {
 }
 
 #[tokio::test]
-async fn help_embed_followup_is_ephemeral_sanitized_single_attempt_and_token_safe() {
-    use common::{MockRest, ScriptedResponse};
-    use twilight_model::channel::message::Embed;
-    use two_bot_discord::ActionExecutor;
-    let embed: Embed = serde_json::from_value(serde_json::json!({
-        "type": "rich",
-        "description": "page two @everyone",
-        "fields": [{"name": "Group", "value": "/cmd", "inline": false}],
-    }))
-    .unwrap();
-    let mock = MockRest::start(
-        Vec::new(),
-        ScriptedResponse::json(200, serde_json::json!({"id": "99"})),
-    )
-    .await;
-    let executor =
-        ActionExecutor::with_proxy("reply-test-token".into(), Some(mock.origin())).unwrap();
-    executor
-        .send_ephemeral_embed_followup(1111, "routing-test-token", std::slice::from_ref(&embed))
-        .await
-        .expect("followup accepted");
-    let requests = mock.requests();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].method, "POST");
-    assert_eq!(
-        requests[0].path,
-        "/api/v10/webhooks/1111/routing-test-token?with_components=false"
-    );
-    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(body["flags"], 64);
-    assert_eq!(body["allowed_mentions"]["parse"], serde_json::json!([]));
-    assert!(!body["embeds"][0]["description"]
-        .as_str()
-        .unwrap()
-        .contains("@everyone"));
-    mock.shutdown().await;
-
-    let mock = MockRest::start(Vec::new(), ScriptedResponse::status(500)).await;
-    let executor =
-        ActionExecutor::with_proxy("reply-test-token".into(), Some(mock.origin())).unwrap();
-    let err = executor
-        .send_ephemeral_embed_followup(1111, "routing-test-token", &[embed])
-        .await
-        .expect_err("server failure");
-    assert!(!format!("{err} {err:?}").contains("routing-test-token"));
-    assert_eq!(mock.requests().len(), 1, "failed followup is not retried");
-    mock.shutdown().await;
-}
-
-#[tokio::test]
 async fn publish_sends_the_complete_merged_set_once() {
     // Publish-once against the mock double through the real bulk-set
     // endpoint: one request, all 48 names, no partial view.

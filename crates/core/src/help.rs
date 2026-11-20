@@ -209,70 +209,111 @@ const HELP_GROUPS: &[HelpGroup] = &[
     },
 ];
 
-/// Render the ephemeral `/help` reply for the given live publish set.
-///
-/// Only commands present in `defs` render, in publish order within each
-/// group; empty groups are skipped. Large custom-command sets exceed the
-/// plain content ceiling; the Discord adapter uses an embed to preserve names.
+const RSVP_ATTENDANCE_NOTES: &[&str] = &[
+    "Paste the event id or link, e.g. https://discord.com/events/<server-id>/<event-id>.",
+    "Totals include your saved response and saved time; live event availability is not checked.",
+];
+
+/// One discovery group with its permission hint and trailing explanatory lines.
+pub struct HelpSection<'a> {
+    pub title: &'static str,
+    pub requires: Option<&'static str>,
+    pub commands: Vec<&'a str>,
+    pub notes: &'static [&'static str],
+}
+
+/// Ordered discovery content from one confirmed command publication.
+pub struct HelpCatalog<'a> {
+    pub heading: String,
+    pub sections: Vec<HelpSection<'a>>,
+    pub closing_note: &'static str,
+}
+
+/// Build the discovery groups before rendering them to text or embeds.
+/// Empty and inactive groups are omitted. Ungrouped names retain publish order.
 #[must_use]
-pub fn help_text(defs: &[CommandDefinition]) -> String {
+pub fn help_catalog(defs: &[CommandDefinition]) -> HelpCatalog<'_> {
     let live: HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-    let mut out = String::new();
-    let _ = writeln!(out, "**Server commands** ({} live)", live.len(),);
-    let mut rendered: HashSet<&str> = HashSet::new();
+    let mut rendered = HashSet::new();
+    let mut sections = Vec::new();
     for group in HELP_GROUPS {
         if group.anchor.is_some_and(|anchor| !live.contains(anchor)) {
             continue;
         }
-        let present: Vec<_> = group
+        let commands: Vec<_> = group
             .commands
             .iter()
-            .filter(|name| live.contains(**name))
+            .copied()
+            .filter(|name| live.contains(name))
             .collect();
-        if present.is_empty() {
+        if commands.is_empty() {
             continue;
         }
-        rendered.extend(present.iter().map(|name| **name));
+        rendered.extend(commands.iter().copied());
+        let notes = if commands.contains(&"rsvp-attendance") {
+            RSVP_ATTENDANCE_NOTES
+        } else {
+            &[]
+        };
+        sections.push(HelpSection {
+            title: group.title,
+            requires: group.requires,
+            commands,
+            notes,
+        });
+    }
+    // Future builtins and custom commands that have no active group still
+    // appear in discovery.
+    let custom: Vec<_> = defs
+        .iter()
+        .map(|def| def.name.as_str())
+        .filter(|name| !rendered.contains(name))
+        .collect();
+    if !custom.is_empty() {
+        sections.push(HelpSection {
+            title: "Custom",
+            requires: None,
+            commands: custom,
+            notes: &[],
+        });
+    }
+    HelpCatalog {
+        heading: format!("**Server commands** ({} live)", live.len()),
+        sections,
+        closing_note:
+            "This is the last confirmed command list. Your picker hides gated commands you cannot use.",
+    }
+}
+
+/// Render the ephemeral `/help` reply for the given live publish set.
+#[must_use]
+pub fn help_text(defs: &[CommandDefinition]) -> String {
+    let catalog = help_catalog(defs);
+    let mut out = catalog.heading;
+    out.push('\n');
+    for section in catalog.sections {
         out.push('\n');
-        match group.requires {
+        match section.requires {
             Some(perm) => {
-                let _ = writeln!(out, "**{}** — needs {}", group.title, perm);
+                let _ = writeln!(out, "**{}** — needs {perm}", section.title);
             }
             None => {
-                let _ = writeln!(out, "**{}**", group.title);
+                let _ = writeln!(out, "**{}**", section.title);
             }
         }
-        let names: Vec<String> = present.iter().map(|name| format!("/{name}")).collect();
-        out.push_str(&names.join(" · "));
+        for (index, name) in section.commands.iter().enumerate() {
+            if index != 0 {
+                out.push_str(" · ");
+            }
+            let _ = write!(out, "/{name}");
+        }
         out.push('\n');
-        if group.commands.contains(&"rsvp-attendance") && live.contains("rsvp-attendance") {
-            out.push_str("Paste the event id or link, e.g. https://discord.com/events/<server-id>/<event-id>.\n");
-            out.push_str("Totals include your saved response and saved time; live event availability is not checked.\n");
+        for note in section.notes {
+            let _ = writeln!(out, "{note}");
         }
     }
-    // DB custom rows publish alongside the builtins; anything else ungrouped
-    // (a future builtin this table predates) still renders rather than
-    // vanishing from discovery.
-    let mut custom = Vec::new();
-    for def in defs {
-        if !rendered.contains(def.name.as_str()) {
-            custom.push(def.name.as_str());
-        }
-    }
-    if !custom.is_empty() {
-        out.push_str("\n**Custom**\n");
-        out.push_str(
-            &custom
-                .iter()
-                .map(|name| format!("/{name}"))
-                .collect::<Vec<_>>()
-                .join(" · "),
-        );
-        out.push('\n');
-    }
-    out.push_str(
-        "\nThis is the last confirmed command list. Your picker hides gated commands you cannot use.",
-    );
+    out.push('\n');
+    out.push_str(catalog.closing_note);
     out
 }
 
@@ -891,6 +932,77 @@ mod tests {
             onboarding_picker: true,
             session_picker: true,
         }
+    }
+
+    #[test]
+    fn catalog_keeps_groups_hints_and_notes_in_display_order() {
+        let defs: Vec<_> = ["ping", "rsvp-attendance", "ban", "faq", "rsvp"]
+            .into_iter()
+            .map(|name| CommandDefinition::new(name, "A test command"))
+            .collect();
+        let catalog = help_catalog(&defs);
+        let groups: Vec<_> = catalog
+            .sections
+            .iter()
+            .map(|section| (section.title, section.requires, section.commands.as_slice()))
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                ("RSVPs", None, ["rsvp", "rsvp-attendance"].as_slice()),
+                ("Bans", Some("Ban Members"), ["ban"].as_slice()),
+                ("Custom", None, ["ping", "faq"].as_slice()),
+            ]
+        );
+        assert_eq!(catalog.sections[0].notes, RSVP_ATTENDANCE_NOTES);
+        assert!(catalog.sections[1..]
+            .iter()
+            .all(|section| section.notes.is_empty()));
+        assert_eq!(
+            help_text(&defs),
+            concat!(
+                "**Server commands** (5 live)\n\n",
+                "**RSVPs**\n/rsvp · /rsvp-attendance\n",
+                "Paste the event id or link, e.g. https://discord.com/events/<server-id>/<event-id>.\n",
+                "Totals include your saved response and saved time; live event availability is not checked.\n\n",
+                "**Bans** — needs Ban Members\n/ban\n\n**Custom**\n/ping · /faq\n\n",
+                "This is the last confirmed command list. Your picker hides gated commands you cannot use.",
+            )
+        );
+    }
+
+    #[test]
+    fn catalog_lists_every_name_in_a_maximum_admitted_registry() {
+        use crate::commands::{CustomCommand, GUILD_COMMAND_LIMIT};
+
+        let router = InteractionRouter::new(all_on());
+        let rows: Vec<_> = (0..GUILD_COMMAND_LIMIT)
+            .map(|i| CustomCommand {
+                name: format!("{}-{i:02}", "界".repeat(29)),
+                description: "A test command".to_owned(),
+                enabled: true,
+            })
+            .collect();
+        let defs = router.publish_set(&rows).expect("full registry");
+        assert_eq!(defs.len(), GUILD_COMMAND_LIMIT);
+        let catalog = help_catalog(&defs);
+        let rendered: Vec<_> = catalog
+            .sections
+            .iter()
+            .flat_map(|section| &section.commands)
+            .copied()
+            .collect();
+        assert_eq!(rendered.len(), defs.len());
+        assert!(defs.iter().all(|def| rendered.contains(&def.name.as_str())));
+        let custom = catalog.sections.last().expect("custom group");
+        assert_eq!(custom.title, "Custom");
+        let expected: Vec<_> = defs
+            .iter()
+            .filter(|def| def.name.starts_with('界'))
+            .map(|def| def.name.as_str())
+            .collect();
+        assert!(!expected.is_empty());
+        assert_eq!(custom.commands, expected);
     }
 
     #[test]
