@@ -16,8 +16,9 @@ and `snapshot` steps succeeded and a later step fails (receipt validation,
 ownership takeover, `verify`, or the error-rate gate);
 `scripts/staging_rollout.py` itself performs
 no rollback. On success the pre-deploy Worker version **and** container image
-are restored before takeover. The run stays red; recovery does not certify the
-failed build. Without a successful deploy and snapshot there is no auto-rollback.
+are restored before takeover and the run stays red — the restore
+recovers service, it never certifies the failed build. Without a successful
+deploy and snapshot there is nothing to restore, so no rollback is attempted.
 Routine deploys refuse a fenced or uninitialized owner before replacing either
 component. Use the authorized `release_fence` path to restore a staging baseline.
 The helper additionally requires a proven finite-policy target and the original
@@ -501,12 +502,17 @@ check.
 A valid stale Worker readback does not block the image POST while fenced; split
 traffic, unrelated versions and read errors do. Neither POST is retried. After
 image convergence, the target Worker must serve 100% within seven reads, ten
-seconds apart. Before takeover and after the 18 passing `/health` and `/readyz`
-polls, read the exact rollout, application and history. Accept a listing lag only
-if it still shows the verified previous digest, has not shown the restore digest,
-and history has no newer rollout. Drift before takeover leaves staging fenced;
-late drift fails the restore without a success receipt. The drill also requires
-an opaque restore rollout ID distinct from the snapshot and forward rollout IDs.
+seconds apart.
+
+Image completion is not rollback success: ownership takeover and the existing
+18 consecutive passing `/health` and `/readyz` polls still follow. Those polls
+require the restored Worker version, expected build revision (subject to the
+existing pre-stamp exception), and `gateway=ready`; any miss resets the streak.
+Before takeover and after the probes, verify the pinned rollout, application and
+history. Accept only the previous digest as listing lag, and only if the listing
+has never shown the restore digest and no newer rollout exists. Early drift keeps
+staging fenced; late drift prevents a success receipt. The drill requires a restore
+rollout ID distinct from both the snapshot and forward rollout IDs.
 
 If the image leg times out, the log and failure evidence name the unmet condition
 as `waiting_for=target_version|rollout_completion|counters_or_progress|application_image`.

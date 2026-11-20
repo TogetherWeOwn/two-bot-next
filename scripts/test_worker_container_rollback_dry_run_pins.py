@@ -45,11 +45,9 @@ class DryRunPinTests(acc.DryRunCase):
                 code, out = self.run_dry(acc.manual_argv(evidence), client)
         self.assertEqual(code, 0, out)
         plan = self.plan_lines(out)
-        self.assertEqual(plan[0],
-                         f"dry-run plan: fence the singleton before restoring "
-                         f"version {acc.GOOD_VERSION}")
-        self.assertEqual(plan[1],
-                         f"dry-run plan: worker already serves {acc.GOOD_VERSION}; image leg only")
+        self.assertEqual(plan[:2], [
+            f"dry-run plan: fence the singleton before restoring version {acc.GOOD_VERSION}",
+            f"dry-run plan: worker already serves {acc.GOOD_VERSION}; image leg only"])
         self.assertIn("image POST container rollout", plan[2])
         self.assert_no_posts(client, out)
         self.assert_no_mutations(calls, out)

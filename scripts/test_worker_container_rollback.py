@@ -741,11 +741,10 @@ class RollbackRunTests(unittest.TestCase):
                         routes[("GET", path + "?limit=100")] = lambda: {"success": True, "result": [
                             rollout_row("r-later", bad_image(), created="2026-10-15T02:00:00Z")]}
                     else:
-                        app["configuration"]["image"] = bad_image()
+                        listing = ("GET", "/containers/applications")
+                        routes[listing] = self.routes(listing_lag=True)[0][listing]
                     return probe()
 
-                app = routes[("GET", "/containers/applications")]()["result"][0]
-                routes[("GET", "/containers/applications")] = lambda: {"success": True, "result": [app]}
                 routes[("PROBE", "readyz")] = readyz
                 failure = "rollout_replaced_or_reverted" if drift == "reverted" else "application_image_drift"
                 with self.assertRaisesRegex(base.GateError, f"^{failure}$"):

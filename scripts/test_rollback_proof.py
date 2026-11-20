@@ -68,13 +68,12 @@ def files():
     return {"staging-rollback-snapshot.json": {
                 "worker": "two-bot-next-staging", "has_previous": True,
                 "serving_version": VERSION, "serving_image": "registry.example/image@" + DIGEST,
-                "serving_rollout_id": "11111111-1111-4111-8111-111111111111"},
+                "serving_rollout_id": "r-before"},
             "auto-rollback-evidence.json": {"worker": "two-bot-next-staging", "variant": "staging",
-                "restored_version": VERSION, "restored_image_digest": DIGEST,
-                "restored_rollout_id": "22222222-2222-4222-8222-222222222222",
+                "restored_version": VERSION, "restored_image_digest": DIGEST, "restored_rollout_id": "r-new",
                 "gate": "stable-200-gateway-ready", "takeover": True},
             "error-rate-gate.json": {"mode": "rehearsal", "verdict": "fail", "firing": ["rest_5xx_rate"]},
-            "evidence.json": {"revision": "a" * 40, "rollout_id": "33333333-3333-4333-8333-333333333333"},
+            "evidence.json": {"revision": "a" * 40, "rollout_id": "r-forward"},
             "staging-use.jsonl": [{"schema": "two-bot-staging-pipeline.v1", "action": "window",
                 "environment": "staging", "runId": "123", "runAttempt": 1, "expiresAt": 1000, "sha": "a" * 40}]}
 
@@ -361,11 +360,10 @@ class RollbackProofTests(unittest.TestCase):
             ("auto-rollback-evidence.json", "restored_image_digest", "sha256:" + "b" * 64),
             ("auto-rollback-evidence.json", "restored_rollout_id", None),
             ("auto-rollback-evidence.json", "restored_rollout_id", "../invalid"),
-            ("auto-rollback-evidence.json", "restored_rollout_id", files()["evidence.json"]["rollout_id"]),
+            ("auto-rollback-evidence.json", "restored_rollout_id", "r-forward"),
+            ("auto-rollback-evidence.json", "restored_rollout_id", "r-before"),
             ("evidence.json", "rollout_id", None),
             ("evidence.json", "rollout_id", "x" * 129),
-            ("auto-rollback-evidence.json", "restored_rollout_id",
-             files()["staging-rollback-snapshot.json"]["serving_rollout_id"]),
             ("auto-rollback-evidence.json", "variant", "production"),
             ("auto-rollback-evidence.json", "takeover", False),
             ("auto-rollback-evidence.json", "gate", "ready-once"),
@@ -378,14 +376,9 @@ class RollbackProofTests(unittest.TestCase):
             evidence[file][key] = value
             with self.subTest(file=file, key=key), self.assertRaises(proof.ProofError):
                 proof.validate_evidence(evidence)
-        self.assertEqual(proof.validate_evidence(files())["gate"], "stable-200-gateway-ready")
-
-    def test_restore_accepts_distinct_opaque_rollout_ids(self):
-        evidence = files()
-        evidence["staging-rollback-snapshot.json"]["serving_rollout_id"] = "r-before"
-        evidence["auto-rollback-evidence.json"]["restored_rollout_id"] = "r-new"
-        evidence["evidence.json"]["rollout_id"] = "r-forward"
-        self.assertEqual(proof.validate_evidence(evidence)["restored_rollout_id"], "r-new")
+        restored = proof.validate_evidence(files())
+        self.assertEqual(restored["gate"], "stable-200-gateway-ready")
+        self.assertEqual(restored["restored_rollout_id"], "r-new")
 
     def test_artifact_is_exact_bounded_and_never_extracted(self):
         data = io.BytesIO()
