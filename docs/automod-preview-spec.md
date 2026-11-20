@@ -436,7 +436,9 @@ Resolved semantics:
    equivalence cannot be shown for the cloned-CREATE reference, the
    fallback is to report the repeat filter as `indeterminate` and label
    the whole reply partial — never to silently fall through to
-   `no_match` or a later filter as if repeats were evaluated.
+   `no_match` or a later filter as if repeats were evaluated. Text that
+   normalizes to empty cannot repeat; a blank attachment-only or mention-only
+   sample does not need a history read to reach its later filters.
 3. **Previews never accumulate.** Because nothing is recorded, previewing
    the same text 3 times cannot manufacture a `repeated_message` verdict,
    and a preview between two real identical posts neither extends nor
