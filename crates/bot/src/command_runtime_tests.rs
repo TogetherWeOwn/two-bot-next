@@ -1536,7 +1536,8 @@ async fn automod_preview_router_refuses_before_decode_and_only_answers_privately
         moderation: true,
         ..gates(false, false)
     };
-    let runtime = runtime_without_db(router_gates, false, origin);
+    let runtime = runtime_without_db(router_gates, false, origin.clone());
+    let disabled = runtime_without_db(gates(false, false), false, origin);
     let permission_reply = RouterRefusal::AutomodPreviewPermission.message();
     let denied = permission_reply.as_str();
     let cases = [
@@ -1575,6 +1576,9 @@ async fn automod_preview_router_refuses_before_decode_and_only_answers_privately
         command.guild_id = None;
     }
     runtime.on_interaction(&dm).await;
+    disabled
+        .on_interaction(&slash("automod-preview", Some(CHANNEL), Vec::new()))
+        .await;
 
     runtime
         .on_delayed_interaction(&dm, Duration::from_secs(3))
@@ -1584,10 +1588,10 @@ async fn automod_preview_router_refuses_before_decode_and_only_answers_privately
     let expected = cases
         .map(|(_, _, reply)| reply)
         .into_iter()
-        .chain([PREVIEW_NOT_EVALUATED_REPLY]);
+        .chain([PREVIEW_NOT_EVALUATED_REPLY; 2]);
     assert_eq!(
         requests.len(),
-        cases.len() + 1,
+        cases.len() + 2,
         "only one callback per invocation"
     );
     for (request, expected) in requests.iter().zip(expected) {
@@ -1608,16 +1612,23 @@ async fn automod_preview_router_refuses_before_decode_and_only_answers_privately
 
 #[tokio::test]
 async fn automod_preview_uses_attached_activation_and_fails_closed_without_audit() {
+    use crate::gateway_commands::GatewayCommandConfig;
     use two_bot_core::automod_preview_report::PREVIEW_UNAVAILABLE_REPLY;
     use two_bot_core::automod_runtime::STAGING_GUILD_ID;
 
     let guild = STAGING_GUILD_ID.parse::<u64>().expect("staging ID");
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let executor = executor_at(origin);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let port = listener.local_addr().expect("listener address").port();
     let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .connect_lazy(&format!(
+            "postgres://agent_test@127.0.0.1:{port}/agent_test"
+        ))
         .expect("lazy pool");
-    pool.close().await;
     let resolved = crate::automod_gateway::resolve(
         &[
             ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
@@ -1633,15 +1644,22 @@ async fn automod_preview_uses_attached_activation_and_fails_closed_without_audit
     .expect("enabled policy");
     let activation = crate::automod_gateway::build(resolved, pool.clone(), executor.clone());
     let runtime = CommandRuntime::new(
-        pool,
+        pool.clone(),
         executor,
         router_with_commands(RouterGates {
             moderation: true,
-            ..gates(false, false)
+            configured_guild: Some(guild),
+            ..gates(true, false)
         }),
         guild,
-        false,
+        true,
     );
+    let vars = [("TWO_AUTOMATIONS".to_owned(), "1".to_owned())].into();
+    runtime.initialize_custom_commands_for_test(
+        GatewayCommandConfig::from_map_for_activation(guild, &vars, true)
+            .expect("test custom-command config"),
+    );
+    let _guard = runtime.dispatch_guard();
     runtime.set_automod(activation);
     let mut interaction = slash(
         "automod-preview",
@@ -1656,20 +1674,40 @@ async fn automod_preview_uses_attached_activation_and_fails_closed_without_audit
     if let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_mut() {
         data.guild_id = Some(Id::new(guild));
     }
-    interaction
-        .member
-        .as_mut()
-        .expect("invoking member")
-        .permissions = Some(Permissions::MANAGE_GUILD);
-    runtime.on_interaction(&interaction).await;
-
-    let requests = mock.requests();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].path.ends_with("/callback"));
-    let reply: serde_json::Value =
-        serde_json::from_slice(&requests[0].body).expect("callback JSON");
-    assert_eq!(reply["data"]["flags"], 64);
-    assert_eq!(reply["data"]["content"], PREVIEW_UNAVAILABLE_REPLY);
+    let denied = RouterRefusal::AutomodPreviewPermission.message();
+    for (index, (permissions, expected)) in [
+        (Permissions::empty(), denied.as_str()),
+        (Permissions::MANAGE_GUILD, PREVIEW_UNAVAILABLE_REPLY),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        interaction.id = Id::new(10 + index as u64);
+        interaction
+            .member
+            .as_mut()
+            .expect("invoking member")
+            .permissions = Some(permissions);
+        assert!(
+            runtime.dispatch(&Event::InteractionCreate(Box::new(InteractionCreate(
+                interaction.clone()
+            ))))
+        );
+        wait_for(|| mock.requests().len() > index, "preview callback").await;
+        let requests = mock.requests();
+        assert!(requests[index].path.ends_with("/callback"));
+        let reply: serde_json::Value =
+            serde_json::from_slice(&requests[index].body).expect("callback JSON");
+        assert_eq!(reply["data"]["flags"], 64);
+        assert_eq!(reply["data"]["content"], expected);
+        if index == 0 {
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+            );
+            pool.close().await;
+        }
+    }
+    assert_eq!(mock.requests().len(), 2);
     mock.shutdown().await;
 }
 

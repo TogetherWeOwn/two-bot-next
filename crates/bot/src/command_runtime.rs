@@ -1611,23 +1611,13 @@ impl CommandRuntime {
                 }
             }
         }
-        if name == "automod-preview"
-            && matches!(
-                outcome,
-                SlashOutcome::Refuse {
-                    refusal: RouterRefusal::GuildRestricted
-                }
-            )
-        {
-            self.answer_preview(
-                interaction,
-                preview_response(PREVIEW_NOT_EVALUATED_REPLY),
-                &receipt,
-            )
-            .await;
-            return;
-        }
-        if let Some(response) = response_for_slash(&outcome) {
+        let response = match &outcome {
+            SlashOutcome::Refuse {
+                refusal: RouterRefusal::GuildRestricted | RouterRefusal::ModerationDisabled,
+            } if name == "automod-preview" => Some(preview_response(PREVIEW_NOT_EVALUATED_REPLY)),
+            _ => response_for_slash(&outcome),
+        };
+        if let Some(response) = response {
             if name == "automod-preview" {
                 self.answer_preview(interaction, response, &receipt).await;
             } else {

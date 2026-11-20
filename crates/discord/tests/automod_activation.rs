@@ -1392,8 +1392,7 @@ mod preview_attempt_acceptance {
         missing.data = None;
         let refreshes = AtomicUsize::new(0);
         let preview_dry_run = AtomicBool::new(false);
-        let run = |active, limit, request, receipt| {
-            let deadline = Instant::now() + Duration::from_secs(5);
+        let run_until = |active, limit, request, receipt, deadline| {
             handle_automod_preview(active, &pool, limit, request, receipt, deadline, |guild| {
                 assert_eq!(guild, STAGING_GUILD_ID);
                 refreshes.fetch_add(1, Ordering::Relaxed);
@@ -1401,6 +1400,15 @@ mod preview_attempt_acceptance {
                     .load(Ordering::Relaxed)
                     .then(|| runtime(false).effective_config())
             })
+        };
+        let run = |active, limit, request, receipt| {
+            run_until(
+                active,
+                limit,
+                request,
+                receipt,
+                Instant::now() + Duration::from_secs(5),
+            )
         };
         let count_sql = "SELECT COUNT(*) FROM automation_audit_log";
         let count = || sqlx::query_scalar::<_, i64>(count_sql).fetch_one(&pool);
@@ -1417,6 +1425,8 @@ mod preview_attempt_acceptance {
             let result = run(activation, &limiter, request, RECEIPT_MS).await;
             assert_eq!((result.reply.as_str(), result.metric), expected);
         }
+        let expired = run_until(active, &limiter, &request, RECEIPT_MS, Instant::now()).await;
+        assert_eq!((expired.reply.as_str(), expired.metric), unavailable);
         assert_eq!(count().await?, 0);
         assert_eq!(refreshes.load(Ordering::Relaxed), 0);
 

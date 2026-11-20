@@ -209,18 +209,18 @@ otherwise the loop is unchanged.
   unavailable, timed-out and uninspected (`Bypassed`) creates are rejected for
   automations as well as for XP/activity.
 - **Funnel-vs-trigger verdicts.** Each delivery gets one `WorkerVerdict`
-  (`crates/bot/src/automod_gateway.rs:305-308`): `funnel` is its single call
+  (`crates/bot/src/automod_gateway.rs:323-326`): `funnel` is its single call
   into the funnel and `trigger` is the verdict prefix triggers act on. A
   delivery automod did not inspect, or whose completion was not recorded, keeps
   its funnel disposition but its trigger verdict is capture-only
-  (`crates/bot/src/automod_gateway.rs:300-303`).
-  `verdict_of` (`crates/bot/src/automod_gateway.rs:310-319`) forces the trigger to `CaptureOnly` when the
+  (`crates/bot/src/automod_gateway.rs:318-321`).
+  `verdict_of` (`crates/bot/src/automod_gateway.rs:328-337`) forces the trigger to `CaptureOnly` when the
   outcome is `Bypassed` or `Retained(_)`, and otherwise copies the funnel. A
-  `process` timeout keeps raw capture only for both (`crates/bot/src/automod_gateway.rs:330-339`). The worker
+  `process` timeout keeps raw capture only for both (`crates/bot/src/automod_gateway.rs:348-358`). The worker
   hands the funnel disposition to
   `handle_at_with_message_disposition` exactly once and fires the message hook
   only when `runs_text_automations` passes the trigger verdict — `None`
-  (automod inactive) or `Accept` (`crates/bot/src/automod_gateway.rs:343-347`,
+  (automod inactive) or `Accept` (`crates/bot/src/automod_gateway.rs:361-365`,
   `crates/bot/src/gateway.rs:52-72`). The hook carries
   the trigger verdict into the trigger handler, where a missing verdict fails
   closed (`CommandRuntime::dispatch_with_verdict` in

@@ -103,6 +103,9 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     deadline: Instant,
     resolve_live: impl FnOnce(&str) -> Option<AutomodConfig>,
 ) -> AttemptResult {
+    if Instant::now() >= deadline {
+        return unavailable(None);
+    }
     let (InteractionType::ApplicationCommand, Some(InteractionData::ApplicationCommand(data))) =
         (interaction.kind, interaction.data.as_ref())
     else {

@@ -90,7 +90,7 @@ Inspected at the commit this file lands with; line refs are to that tree.
   mention limit, repeat count and window, sanctions, bypass/exempt ids,
   and the enforce flag (`crates/bot/src/automod_gateway.rs:113-127`) — are layered
   store-first over the boot env from the live settings snapshot and applied
-  per delivery (`crates/bot/src/automod_gateway.rs:172-223`, `:328`;
+  per delivery (`crates/bot/src/automod_gateway.rs:172-223`, `:341-358`;
   `crates/core/src/automod_runtime.rs:205-216`). An unusable stored value
   falls back to its boot value, and a sanctions-shape error keeps the last
   good policy. Any preview that re-parses env on its own can answer for a
@@ -386,7 +386,7 @@ publish globally.
 **Effective config source.** The preview runs against the same
 in-memory `AutomodRuntime` the gateway inspects with, after the same
 per-event live-snapshot refresh the delivery path performs
-(`crates/bot/src/automod_gateway.rs:207-223`, `:323-341`). Preview uses
+(`crates/bot/src/automod_gateway.rs:187-240`, `:341-358`). Preview uses
 that resolver's policy and mode only in its own snapshot, falling back to
 the activation's last-good config when no overlay can be resolved. It must
 not apply the overlay to the shared runtime while enforcement is in flight.
