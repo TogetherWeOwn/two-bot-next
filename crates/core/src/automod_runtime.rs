@@ -178,7 +178,6 @@ pub enum Inspection {
 }
 
 /// Effective policy and the invoker's bounded repeat history captured together.
-/// Keep this in memory until the attempt driver decides whether to evaluate.
 pub struct AutomodPreviewSnapshot {
     config: AutomodConfig,
     repeats: RepeatTracker,

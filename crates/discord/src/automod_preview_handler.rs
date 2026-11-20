@@ -3,7 +3,6 @@
 
 #[cfg(feature = "db")]
 use std::sync::{Mutex, PoisonError};
-
 #[cfg(feature = "db")]
 use tokio::time::Instant;
 use twilight_model::application::interaction::{
@@ -92,10 +91,8 @@ pub fn decode_interaction_options(
     decode_preview_input(&map_preview_options(data))
 }
 
-/// Drive an already-authorized slash invocation without sending a reply.
-/// The caller refreshes the shared activation first and reserves time to send
-/// the ephemeral response after `deadline`. `receipt_ms` is captured on receipt,
-/// not after the claim wait. All limiter and runtime locks are synchronous.
+/// Drive an authorized invocation with a refreshed activation and its UTC receipt.
+/// The caller owns ephemeral delivery and reserves time for it after `deadline`.
 #[cfg(feature = "db")]
 pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     activation: Option<&AutomodActivation<L, F>>,
@@ -144,9 +141,11 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
         return unavailable(Some(snapshot.dry_run()));
     };
     let receipt_iso = format_iso_millis(i64::try_from(receipt_ms).unwrap_or(i64::MAX));
+    let actor_id = &request.actor_id;
+    let id = request.interaction_id;
     let context = AttemptContext {
         guild_id,
-        actor_id: &request.actor_id,
+        actor_id,
         channel_id: &request.channel_id,
         receipt_iso: &receipt_iso,
         dry_run: snapshot.dry_run(),
@@ -159,12 +158,7 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
             limiter
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .check_and_admit(
-                    &request.actor_id,
-                    guild_id,
-                    request.interaction_id,
-                    receipt_ms,
-                )
+                .admit_before(actor_id, guild_id, id, deadline)
         },
         || snapshot.evaluate(&message, input.mention_count),
     )

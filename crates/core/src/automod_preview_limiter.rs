@@ -6,12 +6,11 @@
 //! actor cooldowns: expired entries are pruned and reusable, and a full map
 //! refuses new actors rather than evicting live counters (fail closed).
 //!
-//! Time is an explicit `now_ms` (wall-clock millis) so tests pin boundaries
-//! on a paused clock. Charges are idempotent by interaction id for the
-//! limiter's in-memory lifetime: a redelivered interaction does not charge
-//! again. Refusals never charge.
+//! Charge on the monotonic admission clock, not the UTC interaction receipt.
+//! A redelivered interaction does not charge again. Refusals never charge.
 
 use std::collections::{HashMap, VecDeque};
+use tokio::time::Instant;
 
 /// Minimum gap between two admitted previews of one actor in one guild.
 pub const PREVIEW_MIN_INTERVAL_MS: u64 = 5_000;
@@ -77,6 +76,7 @@ impl ActorBucket {
 pub struct PreviewRateLimiter {
     buckets: HashMap<(String, String), ActorBucket>,
     capacity: usize,
+    epoch: Instant,
 }
 
 impl PreviewRateLimiter {
@@ -90,7 +90,23 @@ impl PreviewRateLimiter {
         Self {
             buckets: HashMap::new(),
             capacity,
+            epoch: Instant::now(),
         }
+    }
+
+    /// Sample under the caller's limiter guard. An expired attempt changes no counters.
+    pub fn admit_before(
+        &mut self,
+        actor: &str,
+        guild: &str,
+        interaction: u64,
+        deadline: Instant,
+    ) -> Option<PreviewRateDecision> {
+        let now = Instant::now();
+        (now < deadline).then(|| {
+            let ms = now.duration_since(self.epoch).as_millis();
+            self.check_and_admit(actor, guild, interaction, ms.try_into().unwrap_or(u64::MAX))
+        })
     }
 
     fn prune_all(&mut self, now_ms: u64) {
@@ -112,7 +128,7 @@ impl PreviewRateLimiter {
     /// Strict-decode refusals never reach this call, so every `Admit` here
     /// is an evaluated preview (including `no_match` and `exempt`); every
     /// `RateLimited` evaluated nothing and charged nothing.
-    pub fn check_and_admit(
+    fn check_and_admit(
         &mut self,
         actor: &str,
         guild: &str,
@@ -166,6 +182,14 @@ mod tests {
 
     const ACTOR: &str = "actor-1";
     const GUILD: &str = "guild-1";
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_admission_leaves_budget_untouched() {
+        let mut limiter = PreviewRateLimiter::new();
+        let deadline = Instant::now();
+        assert_eq!(limiter.admit_before(ACTOR, GUILD, 1, deadline), None);
+        assert!(limiter.buckets.is_empty());
+    }
 
     #[test]
     fn five_second_boundary() {
