@@ -116,15 +116,26 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
         return unavailable(None);
     };
     let decoded = decode_interaction_options(data);
-    let scoped = decoded.as_ref().ok().and_then(|input| {
-        let (active, guild) = activation.zip(request.guild_id.as_deref())?;
-        if !active.preview(|runtime| runtime.admits(Some(guild))) {
-            return None;
+    let candidate = decoded
+        .as_ref()
+        .ok()
+        .zip(activation.zip(request.guild_id.as_deref()));
+    let scoped = if let Some((input, (active, guild))) = candidate {
+        match resolve_admitted_policy(
+            || active.preview(|runtime| runtime.admits(Some(guild))),
+            deadline,
+            Instant::now,
+            || {
+                resolve_live(guild)
+                    .unwrap_or_else(|| active.preview(|runtime| runtime.effective_config()))
+            },
+        ) {
+            Ok(config) => config.map(|config| (guild, input, config)),
+            Err(result) => return result,
         }
-        let config = resolve_live(guild)
-            .unwrap_or_else(|| active.preview(|runtime| runtime.effective_config()));
-        Some((guild, input, config))
-    });
+    } else {
+        None
+    };
     let plan = plan_pre_claim(
         decoded.as_ref().map_err(|refusal| *refusal),
         scoped.is_some(),
@@ -171,6 +182,23 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
 }
 
 #[cfg(feature = "db")]
+fn resolve_admitted_policy(
+    admit: impl FnOnce() -> bool,
+    deadline: Instant,
+    now: impl FnOnce() -> Instant,
+    resolve: impl FnOnce() -> AutomodConfig,
+) -> Result<Option<AutomodConfig>, AttemptResult> {
+    if !admit() {
+        return Ok(None);
+    }
+    // Admission can wait for the activation lock and exhaust the budget.
+    if now() >= deadline {
+        return Err(unavailable(None));
+    }
+    Ok(Some(resolve()))
+}
+
+#[cfg(feature = "db")]
 fn unavailable(dry_run: Option<bool>) -> AttemptResult {
     AttemptResult {
         reply: PREVIEW_UNAVAILABLE_REPLY.to_owned(),
@@ -205,6 +233,28 @@ mod tests {
             json!({"id": "1", "type": 1, "name": "automod-preview", "options": options}),
         )
         .expect("synthetic command data")
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn deadline_reached_during_admission_skips_policy_resolution() {
+        let now = std::cell::Cell::new(Instant::now());
+        let deadline = now.get() + std::time::Duration::from_secs(1);
+        let result = resolve_admitted_policy(
+            || {
+                assert!(now.get() < deadline);
+                now.set(deadline);
+                true
+            },
+            deadline,
+            || now.get(),
+            || panic!("expired preview must not resolve policy"),
+        );
+        let Err(result) = result else {
+            panic!("expired preview must return unavailable");
+        };
+        assert_eq!(result.reply, PREVIEW_UNAVAILABLE_REPLY);
+        assert_eq!(result.metric, Some(metric_unavailable(None)));
     }
 
     #[test]
