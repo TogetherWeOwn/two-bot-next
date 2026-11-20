@@ -54,6 +54,12 @@ class VoiceMeasurementPolicyTests(unittest.TestCase):
             with self.subTest(lock_guard=guard):
                 changed = dict(scaffold, concurrency=dict(queue, group=queue["group"].replace(guard + " && ", "", 1)))
                 self.assertFalse(is_measurement_caller(changed, "staging-lifecycle"))
+        for fallback in ("'staging-lifecycle'", "'voice-rest-measurement-refused'",
+                         "format('voice-rest-measurement-refused-{0}', github.run_id)"):
+            with self.subTest(fallback=fallback):
+                group = queue["group"].split(" || ", 1)[0] + f" || {fallback} }}}}"
+                changed = dict(scaffold, concurrency=dict(queue, group=group))
+                self.assertFalse(is_measurement_caller(changed, "staging-lifecycle"))
         for key, value in (("queue", "single"), ("cancel-in-progress", "true")):
             with self.subTest(lock_key=key):
                 changed = dict(scaffold, concurrency=dict(queue, **{key: value}))

@@ -10192,6 +10192,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_public_hosted_runner_and_service_isolation(self):
         for name, workflow in self.workflows.items():
+            if name == MEASUREMENT:
+                self.assertTrue(is_measurement_caller(workflow, STAGING_LIFECYCLE_GROUP), name)
             for job_id, job in workflow["jobs"].items():
                 with self.subTest(workflow=name, job=job_id):
                     if "uses" in job:

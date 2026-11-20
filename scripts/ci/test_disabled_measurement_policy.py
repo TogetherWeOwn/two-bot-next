@@ -67,10 +67,12 @@ class VoiceMeasurementAdmissionTests(unittest.TestCase):
         check = policy.WorkflowTests("test_public_hosted_runner_and_service_isolation")
         check.workflows = {WORKFLOW: deepcopy(self.workflows[WORKFLOW])}
         check.test_public_hosted_runner_and_service_isolation()
-        for mutation in ("target", "runner"):
+        for mutation in ("guard", "target", "runner"):
             with self.subTest(mutation=mutation):
                 candidate = deepcopy(self.workflows[WORKFLOW])
-                if mutation == "target":
+                if mutation == "guard":
+                    candidate["jobs"]["staging-window"]["if"] = "${{ true }}"
+                elif mutation == "target":
                     candidate["jobs"]["voice-first"]["uses"] = "./.github/workflows/other.yml"
                 else:
                     candidate["jobs"]["voice-first"]["runs-on"] = "ubuntu-latest"
@@ -88,10 +90,9 @@ class VoiceMeasurementAdmissionTests(unittest.TestCase):
             if field != "runs-on":
                 self.assertTrue(policy.workflow_policy_errors(wfs), field)
                 self.assertTrue(lifecycle.lifecycle_errors(wfs), field)
-            if field != "if":
-                check.workflows = {WORKFLOW: candidate}
-                with self.assertRaises(AssertionError, msg=field):
-                    check.test_public_hosted_runner_and_service_isolation()
+            check.workflows = {WORKFLOW: candidate}
+            with self.assertRaises(AssertionError, msg=field):
+                check.test_public_hosted_runner_and_service_isolation()
         text = f"jobs:\n  voice-second:\n    uses: {TARGET}\n"
         self.assertEqual(runner.violations(text, WORKFLOW), [])
         self.assertTrue(runner.violations(text.replace(TARGET, other), WORKFLOW))
