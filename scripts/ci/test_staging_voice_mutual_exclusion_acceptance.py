@@ -59,6 +59,7 @@ from unittest import mock
 
 import yaml
 
+from staging_soak_policy import SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
     WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
@@ -182,7 +183,11 @@ def _parsed(root):
 
 def load_all(root=WORKFLOWS):
     # Parse once; callers may mutate their copy.
-    return deepcopy(_parsed(root))
+    workflows = deepcopy(_parsed(root))
+    if admitted_soak(workflows):
+        workflows[PRODUCTION]["jobs"][SOAK] = soak_view(workflows)
+        del workflows[STAGING_SOAK]
+    return workflows
 
 
 def events(workflow):

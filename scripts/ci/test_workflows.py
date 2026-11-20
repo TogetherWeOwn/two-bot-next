@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import yaml
 
+from staging_soak_policy import SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, GUARDS as MEASUREMENT_GUARDS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
     TARGET as MEASUREMENT_TARGET, WORKFLOW as MEASUREMENT, is_measurement_caller,
@@ -54,6 +55,7 @@ JOB_INVENTORY = {
                   # Promoted nextest lane (shared reusable), gated by ci-ok
                   # like the Rust lanes.
                   "nextest"},
+    STAGING_SOAK: {"begin", "voice", "finish"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
                               "promotion-skipped", "production"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "help-embed-synthetic",
@@ -143,7 +145,9 @@ JOB_INVENTORY = {
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
-REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
+REUSABLE_CALLS = {("deploy-production.yml", "soak"): "./.github/workflows/staging-soak.yml",
+                  (STAGING_SOAK, "voice"): "./.github/workflows/voice-synthetic.yml",
+                  ("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
                    ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
                    ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                    # After every staging deploy; its failure fails deploy-staging (promotion gate).
@@ -875,7 +879,7 @@ def staging_pinned_sha_errors(workflows):
             env = (steps[1].get("env") or {}) if len(steps) > 1 else {}
             if env.get("REQUESTED_SHA") == "${{ inputs.sha }}" and str(workflow).count("inputs.sha") == 1:
                 continue  # Only the reviewed proof binding may read this input.
-        if "inputs.sha" in str(workflow):
+        if "inputs.sha" in str(workflow) and not (name == STAGING_SOAK and admitted_soak(workflows)):
             errors.append(f"{name}: pinned-sha marker inputs.sha outside the deploy workflows")
     staging = workflows.get("deploy-staging.yml") or {}
     text = str(staging)
@@ -2929,6 +2933,8 @@ def production_errors(workflow):
     jobs = workflow.get("jobs", {})
     production, guard = jobs.get("production", {}), jobs.get("guard", {})
     soak, recheck = jobs.get("soak", {}), jobs.get("recheck", {})
+    if soak.get("uses") == "./.github/workflows/staging-soak.yml":
+        soak = soak_view({**load_workflows(), name: workflow})
     needs = production.get("needs")
     needs = [needs] if isinstance(needs, str) else (needs or [])
     expected_production_if = (
@@ -2937,7 +2943,7 @@ def production_errors(workflow):
         "((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || "
         "(needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && "
         "(needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || "
-        "(needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && "
+        "(github.run_attempt == 1 && needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && "
         "needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
     )
     if production.get("environment") != "production" \
@@ -3037,7 +3043,7 @@ def production_errors(workflow):
     evidence_job = jobs.get("staging-soak-evidence", {})
     expected_evidence_if = ("!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' "
         "&& needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
-        "&& needs.soak.result == 'success'")
+        "&& github.run_attempt == 1 && needs.soak.result == 'success'")
     if (evidence_job.get("needs") != ["guard", "soak"] or "environment" in evidence_job
             or evidence_job.get("permissions") != {"contents": "read"}
             or evidence_job.get("if") != expected_evidence_if):
@@ -3617,7 +3623,7 @@ def staging_callee_window_errors(name, workflow, consumer):
     errors = []
     on = workflow.get("on") or {}
     call = on.get("workflow_call") or {}
-    if on.get("workflow_dispatch") or set(call) != {"secrets", "inputs"}:
+    if on.get("workflow_dispatch") or set(call) != ({"secrets", "inputs", "outputs"} if name == "voice-synthetic.yml" else {"secrets", "inputs"}):
         errors.append(f"{name}: workflow_call takes exactly the two token secrets and the three grant inputs; "
                       "workflow_dispatch takes no inputs")
     if call.get("secrets") != {
@@ -3826,6 +3832,9 @@ def voice_synthetic_errors(workflow):
             errors.append(f"{name}:synthetic: must not set {key}")
     steps = job.get("steps") or []
     runs = [step for step in steps if "run" in step]
+    marker = 'printf \'exercised=true\\n\' >> "$GITHUB_OUTPUT"'
+    if len(runs) == 1 and (runs[0]["run"].count(marker) != 1 or f'then\n    {marker}\n    exit 0' not in runs[0]["run"] or job.get("outputs") != {"exercised": "${{ steps.voice.outputs.exercised }}"} or on["workflow_call"].get("outputs") != {"exercised": {"value": "${{ jobs.synthetic.outputs.exercised }}"}}):
+        errors.append(f"{name}: only a completed voice scenario may attest exercise")
     if len(steps) != 3 or len(runs) != 1 or "scripts/staging_voice_synthetic.py" not in runs[0]["run"]:
         errors.append(f"{name}:synthetic: must be checkout, one Run step of the reviewed script, evidence upload")
     if len(steps) == 3 and steps[2].get("with", {}).get("name") != (
@@ -4569,6 +4578,8 @@ def workflow_policy_errors(workflows):
     measurement = is_measurement_caller(workflows.get(MEASUREMENT), STAGING_LIFECYCLE_GROUP)
     if not measurement:
         errors.append(f"{MEASUREMENT}: dispatch, lock, guards or staging authority changed")
+    if not admitted_soak(workflows):
+        errors.append("staging soak must retain the exact caller, grant, lock and evidence handoff")
     if set(workflows) != set(JOB_INVENTORY):
         errors.append("workflow inventory changed")
     # Every allowed reusable call must still exist with its pinned ref:
@@ -4598,6 +4609,8 @@ def workflow_policy_errors(workflows):
             errors.extend(production_error_rate_gate_errors(workflow))
             errors.extend(production_deploy_id_errors(workflow))
             continue
+        if name == STAGING_SOAK:
+            continue  # Exact staging-only graph pinned by admitted_soak.
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
             errors.extend(staging_active_errors(workflow))
@@ -7989,7 +8002,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_promotion_soak_keeps_cleanup_headroom_without_extending_authority(self):
         workflow = self.workflows["deploy-production.yml"]
-        soak = workflow["jobs"]["soak"]
+        soak = soak_view(self.workflows)
+        workflow = {**workflow, "jobs": {**workflow["jobs"], "soak": soak}}
         begin = next(step for step in soak["steps"] if step.get("id") == "staging-use-begin")
         self.assertEqual(begin["env"]["STAGING_USE_MINUTES"], "40")
         self.assertEqual(soak["timeout-minutes"], "50")
@@ -8430,6 +8444,8 @@ class WorkflowTests(unittest.TestCase):
                                           ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
                                           ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                                           ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
+                                          ("deploy-production.yml", "soak"): "./.github/workflows/staging-soak.yml",
+                                          (STAGING_SOAK, "voice"): "./.github/workflows/voice-synthetic.yml",
                                           ("voice-rest-measurement.yml", "voice-first"): "./.github/workflows/voice-synthetic.yml",
                                           ("voice-rest-measurement.yml", "voice-second"): "./.github/workflows/voice-synthetic.yml",
                                           ("deploy-staging.yml", "help-embed-synthetic"): "./.github/workflows/help-embed-synthetic.yml",
@@ -8517,6 +8533,12 @@ class WorkflowTests(unittest.TestCase):
                 change(workflow)
                 self.assertTrue(production_errors(workflow), label)
 
+    def test_soak_rejects_unsafe_handoffs(self):
+        for job, key in (("begin", "outputs"), ("voice", "needs"), ("finish", "if"), ("finish", "steps")):
+            changed = deepcopy(self.workflows)
+            del changed[STAGING_SOAK]["jobs"][job][key]
+            self.assertFalse(admitted_soak(changed), (job, key))
+
     def test_production_route_is_automatic_or_dispatch_and_gated(self):
         production = self.workflows["deploy-production.yml"]
         self.assertEqual(production_errors(production), [])
@@ -8524,6 +8546,7 @@ class WorkflowTests(unittest.TestCase):
 
         def mutated(change):
             workflow = deepcopy(production)
+            workflow["jobs"]["soak"] = soak_view(self.workflows)
             change(workflow)
             return production_errors(workflow)
 
@@ -10775,7 +10798,7 @@ class WorkflowTests(unittest.TestCase):
                         # Reads workflow runs to skip while an operator
                         # dispatch is active; the compare read needs contents.
                         expected = {"contents": "read", "actions": "read"}
-                    elif (name, job_id) == ("deploy-production.yml", "soak"):
+                    elif (name, job_id) in (("deploy-production.yml", "soak"), (STAGING_SOAK, "finish")):
                         # Reads deploy-staging runs within the bounded staging lock.
                         expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "staging-soak-evidence"):

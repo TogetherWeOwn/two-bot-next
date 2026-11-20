@@ -1047,152 +1047,31 @@ jobs:
             --expected-branch-id "$TWO_BOT_PRODUCTION_BRANCH_ID" \
             --mode "$MODE" --allow-unstaged "$ALLOW_UNSTAGED"
 
-  # One canonical staging lock spans startup, baseline, a fresh full live
-  # interval, final regression evidence and release. Historical staging-green
-  # age is not live soak credit. Only this job holds staging: production and
-  # its rollback dispatch remain independent of the staging queue.
+  # Only the reusable soak queues on staging; rollback stays independent.
   soak:
     name: bounded live staging soak and regression evidence
     needs: guard
     if: needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'
-    concurrency:
-      group: staging-lifecycle
-      cancel-in-progress: false
-      queue: max
     permissions:
       contents: read
-      actions: read # deploy-staging runs: which build the serving revision still promotes
-    environment:
-      name: staging
-      deployment: false
-    # Runner routing: see the note on `check` in check.yml.
-    runs-on: ubuntu-latest
-    # Keep ten minutes beyond the unchanged 40-minute authority cap for
-    # checkout/setup, confirmed stop and evidence. Never renew the grant.
-    timeout-minutes: 50
-    outputs:
-      skip: ${{ steps.judge.outputs.skip }}
-      evidence: ${{ steps.judge.outputs.evidence }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # Reviewed tooling from the workflow's own commit, never the guarded SHA.
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          fetch-depth: 1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-      - name: Acquire and ready the guarded staging candidate
-        id: staging-use-begin
-        env:
-          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
-          STAGING_USE_EXPECTED_SHA: ${{ needs.guard.outputs.sha }}
-          STAGING_USE_MINUTES: '40'
-          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-soak-use.ndjson
-        run: node wrangler/scripts/staging-use-pipeline.mjs begin
-      - name: Record the soak-baseline REST counters
-        env:
-          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
-        run: |
-          set -euo pipefail
-          # The judged soak window starts here: the regression gate compares
-          # this baseline with the post-soak sample and records
-          # `insufficient_data` when the process identity changed between
-          # them (a restart resets the cumulative counters). A missing
-          # bearer records no data (exit 0); a failed scrape fails the soak
-          # closed.
-          node wrangler/scripts/rest-5xx-counters.mjs --metrics-url "$STAGING_WORKER_URL" \
-            --out "$RUNNER_TEMP/staging-soak-baseline.json"
-      - name: Measure a fresh live staging interval
-        env:
-          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
-          STAGING_USE_SHA: ${{ needs.guard.outputs.sha }}
-          STAGING_USE_DEPLOYMENT: ${{ steps.staging-use-begin.outputs.deployment_id }}
-          STAGING_USE_EXPIRES_AT: ${{ steps.staging-use-begin.outputs.expires_at }}
-          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-soak-use.ndjson
-          # Duration is not authorization: keep the true trigger mode for the judge.
-          FULL_SOAK: ${{ needs.guard.outputs.auto == 'true' || (github.event_name == 'workflow_dispatch' && needs.guard.outputs.takeover == 'true' && needs.guard.outputs.allow_unstaged != 'true') }}
-        run: node wrangler/scripts/staging-soak-window.mjs
-      - name: Read the candidate's staging journeys and soak REST counters
-        id: judge
-        env:
-          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
-          SHA: ${{ needs.guard.outputs.sha }}
-          AUTO: ${{ needs.guard.outputs.auto }}
-          RUN_ID: ${{ needs.guard.outputs.staging_run_id }}
-          RUN_ATTEMPT: ${{ needs.guard.outputs.staging_attempt }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # Exit 1 is a recorded journey failure the comparison judges;
-          # anything else (a refused origin) fails closed here.
-          probe=0
-          python3 scripts/staging_health_contract_probe.py --expected-sha "$SHA" \
-            --evidence "$RUNNER_TEMP/staging-soak-probe.json" || probe=$?
-          if [ "$probe" -gt 1 ]; then
-            echo "::error::staging probe refused to run (exit $probe); the regression gate cannot judge"
-            exit 1
-          fi
-          node wrangler/scripts/rest-5xx-counters.mjs --metrics-url "$STAGING_WORKER_URL" \
-            --out "$RUNNER_TEMP/staging-soak-counters.json"
-          # Which main-branch staging runs still promote the serving
-          # revision: a serving build nothing promotes means the promotion
-          # stalled, which refuses instead of skipping. A failed listing
-          # fails closed here. The baseline always belongs to this same
-          # bounded job; neither idle time nor a missing baseline is credit.
-          # gh api switches to POST when -f fields are passed, but the
-          # runs listing is a GET endpoint: request GET explicitly. The jq
-          # filter wraps the rows in one JSON array, which read_runs needs.
-          gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-staging.yml/runs" \
-            -f branch=main -f per_page=100 \
-            -q '[.workflow_runs[] | {head_sha, head_branch, status, conclusion}]' \
-            > "$RUNNER_TEMP/staging-runs.json"
-          python3 scripts/promotion_regression_gate.py staging \
-            --probe "$RUNNER_TEMP/staging-soak-probe.json" --counters "$RUNNER_TEMP/staging-soak-counters.json" \
-            --sha "$SHA" --auto "$AUTO" --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" \
-            --staging-runs "$RUNNER_TEMP/staging-runs.json" \
-            --baseline-counters "$RUNNER_TEMP/staging-soak-baseline.json" \
-            --out "$RUNNER_TEMP/staging-soak-evidence.json"
-      - name: Recheck the original grant after final sampling
-        env:
-          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
-          STAGING_USE_SHA: ${{ needs.guard.outputs.sha }}
-          STAGING_USE_DEPLOYMENT: ${{ steps.staging-use-begin.outputs.deployment_id }}
-          STAGING_USE_EXPIRES_AT: ${{ steps.staging-use-begin.outputs.expires_at }}
-          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-soak-use.ndjson
-        run: node wrangler/scripts/staging-use-pipeline.mjs consume
-      - name: Release the original staging soak window
-        if: always() && steps.staging-use-begin.outputs.expires_at != ''
-        env:
-          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
-          STAGING_USE_EXPIRES_AT: ${{ steps.staging-use-begin.outputs.expires_at }}
-          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-soak-use.ndjson
-        run: node wrangler/scripts/staging-use-pipeline.mjs finish
-      - name: Retain staging soak lifecycle and measurement evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: staging-soak-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/staging-soak-use.ndjson
-            ${{ runner.temp }}/staging-soak-*.json
-          if-no-files-found: error
-          retention-days: 7
+      actions: read
+    uses: ./.github/workflows/staging-soak.yml
+    with:
+      sha: ${{ needs.guard.outputs.sha }}
+      auto: ${{ needs.guard.outputs.auto }}
+      full_soak: ${{ needs.guard.outputs.auto == 'true' || (github.event_name == 'workflow_dispatch' && needs.guard.outputs.takeover == 'true' && needs.guard.outputs.allow_unstaged != 'true') }}
+      staging_run_id: ${{ needs.guard.outputs.staging_run_id }}
+      staging_attempt: ${{ needs.guard.outputs.staging_attempt }}
+    secrets:
+      STAGING_OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+      TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
 
   # Publish only the completed bounded job's verdict; no live staging reads
   # can escape its lock. Failure, cancellation or unconfirmed release blocks it.
   staging-soak-evidence:
     name: staging soak evidence for the regression gate
     needs: [guard, soak]
-    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && needs.soak.result == 'success'"
+    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && github.run_attempt == 1 && needs.soak.result == 'success'"
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -1476,7 +1355,7 @@ jobs:
     # must have succeeded or been skipped (a failed soak fails closed: no bake,
     # no deploy), and a skipped recheck counts only for manual runs — an
     # automatic run always needs a fresh recheck pass with no skip.
-    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
+    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (github.run_attempt == 1 && needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
     # The only job holding the deploy-production lane: only a running or
     # pending production job occupies it. The guard, gates, soak and recheck
     # jobs carry no concurrency, so recovery

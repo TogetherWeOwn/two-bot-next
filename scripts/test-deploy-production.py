@@ -117,6 +117,24 @@ def run_blocks():
 
 TOP = children(LINES, 0)
 JOBS = children(TOP["jobs"][1:], 2)
+# Read the original lifecycle sequence across the split for these step-local
+# checks. The reusable graph itself is pinned by the workflow-policy tests.
+SOAK = children(WORKFLOW.with_name("staging-soak.yml").read_text().splitlines(), 0)
+BEGIN, FINISH = (children(SOAK["jobs"][1:], 2)[job] for job in ("begin", "finish"))
+CALL = children(JOBS["soak"][1:], 4)
+FINISH_FIELDS = children(FINISH[1:], 4)
+GRANT_ENV = next(step[1:-1] for step in steps(FINISH) if "        env: &grant" in step)
+SOAK_BODY = "\n".join(sum(steps(BEGIN)[1:5] + steps(FINISH)[-5:], []))
+SOAK_BODY = (SOAK_BODY.replace("        env: *grant", "\n".join(GRANT_ENV))
+             .replace("inputs.full_soak", value(children(CALL["with"][1:], 6)["full_soak"])[4:-3])
+             .replace("inputs.", "needs.guard.outputs.")
+             .replace("needs.begin.outputs.", "steps.staging-use-begin.outputs."))
+JOBS["soak"] = (JOBS["soak"][:4] + FINISH_FIELDS["permissions"] + FINISH_FIELDS["runs-on"] + FINISH_FIELDS["timeout-minutes"]
+                + ["    environment:", "      name: staging", "      deployment: false", "    concurrency:"]
+                + ["      " + value for value in ("group: staging-lifecycle", "cancel-in-progress: false", "queue: max")]
+                + ["    outputs:", "      skip: ${{ steps.judge.outputs.skip }}", "      evidence: ${{ steps.judge.outputs.evidence }}",
+                   "    steps:"] + SOAK_BODY.splitlines())
+LINES += SOAK_BODY.splitlines()
 GUARD = inline_script(GUARD_STEP)
 RECHECK_STEP = "Re-read the promotion hold and the live revision"
 RECHECK = inline_script(RECHECK_STEP)
