@@ -55,8 +55,8 @@ pub fn plan(blocks: &[Block<'_>], outside: usize, inside: usize) -> Result<Vec<P
         if name_units <= EMBED_FIELD_NAME_LIMIT
             && value_units <= EMBED_FIELD_VALUE_LIMIT
             && cost <= total
-            && has_message_text(&name)
-            && has_message_text(&value)
+            && [&name, &value].iter().all(|s| !s.trim().is_empty())
+            && (has_message_text(&name) || has_message_text(&value))
         {
             if !run.is_empty() {
                 used = flush(&mut pages, std::mem::take(&mut run), desc_limit)?;
@@ -150,21 +150,18 @@ mod tests {
     #[test]
     fn preserves_order_across_notes_and_group_breaks() {
         let heading = "x".repeat(4050);
-        let [a, b] = [heading.as_str(), "Note"].map(Description);
-        let blocks = [
-            a,
-            Field("Group", "/a"),
-            b,
-            Field("Next", "/b"),
-            Field("End", ""),
-        ];
+        let notes = [heading.as_str(), "Note", "End"];
+        let [a, b, _] = notes.map(Description);
+        let end = Field("End", "");
+        let blocks = [a, Field("Group", "/a"), b, Field("Next", "/b"), end];
         let pages = plan(&blocks, 80, 0).unwrap();
-        let actual = pages.iter().map(|p| p.description.as_str());
-        assert!(actual.eq([heading.as_str(), "Note", "End"]));
+        assert!(pages.iter().map(|p| p.description.as_str()).eq(notes));
         assert_eq!(pages[0].fields, [("Group".to_owned(), "/a".to_owned())]);
         assert_eq!(pages[1].fields, [("Next".to_owned(), "/b".to_owned())]);
-        let pages = plan(&[Field("End", "\u{200b}")], 80, 0).unwrap();
-        assert_split(pages, "End\n\u{200b}", &[5]);
+        let placeholders = [("\u{200b}", "/a"), ("End", "\u{200b}")];
+        let pages = plan(&placeholders.map(|(n, v)| Field(n, v)), 80, 0).unwrap();
+        let expected = placeholders.map(|(n, v)| (n.to_owned(), v.to_owned()));
+        assert_eq!(pages[0].fields, expected);
     }
 
     #[test]
@@ -207,9 +204,9 @@ mod tests {
             assert_split(pages, &format!("abc\n \n{tail}"), lengths);
         }
         let value = format!("@here{}", "🔥".repeat(2200));
-        let pages = plan(&[Description("Notes"), Field("Group", &value)], 0, 80).unwrap();
         let expected = format!("Notes\nGroup\n{}", neutralize_mentions(&value));
-        assert_split(pages, &expected, &[4016, text_len(&expected) - 4016]);
+        let pages = plan(&[Description("Notes"), Field("Group", &value)], 2200, 100).unwrap();
+        assert_split(pages, &expected, &[3700, text_len(&expected) - 3700]);
     }
 
     fn assert_split(pages: Vec<Page>, input: &str, lengths: &[usize]) {
@@ -227,10 +224,12 @@ mod tests {
         assert_eq!(plan(&[], 80, 0), Ok(vec![Page::default()]));
         assert_eq!(plan(&[], 0, EMBED_DESCRIPTION_LIMIT), Err(PlanError));
         assert_eq!(plan(&[], EMBED_TOTAL_LIMIT, 1), Err(PlanError));
+        assert!(plan(&[Field("\u{200b}", "\u{200b}")], 0, 0).is_err());
         for input in [
             String::new(),
             " ".into(),
             "\u{200b}".into(),
+            "\u{200b}".repeat(4017),
             format!("a{}", " ".repeat(4016)),
             "a".repeat(SOURCE_UNITS + 1),
             "a".repeat(SOURCE_BYTES + 1),
