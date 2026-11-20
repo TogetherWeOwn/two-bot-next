@@ -316,19 +316,32 @@ class OwnedRoomBindingTest(unittest.TestCase):
         fake = make_fake(rooms=rooms, before=before, after=after,
                          creator_name=ORIGINAL_NAME)
         session, now = FakeSession(batches), [0]
-        pump = session.pump
+        pump, read, voice = session.pump, fake.rest, session.voice
+
+        def leave_after_setup(guild, channel):
+            voice(guild, channel)
+            if channel is None:
+                now[0] = 119
 
         def after_grace(until, deadline):
-            if session.voices and session.voices[-1][1] is None:
+            if session.voices[-1:] == [(GUILD, None)]:
                 now[0] += 180
                 self.assertGreater(deadline, now[0])
             return pump(until, deadline)
 
+        def restore_after_cutoff(token, path):
+            if now[0] == 299:
+                self.assertEqual(path, f"/channels/{CREATOR}")
+                now[0] = 301
+            return read(token, path)
+
+        session.voice = leave_after_setup
         session.pump = after_grace
+        fake.rest = restore_after_cutoff
         with mock.patch.object(synth.time, "monotonic", side_effect=lambda: now[0]), \
                 mock.patch.dict(os.environ, {"VOICE_WORK_SECONDS": "300"}):
             code, _, _, evidence = run_with_fakes(["--grace", "180"], session, fake)
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 0, evidence)
         self.assertEqual(evidence["room_id"], OWN)
         found = verdicts(evidence)
         self.assertEqual(found["create"], "PASS")
@@ -336,6 +349,18 @@ class OwnedRoomBindingTest(unittest.TestCase):
         self.assertEqual(fake.patches,
                          [rename_cycle()[0]] + room_round_trip()
                          + [rename_cycle()[1]])
+        self.assertEqual(now[0], 301)
+        self.assertTrue(session.closed)
+
+    def test_grace_that_cannot_fit_is_refused_before_discord_io(self):
+        session = FakeSession([[GUILD_CREATE]])
+        fake = make_fake(rooms={}, before=[], after=[], creator_name=ORIGINAL_NAME)
+        with mock.patch.dict(os.environ, {"VOICE_WORK_SECONDS": "300"}):
+            code, _, _, evidence = run_with_fakes(["--grace", "300"], session, fake)
+        self.assertEqual(code, 1)
+        self.assertIn("grace and delete slack", detail(evidence, "run"))
+        self.assertEqual((session.events, session.voices, fake.gets, fake.patches),
+                         ([], [], [], []))
 
     def test_missing_move_refuses_before_any_patch(self):
         batches = [[GUILD_CREATE], [channel_create(FOREIGN)]]
@@ -371,21 +396,100 @@ class OwnedRoomBindingTest(unittest.TestCase):
     def test_work_deadline_during_creator_restore_still_closes_session(self):
         session = FakeSession([[GUILD_CREATE]])
         fake = make_fake(rooms={}, before=[], after=[], creator_name=ORIGINAL_NAME)
-        read, now = fake.rest, [0]
+        read, voice, now = fake.rest, session.voice, [0]
+
+        def leave_near_cutoff(guild, channel):
+            voice(guild, channel)
+            if channel is None:
+                now[0] = 179
 
         def expire_during_restore(token, path):
-            if fake.gets_to(CREATOR) == 2:
+            if path == f"/channels/{CREATOR}" and fake.gets_to(CREATOR) == 2:
                 now[0] = 181
             return read(token, path)
 
         fake.rest = expire_during_restore
+        session.voice = leave_near_cutoff
         with mock.patch.object(synth.time, "monotonic", side_effect=lambda: now[0]), \
                 mock.patch.dict(os.environ, {"VOICE_WORK_SECONDS": "180"}):
             code, _, _, evidence = run_with_fakes([], session, fake)
-        self.assertEqual((code, verdicts(evidence).get("run")), (1, "FAIL"))
+        self.assertEqual((code, verdicts(evidence).get("create")), (1, "FAIL"))
         self.assertEqual(fake.patches, rename_cycle())
         self.assertEqual(fake.rooms[CREATOR]["name"], ORIGINAL_NAME)
         self.assertTrue(session.closed)
+
+    def test_stalled_work_io_leaves_time_for_restore_and_close(self):
+        for waiting_on in ("gateway", "rest"):
+            with self.subTest(waiting_on=waiting_on):
+                self.assert_stalled_work_io(waiting_on)
+
+    def assert_stalled_work_io(self, waiting_on):
+        batches = [[GUILD_CREATE], [channel_create(OWN), voice_update(OWN)],
+                   [], [channel_create(REJOIN), voice_update(REJOIN)]]
+        session = FakeSession(batches)
+        fake = make_fake(rooms={OWN: room_state(OWN)}, before=[], after=[],
+                         creator_name=ORIGINAL_NAME)
+        now, alarms, handler, closed = [0], [], [None], []
+
+        def install(_sig, fn):
+            previous, handler[0] = handler[0], fn
+            return previous
+
+        def arm(_timer, seconds):
+            alarms[:] = [now[0] + seconds] if seconds else []
+
+        def stall():
+            # Consume part of a response, then stop producing bytes.
+            now[0] = 299
+            if alarms:
+                now[0] = alarms.pop()
+                handler[0](None, None)
+            now[0] = 450  # Without a work timer, only the hard kill remains.
+            raise TimeoutError("hard process limit")
+
+        session.close = lambda: closed.append(now[0])
+        pump, read, patch = session.pump, fake.rest, fake.rest_patch
+        pump_wire, real_rest = synth.Session.pump, synth.rest
+        session.ws = synth.WebSocket.__new__(synth.WebSocket)
+        sock = session.ws.sock = mock.Mock()
+        sock.recv.side_effect = lambda _n: b"\x81" if sock.recv.call_count == 1 else stall()
+
+        def pump_until_delete(until, deadline):
+            if session.voices[-1:] == [(GUILD, None)]:
+                return pump_wire(session, until, deadline)
+            event = pump(until, deadline)
+            now[0] += 30
+            return event
+
+        def read_until_stall(token, path):
+            if path != f"/guilds/{GUILD}/channels":
+                return read(token, path)
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.side_effect = lambda _n: stall()
+            with mock.patch.object(synth, "_open_no_redirect", return_value=response):
+                return real_rest(token, path)
+
+        def restore_in_reserve(token, path, payload):
+            if payload == {"name": ORIGINAL_NAME}:
+                self.assertEqual(now[0], 300)
+                now[0] += 1
+            return patch(token, path, payload)
+
+        if waiting_on == "gateway":
+            session.pump = pump_until_delete
+        else:
+            fake.rest = read_until_stall
+        fake.rest_patch = restore_in_reserve
+        with mock.patch.object(synth.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch("signal.signal", side_effect=install), \
+                mock.patch("signal.setitimer", side_effect=arm), \
+                mock.patch.dict(os.environ, {"VOICE_WORK_SECONDS": "300"}):
+            code, _, _, evidence = run_with_fakes(["--grace", "180"], session, fake)
+        self.assertEqual((code, verdicts(evidence).get("run")), (1, "FAIL"))
+        self.assertEqual(fake.rooms[CREATOR]["name"], ORIGINAL_NAME)
+        self.assertEqual(closed, [301])
+        self.assertFalse(alarms)
+        self.assertIsNone(handler[0])
 
     def test_move_to_preexisting_room_refuses_before_any_patch(self):
         batches = [[GUILD_CREATE], [voice_update(PRE)]]

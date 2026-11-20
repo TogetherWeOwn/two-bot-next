@@ -127,9 +127,11 @@ no permanent staging keepalive, host timer or new always-on cost is authorized.
 Each live run can retry up to twice after 60 s for a transient failure.
 The original staging grant and job deadline must both have room for the
 retry pause (if any), 300 seconds of work (including the 180-second grace),
-and 150 seconds for cleanup. The work cutoff does not interrupt restoration;
-a separate hard limit bounds the process. Evidence JSON is uploaded as the
-`voice-synthetic-<run id>` artifact for 14 days. A reusable
+and 150 seconds for cleanup. The attempt refuses before Discord I/O if grace
+plus deletion slack leaves no time for setup under the work cutoff. That
+cutoff applies during gateway and REST I/O, not to restoration, which has
+separate timeouts. The 450-second hard limit bounds the process. Evidence JSON
+is uploaded as the `voice-synthetic-<run id>` artifact for 14 days. A reusable
 workflow caller can provide the optional `artifact_invocation` label to append
 `-<label>` to that artifact and the `staging-use-voice-start-<run id>-<attempt>`
 receipt. An omitted or empty label preserves the original names. Callers with

@@ -66,6 +66,7 @@ import json
 import math
 import os
 import re
+import signal
 import socket
 import ssl
 import struct
@@ -783,7 +784,17 @@ class Session:
             raise GatewayShapeError("gateway hello was malformed")
         self.interval = seconds
         self.seq, self.alive = None, True
-        threading.Thread(target=self._beat, daemon=True).start()
+        heartbeat = threading.Thread(target=self._beat, daemon=True)
+        if hasattr(signal, "pthread_sigmask"):
+            # The thread inherits a blocked SIGALRM so the work alarm goes
+            # to the main thread even while that thread is blocked in I/O.
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+            try:
+                heartbeat.start()
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        else:
+            heartbeat.start()
         self.ws.send({"op": 2, "d": {"token": token, "intents": INTENTS,
                                      "properties": {"os": "linux", "browser": "voice-synthetic",
                                                     "device": "voice-synthetic"}}})
@@ -791,6 +802,8 @@ class Session:
     def _beat(self):
         while self.alive:
             time.sleep(self.interval)
+            if not self.alive:
+                return
             try:
                 self.ws.send({"op": 1, "d": self.seq})
             except OSError:
@@ -838,35 +851,82 @@ class Session:
         self.ws.close()
 
 
+class DeadlineExceeded(RuntimeError):
+    """Distinct from socket timeouts, which some probes treat as no event."""
+
+
+def _raise_deadline(_signum=None, _frame=None):
+    raise DeadlineExceeded("voice synthetic I/O deadline reached")
+
+
+def _call_before(deadline, operation, *args):
+    if math.isinf(deadline):
+        return operation(*args)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        _raise_deadline()
+    # Span the whole operation, not just one gateway read or HTTP recv.
+    try:
+        signal.setitimer(signal.ITIMER_REAL, remaining)
+        result = operation(*args)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    if time.monotonic() >= deadline:
+        _raise_deadline()
+    return result
+
+
 def run_live(args, token):
-    return _exercise(args, token, rest)
+    if "VOICE_WORK_SECONDS" not in os.environ:
+        return _exercise(args, token, rest)
+    # The timed workflow owns ITIMER_REAL on the Linux CLI's main thread.
+    previous = signal.signal(signal.SIGALRM, _raise_deadline)
+    try:
+        return _exercise(args, token, rest)
+    finally:
+        signal.signal(signal.SIGALRM, previous)
 
 
 def _exercise(args, token, restore_read):
-    deadline = time.monotonic() + float(os.environ.get("VOICE_WORK_SECONDS", "inf"))
+    work_input = os.environ.get("VOICE_WORK_SECONDS")
+    work_seconds = timing_seconds(work_input) if work_input is not None else math.inf
+    if args.grace + args.delete_slack >= work_seconds:
+        raise Refusal("grace and delete slack leave no time for setup in the voice work budget")
+    deadline = time.monotonic() + work_seconds
 
-    def check_budget():
-        if time.monotonic() >= deadline:
-            raise TimeoutError("voice synthetic work deadline reached")
+    def work(operation, *args):
+        return _call_before(deadline, operation, *args)
 
-    # Work reads stop at the cutoff; restoration uses the original read.
+    def cleanup(seconds, operation, *args):
+        # At most one 5 s disconnect and five 20 s REST calls (room and
+        # creator), independent of the work cutoff and within the 150 s reserve.
+        end = time.monotonic() + seconds if math.isfinite(deadline) else math.inf
+        return _call_before(end, operation, *args)
+
     def rest(token, path):
-        check_budget()
-        return restore_read(token, path)
+        return work(restore_read, token, path)
+
+    def patch_probe(key, path, payload):
+        obs[key] = True  # Mark before sending: a timed-out write may have landed.
+        return rest_patch(token, path, payload)
 
     def pump(until, until_at):
-        result = s.pump(until, min(deadline, until_at))
-        check_budget()
-        return result
+        return work(s.pump, until, min(deadline, until_at))
 
     obs = {"grace_seconds": args.grace, "statuses": [], "deleted": False,
            "received_delta": None, "refused_delta": {}}
-    before = metrics_value(args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
-    snap_before = metrics_snapshot(args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
-    s = Session(token)
+    metrics_token = os.environ.get("TWO_STAGING_METRICS_TOKEN")
+
+    def sample_metrics():
+        if not (args.staging_url and metrics_token):
+            return None, (None, None)
+        return (work(metrics_value, args.staging_url, metrics_token),
+                work(metrics_snapshot, args.staging_url, metrics_token))
+
+    before, (received_before, refused_before) = sample_metrics()
+    s = work(Session, token)
     joined = False
     try:
-        check_budget()
         if not pump(lambda e: e["t"] == "GUILD_CREATE" and e["d"]["id"] == args.guild, time.monotonic() + 30):
             raise RuntimeError("the test bot is not in the staging guild (no GUILD_CREATE)")
         obs["me"] = s.me
@@ -888,9 +948,8 @@ def _exercise(args, token, restore_read):
             obs["rename_note"] = ("creator already carries synthetic residue "
                                   f"({original_name!r}); rename skipped, restore it manually")
         else:
-            check_budget()
-            obs["rename_attempted"] = True
-            status, _ = rest_patch(token, f"/channels/{args.creator}", {"name": temp_name})
+            status, _ = work(patch_probe, "rename_attempted", f"/channels/{args.creator}",
+                             {"name": temp_name})
             if status == 403:
                 obs["rename_forbidden"] = True
             elif status == 429:
@@ -914,9 +973,8 @@ def _exercise(args, token, restore_read):
         obs["channels_before"] = rest(token, f"/guilds/{args.guild}/channels")
         pre_existing_ids = {c.get("id") for c in obs["channels_before"]
                             if isinstance(c.get("id"), str)}
-        check_budget()
-        s.voice(args.guild, args.creator)
-        joined = True
+        joined = True  # A timed-out gateway send may have landed.
+        work(s.voice, args.guild, args.creator)
         mark = len(s.events)
         parent = creator.get("parent_id")
 
@@ -985,11 +1043,11 @@ def _exercise(args, token, restore_read):
                     # uncertain write never reads as green.
                     verified = False
                     try:
-                        back, _ = rest_patch(token, f"/channels/{room_id}",
-                                             {"user_limit": initial})
+                        back, _ = cleanup(20, rest_patch, token, f"/channels/{room_id}",
+                                          {"user_limit": initial})
                         if back is not None and 200 <= back < 300:
                             try:
-                                final = int(restore_read(token, f"/channels/{room_id}")
+                                final = int(cleanup(20, restore_read, token, f"/channels/{room_id}")
                                             .get("user_limit") or 0)
                             except Exception:
                                 verified = False
@@ -1007,12 +1065,12 @@ def _exercise(args, token, restore_read):
                             f"{probed}, original {initial}); restore "
                             f"user_limit to {initial} manually")
 
-                check_budget()
-                obs["limit_attempted"] = True
                 try:
-                    status, _ = rest_patch(token, f"/channels/{room_id}",
-                                           {"user_limit": probed})
+                    status, _ = work(patch_probe, "limit_attempted", f"/channels/{room_id}",
+                                     {"user_limit": probed})
                 except Exception:
+                    if not obs["limit_attempted"]:
+                        raise
                     restore_uncertain_limit()
                 else:
                     if status == 403:
@@ -1032,16 +1090,16 @@ def _exercise(args, token, restore_read):
                                 restore_uncertain_limit()
                             else:
                                 try:
-                                    back, _ = rest_patch(
-                                        token, f"/channels/{room_id}",
-                                        {"user_limit": initial})
+                                    back, _ = cleanup(20, rest_patch, token,
+                                                      f"/channels/{room_id}",
+                                                      {"user_limit": initial})
                                 except Exception:
                                     obs["limit_set_ok"] = True
                                 else:
                                     if back is not None and 200 <= back < 300:
                                         try:
-                                            final = int(restore_read(
-                                                token, f"/channels/{room_id}")
+                                            final = int(cleanup(
+                                                20, restore_read, token, f"/channels/{room_id}")
                                                 .get("user_limit") or 0)
                                         except Exception:
                                             obs["limit_set_ok"] = True
@@ -1086,8 +1144,7 @@ def _exercise(args, token, restore_read):
             # update, a move into a pre-existing room or an unrelated channel
             # without a CREATE never counts.
             rejoin_mark = len(s.events)
-            check_budget()
-            s.voice(args.guild, args.creator)
+            work(s.voice, args.guild, args.creator)
             again = pump(landed((room_id,)), time.monotonic() + args.create_within)
             rejoin_to = again["d"]["channel_id"] if again else None
             if (rejoin_to is None or rejoin_to == args.creator
@@ -1098,7 +1155,7 @@ def _exercise(args, token, restore_read):
                 # and the verdict is finalized after it.
                 obs["rejoin_room_id"] = rejoin_to
         rooms = [r for r in (room_id, obs.get("rejoin_room_id")) if r]
-        s.voice(args.guild, None)
+        work(s.voice, args.guild, None)
         joined = False
         left = time.monotonic()
         if rooms:
@@ -1115,30 +1172,27 @@ def _exercise(args, token, restore_read):
     finally:
         if joined:
             try:
-                s.voice(args.guild, None)
-            except OSError:
+                cleanup(5, s.voice, args.guild, None)
+            except (OSError, DeadlineExceeded):
                 pass
         # Restore whenever a rename was attempted and the live name differs
         # from the original: the PATCH may have applied while its response
         # was lost, which the old applied-only gate left as residue.
         if obs.get("rename_attempted") and not obs.get("rename_forbidden"):
             try:
-                seen_now = restore_read(token, f"/channels/{args.creator}")
+                path = f"/channels/{args.creator}"
+                seen_now = cleanup(20, restore_read, token, path)
                 if seen_now.get("name") != obs.get("rename_original", ""):
-                    status, _ = rest_patch(token, f"/channels/{args.creator}",
-                                           {"name": obs.get("rename_original", "")})
-                    seen = restore_read(token, f"/channels/{args.creator}")
+                    status, _ = cleanup(20, rest_patch, token, path,
+                                        {"name": obs.get("rename_original", "")})
+                    seen = cleanup(20, restore_read, token, path)
                     obs["rename_restored"] = (isinstance(status, int) and 200 <= status < 300
                                               and seen.get("name") == obs.get("rename_original"))
             except Exception:
                 obs["rename_restored"] = False
         s.close()
-    check_budget()
-    after = metrics_value(args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
+    after, (received_after, refused_after) = sample_metrics()
     obs["metrics_delta"] = None if before is None or after is None else int(after - before)
-    received_before, refused_before = snap_before
-    received_after, refused_after = metrics_snapshot(
-        args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
     if received_before is not None and received_after is not None:
         obs["received_delta"] = received_after - received_before
     if refused_before is not None and refused_after is not None:
@@ -1150,7 +1204,6 @@ def _exercise(args, token, restore_read):
         obs["refused_delta"] = delta
     obs.setdefault("creator", {"id": args.creator})
     obs.setdefault("channels", [])
-    check_budget()
     return obs
 
 
