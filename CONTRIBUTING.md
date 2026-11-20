@@ -93,24 +93,21 @@ no review stage. Pin the merge to that head SHA. At merge, record the squash SHA
 and any applicable PR confirmation in the release log; record the production
 decision there when the Release Manager accepts the release candidate.
 
-The ordinary-PR exemption applies only while `PRODUCTION_AUTO_PROMOTE_DISABLED=true`
-is verified live, so a merge to `main` does not reach production on its own. A
-merge that would deploy, or whose deploy behaviour is unverified, needs fresh
-exact-head Release Manager confirmation before merge, like a promotion-path PR. Under that condition, ordinary PRs need **no per-PR
-Release Manager confirmation**: required checks and the review stages suffice.
-Promotion-path PRs still need a fresh Release Manager `request_confirmation` on
-their exact head before merge: workflows, actions and tooling that qualify,
-select, deploy or roll back a production candidate; deploy, Wrangler or binding
-config; production schema or data changes (migrations); anything that changes
-`PRODUCTION_AUTO_PROMOTE_*` behaviour; and edits to the production-authorization
-guidance in this section, `AGENTS.md` or `REVIEW.md`. Put the confirmation on a
-child task assigned and addressed to the Release Manager
-(`resolverPolicy: not_creator`).
+A bot merge verified not to deploy production needs **no standing per-PR
+Release Manager confirmation**. Verify live that
+`PRODUCTION_AUTO_PROMOTE_DISABLED=true` and check that the change does not
+introduce or re-enable a path from the merge to production. This rule also
+covers changes to promotion-path code or guidance when the merge itself is
+verified non-deploying. If the merge would deploy production or you cannot rule
+out deployment, require a Release Manager approval stage on the source card
+for the full, exact PR head SHA before merging. This rule does not waive any
+PR-specific direction.
 
 Production release acceptance binds to the exact full release SHA; dispatch
 production with that SHA ([production deploy](docs/production-deploy.md)). A
-different SHA needs fresh acceptance. A production migration apply, manual
-production dispatch or rollback needs its own Release Manager confirmation too.
+different SHA needs fresh acceptance. A manual production dispatch, production
+schema or data operation (including migration apply), or production rollback
+requires its own exact-SHA Release Manager authorization on the source card.
 
 For two-web-next and two-bot-next, staging qualification is the
 **post-merge, pre-production exact-main staging/e2e/soak gate** (owner decision
@@ -134,19 +131,18 @@ merge, or treat artifact equality as permission to skip post-merge qualification
 The pipeline's exact-SHA artifact and promotion evidence remains required.
 
 Before merge, retain required GitHub Actions checks and Devin Review on the
-exact PR head, all applicable specialist and native review, and evidence-backed
-finding dispositions. Include the migration ledger entry (or `no migration`)
-and rollback target in the release decision (and in the exact-head Release
-Manager confirmation for a promotion-path PR).
+exact PR head, Security before QA where required by the review tiers, all other
+applicable review stages, and evidence-backed finding dispositions. Include the
+migration ledger entry (or `no migration`) and rollback target in the release
+decision and in any required approval for a deploying or unverified merge.
 Keep incident, freeze and hold safeguards, identity/capability holds and red
 staging-drill or other deterministic gates; this staging contract lifts none of
-them. A previous rejection remains a rejection, not retroactive approval. Submit
-a fresh confirmation only after its remaining conditions are met. Any new PR
-head requires fresh review/check evidence (and, for a promotion-path PR, fresh
-Release Manager confirmation) before the SHA-pinned squash merge and
-release-log recording. This documentation
-authorizes no pipeline skip/no-op implementation, hold lift, deployment or other
-production action.
+them. A previous rejection remains a rejection, not retroactive approval.
+Resubmit only after its remaining conditions are met. A new PR head requires
+fresh review and check evidence, and fresh Release Manager approval if the merge
+would deploy or cannot be verified non-deploying, before the SHA-pinned squash
+merge. This documentation authorizes no pipeline skip/no-op implementation,
+hold lift, deployment or other production action.
 
 ### CI lanes
 
