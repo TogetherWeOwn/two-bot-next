@@ -352,7 +352,7 @@ pub const MODERATION_ENFORCEMENT_OUTCOMES: &[&str] = &[
 ];
 /// Dispatch-lane names for `two_bot_dispatch_drops_total{lane}`, in the bot's
 /// `DISPATCH_LIMITS` order (messages, interactions, registry, privileged,
-/// busy, reactions). Length must equal the lane count; unknown names collapse
+/// busy, help, reactions). Length must equal the lane count; unknown names collapse
 /// to the trailing `reactions` slot only when the allowlist grows, never to a
 /// dynamic label.
 ///
@@ -369,6 +369,7 @@ pub const DISPATCH_LANES: &[&str] = &[
     "registry",
     "privileged",
     "busy",
+    "help",
     "reactions",
 ];
 /// Checkpoint-failure stages for `two_bot_gateway_checkpoint_failures_total{stage}`.
@@ -3473,7 +3474,7 @@ mod tests {
         assert!(text.contains("two_bot_dispatch_drops_total{lane=\"busy\"} 1\n"));
         assert!(text.contains("two_bot_dispatch_drops_total{lane=\"reactions\"} 1\n"));
         assert!(text.contains("two_bot_dispatch_drops_total{lane=\"interactions\"} 0\n"));
-        // Fixed cardinality: six lanes.
+        // Fixed cardinality: seven lanes.
         let mut series = std::collections::HashSet::new();
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let (key, value) = line.rsplit_once(' ').unwrap();

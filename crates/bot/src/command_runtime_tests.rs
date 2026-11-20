@@ -1587,6 +1587,105 @@ async fn help_answers_immediately_from_the_live_publish_set() {
 }
 
 #[tokio::test]
+async fn gateway_help_opens_a_new_private_page_from_the_confirmed_registry() {
+    use crate::command_runtime::LANE_HELP;
+    use serde_json::{json, Value};
+    use tokio::time::Instant;
+    use two_bot_discord::brand::{EmbedKind, BRAND_ICON_URL};
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(
+        RouterGates {
+            scorecard: true,
+            moderation: true,
+            ..gates(true, true)
+        },
+        true,
+        origin,
+    );
+    runtime.set_identity(2222, 1111);
+    runtime.publish_registry_checked(Some(1111)).await.unwrap();
+    let actor_id = 834;
+    let first = interaction_event(from_member(
+        slash("help", Some(CHANNEL), Vec::new()),
+        actor_id,
+        Permissions::empty(),
+    ));
+    assert!(runtime.dispatch_help(&first, Instant::now()));
+    assert!(
+        runtime.dispatch_help(&first, Instant::now()),
+        "the active duplicate is owned but not answered"
+    );
+    wait_for(
+        || runtime.lane_in_flight(LANE_HELP) == 0,
+        "initial help callback",
+    )
+    .await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1);
+    let initial: Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+    let data = &initial["data"];
+    assert_eq!(data["flags"], 64);
+    assert_eq!(data["embeds"][0]["color"], EmbedKind::Default.color());
+    assert_eq!(data["embeds"][0]["footer"]["icon_url"], BRAND_ICON_URL);
+    let controls = &data["components"];
+    let actor = json!({"id": actor_id.to_string(), "username": "actor", "discriminator": "0"});
+    let payload = json!({
+        "id": "835", "type": 3, "application_id": "1111", "guild_id": GUILD.to_string(),
+        "authorizing_integration_owners": {"0": GUILD.to_string()}, "entitlements": [], "token": "click-fixture",
+        "data": {"component_type": 2, "custom_id": controls[0]["components"][0]["custom_id"], "values": []},
+        "member": {"deaf": false, "mute": false, "flags": 0, "roles": [], "user": actor},
+        "message": {
+            "id": "836", "channel_id": CHANNEL.to_string(), "type": 20,
+            "author": {"id": "2222", "username": "bot", "discriminator": "0", "bot": true},
+            "flags": 64, "components": controls, "embeds": data["embeds"],
+            "interaction_metadata": {
+                "id": actor_id.to_string(), "type": 2, "user": actor,
+                "authorizing_integration_owners": {"0": GUILD.to_string()}
+            },
+            "attachments": [], "content": "", "mention_everyone": false, "mention_roles": [],
+            "mentions": [], "pinned": false, "timestamp": "2026-01-01T00:00:00+00:00", "tts": false
+        }
+    });
+    assert_eq!(controls[0]["components"][0]["label"], "Go to page 2");
+    let click: Interaction = serde_json::from_value(payload).expect("valid help source fixture");
+    let mut wrong_scope = click.clone();
+    set_guild(&mut wrong_scope, None);
+    assert!(runtime.dispatch_help(&interaction_event(wrong_scope), Instant::now()));
+    assert!(runtime.dispatch_help(&first, Instant::now() - Duration::from_secs(3)));
+    assert!(runtime.dispatch_help(&interaction_event(click), Instant::now()));
+    wait_for(
+        || runtime.lane_in_flight(LANE_HELP) == 0,
+        "help page callback",
+    )
+    .await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(
+        callbacks.len(),
+        2,
+        "no callbacks for duplicates, expired receipts, or foreign scope"
+    );
+    assert!(callbacks[1].path.ends_with("/835/click-fixture/callback"));
+    let page: Value = serde_json::from_slice(&callbacks[1].body).unwrap();
+    assert_eq!(
+        page["type"], 4,
+        "a new message, not a source update or defer"
+    );
+    assert_eq!(page["data"]["flags"], 64);
+    assert_eq!(page["data"]["allowed_mentions"]["parse"], json!([]));
+    let footer = page["data"]["embeds"][0]["footer"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(footer.starts_with("Together We Own · Help · Page 2 of "));
+    assert_eq!(
+        mock.requests().len(),
+        3,
+        "one publication and two callbacks; no edits or followups"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn published_unwired_commands_reply_without_defer_or_store_work() {
     for router_gates in [
         gates(false, false),

@@ -174,14 +174,16 @@ pub type VoiceKickVote =
 /// hold the permission; open interactions never enter it, so a burst of them
 /// cannot starve moderation. `BUSY` carries the one-call "busy" replies.
 /// `REACTIONS` keeps self-role reaction bursts off the message lane, so neither
-/// burst can discard the other's automations.
-pub(crate) const DISPATCH_LIMITS: [usize; 6] = [16, 16, 1, 8, 8, 8];
+/// burst can discard the other's automations. `HELP` reserves capacity
+/// for discovery callbacks before the generic command lane.
+pub(crate) const DISPATCH_LIMITS: [usize; 7] = [16, 16, 1, 8, 8, 8, 8];
 pub(crate) const LANE_MESSAGES: usize = 0;
 const LANE_INTERACTIONS: usize = 1;
 const LANE_REGISTRY: usize = 2;
 const LANE_PRIVILEGED: usize = 3;
 pub(crate) const LANE_BUSY: usize = 4;
-pub(crate) const LANE_REACTIONS: usize = 5;
+pub(crate) const LANE_HELP: usize = 5;
+pub(crate) const LANE_REACTIONS: usize = 6;
 
 // A single member's reaction burst must leave room for other members: the
 // per-member budget stays strictly below the lane cap, so fairness holds even
@@ -592,10 +594,9 @@ impl CommandRuntime {
         // in `publish_registry_checked`. Zero means unpinned (unparseable
         // token); such a runtime never publishes on faith.
         if let Some(application_id) = activation.application_id() {
-            runtime.interactions.set_application_id(application_id);
-            runtime
-                .application_id
-                .store(application_id, Ordering::Relaxed);
+            // The bot token identifies its bot user as well as the app. Keep
+            // source validation armed after a cold RESUME, which has no READY.
+            runtime.set_identity(application_id, application_id);
         }
         runtime
     }
@@ -3489,6 +3490,9 @@ pub(crate) fn sticky_options_strict(
 #[cfg(test)]
 #[path = "command_runtime_resumed_tests.rs"]
 mod resumed_tests;
+
+#[path = "help_ingress.rs"]
+mod help_ingress;
 
 /// Full-set publication: a bulk replace needs an authoritative custom-command
 /// row load, so an unknown store defers instead of deleting Discord commands.
