@@ -705,14 +705,13 @@ class RollbackRunTests(unittest.TestCase):
                 read_rollout = routes[pinned]
                 control, actions = control_stub()
                 rb, client, _ = make_rollback(routes, control=control)
-                rb.staging_use = mock.Mock()
 
                 def read_pinned():
                     response = read_rollout()
                     if pinned in client.calls[:-1]:
                         response["result"].update(changes)
                     return response
-
+                rb.staging_use = mock.Mock()
                 client.routes[pinned] = read_pinned
                 with self.assertRaisesRegex(base.GateError, f"^{failure}$"):
                     rb.run(GOOD_VERSION, good_image())
@@ -1157,7 +1156,7 @@ class MainProvenanceTests(unittest.TestCase):
 
         def get_rollout():
             return {"success": True, "result": rollout_row(
-                "r-new", good_image(), created="2026-10-15T01:00:00Z",
+                "r-new", good_image(), created="2026-10-15T02:00:00Z",
                 status="completed", target_version=9)}
 
         deployments = [{"versions": [{"version_id": v, "percentage": 100}]}
