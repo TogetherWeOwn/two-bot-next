@@ -36,11 +36,16 @@ ordered restore plan for a receipt without any mutation via
 the receipt identically to the live path and exits 0.
 
 If the forward gate rejects a `/readyz` 200 with `serving_worker_mismatch` or
-`serving_image_mismatch`, look for `evidence.readyz-mismatch.json` in the
-`staging-rollout-evidence` artifact. It records the child run/attempt, sample
-receipt time in UTC, and expected and observed identities (`absent` or
-`invalid` where applicable). `request_id` is the response's `x-request-id`
-only if it matches the existing format; the gate does not generate one.
+`serving_image_mismatch`, the `staging-rollout-evidence` artifact may include
+`evidence.readyz-mismatch.json`. This sidecar is best-effort: a write failure
+never changes the original rejection. Pinned drills use the deployed commit's
+verifier, so older pins may not produce it.
+
+The sidecar records the child run/attempt, sample receipt time in UTC, and
+expected and observed identities (`absent` or `invalid` where applicable).
+Multiple Worker version headers are ambiguous and recorded as `invalid`.
+`request_id` is the response's `x-request-id` only if it matches the existing
+format; the gate does not generate one.
 The control-plane timestamp is when the runner observed the completed rollout,
 not when it completed. Its target digest does not identify the serving image.
 This file is diagnostic only, not `evidence.json` or a qualification receipt.
