@@ -159,6 +159,7 @@ fn click_fixture() -> Value {
     let actor = json!({"id": ACTOR.to_string(), "username": "actor", "discriminator": "0"});
     json!({
         "id": "100", "type": 3, "application_id": "2", "guild_id": "1",
+        "attachment_size_limit": 10_485_760,
         "authorizing_integration_owners": {"0": "1"}, "entitlements": [], "token": "fixture",
         "data": {"component_type": 2, "custom_id": rows[0]["components"][0]["custom_id"], "values": []},
         "member": {"deaf": false, "mute": false, "flags": 0, "roles": [], "user": actor},
