@@ -938,6 +938,17 @@ jobs:
       - name: prepare gateway lifecycle acceptance
         run: python3 tests/gateway_lifecycle/prepare.py --prepare
 
+      - name: Prepare synthetic RSVP reply capture
+        id: rsvp_reply_capture
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          # The PR job can test a synthetic merge; record the actual source tree.
+          checkout=$(git rev-parse HEAD)
+          tree=$(git rev-parse 'HEAD^{tree}')
+          printf 'RSVP capture source: %s (tree %s)\n' "$checkout" "$tree"
+          directory=$(mktemp -d "$RUNNER_TEMP/rsvp-replies.XXXXXX")
+          printf 'directory=%s\n' "$directory" >> "$GITHUB_OUTPUT"
+
       # The standalone backup fixture has its own scratch-only URL guard.
       # Supplying it here executes the round trip rather than its local skip.
       - name: cargo test (integration, including website acceptance and backup round trip)
@@ -948,6 +959,7 @@ jobs:
           TWO_RSVP_RUNTIME_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
           TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
+          TWO_RSVP_REPLY_CAPTURE_DIR: ${{ steps.rsvp_reply_capture.outputs.directory }}
         # The publication regression has its own guarded DB and actual binary
         # in the dedicated step below; never feed it the round-trip fixture URL.
         # The invite saturation tests build throwaway schema names from a
@@ -963,6 +975,32 @@ jobs:
           --skip saturated_write_warns_with_identifiers_and_no_raw_counter
           --skip normal_uses_round_trip_byte_identical
           --skip exact_i32_max_writes_without_saturation_warn
+
+      - name: Verify synthetic RSVP reply capture
+        if: steps.rsvp_reply_capture.outputs.directory != ''
+        env:
+          CAPTURE_DIR: ${{ steps.rsvp_reply_capture.outputs.directory }}
+        run: |
+          for name in saved.json cancelled.json historical.json; do
+            file="$CAPTURE_DIR/$name"
+            if [ -L "$file" ] || [ ! -f "$file" ] || [ ! -s "$file" ] ||
+              ! size=$(wc -c < "$file") || [ "$size" -gt 16384 ]; then
+              printf 'Missing or invalid synthetic RSVP capture: %s\n' "$name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload synthetic RSVP replies
+        if: steps.rsvp_reply_capture.outputs.directory != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: synthetic-rsvp-replies
+          path: |
+            ${{ steps.rsvp_reply_capture.outputs.directory }}/saved.json
+            ${{ steps.rsvp_reply_capture.outputs.directory }}/cancelled.json
+            ${{ steps.rsvp_reply_capture.outputs.directory }}/historical.json
+          if-no-files-found: error
+          retention-days: 14
 
       # Invite saturation acceptance is DB-backed and racy under parallelism
       # (nanos+pid schema nonce; one head collided on CREATE SCHEMA with a
