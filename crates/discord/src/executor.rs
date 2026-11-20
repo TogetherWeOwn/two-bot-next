@@ -5102,6 +5102,63 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn callback_releases_permit_when_admission_reaches_deadline() {
+        use crate::strict_transport_fixture::{loopback, Admission};
+
+        #[derive(Debug)]
+        struct DeadlineAdmission {
+            gate: Arc<Admission>,
+            deadline: Instant,
+        }
+
+        impl SendAdmission for DeadlineAdmission {
+            fn token_key(&self) -> &TokenKey {
+                self.gate.token_key()
+            }
+
+            fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+                Box::pin(async {
+                    assert!(Instant::now() < self.deadline);
+                    // At the shared deadline, timeout_at polls ready admission first.
+                    tokio::time::sleep_until(self.deadline).await;
+                    self.gate.admit().await
+                })
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = "fixture-callback-late-admission";
+        let (listener, origin) = loopback().await;
+        let gate = Arc::new(Admission::new(token, None, None));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let admission = Arc::new(DeadlineAdmission {
+            gate: gate.clone(),
+            deadline,
+        });
+        let transport =
+            HyperTransport::with_admission(token.to_owned(), Some(origin.clone()), admission)
+                .unwrap()
+                .with_test_guard();
+        let executor = ActionExecutor::assemble(token.to_owned(), Some(origin), transport).unwrap();
+        let reply = crate::interactions::text_response(
+            two_bot_core::router::replies::InteractionReply::new("fixture", true),
+        );
+        assert!(matches!(
+            executor
+                .answer_interaction_with_blocked_retry_before(1, "fixture", &reply, deadline)
+                .await,
+            Err(DiscordError::Timeout),
+        ));
+        assert_eq!(*gate.completed.lock().unwrap(), vec![None]);
+        tokio::time::resume();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn strict_transport_refuses_expired_deadline_after_admission() {
         use crate::strict_transport_fixture::{loopback, Admission};
