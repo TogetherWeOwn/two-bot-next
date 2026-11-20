@@ -2,6 +2,7 @@
 
 #![cfg(feature = "db")]
 
+use sqlx::postgres::{PgDatabaseError, PgPoolOptions};
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
 use two_bot_core::voice_heat::{truncate_to_hour, Accumulator, HourBucket};
@@ -171,21 +172,47 @@ async fn timed_out_backlog_retry_reaches_tail_without_rewriting_committed_prefix
         .collect();
     // An earlier attempt committed this prefix before the timeout and retry.
     assert_eq!(flush_hour_buckets(pool, &backlog[..3]).await.unwrap(), 3);
+    // Time out inside the insert, not while the client waits for commit.
     sqlx::raw_sql(
         "CREATE FUNCTION public.slow_heat_statement() RETURNS trigger LANGUAGE plpgsql AS $$
-         BEGIN PERFORM pg_sleep(0.5); RETURN NULL; END $$;
+         BEGIN PERFORM pg_sleep(10); RETURN NULL; END $$;
          CREATE TRIGGER slow_heat_statement AFTER INSERT ON public.voice_heat_hours
          FOR EACH STATEMENT EXECUTE FUNCTION public.slow_heat_statement()",
     )
     .execute(pool)
     .await
     .unwrap();
-    assert!(tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        flush_hour_buckets(pool, &backlog)
-    )
-    .await
-    .is_err());
+    let timeout_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET statement_timeout = '1s'")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap_or_else(|_| panic!("connect timeout test pool"));
+    let failure = flush_hour_buckets(&timeout_pool, &backlog).await;
+    timeout_pool.close().await;
+    let Err(VoiceHeatStoreError::Db(sqlx::Error::Database(error))) = failure else {
+        panic!("expected an insert statement timeout from Postgres");
+    };
+    assert_eq!(error.code().as_deref(), Some("57014"));
+    assert!(error
+        .downcast_ref::<PgDatabaseError>()
+        .r#where()
+        .is_some_and(|context| context.contains("slow_heat_statement()")));
+    assert_eq!(
+        stored_buckets(pool).await,
+        backlog[..3].iter().map(stored_bucket).collect::<Vec<_>>()
+    );
+    sqlx::query("DROP TRIGGER slow_heat_statement ON public.voice_heat_hours")
+        .execute(pool)
+        .await
+        .unwrap();
 
     let mut retry = backlog.clone();
     for row in &mut retry[..3] {
@@ -198,7 +225,7 @@ async fn timed_out_backlog_retry_reaches_tail_without_rewriting_committed_prefix
     .await
     .expect("bulk retry advances within budget")
     .unwrap();
-    assert!(written <= 332, "the committed prefix cannot be rewritten");
+    assert_eq!(written, 332, "the retry must insert every missing hour");
     assert_eq!(
         stored_buckets(pool).await,
         backlog.iter().map(stored_bucket).collect::<Vec<_>>()
