@@ -2328,7 +2328,10 @@ authorized [qualification/recovery procedure](staging-rollout-gate.md#full-windo
    dispatch again from current `main` with the same pin and inputs; do not rerun
    the stale workflow. A successful arm can still be red when the pin is behind
    the workflow head: the history guard rejects that run for qualification.
-   Confirm the exact run's deploy and rollout verification before observing.
+   Before observing, wait for the exact run's **wrangler deploy + intended
+   rollout gate** job to finish successfully: the rollout verification and
+   REST 5xx gate steps must pass, and auto-rollback must be skipped. Confirm
+   the arm deploy ID in that run's `staging-rollout-evidence`.
 4. Run the R1/R2/STOP observation above. A staging run that honors the hold
    fails fast with the deferral message (red, by design: a quiet green would
    read as staging history to the production guard); merges stay unblocked.
@@ -2336,12 +2339,11 @@ authorized [qualification/recovery procedure](staging-rollout-gate.md#full-windo
    deploy-staging.yml --ref main -f "sha=$DRILL_SHA" -f recover_prior_sha=true`.
    If refused because the workflow head was superseded, dispatch again from
    current `main` with the same pin and no injection flags, not a rerun. In the
-   exact disarm run, require **Deploy to staging** and **Verify exact new rollout
-   and serving Worker/container readiness** to pass and confirm auto-rollback
-   did not run. Use the `staging-rollout-evidence` for that disarm's deploy ID:
-   the SHA alone cannot distinguish arm from disarm. A red history guard is
-   expected for a prior pin; a skipped, failed or rolled-back deploy is not a
-   clear. Do not start the clear window or release the hold without disarm evidence.
+   exact disarm run, require the same successful deploy job and confirm the
+   disarm deploy ID in `staging-rollout-evidence`: the SHA alone cannot
+   distinguish arm from disarm. A red history guard is expected for a prior pin;
+   a skipped, failed or rolled-back deploy is not a clear. Do not start the
+   clear window or release the hold without disarm evidence.
 6. Watch the 30-minute clear (triggers resolve, guards reset), then release
    the hold: `gh variable delete STAGING_SOAK_HOLD_UNTIL`. Letting it expire
    works too: expiry fails open. It does not itself start a deployment;
