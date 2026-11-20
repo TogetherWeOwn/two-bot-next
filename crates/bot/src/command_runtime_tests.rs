@@ -1576,6 +1576,10 @@ async fn automod_preview_router_refuses_before_decode_and_only_answers_privately
     }
     runtime.on_interaction(&dm).await;
 
+    runtime
+        .on_delayed_interaction(&dm, Duration::from_secs(3))
+        .await;
+
     let requests = mock.requests();
     let expected = cases
         .map(|(_, _, reply)| reply)
@@ -1599,6 +1603,73 @@ async fn automod_preview_router_refuses_before_decode_and_only_answers_privately
             serde_json::json!([])
         );
     }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn automod_preview_uses_attached_activation_and_fails_closed_without_audit() {
+    use two_bot_core::automod_preview_report::PREVIEW_UNAVAILABLE_REPLY;
+    use two_bot_core::automod_runtime::STAGING_GUILD_ID;
+
+    let guild = STAGING_GUILD_ID.parse::<u64>().expect("staging ID");
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let executor = executor_at(origin);
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    pool.close().await;
+    let resolved = crate::automod_gateway::resolve(
+        &[
+            ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
+            (
+                "TWO_OWEN_USER_ID".to_owned(),
+                "123456789012345678".to_owned(),
+            ),
+        ]
+        .into(),
+        guild,
+    )
+    .expect("valid policy")
+    .expect("enabled policy");
+    let activation = crate::automod_gateway::build(resolved, pool.clone(), executor.clone());
+    let runtime = CommandRuntime::new(
+        pool,
+        executor,
+        router_with_commands(RouterGates {
+            moderation: true,
+            ..gates(false, false)
+        }),
+        guild,
+        false,
+    );
+    runtime.set_automod(activation);
+    let mut interaction = slash(
+        "automod-preview",
+        Some(CHANNEL),
+        vec![option(
+            "text",
+            CommandOptionValue::String("synthetic".to_owned()),
+        )],
+    );
+    interaction.guild_id = Some(Id::new(guild));
+    interaction.authorizing_integration_owners.guild = Some(AnonymizableId::Id(Id::new(guild)));
+    if let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_mut() {
+        data.guild_id = Some(Id::new(guild));
+    }
+    interaction
+        .member
+        .as_mut()
+        .expect("invoking member")
+        .permissions = Some(Permissions::MANAGE_GUILD);
+    runtime.on_interaction(&interaction).await;
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].path.ends_with("/callback"));
+    let reply: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("callback JSON");
+    assert_eq!(reply["data"]["flags"], 64);
+    assert_eq!(reply["data"]["content"], PREVIEW_UNAVAILABLE_REPLY);
     mock.shutdown().await;
 }
 

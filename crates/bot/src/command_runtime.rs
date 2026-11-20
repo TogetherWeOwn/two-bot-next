@@ -1453,6 +1453,13 @@ impl CommandRuntime {
             .await;
     }
 
+    #[cfg(test)]
+    pub(crate) async fn on_delayed_interaction(&self, interaction: &Interaction, age: Duration) {
+        let mut receipt = PreviewReceipt::now();
+        receipt.received_at -= age;
+        self.on_interaction_at(interaction, None, receipt).await;
+    }
+
     async fn on_interaction_at(
         &self,
         interaction: &Interaction,
@@ -1612,12 +1619,20 @@ impl CommandRuntime {
                 }
             )
         {
-            self.answer(interaction, preview_response(PREVIEW_NOT_EVALUATED_REPLY))
-                .await;
+            self.answer_preview(
+                interaction,
+                preview_response(PREVIEW_NOT_EVALUATED_REPLY),
+                &receipt,
+            )
+            .await;
             return;
         }
         if let Some(response) = response_for_slash(&outcome) {
-            self.answer(interaction, response).await;
+            if name == "automod-preview" {
+                self.answer_preview(interaction, response, &receipt).await;
+            } else {
+                self.answer(interaction, response).await;
+            }
             return;
         }
         let SlashOutcome::Handled { handler } = outcome else {
@@ -1630,13 +1645,11 @@ impl CommandRuntime {
                 &self.preview_limiter,
                 interaction,
                 receipt.utc_ms,
-                receipt.audit_deadline,
-                |activation, guild| {
-                    crate::automod_gateway::refresh_from_poller(activation, Some(guild))
-                },
+                receipt.received_at + Duration::from_secs(2),
+                |guild| crate::automod_gateway::preview_live_config(guild, live),
             )
             .await;
-            self.answer(interaction, preview_response(result.reply))
+            self.answer_preview(interaction, preview_response(result.reply), &receipt)
                 .await;
             return;
         }
@@ -2776,6 +2789,23 @@ impl CommandRuntime {
         }
     }
 
+    async fn answer_preview(
+        &self,
+        interaction: &Interaction,
+        response: InteractionResponse,
+        receipt: &PreviewReceipt,
+    ) {
+        let deadline = receipt.received_at
+            + Duration::from_millis(two_bot_discord::executor::RECEIPT_ADMISSION_BUDGET_MS);
+        if Instant::now() >= deadline
+            || tokio::time::timeout_at(deadline, self.answer(interaction, response))
+                .await
+                .is_err()
+        {
+            warn!(interaction_id = %interaction.id.get(), "automod preview callback deadline elapsed");
+        }
+    }
+
     /// Complete the original ephemeral defer, never issue a second callback.
     async fn finish(&self, interaction: &Interaction, content: impl AsRef<str>) {
         if let Err(err) = self
@@ -3418,14 +3448,13 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
 
 struct PreviewReceipt {
     utc_ms: u64,
-    audit_deadline: Instant,
+    received_at: Instant,
 }
 
 impl PreviewReceipt {
     fn now() -> Self {
-        // Stop audit work before Discord's three-second initial callback limit.
         Self {
-            audit_deadline: Instant::now() + Duration::from_secs(2),
+            received_at: Instant::now(),
             utc_ms: now_millis_for_test().max(0) as u64,
         }
     }

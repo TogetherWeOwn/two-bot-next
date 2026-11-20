@@ -1391,20 +1391,16 @@ mod preview_attempt_acceptance {
         let mut missing = request.clone();
         missing.data = None;
         let refreshes = AtomicUsize::new(0);
+        let preview_dry_run = AtomicBool::new(false);
         let run = |active, limit, request, receipt| {
             let deadline = Instant::now() + Duration::from_secs(5);
-            handle_automod_preview(
-                active,
-                &pool,
-                limit,
-                request,
-                receipt,
-                deadline,
-                |_, guild| {
-                    assert_eq!(guild, STAGING_GUILD_ID);
-                    refreshes.fetch_add(1, Ordering::Relaxed);
-                },
-            )
+            handle_automod_preview(active, &pool, limit, request, receipt, deadline, |guild| {
+                assert_eq!(guild, STAGING_GUILD_ID);
+                refreshes.fetch_add(1, Ordering::Relaxed);
+                preview_dry_run
+                    .load(Ordering::Relaxed)
+                    .then(|| runtime(false).effective_config())
+            })
         };
         let count_sql = "SELECT COUNT(*) FROM automation_audit_log";
         let count = || sqlx::query_scalar::<_, i64>(count_sql).fetch_one(&pool);
@@ -1482,9 +1478,11 @@ mod preview_attempt_acceptance {
             ["automod-preview:4243", "rate_limited", rate_reason],
         ];
         assert_eq!(rows.fetch_all(&pool).await?, expected);
+        preview_dry_run.store(true, Ordering::Relaxed);
         let fresh = sample("4244");
         let fresh = run(active, &Mutex::default(), &fresh, RECEIPT_MS).await;
-        let no_match_labels = ("no_match", "none", "enforce");
+        let no_match_labels = ("no_match", "none", "dry_run");
+        assert!(!activation.preview(AutomodRuntime::dry_run));
         assert_eq!(fresh.metric.map(labels), Some(no_match_labels));
         assert_eq!(count().await?, 3);
         assert_eq!(ledger.claims(), 3, "only the three gateway creates claim");

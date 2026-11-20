@@ -254,17 +254,21 @@ impl AutomodRuntime {
 
     /// Freeze the invoker's history and policy before the audit wait, so a
     /// later gateway event cannot evict a row relevant to the receipt clock.
+    /// An already resolved live overlay applies only to this snapshot.
     #[must_use]
     pub fn preview_snapshot(
         &self,
         guild_id: &str,
         actor_id: &str,
+        live: Option<AutomodConfig>,
     ) -> Option<(
         bool,
         impl Fn(&AutomodMessage, usize) -> PreviewVerdict + use<>,
     )> {
         self.admits(Some(guild_id)).then(|| {
-            let config = self.effective_config();
+            // Preview reads only the policy and mode from a supplied overlay;
+            // the admission fence above still uses the running activation.
+            let config = live.unwrap_or_else(|| self.effective_config());
             let repeats = self.repeats.snapshot_for(guild_id, actor_id);
             (config.dry_run, move |message: &AutomodMessage, mentions| {
                 preview_automod(message, mentions, &config, &repeats)

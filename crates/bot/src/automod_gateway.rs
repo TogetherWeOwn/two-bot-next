@@ -180,11 +180,20 @@ pub(crate) fn refresh_live<L: AutomodClaimLedger, F: AutomodFacts>(
     guild_id: &str,
     live: &two_bot_core::settings::LiveSettings,
 ) -> bool {
+    resolve_live_config(deployment, guild_id, live)
+        .is_some_and(|config| activation.apply_live_config(&config))
+}
+
+fn resolve_live_config(
+    deployment: &HashMap<String, String>,
+    guild_id: &str,
+    live: &two_bot_core::settings::LiveSettings,
+) -> Option<AutomodConfig> {
     let mut vars = layered_vars(deployment, guild_id, live);
     let mut reverted: Vec<&'static str> = Vec::new();
     loop {
         match AutomodConfig::from_map(&vars) {
-            Ok(config) => return activation.apply_live_config(&config),
+            Ok(config) => return Some(config),
             Err(error) => match live_key_of(&error) {
                 Some(key) if !reverted.contains(&key) => {
                     reverted.push(key);
@@ -197,18 +206,27 @@ pub(crate) fn refresh_live<L: AutomodClaimLedger, F: AutomodFacts>(
                 }
                 _ => {
                     warn!(error = %error, "automod live settings unusable; keeping the last good policy");
-                    return false;
+                    return None;
                 }
             },
         }
     }
 }
 
+pub(crate) fn preview_live_config(
+    guild_id: &str,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> Option<AutomodConfig> {
+    let live = live?;
+    let deployment = std::env::vars().collect();
+    resolve_live_config(&deployment, guild_id, live)
+}
+
 /// Per-delivery refresh from the poller-published snapshot (TOG-19027): the
 /// deployment environment is the base, the live snapshot overlays stored
 /// lists/thresholds. Parked or pre-first-poll readers layer nothing, so the
 /// rebuild is a no-op until the first publish moves.
-pub(crate) fn refresh_from_poller<L: AutomodClaimLedger, F: AutomodFacts>(
+fn refresh_from_poller<L: AutomodClaimLedger, F: AutomodFacts>(
     activation: &AutomodActivation<L, F>,
     guild_id: Option<&str>,
 ) {

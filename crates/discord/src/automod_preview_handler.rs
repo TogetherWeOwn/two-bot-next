@@ -24,6 +24,7 @@ use {
         automod_preview_store::SqlPreviewStore,
         automod_runtime::AutomodClaimLedger,
         funnel::format_iso_millis,
+        AutomodConfig,
     },
 };
 
@@ -89,8 +90,8 @@ pub fn decode_interaction_options(
     decode_preview_input(&map_preview_options(data))
 }
 
-/// Drive an authorized invocation with its UTC receipt. Refresh the shared
-/// activation after decode and scope, before capturing the preview snapshot.
+/// Drive an authorized invocation with its UTC receipt. Resolve the preview
+/// policy after decode and scope, without changing the gateway activation.
 /// The caller owns ephemeral delivery and reserves time for it after `deadline`.
 #[cfg(feature = "db")]
 pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
@@ -100,7 +101,7 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     interaction: &Interaction,
     receipt_ms: u64,
     deadline: Instant,
-    refresh: impl FnOnce(&AutomodActivation<L, F>, &str),
+    resolve_live: impl FnOnce(&str) -> Option<AutomodConfig>,
 ) -> AttemptResult {
     let (InteractionType::ApplicationCommand, Some(InteractionData::ApplicationCommand(data))) =
         (interaction.kind, interaction.data.as_ref())
@@ -116,9 +117,9 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
         if !active.preview(|runtime| runtime.admits(Some(guild))) {
             return None;
         }
-        refresh(active, guild);
+        let live = resolve_live(guild);
         let snapshot =
-            active.preview(|runtime| runtime.preview_snapshot(guild, &request.actor_id))?;
+            active.preview(|runtime| runtime.preview_snapshot(guild, &request.actor_id, live))?;
         Some((guild, input, snapshot))
     });
     let plan = plan_pre_claim(

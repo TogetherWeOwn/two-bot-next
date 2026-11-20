@@ -386,8 +386,11 @@ publish globally.
 **Effective config source.** The preview runs against the same
 in-memory `AutomodRuntime` the gateway inspects with, after the same
 per-event live-snapshot refresh the delivery path performs
-(`crates/bot/src/automod_gateway.rs:207-223`, `:323-341`), cloning the
-resulting config once so one evaluation sees one config. It must not call
+(`crates/bot/src/automod_gateway.rs:207-223`, `:323-341`). Preview uses
+that resolver's policy and mode only in its own snapshot, falling back to
+the activation's last-good config when no overlay can be resolved. It must
+not apply the overlay to the shared runtime while enforcement is in flight.
+Each evaluation sees one config. It must not call
 `AutomodConfig::from_env` itself: that would miss live-snapshot value
 overlays and last-good-policy fallback (§2) and could contradict the next
 real message. Neither reach nor clone exists today — the only config
