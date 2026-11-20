@@ -25,7 +25,11 @@ use super::commands::{
 };
 use super::message_safety;
 
+mod catalog_pages;
+pub mod cursor;
 pub mod pages;
+
+pub use catalog_pages::plan_discovery;
 
 /// One `/help` group: commands that share an audience.
 struct HelpGroup {
@@ -973,8 +977,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn catalog_lists_every_name_in_a_maximum_admitted_registry() {
+    pub(super) fn maximum_publication() -> Vec<CommandDefinition> {
         use crate::commands::{CustomCommand, GUILD_COMMAND_LIMIT};
 
         let router = InteractionRouter::new(all_on());
@@ -985,8 +988,13 @@ mod tests {
                 enabled: true,
             })
             .collect();
-        let defs = router.publish_set(&rows).expect("full registry");
-        assert_eq!(defs.len(), GUILD_COMMAND_LIMIT);
+        router.publish_set(&rows).expect("full registry")
+    }
+
+    #[test]
+    fn catalog_lists_every_name_in_a_maximum_admitted_registry() {
+        let defs = maximum_publication();
+        assert_eq!(defs.len(), crate::commands::GUILD_COMMAND_LIMIT);
         let catalog = help_catalog(&defs);
         let rendered: Vec<_> = catalog
             .sections
