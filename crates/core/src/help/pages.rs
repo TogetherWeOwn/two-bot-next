@@ -1,8 +1,8 @@
 //! Pure packing for ordered discovery content, before Discord rendering.
 
 use crate::message_safety::{
-    neutralize_mentions, text_len, EMBED_DESCRIPTION_LIMIT, EMBED_FIELD_NAME_LIMIT,
-    EMBED_FIELD_VALUE_LIMIT, EMBED_TOTAL_LIMIT,
+    has_message_text, neutralize_mentions, text_len, EMBED_DESCRIPTION_LIMIT,
+    EMBED_FIELD_NAME_LIMIT, EMBED_FIELD_VALUE_LIMIT, EMBED_TOTAL_LIMIT,
 };
 use std::collections::VecDeque;
 
@@ -28,52 +28,54 @@ pub struct Page {
 #[derive(Debug, PartialEq, Eq)]
 pub struct PlanError;
 
-/// Pack all blocks or fail. Reserve space for title, footer and navigation.
-pub fn plan(blocks: &[Block<'_>], reserved: usize) -> Result<Vec<Page>, PlanError> {
-    let desc_limit = EMBED_DESCRIPTION_LIMIT.saturating_sub(reserved);
+/// Pack all blocks or fail. `inside` reserves description units; `outside`
+/// reserves other embed text (e.g. title/footer). Both count against the total.
+/// Content that may split, including field fallbacks, must be plain text:
+/// scalar-safe cuts do not keep Markdown constructs intact across embeds.
+pub fn plan(blocks: &[Block<'_>], outside: usize, inside: usize) -> Result<Vec<Page>, PlanError> {
+    let total = EMBED_TOTAL_LIMIT.saturating_sub(outside.saturating_add(inside));
+    let desc_limit = EMBED_DESCRIPTION_LIMIT.saturating_sub(inside).min(total);
     (desc_limit >= 2).then_some(()).ok_or(PlanError)?;
     let mut pages = vec![Page::default()];
     let (mut bytes, mut units, mut used) = (0usize, SOURCE_UNITS, 0);
     let mut run = String::new();
     for &block in blocks {
-        let (name, value, is_field) = match block {
-            Block::Description(value) => ("", value, false),
-            Block::Field(name, value) => (name, value, true),
+        let (name, value) = match block {
+            Block::Description(value) => ("", value),
+            Block::Field(name, value) => (name, value),
         };
-        // Bound raw input before neutralizing; count fallback separators below.
         bytes = bytes.saturating_add(name.len()).saturating_add(value.len());
-        if bytes > SOURCE_BYTES || value.is_empty() {
+        if bytes > SOURCE_BYTES || (name.is_empty() && value.is_empty()) {
             return Err(PlanError);
         }
         let [name, value] = [name, value].map(neutralize_mentions);
         let [name_units, value_units] = [&name, &value].map(|s| text_len(s));
         let cost = name_units + value_units;
-        let joins = !run.is_empty();
-        let size = cost + usize::from(is_field) + usize::from(joins);
-        units = units.checked_sub(size).ok_or(PlanError)?;
+        units = units.checked_sub(cost).ok_or(PlanError)?;
         if name_units <= EMBED_FIELD_NAME_LIMIT
             && value_units <= EMBED_FIELD_VALUE_LIMIT
-            && !name.trim().is_empty()
-            && !value.trim().is_empty()
+            && cost <= total
+            && has_message_text(&name)
+            && has_message_text(&value)
         {
-            if joins {
+            if !run.is_empty() {
                 used = flush(&mut pages, std::mem::take(&mut run), desc_limit)?;
             }
             let mut page = pages.last_mut().expect("page exists");
-            if page.fields.len() == FIELDS_PER_PAGE || used + cost > EMBED_TOTAL_LIMIT - reserved {
+            if page.fields.len() == FIELDS_PER_PAGE || used + cost > total {
                 page = new_page(&mut pages)?;
                 used = 0;
             }
             page.fields.push((name, value));
             used += cost;
         } else {
-            if joins {
-                run.push('\n');
+            for part in [name, value].into_iter().filter(|s| !s.is_empty()) {
+                if !run.is_empty() {
+                    units = units.checked_sub(1).ok_or(PlanError)?;
+                    run.push('\n');
+                }
+                run.push_str(&part);
             }
-            if is_field {
-                run.extend([name.as_str(), "\n"]);
-            }
-            run.push_str(&value);
         }
     }
     if !run.is_empty() {
@@ -89,7 +91,7 @@ fn flush(pages: &mut Vec<Page>, text: String, limit: usize) -> Result<usize, Pla
     }
     let width = text_len(&text);
     if width <= limit {
-        (!text.trim().is_empty()).then_some(()).ok_or(PlanError)?;
+        has_message_text(&text).then_some(()).ok_or(PlanError)?;
         page.description = text;
         return Ok(width);
     }
@@ -100,7 +102,7 @@ fn flush(pages: &mut Vec<Page>, text: String, limit: usize) -> Result<usize, Pla
     for (byte, ch) in text.char_indices().rev() {
         units += ch.len_utf16();
         // Both ends of the valid window move left. Keep the furthest cut on ties.
-        if !ch.is_whitespace() {
+        if has_message_text(&text[byte..byte + ch.len_utf8()]) {
             for end in (scanned..suffix.len()).filter(|&i| suffix[i].2 != usize::MAX) {
                 let worse = |&old: &usize| suffix[old].2 > suffix[end].2;
                 while ends.back().is_some_and(worse) {
@@ -147,27 +149,40 @@ mod tests {
 
     #[test]
     fn preserves_order_across_notes_and_group_breaks() {
-        let notes = ["Heading", "Note", "End"];
-        let [a, b, c] = notes.map(Description);
-        let blocks = [a, Field("Group", "/a"), b, Field("Next", "/b"), c];
-        let pages = plan(&blocks, 80).unwrap();
-        let actual: Vec<_> = pages.iter().map(|p| p.description.as_str()).collect();
-        assert_eq!(actual, notes);
+        let heading = "x".repeat(4050);
+        let [a, b] = [heading.as_str(), "Note"].map(Description);
+        let blocks = [
+            a,
+            Field("Group", "/a"),
+            b,
+            Field("Next", "/b"),
+            Field("End", ""),
+        ];
+        let pages = plan(&blocks, 80, 0).unwrap();
+        let actual = pages.iter().map(|p| p.description.as_str());
+        assert!(actual.eq([heading.as_str(), "Note", "End"]));
         assert_eq!(pages[0].fields, [("Group".to_owned(), "/a".to_owned())]);
         assert_eq!(pages[1].fields, [("Next".to_owned(), "/b".to_owned())]);
+        let pages = plan(&[Field("End", "\u{200b}")], 80, 0).unwrap();
+        assert_split(pages, "End\n\u{200b}", &[5]);
     }
 
     #[test]
     fn keeps_every_field_past_five_pages() {
-        let tail = "x".repeat(998);
+        let name = "x".repeat(256);
+        let tail = "x".repeat(766);
         let values: Vec<_> = (0..32).map(|i| format!("{i:02}{tail}")).collect();
-        let fields: Vec<_> = values.iter().map(|v| Field("Group", v)).collect();
-        let pages = plan(&fields, 80).unwrap();
+        let mut fields: Vec<_> = values.iter().map(|v| Field(&name, v)).collect();
+        let pages = plan(&fields, 80, 0).unwrap(); // Exactly 32,768 source units.
         assert!(pages.len() > 5);
         assert_eq!(pages[0].fields.len(), 5); // Six would exceed the shared budget.
         let actual = pages.iter().flat_map(|p| &p.fields).map(|(_, v)| v);
         assert!(actual.eq(&values));
-        assert_eq!(plan(&[Field("Group", "/a"); 7], 0).unwrap().len(), 2);
+        let note = "x".repeat(1024);
+        fields[30] = Description(&note);
+        let pages = plan(&fields, 80, 0).unwrap();
+        assert_eq!(pages.last().unwrap().description, note);
+        assert_eq!(plan(&[Field("Group", "/a"); 7], 0, 0).unwrap().len(), 2);
     }
 
     #[test]
@@ -181,16 +196,18 @@ mod tests {
             (format!("{full}{}🔥", " ".repeat(4015)), &[4015, 4016, 2]),
             (format!("{full}{}🔥", " ".repeat(4014)), &[4016, 4016]),
             (deep_suffix, &[4014, 3, 4016]),
+            (format!("{full}\u{200b}"), &[4015, 2]),
         ] {
-            assert_split(plan(&[Description(&input)], 80).unwrap(), &input, lengths);
+            let pages = plan(&[Description(&input)], 0, 80).unwrap();
+            assert_split(pages, &input, lengths);
         }
         let reserved = EMBED_DESCRIPTION_LIMIT - 4;
         for (tail, lengths) in [("d", &[4, 3][..]), ("d   ", &[2, 4, 4])] {
-            let pages = plan(&["abc", " ", tail].map(Description), reserved).unwrap();
+            let pages = plan(&["abc", " ", tail].map(Description), 0, reserved).unwrap();
             assert_split(pages, &format!("abc\n \n{tail}"), lengths);
         }
         let value = format!("@here{}", "🔥".repeat(2200));
-        let pages = plan(&[Description("Notes"), Field("Group", &value)], 80).unwrap();
+        let pages = plan(&[Description("Notes"), Field("Group", &value)], 0, 80).unwrap();
         let expected = format!("Notes\nGroup\n{}", neutralize_mentions(&value));
         assert_split(pages, &expected, &[4016, text_len(&expected) - 4016]);
     }
@@ -199,7 +216,7 @@ mod tests {
         let actual: Vec<_> = pages.iter().map(|p| text_len(&p.description)).collect();
         assert_eq!(actual, lengths);
         for page in &pages {
-            assert!(page.fields.is_empty() && !page.description.trim().is_empty());
+            assert!(page.fields.is_empty() && has_message_text(&page.description));
         }
         let joined: String = pages.into_iter().map(|p| p.description).collect();
         assert_eq!(joined, input);
@@ -207,18 +224,20 @@ mod tests {
 
     #[test]
     fn rejects_a_whole_plan_when_bounds_are_exceeded() {
-        assert_eq!(plan(&[], 80), Ok(vec![Page::default()]));
-        assert_eq!(plan(&[], EMBED_DESCRIPTION_LIMIT), Err(PlanError));
+        assert_eq!(plan(&[], 80, 0), Ok(vec![Page::default()]));
+        assert_eq!(plan(&[], 0, EMBED_DESCRIPTION_LIMIT), Err(PlanError));
+        assert_eq!(plan(&[], EMBED_TOTAL_LIMIT, 1), Err(PlanError));
         for input in [
             String::new(),
             " ".into(),
+            "\u{200b}".into(),
             format!("a{}", " ".repeat(4016)),
             "a".repeat(SOURCE_UNITS + 1),
             "a".repeat(SOURCE_BYTES + 1),
         ] {
-            assert_eq!(plan(&[Description(&input)], 80), Err(PlanError));
+            assert_eq!(plan(&[Description(&input)], 0, 80), Err(PlanError));
         }
         let too_many = [Field("Group", "/a"), Description("Note")].repeat(MAX_HELP_PAGES);
-        assert_eq!(plan(&too_many, 80), Err(PlanError));
+        assert_eq!(plan(&too_many, 80, 0), Err(PlanError));
     }
 }
