@@ -145,7 +145,7 @@ fn interaction(id: u64, action: &str, options: Value, permissions: u64) -> Inter
         "data": {"id": "555555555555555555", "type": 1, "name": action, "options": options},
         "member": {"user": {"id": ACTOR, "username": "test-member", "discriminator": "0", "avatar": null},
                    "roles": [], "flags": 0, "deaf": false, "mute": false, "permissions": permissions.to_string()},
-        "token": "synthetic-interaction-token", "version": 1, "locale": "en-US", "guild_locale": "en-US",
+        "token": "synthetic-interaction-token", "version": 1, "attachment_size_limit": 10485760, "locale": "en-US", "guild_locale": "en-US",
         "authorizing_integration_owners": {"0": GUILD}, "entitlements": []
     })).expect("synthetic Twilight interaction")
 }

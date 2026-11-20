@@ -64,13 +64,7 @@ fn is_loggy(name: &str) -> bool {
     while i < bytes.len() && bytes[i].is_ascii_digit() {
         i += 1;
     }
-    if i > 0
-        && bytes.get(i) == Some(&b'-')
-        && bytes.get(i + 1).is_some_and(|b| b.is_ascii_lowercase())
-    {
-        return true;
-    }
-    false
+    i > 0 && bytes.get(i) == Some(&b'-') && bytes.get(i + 1).is_some_and(|b| b.is_ascii_lowercase())
 }
 
 /// True when already-lowercased `haystack` contains `needle` as a whole

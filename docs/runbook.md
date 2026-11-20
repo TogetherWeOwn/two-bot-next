@@ -97,7 +97,7 @@ separate authorization.
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.156.0 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.161.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.
@@ -2274,59 +2274,32 @@ manual.
 
 #### Staging fault injector drill
 
-Positive-path staging proof uses the staging-only fault injector
-(`wrangler/src/staging-fault.ts`), armed solely through the generated
-staging deploy config by a manual `deploy-staging` dispatch with
-`inject_voice_stall` and/or `inject_unpaired_disconnect` (both default
-false; a push can never arm them, and the switches are never committed
-vars). While armed, the keepalive tick holds
-`two_bot_voice_creator_map_generation` at 1 with age 660 s (past the 600 s
-bound, the 2x300 s refresh) and/or advances
-`two_bot_gateway_disconnects_total` with no recovery so the unpaired rule
-holds an outstanding disconnect; the alert rules and the guard above run
-unmodified, so every recommendation still fires only alongside its trigger.
-Expected timeline at the 60 s keepalive: the stall alert fires on the first
-armed tick, the unpaired alert needs one baseline tick plus three
-outstanding ticks (about 4 min). Observe one full 30-minute cooldown window
-for R1-to-R2 escalation (`creator-map-reload`, no host action, then one
-Operator card for `same-sha-takeover` at the same SHA); a further window
-proves the two-failure CEO page and silence. Disarming re-dispatches the
-same SHA without the flags: the triggers resolve on their own rules and the
-guards reset. Rollback is disarm-by-redeploy; the Worker recommends only, so
-nothing executes from this path.
+**Unsupported on bounded staging.** Do not run a standalone arm/observe/disarm
+sequence. `deploy-staging` releases its run-owned staging window in
+`staging-use-release` after its jobs finish, even if the pinned-history guard
+rejects a prior-SHA run. The 120-minute expiry is a ceiling, not a reservation.
+`STAGING_SOAK_HOLD_UNTIL` can defer rollback rehearsals; it does not keep the
+container running. No supported workflow owns both the fault observation and
+30-minute clear window. Do not extend the window or bypass cleanup to run the
+standalone drill.
 
-Drill procedure (Operator). The soak needs the armed build undisturbed for
-at least 90 minutes (R1, R2 30+ minutes later, STOP 30+ minutes after R2,
-disarm, then a 30-minute clear) while merges keep landing. Arm the hold
-first so no push redeploys staging mid-soak: without it, the next push
-disarms the drill by redeploy.
+The staging-only injector (`wrangler/src/staging-fault.ts`) exercises the
+voice-stall and unpaired-disconnect recommendations; both inputs default off.
+At a 60-second keepalive cadence, a voice stall fires on the first armed tick,
+while an unpaired disconnect needs a baseline and three outstanding ticks.
+The full observation needs R1, R2 at least 30 minutes later, STOP at least 30
+minutes after R2, then disarm and another 30 minutes of clear observations.
+The Worker only recommends remediation; it does not execute it.
 
-1. Pick the drill SHA: the full 40-hex main commit staging currently serves
-   (the `build_revision` on staging `/readyz`, not a guess). The pin must be
-   an ancestor of `origin/main`. Save it once: `DRILL_SHA=<paste the 40-hex
-   SHA>` (replace the placeholder before running; the shell would read the
-   angle brackets as a redirection).
-2. Arm the hold: `gh variable set STAGING_SOAK_HOLD_UNTIL --body
-   "2026-10-19T20:00:00Z"` with an ISO-8601 UTC deadline at most 4h out
-   (past the planned disarm plus the 30-minute clear).
-3. Arm the fault at the pinned SHA: `gh workflow run deploy-staging.yml
-   --ref main -f "sha=$DRILL_SHA" -f inject_voice_stall=true` (add
-   `-f inject_unpaired_disconnect=true` for the crash-loop scope).
-   Explicit arm/disarm dispatches bypass the hold. Error-rate rollback proofs,
-   including the daily automated dispatch, honor it and fail without deploying
-   while it is armed; do not clear the hold for a proof.
-   The arm run stays red by design: the history guard fails it after a green
-   deploy and synthetic so the pin never reads as staging history for the
-   head. Read the deploy and synthetic steps, not the run color.
-4. Run the R1/R2/STOP observation above. Pushes during the window fail fast
-   with the deferral message (red, by design: a quiet green would read as
-   staging history to the production guard); merges stay unblocked.
-5. Disarm at the SAME SHA with no flags: `gh workflow run
-   deploy-staging.yml --ref main -f "sha=$DRILL_SHA"`. The disarm run stays
-   red for the same reason while the pin sits below the head.
-6. Watch the 30-minute clear (triggers resolve, guards reset), then release
-   the hold: `gh variable delete STAGING_SOAK_HOLD_UNTIL`. Letting it expire
-   works too: expiry fails open and the next push deploys normally.
+For an existing arm or disarm run, a successful **wrangler deploy + intended
+rollout gate** job, skipped auto-rollback, and the operation-specific deploy
+ID in `staging-rollout-evidence` show the intended deployment applied without
+an automatic rollback. A failed pinned-history guard still prevents staging
+qualification, and rollout evidence does not prove the container stayed up.
+Separately, only `error-rate-gate.json` in the same artifact with `mode: live`
+and `verdict: pass` proves a measured REST 5xx pass. A green step with `skip`
+or `insufficient_data` does not. For staging qualification or recovery, use
+[the bounded workflow procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
 
 #### Staging guard receipts (persisted remediation evidence)
 
@@ -2497,12 +2470,15 @@ this client rejects production origins. Never roll back to an unfenced wrapper.
 - Record current deployment and known-good **Worker version + Git SHA + image**.
   Versions are not Git SHAs. Check whether migrations or resource changes make
   the old code incompatible; rollback does not rewind Postgres or DO storage.
-- Check the current staging workflow result. `deploy-staging.yml` runs on merge
-  to `main` unless the merge touches only docs, root markdown or repository
-  chrome (then no run starts and staging keeps serving the previous runtime
-  commit), and also allows manual dispatch, but currently accepts a 503
-  readiness response as a scaffold-era gate. **Workflow green is not gateway
-  ready**: require your own first `/readyz` 200 observation and feature evidence.
+- Check the current staging workflow result and the triggers at the relevant
+  ref. A merge does not establish a deploy or exact-SHA qualification; keep
+  promotion held without qualifying evidence and follow the separately
+  authorized [qualification/recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
+  Rollout verification requires `/readyz` to return `200` for the exact build.
+  Warming may return `503`, but that response cannot pass verification. A
+  successful rollout verifies readiness at rollout time, not current readiness
+  or feature coverage. Independently verify a current `/readyz` `200` for the
+  intended build and collect feature evidence through the reviewed paths.
 - Gateway startup connects DML-only and does not migrate; lazy jobs also use
   `skip_migrations=true` and install no web-contract DDL. Schema and grants must
   already be provisioned through the reviewed operator path before runtime
@@ -2898,11 +2874,11 @@ the fence, rollback, takeover and first-ready times, the time-to-ready against
 the workflow's 60 s budget, probe counts, the container image digest and
 instance counts. This workflow interval is not an outage-start recovery
 measurement and cannot prove B2's under-60-second recovery criterion. An empty
-`target_version` instead selects the [daily automatic rollback proof](production-deploy.md#daily-staging-proof),
-which also runs on a daily schedule and verifies both Worker and image restoration.
+`target_version` instead selects the [on-demand automatic rollback proof](production-deploy.md#on-demand-staging-proof),
+which verifies both Worker and image restoration.
 Gateway-session count is not observable from probes; read the Worker logs for it.
 
-The finite-use implementation (activated by merge through the ordinary staging deploy; see the [first-activation bootstrap](staging-rollout-gate.md#first-activation-roll-forward-bootstrap) and its unmet live gates)
+The finite-use implementation (see the [first-activation bootstrap](staging-rollout-gate.md#first-activation-roll-forward-bootstrap) and its unmet live gates)
 validates immutable bounded-policy/environment/SHA bindings on **both** Worker
 versions before startup. Both must stamp the same compiled-image SHA: a
 Worker-only rollback cannot change the image. Old always-on, unstamped or

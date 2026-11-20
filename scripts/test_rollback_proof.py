@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -51,7 +52,7 @@ def local_gh(script):
 NOW = datetime(2026, 10, 23, 6, 23, tzinfo=timezone.utc)
 VERSION = "11111111-1111-1111-1111-111111111111"
 DIGEST = "sha256:" + "a" * 64
-ENV = {"GITHUB_REPOSITORY": proof.REPO, "GITHUB_REF": "refs/heads/main"}
+ENV = {"GITHUB_REPOSITORY": proof.REPO, "GITHUB_REF": "refs/heads/main", "GITHUB_RUN_ATTEMPT": "1"}
 
 
 PASS = {"verdict": "pass", "proof_completed_at": NOW.isoformat()}
@@ -66,39 +67,225 @@ def run(workflow=proof.WORKFLOW, event="workflow_dispatch", conclusion="failure"
 def files():
     return {"staging-rollback-snapshot.json": {
                 "worker": "two-bot-next-staging", "has_previous": True,
-                "serving_version": VERSION, "serving_image": "registry.example/image@" + DIGEST},
+                "serving_version": VERSION, "serving_image": "registry.example/image@" + DIGEST,
+                "serving_rollout_id": "r-before"},
             "auto-rollback-evidence.json": {"worker": "two-bot-next-staging", "variant": "staging",
-                "restored_version": VERSION, "restored_image_digest": DIGEST,
+                "restored_version": VERSION, "restored_image_digest": DIGEST, "restored_rollout_id": "r-new",
                 "gate": "stable-200-gateway-ready", "takeover": True},
-            "error-rate-gate.json": {"mode": "rehearsal", "verdict": "fail", "firing": ["rest_5xx_rate"]}}
+            "error-rate-gate.json": {"mode": "rehearsal", "verdict": "fail", "firing": ["rest_5xx_rate"]},
+            "evidence.json": {"revision": "a" * 40, "rollout_id": "r-forward"},
+            "staging-use.jsonl": [{"schema": "two-bot-staging-pipeline.v1", "action": "window",
+                "environment": "staging", "runId": "123", "runAttempt": 1, "expiresAt": 1000, "sha": "a" * 40}]}
+
+
+def stop_files():
+    attempt = {"environment": "staging", "runId": "123", "runAttempt": 1}
+    use = dict(attempt, expiresAt=1000, phase="released")
+    build = dict(attempt, schema="two-bot-staging-use.v1", sha="c" * 40, deploymentId=VERSION)
+    return {"staging-use-release.jsonl": [
+        dict(attempt, schema="two-bot-staging-pipeline.v1", action="attempt", operation="finish"),
+        dict(build, action="status", running=True, use=dict(use, phase="active")),
+        dict(build, action="release", running=False, use=use),
+    ]}
 
 
 def jobs():
-    return {"total_count": 1, "jobs": [{"name": "wrangler deploy + intended rollout gate",
-            "steps": [{"name": name, "conclusion": outcome} for name, outcome in EXPECTED_STEPS.items()]}]}
+    return {"total_count": 2, "jobs": [{"name": "wrangler deploy + intended rollout gate",
+            "steps": [{"name": name, "conclusion": outcome} for name, outcome in EXPECTED_STEPS.items()]},
+            {"name": "staging-use-release", "conclusion": "success"}]}
+
+
+class RollbackProofValidatorTests(unittest.TestCase):
+    def test_deployed_sha_requires_exact_full_revision(self):
+        requested = "b" * 40
+        proof.validate_deployed_sha({"evidence.json": {"revision": requested}}, requested)
+        for artifact in (None, {}, {"evidence.json": [requested]}, {"evidence.json": {}},
+                         {"evidence.json": {"revision": "a" * 40}}):
+            with self.subTest(artifact=artifact), self.assertRaisesRegex(proof.ProofError, "^deployed_sha_mismatch$"):
+                proof.validate_deployed_sha(artifact, requested)
+        for invalid in (None, "", "a" * 39, "B" * 40, "g" * 40):
+            with self.subTest(sha=invalid), self.assertRaisesRegex(proof.ProofError, "^requested_sha_invalid$"):
+                proof.validate_deployed_sha({"evidence.json": {"revision": invalid}}, invalid)
+
+    def setUp(self):
+        self.sha = "b" * 40
+        correlation = {"environment": "staging", "runId": "123", "runAttempt": 1}
+        pipeline = dict(correlation, schema="two-bot-staging-pipeline.v1", observedAt=NOW.isoformat())
+        client = dict(correlation, schema="two-bot-staging-use.v1", observedAt=NOW.isoformat())
+        original = {"sha": self.sha, "deploymentId": VERSION, "epoch": 1}
+        restored = {"sha": "a" * 40, "deploymentId": "22222222-2222-2222-2222-222222222222", "epoch": 2}
+        acquired_at = int(NOW.timestamp()) * 1000
+        expires_at = acquired_at + 120 * 60 * 1000
+        self.window = dict(pipeline, action="window", expiresAt=expires_at, sha=self.sha, deploymentId=VERSION)
+        self.use = dict(correlation, **restored, acquiredAt=acquired_at, expiresAt=expires_at, phase="released")
+        self.status = dict(client, **restored, action="status", running=True, use=dict(self.use, phase="active"))
+        self.release = dict(client, **restored, action="release", running=False, use=self.use)
+        self.start = {"evidence.json": {"revision": self.sha}, "staging-use.jsonl": [
+            dict(pipeline, action="attempt", operation="begin"),
+            dict(client, **original, action="status", running=False, use=None),
+            self.window,
+            dict(client, **original, action="acquire", running=False,
+                 use=dict(correlation, **original, acquiredAt=acquired_at, expiresAt=expires_at, phase="active")),
+        ]}
+        self.finish = dict(pipeline, action="attempt", operation="finish")
+        self.stop = {"staging-use-release.jsonl": [self.finish, self.status, self.release]}
+
+    def test_shutdown_rejects_wrong_or_missing_outer_release_identity(self):
+        for key, invalid in (("runId", "124"), ("runAttempt", 2), ("runAttempt", True),
+                             ("runId", None), ("runAttempt", None)):
+            with self.subTest(key=key, value=invalid), patch.dict(self.release):
+                if invalid is None:
+                    del self.release[key]
+                else:
+                    self.release[key] = invalid
+                with self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                    proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+    def test_shutdown_requires_ordered_finish_receipt(self):
+        for rows in ([self.release], [self.finish, self.release], [self.status, self.release],
+                     [self.finish, self.release, self.status],
+                     [self.finish, self.status, self.release, self.status],
+                     [dict(self.finish, operation="begin"), self.status, self.release]):
+            with self.subTest(actions=[row["action"] for row in rows]), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_not_confirmed$"):
+                proof.validate_shutdown(self.start, {"staging-use-release.jsonl": rows}, 123, self.sha)
+
+    def test_shutdown_requires_initial_window_on_deployed_sha(self):
+        with patch.dict(self.window, sha="c" * 40), \
+                self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+            proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+        with patch.dict(self.start["evidence.json"], revision="c" * 40), \
+                self.assertRaisesRegex(proof.ProofError, "^deployed_sha_mismatch$"):
+            proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+    def test_shutdown_rejects_matching_expiry_above_safe_integer_limit(self):
+        expiry = {"expiresAt": 9007199254740992}
+        with patch.dict(self.window, expiry), patch.dict(self.use, expiry), \
+                patch.dict(self.status["use"], expiry), \
+                self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+            proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+    def test_shutdown_requires_matching_finish_build(self):
+        for key, other in (("sha", self.sha), ("deploymentId", VERSION)):
+            with self.subTest(field=key), patch.dict(self.release, {key: other}), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+        for key, invalid in (("sha", "A" * 40), ("sha", 1), ("deploymentId", "bad/id"),
+                             ("deploymentId", "a" * 129), ("deploymentId", [])):
+            with self.subTest(field=key, value=invalid), patch.dict(self.status, {key: invalid}), \
+                    patch.dict(self.release, {key: invalid}), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+        for key in ("sha", "deploymentId"):
+            with self.subTest(missing=key), patch.dict(self.status), patch.dict(self.release), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                del self.status[key], self.release[key]
+                proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+    def test_shutdown_confirms_release_of_original_window_after_rebind(self):
+        proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+    def test_shutdown_rejects_malformed_receipts_and_run_id(self):
+        for start, stop in ((None, self.stop), (self.start, {}), (self.start, {"staging-use-release.jsonl": [False]}),
+                            ({"staging-use.jsonl": self.window}, self.stop)):
+            with self.subTest(start=start, stop=stop), self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_invalid$"):
+                proof.validate_shutdown(start, stop, 123, self.sha)
+        for invalid in (True, 0, "123"):
+            with self.subTest(run_id=invalid), self.assertRaisesRegex(proof.ProofError, "^shutdown_run_id_invalid$"):
+                proof.validate_shutdown(self.start, self.stop, invalid, self.sha)
+
+    def test_shutdown_rejects_missing_duplicate_or_failed_outcomes(self):
+        begin = self.start["staging-use.jsonl"]
+        finish = self.stop["staging-use-release.jsonl"]
+        for start, stop in ((begin[:2], finish), (begin + [self.window], finish), (begin, []),
+                            (begin, finish + [self.release]), (begin + [{"action": "failed"}], finish),
+                            (begin, finish[:2] + [{"action": "not-owned"}]),
+                            (begin, finish + [{"action": "failed"}])):
+            with self.subTest(start=[row["action"] for row in start], stop=[row["action"] for row in stop]), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_not_confirmed$"):
+                proof.validate_shutdown(dict(self.start, **{"staging-use.jsonl": start}),
+                                        {"staging-use-release.jsonl": stop}, 123, self.sha)
+
+    def test_shutdown_requires_same_staging_run_attempt_and_expiry_and_stopped_runtime(self):
+        for target, changes in (
+            (self.window, {"schema": "unknown", "environment": "production", "runId": "124", "runAttempt": True, "expiresAt": 0}),
+            (self.finish, {"schema": "unknown", "runId": "124"}),
+            (self.status, {"schema": "unknown", "runAttempt": 2, "running": 0, "use": None}),
+            (self.status["use"], {"runId": "124", "expiresAt": 1001, "phase": "unknown"}),
+            (self.release, {"schema": "unknown", "environment": "production", "running": 0, "use": []}),
+            (self.use, {"environment": "production", "runId": "124", "runAttempt": 2, "expiresAt": 1001, "phase": "active"}),
+        ):
+            for key, invalid in changes.items():
+                with self.subTest(key=key, value=invalid), patch.dict(target, {key: invalid}), \
+                        self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                    proof.validate_shutdown(self.start, self.stop, 123, self.sha)
 
 
 class RollbackProofTests(unittest.TestCase):
+    def test_invalid_sha_refuses_before_dispatch(self):
+        for requested in (None, "", "a" * 39, "A" * 40, "g" * 40):
+            with self.subTest(requested=requested), patch.object(proof, "gh") as gh:
+                with self.assertRaisesRegex(proof.ProofError, "requested_sha_invalid"):
+                    proof.prove(requested_sha=requested)
+                gh.assert_not_called()
+
+    def test_deployed_sha_evidence_must_match_requested_commit(self):
+        for candidate in (None, "b" * 40):
+            evidence = files()
+            evidence["evidence.json"]["revision"] = candidate
+            with self.subTest(candidate=candidate), redirect_stdout(io.StringIO()), \
+                    patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, run(), jobs()]), \
+                    patch.object(proof, "artifact_files", side_effect=[evidence, stop_files()]):
+                with self.assertRaisesRegex(proof.ProofError, "^deployed_sha_mismatch$"):
+                    proof.prove(requested_sha="a" * 40)
+
     def test_dispatch_is_exactly_once_staging_main_and_restores_both_members(self):
-        with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, run(), jobs()]) as gh, \
-                patch.object(proof, "artifact_files", return_value=files()) as artifacts, redirect_stdout(io.StringIO()):
-            result = proof.prove()
+        child = dict(run(), head_sha="b" * 40)
+        with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, child, jobs()]) as gh, \
+                patch.object(proof, "artifact_files", side_effect=[files(), stop_files()]) as artifacts, redirect_stdout(io.StringIO()):
+            result = proof.prove(requested_sha="a" * 40)
         self.assertEqual(gh.call_count, 3)
         self.assertEqual(gh.call_args_list[0].args, (f"repos/{proof.REPO}/actions/workflows/deploy-staging.yml/dispatches",))
         self.assertEqual(gh.call_args_list[0].kwargs["body"],
-                         {"ref": "main", "inputs": {"inject_error_rate_spike": True}})
-        artifacts.assert_called_once_with(123, "staging-rollout-evidence")
+                         {"ref": "main", "inputs": {"inject_error_rate_spike": True, "recover_prior_sha": True, "sha": "a" * 40}})
+        self.assertEqual([call.args for call in artifacts.call_args_list],
+                         [(123, "staging-rollout-evidence"), (123, "staging-use-deploy-stop-123-1")])
         self.assertEqual(result["restored_version"], VERSION)
         self.assertEqual(result["restored_image_digest"], DIGEST)
         self.assertEqual(result["child_conclusion"], "failure")
+        self.assertEqual((result["child_sha"], result["workflow_sha"]), ("a" * 40, "b" * 40))
         self.assertEqual(result["verdict"], "pass")
+
+    def test_successful_rollback_without_confirmed_shutdown_never_passes(self):
+        for outcome in ("failure", "skipped", None):
+            child_jobs = jobs()
+            child_jobs["jobs"][1]["conclusion"] = outcome
+            with self.subTest(outcome=outcome), \
+                    patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, run(), child_jobs]), \
+                    patch.object(proof, "artifact_files") as artifacts, redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(proof.ProofError, "shutdown_job_not_successful"):
+                    proof.prove(requested_sha="a" * 40)
+                artifacts.assert_not_called()
+        with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, run(), jobs()]), \
+                patch.object(proof, "artifact_files", side_effect=[files(), {}]), redirect_stdout(io.StringIO()):
+            with self.assertRaises(proof.ProofError):
+                proof.prove(requested_sha="a" * 40)
 
     def test_missing_dispatch_id_never_searches_latest_or_redispatches(self):
         for response in ({}, {"workflow_run_id": True}, {"workflow_run_id": "123"}):
-            with self.subTest(response=response), patch.object(proof, "gh", return_value=response) as gh:
-                with self.assertRaisesRegex(proof.ProofError, "dispatch_missing_exact_run_id"):
-                    proof.prove()
-                self.assertEqual(gh.call_count, 1)
+            with self.subTest(response=response), patch.object(proof, "gh", return_value=response) as gh, \
+                    tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, ENV), \
+                    redirect_stderr(io.StringIO()) as errors:
+                path = Path(directory) / "proof.json"
+                args = ["run", "--sha", "a" * 40, "--evidence", str(path)]
+                for attempt, code in (("1", "dispatch_missing_exact_run_id_no_retry"), ("2", "wrapper_rerun_refused")):
+                    with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": attempt}):
+                        self.assertEqual(proof.main(args), 1)
+                    self.assertEqual(gh.call_count, 1)
+                    self.assertEqual(json.loads(errors.getvalue().splitlines()[-1])["code"], code)
+                    self.assertFalse(path.exists())
 
     def test_child_provenance_or_unexpected_outcome_is_not_a_proof(self):
         mutations = [lambda r: r.update(conclusion="success"), lambda r: r.update(conclusion="cancelled"),
@@ -112,18 +299,18 @@ class RollbackProofTests(unittest.TestCase):
             with self.subTest(child=child), patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, child]), \
                     patch.object(proof, "artifact_files") as artifacts, redirect_stdout(io.StringIO()):
                 with self.assertRaises(proof.ProofError):
-                    proof.prove()
+                    proof.prove(requested_sha="a" * 40)
                 artifacts.assert_not_called()
 
     def test_transient_display_title_before_completion_is_tolerated(self):
         pending = run()
         pending.update(status="in_progress", conclusion=None, display_title="deploy-staging")
         with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, pending, run(), jobs()]) as gh, \
-                patch.object(proof, "artifact_files", return_value=files()) as artifacts, \
+                patch.object(proof, "artifact_files", side_effect=[files(), stop_files()]) as artifacts, \
                 redirect_stdout(io.StringIO()):
-            result = proof.prove(sleep=lambda _: None, clock=lambda: 0)
+            result = proof.prove(requested_sha="a" * 40, sleep=lambda _: None, clock=lambda: 0)
         self.assertEqual(gh.call_count, 4)
-        artifacts.assert_called_once_with(123, "staging-rollout-evidence")
+        self.assertEqual(artifacts.call_count, 2)
         self.assertEqual(result["verdict"], "pass")
         self.assertEqual(result["child_run_id"], 123)
 
@@ -133,7 +320,7 @@ class RollbackProofTests(unittest.TestCase):
         with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, child]), \
                 patch.object(proof, "artifact_files") as artifacts, redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(proof.ProofError, "child_not_rehearsal"):
-                proof.prove()
+                proof.prove(requested_sha="a" * 40)
             artifacts.assert_not_called()
 
     def test_timeout_does_not_cancel_or_redispatch_a_mutating_child(self):
@@ -142,7 +329,7 @@ class RollbackProofTests(unittest.TestCase):
         with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, child]) as gh, \
                 redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(proof.ProofError, "staging_run_timeout"):
-                proof.prove(clock=iter([0, proof.MAX_WAIT + 1]).__next__)
+                proof.prove(requested_sha="a" * 40, clock=iter([0, proof.MAX_WAIT + 1]).__next__)
         self.assertEqual(gh.call_count, 2)
 
     def test_every_expected_step_is_required(self):
@@ -161,7 +348,7 @@ class RollbackProofTests(unittest.TestCase):
                         side_effect=[{"workflow_run_id": 123}, run(), job]), \
                         patch.object(proof, "artifact_files") as artifacts, redirect_stdout(io.StringIO()):
                     with self.assertRaisesRegex(proof.ProofError, "unexpected_staging_step_outcome"):
-                        proof.prove()
+                        proof.prove(requested_sha="a" * 40)
                     artifacts.assert_not_called()
 
     def test_evidence_rejects_wrong_version_image_staging_gate_or_injection(self):
@@ -171,6 +358,12 @@ class RollbackProofTests(unittest.TestCase):
             ("staging-rollback-snapshot.json", "serving_image", "unversioned:latest"),
             ("auto-rollback-evidence.json", "restored_version", "22222222-2222-2222-2222-222222222222"),
             ("auto-rollback-evidence.json", "restored_image_digest", "sha256:" + "b" * 64),
+            ("auto-rollback-evidence.json", "restored_rollout_id", None),
+            ("auto-rollback-evidence.json", "restored_rollout_id", "../invalid"),
+            ("auto-rollback-evidence.json", "restored_rollout_id", "r-forward"),
+            ("auto-rollback-evidence.json", "restored_rollout_id", "r-before"),
+            ("evidence.json", "rollout_id", None),
+            ("evidence.json", "rollout_id", "x" * 129),
             ("auto-rollback-evidence.json", "variant", "production"),
             ("auto-rollback-evidence.json", "takeover", False),
             ("auto-rollback-evidence.json", "gate", "ready-once"),
@@ -183,13 +376,16 @@ class RollbackProofTests(unittest.TestCase):
             evidence[file][key] = value
             with self.subTest(file=file, key=key), self.assertRaises(proof.ProofError):
                 proof.validate_evidence(evidence)
-        self.assertEqual(proof.validate_evidence(files())["gate"], "stable-200-gateway-ready")
+        restored = proof.validate_evidence(files())
+        self.assertEqual(restored["gate"], "stable-200-gateway-ready")
+        self.assertEqual(restored["restored_rollout_id"], "r-new")
 
     def test_artifact_is_exact_bounded_and_never_extracted(self):
         data = io.BytesIO()
         with zipfile.ZipFile(data, "w") as archive:
             for name, value in files().items():
-                archive.writestr("../" + name, json.dumps(value))
+                content = "\n".join(json.dumps(row) for row in value) if name.endswith(".jsonl") else json.dumps(value)
+                archive.writestr("../" + name, content)
         listing = {"total_count": 1, "artifacts": [{"id": 1, "name": "staging-rollout-evidence",
                     "size_in_bytes": len(data.getvalue()), "expired": False}]}
         with patch.object(proof, "gh", side_effect=[listing, data.getvalue()]):
@@ -340,7 +536,7 @@ class RollbackProofTests(unittest.TestCase):
     @staticmethod
     def alert_text(code):
         return (f"two-bot-next ALERT staging rollback proof: {code}. "
-                "Inspect the daily staging drill and its child run before retrying; never drill production. "
+                "Inspect the on-demand staging drill and its child run before retrying; never drill production. "
                 "Runbook: https://github.com/TogetherWeOwn/two-bot-next/blob/main/docs/production-deploy.md#daily-staging-proof "
                 "| logs https://example.test/run/123")
 
@@ -351,10 +547,14 @@ class RollbackProofTests(unittest.TestCase):
             self.assertEqual(proof.main(["alert"]), 0)
         opened.assert_called_once_with(os.environ, "staging-rollback-proof",
                                        "staging rollback proof failed", self.alert_text("daily_proof_failed"))
+        runbook = Path(__file__).resolve().parent.parent / "docs/production-deploy.md"
+        self.assertIn('<a id="daily-staging-proof"></a>', runbook.read_text())
 
     def test_dry_run_has_no_effects_and_missing_evidence_refuses_before_dispatch(self):
-        with patch.object(proof, "gh") as gh, patch.object(proof, "alert") as alert, redirect_stdout(io.StringIO()):
-            self.assertEqual(proof.main(["run", "--dry-run"]), 0)
+        with patch.object(proof, "gh") as gh, patch.object(proof, "alert") as alert, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(proof.main(["run", "--dry-run", "--sha", "b" * 40]), 0)
+            self.assertEqual(json.loads(output.getvalue())["dispatch"],
+                             {"ref": "main", "inputs": {"inject_error_rate_spike": True, "recover_prior_sha": True, "sha": "b" * 40}})
             gh.assert_not_called()
             alert.assert_not_called()
         with patch.dict(os.environ, ENV), patch.object(proof, "prove") as prove, redirect_stderr(io.StringIO()):
@@ -544,13 +744,18 @@ class PromotionAndHoldTests(unittest.TestCase):
                     self.assertEqual(result[1], {})
 
     def test_daily_rehearsal_honors_the_hold_but_manual_arm_disarm_keeps_exception(self):
-        lines = (Path(__file__).resolve().parents[1] / ".github/workflows/deploy-staging.yml").read_text().splitlines()
-        start = lines.index("      - name: Defer the push while the soak hold is armed")
-        start = lines.index("        run: |", start) + 1
-        end = start
-        while end < len(lines) and (not lines[end].strip() or lines[end].startswith("          ")):
-            end += 1
-        shell = textwrap.dedent("\n".join(lines[start:end]))
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/deploy-staging.yml").read_text()
+        jobs = re.findall(r"^  soak-hold:\n(.*?)(?=^ {0,2}[^ \t\n#]|\Z)", workflow, re.M | re.S)
+        self.assertEqual(len(jobs), 1, "expected exactly one soak-hold job")
+        # Bind to the hold variable within this job, not the step's display name.
+        binding = "          HOLD_UNTIL: ${{ vars.STAGING_SOAK_HOLD_UNTIL }}"
+        steps = re.split(r"^      - ", jobs[0], flags=re.M)[1:]
+        hold_steps = [step for step in steps if binding in step.splitlines()]
+        self.assertEqual(len(hold_steps), 1, "expected exactly one hold step in soak-hold")
+        scripts = re.findall(r"^        run: \|\n((?:^ {10}.*(?:\n|\Z)|^\n)+)", hold_steps[0], re.M)
+        self.assertEqual(len(scripts), 1, "expected exactly one inline script in the soak-hold step")
+        shell = textwrap.dedent(scripts[0])
+        self.assertTrue(shell.strip(), "expected a non-empty soak-hold script")
         now = datetime.now(timezone.utc)
         for rehearsal, hold, expected in (
             ("true", now + timedelta(hours=2), 1), ("false", now + timedelta(hours=2), 0),

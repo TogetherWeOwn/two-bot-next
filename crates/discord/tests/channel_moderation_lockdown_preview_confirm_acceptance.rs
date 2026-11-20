@@ -153,7 +153,7 @@ fn slash(id: u64, permissions: u64) -> Interaction {
                  "options": [{"name": "reason", "type": 3, "value": "raid drill"}]},
         "member": {"user": {"id": ACTOR, "username": "test-member", "discriminator": "0", "avatar": null},
                    "roles": [], "flags": 0, "deaf": false, "mute": false, "permissions": permissions.to_string()},
-        "token": "synthetic-interaction-token", "version": 1, "locale": "en-US", "guild_locale": "en-US",
+        "token": "synthetic-interaction-token", "version": 1, "attachment_size_limit": 10485760, "locale": "en-US", "guild_locale": "en-US",
         "authorizing_integration_owners": {"0": GUILD}, "entitlements": []
     })).expect("synthetic Twilight interaction")
 }
@@ -168,7 +168,7 @@ fn press_in(id: u64, guild: &str, user: &str, permissions: u64, custom_id: &str)
         "guild_id": guild, "channel": {"id": CHANNEL, "type": 0, "permissions": permissions.to_string()},
         "member": {"user": {"id": user, "username": "member", "discriminator": "0", "avatar": null},
                    "roles": [], "flags": 0, "deaf": false, "mute": false, "permissions": permissions.to_string()},
-        "token": "synthetic-interaction-token", "version": 1, "locale": "en-US", "guild_locale": "en-US",
+        "token": "synthetic-interaction-token", "version": 1, "attachment_size_limit": 10485760, "locale": "en-US", "guild_locale": "en-US",
         "authorizing_integration_owners": {"0": guild}, "entitlements": [],
         "data": {"custom_id": custom_id, "component_type": 2}
     })).expect("synthetic Twilight component interaction")

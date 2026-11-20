@@ -204,6 +204,7 @@ fn synthetic_slash(name: &str, application: u64, guild: u64, interaction_id: u64
     Interaction {
         app_permissions: None,
         application_id: Id::new(application),
+        attachment_size_limit: 10_485_760,
         authorizing_integration_owners: ApplicationIntegrationMap {
             guild: None,
             user: None,

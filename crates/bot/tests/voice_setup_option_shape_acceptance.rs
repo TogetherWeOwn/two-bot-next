@@ -487,6 +487,7 @@ impl Drop for Fixture {
 fn interaction(name: &str, options: Vec<CommandDataOption>) -> Interaction {
     let mut interaction: Interaction = serde_json::from_value(json!({
         "id": "2", "application_id": "1", "type": 2, "token": "fixture-only",
+        "attachment_size_limit": 10485760,
         "guild_id": GUILD.to_string(), "authorizing_integration_owners": {},
         "data": {"id": "3", "name": name, "type": 1},
         "member": {

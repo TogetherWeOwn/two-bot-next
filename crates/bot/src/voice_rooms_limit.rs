@@ -15,6 +15,7 @@ use two_bot_core::{
     voice_ownership::require_room_owner,
     voice_room_controls::{parse_limit, unlimit, LimitError, RoomLimit, MAX_ROOM_LIMIT},
 };
+use two_bot_discord::brand::{ephemeral_reply_embed, EmbedKind};
 
 /// How long a `/limit` reply waits for the queued write to finish. Discord
 /// wants the interaction answered within three seconds, so a write that is
@@ -53,6 +54,8 @@ impl LimitCommand {
 pub(super) enum LimitReply {
     /// Refused or answered without a Discord write.
     Done(String),
+    /// The worker is temporarily unavailable.
+    Pending(String),
     /// The write is queued; `ack` resolves when it finishes.
     Queued {
         limit: RoomLimit,
@@ -217,7 +220,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let (channel, headcount, writable) = {
             let live = self.live.read_state();
             if !live.ready {
-                return LimitReply::Done(
+                return LimitReply::Pending(
                     "The voice worker isn't warmed up yet — try again in a moment.".to_owned(),
                 );
             }
@@ -416,6 +419,18 @@ where
         is_admin: bool,
         command: LimitCommand,
     ) -> Option<String> {
+        self.run_limit_classified(guild, actor_id, is_admin, command)
+            .await
+            .map(|(text, _)| text)
+    }
+
+    async fn run_limit_classified(
+        &self,
+        guild: Snowflake,
+        actor_id: Snowflake,
+        is_admin: bool,
+        command: LimitCommand,
+    ) -> Option<(String, EmbedKind)> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor
@@ -435,15 +450,17 @@ where
         let reply = match tokio::time::timeout(LIMIT_ACK_WAIT, inbox).await {
             Ok(Ok(reply)) => reply,
             _ => {
-                return Some(
+                return Some((
                     "I couldn't confirm the change. Check the room's limit, then try \
                      again."
                         .to_owned(),
-                );
+                    EmbedKind::Warn,
+                ));
             }
         };
         match reply {
-            LimitReply::Done(text) => Some(text),
+            LimitReply::Done(text) => Some((text, EmbedKind::Danger)),
+            LimitReply::Pending(text) => Some((text, EmbedKind::Warn)),
             LimitReply::Queued { limit, ack } => {
                 let remaining = LIMIT_ACK_WAIT.saturating_sub(start.elapsed());
                 let outcome = match tokio::time::timeout(remaining, ack).await {
@@ -451,15 +468,21 @@ where
                     // The worker dropped the write unanswered (it halted, or
                     // the room was forgotten): we cannot say it landed.
                     Ok(Err(_)) => {
-                        return Some(
+                        return Some((
                             "I couldn't confirm the change. Check the room's limit, then try \
                              again."
                                 .to_owned(),
-                        );
+                            EmbedKind::Warn,
+                        ));
                     }
                     Err(_) => None,
                 };
-                Some(outcome_text(command, limit, outcome))
+                let kind = match outcome {
+                    Some(LimitAck::Applied) => EmbedKind::Ok,
+                    Some(LimitAck::Delayed) | None => EmbedKind::Warn,
+                    Some(LimitAck::Refused(_) | LimitAck::Obsolete) => EmbedKind::Danger,
+                };
+                Some((outcome_text(command, limit, outcome), kind))
             }
         }
     }
@@ -483,19 +506,34 @@ where
     F: Future<Output = ()> + Send,
 {
     let Some(actor_id) = invoker_member_id(interaction) else {
-        reply(ephemeral_response(&format!(
-            "I couldn't tell who invoked /{} — try again.",
-            command.name()
-        )))
+        reply(limit_response(
+            format!(
+                "I couldn't tell who invoked /{} — try again.",
+                command.name()
+            ),
+            EmbedKind::Danger,
+        ))
         .await;
         return true;
     };
-    let text = runtime
-        .run_limit(guild_id, actor_id, is_admin, command)
+    let (text, kind) = runtime
+        .run_limit_classified(guild_id, actor_id, is_admin, command)
         .await
         .unwrap_or_else(|| {
-            "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+            (
+                "The voice worker isn't warmed up yet — try again in a moment.".to_owned(),
+                EmbedKind::Warn,
+            )
         });
-    reply(ephemeral_response(&text)).await;
+    reply(limit_response(text, kind)).await;
     true
+}
+
+pub(super) fn limit_response(text: String, kind: EmbedKind) -> InteractionResponse {
+    let mut response = ephemeral_response("");
+    if let Some(data) = &mut response.data {
+        data.content = None;
+        data.embeds = Some(vec![ephemeral_reply_embed(kind, "Voice", text)]);
+    }
+    response
 }

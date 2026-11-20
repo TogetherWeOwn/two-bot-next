@@ -70,7 +70,7 @@ fn ready_payload(gw_addr: &SocketAddr) -> String {
 }
 
 /// Minimal `INTERACTION_CREATE` for `/ping`: twilight-model requires
-/// `application_id`, `authorizing_integration_owners`, `id`, `token`, `type`
+/// `application_id`, `attachment_size_limit`, `authorizing_integration_owners`, `id`, `token`, `type`
 /// plus `data` for application-command interactions.
 fn interaction_create_payload() -> String {
     serde_json::json!({
@@ -79,6 +79,7 @@ fn interaction_create_payload() -> String {
         "t": "INTERACTION_CREATE",
         "d": {
             "application_id": APP_ID.to_string(),
+            "attachment_size_limit": 10485760,
             "authorizing_integration_owners": {"0": GUILD_ID.to_string()},
             "id": INTERACTION_ID.to_string(),
             "token": INTERACTION_TOKEN,

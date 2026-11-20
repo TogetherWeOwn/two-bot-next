@@ -25,10 +25,8 @@ name: dora-metrics
 # git config. A refused or conflicting push fails the run closed; the
 # compute artifact still preserves the numbers for that week.
 #
-# `ops/**` sits in deploy-staging's push ignore list, so any future main-side
-# delivery evidence restarts nothing: without that entry a metrics merge
-# would bounce the staging gateway and feed the production promotion queue a
-# no-op SHA. The weekly side-branch push itself triggers no deploys.
+# The weekly report stays on the automation branch. Publishing it does not
+# update main or trigger a deployment.
 #
 # Proof: dispatch with dry_run from any branch to run the real computation
 # against the live API and upload the files as an artifact without

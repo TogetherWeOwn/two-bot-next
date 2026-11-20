@@ -53,6 +53,22 @@ fn public_cmd(worker: &mut Worker, actor: u64) -> String {
     worker.apply_privacy(actor, false, "Ana", PrivacyCommand::Public)
 }
 
+#[tokio::test]
+async fn privacy_classifies_noop_queued_and_refused_outcomes() {
+    let (mut worker, _) = worker().await;
+    let (text, kind) = worker.apply_privacy_classified(OWNER, false, "Ana", PrivacyCommand::Public);
+    assert_eq!(text, "This room is already public.");
+    assert_eq!(kind, EmbedKind::Ok);
+
+    let (text, kind) =
+        worker.apply_privacy_classified(OWNER, false, "Ana", PrivacyCommand::Private);
+    assert!(text.starts_with("Making this room private:"));
+    assert_eq!(kind, EmbedKind::Warn);
+
+    let (_, kind) = worker.apply_privacy_classified(GUEST, false, "Guest", PrivacyCommand::Public);
+    assert_eq!(kind, EmbedKind::Danger);
+}
+
 fn calls(trace: &Trace) -> Vec<String> {
     trace.lock().unwrap().clone()
 }

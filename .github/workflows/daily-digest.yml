@@ -34,26 +34,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  rollback-proof-watch:
-    name: alert on a missing daily staging rollback proof
-    if: github.ref == 'refs/heads/main' && inputs.dry_run != true
-    permissions:
-      contents: read
-      actions: read # Read workflow runs and artifacts for staging-rollback-proof-watch.py.
-      issues: write # open or close the staging-rollback-proof incident issue
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 1
-      - name: Check daily rollback proof freshness independently of the digest
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python3 scripts/rollback_proof.py watch
-
   digest:
     name: cut the daily digest tag and release
     permissions:
@@ -91,7 +71,7 @@ jobs:
         run: node .github/scripts/daily-digest.cjs request
       - name: Plan the CalVer digest (read-only)
         id: plan
-        uses: TogetherWeOwn/.github/actions/calver@2f0f9667c091e5d877b343d4f722a30b96124561
+        uses: TogetherWeOwn/.github/actions/calver@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
         with:
           runs-on-json: '"ubuntu-latest"'
           request: ${{ steps.request.outputs.request }}
@@ -110,7 +90,7 @@ jobs:
       - name: Publish the CalVer tag and Release
         id: publish
         if: steps.digest.outputs.publish == 'true'
-        uses: TogetherWeOwn/.github/actions/calver@2f0f9667c091e5d877b343d4f722a30b96124561
+        uses: TogetherWeOwn/.github/actions/calver@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
         with:
           runs-on-json: '"ubuntu-latest"'
           request: ${{ steps.digest.outputs.publish_request }}

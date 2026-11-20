@@ -285,6 +285,28 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "clean plan drifted",
     )?;
 
+    // Dormant heat has an owner for restore, but none of the service roles
+    // may read or write it. Check effective privileges, not just schema usage.
+    as_role(pool, &roles[0], "TRUNCATE public.voice_heat_hours").await?;
+    for role in &roles[1..] {
+        require(
+            !sqlx::query_scalar::<_, bool>(
+                "SELECT has_table_privilege($1::text, 'public.voice_heat_hours',
+                         'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')",
+            )
+            .bind(role)
+            .fetch_one(pool)
+            .await?,
+            "dormant voice heat has a service role grant",
+        )?;
+    }
+    require(
+        sqlx::query_scalar::<_, bool>("SELECT to_regclass('web_v1.voice_heat') IS NULL")
+            .fetch_one(pool)
+            .await?,
+        "dormant voice heat must not publish a reader view",
+    )?;
+
     exercise_member_grants(pool, roles).await?;
     exercise_member_store(pool, &roles[1]).await?;
 
