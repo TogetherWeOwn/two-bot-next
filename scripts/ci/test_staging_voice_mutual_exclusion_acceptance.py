@@ -620,6 +620,7 @@ def repository_errors(wfs, canonical):
             env = str(node.get("environment") or "")
             touches = STAGING_TOUCH.search(str(node)) or "staging" in env
             classified = (file in (DEPLOY, *CONSUMERS) or (file, name) in holders
+                          or (file == STAGING_SOAK and admitted_soak(wfs))
                           or (measurement and (name in MEASUREMENT_STAGING_JOBS or name in MEASUREMENT_CALLS))
                           or (file, name) in EXEMPT)
             if touches and not classified:
@@ -820,8 +821,7 @@ def promotion_soak_errors(wfs, canonical):
 
 
 def lifecycle_errors(wfs):
-    if STAGING_SOAK in wfs:
-        wfs = load_all(workflows=wfs)
+    wfs = load_all(workflows=wfs) if STAGING_SOAK in wfs else wfs
     errors = []
     canonical = canonical_group(wfs.get(DEPLOY, {}), errors)
     if canonical is None:
