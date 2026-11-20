@@ -1,5 +1,5 @@
-//! Discord invocation mapping for `/automod-preview`. The core decoder owns
-//! validation; this module does not authorize, evaluate, or send replies.
+//! Map Discord invocations and drive preview attempts. The router owns
+//! authorization and the caller owns ephemeral delivery and metric emission.
 
 use twilight_model::application::interaction::{
     application_command::{CommandData, CommandOptionValue},
@@ -7,6 +7,24 @@ use twilight_model::application::interaction::{
 };
 use two_bot_core::automod_preview_input::{
     decode_preview_input, DecodedPreviewInput, PreviewInputRefusal, PreviewOptionValue,
+};
+
+#[cfg(feature = "db")]
+use {
+    crate::automod_activation::{AutomodActivation, AutomodFacts},
+    std::sync::{Mutex, PoisonError},
+    tokio::time::Instant,
+    twilight_model::application::interaction::{InteractionData, InteractionType},
+    two_bot_core::{
+        automod_preview_attempt::{attempt_preview, AttemptContext, AttemptResult},
+        automod_preview_flow::{plan_pre_claim, PreClaimPlan},
+        automod_preview_input::build_preview_message,
+        automod_preview_limiter::PreviewRateLimiter,
+        automod_preview_report::{metric_unavailable, PREVIEW_UNAVAILABLE_REPLY},
+        automod_preview_store::SqlPreviewStore,
+        automod_runtime::AutomodClaimLedger,
+        funnel::format_iso_millis,
+    },
 };
 
 /// The invoker's context only. A DM has no guild or roles and must still pass
@@ -69,6 +87,83 @@ pub fn decode_interaction_options(
     data: &CommandData,
 ) -> Result<DecodedPreviewInput, PreviewInputRefusal> {
     decode_preview_input(&map_preview_options(data))
+}
+
+/// Drive an authorized invocation with a refreshed activation and its UTC receipt.
+/// The caller owns ephemeral delivery and reserves time for it after `deadline`.
+#[cfg(feature = "db")]
+pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
+    activation: Option<&AutomodActivation<L, F>>,
+    pool: &sqlx::PgPool,
+    limiter: &Mutex<PreviewRateLimiter>,
+    interaction: &Interaction,
+    receipt_ms: u64,
+    deadline: Instant,
+) -> AttemptResult {
+    let (InteractionType::ApplicationCommand, Some(InteractionData::ApplicationCommand(data))) =
+        (interaction.kind, interaction.data.as_ref())
+    else {
+        return unavailable(None);
+    };
+    let Some(request) = PreviewRequest::from_interaction(interaction) else {
+        return unavailable(None);
+    };
+    let decoded = decode_interaction_options(data);
+    let scoped = decoded.as_ref().ok().and_then(|input| {
+        let (active, guild) = activation.zip(request.guild_id.as_deref())?;
+        let snapshot =
+            active.preview(|runtime| runtime.preview_snapshot(guild, &request.actor_id))?;
+        Some((guild, input, snapshot))
+    });
+    let plan = plan_pre_claim(
+        decoded.as_ref().map_err(|refusal| *refusal),
+        scoped.is_some(),
+        scoped.is_some(),
+        &request.interaction_id.to_string(),
+    );
+    if let PreClaimPlan::AnswerNow { reply, metric } = plan {
+        return AttemptResult { reply, metric };
+    }
+    let Some((guild_id, input, (dry_run, evaluate))) = scoped else {
+        return unavailable(None);
+    };
+    let Ok(message) = build_preview_message(
+        input,
+        guild_id,
+        &request.channel_id,
+        &request.actor_id,
+        &request.role_ids,
+        request.interaction_id,
+        receipt_ms,
+    ) else {
+        return unavailable(Some(dry_run));
+    };
+    let receipt_iso = format_iso_millis(i64::try_from(receipt_ms).unwrap_or(i64::MAX));
+    let (actor_id, id) = (&request.actor_id, request.interaction_id);
+    let context = AttemptContext {
+        guild_id,
+        actor_id,
+        channel_id: &request.channel_id,
+        receipt_iso: &receipt_iso,
+        dry_run,
+    };
+    let store = SqlPreviewStore::new(pool, deadline);
+    let admit = || {
+        limiter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .admit_before(actor_id, guild_id, id, deadline)
+    };
+    let evaluate = || evaluate(&message, input.mention_count);
+    attempt_preview(plan, context, store, admit, evaluate).await
+}
+
+#[cfg(feature = "db")]
+fn unavailable(dry_run: Option<bool>) -> AttemptResult {
+    AttemptResult {
+        reply: PREVIEW_UNAVAILABLE_REPLY.to_owned(),
+        metric: Some(metric_unavailable(dry_run)),
+    }
 }
 
 #[cfg(test)]
