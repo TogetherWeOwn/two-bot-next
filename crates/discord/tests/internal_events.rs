@@ -955,6 +955,12 @@ mod database {
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use sqlx::{ConnectOptions, PgPool, Row};
     use std::str::FromStr;
+    use std::time::Duration;
+    use two_bot_core::internal_action_store::{
+        AuditSubject, DiscordId, EventOutcome, ExecutionClaim, InternalActionStore, InternalClaim,
+        InternalStoreError, RequestIdentity, TerminalResponse,
+    };
+    use two_bot_core::internal_actions::body_hash;
 
     // Same fail-closed effective-options guard as internal_action_store.rs.
     fn test_options(url: &str) -> Result<PgConnectOptions, &'static str> {
@@ -1115,6 +1121,284 @@ mod database {
             ""
         };
         sqlx::AssertSqlSafe(format!("{command} {schema}{suffix}"))
+    }
+
+    // Only the isolated schema owner runs DDL. The store connects as the
+    // fixture runtime principal, not as a superuser with SET ROLE.
+    async fn claim_runtime(db: &TestDb) -> PgPool {
+        for migration in [
+            include_str!("../../cutover/migrations/0350_internal_actions.sql"),
+            include_str!("../../cutover/migrations/0351_internal_action_roles.sql"),
+            include_str!("../../cutover/migrations/0352_internal_action_not_sent.sql"),
+            include_str!("../../cutover/migrations/0415_internal_event_keys.sql"),
+            include_str!("../../cutover/migrations/0423_internal_actions_version_conflict.sql"),
+            include_str!("../../cutover/migrations/0424_internal_action_outcome.sql"),
+            include_str!("../../cutover/migrations/0425_internal_action_audit_resources.sql"),
+            include_str!("../../cutover/migrations/0448_internal_action_stop_reason.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&db.pool).await.unwrap();
+        }
+        // `ddl` validates the generated identifier; use it for the role too.
+        sqlx::query(ddl("CREATE ROLE", &db.schema))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        // LOGIN uses the job container's existing trust auth, with no password.
+        let name = &db.schema;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "ALTER ROLE {name} LOGIN; \
+             GRANT USAGE ON SCHEMA {name} TO {name}; \
+             GRANT SELECT, INSERT, UPDATE ON internal_idempotency TO {name}; \
+             GRANT SELECT, INSERT ON internal_action_log TO {name}; \
+             GRANT USAGE ON SEQUENCE internal_idempotency_intent_id_seq, \
+                 internal_action_log_audit_id_seq TO {name};"
+        )))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let runtime = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_with(
+                db.pool
+                    .connect_options()
+                    .as_ref()
+                    .clone()
+                    .username(name)
+                    .options([
+                        ("search_path", name.as_str()),
+                        ("statement_timeout", "5000"),
+                        ("lock_timeout", "2000"),
+                    ]),
+            )
+            .await
+            .expect("connect as disposable claim runtime");
+        let confined: bool = sqlx::query_scalar(
+            "SELECT current_user = $1 AND session_user = $1 \
+             AND NOT (r.rolsuper OR r.rolcreaterole OR r.rolbypassrls) \
+             AND NOT pg_has_role(c.relowner, 'MEMBER') \
+             AND NOT has_table_privilege(c.oid, 'TRIGGER') \
+             AND NOT has_parameter_privilege('session_replication_role', 'SET') \
+             FROM pg_roles r CROSS JOIN pg_class c \
+             WHERE r.rolname = current_user AND c.oid = 'internal_idempotency'::regclass",
+        )
+        .bind(name)
+        .fetch_one(&runtime)
+        .await
+        .unwrap();
+        assert!(confined, "claim runtime must not own or control the guard");
+        runtime
+    }
+
+    async fn install_claim_denial(owner: &PgPool) {
+        // AFTER INSERT sees actual rows only: the speculative insert in
+        // ON CONFLICT DO NOTHING must still reach the existing-row branches.
+        sqlx::raw_sql(
+            "CREATE FUNCTION fixture_deny_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+               BEGIN RAISE EXCEPTION 'fixture denies new event claim' USING ERRCODE = '42501'; END;
+             $$;
+             CREATE TRIGGER fixture_deny_insert AFTER INSERT ON internal_idempotency
+               FOR EACH ROW WHEN (NEW.action IN ('event.upsert', 'event.cancel'))
+               EXECUTE FUNCTION fixture_deny_claim();
+             CREATE TRIGGER fixture_deny_reacquire AFTER UPDATE ON internal_idempotency
+               FOR EACH ROW WHEN (NEW.action IN ('event.upsert', 'event.cancel')
+                                  AND OLD.state = 'not_sent' AND NEW.state = 'in_flight')
+               EXECUTE FUNCTION fixture_deny_claim();",
+        )
+        .execute(owner)
+        .await
+        .unwrap();
+    }
+
+    async fn claim_snapshot(observer: &PgPool) -> Value {
+        sqlx::query_scalar(
+            "SELECT jsonb_build_array(
+                 (SELECT jsonb_agg(to_jsonb(i) ORDER BY intent_id) FROM internal_idempotency i),
+                 (SELECT jsonb_agg(to_jsonb(l) ORDER BY audit_id) FROM internal_action_log l),
+                 (SELECT jsonb_agg(to_jsonb(k) ORDER BY guild_id, event_key) FROM internal_event_keys k),
+                 (SELECT jsonb_agg(to_jsonb(e) ORDER BY guild_id, event_id) FROM scheduled_events e)
+             )",
+        )
+        .fetch_one(observer)
+        .await
+        .unwrap()
+    }
+
+    fn execution_claim(result: InternalClaim) -> ExecutionClaim {
+        let InternalClaim::Claimed(claim) = result else {
+            panic!("expected committed execution authority, got {result:?}");
+        };
+        claim
+    }
+
+    const CLAIM_CALLER: &str = "fixture-caller";
+    const CLAIM_PAYLOAD: &[u8] = br#"{"event_key":"fixture-event"}"#;
+
+    fn claim_identity(key: &str, action: &str) -> RequestIdentity {
+        RequestIdentity::new(CLAIM_CALLER, key, action, CLAIM_PAYLOAD).unwrap()
+    }
+
+    // The observer is a different pool. A returned authority is not enough:
+    // verify the stored identity, state and intent audit are committed too.
+    async fn assert_committed_claim(
+        observer: &PgPool,
+        claim: &ExecutionClaim,
+        key: &str,
+        action: &str,
+    ) {
+        let committed: bool = sqlx::query_scalar(
+            "SELECT i.state = 'in_flight' AND i.caller_hash = $2 AND i.key_hash = $3
+                    AND i.payload_hash = $4 AND i.action = $5 AND i.guild_id = $6
+             FROM internal_idempotency i JOIN internal_action_log l USING (intent_id)
+             WHERE i.intent_id = $1 AND l.phase = 'intent'",
+        )
+        .bind(claim.intent_id())
+        .bind(body_hash(CLAIM_CALLER.as_bytes()))
+        .bind(body_hash(key.as_bytes()))
+        .bind(body_hash(CLAIM_PAYLOAD))
+        .bind(action)
+        .bind(GUILD)
+        .fetch_one(observer)
+        .await
+        .unwrap();
+        assert!(committed, "committed claim must retain its request binding");
+    }
+
+    async fn compare_claim_case(db: &TestDb, store: &InternalActionStore, guarded: bool) {
+        let subject = AuditSubject {
+            guild_id: Some(DiscordId::new(GUILD).unwrap()),
+            ..AuditSubject::default()
+        };
+        let completed = claim_identity("fixture-completed", "event.upsert");
+        let unknown = claim_identity("fixture-unknown", "event.cancel");
+        let released = claim_identity("fixture-released", "event.upsert");
+        let event_receipt = TerminalResponse::Success {
+            resource_id: Some(DiscordId::new(EVENT).unwrap()),
+            affected: 1,
+            outcome: Some(EventOutcome::Created),
+            stop_reason: None,
+        };
+        let claim = execution_claim(store.claim(&completed, &subject).await.unwrap());
+        store.finish(&claim, &event_receipt).await.unwrap();
+        let claim = execution_claim(store.claim(&unknown, &subject).await.unwrap());
+        store.mark_unknown(&claim).await.unwrap();
+        let claim = execution_claim(store.claim(&released, &subject).await.unwrap());
+        let released_id = claim.intent_id();
+        store.release_proven_not_sent(claim).await.unwrap();
+        InternalActionStore::new(db.pool.clone())
+            .put_event_key(GUILD, "fixture-event", EVENT)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO scheduled_events (guild_id, event_id, name, starts_at, status, updated_at)
+             VALUES ($1, $2, 'Fixture event', $3, 'scheduled', $3)",
+        )
+        .bind(GUILD)
+        .bind(EVENT)
+        .bind(OBSERVED)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let prior = claim_snapshot(&db.pool).await;
+        if guarded {
+            install_claim_denial(&db.pool).await;
+        }
+        assert!(matches!(store.claim(&completed, &subject).await.unwrap(),
+            InternalClaim::Replay(receipt) if receipt == event_receipt));
+        assert!(matches!(
+            store.claim(&unknown, &subject).await.unwrap(),
+            InternalClaim::NeedsReconciliation
+        ));
+        let changed_payload = RequestIdentity::new(
+            CLAIM_CALLER,
+            "fixture-completed",
+            "event.upsert",
+            b"different bytes",
+        )
+        .unwrap();
+        assert!(matches!(
+            store.claim(&changed_payload, &subject).await.unwrap(),
+            InternalClaim::Mismatch
+        ));
+        assert!(matches!(
+            store
+                .claim(&released, &AuditSubject::default())
+                .await
+                .unwrap(),
+            InternalClaim::Mismatch
+        ));
+        assert_eq!(
+            claim_snapshot(&db.pool).await,
+            prior,
+            "duplicate cases changed rows"
+        );
+
+        for (key, action) in [
+            ("fixture-upsert", "event.upsert"),
+            ("fixture-cancel", "event.cancel"),
+            ("fixture-released", "event.upsert"),
+        ] {
+            let result = store.claim(&claim_identity(key, action), &subject).await;
+            if guarded {
+                assert_eq!(
+                    result.unwrap_err(),
+                    InternalStoreError::Unavailable,
+                    "{key}"
+                );
+                assert_eq!(
+                    claim_snapshot(&db.pool).await,
+                    prior,
+                    "{key} changed durable rows"
+                );
+            } else {
+                let claim = execution_claim(result.unwrap());
+                assert_committed_claim(&db.pool, &claim, key, action).await;
+                if key == "fixture-released" {
+                    assert_eq!(
+                        claim.intent_id(),
+                        released_id,
+                        "reacquisition changed intent"
+                    );
+                }
+            }
+        }
+
+        let key = "fixture-announcement";
+        let action = "announcement.post";
+        let identity = claim_identity(key, action);
+        let claim = execution_claim(store.claim(&identity, &subject).await.unwrap());
+        assert_committed_claim(&db.pool, &claim, key, action).await;
+        let receipt = TerminalResponse::Success {
+            resource_id: Some(DiscordId::new(CHANNEL).unwrap()),
+            affected: 1,
+            outcome: None,
+            stop_reason: None,
+        };
+        store.finish(&claim, &receipt).await.unwrap();
+        assert!(matches!(store.claim(&identity, &subject).await.unwrap(),
+            InternalClaim::Replay(replay) if replay == receipt));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb; CI explicitly runs this test"]
+    async fn event_claim_denial_preserves_receipts_and_non_event_claims() {
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+        for guarded in [false, true] {
+            let db = TestDb::new().await;
+            let runtime = claim_runtime(&db).await;
+            compare_claim_case(&db, &InternalActionStore::new(runtime.clone()), guarded).await;
+            runtime.close().await;
+            let drop_role = ddl("DROP ROLE", &db.schema);
+            let admin = db.admin.clone();
+            db.pool.close().await;
+            sqlx::query(ddl("DROP SCHEMA", &db.schema))
+                .execute(&admin)
+                .await
+                .unwrap();
+            sqlx::query(drop_role).execute(&admin).await.unwrap();
+            admin.close().await;
+        }
     }
 
     #[tokio::test]
