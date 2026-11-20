@@ -35,6 +35,7 @@ pub use channel_moderation::{
     ChannelRuntimeError,
 };
 pub mod help_embed_smoke;
+pub mod help_navigation;
 pub mod intents;
 pub mod interactions;
 pub mod internal_actions;
