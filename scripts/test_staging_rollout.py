@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import copy
 from datetime import datetime, timezone
+from email.message import Message
 import importlib.util
 import io
 import json
@@ -1406,11 +1407,77 @@ class OrchestrationTests(OfflineTestCase):
         client = verify_client()
         status, _, body = ready_response()
         client.request_routes[URL + "/readyz"] = [(status, {}, body)]
-        with patch.object(rollout, "save", side_effect=OSError(SENTINEL)):
+        before = set(self.root.iterdir())
+
+        def partial_write(path, _record):
+            Path(path).write_text('{"error":')
+            raise OSError(SENTINEL)
+
+        with patch.object(rollout, "save", side_effect=partial_write):
             self.assert_gate("serving_worker_mismatch", rollout.verify, self.args, client)
+        self.assertEqual(set(self.root.iterdir()), before)
         self.assertIn("readiness mismatch evidence could not be written", self.stdout.getvalue())
         self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
+
+    def test_forward_mismatch_invalid_evidence_path_keeps_cli_verdict(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        status, _, body = ready_response()
+        client.request_routes[URL + "/readyz"] = [(status, {}, body)]
+        argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", "."]
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
+            self.assertEqual(rollout.main(), 1)
+        self.assertIn("staging rollout gate failed: serving_worker_mismatch", self.stdout.getvalue())
+        self.assertNotIn("invalid_local_receipt", self.stdout.getvalue())
+        self.assertEqual([call for call in client.calls if call[0] == "request"],
+                         [("request", URL + "/readyz")])
+
+    def test_forward_mismatch_preserves_both_verification_inputs(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        status, _, body = ready_response()
+        for arg in ("receipt", "output"):
+            original = Path(getattr(self.args, arg)).read_bytes()
+            for layout in ("same-path", "symlink", "hardlink"):
+                with self.subTest(arg=arg, layout=layout):
+                    evidence = self.root / f"{arg}-{layout}.json"
+                    sidecar = evidence.with_suffix(".readyz-mismatch.json")
+                    sidecar.write_bytes(original)
+                    input_path = sidecar if layout == "same-path" else sidecar.with_suffix(".input")
+                    if layout == "symlink":
+                        input_path.symlink_to(sidecar)
+                    elif layout == "hardlink":
+                        input_path.hardlink_to(sidecar)
+                    client = verify_client()
+                    client.request_routes[URL + "/readyz"] = [(status, {}, body)]
+                    args = argparse.Namespace(**(vars(self.args) | {arg: str(input_path), "evidence": str(evidence)}))
+                    inputs = {path: Path(path).read_bytes() for path in (args.receipt, args.output)}
+                    self.assert_gate("serving_worker_mismatch", rollout.verify, args, client)
+                    self.assertEqual({path: Path(path).read_bytes() for path in inputs}, inputs)
+                    self.assertEqual(sidecar.read_bytes(), original)
+                    self.assertFalse(evidence.exists())
+
+    def test_forward_worker_mismatch_distinguishes_single_from_ambiguous_header(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        status, _, body = ready_response()
+        other_version = "87654321-1234-4234-8234-123456789abc"
+        for versions, observed in [([other_version], other_version), ([other_version, VERSION], "invalid")]:
+            with self.subTest(versions=versions):
+                headers = Message()
+                for version in versions:
+                    headers["X-Two-Worker-Version"] = version
+                client = verify_client()
+                client.request_routes[URL + "/readyz"] = [(status, headers, body)]
+                self.assert_gate("serving_worker_mismatch", rollout.verify, self.args, client)
+                record = json.loads((self.root / "evidence.readyz-mismatch.json").read_bytes())
+                self.assertEqual(record["error"], "serving_worker_mismatch")
+                self.assertEqual(record["expected"]["worker_version"], VERSION)
+                self.assertEqual(record["observed"]["worker_version"], observed)
+                self.assert_no_evidence()
 
     def test_success_exact_pinned_evidence_with_post_probe_rechecks(self):
         self.prepare_baseline()

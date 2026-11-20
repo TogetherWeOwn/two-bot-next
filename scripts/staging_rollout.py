@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import time
 import tomllib
 from urllib.error import HTTPError, URLError
@@ -551,15 +552,23 @@ def runtime_ready(status, headers, body, version, revision, build_id, deploy_id)
                                    for part in components)
 
 
-def save_forward_mismatch(evidence, code, headers, body, version, baseline, pinned, image,
+def save_forward_mismatch(args, code, headers, body, version, baseline, pinned, image,
                           rollout_observed_at, sample_received_at):
     """Retain only bounded identities, never probe text or configurations."""
+    sidecar = Path(args.evidence).with_suffix(".readyz-mismatch.json")
+    if sidecar.exists() and any(sidecar.samefile(path) for path in (args.receipt, args.output)):
+        raise ValueError("mismatch evidence aliases a verification input")
     missing = object()
 
     def field(value, valid):
         if value is missing:
             return "absent"
         return value if isinstance(value, str) and valid(value) else "invalid"
+
+    def singleton_header(name, valid):
+        if hasattr(headers, "get_all") and len(headers.get_all(name, [])) > 1:
+            return "invalid"
+        return field(headers.get(name, missing), valid)
 
     def utc(seconds):
         return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="milliseconds")
@@ -575,15 +584,11 @@ def save_forward_mismatch(evidence, code, headers, body, version, baseline, pinn
         "deploy_id": ("deploy_id", is_deploy_id_shape),
     }
     expected = {"worker_version": version}
-    observed = {"worker_version": field(headers.get("x-two-worker-version", missing),
-                                        re.compile(UUID).fullmatch)}
+    observed = {"worker_version": singleton_header("x-two-worker-version", re.compile(UUID).fullmatch)}
     for key, (baseline_key, valid) in compiled_fields.items():
         expected[key] = field(baseline[baseline_key], valid)
         observed[key] = field(report.get(key, missing), lambda value: value == UNSTAMPED or valid(value))
 
-    request_id = headers.get("x-request-id", missing)
-    if hasattr(headers, "get_all") and len(headers.get_all("x-request-id", [])) > 1:
-        request_id = None
     target_version = pinned["target_version"]  # already checked as a nonnegative int
     record = {
         "error": code, "readyz_status": 200, "sample_received_at_utc": utc(sample_received_at),
@@ -591,7 +596,7 @@ def save_forward_mismatch(evidence, code, headers, body, version, baseline, pinn
         "run_attempt": field(os.environ.get("GITHUB_RUN_ATTEMPT", missing),
                              re.compile(r"[1-9][0-9]{0,19}").fullmatch),
         # Match the existing Worker/Rust correlation ID contract; do not mint one.
-        "request_id": field(request_id, re.compile(r"[0-9A-HJKMNP-TV-Z]{26}").fullmatch),
+        "request_id": singleton_header("x-request-id", re.compile(r"[0-9A-HJKMNP-TV-Z]{26}").fullmatch),
         "expected": expected, "observed": observed,
         "control_plane": {
             "rollout_id": pinned["id"],  # already shape- and length-checked
@@ -600,10 +605,11 @@ def save_forward_mismatch(evidence, code, headers, body, version, baseline, pinn
             "target_image_digest": image.rsplit("@", 1)[1],  # checked by docker_image and the rollout gate
         },
     }
-    try:
-        save(Path(evidence).with_suffix(".readyz-mismatch.json"), record)
-    except OSError:
-        print("staging rollout readiness mismatch evidence could not be written")
+    # Stage privately on the same filesystem; publish only a complete record.
+    with tempfile.TemporaryDirectory(dir=sidecar.parent, prefix=".readyz-mismatch-") as temporary:
+        staged = Path(temporary) / "record.json"
+        save(staged, record)
+        os.replace(staged, sidecar)
 
 
 def rollout_observation(row):
@@ -1055,8 +1061,12 @@ def verify(args, client):
                                           baseline["build_id"], baseline["deploy_id"])
                 except GateError as error:
                     if str(error) in ("serving_worker_mismatch", "serving_image_mismatch"):
-                        save_forward_mismatch(args.evidence, str(error), headers, body, version, baseline,
-                                              pinned, image, rollout_observed_at, sample_received_at)
+                        try:
+                            save_forward_mismatch(args, str(error), headers, body, version, baseline,
+                                                  pinned, image, rollout_observed_at, sample_received_at)
+                        except Exception:
+                            # The optional sidecar must not replace the gate's verdict.
+                            print("staging rollout readiness mismatch evidence could not be written")
                     raise
                 if ready:
                     health, health_headers, _ = client.request(url + "/health")
