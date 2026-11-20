@@ -25,20 +25,19 @@ fn check_horizon(retention_days: i32) -> Result<(), VoiceHeatStoreError> {
     Ok(())
 }
 
-// Bind retention days at $1 in both queries. Use elapsed 24-hour days even in
-// non-UTC sessions; now() is fixed at the start of the transaction.
+// Bind retention days at $1. Use elapsed 24-hour days even in non-UTC sessions.
 macro_rules! voice_heat_cutoff_sql {
-    () => {
-        "now() - make_interval(hours => $1 * 24)"
+    ($clock:literal) => {
+        concat!($clock, " - make_interval(hours => $1 * 24)")
     };
 }
 
 macro_rules! stale_voice_heat_sql {
-    ($operation:literal) => {
+    ($operation:literal, $cutoff:expr) => {
         concat!(
             $operation,
             " FROM public.voice_heat_hours WHERE hour_start_utc < ",
-            voice_heat_cutoff_sql!()
+            $cutoff
         )
     };
 }
@@ -63,17 +62,30 @@ pub async fn flush_hour_buckets(
     let observed: Vec<_> = buckets.iter().map(|b| b.last_observed_at).collect();
 
     let mut tx = pool.begin().await?;
-    prune_voice_heat(&mut *tx, VOICE_HEAT_RETENTION_DAYS).await?;
-    let written = sqlx::query(concat!(
+    // Conflict with a sweep's DELETE and with other flushes, but not readers.
+    // The next statement samples the cutoff after the wait, not at BEGIN.
+    sqlx::query("LOCK TABLE public.voice_heat_hours IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    let cutoff: time::OffsetDateTime = sqlx::query_scalar(concat!(
+        "SELECT ",
+        voice_heat_cutoff_sql!("statement_timestamp()")
+    ))
+    .bind(VOICE_HEAT_RETENTION_DAYS)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(stale_voice_heat_sql!("DELETE", "$1"))
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?;
+    let written = sqlx::query(
         "INSERT INTO public.voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
          SELECT hour_start_utc, samples, occupancy_sum, last_observed_at
          FROM UNNEST($2::timestamptz[], $3::bigint[], $4::bigint[], $5::timestamptz[])
              AS incoming(hour_start_utc, samples, occupancy_sum, last_observed_at)
-         WHERE hour_start_utc >= ",
-        voice_heat_cutoff_sql!(),
-        " ON CONFLICT (hour_start_utc) DO NOTHING"
-    ))
-    .bind(VOICE_HEAT_RETENTION_DAYS)
+         WHERE hour_start_utc >= $1 ON CONFLICT (hour_start_utc) DO NOTHING",
+    )
+    .bind(cutoff)
     .bind(hours)
     .bind(samples)
     .bind(sums)
@@ -92,10 +104,13 @@ pub async fn count_stale_voice_heat<'e>(
     retention_days: i32,
 ) -> Result<u64, VoiceHeatStoreError> {
     check_horizon(retention_days)?;
-    let stale: i64 = sqlx::query_scalar(stale_voice_heat_sql!("SELECT count(*)"))
-        .bind(retention_days)
-        .fetch_one(executor)
-        .await?;
+    let stale: i64 = sqlx::query_scalar(stale_voice_heat_sql!(
+        "SELECT count(*)",
+        voice_heat_cutoff_sql!("now()")
+    ))
+    .bind(retention_days)
+    .fetch_one(executor)
+    .await?;
     Ok(stale as u64)
 }
 
@@ -106,10 +121,13 @@ pub async fn prune_voice_heat<'e>(
     retention_days: i32,
 ) -> Result<u64, VoiceHeatStoreError> {
     check_horizon(retention_days)?;
-    let deleted = sqlx::query(stale_voice_heat_sql!("DELETE"))
-        .bind(retention_days)
-        .execute(executor)
-        .await?;
+    let deleted = sqlx::query(stale_voice_heat_sql!(
+        "DELETE",
+        voice_heat_cutoff_sql!("now()")
+    ))
+    .bind(retention_days)
+    .execute(executor)
+    .await?;
     Ok(deleted.rows_affected())
 }
 

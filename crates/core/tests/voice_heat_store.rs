@@ -239,7 +239,10 @@ async fn flush_prunes_and_filters_with_the_same_strict_cutoff() {
     sqlx::raw_sql(
         "CREATE SCHEMA flush_test_clock;
          CREATE FUNCTION flush_test_clock.now() RETURNS timestamptz
-             LANGUAGE sql STABLE AS $$ SELECT TIMESTAMPTZ '2025-03-17 12:00:00+00' $$;",
+             LANGUAGE sql STABLE AS $$ SELECT TIMESTAMPTZ '2025-03-17 11:59:59.999999+00' $$;
+         CREATE TABLE flush_test_clock.clock AS SELECT flush_test_clock.now() AS ts;
+         CREATE FUNCTION flush_test_clock.statement_timestamp() RETURNS timestamptz
+             LANGUAGE sql STABLE AS $$ SELECT ts FROM flush_test_clock.clock $$;",
     )
     .execute(fixture.pool())
     .await
@@ -252,18 +255,39 @@ async fn flush_prunes_and_filters_with_the_same_strict_cutoff() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let cutoff = now - Duration::days(35);
+    let cutoff = now - Duration::days(35) + Duration::microseconds(1);
     let stale = bucket(cutoff - Duration::microseconds(1), 1, 10);
     let boundary = bucket(cutoff, 1, 20);
     let fresh = bucket(cutoff + Duration::microseconds(1), 0, 0);
     seed_expired_hour(&pool, stale.hour_start).await;
 
-    assert_eq!(
-        flush_hour_buckets(&pool, &[stale, boundary, fresh])
+    // The sweep makes its deletion and newer clock visible together. A flush
+    // using its transaction clock or sampling too early still admits this hour.
+    let mut sweep = fixture.pool().begin().await.unwrap();
+    assert_eq!(prune_voice_heat(&mut *sweep, 35).await.unwrap(), 1);
+    sqlx::query("UPDATE flush_test_clock.clock SET ts = ts + interval '1 microsecond'")
+        .execute(&mut *sweep)
+        .await
+        .unwrap();
+    let buckets = [stale, boundary, fresh];
+    let (written, ()) = tokio::join!(flush_hour_buckets(&pool, &buckets), async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT FROM pg_locks WHERE NOT granted
+                 AND pg_backend_pid() = ANY(pg_blocking_pids(pid)))",
+            )
+            .fetch_one(&mut *sweep)
             .await
-            .unwrap(),
-        2
-    );
+            .unwrap()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("flush should wait for the sweep");
+        sweep.commit().await.unwrap();
+    });
+    assert_eq!(written.unwrap(), 2);
     assert_eq!(
         stored_buckets(&pool).await,
         [stored_bucket(&fresh), stored_bucket(&boundary)]
