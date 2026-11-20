@@ -126,7 +126,7 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     if let PreClaimPlan::AnswerNow { reply, metric } = plan {
         return AttemptResult { reply, metric };
     }
-    let Some((guild_id, input, snapshot)) = scoped else {
+    let Some((guild_id, input, (dry_run, evaluate))) = scoped else {
         return unavailable(None);
     };
     let Ok(message) = build_preview_message(
@@ -138,7 +138,7 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
         request.interaction_id,
         receipt_ms,
     ) else {
-        return unavailable(Some(snapshot.dry_run()));
+        return unavailable(Some(dry_run));
     };
     let receipt_iso = format_iso_millis(i64::try_from(receipt_ms).unwrap_or(i64::MAX));
     let actor_id = &request.actor_id;
@@ -148,7 +148,7 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
         actor_id,
         channel_id: &request.channel_id,
         receipt_iso: &receipt_iso,
-        dry_run: snapshot.dry_run(),
+        dry_run,
     };
     attempt_preview(
         plan,
@@ -160,7 +160,7 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
                 .unwrap_or_else(PoisonError::into_inner)
                 .admit_before(actor_id, guild_id, id, deadline)
         },
-        || snapshot.evaluate(&message, input.mention_count),
+        || evaluate(&message, input.mention_count),
     )
     .await
 }

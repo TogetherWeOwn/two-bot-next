@@ -10,6 +10,7 @@
 //! A redelivered interaction does not charge again. Refusals never charge.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 use tokio::time::Instant;
 
 /// Minimum gap between two admitted previews of one actor in one guild.
@@ -25,6 +26,9 @@ pub const PREVIEW_LIMITER_CAPACITY: usize = 1024;
 
 const HOUR_MS: u64 = 3_600_000;
 const DAY_MS: u64 = 86_400_000;
+const HOUR: u128 = Duration::from_millis(HOUR_MS).as_nanos();
+const DAY: u128 = Duration::from_millis(DAY_MS).as_nanos();
+const COOLDOWN: u128 = Duration::from_millis(PREVIEW_MIN_INTERVAL_MS).as_nanos();
 
 /// Outcome of a limiter check. `ReplayDuplicate` means the interaction was
 /// already charged. The caller replays a committed row without evaluating, or
@@ -38,36 +42,37 @@ pub enum PreviewRateDecision {
 
 #[derive(Debug, Default)]
 struct ActorBucket {
-    last_admit_ms: Option<u64>,
-    hour: VecDeque<u64>,
-    day: VecDeque<u64>,
-    seen: HashMap<u64, u64>,
+    // Nanosecond ticks since the limiter was created.
+    last_admit: Option<u128>,
+    hour: VecDeque<u128>,
+    day: VecDeque<u128>,
+    seen: HashMap<u64, u128>,
 }
 
 impl ActorBucket {
-    fn prune(&mut self, now_ms: u64) {
+    fn prune(&mut self, now: u128) {
         while self
             .hour
             .front()
-            .is_some_and(|t| now_ms.saturating_sub(*t) >= HOUR_MS)
+            .is_some_and(|t| now.saturating_sub(*t) >= HOUR)
         {
             self.hour.pop_front();
         }
         while self
             .day
             .front()
-            .is_some_and(|t| now_ms.saturating_sub(*t) >= DAY_MS)
+            .is_some_and(|t| now.saturating_sub(*t) >= DAY)
         {
             self.day.pop_front();
         }
-        self.seen.retain(|_, t| now_ms.saturating_sub(*t) < DAY_MS);
+        self.seen.retain(|_, t| now.saturating_sub(*t) < DAY);
         if self.hour.is_empty() && self.day.is_empty() && self.seen.is_empty() {
-            self.last_admit_ms = None;
+            self.last_admit = None;
         }
     }
 
     fn is_live(&self) -> bool {
-        self.last_admit_ms.is_some() || !self.hour.is_empty() || !self.seen.is_empty()
+        self.last_admit.is_some() || !self.hour.is_empty() || !self.seen.is_empty()
     }
 }
 
@@ -103,15 +108,13 @@ impl PreviewRateLimiter {
         deadline: Instant,
     ) -> Option<PreviewRateDecision> {
         let now = Instant::now();
-        (now < deadline).then(|| {
-            let ms = now.duration_since(self.epoch).as_millis();
-            self.check_and_admit(actor, guild, interaction, ms.try_into().unwrap_or(u64::MAX))
-        })
+        let ticks = now.duration_since(self.epoch).as_nanos();
+        (now < deadline).then(|| self.admit_at(actor, guild, interaction, ticks))
     }
 
-    fn prune_all(&mut self, now_ms: u64) {
+    fn prune_all(&mut self, now: u128) {
         for bucket in self.buckets.values_mut() {
-            bucket.prune(now_ms);
+            bucket.prune(now);
         }
         self.buckets.retain(|_, bucket| bucket.is_live());
     }
@@ -128,22 +131,22 @@ impl PreviewRateLimiter {
     /// Strict-decode refusals never reach this call, so every `Admit` here
     /// is an evaluated preview (including `no_match` and `exempt`); every
     /// `RateLimited` evaluated nothing and charged nothing.
-    fn check_and_admit(
+    fn admit_at(
         &mut self,
         actor: &str,
         guild: &str,
         interaction: u64,
-        now_ms: u64,
+        now: u128,
     ) -> PreviewRateDecision {
-        self.prune_all(now_ms);
+        self.prune_all(now);
         let key = (actor.to_owned(), guild.to_owned());
         if let Some(bucket) = self.buckets.get(&key) {
             if bucket.seen.contains_key(&interaction) {
                 return PreviewRateDecision::ReplayDuplicate;
             }
             if bucket
-                .last_admit_ms
-                .is_some_and(|last| now_ms.saturating_sub(last) < PREVIEW_MIN_INTERVAL_MS)
+                .last_admit
+                .is_some_and(|last| now.saturating_sub(last) < COOLDOWN)
             {
                 return PreviewRateDecision::RateLimited;
             }
@@ -162,10 +165,10 @@ impl PreviewRateLimiter {
             }
         }
         let bucket = self.buckets.entry(key).or_default();
-        bucket.last_admit_ms = Some(now_ms);
-        bucket.hour.push_back(now_ms);
-        bucket.day.push_back(now_ms);
-        bucket.seen.insert(interaction, now_ms);
+        bucket.last_admit = Some(now);
+        bucket.hour.push_back(now);
+        bucket.day.push_back(now);
+        bucket.seen.insert(interaction, now);
         PreviewRateDecision::Admit
     }
 }
@@ -183,12 +186,27 @@ mod tests {
     const ACTOR: &str = "actor-1";
     const GUILD: &str = "guild-1";
 
+    use tokio::time::advance;
+    use PreviewRateDecision::{self as Decision, Admit, RateLimited};
+
+    impl PreviewRateLimiter {
+        fn check_and_admit(&mut self, actor: &str, guild: &str, id: u64, ms: u64) -> Decision {
+            self.admit_at(actor, guild, id, Duration::from_millis(ms).as_nanos())
+        }
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn expired_admission_leaves_budget_untouched() {
+    async fn admission_preserves_submillisecond_boundary_and_expiry() {
         let mut limiter = PreviewRateLimiter::new();
-        let deadline = Instant::now();
-        assert_eq!(limiter.admit_before(ACTOR, GUILD, 1, deadline), None);
-        assert!(limiter.buckets.is_empty());
+        let mut admit = |id, deadline| limiter.admit_before(ACTOR, GUILD, id, deadline);
+        let deadline = Instant::now() + Duration::from_secs(6);
+        advance(Duration::from_micros(900)).await;
+        assert_eq!(admit(1, deadline), Some(Admit));
+        advance(Duration::from_micros(4_999_200)).await;
+        assert_eq!(admit(2, deadline), Some(RateLimited));
+        advance(Duration::from_micros(800)).await;
+        assert_eq!(admit(2, Instant::now()), None);
+        assert_eq!(admit(2, deadline), Some(Admit));
     }
 
     #[test]

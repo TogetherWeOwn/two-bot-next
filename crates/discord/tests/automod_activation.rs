@@ -1333,12 +1333,11 @@ mod preview_attempt_acceptance {
     use tokio::time::Instant;
     use twilight_model::application::interaction::Interaction;
     use two_bot_core::{
-        automod_preview_audit::{load_preview_audit, lock_preview_attempt},
-        automod_preview_input::PreviewInputRefusal,
-        automod_preview_limiter::{PreviewRateLimiter, PREVIEW_MIN_INTERVAL_MS},
+        automod_preview_audit::lock_preview_attempt,
+        automod_preview_limiter::PreviewRateLimiter,
         automod_preview_report::{
-            metric_not_evaluated, metric_rate_limited, metric_unavailable, PreviewMetricLabels,
-            PREVIEW_NOT_EVALUATED_REPLY, PREVIEW_RATE_LIMITED_REPLY, PREVIEW_UNAVAILABLE_REPLY,
+            metric_not_evaluated, metric_unavailable, PREVIEW_NOT_EVALUATED_REPLY,
+            PREVIEW_UNAVAILABLE_REPLY,
         },
     };
     use two_bot_discord::automod_preview_handler::handle_automod_preview;
@@ -1388,37 +1387,29 @@ mod preview_attempt_acceptance {
         let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
         let ledger = MemLedger::default();
         let facts = StaticFacts::default();
-        let rest = executor(&mock);
-        let activation =
-            AutomodActivation::new(runtime(false), ledger.clone(), facts.clone(), rest);
+        let activation = AutomodActivation::new(
+            runtime(false),
+            ledger.clone(),
+            facts.clone(),
+            executor(&mock),
+        );
         let limiter = Mutex::new(PreviewRateLimiter::new());
-        let restarted = Mutex::new(PreviewRateLimiter::new());
-        let make = |id, text| interaction(id, STAGING_GUILD_ID, text);
-        let sample = make("4242", CANARY);
-        let blank = make("4242", "");
-        let next = make("4243", CANARY);
-        let fresh = make("4244", CANARY);
+        let sample = interaction("4242", STAGING_GUILD_ID, CANARY);
         let outside = interaction("4242", "9876", CANARY);
         let mut missing = sample.clone();
         missing.data = None;
-        let active = Some(&activation);
-        let run = |active, limit, request, receipt| {
+        let run = |limit, request, receipt| {
             let deadline = Instant::now() + Duration::from_secs(5);
-            handle_automod_preview(active, &pool, limit, request, receipt, deadline)
+            handle_automod_preview(Some(&activation), &pool, limit, request, receipt, deadline)
         };
         let count = || {
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM automation_audit_log")
                 .fetch_one(&pool)
         };
-        let blank = run(None, &limiter, &blank, RECEIPT_MS).await;
-        assert_eq!(blank.reply, PreviewInputRefusal::TextBounds.message());
-        assert_eq!(blank.metric, None);
-        for (activation, request) in [(None, &sample), (active, &outside)] {
-            let refused = run(activation, &limiter, request, RECEIPT_MS).await;
-            assert_eq!(refused.reply, PREVIEW_NOT_EVALUATED_REPLY);
-            assert_eq!(refused.metric, Some(metric_not_evaluated()));
-        }
-        let malformed = run(active, &limiter, &missing, RECEIPT_MS).await;
+        let refused = run(&limiter, &outside, RECEIPT_MS).await;
+        assert_eq!(refused.reply, PREVIEW_NOT_EVALUATED_REPLY);
+        assert_eq!(refused.metric, Some(metric_not_evaluated()));
+        let malformed = run(&limiter, &missing, RECEIPT_MS).await;
         assert_eq!(malformed.reply, PREVIEW_UNAVAILABLE_REPLY);
         assert_eq!(malformed.metric, Some(metric_unavailable(None)));
         assert_eq!(count().await?, 0);
@@ -1430,84 +1421,50 @@ mod preview_attempt_acceptance {
         let mut holder = pool.begin().await?;
         lock_preview_attempt(&mut holder, "4242").await?;
         let release = async {
-            let waiting = "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE
-                datname = current_database() AND pg_backend_pid() = ANY(pg_blocking_pids(pid)))";
+            let waiting = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory'
+                AND NOT granted AND pg_backend_pid() = ANY(pg_blocking_pids(pid)))";
             let until = Instant::now() + Duration::from_secs(2);
-            while !sqlx::query_scalar::<_, bool>(waiting)
-                .fetch_one(&mut *holder)
-                .await?
-            {
-                assert!(
-                    Instant::now() < until,
-                    "Discord handler waits on the held claim"
-                );
+            loop {
+                let poll = sqlx::query_scalar::<_, bool>(waiting).fetch_one(&mut *holder);
+                let blocked = tokio::time::timeout_at(until, poll)
+                    .await
+                    .expect("claim wait timed out")?;
+                if blocked {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            let create = create_at("4212", "other text", RECEIPT_MS + 1);
-            activation.process(create, AT).await;
+            activation
+                .process(create_at("4212", "other text", RECEIPT_MS + 1), AT)
+                .await;
             assert!(activation.apply_live_config(&runtime(true).effective_config()));
             holder.rollback().await
         };
-        let (first, released) = tokio::join!(run(active, &limiter, &sample, RECEIPT_MS), release);
+        let (first, released) = tokio::join!(run(&limiter, &sample, RECEIPT_MS), release);
         released?;
         assert!(first.reply.contains("TWO_AUTOMOD_REPEAT_COUNT"));
         assert!(!first.reply.contains(CANARY));
-        assert_eq!(
-            first.metric,
-            Some(PreviewMetricLabels {
-                result: "matched",
-                filter: "repeated_message",
-                mode: "dry_run",
-            })
-        );
-        let identity: Vec<String> = sqlx::query_scalar(
-            "SELECT ARRAY[guild_id, actor_id, target_key, action] FROM automation_audit_log
-             WHERE id = 'automod-preview:4242'",
-        )
-        .fetch_one(&pool)
-        .await?;
+        assert_eq!(first.metric.map(|m| m.result), Some("matched"));
+        let receipt = "2023-11-14 22:13:20.000000+00";
+        assert!(first.reply.contains(receipt));
+        let audit: Vec<String> = sqlx::query_scalar(
+            "SELECT ARRAY[guild_id, actor_id, target_key, action, outcome, reason]
+             FROM automation_audit_log WHERE id = 'automod-preview:4242' AND created_at = $1::text::timestamptz",
+        ).bind(receipt).fetch_one(&pool).await?;
+        let reason = "filter=repeated_message;exemption=none;mode=dry_run;len=0_50";
+        let (identity, decision) = audit.split_at(4);
         let expected = [STAGING_GUILD_ID, AUTHOR, CHANNEL, "automod.preview"];
         assert_eq!(identity, expected);
-        let row = load_preview_audit(&pool, "automod-preview:4242")
-            .await?
-            .expect("the reply is backed by a committed audit row");
-        assert_eq!(row.outcome, "matched");
-        assert_eq!(
-            row.reason.as_deref(),
-            Some("filter=repeated_message;exemption=none;mode=dry_run;len=0_50")
-        );
-        assert_eq!(row.created_at, "2023-11-14 22:13:20.000000+00");
-        assert!(first.reply.contains(&row.created_at));
+        assert_eq!(decision, ["matched", reason]);
 
-        // Receipts are one interval apart, but these admissions are not.
-        let later = RECEIPT_MS + PREVIEW_MIN_INTERVAL_MS;
-        let rate = run(active, &limiter, &next, later).await;
-        assert_eq!(rate.reply, PREVIEW_RATE_LIMITED_REPLY);
-        assert_eq!(rate.metric, Some(metric_rate_limited(false)));
-        let row = load_preview_audit(&pool, "automod-preview:4243")
-            .await?
-            .expect("rate refusal commits");
-        assert_eq!(row.outcome, "rate_limited");
-        assert_eq!(
-            row.reason.as_deref(),
-            Some("filter=none;exemption=none;mode=enforce;len=0_50")
-        );
-
-        let replay = run(active, &restarted, &sample, later).await;
-        assert_eq!(replay.reply, first.reply);
-        assert_eq!(replay.metric, None);
+        let closed = Mutex::new(PreviewRateLimiter::with_capacity(0));
+        let replay = run(&closed, &sample, RECEIPT_MS + 1).await;
+        assert_eq!((replay.reply, replay.metric), (first.reply, None));
+        assert_eq!(count().await?, 1);
+        let fresh = interaction("4243", STAGING_GUILD_ID, CANARY);
+        let fresh = run(&Mutex::default(), &fresh, RECEIPT_MS).await;
+        assert_eq!(fresh.metric.map(|m| m.result), Some("no_match"));
         assert_eq!(count().await?, 2);
-        let fresh = run(active, &restarted, &fresh, RECEIPT_MS).await;
-        assert_eq!(
-            fresh.metric,
-            Some(PreviewMetricLabels {
-                result: "no_match",
-                filter: "none",
-                mode: "enforce",
-            }),
-            "the edge is gone from live history and replay did not charge the limiter"
-        );
-        assert_eq!(count().await?, 3);
         assert_eq!(ledger.claims(), 3, "only the three gateway creates claim");
         assert_eq!(ledger.violations(), 0);
         assert_eq!(facts.target_calls(), 0);

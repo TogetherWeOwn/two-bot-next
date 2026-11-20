@@ -177,24 +177,6 @@ pub enum Inspection {
     Matched(AutomodMatch),
 }
 
-/// Effective policy and the invoker's bounded repeat history captured together.
-pub struct AutomodPreviewSnapshot {
-    config: AutomodConfig,
-    repeats: RepeatTracker,
-}
-
-impl AutomodPreviewSnapshot {
-    #[must_use]
-    pub fn dry_run(&self) -> bool {
-        self.config.dry_run
-    }
-
-    #[must_use]
-    pub fn evaluate(&self, message: &AutomodMessage, mention_count: usize) -> PreviewVerdict {
-        preview_automod(message, mention_count, &self.config, &self.repeats)
-    }
-}
-
 pub struct AutomodRuntime {
     config: AutomodConfig,
     scope: AutomodScope,
@@ -277,10 +259,16 @@ impl AutomodRuntime {
         &self,
         guild_id: &str,
         actor_id: &str,
-    ) -> Option<AutomodPreviewSnapshot> {
-        self.admits(Some(guild_id)).then(|| AutomodPreviewSnapshot {
-            config: self.effective_config(),
-            repeats: self.repeats.snapshot_for(guild_id, actor_id),
+    ) -> Option<(
+        bool,
+        impl Fn(&AutomodMessage, usize) -> PreviewVerdict + use<>,
+    )> {
+        self.admits(Some(guild_id)).then(|| {
+            let config = self.effective_config();
+            let repeats = self.repeats.snapshot_for(guild_id, actor_id);
+            (config.dry_run, move |message: &AutomodMessage, mentions| {
+                preview_automod(message, mentions, &config, &repeats)
+            })
         })
     }
 
