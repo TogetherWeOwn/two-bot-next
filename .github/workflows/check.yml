@@ -948,6 +948,8 @@ jobs:
           printf 'RSVP capture source: %s (tree %s)\n' "$checkout" "$tree"
           directory=$(mktemp -d "$RUNNER_TEMP/rsvp-replies.XXXXXX")
           printf 'directory=%s\n' "$directory" >> "$GITHUB_OUTPUT"
+          # Keep CI-only artifact output out of the mirrored DB step environment.
+          printf 'RSVP_REPLY_CAPTURE_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
 
       # The standalone backup fixture has its own scratch-only URL guard.
       # Supplying it here executes the round trip rather than its local skip.
@@ -959,7 +961,6 @@ jobs:
           TWO_RSVP_RUNTIME_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
           TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
-          TWO_RSVP_REPLY_CAPTURE_DIR: ${{ steps.rsvp_reply_capture.outputs.directory }}
         # The publication regression has its own guarded DB and actual binary
         # in the dedicated step below; never feed it the round-trip fixture URL.
         # The invite saturation tests build throwaway schema names from a
@@ -978,11 +979,11 @@ jobs:
 
       - name: Verify synthetic RSVP reply capture
         if: steps.rsvp_reply_capture.outputs.directory != ''
-        env:
-          CAPTURE_DIR: ${{ steps.rsvp_reply_capture.outputs.directory }}
         run: |
+          # Do not capture from any later test step in this job.
+          printf 'RSVP_REPLY_CAPTURE_DIR=\n' >> "$GITHUB_ENV"
           for name in saved.json cancelled.json historical.json; do
-            file="$CAPTURE_DIR/$name"
+            file="${RSVP_REPLY_CAPTURE_DIR:?}/$name"
             if [ -L "$file" ] || [ ! -f "$file" ] || [ ! -s "$file" ] ||
               ! size=$(wc -c < "$file") || [ "$size" -gt 16384 ]; then
               printf 'Missing or invalid synthetic RSVP capture: %s\n' "$name" >&2

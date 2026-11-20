@@ -326,8 +326,7 @@ fn assert_reply_kind(mock: &MockRest, content: &str, deferred: bool, kind: Embed
 }
 
 fn capture_reply(mock: &MockRest, filename: &str) {
-    let Some(directory) =
-        std::env::var_os("TWO_RSVP_REPLY_CAPTURE_DIR").filter(|dir| !dir.is_empty())
+    let Some(directory) = std::env::var_os("RSVP_REPLY_CAPTURE_DIR").filter(|dir| !dir.is_empty())
     else {
         return;
     };
