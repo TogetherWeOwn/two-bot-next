@@ -11,8 +11,8 @@ name: staging-container-drill
 # baseline. It reads only the `staging` environment's existing
 # ownership-control pair and Cloudflare token; it creates or changes no
 # credential and never prints a body, an identifier, a token or a secret.
-# Shares the deploy-staging concurrency group so a push-triggered deploy
-# cannot interleave with a drill.
+# Shares the `staging-lifecycle` concurrency group with `deploy-staging`
+# so a deployment cannot interleave with a drill.
 on:
   workflow_dispatch:
     inputs:
@@ -59,6 +59,7 @@ permissions: {}
 concurrency:
   group: staging-lifecycle
   cancel-in-progress: false
+  queue: max
 
 jobs:
   container-drill:

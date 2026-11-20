@@ -42,7 +42,7 @@ fn observe<T: ObserveAdd, E>(
 fn add(kind: &str, source: &str, channel: &str) -> Interaction {
     serde_json::from_value(json!({
         "application_id":"1111", "authorizing_integration_owners":{"0":GUILD},
-        "id":"7007", "token":"synthetic-feed-duplicate-token", "type":2,
+        "id":"7007", "token":"synthetic-feed-duplicate-token", "type":2, "attachment_size_limit":10485760,
         "guild_id":GUILD, "channel_id":channel, "entitlements":[],
         "member":{"user":{"id":"88","username":"fixture-admin","discriminator":"0", "bot":false,"mfa_enabled":false},
                   "permissions":"32","roles":[],"deaf":false,"mute":false,"flags":0,"joined_at":null},

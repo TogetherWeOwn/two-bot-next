@@ -37,6 +37,7 @@ fn option(name: &str, value: CommandOptionValue) -> CommandDataOption {
 fn invocation(options: Vec<CommandDataOption>) -> Interaction {
     let mut interaction: Interaction = serde_json::from_value(json!({
         "id":"7", "application_id":"1111", "type":2, "token":"preview-fixture",
+        "attachment_size_limit":10485760,
         "guild_id":"2222", "channel_id":"3333",
         "channel":{"id":"3333","guild_id":"2222","type":0},
         "authorizing_integration_owners":{"0":"2222"},

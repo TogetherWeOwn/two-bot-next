@@ -150,6 +150,11 @@ class DigestExecutionTest(unittest.TestCase):
         self.assertEqual(STEPS["resolve"]["run"], "python3 scripts/digest_resolve.py")
         self.assertEqual(STEPS["request"]["env"]["PROD_SHA"], "${{ steps.resolve.outputs.live_sha }}")
         self.assertEqual(STEPS["digest"]["env"]["PROD_SHA"], "${{ steps.resolve.outputs.live_sha }}")
+        for variable, output in (("SKIPPED", "skipped"), ("REASON", "reason"),
+                                 ("PLAN", "plan"), ("PREV_TAG", "previous-stable-tag")):
+            self.assertEqual(STEPS["digest"]["env"][variable], f"${{{{ steps.plan.outputs.{output} }}}}")
+        for variable, output in (("CREATED", "created"), ("TAG", "tag")):
+            self.assertEqual(STEPS["record"]["env"][variable], f"${{{{ steps.publish.outputs.{output} }}}}")
         for step_id, mode in (("request", "request"), ("digest", "adapt"), ("record", "record")):
             self.assertEqual(STEPS[step_id]["run"], f"node .github/scripts/daily-digest.cjs {mode}")
         pins = {STEPS[step_id]["uses"] for step_id in ("plan", "publish")}

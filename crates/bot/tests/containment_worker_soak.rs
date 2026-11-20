@@ -59,7 +59,8 @@
 mod common;
 
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{MockRest, RestRequest, ScriptedResponse};
 use serde_json::{json, Value};
@@ -185,6 +186,25 @@ fn assert_post_is_fixed_vocabulary(content: &str) {
     );
 }
 
+fn schema_name_at(pid: u32, timestamp: Duration) -> String {
+    // Distinguish parallel fixtures even when the wall clock repeats.
+    static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed);
+    let nanos = timestamp.as_nanos();
+    // At most 63 bytes: prefix 13 + PID 8 + separators 2 + nanos 24 + sequence 16.
+    format!("contain_soak_{pid:x}_{nanos:x}_{sequence:016x}")
+}
+
+#[test]
+fn schema_names_are_distinct_and_bounded_when_the_clock_repeats() {
+    let first = schema_name_at(u32::MAX, Duration::MAX);
+    let second = schema_name_at(u32::MAX, Duration::MAX);
+    assert_ne!(first, second);
+    for name in [first, second] {
+        assert!(name.len() <= 63, "Postgres must not truncate {name}");
+    }
+}
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -192,11 +212,8 @@ struct TestSchema {
 
 impl TestSchema {
     async fn new() -> Self {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!("contain_soak_{stamp}");
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let schema = schema_name_at(std::process::id(), timestamp);
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");

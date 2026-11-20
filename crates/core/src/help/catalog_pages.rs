@@ -1,11 +1,12 @@
 //! Turn one confirmed discovery catalog into ordered help pages.
 
 use super::pages::{plan, Block, Page, PlanError};
-use super::{help_catalog, HelpSection};
+use super::{help_catalog, HelpCatalog, HelpSection};
 use crate::commands::{CommandDefinition, GUILD_COMMAND_LIMIT};
-use crate::custom_commands::MAX_COMMAND_NAME_CHARS;
+use crate::custom_commands::{escape_inspect_text, MAX_COMMAND_NAME_CHARS};
 use crate::message_safety::{
     neutralize_mentions, text_len, EMBED_FIELD_NAME_LIMIT, EMBED_FIELD_VALUE_LIMIT,
+    EMBED_TOTAL_LIMIT,
 };
 
 const COMMAND_SEPARATOR: &str = " · ";
@@ -17,18 +18,33 @@ pub fn plan_discovery(defs: &[CommandDefinition], reserved: usize) -> Result<Vec
     // Bound formatting before allocating the catalog or joined commands.
     if defs.len() > GUILD_COMMAND_LIMIT
         || defs.iter().any(|def| {
-            def.name.is_empty()
-                || def.name.chars().take(MAX_COMMAND_NAME_CHARS + 1).count()
-                    > MAX_COMMAND_NAME_CHARS
+            def.name.is_empty() || def.name.chars().nth(MAX_COMMAND_NAME_CHARS).is_some()
         })
     {
         return Err(PlanError);
     }
-    let catalog = help_catalog(defs);
+    plan_catalog(&help_catalog(defs), reserved)
+}
+
+fn plan_catalog(catalog: &HelpCatalog<'_>, reserved: usize) -> Result<Vec<Page>, PlanError> {
     let description = format!("{}\n{}", catalog.heading, catalog.closing_note);
     let groups: Vec<_> = catalog.sections.iter().flat_map(group_fragments).collect();
     let blocks: Vec<_> = groups.iter().map(Fragment::block).collect();
-    let mut pages = plan(&blocks, reserved.saturating_add(text_len(&description) + 2))?;
+    let has_fallback = blocks
+        .iter()
+        .any(|b| matches!(b, Block::DescriptionFragment(_)));
+    let inside = text_len(&description) + if has_fallback { 2 } else { 0 };
+    let budget = EMBED_TOTAL_LIMIT
+        .checked_sub(reserved)
+        .and_then(|left| left.checked_sub(inside))
+        .ok_or(PlanError)?;
+    // A tight caller budget must not make the planner split an escaped field.
+    if blocks.iter().any(
+        |b| matches!(b, Block::Field(title, value) if text_len(title) + text_len(value) > budget),
+    ) {
+        return Err(PlanError);
+    }
+    let mut pages = plan(&blocks, reserved, inside)?;
     for page in &mut pages {
         page.description = if page.description.is_empty() {
             description.clone()
@@ -57,16 +73,18 @@ fn group_fragments(section: &HelpSection<'_>) -> Vec<Fragment> {
     let hint = section.requires.map(|perm| format!("Needs {perm}\n"));
     let hint = hint.as_deref().unwrap_or_default();
     let capacity = EMBED_FIELD_VALUE_LIMIT.saturating_sub(text_len(hint));
-    let commands = section
-        .commands
+    let commands = section.commands.iter().map(|name| {
+        let token = escape_inspect_text(&format!("/{}", neutralize_mentions(name)));
+        (token, COMMAND_SEPARATOR)
+    });
+    let notes = section
+        .notes
         .iter()
-        .map(|name| (format!("/{name}"), COMMAND_SEPARATOR));
-    let notes = section.notes.iter().map(|note| (note.to_string(), "\n"));
+        .map(|note| (neutralize_mentions(note), "\n"));
     let mut fragments = Vec::new();
     let mut body = String::new();
     let mut used = 0;
     for (entry, separator) in commands.chain(notes) {
-        let entry = neutralize_mentions(&entry);
         let cost = text_len(&entry);
         if used != 0 && used + text_len(separator) + cost > capacity {
             fragments.push(std::mem::take(&mut body));
@@ -111,7 +129,7 @@ mod tests {
 
     #[test]
     fn maximum_publication_reconstructs_every_group_and_note() {
-        let defs = maximum_publication();
+        let (defs, _) = maximum_publication();
         assert_eq!(defs.len(), GUILD_COMMAND_LIMIT);
         let catalog = help_catalog(&defs);
         let pages = plan_discovery(&defs, 150).expect("bounded discovery");
@@ -175,12 +193,24 @@ mod tests {
     }
 
     #[test]
+    fn renders_a_literal_command_or_rejects_a_tight_reservation() {
+        let defs = [CommandDefinition::new(&"__name__".repeat(4), "Test")];
+        let pages = plan_discovery(&defs, 150).unwrap();
+        let (title, value) = &pages[0].fields[0];
+        assert_eq!(value, &format!("/{}", r"\_\_name\_\_".repeat(4)));
+        let reserved =
+            EMBED_TOTAL_LIMIT - text_len(&pages[0].description) - text_len(title) - text_len(value);
+        assert_eq!(plan_discovery(&defs, reserved), Ok(pages));
+        assert_eq!(plan_discovery(&defs, reserved + 1), Err(PlanError));
+    }
+
+    #[test]
     fn rejects_unbounded_input_and_splits_after_mention_neutralization() {
         let long = CommandDefinition::new(&"界".repeat(33), "A test command");
         let empty = CommandDefinition::new("", "A test command");
         assert_eq!(plan_discovery(&[empty], 150), Err(PlanError));
         assert_eq!(plan_discovery(&[long], 150), Err(PlanError));
-        let name = "@here😀".repeat(5);
+        let name = "@here😀_".repeat(4);
         let defs =
             vec![CommandDefinition::new(name.as_str(), "A test command"); GUILD_COMMAND_LIMIT + 1];
         assert_eq!(plan_discovery(&defs, 150), Err(PlanError));
@@ -191,7 +221,7 @@ mod tests {
             notes: &[],
         });
         assert!(fragments.len() > 1);
-        let command = format!("/{}", neutralize_mentions(&name));
+        let command = format!("/{}", "@\u{200b}here😀\\_".repeat(4));
         let mut actual = Vec::new();
         for (index, fragment) in fragments.iter().enumerate() {
             let Fragment::Field(title, value) = fragment else {
@@ -220,23 +250,31 @@ mod tests {
         // large to fit in one field but still safe in the description.
         let note = "🔥".repeat(600);
         let notes = [note.as_str(), "Last note."];
-        let fragments = group_fragments(&HelpSection {
-            title: "Custom",
-            requires: Some("Manage Server"),
-            commands: vec!["test"],
-            notes: &notes,
-        });
-        let blocks: Vec<_> = fragments.iter().map(Fragment::block).collect();
-        let pages = plan(&blocks, 150).expect("bounded fallback");
+        let mut catalog = HelpCatalog {
+            heading: "Overview".into(),
+            closing_note: "Closing note.",
+            sections: vec![HelpSection {
+                title: "Custom",
+                requires: Some("Manage Server"),
+                commands: vec!["test"],
+                notes: &notes,
+            }],
+        };
+        let pages = plan_catalog(&catalog, 150).expect("bounded fallback");
         assert_eq!(pages.len(), 2);
         assert_eq!(
             pages[0].fields,
             [("Custom".into(), "Needs Manage Server\n/test".into())]
         );
+        assert_eq!(pages[0].description, "Overview\nClosing note.");
         assert_eq!(
             pages[1].description,
-            format!("**Custom (continued)** — needs Manage Server\n{note}")
+            format!(
+                "Overview\nClosing note.\n\n**Custom (continued)** — needs Manage Server\n{note}"
+            )
         );
+        catalog.heading = "x".repeat(3500);
+        assert_eq!(plan_catalog(&catalog, 150), Err(PlanError));
         assert_eq!(
             pages[1].fields,
             [(

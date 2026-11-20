@@ -17,6 +17,7 @@
 
 use super::*;
 use two_bot_core::{RsvpRecord, RsvpStatus};
+use two_bot_discord::brand::EmbedKind;
 
 const OLD_AT: &str = "2020-01-02T03:04:05.000Z";
 
@@ -86,8 +87,9 @@ async fn live_save(pool: &Pool<Postgres>, id: u64, status: &str) -> String {
         "/api/v10/webhooks/1111/mock-rsvp-token/messages/@original"
     );
     let edit: Value = serde_json::from_slice(&requests[5].body).expect("edit JSON");
-    assert_eq!(edit["allowed_mentions"]["parse"], json!([]));
-    let text = edit["content"].as_str().expect("text receipt").to_owned();
+    assert_ne!(edit["allowed_mentions"]["replied_user"], true);
+    let text = attendance_reply::deferred_text(&edit, EmbedKind::Ok).to_owned();
+    assert!(!text.is_empty(), "receipt must have visible text");
     assert!(
         !text.contains(USER) && !text.contains(EVENT),
         "receipt names no snowflake: {text}"
@@ -180,6 +182,7 @@ async fn changed_responses_reject_old_generic_sentence_and_name_both_choices() {
             RsvpStatus::parse(previous).expect("seeded status"),
         )
         .await;
+        let before = stored(fixture.pool()).await;
         let text = live_save(fixture.pool(), 9200 + i as u64, current).await;
         let row = stored(fixture.pool()).await;
         let count = counts(fixture.pool()).await;
@@ -196,7 +199,7 @@ async fn changed_responses_reject_old_generic_sentence_and_name_both_choices() {
         );
         assert_eq!(text, changed_text(previous, current));
         assert_eq!(row.0, *current);
-        assert_ne!(row.1, OLD_AT, "rewrite stamps a new saved time");
+        assert_ne!(row.1, before.1, "rewrite stamps a new saved time");
         assert_eq!(count, (1, 1, 0), "seeded row rewritten, one audit");
         assert_eq!(audits, vec![(*current).to_owned()]);
         assert_no_forbidden_copy(&text);
@@ -214,6 +217,7 @@ async fn repeated_choices_reject_old_generic_sentence_and_confirm_time_update() 
             RsvpStatus::parse(status).expect("seeded status"),
         )
         .await;
+        let before = stored(fixture.pool()).await;
         let text = live_save(fixture.pool(), 9300 + i as u64, status).await;
         let row = stored(fixture.pool()).await;
         let count = counts(fixture.pool()).await;
@@ -230,7 +234,7 @@ async fn repeated_choices_reject_old_generic_sentence_and_confirm_time_update() 
         );
         assert_eq!(text, repeat_text(status));
         assert_eq!(row.0, *status);
-        assert_ne!(row.1, OLD_AT, "repeat rewrites saved time");
+        assert_ne!(row.1, before.1, "repeat rewrites saved time");
         assert_eq!(count, (1, 1, 0), "repeat audits like any save");
         assert_eq!(audits, vec![(*status).to_owned()]);
         assert_no_forbidden_copy(&text);
@@ -259,8 +263,11 @@ async fn failure_never_renders_success_branch_control() {
     run(fixture.pool(), &mock, &rsvp(9400, "going")).await;
     let requests = mock.requests();
     let last = requests.last().expect("refusal edit");
+    assert_eq!(last.method, "PATCH");
+    assert!(last.path.ends_with("/messages/@original"));
     let body: Value = serde_json::from_slice(&last.body).expect("refusal JSON");
-    let text = body["content"].as_str().expect("refusal text").to_owned();
+    assert_ne!(body["allowed_mentions"]["replied_user"], true);
+    let text = attendance_reply::deferred_text(&body, EmbedKind::Danger).to_owned();
     let count = counts(fixture.pool()).await;
     mock.shutdown().await;
     fixture.close().await;

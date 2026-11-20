@@ -11,6 +11,7 @@ pub mod audit_mirror;
 mod automation_admission;
 pub mod automod;
 pub mod automod_activation;
+pub mod automod_preview_handler;
 pub mod brand;
 pub mod channel_access;
 #[cfg(feature = "db")]
@@ -62,6 +63,8 @@ pub mod rsvp;
 #[cfg(any(test, feature = "test-support"))]
 pub mod staging_slash_smoke;
 #[cfg(test)]
+mod strict_transport_fixture;
+#[cfg(test)]
 mod test_clock;
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
@@ -93,6 +96,6 @@ pub use internal_events::{event_status_name, scheduled_event_body, EventActionEr
 pub use pipeline::{
     build_cache, AuditEntryObserver, AuditLogObservation, ChannelClassifier, InviteSource,
     JoinObservation, JoinObserver, MemPipeline, MessageEligibility, NoClassification, NoInvites,
-    Pipeline, PipelineSnapshots, ScriptedInvites, SettingsChannelClassifier,
+    Pipeline, PipelineSnapshots, ScriptedInvites, SettingsChannelClassifier, SharedCache,
     VoiceTransitionObservation, VoiceTransitionObserver,
 };

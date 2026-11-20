@@ -619,6 +619,7 @@ fn interaction_with(
 ) -> Interaction {
     let mut interaction: Interaction = serde_json::from_value(json!({
         "id": interaction_id.to_string(), "application_id": "1", "type": 2, "token": "fixture-only",
+        "attachment_size_limit": 10485760,
         "guild_id": guild.to_string(), "authorizing_integration_owners": {},
         "data": {"id": "3", "name": name, "type": 1},
         "member": {
@@ -1379,7 +1380,25 @@ async fn refused_kick_reason(options: Vec<CommandDataOption>) -> Vec<String> {
     let fixture = Fixture::new().await;
     let mut failures = vec![];
     let response = fixture.dispatch_kick(options, VOTER_A, 2).await;
-    let text = private_text(&response).to_owned();
+    assert_eq!(
+        response.kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    let data = response.data.as_ref().expect("private response data");
+    assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+    assert!(data.components.as_ref().is_none_or(Vec::is_empty));
+    assert!(data.content.is_none());
+    let embeds = data.embeds.as_ref().expect("kick correction embed");
+    assert_eq!(embeds.len(), 1);
+    assert_eq!(
+        embeds[0].color,
+        Some(two_bot_discord::brand::EmbedKind::Danger.color())
+    );
+    let text = embeds[0]
+        .description
+        .as_deref()
+        .expect("correction text")
+        .to_owned();
     {
         let observed = fixture.state.lock().expect("observation lock");
         if !observed.calls.is_empty() {

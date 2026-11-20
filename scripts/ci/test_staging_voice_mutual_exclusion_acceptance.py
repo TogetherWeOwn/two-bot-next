@@ -15,8 +15,8 @@ point and its deletion budget are unchanged) and the exclusion window grows:
   no split lock survives a rename;
 * the five-minute user-flow staging probe is a read-only observer, not a
   holder: it never holds the lifecycle group (or a legacy alias, in any case
-  or expression form) at workflow or job level, so it cannot keep replacing a
-  pending deploy-staging or promotion soak run in GitHub's one-slot queue. It
+  or expression form) at workflow or job level, so its ticks never compete
+  with queued deploy-staging or promotion soak runs. It
   serializes on its own fixed, non-cancelling queue that no other workflow
   or job shares, runs only the ``observe`` lifecycle action (never acquire,
   ready/assert, release or extend), and reads staging only after the observer
@@ -42,8 +42,8 @@ point and its deletion budget are unchanged) and the exclusion window grows:
 Run with check.yml's scripts/ci unittest discovery. Only YAML and Python
 source are read; no workflow is dispatched and no Discord, database or deploy
 is used. Controls mutate in-memory copies only. These tests prove the
-declared lock scope, not GitHub scheduler execution, queue fairness (GitHub
-keeps one pending run per group and replaces it), runtime expiry, or that a
+declared lock scope and queue configuration, not GitHub scheduler execution,
+queue fairness, runtime expiry, or that a
 runtime deletion failure has been repaired.
 """
 
@@ -58,6 +58,11 @@ import unittest
 from unittest import mock
 
 import yaml
+
+from voice_measurement_policy import (
+    CALLS as MEASUREMENT_CALLS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
+    WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github/workflows"
@@ -93,6 +98,8 @@ INHERITED = {"staging_use_expires_at": "STAGING_USE_EXPIRES_AT",
 OWNERSHIP_TOKEN = "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"
 STANDALONE_GUARD = "inputs.staging_use_expires_at == ''"
 INHERITED_GUARD = "inputs.staging_use_expires_at != ''"
+EXPLICIT_STANDALONE_GUARD = STANDALONE_GUARD + " && !inputs.deploy_staging_call"
+EXPLICIT_INHERITED_GUARD = "(inputs.deploy_staging_call || " + INHERITED_GUARD + ")"
 MAIN_ONLY = "github.ref == 'refs/heads/main'"
 # (workflow, job) that must hold the canonical group when run standalone,
 # and whether the hold must be job-level (to keep sibling prod probes free).
@@ -103,9 +110,8 @@ STANDALONE_HOLDERS = {(VOICE, "synthetic"): False,
                       (MCP, "proveout"): False,
                       (PRODUCTION, SOAK): True}
 # Periodic read-only observers of the staging window. They hold their own
-# exclusive job-level queue, never the lifecycle group: a */5 holder would
-# keep replacing pending deploy-staging and soak runs (one pending run per
-# group). Formerly a holder; reclassified, not exempted.
+# exclusive job-level queue, never the lifecycle group: a */5 holder must
+# not fill the queue for deploy-staging and soak runs.
 OBSERVERS = {(USER_FLOW, "staging"): "user-flow staging observer"}
 OBSERVE = "observe"
 # The observer's own step outputs that gate every live read on an active window.
@@ -140,7 +146,8 @@ STAGING_TOUCH = re.compile(r"STAGING_WORKER_URL|STAGING_OWNERSHIP_CONTROL_TOKEN|
 # The only accepted expression group forms. Anything else is unprovable and is
 # rejected on a holder and treated as holding the lock on an ancestor.
 CALLED_FORM = re.compile(
-    r"\$\{\{\s*inputs\.staging_use_expires_at\s*!=\s*''\s*&&\s*"
+    r"\$\{\{\s*(?:\(inputs\.deploy_staging_call\s*\|\|\s*inputs\.staging_use_expires_at\s*!=\s*''\)"
+    r"|inputs\.staging_use_expires_at\s*!=\s*'')\s*&&\s*"
     r"format\('([a-z0-9][a-z0-9-]*)\{0\}',\s*github\.run_id\)\s*\|\|\s*"
     r"'([A-Za-z0-9_.-]+)'\s*\}\}")
 EVENT_FORM = re.compile(r"([A-Za-z0-9_.-]*)\$\{\{\s*github\.event_name\s*\}\}")
@@ -249,6 +256,8 @@ def holds_exactly(node, context, triggers, canonical):
         return "lifecycle group must resolve to the fixed canonical group"
     if cancel != "false":
         return "lifecycle lock must explicitly preserve the running job"
+    if node["concurrency"].get("queue") != "max":
+        return "lifecycle lock must use queue: max"
     return None
 
 
@@ -266,6 +275,8 @@ def canonical_group(deploy, errors):
         return None
     if cancel != "false":
         errors.append("deploy-staging: full-window lock must explicitly preserve the running run")
+    if deploy["concurrency"].get("queue") != "max":
+        errors.append("deploy-staging: full-window lock must use queue: max")
     # GitHub concurrency group matching is case-insensitive, repository-scoped.
     return group.casefold()
 
@@ -373,7 +384,9 @@ def consumer_errors(callee_name, callee):
         for action in ("acquire", "release"):
             for step in staging_use_steps(job, action):
                 guard = bare(step.get("if"))
-                if guard != STANDALONE_GUARD and not guard.startswith(STANDALONE_GUARD + " && "):
+                explicit = "inputs.deploy_staging_call" in str(callee.get("concurrency", ""))
+                required = EXPLICIT_STANDALONE_GUARD if explicit else STANDALONE_GUARD
+                if guard != required:
                     errors.append(f"{callee_name} {job_name}: {action} can touch the caller's grant")
     consumer_name, entry = CONSUMERS[callee_name]
     consumer = jobs.get(consumer_name, {})
@@ -387,7 +400,12 @@ def consumer_errors(callee_name, callee):
     text = str(consumer).lower()
     if "ownership_control" in text or "staging-use.mjs" in text:
         errors.append(f"{callee_name}: live consumer job holds the staging control credential")
-    if bare(consumer.get("if")) not in ("", MAIN_ONLY) or "continue-on-error" in consumer:
+    attempt_gate = MAIN_ONLY + " && (!inputs.deploy_staging_call || github.run_attempt == 1)"
+    permitted_gates = ("", MAIN_ONLY, attempt_gate)
+    window_gate = (MAIN_ONLY + " && (!inputs.deploy_staging_call || (github.run_attempt == 1 && "
+                   "inputs.staging_use_expires_at != '' && inputs.staging_use_sha != '' && "
+                   "inputs.staging_use_deployment != ''))")
+    if bare(consumer.get("if")) not in permitted_gates or "continue-on-error" in consumer:
         errors.append(f"{callee_name}: live consumer must keep the main-only, "
                       "success-gated, failure-propagating gate")
     needs = consumer.get("needs")
@@ -402,10 +420,11 @@ def consumer_errors(callee_name, callee):
             env = step.get("env") or {}
             bound = all(str(env.get(var, "")).replace(" ", "") ==
                         f"${{{{inputs.{name}}}}}" for name, var in INHERITED.items())
-            # Only the inherited-path guard may skip the assert; its job keeps
-            # the plain main-only gate so a skip cannot silently skip consumers.
-            gated_off = (bare(step.get("if")) not in ("", INHERITED_GUARD)
-                         or bare(owner.get("if")) not in ("", MAIN_ONLY))
+            # The attempt guard also skips the consumer on a refused deploy rerun.
+            gated_off = (bare(step.get("if")) not in ("", INHERITED_GUARD, EXPLICIT_INHERITED_GUARD)
+                         or bare(owner.get("if")) not in (*permitted_gates, window_gate)
+                         or (bare(owner.get("if")) in (attempt_gate, window_gate)
+                             and bare(consumer.get("if")) != attempt_gate))
             if (before and bound
                     and str(env.get("OWNERSHIP_CONTROL_TOKEN", "")) == OWNERSHIP_TOKEN
                     and "continue-on-error" not in step and "continue-on-error" not in owner
@@ -578,6 +597,9 @@ def repository_errors(wfs, canonical):
     callers = {f"./.github/workflows/{name}" for name in CHILDREN.values()}
     holders = set(STANDALONE_HOLDERS) | set(OBSERVERS)
     for file, workflow in wfs.items():
+        measurement = file == MEASUREMENT and is_measurement_caller(workflow, canonical)
+        if file == MEASUREMENT and not measurement:
+            errors.append(f"{file}: dispatch, canonical lock, guards or staging authority changed")
         triggers = tuple(t for t in events(workflow) if t != "workflow_call")
         nodes = [("workflow", workflow)] + list((workflow.get("jobs") or {}).items())
         for name, node in nodes:
@@ -586,11 +608,14 @@ def repository_errors(wfs, canonical):
                     errors.append(f"split lifecycle lock: {file} {name} holds {text}")
             if name == "workflow":
                 continue
-            if node.get("uses") in callers and (file != DEPLOY or name not in CHILDREN):
+            allowed_call = ((file == DEPLOY and name in CHILDREN)
+                            or (measurement and name in MEASUREMENT_CALLS))
+            if node.get("uses") in callers and not allowed_call:
                 errors.append(f"caller closure: {file} {name} calls a window consumer")
             env = str(node.get("environment") or "")
             touches = STAGING_TOUCH.search(str(node)) or "staging" in env
             classified = (file in (DEPLOY, *CONSUMERS) or (file, name) in holders
+                          or (measurement and (name in MEASUREMENT_STAGING_JOBS or name in MEASUREMENT_CALLS))
                           or (file, name) in EXEMPT)
             if touches and not classified:
                 errors.append(f"inventory: unclassified staging consumer {file} {name}")
@@ -841,9 +866,10 @@ def strip_staging_use(workflow):
 
 def target_fixture(group=FIXTURE_GROUP):
     wfs = load_all()
-    lock = {"group": group, "cancel-in-progress": "false"}
+    lock = {"group": group, "cancel-in-progress": "false", "queue": "max"}
     deploy = wfs[DEPLOY]
     deploy["concurrency"] = dict(lock)
+    wfs[MEASUREMENT]["concurrency"] = measurement_queue(group)
     jobs = deploy["jobs"]
     for workflow in (deploy, wfs[VOICE], wfs[HELP]):
         strip_staging_use(workflow)
@@ -861,7 +887,7 @@ def target_fixture(group=FIXTURE_GROUP):
         "steps": [{"run": "node wrangler/scripts/staging-use.mjs release"}]}
     for name, prefix in ((VOICE, "staging-voice-consumer-"), (HELP, "staging-help-consumer-")):
         callee = wfs[name]
-        callee["concurrency"] = {"group": called_group(prefix, group), "cancel-in-progress": "false"}
+        callee["concurrency"] = dict(lock, group=called_group(prefix, group))
         callee["on"]["workflow_call"]["inputs"] = {
             input_name: {"type": "string", "required": "true"} for input_name in INHERITED}
         consumer_name, _ = CONSUMERS[name]
@@ -940,6 +966,26 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_checked_in_workflows_meet_the_full_window_contract(self):
         self.assertEqual(lifecycle_errors(load_all()), [])
+
+    def test_every_lifecycle_holder_must_keep_the_non_displacing_queue(self):
+        for (file, job), job_level in {(DEPLOY, "deploy"): False, **STANDALONE_HOLDERS}.items():
+            for mode in (None, "single"):
+                workflows = load_all()
+                lock = (workflows[file]["jobs"][job] if job_level else workflows[file])["concurrency"]
+                if mode is None:
+                    del lock["queue"]
+                else:
+                    lock["queue"] = mode
+                with self.subTest(file=file, mode=mode):
+                    self.assertTrue(any("queue: max" in error for error in lifecycle_errors(workflows)))
+
+    def test_prepared_window_cannot_skip_an_unguarded_consumer(self):
+        for callee, (job, _) in CONSUMERS.items():
+            workflows = load_all()
+            workflows[callee]["jobs"][job]["if"] = MAIN_ONLY
+            with self.subTest(callee=callee):
+                self.assertTrue(any(f"{callee}: no authenticated window/readiness assert" in error
+                                    for error in lifecycle_errors(workflows)))
 
 
 class LockOracleControls(unittest.TestCase):
@@ -1740,9 +1786,11 @@ class ExistingSafetyControls(unittest.TestCase):
         deploy, voice = wfs[DEPLOY], wfs[VOICE]
         self.assertEqual(set(voice["on"]), set(INVOCATIONS))
         self.assertEqual(voice["on"]["schedule"], [{"cron": "41 */6 * * *"}])
-        self.assertEqual(deploy["on"]["push"]["branches"], ["main"])
+        # The staging trigger policy lives in test_workflows.py.
+        self.assertIn("workflow_dispatch", events(deploy))
         job = voice["jobs"]["synthetic"]
-        self.assertEqual(job["if"], "github.ref == 'refs/heads/main'")
+        self.assertEqual(job["if"], "github.ref == 'refs/heads/main' && "
+                         "(!inputs.deploy_staging_call || github.run_attempt == 1)")
         self.assertEqual(job["environment"], "voice-synthetic")
         self.assertEqual(job["timeout-minutes"], "10")
         self.assertEqual(job["permissions"], {"contents": "read"})
