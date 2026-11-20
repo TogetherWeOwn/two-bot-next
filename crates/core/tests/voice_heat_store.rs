@@ -125,10 +125,10 @@ async fn stored_buckets(pool: &PgPool) -> Vec<StoredBucket> {
     .unwrap()
 }
 
-async fn seed_expired_hour(pool: &PgPool, hour_start: OffsetDateTime) {
+async fn seed_expired_hour<'e>(executor: impl sqlx::PgExecutor<'e>, hour_start: OffsetDateTime) {
     sqlx::query("INSERT INTO public.voice_heat_hours (hour_start_utc) VALUES ($1)")
         .bind(hour_start)
-        .execute(pool)
+        .execute(executor)
         .await
         .unwrap();
 }
@@ -239,7 +239,7 @@ async fn flush_prunes_and_filters_with_the_same_strict_cutoff() {
     sqlx::raw_sql(
         "CREATE SCHEMA flush_test_clock;
          CREATE FUNCTION flush_test_clock.now() RETURNS timestamptz
-             LANGUAGE sql STABLE AS $$ SELECT TIMESTAMPTZ '2025-03-17 11:59:59.999999+00' $$;
+             LANGUAGE sql STABLE AS $$ SELECT TIMESTAMPTZ '2025-03-17 11:59:59.999998+00' $$;
          CREATE TABLE flush_test_clock.clock AS SELECT flush_test_clock.now() AS ts;
          CREATE FUNCTION flush_test_clock.statement_timestamp() RETURNS timestamptz
              LANGUAGE sql STABLE AS $$ SELECT ts FROM flush_test_clock.clock $$;",
@@ -251,21 +251,22 @@ async fn flush_prunes_and_filters_with_the_same_strict_cutoff() {
         .pool_with_search_path("flush_test_clock, pg_catalog, public")
         .await
         .unwrap();
-    let now: OffsetDateTime = sqlx::query_scalar("SELECT now()")
+    let old_cutoff: OffsetDateTime = sqlx::query_scalar("SELECT now() - interval '840 hours'")
         .fetch_one(&pool)
         .await
         .unwrap();
-    let cutoff = now - Duration::days(35) + Duration::microseconds(1);
-    let stale = bucket(cutoff - Duration::microseconds(1), 1, 10);
+    let cutoff = old_cutoff + Duration::microseconds(2);
+    let stale = bucket(old_cutoff, 1, 10);
     let boundary = bucket(cutoff, 1, 20);
     let fresh = bucket(cutoff + Duration::microseconds(1), 0, 0);
     seed_expired_hour(&pool, stale.hour_start).await;
 
-    // The sweep makes its deletion and newer clock visible together. A flush
-    // using its transaction clock or sampling too early still admits this hour.
+    // Advance the clock at sweep commit. A distinct seeded hour must be deleted
+    // by the flush itself, while the replay of the swept hour must be filtered.
     let mut sweep = fixture.pool().begin().await.unwrap();
     assert_eq!(prune_voice_heat(&mut *sweep, 35).await.unwrap(), 1);
-    sqlx::query("UPDATE flush_test_clock.clock SET ts = ts + interval '1 microsecond'")
+    seed_expired_hour(&mut *sweep, old_cutoff + Duration::microseconds(1)).await;
+    sqlx::query("UPDATE flush_test_clock.clock SET ts = ts + interval '2 microseconds'")
         .execute(&mut *sweep)
         .await
         .unwrap();
