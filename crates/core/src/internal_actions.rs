@@ -471,7 +471,10 @@ pub struct BucketDecision {
 #[derive(Debug, Clone, Default)]
 pub struct TokenBuckets {
     buckets: HashMap<String, BucketState>,
-    voice_members: HashMap<String, BucketState>,
+    // Refill deadlines persist only for active buckets; the clock floor
+    // survives eviction so a reinserted member cannot replay elapsed time.
+    voice_members: HashMap<String, u128>,
+    voice_clock_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -480,59 +483,66 @@ struct BucketState {
     updated_ms: u64,
 }
 
-impl BucketState {
-    fn refilled(&self, spec: BucketSpec, now_ms: u64) -> f64 {
-        let elapsed = now_ms.saturating_sub(self.updated_ms) as f64 / 1000.0;
-        spec.capacity
-            .min(self.tokens + elapsed * spec.refill_per_second)
-    }
-}
-
 impl TokenBuckets {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Take one token from `key`'s bucket, creating it full on first use.
-    pub fn take(&mut self, key: &str, spec: BucketSpec, now_ms: u64) -> BucketDecision {
-        Self::take_from(&mut self.buckets, key, spec, now_ms)
-    }
-
     const VOICE_MEMBER_LIMIT: usize = 1024;
+    const VOICE_REFILL_MS: u128 = 50_000;
+    const VOICE_BURST_MS: u128 = 6 * Self::VOICE_REFILL_MS;
 
     /// Charge a validated voice-move subject. Unseen subjects fail closed at
     /// capacity unless a fully replenished entry can be discarded.
     pub fn take_voice_member(&mut self, key: &str, now_ms: u64) -> BucketDecision {
-        let spec = BucketSpec {
-            capacity: 6.0,
-            refill_per_second: 0.02,
+        self.voice_clock_ms = self.voice_clock_ms.max(now_ms);
+        let clock = u128::from(self.voice_clock_ms);
+        let wall = u128::from(now_ms);
+        let denied_until = |deadline: u128| BucketDecision {
+            allowed: false,
+            // Divide before narrowing; deadlines are at most u64::MAX + one burst.
+            retry_after_secs: (deadline.saturating_sub(wall).div_ceil(1_000) as u64).max(1),
         };
+
         let members = &mut self.voice_members;
-        if members.len() >= Self::VOICE_MEMBER_LIMIT && !members.contains_key(key) {
-            // Only evict states equivalent to a fresh bucket; don't reset any debt.
-            members.retain(|_, bucket| bucket.refilled(spec, now_ms) < spec.capacity);
-            if members.len() >= Self::VOICE_MEMBER_LIMIT {
-                return BucketDecision {
-                    allowed: false,
-                    retry_after_secs: 50,
-                };
+        if let Some(full_at) = members.get_mut(key) {
+            // A charge extends the full-refill deadline by one token's worth
+            // of time. This keeps partial credit exact without touching denied buckets.
+            let next_full = (*full_at).max(clock) + Self::VOICE_REFILL_MS;
+            if next_full > clock + Self::VOICE_BURST_MS {
+                return denied_until(next_full - Self::VOICE_BURST_MS);
             }
+            *full_at = next_full;
+        } else {
+            if members.len() >= Self::VOICE_MEMBER_LIMIT {
+                let mut earliest_full = clock + Self::VOICE_BURST_MS;
+                members.retain(|_, &mut full_at| {
+                    earliest_full = earliest_full.min(full_at);
+                    full_at > clock
+                });
+                if members.len() >= Self::VOICE_MEMBER_LIMIT {
+                    return denied_until(earliest_full);
+                }
+            }
+            members.insert(key.to_owned(), clock + Self::VOICE_REFILL_MS);
         }
-        Self::take_from(members, key, spec, now_ms)
+        BucketDecision {
+            allowed: true,
+            retry_after_secs: 0,
+        }
     }
 
-    fn take_from(
-        buckets: &mut HashMap<String, BucketState>,
-        key: &str,
-        spec: BucketSpec,
-        now_ms: u64,
-    ) -> BucketDecision {
-        let bucket = buckets.entry(key.to_owned()).or_insert(BucketState {
+    /// Take one token from `key`'s bucket, creating it full on first use.
+    pub fn take(&mut self, key: &str, spec: BucketSpec, now_ms: u64) -> BucketDecision {
+        let bucket = self.buckets.entry(key.to_owned()).or_insert(BucketState {
             tokens: spec.capacity,
             updated_ms: now_ms,
         });
-        bucket.tokens = bucket.refilled(spec, now_ms);
+        let elapsed = now_ms.saturating_sub(bucket.updated_ms) as f64 / 1000.0;
+        bucket.tokens = spec
+            .capacity
+            .min(bucket.tokens + elapsed * spec.refill_per_second);
         // A backwards wall clock must not let its recovery credit the same
         // elapsed interval twice. Keep the last observed high-water mark.
         bucket.updated_ms = bucket.updated_ms.max(now_ms);
@@ -2682,7 +2692,7 @@ mod tests {
         }
         let denied = buckets.take_voice_member(NEW, 49_999);
         assert!(!denied.allowed);
-        assert!(denied.retry_after_secs > 0);
+        assert_eq!(denied.retry_after_secs, 1);
         assert_eq!(
             buckets.voice_members.len(),
             TokenBuckets::VOICE_MEMBER_LIMIT
@@ -2691,6 +2701,61 @@ mod tests {
         assert_eq!(buckets.voice_members.len(), 2);
         assert!(buckets.take_voice_member(ACTIVE, 50_000).allowed);
         assert!(!buckets.take_voice_member(ACTIVE, 50_000).allowed);
+    }
+
+    #[test]
+    fn voice_member_capacity_retry_waits_for_a_full_bucket() {
+        let mut buckets = TokenBuckets::new();
+        for offset in 0..TokenBuckets::VOICE_MEMBER_LIMIT {
+            let member = (123456789012345678u64 + offset as u64).to_string();
+            for _ in 0..6 {
+                assert!(buckets.take_voice_member(&member, 0).allowed);
+            }
+        }
+        let denied = buckets.take_voice_member("123456789012349999", 0);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 300);
+    }
+
+    #[test]
+    fn voice_member_refills_at_the_same_boundary_with_or_without_denials() {
+        let mut buckets = TokenBuckets::new();
+        let polled = "123456789012345678";
+        let idle = "123456789012345679";
+        for member in [polled, idle] {
+            for _ in 0..6 {
+                assert!(buckets.take_voice_member(member, 0).allowed);
+            }
+        }
+        for step in 1..10 {
+            assert!(!buckets.take_voice_member(polled, step * 5_000).allowed);
+        }
+        assert!(buckets.take_voice_member(polled, 50_000).allowed);
+        assert!(buckets.take_voice_member(idle, 50_000).allowed);
+    }
+
+    #[test]
+    fn voice_member_reinsertion_does_not_credit_clock_recovery() {
+        let mut buckets = TokenBuckets::new();
+        const FIRST: &str = "123456789012345678";
+        for offset in 0..TokenBuckets::VOICE_MEMBER_LIMIT {
+            let member = (123456789012345678u64 + offset as u64).to_string();
+            assert!(buckets.take_voice_member(&member, 100_000).allowed);
+        }
+        assert!(
+            buckets
+                .take_voice_member("123456789012349999", 150_000)
+                .allowed
+        );
+        assert!(!buckets.voice_members.contains_key(FIRST));
+        for _ in 0..6 {
+            assert!(buckets.take_voice_member(FIRST, 100_000).allowed);
+        }
+        let denied = buckets.take_voice_member(FIRST, 100_000);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 100);
+        assert!(!buckets.take_voice_member(FIRST, 150_000).allowed);
+        assert!(buckets.take_voice_member(FIRST, 200_000).allowed);
     }
 
     #[test]

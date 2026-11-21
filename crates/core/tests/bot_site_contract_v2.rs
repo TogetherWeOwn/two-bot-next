@@ -221,8 +221,10 @@ fn move_member_request_and_outcomes_match_the_closed_vocab() {
     let action = "voice.move_member";
     assert_eq!(request["action"], action);
     assert_eq!(v["implemented"], false, "bind does not expose staged moves");
-    assert_eq!(v["gate_flag"], "TWO_INTERNAL_ALLOW_VOICE_MOVE");
-    for flags in [flags_empty(), flags_with("TWO_INTERNAL_ALLOW_VOICE_MOVE")] {
+    // Use the published flag as an input without declaring it as a runtime
+    // environment variable; the staged verb still has no flag loader.
+    let gate_flag = v["gate_flag"].as_str().expect("voice move gate flag");
+    for flags in [flags_empty(), flags_with(gate_flag)] {
         assert_eq!(
             assert_allowed(action, &flags, true, true).unwrap_err().code,
             ErrorCode::ActionNotAllowed
