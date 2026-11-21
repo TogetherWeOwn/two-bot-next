@@ -13,7 +13,10 @@ use two_bot_core::{
     send_admission::{AdmissionError, ClaimFuture, PgSendAdmission, SendAdmission, TokenKey},
     voice_move_decision::VoiceMoveDecision,
 };
-use two_bot_discord::{internal_actions::CooldownGovernor, ActionExecutor, DiscordError};
+use two_bot_discord::{
+    executor::member::VoiceMoveReadError::Discord as VoiceReadError,
+    internal_actions::CooldownGovernor, ActionExecutor, DiscordError,
+};
 
 struct MockDiscord {
     origin: String,
@@ -353,10 +356,10 @@ async fn voice_evidence_checks_member_identity_and_preserves_read_errors() {
         let result = api.voice_move_evidence_until(target, 3, 1, deadline).await;
         match (status, expected, result) {
             (_, Some(expected), Ok(evidence)) => assert_eq!(evidence.decide(1), expected),
-            (StatusCode::OK, None, Err(DiscordError::Unavailable(detail))) => {
+            (StatusCode::OK, None, Err(VoiceReadError(DiscordError::Unavailable(detail)))) => {
                 assert_eq!(detail, "voice_move_evidence_incomplete");
             }
-            (StatusCode::FORBIDDEN, None, Err(DiscordError::Rejected(_))) => {}
+            (StatusCode::FORBIDDEN, None, Err(VoiceReadError(DiscordError::Rejected(_)))) => {}
             _ => panic!("unexpected voice evidence result"),
         }
         let requests = mock.requests.lock().unwrap();
@@ -385,7 +388,10 @@ async fn governed_voice_read_cutoff_leaves_the_real_lane_reusable() {
             Ok(Err(AdmissionError::Blocked))
         ));
     });
-    assert!(matches!(result, Ok(Err(DiscordError::Timeout))));
+    assert!(matches!(
+        result,
+        Ok(Err(VoiceReadError(DiscordError::Timeout)))
+    ));
     assert_eq!((mock.count(), mock.sockets.load(Ordering::SeqCst)), (1, 1));
     assert_eq!(mock.requests.lock().unwrap()[0]["method"], "GET");
     let permit = lane.admit_strict().await.unwrap();

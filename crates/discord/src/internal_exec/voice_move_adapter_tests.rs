@@ -18,7 +18,7 @@ use two_bot_core::send_admission::{
     TokenKey,
 };
 use VoiceMoveNotSent::{Blocked, Deadline, Guard, Revalidation, Storage};
-use VoiceMovePatch::{Denied, Moved, NotSent, Stale, Unavailable};
+use VoiceMovePatch::{Denied, Moved, NotSent, RefusalUnsettled, Stale, Unavailable};
 
 const TOKEN: &str = "voice-patch-fixture";
 const WAIT: Duration = Duration::from_secs(3);
@@ -102,7 +102,7 @@ async fn voice_patch_requires_a_confirmed_member_receipt() {
         (400, "", 10, true, false, Stale, true),
         (403, "", 10, true, false, Denied, true),
         (404, "", 10, true, false, Stale, true),
-        (403, "", 10, true, true, Denied, true),
+        (403, "", 10, true, true, RefusalUnsettled, true),
     ] {
         let mut wire = String::new();
         if status != 0 {
@@ -149,6 +149,61 @@ async fn voice_patch_429_preserves_best_timing_separate_from_settlement() {
         assert_eq!(result, limited(delay, !stall && !stuck));
         let cooldown = delay.map_or(SendCooldown::Indefinite, SendCooldown::FiniteMs);
         assert_eq!(completed, (!stall).then_some(Some(cooldown)).as_slice());
+    }
+}
+
+#[tokio::test]
+async fn voice_preflight_429_preserves_only_validated_timing_without_patch() {
+    use crate::pipeline::SharedCache;
+    use two_bot_core::{internal_actions::VoiceMoveOutcome, voice_move_holds::VoiceMoveHolds};
+
+    let fallback = "Retry-After: invalid\r\nX-RateLimit-Reset-After: 2.1\r\n";
+    for (identity, headers, body, expected) in [
+        (
+            true,
+            "Retry-After: 1\r\n",
+            r#"{"retry_after":1.2}"#,
+            Some(2),
+        ),
+        (false, fallback, "{}", Some(3)),
+        (
+            false,
+            "Retry-After: -1\r\n",
+            r#"{"retry_after": "900"}"#,
+            None,
+        ),
+        (true, "", "{}", None),
+    ] {
+        let (listener, origin) = loopback().await;
+        let action = executor(&origin, Arc::new(Admission::new(TOKEN, None, None)));
+        let cache = SharedCache::default();
+        let holds = std::sync::Mutex::new(VoiceMoveHolds::default());
+        let roster = VoiceMoveRoster::new(&cache, &holds);
+        let attempt = action.move_with_voice_evidence_until(
+            ["1", "2", "3"],
+            roster,
+            Instant::now() + WAIT,
+            || Some(()),
+        );
+        let (actual, ()) = timeout(WAIT, async {
+            tokio::join!(attempt, async {
+                let replies = [(200, "", r#"{"id":"4","bot":true}"#), (429, headers, body)];
+                for &(status, header, body) in &replies[usize::from(identity)..] {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    assert!(read_request(&mut socket).await.starts_with(b"GET "));
+                    socket
+                        .write_all(response(status, header, body.len(), body).as_bytes())
+                        .await
+                        .unwrap();
+                }
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(actual.outcome, VoiceMoveOutcome::RateLimited);
+        assert_eq!((actual.retry_after_secs, actual.from), (expected, None));
+        assert_eq!(action.requests(), if identity { 1 } else { 2 });
+        assert_no_socket(&listener).await;
     }
 }
 
@@ -399,6 +454,119 @@ mod postgres {
     async fn lane(db: &TestDatabase) -> (i64, bool, Option<i64>, bool) {
         sqlx::query_as("SELECT generation, in_flight, pending_settlement_generation, indefinite FROM public.discord_send_admission")
             .fetch_one(db.pool()).await.unwrap()
+    }
+
+    // Pause only completion; claim and generation-checked settlement both use Postgres.
+    #[derive(Debug, Default)]
+    struct CompletionLatch {
+        entered: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    #[derive(Debug)]
+    struct PauseCompletion(PgSendAdmission, Arc<CompletionLatch>);
+
+    impl SendAdmission for PauseCompletion {
+        fn token_key(&self) -> &TokenKey {
+            self.0.token_key()
+        }
+
+        fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+            self.0.admit()
+        }
+
+        fn admit_strict(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+            Box::pin(async {
+                let permit = self.0.admit_strict().await?;
+                Ok(AdmissionPermit::new(Box::new(PausedPermit(
+                    permit,
+                    self.1.clone(),
+                ))))
+            })
+        }
+    }
+
+    struct PausedPermit(AdmissionPermit, Arc<CompletionLatch>);
+
+    impl SendCompletion for PausedPermit {
+        fn complete(
+            self: Box<Self>,
+            cooldown: Option<SendCooldown>,
+        ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+            Box::pin(async move {
+                self.1.entered.notify_one();
+                self.1.resume.notified().await;
+                self.0.complete(cooldown).await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_voice_definitive_refusal_settles_past_wire_cutoff() {
+        let url = std::env::var("TWO_TEST_DATABASE_URL").expect("TWO_TEST_DATABASE_URL");
+        let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .unwrap();
+        let sender = db.independent_pool().await.unwrap();
+        let observer = PgSendAdmission::new(db.pool().clone(), TOKEN).unwrap();
+        let (listener, origin) = loopback().await;
+        let latch = Arc::new(CompletionLatch::default());
+        let gate = PgSendAdmission::new(sender.clone(), TOKEN).unwrap();
+        let action = executor(&origin, Arc::new(PauseCompletion(gate, latch.clone())));
+        let deadline = Instant::now() + 2 * WAIT;
+        let caller = action.clone();
+        let sending = tokio::spawn(async move {
+            caller
+                .move_voice_member_until("1", "2", "3", deadline, async { true })
+                .await
+                .unwrap()
+        });
+        let (mut socket, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+        assert!(read_request(&mut socket)
+            .await
+            .starts_with(b"PATCH /api/v10/guilds/1/members/2 "));
+        let armed = lane(&db).await;
+        assert_eq!(armed, (armed.0, true, Some(armed.0), false));
+        assert!(matches!(
+            observer.admit_strict().await,
+            Err(AdmissionError::Blocked)
+        ));
+
+        // The blocking task inhibits Tokio's automatic time advance while the
+        // loopback socket delivers headers and the completion latch is entered.
+        let (stop, wait) = std::sync::mpsc::channel::<()>();
+        let clock = tokio::task::spawn_blocking(move || wait.recv_timeout(WAIT));
+        tokio::time::pause();
+        tokio::time::advance(deadline - Instant::now() - Duration::from_millis(250)).await;
+        socket
+            .write_all(response(403, "", 20, "").as_bytes())
+            .await
+            .unwrap();
+        timeout(WAIT, latch.entered.notified()).await.unwrap();
+        tokio::time::advance(deadline - Instant::now() + Duration::from_millis(1)).await;
+        assert!(
+            !sending.is_finished(),
+            "settlement must outlive the wire cutoff"
+        );
+        tokio::time::resume();
+        stop.send(()).unwrap();
+        clock.await.unwrap().unwrap();
+        latch.resume.notify_one();
+
+        assert_eq!(finish(sending).await, Denied);
+        assert_eq!(lane(&db).await, (armed.0, false, None, false));
+        observer
+            .admit_strict()
+            .await
+            .unwrap()
+            .complete(None)
+            .await
+            .unwrap();
+        assert_eq!(lane(&db).await, (armed.0 + 1, false, None, false));
+        assert_eq!(action.requests(), 1);
+        assert_no_socket(&listener).await;
+        sender.close().await;
+        db.close().await.unwrap();
     }
 
     async fn voice_fence(fail: bool) {

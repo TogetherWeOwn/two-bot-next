@@ -104,6 +104,8 @@ const RESPONSE_BODY_LIMIT: usize = 8 * 1024 * 1024;
 /// completion cannot be confirmed within the bound, admission stays occupied.
 const READ_SETTLEMENT_GRACE_MS: u64 = 1_000;
 const STRICT_UNSENT_SETTLEMENT_GRACE_MS: u64 = 1_000;
+// Only a definitive header-only refusal can use this post-wire storage budget.
+const STRICT_REFUSAL_SETTLEMENT_GRACE_MS: u64 = 1_000;
 /// Wire marker for a stalled response body: headers arrived but the body never
 /// completed within [`RESPONSE_BODY_TIMEOUT_MS`]. The executor seam maps this
 /// to [`DiscordError::Timeout`] (never `Unavailable`) so the publish wire
@@ -333,6 +335,8 @@ pub enum ChannelCall {
 pub struct RawResponse {
     pub status: u16,
     pub retry_after_header: Option<String>,
+    // Validated 429 evidence, separate from legacy header precedence and waits.
+    pub(crate) validated_retry_after_header: Option<f64>,
     pub body: Vec<u8>,
     pub(crate) completion: Option<two_bot_core::send_admission::AdmissionPermit>,
 }
@@ -1027,7 +1031,9 @@ impl HyperTransport {
                     .map(str::to_owned)
             });
         let retry_after_header = if strict && status == 429 {
-            accounting.longest_admission_header()
+            accounting
+                .longest_admission_header()
+                .map(|secs| secs.to_string())
         } else {
             retry_after_header
         };
@@ -1207,6 +1213,11 @@ impl PendingHeaders<'_> {
         };
         let mut res = RawResponse {
             status,
+            validated_retry_after_header: self
+                .accounting
+                .as_ref()
+                .filter(|_| status == 429)
+                .and_then(crate::ratelimit_guard::ResponseAccounting::longest_admission_header),
             retry_after_header: self.retry_after_header.clone(),
             body,
             completion: self.permit.take(),
@@ -1230,21 +1241,26 @@ impl PendingHeaders<'_> {
     /// because `complete_on_receipt` (GET + rejection/rate-limit statuses)
     /// never fires for a PUT/DELETE success, and no caller completes it later.
     pub(crate) async fn settle_status(mut self) -> u16 {
-        let status = self.status;
-        let mut res = RawResponse {
-            status,
-            retry_after_header: self.retry_after_header.clone(),
+        let complete = self.complete_on_receipt || self.status == 204;
+        let mut res = self.take_status_response();
+        if complete {
+            res.complete().await;
+        }
+        res.status
+    }
+
+    fn take_status_response(&mut self) -> RawResponse {
+        let res = RawResponse {
+            status: self.status,
+            validated_retry_after_header: None,
+            retry_after_header: self.retry_after_header.take(),
             body: Vec::new(),
             completion: self.permit.take(),
         };
-        let _ = self
-            .accounting
-            .take()
-            .map(|mut settled| settled.finish(&res));
-        if self.complete_on_receipt || status == 204 {
-            res.complete().await;
+        if let Some(mut accounting) = self.accounting.take() {
+            accounting.finish(&res);
         }
-        status
+        res
     }
 }
 
@@ -1260,6 +1276,18 @@ impl Drop for PendingHeaders<'_> {
 }
 
 impl StrictEvidenceHeaders<'_> {
+    // Only for a caller's recognized no-effect status; in particular, a 429
+    // still needs bounded body collection and a cooldown on its exact claim.
+    async fn settle_definitive_refusal(mut self) -> StrictSettlement {
+        if !is_definitive_rejection(self.pending.status) {
+            return StrictSettlement::Unconfirmed;
+        }
+        let cutoff = Instant::now() + Duration::from_millis(STRICT_REFUSAL_SETTLEMENT_GRACE_MS);
+        let mut response = self.pending.take_status_response();
+        drop(self.pending);
+        Self::confirm_completion(&mut response, cutoff).await
+    }
+
     /// Observe a bounded strict response without authority to confirm mutations.
     pub async fn collect_evidence(
         self,
@@ -1293,6 +1321,7 @@ impl StrictEvidenceHeaders<'_> {
         let body_available = body.is_some();
         let mut response = RawResponse {
             status: pending.status,
+            validated_retry_after_header: None,
             retry_after_header: pending.retry_after_header.take(),
             body: body.unwrap_or_default(),
             completion: pending.permit.take(),
@@ -1310,6 +1339,10 @@ impl StrictEvidenceHeaders<'_> {
         if !(pending.complete_on_receipt || validated_success) {
             return StrictSettlement::Unconfirmed;
         }
+        Self::confirm_completion(&mut response, deadline).await
+    }
+
+    async fn confirm_completion(response: &mut RawResponse, deadline: Instant) -> StrictSettlement {
         match response.complete_before(Some(deadline)).await {
             Ok(()) => StrictSettlement::Confirmed,
             Err(error) => {
@@ -2764,6 +2797,16 @@ impl ActionExecutor {
         path: &str,
         deadline: Instant,
     ) -> Result<Option<serde_json::Value>, DiscordError> {
+        self.get_json_strict_until_map(path, deadline, throw_for_status)
+            .await
+    }
+
+    async fn get_json_strict_until_map<E: From<DiscordError>>(
+        &self,
+        path: &str,
+        deadline: Instant,
+        status_error: impl FnOnce(&RawResponse) -> E,
+    ) -> Result<Option<serde_json::Value>, E> {
         let route = raw_get_route(path).map_err(DiscordError::Rejected)?;
         let res = self
             .send_preflight_read(&Request::from_route(&route), deadline)
@@ -2771,9 +2814,9 @@ impl ActionExecutor {
         match res.status {
             200..=299 => serde_json::from_slice(&res.body)
                 .map(Some)
-                .map_err(|_| DiscordError::Unavailable("invalid JSON response".into())),
+                .map_err(|_| DiscordError::Unavailable("invalid JSON response".into()).into()),
             404 => Ok(None),
-            _ => Err(throw_for_status(&res)),
+            _ => Err(status_error(&res)),
         }
     }
 
@@ -4022,10 +4065,19 @@ impl ActionExecutor {
     /// Resolve bot identity with the same wire cutoff and settlement as
     /// [`Self::get_json_strict_until`].
     pub async fn current_bot_user_id_until(&self, deadline: Instant) -> Result<u64, DiscordError> {
+        self.current_bot_user_id_until_map(deadline, throw_for_status)
+            .await
+    }
+
+    async fn current_bot_user_id_until_map<E: From<DiscordError>>(
+        &self,
+        deadline: Instant,
+        status_error: impl FnOnce(&RawResponse) -> E,
+    ) -> Result<u64, E> {
         let req = Self::request_of(self.inner.factory.current_user())?;
         let res = self.send_preflight_read(&req, deadline).await?;
         if res.status != 200 {
-            return Err(throw_for_status(&res));
+            return Err(status_error(&res));
         }
         let body: serde_json::Value = serde_json::from_slice(&res.body)
             .map_err(|_| DiscordError::Unavailable("invalid bot user response".into()))?;
@@ -6273,6 +6325,7 @@ mod tests {
     fn raw_response_debug_never_formats_remote_echoes() {
         let response = RawResponse {
             status: 403,
+            validated_retry_after_header: None,
             retry_after_header: Some("fixture-echoed-header-secret".to_owned()),
             body: b"fixture-echoed-body-secret".to_vec(),
             completion: None,
@@ -6303,6 +6356,7 @@ mod tests {
     fn retry_after_body_wins_header() {
         let res = RawResponse {
             status: 429,
+            validated_retry_after_header: None,
             retry_after_header: Some("5".to_owned()),
             body: br#"{"retry_after": 1.5, "global": false}"#.to_vec(),
             completion: None,
@@ -6315,6 +6369,7 @@ mod tests {
     fn retry_after_header_only_and_defaults() {
         let header_only = RawResponse {
             status: 429,
+            validated_retry_after_header: None,
             retry_after_header: Some("2".to_owned()),
             body: Vec::new(),
             completion: None,
@@ -6322,6 +6377,7 @@ mod tests {
         assert_eq!(header_only.retry_after_wait_ms(), 2250);
         let missing = RawResponse {
             status: 429,
+            validated_retry_after_header: None,
             retry_after_header: None,
             body: Vec::new(),
             completion: None,
@@ -6329,6 +6385,7 @@ mod tests {
         assert_eq!(missing.retry_after_wait_ms(), 1250);
         let garbage = RawResponse {
             status: 429,
+            validated_retry_after_header: None,
             retry_after_header: Some("soon".to_owned()),
             body: b"not json".to_vec(),
             completion: None,
@@ -6336,6 +6393,7 @@ mod tests {
         assert_eq!(garbage.retry_after_wait_ms(), 1250);
         let clamped = RawResponse {
             status: 429,
+            validated_retry_after_header: None,
             retry_after_header: Some("86400".to_owned()),
             body: Vec::new(),
             completion: None,
@@ -6347,6 +6405,7 @@ mod tests {
     fn backfill_read_waits_out_long_header_unclamped() {
         let long = RawResponse {
             status: 429,
+            validated_retry_after_header: None,
             retry_after_header: Some("75".to_owned()),
             body: Vec::new(),
             completion: None,
@@ -6357,6 +6416,7 @@ mod tests {
         assert_eq!(long.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
         let short = RawResponse {
             status: 429,
+            validated_retry_after_header: None,
             retry_after_header: Some("2".to_owned()),
             body: Vec::new(),
             completion: None,
@@ -6366,6 +6426,7 @@ mod tests {
         // parking the caller, while the clamped wait is untouched.
         let huge = RawResponse {
             status: 429,
+            validated_retry_after_header: None,
             retry_after_header: Some("86400".to_owned()),
             body: Vec::new(),
             completion: None,
@@ -6408,6 +6469,7 @@ mod tests {
     fn throw_for_status_releases_only_confirmed_rejections() {
         let rl = RawResponse {
             status: 429,
+            validated_retry_after_header: None,
             retry_after_header: None,
             body: Vec::new(),
             completion: None,
@@ -6415,6 +6477,7 @@ mod tests {
         assert_eq!(throw_for_status(&rl), DiscordError::RateLimited);
         let down = RawResponse {
             status: 503,
+            validated_retry_after_header: None,
             retry_after_header: None,
             body: Vec::new(),
             completion: None,
@@ -6428,6 +6491,7 @@ mod tests {
         for status in [400, 401, 403, 404, 405, 413, 415, 422] {
             let no = RawResponse {
                 status,
+                validated_retry_after_header: None,
                 retry_after_header: None,
                 body: Vec::new(),
                 completion: None,
@@ -6438,6 +6502,7 @@ mod tests {
         for status in [100, 200, 202, 204, 301, 302, 307, 408, 409, 425, 500, 503] {
             let uncertain = RawResponse {
                 status,
+                validated_retry_after_header: None,
                 retry_after_header: None,
                 body: Vec::new(),
                 completion: None,
@@ -6516,6 +6581,7 @@ mod tests {
     fn unknown_message_needs_404_with_code_10008() {
         let coded = RawResponse {
             status: 404,
+            validated_retry_after_header: None,
             retry_after_header: None,
             body: br#"{"code": 10008, "message": "Unknown Message"}"#.to_vec(),
             completion: None,
@@ -6531,6 +6597,7 @@ mod tests {
         for body in bodies {
             let unclassified = RawResponse {
                 status: 404,
+                validated_retry_after_header: None,
                 retry_after_header: None,
                 body: body.to_vec(),
                 completion: None,
@@ -6543,6 +6610,7 @@ mod tests {
         }
         let wrong_status = RawResponse {
             status: 403,
+            validated_retry_after_header: None,
             retry_after_header: None,
             body: br#"{"code": 10008}"#.to_vec(),
             completion: None,

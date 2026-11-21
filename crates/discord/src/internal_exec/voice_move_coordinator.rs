@@ -8,7 +8,7 @@ use two_bot_core::{
     voice_move_holds::VoiceMoveHolds, Snowflake,
 };
 
-use super::{ActionExecutor, VoiceMovePatch};
+use super::{ActionExecutor, VoiceMovePatch, VoiceMoveReadError};
 use crate::{pipeline::SharedCache, DiscordError};
 
 /// Read evidence from the same cache and hold ledger that observe gateway transitions.
@@ -35,17 +35,22 @@ impl VoiceMoveAttempt {
             retry_after_secs: None,
         }
     }
+
+    fn limited(retry_after_ms: Option<u64>, from: Option<Snowflake>) -> Self {
+        Self {
+            retry_after_secs: retry_after_ms.map(|ms| ms.div_ceil(1_000).max(1)),
+            ..Self::new(Outcome::RateLimited, from)
+        }
+    }
 }
 
-impl From<DiscordError> for VoiceMoveAttempt {
-    fn from(error: DiscordError) -> Self {
-        Self::new(
-            match error {
-                DiscordError::RateLimited => Outcome::RateLimited,
-                _ => Outcome::DiscordUnavailable,
-            },
-            None,
-        )
+impl From<VoiceMoveReadError> for VoiceMoveAttempt {
+    fn from(error: VoiceMoveReadError) -> Self {
+        match error {
+            VoiceMoveReadError::RateLimited(delay) => Self::limited(delay, None),
+            VoiceMoveReadError::Discord(DiscordError::RateLimited) => Self::limited(None, None),
+            VoiceMoveReadError::Discord(_) => Self::new(Outcome::DiscordUnavailable, None),
+        }
     }
 }
 
@@ -92,7 +97,7 @@ impl ActionExecutor {
         deadline: Instant,
         ready: impl Fn() -> Option<R> + Sync,
     ) -> VoiceMoveAttempt {
-        use VoiceMovePatch::{Denied, Limited, Moved, NotSent, Stale};
+        use VoiceMovePatch::{Denied, Limited, Moved, NotSent, RefusalUnsettled, Stale};
         let no_evidence = VoiceMoveAttempt::new(Outcome::DiscordUnavailable, None);
         let parse = |id: &str| {
             id.parse::<Snowflake>()
@@ -125,7 +130,10 @@ impl ActionExecutor {
             let Ok(mut holds) = roster.holds.lock() else {
                 return no_evidence;
             };
-            if matches!(patch, Ok(Denied | Stale | NotSent(_) | Limited { .. })) {
+            if matches!(
+                patch,
+                Ok(Denied | Stale | RefusalUnsettled | NotSent(_) | Limited { .. })
+            ) {
                 holds.release_no_effect(member);
             } else {
                 holds.complete(member);
@@ -135,10 +143,7 @@ impl ActionExecutor {
         match patch {
             Ok(Moved) => VoiceMoveAttempt::new(Outcome::Moved, from),
             Ok(Denied) => VoiceMoveAttempt::new(Outcome::BotNotPermitted, from),
-            Ok(Limited { retry_after_ms, .. }) => VoiceMoveAttempt {
-                retry_after_secs: retry_after_ms.map(|ms| ms.div_ceil(1_000).max(1)),
-                ..VoiceMoveAttempt::new(Outcome::RateLimited, from)
-            },
+            Ok(Limited { retry_after_ms, .. }) => VoiceMoveAttempt::limited(retry_after_ms, from),
             // Re-read once after a stale refusal, but never issue a second PATCH.
             Ok(Stale) => match self
                 .check_move(roster, ids_numeric, deadline, &ready, false)
