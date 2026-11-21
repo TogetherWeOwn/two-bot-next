@@ -234,7 +234,6 @@ test("staging preview: GET-only fixed registry receipt, with no lifecycle writes
   const h = await harness(t, env, { running: true });
   const ready = () => Response.json({ components: [["gateway", "ready"]], build_revision: sha,
     build_id: `${window.runId}-${window.runAttempt}` });
-  h.setProbeStatus(200);
   h.setProbeResponse(ready);
   const entry = { name: "automod-preview", id: "123456789012345678", version: "223456789012345678",
     application_id: app, guild_id: guild, type: 1 };
@@ -245,6 +244,7 @@ test("staging preview: GET-only fixed registry receipt, with no lifecycle writes
   ] };
   const listUrl = `https://discord.com/api/v10/applications/${app}/guilds/${guild}/commands`;
   const urls = ["https://discord.com/api/v10/users/@me", listUrl, `${listUrl}/${entry.id}`];
+  const outputs = (registry: unknown) => [Response.json({ id: app, bot: true }), Response.json([entry]), Response.json(registry)];
   let replies: Response[] = [];
   const discord = t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
     assert.equal(url, urls[discord.mock.callCount() % 3]);
@@ -274,8 +274,6 @@ test("staging preview: GET-only fixed registry receipt, with no lifecycle writes
   assert.equal((await worker.fetch(request(), { ...edge, CF_VERSION_METADATA: { id: "stale-edge" } } as Env)).status, 503);
   assert.equal(discord.mock.callCount(), 0);
   assert.equal(h.requests.length, 0);
-
-  const outputs = (registry: unknown) => [Response.json({ id: app, bot: true }), Response.json([entry]), Response.json(registry)];
   replies = outputs(detail);
   const pass = await send(request({ [DEPLOYMENT_HEADER]: "spoofed" }));
   assert.equal(pass.status, 200);
@@ -295,18 +293,20 @@ test("staging preview: GET-only fixed registry receipt, with no lifecycle writes
   discord.mock.resetCalls();
   replies = [Response.json({ id: app, bot: true }), new Response("x".repeat(256 * 1024 + 1))];
   assert.equal((await send()).status, 503);
-  discord.mock.resetCalls();
-  replies = outputs(detail);
-  let probes = 0;
-  h.setProbeResponse(() => ++probes === 1 ? ready() : Response.json({ build_revision: sha, build_id: "another-attempt" }));
-  assert.equal((await send()).status, 503);
-  discord.mock.resetCalls();
-  h.setProbeResponse(() => {
-    h.values.set(STAGING_USE_KEY, { ...grant, phase: "released" });
-    return ready();
-  });
-  assert.equal((await send()).status, 503);
-  assert.equal(discord.mock.callCount(), 0, "a released grant cannot send Discord traffic");
+  for (const [change, read, discordCalls] of [["drift", 2, 3], ["release", 1, 0], ["release", 2, 3]] as const) {
+    discord.mock.resetCalls();
+    replies = outputs(detail);
+    h.values.set(STAGING_USE_KEY, grant);
+    let probes = 0;
+    h.setProbeResponse(() => {
+      if (++probes !== read) return ready();
+      if (change === "drift") return Response.json({ build_revision: sha, build_id: "another-attempt" });
+      h.values.set(STAGING_USE_KEY, { ...grant, phase: "released" });
+      return ready();
+    });
+    assert.equal((await send()).status, 503, `${change} during readiness read ${read}`);
+    assert.equal(discord.mock.callCount(), discordCalls, `Discord calls before ${change} on readiness read ${read}`);
+  }
   assert.equal(h.starts.length + h.runtime.destroys, 0);
   assert.deepEqual(await h.bot.listSchedules("stagingExpiry"), []);
 });
