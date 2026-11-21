@@ -42,11 +42,12 @@ pub fn project(
         return Ok(None);
     }
 
+    // Twilight also maps omitted nullable fields to None; only explicit null clears state.
     let operation = match event_type {
         "CHANNEL_CREATE" | "CHANNEL_UPDATE" | "CHANNEL_DELETE" => {
             return channel_change(payload, event_type == "CHANNEL_DELETE");
         }
-        "GUILD_UPDATE" => {
+        "GUILD_UPDATE" if payload.get("afk_channel_id").is_some() => {
             let guild: GuildUpdate = decode(payload)?;
             Operation::Guild(Change::Upsert {
                 id: wire_id(guild_id),
@@ -73,7 +74,7 @@ pub fn project(
                 id: wire_id(event.role_id),
             })
         }
-        "VOICE_STATE_UPDATE" => {
+        "VOICE_STATE_UPDATE" if payload.get("channel_id").is_some() => {
             let state: VoiceStateUpdate = decode(payload)?;
             let id = wire_id(state.user_id);
             Operation::Voice(match state.channel_id {
@@ -87,6 +88,7 @@ pub fn project(
                 None => Change::Remove { id },
             })
         }
+        "GUILD_UPDATE" | "VOICE_STATE_UPDATE" => return Err(ProjectionError::InvalidPayload),
         _ => return Ok(None),
     };
     Ok(Some(operation))

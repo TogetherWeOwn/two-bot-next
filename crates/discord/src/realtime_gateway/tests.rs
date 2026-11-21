@@ -13,6 +13,11 @@ fn operation(event_type: &str, payload: &Value) -> Value {
     .expect("wire operation serializes")
 }
 
+fn assert_invalid_payload(event: &str, payload: &Value) {
+    let expected = Some(ProjectionError::InvalidPayload);
+    assert_eq!(project(GUILD_ID, event, payload).err(), expected, "{event}");
+}
+
 fn channel(kind: u8) -> Value {
     json!({
         "id": "20", "guild_id": "10", "name": "Lobby", "type": kind,
@@ -82,45 +87,43 @@ fn malformed_channel_permission_state_is_not_an_ignored_event() {
 
 #[test]
 fn voice_join_move_and_leave_only_carry_user_and_room_ids() {
-    for (room, expected) in [
-        (
-            Some("20"),
-            json!({"topic": "voice", "op": "upsert", "id": "42", "value": {"userId": "42", "channelId": "20"}}),
-        ),
-        (
-            Some("21"),
-            json!({"topic": "voice", "op": "upsert", "id": "42", "value": {"userId": "42", "channelId": "21"}}),
-        ),
-        (None, json!({"topic": "voice", "op": "remove", "id": "42"})),
-    ] {
-        let payload = json!({
-            "guild_id": "10", "channel_id": room, "user_id": "42", "session_id": "synthetic-session",
-            "deaf": false, "mute": false, "self_deaf": false, "self_mute": false,
-            "self_video": false, "suppress": false
-        });
-        assert_eq!(operation("VOICE_STATE_UPDATE", &payload), expected);
-        assert!(matches!(
-            project(Id::new(11), "VOICE_STATE_UPDATE", &payload),
-            Ok(None)
-        ));
+    let event = "VOICE_STATE_UPDATE";
+    let mut payload = json!({
+        "guild_id": "10", "user_id": "42", "session_id": "synthetic-session",
+        "deaf": false, "mute": false, "self_deaf": false, "self_mute": false,
+        "self_video": false, "suppress": false
+    });
+    assert_invalid_payload(event, &payload);
+    assert!(matches!(project(Id::new(11), event, &payload), Ok(None)));
+    for room in ["20", "21"] {
+        payload["channel_id"] = json!(room);
+        let expected = json!({"topic": "voice", "op": "upsert",
+            "id": "42", "value": {"userId": "42", "channelId": room}});
+        assert_eq!(operation(event, &payload), expected);
     }
+    payload["channel_id"] = Value::Null;
+    let expected = json!({"topic": "voice", "op": "remove", "id": "42"});
+    assert_eq!(operation(event, &payload), expected);
 }
 
 #[test]
 fn owner_afk_and_role_changes_preserve_authorization_inputs() {
-    let guild = json!({
-        "id": "10", "name": "not forwarded", "owner_id": "42", "afk_channel_id": "20",
+    let event = "GUILD_UPDATE";
+    let mut guild = json!({
+        "id": "10", "name": "not forwarded", "owner_id": "42",
         "afk_timeout": 60, "default_message_notifications": 0, "emojis": [], "features": [],
         "explicit_content_filter": 0, "mfa_level": 0, "nsfw_level": 0, "preferred_locale": "en-US",
         "premium_progress_bar_enabled": false, "premium_tier": 0, "roles": [],
         "system_channel_flags": 0, "verification_level": 0
     });
-    assert_eq!(
-        operation("GUILD_UPDATE", &guild),
-        json!({
-            "topic": "guild", "op": "upsert", "id": "10", "value": {"ownerId": "42", "afkChannelId": "20"}
-        })
-    );
+    assert_invalid_payload(event, &guild);
+    assert!(matches!(project(Id::new(11), event, &guild), Ok(None)));
+    for afk in [Some("20"), None] {
+        guild["afk_channel_id"] = json!(afk);
+        let expected = json!({"topic": "guild", "op": "upsert",
+            "id": "10", "value": {"ownerId": "42", "afkChannelId": afk}});
+        assert_eq!(operation(event, &guild), expected);
+    }
     let role = json!({"guild_id": "10", "role": {"id": "31", "name": "not forwarded", "permissions": "3072"}});
     let expected = json!({"topic": "roles", "op": "upsert", "id": "31", "value": {"id": "31", "permissions": "3072"}});
     assert_eq!(operation("GUILD_ROLE_CREATE", &role), expected);
@@ -159,12 +162,8 @@ fn malformed_permission_masks_cannot_replace_rows() {
         let role = json!({"guild_id": "10", "role": {"id": "31", "permissions": mask}});
         let mut channel = channel(2);
         channel["permission_overwrites"][0]["deny"] = mask;
-        for (kind, payload) in [("GUILD_ROLE_UPDATE", role), ("CHANNEL_UPDATE", channel)] {
-            assert!(matches!(
-                project(GUILD_ID, kind, &payload),
-                Err(ProjectionError::InvalidPayload)
-            ));
-        }
+        assert_invalid_payload("GUILD_ROLE_UPDATE", &role);
+        assert_invalid_payload("CHANNEL_UPDATE", &channel);
     }
 }
 
