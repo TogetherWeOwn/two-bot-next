@@ -16,11 +16,6 @@ use two_bot_discord::help_navigation::{source_cursor, DiscoveryPlan, HelpRecover
 use super::{CommandRuntime, DispatchTasks, DISPATCH_LIMITS, LANE_BUSY, LANE_HELP};
 use crate::db_log::discord_class;
 
-enum Request {
-    Discovery,
-    Button,
-}
-
 // Store only active scalar IDs, never tokens or a retained page/session. The
 // separate refusal budget lets a refusal through even when all plan slots are
 // occupied, without queuing work or consuming another plan slot.
@@ -103,7 +98,7 @@ impl CommandRuntime {
         };
         let interaction = &event.0;
         let guild = interaction.guild_id.map(|id| id.get());
-        let request = match (&interaction.kind, interaction.data.as_ref()) {
+        match (&interaction.kind, interaction.data.as_ref()) {
             (InteractionType::MessageComponent, Some(InteractionData::MessageComponent(data)))
                 if Cursor::is_help_control(&data.custom_id) =>
             {
@@ -116,7 +111,6 @@ impl CommandRuntime {
                 else {
                     return true;
                 };
-                Request::Button
             }
             (
                 InteractionType::ApplicationCommand,
@@ -143,10 +137,9 @@ impl CommandRuntime {
                 else {
                     return true;
                 };
-                Request::Discovery
             }
             _ => return false,
-        };
+        }
         let application = self.application_id.load(Ordering::Relaxed);
         let Some(actor) = interaction.author_id() else {
             return true;
@@ -175,15 +168,9 @@ impl CommandRuntime {
             if Instant::now() >= deadline {
                 return;
             }
-            let response = match admission {
-                Admission::Render => runtime
-                    .discovery_response(&interaction, request, application, actor.get(), now)
-                    .unwrap_or_else(HelpRecovery::response),
-                Admission::Refuse => HelpRecovery::Busy {
-                    from_button: matches!(request, Request::Button),
-                }
-                .response(),
-            };
+            let response = runtime
+                .discovery_response(&interaction, admission, application, actor.get(), now)
+                .unwrap_or_else(HelpRecovery::response);
             if let Err(error) = runtime
                 .executor
                 .answer_interaction_since_receipt(id, &interaction.token, &response, received)
@@ -202,23 +189,26 @@ impl CommandRuntime {
     fn discovery_response(
         &self,
         interaction: &Interaction,
-        request: Request,
+        admission: Admission,
         application: u64,
         actor: u64,
         now: u64,
     ) -> Result<InteractionResponse, HelpRecovery> {
-        let cursor = match request {
-            Request::Discovery => None,
-            Request::Button => {
-                let (cursor, _) = source_cursor(
-                    interaction,
-                    application,
-                    self.interactions.known_bot_user_id(),
-                )
-                .ok_or(HelpRecovery::Invalid)?;
-                Some(cursor)
-            }
+        let from_button = interaction.kind == InteractionType::MessageComponent;
+        let cursor = if from_button {
+            let (cursor, _) = source_cursor(
+                interaction,
+                application,
+                self.interactions.known_bot_user_id(),
+            )
+            .ok_or(HelpRecovery::Invalid)?;
+            Some(cursor)
+        } else {
+            None
         };
+        if admission == Admission::Refuse {
+            return Err(HelpRecovery::Busy { from_button });
+        }
         let defs = self.published_commands().ok_or(HelpRecovery::CannotBuild)?;
         let plan = DiscoveryPlan::new(&defs, self.guild_id, application)
             .map_err(|_| HelpRecovery::CannotBuild)?;

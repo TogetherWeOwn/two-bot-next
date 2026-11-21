@@ -1787,7 +1787,7 @@ async fn help_answers_immediately_from_the_live_publish_set() {
 
 #[tokio::test]
 async fn gateway_help_opens_a_new_private_page_from_the_confirmed_registry() {
-    use crate::command_runtime::{LANE_HELP, LANE_INTERACTIONS};
+    use crate::command_runtime::{LANE_BUSY, LANE_HELP, LANE_INTERACTIONS};
     use serde_json::{json, Value};
     use tokio::time::Instant;
     use two_bot_discord::brand::{EmbedKind, BRAND_ICON_URL};
@@ -1850,11 +1850,30 @@ async fn gateway_help_opens_a_new_private_page_from_the_confirmed_registry() {
     assert!(dispatch(&first, Instant::now() - Duration::from_secs(3)));
     assert!(idle(), "an expired receipt must not admit Help work");
     assert_eq!(runtime.dispatch_drops_total(LANE_INTERACTIONS), 0);
+    let mut invalid = click.clone();
+    invalid.id = Id::new(837);
+    invalid.message.as_mut().unwrap().flags = None;
     assert!(dispatch(&interaction_event(click), Instant::now()));
-    wait_for(idle, "help page callback").await;
-    let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 2, "no extra callbacks");
+    assert!(dispatch(&interaction_event(invalid), Instant::now()));
+    assert_eq!(runtime.lane_in_flight(LANE_BUSY), 1, "same actor is busy");
+    wait_for(
+        || idle() && runtime.lane_in_flight(LANE_BUSY) == 0,
+        "help callbacks",
+    )
+    .await;
+    let mut callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 3, "no extra callbacks");
+    callbacks[1..].sort_unstable_by(|a, b| a.path.cmp(&b.path));
     assert!(callbacks[1].path.ends_with("/835/click-fixture/callback"));
+    assert!(callbacks[2].path.ends_with("/837/click-fixture/callback"));
+    let refusal: Value = serde_json::from_slice(&callbacks[2].body).unwrap();
+    assert_eq!(refusal["type"], 4);
+    assert_eq!(refusal["data"]["flags"], 64);
+    assert!(refusal["data"]["components"].is_null());
+    assert_eq!(
+        refusal["data"]["embeds"][0]["description"],
+        "Run `/help` to get your own list."
+    );
     let page: Value = serde_json::from_slice(&callbacks[1].body).unwrap();
     assert_eq!(page["type"], 4, "new message, not an update or defer");
     let data = &page["data"];
@@ -1862,7 +1881,7 @@ async fn gateway_help_opens_a_new_private_page_from_the_confirmed_registry() {
     assert_eq!(data["allowed_mentions"]["parse"], json!([]));
     let footer = data["embeds"][0]["footer"]["text"].as_str().unwrap();
     assert!(footer.starts_with("Together We Own · Help · Page 2 of "));
-    assert_eq!(mock.requests().len(), 3, "no edits or followups");
+    assert_eq!(mock.requests().len(), 4, "no edits or followups");
     mock.shutdown().await;
 }
 
