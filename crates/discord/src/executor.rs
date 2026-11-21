@@ -60,6 +60,7 @@ use twilight_model::id::marker::{
     UserMarker,
 };
 use twilight_model::id::Id;
+use two_bot_core::send_admission::AdmissionPermit;
 use two_bot_core::{
     backoff_ms, classify_kick_status, pace_wait_ms, parse_retry_after_secs, plan_purge,
     retry_after_ms, retry_after_ms_unclamped, utf16_len, ActionOutcome, KickOutcome, KickResult,
@@ -102,6 +103,7 @@ const RESPONSE_BODY_LIMIT: usize = 8 * 1024 * 1024;
 /// This never extends the wire attempt or authorizes another request. If
 /// completion cannot be confirmed within the bound, admission stays occupied.
 const READ_SETTLEMENT_GRACE_MS: u64 = 1_000;
+const STRICT_UNSENT_SETTLEMENT_GRACE_MS: u64 = 1_000;
 /// Wire marker for a stalled response body: headers arrived but the body never
 /// completed within [`RESPONSE_BODY_TIMEOUT_MS`]. The executor seam maps this
 /// to [`DiscordError::Timeout`] (never `Unavailable`) so the publish wire
@@ -378,6 +380,37 @@ async fn complete_early_release(
     }
 }
 
+// Only an acknowledged permit that has not reached its first wire poll can
+// enter this cleanup owner. Its task never runs a request or revalidation.
+struct UnsentStrict(Option<(AdmissionPermit, tokio::runtime::Handle)>);
+
+impl UnsentStrict {
+    fn release(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let (permit, runtime) = self.0.take()?;
+        let cutoff = Instant::now() + Duration::from_millis(STRICT_UNSENT_SETTLEMENT_GRACE_MS);
+        Some(runtime.spawn(async move {
+            if poll_until(cutoff, complete_early_release(permit, "strict_unsent"))
+                .await
+                .is_none()
+            {
+                tracing::warn!("Discord unsent attempt settlement timed out; lane held");
+            }
+        }))
+    }
+
+    async fn settle(&mut self) {
+        if let Some(owner) = self.release() {
+            let _ = owner.await;
+        }
+    }
+}
+
+impl Drop for UnsentStrict {
+    fn drop(&mut self) {
+        drop(self.release());
+    }
+}
+
 // Tokio's timeout polls work before its timer. Never start another I/O poll
 // at the cutoff, but retain evidence obtained by a poll that started in time.
 async fn poll_until<F: Future>(at: Instant, work: F) -> Option<F::Output> {
@@ -548,9 +581,13 @@ pub enum StrictTransportError {
     PreWireDeadline,
     #[error("strict send refused by the route guard before request start")]
     PreWireGuard,
+    #[error("strict send refused by final admission before request start")]
+    PreWireRevalidation,
     #[error("{0}")]
     Transport(String),
 }
+
+type FinalCheck<'a> = std::pin::Pin<&'a mut (dyn Future<Output = bool> + Send)>;
 
 /// Borrowed response evidence, with no ownership of the admission permit.
 pub struct StrictResponseEvidence<'a> {
@@ -713,6 +750,7 @@ impl HyperTransport {
             false,
             None,
             CallbackAdmission::RecoverReady,
+            || {},
         )
         .await
         .map_err(|error| error.to_string())
@@ -731,6 +769,7 @@ impl HyperTransport {
             true,
             None,
             CallbackAdmission::RecoverReady,
+            || {},
         )
         .await
     }
@@ -741,13 +780,25 @@ impl HyperTransport {
         request: &Request,
         deadline: Instant,
     ) -> Result<StrictEvidenceHeaders<'_>, StrictTransportError> {
+        self.send_strict_evidence_headers_after(request, deadline, std::future::ready(true), || {})
+            .await
+    }
+
+    async fn send_strict_evidence_headers_after(
+        &self,
+        request: &Request,
+        deadline: Instant,
+        check: impl Future<Output = bool> + Send,
+        dispatch: impl FnOnce() + Send,
+    ) -> Result<StrictEvidenceHeaders<'_>, StrictTransportError> {
         let pending = self
             .send_request_headers_with_admission(
                 request,
                 Some(deadline),
                 true,
-                Some(deadline),
+                Some((deadline, std::pin::pin!(check))),
                 CallbackAdmission::RecoverReady,
+                dispatch,
             )
             .await?;
         Ok(StrictEvidenceHeaders { pending, deadline })
@@ -758,8 +809,9 @@ impl HyperTransport {
         request: &Request,
         deadline: Option<tokio::time::Instant>,
         strict: bool,
-        evidence_deadline: Option<tokio::time::Instant>,
+        evidence: Option<(Instant, FinalCheck<'_>)>,
         callback_admission: CallbackAdmission,
+        dispatch: impl FnOnce() + Send,
     ) -> Result<PendingHeaders<'_>, StrictTransportError> {
         if request
             .headers()
@@ -822,7 +874,7 @@ impl HyperTransport {
         // Postgres statement on a pooled connection, not a local lock, so an
         // unbounded admit would outlive the receipt/moderation/boot budgets.
         // A timed-out claim may have committed. Never release it without a permit.
-        let permit = match (&self.admission, deadline) {
+        let mut permit = match (&self.admission, deadline) {
             (None, _) if strict => {
                 return Err(two_bot_core::send_admission::AdmissionError::Configuration.into())
             }
@@ -845,7 +897,8 @@ impl HyperTransport {
                 };
                 Some(match deadline {
                     None => take.await?,
-                    Some(at) if strict => poll_before(at, take)
+                    // Recover an acknowledged permit even if this poll crossed cutoff.
+                    Some(at) if strict => poll_until(at, take)
                         .await
                         .ok_or(StrictTransportError::PreWireDeadline)??,
                     // Only receipt callbacks opt out of the work-first poll at
@@ -865,13 +918,28 @@ impl HyperTransport {
                 })
             }
         };
+        let mut unsent = UnsentStrict(if strict {
+            permit
+                .take()
+                .map(|permit| (permit, tokio::runtime::Handle::current()))
+        } else {
+            None
+        });
         let route_key = bucket_route_key(request);
-        if let Some(at) = evidence_deadline {
-            if self.guard.check_route_now(&route_key, false).is_err() {
-                if let Some(permit) = permit {
-                    let _ = poll_before(at, complete_early_release(permit, "strict_guard")).await;
+        let evidence_deadline = evidence.as_ref().map(|(at, _)| *at);
+        if let Some((at, check)) = evidence {
+            let refusal = match poll_before(at, check).await {
+                None => Some(StrictTransportError::PreWireDeadline),
+                Some(false) => Some(StrictTransportError::PreWireRevalidation),
+                Some(true) if self.guard.check_route_now(&route_key, false).is_err() => {
+                    Some(StrictTransportError::PreWireGuard)
                 }
-                return Err(StrictTransportError::PreWireGuard);
+                Some(true) => None,
+            };
+            if let Some(refusal) = refusal {
+                drop(dispatch);
+                unsent.settle().await;
+                return Err(refusal);
             }
         }
         let mut attempt = None;
@@ -886,6 +954,10 @@ impl HyperTransport {
         let captured =
             (read && !strict && deadline.is_some()).then(|| capture_connection(&mut hyper_req));
         let request_fut = async {
+            dispatch();
+            if strict {
+                permit = unsent.0.take().map(|(permit, _)| permit);
+            }
             attempt = Some(crate::executor_metrics::Attempt::new(request));
             self.inner.request(hyper_req).await
         };
@@ -899,7 +971,8 @@ impl HyperTransport {
         let response = match headers {
             Some(Ok(response)) => response,
             None if strict && attempt.is_none() => {
-                return Err(StrictTransportError::PreWireDeadline)
+                unsent.settle().await;
+                return Err(StrictTransportError::PreWireDeadline);
             }
             failure => {
                 let (message, reason) = match failure {
@@ -1042,11 +1115,18 @@ impl HyperTransport {
         deadline: Option<tokio::time::Instant>,
         callback_admission: CallbackAdmission,
     ) -> Result<(RawResponse, bool), String> {
-        self.send_request_headers_with_admission(request, deadline, false, None, callback_admission)
-            .await
-            .map_err(|error| error.to_string())?
-            .collect_with(deadline)
-            .await
+        self.send_request_headers_with_admission(
+            request,
+            deadline,
+            false,
+            None,
+            callback_admission,
+            || {},
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .collect_with(deadline)
+        .await
     }
 }
 
@@ -1553,13 +1633,27 @@ impl ActionExecutor {
         lane: Option<bool>,
         essential: bool,
     ) -> Result<(), GuardError> {
-        let guard = &self.inner.transport.guard;
-        // Lane-less admission also honors learned route deadlines, but only
-        // paced lanes take a shared pacing turn.
-        let route_key = bucket_route_key(request);
         let Some(kick_lane) = lane else {
-            return guard.admit_route_recheck(&route_key, essential).await;
+            return self
+                .inner
+                .transport
+                .guard
+                .admit_route_recheck(&bucket_route_key(request), essential)
+                .await;
         };
+        let mut last = self.reserve_route(request, kick_lane, essential).await?;
+        self.stamp_paced_lane(&mut last, kick_lane);
+        Ok(())
+    }
+
+    async fn reserve_route(
+        &self,
+        request: &Request,
+        kick_lane: bool,
+        essential: bool,
+    ) -> Result<tokio::sync::MutexGuard<'_, Instant>, GuardError> {
+        let guard = &self.inner.transport.guard;
+        let route_key = bucket_route_key(request);
         let (lock, interval) = if kick_lane {
             (&self.inner.kick_last_at, self.inner.kick_interval)
         } else {
@@ -1584,7 +1678,7 @@ impl ActionExecutor {
             // Keep the lane reservation through the lane sleep. Timestamp
             // only the actual dispatch, not each queued caller's
             // pre-cooldown admission.
-            let mut last = lock.lock().await;
+            let last = lock.lock().await;
             if let Err(error) = guard.check_route_now(&route_key, essential) {
                 drop(last);
                 match error {
@@ -1605,8 +1699,7 @@ impl ActionExecutor {
                     other => return Err(other),
                 }
             }
-            self.stamp_paced_lane(&mut last, kick_lane);
-            return Ok(());
+            return Ok(last);
         }
     }
 
