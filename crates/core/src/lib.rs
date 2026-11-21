@@ -138,6 +138,7 @@ pub mod presence_store;
 pub mod privacy;
 pub mod raid;
 pub mod raid_removal;
+pub mod realtime_wire;
 pub mod referral_rewards;
 pub mod rejection_telemetry;
 pub mod router;
