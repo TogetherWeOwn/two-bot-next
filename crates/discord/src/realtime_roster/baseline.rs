@@ -93,9 +93,11 @@ fn validate_baseline_row(input: &ScheduledEventInput) -> Result<(), ProjectionEr
         &input.scheduled_start_time,
         input.scheduled_end_time.as_deref(),
     )?;
+    // Match the v1 validator's millisecond precision, even for discarded rows.
+    let millis = |time: wire::WireTime| time.0.unix_timestamp_nanos().div_euclid(1_000_000);
     if input.privacy_level != PrivacyLevel::GuildOnly
         || !valid_entity
-        || end.is_some_and(|end| end.0 <= start.0)
+        || end.is_some_and(|end| millis(end) <= millis(start))
     {
         return Err(ProjectionError::UnsupportedEvent);
     }
@@ -201,6 +203,14 @@ mod tests {
                 "completed external with end before start",
                 3,
                 json!({"scheduled_end_time": "2026-11-21T12:59:59Z"}),
+            ),
+            (
+                "completed external with start and end in the same wire millisecond",
+                3,
+                json!({
+                    "scheduled_start_time": "2026-11-21T13:00:00.000100Z",
+                    "scheduled_end_time": "2026-11-21T13:00:00.000900Z"
+                }),
             ),
             (
                 "cancelled external with empty location",
