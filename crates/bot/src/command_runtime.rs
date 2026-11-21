@@ -208,6 +208,7 @@ const SATURATION_LOG_WINDOW_SECS: u64 = 60;
 #[derive(Default)]
 struct DispatchTasks {
     stopped: bool,
+    help: help_ingress::HelpTasks,
     lanes: [Vec<tokio::task::AbortHandle>; DISPATCH_LIMITS.len()],
     /// Per-lane drops (test-visible mirror of the global
     /// `two_bot_dispatch_drops_total{lane}` counter, incremented alongside by
@@ -255,6 +256,7 @@ impl Drop for CommandDispatchGuard {
             "command_dispatch_guard",
         );
         tasks.stopped = true;
+        tasks.help.abort();
         for lane in &mut tasks.lanes {
             for handle in lane.drain(..) {
                 handle.abort();
@@ -617,10 +619,8 @@ impl CommandRuntime {
         // in `publish_registry_checked`. Zero means unpinned (unparseable
         // token); such a runtime never publishes on faith.
         if let Some(application_id) = activation.application_id() {
-            runtime.interactions.set_application_id(application_id);
-            runtime
-                .application_id
-                .store(application_id, Ordering::Relaxed);
+            // Cold RESUME has no READY to identify the bot user.
+            runtime.set_identity(application_id, application_id);
         }
         runtime
     }
@@ -739,6 +739,9 @@ impl CommandRuntime {
         received: Instant,
         observed_at: &str,
     ) -> bool {
+        if self.dispatch_help(event, received) {
+            return true;
+        }
         if !ordered {
             return self.dispatch_event(event, None, Some((received, observed_at)));
         }
@@ -3708,6 +3711,9 @@ pub(crate) fn sticky_options_strict(
 #[cfg(test)]
 #[path = "command_runtime_resumed_tests.rs"]
 mod resumed_tests;
+
+#[path = "help_ingress.rs"]
+pub(crate) mod help_ingress;
 
 /// Full-set publication: a bulk replace needs an authoritative custom-command
 /// row load, so an unknown store defers instead of deleting Discord commands.

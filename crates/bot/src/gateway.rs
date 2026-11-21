@@ -1506,14 +1506,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
     // Without the command runtime, keep the ordered builtins-only sync.
     match (interactions.as_ref(), runtime.as_ref()) {
         (Some(ordered), Some(commands)) => {
-            let application_id =
-                commands
-                    .executor()
-                    .current_application_id()
-                    .await
-                    .map_err(|_| {
-                        sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
-                    })?;
+            let application_id = commands.bootstrap_application_id().await.map_err(|_| {
+                sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
+            })?;
             ordered.set_application_id(application_id);
             commands
                 .publish_registry_checked(Some(application_id))
