@@ -93,7 +93,7 @@ impl Drop for Permit {
 impl CommandRuntime {
     /// Claims only the reserved help routes, including silent guild/app
     /// refusals. The gateway must not feed a claimed event to another owner.
-    pub(crate) fn dispatch_help(self: &Arc<Self>, event: &Event, received: Instant) -> bool {
+    pub(super) fn dispatch_help(self: &Arc<Self>, event: &Event, received: Instant) -> bool {
         let Event::InteractionCreate(event) = event else {
             return false;
         };
@@ -106,7 +106,7 @@ impl CommandRuntime {
                 if !matches!(
                     self.interactions
                         .router
-                        .route_component(&data.custom_id, guild),
+                        .route_component_with_help(&data.custom_id, guild),
                     ComponentOutcome::Handled {
                         handler: ComponentHandler::HelpPage
                     }

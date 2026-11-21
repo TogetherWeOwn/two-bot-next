@@ -282,6 +282,18 @@ VALUES ('100000000000000001', '100000000000000011', '2026-08-02T18:00:00.000Z',
         '2026-08-01T18:00:00.000Z', '2026-08-01T20:00:00.000Z', 'completed',
         '2026-08-01T20:01:00.000Z', '2026-08-01T20:10:00.000Z',
         '2026-08-01T20:05:00.000Z', FALSE, TRUE);
+-- Dormant attendance (0480, v17). Archive both the default open shape and
+-- a closed session with tags; none of these rows comes from runtime capture.
+INSERT INTO event_attendance_windows
+    (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at)
+VALUES ('100000000000000001', 'attendance-seed', '100000000000000011',
+        '2026-08-01T18:00:00Z', '2026-08-01T18:00:00Z', '2026-08-01T20:00:00Z');
+INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, joined_at)
+VALUES ('100000000000000001', '100000000000000002', '100000000000000003', '2026-08-01T18:30:00Z');
+INSERT INTO event_voice_sessions
+    (guild_id, member_id, channel_id, channel_name, name_observed_at, joined_at, left_at, event_keys)
+VALUES ('100000000000000001', '100000000000000002', '100000000000000003', 'Event Stage',
+        '2026-08-01T18:30:00Z', '2026-08-01T18:00:00Z', '2026-08-01T18:30:00Z', ARRAY['attendance-seed']);
 -- Event voice pair (0455, v13): one claimed instance plus one closed and one
 -- open presence span, so the roundtrip covers the nullable lease/left_at.
 INSERT INTO event_voice_channels
