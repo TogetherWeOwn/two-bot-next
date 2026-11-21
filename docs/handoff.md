@@ -89,7 +89,10 @@ only; see the [build cache](build-cache.md) for permitted controller fallback.
 - No deployment, drill or production activation was performed to
   write this file.
 
-## Next unfinished step
+## Next unfinished step (2026-11-10 snapshot)
+
+For current next steps and remaining evidence, see the
+[November 21 source reconciliation](plans/current-state-2026-11.md#source-reconciliation-2026-11-21-utc).
 
 Resume the three remaining M2 items once staging recovery lands:
 automod preview (W3) first, then warning history (W4), then `{args}`

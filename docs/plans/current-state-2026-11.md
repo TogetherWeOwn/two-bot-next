@@ -7,6 +7,32 @@ it does not mean the behavior is implemented, merged or active in
 production. Check each specification's own status header and gates
 before building or publishing anything.
 
+## Source reconciliation (2026-11-21 UTC)
+
+Source reviewed at `main` commit `be4867a25210602613277ac04e109695ca2e175c`.
+Use these findings when resuming work from the November 10 snapshot below.
+
+- **Lockdown preview:** Confirm/Cancel merged through the existing mutation
+  path (#1938), with [component acceptance tests](../../crates/discord/tests/channel_moderation_lockdown_preview_confirm_acceptance.rs).
+  The command is still dark in source. The remaining [spec §8](../lockdown-preview-spec.md)
+  slice covers registry, help and docs integration plus synthetic staging
+  evidence. Publication and activation require their applicable review and
+  release gates.
+- **AutoMod verdict preview:** The bounded store (#2267), audit commit gate
+  (#2264), and Discord handler (#2270) are on main. The dry-run and repeat
+  isolation regression (#2342) and conditional staging-guild registration
+  (#2343) also landed. [Spec §8](../automod-preview-spec.md) calls for the
+  exact-head Actions proof and a read-only registry receipt from the
+  qualified staging artifact. Check the serving SHA and registry before
+  treating publication as verified. The scope is staging only.
+- **Warning history and `{args}`:** Check the
+  [history-read gates](../warning-history-spec.md) before building warning
+  history. For [`{args}`](../custom-command-args-spec.md), resume release
+  qualification from the merged build slices.
+- **Operational evidence to confirm:** Current staging recovery and drill
+  status, AutoMod registry read-back, `{args}` staging or production promotion,
+  and any release-hold clearance require current operator or release evidence.
+
 ## Approved scope: preview before you act (M2)
 
 Accepted 2026-11-01 by the owner. Each build re-checks the spec's
