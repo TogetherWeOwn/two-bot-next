@@ -243,13 +243,14 @@ test("staging preview extends readiness without extra cold lifecycle activity", 
   const list = `https://discord.com/api/v10/applications/${app}/guilds/${guild}/commands`;
   const urls = ["https://discord.com/api/v10/users/@me", list, `${list}/${id}`];
   const replies = (end: unknown = detail) => [Response.json({ id: app, bot: true }), Response.json([detail]), Response.json(end)];
-  let queue = replies();
+  let queue = replies(), onDiscordRead: (() => void) | undefined;
   const discord = t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
     assert.equal(url, urls[discord.mock.callCount() % 3]);
     assert.equal(init.method, "GET");
     assert.equal(init.redirect, "error");
     assert.ok(init.signal);
     assert.equal(new Headers(init.headers).get("authorization"), `Bot ${env.DISCORD_TOKEN}`);
+    onDiscordRead?.();
     return queue.shift() ?? Response.error();
   });
   const binding = [ID, sha, window.runId, window.runAttempt, window.expiresAt].join(":");
@@ -300,10 +301,12 @@ test("staging preview extends readiness without extra cold lifecycle activity", 
   const unready = { ...report, components: report.components.map(([key, state]) => [key, key === "gateway" ? "down" : state]),
     gateway_failure: { phase: "durable_gateway", class: "checkpoint_load_failed" } };
   for (const [change, read, status, calls] of [["redirect", 1, 500, 0], ["unready", 1, 503, 0], ["unready", 2, 503, 3],
-    ["drift", 1, 503, 0], ["drift", 2, 503, 3], ["release", 1, 503, 0], ["release", 2, 503, 3], ["expiry", 2, 503, 3]] as const) {
+    ["drift", 1, 503, 0], ["drift", 2, 503, 3], ["release", 0, 503, 1], ["release", 1, 503, 0],
+    ["release", 2, 503, 3], ["expiry", 2, 503, 3]] as const) {
     discord.mock.resetCalls();
     queue = replies();
     h.values.set(STAGING_USE_KEY, grant);
+    onDiscordRead = read === 0 ? () => h.values.set(STAGING_USE_KEY, { ...grant, phase: "released" }) : undefined;
     let probes = 0;
     h.setProbeResponse((_, path, redirect) => {
       if (path !== "/readyz" || ++probes !== read) return Response.json(report);
@@ -325,12 +328,11 @@ test("staging preview extends readiness without extra cold lifecycle activity", 
     replies({ ...detail, version: "323456789012345678" }), [replies()[0]!, Response.json([])],
     [replies()[0]!, new Response("x".repeat(256 * 1024 + 1))]]) {
     discord.mock.resetCalls();
-    const attempts = bad.length;
-    queue = bad;
+    queue = [...bad];
     const result = await send();
     assert.deepEqual([result.status, result.headers.has(PREVIEW_HEADER)], [200, false]);
     assert.deepEqual(await result.json(), report);
-    assert.equal(discord.mock.callCount(), attempts);
+    assert.equal(discord.mock.callCount(), bad.length);
   }
 });
 

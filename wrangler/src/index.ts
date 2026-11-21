@@ -1214,13 +1214,12 @@ export class TwoBotContainer extends Container<Env> {
       const registryOk = await readPreview(this.env, async (url, token) => JSON.parse(await jsonText(await send(() =>
         fetch(url, { method: "GET", redirect: "error", cache: "no-store", signal,
           headers: { authorization: `Bot ${token}` } })), 256 * 1024))).then(() => true, () => false);
-      if (!registryOk) return readyReply(body, 200);
+      if (!registryOk) return await allowed(() => readyReply(body, 200));
       const final = await send(() => this.ctx.container!.getTcpPort(this.defaultPort).fetch(
         new Request("http://c/readyz", { method: "GET", redirect: "manual", signal })));
       const finalBody = await jsonText(final, MAX_PROBE_BODY_BYTES, true);
       serving(finalBody, final.status);
-      if (final.status === 503) return readyReply(finalBody, 503);
-      return await allowed(() => {
+      return final.status === 503 ? readyReply(finalBody, 503) : await allowed(() => {
         const result = readyReply(finalBody, 200);
         result.headers.set(PREVIEW_HEADER, JSON.stringify({ registry: "pass", command: "automod-preview",
           deploymentId, sha, runId, runAttempt, expiresAt }));

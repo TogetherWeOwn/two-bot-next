@@ -314,8 +314,7 @@ def preview_request(sha, authorization):
         raise ProbeError("AutoMod preview request is missing valid rollout authority")
     receipt = dict(registry="pass", command="automod-preview", deploymentId=deployment,
                    sha=sha, runId=run, runAttempt=int(attempt), expiresAt=int(expiry))
-    return {"Authorization": authorization, PREVIEW_HEADER: ":".join(
-        (deployment, sha, run, attempt, expiry))}, receipt
+    return {"Authorization": authorization, PREVIEW_HEADER: ":".join((deployment, sha, run, attempt, expiry))}, receipt
 
 
 def run(args, fetch_fn=fetch):
