@@ -146,6 +146,11 @@ the bound and leaves any unconfirmed durable outcome occupied; process loss
 still uses the lease below. Mutations, generic permit Drop, shutdown publication
 rules and the lease duration are unchanged.
 
+`get_json_strict_until` and `current_bot_user_id_until` cap the caller’s deadline
+at the moderation budget (five seconds max). At cutoff the owner only settles
+ready claims or received 429 headers. A timed-out claim transaction discards
+its connection without flushing any buffered writes.
+
 Strict admission is an opt-in pre-wire capability. Migration 0473 adds a
 pending-settlement generation constrained to match an occupied lane. An
 acknowledged strict claim remains blocked across lease expiry and restart until
@@ -157,8 +162,9 @@ explicitly authorized, all-consumer-fenced reconciliation with effect and
 cooldown evidence; neither startup nor time alone clears the marker. This core
 capability does not enable or wire a new sender.
 
-If a strict claim is acknowledged after the attempt deadline, the transport
-refuses before starting the request and leaves the claim armed. The opt-in
+A strict permit returned by a poll crossing cutoff is settled as known unsent.
+Cancelling an acknowledged final check also triggers bounded, storage-only
+settlement. An unacknowledged claim cannot be cleared. The opt-in
 collector retains status and retry headers but omits the body when the body cap
 or attempt deadline expires before collection finishes. Only crate-internal
 code can validate a mutation. Storage shares the attempt cutoff; evidence does

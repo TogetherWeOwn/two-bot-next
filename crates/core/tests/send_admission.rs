@@ -35,7 +35,8 @@ async fn cross_pool_atomic_admission_and_restart_do_not_expire_claims() {
     drop(connection);
     let a = Arc::new(PgSendAdmission::new(db.pool().clone(), "fixture-token").unwrap());
     let b = Arc::new(PgSendAdmission::new(second.clone(), "Bot fixture-token").unwrap());
-    let (first, other) = tokio::join!(a.admit(), b.admit());
+    let at = tokio::time::Instant::now() + Duration::from_secs(5);
+    let (first, other) = tokio::join!(a.admit_until(at), b.admit_until(at));
     assert_eq!(usize::from(first.is_ok()) + usize::from(other.is_ok()), 1);
     let (permit, denied) = if let Ok(permit) = first {
         (permit, other)

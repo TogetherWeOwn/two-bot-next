@@ -154,6 +154,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('web_v1', 'next_event', 'view'),
     ('web_v1', 'funnel_daily', 'view'),
     ('web_v1', 'funnel_by_source', 'view'),
+    ('web_v1', 'voice_heat', 'view'),
     ('web_v1', '_ts(text)', 'function'),
     ('web_v1', '_iso(timestamp with time zone)', 'function'),
     ('web_v1', '_json(text)', 'function')
