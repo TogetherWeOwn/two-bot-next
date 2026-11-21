@@ -1941,7 +1941,7 @@ mod preview_callback_acceptance {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use two_bot_core::automod::AutomodMessage;
         use two_bot_core::automod_runtime::{
-            CompletionKind, MessageDelivery, MessageDeliveryKind, StoredOutcome,
+            CompletionKind, FunnelDisposition, MessageDelivery, MessageDeliveryKind, StoredOutcome,
         };
         use two_bot_discord::automod_activation::ActivationOutcome;
 
@@ -2060,15 +2060,23 @@ mod preview_callback_acceptance {
             );
             let request = requests.last().expect("preview callback");
             assert_eq!(request.method, "POST");
-            assert!(request.path.ends_with("/callback"));
-            let body: serde_json::Value = serde_json::from_slice(&request.body)?;
-            assert_eq!(body["type"], 4);
-            assert_eq!(body["data"]["flags"], 64);
             assert_eq!(
-                body["data"]["allowed_mentions"]["parse"],
-                serde_json::json!([])
+                request.path,
+                format!("/api/v10/interactions/{id}/preview-{id}/callback")
             );
-            assert_eq!(body["data"]["content"], reply);
+            let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+            // Twilight omits empty role/user lists and a false reply-mention flag.
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "type": 4,
+                    "data": {
+                        "flags": 64,
+                        "allowed_mentions": {"parse": []},
+                        "content": reply,
+                    },
+                })
+            );
         }
         let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM automod_delivery_claims")
             .fetch_one(&pool)
@@ -2106,7 +2114,11 @@ mod preview_callback_acceptance {
                 let processed = activation.process(delivery, received).await;
                 assert_eq!(
                     processed.disposition,
-                    MessageDeliveryKind::Create.funnel(matched)
+                    if matched {
+                        FunnelDisposition::CaptureOnly
+                    } else {
+                        FunnelDisposition::Accept
+                    }
                 );
                 assert_eq!(
                     processed.outcome,
