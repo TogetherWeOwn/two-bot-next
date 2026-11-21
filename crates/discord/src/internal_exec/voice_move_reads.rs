@@ -99,7 +99,7 @@ impl ActionExecutor {
             room,
         } = target;
         let member = self
-            .voice_move_member_read(guild, member_id, deadline)
+            .voice_move_member_read(guild, member_id, true, deadline)
             .await?;
         let source = self
             .required_voice_read(&format!("/channels/{from}"), deadline)
@@ -108,7 +108,9 @@ impl ActionExecutor {
             return Err(incomplete());
         }
         let source = voice_room(from, &source).ok_or_else(incomplete)?;
-        let bot_member = self.voice_move_member_read(guild, bot, deadline).await?;
+        let bot_member = self
+            .voice_move_member_read(guild, bot, false, deadline)
+            .await?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| incomplete())?
@@ -145,11 +147,15 @@ impl ActionExecutor {
         &self,
         guild: Snowflake,
         id: Snowflake,
+        require_timeout: bool,
         deadline: Instant,
     ) -> Result<Member, DiscordError> {
         let doc = self
             .required_voice_read(&format!("/guilds/{guild}/members/{id}"), deadline)
             .await?;
+        if require_timeout && doc.get("communication_disabled_until").is_none() {
+            return Err(incomplete());
+        }
         let member: Member = serde_json::from_value(doc).map_err(|_| incomplete())?;
         (member.user.id.get() == id)
             .then_some(member)

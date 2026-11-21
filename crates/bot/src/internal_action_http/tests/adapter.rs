@@ -3,9 +3,13 @@
 //! Only guarded TestDatabase pools and an ephemeral loopback Discord double.
 use super::*;
 use axum::{extract::State, serve::ListenerExt};
-use tokio::time::{timeout_at, Instant};
+use tokio::{
+    sync::Notify,
+    time::{timeout_at, Instant},
+};
 use two_bot_core::{
-    send_admission::{PgSendAdmission, SendAdmission},
+    internal_actions::VoiceMoveOutcome,
+    send_admission::{AdmissionError, PgSendAdmission, SendAdmission},
     voice_move_decision::VoiceMoveDecision,
 };
 use two_bot_discord::{internal_actions::CooldownGovernor, ActionExecutor, DiscordError};
@@ -21,15 +25,18 @@ struct MockDiscord {
 struct MockState {
     requests: Arc<Mutex<Vec<Value>>>,
     replies: Arc<Vec<(StatusCode, Value)>>,
-    stall_first: bool,
+    stall_first: Option<Arc<Notify>>,
 }
 
 impl MockDiscord {
     async fn start(replies: Vec<(StatusCode, Value)>) -> Self {
-        Self::start_with_stall(replies, false).await
+        Self::start_with_stall(replies, None).await
     }
 
-    async fn start_with_stall(replies: Vec<(StatusCode, Value)>, stall_first: bool) -> Self {
+    async fn start_with_stall(
+        replies: Vec<(StatusCode, Value)>,
+        stall_first: Option<Arc<Notify>>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -49,7 +56,8 @@ impl MockDiscord {
                         }));
                         index
                     };
-                    if state.stall_first && index == 0 {
+                    if let Some(stalled) = state.stall_first.filter(|_| index == 0) {
+                        stalled.notify_one();
                         std::future::pending::<()>().await;
                     }
                     let (status, body) = state.replies[index.min(state.replies.len() - 1)].clone();
@@ -304,22 +312,29 @@ async fn real_adapter_invalid_receipt_keeps_intent_and_restart_send_lane_occupie
 async fn voice_evidence_checks_member_identity_and_preserves_read_errors() {
     let guild = staging_guild();
     let _ = rustls::crypto::ring::default_provider().install_default();
-    for (status, returned_member) in [
-        (StatusCode::OK, "3"),
-        (StatusCode::OK, "9"),
-        (StatusCode::FORBIDDEN, "3"),
+    let allowed = Some(VoiceMoveDecision::Proceed { from_channel_id: 1 });
+    let denied = Some(VoiceMoveDecision::Refuse(VoiceMoveOutcome::NotPermitted));
+    let active = json!("2099-01-01T00:00:00.000000+00:00");
+    for (status, id, timeout, expected) in [
+        (StatusCode::OK, "3", Some(Value::Null), allowed),
+        (StatusCode::OK, "3", Some(active), denied),
+        (StatusCode::OK, "3", None, None),
+        (StatusCode::OK, "9", Some(Value::Null), None),
+        (StatusCode::FORBIDDEN, "3", Some(Value::Null), None),
     ] {
+        let mut member = voice_member(id, false);
+        if let Some(timeout) = timeout {
+            member["communication_disabled_until"] = timeout;
+        }
         let mock = MockDiscord::start(vec![
             (StatusCode::OK, json!({"id":"4","bot":true})),
             (
                 StatusCode::OK,
-                json!({
-                    "id": guild, "owner_id": "8", "afk_channel_id": null,
-                    "roles": [{"id": guild, "position": 0, "permissions": "8"}]
-                }),
+                json!({"id": guild, "owner_id": "4", "afk_channel_id": null,
+                "roles": [{"id": guild, "position": 0, "permissions": "1049600"}]}),
             ),
             (StatusCode::OK, voice_channel("2", 2, "target", 0, 3)),
-            (status, voice_member(returned_member, false)),
+            (status, member),
             (StatusCode::OK, voice_channel("1", 2, "source", 0, 0)),
             (StatusCode::OK, voice_member("4", true)),
         ])
@@ -333,50 +348,46 @@ async fn voice_evidence_checks_member_identity_and_preserves_read_errors() {
             .unwrap();
         assert_eq!(target.user_limit(), 3);
         let result = api.voice_move_evidence_until(target, 3, 1, deadline).await;
-        match (status, returned_member, result) {
-            (StatusCode::OK, "3", Ok(evidence)) => assert_eq!(
-                evidence.decide(1),
-                VoiceMoveDecision::Proceed { from_channel_id: 1 }
-            ),
-            (StatusCode::OK, "9", Err(DiscordError::Unavailable(detail))) => {
+        match (status, expected, result) {
+            (_, Some(expected), Ok(evidence)) => assert_eq!(evidence.decide(1), expected),
+            (StatusCode::OK, None, Err(DiscordError::Unavailable(detail))) => {
                 assert_eq!(detail, "voice_move_evidence_incomplete");
                 assert_eq!(mock.count(), 4);
             }
-            (StatusCode::FORBIDDEN, _, Err(DiscordError::Rejected(_))) => {
+            (StatusCode::FORBIDDEN, None, Err(DiscordError::Rejected(_))) => {
                 assert_eq!(mock.count(), 4);
             }
             _ => panic!("unexpected voice evidence result"),
         }
-        assert!(mock
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|request| request["method"] == "GET"));
+        let requests = mock.requests.lock().unwrap();
+        assert!(requests.iter().all(|request| request["method"] == "GET"));
     }
 }
 
 #[tokio::test]
 async fn governed_voice_read_cutoff_leaves_the_real_lane_reusable() {
     let Some(db) = database().await else { return };
-    let mock = MockDiscord::start_with_stall(vec![(StatusCode::OK, Value::Null)], true).await;
+    let stalled = Arc::new(Notify::new());
+    let mock =
+        MockDiscord::start_with_stall(vec![(StatusCode::OK, Value::Null)], Some(stalled.clone()))
+            .await;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let lane = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
     let api =
         ActionExecutor::with_admission(token(), Some(mock.origin.clone()), lane.clone()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     let read = api.voice_move_target_until(staging_guild().parse().unwrap(), 2, deadline);
-    assert!(matches!(
-        timeout_at(deadline + Duration::from_secs(1), read).await,
-        Ok(Err(DiscordError::Timeout))
-    ));
+    let (result, ()) = tokio::join!(timeout_at(deadline + Duration::from_secs(1), read), async {
+        timeout_at(deadline, stalled.notified()).await.unwrap();
+        assert!(matches!(
+            timeout_at(deadline, lane.admit_strict()).await,
+            Ok(Err(AdmissionError::Blocked))
+        ));
+    });
+    assert!(matches!(result, Ok(Err(DiscordError::Timeout))));
     assert_eq!((mock.count(), mock.sockets.load(Ordering::SeqCst)), (1, 1));
     assert_eq!(mock.requests.lock().unwrap()[0]["method"], "GET");
-    lane.admit_strict()
-        .await
-        .unwrap()
-        .complete(None)
-        .await
-        .unwrap();
+    let permit = lane.admit_strict().await.unwrap();
+    permit.complete(None).await.unwrap();
     db.close().await.unwrap();
 }
