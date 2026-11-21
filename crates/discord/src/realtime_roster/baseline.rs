@@ -36,11 +36,18 @@ pub fn scheduled_events(
     guild_id: Id<GuildMarker>,
     raw: &str,
 ) -> Result<Option<Vec<wire::Event>>, ProjectionError> {
-    let dispatch: Dispatch<'_> = decode(raw, '{')?;
+    events_from_dispatch(guild_id, &decode(raw, '{')?, false)
+}
+
+pub(super) fn events_from_dispatch(
+    guild_id: Id<GuildMarker>,
+    dispatch: &Dispatch<'_>,
+    check_text: bool,
+) -> Result<Option<Vec<wire::Event>>, ProjectionError> {
     if !matches!(dispatch.kind()?, Some(Kind::GuildCreate)) {
         return Ok(None);
     }
-    let body = dispatch.d.ok_or(ProjectionError::MalformedDispatch)?.get();
+    let body = dispatch.body()?;
     let header: GuildHeader = decode(body, '{')?;
     if header.id != guild_id || header.unavailable {
         return Ok(None);
@@ -52,18 +59,7 @@ pub fn scheduled_events(
     let mut seen = HashSet::new();
     let mut events = Vec::new();
     for row in rows {
-        let body = row.get();
-        let header: RowHeader<'_> = decode(body, '{')?;
-        if header.guild_id != guild_id
-            || header
-                .entity_metadata
-                .is_some_and(|raw| !raw.get().trim_start().starts_with('{'))
-        {
-            return Err(ProjectionError::MalformedDispatch);
-        }
-        let input = decode(body, '{')?;
-        validate_baseline_row(&input)?;
-        let (id, event) = match event_change(input)? {
+        let (id, event) = match strict_event_change(guild_id, row.get(), check_text)? {
             Change::Upsert { id, value } => (id, Some(value)),
             Change::Remove { id } => (id, None),
         };
@@ -75,8 +71,33 @@ pub fn scheduled_events(
     Ok(Some(events))
 }
 
-// Validate the full row before projection can discard terminal events or
-// fields that are not part of the wire shape. Leave delta semantics unchanged.
+// Intake checks wire text bounds even for rows that project to removals.
+pub(super) fn strict_event_change(
+    guild_id: Id<GuildMarker>,
+    body: &str,
+    check_text: bool,
+) -> Result<Change<wire::Event>, ProjectionError> {
+    let header: RowHeader<'_> = decode(body, '{')?;
+    if header.guild_id != guild_id
+        || header
+            .entity_metadata
+            .is_some_and(|raw| !raw.get().trim_start().starts_with('{'))
+    {
+        return Err(ProjectionError::MalformedDispatch);
+    }
+    let input = decode(body, '{')?;
+    validate_baseline_row(&input)?;
+    if check_text {
+        let metadata = input.entity_metadata.as_ref();
+        let location = metadata.and_then(|meta| meta.location.as_deref());
+        let description = input.description.as_deref().unwrap_or_default();
+        if !wire::event_text_is_valid(&input.name, description, location) {
+            return Err(ProjectionError::UnsupportedEvent);
+        }
+    }
+    event_change(input)
+}
+
 fn validate_baseline_row(input: &ScheduledEventInput) -> Result<(), ProjectionError> {
     let valid_entity = match (&input.entity_type, input.channel_id, &input.entity_metadata) {
         (EntityType::StageInstance | EntityType::Voice, Some(_), None) => true,
