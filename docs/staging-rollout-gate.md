@@ -480,23 +480,14 @@ merge or an unverified deployment is not `t0`.
    shape, that listing-lag acceptance still requires two consecutive full passes.
    Successful stale-listing acceptance records `"application_listing_lag": true`.
 
-   Once the exact pinned rollout reports completion with validated steps and
-   identity, the verifier stops the singleton under the existing staging grant.
-   This also runs when the instance counters read zero: an alarm can have
-   started the prior build since acquisition. Only the authenticated stop
-   receipt with `running: false` opens the runtime acceptance path. Earlier
-   warm-up and diagnostic probes do not count. The next probe can cold-start
-   the replacement and still checks the exact Worker, revision, build and
-   deploy ID. If the counters still report zero or a starting singleton after
-   the probe, the verifier polls again within the same deadline; those counters
-   are never accepted. The stop client retries a busy (503) status read within
-   its budget, but sends the stop only once. An unconfirmed stop fails the
-   rollout gate. The stop does not release or renew the grant: automatic
-   rollback and final release still use the original expiry.
-
-   This describes normal qualification with a deploy checkout containing the
-   fresh-stop verifier. Historical recovery pins use their own checkout's
-   verifier and do not provide fresh-stop evidence if they predate this change.
+   After validating pinned rollout completion, require an authenticated stop receipt with
+   `running: false`, even at zero instances: an alarm may have started the prior build.
+   Only post-stop probes certify the exact Worker, revision, build and deploy ID; they can
+   cold-start the replacement. Zero or starting counters retry within the same deadline.
+   A busy status GET may retry within budget; send the stop POST once and fail if unconfirmed.
+   Stop preserves the grant and its expiry for automatic rollback and final release.
+   Historical recovery pins use their own checkout's verifier; pins predating this change
+   cannot supply fresh-stop evidence.
 
    A stale listing that is not verified as the rollout's previous image fails as
    `application_image_drift`. For a verified previous-image listing that has not
