@@ -200,7 +200,6 @@ impl Pending {
                         return Err(InvalidTopics);
                     }
                     let update = kind == "CHANNEL_UPDATE";
-                    // Only categories prove an absent parent without an explicit key.
                     let category = matches!(value.kind, wire::ChannelKind::Category);
                     if update && !category && body.get("parent_id").is_none() {
                         return Err(AmbiguousDispatch);

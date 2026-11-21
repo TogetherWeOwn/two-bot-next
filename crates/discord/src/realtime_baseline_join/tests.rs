@@ -26,6 +26,8 @@ fn start(join: &mut BaselineJoin, id: &str, roles: &[&str]) {
                     {"id":"22","name":"Category","type":4,"position":3,"permission_overwrites":[]}],
         "roles":[{"id":"10","permissions":"0"}],"voice_states":[{"user_id":"31","channel_id":"20"}],
         "guild_scheduled_events":[]}}"#;
+    let bad = create.replace(r#""member_count""#, r#""x":1,"x":2,"member_count""#);
+    assert_eq!(join.begin(&bad, id.into()).err(), Some(AmbiguousDispatch));
     assert!(matches!(join.begin(create, id.to_owned()), Ok(Some(_))));
     pending(join, &chunk(id, 0, "31", json!(roles)));
 }
@@ -110,7 +112,7 @@ fn malformed_rows_retire_both_collectors_before_replacement() {
     for raw in [
         r#"{"op":0,"t":"CHANNEL_DELETE","d":{"guild_id":"10","guild_id":"11","id":"20","type":2}}"#,
         r#"{"op":0,"t":"CHANNEL_DELETE","d":{"id":"20","type":2}}"#,
-        r#"{"op":0,"t":"CHANNEL_UPDATE","d":{"guild_id":"10","id":"20","type":11}}"#,
+        r#"{"op":0,"t":"CHANNEL_UPDATE","d":{"guild_id":"10","id":"20","type":2,"name":"Room","permission_overwrites":[]}}"#,
         &frame("CHANNEL_UPDATE", room("20", "")),
         &frame("CHANNEL_UPDATE", room_with_duplicates),
         r#"{"op":0,"t":"GUILD_SCHEDULED_EVENT_DELETE","d":{"guild_id":"10","id":"80","extra":1,"extra":2}}"#,
@@ -119,8 +121,7 @@ fn malformed_rows_retire_both_collectors_before_replacement() {
         let mut join = BaselineJoin::new(GUILD);
         start(&mut join, &id, &[]);
         let error = join.observe(raw, NOW).err();
-        let refused = matches!(error, Some(AmbiguousDispatch | InvalidTopics));
-        assert!(refused, "{raw}: {error:?}");
+        assert!(matches!(error, Some(AmbiguousDispatch | InvalidTopics)));
         pending(&mut join, &frame("CHANNEL_UPDATE", room("20", "Restored")));
         pending(&mut join, &chunk(&id, 1, "32", json!([])));
     }
