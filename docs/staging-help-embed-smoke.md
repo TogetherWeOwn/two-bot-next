@@ -1,8 +1,8 @@
 # Staging help embed smoke
 
-This is the human-free live proof that Discord serves both branded `/help`
-embeds with the Icon 1 footer and brand colour intact. It runs after every
-staging deploy and can also be dispatched by hand.
+This human-free smoke checks whether Discord serves each branded embed with
+its kit colour and footer intact. It runs after staging deploys and can also
+be dispatched by hand.
 
 Discord creates slash-command interactions only for real users, so this smoke
 does not invoke `/help` and does not claim to prove gateway interaction
@@ -13,9 +13,8 @@ ordered fields. It does not post buttons or verify callback behavior.
 ## Flow
 
 1. CI builds `help_embed_smoke_payloads`, a Rust example in the discord crate.
-   It calls `DiscoveryPlan::first` and `branded_help_detail_response`, passes both replies
-   through the executor sanitizer, and emits their single embeds plus the
-   expected brand values from `brand.rs`.
+   It calls the builders below, passes Help replies through the executor
+   sanitizer, and emits the embeds and their expected kit values.
 2. `scripts/staging_help_embed_smoke.py` fences the run to the staging guild
    and to a dedicated test bot (TWO Voice Synthetic (staging)): the token
    must belong to a bot account that is none of the product applications and
@@ -26,13 +25,14 @@ ordered fields. It does not post buttons or verify callback behavior.
    [the slash smoke doc](staging-slash-smoke.md#why-it-is-not-a-github-workflow).
 3. For each post, it reads `GET /channels/{channel_id}/messages/{message_id}`
    and asserts on that read-back—never the POST response—that:
-   - both colours match the generated kit ember default;
+   - the single embed matches its row’s colour and footer text and icon policy;
    - the discovery footer says `Together We Own · Help · Page 1 of N`,
      where `N` is the page count; the detail footer says `Together We Own · Help`;
-   - `embeds[0].footer.icon_url == BRAND_ICON_URL`;
+   - Icon 1 rows use `BRAND_ICON_URL`, text-only footers omit it, and no
+     embed byline is expected (the message author must be the test bot);
    - the title, description and ordered fields match the sanitized payload
      after trimming outer whitespace.
-4. It deletes both messages, pass or fail, and writes evidence containing
+4. It deletes each message, pass or fail, and writes evidence containing
    only row results, durations and message IDs. Before each post it records
    the channel's newest message ID as an anchor; if a post's outcome is
    lost (timeout, 5xx or an unreadable answer), it reconciles by deleting
@@ -41,10 +41,28 @@ ordered fields. It does not post buttons or verify callback behavior.
 
 The payload deliberately uses the maximal command registry and a wide topic
 detail, matching the Rust builder tests. It exercises pagination and overflow
-rather than simulating staging's current registry size. The topic embed is a
-staging preview: the product bot still uses the existing topic reply until
-the separate runtime change is reviewed and merged. The Actions payload
+rather than simulating staging's current registry size. The topic fixture
+uses the same adapter as the product bot's topic reply. The Actions payload
 artifact contains only synthetic fixture embeds, not staging messages.
+
+## Rendered payload inventory
+
+| Rows | Builder | Colour | Footer suffix | Icon |
+| --- | --- | --- | --- | --- |
+| `help`, `help_topic` | `DiscoveryPlan::first`, `help_detail_response` | Default | Help · Page 1 of N, Help | Icon 1 |
+| `help_warn`, `help_error` | `HelpRecovery::response` (expired, cannot build) | Warn, Danger | Help | Icon 1 |
+| `announcement`, `echo` | `announcement_embed` (ordinary and Echo titles) | Default, Echo | Announcements, Echo | Icon 1 |
+| `rsvp_ok`, `rsvp_error` | `rsvp_reply_embed` (RSVP and attendance) | Ok, Danger | Events | None |
+| `voice_ok`, `voice_warn`, `voice_error` | `ephemeral_reply_embed` (shared by Voice replies) | Ok, Warn, Danger | Voice | None |
+
+Later Help pages reuse the first-page renderer; button navigation and all
+recovery copy variants have hermetic tests in `help_navigation/tests.rs`.
+Short replies and overflow handling have hermetic tests in `interactions.rs`.
+Voice outcome selection and deferred completion stay in hermetic handler tests;
+these posts only exercise the shared builder. Moderation confirmations and
+audit entries are plain text: `member_runtime.rs` and `audit.rs` test severity
+labels and the unban exception without moderating a member. The smoke does not
+prove ephemeral visibility, real events or room changes, or unimplemented DMs.
 
 ## Token source and updates
 
@@ -63,7 +81,7 @@ the pinned digest offline. Python fixtures prove a hand-edited colour fails
 without rewriting files or accessing the network. `--check-upstream` compares
 the pinned upstream bytes without writing. The smoke payload gets its expected
 colour from the same helper, and its Python fixtures check the generated
-default constant, so renderer and smoke cannot drift silently.
+colour constants used by the rows, so renderer and smoke cannot drift silently.
 
 To update (bump tag → re-vendor → drift green):
 
@@ -79,7 +97,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_stagi
 
 On the controller, use the [bounded Cargo wrapper](build-cache.md) for both
 compiling commands. Update the tag in module documentation and this guide,
-and update the smoke fixture colour only when the kit default moves. Record
+and update smoke fixture colours only when their kit tokens move. Record
 the test results in the PR. Never hand-edit `brand_tokens.rs`.
 
 ## Icon delivery and rollback contract
@@ -90,8 +108,8 @@ This is the approved Icon 1 dark 512×512 PNG, already imported as image
 `two-icon1-dark512-4469ca165f03`, served with the existing `public` variant.
 No upload, new variant or credential is needed by the bot.
 
-The discovery renderer and `branded_help_detail_response` use this URL in their
-footer through `brand_footer_for`. Neither builder adds an author icon.
+Help, announcement and Echo use this URL through `brand_footer_for`.
+None adds an author icon.
 Changing this constant does not synchronize the bot avatar.
 
 Keep `assets/brand/two-icon-1-dark-512.png` unchanged (29,035 bytes; SHA-256
@@ -103,7 +121,7 @@ assertion and Python fixture, through the normal review and release gates.
 Do not delete or re-import the Images copy as part of a code rollback.
 
 Use the existing payload builder and smoke above to check the synthetic
-round-trip on the changed SHA: both per-embed `icon_url` expectations and read-back footers
+round-trip on the changed SHA: all Icon 1 expectations and corresponding read-back footers
 must contain the Images URL. Record that SHA and smoke run as synthetic evidence
 only: the separate test bot posts these payloads, so a pass does not prove
 that the deployed product bot adopted the Images URL.
@@ -209,11 +227,11 @@ python3 scripts/cargo_cache.py run -- run -p two-bot-discord --example help_embe
 
 ## Reading a result
 
-- Exit `0` / `VERDICT PASS`: both read-backs matched and both test messages
+- Exit `0` / `VERDICT PASS`: all read-backs matched and all test messages
   were deleted.
 - Exit `1` / `VERDICT FAIL`: identity, channel, post, read-back or brand
-  failed. The row names the first fixed-vocabulary fault; the other embed
-  still runs.
+  failed. The row names the first fixed-vocabulary fault; a failed
+  embed row does not stop the others.
 - Exit `2` / `REFUSED`: a fence stopped the run before any post, for example
   the wrong guild, a missing or malformed token, a missing channel, an
   invalid snowflake or an invalid or already-unbranded payload file.

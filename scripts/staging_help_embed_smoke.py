@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
-"""Live staging /help embed smoke: post, read back, assert the brand (stdlib only).
+"""Live staging embed smoke: post, read back, assert the brand (stdlib only).
 
-Discord creates interactions only for real users, so a bot token cannot
-invoke /help and capture its reply. This smoke proves the rendered half
-that unit tests cannot: the exact embeds the two help builders produce
-(discovery page one and /help <topic>, emitted
-after the executor sanitizer by the `help_embed_smoke_payloads` example in
-crates/discord) are posted to one staging test channel as ordinary
-messages, read back with GET channels/{id}/messages/{id}, and asserted to
-carry the expected branding and rendered text and fields. Both messages are deleted afterwards, pass or fail. It proves
-a rendered Discord message serves the builder payload with the brand
-intact; it is not a slash-command invocation proof (no human-free one
-exists) and claims nothing about the gateway path.
+The Rust renderer emits Help, announcement/Echo, RSVP and Voice embeds.
+The smoke posts them as ordinary staging messages, verifies branding and
+rendered text and fields on read-back, then deletes each message. It does
+not invoke commands, publish a real event or prove ephemeral delivery.
 
 The posting identity is the dedicated staging test bot (TWO Voice
 Synthetic (staging), the same bot the voice synthetic drives), never the
@@ -27,7 +20,7 @@ Fences, all before the first request:
   * the test bot token comes only from $TWO_VOICE_SYNTHETIC_BOT_TOKEN and
     is never printed, logged or written to evidence; a 401 refuses with a
     fixed message and no substitute credential is ever tried;
-  * the payload file must carry schema help_embed_smoke.v2, both embeds
+  * the payload file must carry schema help_embed_smoke.v3, every required embed
     and each row’s expected colour/footer/icon, and each payload embed must
     already match those expectations;
   * the channel id must be a canonical snowflake. Its staging-guild and
@@ -68,14 +61,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import staging_automation_read_smoke as fenced
 
 API = fenced.API
-SCHEMA = "help_embed_smoke.v2"
+SCHEMA = "help_embed_smoke.v3"
 USER_AGENT = "two-bot-next-staging-help-embed-smoke/1.0"
 BODY_CAP = fenced.BODY_CAP
 PAYLOAD_CAP = 1 << 20
 TIMEOUT_SECONDS = 15
 # Guild text (0) and announcement (5) channels accept bot message posts.
 TEXT_CHANNEL_TYPES = (0, 5)
-EMBED_KEYS = ("help", "help_topic")
+TEXT_ONLY_FOOTER_KEYS = ("rsvp_ok", "rsvp_error", "voice_ok", "voice_warn", "voice_error")
+EMBED_KEYS = ("help", "help_topic", "help_warn", "help_error",
+              "announcement", "echo", *TEXT_ONLY_FOOTER_KEYS)
 # The product applications a test-bot token must never turn out to be:
 # staging product bot (the shared fence value), live bot and the superseded
 # staging bot (public ids from two_bot_core::backup::guild_config).
@@ -172,22 +167,24 @@ def load_payloads(path):
     embeds = payloads.get("embeds")
     if not isinstance(expected, dict) or not isinstance(embeds, dict):
         raise Refused("refusing: payload carries no expectations or embeds")
+    if expected.keys() != embeds.keys() or set(embeds) != set(EMBED_KEYS):
+        raise Refused("refusing: payload does not match the required embed inventory")
     for key in EMBED_KEYS:
-        brand = expected.get(key)
-        if not isinstance(brand, dict):
-            raise Refused(f"refusing: payload expectations for {key} are missing")
-        color = brand.get("color")
-        footer_text = brand.get("footer_text")
-        icon_url = brand.get("icon_url")
+        brand = expected[key]
+        if not isinstance(brand, dict) or "icon_url" not in brand:
+            raise Refused(f"refusing: payload expectations for {key} are incomplete")
+        color, footer_text, icon_url = (brand.get(field) for field in
+                                        ("color", "footer_text", "icon_url"))
         if type(color) is not int or not (0 <= color <= 0xFFFFFF):
-            raise Refused("refusing: payload expected colour is not a Discord colour")
+            raise Refused(f"refusing: payload expected colour for {key} is not a Discord colour")
         if not isinstance(footer_text, str) or not footer_text:
-            raise Refused("refusing: payload expected footer text is missing")
-        if not isinstance(icon_url, str) or not icon_url.startswith("https://"):
-            raise Refused("refusing: payload expected icon url is not https")
-        embed = embeds.get(key)
-        if not isinstance(embed, dict):
-            raise Refused(f"refusing: payload embed {key} is missing")
+            raise Refused(f"refusing: payload expected footer text for {key} is missing")
+        if key in TEXT_ONLY_FOOTER_KEYS:
+            if icon_url is not None:
+                raise Refused(f"refusing: payload footer for {key} must be text-only")
+        elif not isinstance(icon_url, str) or not icon_url.startswith("https://"):
+            raise Refused(f"refusing: payload expected icon url for {key} is not https")
+        embed = embeds[key]
         if brand_fault(embed, brand) is not None:
             raise Refused(f"refusing: payload embed {key} already misses the brand")
         description = embed.get("description")
@@ -200,8 +197,11 @@ def brand_fault(embed, expected):
     """Fixed phrase for the first brand mismatch on one embed, or None."""
     if not isinstance(embed, dict):
         return "embed is not an object"
-    if embed.get("color") != expected["color"]:
-        return f"colour is {embed.get('color')!r}, expected {expected['color']}"
+    color = embed.get("color")
+    if type(color) is not int or not 0 <= color <= 0xFFFFFF:
+        return "colour is missing or invalid"
+    if color != expected["color"]:
+        return f"colour is {color}, expected {expected['color']}"
     footer = embed.get("footer")
     if not isinstance(footer, dict):
         return "footer is missing"
@@ -209,6 +209,8 @@ def brand_fault(embed, expected):
         return "footer text does not match"
     if footer.get("icon_url") != expected["icon_url"]:
         return "footer icon url does not match"
+    if embed.get("author") is not None:
+        return "embed has an unexpected author"
     return None
 
 
@@ -508,7 +510,7 @@ def fences(guild_id, token, channel_id):
 
 
 def run(payload_path, guild_id, token, channel_id, transport=None):
-    """Fences, identity, channel, then both embed round trips."""
+    """Fences, identity, channel, then each embed round trip."""
     report = Report()
     try:
         guild, channel = fences(guild_id, token, channel_id)
