@@ -130,22 +130,25 @@ export async function stagingUse(args, send = fetch, pause = wait, now = Date.no
   // A release may be retried after expiry, but never extends that expiry.
   if (!["status", "observe"].includes(args.action)) binding(args, args.action === "release" ? Math.min(now(), args.expiresAt - 1) : now());
   let statusRetryDeadline = args.statusRetryDeadline;
+  let stopDeadline;
   if (args.action === "stop") {
     const budget = args.stopTimeoutMs ?? 50000;
-    // Reserve one POST and time for subprocess startup and receipt output.
-    const statusBudget = Math.min(30000, budget - MAX_REQUEST_MS - 2000);
-    require(positive(statusBudget), "staging_request_timeout");
-    statusRetryDeadline = performance.now() + statusBudget;
+    require(positive(budget), "staging_request_timeout");
+    const start = performance.now();
+    // Leave time for subprocess startup and receipt output. Reserve a full
+    // POST allowance only for optional retries, not the first status read.
+    stopDeadline = start + budget - 2000;
+    statusRetryDeadline = Math.min(start + 30000, stopDeadline - MAX_REQUEST_MS);
   }
   const headers = { authorization: `Bearer ${args.token}`, "cache-control": "no-cache" };
   const control = async (init) => {
+    const retryDeadline = init.method === "GET" ? statusRetryDeadline : undefined;
+    let deadline = stopDeadline ?? retryDeadline ?? performance.now() + MAX_REQUEST_MS;
     for (;;) {
-      const deadline = statusRetryDeadline === undefined || init.method !== "GET"
-        ? performance.now() + MAX_REQUEST_MS : statusRetryDeadline;
       const response = await request(send, new URL(PATH, base), { ...init, headers }, deadline);
-      if (response.status === 503 && init.method === "GET" && statusRetryDeadline !== undefined
-        && performance.now() + 5000 < deadline) {
+      if (response.status === 503 && retryDeadline !== undefined && performance.now() + 5000 < retryDeadline) {
         await pause(5000);
+        deadline = retryDeadline;
         continue;
       }
       require(response.status === 200, "staging_control_refused");

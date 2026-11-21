@@ -65,6 +65,29 @@ test("staging client: stop requires a confirmed stop on the same epoch and activ
   assert.equal(wrongRun.calls.length, 1);
 });
 
+test("staging client: stop shares a short deadline across the status read and mutation", async (t) => {
+  let elapsed = 0;
+  t.mock.method(performance, "now", () => elapsed);
+  const stop = { ...args, action: "stop", stopTimeoutMs: 15000 };
+  const before = { ...state, running: true };
+  const h = responses([Response.json(before), Response.json(state)]);
+  const receipt = await stagingUse(stop, async (url: URL, init: RequestInit) => {
+    elapsed += init.method === "GET" ? 1000 : 2000;
+    return h.send(url, init);
+  }, async () => { assert.fail("a successful status read needs no retry"); }, clock);
+  assert.equal(receipt.running, false);
+  assert.deepEqual(receipt.use, use);
+  assert.deepEqual(h.calls.map(({ init }) => init.method), ["GET", "POST"]);
+
+  elapsed = 0;
+  const expired = responses([Response.json(before)]);
+  await assert.rejects(stagingUse(stop, async (url: URL, init: RequestInit) => {
+    elapsed = stop.stopTimeoutMs;
+    return expired.send(url, init);
+  }, async () => {}, clock), /staging_request_timeout/);
+  assert.deepEqual(expired.calls.map(({ init }) => init.method), ["GET"]);
+});
+
 test("staging client: stop retries a busy status read but never retries the mutation", async () => {
   const stop = { ...args, action: "stop", stopTimeoutMs: 50000 };
   const busy = () => new Response(null, { status: 503 });

@@ -1420,17 +1420,33 @@ class OrchestrationTests(OfflineTestCase):
     def test_post_stop_counters_can_drop_before_the_exact_replacement_converges(self):
         self.prepare_baseline()
         self.write_deploy_output()
-        client = verify_client()
-        zero = completed_row()
-        zero["health"]["instances"].update(active=0, healthy=0)
-        starting = copy.deepcopy(zero)
-        starting["health"]["instances"]["starting"] = 1
-        client.api_routes[DETAIL_PATH] = [completed_row(), zero, starting, completed_row()]
-        client.deadline = 120
-        rollout.verify(self.args, client)
-        client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
-        self.assertEqual(self.clock.sleeps, [5, 5])
-        self.assertEqual(json.loads(Path(self.args.evidence).read_text())["readyz"], 200)
+        for counter in ("zero", "starting", "scheduling"):
+            with self.subTest(counter=counter):
+                self.args.evidence = str(self.root / f"evidence-{counter}.json")
+                client = verify_client()
+                transient = completed_row()
+                counts = transient["health"]["instances"]
+                counts.update(active=0, healthy=0)
+                if counter != "zero":
+                    counts[counter] = 1
+                # First opening read, first final recheck, then a healthy retry.
+                client.api_routes[DETAIL_PATH] = [completed_row(), transient, completed_row(), completed_row()]
+                client.deadline = self.clock.now + 20
+
+                def retry(seconds, client=client):
+                    self.assertEqual(seconds, 5)
+                    self.assertEqual(client.calls[-1], ("api", DETAIL_PATH))
+                    self.assertEqual(client.calls.count(("request", URL + "/readyz")), 1)
+                    self.assert_no_evidence()
+                    self.clock.sleep(seconds)
+
+                with patch.object(rollout.time, "sleep", side_effect=retry) as sleep:
+                    rollout.verify(self.args, client)
+                sleep.assert_called_once_with(5)
+                client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
+                self.assertEqual(client.calls.count(("api", DETAIL_PATH)), 4)
+                self.assertEqual(client.calls.count(("request", URL + "/readyz")), 2)
+                self.assertEqual(json.loads(Path(self.args.evidence).read_text())["readyz"], 200)
 
     def test_stop_refusal_prevents_readiness_on_completed_rollout(self):
         self.prepare_baseline()
