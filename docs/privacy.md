@@ -309,6 +309,9 @@ the heat sweep in both modes and does not enforce a live 35-day TTL.
 
 No other automatic age-based purger is installed: do not claim a live TTL
 beyond the windows this job enforces. Every run reports per-class metrics.
+The `retention_run` event's `attendance_raw_deleted` field counts age-based
+session deletions in execute mode and candidates in dry-run mode, without
+logging session identifiers.
 Partial runs (deferred/overdue deletions, failed guild purges) surface as
 warnings and stay retryable. The existing `presence_probe`, funnel `events` and
 `operational_audit_log` cutoffs are evaluated at each successful run; scheduling
