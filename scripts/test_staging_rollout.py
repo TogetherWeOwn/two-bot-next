@@ -2649,6 +2649,8 @@ class OrchestrationTests(OfflineTestCase):
 
         client = rollout.Client(ACCOUNT, SENTINEL, deadline=clock.now + 300)
         client.opener = Opener()
+        # Exercise real HTTP deadline clamping without invoking the stop subprocess.
+        client.stop_staging = Mock()
         return client, timeouts
 
     def gate_error_at_deadline_offset(self, offset):
@@ -2698,6 +2700,7 @@ class OrchestrationTests(OfflineTestCase):
         failure = {"phase": "durable_gateway", "class": "checkpoint_load_failed"}
         client, _ = self.client_with_real_deadline_reads(failure)
         self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
         self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
         self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
