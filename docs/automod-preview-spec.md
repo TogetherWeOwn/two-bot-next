@@ -374,9 +374,10 @@ exist in config. Evaluating "hypothetically" outside scope would open the
 oracle precisely where automod does not run. When automod was disabled at
 boot, no runtime exists and the handler answers `not_evaluated` without
 building one ad hoc. Registration is part of the same boundary: slice 4
-publishes the definition into a guild registry **only when that guild is
-the stack's configured guild and the automod scope admits it**, through
-the existing guild-registry publication path
+publishes the definition into a guild registry **only when AutoMod
+was activated at boot, that guild is the stack's configured staging guild,
+and the active scope admits it**, through the existing guild-registry
+publication path
 ([command-publish](command-publish.md)) — the live guild should not even
 list an inert oracle in its picker. If the publish set cannot be
 scope-conditioned without a large refactor, that is the same
@@ -585,8 +586,9 @@ target fetch, no `target_gate`, no `plan`, no executor call.
 
 ## 8. Test plan for the future build (acceptance shape)
 
-Offline first: no test needs Discord, a live database, or staging data
-until slice 4. Each row names the proof, not a vague area.
+Source tests use synthetic fixtures, mock Discord REST and disposable
+PostgreSQL as needed; only the registry/serving read-back needs staging
+(§9). Each row names the proof, not a vague area.
 
 | # | Scenario | Expected proof |
 | --- | --- | --- |
@@ -608,7 +610,7 @@ until slice 4. Each row names the proof, not a vague area.
 | T15 | Config parity | Hot-changed word/threshold via live snapshot flips preview and next real delivery identically; invalid stored value keeps last-good in both |
 | T16 | Injection | Text with `<@everyone>`, markdown, URLs → reply byte-shape is a fixed template, `allowed_mentions` empty |
 | T17 | Redelivery and recovery | Successful non-exempt sequential/concurrent delivery: matcher call count 1, one audit row, one actor charge, one guild charge, both replies equal the committed row. Repeat all T6 exemption cases: matcher count 0, stored class/derived knob identical on replay even after config/roles change; no extra charges. Missing/invalid stored class → unavailable without evaluation. Advance the clock between receipt, insert, commit, and replay; replay read includes `created_at`, and first/replayed invocation receipt times equal the stored receipt timestamp at database precision. Crash/failure before commit then redelivery: retry succeeds without a stranded claim; failed evaluations disclose nothing; idempotent actor/guild charges do not double in the same limiter lifetime. Unknown commit outcome: replay if committed, retry only if the locked read proves no row (§6) |
-| T18 | Registration scope | Publish set contains `automod-preview` only for the configured guild when the automod scope admits it; absent for the live guild without approval (§5.0) |
+| T18 | Registration scope | Guild registry includes `automod-preview` only for the configured staging guild when AutoMod is active and its scope admits the guild; absent with no activation, denied scope, another guild, or global registration (§5.0) |
 | T19 | Detached command without ordered history | When repeat-eligible text reaches the repeat check: repeat status `indeterminate`, reply result `partial` with fixed explanation and no deciding filter/knob; later filters not evaluated; audit `outcome=partial,filter=none` and effective mode/length; metric `result=partial,filter=none` and effective mode; redelivery renders the same partial reply. Earlier exemption/`bad_words` short-circuits remain complete |
 
 ## 9. Future build slices (each ≤1 day, cut-ready; not created here)
@@ -641,12 +643,24 @@ slices (2–4) carry the CISO comment-gate.
 4. **Publish + docs + staging proof** — add the definition to the
    published moderation set under the §5.0 scope condition (T18),
    regenerate `docs/commands.md`, operator-guide
-   section pointing here, smoke-surface inventory row. Staging-only
-   synthetic proof in the staging guild with a synthetic bad word:
-   preview verdicts in dry-run (and, only if separately authorized,
-   enforce), then real posts confirming previews left no repeat streak
-   and no violation (T3 at system level). Rollback: remove from the
-   published set (one revert); no persisted preview state exists to clean.
+   section pointing here, smoke-surface inventory row. Record two separate
+   pieces of acceptance evidence:
+   - **Staging (read-only):** confirm the serving artifact is the exact
+     qualified main SHA and read back the command definition from that
+     build's configured staging guild registry. No interaction is invoked.
+   - **GitHub Actions (exact head):** in the system regression, send a
+     synthetic sample through detached command dispatch in dry-run. Check
+     the matched, mention-safe ephemeral callback against the committed
+     audit row, using mock Discord REST and disposable PostgreSQL. Compare
+     repeat-eligible synthetic `MESSAGE_CREATE` fixtures with and without
+     prior previews of their text; require the same repeat decision
+     sequence and no violation rows (T3). Bot-authored posts are not a
+     substitute because the matcher exempts bots.
+
+   Neither receipt is a live Discord interaction test. Only staging is
+   in scope; the release gates and §1 kill rule still apply. Rollback:
+   remove from the published set (one revert); no persisted preview state
+   exists to clean.
 
 Out of scope for every slice: config editing from the preview, new
 `TWO_AUTOMOD_*` keys, sanction prediction, member-targeted preview,
