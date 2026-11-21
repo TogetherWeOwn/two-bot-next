@@ -37,6 +37,14 @@ Without these gates, only the always-enabled core commands are included. Other
 router surfaces have no additional published command definitions here. Invalid
 feature configuration fails before a request.
 
+The gateway is the only publisher of `/automod-preview`: it requires active
+AutoMod (`TWO_AUTOMOD=1`) admitting the configured staging guild, the moderation
+router gate (`TWO_MODERATION=1`),
+and a spare slot after the complete registry is assembled. The standalone CLI
+and env-only boot sync cannot see that activation; leave the gateway as the
+registry owner on staging. Follow the [preview spec](automod-preview-spec.md)
+for GET-only acceptance evidence and the removal rule.
+
 **This is a complete replacement, not a per-command patch.** The CLI refuses
 `publish --apply` with exit `1` before PUT if any removal is **unrecognized**:
 its raw command type/name is absent from both the desired set and the complete
