@@ -1750,11 +1750,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         // disposition: rejected creates never reach automations.
                         if let (Some(runtime), Some(dispatch)) = (runtime.as_ref(), dispatch.as_ref()) {
                             if !(automod_enabled && matches!(dispatch.event, Event::MessageCreate(_))) {
-                                if interactions.is_some() {
-                                    runtime.dispatch_remaining(&dispatch.event);
-                                } else {
-                                    runtime.dispatch(&dispatch.event);
-                                }
+                                runtime.dispatch_received(&dispatch.event, interactions.is_some(), dispatch.received, &dispatch.observed_at);
                             }
                         }
                         // The ordered runtime is a separate instance from the

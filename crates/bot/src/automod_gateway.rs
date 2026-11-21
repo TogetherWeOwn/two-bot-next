@@ -214,6 +214,15 @@ fn resolve_live_config(
     }
 }
 
+pub(crate) fn preview_live_config(
+    guild_id: &str,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> Option<AutomodConfig> {
+    let live = live?;
+    let deployment = std::env::vars().collect();
+    resolve_live_config(&deployment, guild_id, live)
+}
+
 /// Per-delivery refresh from the poller-published snapshot (TOG-19027): the
 /// deployment environment is the base, the live snapshot overlays stored
 /// lists/thresholds. Parked or pre-first-poll readers layer nothing, so the
