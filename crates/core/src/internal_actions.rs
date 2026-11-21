@@ -471,12 +471,21 @@ pub struct BucketDecision {
 #[derive(Debug, Clone, Default)]
 pub struct TokenBuckets {
     buckets: HashMap<String, BucketState>,
+    voice_members: HashMap<String, BucketState>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct BucketState {
     tokens: f64,
     updated_ms: u64,
+}
+
+impl BucketState {
+    fn refilled(&self, spec: BucketSpec, now_ms: u64) -> f64 {
+        let elapsed = now_ms.saturating_sub(self.updated_ms) as f64 / 1000.0;
+        spec.capacity
+            .min(self.tokens + elapsed * spec.refill_per_second)
+    }
 }
 
 impl TokenBuckets {
@@ -487,14 +496,43 @@ impl TokenBuckets {
 
     /// Take one token from `key`'s bucket, creating it full on first use.
     pub fn take(&mut self, key: &str, spec: BucketSpec, now_ms: u64) -> BucketDecision {
-        let bucket = self.buckets.entry(key.to_owned()).or_insert(BucketState {
+        Self::take_from(&mut self.buckets, key, spec, now_ms)
+    }
+
+    const VOICE_MEMBER_LIMIT: usize = 1024;
+
+    /// Charge a validated voice-move subject. Unseen subjects fail closed at
+    /// capacity unless a fully replenished entry can be discarded.
+    pub fn take_voice_member(&mut self, key: &str, now_ms: u64) -> BucketDecision {
+        let spec = BucketSpec {
+            capacity: 6.0,
+            refill_per_second: 0.02,
+        };
+        let members = &mut self.voice_members;
+        if members.len() >= Self::VOICE_MEMBER_LIMIT && !members.contains_key(key) {
+            // Only evict states equivalent to a fresh bucket; don't reset any debt.
+            members.retain(|_, bucket| bucket.refilled(spec, now_ms) < spec.capacity);
+            if members.len() >= Self::VOICE_MEMBER_LIMIT {
+                return BucketDecision {
+                    allowed: false,
+                    retry_after_secs: 50,
+                };
+            }
+        }
+        Self::take_from(members, key, spec, now_ms)
+    }
+
+    fn take_from(
+        buckets: &mut HashMap<String, BucketState>,
+        key: &str,
+        spec: BucketSpec,
+        now_ms: u64,
+    ) -> BucketDecision {
+        let bucket = buckets.entry(key.to_owned()).or_insert(BucketState {
             tokens: spec.capacity,
             updated_ms: now_ms,
         });
-        let elapsed = now_ms.saturating_sub(bucket.updated_ms) as f64 / 1000.0;
-        bucket.tokens = spec
-            .capacity
-            .min(bucket.tokens + elapsed * spec.refill_per_second);
+        bucket.tokens = bucket.refilled(spec, now_ms);
         // A backwards wall clock must not let its recovery credit the same
         // elapsed interval twice. Keep the last observed high-water mark.
         bucket.updated_ms = bucket.updated_ms.max(now_ms);
@@ -1414,9 +1452,20 @@ pub struct VoiceMoveRequest<'a> {
 
 impl<'a> VoiceMoveRequest<'a> {
     pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        let canonical_id = |field| {
+            let value = require_snowflake(body, field)?;
+            if value.starts_with('0') || value.parse::<u64>().is_err() {
+                return Err(ActionError::new(
+                    ErrorCode::Malformed,
+                    "Invalid Discord id",
+                    format!("bad_{field}"),
+                ));
+            }
+            Ok(value)
+        };
         Ok(Self {
-            discord_id: require_snowflake(body, "discord_id")?,
-            channel_id: require_snowflake(body, "channel_id")?,
+            discord_id: canonical_id("discord_id")?,
+            channel_id: canonical_id("channel_id")?,
         })
     }
 
@@ -2620,6 +2669,31 @@ mod tests {
     }
 
     #[test]
+    fn voice_member_buckets_reclaim_only_full_entries() {
+        let mut buckets = TokenBuckets::new();
+        const ACTIVE: &str = "123456789012345678";
+        const NEW: &str = "123456789012349999";
+        for offset in 0..TokenBuckets::VOICE_MEMBER_LIMIT {
+            let member = (123456789012345678u64 + offset as u64).to_string();
+            assert!(buckets.take_voice_member(&member, 0).allowed);
+        }
+        for _ in 1..6 {
+            assert!(buckets.take_voice_member(ACTIVE, 0).allowed);
+        }
+        let denied = buckets.take_voice_member(NEW, 49_999);
+        assert!(!denied.allowed);
+        assert!(denied.retry_after_secs > 0);
+        assert_eq!(
+            buckets.voice_members.len(),
+            TokenBuckets::VOICE_MEMBER_LIMIT
+        );
+        assert!(buckets.take_voice_member(NEW, 50_000).allowed);
+        assert_eq!(buckets.voice_members.len(), 2);
+        assert!(buckets.take_voice_member(ACTIVE, 50_000).allowed);
+        assert!(!buckets.take_voice_member(ACTIVE, 50_000).allowed);
+    }
+
+    #[test]
     fn voice_move_request_names_one_member_and_one_room() {
         let body = map(json!({
             "discord_id": "123456789012345678",
@@ -2638,6 +2712,26 @@ mod tests {
                 VoiceMoveRequest::validate(&body).unwrap_err().code,
                 ErrorCode::Malformed
             );
+        }
+    }
+
+    #[test]
+    fn voice_move_request_rejects_noncanonical_snowflakes() {
+        for invalid in [
+            "00000000000000000",
+            "012345678901234567",
+            "18446744073709551616",
+        ] {
+            for (member, channel) in [
+                (invalid, "123456789012345679"),
+                ("123456789012345678", invalid),
+            ] {
+                let body = map(json!({"discord_id": member, "channel_id": channel}));
+                assert_eq!(
+                    VoiceMoveRequest::validate(&body).unwrap_err().code,
+                    ErrorCode::Malformed
+                );
+            }
         }
     }
 
