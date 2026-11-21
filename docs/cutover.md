@@ -206,7 +206,7 @@ FAIL; on a real restore require exit 0 and `RESTORE VERIFIED`, then separately
 verify canonical content and required table coverage. The historical v4 dump covered
 then-current tables, except `xp_cooldowns`, the store
 chain's `rollback_journal`/`rollback_watermarks` and the migration ledgers
-([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L222)),
+([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L339)),
 plus retired legacy tables when the source still has them
 ([`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44)). Restore needs a
 target migrated to the dump's schema, and refuses before any write when a

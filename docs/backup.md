@@ -202,9 +202,9 @@ retain their versioned clearing behavior.
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
 has 110 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
+All v3–v16 archives may also omit the attendance tables (`V17_ADDED_TABLES`).
 Each readable version requires its historical inventory and waives only
-versioned additions introduced later. In addition to the omissions below,
-v3–v16 may omit both attendance tables (`V17_ADDED_TABLES`).
+versioned additions introduced later:
 
 | Version | Tables it may omit |
 | --- | --- |
