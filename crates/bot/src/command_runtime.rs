@@ -423,7 +423,14 @@ impl CommandRuntime {
     }
 
     pub(crate) fn set_automod(&self, activation: Arc<crate::automod_gateway::ProductionAutomod>) {
-        let _ = self.automod.set(activation);
+        // Boot attaches AutoMod before the shard can publish. Both READY and
+        // custom-command republication use this same router, even if custom
+        // commands bootstrapped before AutoMod was attached.
+        self.automod.get_or_init(|| activation).preview(|automod| {
+            self.interactions
+                .router
+                .enable_staging_automod_preview(automod);
+        });
     }
 
     /// Test-only access to the shared interaction surface for identity assertions.

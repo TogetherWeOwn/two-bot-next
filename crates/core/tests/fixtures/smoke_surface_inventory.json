@@ -2,6 +2,16 @@
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
   "count": 46,
   "dm_permission_all_false": true,
+  "staging_only_commands": [
+    {
+      "name": "automod-preview",
+      "dm_permission": false,
+      "default_member_permissions": "32",
+      "gate": "Active AutoMod admits the configured staging guild; moderation enabled and a spare slot",
+      "smoke": "deferred",
+      "deferral_reason": "Read back the staging registry; verify behavior in Actions without a live invocation."
+    }
+  ],
   "commands": [
     {
       "name": "rank",

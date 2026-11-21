@@ -360,6 +360,34 @@ async fn real_opt_in_boot_fetches_matching_registry_without_put_before_local_db_
 }
 
 #[tokio::test]
+async fn staging_restart_leaves_preview_and_saved_command_for_the_gateway() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(
+            200,
+            json!([
+                {"id": "8001", "type": 1, "name": "automod-preview", "description": "Staff preview", "default_member_permissions": "32"},
+                {"id": "8002", "type": 1, "name": "registry-test", "description": "Saved command"}
+            ]),
+        )],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let mut command = bot(&mock);
+    credentials(&mut command);
+    command
+        .env("GUILD_ID", two_bot_core::automod_runtime::STAGING_GUILD_ID)
+        .env("TWO_COMMANDS_PUBLISH_ON_BOOT", "1")
+        .env("TWO_AUTOMOD", "1")
+        .env("DATABASE_URL", INVALID_DB)
+        .env("RUST_LOG", "two_bot=info");
+    let output = run(command).await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).contains("database initialization failed"));
+    assert!(mock.requests().is_empty(), "no pre-gateway registry I/O");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn opt_in_boot_with_voice_on_keeps_the_voice_set_in_the_put() {
     let mock = MockRest::start(
         vec![
