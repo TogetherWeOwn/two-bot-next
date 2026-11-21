@@ -124,12 +124,9 @@ mod tests {
         let original = adapter.accumulator.completed(NEXT);
         assert_eq!(original.len(), 1);
         assert_eq!(original[0].occupancy_sum, 5_000);
-        assert_eq!(
-            adapter.tick(NEXT, None, &pool).await,
-            Err(JobErrorClass::Database)
-        );
-        assert_eq!(adapter.accumulator.completed(NEXT), original);
 
+        // The timeout must be the first tick at NEXT, so the rewind below tests
+        // that this attempt closed FIRST even though the write did not return.
         let started = tokio::time::Instant::now();
         assert_eq!(
             adapter
