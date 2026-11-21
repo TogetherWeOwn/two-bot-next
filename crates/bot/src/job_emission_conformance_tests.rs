@@ -60,7 +60,7 @@ fn has_framework_marker(source: &str) -> bool {
 }
 
 /// Emitter sources read at compile time so the suite is fully offline.
-const EMITTER_SOURCES: [(&str, &str); 11] = [
+const EMITTER_SOURCES: [(&str, &str); 12] = [
     ("website_jobs.rs", include_str!("website_jobs.rs")),
     ("settings_jobs.rs", include_str!("settings_jobs.rs")),
     ("community_jobs.rs", include_str!("community_jobs.rs")),
@@ -75,11 +75,15 @@ const EMITTER_SOURCES: [(&str, &str); 11] = [
     ("lfg_jobs.rs", include_str!("lfg_jobs.rs")),
     ("automod_gateway.rs", include_str!("automod_gateway.rs")),
     ("gateway_metrics.rs", include_str!("gateway_metrics.rs")),
+    (
+        "voice_heat_runtime.rs",
+        include_str!("voice_heat_runtime.rs"),
+    ),
 ];
 
 /// Every scrape job with a supervised emitter, paired with the file that
 /// schedules it. The file must name the job and keep the framework marker.
-const LIVE_JOB_EMITTERS: [(&str, &str); 14] = [
+const LIVE_JOB_EMITTERS: [(&str, &str); 15] = [
     ("counter", "website_jobs.rs"),
     ("rank", "website_jobs.rs"),
     ("scheduled_events", "website_jobs.rs"),
@@ -94,6 +98,7 @@ const LIVE_JOB_EMITTERS: [(&str, &str); 14] = [
     ("self_role_recovery", "self_role_handlers.rs"),
     ("automod_expiry", "automod_gateway.rs"),
     ("lfg_sweep", "lfg_jobs.rs"),
+    ("voice_heat", "voice_heat_runtime.rs"),
 ];
 
 /// Every `website_jobs.rs` call that schedules a live job. Naming the job in
@@ -116,7 +121,8 @@ const REGISTER_CALLS: [&str; 9] = [
 /// or `drop(...)` keeps the call while the job never registers, so each entry
 /// pins the sink together with the call, matched against the source with
 /// full-line `//` comments removed.
-const REGISTER_SINKS: [&str; 8] = [
+const REGISTER_SINKS: [&str; 9] = [
+    "registered.push(voice_heat_runtime::job(",
     "registered.push(crate::settings_jobs::job(",
     "registered.push(Job {",
     "registered.extend(scheduled)",

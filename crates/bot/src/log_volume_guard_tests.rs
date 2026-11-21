@@ -144,7 +144,7 @@ struct JobCap {
 
 /// One row per `metrics::JOBS` entry, in the same order. The hourly
 /// presence probe parks first; the durable checkpoint marker never sheds.
-const JOB_CAPS: [JobCap; 17] = [
+const JOB_CAPS: [JobCap; 18] = [
     JobCap {
         job: "invite_snapshot",
         shed_order: None,
@@ -207,6 +207,10 @@ const JOB_CAPS: [JobCap; 17] = [
     },
     JobCap {
         job: "lfg_sweep",
+        shed_order: None,
+    },
+    JobCap {
+        job: "voice_heat",
         shed_order: None,
     },
     JobCap {
@@ -538,6 +542,7 @@ fn job_caps_cover_every_job_label_and_presence_sheds_first() {
                         | "member_unban_sweep"
                         | "automod_expiry"
                         | "lfg_sweep"
+                        | "voice_heat"
                         | "other"
                 ),
                 "{} never sheds; shed it only through its feature flag, not the log guard",

@@ -312,7 +312,8 @@ export const HANDLER_SATURATED_SHARE = 0.01;
 /** Consecutive saturated handler windows before the ticket. */
 export const HANDLER_SATURATED_SAMPLES = 3;
 /** Fixed job labels for `two_bot_job_runs_total`, pinned to Rust `JOBS`. */
-export const JOB_RUNS_JOBS: readonly string[] = ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "lfg_sweep", "voice_heat", "other"];
+export const VOICE_HEAT_JOB = "voice_heat";
+export const JOB_RUNS_JOBS: readonly string[] = ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "lfg_sweep", VOICE_HEAT_JOB, "other"];
 /** Fixed outcomes for `two_bot_job_runs_total`, pinned to Rust `JOB_OUTCOMES`. */
 export const JOB_RUNS_OUTCOMES: readonly string[] = ["success", "failure"];
 /** Failed runs must exceed this share of a judged window... */
@@ -2419,6 +2420,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const jobRunsNow: Record<string, { failure: number; total: number }> | undefined = (() => {
     const acc: Record<string, { failure: number; total: number }> = Object.create(null);
     for (const job of JOB_RUNS_JOBS) {
+      if (job === VOICE_HEAT_JOB && !jobRunsRows.some((row) => row.labels.job === job)) continue;
       const success = exactSeries(jobRunsRows, { job, outcome: "success" });
       const failure = exactSeries(jobRunsRows, { job, outcome: "failure" });
       if (success === undefined || failure === undefined || !Number.isSafeInteger(success + failure)) return undefined;
@@ -2452,10 +2454,14 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   } else {
     jobShareSeen = true;
     for (const job of JOB_RUNS_JOBS) {
-      const now = jobRunsNow[job]!;
+      const now = jobRunsNow[job];
       const base = prevJobShareBase[job];
       const key = `${JOB_SHARE_RULE}:${job}`;
       const wasShareFiring = prev.firing.includes(key);
+      if (now === undefined) {
+        if (wasShareFiring) firing.push(key);
+        continue; // Re-baseline this job if it returns after rollback.
+      }
       if (base === undefined || typeof base.failure !== "number" || typeof base.total !== "number"
         || !Number.isSafeInteger(base.failure) || !Number.isSafeInteger(base.total)) {
         jobShareBase[job] = { ...now };

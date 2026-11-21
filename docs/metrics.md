@@ -167,10 +167,9 @@ The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
 `community_scorecard`, `inactivity`, `audit_retry`, `self_role_recovery`, `feeds`,
-`member_unban_sweep`, `automod_expiry`, `lfg_sweep`, `voice_heat`, `settings` and
-`scheduled_messages` (the last two are 15 s tickers). The community, audit, recovery, feed, unban-sweep,
-automod-expiry, LFG lifecycle, heat sampler and ticker names may be parked by
-configuration.
+`member_unban_sweep`, `automod_expiry`, `lfg_sweep`, `voice_heat`, `settings` and `scheduled_messages`
+(the two 15 s tickers). The community, audit, recovery, feed, unban-sweep,
+automod-expiry, LFG lifecycle, heat sampler and ticker names may be parked by configuration.
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
 still-running or always-failing job; use `/readyz` job status for that distinction.

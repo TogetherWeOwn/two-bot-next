@@ -193,17 +193,12 @@ fn boot_admits_heat_only_with_execute_and_gateway_prerequisites_even_if_rest_ref
         if let Some(retention) = retention {
             command.env(crate::retention_jobs::MODE_SETTING, retention);
         }
-        let output = command
-            .output()
-            .expect("run isolated voice heat boot probe");
+        let output = command.output().expect("run isolated heat boot probe");
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            output.status.success(),
-            "boot mode {mode} failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            output.status.success() && stderr.contains("voice heat boot probe completed"),
+            "boot mode {mode} failed: {stderr}"
         );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("voice heat boot probe completed"));
     }
 }
 
@@ -229,35 +224,29 @@ async fn isolated_heat_boot_probe() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (stop, _) = watch::channel(false);
-    let shutdown = stop.clone();
-    let gateway = server::SharedState::new(
-        Arc::new(RwLock::new(crate::gateway::GatewayState::Connected)),
+    let gateway = Arc::new(RwLock::new(crate::gateway::GatewayState::Connected));
+    let serve = website_jobs::serve(
+        &config,
+        listener,
+        server::SharedState::new(gateway, None),
+        stop.clone(),
         None,
+        Arc::new(std::sync::OnceLock::new()),
+        None,
+        None,
+        None,
+        crate::voice_snapshot::new_shared_cache(),
     );
-    let owner = tokio::spawn(async move {
-        website_jobs::serve(
-            &config,
-            listener,
-            gateway,
-            shutdown,
-            None,
-            Arc::new(std::sync::OnceLock::new()),
-            None,
-            None,
-            None,
-            crate::voice_snapshot::new_shared_cache(),
-        )
-        .await
-    });
-    let response = tokio::time::timeout(Duration::from_secs(5), readiness(address))
-        .await
-        .expect("boot readiness must answer promptly");
-    stop.send_replace(true);
-    tokio::time::timeout(Duration::from_secs(5), owner)
-        .await
-        .expect("boot owner joins shutdown")
-        .unwrap()
-        .unwrap();
+    let probe = async {
+        let response = readiness(address).await;
+        stop.send_replace(true);
+        response
+    };
+    let (result, response) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(serve, probe) })
+            .await
+            .expect("boot must answer readiness and join shutdown");
+    result.unwrap();
     let jobs = &response["jobs"];
     let name = crate::voice_heat_runtime::NAME;
     assert!(jobs[name].is_object(), "heat readiness entry: {response}");

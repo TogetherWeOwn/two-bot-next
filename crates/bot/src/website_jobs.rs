@@ -423,20 +423,22 @@ pub async fn serve(
     // Discord gateway is unconfigured. Missing/invalid/`off` mode or a
     // missing/unusable database parks the job without attempting destructive
     // work; the `/readyz` status entry exists either way.
-    if let Some((pool, mode)) = retention_registration(config) {
-        // Share the validated runtime DML pool and execute admission. Heat is
-        // independent of the optional voice-room actor and Discord REST.
-        if let (RetentionMode::Execute, Ok((_, _, guild))) =
-            (mode, crate::gateway_prerequisites(config))
-        {
-            registered.push(voice_heat_runtime::job(
-                pool.clone(),
-                guild,
-                voice_cache,
-                gateway.gateway.clone(),
-            ));
+    match retention_registration(config) {
+        RetentionRegistration::Active(pool, mode) => {
+            // Share the DML pool and execute admission, independently of REST.
+            if let (RetentionMode::Execute, Ok((_, _, guild))) =
+                (mode, crate::gateway_prerequisites(config))
+            {
+                registered.push(voice_heat_runtime::job(
+                    pool.clone(),
+                    guild,
+                    voice_cache,
+                    gateway.gateway.clone(),
+                ));
+            }
+            registered.push(crate::retention_jobs::job(pool, mode));
         }
-        registered.push(crate::retention_jobs::job(pool, mode));
+        RetentionRegistration::Parked => parked.push(crate::retention_jobs::NAME),
     }
 
     if let Some(service) = self_roles {
@@ -479,11 +481,18 @@ pub async fn serve(
     serve_jobs(registered, status, shutdown.clone(), http).await
 }
 
+/// Retention registration outcome: validated inputs for an active supervised
+/// job, or a parked status entry with no job.
+enum RetentionRegistration {
+    Active(PgPool, RetentionMode),
+    Parked,
+}
+
 /// Resolve the retention scheduler registration from the process environment
 /// and the database binding alone: the job never needs a Discord token or
 /// guild. Anything but the exact `execute` opt-in is dry run or parked, and
 /// a missing/unusable database parks without attempting destructive work.
-fn retention_registration(config: &Config) -> Option<(PgPool, RetentionMode)> {
+fn retention_registration(config: &Config) -> RetentionRegistration {
     let setting = std::env::var(crate::retention_jobs::MODE_SETTING).ok();
     let mode = match crate::retention_jobs::mode_from_setting(setting.as_deref()) {
         Ok(mode) => mode,
@@ -491,20 +500,25 @@ fn retention_registration(config: &Config) -> Option<(PgPool, RetentionMode)> {
             tracing::warn!(
                 "retention parked: invalid TWO_RETENTION_MODE; expected dry-run, execute or off"
             );
-            return None;
+            return RetentionRegistration::Parked;
         }
     };
-    let mode = mode?;
+    let Some(mode) = mode else {
+        return RetentionRegistration::Parked;
+    };
     let url = config
         .database_url
         .as_ref()
         .map(|secret| secret.expose().as_str())
-        .filter(|url| !url.is_empty())?;
+        .filter(|url| !url.is_empty());
+    let Some(url) = url else {
+        return RetentionRegistration::Parked;
+    };
     match crate::retention_jobs::pool_from_url(url) {
-        Ok(pool) => Some((pool, mode)),
+        Ok(pool) => RetentionRegistration::Active(pool, mode),
         Err(_) => {
             tracing::warn!("retention parked: invalid database configuration");
-            None
+            RetentionRegistration::Parked
         }
     }
 }

@@ -132,8 +132,8 @@ So shedding means doing less work per dispatch, in this order:
 5. Voice reconcile detail (plan counts only; outcomes stay counted).
 6. Never shed: session lifecycle lines, checkpoint commits, disconnect and
    missed-events counters, failure classes, or the `other` catchall. `feeds`,
-   `self_role_recovery`, `member_unban_sweep`, `automod_expiry` and `lfg_sweep` completion
-   metrics also never shed; park these jobs only through their existing
+   `self_role_recovery`, `member_unban_sweep`, `automod_expiry`, `lfg_sweep` and `voice_heat`
+   completion metrics also never shed; park these jobs only through their existing
    feature configuration, not the log guard.
 
 The send-admission `blocked` counter is the pipeline's own shed meter:

@@ -90,43 +90,21 @@ mod tests {
         assert_eq!((job.action)().await, Ok(()));
 
         let mut buffer = VoiceHeat::default();
-        let first = datetime!(2026-11-21 00:00 UTC);
-        assert_eq!(
-            tick(&mut buffer, &pool, &cache, &gateway, 100, first).await,
-            Ok(())
-        );
-
+        use GatewayState::{Armed, Connected, Draining};
+        let mut probe = async |state, hour| {
+            *gateway.write().await = state;
+            let now = datetime!(2026-11-21 00:00 UTC) + WallDuration::hours(hour);
+            tick(&mut buffer, &pool, &cache, &gateway, 100, now).await
+        };
+        assert_eq!(probe(Connected, 0).await, Ok(()));
         cache.update(&Event::GuildCreate(Box::new(GuildCreate::Available(
             serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json"))
                 .expect("complete, empty guild fixture"),
         ))));
-        *gateway.write().await = GatewayState::Armed;
-        let next = first + WallDuration::hours(1);
-        assert_eq!(
-            tick(&mut buffer, &pool, &cache, &gateway, 100, next).await,
-            Ok(())
-        );
-        let third = next + WallDuration::hours(1);
-        // The previous cold and disconnected ticks did not buffer a zero.
-        *gateway.write().await = GatewayState::Connected;
-        assert_eq!(
-            tick(&mut buffer, &pool, &cache, &gateway, 100, third).await,
-            Ok(())
-        );
-        // A complete empty cache contributes a true zero. An ensuing gap
-        // still tries to flush that completed hour, exposing the closed pool.
-        *gateway.write().await = GatewayState::Draining;
-        assert_eq!(
-            tick(
-                &mut buffer,
-                &pool,
-                &cache,
-                &gateway,
-                100,
-                third + WallDuration::hours(1)
-            )
-            .await,
-            Err(ErrorClass::Database)
-        );
+        // The cold and disconnected ticks did not buffer a zero.
+        assert_eq!(probe(Armed, 1).await, Ok(()));
+        assert_eq!(probe(Connected, 2).await, Ok(()));
+        // A true zero is buffered, then the next gap tries to flush it.
+        assert_eq!(probe(Draining, 3).await, Err(ErrorClass::Database));
     }
 }

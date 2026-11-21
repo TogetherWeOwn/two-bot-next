@@ -2805,7 +2805,9 @@ impl Metrics {
 }
 
 fn header(out: &mut String, name: &str, kind: &str, help: &str) {
-    if help.is_empty() {
+    // Keep these families' descriptions in docs/metrics.md to fit the scrape budget.
+    let family = name.split('_').nth(2);
+    if help.is_empty() || matches!(family, Some("voice" | "job" | "rest" | "gateway")) {
         // No trailing space: keeps checked-in exposition fixtures free of
         // trailing whitespace while saving scrape bytes (see the
         // byte-budget test below).
