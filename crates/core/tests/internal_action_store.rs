@@ -878,6 +878,121 @@ async fn voice_snapshot_equal_completion_cannot_add_an_end_after_unknown_end_omi
     db.cleanup().await;
 }
 
+async fn assert_attendance_recovery_boundary(
+    db: &TestDb,
+    expected_status: &str,
+    expected_boundary: Option<&str>,
+) {
+    let (status, boundary): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, to_char(attendance_recovered_at AT TIME ZONE 'UTC',
+                                'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+         FROM event_instance_windows WHERE guild_id = $1 AND event_id = $2 AND is_current",
+    )
+    .bind(SNAPSHOT_GUILD)
+    .bind(SNAPSHOT_EVENT)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(status, expected_status);
+    assert_eq!(boundary.as_deref(), expected_boundary);
+}
+
+#[tokio::test]
+async fn voice_snapshot_attendance_boundary_moves_only_on_accepted_recovery() {
+    use two_bot_core::{
+        scheduled_events::EventStatus,
+        website_store::{replace_events, upsert_event},
+    };
+
+    let db = TestDb::new().await;
+    let mut event = snapshot_event_fixture(&db, EventStatus::Active).await;
+    assert_attendance_recovery_boundary(&db, "active", None).await;
+
+    let omitted = "2026-11-03T10:01:00.000Z";
+    replace_events(&db.pool, SNAPSHOT_GUILD, omitted, &[])
+        .await
+        .unwrap();
+    upsert_event(&db.pool, SNAPSHOT_GUILD, omitted, &event)
+        .await
+        .unwrap();
+    assert_attendance_recovery_boundary(&db, "missing", None).await;
+
+    let recovered = "2026-11-03T10:02:00.000Z";
+    replace_events(
+        &db.pool,
+        SNAPSHOT_GUILD,
+        recovered,
+        std::slice::from_ref(&event),
+    )
+    .await
+    .unwrap();
+    assert_attendance_recovery_boundary(&db, "active", Some(recovered)).await;
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:03:00.000Z", &event)
+        .await
+        .unwrap();
+    assert_attendance_recovery_boundary(&db, "active", Some(recovered)).await;
+
+    replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:04:00.000Z", &[])
+        .await
+        .unwrap();
+    assert_attendance_recovery_boundary(&db, "missing", Some(recovered)).await;
+    let recovered_again = "2026-11-03T10:05:00.000Z";
+    upsert_event(&db.pool, SNAPSHOT_GUILD, recovered_again, &event)
+        .await
+        .unwrap();
+    assert_attendance_recovery_boundary(&db, "active", Some(recovered_again)).await;
+
+    replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:06:00.000Z", &[])
+        .await
+        .unwrap();
+    event.status = EventStatus::Cancelled;
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:07:00.000Z", &event)
+        .await
+        .unwrap();
+    assert_attendance_recovery_boundary(&db, "cancelled", Some(recovered_again)).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_delayed_completion_keeps_conservative_attendance_floor() {
+    use two_bot_core::{
+        scheduled_events::EventStatus,
+        website_store::{replace_events, upsert_event},
+    };
+
+    let omitted = "2026-11-03T10:02:00.000Z";
+    let legacy_floor = "2026-11-03T10:03:00.000Z";
+    for prior in [None, Some(legacy_floor)] {
+        let db = TestDb::new().await;
+        let mut event = snapshot_event_fixture(&db, EventStatus::Active).await;
+        if let Some(prior) = prior {
+            // Model a migration/restore fence newer than the delayed evidence.
+            sqlx::query(
+                "UPDATE event_instance_windows SET attendance_recovered_at = $3::text::timestamptz
+                 WHERE guild_id = $1 AND event_id = $2",
+            )
+            .bind(SNAPSHOT_GUILD)
+            .bind(SNAPSHOT_EVENT)
+            .bind(prior)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        replace_events(&db.pool, SNAPSHOT_GUILD, omitted, &[])
+            .await
+            .unwrap();
+        assert_attendance_recovery_boundary(&db, "missing", prior).await;
+
+        event.status = EventStatus::Completed;
+        event.ends_at = Some(snapshot_time(&db.pool, "-5 minutes").await);
+        upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &event)
+            .await
+            .unwrap();
+        assert_attendance_recovery_boundary(&db, "completed", Some(prior.unwrap_or(omitted))).await;
+        db.cleanup().await;
+    }
+}
+
 #[tokio::test]
 async fn voice_snapshot_event_evidence_failure_rolls_back_each_mirror_writer() {
     use two_bot_core::{
