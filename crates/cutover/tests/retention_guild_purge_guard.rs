@@ -18,6 +18,7 @@ use two_bot_cutover::retention::{
 use two_bot_testsupport::TestDatabase;
 
 const GONE_GUILD: &str = "333333333333333333";
+const OTHER_GUILD: &str = "333333333333333334";
 const MEMBER: &str = "444444444444444444";
 const PENDING_MEMBER: &str = "555555555555555555";
 const GUARDED_OTHER: &str = "666666666666666666";
@@ -54,11 +55,7 @@ async fn guild_purge_removes_omitted_instance_fences_and_references_together() {
         .unwrap();
     for (guild, event, channel) in [
         (GONE_GUILD, "200000000000000001", "300000000000000001"),
-        (
-            "333333333333333334",
-            "200000000000000002",
-            "300000000000000002",
-        ),
+        (OTHER_GUILD, "200000000000000002", "300000000000000002"),
     ] {
         sqlx::query(
             "INSERT INTO event_instance_windows
@@ -75,20 +72,49 @@ async fn guild_purge_removes_omitted_instance_fences_and_references_together() {
         // scope for member erasure and guild deletion through its instance.
         sqlx::query("INSERT INTO event_voice_presence (event_id, instance, user_id, joined_at) VALUES ($1, '2026-11-03T09:00:00Z', $2, NOW())")
             .bind(event).bind(MEMBER).execute(db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO event_attendance_windows (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at) VALUES ($1, 'fixture', $2, NOW(), NOW(), NOW() + interval '1 hour')")
+        sqlx::query("INSERT INTO event_attendance_windows (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at) VALUES ($1, 'fixture', $2, '2026-11-03T09:00:00Z', NOW(), NOW() + interval '1 hour')")
             .bind(guild).bind(event).execute(db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, joined_at, left_at) VALUES ($1, $2, $4, NOW(), NOW()), ($1, $3, $4, NOW(), NULL)")
-            .bind(guild).bind(PENDING_MEMBER).bind(MEMBER).bind(channel).execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, joined_at, left_at, event_keys)
+             VALUES ($1, $2, $4, NOW(), NOW(), ARRAY['fixture']),
+                    ($1, $3, $4, NOW(), NULL, ARRAY['fixture'])",
+        )
+        .bind(guild)
+        .bind(PENDING_MEMBER)
+        .bind(MEMBER)
+        .bind(channel)
+        .execute(db.pool())
+        .await
+        .unwrap();
     }
-    erase_member(
-        db.pool(),
-        GONE_GUILD,
-        PENDING_MEMBER,
+    for mode in [
+        ErasureMode::DryRun,
         ErasureMode::Execute { actor: "fixture" },
-    )
-    .await
-    .unwrap();
-    assert_eq!(count(db.pool(), "SELECT count(*) FROM event_voice_sessions WHERE guild_id = '333333333333333333' AND member_id = '555555555555555555'").await, 0);
+    ] {
+        let report = erase_member(db.pool(), GONE_GUILD, PENDING_MEMBER, mode)
+            .await
+            .unwrap();
+        assert_eq!(
+            report
+                .iter()
+                .find(|row| row.table == "event_voice_sessions")
+                .unwrap()
+                .rows,
+            1
+        );
+    }
+    assert_eq!(
+        session_members(db.pool()).await,
+        vec![
+            (GONE_GUILD.to_owned(), MEMBER.to_owned()),
+            (OTHER_GUILD.to_owned(), MEMBER.to_owned()),
+            (OTHER_GUILD.to_owned(), PENDING_MEMBER.to_owned()),
+        ]
+    );
+    assert_eq!(
+        count(db.pool(), "SELECT count(*) FROM event_attendance_windows").await,
+        2
+    );
     handle_guild_delete(db.pool(), GONE_GUILD, None)
         .await
         .unwrap();
@@ -100,16 +126,11 @@ async fn guild_purge_removes_omitted_instance_fences_and_references_together() {
         .unwrap();
     assert_eq!(dry.guild_rows_purged, 6);
     assert_eq!(live.guild_rows_purged, dry.guild_rows_purged);
-    let sessions: Vec<(String, String)> =
-        sqlx::query_as("SELECT guild_id, member_id FROM event_voice_sessions ORDER BY member_id")
-            .fetch_all(db.pool())
-            .await
-            .unwrap();
     assert_eq!(
-        sessions,
+        session_members(db.pool()).await,
         vec![
-            ("333333333333333334".to_owned(), MEMBER.to_owned()),
-            ("333333333333333334".to_owned(), PENDING_MEMBER.to_owned()),
+            (OTHER_GUILD.to_owned(), MEMBER.to_owned()),
+            (OTHER_GUILD.to_owned(), PENDING_MEMBER.to_owned()),
         ]
     );
     assert_eq!(
@@ -130,6 +151,138 @@ async fn guild_purge_removes_omitted_instance_fences_and_references_together() {
             .unwrap();
         assert_eq!(remaining, 1, "the other guild's {table} survives");
     }
+    db.close().await.unwrap();
+}
+
+async fn session_members(pool: &PgPool) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT guild_id, member_id FROM event_voice_sessions ORDER BY guild_id, member_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn attendance_ttl_counts_and_prunes_before_guild_purge() {
+    let Some(db) = database().await else { return };
+    // Freeze now() across pool transactions at a date whose 90-day window
+    // crosses spring-forward. Keep public first for erasure schema discovery.
+    sqlx::query(
+        "CREATE FUNCTION public.now() RETURNS timestamptz LANGUAGE sql STABLE
+         AS $$ SELECT TIMESTAMPTZ '2025-03-17 12:00:00+00' $$",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let test_pool = sqlx::postgres::PgPoolOptions::new()
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET search_path = public, pg_catalog")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("SET TIME ZONE 'America/New_York'")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(db.pool().connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let pool = &test_pool;
+    let calendar_cutoff_is_early: bool =
+        sqlx::query_scalar("SELECT now() - interval '90 days' = now() - interval '2159 hours'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(calendar_cutoff_is_early);
+    // Both guilds have older window history under the same key. The window
+    // for the remaining guild must outlive its expired sessions.
+    sqlx::query(
+        "INSERT INTO event_attendance_windows
+         (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at)
+         SELECT g, 'fixture', g, now() - interval '100 days', now() - interval '100 days',
+                now() - interval '99 days' FROM unnest(ARRAY[$1::text, $2::text]) AS guilds(g)",
+    )
+    .bind(GONE_GUILD)
+    .bind(OTHER_GUILD)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, joined_at, left_at, event_keys)
+         VALUES ($1, $3, '1', now() - interval '2160 hours 1 microsecond', NULL, ARRAY['fixture']),
+                ($1, $3, '2', now() - interval '2160 hours', NULL, ARRAY['fixture']),
+                ($1, $4, '3', now() - interval '1 day', NULL, ARRAY['fixture']),
+                ($2, $3, '4', now() - interval '2160 hours 1 microsecond', now(), ARRAY['fixture']),
+                ($2, $4, '5', now() - interval '2160 hours' + interval '1 microsecond', NULL, ARRAY['fixture']),
+                ($2, $4, '6', now() - interval '2160 hours', NULL, ARRAY['fixture'])",
+    )
+    .bind(GONE_GUILD)
+    .bind(OTHER_GUILD)
+    .bind(MEMBER)
+    .bind(PENDING_MEMBER)
+    .execute(pool)
+    .await
+    .unwrap();
+    request_user_deletion(pool, GONE_GUILD, PENDING_MEMBER)
+        .await
+        .unwrap();
+    assert!(handle_guild_delete(pool, GONE_GUILD, None).await.unwrap());
+
+    let dry = run_retention(pool, RetentionMode::DryRun).await.unwrap();
+    assert_eq!(
+        dry.attendance_raw_deleted, 2,
+        "only sessions strictly older than 90 elapsed days by join time"
+    );
+    assert_eq!(
+        dry.guild_rows_purged, 2,
+        "only the exact-cutoff session and its window"
+    );
+    assert_eq!(dry.deletions_completed, 1);
+    assert_eq!(
+        count(pool, "SELECT count(*) FROM event_voice_sessions").await,
+        6
+    );
+    assert_eq!(
+        count(pool, "SELECT count(*) FROM event_attendance_windows").await,
+        2
+    );
+
+    let live = run_retention(pool, RetentionMode::Execute).await.unwrap();
+    assert_eq!(live.attendance_raw_deleted, dry.attendance_raw_deleted);
+    assert_eq!(live.guild_rows_purged, dry.guild_rows_purged);
+    assert_eq!(live.deletions_completed, dry.deletions_completed);
+    assert_eq!(live.total_deleted(), 4);
+    let survivors: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT s.guild_id, s.member_id, s.channel_id FROM event_voice_sessions s
+         JOIN event_attendance_windows w ON w.guild_id = s.guild_id AND w.event_key = ANY(s.event_keys)
+         ORDER BY s.channel_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        survivors,
+        ["5", "6"].map(|channel| (
+            OTHER_GUILD.to_owned(),
+            PENDING_MEMBER.to_owned(),
+            channel.to_owned()
+        ))
+    );
+    assert_eq!(
+        count(pool, "SELECT count(*) FROM event_voice_sessions").await,
+        2
+    );
+    assert_eq!(
+        count(pool, "SELECT count(*) FROM event_attendance_windows").await,
+        1
+    );
+    let repeat = run_retention(pool, RetentionMode::Execute).await.unwrap();
+    assert_eq!(repeat.total_deleted(), 0);
+    assert_eq!(repeat.deletions_completed, 0);
+    test_pool.close().await;
     db.close().await.unwrap();
 }
 

@@ -285,21 +285,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "clean plan drifted",
     )?;
 
-    // Dormant heat has an owner for restore, but none of the service roles
-    // may read or write it. Check effective privileges, not just schema usage.
-    as_role(pool, &roles[0], "TRUNCATE public.voice_heat_hours").await?;
-    for role in &roles[1..] {
-        require(
-            !sqlx::query_scalar::<_, bool>(
-                "SELECT has_table_privilege($1::text, 'public.voice_heat_hours',
-                         'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')",
-            )
-            .bind(role)
-            .fetch_one(pool)
-            .await?,
-            "dormant voice heat has a service role grant",
-        )?;
-    }
+    exercise_voice_heat_grants(pool, roles).await?;
     require(
         sqlx::query_scalar::<_, bool>("SELECT to_regclass('web_v1.voice_heat') IS NULL")
             .fetch_one(pool)
@@ -502,6 +488,14 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // PUBLIC/column access, attributes, inheritance and future grants all count.
     let (migrator, runtime, reader, ro) = (&roles[0], &roles[1], &roles[2], &roles[3]);
     for (change, restore) in [
+        (format!("REVOKE DELETE ON public.voice_heat_hours FROM {runtime}"),
+         format!("GRANT DELETE ON public.voice_heat_hours TO {runtime}")),
+        (format!("GRANT UPDATE ON public.voice_heat_hours TO {runtime}"),
+         format!("REVOKE UPDATE ON public.voice_heat_hours FROM {runtime}")),
+        (format!("GRANT SELECT ON public.voice_heat_hours TO {runtime} WITH GRANT OPTION"),
+         format!("REVOKE GRANT OPTION FOR SELECT ON public.voice_heat_hours FROM {runtime}")),
+        ("GRANT SELECT ON public.voice_heat_hours TO PUBLIC".to_owned(),
+         "REVOKE SELECT ON public.voice_heat_hours FROM PUBLIC".to_owned()),
         (format!("REVOKE SELECT ON public.discord_send_admission FROM {runtime}"),
          format!("GRANT SELECT ON public.discord_send_admission TO {runtime}")),
         (format!("REVOKE INSERT ON public.discord_send_admission FROM {runtime}"),
@@ -577,6 +571,79 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "restored matrix drifted",
     )?;
     Ok(())
+}
+
+async fn exercise_voice_heat_grants(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
+    use time::{Duration, OffsetDateTime};
+    use two_bot_core::{
+        voice_heat::{truncate_to_hour, Accumulator},
+        voice_heat_store::flush_hour_buckets,
+    };
+
+    as_role(pool, &roles[0], "TRUNCATE public.voice_heat_hours").await?;
+    for role in &roles[2..] {
+        denied(pool, role, "SELECT * FROM public.voice_heat_hours").await?;
+    }
+    denied(
+        pool,
+        &roles[1],
+        "UPDATE public.voice_heat_hours SET occupancy_sum = 1",
+    )
+    .await?;
+    denied(pool, &roles[1], "TRUNCATE public.voice_heat_hours").await?;
+
+    // Use the planned runtime role, not the scratch database owner, for the real
+    // writer and its explicit table lock, prune, insert and immutable replay.
+    let runtime = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            pool.connect_options()
+                .as_ref()
+                .clone()
+                .options([("role", roles[1].as_str())]),
+        )
+        .await?;
+    let result = async {
+        let active_role: String = sqlx::query_scalar("SELECT current_user::text")
+            .fetch_one(&runtime)
+            .await?;
+        require(active_role == roles[1], "voice heat writer used the wrong role")?;
+
+        let now = OffsetDateTime::now_utc();
+        let start = truncate_to_hour(now) - Duration::hours(1);
+        let expired = start - Duration::days(36);
+        sqlx::query("INSERT INTO public.voice_heat_hours (hour_start_utc) VALUES ($1)")
+            .bind(expired)
+            .execute(&runtime)
+            .await?;
+
+        let mut sampler = Accumulator::default();
+        sampler.record(start, 7);
+        sampler.record(expired, 9);
+        let flush_error = |error| sqlx::Error::InvalidArgument(format!("runtime flush: {error}"));
+        let written = flush_hour_buckets(&runtime, &sampler.completed(now))
+            .await
+            .map_err(flush_error)?;
+        require(written == 1, "runtime did not insert only the fresh bucket")?;
+
+        sampler.record(start + Duration::minutes(5), 11);
+        let replay = flush_hour_buckets(&runtime, &sampler.completed(now))
+            .await
+            .map_err(flush_error)?;
+        require(replay == 0, "runtime replay inserted the bucket again")?;
+        let rows = sqlx::query_as::<_, (OffsetDateTime, i32, i64, Option<OffsetDateTime>)>(
+            "SELECT hour_start_utc, samples, occupancy_sum, last_observed_at FROM public.voice_heat_hours",
+        )
+        .fetch_all(&runtime)
+        .await?;
+        require(
+            rows == [(start, 1, 7, Some(start))],
+            "runtime failed to expire old heat or changed the replayed row",
+        )
+    }
+    .await;
+    runtime.close().await;
+    result
 }
 
 async fn exercise_member_grants(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {

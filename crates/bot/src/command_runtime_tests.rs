@@ -1527,6 +1527,53 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
+async fn automod_preview_dispatch_counts_refusals_and_a_failed_callback() {
+    use two_bot_core::automod_preview_report::PREVIEW_NOT_EVALUATED_REPLY;
+
+    let (mock, origin) = MockRest::start(vec![200, 200, 200, 400]).await;
+    let manage = Permissions::MANAGE_GUILD;
+    let denied = RouterRefusal::AutomodPreviewPermission.message();
+    let interaction = slash(
+        "automod-preview",
+        Some(CHANNEL),
+        vec![option(
+            "text",
+            CommandOptionValue::String("synthetic".into()),
+        )],
+    );
+    for (configured_guild, moderation, permissions, expected) in [
+        (GUILD + 1, true, manage, PREVIEW_NOT_EVALUATED_REPLY),
+        (GUILD, false, manage, PREVIEW_NOT_EVALUATED_REPLY),
+        (GUILD, true, Permissions::empty(), denied.as_str()),
+        // Authorized handler, but this runtime has no AutoMod activation.
+        (GUILD, true, manage, PREVIEW_NOT_EVALUATED_REPLY),
+    ] {
+        let router_gates = RouterGates {
+            configured_guild: Some(configured_guild),
+            moderation,
+            ..gates(true, false)
+        };
+        let runtime = runtime_without_db(router_gates, true, origin.clone());
+        let metrics = runtime.preview_metrics.get_or_init(Default::default);
+        runtime
+            .on_interaction(&from_member(interaction.clone(), 42, permissions))
+            .await;
+        let reply = callback_json(mock.requests().last().expect("preview callback"));
+        assert_eq!(reply["data"]["content"], expected);
+        assert_eq!(reply["data"]["flags"], 64);
+        let text = metrics.render(None);
+        let mut counted = text.lines().filter(|line| {
+            line.starts_with("two_bot_automod_previews_total{") && !line.ends_with(" 0")
+        });
+        let sample = r#"two_bot_automod_previews_total{result="not_evaluated",filter="none",mode="not_evaluated"} 1"#;
+        assert_eq!(counted.next(), (permissions == manage).then_some(sample));
+        assert_eq!(counted.next(), None);
+    }
+    assert_eq!(mock.requests().len(), 4);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 #[ignore = "requires disposable agent-testdb for the preview audit receipt"]
 async fn automod_preview_dispatch_uses_ingress_clocks_even_when_busy() {
     use crate::command_runtime::{LANE_BUSY, LANE_INTERACTIONS};
@@ -1725,6 +1772,7 @@ mod preview_callback_acceptance {
         saw_commit: std::sync::atomic::AtomicBool,
         blocked: tokio::sync::Notify,
         hold_retries: std::sync::atomic::AtomicBool,
+        attempts: Mutex<Vec<Instant>>,
         settlement: Arc<SettlementGate>,
     }
 
@@ -1756,6 +1804,10 @@ mod preview_callback_acceptance {
 
         fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
             Box::pin(async {
+                self.attempts
+                    .lock()
+                    .expect("admission trace")
+                    .push(Instant::now());
                 // After real PostgreSQL confirms the held lane, model its
                 // continued occupancy without I/O on the paused clock.
                 if self.hold_retries.load(Ordering::Relaxed) {
@@ -1809,24 +1861,23 @@ mod preview_callback_acceptance {
             saw_commit: std::sync::atomic::AtomicBool::new(false),
             blocked: tokio::sync::Notify::new(),
             hold_retries: std::sync::atomic::AtomicBool::new(false),
+            attempts: Mutex::default(),
             settlement: Arc::default(),
         });
         let executor =
             ActionExecutor::with_admission(token.to_owned(), Some(origin), admission.clone())
                 .expect("loopback executor");
-        let resolved = crate::automod_gateway::resolve(
-            &[
-                ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
-                (
-                    "TWO_OWEN_USER_ID".to_owned(),
-                    "123456789012345678".to_owned(),
-                ),
-                ("TWO_AUTOMOD_BAD_WORDS".to_owned(), "bootword".to_owned()),
-            ]
-            .into(),
-            guild,
-        )?
-        .expect("enabled policy");
+        let deployment = [
+            ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
+            (
+                "TWO_OWEN_USER_ID".to_owned(),
+                "123456789012345678".to_owned(),
+            ),
+            ("TWO_AUTOMOD_BAD_WORDS".to_owned(), "bootword".to_owned()),
+        ]
+        .into();
+        let resolved =
+            crate::automod_gateway::resolve(&deployment, guild)?.expect("enabled policy");
         let activation = crate::automod_gateway::build(resolved, pool.clone(), executor.clone());
         let runtime = CommandRuntime::new(
             pool.clone(),
@@ -1841,6 +1892,10 @@ mod preview_callback_acceptance {
         );
         let boot = activation.preview(|engine| engine.effective_config());
         assert_eq!(boot.policy.bad_words, vec!["bootword"]);
+        runtime
+            .preview_deployment
+            .set(deployment)
+            .expect("fixture deployment");
         runtime.set_automod(activation.clone());
         let store = SettingsStore::new(&pool);
         store
@@ -1938,9 +1993,17 @@ mod preview_callback_acceptance {
         );
         let mut audit = pool.begin().await?;
         lock_preview_attempt(&mut audit, "802").await?;
-        // Model ingress delay without sleeping. A worker that replaces the
-        // supplied receipt with its own start time would get 750 ms back.
-        let received_at = Instant::now() - Duration::from_millis(750);
+        admission.attempts.lock().expect("admission trace").clear();
+        // A blocking task inhibits Tokio's auto-advance while the real I/O
+        // runs. Its receive timeout uses wall time, not the receipt budget.
+        tokio::time::pause();
+        let (io_done, wait_for_io) = std::sync::mpsc::channel::<()>();
+        let mut watchdog =
+            tokio::task::spawn_blocking(move || wait_for_io.recv_timeout(Duration::from_secs(10)));
+        // A worker that replaces the ingress receipt with its own start time
+        // would get 750 ms back.
+        let started_at = Instant::now();
+        let received_at = started_at - Duration::from_millis(750);
         let deadline = received_at + Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS);
         let contended_worker = dispatch_worker(|| {
             assert!(runtime.dispatch_received(
@@ -1963,31 +2026,57 @@ mod preview_callback_acceptance {
                 if waiting {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                sqlx::query("SELECT pg_sleep(0.005)")
+                    .execute(&mut *audit)
+                    .await?;
             }
+            assert!(
+                admission
+                    .attempts
+                    .lock()
+                    .expect("admission trace")
+                    .is_empty(),
+                "callback admission must wait for the audit claim"
+            );
             audit.rollback().await?;
             admission.blocked.notified().await;
             Ok::<(), sqlx::Error>(())
         };
-        tokio::time::timeout_at(deadline, contend).await??;
-        // Both real waits were observed. Only the retry timer drives this
-        // phase; no virtual-time deadline races a real PostgreSQL request.
-        tokio::time::pause();
+        tokio::select! {
+            result = contend => result?,
+            _ = &mut watchdog => panic!("real PostgreSQL contention watchdog elapsed"),
+        }
+        assert_eq!(
+            Instant::now(),
+            started_at,
+            "receipt clock stayed frozen during I/O"
+        );
+        io_done.send(())?;
+        // Now only the in-memory refusals and retry timers drive the worker.
         tokio::time::sleep_until(deadline - Duration::from_millis(20)).await;
         let waited_before_cutoff = Instant::now() < deadline && !contended_worker.is_finished();
         tokio::time::sleep_until(deadline + Duration::from_millis(1)).await;
         let settled =
             tokio::time::timeout_at(deadline + Duration::from_millis(100), contended_worker).await;
+        let attempts = std::mem::take(&mut *admission.attempts.lock().expect("admission trace"));
         tokio::time::resume();
+        watchdog.await??;
         lane.complete(None).await?;
-        admission.hold_retries.store(false, Ordering::Relaxed);
         assert!(
             waited_before_cutoff,
             "callback must not abandon the held lane early"
         );
         assert!(
+            attempts.len() > 1,
+            "callback must retry after the real refusal"
+        );
+        assert!(
+            attempts.iter().all(|&attempt| attempt < deadline),
+            "no callback admission may start at or after the original receipt cutoff"
+        );
+        assert!(
             settled
-                .expect("callback attempt obeys the original receipt deadline")
+                .expect("contended worker join watchdog elapsed")
                 .is_ok(),
             "contended preview worker must exit normally"
         );

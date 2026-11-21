@@ -185,7 +185,7 @@ pub(crate) fn refresh_live<L: AutomodClaimLedger, F: AutomodFacts>(
             .is_some_and(|config| activation.apply_live_config(&config))
 }
 
-fn resolve_live_config(
+pub(crate) fn resolve_live_config(
     deployment: &HashMap<String, String>,
     guild_id: &str,
     live: &two_bot_core::settings::LiveSettings,

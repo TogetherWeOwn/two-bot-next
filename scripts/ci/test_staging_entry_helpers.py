@@ -228,8 +228,8 @@ class VoiceArtifactNamingTests(unittest.TestCase):
         self.assertEqual(workflow["on"]["workflow_call"]["inputs"]["artifact_invocation"],
                          {"type": "string", "required": "false", "default": ""})
         jobs = workflow["jobs"]
-        start = jobs["staging-window"]["steps"][-1]["with"]
-        voice = jobs["synthetic"]["steps"][-1]["with"]
+        start, = (s["with"] for s in jobs["staging-window"]["steps"] if s.get("uses", "").startswith("actions/upload-artifact@"))
+        voice, = (s["with"] for s in jobs["synthetic"]["steps"] if s.get("uses", "").startswith("actions/upload-artifact@"))
         suffix = "${{ inputs.artifact_invocation != '' && format('-{0}', inputs.artifact_invocation) || '' }}"
         bases = ("staging-use-voice-start-${{ github.run_id }}-${{ github.run_attempt }}",
                  "voice-synthetic-${{ github.run_id }}")
