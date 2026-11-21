@@ -418,6 +418,11 @@ owned by `agent_test` (empty password, `CREATEDB` permission), with
 `TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local`.
 This describes fixture setup, not permission to start a local full-suite runner.
 
+Reproduce `voice_heat_expiry_parks_without_table_access` on the disposable
+Actions Postgres service unless the approved local fixture can create and drop
+the temporary test role and `SET ROLE` to it. `CREATEDB` alone is not enough;
+do not change runtime grants or elevate the local fixture to run this test.
+
 The shared guard requires `postgres`/`postgresql`, literal `agent_test:@`, an
 allowlisted host, explicit port 5432, and a lowercase `two_bot_test_*` database
 name (1–63 bytes, letters/digits/underscores, no trailing underscore). It refuses

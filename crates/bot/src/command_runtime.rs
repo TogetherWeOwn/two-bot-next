@@ -51,23 +51,29 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, PoisonError, RwLock,
+        Arc, Mutex, OnceLock, PoisonError, RwLock,
     },
+    time::Duration,
 };
 
 use crate::member_runtime::MemberRuntime;
 use crate::self_role_handlers::SelfRoleService;
 use sqlx::{Pool, Postgres};
+use tokio::time::Instant;
 use tracing::warn;
 use twilight_gateway::Event;
 use twilight_model::{
-    application::interaction::{application_command::CommandOptionValue, Interaction},
+    application::interaction::{
+        application_command::CommandOptionValue, Interaction, InteractionData,
+    },
     channel::message::{Message, MessageFlags},
     gateway::GatewayReaction,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot::voice_rooms::voice_claims_custom_id;
 use two_bot_core::{
+    automod_preview_limiter::PreviewRateLimiter,
+    automod_preview_report::PREVIEW_NOT_EVALUATED_REPLY,
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
     custom_command_store,
@@ -85,7 +91,7 @@ use two_bot_core::{
     funnel::now_millis_for_test,
     help::{canonical_help_selector, unknown_help_branch_correction, unknown_help_correction},
     moderation::ModerationAction,
-    router::replies::EXPIRED_COMPONENT_REPLY,
+    router::replies::{InteractionReply, EXPIRED_COMPONENT_REPLY},
     settings::LiveSettings,
     sticky::{
         activity_eligible, decide_activity, sticky_removed_reply, sticky_set_reply, store,
@@ -97,10 +103,11 @@ use two_bot_core::{
     InteractionHandler, InteractionRouter, ModerationGates, RouterGates, RouterRefusal,
     SlashOutcome, SurfaceFlags,
 };
+use two_bot_discord::interactions::text_response;
 use two_bot_discord::{
-    help_detail_response, help_response, publish_commands, register_channel_handlers,
-    response_for_slash, route_interaction, ActionExecutor, ChannelModerationRuntime, DiscordError,
-    LevelingRuntime, RoutedInteraction,
+    automod_preview_handler::handle_automod_preview, help_detail_response, help_response,
+    publish_commands, register_channel_handlers, response_for_slash, route_interaction,
+    ActionExecutor, ChannelModerationRuntime, DiscordError, LevelingRuntime, RoutedInteraction,
 };
 
 use crate::activation::BootActivation;
@@ -178,9 +185,9 @@ pub type VoiceKickVote =
 /// burst can discard the other's automations.
 pub(crate) const DISPATCH_LIMITS: [usize; 6] = [16, 16, 1, 8, 8, 8];
 pub(crate) const LANE_MESSAGES: usize = 0;
-const LANE_INTERACTIONS: usize = 1;
+pub(crate) const LANE_INTERACTIONS: usize = 1;
 const LANE_REGISTRY: usize = 2;
-const LANE_PRIVILEGED: usize = 3;
+pub(crate) const LANE_PRIVILEGED: usize = 3;
 pub(crate) const LANE_BUSY: usize = 4;
 pub(crate) const LANE_REACTIONS: usize = 5;
 
@@ -279,6 +286,8 @@ pub struct CommandRuntime {
     /// router, whose registrations are complete once built.
     gateway_commands: tokio::sync::OnceCell<crate::gateway_commands::GatewayCommands>,
     channel: ChannelModerationRuntime,
+    automod: OnceLock<Arc<crate::automod_gateway::ProductionAutomod>>,
+    preview_limiter: Mutex<PreviewRateLimiter>,
     tasks: Mutex<DispatchTasks>,
     giveaways: crate::giveaway_runtime::GiveawayRuntime,
     /// Interactions admitted per member; see [`crate::interaction_admission`].
@@ -385,6 +394,8 @@ impl CommandRuntime {
             application_id: AtomicU64::new(0),
             gateway_commands: tokio::sync::OnceCell::new(),
             channel,
+            automod: OnceLock::new(),
+            preview_limiter: Mutex::default(),
             tasks: Mutex::new(DispatchTasks::default()),
             user_slots: UserSlots::default(),
             self_roles,
@@ -398,6 +409,10 @@ impl CommandRuntime {
             voice_kick_vote: Mutex::new(None),
             live_override: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn set_automod(&self, activation: Arc<crate::automod_gateway::ProductionAutomod>) {
+        let _ = self.automod.set(activation);
     }
 
     /// Test-only access to the shared interaction surface for identity assertions.
@@ -708,7 +723,16 @@ impl CommandRuntime {
     /// Dispatch alongside ordered RSVP execution. That path owns RSVP replies
     /// (including refusals) and publishes the full registry before polling.
     /// Keep the standalone dispatch fallback for gateway callers without it.
-    pub(crate) fn dispatch_remaining(self: &Arc<Self>, event: &Event) {
+    pub(crate) fn dispatch_received(
+        self: &Arc<Self>,
+        event: &Event,
+        ordered: bool,
+        received: Instant,
+        observed_at: &str,
+    ) -> bool {
+        if !ordered {
+            return self.dispatch_event(event, None, Some((received, observed_at)));
+        }
         match event {
             Event::Ready(ready) => {
                 // The ordered surface owns registry publication; identity still
@@ -736,7 +760,7 @@ impl CommandRuntime {
                         .publish_registry_if_resync_pending(Some(application_id))
                         .await;
                 });
-                return;
+                return true;
             }
             Event::Resumed => {
                 self.dispatch_ticket_connection(event);
@@ -746,7 +770,7 @@ impl CommandRuntime {
                 self.spawn(LANE_REGISTRY, async move {
                     runtime.publish_registry_if_resync_pending(None).await;
                 });
-                return;
+                return true;
             }
             Event::InteractionCreate(interaction)
                 if self
@@ -757,11 +781,16 @@ impl CommandRuntime {
                         matches!(name.as_str(), "rsvp" | "rsvp-attendance" | "attendance")
                     }) =>
             {
-                return;
+                return true;
             }
             _ => {}
         }
-        self.dispatch(event);
+        self.dispatch_event(event, None, Some((received, observed_at)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dispatch_remaining(self: &Arc<Self>, event: &Event) {
+        self.dispatch_received(event, true, Instant::now(), &two_bot_core::now_iso());
     }
 
     pub(crate) fn dispatch_guard(self: &Arc<Self>) -> CommandDispatchGuard {
@@ -817,13 +846,19 @@ impl CommandRuntime {
     /// Admit one non-ticket interaction. A member at their cap, or a full lane,
     /// gets an ephemeral busy reply rather than silence. Privileged commands try
     /// the reserved lane first and may spill into the shared one.
-    fn admit_interaction(self: &Arc<Self>, interaction: Interaction) -> bool {
+    fn admit_interaction(
+        self: &Arc<Self>,
+        interaction: Interaction,
+        receipt: PreviewReceipt,
+    ) -> bool {
         let busy = self.busy_target(&interaction);
+        let deadline = matches!(&interaction.data, Some(InteractionData::ApplicationCommand(data)) if data.name == "automod-preview")
+            .then(|| receipt.callback_deadline());
         let slot = match interaction.author_id() {
             Some(user) => match self.user_slots.acquire(user.get()) {
                 Some(slot) => Some(slot),
                 None => {
-                    self.reply_busy(busy);
+                    self.reply_busy(busy, deadline);
                     return false;
                 }
             },
@@ -842,11 +877,14 @@ impl CommandRuntime {
                 None => false,
             };
             if !handled {
-                runtime.on_interaction(&interaction).await;
+                let live = runtime.live_source();
+                runtime
+                    .on_interaction_at(&interaction, live.as_ref(), receipt)
+                    .await;
             }
         });
         if !admitted {
-            self.reply_busy(busy);
+            self.reply_busy(busy, deadline);
         }
         admitted
     }
@@ -867,12 +905,23 @@ impl CommandRuntime {
 
     /// Tell the invoker to retry: one callback on a small dedicated lane. When
     /// that lane is saturated too, the event is dropped with only a log line.
-    fn reply_busy(self: &Arc<Self>, target: Option<BusyTarget>) {
+    fn reply_busy(self: &Arc<Self>, target: Option<BusyTarget>, deadline: Option<Instant>) {
         let Some(target) = target else {
             return;
         };
         let runtime = Arc::clone(self);
         self.spawn(LANE_BUSY, async move {
+            if let Some(deadline) = deadline {
+                runtime
+                    .answer_preview(
+                        target.interaction_id,
+                        &target.token,
+                        preview_response(BUSY_REPLY),
+                        deadline,
+                    )
+                    .await;
+                return;
+            }
             if let Err(error) = runtime
                 .executor
                 .answer_interaction(target.interaction_id, &target.token, &ephemeral(BUSY_REPLY))
@@ -1011,6 +1060,7 @@ impl CommandRuntime {
     /// connection events coalesce while the full registry is being synchronized.
     /// Custom commands answer first and report ownership, so sticky/feed
     /// routing never sends a second response after an acknowledgement.
+    #[cfg(test)]
     pub fn dispatch(self: &Arc<Self>, event: &Event) -> bool {
         self.dispatch_with_verdict(event, None)
     }
@@ -1034,6 +1084,15 @@ impl CommandRuntime {
         self: &Arc<Self>,
         event: &Event,
         verdict: Option<FunnelDisposition>,
+    ) -> bool {
+        self.dispatch_event(event, verdict, None)
+    }
+
+    fn dispatch_event(
+        self: &Arc<Self>,
+        event: &Event,
+        verdict: Option<FunnelDisposition>,
+        ingress: Option<(Instant, &str)>,
     ) -> bool {
         if let Some(custom) = self.gateway_commands.get() {
             custom.observe(event);
@@ -1104,11 +1163,23 @@ impl CommandRuntime {
                     });
                     if !admitted {
                         tickets.record_component_saturation(interaction_id);
-                        self.reply_busy(busy);
+                        self.reply_busy(busy, None);
                     }
                     admitted
                 } else {
-                    self.admit_interaction(interaction)
+                    let receipt = if let Some((received_at, observed_at)) = ingress {
+                        let Some(utc_ms) = crate::automod_gateway::received_at_ms(observed_at)
+                        else {
+                            return false;
+                        };
+                        PreviewReceipt {
+                            utc_ms,
+                            received_at,
+                        }
+                    } else {
+                        PreviewReceipt::now()
+                    };
+                    self.admit_interaction(interaction, receipt)
                 }
             }
             Event::ReactionAdd(reaction) => self.dispatch_self_role_reaction(&reaction.0, false),
@@ -1416,8 +1487,9 @@ impl CommandRuntime {
     /// commands own their defer/audit lifecycle. Unwired builtins
     /// get an unavailable reply; router Ignore (unknown/guild) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
+        let receipt = PreviewReceipt::now();
         let live = self.live_source();
-        self.on_interaction_with_live(interaction, live.as_ref())
+        self.on_interaction_at(interaction, live.as_ref(), receipt)
             .await;
     }
 
@@ -1425,10 +1497,21 @@ impl CommandRuntime {
     /// `register_gated_with` shape). Production reads the poller-published
     /// snapshot; a stored `0` refuses the live-gated announcement commands
     /// with the disabled reply before any defer.
+    #[cfg(test)]
     pub(crate) async fn on_interaction_with_live(
         &self,
         interaction: &Interaction,
         live: Option<&LiveSettings>,
+    ) {
+        self.on_interaction_at(interaction, live, PreviewReceipt::now())
+            .await;
+    }
+
+    async fn on_interaction_at(
+        &self,
+        interaction: &Interaction,
+        live: Option<&LiveSettings>,
+        receipt: PreviewReceipt,
     ) {
         let application_id = self.application_id.load(Ordering::Relaxed);
         if application_id != 0 && interaction.application_id.get() != application_id {
@@ -1575,13 +1658,49 @@ impl CommandRuntime {
                 }
             }
         }
-        if let Some(response) = response_for_slash(&outcome) {
-            self.answer(interaction, response).await;
+        let response = match &outcome {
+            SlashOutcome::Refuse {
+                refusal: RouterRefusal::GuildRestricted | RouterRefusal::ModerationDisabled,
+            } if name == "automod-preview" => Some(preview_response(PREVIEW_NOT_EVALUATED_REPLY)),
+            _ => response_for_slash(&outcome),
+        };
+        if let Some(response) = response {
+            if name == "automod-preview" {
+                self.answer_preview(
+                    interaction.id.get(),
+                    &interaction.token,
+                    response,
+                    receipt.callback_deadline(),
+                )
+                .await;
+            } else {
+                self.answer(interaction, response).await;
+            }
             return;
         }
         let SlashOutcome::Handled { handler } = outcome else {
             return;
         };
+        if handler == HandlerId::AutomodPreview {
+            let result = handle_automod_preview(
+                self.automod.get().map(Arc::as_ref),
+                &self.pool,
+                &self.preview_limiter,
+                interaction,
+                receipt.utc_ms,
+                receipt.received_at + Duration::from_secs(2),
+                |guild| crate::automod_gateway::preview_live_config(guild, live),
+            )
+            .await;
+            self.answer_preview(
+                interaction.id.get(),
+                &interaction.token,
+                preview_response(result.reply),
+                receipt.callback_deadline(),
+            )
+            .await;
+            return;
+        }
         if handler == HandlerId::Reopen {
             // The onboarding worker owns `/reopen` end to end (ingress defer
             // at reception plus the durable menu job through the same
@@ -2718,6 +2837,26 @@ impl CommandRuntime {
         }
     }
 
+    async fn answer_preview(
+        &self,
+        id: u64,
+        token: &str,
+        response: InteractionResponse,
+        deadline: Instant,
+    ) {
+        if let Err(err) = self
+            .executor
+            .answer_interaction_with_blocked_retry_before(id, token, &response, deadline)
+            .await
+        {
+            warn!(
+                interaction_id = id,
+                reason = discord_class(&err),
+                "automod preview callback failed"
+            );
+        }
+    }
+
     /// Complete the original ephemeral defer, never issue a second callback.
     async fn finish(&self, interaction: &Interaction, content: impl AsRef<str>) {
         if let Err(err) = self
@@ -3356,6 +3495,29 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     router.register(Box::new(SliceHandler(HandlerId::WelcomePreview)));
     router.register(Box::new(SliceHandler(HandlerId::GameMix)));
     router
+}
+
+struct PreviewReceipt {
+    utc_ms: u64,
+    received_at: Instant,
+}
+
+impl PreviewReceipt {
+    fn callback_deadline(&self) -> Instant {
+        self.received_at
+            + Duration::from_millis(two_bot_discord::executor::RECEIPT_ADMISSION_BUDGET_MS)
+    }
+
+    fn now() -> Self {
+        Self {
+            received_at: Instant::now(),
+            utc_ms: now_millis_for_test().max(0) as u64,
+        }
+    }
+}
+
+fn preview_response(text: impl Into<String>) -> InteractionResponse {
+    text_response(InteractionReply::new(text, true))
 }
 
 /// Ephemeral channel-message reply (same shape the router's refusal builder

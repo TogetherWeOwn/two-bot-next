@@ -123,6 +123,10 @@ instance start, with no member column, so there is nothing to erase and no
 reader grant beyond the app pool. Backups archive it (v16); an old-format
 restore clears it and never backfills liveness.
 
+The dormant attendance tables and session ID sequence use the reviewed grants,
+with no web reader access. Member erasure removes scoped sessions; guild purge
+removes both tables' rows for the guild.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not
