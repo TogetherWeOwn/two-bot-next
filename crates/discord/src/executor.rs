@@ -393,12 +393,12 @@ async fn poll_until<F: Future>(at: Instant, work: F) -> Option<F::Output> {
 
 async fn wait_for_headers<F: Future>(
     deadline: Option<Instant>,
-    callback: bool,
+    stop_at_cutoff: bool,
     send: F,
 ) -> Option<F::Output> {
     match deadline {
         None => Some(send.await),
-        Some(at) if callback => poll_until(at, send).await,
+        Some(at) if stop_at_cutoff => poll_until(at, send).await,
         Some(at) => tokio::time::timeout_at(at, send).await.ok(),
     }
 }
@@ -808,6 +808,7 @@ impl HyperTransport {
             .body(http_body_util::Full::new(body_bytes))
             .map_err(|e| format!("build request: {e}"))?;
         let callback = !strict && is_interaction_callback(request);
+        let read = request.method() == Method::Get;
         // Durable admission shares the caller's absolute deadline: it is a
         // Postgres statement on a pooled connection, not a local lock, so an
         // unbounded admit would outlive the receipt/moderation/boot budgets.
@@ -840,9 +841,19 @@ impl HyperTransport {
                             .await
                             .ok_or_else(|| HEADER_TIMEOUT_MESSAGE.to_owned())??
                     }
-                    Some(at) => tokio::time::timeout_at(at, take)
-                        .await
-                        .map_err(|_| HEADER_TIMEOUT_MESSAGE.to_owned())??,
+                    Some(at) => tokio::time::timeout_at(at, async {
+                        // A detached GET owner can start at cutoff. Refuse its
+                        // first claim poll then, but recover a ready permit
+                        // if a claim started earlier. Pending is not rollback.
+                        if read && Instant::now() >= at {
+                            return Err(StrictTransportError::Transport(
+                                HEADER_TIMEOUT_MESSAGE.to_owned(),
+                            ));
+                        }
+                        take.await.map_err(StrictTransportError::from)
+                    })
+                    .await
+                    .map_err(|_| HEADER_TIMEOUT_MESSAGE.to_owned())??,
                 })
             }
         };
@@ -868,7 +879,8 @@ impl HyperTransport {
             attempt = Some(crate::executor_metrics::Attempt::new(request));
             self.inner.request(hyper_req).await
         };
-        let response = match wait_for_headers(deadline, strict || callback, request_fut).await {
+        let stop_at_cutoff = strict || callback || read;
+        let response = match wait_for_headers(deadline, stop_at_cutoff, request_fut).await {
             Some(Ok(response)) => response,
             None if strict && attempt.is_none() => {
                 return Err(StrictTransportError::PreWireDeadline)
@@ -881,7 +893,7 @@ impl HyperTransport {
                 };
                 // An unpolled callback is known unsent; after the first poll,
                 // a timeout cannot tell whether Hyper already dispatched it.
-                if request.method() == Method::Get || (callback && attempt.is_none()) {
+                if read || (callback && attempt.is_none()) {
                     if let Some(permit) = permit {
                         let release = complete_early_release(permit, reason);
                         if let Some(at) = evidence_deadline {
@@ -1716,11 +1728,37 @@ impl ActionExecutor {
         // inside it (the receipt window refuses to land past it). No outer
         // backstop: the transport's timers share the absolute deadline, and a
         // stalled GET releases its lane where the permit is in scope.
-        if is_interaction_callback(request) && Instant::now() >= deadline {
+        if (is_interaction_callback(request) || request.method() == Method::Get)
+            && Instant::now() >= deadline
+        {
             return Err(DiscordError::Timeout);
         }
         self.send_admitted_for(request, SendBudget::Absolute(deadline, callback_admission))
             .await
+    }
+
+    fn preflight_read_cutoff(&self) -> Instant {
+        Instant::now()
+            + self
+                .inner
+                .moderation_timeout
+                .min(Duration::from_millis(MODERATION_TIMEOUT_MS))
+    }
+
+    async fn send_preflight_read(
+        &self,
+        request: &Request,
+        deadline: Instant,
+    ) -> Result<RawResponse, DiscordError> {
+        let (response, _) = self
+            .send_with_deadline(
+                request,
+                Some(false),
+                deadline.min(self.preflight_read_cutoff()),
+                CallbackAdmission::RecoverReady,
+            )
+            .await?;
+        Ok(response)
     }
 
     /// Singular role mutations use status only. A truncated/stalled provider
@@ -2612,10 +2650,21 @@ impl ActionExecutor {
         &self,
         path: &str,
     ) -> Result<Option<serde_json::Value>, DiscordError> {
+        self.get_json_strict_until(path, self.preflight_read_cutoff())
+            .await
+    }
+
+    /// Like [`Self::get_json_strict`], with an absolute deadline capped by the
+    /// moderation budget (at most five seconds). The governed transport owns
+    /// settlement, which can continue for up to one second after wire cutoff.
+    pub async fn get_json_strict_until(
+        &self,
+        path: &str,
+        deadline: Instant,
+    ) -> Result<Option<serde_json::Value>, DiscordError> {
         let route = raw_get_route(path).map_err(DiscordError::Rejected)?;
-        // Guard admission and pacing run inside the one bounded attempt.
-        let (res, _) = self
-            .send_with_timeout(&Request::from_route(&route), Some(false))
+        let res = self
+            .send_preflight_read(&Request::from_route(&route), deadline)
             .await?;
         match res.status {
             200..=299 => serde_json::from_slice(&res.body)
@@ -3864,8 +3913,18 @@ impl ActionExecutor {
     /// One bounded, paced read; malformed/non-bot evidence never initializes
     /// author checks or permission targets with a guessed identity.
     pub async fn current_bot_user_id(&self) -> Result<u64, DiscordError> {
+        self.current_bot_user_id_until(self.preflight_read_cutoff())
+            .await
+    }
+
+    /// Resolve bot identity with the same wire cutoff and settlement as
+    /// [`Self::get_json_strict_until`].
+    pub async fn current_bot_user_id_until(&self, deadline: Instant) -> Result<u64, DiscordError> {
         let req = Self::request_of(self.inner.factory.current_user())?;
-        let res = self.call_once_raw_paced(req, &[200]).await?;
+        let res = self.send_preflight_read(&req, deadline).await?;
+        if res.status != 200 {
+            return Err(throw_for_status(&res));
+        }
         let body: serde_json::Value = serde_json::from_slice(&res.body)
             .map_err(|_| DiscordError::Unavailable("invalid bot user response".into()))?;
         let id = body["id"]
@@ -5065,8 +5124,10 @@ impl two_bot_core::stream_live_store::LiveSender for ActionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use two_bot_core::send_admission::{
-        AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, TokenKey,
+        AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, SendCompletion,
+        SendCooldown, TokenKey,
     };
     use two_bot_core::MAX_BACKFILL_RETRY_AFTER_MS;
 
@@ -5698,6 +5759,215 @@ mod tests {
         );
         assert_eq!(entered.load(Ordering::SeqCst), 1, "no detached retry");
         assert_eq!(executor.requests(), 1);
+    }
+
+    // An ordinary claim can commit before its acknowledgement is observed.
+    // Only the returned completion capability can clear its exact generation.
+    #[derive(Debug)]
+    struct ReadLane {
+        key: TokenKey,
+        claimed: Arc<AtomicUsize>,
+        polls: AtomicUsize,
+        acknowledge: tokio::sync::Semaphore,
+    }
+
+    const READ_TOKEN: &str = "fixture-preflight-read";
+
+    impl ReadLane {
+        fn new(ready: bool) -> Self {
+            Self {
+                key: TokenKey::for_bot_token(READ_TOKEN).unwrap(),
+                claimed: Arc::default(),
+                polls: AtomicUsize::new(0),
+                acknowledge: tokio::sync::Semaphore::new(usize::from(ready)),
+            }
+        }
+
+        fn transport(self: &Arc<Self>, origin: &str) -> HyperTransport {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            HyperTransport::with_admission(
+                READ_TOKEN.to_owned(),
+                Some(origin.to_owned()),
+                self.clone(),
+            )
+            .unwrap()
+            .with_test_guard()
+        }
+    }
+
+    impl SendAdmission for ReadLane {
+        fn token_key(&self) -> &TokenKey {
+            &self.key
+        }
+
+        fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+            Box::pin(async {
+                let generation = self.polls.fetch_add(1, Ordering::Relaxed) + 1;
+                self.claimed
+                    .compare_exchange(0, generation, Ordering::Relaxed, Ordering::Relaxed)
+                    .map_err(|_| AdmissionError::Blocked)?;
+                self.acknowledge.acquire().await.unwrap().forget();
+                Ok(AdmissionPermit::new(Box::new(ReadRelease {
+                    claimed: self.claimed.clone(),
+                    generation,
+                })))
+            })
+        }
+    }
+
+    struct ReadRelease {
+        claimed: Arc<AtomicUsize>,
+        generation: usize,
+    }
+
+    impl SendCompletion for ReadRelease {
+        fn complete(
+            self: Box<Self>,
+            cooldown: Option<SendCooldown>,
+        ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+            Box::pin(async move {
+                assert_eq!(cooldown, None);
+                assert_eq!(
+                    self.claimed.compare_exchange(
+                        self.generation,
+                        0,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed
+                    ),
+                    Ok(self.generation),
+                    "complete exactly the acknowledged claim, once"
+                );
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_governed_read_owner_does_not_claim_the_lane() {
+        let (_listener, origin) = crate::strict_transport_fixture::loopback().await;
+        let lane = Arc::new(ReadLane::new(true));
+        let request = Request::from_route(&Route::GetCurrentUser);
+        // Bypass the executor's earlier deadline check to exercise an owner
+        // that gets its first turn after the caller's deadline check passed.
+        let result = lane
+            .transport(&origin)
+            .send_request(&request, Some(Instant::now()))
+            .await;
+        assert_eq!(result.unwrap_err(), HEADER_TIMEOUT_MESSAGE);
+        assert_eq!(lane.polls.load(Ordering::Relaxed), 0);
+        assert_eq!(lane.claimed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn governed_read_cutoff_settles_only_a_ready_claim_without_dispatch() {
+        use crate::strict_transport_fixture::loopback;
+
+        for acknowledged in [true, false] {
+            let (listener, origin) = loopback().await;
+            let lane = Arc::new(ReadLane::new(false));
+            let transport = lane.transport(&origin);
+            let request = Request::from_route(&Route::GetCurrentUser);
+            tokio::time::pause();
+            let budget = Duration::from_secs(1);
+            let cutoff = Instant::now() + budget;
+            // Poll the owner's work directly so the claim cannot consume the
+            // deadline wake until after we choose whether it can acknowledge.
+            let mut read = std::pin::pin!(transport.send_request_inner(
+                &request,
+                Some(cutoff),
+                CallbackAdmission::RecoverReady,
+            ));
+            assert!(futures_util::poll!(&mut read).is_pending());
+            assert_eq!(lane.claimed.load(Ordering::Relaxed), 1);
+            tokio::time::advance(budget).await;
+            assert_eq!(Instant::now(), cutoff);
+            if acknowledged {
+                lane.acknowledge.add_permits(1);
+            }
+            assert_eq!(read.await.unwrap_err(), HEADER_TIMEOUT_MESSAGE);
+            assert_eq!(lane.polls.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                lane.claimed.load(Ordering::Relaxed),
+                usize::from(!acknowledged)
+            );
+            tokio::time::resume();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_preflight_gets_honor_earliest_cutoff_and_release_lane() {
+        use crate::strict_transport_fixture::{loopback, read_request};
+        use tokio::time::{advance, pause, resume, timeout};
+
+        for identity in [true, false] {
+            // Earlier caller instant, shorter configured budget, hard ceiling.
+            for (configured, caller, effective) in [(3, 2, 2), (3, 30, 3), (30, 30, 5)] {
+                let (listener, origin) = loopback().await;
+                let lane = Arc::new(ReadLane::new(true));
+                let executor = ActionExecutor::assemble_with_timeout(
+                    READ_TOKEN.to_owned(),
+                    Some(origin.clone()),
+                    lane.transport(&origin),
+                    Duration::from_secs(configured),
+                )
+                .unwrap();
+
+                pause();
+                let start = Instant::now();
+                let deadline = start + Duration::from_secs(caller);
+                let mut read = std::pin::pin!(async {
+                    if identity {
+                        executor
+                            .current_bot_user_id_until(deadline)
+                            .await
+                            .map(|_| ())
+                    } else {
+                        executor
+                            .get_json_strict_until("/guilds/1", deadline)
+                            .await
+                            .map(|_| ())
+                    }
+                });
+                assert!(futures_util::poll!(&mut read).is_pending());
+                resume();
+                let (mut socket, _) = timeout(Duration::from_secs(2), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let path: &[u8] = if identity {
+                    b"GET /api/v10/users/@me "
+                } else {
+                    b"GET /api/v10/guilds/1 "
+                };
+                assert!(read_request(&mut socket).await.starts_with(path));
+                assert!(matches!(lane.admit().await, Err(AdmissionError::Blocked)));
+
+                pause();
+                let cutoff = start + Duration::from_secs(effective);
+                let just_before = cutoff - Duration::from_millis(10);
+                assert!(Instant::now() < just_before);
+                advance(just_before - Instant::now()).await;
+                assert!(futures_util::poll!(&mut read).is_pending());
+                assert_eq!(lane.claimed.load(Ordering::Relaxed), 1);
+                advance(Duration::from_millis(10)).await;
+                // No headers arrive; verify the result near the wire deadline
+                // without letting the paused clock jump to the caller's cap.
+                assert_eq!(
+                    timeout(Duration::from_millis(25), read).await.unwrap(),
+                    Err(DiscordError::Timeout)
+                );
+                assert_eq!(lane.claimed.load(Ordering::Relaxed), 0);
+                resume();
+                lane.acknowledge.add_permits(1);
+                lane.admit().await.unwrap().complete(None).await.unwrap();
+                assert_eq!(lane.polls.load(Ordering::Relaxed), 3, "no detached retry");
+            }
+        }
     }
 
     fn boot_executor() -> ActionExecutor {
