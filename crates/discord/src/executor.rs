@@ -450,6 +450,36 @@ async fn poll_before<F: Future>(at: Instant, work: F) -> Option<F::Output> {
     poll_until(at, work).await.filter(|_| Instant::now() < at)
 }
 
+// The first Hyper poll commits the local attempt (it can open a socket).
+// Never carry the synchronous fence into a later poll or a network wait.
+async fn poll_wire_with_commit<F: Future>(
+    deadline: Instant,
+    commit: FinalCommit<'_>,
+    work: F,
+) -> Result<F::Output, StrictTransportError> {
+    use std::task::Poll;
+
+    let mut work = std::pin::pin!(work);
+    let mut first = true;
+    std::future::poll_fn(|cx| {
+        if !std::mem::take(&mut first) {
+            return work.as_mut().poll(cx).map(Ok);
+        }
+        let mut polled = None;
+        commit(&mut || {
+            polled.get_or_insert_with(|| {
+                if Instant::now() >= deadline {
+                    Poll::Ready(Err(StrictTransportError::PreWireDeadline))
+                } else {
+                    work.as_mut().poll(cx).map(Ok)
+                }
+            });
+        });
+        polled.unwrap_or(Poll::Ready(Err(StrictTransportError::PreWireRevalidation)))
+    })
+    .await
+}
+
 impl RawResponse {
     /// Call only for a definite effect/no-effect, after validating any required
     /// mutation receipt. A storage fault must not authorize effect replay.
@@ -588,6 +618,9 @@ pub enum StrictTransportError {
 }
 
 type FinalCheck<'a> = std::pin::Pin<&'a mut (dyn Future<Output = bool> + Send)>;
+// A synchronous fence: call `start` under the guard or omit it to refuse.
+type FinalCommit<'a> = &'a (dyn Fn(&mut dyn FnMut()) + Sync);
+type FinalEvidence<'a> = (Instant, FinalCheck<'a>, FinalCommit<'a>);
 
 /// Borrowed response evidence, with no ownership of the admission permit.
 pub struct StrictResponseEvidence<'a> {
@@ -780,8 +813,14 @@ impl HyperTransport {
         request: &Request,
         deadline: Instant,
     ) -> Result<StrictEvidenceHeaders<'_>, StrictTransportError> {
-        self.send_strict_evidence_headers_after(request, deadline, std::future::ready(true), || {})
-            .await
+        self.send_strict_evidence_headers_after(
+            request,
+            deadline,
+            std::future::ready(true),
+            &|start| start(),
+            || {},
+        )
+        .await
     }
 
     async fn send_strict_evidence_headers_after(
@@ -789,6 +828,7 @@ impl HyperTransport {
         request: &Request,
         deadline: Instant,
         check: impl Future<Output = bool> + Send,
+        commit: FinalCommit<'_>,
         dispatch: impl FnOnce() + Send,
     ) -> Result<StrictEvidenceHeaders<'_>, StrictTransportError> {
         let pending = self
@@ -796,7 +836,7 @@ impl HyperTransport {
                 request,
                 Some(deadline),
                 true,
-                Some((deadline, std::pin::pin!(check))),
+                Some((deadline, std::pin::pin!(check), commit)),
                 CallbackAdmission::RecoverReady,
                 dispatch,
             )
@@ -809,7 +849,7 @@ impl HyperTransport {
         request: &Request,
         deadline: Option<tokio::time::Instant>,
         strict: bool,
-        evidence: Option<(Instant, FinalCheck<'_>)>,
+        evidence: Option<FinalEvidence<'_>>,
         callback_admission: CallbackAdmission,
         dispatch: impl FnOnce() + Send,
     ) -> Result<PendingHeaders<'_>, StrictTransportError> {
@@ -926,8 +966,8 @@ impl HyperTransport {
             None
         });
         let route_key = bucket_route_key(request);
-        let evidence_deadline = evidence.as_ref().map(|(at, _)| *at);
-        if let Some((at, check)) = evidence {
+        let evidence_deadline = evidence.as_ref().map(|(at, _, _)| *at);
+        let commit = if let Some((at, check, commit)) = evidence {
             let refusal = match poll_before(at, check).await {
                 None => Some(StrictTransportError::PreWireDeadline),
                 Some(false) => Some(StrictTransportError::PreWireRevalidation),
@@ -941,7 +981,10 @@ impl HyperTransport {
                 unsent.settle().await;
                 return Err(refusal);
             }
-        }
+            Some((at, commit))
+        } else {
+            None
+        };
         let mut attempt = None;
         // Bound the header wait inside the permit scope so a stalled read
         // releases its lane instead of orphaning it: an outer cancellation
@@ -961,7 +1004,15 @@ impl HyperTransport {
             attempt = Some(crate::executor_metrics::Attempt::new(request));
             self.inner.request(hyper_req).await
         };
-        let headers = if let (Some(at), Some(captured)) = (deadline, captured) {
+        let headers = if let Some((at, commit)) = commit {
+            match poll_until(at, poll_wire_with_commit(at, commit, request_fut)).await {
+                Some(Err(refusal)) => {
+                    unsent.settle().await;
+                    return Err(refusal);
+                }
+                result => result.and_then(Result::ok),
+            }
+        } else if let (Some(at), Some(captured)) = (deadline, captured) {
             // Hyper captures the connection and queues the GET in the same
             // poll. With resends off, later polls only check the reply channel.
             poll_until_or(at, request_fut, || captured.connection_metadata().is_some()).await
@@ -5249,6 +5300,32 @@ mod tests {
 
     fn never_send_admission(token: &str) -> Arc<dyn SendAdmission> {
         Arc::new(NeverSendAdmission(TokenKey::for_bot_token(token).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn strict_commit_fences_only_the_first_transport_poll() {
+        let fence = std::sync::Mutex::new(());
+        let mut first = true;
+        let work = std::future::poll_fn(|cx| {
+            if std::mem::take(&mut first) {
+                assert!(fence.try_lock().is_err());
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            assert!(fence.try_lock().is_ok());
+            std::task::Poll::Ready(())
+        });
+        let at = Instant::now() + Duration::from_secs(1);
+        poll_wire_with_commit(
+            at,
+            &|start| {
+                let _held = fence.lock().unwrap();
+                start();
+            },
+            work,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

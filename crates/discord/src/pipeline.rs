@@ -507,6 +507,7 @@ impl SharedCache {
     /// Apply one gateway event atomically with respect to guild projections.
     pub fn update(&self, event: &Event) {
         let mut complete = self.complete_guilds.write().expect("cache snapshot fence");
+        let policy_guild = voice_policy_guild(&self.inner, event);
         self.apply_twilight_event(event);
         match event {
             Event::Ready(_) => complete.clear(),
@@ -527,8 +528,7 @@ impl SharedCache {
                 complete.remove(&guild.id.get());
             }
             _ => {
-                if let Some(epoch) = voice_policy_guild(event).and_then(|id| complete.get_mut(&id))
-                {
+                if let Some(epoch) = policy_guild.and_then(|id| complete.get_mut(&id)) {
                     *epoch = Arc::new(());
                 }
             }
@@ -564,7 +564,7 @@ impl SharedCache {
     }
 }
 
-fn voice_policy_guild(event: &Event) -> Option<Snowflake> {
+fn voice_policy_guild(cache: &InMemoryCache, event: &Event) -> Option<Snowflake> {
     // Invalidate conservatively: these frames can change eligibility, seat
     // limits, overwrites, role hierarchy, membership, or communication timeout.
     match event {
@@ -578,6 +578,19 @@ fn voice_policy_guild(event: &Event) -> Option<Snowflake> {
         Event::MemberAdd(member) => Some(member.guild_id.get()),
         Event::MemberUpdate(member) => Some(member.guild_id.get()),
         Event::MemberRemove(member) => Some(member.guild_id.get()),
+        Event::VoiceStateUpdate(update) => {
+            // Twilight also caches the embedded member. Compare before publishing it.
+            let guild = update.0.guild_id?;
+            let member = update.0.member.as_ref()?;
+            cache
+                .member(guild, member.user.id)
+                .is_none_or(|prior| {
+                    prior.roles() != member.roles.as_slice()
+                        || prior.communication_disabled_until()
+                            != member.communication_disabled_until
+                })
+                .then_some(guild.get())
+        }
         _ => None,
     }
 }
@@ -1392,11 +1405,18 @@ mod tests {
     fn voice_policy_epoch_is_guild_scoped_and_never_reused_after_reseed() {
         let cache = SharedCache::default();
         cache.update(&lifecycle_available_guild());
-        let current = || cache.with_guild_policy_snapshot(GUILD, |_, epoch| Arc::clone(epoch));
+        cache.update(&lifecycle_guild(GUILD + 1));
+        let epoch = |id| cache.with_guild_policy_snapshot(id, |_, epoch| Arc::clone(epoch));
+        let current = || epoch(GUILD);
         let initial = current().expect("complete guild");
+        let peer = epoch(GUILD + 1).expect("complete peer");
         cache.update(&lifecycle_voice(GUILD, 1, 10));
         cache.update(&lifecycle_delete(GUILD + 1, Some(11)));
         assert!(Arc::ptr_eq(&initial, &current().expect("unchanged epoch")));
+        assert!(!Arc::ptr_eq(
+            &peer,
+            &epoch(GUILD + 1).expect("peer changed")
+        ));
 
         let role = Event::RoleDelete(
             serde_json::from_value(serde_json::json!({
@@ -1855,11 +1875,15 @@ mod tests {
     }
 
     fn lifecycle_available_guild() -> Event {
+        lifecycle_guild(GUILD)
+    }
+
+    fn lifecycle_guild(id: Snowflake) -> Event {
         let mut guild: serde_json::Value =
             serde_json::from_str(include_str!("../../bot/tests/fixtures/voice_guild.json"))
                 .expect("available guild fixture");
-        guild["id"] = serde_json::json!(GUILD.to_string());
-        guild["roles"][0]["id"] = serde_json::json!(GUILD.to_string());
+        guild["id"] = serde_json::json!(id.to_string());
+        guild["roles"][0]["id"] = serde_json::json!(id.to_string());
         guild["members"] = serde_json::json!([]);
         guild["voice_states"] = serde_json::json!([]);
         Event::GuildCreate(Box::new(

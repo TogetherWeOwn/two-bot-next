@@ -412,7 +412,8 @@ enum MoveVeto {
     Readiness,
     Source,
     PolicyDuringReads(u32),
-    PolicyBeforePatch,
+    MemberRole,
+    MemberTimeout,
     Cutoff,
 }
 
@@ -486,14 +487,17 @@ fn move_facts() -> [(StatusCode, Value); 6] {
 #[tokio::test]
 async fn governed_voice_move_checks_the_ordered_roster_and_reuses_unsent_lane() {
     use two_bot_discord::executor::member::VoiceMoveRoster;
-    use MoveVeto::{Capacity, Cutoff, PolicyBeforePatch, PolicyDuringReads, Readiness, Source};
+    use MoveVeto::{
+        Capacity, Cutoff, MemberRole, MemberTimeout, PolicyDuringReads, Readiness, Source,
+    };
     let vetoes = [
         (Capacity, 6),
         (Readiness, 6),
         (Source, 6),
         (PolicyDuringReads(2), 3),
         (PolicyDuringReads(6), 6),
-        (PolicyBeforePatch, 6),
+        (MemberTimeout, 6),
+        (MemberRole, 6),
         (Cutoff, 6),
     ];
     let Some(db) = database().await else { return };
@@ -559,16 +563,25 @@ async fn governed_voice_move_checks_the_ordered_roster_and_reuses_unsent_lane() 
             Capacity => change_room(SECOND, Some(TARGET)).await,
             Readiness => ready.store(false, Ordering::SeqCst),
             Source => change_room(FIRST, Some("32")).await,
-            PolicyDuringReads(_) | PolicyBeforePatch => {
-                // No roster change: only the gateway policy epoch can veto this proof.
-                let limit = match veto {
-                    PolicyDuringReads(read) => read,
-                    _ => 3,
-                };
-                let room = serde_json::from_value(voice_channel(TARGET, 2, "target", 0, limit))
+            PolicyDuringReads(read) => {
+                let room = serde_json::from_value(voice_channel(TARGET, 2, "target", 0, read))
                     .expect("channel update fixture");
                 let event = Event::ChannelUpdate(Box::new(room));
                 pipeline.handle(&event).await.unwrap();
+            }
+            MemberTimeout | MemberRole => {
+                // No roster change. Change the timeout once, then only the roles.
+                let mut state = voice_state(FIRST, Some(SOURCE));
+                let mut member = voice_member(FIRST, false);
+                member["communication_disabled_until"] = json!("2026-09-30T00:00:00Z");
+                if veto == MemberRole {
+                    member["roles"] = json!(["44"]);
+                }
+                state.0.member = Some(serde_json::from_value(member).unwrap());
+                pipeline
+                    .handle(&Event::VoiceStateUpdate(Box::new(state)))
+                    .await
+                    .unwrap();
             }
             Cutoff => tokio::time::sleep_until(deadline).await,
         }

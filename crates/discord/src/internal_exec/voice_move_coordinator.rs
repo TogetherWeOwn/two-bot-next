@@ -124,16 +124,18 @@ impl ActionExecutor {
             Ok(proof) => proof,
             Err(refusal) => return refusal,
         };
-        let revalidate = async {
-            let Some(_ready) = ready() else { return false };
-            roster.read(ids_numeric, &epoch, |source, cached, holds| {
+        let commit = |start: &mut dyn FnMut()| {
+            let Some(_ready) = ready() else { return };
+            let _ = roster.read(ids_numeric, &epoch, |source, cached, holds| {
                 let seats = holds.reserved_occupancy(member, target, cached)?;
-                Some(source == Some(from) && (limit == 0 || seats <= limit))
-            }) == Some(true)
+                if source == Some(from) && (limit == 0 || seats <= limit) {
+                    start();
+                }
+                Some(())
+            });
         };
-        let [guild, user, room] = ids;
         let patch = self
-            .move_voice_member_until(guild, user, room, deadline, revalidate)
+            .move_voice_member_with_commit_until(ids, deadline, std::future::ready(true), &commit)
             .await;
         {
             let Ok(mut holds) = roster.holds.lock() else {
