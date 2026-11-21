@@ -310,8 +310,8 @@ the staging holder entirely. A superseded SHA refuses before acquisition;
 select the current verified candidate on the next promotion rather than
 starting a different build under the old candidate's authorization.
 
-The non-cancelling `staging-lifecycle` lock spans startup, baseline, voice
-(up to 330 seconds per attempt, including restoration), measurement and release. Native persisted expiry
+The reusable soak holds the non-cancelling `staging-lifecycle` lock across
+baseline, one inherited voice exercise, measurement and release. Native expiry
 is still required if the runner disappears; `always()` alone is not cleanup
 proof. The original absolute expiry never moves. The grant remains capped at
 40 minutes; the 50-minute finish timeout is not a lock cap. It leaves time for

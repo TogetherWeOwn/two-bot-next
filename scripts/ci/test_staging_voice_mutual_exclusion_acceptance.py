@@ -1809,7 +1809,8 @@ class ExistingSafetyControls(unittest.TestCase):
         self.assertNotIn("continue-on-error", live[0])
         self.assertIn('python3 scripts/staging_voice_synthetic.py --evidence', live[0]["run"])
         self.assertIn("for attempt in 1 2 3; do", live[0]["run"])
-        self.assertIn('[ "$attempt" = 3 ] || sleep 60', live[0]["run"])
+        self.assertIn('if [ "$attempt" != 3 ]; then reserve_attempt 60 sleep 60 fi',
+                      ' '.join(live[0]["run"].split()))
         self.assertEqual(live[0]["env"]["TWO_STAGING_EMPTY_GRACE_SECONDS"],
                          "${{ vars.STAGING_EMPTY_GRACE_SECONDS || '60' }}")
         self.assertNotIn("--grace", live[0]["run"])
@@ -1851,9 +1852,9 @@ class ExistingSafetyControls(unittest.TestCase):
         # Pin executable source (not comments) linking both deadlines and both
         # room IDs to the observation consumed by the real delete verdict.
         tree = ast.parse(path.read_text())
-        live = next(node for node in tree.body
-                    if isinstance(node, ast.FunctionDef) and node.name == "run_live")
-        text = ast.unparse(live)
+        functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+        self.assertIn("return _exercise(args, token, rest)", ast.unparse(functions["run_live"]))
+        text = ast.unparse(functions["_exercise"])
         self.assertIn("time.monotonic() + args.grace + args.delete_slack", text)
         self.assertIn("e['t'] == 'CHANNEL_DELETE' and e['d']['id'] in rooms", text)
         self.assertIn("obs['deleted'] = set(rooms) <= gone", text)
