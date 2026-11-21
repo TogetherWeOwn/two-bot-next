@@ -161,7 +161,7 @@ pub async fn complete_rsvp_interaction(
     Ok(true)
 }
 
-fn rsvp_reply_embed(
+pub(crate) fn rsvp_reply_embed(
     result: Result<String, String>,
 ) -> twilight_model::channel::message::embed::Embed {
     let (kind, text) = match result {

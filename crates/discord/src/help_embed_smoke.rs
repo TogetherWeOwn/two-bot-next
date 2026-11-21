@@ -1,13 +1,11 @@
-//! Payloads for the live staging `/help` embed smoke (offline half).
+//! Renderer for the staging branded embed smoke (offline half).
 //!
-//! Discord creates interactions only for real users, so no bot token can
-//! invoke `/help` and capture its reply. The smoke therefore posts the exact
-//! embeds the two help builders produce — [`help_response`] for `/help` and
-//! [`help_detail_response`] for `/help <topic>` — as ordinary channel
-//! messages and reads them back (scripts/staging_help_embed_smoke.py). This
-//! module emits those embeds after the same executor sanitizer the live
-//! reply path uses, together with the brand expectations the read-back must
-//! match, so the Python half never re-implements builder or brand logic.
+//! The runner posts embeds from the Help, announcement/Echo, RSVP and Voice
+//! builders as ordinary test-channel messages. This does not invoke any
+//! commands, publish a real event or test ephemeral interaction delivery.
+//! Help replies go through the executor sanitizer before their embeds are
+//! extracted. Expectations select the kit kind and footer independently of
+//! the rendered payload.
 //! See docs/staging-help-embed-smoke.md for what this proves and does not.
 
 use serde_json::{json, Value};
@@ -16,11 +14,13 @@ use two_bot_core::commands::{
     CustomCommand, GUILD_COMMAND_LIMIT,
 };
 
-use crate::brand::{EmbedKind, BRAND_FOOTER_TEXT, BRAND_ICON_URL};
+use crate::brand::{ephemeral_reply_embed, EmbedKind, BRAND_FOOTER_TEXT, BRAND_ICON_URL};
 use crate::interactions::{help_detail_response, help_response};
+use crate::internal_actions::announcement_embed;
+use crate::rsvp::rsvp_reply_embed;
 
 /// Versioned payload schema the Python smoke refuses anything else under.
-pub const HELP_EMBED_SMOKE_SCHEMA: &str = "help_embed_smoke.v1";
+pub const HELP_EMBED_SMOKE_SCHEMA: &str = "help_embed_smoke.v3";
 
 /// Build the maximal published registry: only a full registry pushes the
 /// discovery text past Discord's content limit into the embed path, exactly
@@ -100,28 +100,59 @@ fn single_branded_embed(
     Ok(embed.clone())
 }
 
-/// The two help embeds and the brand triple the live read-back must carry.
+fn expected_brand(kind: EmbedKind, surface: &str, icon_url: Option<&str>) -> Value {
+    // Select the expected kit kind and footer independently of the built embed.
+    let footer_text = if surface.is_empty() {
+        BRAND_FOOTER_TEXT.to_owned()
+    } else {
+        format!("{BRAND_FOOTER_TEXT} · {surface}")
+    };
+    json!({"color": kind.color(), "footer_text": footer_text, "icon_url": icon_url})
+}
+
+/// The rendered embeds and per-builder expectations for the live read-back.
 ///
 /// # Errors
-/// Returns a fixed machine-readable code when the maximal registry cannot be
-/// built or either builder stops producing a single branded embed.
+/// Returns a fixed machine-readable code when the registry or help replies
+/// cannot be rendered.
 pub fn help_embed_smoke_payloads() -> Result<Value, &'static str> {
+    use EmbedKind::{Danger, Default, Echo, Ok as Saved, Warn};
+
+    let voice = |kind, text: &str| ephemeral_reply_embed(kind, "Voice", text.to_owned());
     let defs = maximal_registry()?;
     let help = single_branded_embed(&help_response(&defs), "help_embed_missing")?;
     let help_topic = single_branded_embed(
         &help_detail_response(wide_detail_text()),
         "help_topic_embed_missing",
     )?;
+    let announcement = announcement_embed("Smoke announcement\nAn offline example.");
+    let echo = announcement_embed("Echo · Smoke event\nAn offline example.");
+    let rsvp_ok = rsvp_reply_embed(Ok("RSVP saved for the example event.".to_owned()));
+    let rsvp_error = rsvp_reply_embed(Err("The example event is closed.".to_owned()));
+    let icon = Some(BRAND_ICON_URL);
     Ok(json!({
         "schema": HELP_EMBED_SMOKE_SCHEMA,
         "expected": {
-            "color": EmbedKind::Default.color(),
-            "footer_text": BRAND_FOOTER_TEXT,
-            "icon_url": BRAND_ICON_URL,
+            "help": expected_brand(Default, "", icon),
+            "help_topic": expected_brand(Default, "", icon),
+            "announcement": expected_brand(Default, "Announcements", icon),
+            "echo": expected_brand(Echo, "Echo", icon),
+            "rsvp_ok": expected_brand(Saved, "Events", None),
+            "rsvp_error": expected_brand(Danger, "Events", None),
+            "voice_ok": expected_brand(Saved, "Voice", None),
+            "voice_warn": expected_brand(Warn, "Voice", None),
+            "voice_error": expected_brand(Danger, "Voice", None),
         },
         "embeds": {
             "help": help,
             "help_topic": help_topic,
+            "announcement": announcement,
+            "echo": echo,
+            "rsvp_ok": rsvp_ok,
+            "rsvp_error": rsvp_error,
+            "voice_ok": voice(Saved, "The example room limit was updated."),
+            "voice_warn": voice(Warn, "The example room is still updating."),
+            "voice_error": voice(Danger, "The example room could not be updated."),
         },
     }))
 }
@@ -135,17 +166,18 @@ mod help_embed_smoke_tests {
     fn payloads_carry_both_builders_branded_embeds() {
         let payloads = help_embed_smoke_payloads().expect("payloads build");
         assert_eq!(payloads["schema"], HELP_EMBED_SMOKE_SCHEMA);
-        assert_eq!(
-            payloads["expected"]["color"].as_u64(),
-            Some(u64::from(EmbedKind::Default.color()))
-        );
-        assert_eq!(
-            payloads["expected"]["color"],
-            crate::brand::brand_tokens::BRAND_DISCORD_EMBED_DEFAULT
-        );
-        assert_eq!(payloads["expected"]["footer_text"], BRAND_FOOTER_TEXT);
-        assert_eq!(payloads["expected"]["icon_url"], BRAND_ICON_URL);
         for key in ["help", "help_topic"] {
+            let expected = &payloads["expected"][key];
+            assert_eq!(
+                expected["color"].as_u64(),
+                Some(u64::from(EmbedKind::Default.color()))
+            );
+            assert_eq!(
+                expected["color"],
+                crate::brand::brand_tokens::BRAND_DISCORD_EMBED_DEFAULT
+            );
+            assert_eq!(expected["footer_text"], BRAND_FOOTER_TEXT);
+            assert_eq!(expected["icon_url"], BRAND_ICON_URL);
             let embed = &payloads["embeds"][key];
             assert_eq!(
                 embed["color"].as_u64(),
@@ -165,6 +197,49 @@ mod help_embed_smoke_tests {
             assert!(
                 text_len(description) <= EMBED_DESCRIPTION_LIMIT,
                 "{key} description fits Discord's embed limit"
+            );
+        }
+    }
+
+    #[test]
+    fn additional_rows_match_their_kit_contracts() {
+        use crate::brand::brand_tokens::{
+            BRAND_DISCORD_EMBED_DANGER, BRAND_DISCORD_EMBED_DEFAULT, BRAND_DISCORD_EMBED_ECHO,
+            BRAND_DISCORD_EMBED_OK, BRAND_DISCORD_EMBED_WARN,
+        };
+
+        let payloads = help_embed_smoke_payloads().expect("payloads build");
+        for (key, color, surface, icon) in [
+            (
+                "announcement",
+                BRAND_DISCORD_EMBED_DEFAULT,
+                "Announcements",
+                Some(BRAND_ICON_URL),
+            ),
+            (
+                "echo",
+                BRAND_DISCORD_EMBED_ECHO,
+                "Echo",
+                Some(BRAND_ICON_URL),
+            ),
+            ("rsvp_ok", BRAND_DISCORD_EMBED_OK, "Events", None),
+            ("rsvp_error", BRAND_DISCORD_EMBED_DANGER, "Events", None),
+            ("voice_ok", BRAND_DISCORD_EMBED_OK, "Voice", None),
+            ("voice_warn", BRAND_DISCORD_EMBED_WARN, "Voice", None),
+            ("voice_error", BRAND_DISCORD_EMBED_DANGER, "Voice", None),
+        ] {
+            let footer = format!("Together We Own · {surface}");
+            let expected = &payloads["expected"][key];
+            let embed = &payloads["embeds"][key];
+            assert_eq!(expected["color"], color, "{key} expected color");
+            assert_eq!(embed["color"], color, "{key} rendered color");
+            assert_eq!(expected["footer_text"], footer, "{key} expected footer");
+            assert_eq!(embed["footer"]["text"], footer, "{key} rendered footer");
+            assert_eq!(expected["icon_url"], json!(icon), "{key} expected icon");
+            assert_eq!(
+                embed["footer"]["icon_url"].as_str(),
+                icon,
+                "{key} rendered icon"
             );
         }
     }

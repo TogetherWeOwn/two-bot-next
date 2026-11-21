@@ -8,7 +8,10 @@
 use std::io::Write as _;
 
 fn report(status: &str, code: Option<&str>) -> String {
-    let mut line = String::from("{\"schema\":\"help_embed_smoke.v1\",\"status\":\"");
+    let mut line = format!(
+        "{{\"schema\":\"{}\",\"status\":\"",
+        two_bot_discord::help_embed_smoke::HELP_EMBED_SMOKE_SCHEMA
+    );
     line.push_str(status);
     line.push('"');
     if let Some(code) = code {

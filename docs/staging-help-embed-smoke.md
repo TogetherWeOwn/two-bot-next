@@ -1,8 +1,8 @@
 # Staging help embed smoke
 
-This is the human-free live proof that Discord serves both branded `/help`
-embeds with the Icon 1 footer and brand colour intact. It runs after every
-staging deploy and can also be dispatched by hand.
+This smoke checks whether Discord serves the kit colour, footer text and
+footer icon policy of each rendered embed. It runs after staging deploys
+and can also be dispatched by hand.
 
 Discord creates slash-command interactions only for real users, so this smoke
 does not invoke `/help` and does not claim to prove gateway interaction
@@ -13,9 +13,8 @@ post and read-back unchanged.
 ## Flow
 
 1. CI builds `help_embed_smoke_payloads`, a Rust example in the discord crate.
-   It calls `help_response` and `help_detail_response`, passes both replies
-   through the executor sanitizer, and emits their single embeds plus the
-   expected brand values from `brand.rs`.
+   It calls the builders below, passes Help replies through the executor
+   sanitizer, and emits the embeds plus independently selected kit expectations.
 2. `scripts/staging_help_embed_smoke.py` fences the run to the staging guild
    and to a dedicated test bot (TWO Voice Synthetic (staging)): the token
    must belong to a bot account that is none of the product applications and
@@ -24,23 +23,39 @@ post and read-back unchanged.
    ordinary test-bot message. The staging product bot's token is never
    used; it stays out of GitHub by the recorded decision in
    [the slash smoke doc](staging-slash-smoke.md#why-it-is-not-a-github-workflow).
-3. For each post, it reads `GET /channels/{channel_id}/messages/{message_id}`
-   and asserts on that read-back—never the POST response—that:
-   - `embeds[0].color == 16751670` (`0xFF9C36`, kit ember default);
-   - `embeds[0].footer.text == "Together We Own"`;
-   - `embeds[0].footer.icon_url == BRAND_ICON_URL`.
-4. It deletes both messages, pass or fail, and writes evidence containing
+3. For each post, it reads `GET /channels/{channel_id}/messages/{message_id}`.
+   It checks the message ID, channel and bot author, then checks the single
+   embed's colour, footer text and icon policy against its row's contract.
+   It never asserts against the POST response.
+4. It deletes each message, pass or fail, and writes evidence containing
    only row results, durations and message IDs. Before each post it records
    the channel's newest message ID as an anchor; if a post's outcome is
    lost (timeout, 5xx or an unreadable answer), it reconciles by deleting
    every newer test-bot message, so a committed-but-unseen post cannot be
    left behind by a later green run.
 
-The payload deliberately uses the maximal command registry and a wide topic
-detail, matching the Rust builder tests. Short `/help` and short
-`/help <topic>` replies are intentionally plain ephemeral content and cannot
-carry an embed footer; this smoke exercises the embed path of both builders,
-rather than simulating staging's current registry size.
+## Rendered payload inventory
+
+| Rows | Builder | Colour | Footer suffix | Icon |
+| --- | --- | --- | --- | --- |
+| `help`, `help_topic` | `help_response`, `help_detail_response` | Default | None | Icon 1 |
+| `announcement` | `announcement_embed` | Default | Announcements | Icon 1 |
+| `echo` | `announcement_embed` with an Echo title | Echo | Echo | Icon 1 |
+| `rsvp_ok`, `rsvp_error` | `rsvp_reply_embed` (RSVP and attendance) | Ok, Danger | Events | None |
+| `voice_ok`, `voice_warn`, `voice_error` | `ephemeral_reply_embed` (shared by Voice utility replies) | Ok, Warn, Danger | Voice | None |
+
+The Help payload retains the maximal registry and wide topic detail to
+exercise both original embed paths. Announcements and Echo use invented text;
+RSVP and Voice use fixed outcomes, not real attendance or a room mutation.
+The payloads have no embed byline; the message-author check verifies the
+test bot identity separately.
+
+Actual member interactions, ephemeral visibility and side effects are outside
+this proof. The Voice fixtures cover outcome selection and deferred completion;
+the smoke only exercises their shared embed builder. Moderation confirmations
+and audit mirror entries are plain text: tests in `member_runtime.rs` and
+`audit.rs` check `high`, `medium`, and `low` labels and the unban exception
+without moderating members. Unimplemented notification DMs are out of scope.
 
 ## Token source and updates
 
@@ -59,7 +74,7 @@ the pinned digest offline. Python fixtures prove a hand-edited colour fails
 without rewriting files or accessing the network. `--check-upstream` compares
 the pinned upstream bytes without writing. The smoke payload gets its expected
 colour from the same helper, and its Python fixtures check the generated
-default constant, so renderer and smoke cannot drift silently.
+constants used by each row, so renderer and smoke cannot drift silently.
 
 To update (bump tag → re-vendor → drift green):
 
@@ -100,9 +115,9 @@ To roll delivery back, restore that URL in the constant and its exact-URL Rust
 assertion and Python fixture, through the normal review and release gates.
 Do not delete or re-import the Images copy as part of a code rollback.
 
-Use the existing payload builder and smoke above to check the synthetic
-round-trip on the changed SHA: `expected.icon_url` and both read-back footers
-must contain the Images URL. Record that SHA and smoke run as synthetic evidence
+Use the payload builder and smoke above to check the synthetic round trip on
+the changed SHA: each Icon 1 row's expectation and read-back footer must
+contain the Images URL. Record that SHA and smoke run as synthetic evidence
 only: the separate test bot posts these payloads, so a pass does not prove
 that the deployed product bot adopted the Images URL.
 
@@ -207,11 +222,11 @@ python3 scripts/cargo_cache.py run -- run -p two-bot-discord --example help_embe
 
 ## Reading a result
 
-- Exit `0` / `VERDICT PASS`: both read-backs matched and both test messages
-  were deleted.
+- Exit `0` / `VERDICT PASS`: every read-back matched and every test message
+  was deleted.
 - Exit `1` / `VERDICT FAIL`: identity, channel, post, read-back or brand
-  failed. The row names the first fixed-vocabulary fault; the other embed
-  still runs.
+  failed. After preflight, a failed row names its first fault and the
+  remaining rows still run.
 - Exit `2` / `REFUSED`: a fence stopped the run before any post, for example
   the wrong guild, a missing or malformed token, a missing channel, an
   invalid snowflake or an invalid or already-unbranded payload file.
