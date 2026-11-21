@@ -146,6 +146,11 @@ the bound and leaves any unconfirmed durable outcome occupied; process loss
 still uses the lease below. Mutations, generic permit Drop, shutdown publication
 rules and the lease duration are unchanged.
 
+`get_json_strict_until` and `current_bot_user_id_until` cap the caller’s deadline
+at the moderation budget (five seconds max). At cutoff the owner only settles
+ready claims or received 429 headers. A timed-out claim transaction discards
+its connection without flushing any buffered writes.
+
 Strict admission is an opt-in pre-wire capability. Migration 0473 adds a
 pending-settlement generation constrained to match an occupied lane. An
 acknowledged strict claim remains blocked across lease expiry and restart until
