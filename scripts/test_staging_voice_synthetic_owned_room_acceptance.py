@@ -333,8 +333,7 @@ class OwnedRoomBindingTest(unittest.TestCase):
                 now[0] = 301
             return read(token, path)
 
-        session.pump = after_grace
-        fake.rest = restore_after_cutoff
+        session.pump, fake.rest = after_grace, restore_after_cutoff
         with mock.patch.object(synth.time, "monotonic", side_effect=lambda: now[0]), \
                 mock.patch.dict(os.environ, {"VOICE_WORK_SECONDS": "300"}):
             with mock.patch.object(synth, "Session") as open_session, self.assertRaisesRegex(synth.Refusal, "grace and delete slack"):
@@ -387,6 +386,7 @@ class OwnedRoomBindingTest(unittest.TestCase):
         for connect in (lambda: synth.WebSocket(synth.GATEWAY, "/", .2),
                         lambda: synth.rest("fixture", "/channels/x", .2)):
             release = synth.threading.Event()
+            self.addCleanup(release.set)
 
             def resolve(*_args, release=release, **_kwargs):
                 release.wait(2)
@@ -394,13 +394,10 @@ class OwnedRoomBindingTest(unittest.TestCase):
 
             with mock.patch.object(synth.socket, "getaddrinfo", side_effect=resolve) as dns, \
                     mock.patch.object(synth.urllib.request, "getproxies", return_value={}):
-                try:
-                    with self.assertRaises((TimeoutError, synth.urllib.error.URLError)) as caught:
-                        connect()
-                    self.assertIsInstance(getattr(caught.exception, "reason", caught.exception), TimeoutError)
-                    dns.assert_called_once()
-                finally:
-                    release.set()
+                with self.assertRaises((TimeoutError, synth.urllib.error.URLError)) as caught:
+                    connect()
+                self.assertIsInstance(getattr(caught.exception, "reason", caught.exception), TimeoutError)
+                dns.assert_called_once()
 
     def test_stalled_work_io_leaves_time_for_restore_and_close(self):
         for waiting_on in ("gateway", "rest"):
@@ -410,10 +407,9 @@ class OwnedRoomBindingTest(unittest.TestCase):
     def assert_stalled_work_io(self, waiting_on):
         batches = [[GUILD_CREATE], [channel_create(OWN), voice_update(OWN)],
                    [], [channel_create(REJOIN), voice_update(REJOIN)]]
-        session = FakeSession(batches)
+        session, now = FakeSession(batches), [0]
         fake = make_fake(rooms={OWN: room_state(OWN)}, before=[], after=[],
                          creator_name=ORIGINAL_NAME)
-        now = [0]
         signal = synth.signal
         original = signal.getsignal(signal.SIGALRM)
 
