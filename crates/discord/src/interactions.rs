@@ -683,15 +683,15 @@ impl InteractionRuntime {
             .store(id, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Ingress paths with no REST prerequisite read only the armed identity.
+    /// The identity already armed by trusted bootstrap or READY.
     pub fn known_bot_user_id(&self) -> u64 {
         self.bot_user_id.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Resolve an uncached bot user through the shared executor. Unknown
-    /// stays 0, which nonce recovery refuses.
+    /// RESUMED boots without tickets never learn the bot user: resolve it once
+    /// through the shared executor. Unknown stays 0, which nonce recovery refuses.
     async fn bot_user_id(&self) -> u64 {
-        let id = self.known_bot_user_id();
+        let id = self.bot_user_id.load(std::sync::atomic::Ordering::Relaxed);
         if id != 0 {
             return id;
         }

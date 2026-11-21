@@ -123,6 +123,11 @@ impl Cursor {
         Self::new(Revision(bytes), actor, expires_at, page)
     }
 
+    /// The original navigation lifetime never extends on a later click.
+    pub fn is_expired(self, now: u64) -> bool {
+        now >= self.expires_at || self.expires_at > now.saturating_add(LIFETIME_SECONDS)
+    }
+
     /// Use only after checking the component's source message and guild. The
     /// returned expiry must be kept unchanged in descendant controls.
     pub fn target(
@@ -138,7 +143,7 @@ impl Cursor {
         if current != self.revision {
             return Err(CursorError::Stale);
         }
-        if now >= self.expires_at || self.expires_at > now.saturating_add(LIFETIME_SECONDS) {
+        if self.is_expired(now) {
             return Err(CursorError::Expired);
         }
         Ok((self.page, self.expires_at))

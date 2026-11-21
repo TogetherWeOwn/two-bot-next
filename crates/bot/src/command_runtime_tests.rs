@@ -1787,101 +1787,136 @@ async fn help_answers_immediately_from_the_live_publish_set() {
 
 #[tokio::test]
 async fn gateway_help_opens_a_new_private_page_from_the_confirmed_registry() {
-    use crate::command_runtime::{LANE_BUSY, LANE_HELP, LANE_INTERACTIONS};
+    use crate::command_runtime::help_ingress::{HELP_LIMIT, LANE_HELP, LANE_HELP_REFUSAL};
+    use crate::command_runtime::{DISPATCH_LIMITS, LANE_BUSY, LANE_INTERACTIONS};
     use serde_json::{json, Value};
     use tokio::time::Instant;
     use two_bot_discord::brand::{EmbedKind, BRAND_ICON_URL};
 
-    let (mock, origin) = MockRest::start(Vec::new()).await;
-    let runtime = runtime_without_db(
-        RouterGates {
-            scorecard: true,
-            moderation: true,
-            ..gates(true, true)
-        },
-        true,
-        origin,
-    );
-    runtime.set_identity(2222, 1111);
-    runtime.publish_registry_checked(Some(1111)).await.unwrap();
-    let actor_id = 834;
-    let first = interaction_event(from_member(
-        slash("help", Some(CHANNEL), Vec::new()),
-        actor_id,
-        Permissions::empty(),
-    ));
+    let app = RestResponse {
+        body: Some(json!({"id": "1111"}).to_string()),
+        ..RestResponse::status(200)
+    };
+    let (mock, origin) = MockRest::start_script(vec![app]).await;
+    let mut gates = gates(true, true);
+    gates.scorecard = true;
+    gates.moderation = true;
+    let runtime = runtime_without_db(gates, true, origin);
+    let _guard = runtime.dispatch_guard();
+    runtime.set_identity(0, 0);
+    let application = runtime.bootstrap_application_id().await.unwrap();
+    runtime
+        .publish_registry_checked(Some(application))
+        .await
+        .unwrap();
     let dispatch = |e: &Event, at| runtime.dispatch_received(e, true, at, "2026-01-01T00:00:00Z");
+    let first = interaction_event(slash("help", Some(CHANNEL), vec![]));
+    dispatch(&Event::Resumed, Instant::now());
     assert!(dispatch(&first, Instant::now()));
     assert!(dispatch(&first, Instant::now()), "duplicate");
-    let idle = || runtime.lane_in_flight(LANE_HELP) == 0;
-    wait_for(idle, "initial help callback").await;
+    let idle = |lane| runtime.help_in_flight(lane) == 0;
+    wait_for(|| idle(LANE_HELP), "initial help callback").await;
     let callbacks = mock.posts_to("/callback").await;
     assert_eq!(callbacks.len(), 1);
-    let initial: Value = serde_json::from_slice(&callbacks[0].body).unwrap();
-    let data = &initial["data"];
+    let data = &serde_json::from_slice::<Value>(&callbacks[0].body).unwrap()["data"];
     assert_eq!(data["flags"], 64);
     assert_eq!(data["embeds"][0]["color"], EmbedKind::Default.color());
     assert_eq!(data["embeds"][0]["footer"]["icon_url"], BRAND_ICON_URL);
-    let controls = &data["components"];
-    let actor = json!({"id": actor_id.to_string(), "username": "actor", "discriminator": "0"});
-    let payload = json!({
-        "id": "835", "type": 3, "application_id": "1111", "guild_id": GUILD.to_string(),
-        "attachment_size_limit": 10_485_760,
-        "authorizing_integration_owners": {"0": GUILD.to_string()}, "entitlements": [], "token": "click-fixture",
-        "data": {"component_type": 2, "custom_id": controls[0]["components"][0]["custom_id"], "values": []},
-        "member": {"deaf": false, "mute": false, "flags": 0, "roles": [], "user": actor},
-        "message": {
-            "id": "836", "channel_id": CHANNEL.to_string(), "type": 20,
-            "author": {"id": "2222", "username": "bot", "discriminator": "0", "bot": true},
-            "flags": 64, "components": controls, "embeds": data["embeds"],
-            "interaction_metadata": {
-                "id": actor_id.to_string(), "type": 2, "user": actor,
-                "authorizing_integration_owners": {"0": GUILD.to_string()}
-            },
-            "attachments": [], "content": "", "mention_everyone": false, "mention_roles": [],
-            "mentions": [], "pinned": false, "timestamp": "2026-01-01T00:00:00+00:00", "tts": false
-        }
-    });
-    assert_eq!(controls[0]["components"][0]["label"], "Go to page 2");
-    let click: Interaction = serde_json::from_value(payload).expect("valid help source fixture");
-    let mut wrong_scope = click.clone();
+    let button = &data["components"][0]["components"][0];
+    assert_eq!(button["label"], "Go to page 2");
+    let cursor = button["custom_id"].as_str().unwrap();
+    let click = |id, cursor: &str, flags| {
+        let mut click = stale_unknown_component(cursor, ComponentType::Button, vec![]);
+        click.id = Id::new(id);
+        let mut source = message(836, CHANNEL, true, Some(GUILD));
+        source.author.id = Id::new(1111);
+        source.flags = flags;
+        source.interaction_metadata = serde_json::from_value(json!({ "id": "7", "type": 2,
+            "user": user(88, false), "authorizing_integration_owners": {"0": GUILD.to_string()} }))
+        .unwrap();
+        let mut button = button.clone();
+        button["custom_id"] = json!(cursor);
+        source.components =
+            serde_json::from_value(json!([{"type": 1, "components": [button]}])).unwrap();
+        click.message = Some(source);
+        click
+    };
+    let private = Some(MessageFlags::EPHEMERAL);
+    let event = |id, cursor: &str, flags| interaction_event(click(id, cursor, flags));
+    let mut wrong_scope = click(835, cursor, private);
     set_guild(&mut wrong_scope, None);
     assert!(dispatch(&interaction_event(wrong_scope), Instant::now()));
     assert!(dispatch(&first, Instant::now() - Duration::from_secs(3)));
-    assert!(idle(), "an expired receipt must not admit Help work");
+    assert!(
+        idle(LANE_HELP),
+        "an expired receipt must not admit Help work"
+    );
     assert_eq!(runtime.dispatch_drops_total(LANE_INTERACTIONS), 0);
-    let mut invalid = click.clone();
-    invalid.id = Id::new(837);
-    invalid.message.as_mut().unwrap().flags = None;
-    assert!(dispatch(&interaction_event(click), Instant::now()));
-    assert!(dispatch(&interaction_event(invalid), Instant::now()));
-    assert_eq!(runtime.lane_in_flight(LANE_BUSY), 1, "same actor is busy");
+    for _ in 0..DISPATCH_LIMITS[LANE_BUSY] {
+        assert!(runtime.hold_lane_for_test(LANE_BUSY, Duration::from_secs(60)));
+    }
+    assert!(dispatch(&event(835, cursor, private), Instant::now()));
+    assert!(dispatch(&event(837, cursor, None), Instant::now()));
+    assert_eq!(
+        runtime.help_in_flight(LANE_HELP_REFUSAL),
+        1,
+        "same actor is busy"
+    );
     wait_for(
-        || idle() && runtime.lane_in_flight(LANE_BUSY) == 0,
+        || idle(LANE_HELP) && idle(LANE_HELP_REFUSAL),
         "help callbacks",
     )
     .await;
+    let prefix = cursor.rsplitn(3, ':').last().unwrap();
+    let hold = |actor, id| runtime.hold_help_for_test(actor, id);
+    assert_eq!(hold(88, 836), Some(LANE_HELP));
+    assert!(dispatch(
+        &event(839, &format!("{prefix}:1:2"), private),
+        Instant::now()
+    ));
+    wait_for(|| idle(LANE_HELP_REFUSAL), "expired button recovery").await;
     let mut callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 3, "no extra callbacks");
+    assert_eq!(callbacks.len(), 4, "no extra callbacks");
     callbacks[1..].sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    assert!(callbacks[1].path.ends_with("/835/click-fixture/callback"));
-    assert!(callbacks[2].path.ends_with("/837/click-fixture/callback"));
-    let refusal: Value = serde_json::from_slice(&callbacks[2].body).unwrap();
-    assert_eq!(refusal["type"], 4);
-    assert_eq!(refusal["data"]["flags"], 64);
-    assert!(refusal["data"]["components"].is_null());
-    assert_eq!(
-        refusal["data"]["embeds"][0]["description"],
-        "Run `/help` to get your own list."
-    );
-    let page: Value = serde_json::from_slice(&callbacks[1].body).unwrap();
-    assert_eq!(page["type"], 4, "new message, not an update or defer");
-    let data = &page["data"];
-    assert_eq!(data["flags"], 64);
-    assert_eq!(data["allowed_mentions"]["parse"], json!([]));
-    let footer = data["embeds"][0]["footer"]["text"].as_str().unwrap();
-    assert!(footer.starts_with("Together We Own · Help · Page 2 of "));
-    assert_eq!(mock.requests().len(), 4, "no edits or followups");
+    for (callback, id) in callbacks[1..].iter().zip([835, 837, 839]) {
+        assert!(callback
+            .path
+            .ends_with(&format!("/{id}/sticky-test-token/callback")));
+        let reply: Value = serde_json::from_slice(&callback.body).unwrap();
+        assert_eq!(reply["type"], 4, "new message, not an update or defer");
+        let data = &reply["data"];
+        assert_eq!(data["flags"], 64);
+        if id == 835 {
+            assert_eq!(data["allowed_mentions"]["parse"], json!([]));
+            assert!(data["embeds"][0]["footer"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Together We Own · Help · Page 2 of "));
+        } else {
+            assert!(data["components"].is_null());
+            let description = if id == 837 {
+                "Run `/help` to get your own list."
+            } else {
+                "Help pages last 10 minutes. Run `/help` to start again."
+            };
+            assert_eq!(data["embeds"][0]["description"], description);
+        }
+    }
+    assert_eq!(hold(88, 836), None, "render duplicate");
+    assert_eq!(hold(88, 900), Some(LANE_HELP_REFUSAL));
+    assert_eq!(hold(88, 900), None, "refusal duplicate");
+    assert_eq!(runtime.dispatch_drops_total(LANE_INTERACTIONS), 0);
+    assert_eq!(hold(88, 901), None, "one refusal per actor");
+    for i in 1..HELP_LIMIT as u64 {
+        assert_eq!(hold(i, 100 + i), Some(LANE_HELP));
+    }
+    for i in 1..HELP_LIMIT as u64 {
+        assert_eq!(hold(i, 200 + i), Some(LANE_HELP_REFUSAL));
+    }
+    assert_eq!(hold(99, 300), None, "both Help lanes are full");
+    assert_eq!(runtime.dispatch_drops_total(LANE_INTERACTIONS), 2);
+    assert_eq!(runtime.dispatch_drops_total(LANE_BUSY), 0);
+    assert_eq!(mock.requests().len(), 6);
     mock.shutdown().await;
 }
 
@@ -11477,7 +11512,7 @@ async fn saturated_lane_counts_drops_per_lane_and_quiets_logs() {
         BUSY_DROPS as u64,
         "every busy-lane drop counts on its own lane"
     );
-    for lane in 0..two_bot_core::metrics::DISPATCH_LANES.len() {
+    for lane in 0..DISPATCH_LIMITS.len() {
         if lane != LANE_MESSAGES && lane != LANE_BUSY {
             assert_eq!(
                 runtime.dispatch_drops_total(lane),

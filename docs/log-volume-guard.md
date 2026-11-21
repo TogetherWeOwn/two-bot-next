@@ -145,7 +145,7 @@ Both counters are class steady and never shed.
 Dispatch-lane saturation (TOG-19878) follows the same shed-meter shape: every
 `spawn_first` refusal increments `two_bot_dispatch_drops_total{lane}` per
 attempted lane, while the `warn!` samples the first drop per 60 s per runtime.
-Drops at the Help slot gate or in the Help render lane count under `interactions`.
+Capacity drops from either Help lane count under `interactions`.
 A burst is O(1) log lines with N counter increments. The six lane labels are
 class steady and never shed; growth means a lane is undersized or a burst
 needs the M2.1 alert rule, not a new label. The `reactions` lane additionally

@@ -184,14 +184,13 @@ pub type VoiceKickVote =
 /// cannot starve moderation. `BUSY` carries the one-call "busy" replies.
 /// `REACTIONS` keeps self-role reaction bursts off the message lane, so neither
 /// burst can discard the other's automations.
-pub(crate) const DISPATCH_LIMITS: [usize; 7] = [16, 16, 1, 8, 8, 8, 8];
+pub(crate) const DISPATCH_LIMITS: [usize; 6] = [16, 16, 1, 8, 8, 8];
 pub(crate) const LANE_MESSAGES: usize = 0;
 pub(crate) const LANE_INTERACTIONS: usize = 1;
 const LANE_REGISTRY: usize = 2;
 pub(crate) const LANE_PRIVILEGED: usize = 3;
 pub(crate) const LANE_BUSY: usize = 4;
 pub(crate) const LANE_REACTIONS: usize = 5;
-pub(crate) const LANE_HELP: usize = 6;
 
 // A single member's reaction burst must leave room for other members: the
 // per-member budget stays strictly below the lane cap, so fairness holds even
@@ -209,12 +208,13 @@ const SATURATION_LOG_WINDOW_SECS: u64 = 60;
 #[derive(Default)]
 struct DispatchTasks {
     stopped: bool,
+    help: help_ingress::HelpTasks,
     lanes: [Vec<tokio::task::AbortHandle>; DISPATCH_LIMITS.len()],
     /// Per-lane drops (test-visible mirror of the global
     /// `two_bot_dispatch_drops_total{lane}` counter, incremented alongside by
     /// `DispatchTasks::record_drop`; fairness drops share their lane's
     /// counter).
-    drops: [u64; LANE_HELP],
+    drops: [u64; DISPATCH_LIMITS.len()],
     last_drop_log: Option<std::time::Instant>,
 }
 
@@ -227,10 +227,6 @@ impl DispatchTasks {
     /// sampled message so existing log filters keep matching.
     fn record_drop(&mut self, lanes: &[usize], reason: &'static str, message: &'static str) {
         for &lane in lanes {
-            let lane = match lane {
-                LANE_HELP => LANE_INTERACTIONS,
-                _ => lane,
-            };
             self.drops[lane] = self.drops[lane].saturating_add(1);
             two_bot_core::metrics::global()
                 .dispatch_drop(two_bot_core::metrics::DISPATCH_LANES[lane]);
@@ -246,9 +242,8 @@ impl DispatchTasks {
     }
 }
 
-// The metric allowlist follows the dispatch order up to the internal help lane.
-const _: () = assert!(two_bot_core::metrics::DISPATCH_LANES.len() == LANE_HELP);
-const _: () = assert!(DISPATCH_LIMITS.len() == LANE_HELP + 1);
+// Lane labels stay in `DISPATCH_LIMITS` order with the global metric allowlist.
+const _: () = assert!(two_bot_core::metrics::DISPATCH_LANES.len() == DISPATCH_LIMITS.len());
 
 /// Cancels admitted work on gateway exit, including supervisor cancellation.
 /// Interrupted channel effects retain their durable claims for reconciliation.
@@ -261,6 +256,7 @@ impl Drop for CommandDispatchGuard {
             "command_dispatch_guard",
         );
         tasks.stopped = true;
+        tasks.help.abort();
         for lane in &mut tasks.lanes {
             for handle in lane.drain(..) {
                 handle.abort();
@@ -619,8 +615,7 @@ impl CommandRuntime {
         // in `publish_registry_checked`. Zero means unpinned (unparseable
         // token); such a runtime never publishes on faith.
         if let Some(application_id) = activation.application_id() {
-            // The bot token identifies its bot user as well as the app. Keep
-            // source validation armed after a cold RESUME, which has no READY.
+            // Cold RESUME has no READY to identify the bot user.
             runtime.set_identity(application_id, application_id);
         }
         runtime
@@ -3704,7 +3699,7 @@ pub(crate) fn sticky_options_strict(
 mod resumed_tests;
 
 #[path = "help_ingress.rs"]
-mod help_ingress;
+pub(crate) mod help_ingress;
 
 /// Full-set publication: a bulk replace needs an authoritative custom-command
 /// row load, so an unknown store defers instead of deleting Discord commands.
