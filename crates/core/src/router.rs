@@ -998,11 +998,6 @@ impl InteractionRouter {
                 return ComponentOutcome::Ignore;
             }
             ComponentHandler::LockdownPreview
-        } else if crate::help::cursor::Cursor::is_help_control(custom_id) {
-            if !self.guild_ok(guild_id) {
-                return ComponentOutcome::Ignore;
-            }
-            ComponentHandler::HelpPage
         } else {
             return if self.guild_ok(guild_id) {
                 ComponentOutcome::Unknown
@@ -1013,16 +1008,30 @@ impl InteractionRouter {
         ComponentOutcome::Handled { handler }
     }
 
+    /// Opt in to discovery navigation for message components. Only callers
+    /// that dispatch `HelpPage` and validate its source should use this route.
+    #[must_use]
+    pub fn route_component_with_help(
+        &self,
+        custom_id: &str,
+        guild_id: Option<u64>,
+    ) -> ComponentOutcome {
+        if !crate::help::cursor::Cursor::is_help_control(custom_id) {
+            return self.route_component(custom_id, guild_id);
+        }
+        if !self.guild_ok(guild_id) {
+            return ComponentOutcome::Ignore;
+        }
+        ComponentOutcome::Handled {
+            handler: ComponentHandler::HelpPage,
+        }
+    }
+
     /// Route one modal submit by `custom_id` through the same table as
     /// components. Unknown ids reply only inside the configured guild.
     #[must_use]
     pub fn route_modal(&self, custom_id: &str, guild_id: Option<u64>) -> ComponentOutcome {
-        match self.route_component(custom_id, guild_id) {
-            ComponentOutcome::Handled {
-                handler: ComponentHandler::HelpPage,
-            } => ComponentOutcome::Unknown,
-            outcome => outcome,
-        }
+        self.route_component(custom_id, guild_id)
     }
 
     /// Every built-in slash name the dispatch table recognizes, independent
@@ -1989,21 +1998,33 @@ mod tests {
         let id = "h1:malformed";
         assert_eq!(
             r.route_component(id, Some(GUILD)),
+            ComponentOutcome::Unknown
+        );
+        assert_eq!(r.route_modal(id, Some(GUILD)), ComponentOutcome::Unknown);
+        assert_eq!(
+            r.route_component_with_help(id, Some(GUILD)),
             ComponentOutcome::Handled {
                 handler: ComponentHandler::HelpPage,
             }
         );
-        assert_eq!(r.route_modal(id, Some(GUILD)), ComponentOutcome::Unknown);
         for guild in [Some(GUILD + 1), None] {
             assert_eq!(r.route_component(id, guild), ComponentOutcome::Ignore);
             assert_eq!(r.route_modal(id, guild), ComponentOutcome::Ignore);
+            assert_eq!(
+                r.route_component_with_help(id, guild),
+                ComponentOutcome::Ignore
+            );
         }
         for id in ["h1", "h12:malformed", "h2:malformed"] {
             assert_eq!(
-                r.route_component(id, Some(GUILD)),
+                r.route_component_with_help(id, Some(GUILD)),
                 ComponentOutcome::Unknown
             );
         }
+        assert_eq!(
+            r.route_component_with_help(GAME_SELECT_ID, Some(GUILD)),
+            r.route_component(GAME_SELECT_ID, Some(GUILD))
+        );
     }
 
     #[test]

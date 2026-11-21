@@ -110,6 +110,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'backfill_history_messages', 'table'),
     ('public', 'backfill_history_counts', 'table'),
     ('public', 'game_activity_guild_aggregates', 'table'),
+    ('public', 'voice_heat_hours', 'migrator'),
     ('public', 'assistant_monthly_builds', 'table'),
     ('public', 'scheduled_events_claim', 'table'),
     ('public', 'scheduled_events_tombstone', 'table'),

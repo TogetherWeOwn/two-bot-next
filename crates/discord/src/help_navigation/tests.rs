@@ -15,6 +15,7 @@ fn wire(response: &InteractionResponse) -> Value {
     assert_eq!(wire["data"]["flags"], MessageFlags::EPHEMERAL.bits());
     assert_eq!(wire["data"]["allowed_mentions"], json!({"parse": []}));
     assert_eq!(wire["data"]["embeds"].as_array().expect("embeds").len(), 1);
+    assert!(wire["data"]["embeds"][0].get("flags").is_none());
     assert_eq!(
         wire["data"]["embeds"][0]["footer"]["icon_url"],
         BRAND_ICON_URL
@@ -158,6 +159,7 @@ fn click_fixture() -> Value {
     let actor = json!({"id": ACTOR.to_string(), "username": "actor", "discriminator": "0"});
     json!({
         "id": "100", "type": 3, "application_id": "2", "guild_id": "1",
+        "attachment_size_limit": 10_485_760,
         "authorizing_integration_owners": {"0": "1"}, "entitlements": [], "token": "fixture",
         "data": {"component_type": 2, "custom_id": rows[0]["components"][0]["custom_id"], "values": []},
         "member": {"deaf": false, "mute": false, "flags": 0, "roles": [], "user": actor},
@@ -191,6 +193,19 @@ fn initial_and_descendant_help_messages_belong_to_the_clicking_actor() {
         }
         let interaction = serde_json::from_value(payload.clone()).expect("click");
         assert_eq!(source_cursor(&interaction, 2, 2), Some((expected, ACTOR)));
+    }
+}
+
+#[test]
+fn help_cursor_requires_the_exact_enabled_source_button() {
+    for (field, value) in [
+        ("custom_id", json!("other-button")),
+        ("disabled", json!(true)),
+    ] {
+        let mut payload = click_fixture();
+        payload["message"]["components"][0]["components"][0][field] = value;
+        let interaction = serde_json::from_value(payload).expect("click");
+        assert_eq!(source_cursor(&interaction, 2, 2), None, "changed {field}");
     }
 }
 

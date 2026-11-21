@@ -4,6 +4,7 @@ Adapted from base_attestation_gate.py at commit 3935a2c82e780fad7e923f427c43299b
 This module does not enforce an attestation policy or schedule a workflow.
 """
 
+import copy
 import re
 from urllib.parse import quote
 
@@ -15,10 +16,13 @@ SELF_GATE_PATHS = frozenset({
     ".github/scripts/base_attestation_gate.py",
     "scripts/ci/test_base_attestation_gate.py",
     ".github/scripts/attestation_inventory.py",
+    ".github/scripts/attestation_transport.py",
+    "scripts/ci/test_attestation_transport.py",
     "scripts/ci/test_attestation_inventory.py",
     "scripts/ci/test_attestation_snapshot.py",
     "scripts/ci/test_attestation_event_identity.py",
     "scripts/ci/test_attestation_policy.py",
+    "scripts/ci/test_attestation_orchestration.py",
 })
 
 
@@ -119,6 +123,26 @@ def evaluate_metadata(event, repository, run_sha, paths, policy):
                 "file_count": pr["changed_files"], "path_count": len(validated)}
     except Exception:
         raise InventoryError("Metadata policy evaluation refused") from None
+
+
+def evaluate_bracketed(event, repository, run_sha, api, policy):
+    """Compose inactive comparisons, inventory and policy; not a live fence.
+
+    The caller must establish reader and policy provenance, provider consistency,
+    atomicity and snapshot semantics before using this for any enforcement.
+    """
+    try:
+        baseline = copy.deepcopy(event)
+        validate_event_identity(baseline, repository, run_sha)
+        pr = baseline["pull_request"]
+        require_fresh(api, pr)
+        prefix = f"repos/{repository}/pulls/{pr['number']}"
+        paths = changed_paths(api, prefix, pr["changed_files"])
+        result = evaluate_metadata(copy.deepcopy(baseline), repository, run_sha, paths, policy)
+        require_fresh(api, pr)
+        return result
+    except Exception:
+        raise InventoryError("Attestation evaluation refused") from None
 
 
 def require_fresh(api, pr):

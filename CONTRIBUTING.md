@@ -89,17 +89,27 @@ head/base change; a stale check does not validate a new head.
 The final-stage reviewer squash-merges the settled, exact reviewed head in the
 same run as final approval, after all required checks pass and every review
 finding is fixed or answered with evidence. The author merges only when there is
-no review stage. Pin the merge to that head SHA; record the squash SHA and the
-release decision in the release log.
+no review stage. Pin the merge to that head SHA. At merge, record the squash SHA
+and any applicable PR confirmation in the release log; record the production
+decision there when the Release Manager accepts the release candidate.
 
-`main` reaches production through staging and automatic promotion. A path ignored
-by `deploy-staging.yml` does not exempt a merge from production safeguards: even a
-docs-only PR needs a fresh, per-PR Release Manager `request_confirmation` on its
-exact head before merge. Put the confirmation on a child task assigned and
-addressed to the Release Manager (`resolverPolicy: not_creator`). A manual
-production dispatch or rollback needs its own Release Manager confirmation too.
+A bot merge verified not to deploy production needs **no standing per-PR
+Release Manager confirmation**. Verify live that
+`PRODUCTION_AUTO_PROMOTE_DISABLED=true` and check that the change does not
+introduce or re-enable a path from the merge to production. This rule also
+covers changes to promotion-path code or guidance when the merge itself is
+verified non-deploying. If the merge would deploy production or you cannot rule
+out deployment, require a Release Manager approval stage on the source card
+for the full, exact PR head SHA before merging. This rule does not waive any
+PR-specific direction.
 
-For two-web-next and two-bot-next, staging qualification is the automatic
+Production release acceptance binds to the exact full release SHA; dispatch
+production with that SHA ([production deploy](docs/production-deploy.md)). A
+different SHA needs fresh acceptance. A manual production dispatch, production
+schema or data operation (including migration apply), or production rollback
+requires its own exact-SHA Release Manager authorization on the source card.
+
+For two-web-next and two-bot-next, staging qualification is the
 **post-merge, pre-production exact-main staging/e2e/soak gate** (owner decision
 2026-11-06). Staging accepts only main-ancestor SHAs; an unmerged PR-head staging
 run is not a merge prerequisite. Production promotes only the exact main SHA
@@ -107,13 +117,12 @@ that passes staging deploy, e2e and soak, enforced by the promotion guard. See t
 [production deploy gate](docs/production-deploy.md) and
 [staging rollout gate](docs/staging-rollout-gate.md) for the pipeline evidence.
 This describes the required gate, not a claim that any SHA has qualified.
-Automatic qualification starts on runtime-input pushes to `main`;
-`deploy-staging.yml` ignores docs-only merges. To promote an otherwise unqualified
-exact main SHA, including a docs-only squash SHA, first obtain authorized staging
-dispatch/qualification using the existing
-[dispatch/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
-Do not wait for a docs-only push to trigger it, skip qualification or dispatch
-through an existing hold.
+A merge is not evidence of staging deployment or qualification. Consult
+`deploy-staging.yml` at the relevant ref for its triggers and verify completed
+qualifying evidence for the intended exact `main` SHA. If evidence is absent,
+keep promotion held and follow the separately authorized
+[qualification/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics);
+do not skip qualification or act through an existing hold.
 
 This contract supersedes the earlier artifact-identical staging exception.
 Unmerged-head staging and paired artifact-equality proofs are not substitute
@@ -122,17 +131,18 @@ merge, or treat artifact equality as permission to skip post-merge qualification
 The pipeline's exact-SHA artifact and promotion evidence remains required.
 
 Before merge, retain required GitHub Actions checks and Devin Review on the
-exact PR head, all applicable specialist and native review, and evidence-backed
-finding dispositions. Include the migration ledger entry (or `no migration`)
-and rollback target in the fresh per-PR exact-head Release Manager decision.
+exact PR head, Security before QA where required by the review tiers, all other
+applicable review stages, and evidence-backed finding dispositions. Include the
+migration ledger entry (or `no migration`) and rollback target in the release
+decision and in any required approval for a deploying or unverified merge.
 Keep incident, freeze and hold safeguards, identity/capability holds and red
 staging-drill or other deterministic gates; this staging contract lifts none of
-them. A previous rejection remains a rejection, not retroactive approval. Submit
-a fresh confirmation only after its remaining conditions are met. Any new PR
-head requires fresh review/check evidence and Release Manager acceptance before
-the SHA-pinned squash merge and release-log recording. This documentation
-authorizes no pipeline skip/no-op implementation, hold lift, deployment or other
-production action.
+them. A previous rejection remains a rejection, not retroactive approval.
+Resubmit only after its remaining conditions are met. A new PR head requires
+fresh review and check evidence, and fresh Release Manager approval if the merge
+would deploy or cannot be verified non-deploying, before the SHA-pinned squash
+merge. This documentation authorizes no pipeline skip/no-op implementation,
+hold lift, deployment or other production action.
 
 ### CI lanes
 
@@ -207,8 +217,9 @@ unchanged, including non-UTF-8 output. Only the closing harness summary supplies
 summary/count evidence; earlier summary-looking child lines are diagnostics.
 The successful closing summary/counts and process exit remain mandatory.
 Missing, empty, duplicate, failed, ignored or unknown result records fail closed.
-The pinned Rust 1.99.1 supports this deprecated flag; recheck its protocol when
-upgrading the toolchain rather than falling back to parsing mixed console output.
+The nightly partition workflow exercises this deprecated flag on the pinned Rust
+toolchain; recheck its protocol when upgrading rather than falling back to parsing
+mixed console output.
 
 Verify a change with an actual executing `pull_request` run on its exact head,
 record each heavy job's time and headroom, and aim for at most 35 minutes per

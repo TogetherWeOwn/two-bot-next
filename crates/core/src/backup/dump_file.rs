@@ -376,6 +376,9 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "backfill_history_counts",
     "member_catchup_cursors",
     "member_catchup_members",
+    // Short-lived derived voice calibration, not source data. Restore clears
+    // any target rows rather than mixing them with later observations.
+    "voice_heat_hours",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
     // manifest metadata only, never restored application data. The store
@@ -1300,15 +1303,29 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // Historical inventories are pinned by fixtures. Each old version waives
-    // only tables first covered by a later version. New v16 archives require
-    // the full inventory, including both guild counters (0441/0442/0446/0447),
-    // the epoch-claim guard (0450/0451), the delete tombstones (0452/0453),
-    // the token registry (0456/0457), the event voice pair (0455) and
-    // the starboard tables (0458/0459) and giveaways (0460/0461),
-    // and the event instance windows (0472).
     let version = obj.get("version").and_then(Value::as_u64);
-    let missing: Vec<&str> = DUMP_TABLES
+    let missing: Vec<&str> = required_manifest_tables(version)
+        .into_iter()
+        .filter(|name| !names.contains(*name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(refuse(format!(
+            "manifest is missing tables: {}",
+            missing.join(", ")
+        )));
+    }
+    serde_json::from_value(obj.clone()).map_err(|e| refuse(format!("manifest is malformed: {e}")))
+}
+
+// Historical inventories are pinned by fixtures. Each old version waives
+// only tables first covered by a later version. New v16 archives require
+// the full inventory, including both guild counters (0441/0442/0446/0447),
+// the epoch-claim guard (0450/0451), the delete tombstones (0452/0453),
+// the token registry (0456/0457), the event voice pair (0455) and
+// the starboard tables (0458/0459) and giveaways (0460/0461),
+// and the event instance windows (0472).
+fn required_manifest_tables(version: Option<u64>) -> Vec<&'static str> {
+    DUMP_TABLES
         .iter()
         .copied()
         .enumerate()
@@ -1390,15 +1407,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)
-        .filter(|name| !names.contains(*name))
-        .collect();
-    if !missing.is_empty() {
-        return Err(refuse(format!(
-            "manifest is missing tables: {}",
-            missing.join(", ")
-        )));
-    }
-    serde_json::from_value(obj.clone()).map_err(|e| refuse(format!("manifest is malformed: {e}")))
+        .collect()
 }
 
 /// Restore raises allocators to these marks, so a malformed one must refuse
@@ -1686,6 +1695,24 @@ mod tests {
         "retention_deletion_requests",
         "event_store",
     ];
+
+    // Literal additions in archive order, independent of the reader's waivers.
+    // A fixture may declare an older version than the inventory it carries.
+    const LATE_FIXTURE_TABLES: &[(u64, &[&str])] = &[
+        (
+            14,
+            &["starboard_config", "starboard_starrers", "starboard_posts"],
+        ),
+        (15, &["giveaways", "giveaway_entries", "giveaway_draws"]),
+        (16, &["event_instance_windows"]),
+    ];
+
+    fn fixture_tables_after(version: u64) -> impl Iterator<Item = &'static str> {
+        LATE_FIXTURE_TABLES
+            .iter()
+            .filter(move |(introduced, _)| *introduced > version)
+            .flat_map(|&(_, names)| names.iter().copied())
+    }
 
     fn complete_tables(overrides: &BTreeMap<&str, (Vec<&str>, u64)>) -> Vec<Value> {
         DUMP_TABLES
@@ -2328,6 +2355,44 @@ mod tests {
     }
 
     #[test]
+    fn manifest_inventory_requires_each_addition_at_its_version_boundary() {
+        for (introduced, tables) in [
+            (5, V5_ADDED_TABLES),
+            (6, V6_ADDED_TABLES),
+            (7, V7_ADDED_TABLES),
+            (8, V8_ADDED_TABLES),
+            (9, V9_ADDED_TABLES),
+            (10, V10_ADDED_TABLES),
+            (11, V11_ADDED_TABLES),
+            (12, V12_ADDED_TABLES),
+            (13, V13_ADDED_TABLES),
+            (14, V14_ADDED_TABLES),
+            (15, V15_ADDED_TABLES),
+            (16, V16_ADDED_TABLES),
+        ] {
+            for table in tables {
+                let mut objs = empty_dump();
+                objs[0]["tables"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|entry| entry["name"] != *table);
+                objs[0]["version"] = serde_json::json!(introduced - 1);
+                inspect_bytes(&gzip_lines(&objs)).expect("older version may omit the table");
+                objs[0]["version"] = serde_json::json!(introduced);
+                let err =
+                    inspect_bytes(&gzip_lines(&objs)).expect_err("new version requires table");
+                assert!(err.to_string().contains(*table), "{introduced}: {err}");
+            }
+        }
+        for (index, required) in [(21, true), (22, false)] {
+            let mut objs = empty_dump();
+            objs[0]["version"] = serde_json::json!(3);
+            objs[0]["tables"].as_array_mut().unwrap().remove(index);
+            assert_eq!(inspect_bytes(&gzip_lines(&objs)).is_err(), required);
+        }
+    }
+
+    #[test]
     fn refuses_a_manifest_missing_tables() {
         let tables =
             vec![serde_json::json!({"name":"events","columns":[],"column_types":[],"count":0})];
@@ -2402,16 +2467,7 @@ mod tests {
                     && !V11_ADDED_TABLES.contains(name)
                     && !V12_ADDED_TABLES.contains(name)
                     && !V13_ADDED_TABLES.contains(name)
-                    && ![
-                        "starboard_config",
-                        "starboard_starrers",
-                        "starboard_posts",
-                        "giveaways",
-                        "giveaway_entries",
-                        "giveaway_draws",
-                        "event_instance_windows",
-                    ]
-                    .contains(name)
+                    && !fixture_tables_after(13).any(|later| *name == later)
             })
             .collect();
         assert_eq!(names, expected);
@@ -2435,14 +2491,10 @@ mod tests {
                 "retention_guild_purge_queue",
                 "retention_deletion_requests",
                 "event_store",
-                "starboard_config",
-                "starboard_starrers",
-                "starboard_posts",
-                "giveaways",
-                "giveaway_entries",
-                "giveaway_draws",
-                "event_instance_windows"
             ]
+            .into_iter()
+            .chain(fixture_tables_after(13))
+            .collect::<Vec<_>>()
         );
         assert_eq!(contents.buffers["voice_rooms"][0]["channel_id"], "500");
         let mut manifest = serde_json::to_value(&contents.manifest).unwrap();
@@ -2471,17 +2523,7 @@ mod tests {
             .into_iter()
             .filter(|table| {
                 table["name"] != "event_store"
-                    && ![
-                        "starboard_config",
-                        "starboard_starrers",
-                        "starboard_posts",
-                        "giveaways",
-                        "giveaway_entries",
-                        "giveaway_draws",
-                        "event_instance_windows",
-                    ]
-                    .iter()
-                    .any(|n| table["name"] == *n)
+                    && !fixture_tables_after(13).any(|later| table["name"] == later)
             })
             .collect();
         let mut v5 = manifest(v5_tables);
@@ -2496,16 +2538,10 @@ mod tests {
         assert_eq!(contents.manifest.version, 5);
         assert_eq!(
             contents.manifest.missing_tables(),
-            [
-                "event_store",
-                "starboard_config",
-                "starboard_starrers",
-                "starboard_posts",
-                "giveaways",
-                "giveaway_entries",
-                "giveaway_draws",
-                "event_instance_windows"
-            ]
+            ["event_store"]
+                .into_iter()
+                .chain(fixture_tables_after(13))
+                .collect::<Vec<_>>()
         );
         // The same inventory at the current version refuses: new archives must
         // cover the event store.
@@ -2530,16 +2566,7 @@ mod tests {
             .copied()
             .filter(|name| {
                 !V6_ADDED_TABLES.contains(name)
-                    && ![
-                        "starboard_config",
-                        "starboard_starrers",
-                        "starboard_posts",
-                        "giveaways",
-                        "giveaway_entries",
-                        "giveaway_draws",
-                        "event_instance_windows",
-                    ]
-                    .contains(name)
+                    && !fixture_tables_after(13).any(|later| *name == later)
             })
             .map(|name| {
                 serde_json::json!({
@@ -2581,16 +2608,7 @@ mod tests {
             .copied()
             .filter(|name| {
                 !V6_ADDED_TABLES.contains(name)
-                    && ![
-                        "starboard_config",
-                        "starboard_starrers",
-                        "starboard_posts",
-                        "giveaways",
-                        "giveaway_entries",
-                        "giveaway_draws",
-                        "event_instance_windows",
-                    ]
-                    .contains(name)
+                    && !fixture_tables_after(13).any(|later| *name == later)
             })
             .map(|name| {
                 serde_json::json!({
@@ -2633,17 +2651,7 @@ mod tests {
                 .into_iter()
                 .filter(|t| {
                     t.get("name").and_then(Value::as_str) != Some(name)
-                        && ![
-                            "starboard_config",
-                            "starboard_starrers",
-                            "starboard_posts",
-                            "giveaways",
-                            "giveaway_entries",
-                            "giveaway_draws",
-                            "event_instance_windows",
-                        ]
-                        .iter()
-                        .any(|n| t["name"] == *n)
+                        && !fixture_tables_after(13).any(|later| t["name"] == later)
                 })
                 .collect()
         }
@@ -2668,16 +2676,10 @@ mod tests {
         assert_eq!(contents.manifest.version, 6);
         assert_eq!(
             contents.manifest.missing_tables(),
-            [
-                "member_season_xp",
-                "starboard_config",
-                "starboard_starrers",
-                "starboard_posts",
-                "giveaways",
-                "giveaway_entries",
-                "giveaway_draws",
-                "event_instance_windows"
-            ]
+            ["member_season_xp"]
+                .into_iter()
+                .chain(fixture_tables_after(13))
+                .collect::<Vec<_>>()
         );
         // Dropping a v6-covered table from a v6 manifest still refuses.
         let mut v6_gap = v6.clone();
@@ -2709,17 +2711,7 @@ mod tests {
                 .into_iter()
                 .filter(|t| {
                     t.get("name").and_then(Value::as_str).is_none_or(|n| {
-                        !names.contains(&n)
-                            && ![
-                                "starboard_config",
-                                "starboard_starrers",
-                                "starboard_posts",
-                                "giveaways",
-                                "giveaway_entries",
-                                "giveaway_draws",
-                                "event_instance_windows",
-                            ]
-                            .contains(&n)
+                        !names.contains(&n) && !fixture_tables_after(13).any(|later| n == later)
                     })
                 })
                 .collect()
@@ -2756,14 +2748,10 @@ mod tests {
                 "member_season_xp",
                 "retention_guild_purge_queue",
                 "retention_deletion_requests",
-                "starboard_config",
-                "starboard_starrers",
-                "starboard_posts",
-                "giveaways",
-                "giveaway_entries",
-                "giveaway_draws",
-                "event_instance_windows"
             ]
+            .into_iter()
+            .chain(fixture_tables_after(13))
+            .collect::<Vec<_>>()
         );
         // Dropping the v6 event store from a v6 manifest still refuses.
         let mut v6_gap = v6.clone();
@@ -2794,17 +2782,7 @@ mod tests {
                 .into_iter()
                 .filter(|t| {
                     t.get("name").and_then(Value::as_str) != Some(name)
-                        && ![
-                            "starboard_config",
-                            "starboard_starrers",
-                            "starboard_posts",
-                            "giveaways",
-                            "giveaway_entries",
-                            "giveaway_draws",
-                            "event_instance_windows",
-                        ]
-                        .iter()
-                        .any(|n| t["name"] == *n)
+                        && !fixture_tables_after(13).any(|later| t["name"] == later)
                 })
                 .collect()
         }
@@ -2830,16 +2808,10 @@ mod tests {
         assert_eq!(contents.manifest.version, 7);
         assert_eq!(
             contents.manifest.missing_tables(),
-            [
-                "stream_live_claims",
-                "starboard_config",
-                "starboard_starrers",
-                "starboard_posts",
-                "giveaways",
-                "giveaway_entries",
-                "giveaway_draws",
-                "event_instance_windows"
-            ]
+            ["stream_live_claims"]
+                .into_iter()
+                .chain(fixture_tables_after(13))
+                .collect::<Vec<_>>()
         );
         // Dropping a v7-covered table from a v7 manifest still refuses.
         let mut v7_gap = v7.clone();
@@ -2873,13 +2845,7 @@ mod tests {
             .filter(|table| {
                 table["name"] != "assistant_monthly_builds"
                     && table["name"] != "game_activity_guild_aggregates"
-                    && table["name"] != "starboard_config"
-                    && table["name"] != "starboard_starrers"
-                    && table["name"] != "starboard_posts"
-                    && table["name"] != "giveaways"
-                    && table["name"] != "giveaway_entries"
-                    && table["name"] != "giveaway_draws"
-                    && table["name"] != "event_instance_windows"
+                    && !fixture_tables_after(13).any(|later| table["name"] == later)
             })
             .collect();
         let mut old = manifest(tables);
@@ -2893,17 +2859,10 @@ mod tests {
             assert_eq!(contents.manifest.version, version);
             assert_eq!(
                 contents.manifest.missing_tables(),
-                [
-                    "game_activity_guild_aggregates",
-                    "assistant_monthly_builds",
-                    "starboard_config",
-                    "starboard_starrers",
-                    "starboard_posts",
-                    "giveaways",
-                    "giveaway_entries",
-                    "giveaway_draws",
-                    "event_instance_windows"
-                ]
+                ["game_activity_guild_aggregates", "assistant_monthly_builds"]
+                    .into_iter()
+                    .chain(fixture_tables_after(13))
+                    .collect::<Vec<_>>()
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -2941,17 +2900,7 @@ mod tests {
             .into_iter()
             .filter(|table| {
                 table["name"] != "scheduled_events_claim"
-                    && ![
-                        "starboard_config",
-                        "starboard_starrers",
-                        "starboard_posts",
-                        "giveaways",
-                        "giveaway_entries",
-                        "giveaway_draws",
-                        "event_instance_windows",
-                    ]
-                    .iter()
-                    .any(|n| table["name"] == *n)
+                    && !fixture_tables_after(13).any(|later| table["name"] == later)
             })
             .collect();
         let mut old = manifest(tables);
@@ -2965,16 +2914,10 @@ mod tests {
             assert_eq!(contents.manifest.version, version);
             assert_eq!(
                 contents.manifest.missing_tables(),
-                [
-                    "scheduled_events_claim",
-                    "starboard_config",
-                    "starboard_starrers",
-                    "starboard_posts",
-                    "giveaways",
-                    "giveaway_entries",
-                    "giveaway_draws",
-                    "event_instance_windows"
-                ]
+                ["scheduled_events_claim"]
+                    .into_iter()
+                    .chain(fixture_tables_after(13))
+                    .collect::<Vec<_>>()
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -3015,13 +2958,7 @@ mod tests {
                 table["name"] != "scheduled_events_tombstone"
                     && table["name"] != "event_voice_channels"
                     && table["name"] != "event_voice_presence"
-                    && table["name"] != "starboard_config"
-                    && table["name"] != "starboard_starrers"
-                    && table["name"] != "starboard_posts"
-                    && table["name"] != "giveaways"
-                    && table["name"] != "giveaway_entries"
-                    && table["name"] != "giveaway_draws"
-                    && table["name"] != "event_instance_windows"
+                    && !fixture_tables_after(13).any(|later| table["name"] == later)
                     && table["name"] != "admin_api_tokens"
             })
             .collect();
@@ -3041,14 +2978,10 @@ mod tests {
                     "event_voice_channels",
                     "event_voice_presence",
                     "admin_api_tokens",
-                    "starboard_config",
-                    "starboard_starrers",
-                    "starboard_posts",
-                    "giveaways",
-                    "giveaway_entries",
-                    "giveaway_draws",
-                    "event_instance_windows"
                 ]
+                .into_iter()
+                .chain(fixture_tables_after(13))
+                .collect::<Vec<_>>()
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -3071,13 +3004,7 @@ mod tests {
                 table["name"] != "admin_api_tokens"
                     && table["name"] != "event_voice_channels"
                     && table["name"] != "event_voice_presence"
-                    && table["name"] != "starboard_config"
-                    && table["name"] != "starboard_starrers"
-                    && table["name"] != "starboard_posts"
-                    && table["name"] != "giveaways"
-                    && table["name"] != "giveaway_entries"
-                    && table["name"] != "giveaway_draws"
-                    && table["name"] != "event_instance_windows"
+                    && !fixture_tables_after(13).any(|later| table["name"] == later)
             })
             .collect();
         let mut at_v11 = manifest(old_v11);
@@ -3094,14 +3021,10 @@ mod tests {
                 "event_voice_channels",
                 "event_voice_presence",
                 "admin_api_tokens",
-                "starboard_config",
-                "starboard_starrers",
-                "starboard_posts",
-                "giveaways",
-                "giveaway_entries",
-                "giveaway_draws",
-                "event_instance_windows"
             ]
+            .into_iter()
+            .chain(fixture_tables_after(13))
+            .collect::<Vec<_>>()
         );
         let mut tombstone_gap = at_v11.clone();
         tombstone_gap["tables"]
@@ -3140,13 +3063,7 @@ mod tests {
                 table["name"] != "admin_api_tokens"
                     && table["name"] != "event_voice_channels"
                     && table["name"] != "event_voice_presence"
-                    && table["name"] != "starboard_config"
-                    && table["name"] != "starboard_starrers"
-                    && table["name"] != "starboard_posts"
-                    && table["name"] != "giveaways"
-                    && table["name"] != "giveaway_entries"
-                    && table["name"] != "giveaway_draws"
-                    && table["name"] != "event_instance_windows"
+                    && !fixture_tables_after(13).any(|later| table["name"] == later)
             })
             .collect();
         let mut old = manifest(tables);
@@ -3164,14 +3081,10 @@ mod tests {
                     "event_voice_channels",
                     "event_voice_presence",
                     "admin_api_tokens",
-                    "starboard_config",
-                    "starboard_starrers",
-                    "starboard_posts",
-                    "giveaways",
-                    "giveaway_entries",
-                    "giveaway_draws",
-                    "event_instance_windows"
                 ]
+                .into_iter()
+                .chain(fixture_tables_after(13))
+                .collect::<Vec<_>>()
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -3214,13 +3127,7 @@ mod tests {
             .filter(|table| {
                 table["name"] != "event_voice_channels"
                     && table["name"] != "event_voice_presence"
-                    && table["name"] != "starboard_config"
-                    && table["name"] != "starboard_starrers"
-                    && table["name"] != "starboard_posts"
-                    && table["name"] != "giveaways"
-                    && table["name"] != "giveaway_entries"
-                    && table["name"] != "giveaway_draws"
-                    && table["name"] != "event_instance_windows"
+                    && !fixture_tables_after(13).any(|later| table["name"] == later)
             })
             .collect();
         let mut old = manifest(tables);
@@ -3234,17 +3141,10 @@ mod tests {
             assert_eq!(contents.manifest.version, version);
             assert_eq!(
                 contents.manifest.missing_tables(),
-                [
-                    "event_voice_channels",
-                    "event_voice_presence",
-                    "starboard_config",
-                    "starboard_starrers",
-                    "starboard_posts",
-                    "giveaways",
-                    "giveaway_entries",
-                    "giveaway_draws",
-                    "event_instance_windows"
-                ]
+                ["event_voice_channels", "event_voice_presence"]
+                    .into_iter()
+                    .chain(fixture_tables_after(13))
+                    .collect::<Vec<_>>()
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -3291,17 +3191,10 @@ mod tests {
             assert_eq!(contents.manifest.tables.len(), 99);
             assert_eq!(
                 contents.manifest.missing_tables(),
-                [
-                    "event_voice_channels",
-                    "event_voice_presence",
-                    "starboard_config",
-                    "starboard_starrers",
-                    "starboard_posts",
-                    "giveaways",
-                    "giveaway_entries",
-                    "giveaway_draws",
-                    "event_instance_windows"
-                ]
+                ["event_voice_channels", "event_voice_presence"]
+                    .into_iter()
+                    .chain(fixture_tables_after(13))
+                    .collect::<Vec<_>>()
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -3400,15 +3293,7 @@ mod tests {
         assert_eq!(contents.manifest.tables.len(), 101);
         assert_eq!(
             contents.manifest.missing_tables(),
-            [
-                "starboard_config",
-                "starboard_starrers",
-                "starboard_posts",
-                "giveaways",
-                "giveaway_entries",
-                "giveaway_draws",
-                "event_instance_windows"
-            ]
+            fixture_tables_after(13).collect::<Vec<_>>()
         );
         assert_eq!(
             V13_ADDED_TABLES,
@@ -3572,6 +3457,10 @@ mod tests {
         let contents = inspect_bytes(&gzip_lines(&[released.clone(), end.clone()]))
             .expect("released v16 inventory remains readable");
         assert_eq!(contents.manifest.version, 16);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            fixture_tables_after(16).collect::<Vec<_>>()
+        );
         assert!(contents
             .manifest
             .tables
@@ -3596,7 +3485,7 @@ mod tests {
         // inventory even if the version waiver is accidentally removed.
         let v15_tables: Vec<Value> = complete_tables(&BTreeMap::new())
             .into_iter()
-            .filter(|table| table["name"] != "event_instance_windows")
+            .filter(|table| !fixture_tables_after(15).any(|later| table["name"] == later))
             .collect();
         let mut old = manifest(v15_tables);
         old["version"] = serde_json::json!(15);
@@ -3610,7 +3499,7 @@ mod tests {
         // pre-v16 restore leaves no liveness evidence (no legacy backfill).
         assert_eq!(
             contents.manifest.missing_tables(),
-            ["event_instance_windows"]
+            fixture_tables_after(15).collect::<Vec<_>>()
         );
         // v15 still requires its own inventory.
         let mut gap = old.clone();
@@ -3645,15 +3534,7 @@ mod tests {
         let without_giveaways = |tables: Vec<Value>| {
             tables
                 .into_iter()
-                .filter(|table| {
-                    ![
-                        "giveaways",
-                        "giveaway_entries",
-                        "giveaway_draws",
-                        "event_instance_windows",
-                    ]
-                    .contains(&table["name"].as_str().unwrap_or_default())
-                })
+                .filter(|table| !fixture_tables_after(14).any(|later| table["name"] == later))
                 .collect::<Vec<_>>()
         };
         let tables = without_giveaways(complete_tables(&BTreeMap::new()));
@@ -3668,12 +3549,7 @@ mod tests {
             assert_eq!(contents.manifest.version, version);
             assert_eq!(
                 contents.manifest.missing_tables(),
-                [
-                    "giveaways",
-                    "giveaway_entries",
-                    "giveaway_draws",
-                    "event_instance_windows"
-                ]
+                fixture_tables_after(14).collect::<Vec<_>>()
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -3734,17 +3610,7 @@ mod tests {
                 .into_iter()
                 .filter(|t| {
                     t.get("name").and_then(Value::as_str) != Some(name)
-                        && ![
-                            "starboard_config",
-                            "starboard_starrers",
-                            "starboard_posts",
-                            "giveaways",
-                            "giveaway_entries",
-                            "giveaway_draws",
-                            "event_instance_windows",
-                        ]
-                        .iter()
-                        .any(|n| t["name"] == *n)
+                        && !fixture_tables_after(13).any(|later| t["name"] == later)
                 })
                 .collect()
         }
@@ -3764,16 +3630,10 @@ mod tests {
         assert_eq!(contents.manifest.version, 5);
         assert_eq!(
             contents.manifest.missing_tables(),
-            [
-                "event_store",
-                "starboard_config",
-                "starboard_starrers",
-                "starboard_posts",
-                "giveaways",
-                "giveaway_entries",
-                "giveaway_draws",
-                "event_instance_windows"
-            ]
+            ["event_store"]
+                .into_iter()
+                .chain(fixture_tables_after(13))
+                .collect::<Vec<_>>()
         );
         // Dropping a v5-covered table from a v5 manifest still refuses.
         let mut v5_gap = v5.clone();
@@ -3803,33 +3663,17 @@ mod tests {
         v5[0]["version"] = serde_json::json!(5);
         v5[0]["tables"].as_array_mut().unwrap().retain(|t| {
             t.get("name").and_then(Value::as_str) != Some("event_store")
-                && ![
-                    "starboard_config",
-                    "starboard_starrers",
-                    "starboard_posts",
-                    "giveaways",
-                    "giveaway_entries",
-                    "giveaway_draws",
-                    "event_instance_windows",
-                ]
-                .iter()
-                .any(|n| t["name"] == *n)
+                && !fixture_tables_after(13).any(|later| t["name"] == later)
         });
         let contents = inspect_bytes(&gzip_lines(&v5)).expect("a v5 archive stays readable");
         assert_eq!(contents.manifest.version, 5);
         assert_eq!(contents.rows, 1);
         assert_eq!(
             contents.manifest.missing_tables(),
-            [
-                "event_store",
-                "starboard_config",
-                "starboard_starrers",
-                "starboard_posts",
-                "giveaways",
-                "giveaway_entries",
-                "giveaway_draws",
-                "event_instance_windows"
-            ]
+            ["event_store"]
+                .into_iter()
+                .chain(fixture_tables_after(13))
+                .collect::<Vec<_>>()
         );
 
         let mut future = good_dump();

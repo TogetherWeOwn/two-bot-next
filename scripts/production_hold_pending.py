@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """Find when a runtime-affecting main commit first became pending production.
 
-Answers one question from a full-depth local checkout: of the commits on main
-after the promoted commit, when did the first one land that deploy-staging
-would have built? Metadata only (file names and committer time), never
-patches, and no network, fetch or downloaded code.
+Answers one question from a full-depth local checkout: when did the first
+runtime-affecting commit after the promoted commit land on main? Metadata only
+(file names and committer time), never patches, and no network, fetch or
+downloaded code.
 
 History must be a first-parent, squash-merge line: promoted is an ancestor of
 main, every commit in between has exactly one parent, and the chain from main
 reaches promoted. Anything unreadable, shallow, diverged, merge-shaped or over
 a cap raises incident_issue.IncidentError; it never reports a false None.
 
-Each commit is judged on its own paths, so a staging run that failed on an
-early runtime commit still counts even when a later staging run succeeded.
-The ignore list mirrors `on.push.paths-ignore` in deploy-staging.yml; a push
-is skipped only when EVERY changed path matches. Renames are split
-(--no-renames) so the old path of a runtime file moved into docs still counts.
+Each commit is judged on its own paths, regardless of whether staging ran or
+succeeded. A commit with changes is excluded only when every changed path
+matches the metric's exclusion rules. Renames are split (--no-renames) so the
+old path of a runtime file moved into docs still counts.
 
 Bounded-subprocess policy: docs/bounded-subprocess-checks.md.
 """
@@ -37,8 +36,8 @@ MAX_OUTPUT_BYTES = 1024 * 1024
 
 SHA40 = re.compile(r"[0-9a-f]{40}\Z")
 
-# Mirrors deploy-staging.yml `paths-ignore`; scripts/ci/test_workflows.py pins
-# the workflow list and the tests here pin this copy against it.
+# These exclusions define the pending-age metric independently of deploy
+# triggers. scripts/ci/test_production_hold_pending.py pins the contract.
 IGNORED_PREFIXES = (
     "docs/",
     ".github/ISSUE_TEMPLATE/",
@@ -61,10 +60,10 @@ def _fail(message):
 
 
 def is_ignored(path):
-    """True when deploy-staging's paths-ignore matches this repo-relative path."""
+    """True when this repo-relative path is excluded from pending age."""
     if path in IGNORED_EXACT or path.startswith(IGNORED_PREFIXES):
         return True
-    # '*.md' is root-only: `*` never crosses '/', so nested READMEs deploy.
+    # Markdown is ignored only at the repository root unless otherwise excluded.
     return "/" not in path and path.endswith(".md")
 
 

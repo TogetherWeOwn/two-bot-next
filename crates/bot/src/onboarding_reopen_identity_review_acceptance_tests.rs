@@ -38,7 +38,7 @@ fn identity_runtime(db: &TestSchema, mock: &MockRest) -> OnboardingRuntime {
 fn invocation(id: u64, incoming_name: &str) -> Interaction {
     serde_json::from_value(json!({
         "application_id":"111", "authorizing_integration_owners":{"0":"22"},
-        "id":"333", "token":"identity-callback", "type":2, "version":1,
+        "id":"333", "token":"identity-callback", "type":2, "version":1, "attachment_size_limit":10485760,
         "guild_id":"22",
         "member":{
             "user":{"id":"44","username":"member","discriminator":"0","bot":false},

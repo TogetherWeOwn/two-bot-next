@@ -68,6 +68,8 @@ const EXPECTED_DISPOSITIONS: &[(&str, &str)] = &[
     ("voice_creators", ACCEPT_WITH_REASON),
     ("voice_game_aliases", ACCEPT_WITH_REASON),
     ("voice_guild_settings", ACCEPT_WITH_REASON),
+    // Derived calibration is discarded on restore, not replayed as source data.
+    ("voice_heat_hours", ACCEPT_WITH_REASON),
     ("voice_logging", ACCEPT_WITH_REASON),
     ("voice_logging_mention_members", ACCEPT_WITH_REASON),
     ("voice_logging_mention_roles", ACCEPT_WITH_REASON),
@@ -218,6 +220,7 @@ impl TestDb {
             include_str!("../migrations/0414_voice_rooms_custom_name.sql"),
             include_str!("../migrations/0416_voice_room_privacy.sql"),
             include_str!("../migrations/0422_voice_create_reservations.sql"),
+            include_str!("../migrations/0479_voice_heat_hours.sql"),
         ] {
             sqlx::raw_sql(migration).execute(&pool).await?;
         }

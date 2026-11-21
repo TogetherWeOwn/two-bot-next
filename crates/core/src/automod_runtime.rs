@@ -252,6 +252,26 @@ impl AutomodRuntime {
         preview_automod(message, mention_count, &self.config, &self.repeats)
     }
 
+    /// Freeze the invoker's history and policy before the audit wait, so a
+    /// later gateway event cannot evict a row relevant to the receipt clock.
+    #[must_use]
+    pub fn preview_snapshot(
+        &self,
+        guild_id: &str,
+        actor_id: &str,
+    ) -> Option<(
+        bool,
+        impl Fn(&AutomodMessage, usize) -> PreviewVerdict + use<>,
+    )> {
+        self.admits(Some(guild_id)).then(|| {
+            let config = self.effective_config();
+            let repeats = self.repeats.snapshot_for(guild_id, actor_id);
+            (config.dry_run, move |message: &AutomodMessage, mentions| {
+                preview_automod(message, mentions, &config, &repeats)
+            })
+        })
+    }
+
     /// The shared maintenance tick can expire idle authors without receiving
     /// another message. This does not inspect content or create any effects.
     pub fn expire_repeat_history(&mut self, now_ms: u64) {

@@ -252,13 +252,17 @@ An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.
 
-Four application tables are excluded, each with its reason inline in
-`EXCLUDED_TABLES`: `xp_cooldowns` (short-lived award throttles; restore clears
-target cooldowns), `discord_send_admission` (per-credential lane state that a
-recovered process re-learns), `gateway_onboarding_jobs` (a restart-recovery
+Application tables excluded in `EXCLUDED_TABLES` include `xp_cooldowns`
+(short-lived award throttles; restore clears target cooldowns),
+`discord_send_admission` (per-credential lane state that a recovered process
+re-learns), `gateway_onboarding_jobs` (a restart-recovery
 queue bound to a gateway session) and `automation_command_registry_resync`
 (the pending registry-publication marker; a recovered process republishes
-the complete custom-command set on boot regardless). The store chain's `rollback_journal` and
+the complete custom-command set on boot regardless). `voice_heat_hours` is
+also excluded: it is derived calibration, not source data. Restore clears it
+in the same transaction without `CASCADE` if the table exists, and skips it
+on older targets. A failed restore leaves it unchanged. Archives remain v16
+and readers still accept v3–v16. The store chain's `rollback_journal` and
 `rollback_watermarks` are excluded too: the journal is append-only
 cutover evidence (the `PgFunnelStore` funnel append and the production
 gateway batch writer in `crates/cutover/src/gateway_session.rs` journal each
@@ -278,13 +282,25 @@ chain (`crates/store/migrations`) is text-scanned for `CREATE TABLE`, so a
 new store table without a dump/exclude decision is refused rather than
 silently omitted from the backup.
 
+For an installed `web_v1.contract_meta` view (or its schema-qualified
+counterpart), restore keeps the destination's recorded `contract_version`,
+even if the archive contains an older version or no metadata row. Restore
+still validates and replays the archive's `guild_id`; it never keeps the old
+destination guild ID. If the view exists but its metadata row is missing,
+restore refuses before writing instead of guessing the installed version. Use
+a fresh migrated target with intact contract metadata. A migrated target without
+the view uses the archived metadata. Replay and version preservation commit
+together, so invalid metadata rolls back the restore.
+
 v3 must contain its original 22 table entries. It can lack later tables, but
 restore clears their old target rows and emits a warning in both dry-run and
-real-restore CLI output. One explicit infrastructure exception is the required
-`guild_settings_revision` singleton: an old archive that lacks it initializes
-`(TRUE, 0)` so subsequent settings writes work. `RestoreReport.initialized_tables`
-and CLI warnings identify that baseline as synthesized, **not archived data**.
-No settings values, rank ladder or other application history are synthesized.
+real-restore CLI output. If the archive lacks `guild_settings_revision`,
+restore initializes `(TRUE, 0)` so subsequent settings writes work. If the
+archive has no contract metadata row but the target has a version to preserve,
+restore initializes a singleton with that version and no stored guild ID.
+`RestoreReport.initialized_tables` and the CLI identify these baselines as
+**not archived data**. No settings values, rank ladder or other application
+history are synthesized.
 
 Restore ignores manifest ordering and inserts parents before children using the
 inventory. It acquires explicit `ACCESS EXCLUSIVE` table locks and truncates the

@@ -32,8 +32,8 @@ runtime fencing refuses access after authority ends and a refused sample stays
 failed, never idle or recovery. The deploy workflow's exact-SHA user-flow job
 remains mandatory; scheduled samples cannot certify it. Production has an
 independent job queue and no staging Environment, control credential or
-dependency. Keep the five-minute schedule; its ticks can no longer cancel queued
-deployments or promotion soaks through the lifecycle group's pending slot.
+dependency. Keep the five-minute schedule; its ticks never join the staging
+lifecycle queue for deployments and promotion soaks.
 
 This protocol remains unactivated. The workflow change is not evidence of zero
 idle runtime cost. Do not claim activation until the live resource/consumer
@@ -166,12 +166,12 @@ two-bot-next ALERT synthetic-user-flow:<staging|prod>: <failing checks>. Runbook
 ### Incident issues
 
 `scripts/incident_issue.py` is the one alert sink for this workflow, the
-daily staging rollback proof and the daily digest:
+on-demand staging rollback proof and the daily digest:
 
 | Check | Incident key | Opened by | Closed by |
 | --- | --- | --- | --- |
 | Staging / prod synthetic | `synthetic-user-flow:<env>` | ALERT | RECOVERY (first healthy sample) |
-| Daily staging rollback proof | `staging-rollback-proof` | failed proof or watch | next passing watch |
+| On-demand staging rollback proof | `staging-rollback-proof` | failed proof | manually after inspecting a passing proof |
 | Daily digest | `daily-digest` | owed digest not released | the agent who cuts the tag |
 
 The key lives in a hidden body marker (`<!-- incident-key: <key> -->`). An

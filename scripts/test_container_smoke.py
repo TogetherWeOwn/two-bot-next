@@ -569,7 +569,7 @@ class ContainerSmokeTests(unittest.TestCase):
         self.fixture.image_size = 142437143
         self.fixture.binary_size = 10287160
         self.assertEqual(smoke.IMAGE_MAX_BYTES, 112 * smoke.MIB)
-        self.assertEqual(smoke.BINARY_MAX_BYTES, 18 * smoke.MIB)
+        self.assertEqual(smoke.BINARY_MAX_BYTES, 20 * smoke.MIB)
         self.assert_rejected("image exceeds size budget")
         self.assertFalse(any("--detach" in args for args, _ in self.fixture.calls))
 
@@ -588,8 +588,12 @@ class ContainerSmokeTests(unittest.TestCase):
         self.assert_rejected("image exceeds size budget")
 
     def test_default_binary_budget_is_enforced(self):
-        self.fixture.binary_size = smoke.BINARY_MAX_BYTES + 1
+        self.fixture.binary_size = 20 * smoke.MIB + 1
         self.assert_rejected("release binary exceeds size budget")
+
+    def test_exact_default_binary_budget_is_allowed(self):
+        self.fixture.binary_size = 20 * smoke.MIB
+        self.run_smoke()
 
     def test_exact_budget_is_allowed(self):
         self.run_smoke(image_max_bytes=self.fixture.image_size, binary_max_bytes=self.fixture.binary_size)

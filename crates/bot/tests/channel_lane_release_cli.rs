@@ -84,6 +84,7 @@ fn interaction(id: u64, action: &str) -> Interaction {
     let permissions = ((1u64 << 4) | (1 << 13)).to_string();
     serde_json::from_value(json!({
         "id": id.to_string(), "application_id": "444444444444444444", "type": 2,
+        "attachment_size_limit": 10485760,
         "guild_id": GUILD, "channel": {"id": CHANNEL, "type": 0, "permissions": permissions},
         "data": {"id": "555555555555555555", "type": 1, "name": action,
                  "options": [{"name": "reason", "type": 3, "value": "fixture reconciliation"}]},

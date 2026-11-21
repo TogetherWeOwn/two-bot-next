@@ -26,18 +26,25 @@ Companions: [staging-soak.md](staging-soak.md) (lifecycle and acceptance),
 
 ## Gate 1 — container healthy at a pinned SHA
 
-The staging deployment is the `main` head it claims to be, and the process
-answers truthfully.
+The staging deployment serves the pinned `main` SHA, and the process answers
+truthfully. A merge does not prove staging deployment or qualification. Consult
+`deploy-staging.yml` at the relevant ref for its triggers. If qualifying evidence
+for the intended SHA is absent, keep the gate closed and promotion held. Follow
+only the separately authorized
+[qualification/recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
 
 | Check | Verification command | Expected value |
 |---|---|---|
-| Deploy green | `gh run list --workflow deploy-staging.yml --branch main --limit 1` | `conclusion: success`, head SHA recorded as the pinned SHA. Docs-only merges start no run, so `main` may be ahead of the pinned SHA by docs-only commits; confirm with `git diff --stat <pinned>..origin/main` that nothing outside the `deploy-staging.yml` `paths-ignore` list changed |
+| Deploy green | `gh run list --workflow deploy-staging.yml --branch main --commit <pinned> --limit 1 --json headSha,status,conclusion,url` | The latest run completed with `conclusion: success` on the pinned SHA; retain the exact-SHA rollout and qualification evidence. A newer merge or another SHA's run is not a substitute. |
 | Liveness | `curl -s -o /tmp/health.json -w '%{http_code}' "$STAGING_WORKER_URL/health"` | `200`, body `{"status":"ok"}` |
-| Readiness | `curl -s -o /tmp/readyz.json -w '%{http_code}' "$STAGING_WORKER_URL/readyz"` | `200` with `components` `[["process","ready"],["gateway","ready"],["database","ready"]]` (plus informational `jobs`) |
+| Readiness | `curl -s -o /tmp/readyz.json -w '%{http_code}' "$STAGING_WORKER_URL/readyz"` | `200` with `components` `[["process","ready"],["gateway","ready"],["database","ready"]]` (plus informational `jobs`) and `build_revision` exactly equal to the pinned SHA in the same response |
 
+A historical green run for the pin does not prove it is still serving. Use the
+existing reviewed staging readiness read path; a missing or mismatched live
+`build_revision` keeps the gate closed, even when both endpoints return `200`.
 `503` means the gateway is parked or starting — the gate is closed, not broken.
-Any other status (500/1101/…) means the deploy is broken: file a repair card,
-do not start the clock. `/health` 200 alone never passes this gate.
+Any other non-200 status (500/1101/…) means the deploy is broken: file a repair
+card, do not start the clock. `/health` 200 alone never passes this gate.
 
 ## Gate 2 — qualify entry (no passive wait)
 
@@ -73,7 +80,7 @@ checks between the Gate 1 readiness probe and the final pre-`T` probe:
 |---|---|---|
 | No readiness alerts | Worker-log query for `container_unready_alert` between the two probes | `0`; a `container_unready_recovery` without a preceding alert is fine |
 | No deployment | Existing authorized workflow execution-attempt verification for `main` over the recorded probe interval, including reruns and executions spanning either probe | `0` deployment executions; missing or incomplete attempt evidence closes the gate |
-| Final readiness | Same `/readyz` curl as Gate 1, before writing `T` | `200` with all three components `ready` |
+| Final readiness | Same `/readyz` curl as Gate 1, before writing `T` | Meets Gate 1 readiness expectations, including the pinned `build_revision` |
 
 Record the Gate 1 and final readiness probe timestamps as UTC in `GATE1_UTC`
 and `FINAL_UTC`. This paginated, explicitly read-only listing discovers
@@ -182,13 +189,15 @@ and historical records remain intact.
   it does not prove a deployed build, live event coverage or staging
   acceptance, so the Gate 5 recovery measurement stays NOT VERIFIED until a
   reviewed log source exists.
-- The staging deploy workflow documents a **95–139-second gateway drop per
-  deploy**, and a separate historical staging note records a **92–139-second
-  redeploy**. These are documented historical interruption ranges, not a
-  verified outage-start-to-recovery measurement. Interrupting planned redeploys
-  count as actual outages by default; historical warnings are not waivers.
-  These exercises cannot establish PASS without independently measured
-  under-60-second recovery and separately authorized stop/restore and budgets.
+- A [historical staging workflow comment](https://github.com/TogetherWeOwn/two-bot-next/blob/057a4b2cc0d67439c92eded1d25421852d32840f/.github/workflows/deploy-staging.yml#L10-L12)
+  warns of a **95–139-second gateway drop per deploy**. A separate historical
+  staging note records a **92–139-second redeploy**
+  ([boot-window record](discord-send-admission.md#cancellation-crash-unavailable-storage-and-recovery)).
+  These ranges are not verified outage-start-to-recovery measurements.
+  Interrupting planned redeploys count as actual outages by default;
+  historical warnings are not waivers. These exercises cannot establish PASS
+  without independently measured under-60-second recovery and separately
+  authorized stop/restore and budgets.
 - Flat memory and no error spikes remain requirements. Numeric RSS/error
   definitions are unaccepted; the historical B1 RSS receipt is not a new B2
   numeric criterion.
