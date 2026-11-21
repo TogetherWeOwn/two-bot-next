@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = []
-db = ["two-bot-core/db", "dep:sqlx", "dep:time"]
+db = ["two-bot-core/db", "dep:sqlx"]
 # Explicit service-DB acceptance lane; no credentialed Discord traffic.
 db-tests = ["db"]
 # Loopback-only origin seam for downstream acceptance tests; never enabled by runtime.
@@ -29,7 +29,7 @@ hyper-rustls = { workspace = true, features = ["http2", "rustls-platform-verifie
 hyper-util = { workspace = true, features = ["http2"] }
 rustls = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -40,7 +40,7 @@ twilight-gateway = { workspace = true }
 twilight-http = { workspace = true }
 twilight-model = { workspace = true }
 
-time = { workspace = true, optional = true }
+time = { workspace = true }
 
 # Local Discord doubles and measurement drivers only; none ship in release.
 [dev-dependencies]

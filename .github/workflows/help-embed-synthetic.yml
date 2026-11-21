@@ -205,6 +205,7 @@ jobs:
           set -euo pipefail
           cargo run --locked -p two-bot-discord --example help_embed_smoke_payloads -- "$RUNNER_TEMP/help-embed-payloads.json"
           test -s "$RUNNER_TEMP/help-embed-payloads.json"
+          cp "$RUNNER_TEMP/help-embed-payloads.json" "help-embed-synthetic-$GITHUB_RUN_ID-rendered.json"
       - name: Run the staging help embed smoke
         if: steps.gate.outputs.configured == 'true'
         env:

@@ -162,8 +162,9 @@ explicitly authorized, all-consumer-fenced reconciliation with effect and
 cooldown evidence; neither startup nor time alone clears the marker. This core
 capability does not enable or wire a new sender.
 
-If a strict claim is acknowledged after the attempt deadline, the transport
-refuses before starting the request and leaves the claim armed. The opt-in
+A strict permit returned by a poll crossing cutoff is settled as known unsent.
+Cancelling an acknowledged final check also triggers bounded, storage-only
+settlement. An unacknowledged claim cannot be cleared. The opt-in
 collector retains status and retry headers but omits the body when the body cap
 or attempt deadline expires before collection finishes. Only crate-internal
 code can validate a mutation. Storage shares the attempt cutoff; evidence does
