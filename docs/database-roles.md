@@ -294,11 +294,9 @@ their login status or silently removing memberships. It contains no passwords.
    to a member login; (c) the provisioning identity reapplies the reviewed full
    plan after migrations and view updates, then `verify` reads 0 findings.
    Install schema-matched views and helpers before bootstrap (1.0 on pre-heat
-   targets). Install current `sql/web_v1.sql` after pending migrations and before
-   the full role plan, using `public` as the bot-table search path. The plan grants
-   the heat view, not `voice_heat_hours`. If a 1.1 heat read returns insufficient
-   privilege before the grant, use the insufficient-data fallback. Functions stay
-   strict in both phases.
+   targets); functions stay strict in both phases. Apply `sql/web_v1.sql` after
+   migrations and before the full role plan with `public` as the bot-table search
+   path. See the [heat reader fallback](bot-site-contract.md#5-voice-heat-map--the-now-lines-measured-truth).
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
    tables are not transferred or granted to the runtime.

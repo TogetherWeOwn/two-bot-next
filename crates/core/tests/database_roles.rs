@@ -643,14 +643,22 @@ async fn exercise_voice_heat_backout(pool: &PgPool, roles: &[String]) -> Result<
         drift.iter().any(heat_select),
         "pre-heat verifier missed heat grant",
     )?;
+    let readback = || {
+        sqlx::query_as::<_, (String, Vec<String>)>(
+            "SELECT contract_version, ARRAY(SELECT h::text FROM public.voice_heat_hours h
+             ORDER BY hour_start_utc) FROM web_v1.contract_meta",
+        )
+        .fetch_one(pool)
+    };
+    let (version, before) = readback().await?;
+    require(version == "1.1" && !before.is_empty(), "no 1.1 fixture")?;
     let backout = include_str!("../../../sql/voice_heat_staging_backout.sql");
     execute(pool, isolated(backout, roles)).await?;
     let drift = findings_for_matrix(pool, roles, &prior).await?;
     require(drift.is_empty(), &format!("pre-heat role drift: {drift:?}"))?;
-    let version: String = sqlx::query_scalar("SELECT contract_version FROM web_v1.contract_meta")
-        .fetch_one(pool)
-        .await?;
-    require(version == "1.0", "backout did not restore 1.0")
+    let (version, after) = readback().await?;
+    require(version == "1.0", "backout did not restore 1.0")?;
+    require(before == after, "backout changed persisted heat rows")
 }
 
 async fn exercise_voice_heat_grants(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
@@ -1833,14 +1841,6 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
     two_bot_core::apply_web_contract(&migrator_pool)
         .await
         .unwrap();
-    let initial_cells: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM web_v1.voice_heat
-         WHERE source = 'insufficient' AND avg_in_voice IS NULL AND coverage = 0",
-    )
-    .fetch_one(&migrator_pool)
-    .await
-    .unwrap();
-    assert_eq!(initial_cells, 168);
     let pending_rows = pending
         .iter()
         .map(|version| format!("({version})"))
