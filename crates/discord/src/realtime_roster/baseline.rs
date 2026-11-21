@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use super::{
-    decode, event_change, wire, Change, Deserialize, Dispatch, GuildMarker, GuildScope, Id, Kind,
-    ProjectionError, RawValue,
+    decode, event_change, wire, Change, Deserialize, Dispatch, EntityType, GuildMarker, GuildScope,
+    Id, Kind, PrivacyLevel, ProjectionError, RawValue, ScheduledEventInput,
 };
 
 #[derive(Deserialize)]
@@ -45,8 +45,9 @@ pub fn scheduled_events(
         if decode::<GuildScope>(body, '{')?.guild_id != guild_id {
             return Err(ProjectionError::MalformedDispatch);
         }
-        let change = event_change(decode(body, '{')?)?;
-        let (id, event) = match change {
+        let input = decode(body, '{')?;
+        validate_baseline_row(&input)?;
+        let (id, event) = match event_change(input)? {
             Change::Upsert { id, value } => (id, Some(value)),
             Change::Remove { id } => (id, None),
         };
@@ -56,6 +57,22 @@ pub fn scheduled_events(
         events.extend(event);
     }
     Ok(Some(events))
+}
+
+// Validate the full row before projection can discard terminal events or
+// fields that are not part of the wire shape. Leave delta semantics unchanged.
+fn validate_baseline_row(input: &ScheduledEventInput) -> Result<(), ProjectionError> {
+    let valid_entity = match (&input.entity_type, input.channel_id, &input.entity_metadata) {
+        (EntityType::StageInstance | EntityType::Voice, Some(_), None) => true,
+        (EntityType::External, None, Some(metadata)) => {
+            metadata.location.is_some() && input.scheduled_end_time.is_some()
+        }
+        _ => false,
+    };
+    if input.privacy_level != PrivacyLevel::GuildOnly || !valid_entity {
+        return Err(ProjectionError::UnsupportedEvent);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -117,8 +134,14 @@ mod tests {
 
     #[test]
     fn explicit_list_projects_only_current_allowlisted_event_fields() {
+        let mut voice = event("95", 1);
+        voice["entity_type"] = json!(2);
+        voice["channel_id"] = json!("30");
+        voice["entity_metadata"] = Value::Null;
+        voice["scheduled_end_time"] = Value::Null;
         let raw = dispatch(json!({
-            "id": "10", "guild_scheduled_events": [event("91", 1), event("92", 2), event("93", 3), event("94", 4)]
+            "id": "10",
+            "guild_scheduled_events": [event("91", 1), event("92", 2), event("93", 3), event("94", 4), voice]
         }));
         let rows = scheduled_events(GUILD, &raw)
             .expect("valid dispatch")
@@ -129,9 +152,66 @@ mod tests {
                 {"id": "91", "channelId": null, "status": "scheduled", "title": "Tournament", "description": null,
                  "location": "Venue", "startsAt": "2026-11-21T13:00:00Z", "endsAt": "2026-11-21T15:00:00Z"},
                 {"id": "92", "channelId": null, "status": "active", "title": "Tournament", "description": null,
-                 "location": "Venue", "startsAt": "2026-11-21T13:00:00Z", "endsAt": "2026-11-21T15:00:00Z"}
+                 "location": "Venue", "startsAt": "2026-11-21T13:00:00Z", "endsAt": "2026-11-21T15:00:00Z"},
+                {"id": "95", "channelId": "30", "status": "scheduled", "title": "Tournament", "description": null,
+                 "location": null, "startsAt": "2026-11-21T13:00:00Z", "endsAt": null}
             ])
         );
+    }
+
+    #[test]
+    fn inconsistent_entity_fields_or_privacy_invalidate_the_whole_baseline() {
+        for (case, status, overrides) in [
+            (
+                "cancelled external with channel",
+                4,
+                json!({"channel_id": "30"}),
+            ),
+            (
+                "completed without guild-only privacy",
+                3,
+                json!({"privacy_level": 99}),
+            ),
+            (
+                "external without metadata",
+                2,
+                json!({"entity_metadata": null}),
+            ),
+            (
+                "external without location",
+                2,
+                json!({"entity_metadata": {"location": null}}),
+            ),
+            (
+                "external without end time",
+                2,
+                json!({"scheduled_end_time": null}),
+            ),
+            (
+                "stage with metadata",
+                2,
+                json!({"entity_type": 1, "channel_id": "30"}),
+            ),
+            (
+                "voice without channel",
+                2,
+                json!({"entity_type": 2, "entity_metadata": null}),
+            ),
+        ] {
+            let mut row = event("92", status);
+            for (key, value) in overrides.as_object().expect("fixture overrides") {
+                row[key.as_str()] = value.clone();
+            }
+            let raw =
+                dispatch(json!({"id": "10", "guild_scheduled_events": [event("91", 1), row]}));
+            assert!(
+                matches!(
+                    scheduled_events(GUILD, &raw),
+                    Err(ProjectionError::UnsupportedEvent)
+                ),
+                "{case}"
+            );
+        }
     }
 
     #[test]
