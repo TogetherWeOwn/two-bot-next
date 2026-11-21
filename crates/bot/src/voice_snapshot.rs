@@ -263,7 +263,6 @@ fn total_in_voice(rooms: &[RoomDraft]) -> usize {
         .sum()
 }
 
-#[cfg(test)]
 pub(crate) fn read_voice_total(
     cache: &two_bot_discord::SharedCache,
     guild_id: Snowflake,

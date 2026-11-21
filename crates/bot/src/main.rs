@@ -158,6 +158,7 @@ mod tracing_capture;
 // file is not loaded as two modules (clippy::duplicate_mod).
 #[cfg(test)]
 mod tuning_test_support;
+mod voice_heat_runtime;
 mod voice_snapshot;
 mod website_jobs;
 #[cfg(test)]
@@ -1024,6 +1025,7 @@ async fn run(cli_args: &[String]) {
         receiver,
         eventsub_receiver,
         member,
+        voice_cache,
     );
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,

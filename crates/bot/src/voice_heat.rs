@@ -1,4 +1,4 @@
-//! Dormant adapter from aggregate voice observations to hourly persistence.
+//! Adapter from aggregate voice observations to hourly persistence.
 //!
 //! This module does not read the gateway, start a timer or publish data. Its
 //! buffer is process-local: a restart leaves gaps rather than invented zeros.
