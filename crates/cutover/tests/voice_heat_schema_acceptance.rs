@@ -5,6 +5,9 @@ use two_bot_cutover::{rollback_delta::report, staging_migrate::MIGRATOR as CUTOV
 use two_bot_store::migrate;
 use two_bot_testsupport::TestDatabase;
 
+#[path = "support/pre_expand_privacy_acl.rs"]
+mod pre_expand_privacy_acl;
+
 type HeatShape = (Vec<(String, String, String, Option<String>)>, Vec<String>);
 
 async fn voice_heat_shape(pool: &Pool<Postgres>) -> HeatShape {
