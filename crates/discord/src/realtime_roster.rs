@@ -102,7 +102,6 @@ struct ScheduledEventInput {
     status: Status,
     name: String,
     description: Option<String>,
-    #[serde(default, deserialize_with = "event_metadata")]
     entity_metadata: Option<EventMetadata>,
     scheduled_start_time: String,
     scheduled_end_time: Option<String>,
@@ -111,17 +110,6 @@ struct ScheduledEventInput {
 #[derive(Deserialize)]
 struct EventMetadata {
     location: Option<String>,
-}
-
-fn event_metadata<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<EventMetadata>, D::Error> {
-    Option::<&RawValue>::deserialize(deserializer)?
-        .map(|raw| {
-            decode(raw.get(), '{')
-                .map_err(|_| serde::de::Error::custom("invalid scheduled event metadata"))
-        })
-        .transpose()
 }
 
 /// Read only supported operations for the configured guild from original gateway JSON.
@@ -186,13 +174,6 @@ fn member_change(input: MemberInput) -> Result<Operation, ProjectionError> {
 
 fn event_change(input: ScheduledEventInput) -> Result<Change<wire::Event>, ProjectionError> {
     let id = wire_id(input.id);
-    // Even a row that produces only a removal must be well-formed.
-    let starts_at = wire_time(&input.scheduled_start_time)?;
-    let ends_at = input
-        .scheduled_end_time
-        .as_deref()
-        .map(wire_time)
-        .transpose()?;
     let status = match input.status {
         Status::Scheduled => wire::EventStatus::Scheduled,
         Status::Active => wire::EventStatus::Active,
@@ -209,6 +190,10 @@ fn event_change(input: ScheduledEventInput) -> Result<Change<wire::Event>, Proje
         }
         _ => return Err(ProjectionError::UnsupportedEvent),
     };
+    let (starts_at, ends_at) = event_times(
+        &input.scheduled_start_time,
+        input.scheduled_end_time.as_deref(),
+    )?;
     Ok(Change::Upsert {
         id,
         value: wire::Event {
@@ -222,6 +207,13 @@ fn event_change(input: ScheduledEventInput) -> Result<Change<wire::Event>, Proje
             ends_at,
         },
     })
+}
+
+fn event_times(
+    start: &str,
+    end: Option<&str>,
+) -> Result<(wire::WireTime, Option<wire::WireTime>), ProjectionError> {
+    Ok((wire_time(start)?, end.map(wire_time).transpose()?))
 }
 
 fn wire_time(input: &str) -> Result<wire::WireTime, ProjectionError> {

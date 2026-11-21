@@ -1,17 +1,28 @@
 use std::collections::HashSet;
 
 use super::{
-    decode, event_change, wire, Change, Deserialize, Dispatch, EntityType, GuildMarker, GuildScope,
-    Id, Kind, PrivacyLevel, ProjectionError, RawValue, ScheduledEventInput,
+    decode, event_change, event_times, wire, Change, Deserialize, Dispatch, EntityType,
+    GuildMarker, Id, Kind, PrivacyLevel, ProjectionError, RawValue, ScheduledEventInput,
 };
 
 #[derive(Deserialize)]
-struct GuildInput<'a> {
+struct GuildHeader {
     id: Id<GuildMarker>,
     #[serde(default)]
     unavailable: bool,
+}
+
+#[derive(Deserialize)]
+struct EventList<'a> {
     #[serde(borrow)]
     guild_scheduled_events: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct RowHeader<'a> {
+    guild_id: Id<GuildMarker>,
+    #[serde(borrow)]
+    entity_metadata: Option<&'a RawValue>,
 }
 
 /// Read the events topic from an original `GUILD_CREATE` dispatch, before
@@ -29,12 +40,12 @@ pub fn scheduled_events(
     if !matches!(dispatch.kind()?, Some(Kind::GuildCreate)) {
         return Ok(None);
     }
-    let body = dispatch.d.ok_or(ProjectionError::MalformedDispatch)?;
-    let guild: GuildInput<'_> = decode(body.get(), '{')?;
-    if guild.id != guild_id || guild.unavailable {
+    let body = dispatch.d.ok_or(ProjectionError::MalformedDispatch)?.get();
+    let header: GuildHeader = decode(body, '{')?;
+    if header.id != guild_id || header.unavailable {
         return Ok(None);
     }
-    let list = guild
+    let list = decode::<EventList<'_>>(body, '{')?
         .guild_scheduled_events
         .ok_or(ProjectionError::MalformedDispatch)?;
     let rows: Vec<&RawValue> = decode(list.get(), '[')?;
@@ -42,7 +53,12 @@ pub fn scheduled_events(
     let mut events = Vec::new();
     for row in rows {
         let body = row.get();
-        if decode::<GuildScope>(body, '{')?.guild_id != guild_id {
+        let header: RowHeader<'_> = decode(body, '{')?;
+        if header.guild_id != guild_id
+            || header
+                .entity_metadata
+                .is_some_and(|raw| !raw.get().trim_start().starts_with('{'))
+        {
             return Err(ProjectionError::MalformedDispatch);
         }
         let input = decode(body, '{')?;
@@ -65,11 +81,22 @@ fn validate_baseline_row(input: &ScheduledEventInput) -> Result<(), ProjectionEr
     let valid_entity = match (&input.entity_type, input.channel_id, &input.entity_metadata) {
         (EntityType::StageInstance | EntityType::Voice, Some(_), None) => true,
         (EntityType::External, None, Some(metadata)) => {
-            metadata.location.is_some() && input.scheduled_end_time.is_some()
+            metadata
+                .location
+                .as_ref()
+                .is_some_and(|location| !location.is_empty())
+                && input.scheduled_end_time.is_some()
         }
         _ => false,
     };
-    if input.privacy_level != PrivacyLevel::GuildOnly || !valid_entity {
+    let (start, end) = event_times(
+        &input.scheduled_start_time,
+        input.scheduled_end_time.as_deref(),
+    )?;
+    if input.privacy_level != PrivacyLevel::GuildOnly
+        || !valid_entity
+        || end.is_some_and(|end| end.0 <= start.0)
+    {
         return Err(ProjectionError::UnsupportedEvent);
     }
     Ok(())
@@ -81,6 +108,7 @@ mod tests {
     use twilight_model::guild::Guild;
 
     use super::*;
+    use crate::realtime_roster::{project, Operation};
 
     const GUILD: Id<GuildMarker> = Id::new(10);
 
@@ -125,6 +153,8 @@ mod tests {
         for raw in [
             dispatch(json!({"id": "11", "guild_scheduled_events": []})),
             dispatch(json!({"id": "10", "unavailable": true, "guild_scheduled_events": []})),
+            r#"{"op":0,"t":"GUILD_CREATE","d":{"id":"11","guild_scheduled_events":null,"guild_scheduled_events":[]}}"#.into(),
+            r#"{"op":0,"t":"GUILD_CREATE","d":{"id":"10","unavailable":true,"guild_scheduled_events":null,"guild_scheduled_events":[]}}"#.into(),
             r#"{"op":0,"t":"GUILD_UPDATE","d":{"id":"10","guild_scheduled_events":[]}}"#.into(),
             r#"{"op":11,"t":"GUILD_CREATE","d":{"id":"10","guild_scheduled_events":[]}}"#.into(),
         ] {
@@ -160,12 +190,22 @@ mod tests {
     }
 
     #[test]
-    fn inconsistent_entity_fields_or_privacy_invalidate_the_whole_baseline() {
+    fn inconsistent_event_fields_invalidate_the_whole_baseline() {
         for (case, status, overrides) in [
             (
                 "cancelled external with channel",
                 4,
                 json!({"channel_id": "30"}),
+            ),
+            (
+                "completed external with end before start",
+                3,
+                json!({"scheduled_end_time": "2026-11-21T12:59:59Z"}),
+            ),
+            (
+                "cancelled external with empty location",
+                4,
+                json!({"entity_metadata": {"location": ""}}),
             ),
             (
                 "completed without guild-only privacy",
@@ -212,6 +252,29 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    #[test]
+    fn strict_baseline_checks_do_not_change_delta_projection() {
+        let delta = |row: Value| {
+            json!({"op": 0, "t": "GUILD_SCHEDULED_EVENT_UPDATE", "d": row}).to_string()
+        };
+        let mut terminal = event("91", 4);
+        terminal["scheduled_start_time"] = json!("invalid timestamp");
+        terminal["scheduled_end_time"] = json!("invalid timestamp");
+        assert!(matches!(
+            project(GUILD, &delta(terminal)),
+            Ok(Some(Operation::Events(Change::Remove { .. })))
+        ));
+
+        let mut voice = event("92", 1);
+        voice["entity_type"] = json!(2);
+        voice["channel_id"] = json!("30");
+        voice["entity_metadata"] = json!(["ignored location"]);
+        assert!(matches!(
+            project(GUILD, &delta(voice)),
+            Ok(Some(Operation::Events(Change::Upsert { value, .. }))) if value.location.is_none()
+        ));
     }
 
     #[test]
