@@ -197,6 +197,19 @@ fn initial_and_descendant_help_messages_belong_to_the_clicking_actor() {
 }
 
 #[test]
+fn help_cursor_requires_the_exact_enabled_source_button() {
+    for (field, value) in [
+        ("custom_id", json!("other-button")),
+        ("disabled", json!(true)),
+    ] {
+        let mut payload = click_fixture();
+        payload["message"]["components"][0]["components"][0][field] = value;
+        let interaction = serde_json::from_value(payload).expect("click");
+        assert_eq!(source_cursor(&interaction, 2, 2), None, "changed {field}");
+    }
+}
+
+#[test]
 fn help_cursor_does_not_authorize_a_different_actor_or_source() {
     for (path, value) in [
         ("/application_id", json!("5")),
