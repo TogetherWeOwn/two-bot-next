@@ -56,6 +56,10 @@ on:
         description: Intentionally redeploy a prior main commit supplied in sha; never qualifies as staging history
         type: boolean
         default: false
+      verify_automod_preview:
+        description: Require a GET-only AutoMod preview receipt on a clean current-main rollout
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -724,6 +728,12 @@ jobs:
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          STAGING_PREVIEW_AUTHORIZATION: >-
+            ${{ inputs.verify_automod_preview && !inputs.recover_prior_sha && !inputs.inject_error_rate_spike &&
+            needs.deploy.outputs.promotion_clean == 'true' && needs.deploy.outputs.staging_use_sha == github.sha &&
+            format('Bearer {0}', secrets.STAGING_OWNERSHIP_CONTROL_TOKEN) || '' }}
+          STAGING_USE_DEPLOYMENT: ${{ needs.deploy.outputs.staging_use_deployment }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.deploy.outputs.staging_use_expires_at }}
         run: |
           set -euo pipefail
           if [ -z "$STAGING_WORKER_URL" ]; then

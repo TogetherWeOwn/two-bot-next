@@ -29,6 +29,7 @@ import {
   authenticated, deploymentId, readChange, readControlBody, refused,
 } from "./ownership.ts";
 import { StagingLifecycle, STAGING_USE_PATH, parseStagingUseChange, type StagingUse } from "./staging-lifecycle.ts";
+import { PREVIEW_HEADER, previewRefusal, readPreview } from "./staging-preview.ts";
 import {
   TokenBuckets,
   RedirectMissCache,
@@ -1026,8 +1027,12 @@ export class TwoBotContainer extends Container<Env> {
       && url.pathname !== OPS_METRICS_PATH && !OPS_JSON_PATHS.includes(url.pathname)) {
       return new Response("not found", { status: 404, headers: withSecurityHeaders() });
     }
+    const preview = url.pathname === "/readyz" && this.boundedStaging() && request.headers.has(PREVIEW_HEADER);
+    const previewDenied = preview && await previewRefusal(request, url, this.env.OWNERSHIP_CONTROL_TOKEN);
+    if (previewDenied) return previewDenied;
+    let admitted: StagingUse | undefined;
     try {
-      return await this.owned(async () => {
+      const response = await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
         // Reached only through the Worker's ops gates (see default export).
         // MCP's internal dispatch reads the Rust audit, not the DO's admin
@@ -1120,7 +1125,9 @@ export class TwoBotContainer extends Container<Env> {
         // abort-shaped bodies are released best-effort without replacing
         // the fixed refusal.
         const probeSignal = AbortSignal.timeout(6000);
-        const probe = new Request(request, { signal: probeSignal });
+        const probe = new Request(request, { signal: probeSignal, redirect: preview ? "manual" : request.redirect });
+        if (preview) admitted = await this.previewUse(request);
+        for (const name of [PREVIEW_HEADER, "authorization"]) probe.headers.delete(name);
         let probeResponse: Response;
         try {
           probeResponse = await deadlineFetch(this.containerFetch(probe), probeSignal);
@@ -1149,7 +1156,78 @@ export class TwoBotContainer extends Container<Env> {
           return containerUnavailable(this.env.CF_VERSION_METADATA?.id);
         }
       });
+      return admitted && response.status === 200 ? await this.stagingPreview(request, admitted, response) : response;
     } catch (error) { return refused(error); }
+  }
+
+  private async previewUse(request: Request): Promise<StagingUse> {
+    const id = this.id();
+    const owner = await this.ownership.require(id, request.headers.get(DEPLOYMENT_HEADER) ?? "");
+    const use = await this.stagingUse.require({ deploymentId: id, sha: this.env.CONTAINER_RELEASE ?? "", owner });
+    if (this.recoveryFailed || Date.now() >= use.expiresAt || request.headers.get(PREVIEW_HEADER)
+      !== [id, use.sha, use.runId, use.runAttempt, use.expiresAt].join(":")) {
+      throw new OwnershipRefused("staging_use_required");
+    }
+    return use;
+  }
+
+  private async stagingPreview(request: Request, admitted: StagingUse, response: Response): Promise<Response> {
+    const { deploymentId, sha, runId, runAttempt, expiresAt } = admitted;
+    const signal = AbortSignal.timeout(Math.max(0, Math.min(8_000, expiresAt - Date.now())));
+    const allowed = <T>(operation: () => T) => abortable(this.gated(async () => {
+      const use = await this.previewUse(request);
+      if (use.epoch !== admitted.epoch || use.acquiredAt !== admitted.acquiredAt || !this.ctx.container?.running) {
+        throw new OwnershipRefused("staging_use_required");
+      }
+      signal.throwIfAborted();
+      return operation();
+    }), signal);
+    const send = async (start: () => Promise<Response>) => (await allowed(() => {
+      const work = deadlineFetch(start(), signal);
+      void work.catch(() => {}); // Admission can time out before handing off the work.
+      return { work };
+    })).work;
+    const jsonText = async (res: Response, limit: number, readiness = false): Promise<string> => {
+      if (!(readiness ? isBotProbeResponse(res) : res.status === 200) || res.redirected || res.headers.has("location")) {
+        releaseBody(res);
+        throw new Error("staging_preview_unavailable");
+      }
+      return await readBoundedText(res, limit, signal) ?? "";
+    };
+    const serving = (body: string, status = 200) => {
+      const report = JSON.parse(body), rows = report?.components;
+      const names = ["process", "gateway", "database", "token_invalid"];
+      if (report?.build_revision !== sha || report.build_id !== `${runId}-${runAttempt}`
+        || report.error != null || (status === 200 && report.gateway_failure != null)
+        || !report.jobs || typeof report.jobs !== "object" || Array.isArray(report.jobs)
+        || !Array.isArray(rows) || rows.length !== names.length || !rows.every((row, i) =>
+          Array.isArray(row) && row.length === 2 && row[0] === names[i] && ["ready", "starting", "down"].includes(row[1]))
+        || rows.every((row) => row[1] === "ready") !== (status === 200)) {
+        throw new Error("staging_preview_identity");
+      }
+    };
+    const readyReply = (body: string, status: number) => new Response(body, { status,
+      headers: { "content-type": "application/json", "cache-control": "no-store" } });
+    try {
+      const body = await jsonText(response, MAX_PROBE_BODY_BYTES);
+      serving(body);
+      const registryOk = await readPreview(this.env, async (url, token) => JSON.parse(await jsonText(await send(() =>
+        fetch(url, { method: "GET", redirect: "error", cache: "no-store", signal,
+          headers: { authorization: `Bot ${token}` } })), 256 * 1024))).then(() => true, () => false);
+      if (!registryOk) return await allowed(() => readyReply(body, 200));
+      const final = await send(() => this.ctx.container!.getTcpPort(this.defaultPort).fetch(
+        new Request("http://c/readyz", { method: "GET", redirect: "manual", signal })));
+      const finalBody = await jsonText(final, MAX_PROBE_BODY_BYTES, true);
+      serving(finalBody, final.status);
+      return final.status === 503 ? readyReply(finalBody, 503) : await allowed(() => {
+        const result = readyReply(finalBody, 200);
+        result.headers.set(PREVIEW_HEADER, JSON.stringify({ registry: "pass", command: "automod-preview",
+          deploymentId, sha, runId, runAttempt, expiresAt }));
+        return result;
+      });
+    } catch {
+      return readyReply('{"ready":false}', 503);
+    }
   }
 
   /**
@@ -2226,6 +2304,10 @@ export default {
           }),
         });
       }
+      const preview = url.pathname === "/readyz" && request.headers.has(PREVIEW_HEADER)
+        && env.TWO_DEPLOY_ENV === "staging" && env.STAGING_RUNTIME_POLICY === "bounded";
+      const previewDenied = preview && await previewRefusal(request, url, env.OWNERSHIP_CONTROL_TOKEN);
+      if (previewDenied) return previewDenied;
       // Sanitize the forwarded probe: keep the origin (Host) the Container
       // expects, but drop the query, caller headers and body. The DO sees the
       // Worker-stamped deployment id the fence requires, plus the validated
@@ -2246,6 +2328,10 @@ export default {
           method: request.method,
           headers: { [DEPLOYMENT_HEADER]: deployment, [REQUEST_ID_HEADER]: probeId },
         });
+        if (preview) {
+          sanitized.headers.set(PREVIEW_HEADER, request.headers.get(PREVIEW_HEADER)!);
+          sanitized.headers.set("authorization", request.headers.get("authorization")!);
+        }
         const upstream = await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         // SDK startup failures arrive as responses rather than rejections.
         // Cancel without reading: a huge non-bot body must not bypass the
@@ -2264,6 +2350,7 @@ export default {
       // The outer Worker owns provenance, not the container or DO version.
       // Copy the response to get mutable headers without changing status/body.
       const result = new Response(response.body, response);
+      if (!preview) result.headers.delete(PREVIEW_HEADER);
       if (env.CF_VERSION_METADATA) {
         result.headers.set("x-two-worker-version", env.CF_VERSION_METADATA.id);
       } else {
