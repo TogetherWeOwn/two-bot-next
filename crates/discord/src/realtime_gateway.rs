@@ -1,16 +1,21 @@
 //! Project allowlisted gateway events into realtime v1 operations. No I/O.
 
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 use twilight_model::{
-    channel::{permission_overwrite::PermissionOverwriteType, Channel, ChannelType},
-    gateway::event::Event,
-    guild::Role,
-    id::{marker::GuildMarker, Id},
+    channel::{permission_overwrite::PermissionOverwriteType, ChannelType},
+    gateway::payload::incoming::{GuildUpdate, RoleDelete, VoiceStateUpdate},
+    id::{
+        marker::{ChannelMarker, GenericMarker, GuildMarker, RoleMarker},
+        Id,
+    },
 };
 use two_bot_core::realtime_wire as wire;
 use wire::{Change, Operation};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectionError {
+    InvalidPayload,
     UnknownChannelKind,
     IncompleteChannel,
     UnsupportedOverwrite,
@@ -18,34 +23,58 @@ pub enum ProjectionError {
 }
 
 /// Project a topology or voice change for the configured guild only.
+/// Pass the dispatch type (`t`) and original data (`d`) from the same Discord
+/// envelope, before Twilight's permission decoder can truncate unknown bits.
 /// `Ok(None)` is outside this allowlist. An error means the reducer cannot
 /// apply the update safely and must rebuild rather than keep its old state.
 /// The reducer still owns codec validation, reference cleanup and sequencing.
 pub fn project(
     guild_id: Id<GuildMarker>,
-    event: &Event,
+    event_type: &str,
+    payload: &Value,
 ) -> Result<Option<Operation>, ProjectionError> {
-    if event.guild_id() != Some(guild_id) {
+    let scope_key = if event_type == "GUILD_UPDATE" {
+        "id"
+    } else {
+        "guild_id"
+    };
+    if Id::<GuildMarker>::deserialize(&payload[scope_key]).ok() != Some(guild_id) {
         return Ok(None);
     }
 
-    let operation = match event {
-        Event::ChannelCreate(channel) => return channel_change(&channel.0, false),
-        Event::ChannelUpdate(channel) => return channel_change(&channel.0, false),
-        Event::ChannelDelete(channel) => return channel_change(&channel.0, true),
-        Event::GuildUpdate(guild) => Operation::Guild(Change::Upsert {
-            id: wire_id(guild_id),
-            value: wire::Guild {
-                owner_id: wire_id(guild.owner_id),
-                afk_channel_id: guild.afk_channel_id.map(wire_id),
-            },
-        }),
-        Event::RoleCreate(event) => role_change(&event.role),
-        Event::RoleUpdate(event) => role_change(&event.role),
-        Event::RoleDelete(event) => Operation::Roles(Change::Remove {
-            id: wire_id(event.role_id),
-        }),
-        Event::VoiceStateUpdate(state) => {
+    let operation = match event_type {
+        "CHANNEL_CREATE" | "CHANNEL_UPDATE" | "CHANNEL_DELETE" => {
+            return channel_change(payload, event_type == "CHANNEL_DELETE");
+        }
+        "GUILD_UPDATE" => {
+            let guild: GuildUpdate = decode(payload)?;
+            Operation::Guild(Change::Upsert {
+                id: wire_id(guild_id),
+                value: wire::Guild {
+                    owner_id: wire_id(guild.owner_id),
+                    afk_channel_id: guild.afk_channel_id.map(wire_id),
+                },
+            })
+        }
+        "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" => {
+            let role: RoleRow = decode(&payload["role"])?;
+            let id = wire_id(role.id);
+            Operation::Roles(Change::Upsert {
+                id,
+                value: wire::Role {
+                    id,
+                    permissions: role.permissions,
+                },
+            })
+        }
+        "GUILD_ROLE_DELETE" => {
+            let event: RoleDelete = decode(payload)?;
+            Operation::Roles(Change::Remove {
+                id: wire_id(event.role_id),
+            })
+        }
+        "VOICE_STATE_UPDATE" => {
+            let state: VoiceStateUpdate = decode(payload)?;
             let id = wire_id(state.user_id);
             Operation::Voice(match state.channel_id {
                 Some(channel_id) => Change::Upsert {
@@ -67,18 +96,55 @@ fn wire_id<M>(id: Id<M>) -> wire::Id {
     wire::Id(id.into_nonzero())
 }
 
-fn role_change(role: &Role) -> Operation {
-    let id = wire_id(role.id);
-    Operation::Roles(Change::Upsert {
-        id,
-        value: wire::Role {
-            id,
-            permissions: wire::Permissions(role.permissions.bits()),
-        },
-    })
+fn decode<'a, T: Deserialize<'a>>(payload: &'a Value) -> Result<T, ProjectionError> {
+    T::deserialize(payload).map_err(|_| ProjectionError::InvalidPayload)
 }
 
-fn channel_change(channel: &Channel, delete: bool) -> Result<Option<Operation>, ProjectionError> {
+fn permission_mask<'de, D: Deserializer<'de>>(d: D) -> Result<wire::Permissions, D::Error> {
+    let mask = <&str>::deserialize(d)?;
+    if !mask.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(serde::de::Error::custom("permission mask is not decimal"));
+    }
+    mask.parse()
+        .map(wire::Permissions)
+        .map_err(serde::de::Error::custom)
+}
+
+#[derive(Deserialize)]
+struct RoleRow {
+    id: Id<RoleMarker>,
+    #[serde(deserialize_with = "permission_mask")]
+    permissions: wire::Permissions,
+}
+
+#[derive(Deserialize)]
+struct ChannelKey {
+    id: Id<ChannelMarker>,
+    #[serde(rename = "type")]
+    kind: ChannelType,
+}
+
+#[derive(Deserialize)]
+struct ChannelRow {
+    name: Option<String>,
+    parent_id: Option<Id<ChannelMarker>>,
+    position: Option<i32>,
+    permission_overwrites: Option<Vec<OverwriteRow>>,
+}
+
+#[derive(Deserialize)]
+struct OverwriteRow {
+    id: Id<GenericMarker>,
+    #[serde(rename = "type")]
+    kind: PermissionOverwriteType,
+    #[serde(deserialize_with = "permission_mask")]
+    allow: wire::Permissions,
+    #[serde(deserialize_with = "permission_mask")]
+    deny: wire::Permissions,
+}
+
+fn channel_change(payload: &Value, delete: bool) -> Result<Option<Operation>, ProjectionError> {
+    let channel: ChannelKey = decode(payload)?;
     let kind = match channel.kind {
         ChannelType::GuildVoice => wire::ChannelKind::Voice,
         ChannelType::GuildStageVoice => wire::ChannelKind::Stage,
@@ -100,15 +166,12 @@ fn channel_change(channel: &Channel, delete: bool) -> Result<Option<Operation>, 
         return Ok(Some(Operation::Channels(Change::Remove { id })));
     }
 
-    let name = channel
-        .name
-        .clone()
-        .ok_or(ProjectionError::IncompleteChannel)?;
+    let channel: ChannelRow = decode(payload)?;
+    let name = channel.name.ok_or(ProjectionError::IncompleteChannel)?;
     let overwrites = channel
         .permission_overwrites
-        .as_deref()
         .ok_or(ProjectionError::IncompleteChannel)?
-        .iter()
+        .into_iter()
         .map(|entry| {
             let kind = match entry.kind {
                 PermissionOverwriteType::Role => wire::OverwriteKind::Role,
@@ -118,8 +181,8 @@ fn channel_change(channel: &Channel, delete: bool) -> Result<Option<Operation>, 
             Ok(wire::Overwrite {
                 kind,
                 id: wire_id(entry.id),
-                allow: wire::Permissions(entry.allow.bits()),
-                deny: wire::Permissions(entry.deny.bits()),
+                allow: entry.allow,
+                deny: entry.deny,
             })
         })
         .collect::<Result<_, _>>()?;
