@@ -18,11 +18,7 @@ pub struct VoiceMoveRoster<'a> {
     holds: &'a Mutex<VoiceMoveHolds>,
 }
 
-struct VoiceMoveProof {
-    from: Snowflake,
-    limit: u32,
-    epoch: Arc<()>,
-}
+type VoiceMoveProof = (Snowflake, u32, Arc<()>);
 
 /// Terminal decision and scalar evidence. `DiscordUnavailable` may mean the
 /// provider acted but a successful receipt could not be confirmed.
@@ -72,24 +68,24 @@ impl<'a> VoiceMoveRoster<'a> {
         expected_epoch: &Arc<()>,
         use_roster: impl FnOnce(Option<Snowflake>, u32, &mut VoiceMoveHolds) -> Option<T>,
     ) -> Option<T> {
-        let mut holds = self.holds.lock().ok()?;
-        self.cache
-            .with_guild_policy_snapshot(guild, |cache, epoch| {
-                Arc::ptr_eq(epoch, expected_epoch).then_some(())?;
-                let guild = Id::new(guild);
-                (cache.guild(guild)?.unavailable() != Some(true)).then_some(())?;
-                // The rebuilt roster, not a possibly retained voice state, owns membership.
-                let (mut source, mut count) = (None, 0u32);
-                let roster = cache.guild_voice_states(guild);
-                for user in roster.as_deref().into_iter().flatten() {
-                    let room = cache.voice_state(*user, guild)?.channel_id().get();
-                    if user.get() == member {
-                        source = Some(room);
-                    }
-                    count = count.checked_add(u32::from(room == target))?;
+        let Self { cache, holds } = self;
+        let mut holds = holds.lock().ok()?;
+        cache.with_guild_policy_snapshot(guild, |cache, epoch| {
+            Arc::ptr_eq(epoch, expected_epoch).then_some(())?;
+            let guild = Id::new(guild);
+            (cache.guild(guild)?.unavailable() != Some(true)).then_some(())?;
+            // The rebuilt roster, not a possibly retained voice state, owns membership.
+            let (mut source, mut count) = (None, 0u32);
+            let roster = cache.guild_voice_states(guild);
+            for user in roster.as_deref().into_iter().flatten() {
+                let room = cache.voice_state(*user, guild)?.channel_id().get();
+                if user.get() == member {
+                    source = Some(room);
                 }
-                use_roster(source, count, &mut holds)
-            })?
+                count = count.checked_add(u32::from(room == target))?;
+            }
+            use_roster(source, count, &mut holds)
+        })?
     }
 }
 
@@ -117,7 +113,7 @@ impl ActionExecutor {
             return no_evidence;
         };
         let ids_numeric = [guild, member, target];
-        let VoiceMoveProof { from, limit, epoch } = match self
+        let (from, limit, epoch) = match self
             .check_move(roster, ids_numeric, deadline, &ready, true)
             .await
         {
@@ -215,11 +211,7 @@ impl ActionExecutor {
                         if reserve {
                             holds.reserve(member, target).ok()?;
                         }
-                        Some(Ok(VoiceMoveProof {
-                            from,
-                            limit,
-                            epoch: Arc::clone(&epoch),
-                        }))
+                        Some(Ok((from, limit, Arc::clone(&epoch))))
                     }
                     VoiceMoveDecision::Incomplete => None,
                 }

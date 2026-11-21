@@ -414,6 +414,7 @@ enum MoveVeto {
     PolicyDuringReads(u32),
     MemberRole,
     MemberTimeout,
+    MessageRole,
     Cutoff,
 }
 
@@ -430,20 +431,18 @@ impl SendAdmission for PausedAdmission {
     }
     fn admit_until(&self, at: Instant) -> ClaimFuture<'_> {
         Box::pin(async move {
-            let pause = {
-                let mut veto = self.1.lock().unwrap();
-                match veto.as_mut() {
-                    Some(MoveVeto::PolicyDuringReads(remaining)) if *remaining > 1 => {
-                        *remaining -= 1;
-                        false
-                    }
-                    Some(MoveVeto::PolicyDuringReads(_)) => {
-                        *veto = None;
-                        true
-                    }
-                    _ => false,
-                }
-            };
+            let pause = self
+                .1
+                .lock()
+                .unwrap()
+                .take_if(|veto| {
+                    let MoveVeto::PolicyDuringReads(remaining) = veto else {
+                        return false;
+                    };
+                    *remaining -= 1;
+                    *remaining == 0
+                })
+                .is_some();
             if pause {
                 self.2.wait().await;
             }
@@ -488,7 +487,8 @@ fn move_facts() -> [(StatusCode, Value); 6] {
 async fn governed_voice_move_checks_the_ordered_roster_and_reuses_unsent_lane() {
     use two_bot_discord::executor::member::VoiceMoveRoster;
     use MoveVeto::{
-        Capacity, Cutoff, MemberRole, MemberTimeout, PolicyDuringReads, Readiness, Source,
+        Capacity, Cutoff, MemberRole, MemberTimeout, MessageRole, PolicyDuringReads, Readiness,
+        Source,
     };
     let vetoes = [
         (Capacity, 6),
@@ -498,6 +498,7 @@ async fn governed_voice_move_checks_the_ordered_roster_and_reuses_unsent_lane() 
         (PolicyDuringReads(6), 6),
         (MemberTimeout, 6),
         (MemberRole, 6),
+        (MessageRole, 6),
         (Cutoff, 6),
     ];
     let Some(db) = database().await else { return };
@@ -569,19 +570,29 @@ async fn governed_voice_move_checks_the_ordered_roster_and_reuses_unsent_lane() 
                 let event = Event::ChannelUpdate(Box::new(room));
                 pipeline.handle(&event).await.unwrap();
             }
-            MemberTimeout | MemberRole => {
-                // No roster change. Change the timeout once, then only the roles.
+            MemberTimeout | MemberRole | MessageRole => {
                 let mut state = voice_state(FIRST, Some(SOURCE));
                 let mut member = voice_member(FIRST, false);
-                member["communication_disabled_until"] = json!("2026-09-30T00:00:00Z");
+                member["communication_disabled_until"] = member["joined_at"].clone();
                 if veto == MemberRole {
                     member["roles"] = json!(["44"]);
                 }
-                state.0.member = Some(serde_json::from_value(member).unwrap());
-                pipeline
-                    .handle(&Event::VoiceStateUpdate(Box::new(state)))
-                    .await
-                    .unwrap();
+                // Remove the role through a message before publishing the matching voice frame.
+                if veto == MessageRole {
+                    let message = serde_json::from_value(json!({
+                        "id": "50", "guild_id": staging_guild(), "channel_id": "37", "type": 0,
+                        "author": member["user"], "member": member, "content": "fixture",
+                        "timestamp": member["joined_at"], "tts": false, "mention_everyone": false,
+                        "mentions": [], "mention_roles": [], "attachments": [], "embeds": [],
+                        "pinned": false
+                    }))
+                    .expect("message member fixture");
+                    let event = Event::MessageCreate(Box::new(message));
+                    pipeline.handle(&event).await.unwrap();
+                }
+                state.0.member = Some(serde_json::from_value(member).expect("member fixture"));
+                let event = Event::VoiceStateUpdate(Box::new(state));
+                pipeline.handle(&event).await.unwrap();
             }
             Cutoff => tokio::time::sleep_until(deadline).await,
         }

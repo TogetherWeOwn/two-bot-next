@@ -813,14 +813,10 @@ impl HyperTransport {
         request: &Request,
         deadline: Instant,
     ) -> Result<StrictEvidenceHeaders<'_>, StrictTransportError> {
-        self.send_strict_evidence_headers_after(
-            request,
-            deadline,
-            std::future::ready(true),
-            &|start| start(),
-            || {},
-        )
-        .await
+        let check = std::future::ready(true);
+        let commit = |start: &mut dyn FnMut()| start();
+        self.send_strict_evidence_headers_after(request, deadline, check, &commit, || {})
+            .await
     }
 
     async fn send_strict_evidence_headers_after(
@@ -5316,16 +5312,11 @@ mod tests {
             std::task::Poll::Ready(())
         });
         let at = Instant::now() + Duration::from_secs(1);
-        poll_wire_with_commit(
-            at,
-            &|start| {
-                let _held = fence.lock().unwrap();
-                start();
-            },
-            work,
-        )
-        .await
-        .unwrap();
+        let commit = |start: &mut dyn FnMut()| {
+            let _held = fence.lock().unwrap();
+            start();
+        };
+        poll_wire_with_commit(at, &commit, work).await.unwrap();
     }
 
     #[tokio::test]

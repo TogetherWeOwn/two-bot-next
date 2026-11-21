@@ -565,8 +565,15 @@ impl SharedCache {
 }
 
 fn voice_policy_guild(cache: &InMemoryCache, event: &Event) -> Option<Snowflake> {
-    // Invalidate conservatively: these frames can change eligibility, seat
-    // limits, overwrites, role hierarchy, membership, or communication timeout.
+    let changed = |guild: Option<Id<_>>, user, roles: &[_], timeout| {
+        let guild = guild?;
+        cache
+            .member(guild, user)
+            .is_none_or(|prior| {
+                prior.roles() != roles || prior.communication_disabled_until() != timeout
+            })
+            .then_some(guild.get())
+    };
     match event {
         Event::GuildUpdate(guild) => Some(guild.id.get()),
         Event::ChannelCreate(channel) => channel.guild_id.map(Id::get),
@@ -578,20 +585,33 @@ fn voice_policy_guild(cache: &InMemoryCache, event: &Event) -> Option<Snowflake>
         Event::MemberAdd(member) => Some(member.guild_id.get()),
         Event::MemberUpdate(member) => Some(member.guild_id.get()),
         Event::MemberRemove(member) => Some(member.guild_id.get()),
-        Event::VoiceStateUpdate(update) => {
-            // Twilight also caches the embedded member. Compare before publishing it.
-            let guild = update.0.guild_id?;
-            let member = update.0.member.as_ref()?;
-            cache
-                .member(guild, member.user.id)
-                .is_none_or(|prior| {
-                    prior.roles() != member.roles.as_slice()
-                        || prior.communication_disabled_until()
-                            != member.communication_disabled_until
-                })
-                .then_some(guild.get())
+        Event::MemberChunk(chunk) if !chunk.members.is_empty() => Some(chunk.guild_id.get()),
+        // Twilight may cache both the invoking/resolved members and resolved roles.
+        Event::InteractionCreate(interaction) => interaction.guild_id.map(Id::get),
+        // Voice and message frames can overwrite the member baseline.
+        Event::VoiceStateUpdate(v) => {
+            let m = v.member.as_ref()?;
+            changed(
+                v.guild_id,
+                m.user.id,
+                &m.roles,
+                m.communication_disabled_until,
+            )
         }
-        _ => None,
+        _ => {
+            let msg = match event {
+                Event::MessageCreate(msg) => &msg.message,
+                Event::MessageUpdate(msg) => &msg.0,
+                _ => return None,
+            };
+            let m = msg.member.as_ref()?;
+            changed(
+                msg.guild_id,
+                msg.author.id,
+                &m.roles,
+                m.communication_disabled_until,
+            )
+        }
     }
 }
 
@@ -1408,8 +1428,21 @@ mod tests {
         cache.update(&lifecycle_guild(GUILD + 1));
         let epoch = |id| cache.with_guild_policy_snapshot(id, |_, epoch| Arc::clone(epoch));
         let current = || epoch(GUILD);
+        let Event::VoiceStateUpdate(mut voice) = lifecycle_voice(GUILD, 1, 10) else {
+            unreachable!("voice fixture");
+        };
+        voice.0.member = Some(
+            serde_json::from_value(serde_json::json!({
+                "user": {"id": "1", "username": "member", "discriminator": "0"},
+                "roles": ["12"], "deaf": false, "mute": false, "flags": 0
+            }))
+            .expect("voice member fixture"),
+        );
+        let unchanged = Event::VoiceStateUpdate(voice);
+        cache.update(&unchanged);
         let initial = current().expect("complete guild");
         let peer = epoch(GUILD + 1).expect("complete peer");
+        cache.update(&unchanged);
         cache.update(&lifecycle_voice(GUILD, 1, 10));
         cache.update(&lifecycle_delete(GUILD + 1, Some(11)));
         assert!(Arc::ptr_eq(&initial, &current().expect("unchanged epoch")));
@@ -1418,12 +1451,10 @@ mod tests {
             &epoch(GUILD + 1).expect("peer changed")
         ));
 
-        let role = Event::RoleDelete(
-            serde_json::from_value(serde_json::json!({
-                "guild_id": GUILD.to_string(), "role_id": "12"
-            }))
-            .expect("role deletion fixture"),
-        );
+        let role = Event::RoleDelete(twilight_model::gateway::payload::incoming::RoleDelete {
+            guild_id: Id::new(GUILD),
+            role_id: Id::new(12),
+        });
         let mut prior = initial;
         for event in [
             role,
