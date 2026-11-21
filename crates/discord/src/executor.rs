@@ -5895,10 +5895,10 @@ mod tests {
                 let mut read = std::pin::pin!(read_at(start + Duration::from_secs(caller)));
                 assert!(futures_util::poll!(&mut read).is_pending());
                 resume();
-                let (mut socket, _) = timeout(Duration::from_secs(1), listener.accept())
-                    .await
-                    .unwrap()
-                    .unwrap();
+                let (mut socket, _) = tokio::select! {
+                    result = &mut read => panic!("preflight ended before dispatch: {result:?}"),
+                    socket = timeout(Duration::from_secs(1), listener.accept()) => socket.unwrap().unwrap(),
+                };
                 assert!(read_request(&mut socket).await.starts_with(b"GET "));
                 pause();
                 let cutoff = start + Duration::from_secs(effective);
