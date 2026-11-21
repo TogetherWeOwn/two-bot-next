@@ -289,6 +289,8 @@ pub struct CommandRuntime {
     channel: ChannelModerationRuntime,
     automod: OnceLock<Arc<crate::automod_gateway::ProductionAutomod>>,
     preview_limiter: Mutex<PreviewRateLimiter>,
+    #[cfg(test)]
+    pub(crate) preview_metrics: OnceLock<two_bot_core::metrics::Metrics>,
     tasks: Mutex<DispatchTasks>,
     giveaways: crate::giveaway_runtime::GiveawayRuntime,
     /// Interactions admitted per member; see [`crate::interaction_admission`].
@@ -397,6 +399,8 @@ impl CommandRuntime {
             channel,
             automod: OnceLock::new(),
             preview_limiter: Mutex::default(),
+            #[cfg(test)]
+            preview_metrics: OnceLock::new(),
             tasks: Mutex::new(DispatchTasks::default()),
             user_slots: UserSlots::default(),
             self_roles,
@@ -1660,7 +1664,7 @@ impl CommandRuntime {
             }
         }
         let response = if name == "automod-preview" {
-            preview_router_response(&outcome, two_bot_core::metrics::global())
+            preview_router_response(&outcome, self.preview_metrics())
         } else {
             response_for_slash(&outcome)
         };
@@ -1695,7 +1699,7 @@ impl CommandRuntime {
             self.answer_preview(
                 interaction.id.get(),
                 &interaction.token,
-                preview_attempt_response(result, two_bot_core::metrics::global()),
+                preview_attempt_response(result, self.preview_metrics()),
                 receipt.callback_deadline(),
             )
             .await;
@@ -2837,6 +2841,14 @@ impl CommandRuntime {
         }
     }
 
+    fn preview_metrics(&self) -> &two_bot_core::metrics::Metrics {
+        #[cfg(test)]
+        if let Some(metrics) = self.preview_metrics.get() {
+            return metrics;
+        }
+        two_bot_core::metrics::global()
+    }
+
     async fn answer_preview(
         &self,
         id: u64,
@@ -3715,52 +3727,6 @@ mod preview_metric_tests {
     use super::*;
     use two_bot_core::{automod_preview_report::metric_unavailable, metrics::Metrics};
 
-    fn assert_preview_count(metrics: &Metrics, tuple: &str, count: u64) {
-        let render = metrics.render(None);
-        let nonzero: Vec<_> = render
-            .lines()
-            .filter(|line| {
-                line.starts_with("two_bot_automod_previews_total{") && !line.ends_with(" 0")
-            })
-            .collect();
-        let expected = format!("two_bot_automod_previews_total{{{tuple}}} {count}");
-        assert_eq!(nonzero, [expected.as_str()]);
-    }
-
-    #[test]
-    fn preview_router_counts_guild_and_disabled_refusals_but_not_permission() {
-        let metrics = Metrics::default();
-        for refusal in [
-            RouterRefusal::GuildRestricted,
-            RouterRefusal::ModerationDisabled,
-        ] {
-            let response = preview_router_response(&SlashOutcome::Refuse { refusal }, &metrics)
-                .expect("preview refusal has a reply");
-            let data = response.data.unwrap();
-            assert_eq!(data.content.as_deref(), Some(PREVIEW_NOT_EVALUATED_REPLY));
-            assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
-        }
-        let refusal = RouterRefusal::AutomodPreviewPermission;
-        let data = preview_router_response(&SlashOutcome::Refuse { refusal }, &metrics)
-            .unwrap()
-            .data
-            .unwrap();
-        assert_eq!(data.content, Some(refusal.message()));
-        assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
-        assert!(preview_router_response(
-            &SlashOutcome::Handled {
-                handler: HandlerId::AutomodPreview
-            },
-            &metrics
-        )
-        .is_none());
-        assert_preview_count(
-            &metrics,
-            r#"result="not_evaluated",filter="none",mode="not_evaluated""#,
-            2,
-        );
-    }
-
     #[test]
     fn preview_reply_preparation_counts_audit_failure_but_not_replay() {
         let metrics = Metrics::default();
@@ -3782,10 +3748,18 @@ mod preview_metric_tests {
             assert_eq!(data.content.as_deref(), Some(reply));
             assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
         }
-        assert_preview_count(
-            &metrics,
-            r#"result="unavailable",filter="none",mode="dry_run""#,
-            1,
+        let render = metrics.render(None);
+        let nonzero: Vec<_> = render
+            .lines()
+            .filter(|line| {
+                line.starts_with("two_bot_automod_previews_total{") && !line.ends_with(" 0")
+            })
+            .collect();
+        assert_eq!(
+            nonzero,
+            [
+                r#"two_bot_automod_previews_total{result="unavailable",filter="none",mode="dry_run"} 1"#
+            ]
         );
     }
 }

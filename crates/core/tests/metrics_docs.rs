@@ -61,8 +61,7 @@ fn automod_preview_metrics_accept_only_valid_tuples() {
     }
 
     let metrics = Metrics::default();
-    let mut expected_zero = BTreeSet::new();
-    let mut expected_counted = BTreeSet::new();
+    let mut expected = BTreeMap::new();
     let first = PreviewMetricLabels {
         result: "matched",
         filter: "bad_words",
@@ -87,22 +86,11 @@ fn automod_preview_metrics_accept_only_valid_tuples() {
                     let key = format!(
                         r#"{PREVIEW_METRIC}{{result="{result}",filter="{filter}",mode="{mode}"}}"#
                     );
-                    expected_zero.insert(format!("{key} 0"));
-                    let count = if labels == first { 2 } else { 1 };
-                    expected_counted.insert(format!("{key} {count}"));
+                    expected.insert(key, if labels == first { 2 } else { 1 });
                 }
             }
         }
     }
-    let baseline = Metrics::default().render(None);
-    assert_eq!(
-        samples(&baseline),
-        expected_zero
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>()
-    );
-    assert_eq!(samples(&baseline).len(), 24);
 
     let forged = "sample\"} 999\nforged_series";
     for labels in [
@@ -124,13 +112,13 @@ fn automod_preview_metrics_accept_only_valid_tuples() {
     metrics.automod_preview(first);
     let text = metrics.render(None);
     assert!(!text.contains("forged_series"));
-    assert_eq!(
-        samples(&text),
-        expected_counted
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>()
-    );
+    let baseline = Metrics::default().render(None);
+    let (zero, actual) = (samples(&baseline), samples(&text));
+    assert_eq!((zero.len(), actual.len()), (24, 24));
+    for (key, count) in expected {
+        assert!(zero.contains(format!("{key} 0").as_str()), "{key}");
+        assert!(actual.contains(format!("{key} {count}").as_str()), "{key}");
+    }
 }
 
 /// One `| Metric | Meaning |` row whose name ends in `_total`.

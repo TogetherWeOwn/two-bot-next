@@ -228,13 +228,12 @@ REST clients are not silently claimed as covered.
   gateway and no database. There is no `503` or empty-body case.
 - Headers, byte-exact: `Content-Type: text/plain; version=0.0.4;
   charset=utf-8` and `Cache-Control: no-store`.
-- Body: Prometheus text exposition 0.0.4. Every family is preceded by its
-  `# HELP` / `# TYPE` lines, one sample per line, body ends with a trailing
-  newline. All families render from process start at zero/`NaN`, before any
-  gateway event or job completion. Keep HELP descriptions concise: the full
-  exposition must fit the consumers' 64 KiB body cap, not only the series-count
-  budget. A regression saturates EventSub, pool and REST-guard samples and
-  reserves 1 KiB for other value growth; it does not bound every possible
+- Body: Prometheus text exposition 0.0.4. Every family has a `# TYPE` line;
+  `# HELP` is optional. Samples use one line each, with a trailing newline.
+  All families render from process start at zero/`NaN`, before any gateway
+  event or job completion. The byte-budget regression saturates EventSub,
+  AutoMod preview, pool and REST-guard samples and reserves 1 KiB for other
+  value growth under the 64 KiB cap. It does not bound every possible
   combination of process counters at their maxima.
 
 ## Label allowlists (stable)

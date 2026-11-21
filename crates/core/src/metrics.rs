@@ -2868,7 +2868,9 @@ impl Metrics {
 fn header(out: &mut String, name: &str, kind: &str, help: &str) {
     // Omit optional HELP for empty descriptions and the voice families to
     // preserve headroom under the Worker cap. docs/metrics.md covers both.
-    let voice = name.starts_with("two_bot_voice_") || name.starts_with("two_bot_event_voice_");
+    let voice = name
+        .strip_prefix("two_bot_")
+        .is_some_and(|family| family.starts_with("voice_") || family.starts_with("event_voice_"));
     if !help.is_empty() && !voice {
         writeln!(out, "# HELP {name} {help}").unwrap();
     }
