@@ -322,7 +322,8 @@ async fn voice_evidence_checks_member_identity_and_preserves_read_errors() {
         (StatusCode::OK, "9", Some(Value::Null), None),
         (StatusCode::FORBIDDEN, "3", Some(Value::Null), None),
     ] {
-        let mut member = voice_member(id, false);
+        let (mut member, mut bot) = (voice_member(id, false), voice_member("4", true));
+        bot["roles"] = json!(["5"]);
         if let Some(timeout) = timeout {
             member["communication_disabled_until"] = timeout;
         }
@@ -330,13 +331,14 @@ async fn voice_evidence_checks_member_identity_and_preserves_read_errors() {
             (StatusCode::OK, json!({"id":"4","bot":true})),
             (
                 StatusCode::OK,
-                json!({"id": guild, "owner_id": "4", "afk_channel_id": null,
-                "roles": [{"id": guild, "position": 0, "permissions": "1049600"}]}),
+                json!({"id": guild, "owner_id": "6", "afk_channel_id": null,
+                "roles": [{"id": guild, "position": 0, "permissions": "1049600"},
+                          {"id": "5", "position": 1, "permissions": "16777216"}]}),
             ),
             (StatusCode::OK, voice_channel("2", 2, "target", 0, 3)),
             (status, member),
             (StatusCode::OK, voice_channel("1", 2, "source", 0, 0)),
-            (StatusCode::OK, voice_member("4", true)),
+            (StatusCode::OK, bot),
         ])
         .await;
         let api = ActionExecutor::with_proxy(token(), Some(mock.origin.clone())).unwrap();
@@ -352,14 +354,12 @@ async fn voice_evidence_checks_member_identity_and_preserves_read_errors() {
             (_, Some(expected), Ok(evidence)) => assert_eq!(evidence.decide(1), expected),
             (StatusCode::OK, None, Err(DiscordError::Unavailable(detail))) => {
                 assert_eq!(detail, "voice_move_evidence_incomplete");
-                assert_eq!(mock.count(), 4);
             }
-            (StatusCode::FORBIDDEN, None, Err(DiscordError::Rejected(_))) => {
-                assert_eq!(mock.count(), 4);
-            }
+            (StatusCode::FORBIDDEN, None, Err(DiscordError::Rejected(_))) => {}
             _ => panic!("unexpected voice evidence result"),
         }
         let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), if expected.is_some() { 6 } else { 4 });
         assert!(requests.iter().all(|request| request["method"] == "GET"));
     }
 }
