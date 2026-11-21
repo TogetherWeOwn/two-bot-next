@@ -29,7 +29,8 @@ const isVoiceFamilyLine = (line: string) =>
 
 const isHeat = (line: string) => line.includes('job="voice_heat"');
 test("every current required label combination is required, not merely one row per family", () => {
-  const lines = metricsLines().filter((line) => !isOptionalLine(line) && !isVoiceFamilyLine(line));
+  const lines = metricsLines().filter((line) => !isOptionalLine(line) && !isVoiceFamilyLine(line) && !isHeat(line));
+  assert.ok(parseAlertScrape(lines.join("\n")));
   for (let i = 0; i < lines.length; i++) {
     assert.equal(parseAlertScrape(lines.filter((_, j) => j !== i).join("\n")), null, lines[i]);
   }
@@ -63,15 +64,15 @@ test("only complete heat scrapes affect heat alerts, without holding unrelated j
   const updated = parseAlertScrape(older.replace('job="rank",outcome="failure"} 0', `job="rank",outcome="failure"} ${JOB_FAILURE_SHARE_MIN_RUNS}`));
   assert.ok(updated);
   assert.ok(evaluateMetrics(updated, state, 160).state.firing.includes("job_failure_share:rank"));
-
-  // Roll out, then roll back to a new process with no heat metrics.
   const heat = ["job_consecutive_failures:voice_heat", "job_unknown_stale:voice_heat"];
-  const evaluate = (rows: string[], prev = EMPTY_STATE) => evaluateMetrics(parseAlertScrape(rows.join("\n"))!, prev, 10_000).state;
-  const baseline = evaluate(lines);
+  const share = "job_failure_share:voice_heat";
+  const evaluate = (rows: string[], prev = EMPTY_STATE, now = 10_000) => evaluateMetrics(parseAlertScrape(rows.join("\n"))!, prev, now).state;
   const rollback = older.split("\n").map((line) => line.replace('incarnation{part="3"} 1', 'incarnation{part="3"} 2'));
-  const held = evaluate(rollback, { ...baseline, firing: [...heat, "job_consecutive_failures:rank"] });
-  assert.deepEqual(held.firing.filter((key) => key.startsWith("job_")), heat);
-  assert.deepEqual(evaluate(lines, held).firing.filter((key) => key.endsWith(":voice_heat")), []);
+  const held = evaluate(rollback, { ...evaluate(lines), firing: [...heat, share, "job_consecutive_failures:rank"] });
+  assert.deepEqual(held.firing.filter((key) => key.startsWith("job_")).sort(), [...heat, share].sort());
+  const stillHeld = evaluate(rollback, held, 10_060);
+  assert.ok(stillHeld.firing.includes(share));
+  assert.deepEqual(evaluate(lines, stillHeld, 10_120).firing.filter((key) => heat.includes(key)), []);
 });
 
 test("older exposition without the optional gauges still parses", () => {
