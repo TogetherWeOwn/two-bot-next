@@ -183,8 +183,7 @@ pub type VoiceKickVote =
 /// hold the permission; open interactions never enter it, so a burst of them
 /// cannot starve moderation. `BUSY` carries the one-call "busy" replies.
 /// `REACTIONS` keeps self-role reaction bursts off the message lane, so neither
-/// burst can discard the other's automations. `HELP` reserves capacity
-/// for discovery callbacks before the generic command lane.
+/// burst can discard the other's automations.
 pub(crate) const DISPATCH_LIMITS: [usize; 7] = [16, 16, 1, 8, 8, 8, 8];
 pub(crate) const LANE_MESSAGES: usize = 0;
 pub(crate) const LANE_INTERACTIONS: usize = 1;
@@ -211,27 +210,30 @@ const SATURATION_LOG_WINDOW_SECS: u64 = 60;
 struct DispatchTasks {
     stopped: bool,
     lanes: [Vec<tokio::task::AbortHandle>; DISPATCH_LIMITS.len()],
-    /// Per-lane drops (test-visible; the public metric folds help into interactions).
-    drops: [u64; DISPATCH_LIMITS.len()],
+    /// Per-lane drops (test-visible mirror of the global
+    /// `two_bot_dispatch_drops_total{lane}` counter, incremented alongside by
+    /// `DispatchTasks::record_drop`; fairness drops share their lane's
+    /// counter).
+    drops: [u64; LANE_HELP],
     last_drop_log: Option<std::time::Instant>,
 }
 
 impl DispatchTasks {
-    /// Record a refused event on `lanes`: increment the internal and public
-    /// drop counters and emit at most one `warn!` per 60 s
+    /// Record a refused event on `lanes`: increment each lane's drop counter
+    /// (test-visible mirror of the global `two_bot_dispatch_drops_total{lane}`
+    /// counter, incremented alongside) and emit at most one `warn!` per 60 s
     /// per runtime. Fairness drops share their lane's counter so every refused
     /// event stays observable through one path; each caller keeps its own
     /// sampled message so existing log filters keep matching.
     fn record_drop(&mut self, lanes: &[usize], reason: &'static str, message: &'static str) {
-        // Help has its own admission budget but shares the interactions series.
-        let labels = two_bot_core::metrics::DISPATCH_LANES;
         for &lane in lanes {
-            self.drops[lane] = self.drops[lane].saturating_add(1);
-            let label = match lane {
-                LANE_HELP => labels[LANE_INTERACTIONS],
-                _ => labels[lane],
+            let lane = match lane {
+                LANE_HELP => LANE_INTERACTIONS,
+                _ => lane,
             };
-            two_bot_core::metrics::global().dispatch_drop(label);
+            self.drops[lane] = self.drops[lane].saturating_add(1);
+            two_bot_core::metrics::global()
+                .dispatch_drop(two_bot_core::metrics::DISPATCH_LANES[lane]);
         }
         let now = std::time::Instant::now();
         let due = self

@@ -1787,7 +1787,7 @@ async fn help_answers_immediately_from_the_live_publish_set() {
 
 #[tokio::test]
 async fn gateway_help_opens_a_new_private_page_from_the_confirmed_registry() {
-    use crate::command_runtime::LANE_HELP;
+    use crate::command_runtime::{LANE_HELP, LANE_INTERACTIONS};
     use serde_json::{json, Value};
     use tokio::time::Instant;
     use two_bot_discord::brand::{EmbedKind, BRAND_ICON_URL};
@@ -1849,6 +1849,7 @@ async fn gateway_help_opens_a_new_private_page_from_the_confirmed_registry() {
     assert!(dispatch(&interaction_event(wrong_scope), Instant::now()));
     assert!(dispatch(&first, Instant::now() - Duration::from_secs(3)));
     assert!(idle(), "an expired receipt must not admit Help work");
+    assert_eq!(runtime.dispatch_drops_total(LANE_INTERACTIONS), 0);
     assert!(dispatch(&interaction_event(click), Instant::now()));
     wait_for(idle, "help page callback").await;
     let callbacks = mock.posts_to("/callback").await;
@@ -11457,7 +11458,7 @@ async fn saturated_lane_counts_drops_per_lane_and_quiets_logs() {
         BUSY_DROPS as u64,
         "every busy-lane drop counts on its own lane"
     );
-    for lane in 0..DISPATCH_LIMITS.len() {
+    for lane in 0..two_bot_core::metrics::DISPATCH_LANES.len() {
         if lane != LANE_MESSAGES && lane != LANE_BUSY {
             assert_eq!(
                 runtime.dispatch_drops_total(lane),

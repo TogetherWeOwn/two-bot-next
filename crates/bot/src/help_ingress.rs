@@ -13,10 +13,9 @@ use two_bot_core::{ComponentHandler, ComponentOutcome, HandlerId, SlashContext, 
 use two_bot_discord::executor::RECEIPT_ADMISSION_BUDGET_MS;
 use two_bot_discord::help_navigation::{source_cursor, DiscoveryPlan, HelpRecovery};
 
-use super::{CommandRuntime, DISPATCH_LIMITS, LANE_BUSY, LANE_HELP};
+use super::{CommandRuntime, DispatchTasks, DISPATCH_LIMITS, LANE_BUSY, LANE_HELP};
 use crate::db_log::discord_class;
 
-#[derive(Clone, Copy)]
 enum Request {
     Discovery,
     Button,
@@ -27,7 +26,7 @@ enum Request {
 // occupied, without queuing work or consuming another plan slot.
 const HELP_LIMIT: usize = DISPATCH_LIMITS[LANE_HELP];
 const REFUSAL_LIMIT: usize = DISPATCH_LIMITS[LANE_BUSY];
-static HELP_SLOTS: Mutex<Slots> = Mutex::new(Slots(Vec::new()));
+static HELP_SLOTS: Slots = Slots(Mutex::new(Vec::new()));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Admission {
@@ -41,41 +40,49 @@ struct Slot {
     admission: Admission,
 }
 
-struct Slots(Vec<Slot>);
+struct Slots(Mutex<Vec<Slot>>);
 
 impl Slots {
-    fn claim(&mut self, actor: u64, interaction: u64) -> Option<Admission> {
-        if self.0.iter().any(|slot| slot.interaction == interaction) {
+    fn claim(&self, actor: u64, id: u64, tasks: &Mutex<DispatchTasks>) -> Option<Admission> {
+        let mut slots = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if slots.iter().any(|slot| slot.interaction == id) {
             return None;
         }
-        let plans = self
-            .0
+        let plans = slots
             .iter()
             .filter(|slot| slot.admission == Admission::Render)
             .count();
-        let actor_active = self.0.iter().any(|slot| slot.actor == actor);
+        let actor_active = slots.iter().any(|slot| slot.actor == actor);
         let admission = if plans < HELP_LIMIT && !actor_active {
             Admission::Render
-        } else if self.0.len() - plans < REFUSAL_LIMIT
-            && !self
-                .0
+        } else if slots.len() - plans < REFUSAL_LIMIT
+            && !slots
                 .iter()
                 .any(|slot| slot.actor == actor && slot.admission == Admission::Refuse)
         {
             Admission::Refuse
         } else {
+            drop(slots);
+            tasks.lock().expect("command task scope").record_drop(
+                &[LANE_HELP],
+                "help capacity reached",
+                "command dispatch saturated; Help event not admitted (sampled; see two_bot_dispatch_drops_total)",
+            );
             return None;
         };
-        self.0.push(Slot {
+        slots.push(Slot {
             actor,
-            interaction,
+            interaction: id,
             admission,
         });
         Some(admission)
     }
 
-    fn release(&mut self, interaction: u64) {
-        self.0.retain(|slot| slot.interaction != interaction);
+    fn release(&self, interaction: u64) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|slot| slot.interaction != interaction);
     }
 }
 
@@ -83,10 +90,7 @@ struct Permit(u64);
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        HELP_SLOTS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .release(self.0);
+        HELP_SLOTS.release(self.0);
     }
 }
 
@@ -103,16 +107,15 @@ impl CommandRuntime {
             (InteractionType::MessageComponent, Some(InteractionData::MessageComponent(data)))
                 if Cursor::is_help_control(&data.custom_id) =>
             {
-                if !matches!(
-                    self.interactions
-                        .router
-                        .route_component_with_help(&data.custom_id, guild),
-                    ComponentOutcome::Handled {
-                        handler: ComponentHandler::HelpPage
-                    }
-                ) {
+                let ComponentOutcome::Handled {
+                    handler: ComponentHandler::HelpPage,
+                } = self
+                    .interactions
+                    .router
+                    .route_component_with_help(&data.custom_id, guild)
+                else {
                     return true;
-                }
+                };
                 Request::Button
             }
             (
@@ -129,19 +132,17 @@ impl CommandRuntime {
                     .as_deref()
                     == Some("help") =>
             {
-                if !matches!(
-                    self.interactions.router.route_slash(&SlashContext {
-                        name: "help",
-                        guild_id: guild,
-                        actor_permissions: None,
-                        custom_row: None,
-                    }),
-                    SlashOutcome::Handled {
-                        handler: HandlerId::Help
-                    }
-                ) {
+                let SlashOutcome::Handled {
+                    handler: HandlerId::Help,
+                } = self.interactions.router.route_slash(&SlashContext {
+                    name: "help",
+                    guild_id: guild,
+                    actor_permissions: None,
+                    custom_row: None,
+                })
+                else {
                     return true;
-                }
+                };
                 Request::Discovery
             }
             _ => return false,
@@ -155,11 +156,7 @@ impl CommandRuntime {
             return true;
         }
         let id = interaction.id.get();
-        let admission = HELP_SLOTS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .claim(actor.get(), id);
-        let Some(admission) = admission else {
+        let Some(admission) = HELP_SLOTS.claim(actor.get(), id, &self.tasks) else {
             return true;
         };
         let permit = Permit(id);
@@ -239,25 +236,32 @@ impl CommandRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command_runtime::LANE_INTERACTIONS;
 
     #[test]
     fn admission_caps_plans_and_refusals_without_queueing_or_racing_duplicates() {
-        let mut slots = Slots(Vec::new());
-        assert_eq!(slots.claim(1, 101), Some(Admission::Render));
-        assert_eq!(slots.claim(1, 101), None);
-        assert_eq!(slots.claim(1, 201), Some(Admission::Refuse));
-        assert_eq!(slots.claim(1, 201), None);
-        assert_eq!(slots.claim(1, 202), None);
+        let slots = Slots(Mutex::new(Vec::new()));
+        let tasks = Mutex::new(DispatchTasks::default());
+        let claim = |actor, id| slots.claim(actor, id, &tasks);
+        let drops = || tasks.lock().unwrap().drops[LANE_INTERACTIONS];
+        assert_eq!(claim(1, 101), Some(Admission::Render));
+        assert_eq!(claim(1, 101), None);
+        assert_eq!(claim(1, 201), Some(Admission::Refuse));
+        assert_eq!(claim(1, 201), None);
+        assert_eq!(drops(), 0, "in-flight duplicates are not drops");
+        assert_eq!(claim(1, 202), None);
+        assert_eq!(drops(), 1, "per-actor refusal cap");
         for actor in 2..=HELP_LIMIT as u64 {
-            assert_eq!(slots.claim(actor, 100 + actor), Some(Admission::Render));
+            assert_eq!(claim(actor, 100 + actor), Some(Admission::Render));
         }
         for i in 1..REFUSAL_LIMIT as u64 {
-            assert_eq!(slots.claim(900 + i, 201 + i), Some(Admission::Refuse));
+            assert_eq!(claim(900 + i, 201 + i), Some(Admission::Refuse));
         }
-        assert_eq!(slots.claim(900, 300), None, "both budgets are full");
+        assert_eq!(claim(900, 300), None, "both budgets are full");
+        assert_eq!(drops(), 2, "one drop per capacity rejection");
         slots.release(101);
         slots.release(201);
-        assert_eq!(slots.claim(1, 301), Some(Admission::Render));
-        assert_eq!(slots.claim(900, 300), Some(Admission::Refuse));
+        assert_eq!(claim(1, 301), Some(Admission::Render));
+        assert_eq!(claim(900, 300), Some(Admission::Refuse));
     }
 }
