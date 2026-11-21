@@ -1,5 +1,5 @@
 //! Ordered gateway evidence around a single governed voice PATCH.
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tokio::time::Instant;
 use twilight_model::id::Id;
@@ -16,6 +16,12 @@ use crate::{pipeline::SharedCache, DiscordError};
 pub struct VoiceMoveRoster<'a> {
     cache: &'a SharedCache,
     holds: &'a Mutex<VoiceMoveHolds>,
+}
+
+struct VoiceMoveProof {
+    from: Snowflake,
+    limit: u32,
+    epoch: Arc<()>,
 }
 
 /// Terminal decision and scalar evidence. `DiscordUnavailable` may mean the
@@ -55,27 +61,35 @@ impl<'a> VoiceMoveRoster<'a> {
         Self { cache, holds }
     }
 
+    fn policy_epoch(self, guild: Snowflake) -> Option<Arc<()>> {
+        self.cache
+            .with_guild_policy_snapshot(guild, |_, epoch| Arc::clone(epoch))
+    }
+
     fn read<T>(
         self,
         [guild, member, target]: [Snowflake; 3],
+        expected_epoch: &Arc<()>,
         use_roster: impl FnOnce(Option<Snowflake>, u32, &mut VoiceMoveHolds) -> Option<T>,
     ) -> Option<T> {
         let mut holds = self.holds.lock().ok()?;
-        self.cache.with_guild_snapshot(guild, |cache| {
-            let guild = Id::new(guild);
-            (cache.guild(guild)?.unavailable() != Some(true)).then_some(())?;
-            // The rebuilt roster, not a possibly retained voice state, owns membership.
-            let (mut source, mut count) = (None, 0u32);
-            let roster = cache.guild_voice_states(guild);
-            for user in roster.as_deref().into_iter().flatten() {
-                let room = cache.voice_state(*user, guild)?.channel_id().get();
-                if user.get() == member {
-                    source = Some(room);
+        self.cache
+            .with_guild_policy_snapshot(guild, |cache, epoch| {
+                Arc::ptr_eq(epoch, expected_epoch).then_some(())?;
+                let guild = Id::new(guild);
+                (cache.guild(guild)?.unavailable() != Some(true)).then_some(())?;
+                // The rebuilt roster, not a possibly retained voice state, owns membership.
+                let (mut source, mut count) = (None, 0u32);
+                let roster = cache.guild_voice_states(guild);
+                for user in roster.as_deref().into_iter().flatten() {
+                    let room = cache.voice_state(*user, guild)?.channel_id().get();
+                    if user.get() == member {
+                        source = Some(room);
+                    }
+                    count = count.checked_add(u32::from(room == target))?;
                 }
-                count = count.checked_add(u32::from(room == target))?;
-            }
-            use_roster(source, count, &mut holds)
-        })?
+                use_roster(source, count, &mut holds)
+            })?
     }
 }
 
@@ -103,7 +117,7 @@ impl ActionExecutor {
             return no_evidence;
         };
         let ids_numeric = [guild, member, target];
-        let (from, limit) = match self
+        let VoiceMoveProof { from, limit, epoch } = match self
             .check_move(roster, ids_numeric, deadline, &ready, true)
             .await
         {
@@ -112,7 +126,7 @@ impl ActionExecutor {
         };
         let revalidate = async {
             let Some(_ready) = ready() else { return false };
-            roster.read(ids_numeric, |source, cached, holds| {
+            roster.read(ids_numeric, &epoch, |source, cached, holds| {
                 let seats = holds.reserved_occupancy(member, target, cached)?;
                 Some(source == Some(from) && (limit == 0 || seats <= limit))
             }) == Some(true)
@@ -161,19 +175,24 @@ impl ActionExecutor {
         deadline: Instant,
         ready: &impl Fn() -> Option<R>,
         reserve: bool,
-    ) -> Result<(Snowflake, u32), VoiceMoveAttempt> {
+    ) -> Result<VoiceMoveProof, VoiceMoveAttempt> {
         let no_evidence = VoiceMoveAttempt::new(Outcome::DiscordUnavailable, None);
+        // Capture before the first REST read, not after collecting mixed facts.
+        let epoch = {
+            let _ready = ready().ok_or(no_evidence)?;
+            roster.policy_epoch(guild).ok_or(no_evidence)?
+        };
         let room = self
             .voice_move_target_until(guild, target, deadline)
-            .await?
-            .ok_or(VoiceMoveAttempt::new(Outcome::RoomGone, None))?;
-        let from = {
+            .await?;
+        let source = {
             let _ready = ready().ok_or(no_evidence)?;
             roster
-                .read(ids, |source, _, _| Some(source))
+                .read(ids, &epoch, |source, _, _| Some(source))
                 .ok_or(no_evidence)?
-                .ok_or(VoiceMoveAttempt::new(Outcome::NotConnected, None))?
         };
+        let room = room.ok_or(VoiceMoveAttempt::new(Outcome::RoomGone, None))?;
+        let from = source.ok_or(VoiceMoveAttempt::new(Outcome::NotConnected, None))?;
         if from == target {
             return Err(VoiceMoveAttempt::new(Outcome::AlreadyInRoom, Some(from)));
         }
@@ -183,7 +202,7 @@ impl ActionExecutor {
             .await?;
         let _ready = ready().ok_or(no_evidence)?;
         roster
-            .read(ids, |latest, cached, holds| {
+            .read(ids, &epoch, |latest, cached, holds| {
                 (latest == Some(from)).then_some(())?;
                 let count = holds.occupancy(member, target, cached).ok()?;
                 match evidence.decide(count) {
@@ -194,7 +213,11 @@ impl ActionExecutor {
                         if reserve {
                             holds.reserve(member, target).ok()?;
                         }
-                        Some(Ok((from, limit)))
+                        Some(Ok(VoiceMoveProof {
+                            from,
+                            limit,
+                            epoch: Arc::clone(&epoch),
+                        }))
                     }
                     VoiceMoveDecision::Incomplete => None,
                 }

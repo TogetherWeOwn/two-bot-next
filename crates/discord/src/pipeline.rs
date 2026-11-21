@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use twilight_cache_inmemory::{DefaultInMemoryCache, InMemoryCache};
 use twilight_model::gateway::event::Event;
+use twilight_model::id::Id;
 use twilight_model::util::Timestamp;
 use two_bot_core::automod_runtime::FunnelDisposition;
 use two_bot_core::{
@@ -484,8 +485,9 @@ pub struct MessageEligibility {
 pub struct SharedCache {
     inner: InMemoryCache,
     /// Twilight can retain guild data across READY. Only a full GuildCreate
-    /// makes that guild eligible for a projection in the new session.
-    complete_guilds: RwLock<HashSet<Snowflake>>,
+    /// makes that guild eligible for a projection in the new session. A fresh
+    /// arc gives each policy epoch a distinct identity while a proof holds it.
+    complete_guilds: RwLock<HashMap<Snowflake, Arc<()>>>,
     #[cfg(test)]
     before_twilight_update: Option<tests::CacheWriteProbe>,
 }
@@ -494,7 +496,7 @@ impl Default for SharedCache {
     fn default() -> Self {
         Self {
             inner: build_cache(),
-            complete_guilds: RwLock::new(HashSet::new()),
+            complete_guilds: RwLock::new(HashMap::new()),
             #[cfg(test)]
             before_twilight_update: None,
         }
@@ -508,9 +510,14 @@ impl SharedCache {
         self.apply_twilight_event(event);
         match event {
             Event::Ready(_) => complete.clear(),
+            Event::Resumed => {
+                for epoch in complete.values_mut() {
+                    *epoch = Arc::new(());
+                }
+            }
             Event::GuildCreate(create) => match create.as_ref() {
                 twilight_model::gateway::payload::incoming::GuildCreate::Available(guild) => {
-                    complete.insert(guild.id.get());
+                    complete.insert(guild.id.get(), Arc::new(()));
                 }
                 twilight_model::gateway::payload::incoming::GuildCreate::Unavailable(guild) => {
                     complete.remove(&guild.id.get());
@@ -519,7 +526,12 @@ impl SharedCache {
             Event::GuildDelete(guild) => {
                 complete.remove(&guild.id.get());
             }
-            _ => {}
+            _ => {
+                if let Some(epoch) = voice_policy_guild(event).and_then(|id| complete.get_mut(&id))
+                {
+                    *epoch = Arc::new(());
+                }
+            }
         }
     }
 
@@ -538,11 +550,35 @@ impl SharedCache {
         guild_id: Snowflake,
         read: impl FnOnce(&InMemoryCache) -> T,
     ) -> Option<T> {
+        self.with_guild_policy_snapshot(guild_id, |cache, _| read(cache))
+    }
+
+    /// Read the epoch under the same fence as the roster it qualifies.
+    pub(crate) fn with_guild_policy_snapshot<T>(
+        &self,
+        guild_id: Snowflake,
+        read: impl FnOnce(&InMemoryCache, &Arc<()>) -> T,
+    ) -> Option<T> {
         let complete = self.complete_guilds.try_read().ok()?;
-        if !complete.contains(&guild_id) {
-            return None;
-        }
-        Some(read(&self.inner))
+        Some(read(&self.inner, complete.get(&guild_id)?))
+    }
+}
+
+fn voice_policy_guild(event: &Event) -> Option<Snowflake> {
+    // Invalidate conservatively: these frames can change eligibility, seat
+    // limits, overwrites, role hierarchy, membership, or communication timeout.
+    match event {
+        Event::GuildUpdate(guild) => Some(guild.id.get()),
+        Event::ChannelCreate(channel) => channel.guild_id.map(Id::get),
+        Event::ChannelUpdate(channel) => channel.guild_id.map(Id::get),
+        Event::ChannelDelete(channel) => channel.guild_id.map(Id::get),
+        Event::RoleCreate(role) => Some(role.guild_id.get()),
+        Event::RoleUpdate(role) => Some(role.guild_id.get()),
+        Event::RoleDelete(role) => Some(role.guild_id.get()),
+        Event::MemberAdd(member) => Some(member.guild_id.get()),
+        Event::MemberUpdate(member) => Some(member.guild_id.get()),
+        Event::MemberRemove(member) => Some(member.guild_id.get()),
+        _ => None,
     }
 }
 
@@ -1350,6 +1386,41 @@ mod tests {
             Some(42)
         );
         assert!(cache.complete_guilds.try_write().is_ok());
+    }
+
+    #[test]
+    fn voice_policy_epoch_is_guild_scoped_and_never_reused_after_reseed() {
+        let cache = SharedCache::default();
+        cache.update(&lifecycle_available_guild());
+        let current = || cache.with_guild_policy_snapshot(GUILD, |_, epoch| Arc::clone(epoch));
+        let initial = current().expect("complete guild");
+        cache.update(&lifecycle_voice(GUILD, 1, 10));
+        cache.update(&lifecycle_delete(GUILD + 1, Some(11)));
+        assert!(Arc::ptr_eq(&initial, &current().expect("unchanged epoch")));
+
+        let role = Event::RoleDelete(
+            serde_json::from_value(serde_json::json!({
+                "guild_id": GUILD.to_string(), "role_id": "12"
+            }))
+            .expect("role deletion fixture"),
+        );
+        let mut prior = initial;
+        for event in [
+            role,
+            lifecycle_member_remove(1),
+            lifecycle_delete(GUILD, Some(10)),
+            Event::Resumed,
+            lifecycle_available_guild(),
+        ] {
+            cache.update(&event);
+            let fresh = current().expect("complete guild after policy event");
+            assert!(!Arc::ptr_eq(&prior, &fresh), "policy epoch must change");
+            prior = fresh;
+        }
+        cache.update(&lifecycle_ready());
+        assert!(current().is_none());
+        cache.update(&lifecycle_available_guild());
+        assert!(!Arc::ptr_eq(&prior, &current().expect("reseeded guild")));
     }
 
     #[test]

@@ -411,10 +411,12 @@ enum MoveVeto {
     Capacity,
     Readiness,
     Source,
+    PolicyDuringReads(u32),
+    PolicyBeforePatch,
     Cutoff,
 }
 
-/// Hold the real claim before SQL (cutoff) or after it (final guard checks).
+/// Pause a governed read or the real write claim before or after SQL.
 #[derive(Debug)]
 struct PausedAdmission(PgSendAdmission, Mutex<Option<MoveVeto>>, Pause);
 
@@ -426,7 +428,26 @@ impl SendAdmission for PausedAdmission {
         self.0.admit()
     }
     fn admit_until(&self, at: Instant) -> ClaimFuture<'_> {
-        self.0.admit_until(at)
+        Box::pin(async move {
+            let pause = {
+                let mut veto = self.1.lock().unwrap();
+                match veto.as_mut() {
+                    Some(MoveVeto::PolicyDuringReads(remaining)) if *remaining > 1 => {
+                        *remaining -= 1;
+                        false
+                    }
+                    Some(MoveVeto::PolicyDuringReads(_)) => {
+                        *veto = None;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if pause {
+                self.2.wait().await;
+            }
+            self.0.admit_until(at).await
+        })
     }
     fn admit_strict(&self) -> ClaimFuture<'_> {
         Box::pin(async {
@@ -465,7 +486,16 @@ fn move_facts() -> [(StatusCode, Value); 6] {
 #[tokio::test]
 async fn governed_voice_move_checks_the_ordered_roster_and_reuses_unsent_lane() {
     use two_bot_discord::executor::member::VoiceMoveRoster;
-    use MoveVeto::{Capacity, Cutoff, Readiness, Source};
+    use MoveVeto::{Capacity, Cutoff, PolicyBeforePatch, PolicyDuringReads, Readiness, Source};
+    let vetoes = [
+        (Capacity, 6),
+        (Readiness, 6),
+        (Source, 6),
+        (PolicyDuringReads(2), 3),
+        (PolicyDuringReads(6), 6),
+        (PolicyBeforePatch, 6),
+        (Cutoff, 6),
+    ];
     let Some(db) = database().await else { return };
     let _ = rustls::crypto::ring::default_provider().install_default();
     let lane = Arc::new(PausedAdmission(
@@ -473,11 +503,18 @@ async fn governed_voice_move_checks_the_ordered_roster_and_reuses_unsent_lane() 
         Mutex::new(None),
         Pause::default(),
     ));
-    // Four vetoes, a stale PATCH and six fresh GETs, then a rate-limited PATCH.
-    let mut replies = (0..5).flat_map(|_| move_facts()).collect::<Vec<_>>();
+    // The vetoes are read-only; then a stale PATCH, six fresh GETs and a limited PATCH.
+    let mut replies = vetoes
+        .iter()
+        .flat_map(|&(_, reads)| move_facts().into_iter().take(reads))
+        .collect::<Vec<_>>();
+    replies.extend(move_facts());
+    let first_patch = replies.len();
     replies.push((StatusCode::BAD_REQUEST, Value::Null));
     replies.extend(move_facts());
+    let after_refresh = replies.len();
     replies.extend(move_facts());
+    let second_patch = replies.len();
     replies.push((StatusCode::TOO_MANY_REQUESTS, json!({"retry_after":1.0})));
     let mock = MockDiscord::start(replies).await;
     let api =
@@ -509,21 +546,30 @@ async fn governed_voice_move_checks_the_ordered_roster_and_reuses_unsent_lane() 
             || ready.load(Ordering::SeqCst).then_some(()),
         )
     };
-    for (index, veto) in [Capacity, Readiness, Source, Cutoff]
-        .into_iter()
-        .enumerate()
-    {
+    let mut total_reads = 0;
+    for (veto, expected_reads) in vetoes {
         *lane.1.lock().unwrap() = Some(veto);
         let deadline = Instant::now() + Duration::from_secs(if veto == Cutoff { 2 } else { 5 });
         let mut pending = std::pin::pin!(attempt(deadline));
         tokio::select! {
             () = lane.2.entered.notified() => {},
-            _ = pending.as_mut() => panic!("{veto:?}: expected the strict-claim pause"),
+            _ = pending.as_mut() => panic!("{veto:?}: expected the admission pause"),
         }
         match veto {
             Capacity => change_room(SECOND, Some(TARGET)).await,
             Readiness => ready.store(false, Ordering::SeqCst),
             Source => change_room(FIRST, Some("32")).await,
+            PolicyDuringReads(_) | PolicyBeforePatch => {
+                // No roster change: only the gateway policy epoch can veto this proof.
+                let limit = match veto {
+                    PolicyDuringReads(read) => read,
+                    _ => 3,
+                };
+                let room = serde_json::from_value(voice_channel(TARGET, 2, "target", 0, limit))
+                    .expect("channel update fixture");
+                let event = Event::ChannelUpdate(Box::new(room));
+                pipeline.handle(&event).await.unwrap();
+            }
             Cutoff => tokio::time::sleep_until(deadline).await,
         }
         lane.2.resume.notify_one();
@@ -532,10 +578,10 @@ async fn governed_voice_move_checks_the_ordered_roster_and_reuses_unsent_lane() 
             VoiceMoveOutcome::DiscordUnavailable,
             "{veto:?}"
         );
-        let reads = (index + 1) * 6;
+        total_reads += expected_reads;
         assert_eq!(
             (mock.count(), mock.sockets.load(Ordering::SeqCst)),
-            (reads, reads),
+            (total_reads, total_reads),
             "{veto:?}"
         );
         ready.store(true, Ordering::SeqCst);
@@ -549,7 +595,7 @@ async fn governed_voice_move_checks_the_ordered_roster_and_reuses_unsent_lane() 
     );
     assert_eq!(
         mock.count(),
-        37,
+        after_refresh,
         "stale refusal requires exactly one read-only refresh"
     );
     let limited = attempt(Instant::now() + Duration::from_secs(5)).await;
@@ -559,9 +605,9 @@ async fn governed_voice_move_checks_the_ordered_roster_and_reuses_unsent_lane() 
     );
     {
         let requests = mock.requests.lock().unwrap();
-        assert_eq!(requests.len(), 44);
+        assert_eq!(requests.len(), second_patch + 1);
         for (index, request) in requests.iter().enumerate() {
-            let expected = if [30, 43].contains(&index) {
+            let expected = if [first_patch, second_patch].contains(&index) {
                 "PATCH"
             } else {
                 "GET"
