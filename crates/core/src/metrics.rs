@@ -130,6 +130,7 @@ pub const JOBS: &[&str] = &[
     "member_unban_sweep",
     "automod_expiry",
     "lfg_sweep",
+    "voice_heat",
     "other",
 ];
 pub const JOB_OUTCOMES: &[&str] = &["success", "failure"];
@@ -161,7 +162,7 @@ impl JobErrorClass {
     }
 }
 
-/// Complete error-class allowlist. With `JOBS`, this yields 119 fixed series.
+/// Complete error-class allowlist. With `JOBS`, this yields 126 fixed series.
 pub const JOB_ERROR_CLASSES: &[JobErrorClass] = &[
     JobErrorClass::Database,
     JobErrorClass::Rest,
@@ -2866,12 +2867,13 @@ impl Metrics {
 }
 
 fn header(out: &mut String, name: &str, kind: &str, help: &str) {
-    // Omit optional HELP for empty descriptions and the voice families to
-    // preserve headroom under the Worker cap. docs/metrics.md covers both.
-    let voice = name
-        .strip_prefix("two_bot_")
-        .is_some_and(|family| family.starts_with("voice_") || family.starts_with("event_voice_"));
-    if !help.is_empty() && !voice {
+    // Keep optional HELP for other families; these are covered in docs/metrics.md.
+    let family = name.trim_start_matches("two_bot_");
+    let documented = family == "rest_requests_total"
+        || ["voice_", "event_voice_", "job_", "gateway_"]
+            .iter()
+            .any(|&prefix| family.starts_with(prefix));
+    if !help.is_empty() && !documented {
         writeln!(out, "# HELP {name} {help}").unwrap();
     }
     writeln!(out, "# TYPE {name} {kind}").unwrap();
@@ -3118,16 +3120,18 @@ mod tests {
                     count
                 );
             }
-            assert_eq!(JOBS.len(), 17);
+            assert_eq!(JOBS.len(), 18);
             assert!(!text.contains("unknown_job"));
         }
     }
 
     #[test]
-    fn unban_sweep_and_automod_expiry_have_independent_job_series() {
+    fn unban_sweep_automod_expiry_and_voice_heat_have_independent_job_series() {
         for (succeeded, failed) in [
             ("member_unban_sweep", "automod_expiry"),
             ("automod_expiry", "member_unban_sweep"),
+            ("voice_heat", "member_unban_sweep"),
+            ("member_unban_sweep", "voice_heat"),
         ] {
             let metrics = Metrics::default();
             metrics.job_success(failed, 123);
@@ -3165,7 +3169,7 @@ mod tests {
                     count
                 );
             }
-            assert_eq!(JOBS.len(), 17);
+            assert_eq!(JOBS.len(), 18);
             assert!(!text.contains("unknown_job"));
         }
     }

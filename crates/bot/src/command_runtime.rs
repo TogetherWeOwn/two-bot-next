@@ -208,6 +208,7 @@ const SATURATION_LOG_WINDOW_SECS: u64 = 60;
 #[derive(Default)]
 struct DispatchTasks {
     stopped: bool,
+    help: help_ingress::HelpTasks,
     lanes: [Vec<tokio::task::AbortHandle>; DISPATCH_LIMITS.len()],
     /// Per-lane drops (test-visible mirror of the global
     /// `two_bot_dispatch_drops_total{lane}` counter, incremented alongside by
@@ -255,6 +256,7 @@ impl Drop for CommandDispatchGuard {
             "command_dispatch_guard",
         );
         tasks.stopped = true;
+        tasks.help.abort();
         for lane in &mut tasks.lanes {
             for handle in lane.drain(..) {
                 handle.abort();
@@ -291,6 +293,8 @@ pub struct CommandRuntime {
     preview_limiter: Mutex<PreviewRateLimiter>,
     #[cfg(test)]
     pub(crate) preview_metrics: OnceLock<two_bot_core::metrics::Metrics>,
+    #[cfg(test)]
+    pub(crate) preview_deployment: OnceLock<std::collections::HashMap<String, String>>,
     tasks: Mutex<DispatchTasks>,
     giveaways: crate::giveaway_runtime::GiveawayRuntime,
     /// Interactions admitted per member; see [`crate::interaction_admission`].
@@ -401,6 +405,8 @@ impl CommandRuntime {
             preview_limiter: Mutex::default(),
             #[cfg(test)]
             preview_metrics: OnceLock::new(),
+            #[cfg(test)]
+            preview_deployment: OnceLock::new(),
             tasks: Mutex::new(DispatchTasks::default()),
             user_slots: UserSlots::default(),
             self_roles,
@@ -613,10 +619,8 @@ impl CommandRuntime {
         // in `publish_registry_checked`. Zero means unpinned (unparseable
         // token); such a runtime never publishes on faith.
         if let Some(application_id) = activation.application_id() {
-            runtime.interactions.set_application_id(application_id);
-            runtime
-                .application_id
-                .store(application_id, Ordering::Relaxed);
+            // Cold RESUME has no READY to identify the bot user.
+            runtime.set_identity(application_id, application_id);
         }
         runtime
     }
@@ -735,6 +739,9 @@ impl CommandRuntime {
         received: Instant,
         observed_at: &str,
     ) -> bool {
+        if self.dispatch_help(event, received) {
+            return true;
+        }
         if !ordered {
             return self.dispatch_event(event, None, Some((received, observed_at)));
         }
@@ -837,6 +844,8 @@ impl CommandRuntime {
             if handles.len() < DISPATCH_LIMITS[lane] {
                 let task = tokio::spawn(work);
                 handles.push(task.abort_handle());
+                #[cfg(test)]
+                crate::command_runtime_tests::capture_dispatch_worker(task);
                 return true;
             }
         }
@@ -1693,7 +1702,15 @@ impl CommandRuntime {
                 interaction,
                 receipt.utc_ms,
                 receipt.received_at + Duration::from_secs(2),
-                |guild| crate::automod_gateway::preview_live_config(guild, live),
+                |guild| {
+                    #[cfg(test)]
+                    if let Some(deployment) = self.preview_deployment.get() {
+                        return crate::automod_gateway::resolve_live_config(
+                            deployment, guild, live?,
+                        );
+                    }
+                    crate::automod_gateway::preview_live_config(guild, live)
+                },
             )
             .await;
             self.answer_preview(
@@ -3694,6 +3711,9 @@ pub(crate) fn sticky_options_strict(
 #[cfg(test)]
 #[path = "command_runtime_resumed_tests.rs"]
 mod resumed_tests;
+
+#[path = "help_ingress.rs"]
+pub(crate) mod help_ingress;
 
 /// Full-set publication: a bulk replace needs an authoritative custom-command
 /// row load, so an unknown store defers instead of deleting Discord commands.

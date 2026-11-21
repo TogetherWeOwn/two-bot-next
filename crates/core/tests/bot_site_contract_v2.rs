@@ -15,7 +15,8 @@ use two_bot_core::community_snapshots::RankKey;
 use two_bot_core::internal_actions::{
     assert_allowed, is_implemented, is_request_id, is_snowflake, needs_idempotency_key,
     require_snowflake, require_timestamp, utf16_len, valid_event_key, valid_idempotency_key,
-    validate_idempotency_key, ErrorCode, InternalFlags, MAX_EVENT_NAME_CHARS,
+    validate_idempotency_key, ErrorCode, InternalFlags, VoiceMoveOutcome, VoiceMoveRequest,
+    MAX_EVENT_NAME_CHARS,
 };
 
 const IDEMPOTENCY_REQUIREMENTS: [(&str, bool); 6] = [
@@ -215,16 +216,45 @@ fn unimplemented_verbs_stay_closed_until_they_land() {
 fn move_member_request_and_outcomes_match_the_closed_vocab() {
     let fx = fixture();
     let v = verb(&fx, "voice.move_member");
+    use VoiceMoveOutcome::*;
     let request = body(&v["request"]);
-    assert_eq!(request["action"], "voice.move_member");
-    require_snowflake(&request, "discord_id").expect("discord_id snowflake");
-    require_snowflake(&request, "channel_id").expect("channel_id snowflake");
+    let action = "voice.move_member";
+    assert_eq!(request["action"], action);
+    assert_eq!(v["implemented"], false, "bind does not expose staged moves");
+    // Use the published flag as an input without declaring it as a runtime
+    // environment variable; the staged verb still has no flag loader.
+    let gate_flag = v["gate_flag"].as_str().expect("voice move gate flag");
+    for flags in [flags_empty(), flags_with(gate_flag)] {
+        assert_eq!(
+            assert_allowed(action, &flags, true, true).unwrap_err().code,
+            ErrorCode::ActionNotAllowed
+        );
+    }
+    assert!(!needs_idempotency_key(action));
+    let validated = VoiceMoveRequest::validate(&request).expect("valid self-move payload");
+    assert_eq!(request["discord_id"], validated.discord_id());
+    assert_eq!(request["channel_id"], validated.channel_id());
     let outcomes: Vec<&str> = v["outcomes"]
         .as_array()
         .expect("outcomes array")
         .iter()
         .map(|o| o.as_str().expect("outcome str"))
         .collect();
+    assert_eq!(
+        outcomes,
+        [
+            Moved,
+            AlreadyInRoom,
+            NotConnected,
+            NotPermitted,
+            RoomFull,
+            RoomGone,
+            BotNotPermitted,
+            DiscordUnavailable,
+            RateLimited
+        ]
+        .map(VoiceMoveOutcome::as_str)
+    );
     for (name, result) in v["results"].as_object().expect("results object") {
         let outcome = result["outcome"].as_str().expect("outcome str");
         assert_eq!(outcome, name, "golden key names its outcome");

@@ -683,6 +683,11 @@ impl InteractionRuntime {
             .store(id, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The identity already armed by trusted bootstrap or READY.
+    pub fn known_bot_user_id(&self) -> u64 {
+        self.bot_user_id.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// RESUMED boots without tickets never learn the bot user: resolve it once
     /// through the shared executor. Unknown stays 0, which nonce recovery refuses.
     async fn bot_user_id(&self) -> u64 {

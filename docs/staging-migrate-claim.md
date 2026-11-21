@@ -1,9 +1,11 @@
 # Staging migration apply-claim contract
 
-This is non-secret request transport for the staging migration protection rule,
-not an approval, a deployed-rule receipt or permission to apply migrations.
-Existing required reviewers, independent exact-source review, recovery/ACL
-checks and written CEO GO remain required. Production has its own mirror:
+The claim is non-secret evidence of the staging apply request, not an approval
+or permission to apply migrations. The staging gate combines the `main`-only
+GitHub environment branch rule, a successful claim job and a board confirmation
+recorded on the source task **before** dispatch. See the
+[staging migration runbook](runbook.md#staging-only-migration-runner) for recovery
+and ACL prerequisites. Production has its own approval and protection rules:
 `production-migrate.yml` with `scripts/ci/production_migrate_claim.py`, which
 binds the same projection hash but requires the production workflow path,
 environment, `migration_target` and
@@ -22,7 +24,7 @@ are distinguished by the explicit marker, workflow identity and pin match,
 not the denylist. The explicit-target acceptance tests pin both
 directions.
 
-## Available before environment approval
+## Required before the apply job
 
 `staging-migrate.yml` has a `claim` job named `staging-migrate (claim)`. It runs
 only for an apply dispatch on `main`, after the read-only `plan` job succeeds.
@@ -32,10 +34,10 @@ artifact and runs `scripts/ci/staging_migrate_claim.py`. Inputs enter through
 step environment variables, not shell interpolation. Refusal fails the job;
 there is no continue-on-error or upload-on-failure path.
 
-The protected `apply` job needs **both** `plan` and `claim`. This means the claim
-exists when the deployment-protection rule is asked to decide, unlike a step
-inside apply, which cannot execute until approval. GitHub documents that
-[protection rules gate jobs referencing the environment](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments).
+The `apply` job needs **both** `plan` and `claim`. Board confirmation precedes
+workflow dispatch, so it reviews the producing plan, not this later claim.
+The `staging-migrate-apply` environment restricts deployment to `main`; do not
+expect a GitHub reviewer or custom protection rule to pause the job.
 
 ## Exact artifact names and v1 document
 
@@ -61,16 +63,16 @@ The JSON object carries these fields, with no database URL or credentials:
 | `source_sha` | reviewed migration source, full lowercase 40-hex; can differ from workflow head |
 | `plan_manifest_sha256` | lowercase 64-hex Rust projection digest |
 | `store_plan_manifest_sha256` | lowercase 64-hex Rust store-chain projection digest |
-| `target` | object with bare non-secret `host` and `database` |
+| `target` | object with bare non-secret `host`, `database` and `branch_id` (empty for Neon) |
 | `expected_pending` | strictly ascending array of canonical positive i64 **decimal strings** |
 | `expected_store_pending` | strictly ascending array of canonical positive i64 **decimal strings** for the store chain |
 | `recovery_evidence_ref`, `acl_plan_ref` | bare evidence references, not credential-bearing URLs |
 
-The publisher compares the request's source, target, pending set and approval
-references against the **current apply dispatch's read-only plan**, recomputes
-its projection and requires embedded == computed == requested digest. This does
-not authenticate the separately referenced prior plan run. That is mandatory
-consumer work, not a promise inferred from the artifact name or a numeric ID.
+The publisher compares the request's source, target, both pending sets and
+recovery/ACL references against the **current apply dispatch's read-only plan**.
+It recomputes both projections and requires embedded == computed == requested
+for each digest. This does not authenticate the separately referenced prior plan
+run; the reviewer must do that before dispatch.
 
 Pending input follows the runner's trimming and integer parsing: surrounding
 whitespace is ignored, whitespace-only input means no pending migrations, and
@@ -121,26 +123,33 @@ A JavaScript consumer must parse numeric i64 tokens losslessly before comparing
 or hashing; `JSON.parse` into ordinary numbers silently rounds the vector's
 `9007199254740993`. Do not repair a rounded number after parsing it.
 
-## Required independent consumer checks
+## Verify the plan before dispatch and the claim after dispatch
 
-The deployment-protection rule must fail closed unless fresh, attempt-scoped
-GitHub reads establish all of the following:
+Before dispatching apply, use fresh, attempt-scoped GitHub reads to verify a
+successful plan-only `staging-migrate.yml` dispatch on `main`: the plan job
+succeeded and the claim and apply jobs did not run. Authenticate that run's
+`staging-migrate-manifest`; check the source, target, both pending sets and
+recovery/ACL references. Recompute both projection digests losslessly and
+compare them with the embedded digests. Do not dispatch if the artifact is
+missing, expired, ambiguous or cannot be authenticated.
 
-- The request is for the configured repository, workflow, main ref, dispatch
-  event and `staging-migrate-apply` environment, with the expected pending gate.
-- The claim belongs to that apply run/attempt and to its successful unprotected
-  `staging-migrate (claim)` prerequisite; its workflow-head SHA agrees with the
-  fresh run identity. Artifact absence, expiry, ambiguity or API failure refuses.
-- The prior plan is a **different**, successful `staging-migrate.yml`
-  `workflow_dispatch` on `main`, with a successful plan job and plan-mode
-  evidence (not an already-approved apply run relabelled as a plan).
-- Its authenticated `staging-migrate-manifest` artifact is read-only plan mode
-  and binds the exact reviewed source, target, pending set, recovery/ACL refs.
-  Its projection must be recomputed losslessly and equal embedded == claimed.
-- Independent CEO GO approves this exact verified binding; hash equality or
-  a completed adverse security review is not approval.
+Request a board `request_confirmation` on the source task with the full source
+SHA, producing plan run ID, both pending lists, both manifest digests and the
+recovery reference. Dispatch only after the board accepts that exact binding.
+Hash equality does not substitute for confirmation.
 
-The runner still downloads the producing run's manifest and repeats its
-pending/hash/provenance checks **before DDL**, after the environment gate.
-The pre-approval claim supplements that check; it neither replaces it nor
-weakens RO/apply credential separation, main-only protections or bash/pipefail.
+Before submitting `mode: apply` on `main`, compare the actual dispatch inputs
+with the authenticated producing manifest and its run ID. Match the source SHA,
+both pending lists, both digests, the pinned target (`staging_host`,
+`staging_database`, `staging_branch_id`) and both evidence references
+(`recovery_evidence_ref`, `acl_plan_ref`). The digests do not cover the target or
+either reference. Do not dispatch if any value differs.
+
+After dispatch, verify that the claim came from the successful
+`staging-migrate (claim)` job on that run and attempt, agrees with the
+workflow-head SHA and matches the pre-dispatch inputs. This operator comparison
+is audit evidence, not an approval gate; apply does not wait for it. The apply
+job downloads the separate producing run's manifest, and the runner checks its
+pending sets, hashes and provenance **before DDL**. The claim neither replaces
+those checks nor weakens read-only/apply credential separation, main-only
+protections or shell failure propagation.
