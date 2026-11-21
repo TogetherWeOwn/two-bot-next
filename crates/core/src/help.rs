@@ -165,6 +165,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Staging AutoMod preview",
+        requires: Some("Manage Server"),
+        commands: &["automod-preview"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "Game activity (private, live guild unavailable)",
         requires: Some("Manage Server"),
         commands: &["game-mix"],
@@ -955,6 +961,24 @@ mod tests {
             **Bans** — needs Ban Members\n/ban\n\n**Custom**\n/ping · /faq\n\n\
             This is the last confirmed command list. Your picker hides gated commands you cannot use.";
         assert_eq!(help_text(&defs), expected);
+    }
+
+    #[test]
+    fn staging_automod_preview_has_a_manage_server_hint_only_when_confirmed() {
+        let mut defs = InteractionRouter::new(all_on()).publish_set(&[]).unwrap();
+        assert!(!help_text(&defs).contains("Staging AutoMod preview"));
+        assert!(!help_text(&defs).contains("/automod-preview"));
+
+        defs.push(crate::automod_preview::automod_preview_definition());
+        let catalog = help_catalog(&defs);
+        let group = catalog
+            .sections
+            .iter()
+            .find(|section| section.title == "Staging AutoMod preview")
+            .expect("confirmed preview group");
+        assert_eq!(group.requires, Some("Manage Server"));
+        assert_eq!(group.commands, ["automod-preview"]);
+        assert_eq!(help_text(&defs).matches("/automod-preview").count(), 1);
     }
 
     pub(super) fn maximum_publication() -> (Vec<CommandDefinition>, Vec<CustomCommand>) {

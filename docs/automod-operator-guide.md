@@ -13,6 +13,9 @@ configuration, including a missing Owen id, rather than running
 unmoderated. See the [runtime handoff](automod-runtime.md) for the full
 contract.
 
+See the [staging preview spec and removal rule](automod-preview-spec.md#1-decision-alternatives-and-the-no-build-test)
+for the staff-only `/automod-preview` and when to unpublish it.
+
 ## Filters: what trips, in what order
 
 `AutomodFilter` (`crates/core/src/automod.rs:39`) has six reasons, evaluated

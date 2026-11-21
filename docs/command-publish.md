@@ -174,8 +174,9 @@ protected-user/role settings). None of these are enabled by default. Unrelated
 Worker bindings and `DISCORD_API_BASE` are not forwarded into the container.
 
 Boot uses the normal `GUILD_ID`, `DISCORD_TOKEN`, and feature bindings. Normal
-gateway prerequisites (including `DATABASE_URL`) still apply. If enabled,
-publication/refusal happens before opening the gateway database or connecting
+gateway prerequisites (including `DATABASE_URL`) still apply. Outside the
+canonical staging guild, enabled early publication/refusal happens before
+opening the gateway database or connecting
 the shard; failure stops the configured gateway task rather than continuing with
 an unknown registry. The early sync reads the same env flags as the CLI, so with
 `TWO_VOICE=1` it already carries the voice set; keeping it there means a healthy
@@ -193,18 +194,15 @@ can precede a later database/session/shard startup failure; those failures do
 not roll the registry back. Use the explicit CLI dry run to inspect removals
 before opting into this boot behavior.
 
-**Staging** opts in from `wrangler.toml` (`[env.staging.vars]`):
-`TWO_COMMANDS_PUBLISH_ON_BOOT = "1"` plus the staging bot's public
-`DISCORD_APPLICATION_ID`. The container publishes with its own send-admission
-database, so an operator CLI run needs no second database credential, and the
-live-guild fence stays on. `wrangler/scripts/check-env-bindings.py` rejects the opt-in
-at top level and in production; production publication stays an
-Operator-approved Worker binding. The staging guild's registry is a full
-replacement on every boot where the hashes differ: do not keep a separate
-dynamic registry there. Rollback: delete both lines and redeploy, then publish
-the reduced set with the CLI if commands must be removed.
+**Canonical staging** skips early sync even if `wrangler.toml` sets the opt-in.
+Only the gateway publishes the complete registry after it knows the attached
+features and saved commands. This avoids deleting and recreating preview and
+saved commands on restart. To withdraw the preview, restart with its activation
+closed so the gateway publishes the reduced set; do not apply the CLI's
+builtin-only registry. `wrangler/scripts/check-env-bindings.py` still rejects
+the early-sync opt-in at top level and in production.
 
-Each enabled boot fetches the full registry, including localizations, and
+When early sync runs, it fetches the full registry, including localizations, and
 compares canonical SHA-256 hashes. A matching fetched hash skips PUT. This
 fetch-and-compare approach needs no DB publication-hash table, works across
 process restarts, and detects out-of-band edits instead of trusting a stale
