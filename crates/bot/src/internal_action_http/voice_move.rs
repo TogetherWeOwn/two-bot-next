@@ -68,7 +68,10 @@ async fn respond(
                 .then_some(gateway)
         })
         .await;
-    let outcome = attempt.outcome;
+    let outcome = match (attempt.outcome, attempt.retry_after_secs) {
+        (Outcome::RateLimited, None) => Outcome::DiscordUnavailable,
+        (outcome, _) => outcome,
+    };
     if outcome == Outcome::BotNotPermitted {
         tracing::warn!("voice move denied by bot permissions");
     }

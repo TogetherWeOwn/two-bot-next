@@ -690,16 +690,17 @@ async fn governed_voice_move_checks_the_ordered_roster_and_reuses_unsent_lane() 
 
 #[tokio::test]
 async fn voice_move_signed_storage_refusal_releases_member_and_last_seat_without_socket() {
-    signed_voice_move(false).await;
+    signed_voice_move(false, true).await;
+    signed_voice_move(false, false).await;
 }
 
 #[tokio::test]
 async fn voice_move_signed_uncertain_patch_holds_until_newer_gateway_evidence() {
-    signed_voice_move(true).await;
+    signed_voice_move(true, true).await;
 }
 
-async fn signed_voice_move(uncertain: bool) {
-    use VoiceMoveOutcome::{BotNotPermitted, DiscordUnavailable, Moved};
+async fn signed_voice_move(uncertain: bool, with_retry_after: bool) {
+    use VoiceMoveOutcome::{BotNotPermitted, DiscordUnavailable, Moved, RateLimited};
     const FIRST: &str = "111111111111111141";
     const SECOND: &str = "111111111111111142";
     const SOURCE: &str = "111111111111111131";
@@ -720,10 +721,9 @@ async fn signed_voice_move(uncertain: bool) {
     };
     replies.push((StatusCode::OK, receipt));
     replies.extend(facts(FIRST).into_iter().take(2));
-    replies.extend([
-        (StatusCode::OK, thread),
-        (StatusCode::TOO_MANY_REQUESTS, json!({"retry_after":1.0})),
-    ]);
+    let cooldown = json!({"retry_after":with_retry_after.then_some(1.0)});
+    replies.push((StatusCode::OK, thread));
+    replies.push((StatusCode::TOO_MANY_REQUESTS, cooldown));
     let mut pauses = vec![(0, Arc::default())];
     pauses.extend(uncertain.then(|| (patch_at, patch.clone())));
     let mock = MockDiscord::start_with_pauses(replies, pauses).await;
@@ -823,22 +823,12 @@ async fn signed_voice_move(uncertain: bool) {
     assert_eq!(refused.0.as_u16(), DiscordUnavailable.status());
     assert_eq!(refused.2["error"]["code"], DiscordUnavailable.as_str());
     assert_eq!(recovered.2["result"]["outcome"], BotNotPermitted.as_str());
-    audit(
-        &refused.2,
-        &refused_nonce,
-        DiscordUnavailable,
-        FIRST,
-        Some(SOURCE),
-    )
-    .await;
-    audit(
-        &recovered.2,
-        &queued_nonce,
-        BotNotPermitted,
-        SECOND,
-        Some(SOURCE),
-    )
-    .await;
+    for (body, nonce, outcome, member) in [
+        (&refused.2, &refused_nonce, DiscordUnavailable, FIRST),
+        (&recovered.2, &queued_nonce, BotNotPermitted, SECOND),
+    ] {
+        audit(body, nonce, outcome, member, Some(SOURCE)).await;
+    }
     mock.assert_wires(14);
 
     let delivery = nonce();
@@ -878,10 +868,17 @@ async fn signed_voice_move(uncertain: bool) {
         );
         let nonce = nonce();
         let (status, headers, body) = move_to(FIRST, &nonce).await;
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(headers[header::RETRY_AFTER], "1");
-        assert_eq!(body["error"]["code"], "rate_limited");
-        audit(&body, &nonce, VoiceMoveOutcome::RateLimited, FIRST, None).await;
+        let retry_after = with_retry_after.then(|| HeaderValue::from_static("1"));
+        let limited = retry_after
+            .as_ref()
+            .map_or(DiscordUnavailable, |_| RateLimited);
+        assert_eq!(status.as_u16(), limited.status());
+        assert_eq!(headers.get(header::RETRY_AFTER), retry_after.as_ref());
+        assert_eq!(body["error"]["code"], limited.as_str());
+        audit(&body, &nonce, limited, FIRST, None).await;
+        if !with_retry_after {
+            assert!(lane.admit_strict().await.err() == Some(AdmissionError::Blocked));
+        }
         mock.assert_wires(patch_at + 5);
     }
     mock.assert_patch_indices(&[13, patch_at]);
