@@ -171,10 +171,12 @@ fn focused_privacy_deletion_status(text: &str) {
             "128",
         ],
     );
-    let first = text.lines().next().expect("header line");
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some("Together We Own help"), "Help title");
+    let first_description_line = lines.next().expect("topic description line");
     assert!(
-        first.contains("deletion-status"),
-        "header names the focused branch: {text}"
+        first_description_line.contains("deletion-status"),
+        "topic description opens with the focused branch: {text}"
     );
     for sibling in ["/privacy opt-out", "/privacy opt-in", "/privacy status"] {
         assert!(

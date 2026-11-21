@@ -12,8 +12,8 @@ use tokio::{
     time::timeout,
 };
 use two_bot_core::send_admission::{
-    AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, SendCompletion, SendCooldown,
-    TokenKey,
+    AdmissionError, AdmissionFuture, AdmissionPermit, ClaimFuture, SendAdmission, SendCompletion,
+    SendCooldown, TokenKey,
 };
 
 #[derive(Debug)]
@@ -65,6 +65,21 @@ impl SendAdmission for Admission {
     }
     fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
         Box::pin(async { self.permit(self.ordinary) })
+    }
+    fn admit_until(&self, at: tokio::time::Instant) -> ClaimFuture<'_> {
+        Box::pin(async move {
+            if tokio::time::Instant::now() >= at {
+                return Err(AdmissionError::Deadline);
+            }
+            // Reuse the fixture's one-shot claim/ack probe for bounded reads.
+            let claim = match self.resume_strict {
+                Some(_) => self.admit_strict(),
+                None => self.admit(),
+            };
+            tokio::time::timeout_at(at, claim)
+                .await
+                .map_err(|_| AdmissionError::Deadline)?
+        })
     }
     fn admit_strict(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
         Box::pin(async {

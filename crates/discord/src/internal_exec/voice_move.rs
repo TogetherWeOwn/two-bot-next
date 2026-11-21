@@ -20,6 +20,7 @@ pub enum VoiceMoveNotSent {
     Storage,
     Guard,
     Deadline,
+    Revalidation,
 }
 
 /// A result is evidence supplied by the executor, not proof by itself.

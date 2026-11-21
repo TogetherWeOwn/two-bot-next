@@ -18,7 +18,7 @@ use crate::brand::{
     brand_footer_for, ephemeral_reply_embed, rsvp_reply_embed, EmbedKind, BRAND_ICON_URL,
 };
 use crate::help_navigation::{DiscoveryPlan, HelpRecovery, HELP_SURFACE, HELP_TITLE};
-use crate::interactions::branded_help_detail_response;
+use crate::interactions::help_detail_response;
 use crate::internal_actions::announcement_embed;
 
 /// Versioned payload schema the Python smoke refuses anything else under.
@@ -129,7 +129,7 @@ pub fn help_embed_smoke_payloads() -> Result<Value, &'static str> {
     let topic_footer = brand_footer_for(HELP_SURFACE).text;
     let help = single_branded_embed(&first, &help_footer, "help_embed_missing")?;
     let help_topic = single_branded_embed(
-        &branded_help_detail_response(wide_detail_text()),
+        &help_detail_response(wide_detail_text()),
         &topic_footer,
         "help_topic_embed_missing",
     )?;
@@ -262,7 +262,7 @@ mod help_embed_smoke_tests {
             .expect("plan")
             .first(1, 600)
             .expect("first page");
-        let detail = branded_help_detail_response(wide_detail_text());
+        let detail = crate::interactions::branded_help_detail_response(wide_detail_text());
         let payloads = help_embed_smoke_payloads().expect("payloads build");
         for (key, reply) in [("help", first), ("help_topic", detail)] {
             let safe =

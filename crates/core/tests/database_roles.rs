@@ -110,13 +110,9 @@ async fn denied(pool: &PgPool, role: &str, sql: &str) -> Result<(), sqlx::Error>
     }
 }
 
-async fn admission_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
-    use two_bot_core::send_admission::{
-        AdmissionError, PgSendAdmission, SendAdmission, SendCooldown,
-    };
-
+async fn runtime_role_pool(pool: &PgPool, role: &str) -> Result<PgPool, sqlx::Error> {
     let role = role.to_owned();
-    let runtime = PgPoolOptions::new()
+    PgPoolOptions::new()
         .max_connections(1)
         .after_connect(move |connection, _| {
             let role = role.clone();
@@ -128,7 +124,15 @@ async fn admission_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Err
             })
         })
         .connect_with((*pool.connect_options()).clone())
-        .await?;
+        .await
+}
+
+async fn admission_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
+    use two_bot_core::send_admission::{
+        AdmissionError, PgSendAdmission, SendAdmission, SendCooldown,
+    };
+
+    let runtime = runtime_role_pool(pool, role).await?;
     let result = async {
         let error = |error: AdmissionError| sqlx::Error::InvalidArgument(error.to_string());
         let gate = PgSendAdmission::new(runtime.clone(), "offline-database-role-admission")
@@ -151,6 +155,58 @@ async fn admission_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Err
         require(
             matches!(gate.admit().await, Err(AdmissionError::Blocked)),
             "runtime lost indefinite admission hold",
+        )
+    }
+    .await;
+    runtime.close().await;
+    result
+}
+
+// Use only the grants installed by the canonical plan on the migrated fixture.
+// The real adapter owns its transactions, so every pooled session is restricted.
+async fn preview_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
+    use std::time::Duration;
+    use tokio::time::Instant;
+    use two_bot_core::automod_preview_attempt::PreviewAttemptStore;
+    use two_bot_core::automod_preview_audit::{
+        preview_audit_id, preview_audit_record, PreviewAuditRow,
+    };
+    use two_bot_core::automod_preview_store::SqlPreviewStore;
+
+    let runtime = runtime_role_pool(pool, role).await?;
+    let result = async {
+        let effective_role: String = sqlx::query_scalar("SELECT current_user::text")
+            .fetch_one(&runtime)
+            .await?;
+        require(
+            effective_role == role,
+            "preview pool did not assume runtime role",
+        )?;
+
+        let id = preview_audit_id("roles-probe");
+        let new_store = || SqlPreviewStore::new(&runtime, Instant::now() + Duration::from_secs(5));
+        let mut writer = new_store();
+        require(
+            writer.claim_and_read(&id).await?.is_none(),
+            "preview id already exists",
+        )?;
+        let reason = "filter=bad_words;exemption=none;mode=dry_run;len=0_50";
+        let record = preview_audit_record("g", "a", "c", "matched", reason.to_owned());
+        let created_at = writer
+            .insert_and_commit(record, &id, "2026-01-01T00:00:00.123456Z")
+            .await?;
+        require(
+            created_at == "2026-01-01 00:00:00.123456+00",
+            "runtime preview insert did not return the receipt time",
+        )?;
+        require(
+            new_store().claim_and_read(&id).await?
+                == Some(PreviewAuditRow {
+                    outcome: "matched".to_owned(),
+                    reason: Some(reason.to_owned()),
+                    created_at,
+                }),
+            "runtime preview replay did not load the committed row",
         )
     }
     .await;
@@ -400,6 +456,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // ticket foreign key. Delete the transcript before its parent ticket.
     as_role(pool, &roles[1], "INSERT INTO public.tickets (id, guild_id, channel_id, opener_id, status, created_at) VALUES ('ticket-probe', 'g', 'c', 'm', 'open', '2026-01-01T00:00:00Z'); SELECT * FROM public.tickets; UPDATE public.tickets SET claimed_by = 'staff' WHERE id = 'ticket-probe'; INSERT INTO public.ticket_transcripts (ticket_id, guild_id, channel_id, opener_id, claimed_by, content, message_count, created_at, purge_after) VALUES ('ticket-probe', 'g', 'c', 'm', 'staff', 'probe', 1, '2026-01-01T00:00:00Z', '2026-04-01T00:00:00Z'); SELECT * FROM public.ticket_transcripts; UPDATE public.ticket_transcripts SET content = 'updated probe' WHERE ticket_id = 'ticket-probe'; DELETE FROM public.ticket_transcripts WHERE ticket_id = 'ticket-probe'; DELETE FROM public.tickets WHERE id = 'ticket-probe'").await?;
     automod_runtime_role_regression(pool, roles).await?;
+    preview_as_runtime(pool, &roles[1]).await?;
     role_matrix_b2_regression(pool, roles).await?;
     for view in [
         "contract_meta",

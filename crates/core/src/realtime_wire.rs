@@ -5,7 +5,11 @@ use std::{io, num::NonZeroU64};
 use serde::{ser::Error as _, Serialize, Serializer};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
+pub mod recovery;
+mod snapshot;
 mod validation;
+
+pub use snapshot::{encode_snapshot, Topics};
 
 const DELTA_BYTES: usize = 64 * 1024;
 pub const MAX_SEQ: u64 = (1 << 53) - 1;

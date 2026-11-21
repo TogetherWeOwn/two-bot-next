@@ -41,16 +41,15 @@ ordered fields. It does not post buttons or verify callback behavior.
 
 The payload deliberately uses the maximal command registry and a wide topic
 detail, matching the Rust builder tests. It exercises pagination and overflow
-rather than simulating staging's current registry size. The topic embed is a
-staging preview: the product bot still uses the existing topic reply until
-the separate runtime change is reviewed and merged. The Actions payload
+rather than simulating staging's current registry size. The topic fixture
+uses the same adapter as the product bot's topic reply. The Actions payload
 artifact contains only synthetic fixture embeds, not staging messages.
 
 ## Rendered payload inventory
 
 | Rows | Builder | Colour | Footer suffix | Icon |
 | --- | --- | --- | --- | --- |
-| `help`, `help_topic` | `DiscoveryPlan::first`, `branded_help_detail_response` | Default | Help · Page 1 of N, Help | Icon 1 |
+| `help`, `help_topic` | `DiscoveryPlan::first`, `help_detail_response` | Default | Help · Page 1 of N, Help | Icon 1 |
 | `help_warn`, `help_error` | `HelpRecovery::response` (expired, cannot build) | Warn, Danger | Help | Icon 1 |
 | `announcement`, `echo` | `announcement_embed` (ordinary and Echo titles) | Default, Echo | Announcements, Echo | Icon 1 |
 | `rsvp_ok`, `rsvp_error` | `rsvp_reply_embed` (RSVP and attendance) | Ok, Danger | Events | None |
@@ -58,7 +57,7 @@ artifact contains only synthetic fixture embeds, not staging messages.
 
 Later Help pages reuse the first-page renderer; button navigation and all
 recovery copy variants have hermetic tests in `help_navigation/tests.rs`.
-The pre-activation legacy Help overflow paths remain covered in `interactions.rs`.
+Short replies and overflow handling have hermetic tests in `interactions.rs`.
 Voice outcome selection and deferred completion stay in hermetic handler tests;
 these posts only exercise the shared builder. Moderation confirmations and
 audit entries are plain text: `member_runtime.rs` and `audit.rs` test severity

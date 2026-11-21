@@ -1741,7 +1741,63 @@ mod preview_callback_acceptance {
     use two_bot_cutover::settings::SettingsStore;
     use two_bot_discord::executor::RECEIPT_ADMISSION_BUDGET_MS;
 
-    const SAMPLE: &str = "syntheticpreviewcanary";
+    // Keep the invocation distinct from the synthetic word in the stored policy.
+    const SAMPLE: &str = "ＳyntheticCanary PreviewWord";
+
+    #[derive(Clone, Default)]
+    struct PreviewTrace(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for PreviewTrace {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("preview trace")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl PreviewTrace {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("preview trace")).into_owned()
+        }
+    }
+
+    // Seed a separate tracker through the real matcher to read the pinned
+    // toolchain's repeat digest. Don't duplicate its hashing algorithm or
+    // expose the digest through a new production API for this test.
+    fn sentinel_repeat_digest() -> u64 {
+        use two_bot_core::automod::{match_automod, AutomodMessage, AutomodPolicy, RepeatTracker};
+
+        let mut tracker = RepeatTracker::default();
+        let message = AutomodMessage {
+            guild_id: "guild".into(),
+            channel_id: "channel".into(),
+            message_id: "message".into(),
+            author_id: "author".into(),
+            author_is_bot: false,
+            role_ids: vec![],
+            content: SAMPLE.into(),
+            mentioned_user_ids: vec![],
+            attachment_names: vec![],
+            observed_timestamp_ms: 1,
+        };
+        assert!(match_automod(&message, &AutomodPolicy::default(), &mut tracker).is_none());
+        format!("{tracker:?}")
+            .split_once("digest: ")
+            .and_then(|(_, rest)| rest.split_once(','))
+            .and_then(|(digest, _)| digest.parse().ok())
+            .expect("real tracker must contain one decimal digest")
+    }
+
+    fn contains_preview_canary(sink: &str, fingerprints: &[String]) -> bool {
+        let folded = sink.to_ascii_lowercase();
+        fingerprints.iter().any(|needle| folded.contains(needle))
+    }
 
     tokio::task_local! {
         static DISPATCH_WORKER: Cell<Option<JoinHandle<()>>>;
@@ -1834,7 +1890,7 @@ mod preview_callback_acceptance {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn preview_callback_follows_commit_and_respects_receipt_under_contention(
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let url = std::env::var("TWO_TEST_DATABASE_URL")?;
@@ -1843,7 +1899,23 @@ mod preview_callback_acceptance {
             &sqlx::migrate!("../cutover/migrations"),
         )
         .await?;
-        let proof = tokio::spawn(verify_callbacks(db.pool().clone())).await;
+        let trace = PreviewTrace::default();
+        let writer = trace.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .with_span_events(
+                tracing_subscriber::fmt::format::FmtSpan::NEW
+                    | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+            )
+            .with_writer(move || writer.clone())
+            .finish();
+        // Both detached workers are polled on this test's only runtime
+        // thread, where the tracing guard remains installed until they join.
+        let guard = tracing::subscriber::set_default(subscriber);
+        let proof = tokio::spawn(verify_callbacks(db.pool().clone(), trace)).await;
+        drop(guard);
         db.close().await?;
         proof??;
         Ok(())
@@ -1851,6 +1923,7 @@ mod preview_callback_acceptance {
 
     async fn verify_callbacks(
         pool: PgPool,
+        trace: PreviewTrace,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let guild = STAGING_GUILD_ID.parse::<u64>()?;
         let (mock, origin) = MockRest::start(vec![204]).await;
@@ -1902,13 +1975,14 @@ mod preview_callback_acceptance {
             .set(
                 &guild.to_string(),
                 "TWO_AUTOMOD_BAD_WORDS",
-                Some(serde_json::json!([SAMPLE])),
+                Some(serde_json::json!(["previewword"])),
                 "test",
             )
             .await?;
         let (mut writer, live) = two_bot_core::settings::live_channel();
         assert!(writer.publish(&store.load_snapshot().await?).changed);
         runtime.set_live_settings(live);
+        assert!(runtime.preview_metrics.set(Default::default()).is_ok());
         let _guard = runtime.dispatch_guard();
         let preview = |id, sample: &str| {
             let mut request = slash(
@@ -2086,6 +2160,86 @@ mod preview_callback_acceptance {
         assert_eq!(row.outcome, "matched");
         assert_eq!(mock.requests().len(), 1, "no late callback or follow-up");
         mock.shutdown().await;
+
+        let audit_rows: Vec<String> = sqlx::query_scalar(
+            "SELECT to_jsonb(a)::text FROM automation_audit_log AS a ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(audit_rows.len(), 2, "one audit row per preview");
+        let enforcement_rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM automod_violations) + \
+             (SELECT count(*) FROM automod_delivery_claims)",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            enforcement_rows, 0,
+            "preview never touches enforcement stores"
+        );
+        let metrics = runtime
+            .preview_metrics
+            .get()
+            .expect("fixture metrics")
+            .render(None);
+        assert!(metrics.lines().any(|line| {
+            line.starts_with(
+                r#"two_bot_automod_previews_total{result="matched",filter="bad_words","#,
+            ) && line.ends_with(" 2")
+        }));
+        let logs = trace.contents();
+        assert!(
+            logs.contains("automod preview callback failed"),
+            "the real detached failure diagnostic must be captured"
+        );
+
+        let normalized = two_bot_core::automod::normalize_content(SAMPLE);
+        assert_eq!(normalized, "syntheticcanary previewword");
+        let (raw_md5, normalized_md5, raw_sha256, normalized_sha256): (
+            String,
+            String,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT md5($1::text), md5($2::text), \
+                 encode(sha256(convert_to($1, 'UTF8')), 'hex'), \
+                 encode(sha256(convert_to($2, 'UTF8')), 'hex')",
+        )
+        .bind(SAMPLE)
+        .bind(&normalized)
+        .fetch_one(&pool)
+        .await?;
+        let repeat_digest = sentinel_repeat_digest();
+        let fingerprints = [
+            SAMPLE.to_ascii_lowercase(),
+            normalized,
+            raw_md5,
+            normalized_md5,
+            raw_sha256,
+            normalized_sha256,
+            repeat_digest.to_string(),
+            format!("{repeat_digest:x}"),
+        ];
+        for (name, sink) in [
+            ("logs and errors", logs),
+            ("audit rows", audit_rows.join("\n")),
+            ("metrics", metrics),
+            ("callback", String::from_utf8(requests[0].body.clone())?),
+        ] {
+            assert!(
+                !contains_preview_canary(&sink, &fingerprints),
+                "preview canary leaked in {name}"
+            );
+        }
+
+        // Positive control: leak only the actual digest, after the clean scan.
+        // Nothing modifies the repeat tracker, so immutability alone misses it.
+        trace.0.lock().expect("preview trace").clear();
+        tracing::warn!(digest = ?repeat_digest, "synthetic positive control");
+        assert!(
+            contains_preview_canary(&trace.contents(), &fingerprints),
+            "sink checker must detect a decimal repeat digest"
+        );
         Ok(())
     }
 }
@@ -4310,6 +4464,13 @@ fn help_focus_selector_rejects_duplicate_command_with_a_path() {
     assert_eq!(help_focus_selector(&root_only), HelpSubcommand::Absent);
 }
 
+fn help_embed_description(data: &serde_json::Value) -> &str {
+    assert!(data["content"].is_null());
+    let embeds = data["embeds"].as_array().expect("help embeds");
+    assert_eq!(embeds.len(), 1);
+    embeds[0]["description"].as_str().expect("help description")
+}
+
 #[tokio::test]
 async fn help_focused_dispatch_rejects_duplicate_roots_in_both_orders() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
@@ -4367,7 +4528,7 @@ async fn help_focused_dispatch_rejects_duplicate_roots_in_both_orders() {
             reply["data"]["allowed_mentions"]["parse"],
             serde_json::json!([])
         );
-        let content = reply["data"]["content"].as_str().expect("help content");
+        let content = help_embed_description(&reply["data"]);
         if roots.len() == 1 {
             assert!(
                 content.contains("Usage: /privacy deletion-status <request-id>"),
