@@ -13,6 +13,9 @@ use twilight_model::{
 use two_bot_core::realtime_wire as wire;
 use wire::{Change, Operation};
 
+mod baseline;
+pub use baseline::scheduled_events;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectionError {
     MalformedDispatch,
@@ -29,9 +32,20 @@ struct Dispatch<'a> {
     d: Option<&'a RawValue>,
 }
 
+impl Dispatch<'_> {
+    fn kind(&self) -> Result<Option<Kind>, ProjectionError> {
+        if self.op != 0 {
+            return Ok(None);
+        }
+        let name = self.t.ok_or(ProjectionError::MalformedDispatch)?.get();
+        decode(name, '"').map(Some)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum Kind {
+    GuildCreate,
     GuildMemberAdd,
     GuildMemberUpdate,
     GuildMemberRemove,
@@ -104,12 +118,10 @@ struct EventMetadata {
 /// owns codec validation, reference cleanup, sequencing and visibility.
 pub fn project(guild_id: Id<GuildMarker>, raw: &str) -> Result<Option<Operation>, ProjectionError> {
     let dispatch: Dispatch<'_> = decode(raw, '{')?;
-    if dispatch.op != 0 {
+    let Some(kind) = dispatch.kind()? else {
         return Ok(None);
-    }
-    let name = dispatch.t.ok_or(ProjectionError::MalformedDispatch)?.get();
-    let kind: Kind = decode(name, '"')?;
-    if matches!(kind, Kind::Other) {
+    };
+    if matches!(kind, Kind::GuildCreate | Kind::Other) {
         return Ok(None);
     }
     let body = dispatch.d.ok_or(ProjectionError::MalformedDispatch)?.get();
@@ -123,12 +135,12 @@ pub fn project(guild_id: Id<GuildMarker>, raw: &str) -> Result<Option<Operation>
             id: wire_id(decode::<RemovedMember>(body, '{')?.user.id),
         }),
         Kind::GuildScheduledEventCreate | Kind::GuildScheduledEventUpdate => {
-            event_change(decode(body, '{')?)?
+            Operation::Events(event_change(decode(body, '{')?)?)
         }
         Kind::GuildScheduledEventDelete => Operation::Events(Change::Remove {
             id: wire_id(decode::<RemovedEvent>(body, '{')?.id),
         }),
-        Kind::Other => return Ok(None),
+        Kind::GuildCreate | Kind::Other => return Ok(None),
     };
     Ok(Some(operation))
 }
@@ -160,14 +172,12 @@ fn member_change(input: MemberInput) -> Result<Operation, ProjectionError> {
     }))
 }
 
-fn event_change(input: ScheduledEventInput) -> Result<Operation, ProjectionError> {
+fn event_change(input: ScheduledEventInput) -> Result<Change<wire::Event>, ProjectionError> {
     let id = wire_id(input.id);
     let status = match input.status {
         Status::Scheduled => wire::EventStatus::Scheduled,
         Status::Active => wire::EventStatus::Active,
-        Status::Completed | Status::Cancelled => {
-            return Ok(Operation::Events(Change::Remove { id }))
-        }
+        Status::Completed | Status::Cancelled => return Ok(Change::Remove { id }),
         _ => return Err(ProjectionError::UnsupportedEvent),
     };
     if input.privacy_level != PrivacyLevel::GuildOnly {
@@ -180,8 +190,11 @@ fn event_change(input: ScheduledEventInput) -> Result<Operation, ProjectionError
         }
         _ => return Err(ProjectionError::UnsupportedEvent),
     };
-    let scheduled_end = input.scheduled_end_time.as_deref();
-    Ok(Operation::Events(Change::Upsert {
+    let (starts_at, ends_at) = event_times(
+        &input.scheduled_start_time,
+        input.scheduled_end_time.as_deref(),
+    )?;
+    Ok(Change::Upsert {
         id,
         value: wire::Event {
             id,
@@ -190,10 +203,17 @@ fn event_change(input: ScheduledEventInput) -> Result<Operation, ProjectionError
             title: input.name,
             description: input.description,
             location,
-            starts_at: wire_time(&input.scheduled_start_time)?,
-            ends_at: scheduled_end.map(wire_time).transpose()?,
+            starts_at,
+            ends_at,
         },
-    }))
+    })
+}
+
+fn event_times(
+    start: &str,
+    end: Option<&str>,
+) -> Result<(wire::WireTime, Option<wire::WireTime>), ProjectionError> {
+    Ok((wire_time(start)?, end.map(wire_time).transpose()?))
 }
 
 fn wire_time(input: &str) -> Result<wire::WireTime, ProjectionError> {

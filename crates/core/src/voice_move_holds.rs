@@ -97,13 +97,29 @@ impl VoiceMoveHolds {
         if self.targets.contains_key(&member) {
             return Err(HoldRefused);
         }
-        Ok(self.targets.values().fold(cached, |count, hold| {
+        Ok(self.count_target(target, cached))
+    }
+
+    /// Recheck a pending reservation. The total includes this member's seat.
+    pub fn reserved_occupancy(
+        &self,
+        member: Snowflake,
+        target: Snowflake,
+        cached: u32,
+    ) -> Option<u32> {
+        let hold = self.targets.get(&member)?;
+        (hold.target == target && hold.completion_generation.is_none())
+            .then(|| self.count_target(target, cached))
+    }
+
+    fn count_target(&self, target: Snowflake, cached: u32) -> u32 {
+        self.targets.values().fold(cached, |count, hold| {
             if hold.target == target {
                 count.saturating_add(1)
             } else {
                 count
             }
-        }))
+        })
     }
 }
 

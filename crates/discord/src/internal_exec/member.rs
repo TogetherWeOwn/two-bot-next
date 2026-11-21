@@ -22,6 +22,9 @@ pub mod store;
 #[path = "voice_move.rs"]
 pub mod voice_move;
 pub use voice_move::{VoiceMoveNotSent, VoiceMovePatch, VOICE_MOVE_TIMEOUT_MS};
+#[path = "voice_move_reads.rs"]
+mod voice_move_reads;
+pub use voice_move_reads::{VoiceMoveEvidence, VoiceMoveTarget};
 
 #[cfg(test)]
 #[path = "voice_move_adapter_tests.rs"]
