@@ -24,6 +24,14 @@ The test extends this saved fixture in memory with `/lfg-edit`: **46 compiled
 built-ins**, five covered and 41 deferred. The saved JSON deliberately excludes
 edit; this extension is not a live-publication or smoke-acceptance claim.
 
+## Staging-only registry read-back
+
+| Command | Gate / permission | Evidence |
+| --- | --- | --- |
+| `/automod-preview` | Active AutoMod admits the configured staging guild; moderation enabled, spare slot, Manage Server | Read back the guild registry on the exact serving SHA. Verify the private dry-run and repeat isolation in Actions, not with a staging invocation. |
+
+This conditional row does not change the default generated registry or the smoke five.
+
 ## Covered: the smoke five (one per routing family)
 
 Each row links the exact expected reply in

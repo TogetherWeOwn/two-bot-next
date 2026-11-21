@@ -127,7 +127,7 @@ Inspected at the commit this file lands with; line refs are to that tree.
   `crates/core/src/moderation.rs:209-220`) and `/welcome-preview`
   (ManageGuild, the configuration authority,
   `crates/core/src/command_permissions.rs:101`). Ephemeral replies use the
-  shared helper (`crates/bot/src/command_runtime.rs:3085`).
+  shared helper (`crates/bot/src/command_runtime.rs:3591`).
 
 ## 3. Proposed surface (future build, not shipped by this doc)
 
@@ -379,10 +379,9 @@ was activated at boot, that guild is the stack's configured staging guild,
 and the active scope admits it**, through the existing guild-registry
 publication path
 ([command-publish](command-publish.md)) — the live guild should not even
-list an inert oracle in its picker. If the publish set cannot be
-scope-conditioned without a large refactor, that is the same
-stop-and-redesign gate as the runtime handle below, not a reason to
-publish globally.
+list an inert oracle in its picker. The existing moderation router gate
+must also be on. Preview uses only a spare guild registry slot: it never
+displaces a published builtin or a saved custom command.
 
 **Effective config source.** Resolve the same store-first policy used for
 in-scope gateway delivery. If that overlay is unusable, use the activation's
@@ -641,9 +640,9 @@ slices (2–4) carry the CISO comment-gate.
    mock executor/ledger; T14/T17 additionally use a disposable test DB to
    prove transaction release, contended replay, and stored-time parity.
 4. **Publish + docs + staging proof** — add the definition to the
-   published moderation set under the §5.0 scope condition (T18),
-   regenerate `docs/commands.md`, operator-guide
-   section pointing here, smoke-surface inventory row. Record two separate
+   complete guild publish set under the §5.0 scope condition (T18),
+   keep the default generated command reference dark, and add an operator
+   guide link and a conditional smoke-surface inventory row. Record two separate
    pieces of acceptance evidence:
    - **Staging (read-only):** confirm the serving artifact is the exact
      qualified main SHA and read back the command definition from that

@@ -5800,6 +5800,110 @@ fn production_router_matches_composed_production_wiring() {
 }
 
 #[tokio::test]
+async fn staging_preview_survives_both_runtime_registry_publishers(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use two_bot_core::automod_runtime::STAGING_GUILD_ID;
+    use two_bot_core::custom_command_store::put_command;
+    use two_bot_core::custom_commands::StoredCommand;
+
+    let url = std::env::var("TWO_TEST_DATABASE_URL")?;
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await?;
+    let pool = db.pool().clone();
+    let proof = tokio::spawn(async move {
+        let guild = STAGING_GUILD_ID.parse()?;
+        put_command(
+            &pool,
+            &StoredCommand {
+                guild_id: STAGING_GUILD_ID.to_owned(),
+                name: "registry-test".to_owned(),
+                description: "Saved command".to_owned(),
+                template: "Saved response".to_owned(),
+                text_trigger: None,
+                enabled: true,
+            },
+            "66",
+            "67",
+            "2026-10-01T00:00:00Z",
+            "2026-10-01T00:00:00Z",
+        )
+        .await?;
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        for persisted in [false, true] {
+            let executor = executor_at(origin.clone());
+            let runtime = CommandRuntime::new(
+                pool.clone(),
+                executor.clone(),
+                router_with_commands(RouterGates {
+                    configured_guild: Some(guild),
+                    moderation: true,
+                    ..gates(true, false)
+                }),
+                guild,
+                true,
+            );
+            let vars = [
+                ("TWO_AUTOMOD".into(), "1".into()),
+                ("TWO_OWEN_USER_ID".into(), "123456789012345678".into()),
+                ("TWO_AUTOMATIONS".into(), "1".into()),
+            ]
+            .into();
+            if persisted {
+                runtime.initialize_custom_commands_for_test(
+                    crate::gateway_commands::GatewayCommandConfig::from_map_for_activation(
+                        guild, &vars, true,
+                    )?,
+                );
+            }
+            runtime
+                .publish_registry_checked(Some(1111))
+                .await
+                .expect("default-dark guild replacement succeeds");
+            let activation =
+                crate::automod_gateway::resolve(&vars, guild)?.expect("active staging AutoMod");
+            runtime.set_automod(crate::automod_gateway::build(
+                activation,
+                pool.clone(),
+                executor,
+            ));
+            runtime
+                .publish_registry_checked(Some(1111))
+                .await
+                .expect("guild replacement succeeds");
+        }
+        let requests = mock.requests();
+        let expected = [(false, false), (false, true), (true, false), (true, true)];
+        assert_eq!(requests.len(), expected.len());
+        for (request, (persisted, active)) in requests.iter().zip(expected) {
+            assert_eq!(request.method, "PUT");
+            assert_eq!(
+                request.path,
+                format!("/api/v10/applications/1111/guilds/{guild}/commands")
+            );
+            let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+            let defs = body.as_array().expect("full guild registry");
+            assert_eq!(
+                defs.iter()
+                    .filter(|def| def["name"] == "automod-preview")
+                    .count(),
+                if active { 1 } else { 0 }
+            );
+            assert_eq!(
+                defs.iter().any(|def| def["name"] == "registry-test"),
+                persisted
+            );
+        }
+        mock.shutdown().await;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+    db.close().await?;
+    proof??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn duplicate_ready_republishes_the_identical_set() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);

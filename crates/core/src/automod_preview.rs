@@ -99,7 +99,7 @@ pub fn exemption_knobs(exemption: PreviewExemption) -> &'static [&'static str] {
     }
 }
 
-/// Bounds for the unpublished `/automod-preview` slash (spec §3.1).
+/// Bounds for the `/automod-preview` slash (spec §3.1).
 /// Text is 1–2,000 UTF-16 units; `mentions` is a synthetic count 0–100;
 /// `attachments` is one ≤1,000-unit option carrying at most 10 bare names.
 pub const AUTOMOD_PREVIEW_TEXT_MAX_UTF16: u32 = 2000;
@@ -109,9 +109,8 @@ pub const AUTOMOD_PREVIEW_ATTACHMENTS_MAX_FILES: usize = 10;
 
 /// Slash definition for `/automod-preview` (spec slices 2–4).
 ///
-/// ManageGuild-only, guild-only, three options of §3.1. Dark until the
-/// publication slice: built here so the shape is pinned, but kept out of
-/// `publish_set` (the router still adjudicates it via the permission row).
+/// ManageGuild-only, guild-only, three options of §3.1. The router includes
+/// this in the guild registry only after the staging activation admits it.
 #[must_use]
 pub fn automod_preview_definition() -> CommandDefinition {
     CommandDefinition::new(

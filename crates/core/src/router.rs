@@ -55,9 +55,12 @@ pub mod replies;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+use super::automod_preview::automod_preview_definition;
+use super::automod_runtime::{AutomodRuntime, STAGING_GUILD_ID};
 use super::command_permissions::command_permission;
 use super::commands::{
     core_commands, merge_registry, CommandDefinition, CustomCommand, MergedRegistry, RegistryError,
+    GUILD_COMMAND_LIMIT,
 };
 use super::feature_commands::{
     announcement_commands, automation_commands, scorecard_attendance_command, FeatureGates,
@@ -123,7 +126,7 @@ pub const MODERATION_DISABLED_REPLY: &str = "Moderation is not enabled on this s
 /// Scorecard gate: env-gated, not a Discord role — say who enables it.
 pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
 
-/// Slash names routed while dark (unpublished until their slice lands).
+/// Slash names routed but absent from the default published set.
 /// Dispatch shadows each name (see `route_slash`), so a custom row under
 /// one could publish yet never execute. [`crate::custom_commands::reserved_command_names`]
 /// mirrors this set on the write path (`/command`, imports), so writes
@@ -457,6 +460,7 @@ pub enum ComponentOutcome {
 /// prefixes — legacy match order, exact first).
 pub struct InteractionRouter {
     gates: RouterGates,
+    staging_automod_preview: OnceLock<()>,
     handlers: HashMap<HandlerId, Box<dyn InteractionHandler>>,
 }
 
@@ -477,7 +481,24 @@ impl InteractionRouter {
     pub fn new(gates: RouterGates) -> Self {
         Self {
             gates,
+            staging_automod_preview: OnceLock::new(),
             handlers: HashMap::new(),
+        }
+    }
+
+    /// Open staging preview publication after attaching the gateway's AutoMod runtime.
+    /// The existing moderation gate must also allow the router to serve the command.
+    pub fn enable_staging_automod_preview(&self, automod: &AutomodRuntime) {
+        if self.gates.moderation
+            && self
+                .gates
+                .configured_guild
+                .map(|id| id.to_string())
+                .as_deref()
+                == Some(STAGING_GUILD_ID)
+            && automod.admits(Some(STAGING_GUILD_ID))
+        {
+            let _ = self.staging_automod_preview.set(());
         }
     }
 
@@ -718,8 +739,8 @@ impl InteractionRouter {
                 HandlerId::LockdownPreview,
                 RouterRefusal::LockdownPreviewPermission,
             )),
-            // Dark until the publication slice: routed and adjudicated like
-            // the other private reads, but with no published definition.
+            // Publication is staging-only; stale invocations still use the
+            // same guild and Manage Server checks as other moderation reads.
             "automod-preview" => Some((
                 HandlerId::AutomodPreview,
                 RouterRefusal::AutomodPreviewPermission,
@@ -1218,7 +1239,15 @@ impl InteractionRouter {
         } else {
             Vec::new()
         };
-        merge_registry(&extra, &visible)
+        let mut merged = merge_registry(&extra, &visible)?;
+        // Preview may use a spare slot but must not evict persisted custom
+        // commands or change the existing /myroom deferral decision.
+        if self.staging_automod_preview.get().is_some()
+            && merged.commands.len() < GUILD_COMMAND_LIMIT
+        {
+            merged.commands.push(automod_preview_definition());
+        }
+        Ok(merged)
     }
 }
 
