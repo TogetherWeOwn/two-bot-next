@@ -141,6 +141,39 @@ fn rejects_inconsistent_or_over_limit_snapshot_state() {
 }
 
 #[test]
+fn enforces_channel_member_and_event_counts_independently() {
+    let (guild_id, now, mut topics) = baseline();
+    let room = topics.channels[0].clone();
+    topics.channels.extend((1000..1500).map(|n| Channel {
+        id: id(n),
+        ..room.clone()
+    }));
+    assert!(encode_snapshot(guild_id, 2, now, &topics).is_none());
+    topics.channels.pop();
+    assert!(encode_snapshot(guild_id, 2, now, &topics).is_some());
+    topics.channels.truncate(1);
+
+    let member = topics.members[0].clone();
+    topics.members.extend((1000..11_000).map(|n| Member {
+        user_id: id(n),
+        ..member.clone()
+    }));
+    assert!(encode_snapshot(guild_id, 2, now, &topics).is_none());
+    topics.members.pop();
+    assert!(encode_snapshot(guild_id, 2, now, &topics).is_some());
+    topics.members.truncate(1);
+
+    let event = topics.events[0].clone();
+    topics.events.extend((1000..1100).map(|n| Event {
+        id: id(n),
+        ..event.clone()
+    }));
+    assert!(encode_snapshot(guild_id, 2, now, &topics).is_none());
+    topics.events.pop();
+    assert!(encode_snapshot(guild_id, 2, now, &topics).is_some());
+}
+
+#[test]
 fn rejects_duplicate_keys_in_each_non_channel_collection() {
     let (guild_id, now, mut topics) = baseline();
     topics.roles.push(topics.roles[0].clone());
@@ -184,5 +217,10 @@ fn requires_permission_and_room_dependencies_before_encoding() {
     topics.channels[0].kind = ChannelKind::Stage;
     assert!(encode_snapshot(guild_id, 2, now, &topics).is_some());
     topics.channels[0].kind = ChannelKind::Other;
+    let occupant = topics.voice.pop().unwrap();
+    assert!(encode_snapshot(guild_id, 2, now, &topics).is_none());
+    topics.events.clear();
+    assert!(encode_snapshot(guild_id, 2, now, &topics).is_some());
+    topics.voice.push(occupant);
     assert!(encode_snapshot(guild_id, 2, now, &topics).is_none());
 }
