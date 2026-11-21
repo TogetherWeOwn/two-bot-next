@@ -528,15 +528,18 @@ impl std::fmt::Debug for HyperTransport {
 pub enum StrictTransportError {
     #[error(transparent)]
     Admission(#[from] two_bot_core::send_admission::AdmissionError),
-    /// Acknowledged admission, but the request was never started. The fence stays armed.
+    /// No wire poll; a pending or acknowledged claim may still fence the lane.
     #[error("strict send deadline expired before request start")]
     PreWireDeadline,
+    #[error("strict send refused by the route guard before request start")]
+    PreWireGuard,
     #[error("{0}")]
     Transport(String),
 }
 
 /// Borrowed response evidence, with no ownership of the admission permit.
 pub struct StrictResponseEvidence<'a> {
+    response: &'a RawResponse,
     pub status: u16,
     pub retry_after_header: Option<&'a str>,
     /// `None` means collection failed or timed out, not a valid empty body.
@@ -782,8 +785,7 @@ impl HyperTransport {
         // Durable admission shares the caller's absolute deadline: it is a
         // Postgres statement on a pooled connection, not a local lock, so an
         // unbounded admit would outlive the receipt/moderation/boot budgets.
-        // A timed-out admit never resolved, so no permit exists to release;
-        // it reports as a header stall so the caller spends one attempt.
+        // A timed-out claim may have committed. Never release it without a permit.
         let permit = match &self.admission {
             None if strict => {
                 return Err(two_bot_core::send_admission::AdmissionError::Configuration.into())
@@ -798,15 +800,23 @@ impl HyperTransport {
                 };
                 Some(match deadline {
                     None => take.await?,
+                    Some(at) if strict => poll_before(at, take)
+                        .await
+                        .ok_or(StrictTransportError::PreWireDeadline)??,
                     Some(at) => tokio::time::timeout_at(at, take)
                         .await
                         .map_err(|_| HEADER_TIMEOUT_MESSAGE.to_owned())??,
                 })
             }
         };
-        // A ready admission can win timeout_at even after the clock expires.
-        if strict && deadline.is_some_and(|at| Instant::now() >= at) {
-            return Err(StrictTransportError::PreWireDeadline);
+        let route_key = bucket_route_key(request);
+        if let Some(at) = evidence_deadline {
+            if self.guard.check_route_now(&route_key, false).is_err() {
+                if let Some(permit) = permit {
+                    let _ = poll_before(at, complete_early_release(permit, "strict_guard")).await;
+                }
+                return Err(StrictTransportError::PreWireGuard);
+            }
         }
         let callback = !strict && is_interaction_callback(request);
         let mut attempt = None;
@@ -822,8 +832,11 @@ impl HyperTransport {
             attempt = Some(crate::executor_metrics::Attempt::new(request));
             self.inner.request(hyper_req).await
         };
-        let response = match wait_for_headers(deadline, callback, request_fut).await {
+        let response = match wait_for_headers(deadline, strict || callback, request_fut).await {
             Some(Ok(response)) => response,
+            None if strict && attempt.is_none() => {
+                return Err(StrictTransportError::PreWireDeadline)
+            }
             failure => {
                 let (message, reason) = match failure {
                     Some(Err(error)) => (format!("transport: {error}"), "transport_error"),
@@ -854,7 +867,6 @@ impl HyperTransport {
         );
         // Full bucket state is known at headers. Bare Retry-After waits for
         // body classification so existing body timing/scope policy still wins.
-        let route_key = bucket_route_key(request);
         self.guard
             .observe_bucket_headers(&route_key, response.headers());
         if status == 429 {
@@ -877,6 +889,11 @@ impl HyperTransport {
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned)
             });
+        let retry_after_header = if strict && status == 429 {
+            accounting.longest_admission_header()
+        } else {
+            retry_after_header
+        };
         // Reads cannot mutate; a complete failure may be retried independently.
         // Mutation success needs its caller's validated receipt. 5xx, redirects
         // and request-timeout responses remain uncertain even with a full body.
@@ -1123,6 +1140,7 @@ impl StrictEvidenceHeaders<'_> {
             accounting.finish(&response);
         }
         let accepted = observe(StrictResponseEvidence {
+            response: &response,
             status: response.status,
             retry_after_header: response.retry_after_header.as_deref(),
             body: body_available.then_some(response.body.as_slice()),
@@ -5189,7 +5207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_transport_refuses_expired_deadline_after_admission() {
+    async fn strict_transport_refuses_expired_deadline_before_admission() {
         use crate::strict_transport_fixture::{loopback, Admission};
         use std::sync::atomic::Ordering;
 
@@ -5206,7 +5224,7 @@ mod tests {
                 .await,
             Err(StrictTransportError::PreWireDeadline)
         ));
-        assert_eq!(gate.strict_admitted.load(Ordering::Relaxed), 1);
+        assert_eq!(gate.strict_admitted.load(Ordering::Relaxed), 0);
         assert!(
             gate.completed.lock().unwrap().is_empty(),
             "no release after admission"
