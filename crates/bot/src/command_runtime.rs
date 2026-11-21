@@ -3744,9 +3744,9 @@ mod preview_metric_tests {
                 },
                 &metrics,
             );
-            let data = response.data.unwrap();
-            assert_eq!(data.content.as_deref(), Some(reply));
-            assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+            let data = response.data.as_ref();
+            assert_eq!(data.and_then(|d| d.content.as_deref()), Some(reply));
+            assert_eq!(data.and_then(|d| d.flags), Some(MessageFlags::EPHEMERAL));
         }
         let render = metrics.render(None);
         let nonzero: Vec<_> = render
