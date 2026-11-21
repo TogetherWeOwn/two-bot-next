@@ -80,7 +80,7 @@ npm run test:smoke
 `.github/workflows/gradual-promote-proof.yml` (dispatch-only, main-only,
 `staging` environment) holds the pinned invocation:
 
-- Action: `TogetherWeOwn/.github/actions/gradual-promote@89c290be20c0044efaf6916f28341c76e75fff06`
+- Action: `TogetherWeOwn/.github/actions/gradual-promote@2ef8ad6447e11d019ac3098bcfd011193b75266a`
 - Worker: `two-bot-next-gradual-proof` (isolated synthetic target, not yet
   provisioned)
 - `allow-indexable: "false"` (no indexable surface on this Worker)
@@ -92,10 +92,13 @@ npm run test:smoke
 
 ## Passive status (read before claiming proof)
 
-- The proof workflow's target-lock step refuses before any Cloudflare call
-  until the synthetic fixture lands. The pinned caller is therefore the exact
-  future invocation, not a completed rollout.
+- The target-lock step refuses before any Cloudflare call. The pinned caller
+  is a future invocation, not a completed rollout.
 - What runs today: `bin/smoke.mjs` against staging, plus its contract tests.
+- The pinned action invokes `npx wrangler` from the repository root; this
+  repository keeps its locked Wrangler installation under `wrangler/`. The
+  inactive proof does not establish that the action uses that locked version.
+  Resolve and verify the invocation before admitting a proof run.
 - What remains: the isolated synthetic fixture, the success-mode sweep, the
   rollback-mode sweep, and only then any production caller discussion.
 - Never claim a gradual traffic rollout here until a proof run shows the

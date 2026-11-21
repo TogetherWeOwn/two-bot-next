@@ -8,6 +8,7 @@ use super::{ActionExecutor, RawResponse};
 use crate::ratelimit_guard::GuardError;
 use serde::Deserialize;
 use std::time::Duration;
+use tokio::time::Instant;
 use twilight_http::request::{Request, TryIntoRequest};
 use twilight_model::id::{marker::GenericMarker, Id};
 use two_bot_core::internal_actions::{
@@ -17,6 +18,14 @@ use two_bot_core::internal_actions::{
 #[cfg(feature = "db")]
 #[path = "member_store.rs"]
 pub mod store;
+
+#[path = "voice_move.rs"]
+pub mod voice_move;
+pub use voice_move::{VoiceMoveNotSent, VoiceMovePatch, VOICE_MOVE_TIMEOUT_MS};
+
+#[cfg(test)]
+#[path = "voice_move_adapter_tests.rs"]
+mod voice_move_adapter_tests;
 
 pub const ADD_MEMBER_TIMEOUT_MS: u64 = 1500;
 pub const ROLE_TIMEOUT_MS: u64 = 2000;
@@ -215,6 +224,71 @@ impl ActionExecutor {
         Ok(serde_json::from_slice::<Member>(&response.body)
             .ok()
             .map(|m| m.roles))
+    }
+
+    /// Send one bounded voice PATCH. Authorization and occupancy fencing belong
+    /// to the receiver; this adapter never retries.
+    pub async fn move_voice_member(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+        channel_id: &str,
+    ) -> Result<VoiceMovePatch, ActionError> {
+        use super::StrictTransportError::{Admission, PreWireDeadline, PreWireGuard};
+        use twilight_model::guild::Member;
+        use two_bot_core::send_admission::AdmissionError;
+        use VoiceMoveNotSent::{Blocked, Deadline, Guard, Storage};
+        use VoiceMovePatch::{NotSent, Unavailable};
+
+        let request =
+            voice_move::prepare_voice_move(&self.inner.factory, guild_id, member_id, channel_id)?;
+        let deadline = Instant::now() + Duration::from_millis(VOICE_MOVE_TIMEOUT_MS);
+        match super::poll_before(deadline, self.admit(&request, Some(false))).await {
+            None => return Ok(NotSent(Deadline)),
+            Some(Err(_)) => return Ok(NotSent(Guard)),
+            Some(Ok(())) => {}
+        }
+        self.count();
+        let transport = &self.inner.transport;
+        let headers = transport
+            .send_strict_evidence_headers(&request, deadline)
+            .await;
+        let pending = match headers {
+            Ok(pending) => pending,
+            Err(Admission(AdmissionError::Blocked)) => return Ok(NotSent(Blocked)),
+            Err(Admission(AdmissionError::Storage)) => return Ok(NotSent(Storage)),
+            Err(PreWireDeadline) => return Ok(NotSent(Deadline)),
+            Err(PreWireGuard) => return Ok(NotSent(Guard)),
+            Err(_) => return Ok(Unavailable),
+        };
+        let status = pending.pending.status;
+        if let Some(refusal) = voice_move::header_refusal(status) {
+            let _ = super::poll_before(deadline, pending.pending.settle_status()).await;
+            return Ok(refusal);
+        }
+        let mut retry_after_ms = None;
+        let settlement = pending
+            .collect_validated_evidence(|evidence| {
+                if status == 429 {
+                    let header = evidence.retry_after_header.and_then(|s| s.parse().ok());
+                    let body = evidence.response.body_retry_after_secs();
+                    retry_after_ms = voice_move::retry_delay_ms(header, body);
+                }
+                // Modify Guild Member documents a 200 with the updated member.
+                let parse = |body| serde_json::from_slice::<Member>(body).ok();
+                let receipt = evidence.body.filter(|_| status == 200).and_then(parse);
+                receipt.is_some_and(|member| member_id.parse::<u64>() == Ok(member.user.id.get()))
+            })
+            .await;
+        let settlement_confirmed = settlement == super::StrictSettlement::Confirmed;
+        Ok(match status {
+            429 => VoiceMovePatch::Limited {
+                retry_after_ms,
+                settlement_confirmed,
+            },
+            200 if settlement_confirmed => VoiceMovePatch::Moved,
+            _ => Unavailable,
+        })
     }
 
     /// PUT /guilds/{g}/members/{u}. The token is a function argument and wire

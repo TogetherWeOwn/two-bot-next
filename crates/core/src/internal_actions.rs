@@ -1402,6 +1402,93 @@ impl<'a> GuildAddMemberRequest<'a> {
     }
 }
 
+/// Validated voice-move subject: one member and one target room. The trusted
+/// website signer must derive `discord_id` from its authenticated session,
+/// never browser input. This validator does not itself prove consent. Defining
+/// this contract does not enable or dispatch the action.
+#[derive(Debug, Clone, Copy)]
+pub struct VoiceMoveRequest<'a> {
+    discord_id: &'a str,
+    channel_id: &'a str,
+}
+
+impl<'a> VoiceMoveRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        Ok(Self {
+            discord_id: require_snowflake(body, "discord_id")?,
+            channel_id: require_snowflake(body, "channel_id")?,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
+
+    #[must_use]
+    pub fn channel_id(&self) -> &'a str {
+        self.channel_id
+    }
+}
+
+/// Closed result words for a future self-only voice move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceMoveOutcome {
+    Moved,
+    AlreadyInRoom,
+    NotConnected,
+    NotPermitted,
+    RoomFull,
+    RoomGone,
+    BotNotPermitted,
+    RateLimited,
+    DiscordUnavailable,
+}
+
+impl VoiceMoveOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Moved => "moved",
+            Self::AlreadyInRoom => "already_in_room",
+            Self::NotConnected => "not_connected",
+            Self::NotPermitted => "not_permitted",
+            Self::RoomFull => "room_full",
+            Self::RoomGone => "room_gone",
+            Self::BotNotPermitted => "bot_not_permitted",
+            Self::RateLimited => "rate_limited",
+            Self::DiscordUnavailable => "discord_unavailable",
+        }
+    }
+
+    #[must_use]
+    pub fn response_code(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate_limited",
+            Self::DiscordUnavailable => "discord_unavailable",
+            _ => "success",
+        }
+    }
+
+    #[must_use]
+    pub fn status(self) -> u16 {
+        match self {
+            Self::RateLimited => 429,
+            Self::DiscordUnavailable => 502,
+            _ => 200,
+        }
+    }
+
+    #[must_use]
+    pub fn affected(self) -> Option<i64> {
+        match self {
+            Self::Moved => Some(1),
+            Self::RateLimited | Self::DiscordUnavailable => None,
+            _ => Some(0),
+        }
+    }
+}
+
 /// `announcement.post` field validation: channel through the key map, body
 /// within Discord's ceiling. The message id comes back from Discord, so the
 /// stored idempotency result can still tell the website *which* message it has.
@@ -2530,6 +2617,61 @@ mod tests {
                 secret: crate::Secret::new(vec2().secret.as_bytes().to_vec()),
             },
         ])
+    }
+
+    #[test]
+    fn voice_move_request_names_one_member_and_one_room() {
+        let body = map(json!({
+            "discord_id": "123456789012345678",
+            "channel_id": "123456789012345679",
+        }));
+        let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+        assert_eq!(request.discord_id(), "123456789012345678");
+        assert_eq!(request.channel_id(), "123456789012345679");
+        for body in [
+            map(json!({})),
+            map(json!({"discord_id": "abc", "channel_id": "123456789012345679"})),
+            map(json!({"discord_id": "123456789012345678", "channel_id": "12"})),
+            map(json!({"discord_id": 123456789012345678u64, "channel_id": "123456789012345679"})),
+        ] {
+            assert_eq!(
+                VoiceMoveRequest::validate(&body).unwrap_err().code,
+                ErrorCode::Malformed
+            );
+        }
+    }
+
+    #[test]
+    fn voice_move_outcome_table() {
+        use VoiceMoveOutcome::*;
+        for (outcome, word, code, status, affected) in [
+            (Moved, "moved", "success", 200, Some(1)),
+            (AlreadyInRoom, "already_in_room", "success", 200, Some(0)),
+            (NotConnected, "not_connected", "success", 200, Some(0)),
+            (NotPermitted, "not_permitted", "success", 200, Some(0)),
+            (RoomFull, "room_full", "success", 200, Some(0)),
+            (RoomGone, "room_gone", "success", 200, Some(0)),
+            (
+                BotNotPermitted,
+                "bot_not_permitted",
+                "success",
+                200,
+                Some(0),
+            ),
+            (RateLimited, "rate_limited", "rate_limited", 429, None),
+            (
+                DiscordUnavailable,
+                "discord_unavailable",
+                "discord_unavailable",
+                502,
+                None,
+            ),
+        ] {
+            assert_eq!(outcome.as_str(), word);
+            assert_eq!(outcome.response_code(), code);
+            assert_eq!(outcome.status(), status);
+            assert_eq!(outcome.affected(), affected, "{word}");
+        }
     }
 
     fn map(value: Value) -> Map<String, Value> {

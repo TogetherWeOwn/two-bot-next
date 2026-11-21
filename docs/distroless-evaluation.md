@@ -41,10 +41,11 @@ per head through the supply-chain lane.
 
 The runtime is changing from `cc-debian13` to
 `gcr.io/distroless/base-nossl-debian13:nonroot@sha256:e6b0f82595aa1edde72c8054de7a9dca30f0f8f54820c37a167c0ddfc21c5c67`
-(registry index body and header reverified). The builder stays
-`rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137`.
-The sections below that name `cc-debian13` are historical measurements of the
-prior image, not of this candidate.
+(registry index body and header reverified). At evaluation time the builder was
+`rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137`;
+see `Dockerfile` for its current pin. The sections below that name
+`cc-debian13` are historical measurements of the prior image, not of this
+candidate.
 
 - Base packages: base-files, ca-certificates, media-types, netbase, tzdata,
   tzdata-legacy and libc6. The Dockerfile adds only `libgcc-s1` and

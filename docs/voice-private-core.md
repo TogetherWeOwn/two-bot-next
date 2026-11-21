@@ -64,6 +64,20 @@ This core does not authorize `/private` or `/public` themselves: gate those
 owner commands with `voice_ownership::require_room_owner` first. That gate
 covers the commands; answering requests stays owner-only here.
 
+## Member reply surfaces
+
+| Surface | Outcome | Deferred ephemeral reply |
+| --- | --- | --- |
+| `/private`, `/public` | already in the requested state | Voice embed, ok |
+| `/private`, `/public` | change or repair queued; worker unavailable or warming | Voice embed, warn |
+| `/room-access-inspect` | access list read | Voice embed, ok |
+| `/room-access-inspect` | worker unavailable or warming | Voice embed, warn |
+| All three | authorization, input or other refusal | Voice embed, danger |
+
+The existing text remains the embed description. The ephemeral defer/edit flow,
+empty allowed mentions, access checks and effect ordering are unchanged; replies
+with components or attachments are not converted by the completion helper.
+
 ## Replay and concurrency contract
 
 The same inputs always produce the same plan. `make_private`, `make_public`,

@@ -157,6 +157,83 @@ fn decode_keeps_huge_page_as_past_end_candidate() {
 }
 
 #[tokio::test]
+async fn inspect_classifies_reads_and_invalid_pages_at_origin() {
+    let worker = owned_worker().await;
+    let (text, kind) = worker.apply_room_access_classified(MEMBER, false, PageArg::Page(1));
+    assert!(text.contains("**Room access**"));
+    assert_eq!(kind, EmbedKind::Ok);
+    for page in [PageArg::Invalid, PageArg::Page(2)] {
+        let (text, kind) = worker.apply_room_access_classified(MEMBER, false, page);
+        assert!(text.starts_with("Unknown page."));
+        assert_eq!(kind, EmbedKind::Danger);
+    }
+    let (_, kind) = worker.apply_room_access_classified(301, false, PageArg::Page(1));
+    assert_eq!(kind, EmbedKind::Danger);
+}
+
+#[tokio::test]
+async fn actor_preserves_privacy_and_inspect_outcome_kinds() {
+    let runtime = live_runtime(owned_worker().await);
+    let (text, kind) = runtime
+        .run_privacy_classified(
+            GUILD,
+            MEMBER,
+            false,
+            "member".to_owned(),
+            PrivacyCommand::Public,
+        )
+        .await
+        .expect("privacy reply");
+    assert_eq!(text, "This room is already public.");
+    assert_eq!(kind, EmbedKind::Ok);
+    let (text, kind) = runtime
+        .run_room_access_classified(GUILD, MEMBER, false, PageArg::Invalid)
+        .await
+        .expect("inspect reply");
+    assert!(text.starts_with("Unknown page."));
+    assert_eq!(kind, EmbedKind::Danger);
+}
+
+#[tokio::test]
+async fn privacy_and_inspect_replies_reach_embed_completion() {
+    let runtime = live_runtime(owned_worker().await);
+    for (name, options, expected, kind) in [
+        (
+            "public",
+            vec![],
+            "This room is already public.",
+            EmbedKind::Ok,
+        ),
+        (
+            "private",
+            vec![],
+            "Making this room private:",
+            EmbedKind::Warn,
+        ),
+        (
+            "room-access-inspect",
+            vec![],
+            "**Room access**",
+            EmbedKind::Ok,
+        ),
+        (
+            "room-access-inspect",
+            vec![page_option(CommandOptionValue::Integer(0))],
+            "Unknown page.",
+            EmbedKind::Danger,
+        ),
+    ] {
+        let interaction = voice_interaction_as(Some(command_data(name, options)), None, MEMBER);
+        let (owned, response) = handle_capture(&runtime, &interaction).await;
+        assert!(owned);
+        let response = response.expect("reply");
+        assert_utility_embed(&response, kind);
+        assert!(response_text(&response).starts_with(expected));
+        assert!(limit_completion_embed(&interaction, &response).is_some());
+    }
+}
+
+#[tokio::test]
 async fn invalid_page_refuses_without_listing() {
     let worker = owned_worker().await;
     assert_eq!(
@@ -301,7 +378,12 @@ async fn non_owner_page_errors_stay_behind_the_owner_gate() {
     let mut worker = owned_worker().await;
     let blocked: Vec<u64> = (0..300).map(|n| 81_000_000_000_000_000 + n).collect();
     seed_access(&mut worker, &blocked, &[], &[]);
+    let (gate_text, gate_kind) = worker
+        .owned_room(301, false, "room-access-inspect")
+        .expect_err("non-owner is refused");
+    assert_eq!(gate_kind, EmbedKind::Danger);
     let refusal = worker.apply_room_access(301, false, PageArg::Missing);
+    assert_eq!(gate_text, refusal);
     assert_eq!(
         refusal,
         "Only the room owner or an admin can use /room-access-inspect."

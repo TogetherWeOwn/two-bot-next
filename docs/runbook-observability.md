@@ -282,9 +282,8 @@ claim them as shipped acceptance:
   `production-error-rate-gate.json`), failing the stage into the same
   auto-rollback; live enforcement needs the `PRODUCTION_METRICS_SCRAPE_TOKEN`
   secret, else a recorded skip. Production has no drill input, guard binding
-  or rehearsal flag. The [daily staging proof](production-deploy.md#daily-staging-proof)
-  exercises automatic rollback on staging only; its independent freshness
-  watcher alerts when the scheduled proof fails or goes missing.
+  or rehearsal flag. The [on-demand staging proof](production-deploy.md#on-demand-staging-proof)
+  exercises automatic rollback on staging only; a failed proof opens an incident.
 - The shared central gradual-promotion action promotes 5-50-100% with
   per-stage health gates and automatic rollback to the recorded pre-promote
   version. The caller contract is implemented (`bin/smoke.mjs`, contract-tested

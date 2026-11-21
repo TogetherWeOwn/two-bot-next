@@ -432,6 +432,7 @@ pub(crate) fn slash(
     Interaction {
         app_permissions: None,
         application_id: Id::new(1111),
+        attachment_size_limit: 10_485_760,
         authorizing_integration_owners: ApplicationIntegrationMap {
             guild: Some(AnonymizableId::Id(Id::new(GUILD))),
             user: None,
@@ -1626,6 +1627,7 @@ async fn gateway_help_opens_a_new_private_page_from_the_confirmed_registry() {
     let actor = json!({"id": actor_id.to_string(), "username": "actor", "discriminator": "0"});
     let payload = json!({
         "id": "835", "type": 3, "application_id": "1111", "guild_id": GUILD.to_string(),
+        "attachment_size_limit": 10_485_760,
         "authorizing_integration_owners": {"0": GUILD.to_string()}, "entitlements": [], "token": "click-fixture",
         "data": {"component_type": 2, "custom_id": controls[0]["components"][0]["custom_id"], "values": []},
         "member": {"deaf": false, "mute": false, "flags": 0, "roles": [], "user": actor},
@@ -1647,6 +1649,7 @@ async fn gateway_help_opens_a_new_private_page_from_the_confirmed_registry() {
     set_guild(&mut wrong_scope, None);
     assert!(runtime.dispatch_help(&interaction_event(wrong_scope), Instant::now()));
     assert!(runtime.dispatch_help(&first, Instant::now() - Duration::from_secs(3)));
+    assert!(idle(), "an expired receipt must not admit Help work");
     assert!(runtime.dispatch_help(&interaction_event(click), Instant::now()));
     wait_for(idle, "help page callback").await;
     let callbacks = mock.posts_to("/callback").await;
@@ -10953,12 +10956,10 @@ async fn self_role_reactions_have_their_own_bounded_lane() {
     // A reaction burst must not discard message automations: with the
     // reaction lane full, a message still admits on its own lane without
     // touching the reaction depth.
-    let message = Event::MessageCreate(Box::new(MessageCreate(message(
-        9,
-        100_000_000_000_000_007,
-        false,
-        Some(SR_GUILD),
-    ))));
+    let message = Event::MessageCreate(Box::new(MessageCreate {
+        channel_type: None,
+        message: message(9, 100_000_000_000_000_007, false, Some(SR_GUILD)),
+    }));
     assert!(
         runtime.dispatch(&message),
         "full reaction lane still admits messages"
@@ -11401,7 +11402,10 @@ async fn worker_trigger_gate_observes_sticky_http_and_state() {
             }))
             .expect("complete member facts"),
         );
-        Event::MessageCreate(Box::new(MessageCreate(msg)))
+        Event::MessageCreate(Box::new(MessageCreate {
+            channel_type: None,
+            message: msg,
+        }))
     };
     let dispatch = |event: &Event, verdict| {
         worker_prefix_trigger(Some(verdict), event, true)
@@ -11536,7 +11540,10 @@ async fn worker_verdict_drives_prefix_trigger_from_call_site() {
     }
 
     fn verdict_event(message: Message) -> Event {
-        Event::MessageCreate(Box::new(MessageCreate(message)))
+        Event::MessageCreate(Box::new(MessageCreate {
+            channel_type: None,
+            message,
+        }))
     }
 
     let db = TestDb::new().await;

@@ -42,8 +42,10 @@ pub use lockdown_preview_reads::PreviewChannel;
 pub use tickets::{ChannelPresence, TicketChannelRequest, TicketMessage};
 
 use crate::ratelimit_guard::{process_guard, GuardError, RateLimitGuard};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
 
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as HyperClient;
@@ -95,6 +97,7 @@ pub const BOOT_BLOCKED_RETRY_SLEEP_MS: u64 = 250;
 /// Bound response-body collection, including the otherwise untimed GET/kick
 /// lanes, so a stalled global response cannot retain pending admission forever.
 pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
+const RESPONSE_BODY_LIMIT: usize = 8 * 1024 * 1024;
 /// Extra time for a governed read to settle storage after its wire deadline.
 /// This never extends the wire attempt or authorizes another request. If
 /// completion cannot be confirmed within the bound, admission stays occupied.
@@ -332,6 +335,17 @@ pub struct RawResponse {
     pub(crate) completion: Option<two_bot_core::send_admission::AdmissionPermit>,
 }
 
+#[derive(Clone, Copy)]
+enum CallbackAdmission {
+    RecoverReady,
+    StopAtCutoff,
+}
+
+enum SendBudget {
+    Relative(Duration),
+    Absolute(Instant, CallbackAdmission),
+}
+
 type AdmittedSendFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<(RawResponse, bool), DiscordError>> + Send + 'a>,
 >;
@@ -364,6 +378,36 @@ async fn complete_early_release(
     }
 }
 
+// Tokio's timeout polls work before its timer. Never start another I/O poll
+// at the cutoff, but retain evidence obtained by a poll that started in time.
+async fn poll_until<F: Future>(at: Instant, work: F) -> Option<F::Output> {
+    let mut work = std::pin::pin!(work);
+    let guarded = std::future::poll_fn(|cx| {
+        if Instant::now() >= at {
+            return std::task::Poll::Ready(None);
+        }
+        work.as_mut().poll(cx).map(Some)
+    });
+    tokio::time::timeout_at(at, guarded).await.ok().flatten()
+}
+
+async fn wait_for_headers<F: Future>(
+    deadline: Option<Instant>,
+    callback: bool,
+    send: F,
+) -> Option<F::Output> {
+    match deadline {
+        None => Some(send.await),
+        Some(at) if callback => poll_until(at, send).await,
+        Some(at) => tokio::time::timeout_at(at, send).await.ok(),
+    }
+}
+
+// Strict evidence also rejects late acknowledgement. Dropping is not rollback.
+async fn poll_before<F: Future>(at: Instant, work: F) -> Option<F::Output> {
+    poll_until(at, work).await.filter(|_| Instant::now() < at)
+}
+
 impl RawResponse {
     /// Call only for a definite effect/no-effect, after validating any required
     /// mutation receipt. A storage fault must not authorize effect replay.
@@ -376,6 +420,13 @@ impl RawResponse {
     /// A durable delivery caller must observe completion failure, not turn an
     /// accepted-but-unconfirmed exchange into clean success or permission to retry.
     async fn complete_confirmed(&mut self) -> Result<(), DiscordError> {
+        self.complete_before(None).await
+    }
+
+    async fn complete_before(
+        &mut self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), DiscordError> {
         if let Some(permit) = self.completion.take() {
             let cooldown = (self.status == 429).then(|| {
                 two_bot_core::send_admission::cooldown_from_delays(
@@ -385,7 +436,12 @@ impl RawResponse {
                     self.body_retry_after_secs(),
                 )
             });
-            permit.complete(cooldown).await.map_err(|_| {
+            let completion = permit.complete(cooldown);
+            let result = match deadline {
+                Some(at) => poll_before(at, completion).await,
+                None => Some(completion.await),
+            };
+            result.and_then(Result::ok).ok_or_else(|| {
                 DiscordError::Unavailable("send admission completion unconfirmed".into())
             })?;
         }
@@ -470,6 +526,48 @@ impl std::fmt::Debug for HyperTransport {
             .field("token", &self.token)
             .field("admission", &self.admission)
             .finish_non_exhaustive()
+    }
+}
+
+/// Failure before headers, retaining typed durable-admission provenance.
+#[derive(Debug, thiserror::Error)]
+pub enum StrictTransportError {
+    #[error(transparent)]
+    Admission(#[from] two_bot_core::send_admission::AdmissionError),
+    /// No wire poll; a pending or acknowledged claim may still fence the lane.
+    #[error("strict send deadline expired before request start")]
+    PreWireDeadline,
+    #[error("strict send refused by the route guard before request start")]
+    PreWireGuard,
+    #[error("{0}")]
+    Transport(String),
+}
+
+/// Borrowed response evidence, with no ownership of the admission permit.
+pub struct StrictResponseEvidence<'a> {
+    response: &'a RawResponse,
+    pub status: u16,
+    pub retry_after_header: Option<&'a str>,
+    /// `None` means collection failed or timed out, not a valid empty body.
+    pub body: Option<&'a [u8]>,
+}
+
+/// Only an acknowledged durable completion confirms settlement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StrictSettlement {
+    Confirmed,
+    Unconfirmed,
+}
+
+/// Headers from a strict attempt whose deadline also bounds durable settlement.
+pub struct StrictEvidenceHeaders<'a> {
+    pending: PendingHeaders<'a>,
+    deadline: Instant,
+}
+
+impl From<String> for StrictTransportError {
+    fn from(error: String) -> Self {
+        Self::Transport(error)
     }
 }
 
@@ -568,6 +666,12 @@ impl HyperTransport {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_guard(mut self) -> Self {
+        self.guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+        self
+    }
+
     fn url(&self, path: &str) -> String {
         let scheme = if self.scheme_http { "http" } else { "https" };
         format!(
@@ -594,11 +698,67 @@ impl HyperTransport {
         request: &Request,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<PendingHeaders<'_>, String> {
+        self.send_request_headers_with_admission(
+            request,
+            deadline,
+            false,
+            None,
+            CallbackAdmission::RecoverReady,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    /// One strict governed attempt through headers, preserving admission failures.
+    /// This seam does not retry or enable any caller.
+    pub async fn send_strict_request_headers(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<PendingHeaders<'_>, StrictTransportError> {
+        self.send_request_headers_with_admission(
+            request,
+            deadline,
+            true,
+            None,
+            CallbackAdmission::RecoverReady,
+        )
+        .await
+    }
+
+    /// Opt in to bounded evidence collection and settlement for one strict attempt.
+    pub async fn send_strict_evidence_headers(
+        &self,
+        request: &Request,
+        deadline: Instant,
+    ) -> Result<StrictEvidenceHeaders<'_>, StrictTransportError> {
+        let pending = self
+            .send_request_headers_with_admission(
+                request,
+                Some(deadline),
+                true,
+                Some(deadline),
+                CallbackAdmission::RecoverReady,
+            )
+            .await?;
+        Ok(StrictEvidenceHeaders { pending, deadline })
+    }
+
+    async fn send_request_headers_with_admission(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+        strict: bool,
+        evidence_deadline: Option<tokio::time::Instant>,
+        callback_admission: CallbackAdmission,
+    ) -> Result<PendingHeaders<'_>, StrictTransportError> {
         if request
             .headers()
             .is_some_and(|headers| headers.contains_key(hyper::header::AUTHORIZATION))
         {
-            return Err("caller-supplied authorization is forbidden".to_owned());
+            return Err("caller-supplied authorization is forbidden"
+                .to_owned()
+                .into());
         }
         let method: http::Method = request
             .method()
@@ -647,24 +807,55 @@ impl HyperTransport {
         let hyper_req = builder
             .body(http_body_util::Full::new(body_bytes))
             .map_err(|e| format!("build request: {e}"))?;
+        let callback = !strict && is_interaction_callback(request);
         // Durable admission shares the caller's absolute deadline: it is a
         // Postgres statement on a pooled connection, not a local lock, so an
         // unbounded admit would outlive the receipt/moderation/boot budgets.
-        // A timed-out admit never resolved, so no permit exists to release;
-        // it reports as a header stall so the caller spends one attempt.
+        // A timed-out claim may have committed. Never release it without a permit.
         let permit = match &self.admission {
+            None if strict => {
+                return Err(two_bot_core::send_admission::AdmissionError::Configuration.into())
+            }
             // Constructor restricts ungoverned transport to loopback fixtures.
             None => None,
-            Some(admission) => match deadline {
-                None => Some(admission.admit().await.map_err(|e| e.to_string())?),
-                Some(at) => match tokio::time::timeout_at(at, admission.admit()).await {
-                    Ok(Ok(permit)) => Some(permit),
-                    Ok(Err(error)) => return Err(error.to_string()),
-                    Err(_) => return Err(HEADER_TIMEOUT_MESSAGE.to_owned()),
-                },
-            },
+            Some(admission) => {
+                let take = if strict {
+                    admission.admit_strict()
+                } else {
+                    admission.admit()
+                };
+                Some(match deadline {
+                    None => take.await?,
+                    Some(at) if strict => poll_before(at, take)
+                        .await
+                        .ok_or(StrictTransportError::PreWireDeadline)??,
+                    // Only receipt callbacks opt out of the work-first poll at
+                    // cutoff. Existing callers may recover a ready permit to
+                    // release it below; neither path dispatches at cutoff.
+                    Some(at)
+                        if callback
+                            && matches!(callback_admission, CallbackAdmission::StopAtCutoff) =>
+                    {
+                        poll_until(at, take)
+                            .await
+                            .ok_or_else(|| HEADER_TIMEOUT_MESSAGE.to_owned())??
+                    }
+                    Some(at) => tokio::time::timeout_at(at, take)
+                        .await
+                        .map_err(|_| HEADER_TIMEOUT_MESSAGE.to_owned())??,
+                })
+            }
         };
-        let mut attempt = crate::executor_metrics::Attempt::new(request);
+        let route_key = bucket_route_key(request);
+        if let Some(at) = evidence_deadline {
+            if self.guard.check_route_now(&route_key, false).is_err() {
+                if let Some(permit) = permit {
+                    let _ = poll_before(at, complete_early_release(permit, "strict_guard")).await;
+                }
+                return Err(StrictTransportError::PreWireGuard);
+            }
+        }
+        let mut attempt = None;
         // Bound the header wait inside the permit scope so a stalled read
         // releases its lane instead of orphaning it: an outer cancellation
         // would drop the future with the permit already taken, leaving
@@ -673,23 +864,35 @@ impl HyperTransport {
         // caller's absolute deadline — so no outer backstop races it. A GET
         // cannot mutate, so release it here; other methods keep the permit
         // held by dropping it uncompleted (uncertain).
-        let request_fut = self.inner.request(hyper_req);
-        let response = match deadline {
-            None => request_fut
-                .await
-                .map_err(|error| format!("transport: {error}"))?,
-            Some(at) => match tokio::time::timeout_at(at, request_fut).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => return Err(format!("transport: {error}")),
-                Err(_) => {
-                    if request.method() == Method::Get {
-                        if let Some(permit) = permit {
-                            complete_early_release(permit, "header_timeout").await;
+        let request_fut = async {
+            attempt = Some(crate::executor_metrics::Attempt::new(request));
+            self.inner.request(hyper_req).await
+        };
+        let response = match wait_for_headers(deadline, strict || callback, request_fut).await {
+            Some(Ok(response)) => response,
+            None if strict && attempt.is_none() => {
+                return Err(StrictTransportError::PreWireDeadline)
+            }
+            failure => {
+                let (message, reason) = match failure {
+                    Some(Err(error)) => (format!("transport: {error}"), "transport_error"),
+                    None => (HEADER_TIMEOUT_MESSAGE.to_owned(), "header_timeout"),
+                    Some(Ok(_)) => unreachable!(),
+                };
+                // An unpolled callback is known unsent; after the first poll,
+                // a timeout cannot tell whether Hyper already dispatched it.
+                if request.method() == Method::Get || (callback && attempt.is_none()) {
+                    if let Some(permit) = permit {
+                        let release = complete_early_release(permit, reason);
+                        if let Some(at) = evidence_deadline {
+                            let _ = poll_before(at, release).await;
+                        } else {
+                            release.await;
                         }
                     }
-                    return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
                 }
-            },
+                return Err(message.into());
+            }
         };
         let status = response.status().as_u16();
         let mut accounting = crate::ratelimit_guard::ResponseAccounting::new(
@@ -700,13 +903,14 @@ impl HyperTransport {
         );
         // Full bucket state is known at headers. Bare Retry-After waits for
         // body classification so existing body timing/scope policy still wins.
-        let route_key = bucket_route_key(request);
         self.guard
             .observe_bucket_headers(&route_key, response.headers());
         if status == 429 {
             accounting.track_bare_bucket(&route_key, response.headers());
         }
-        attempt.finish(Some(status));
+        if let Some(attempt) = &mut attempt {
+            attempt.finish(Some(status));
+        }
         // The 429 wait honors `retry-after` first, then the bucket
         // `reset-after` hint: on a 429 both name the same pause, and the reset
         // hint is the only timing when `retry-after` is absent (official
@@ -721,6 +925,11 @@ impl HyperTransport {
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned)
             });
+        let retry_after_header = if strict && status == 429 {
+            accounting.longest_admission_header()
+        } else {
+            retry_after_header
+        };
         // Reads cannot mutate; a complete failure may be retried independently.
         // Mutation success needs its caller's validated receipt. 5xx, redirects
         // and request-timeout responses remain uncertain even with a full body.
@@ -752,6 +961,20 @@ impl HyperTransport {
         request: &Request,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(RawResponse, bool), String> {
+        self.send_request_with_callback_admission(
+            request,
+            deadline,
+            CallbackAdmission::RecoverReady,
+        )
+        .await
+    }
+
+    async fn send_request_with_callback_admission(
+        &self,
+        request: &Request,
+        deadline: Option<Instant>,
+        callback_admission: CallbackAdmission,
+    ) -> Result<(RawResponse, bool), String> {
         if self.admission.is_some() && request.method() == Method::Get {
             let transport = self.clone();
             let request = request.clone();
@@ -766,7 +989,7 @@ impl HyperTransport {
                 let settled_by = deadline + Duration::from_millis(READ_SETTLEMENT_GRACE_MS);
                 match tokio::time::timeout_at(
                     settled_by,
-                    transport.send_request_inner(&request, Some(deadline)),
+                    transport.send_request_inner(&request, Some(deadline), callback_admission),
                 )
                 .await
                 {
@@ -781,48 +1004,36 @@ impl HyperTransport {
                 .await
                 .map_err(|_| "Discord read owner unavailable".to_owned())?;
         }
-        self.send_request_inner(request, deadline).await
+        self.send_request_inner(request, deadline, callback_admission)
+            .await
     }
 
     async fn send_request_inner(
         &self,
         request: &Request,
         deadline: Option<tokio::time::Instant>,
+        callback_admission: CallbackAdmission,
     ) -> Result<(RawResponse, bool), String> {
-        match deadline {
-            None => {
-                self.send_request_headers(request, None)
-                    .await?
-                    .collect()
-                    .await
-            }
-            Some(at) => {
-                let pending = self.send_request_headers(request, Some(at)).await?;
-                let remaining = at
-                    .checked_duration_since(tokio::time::Instant::now())
-                    .unwrap_or(Duration::ZERO);
-                // Body shares the attempt deadline: cap it at whatever is
-                // left, so headers-plus-body can never overrun the caller's
-                // absolute budget (the receipt/boot windows).
-                let body_budget = remaining.min(Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS));
-                pending.collect_with(body_budget).await
-            }
-        }
+        self.send_request_headers_with_admission(request, deadline, false, None, callback_admission)
+            .await
+            .map_err(|error| error.to_string())?
+            .collect_with(deadline)
+            .await
     }
 }
 
 /// Headers-received half of one governed wire attempt. The status is known;
 /// the body is not yet collected. The caller either collects the bounded body
 /// ([`PendingHeaders::collect`]) or settles a status-only verdict
-/// ([`PendingHeaders::settle_status`]) and drops the rest unread. Dropping
+/// (`PendingHeaders::settle_status`) and drops the rest unread. Dropping
 /// without settling commits only the header-anchored global timing, never
 /// body timing.
 ///
-/// [`crate::ratelimit_guard::ResponseAccounting`] settles exactly once:
+/// `ResponseAccounting` settles exactly once:
 /// either in `collect`/`settle_status` (with whatever evidence is available)
 /// or in `Drop` (header-anchored fallback). Either way a pending header
 /// restriction resolves to its header timing without opening admission early.
-struct PendingHeaders<'a> {
+pub struct PendingHeaders<'a> {
     response: Option<hyper::Response<hyper::body::Incoming>>,
     accounting: Option<crate::ratelimit_guard::ResponseAccounting<'a>>,
     complete_on_receipt: bool,
@@ -834,32 +1045,35 @@ struct PendingHeaders<'a> {
 impl PendingHeaders<'_> {
     /// Collect the bounded body and settle guard/admission accounting exactly
     /// as the pre-split `send_request` always has.
-    async fn collect(self) -> Result<(RawResponse, bool), String> {
-        self.collect_with(Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS))
-            .await
+    pub async fn collect(self) -> Result<(RawResponse, bool), String> {
+        self.collect_with(None).await
     }
 
-    /// [`Self::collect`] with the caller's body allowance: budgeted wire
-    /// attempts pass what is left of their attempt deadline so a slow header
-    /// phase cannot push the body phase past it.
-    async fn collect_with(mut self, body_timeout: Duration) -> Result<(RawResponse, bool), String> {
+    async fn collect_with(
+        mut self,
+        deadline: Option<Instant>,
+    ) -> Result<(RawResponse, bool), String> {
         use http_body_util::BodyExt as _;
         let response = self.response.take().expect("pending headers");
         let status = self.status;
         // Expiry drops accounting, resolving the pending header restriction to
         // its header-anchored timing/fallback without opening admission early.
-        let collected = tokio::time::timeout(
-            body_timeout,
-            http_body_util::Limited::new(response.into_body(), 8 * 1024 * 1024).collect(),
-        )
-        .await;
+        let collected = if status == 204 {
+            // A 204 receipt needs no body I/O, even at the cutoff.
+            None
+        } else {
+            let cap = Instant::now() + Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS);
+            let body = http_body_util::Limited::new(response.into_body(), RESPONSE_BODY_LIMIT);
+            poll_until(deadline.map_or(cap, |at| at.min(cap)), body.collect()).await
+        };
         let body = match collected {
-            Ok(Ok(body)) => body.to_bytes().to_vec(),
+            Some(Ok(body)) => body.to_bytes().to_vec(),
+            None if status == 204 => Vec::new(),
             // 429 is definitive no-effect even with a broken, oversized or
             // timed-out body. Missing timing installs an indefinite hold
             // instead of a default.
-            Err(_) | Ok(Err(_)) if status == 429 => Vec::new(),
-            Err(_) => {
+            None | Some(Err(_)) if status == 429 => Vec::new(),
+            None => {
                 // Headers arrived but the body stalled: a GET cannot mutate,
                 // so release the lane where the permit is in scope. Without
                 // this the retries are `Blocked` by this attempt's own
@@ -872,7 +1086,7 @@ impl PendingHeaders<'_> {
                 }
                 return Err(BODY_TIMEOUT_MESSAGE.to_owned());
             }
-            Ok(Err(_)) => {
+            Some(Err(_)) => {
                 // Same orphan as a timed-out body: a truncated/errored body on
                 // a receipted read (every GET) must release the lane.
                 if self.complete_on_receipt {
@@ -907,7 +1121,7 @@ impl PendingHeaders<'_> {
     /// 204 is the singular role-mutation success: it releases admission here
     /// because `complete_on_receipt` (GET + rejection/rate-limit statuses)
     /// never fires for a PUT/DELETE success, and no caller completes it later.
-    async fn settle_status(mut self) -> u16 {
+    pub(crate) async fn settle_status(mut self) -> u16 {
         let status = self.status;
         let mut res = RawResponse {
             status,
@@ -934,6 +1148,67 @@ impl Drop for PendingHeaders<'_> {
         // permit intentionally holds the lane: an uncertain response must not
         // release durable send admission.
         drop(self.accounting.take());
+    }
+}
+
+impl StrictEvidenceHeaders<'_> {
+    /// Observe a bounded strict response without authority to confirm mutations.
+    pub async fn collect_evidence(
+        self,
+        observe: impl FnOnce(StrictResponseEvidence<'_>),
+    ) -> StrictSettlement {
+        self.collect_validated_evidence(|evidence| {
+            observe(evidence);
+            false
+        })
+        .await
+    }
+
+    /// Only crate-internal receipt boundaries may confirm a successful mutation.
+    pub(crate) async fn collect_validated_evidence(
+        self,
+        observe: impl FnOnce(StrictResponseEvidence<'_>) -> bool,
+    ) -> StrictSettlement {
+        use http_body_util::BodyExt as _;
+        let deadline = self.deadline;
+        let mut pending = self.pending;
+        let body_cap = Instant::now() + Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS);
+        let response = pending.response.take().expect("pending headers");
+        let body = poll_before(deadline.min(body_cap), async {
+            http_body_util::Limited::new(response.into_body(), RESPONSE_BODY_LIMIT)
+                .collect()
+                .await
+                .map(|body| body.to_bytes().to_vec())
+        })
+        .await
+        .and_then(Result::ok);
+        let body_available = body.is_some();
+        let mut response = RawResponse {
+            status: pending.status,
+            retry_after_header: pending.retry_after_header.take(),
+            body: body.unwrap_or_default(),
+            completion: pending.permit.take(),
+        };
+        if let Some(mut accounting) = pending.accounting.take() {
+            accounting.finish(&response);
+        }
+        let accepted = observe(StrictResponseEvidence {
+            response: &response,
+            status: response.status,
+            retry_after_header: response.retry_after_header.as_deref(),
+            body: body_available.then_some(response.body.as_slice()),
+        });
+        let validated_success = accepted && body_available && (200..300).contains(&response.status);
+        if !(pending.complete_on_receipt || validated_success) {
+            return StrictSettlement::Unconfirmed;
+        }
+        match response.complete_before(Some(deadline)).await {
+            Ok(()) => StrictSettlement::Confirmed,
+            Err(error) => {
+                tracing::warn!(%error, "strict Discord send settlement unconfirmed");
+                StrictSettlement::Unconfirmed
+            }
+        }
     }
 }
 
@@ -1345,37 +1620,39 @@ impl ActionExecutor {
         request: &Request,
         timeout: Duration,
     ) -> Result<(RawResponse, bool), DiscordError> {
-        self.send_admitted_for(request, timeout).await
-    }
-
-    async fn send_admitted(&self, request: &Request) -> Result<(RawResponse, bool), DiscordError> {
-        self.send_admitted_for(request, self.inner.moderation_timeout)
+        self.send_admitted_for(request, SendBudget::Relative(timeout))
             .await
     }
 
-    async fn send_admitted_for(
-        &self,
-        request: &Request,
-        budget: Duration,
-    ) -> Result<(RawResponse, bool), DiscordError> {
-        self.send_admitted_until(request, tokio::time::Instant::now() + budget)
+    async fn send_admitted(&self, request: &Request) -> Result<(RawResponse, bool), DiscordError> {
+        self.send_admitted_for(request, SendBudget::Relative(self.inner.moderation_timeout))
             .await
     }
 
     // Erase the wire future at one non-inlined constructor, so the many REST
     // wrappers share its poll/drop code instead of embedding the transport.
-    // Counting stays lazy; cancellation still drops in place.
+    // Counting and relative deadlines stay lazy; cancellation still drops in place.
     #[inline(never)]
-    fn send_admitted_until<'a>(
+    fn send_admitted_for<'a>(
         &'a self,
         request: &'a Request,
-        deadline: tokio::time::Instant,
+        budget: SendBudget,
     ) -> AdmittedSendFuture<'a> {
         Box::pin(async move {
             self.count();
+            // The absolute attempt instant is fixed before durable admission, so
+            // the admit, the header wait and the body share the one deadline.
+            let (deadline, callback_admission) = match budget {
+                SendBudget::Relative(timeout) => {
+                    (Instant::now() + timeout, CallbackAdmission::RecoverReady)
+                }
+                SendBudget::Absolute(deadline, callback_admission) => {
+                    (deadline, callback_admission)
+                }
+            };
             self.inner
                 .transport
-                .send_request(request, Some(deadline))
+                .send_request_with_callback_admission(request, Some(deadline), callback_admission)
                 .await
                 .map_err(|detail| {
                     // A body that never completed inside the wire budget is
@@ -1415,25 +1692,35 @@ impl ActionExecutor {
         lane: Option<bool>,
         timeout: Duration,
     ) -> Result<(RawResponse, bool), DiscordError> {
-        self.send_with_timeout_until(request, lane, tokio::time::Instant::now() + timeout)
-            .await
+        self.send_with_deadline(
+            request,
+            lane,
+            Instant::now() + timeout,
+            CallbackAdmission::RecoverReady,
+        )
+        .await
     }
 
-    async fn send_with_timeout_until(
+    async fn send_with_deadline(
         &self,
         request: &Request,
         lane: Option<bool>,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
+        callback_admission: CallbackAdmission,
     ) -> Result<(RawResponse, bool), DiscordError> {
         tokio::time::timeout_at(deadline, self.admit(request, lane))
             .await
             .map_err(|_| GuardError::AdmissionTimeout)??;
-        if tokio::time::Instant::now() >= deadline {
-            return Err(GuardError::AdmissionTimeout.into());
+        // The wire phase takes whatever is left of the caller's deadline, so
+        // guard admission, durable admission, headers and body together stay
+        // inside it (the receipt window refuses to land past it). No outer
+        // backstop: the transport's timers share the absolute deadline, and a
+        // stalled GET releases its lane where the permit is in scope.
+        if is_interaction_callback(request) && Instant::now() >= deadline {
+            return Err(DiscordError::Timeout);
         }
-        // No outer wire timer: durable admission, headers and body share the
-        // same instant, and a stalled GET releases its permit in the transport.
-        self.send_admitted_until(request, deadline).await
+        self.send_admitted_for(request, SendBudget::Absolute(deadline, callback_admission))
+            .await
     }
 
     /// Singular role mutations use status only. A truncated/stalled provider
@@ -3742,23 +4029,25 @@ impl ActionExecutor {
         interaction_token: &str,
         response: &twilight_model::http::interaction::InteractionResponse,
     ) -> Result<(), DiscordError> {
-        self.answer_interaction_until(
+        self.answer_interaction_before(
             interaction_id,
             interaction_token,
             response,
-            tokio::time::Instant::now() + self.inner.moderation_timeout,
+            Instant::now() + self.inner.moderation_timeout,
+            CallbackAdmission::RecoverReady,
         )
         .await
     }
 
-    /// One callback attempt: payload construction, guard admission and wire
-    /// transport all spend the caller's remaining acknowledgement budget.
-    async fn answer_interaction_until(
+    /// Admission and wire I/O share the deadline; settlement of a definite
+    /// response must not be cancelled when that deadline elapses.
+    async fn answer_interaction_before(
         &self,
         interaction_id: u64,
         interaction_token: &str,
         response: &twilight_model::http::interaction::InteractionResponse,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
+        callback_admission: CallbackAdmission,
     ) -> Result<(), DiscordError> {
         let interaction_id =
             Id::<InteractionMarker>::new_checked(interaction_id).ok_or_else(|| {
@@ -3772,7 +4061,9 @@ impl ActionExecutor {
                 .create_response(interaction_id, interaction_token, &response),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
-        let (mut res, _) = self.send_with_timeout_until(&req, None, deadline).await?;
+        let (mut res, _) = self
+            .send_with_deadline(&req, None, deadline, callback_admission)
+            .await?;
         match res.status {
             200 => {
                 mutation_receipt_id(&res.body)?;
@@ -3799,8 +4090,8 @@ impl ActionExecutor {
         F: FnMut(Duration) -> Fut,
         Fut: std::future::Future<Output = Result<T, DiscordError>>,
     {
-        self.retry_admission_blocked_within(
-            Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS),
+        self.retry_admission_blocked_before(
+            Instant::now() + Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS),
             Duration::from_millis(BLOCKED_RETRY_SLEEP_MS),
             attempt,
         )
@@ -3808,9 +4099,9 @@ impl ActionExecutor {
     }
 
     /// [`Self::retry_admission_blocked`] with the caller's budget and backoff.
-    async fn retry_admission_blocked_within<T, F, Fut>(
+    async fn retry_admission_blocked_before<T, F, Fut>(
         &self,
-        budget: Duration,
+        deadline: Instant,
         sleep: Duration,
         mut attempt: F,
     ) -> Result<T, DiscordError>
@@ -3818,34 +4109,17 @@ impl ActionExecutor {
         F: FnMut(Duration) -> Fut,
         Fut: std::future::Future<Output = Result<T, DiscordError>>,
     {
-        self.retry_admission_blocked_until(tokio::time::Instant::now() + budget, sleep, |at| {
-            attempt(at.saturating_duration_since(tokio::time::Instant::now()))
-        })
-        .await
-    }
-
-    async fn retry_admission_blocked_until<T, F, Fut>(
-        &self,
-        deadline: tokio::time::Instant,
-        sleep: Duration,
-        mut attempt: F,
-    ) -> Result<T, DiscordError>
-    where
-        F: FnMut(tokio::time::Instant) -> Fut,
-        Fut: std::future::Future<Output = Result<T, DiscordError>>,
-    {
-        let mut last_error = DiscordError::Timeout;
+        let mut blocked: Option<DiscordError> = None;
         loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return Err(last_error);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(blocked.unwrap_or(DiscordError::Timeout));
             }
-            match attempt(deadline.min(now + self.inner.moderation_timeout)).await {
+            match attempt(remaining.min(self.inner.moderation_timeout)).await {
                 Ok(value) => return Ok(value),
                 Err(error) if error.is_admission_blocked() => {
-                    last_error = error;
-                    tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + sleep))
-                        .await;
+                    blocked = Some(error);
+                    tokio::time::sleep_until(deadline.min(Instant::now() + sleep)).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -3869,8 +4143,8 @@ impl ActionExecutor {
         let blocked = std::sync::atomic::AtomicU32::new(0);
         let started = tokio::time::Instant::now();
         let result = self
-            .retry_admission_blocked_within(
-                Duration::from_millis(BOOT_ADMISSION_BUDGET_MS),
+            .retry_admission_blocked_before(
+                Instant::now() + Duration::from_millis(BOOT_ADMISSION_BUDGET_MS),
                 Duration::from_millis(BOOT_BLOCKED_RETRY_SLEEP_MS),
                 |timeout| {
                     let pending = attempt(timeout);
@@ -3898,39 +4172,82 @@ impl ActionExecutor {
         result
     }
 
-    /// Retry a callback within [`RECEIPT_ADMISSION_BUDGET_MS`] from this call.
-    /// Callers that already captured gateway receipt should use
-    /// [`Self::answer_interaction_since_receipt`] instead.
+    /// Retry only pre-wire admission-Blocked failures within a fresh
+    /// [`RECEIPT_ADMISSION_BUDGET_MS`] budget starting when first polled.
+    /// Call [`Self::answer_interaction_since_receipt`] to charge rendering
+    /// time to the same budget.
     pub async fn answer_interaction_with_blocked_retry(
         &self,
         interaction_id: u64,
         interaction_token: &str,
         response: &twilight_model::http::interaction::InteractionResponse,
     ) -> Result<(), DiscordError> {
-        self.answer_interaction_since_receipt(
+        self.answer_interaction_with_blocked_retry_before(
             interaction_id,
             interaction_token,
             response,
-            tokio::time::Instant::now(),
+            Instant::now() + Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS),
         )
         .await
     }
 
-    /// Use the original gateway receipt to budget computation and the callback
-    /// together. Only a proven pre-wire admission refusal may be retried; an
-    /// expired budget starts no attempt and an uncertain outcome is terminal.
+    /// Use the original gateway receipt so rendering and the callback share
+    /// the acknowledgement budget. An expired receipt starts no attempt.
     pub async fn answer_interaction_since_receipt(
         &self,
         interaction_id: u64,
         interaction_token: &str,
         response: &twilight_model::http::interaction::InteractionResponse,
-        received: tokio::time::Instant,
+        received: Instant,
     ) -> Result<(), DiscordError> {
-        self.retry_admission_blocked_until(
+        self.answer_interaction_retry_until(
+            interaction_id,
+            interaction_token,
+            response,
             received + Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS),
+            CallbackAdmission::StopAtCutoff,
+        )
+        .await
+    }
+
+    /// Bound the callback by an absolute deadline. Retry only pre-wire lane
+    /// occupancy and settle definite results even after the wire cutoff.
+    pub async fn answer_interaction_with_blocked_retry_before(
+        &self,
+        interaction_id: u64,
+        interaction_token: &str,
+        response: &twilight_model::http::interaction::InteractionResponse,
+        deadline: Instant,
+    ) -> Result<(), DiscordError> {
+        self.answer_interaction_retry_until(
+            interaction_id,
+            interaction_token,
+            response,
+            deadline,
+            CallbackAdmission::RecoverReady,
+        )
+        .await
+    }
+
+    async fn answer_interaction_retry_until(
+        &self,
+        interaction_id: u64,
+        interaction_token: &str,
+        response: &twilight_model::http::interaction::InteractionResponse,
+        deadline: Instant,
+        callback_admission: CallbackAdmission,
+    ) -> Result<(), DiscordError> {
+        self.retry_admission_blocked_before(
+            deadline,
             Duration::from_millis(BLOCKED_RETRY_SLEEP_MS),
-            |deadline| {
-                self.answer_interaction_until(interaction_id, interaction_token, response, deadline)
+            |timeout| {
+                self.answer_interaction_before(
+                    interaction_id,
+                    interaction_token,
+                    response,
+                    deadline.min(Instant::now() + timeout),
+                    callback_admission,
+                )
             },
         )
         .await
@@ -4152,6 +4469,45 @@ impl ActionExecutor {
         self.retry_admission_blocked(|_| async {
             self.edit_interaction_response(application_id, interaction_token, content)
                 .await
+        })
+        .await
+    }
+
+    /// Complete a deferred interaction with one sanitized embed. Only admission
+    /// failures that did not reach Discord are retried.
+    pub async fn edit_interaction_response_embed_with_blocked_retry(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        embed: &twilight_model::channel::message::embed::Embed,
+    ) -> Result<(), DiscordError> {
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
+        let response = twilight_model::http::interaction::InteractionResponse {
+            kind: twilight_model::http::interaction::InteractionResponseType::UpdateMessage,
+            data: Some(twilight_model::http::interaction::InteractionResponseData {
+                embeds: Some(vec![embed.clone()]),
+                ..Default::default()
+            }),
+        };
+        let safe = crate::message_safety::interaction_response(&response)?;
+        let embeds = safe.data.and_then(|data| data.embeds).unwrap_or_default();
+        let mentions = AllowedMentions::default();
+        self.retry_admission_blocked(|_| async {
+            let req = Self::request_of(
+                self.inner
+                    .factory
+                    .interaction(application)
+                    .update_response(interaction_token)
+                    .content(Some(""))
+                    .embeds(Some(&embeds))
+                    .allowed_mentions(Some(&mentions)),
+            )?;
+            let req = Self::explicit_mentions(req, &mentions)?;
+            let mut res = self.call_once_raw(req, &[200]).await?;
+            mutation_receipt_id(&res.body)?;
+            res.complete().await;
+            Ok(())
         })
         .await
     }
@@ -4731,6 +5087,483 @@ mod tests {
         Arc::new(NeverSendAdmission(TokenKey::for_bot_token(token).unwrap()))
     }
 
+    #[tokio::test]
+    async fn strict_transport_preserves_pre_wire_refusals() {
+        use crate::strict_transport_fixture::{loopback, Admission};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = "fixture-strict-refusal";
+        let (listener, origin) = loopback().await;
+        let transport = HyperTransport::with_admission(
+            token.to_owned(),
+            Some(origin),
+            Arc::new(Admission::new(
+                token,
+                Some(AdmissionError::Blocked),
+                Some(AdmissionError::Storage),
+            )),
+        )
+        .unwrap();
+        let request = Request::from_route(&Route::GetCurrentUser);
+        for deadline in [
+            None,
+            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+        ] {
+            assert!(matches!(
+                transport
+                    .send_strict_request_headers(&request, deadline)
+                    .await,
+                Err(StrictTransportError::Admission(AdmissionError::Storage))
+            ));
+            assert_eq!(
+                transport
+                    .send_request_headers(&request, deadline)
+                    .await
+                    .err()
+                    .unwrap(),
+                AdmissionError::Blocked.to_string()
+            );
+        }
+
+        let ungoverned = HyperTransport::build(
+            token.to_owned(),
+            Some("http://127.0.0.1:1".to_owned()),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            ungoverned.send_strict_request_headers(&request, None).await,
+            Err(StrictTransportError::Admission(
+                AdmissionError::Configuration
+            ))
+        ));
+        let unauthorized = twilight_http::request::RequestBuilder::raw(
+            request.method(),
+            request.path().to_owned(),
+        )
+        .headers(std::iter::once((
+            hyper::header::AUTHORIZATION,
+            hyper::header::HeaderValue::from_static("fixture"),
+        )))
+        .build()
+        .unwrap();
+        assert!(matches!(
+            transport.send_strict_request_headers(&unauthorized, None).await,
+            Err(StrictTransportError::Transport(message)) if message == "caller-supplied authorization is forbidden"
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_transport_fixture_reads_and_completes() {
+        use crate::strict_transport_fixture::Admission;
+        use std::sync::atomic::Ordering;
+
+        let token = "fixture-strict-success";
+        let request = Request::from_route(&Route::GetCurrentUser);
+        for strict in [false, true] {
+            let gate = Arc::new(Admission::new(token, None, None));
+            let (transport, server) = strict_fixture_exchange(
+                token,
+                gate.clone(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .await;
+            let at = Some(Instant::now() + Duration::from_secs(2));
+            let pending = if strict {
+                transport
+                    .send_strict_request_headers(&request, at)
+                    .await
+                    .unwrap()
+            } else {
+                transport.send_request_headers(&request, at).await.unwrap()
+            };
+            let (response, _) = pending.collect().await.unwrap();
+            let wire = server.await.unwrap();
+            assert_eq!(response.status, 200);
+            assert!(wire.starts_with(b"GET /api/v10/users/@me "));
+            let admitted = gate.strict_admitted.load(Ordering::Relaxed);
+            assert_eq!(admitted, usize::from(strict));
+            assert_eq!(*gate.completed.lock().unwrap(), vec![None]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn callback_admission_recovers_legacy_permits_but_stops_receipt_polls_at_cutoff() {
+        use crate::strict_transport_fixture::{loopback, Admission};
+        use std::{future::poll_fn, task::Poll};
+        use twilight_http::request::RequestBuilder;
+
+        #[derive(Debug)]
+        struct DeadlineAdmission {
+            gate: Arc<Admission>,
+            deadline: Instant,
+            finish_in_first_poll: bool,
+        }
+
+        impl SendAdmission for DeadlineAdmission {
+            fn token_key(&self) -> &TokenKey {
+                self.gate.token_key()
+            }
+
+            fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+                Box::pin(async {
+                    assert!(
+                        Instant::now() < self.deadline,
+                        "admission started at cutoff"
+                    );
+                    // Model a claim that has already committed before its result is ready.
+                    let permit = self.gate.admit().await?;
+                    if self.finish_in_first_poll {
+                        poll_fn(|cx| {
+                            // Cross the cutoff inside this poll, without yielding.
+                            let advance = tokio::time::advance(self.deadline - Instant::now());
+                            let _ = std::pin::pin!(advance).poll(cx);
+                            Poll::Ready(())
+                        })
+                        .await;
+                    } else {
+                        poll_fn(|_| {
+                            if Instant::now() < self.deadline {
+                                Poll::Pending
+                            } else {
+                                Poll::Ready(())
+                            }
+                        })
+                        .await;
+                    }
+                    assert_eq!(Instant::now(), self.deadline);
+                    Ok(permit)
+                })
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = "fixture-callback-late-admission";
+        let (listener, origin) = loopback().await;
+        let request = RequestBuilder::raw(Method::Post, "interactions/1/t/callback".to_owned())
+            .build()
+            .unwrap();
+        let response = crate::interactions::text_response(
+            two_bot_core::router::replies::InteractionReply::new("fixture", true),
+        );
+        let budget = Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS);
+        for (remaining, finish_in_first_poll, legacy, expected_releases) in [
+            (budget, false, true, vec![None]),
+            (Duration::ZERO, false, false, vec![]),
+            (budget, false, false, vec![]),
+            (budget, true, false, vec![None]),
+        ] {
+            let received = Instant::now();
+            let deadline = received + remaining;
+            let gate = Arc::new(Admission::new(token, None, None));
+            let admission = Arc::new(DeadlineAdmission {
+                gate: gate.clone(),
+                deadline,
+                finish_in_first_poll,
+            });
+            let transport =
+                HyperTransport::with_admission(token.to_owned(), Some(origin.clone()), admission)
+                    .unwrap()
+                    .with_test_guard();
+            let send = async {
+                if remaining.is_zero() {
+                    let result = transport
+                        .send_request_inner(
+                            &request,
+                            Some(deadline),
+                            CallbackAdmission::StopAtCutoff,
+                        )
+                        .await;
+                    assert_eq!(result.err().as_deref(), Some(HEADER_TIMEOUT_MESSAGE));
+                    return;
+                }
+                let executor =
+                    ActionExecutor::assemble(token.to_owned(), Some(origin.clone()), transport)
+                        .unwrap();
+                let result = if legacy {
+                    executor
+                        .answer_interaction_with_blocked_retry(1, "fixture", &response)
+                        .await
+                } else {
+                    executor
+                        .answer_interaction_since_receipt(1, "fixture", &response, received)
+                        .await
+                };
+                assert_eq!(result, Err(DiscordError::Timeout));
+            };
+            let mut send = std::pin::pin!(send);
+            if !remaining.is_zero() && !finish_in_first_poll {
+                assert!(futures_util::poll!(&mut send).is_pending());
+                tokio::time::advance(remaining).await;
+            }
+            send.await;
+            assert_eq!(Instant::now(), deadline);
+            assert_eq!(
+                *gate.completed.lock().unwrap(),
+                expected_releases,
+                "remaining={remaining:?}, first_poll={finish_in_first_poll}, legacy={legacy}"
+            );
+        }
+        tokio::time::resume();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn callback_send_does_not_poll_ready_connection_at_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let connect_then_send = std::future::poll_fn(|_| {
+            if Instant::now() >= deadline {
+                return std::task::Poll::Ready("dispatched");
+            }
+            std::task::Poll::Pending
+        });
+        let mut send = std::pin::pin!(wait_for_headers(Some(deadline), true, connect_then_send));
+        assert!(futures_util::poll!(&mut send).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(send.await, None);
+    }
+
+    #[tokio::test]
+    async fn callback_at_body_cutoff_preserves_definite_outcomes() {
+        use crate::strict_transport_fixture::Admission;
+        use twilight_http::request::RequestBuilder;
+
+        let token = "fixture-callback-body-deadline";
+        let replies: [(u16, &[u8]); 2] = [
+            (
+                403,
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            ),
+            (204, b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"),
+        ];
+        let request = RequestBuilder::raw(Method::Post, "interactions/1/t/callback".to_owned())
+            .build()
+            .unwrap();
+        for (status, reply) in replies {
+            let gate = Arc::new(Admission::new(token, None, None));
+            let (transport, server) = strict_fixture_exchange(token, gate.clone(), reply).await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let pending = transport
+                .send_request_headers(&request, Some(deadline))
+                .await
+                .unwrap();
+            assert!(server.await.unwrap().starts_with(b"POST "));
+            tokio::time::pause();
+            tokio::time::advance(deadline - Instant::now()).await;
+            let collected = pending.collect_with(Some(deadline)).await;
+            if status == 204 {
+                let (mut response, _) = collected.unwrap();
+                assert_eq!(response.status, 204);
+                assert!(response.body.is_empty());
+                assert!(gate.completed.lock().unwrap().is_empty());
+                response.complete().await;
+            } else {
+                assert_eq!(collected.err().as_deref(), Some(BODY_TIMEOUT_MESSAGE));
+            }
+            assert_eq!(Instant::now(), deadline);
+            assert_eq!(*gate.completed.lock().unwrap(), vec![None]);
+            tokio::time::resume();
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_transport_refuses_expired_deadline_before_admission() {
+        use crate::strict_transport_fixture::{loopback, Admission};
+        use std::sync::atomic::Ordering;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = "fixture-strict-deadline";
+        let (listener, origin) = loopback().await;
+        let gate = Arc::new(Admission::new(token, None, None));
+        let transport =
+            HyperTransport::with_admission(token.to_owned(), Some(origin), gate.clone()).unwrap();
+        let request = Request::from_route(&Route::GetCurrentUser);
+        assert!(matches!(
+            transport
+                .send_strict_request_headers(&request, Some(tokio::time::Instant::now()))
+                .await,
+            Err(StrictTransportError::PreWireDeadline)
+        ));
+        assert_eq!(gate.strict_admitted.load(Ordering::Relaxed), 0);
+        assert!(
+            gate.completed.lock().unwrap().is_empty(),
+            "no release after admission"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    async fn strict_fixture_exchange(
+        token: &str,
+        gate: Arc<crate::strict_transport_fixture::Admission>,
+        reply: &'static [u8],
+    ) -> (HyperTransport, tokio::task::JoinHandle<Vec<u8>>) {
+        use crate::strict_transport_fixture::{loopback, read_request};
+        use tokio::io::AsyncWriteExt;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (listener, origin) = loopback().await;
+        let transport = HyperTransport::with_admission(token.to_owned(), Some(origin), gate)
+            .unwrap()
+            .with_test_guard();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let request = read_request(&mut stream).await;
+            stream.write_all(reply).await.unwrap();
+            request
+        });
+        (transport, server)
+    }
+
+    #[tokio::test]
+    async fn strict_transport_observes_evidence_before_bounded_completion() {
+        use crate::strict_transport_fixture::Admission;
+        use two_bot_core::send_admission::cooldown_from_delays;
+        for (completion, stalled, expired) in [
+            (Ok(()), false, false),
+            (Err(AdmissionError::Storage), false, false),
+            (Ok(()), true, false),
+            (Ok(()), false, true),
+        ] {
+            let token = "fixture-strict-evidence";
+            let mut gate = Admission::new(token, None, None);
+            gate.completion = completion;
+            gate.stall_completion = stalled;
+            let gate = Arc::new(gate);
+            // A zero-length response has EOF ready without another socket poll.
+            let reply: &[u8] = if expired {
+                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n"
+            } else {
+                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 17\r\n\r\n{\"retry_after\":2}"
+            };
+            let (transport, server) = strict_fixture_exchange(token, gate.clone(), reply).await;
+            let request =
+                twilight_http::request::RequestBuilder::raw(Method::Post, "fixture".to_owned())
+                    .build()
+                    .unwrap();
+            let at = tokio::time::Instant::now() + Duration::from_secs(2);
+            let mut observed = false;
+            let pending = transport
+                .send_strict_evidence_headers(&request, at)
+                .await
+                .unwrap();
+            if expired {
+                tokio::time::pause();
+                tokio::time::advance(at.saturating_duration_since(Instant::now())).await;
+            }
+            let settled = tokio::time::timeout_at(
+                at + Duration::from_secs(1),
+                pending.collect_evidence(|evidence| {
+                    assert!(gate.completed.lock().unwrap().is_empty());
+                    assert_eq!(evidence.status, 429);
+                    assert_eq!(evidence.retry_after_header, Some("1"));
+                    let body = br#"{"retry_after":2}"#.as_slice();
+                    assert_eq!(evidence.body, (!expired).then_some(body));
+                    observed = true;
+                }),
+            )
+            .await
+            .expect("settlement must be bounded");
+            if expired {
+                tokio::time::resume();
+            }
+            assert!(observed);
+            let confirmed = completion.is_ok() && !stalled && !expired;
+            assert_eq!(settled == StrictSettlement::Confirmed, confirmed);
+            let attempt = (!expired).then(|| Some(cooldown_from_delays(Some(1.0), Some(2.0))));
+            assert_eq!(
+                gate.completed.lock().unwrap().as_slice(),
+                attempt.as_slice()
+            );
+            assert!(server.await.unwrap().starts_with(b"POST /api/v10/fixture "));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn strict_settlement_checks_before_and_after_poll() {
+        use std::{cell::Cell, future::poll_fn, task::Poll};
+
+        for late in [Duration::ZERO, Duration::from_millis(1)] {
+            let budget = Duration::from_millis(10);
+            let at = tokio::time::Instant::now() + budget;
+            let polls = Cell::new(0);
+            let work = poll_fn(|_| {
+                if polls.replace(polls.get() + 1) == 0 {
+                    return Poll::Pending;
+                }
+                Poll::Ready(())
+            });
+            let mut settled = std::pin::pin!(poll_before(at, work));
+            assert!(futures_util::poll!(&mut settled).is_pending());
+            tokio::time::advance(budget + late).await;
+            assert_eq!(tokio::time::Instant::now(), at + late);
+            assert_eq!(settled.await, None);
+            assert_eq!(polls.get(), 1, "storage was repolled at or after expiry");
+
+            let at = Instant::now() + budget;
+            let work = poll_fn(|cx| {
+                // Advance the paused clock inside one poll, before returning Ready.
+                let _ = std::pin::pin!(tokio::time::advance(budget + late)).poll(cx);
+                assert_eq!(Instant::now(), at + late);
+                Poll::Ready(())
+            });
+            assert_eq!(poll_before(at, work).await, None, "late acknowledgement");
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_transport_requires_mutation_receipt_validation() {
+        use crate::strict_transport_fixture::Admission;
+        let request =
+            twilight_http::request::RequestBuilder::raw(Method::Post, "fixture".to_owned())
+                .build()
+                .unwrap();
+        for validate in [false, true] {
+            let token = "fixture-strict-receipt";
+            let gate = Arc::new(Admission::new(token, None, None));
+            let (transport, server) = strict_fixture_exchange(
+                token,
+                gate.clone(),
+                b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            let at = tokio::time::Instant::now() + Duration::from_secs(2);
+            let pending = transport
+                .send_strict_evidence_headers(&request, at)
+                .await
+                .unwrap();
+            let settled = if validate {
+                pending
+                    .collect_validated_evidence(|evidence| {
+                        evidence.status == 204 && evidence.body == Some(&[])
+                    })
+                    .await
+            } else {
+                pending
+                    .collect_evidence(|evidence| assert_eq!(evidence.status, 204))
+                    .await
+            };
+            assert_eq!(settled == StrictSettlement::Confirmed, validate);
+            assert_eq!(gate.completed.lock().unwrap().len(), usize::from(validate));
+            server.await.unwrap();
+        }
+    }
+
     #[test]
     fn only_the_canonical_blocked_detail_is_retryable() {
         assert!(
@@ -4820,13 +5653,14 @@ mod tests {
         .expect("fixture executor");
         let request = Request::from_route(&Route::GetCurrentUser);
         let budget = Duration::from_millis(50);
-        let unpolled = executor.send_admitted_for(&request, budget);
+        let unpolled = executor.send_admitted_for(&request, SendBudget::Relative(budget));
         drop(unpolled);
         assert_eq!(executor.requests(), 0);
         assert_eq!(entered.load(Ordering::SeqCst), 0);
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
 
-        let mut pending = Box::pin(executor.send_admitted_for(&request, budget));
+        let mut pending =
+            Box::pin(executor.send_admitted_for(&request, SendBudget::Relative(budget)));
         // Construction must not start the deadline or durable admission.
         tokio::time::advance(budget * 2).await;
         assert_eq!(executor.requests(), 0);
@@ -4878,18 +5712,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn callback_retries_only_in_the_time_left_after_rendering() {
-        use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
-
-        let executor = boot_executor();
-        let response = InteractionResponse {
-            kind: InteractionResponseType::ChannelMessageWithSource,
-            data: Some(twilight_model::http::interaction::InteractionResponseData {
-                content: Some("fixture".into()),
-                flags: Some(twilight_model::channel::message::MessageFlags::EPHEMERAL),
-                ..Default::default()
-            }),
-        };
-        let received = tokio::time::Instant::now();
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = "fixture-receipt-budget";
+        let (_listener, origin) = crate::strict_transport_fixture::loopback().await;
+        let transport = HyperTransport::with_admission(
+            token.to_owned(),
+            Some(origin.clone()),
+            never_send_admission(token),
+        )
+        .unwrap()
+        .with_test_guard();
+        let executor = ActionExecutor::assemble(token.to_owned(), Some(origin), transport).unwrap();
+        let response = crate::interactions::text_response(
+            two_bot_core::router::replies::InteractionReply::new("fixture", true),
+        );
+        let received = Instant::now();
         let budget = Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS);
         let remainder = Duration::from_millis(BLOCKED_RETRY_SLEEP_MS + 10);
         tokio::time::advance(budget - remainder).await;
@@ -4905,8 +5742,9 @@ mod tests {
             "only two attempts fit before expiry"
         );
 
+        // An attempt begun after expiry would reject the invalid ID, not time out.
         let expired = executor
-            .answer_interaction_since_receipt(2, "fixture", &response, received)
+            .answer_interaction_since_receipt(0, "fixture", &response, received)
             .await;
         assert_eq!(expired, Err(DiscordError::Timeout));
         assert_eq!(executor.requests(), 2, "expiry must not start a send");
@@ -4915,6 +5753,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn callback_retry_does_not_repeat_an_uncertain_or_rejected_attempt() {
         let executor = boot_executor();
+        let remaining = Duration::from_millis(30);
         for error in [
             DiscordError::Timeout,
             DiscordError::RateLimited,
@@ -4922,14 +5761,17 @@ mod tests {
             DiscordError::Rejected("interaction already acknowledged".into()),
         ] {
             let mut attempts = 0;
-            let now = tokio::time::Instant::now();
-            let deadline = now + Duration::from_millis(30);
+            let now = Instant::now();
             let result: Result<(), _> = executor
-                .retry_admission_blocked_until(deadline, Duration::from_millis(20), |at| {
-                    attempts += 1;
-                    assert_eq!(at, deadline);
-                    std::future::ready(Err(error.clone()))
-                })
+                .retry_admission_blocked_before(
+                    now + remaining,
+                    Duration::from_millis(BLOCKED_RETRY_SLEEP_MS),
+                    |timeout| {
+                        attempts += 1;
+                        assert_eq!(timeout, remaining);
+                        std::future::ready(Err(error.clone()))
+                    },
+                )
                 .await;
             assert_eq!(result, Err(error));
             assert_eq!(attempts, 1);

@@ -1133,7 +1133,7 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         runtime: Option<LevelingRuntime>,
         invite_source: I,
         snapshots: P,
-        cache: Arc<twilight_cache_inmemory::InMemoryCache>,
+        cache: Arc<crate::pipeline::SharedCache>,
     ) -> Self {
         let pending = DeferredLeveling::default();
         let facts = DeferredCommunityFacts::default();
@@ -1203,7 +1203,7 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.facts.drain().await
     }
 
-    /// Access the cache (shard runner updates, tests seed).
+    /// Access individual cached objects; coherent guild reads use SharedCache.
     #[must_use]
     pub fn cache(&self) -> &twilight_cache_inmemory::InMemoryCache {
         self.pipeline.cache()

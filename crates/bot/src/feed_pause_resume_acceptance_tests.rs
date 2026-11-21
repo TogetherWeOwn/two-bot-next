@@ -16,7 +16,7 @@ use crate::command_runtime::{router_with_commands, CommandRuntime};
 fn slash(name: &str, id: Option<&str>, permission: u64, guild: &str) -> Interaction {
     serde_json::from_value(json!({
         "application_id":"1111", "authorizing_integration_owners":{"0":guild},
-        "id":"7007", "token":"synthetic-feed-lifecycle-token", "type":2,
+        "id":"7007", "token":"synthetic-feed-lifecycle-token", "type":2, "attachment_size_limit":10485760,
         "guild_id":guild, "channel_id":CHANNEL, "entitlements":[],
         "member":{"user":{"id":"88","username":"fixture-admin","discriminator":"0", "bot":false, "mfa_enabled":false},
                   "permissions":permission.to_string(), "roles":[], "deaf":false, "mute":false, "flags":0, "joined_at":null},

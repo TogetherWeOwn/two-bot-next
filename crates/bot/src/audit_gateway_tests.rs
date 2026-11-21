@@ -373,6 +373,25 @@ fn raw_message_edit_and_delete_match_core_contracts() {
 }
 
 #[test]
+fn raw_member_disconnect_action_produces_a_moderation_row() {
+    let action: AuditLogEventType = serde_json::from_str("27").expect("audit action code");
+    let events = translate_with(
+        &audit_entry(action, 800_000_000_000_000_027),
+        &build_cache(),
+        AT,
+        7,
+        None,
+        None,
+    );
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, AuditKind::ModerationAction);
+    assert_eq!(
+        events[0].action.as_deref(),
+        Some(ModerationAuditAction::MemberDisconnect.as_str())
+    );
+}
+
+#[test]
 fn all_fourteen_audit_log_actions_produce_uncorrelated_rows() {
     let cache = build_cache();
     for (index, action) in ModerationAuditAction::ALL.into_iter().enumerate() {

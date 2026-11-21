@@ -155,7 +155,7 @@ fn reopen(kind: &str) -> Interaction {
 
 fn reopen_with_options(options: Value) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "111", "authorizing_integration_owners": {"0": "22"},
+        "attachment_size_limit": 10485760, "application_id": "111", "authorizing_integration_owners": {"0": "22"},
         "id": "333", "token": "mock-callback", "type": 2, "version": 1, "guild_id": "22",
         "member": member_value("44", false),
         "data": {"id": "444", "name": "reopen", "type": 1, "options": options},
@@ -165,7 +165,7 @@ fn reopen_with_options(options: Value) -> Interaction {
 
 fn reopen_in_guild(guild_id: &str) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "111", "authorizing_integration_owners": {"0": guild_id},
+        "attachment_size_limit": 10485760, "application_id": "111", "authorizing_integration_owners": {"0": guild_id},
         "id": "333", "token": "mock-callback", "type": 2, "version": 1, "guild_id": guild_id,
         "member": member_value("44", false),
         "data": {"id": "444", "name": "reopen", "type": 1, "options": kind_option("games")},
@@ -175,7 +175,7 @@ fn reopen_in_guild(guild_id: &str) -> Interaction {
 
 fn reopen_by_bot() -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "111", "authorizing_integration_owners": {"0": "22"},
+        "attachment_size_limit": 10485760, "application_id": "111", "authorizing_integration_owners": {"0": "22"},
         "id": "333", "token": "mock-callback", "type": 2, "version": 1, "guild_id": "22",
         "member": member_value("44", true),
         "data": {"id": "444", "name": "reopen", "type": 1, "options": kind_option("games")},
@@ -185,7 +185,7 @@ fn reopen_by_bot() -> Interaction {
 
 fn reopen_without_member() -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "111", "authorizing_integration_owners": {"0": "22"},
+        "attachment_size_limit": 10485760, "application_id": "111", "authorizing_integration_owners": {"0": "22"},
         "id": "333", "token": "mock-callback", "type": 2, "version": 1, "guild_id": "22",
         "member": Value::Null,
         "data": {"id": "444", "name": "reopen", "type": 1, "options": kind_option("games")},

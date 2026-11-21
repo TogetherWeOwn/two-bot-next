@@ -47,6 +47,7 @@
 
 use std::{
     future::Future,
+    ops::Deref,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -1023,7 +1024,7 @@ impl CommandRuntime {
     pub(crate) fn record_refused_prefix_trigger(&self, event: &Event) {
         if let Event::MessageCreate(message) = event {
             if let Some(custom) = self.gateway_commands.get() {
-                custom.record_refused_prefix_trigger(&message.0);
+                custom.record_refused_prefix_trigger(Deref::deref(message.as_ref()));
             }
         }
     }
@@ -1046,7 +1047,7 @@ impl CommandRuntime {
                     return false;
                 }
                 let runtime = Arc::clone(self);
-                let message = message.0.clone();
+                let message = Message::clone(Deref::deref(message.as_ref()));
                 self.spawn(LANE_MESSAGES, async move {
                     if let Some(custom) = runtime.gateway_commands.get() {
                         custom.handle_message(&message, verdict).await;

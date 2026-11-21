@@ -1043,6 +1043,16 @@ impl<'a> ResponseAccounting<'a> {
         }
     }
 
+    pub(crate) fn longest_admission_header(&self) -> Option<String> {
+        use two_bot_core::send_admission::{cooldown_from_delays, SendCooldown};
+        [self.retry_after_header, self.reset_after_header]
+            .into_iter()
+            .flatten()
+            .filter(|&s| cooldown_from_delays(Some(s), None) != SendCooldown::Indefinite)
+            .max_by(f64::total_cmp)
+            .map(|s| s.to_string())
+    }
+
     pub(crate) fn track_bare_bucket(&mut self, route: &str, headers: &http::HeaderMap) {
         if RateLimitGuard::has_bare_retry_after(headers) {
             self.bare_route = Some(route.to_owned());
