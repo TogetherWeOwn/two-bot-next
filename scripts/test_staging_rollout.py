@@ -781,6 +781,22 @@ class IdentityAndControlPlaneTests(OfflineTestCase):
 
 
 class ClientSanitizationTests(OfflineTestCase):
+    def test_stop_subprocess_passes_only_the_bound_staging_inputs_and_deadline(self):
+        parent_env = {"PATH": "/usr/bin", "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
+                      "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2",
+                      "STAGING_USE_EXPIRES_AT": "1700000000000", "STAGING_USE_RECEIPT": "test.jsonl"}
+        client = rollout.Client(ACCOUNT, SENTINEL, deadline=128)
+        with patch.dict(os.environ, {**parent_env, "CLOUDFLARE_API_TOKEN": SENTINEL}, clear=True), \
+                patch.object(rollout.time, "monotonic", return_value=100), \
+                patch.object(rollout.subprocess, "run", return_value=Mock(returncode=0)) as run:
+            client.stop_staging(URL, VERSION, REVISION)
+        script = Path(__file__).resolve().parents[1] / "wrangler/scripts/staging-use.mjs"
+        self.assertTrue(script.is_file())
+        run.assert_called_once_with(["node", str(script), "stop"], timeout=28,
+                                    env={**parent_env, "STAGING_WORKER_URL": URL,
+                                         "STAGING_USE_DEPLOYMENT": VERSION, "STAGING_USE_SHA": REVISION,
+                                         "STAGING_STOP_TIMEOUT_MS": "28000"})
+
     def test_authenticated_api_retries_transport_failures_with_bounded_backoff(self):
         client = rollout.Client(ACCOUNT, SENTINEL)
         response = Mock(status=200, headers={})
@@ -1401,6 +1417,21 @@ class OrchestrationTests(OfflineTestCase):
         client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
         self.assertEqual(json.loads(Path(self.args.evidence).read_text())["readyz"], 200)
 
+    def test_post_stop_counters_can_drop_before_the_exact_replacement_converges(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        starting = copy.deepcopy(zero)
+        starting["health"]["instances"]["starting"] = 1
+        client.api_routes[DETAIL_PATH] = [completed_row(), zero, starting, completed_row()]
+        client.deadline = 120
+        rollout.verify(self.args, client)
+        client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
+        self.assertEqual(self.clock.sleeps, [5, 5])
+        self.assertEqual(json.loads(Path(self.args.evidence).read_text())["readyz"], 200)
+
     def test_stop_refusal_prevents_readiness_on_completed_rollout(self):
         self.prepare_baseline()
         self.write_deploy_output()
@@ -1791,24 +1822,19 @@ class OrchestrationTests(OfflineTestCase):
         self.write_deploy_output()
 
     def test_final_reread_accepts_counters_that_wobble_between_completed_shapes(self):
-        # First read lag, final read converged (and the reverse): the exact
-        # build served ready both times, so a counter wobble must not fail.
-        for first, final, active_lag_expected in [
-            (lag_row(), completed_row(), True),
-            (completed_row(), lag_row(), False),
-        ]:
-            with self.subTest(first_is_lag=active_lag_expected):
+        # A pre-stop convergence sample cannot make a post-stop lagging row
+        # pass on its own. Both directions still accept two exact lag passes.
+        for first, final in [(lag_row(), completed_row()), (completed_row(), lag_row())]:
+            with self.subTest(first=first["health"]):
                 self.fresh_baseline()
                 client = verify_client()
                 client.api_routes[ROWS_PATH] = [[old_row(), first]]
-                client.api_routes[DETAIL_PATH] = [first, final]
-                if active_lag_expected:
-                    client.api_routes[DETAIL_PATH] = [first, first, first, final]
-                    client.request_routes[URL + "/readyz"] = [ready_response()]
-                    client.deadline = 130
+                client.api_routes[DETAIL_PATH] = [first, final, lag_row(), final]
+                client.deadline = 130
                 rollout.verify(self.args, client)
                 evidence = json.loads(Path(self.args.evidence).read_text())
-                self.assertEqual(evidence.get("active_lag", False), active_lag_expected)
+                self.assertTrue(evidence["active_lag"])
+                self.assertEqual(client.calls.count(("request", URL + "/readyz")), 2)
                 Path(self.args.evidence).unlink()
 
     def test_final_reread_still_rejects_failed_starting_or_idle_counters(self):
@@ -1826,7 +1852,7 @@ class OrchestrationTests(OfflineTestCase):
         self.fresh_baseline()
         client = verify_client()
         client.api_routes[DETAIL_PATH] = [completed_row(), idle]
-        self.assert_gate("rollout_not_converged", rollout.verify, self.args, client)
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
         self.assert_no_evidence()
 
     def test_lag_without_exact_runtime_never_succeeds(self):

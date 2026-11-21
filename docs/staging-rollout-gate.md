@@ -487,9 +487,16 @@ merge or an unverified deployment is not `t0`.
    receipt with `running: false` opens the runtime acceptance path. Earlier
    warm-up and diagnostic probes do not count. The next probe can cold-start
    the replacement and still checks the exact Worker, revision, build and
-   deploy ID. The stop does not release or renew the grant: automatic rollback
-   and final release still use the original expiry. An unconfirmed stop fails
-   the rollout gate.
+   deploy ID. If the counters still report zero or a starting singleton after
+   the probe, the verifier polls again within the same deadline; those counters
+   are never accepted. The stop client retries a busy (503) status read within
+   its budget, but sends the stop only once. An unconfirmed stop fails the
+   rollout gate. The stop does not release or renew the grant: automatic
+   rollback and final release still use the original expiry.
+
+   This describes normal qualification with a deploy checkout containing the
+   fresh-stop verifier. Historical recovery pins use their own checkout's
+   verifier and do not provide fresh-stop evidence if they predate this change.
 
    A stale listing that is not verified as the rollout's previous image fails as
    `application_image_drift`. For a verified previous-image listing that has not

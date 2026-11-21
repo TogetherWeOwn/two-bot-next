@@ -65,6 +65,22 @@ test("staging client: stop requires a confirmed stop on the same epoch and activ
   assert.equal(wrongRun.calls.length, 1);
 });
 
+test("staging client: stop retries a busy status read but never retries the mutation", async () => {
+  const stop = { ...args, action: "stop", stopTimeoutMs: 50000 };
+  const busy = () => new Response(null, { status: 503 });
+  const h = responses([busy(), Response.json({ ...state, running: true }), busy()]);
+  const delays: number[] = [];
+  await assert.rejects(stagingUse(stop, h.send, async (ms: number) => { delays.push(ms); }, clock),
+    /staging_control_refused/);
+  assert.deepEqual(delays, [5000]);
+  assert.deepEqual(h.calls.map(({ init }) => init.method), ["GET", "GET", "POST"]);
+
+  const nearDeadline = responses([busy()]);
+  await assert.rejects(stagingUse({ ...stop, stopTimeoutMs: 19000 }, nearDeadline.send,
+    async () => { assert.fail("retry exceeds the stop status budget"); }, clock), /staging_control_refused/);
+  assert.deepEqual(nearDeadline.calls.map(({ init }) => init.method), ["GET"]);
+});
+
 test("staging client: a deployment resource UUID cannot replace the Worker version UUID", async () => {
   const versionId = "11111111-1111-4111-8111-111111111111";
   const deploymentResourceId = "22222222-2222-4222-8222-222222222222";

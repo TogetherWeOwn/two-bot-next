@@ -129,13 +129,21 @@ export async function stagingUse(args, send = fetch, pause = wait, now = Date.no
   require(["status", "observe", "acquire", "assert", "ready", "release", "stop"].includes(args.action), "staging_action_invalid");
   // A release may be retried after expiry, but never extends that expiry.
   if (!["status", "observe"].includes(args.action)) binding(args, args.action === "release" ? Math.min(now(), args.expiresAt - 1) : now());
+  let statusRetryDeadline = args.statusRetryDeadline;
+  if (args.action === "stop") {
+    const budget = args.stopTimeoutMs ?? 50000;
+    // Reserve one POST and time for subprocess startup and receipt output.
+    const statusBudget = Math.min(30000, budget - MAX_REQUEST_MS - 2000);
+    require(positive(statusBudget), "staging_request_timeout");
+    statusRetryDeadline = performance.now() + statusBudget;
+  }
   const headers = { authorization: `Bearer ${args.token}`, "cache-control": "no-cache" };
   const control = async (init) => {
     for (;;) {
-      const deadline = args.statusRetryDeadline === undefined || init.method !== "GET"
-        ? performance.now() + MAX_REQUEST_MS : args.statusRetryDeadline;
+      const deadline = statusRetryDeadline === undefined || init.method !== "GET"
+        ? performance.now() + MAX_REQUEST_MS : statusRetryDeadline;
       const response = await request(send, new URL(PATH, base), { ...init, headers }, deadline);
-      if (response.status === 503 && init.method === "GET" && args.statusRetryDeadline !== undefined
+      if (response.status === 503 && init.method === "GET" && statusRetryDeadline !== undefined
         && performance.now() + 5000 < deadline) {
         await pause(5000);
         continue;
@@ -229,7 +237,8 @@ if (isDirectInvocation(process.argv[1], import.meta.url)) {
     const result = await stagingUse({ action, url: process.env.STAGING_WORKER_URL, token: process.env.OWNERSHIP_CONTROL_TOKEN,
       sha: process.env.STAGING_USE_SHA, deploymentId: process.env.STAGING_USE_DEPLOYMENT,
       runId: process.env.GITHUB_RUN_ID, runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
-      expiresAt: Number(process.env.STAGING_USE_EXPIRES_AT) });
+      expiresAt: Number(process.env.STAGING_USE_EXPIRES_AT),
+      stopTimeoutMs: Number(process.env.STAGING_STOP_TIMEOUT_MS) });
     emit(result);
     // Publish only after the validated receipt is durably retained. Missing
     // output on any error must never open a periodic reader's sample gate.
