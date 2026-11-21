@@ -5,8 +5,9 @@ use std::collections::BTreeMap;
 use twilight_model::gateway::payload::outgoing::RequestGuildMembers;
 
 use super::{
-    baseline::events_from_dispatch, decode, project_dispatch, wire, Change, Deserialize, Dispatch,
-    GuildMarker, Id, Kind, Operation, ProjectionError,
+    baseline::{events_from_dispatch, strict_event_change},
+    decode, project_dispatch, wire, Change, Deserialize, Dispatch, GuildMarker, Id, Kind,
+    Operation, ProjectionError,
 };
 use crate::realtime_member_baseline::{MemberBaseline, MemberBaselineError};
 
@@ -50,10 +51,9 @@ impl BaselineIntake {
         }
     }
 
-    /// Replace the attempt on the configured guild's fresh `GUILD_CREATE`.
-    /// Both the exact member count and the event list must be explicit on that
-    /// dispatch. Supply a nonce unique across attempts and send only the returned
-    /// full roster request. A failed start leaves no pending baseline.
+    /// Call only for the configured guild's fresh `GUILD_CREATE`. Every call
+    /// clears the old attempt. The dispatch must supply both baseline fields.
+    /// Use a unique nonce across attempts and send only the returned request.
     pub fn begin(
         &mut self,
         raw: &str,
@@ -110,8 +110,10 @@ impl BaselineIntake {
                 }));
             }
         } else {
-            match project_dispatch(self.guild_id, kind, &dispatch)
-                .map_err(IntakeError::Projection)?
+            match project_dispatch(self.guild_id, kind, &dispatch, |body| {
+                strict_event_change(self.guild_id, body)
+            })
+            .map_err(IntakeError::Projection)?
             {
                 Some(Operation::Members(_)) => return Err(IntakeError::MemberChanged),
                 Some(Operation::Events(Change::Upsert { id, value })) => {

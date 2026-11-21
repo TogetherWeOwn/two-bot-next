@@ -43,9 +43,7 @@ impl Dispatch<'_> {
     }
 
     fn body(&self) -> Result<&str, ProjectionError> {
-        self.d
-            .map(RawValue::get)
-            .ok_or(ProjectionError::MalformedDispatch)
+        Ok(self.d.ok_or(ProjectionError::MalformedDispatch)?.get())
     }
 }
 
@@ -126,13 +124,16 @@ struct EventMetadata {
 /// owns codec validation, reference cleanup, sequencing and visibility.
 pub fn project(guild_id: Id<GuildMarker>, raw: &str) -> Result<Option<Operation>, ProjectionError> {
     let dispatch: Dispatch<'_> = decode(raw, '{')?;
-    project_dispatch(guild_id, dispatch.kind()?, &dispatch)
+    project_dispatch(guild_id, dispatch.kind()?, &dispatch, |body| {
+        event_change(decode(body, '{')?)
+    })
 }
 
 fn project_dispatch(
     guild_id: Id<GuildMarker>,
     kind: Option<Kind>,
     dispatch: &Dispatch<'_>,
+    project_event: impl FnOnce(&str) -> Result<Change<wire::Event>, ProjectionError>,
 ) -> Result<Option<Operation>, ProjectionError> {
     let kind = match kind {
         None | Some(Kind::GuildCreate | Kind::GuildMembersChunk | Kind::Other) => return Ok(None),
@@ -149,7 +150,7 @@ fn project_dispatch(
             id: wire_id(decode::<RemovedMember>(body, '{')?.user.id),
         }),
         Kind::GuildScheduledEventCreate | Kind::GuildScheduledEventUpdate => {
-            Operation::Events(event_change(decode(body, '{')?)?)
+            Operation::Events(project_event(body)?)
         }
         Kind::GuildScheduledEventDelete => Operation::Events(Change::Remove {
             id: wire_id(decode::<RemovedEvent>(body, '{')?.id),

@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 
 use super::*;
+use IntakeError::{Chunk, InvalidEvents, Projection};
+use ProjectionError::{MalformedDispatch, UnsupportedEvent};
 
 const GUILD: Id<GuildMarker> = Id::new(10);
 
@@ -33,31 +35,34 @@ fn chunk(nonce: &str, index: u8, count: u8, user_id: &str) -> String {
     )
 }
 
+fn start(intake: &mut BaselineIntake, count: u64, events: Value, nonce: &str) {
+    let request = intake.begin(&guild(count, events), nonce.into());
+    assert!(request.expect("valid guild create").is_some());
+}
+
+fn finish(intake: &mut BaselineIntake, nonce: &str, chunks: u8) -> BaselineRows {
+    let result = intake.observe(&chunk(nonce, 0, chunks, "31"));
+    result.expect("valid final chunk").expect("baseline rows")
+}
+
 fn assert_late_chunk_ignored(intake: &mut BaselineIntake, nonce: &str) {
-    assert!(matches!(
-        intake.observe(&chunk(nonce, 0, 1, "31")),
-        Ok(None)
-    ));
+    let result = intake.observe(&chunk(nonce, 0, 1, "31"));
+    assert!(matches!(result, Ok(None)));
 }
 
 #[test]
 fn joins_the_roster_with_events_at_the_final_chunks_receive_position() {
     let mut intake = BaselineIntake::new(GUILD);
-    assert!(matches!(
-        intake.begin(
-            &guild(2, json!([event(91, "Old"), event(92, "Gone")])),
-            "first".into()
-        ),
-        Ok(Some(_))
-    ));
+    let initial = json!([event(91, "Old"), event(92, "Gone")]);
+    start(&mut intake, 2, initial, "first");
     for frame in [
         chunk("first", 1, 2, "32"),
-        dispatch("GUILD_SCHEDULED_EVENT_UPDATE", event(91, "New")),
         dispatch(
             "GUILD_SCHEDULED_EVENT_DELETE",
             json!({"guild_id":"10", "id":"92"}),
         ),
-        dispatch("GUILD_SCHEDULED_EVENT_CREATE", event(93, "Added")),
+        dispatch("GUILD_SCHEDULED_EVENT_UPDATE", event(91, "Replaced")),
+        dispatch("GUILD_SCHEDULED_EVENT_CREATE", event(91, "New")),
         dispatch(
             "GUILD_MEMBER_REMOVE",
             json!({"guild_id":"11", "user":{"id":"32"}}),
@@ -65,146 +70,106 @@ fn joins_the_roster_with_events_at_the_final_chunks_receive_position() {
     ] {
         assert!(matches!(intake.observe(&frame), Ok(None)));
     }
-    let rows = intake
-        .observe(&chunk("first", 0, 2, "31"))
-        .expect("valid final chunk")
-        .expect("complete baseline rows");
+    let rows = finish(&mut intake, "first", 2);
     let members = serde_json::to_value(rows.members).expect("member rows");
     assert_eq!(members[0]["userId"], "31");
     assert_eq!(members[1]["userId"], "32");
-    assert_eq!(
-        rows.events
-            .iter()
-            .map(|row| row.title.as_str())
-            .collect::<Vec<_>>(),
-        ["New", "Added"]
-    );
+    assert_eq!(rows.events.len(), 1);
+    assert_eq!(rows.events[0].title, "New");
     assert_late_chunk_ignored(&mut intake, "first");
 }
 
 #[test]
 fn member_changes_and_retirement_prevent_late_chunks_from_finishing() {
     let mut intake = BaselineIntake::new(GUILD);
-    let frame = guild(1, json!([]));
-    assert!(matches!(intake.begin(&frame, "one".into()), Ok(Some(_))));
+    start(&mut intake, 1, json!([]), "one");
     let remove = dispatch(
         "GUILD_MEMBER_REMOVE",
         json!({"guild_id":"10", "user":{"id":"31"}}),
     );
-    assert!(matches!(
-        intake.observe(&remove),
-        Err(IntakeError::MemberChanged)
-    ));
+    assert_eq!(
+        intake.observe(&remove).err(),
+        Some(IntakeError::MemberChanged)
+    );
     assert_late_chunk_ignored(&mut intake, "one");
 
-    assert!(matches!(intake.begin(&frame, "two".into()), Ok(Some(_))));
+    start(&mut intake, 1, json!([]), "two");
     intake.retire();
-    assert!(matches!(intake.begin(&frame, "three".into()), Ok(Some(_))));
+    start(&mut intake, 1, json!([]), "three");
     assert_late_chunk_ignored(&mut intake, "two");
-    assert!(matches!(
-        intake.observe(&chunk("three", 0, 1, "32")),
-        Ok(Some(_))
-    ));
+    finish(&mut intake, "three", 1);
 }
 
 #[test]
 fn replacement_requires_explicit_count_and_events_from_the_same_dispatch() {
-    let mut intake = BaselineIntake::new(GUILD);
-    for (attempt, data) in [
+    for data in [
         json!({"id":"10", "guild_scheduled_events": []}),
         json!({"id":"10", "member_count": "1", "guild_scheduled_events": []}),
         json!({"id":"10", "member_count": 1}),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let nonce = format!("old-{attempt}");
-        assert!(matches!(
-            intake.begin(&guild(1, json!([])), nonce.clone()),
-            Ok(Some(_))
-        ));
-        assert!(matches!(
-            intake.begin(&dispatch("GUILD_CREATE", data), format!("new-{attempt}")),
-            Err(IntakeError::Projection(ProjectionError::MalformedDispatch))
-        ));
-        assert_late_chunk_ignored(&mut intake, &nonce);
+    ] {
+        let mut intake = BaselineIntake::new(GUILD);
+        start(&mut intake, 1, json!([]), "old");
+        let bad_start = intake.begin(&dispatch("GUILD_CREATE", data), "new".into());
+        assert_eq!(bad_start.err(), Some(Projection(MalformedDispatch)));
+        assert_late_chunk_ignored(&mut intake, "old");
     }
+    let mut intake = BaselineIntake::new(GUILD);
     assert!(matches!(
         intake.begin(&guild(0, json!([])), "empty".into()),
         Ok(None)
     ));
+    let invalid = intake.begin(&guild(1, json!([event(91, "")])), "invalid".into());
+    assert_eq!(invalid.err(), Some(InvalidEvents));
 }
 
 #[test]
 fn invalid_input_cannot_be_repaired_by_a_later_chunk() {
-    let mut intake = BaselineIntake::new(GUILD);
-    for (nonce, bad, expected) in [
-        (
-            "one",
-            dispatch(
-                "GUILD_MEMBERS_CHUNK",
-                json!({"guild_id":"10", "nonce":"one"}),
-            ),
-            IntakeError::Chunk(MemberBaselineError::MalformedChunk),
-        ),
-        (
-            "two",
-            dispatch(
-                "GUILD_SCHEDULED_EVENT_UPDATE",
-                json!({"guild_id":"10", "id":"91"}),
-            ),
-            IntakeError::Projection(ProjectionError::MalformedDispatch),
-        ),
-        (
-            "three",
-            dispatch("GUILD_SCHEDULED_EVENT_CREATE", event(91, "")),
-            IntakeError::InvalidEvents,
-        ),
-        (
-            "four",
-            r#"{"op":0,"d":{}}"#.into(),
-            IntakeError::Projection(ProjectionError::MalformedDispatch),
-        ),
-        (
-            "five",
-            chunk("five", 0, 1, "31"),
-            IntakeError::Chunk(MemberBaselineError::InconsistentChunk),
-        ),
+    let mut terminal = event(91, "Cancelled");
+    terminal["status"] = json!(4);
+    terminal["scheduled_start_time"] = json!("not-a-date");
+    let mut external = event(91, "External");
+    let fields = external.as_object_mut().expect("event object");
+    fields.remove("entity_metadata");
+    fields.remove("scheduled_end_time");
+    let update = |row| dispatch("GUILD_SCHEDULED_EVENT_UPDATE", row);
+    let bad_chunk = r#"{"op":0,"t":"GUILD_MEMBERS_CHUNK","d":{"guild_id":"10","nonce":"one"}}"#;
+    let empty_title = dispatch("GUILD_SCHEDULED_EVENT_CREATE", event(91, ""));
+    let incomplete = update(json!({"guild_id":"10", "id":"91"}));
+    use MemberBaselineError::{InconsistentChunk, MalformedChunk};
+    for (bad, expected) in [
+        (bad_chunk.into(), Chunk(MalformedChunk)),
+        (chunk("one", 0, 2, "31"), Chunk(InconsistentChunk)),
+        (r#"{"op":0,"d":{}}"#.into(), Projection(MalformedDispatch)),
+        (empty_title, InvalidEvents),
+        (incomplete, Projection(MalformedDispatch)),
+        (update(terminal), Projection(MalformedDispatch)),
+        (update(external), Projection(UnsupportedEvent)),
     ] {
-        assert!(matches!(
-            intake.begin(&guild(2, json!([])), nonce.into()),
-            Ok(Some(_))
-        ));
-        assert!(matches!(intake.observe(&bad), Err(error) if error == expected));
-        assert_late_chunk_ignored(&mut intake, nonce);
+        let mut intake = BaselineIntake::new(GUILD);
+        start(&mut intake, 1, json!([event(91, "Existing")]), "one");
+        assert_eq!(intake.observe(&bad).err(), Some(expected), "{bad}");
+        assert_late_chunk_ignored(&mut intake, "one");
     }
 }
 
 #[test]
 fn event_capacity_allows_replacement_but_not_an_extra_key() {
     let mut intake = BaselineIntake::new(GUILD);
-    let events: Vec<_> = (1..=wire::MAX_SNAPSHOT_EVENTS)
+    let events = json!((1..=wire::MAX_SNAPSHOT_EVENTS)
         .map(|id| event(id, "Event"))
-        .collect();
-    assert!(matches!(
-        intake.begin(&guild(1, json!(events)), "one".into()),
-        Ok(Some(_))
-    ));
-    assert!(matches!(
-        intake.observe(&dispatch(
-            "GUILD_SCHEDULED_EVENT_UPDATE",
-            event(1, "Updated")
-        )),
-        Ok(None)
-    ));
-    let extra = event(wire::MAX_SNAPSHOT_EVENTS + 1, "One too many");
-    assert!(matches!(
-        intake.observe(&dispatch("GUILD_SCHEDULED_EVENT_CREATE", extra)),
-        Err(IntakeError::InvalidEvents)
-    ));
-    assert_late_chunk_ignored(&mut intake, "one");
-    assert!(matches!(
-        intake.begin(&guild(1, json!([event(91, "")])), "two".into()),
-        Err(IntakeError::InvalidEvents)
-    ));
+        .collect::<Vec<_>>());
+    start(&mut intake, 1, events.clone(), "one");
+    let update = dispatch("GUILD_SCHEDULED_EVENT_UPDATE", event(1, "Updated"));
+    assert!(matches!(intake.observe(&update), Ok(None)));
+    let rows = finish(&mut intake, "one", 1);
+    assert_eq!(rows.events.len(), wire::MAX_SNAPSHOT_EVENTS);
+    assert_eq!(rows.events[0].title, "Updated");
+
+    start(&mut intake, 1, events, "two");
+    let extra = dispatch(
+        "GUILD_SCHEDULED_EVENT_CREATE",
+        event(wire::MAX_SNAPSHOT_EVENTS + 1, "One too many"),
+    );
+    assert_eq!(intake.observe(&extra).err(), Some(InvalidEvents));
+    assert_late_chunk_ignored(&mut intake, "two");
 }
