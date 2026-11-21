@@ -11,6 +11,7 @@
 //! user data, no secrets in code or comments.
 
 use sqlx::PgPool;
+use two_bot_cutover::member_erasure::{erase_member, ErasureMode};
 use two_bot_cutover::retention::{
     handle_guild_delete, request_user_deletion, run_retention, RetentionMode, RetentionReport,
 };
@@ -74,7 +75,20 @@ async fn guild_purge_removes_omitted_instance_fences_and_references_together() {
         // scope for member erasure and guild deletion through its instance.
         sqlx::query("INSERT INTO event_voice_presence (event_id, instance, user_id, joined_at) VALUES ($1, '2026-11-03T09:00:00Z', $2, NOW())")
             .bind(event).bind(MEMBER).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO event_attendance_windows (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at) VALUES ($1, 'fixture', $2, NOW(), NOW(), NOW() + interval '1 hour')")
+            .bind(guild).bind(event).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, joined_at, left_at) VALUES ($1, $2, $4, NOW(), NOW()), ($1, $3, $4, NOW(), NULL)")
+            .bind(guild).bind(PENDING_MEMBER).bind(MEMBER).bind(channel).execute(db.pool()).await.unwrap();
     }
+    erase_member(
+        db.pool(),
+        GONE_GUILD,
+        PENDING_MEMBER,
+        ErasureMode::Execute { actor: "fixture" },
+    )
+    .await
+    .unwrap();
+    assert_eq!(count(db.pool(), "SELECT count(*) FROM event_voice_sessions WHERE guild_id = '333333333333333333' AND member_id = '555555555555555555'").await, 0);
     handle_guild_delete(db.pool(), GONE_GUILD, None)
         .await
         .unwrap();
@@ -84,8 +98,20 @@ async fn guild_purge_removes_omitted_instance_fences_and_references_together() {
     let live = run_retention(db.pool(), RetentionMode::Execute)
         .await
         .unwrap();
-    assert_eq!(dry.guild_rows_purged, 4);
+    assert_eq!(dry.guild_rows_purged, 6);
     assert_eq!(live.guild_rows_purged, dry.guild_rows_purged);
+    let sessions: Vec<(String, String)> =
+        sqlx::query_as("SELECT guild_id, member_id FROM event_voice_sessions ORDER BY member_id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        sessions,
+        vec![
+            ("333333333333333334".to_owned(), MEMBER.to_owned()),
+            ("333333333333333334".to_owned(), PENDING_MEMBER.to_owned()),
+        ]
+    );
     assert_eq!(
         (live.guild_purges_failed, live.guild_purges_deferred),
         (0, 0)
@@ -95,6 +121,7 @@ async fn guild_purge_removes_omitted_instance_fences_and_references_together() {
         "event_voice_channels",
         "internal_event_keys",
         "event_voice_presence",
+        "event_attendance_windows",
     ] {
         let sql = format!("SELECT count(*) FROM {table}");
         let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))

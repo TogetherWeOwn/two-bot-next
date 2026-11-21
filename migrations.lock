@@ -9,6 +9,10 @@
       "sha256": "1121359cea26d65320906a319dfabff5a31aa3dd89fab958d455220c5d964fc2",
       "justification": "Install the same dormant aggregate-only table in the cutover chain."
     },
+    "crates/cutover/migrations/0480_event_attendance.sql": {
+      "sha256": "d9fc30a3338f9635efc4390bffb83a616b0f7942d2e8c2781dbc39f89bd3e142",
+      "justification": "Create dormant Event Echoes attendance windows and voice-session storage without capture or backfill; include both tables in v17 backups."
+    },
     "crates/cutover/migrations/0473_send_admission_strict_settlement.sql": {
       "sha256": "58262cfceaff752c9db6e5bb79030ec25a10c142be9dee83b0d1c7871c2aba0f",
       "justification": "Fence strict admission until exact-generation settlement while retaining the existing public admission row."
