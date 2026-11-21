@@ -21,16 +21,16 @@ async fn only_finalized_mapped_observations_are_returned() {
     }
     sqlx::raw_sql("INSERT INTO event_instance_windows
           (guild_id,event_id,instance_starts_at,starts_at,ends_at,status,observed_at)
-          VALUES ('100000000000000001','200000000000000001','2026-01-01','2026-01-01',
+          VALUES ('100000000000000001','200000000000000001','2026-01-01 00:00Z','2026-01-01 00:00Z',
                   '2026-01-01 01:00Z','active','2026-01-01T01:00:00Z');
         INSERT INTO event_attendance_windows
           (guild_id,event_key,event_id,instance_starts_at,starts_at,ends_at,capture_stops)
           VALUES ('100000000000000001','read-fixture','200000000000000001',
-                  '2026-01-01','2026-01-01','2026-01-01 01:00Z',ARRAY['2026-01-01 00:20Z'::timestamptz]);
+                  '2026-01-01 00:00Z','2026-01-01 00:00Z','2026-01-01 01:00Z',ARRAY['2026-01-01 00:20Z'::timestamptz]);
         INSERT INTO event_voice_sessions (guild_id,member_id,channel_id,joined_at,event_keys)
-          VALUES ('100000000000000001','300000000000000001','400000000000000001','2026-01-01',ARRAY['read-fixture']),
-                 ('100000000000000002','300000000000000002','400000000000000001','2026-01-01',ARRAY['read-fixture']),
-                 ('100000000000000001','300000000000000003','400000000000000001','2026-01-01',ARRAY['other']);")
+          VALUES ('100000000000000001','300000000000000001','400000000000000001','2026-01-01 00:00Z',ARRAY['read-fixture/200000000000000001/1767225600000000']),
+                 ('100000000000000002','300000000000000002','400000000000000001','2026-01-01 00:00Z',ARRAY['read-fixture/200000000000000001/1767225600000000']),
+                 ('100000000000000001','300000000000000003','400000000000000001','2026-01-01 00:00Z',ARRAY['read-fixture', 'other/200000000000000001/1767225600000000']);")
         .execute(pool).await.unwrap();
     assert!(read().await.unwrap().is_none(), "unmapped historical data");
     sqlx::query(
@@ -57,14 +57,28 @@ async fn only_finalized_mapped_observations_are_returned() {
     assert_eq!(record.sessions.len(), 1, "only exact guild and tag");
     let session = &record.sessions[0];
     assert_eq!(session.member_id, 300000000000000001);
+    assert_eq!(session.name_observed_at, None);
     assert_eq!(
         session.left_at - session.joined_at,
         time::Duration::minutes(20)
     );
+    sqlx::query("UPDATE event_voice_sessions SET left_at = joined_at + INTERVAL '5 minutes', name_observed_at = joined_at")
+        .execute(pool).await.unwrap();
+    let record = read().await.unwrap().expect("observed departure");
+    let session = &record.sessions[0];
+    assert_eq!(session.name_observed_at, Some(session.joined_at));
+    assert_eq!(
+        session.left_at - session.joined_at,
+        time::Duration::minutes(5)
+    );
+    sqlx::query("UPDATE event_voice_sessions SET left_at = NULL, name_observed_at = NULL")
+        .execute(pool)
+        .await
+        .unwrap();
 
     for (mutation, undo) in [
         ("UPDATE internal_event_keys SET event_id = '200000000000000002'", "UPDATE internal_event_keys SET event_id = '200000000000000001'"),
-        ("UPDATE event_instance_windows SET instance_starts_at = '2026-01-02'", "UPDATE event_instance_windows SET instance_starts_at = '2026-01-01'"),
+        ("UPDATE event_instance_windows SET instance_starts_at = '2026-01-02'", "UPDATE event_instance_windows SET instance_starts_at = '2026-01-01 00:00Z'"),
         ("UPDATE event_instance_windows SET is_current = FALSE", "UPDATE event_instance_windows SET is_current = TRUE"),
         ("UPDATE event_instance_windows SET identity_ambiguous = TRUE", "UPDATE event_instance_windows SET identity_ambiguous = FALSE"),
         ("UPDATE event_instance_windows SET revoked_at = '2026-01-01T01:00:00Z'", "UPDATE event_instance_windows SET revoked_at = NULL"),
@@ -74,7 +88,43 @@ async fn only_finalized_mapped_observations_are_returned() {
         assert!(read().await.unwrap().is_none(), "must refuse after {mutation}");
         sqlx::query(undo).execute(pool).await.unwrap();
     }
+    // An invalid tagged row must not be dropped in favor of a valid one.
+    sqlx::query(
+        "INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, joined_at, event_keys)
+         SELECT guild_id, '300000000000000005', channel_id, joined_at, event_keys
+         FROM event_voice_sessions WHERE member_id = '300000000000000001'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_eq!(read().await.unwrap().unwrap().sessions.len(), 2);
+    for (field, value, reset) in [
+        ("joined_at", "'-infinity'", "'2026-01-01 00:00Z'"),
+        ("left_at", "'infinity'", "NULL"),
+        ("left_at", "joined_at - INTERVAL '1 minute'", "NULL"),
+        ("name_observed_at", "'12000-01-01'", "NULL"),
+        ("joined_at", "'2026-01-01 01:16Z'", "'2026-01-01 00:00Z'"),
+    ] {
+        let update = |value| {
+            format!(
+                "UPDATE event_voice_sessions SET {field} = {value}
+             WHERE member_id = '300000000000000005'"
+            )
+        };
+        sqlx::query(&update(value)).execute(pool).await.unwrap();
+        assert!(
+            matches!(read().await, Err(InternalStoreError::Unavailable)),
+            "must refuse {field} = {value}"
+        );
+        sqlx::query(&update(reset)).execute(pool).await.unwrap();
+    }
+    sqlx::query("DELETE FROM event_voice_sessions WHERE member_id = '300000000000000005'")
+        .execute(pool)
+        .await
+        .unwrap();
     for (mutation, undo) in [
+        ("UPDATE event_instance_windows SET starts_at = '0001-01-01 BC'", "UPDATE event_instance_windows SET starts_at = '2026-01-01 00:00Z'"),
+        ("UPDATE event_attendance_windows SET capture_stops = ARRAY['infinity'::timestamptz]", "UPDATE event_attendance_windows SET capture_stops = '{}'"),
         ("UPDATE event_voice_sessions SET channel_id = '18446744073709551616'", "UPDATE event_voice_sessions SET channel_id = '400000000000000001'"),
         ("UPDATE event_voice_sessions SET channel_name = repeat('x', 65537)", "UPDATE event_voice_sessions SET channel_name = ''"),
         ("UPDATE event_attendance_windows SET capture_stops = ARRAY[NULL::timestamptz]", "UPDATE event_attendance_windows SET capture_stops = '{}'"),
@@ -96,7 +146,7 @@ async fn only_finalized_mapped_observations_are_returned() {
             "INSERT INTO event_voice_sessions
                  (guild_id, member_id, channel_id, joined_at, event_keys, channel_name)
              SELECT '100000000000000001', '300000000000000004', '400000000000000001',
-                    '2026-01-01', ARRAY['read-fixture'], repeat('x', $2)
+                    '2026-01-01 00:00Z', ARRAY['read-fixture/200000000000000001/1767225600000000'], repeat('x', $2)
              FROM generate_series(1, $1::int)",
         )
         .bind(copies)
@@ -112,6 +162,39 @@ async fn only_finalized_mapped_observations_are_returned() {
             .execute(pool)
             .await
             .unwrap();
+    }
+    // A legitimate reschedule keeps identity; a replacement with identical
+    // scheduled bounds must not inherit old observations.
+    sqlx::query("UPDATE event_instance_windows SET starts_at = '2026-01-01 00:05Z'")
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_eq!(read().await.unwrap().unwrap().sessions.len(), 1);
+    for (replace, restore) in [
+        (
+            "instance_starts_at = '2026-01-01 00:00:00.000001Z'",
+            "instance_starts_at = '2026-01-01 00:00Z'",
+        ),
+        (
+            "event_id = '200000000000000002'",
+            "event_id = '200000000000000001'",
+        ),
+    ] {
+        for change in [replace, restore] {
+            let mapping = if change.starts_with("event_id") {
+                format!("UPDATE internal_event_keys SET {change};")
+            } else {
+                String::new()
+            };
+            sqlx::raw_sql(&format!(
+                "{mapping} UPDATE event_instance_windows SET {change};
+                UPDATE event_attendance_windows SET {change};"
+            ))
+            .execute(pool)
+            .await
+            .unwrap();
+            assert_eq!(read().await.unwrap().is_some(), change == restore);
+        }
     }
     sqlx::query("DELETE FROM event_voice_sessions")
         .execute(pool)
