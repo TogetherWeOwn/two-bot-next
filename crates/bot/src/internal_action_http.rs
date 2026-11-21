@@ -1590,10 +1590,11 @@ async fn receive(
     } else {
         started + REQUEST_TIMEOUT
     };
-    let burned = match timeout_at(cutoff, burn).await {
-        Ok(Ok(burned)) => burned,
-        Ok(Err(error)) => return reject(Failure::from_action(error), unknown),
-        Err(_) => return reject(Failure::code(ErrorCode::UpstreamTimeout), unknown),
+    let nonce_result = timeout_at(cutoff, burn).await;
+    let burned = match (nonce_result, Instant::now() < cutoff) {
+        (Ok(Ok(burned)), true) => burned,
+        (Ok(Err(error)), true) => return reject(Failure::from_action(error), unknown),
+        _ => return reject(Failure::code(ErrorCode::UpstreamTimeout), unknown),
     };
     // The enabled set is the env-only flag gate, never the settings store: the
     // website must not be able to grant itself verbs. Verbs without a wired

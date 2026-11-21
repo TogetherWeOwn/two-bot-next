@@ -762,7 +762,7 @@ async fn signed_voice_move(uncertain: bool, with_retry_after: bool) {
             tokio::time::timeout(Duration::from_secs(7), move_to(SECOND, &nonce()))
                 .await
                 .unwrap();
-        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
         assert_eq!(body["error"]["code"], "upstream_timeout");
         assert_eq!(receiver.children.lock().await.len(), expected_children);
         mock.assert_wires(expected_children);
