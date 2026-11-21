@@ -78,7 +78,6 @@ pub fn topology(guild_id: Id<GuildMarker>, raw: &str) -> Result<Option<Topology>
         return Ok(None);
     }
     let rows: GuildRows<'_> = object(body)?;
-    // Match the v1 snapshot collection bounds before projecting the rows.
     let channels = unique(rows.channels, 500, |row| {
         let key: ChannelKey = object(row)?;
         // Threads have their own GUILD_CREATE list, not a place in this one.
@@ -177,5 +176,4 @@ fn object<'a, T: Deserialize<'a>>(raw: &'a str) -> Result<T, ProjectionError> {
     serde_json::from_str(raw).map_err(|_| ProjectionError::InvalidPayload)
 }
 
-#[cfg(test)]
 mod tests;
