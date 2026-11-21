@@ -54,10 +54,10 @@ fn requires_all_indices_and_exact_unique_member_count() {
         .ingest_chunk(&chunk(0, 2, &[member("11", true), member("12", false)]).to_string())
         .unwrap();
     assert!(missing_index.finish().is_none());
-
     let mut baseline = start(2);
     let nick = "😀".repeat(50);
     let mut row = member("12", false);
+    row["user"]["bot"] = json!(true);
     row["nick"] = json!(nick);
     row["roles"] = json!(["42", "43"]);
     baseline
@@ -71,7 +71,7 @@ fn requires_all_indices_and_exact_unique_member_count() {
         to_value(baseline.finish().unwrap()).unwrap(),
         json!([
             {"userId": "11", "roleIds": ["42"], "nick": "Test", "bot": false, "pending": true},
-            {"userId": "12", "roleIds": ["42", "43"], "nick": nick, "bot": false, "pending": false}
+            {"userId": "12", "roleIds": ["42", "43"], "nick": nick, "bot": true, "pending": false}
         ])
     );
 }
