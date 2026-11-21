@@ -1098,13 +1098,13 @@ def soak_hold_errors(workflow, name="deploy-staging.yml"):
     return errors
 
 
-PREVIEW_ELIGIBLE = ("inputs.verify_automod_preview && !inputs.recover_prior_sha && !inputs.inject_error_rate_spike && "
-                    "needs.deploy.outputs.promotion_clean == 'true' && needs.deploy.outputs.staging_use_sha == github.sha")
 USER_FLOW_PROBE_ENV = {
     "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
     "EXPECTED_SHA": DEPLOY_SHA_EXPRESSION,
     "STAGING_PREVIEW_AUTHORIZATION": (
-        f"${{{{ {PREVIEW_ELIGIBLE} && format('Bearer {{0}}', secrets.STAGING_OWNERSHIP_CONTROL_TOKEN) || '' }}}}"),
+        "${{ inputs.verify_automod_preview && !inputs.recover_prior_sha && !inputs.inject_error_rate_spike && "
+        "needs.deploy.outputs.promotion_clean == 'true' && needs.deploy.outputs.staging_use_sha == github.sha && "
+        "format('Bearer {0}', secrets.STAGING_OWNERSHIP_CONTROL_TOKEN) || '' }}"),
     "STAGING_USE_EXPIRES_AT": "${{ needs.deploy.outputs.staging_use_expires_at }}",
     "STAGING_USE_DEPLOYMENT": "${{ needs.deploy.outputs.staging_use_deployment }}",
 }
@@ -1142,7 +1142,7 @@ def staging_qualification_assert_errors(job, job_id, entry, receipt, artifact):
         errors.append(f"{label}: must always retain the assertion receipt for 14 days")
     for step in steps:
         if job_id == "user-flow-synthetic" and step in consumers and step.get("env") == USER_FLOW_PROBE_ENV:
-            continue
+            step = {key: value for key, value in step.items() if key != "env"}
         if step is not ready and ("secrets." in str(step) or "ownership_control" in str(step).lower()):
             errors.append(f"{label}: control credential must stay in the readiness step only")
         if job_id == "certify-promotion" and step is not ready and any(marker in str(step).lower() for marker in DEPLOY_MARKERS):
@@ -8020,6 +8020,7 @@ class WorkflowTests(unittest.TestCase):
             "empty origin passes": lambda w: probe(w).__setitem__(
                 "run", probe(w)["run"].replace("exit 1", "exit 0")),
             "secret read": lambda w: probe(w)["env"].__setitem__("TOKEN", "${{ secrets.X }}"),
+            "secret interpolation": lambda w: probe(w).__setitem__("run", probe(w)["run"] + "\necho ${{ secrets.X }}"),
             "write grant": lambda w: w["jobs"]["user-flow-synthetic"].__setitem__(
                 "permissions", {"contents": "write"}),
             "preview token unconditional": lambda w: probe(w)["env"].update({

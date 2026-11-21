@@ -1125,10 +1125,9 @@ export class TwoBotContainer extends Container<Env> {
         // abort-shaped bodies are released best-effort without replacing
         // the fixed refusal.
         const probeSignal = AbortSignal.timeout(6000);
-        const probe = new Request(request, { signal: probeSignal });
+        const probe = new Request(request, { signal: probeSignal, redirect: preview ? "manual" : request.redirect });
         if (preview) admitted = await this.previewUse(request);
-        probe.headers.delete(PREVIEW_HEADER);
-        probe.headers.delete("authorization");
+        for (const name of [PREVIEW_HEADER, "authorization"]) probe.headers.delete(name);
         let probeResponse: Response;
         try {
           probeResponse = await deadlineFetch(this.containerFetch(probe), probeSignal);
@@ -1157,7 +1156,7 @@ export class TwoBotContainer extends Container<Env> {
           return containerUnavailable(this.env.CF_VERSION_METADATA?.id);
         }
       });
-      return admitted ? await this.stagingPreview(request, admitted, response) : response;
+      return admitted && response.status === 200 ? await this.stagingPreview(request, admitted, response) : response;
     } catch (error) { return refused(error); }
   }
 
@@ -1183,8 +1182,6 @@ export class TwoBotContainer extends Container<Env> {
       signal.throwIfAborted();
       return operation();
     }), signal);
-    // Serialize each request's admission with release, then let release run
-    // while the network is pending. Every later GET and the receipt recheck.
     const send = async (start: () => Promise<Response>) => (await allowed(() => {
       const work = deadlineFetch(start(), signal);
       void work.catch(() => {}); // Admission can time out before handing off the work.
@@ -1213,8 +1210,6 @@ export class TwoBotContainer extends Container<Env> {
       await readPreview(this.env, async (url, token) => JSON.parse(await jsonText(await send(() =>
         fetch(url, { method: "GET", redirect: "error", cache: "no-store", signal,
           headers: { authorization: `Bot ${token}` } })), 256 * 1024)));
-      // A native port GET rechecks the process without running the SDK's
-      // auto-start, activity renewal or keepalive arming a second time.
       serving(await jsonText(await send(() => this.ctx.container!.getTcpPort(this.defaultPort).fetch(
         new Request("http://c/readyz", { method: "GET", redirect: "manual", signal }),
       )), MAX_PROBE_BODY_BYTES));

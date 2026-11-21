@@ -122,7 +122,7 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
   const gates: Promise<unknown>[] = [];
   let listenerPort = 8080;
   let probeStatus = 503;
-  let probeResponse: ((status: number, pathname: string) => Response) | undefined;
+  let probeResponse: ((status: number, pathname: string, redirect?: RequestRedirect) => Response) | undefined;
   const runtime = {
     running: flags.running ?? false,
     destroys: 0,
@@ -153,7 +153,7 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
         // Liveness is not readiness, even with a configured token. Preserve
         // gateway-down; a synthetic env fixture is NOT proof of a READY event.
         const status = pathname === "/readyz" ? probeStatus : 200;
-        const response = probeResponse?.(status, pathname)
+        const response = probeResponse?.(status, pathname, input instanceof Request ? input.redirect : init?.redirect)
           ?? Response.json({ ready: status === 200, gateway_connected: status === 200 }, { status });
         Object.defineProperty(response, "webSocket", { value: null });
         return response;
@@ -273,13 +273,15 @@ test("staging preview extends readiness without extra cold lifecycle activity", 
     preview.setProbeResponse(() => Response.json(report));
     const normal = await worker.fetch(request(), edge(ordinary));
     const withPreview = await worker.fetch(opted(), edge(preview));
+    const bodies = await Promise.all([withPreview.text(), normal.text()]);
+    await setImmediate();
     assert.equal(withPreview.status, normal.status);
     assert.ok(ordinary.alarms.some((time) => typeof time === "number"), "pinned SDK writes on cold construction");
     assert.deepEqual(effects(preview), effects(ordinary));
     if (use) {
       assert.equal(ordinary.starts.length, 1);
       assert.equal(discord.mock.callCount(), 3);
-      assert.deepEqual(await withPreview.json(), await normal.json());
+      assert.equal(bodies[0], bodies[1]);
       assert.deepEqual(JSON.parse(withPreview.headers.get(PREVIEW_HEADER)!), { registry: "pass", command: name,
         deploymentId: ID, sha, runId: window.runId, runAttempt: window.runAttempt, expiresAt: window.expiresAt });
     } else assert.equal(withPreview.headers.has(PREVIEW_HEADER), false);
@@ -295,21 +297,27 @@ test("staging preview extends readiness without extra cold lifecycle activity", 
   h.values.set(STAGING_USE_KEY, { ...grant, acquiredAt: Date.now() - 2000, expiresAt: Date.now() - 1000 });
   assert.equal((await send()).status, 503);
   assert.equal(discord.mock.callCount(), 0);
-  const refusals = [["drift", 1, 0], ["drift", 2, 3], ["release", 1, 0], ["release", 2, 3], ["expiry", 2, 3]] as const;
-  for (const [change, read, calls] of refusals) {
+  const unready = { ...report, components: report.components.map(([key, state]) => [key, key === "gateway" ? "down" : state]),
+    gateway_failure: { phase: "durable_gateway", class: "checkpoint_load_failed" } };
+  for (const [change, read, calls] of [["redirect", 1, 0], ["unready", 1, 0], ["drift", 1, 0], ["drift", 2, 3],
+    ["release", 1, 0], ["release", 2, 3], ["expiry", 2, 3]] as const) {
     discord.mock.resetCalls();
     queue = replies();
     h.values.set(STAGING_USE_KEY, grant);
     let probes = 0;
-    h.setProbeResponse((_, path) => {
+    h.setProbeResponse((_, path, redirect) => {
       if (path !== "/readyz" || ++probes !== read) return Response.json(report);
+      if (change === "redirect" && redirect === "manual") return Response.redirect("https://redirect.invalid");
+      if (change === "unready") return Response.json(unready, { status: 503 });
       if (change === "release") h.values.set(STAGING_USE_KEY, { ...grant, phase: "released" });
       if (change === "expiry") t.mock.timers.setTime(grant.expiresAt);
       return Response.json(change === "drift" ? { ...report, build_id: "9-9" } : report);
     });
     const result = await send();
-    assert.deepEqual([result.status, result.headers.has(PREVIEW_HEADER)], [503, false], `${change} during readiness read ${read}`);
+    assert.deepEqual([result.status, result.headers.has(PREVIEW_HEADER)],
+      [change === "redirect" ? 500 : 503, false], `${change} during readiness read ${read}`);
     assert.equal(discord.mock.callCount(), calls);
+    if (change === "unready") assert.deepEqual(await result.json(), unready);
   }
   t.mock.timers.setTime(grant.acquiredAt);
   h.setProbeResponse(() => Response.json(report));

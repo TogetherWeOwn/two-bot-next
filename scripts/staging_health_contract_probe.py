@@ -334,13 +334,11 @@ def run(args, fetch_fn=fetch):
     report = None
     status = None
     preview = os.environ.get("STAGING_PREVIEW_AUTHORIZATION")
-    expected_receipt, headers = None, None
+    expected_receipt, headers, ready_fetch = None, None, fetch_fn
     try:
         if preview and results[0].ok:
             request_headers, expected_receipt = preview_request(args.expected_sha, preview)
             ready_fetch = lambda url: fetch_fn(url, headers=request_headers)
-        else:
-            ready_fetch = fetch_fn
         status, headers, value = get_json(ready_fetch, origin + "/readyz", "readyz")
         state, report = parse_readyz(status, value)
         expected = 200 if all(text == "ready" for text in state.values()) else 503

@@ -92,11 +92,8 @@ rank timeout/failure; sensitive-data exclusion from JSON and Debug; and
 independent simultaneous offline runs. Local timings are fixture timings, not
 production performance measurements.
 
-On a clean current-main rollout, `verify_automod_preview` adds a receipt to
-the existing user-flow `GET /readyz`, even when voice certification is disabled.
-Both sides of the Discord registry read check the active grant and serving
-build. Ordinary readiness can start or reconcile the container. The follow-up
-native readiness read adds no SDK lifecycle calls. The artifact retains the receipt.
+On clean current-main rollouts, `verify_automod_preview` adds a readback receipt to the user-flow artifact.
+The opt-in drains the existing `GET /readyz` before registry GETs and a final native readiness read.
 
 ## Live read-mostly smoke run
 

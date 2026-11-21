@@ -17,9 +17,8 @@ const BOUNDS = ["min_length", "max_length", "min_value", "max_value"];
 const EMPTY = ["choices", "options", "channel_types"];
 
 export async function previewRefusal(request: Request, url: URL, token?: string): Promise<Response | null> {
-  const reply = (status: number, extra = {}) => new Response(null, {
-    status, headers: withSecurityHeaders({ "cache-control": "no-store", ...extra }),
-  });
+  const reply = (status: number, extra = {}) =>
+    new Response(null, { status, headers: withSecurityHeaders({ "cache-control": "no-store", ...extra }) });
   if (request.method !== "GET") return reply(405, { allow: "GET" });
   if (!await authenticated(request, token)) return reply(401);
   return url.search || request.body ? reply(400) : null;
