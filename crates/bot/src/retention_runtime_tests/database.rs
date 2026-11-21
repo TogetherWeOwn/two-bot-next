@@ -44,6 +44,7 @@ pub(super) async fn snapshot(pool: &PgPool) -> Vec<Value> {
         "retention_guild_purge_queue",
         "retention_deletion_requests",
         "internal_idempotency",
+        "event_voice_sessions",
     ] {
         let sql = format!("SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)::text), '[]'::jsonb) FROM {table} r");
         rows.push(
@@ -76,6 +77,18 @@ pub(super) async fn seed(pool: &PgPool) -> String {
         .bind(DEPARTED).bind(MEMBER).execute(pool).await.unwrap();
     handle_guild_delete(pool, DEPARTED, None).await.unwrap();
     request_user_deletion(pool, GUILD, MEMBER).await.unwrap()
+}
+
+async fn seed_expired_attendance(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, joined_at)
+         VALUES ($1, $2, '444444444444444444', now() - interval '91 days')",
+    )
+    .bind(GUILD)
+    .bind(MEMBER)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 /// Run the REAL retention action through the production spawn/cancel/join owner.
@@ -254,6 +267,7 @@ async fn game_aggregate_expiry_denied_delete_identifies_guild_horizon_mode_and_c
     let Some(db) = database().await else { return };
     let pool = db.pool();
     const DENIED_GUILD: &str = "555555555555555555";
+    seed_expired_attendance(pool).await;
     sqlx::query("INSERT INTO game_activity_guild_aggregates (guild_id, game, total_play_ms, in_voice_ms, session_count) VALUES ($1, 'Apex', 600000, 0, 2)")
         .bind(DENIED_GUILD).execute(pool).await.unwrap();
     sqlx::query("UPDATE game_activity_guild_aggregates SET updated_at = now() - make_interval(days => 100) WHERE guild_id = $1")
@@ -283,6 +297,7 @@ async fn game_aggregate_expiry_denied_delete_identifies_guild_horizon_mode_and_c
     );
     assert_no_completed_line(&logs);
     let committed = report_line(&logs);
+    field(committed, "attendance_raw_deleted", 1);
     assert!(
         committed.contains("mode=Execute") || committed.contains("mode=\"Execute\""),
         "committed report must tag the mode on a failed expiry: {committed}"
@@ -408,12 +423,15 @@ async fn dry_run_reports_candidates_and_preserves_raw_queue_requests_and_receipt
     let _serial = RUNTIME_LOCK.lock().await;
     let Some(db) = database().await else { return };
     seed(db.pool()).await;
+    seed_expired_attendance(db.pool()).await;
     let before = snapshot(db.pool()).await;
     let (result, logs) = tick(db.pool(), mode_from_setting(None).unwrap().unwrap()).await;
     result.unwrap();
     let report = report_line(&logs);
+    assert!(report.starts_with("INFO "));
     field(report, "presence_raw_deleted", 1);
     field(report, "voice_raw_deleted", 1);
+    field(report, "attendance_raw_deleted", 1);
     field(report, "audit_cache_deleted", 1);
     field(report, "guild_rows_purged", 3);
     field(report, "deletions_completed", 1);
@@ -426,6 +444,17 @@ async fn dry_run_reports_candidates_and_preserves_raw_queue_requests_and_receipt
         before,
         "dry-run must be byte-identical, including receipt and queue timestamps"
     );
+    let (result, logs) = tick(db.pool(), RetentionMode::Execute).await;
+    result.unwrap();
+    let report = report_line(&logs);
+    assert!(report.starts_with("INFO "));
+    field_str(report, "mode", "Execute");
+    field(report, "attendance_raw_deleted", 1);
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM event_voice_sessions")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
     db.close().await.unwrap();
 }
 
@@ -533,6 +562,7 @@ async fn runtime_schema_gap_defers_deletions_and_guild_purges_and_retries_after_
     let Some(db) = database().await else { return };
     let pool = db.pool();
     let id = seed(pool).await;
+    seed_expired_attendance(pool).await;
     sqlx::query("CREATE TABLE retention_uncovered_fixture (guild_id TEXT, member_id TEXT)")
         .execute(pool)
         .await
@@ -549,6 +579,7 @@ async fn runtime_schema_gap_defers_deletions_and_guild_purges_and_retries_after_
     field(report, "deletions_completed", 0);
     field(report, "presence_raw_deleted", 1);
     field(report, "voice_raw_deleted", 1);
+    field(report, "attendance_raw_deleted", 1);
     field(report, "audit_cache_deleted", 1);
     field(report, "guild_rows_purged", 0);
     field(report, "guild_purges_failed", 1);
