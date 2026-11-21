@@ -23,6 +23,9 @@ pub struct VoiceHeat {
 }
 
 impl VoiceHeat {
+    /// Leave time for the inner flush to time out and record the observation.
+    pub const TICK_TIMEOUT: Duration = Duration::from_secs(65);
+
     /// Attempt to flush completed hours, then record an eligible scalar at `now`.
     /// `None` is a gap, not a zero, and a clock rewind never reopens a closed hour.
     /// Neither stops completed hours from flushing. The pool is unused until
@@ -129,13 +132,15 @@ mod tests {
         // that this attempt closed FIRST even though the write did not return.
         let started = tokio::time::Instant::now();
         assert_eq!(
-            adapter
-                .tick_with(NEXT, None, async |buckets| {
+            tokio::time::timeout(
+                VoiceHeat::TICK_TIMEOUT,
+                adapter.tick_with(NEXT, Some(7), async |buckets| {
                     assert_eq!(buckets, original.as_slice());
                     std::future::pending().await
-                })
-                .await,
-            Err(JobErrorClass::Timeout)
+                }),
+            )
+            .await,
+            Ok(Err(JobErrorClass::Timeout))
         );
         assert!((Duration::from_secs(60)..Duration::from_secs(61)).contains(&started.elapsed()));
         assert_eq!(adapter.accumulator.completed(NEXT), original);
@@ -155,7 +160,12 @@ mod tests {
             .await
             .expect("successful replay acknowledges the original batch");
         assert_eq!(adapter.tick(rewind, Some(8), &pool).await, Ok(()));
-        assert!(adapter.accumulator.completed(LATER).is_empty());
+        let retained = adapter.accumulator.completed(LATER);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            (retained[0].hour_start, retained[0].occupancy_sum),
+            (NEXT, 7)
+        );
     }
 
     #[tokio::test]

@@ -270,6 +270,133 @@ pub(crate) fn read_voice_total(
     observe_rooms(cache, guild_id).map(|rooms| total_in_voice(&rooms))
 }
 
+/// Private five-minute sampling of the same fenced aggregate.
+pub(crate) mod heat {
+    use std::{sync::Arc, time::Duration};
+
+    use sqlx::PgPool;
+    use time::OffsetDateTime;
+    use tokio::sync::{Mutex, RwLock};
+    use two_bot::voice_heat::VoiceHeat;
+    use two_bot_core::Snowflake;
+    use two_bot_discord::SharedCache;
+
+    use crate::{
+        gateway::GatewayState,
+        jobs::{self, ErrorClass, Job},
+    };
+
+    pub(crate) const NAME: &str = "voice_heat";
+    const CADENCE: Duration = Duration::from_secs(300);
+
+    /// Without room actors, still ask the shard to rebuild the cache after cold replay.
+    pub(crate) fn bootstrap_sink() -> Arc<dyn two_bot::voice_rooms::VoiceEventSink> {
+        use twilight_cache_inmemory::DefaultInMemoryCache;
+        use twilight_model::gateway::{event::Event, payload::incoming::PresenceUpdate};
+        struct Bootstrap;
+        impl two_bot::voice_rooms::VoiceEventSink for Bootstrap {
+            fn handle(&self, _: &Event, _: &DefaultInMemoryCache) {}
+            fn presence(&self, _: &PresenceUpdate) {}
+            fn disconnect(&self) {}
+            fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
+                cache.current_user().is_none()
+            }
+        }
+        Arc::new(Bootstrap)
+    }
+
+    pub(crate) fn job(
+        pool: PgPool,
+        guild: Snowflake,
+        cache: Arc<SharedCache>,
+        gateway: Arc<RwLock<GatewayState>>,
+    ) -> Job {
+        let buffer = Arc::new(Mutex::new(VoiceHeat::default()));
+        Job {
+            name: NAME,
+            cadence: CADENCE,
+            cadence_source: None,
+            startup_jitter: jobs::startup_jitter(CADENCE, rand::random()),
+            timeout: VoiceHeat::TICK_TIMEOUT,
+            action: Arc::new(move || {
+                let (pool, cache, gateway, buffer) =
+                    (pool.clone(), cache.clone(), gateway.clone(), buffer.clone());
+                Box::pin(async move {
+                    let mut buffer = buffer.lock().await;
+                    tick(
+                        &mut buffer,
+                        &pool,
+                        &cache,
+                        &gateway,
+                        guild,
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await
+                })
+            }),
+        }
+    }
+
+    async fn tick(
+        buffer: &mut VoiceHeat,
+        pool: &PgPool,
+        cache: &SharedCache,
+        gateway: &RwLock<GatewayState>,
+        guild: Snowflake,
+        now: OffsetDateTime,
+    ) -> Result<(), ErrorClass> {
+        // Hold the gateway state stable through the fenced cache read. Neither
+        // fence waits: a transition or rebuild is a gap, and never holds up a flush.
+        let total = gateway.try_read().ok().and_then(|state| {
+            if *state != GatewayState::Connected {
+                return None;
+            }
+            let total = super::read_voice_total(cache, guild).ok()?;
+            i64::try_from(total).ok()
+        });
+        buffer.tick(now, total, pool).await
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        use time::{macros::datetime, Duration as WallDuration};
+        use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
+
+        #[tokio::test]
+        async fn only_a_connected_complete_snapshot_adds_an_observation() {
+            let cache = crate::voice_snapshot::new_shared_cache();
+            let gateway = Arc::new(RwLock::new(GatewayState::Connected));
+            let pool =
+                PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new_without_pgpass());
+            pool.close().await;
+            let job = job(pool.clone(), 100, cache.clone(), gateway.clone());
+            assert_eq!(job.cadence, CADENCE);
+            assert_eq!(job.timeout, VoiceHeat::TICK_TIMEOUT);
+            assert_eq!((job.action)().await, Ok(()));
+
+            let mut buffer = VoiceHeat::default();
+            use GatewayState::{Armed, Connected, Draining};
+            let mut probe = async |state, hour| {
+                *gateway.write().await = state;
+                let now = datetime!(2026-11-21 00:00 UTC) + WallDuration::hours(hour);
+                tick(&mut buffer, &pool, &cache, &gateway, 100, now).await
+            };
+            assert_eq!(probe(Connected, 0).await, Ok(()));
+            cache.update(&Event::GuildCreate(Box::new(GuildCreate::Available(
+                serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json"))
+                    .expect("complete, empty guild fixture"),
+            ))));
+            // The cold and disconnected ticks did not buffer a zero.
+            assert_eq!(probe(Armed, 1).await, Ok(()));
+            assert_eq!(probe(Connected, 2).await, Ok(()));
+            // A true zero is buffered, then the next gap tries to flush it.
+            assert_eq!(probe(Draining, 3).await, Err(ErrorClass::Database));
+        }
+    }
+}
+
 /// Whole-second Zulu timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for `observed_at`.
 fn observed_at_now() -> String {
     let now = time::OffsetDateTime::now_utc();

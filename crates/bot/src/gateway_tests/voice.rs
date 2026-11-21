@@ -570,6 +570,61 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
 }
 
 #[tokio::test]
+#[ignore = "requires an authorized disposable gateway test database"]
+async fn cold_resume_bootstraps_heat_without_room_actors() {
+    use crate::voice_snapshot::{heat, new_shared_cache, read_voice_total};
+    let db = TestDb::new().await;
+    let release = Arc::new(Notify::new());
+    let mut mock = cold_voice_gateway(release.clone()).await;
+    let saved = checkpoint("saved-session", 2, &mock.url);
+    db.store
+        .commit_dispatch(&saved, FunnelBatch::default())
+        .await
+        .unwrap();
+    ensure_crypto_provider();
+    let shard = crate::gateway::build_shard(
+        TOKEN.into(),
+        two_bot_discord::gateway_intents(false),
+        Some(&saved),
+        Some(&mock.url),
+    );
+    let cache = new_shared_cache();
+    let buffer = GatewayFunnelBuffer::default();
+    let pipeline = two_bot_discord::OrderedLevelingPipeline::with_shared_cache(
+        buffer.clone(),
+        None,
+        two_bot_discord::NoInvites,
+        buffer,
+        cache.clone(),
+    );
+    let state = Arc::new(RwLock::new(GatewayState::Armed));
+    let runner = tokio::spawn(run_shard(
+        shard,
+        Arc::new(pipeline),
+        state.clone(),
+        db.store.clone(),
+        None,
+        None,
+        None,
+        None,
+        Some(heat::bootstrap_sink()),
+        std::future::pending(),
+    ));
+    assert_eq!(mock.authentication().await["op"], 6);
+    assert_eq!(mock.authentication().await["op"], 2);
+    assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 4);
+    assert!(read_voice_total(&cache, VOICE_GUILD_ID).is_err());
+    release.notify_one();
+    wait_sequence(&db.store, 2).await;
+    assert_eq!(*state.read().await, GatewayState::Connected);
+    assert_eq!(read_voice_total(&cache, VOICE_GUILD_ID), Ok(0));
+    runner.abort();
+    let _ = runner.await;
+    mock.task.abort();
+    db.close().await;
+}
+
+#[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn voice_startup_uses_dml_role_without_migration_ledger_access() {
     let db = TestDb::new().await;

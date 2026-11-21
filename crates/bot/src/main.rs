@@ -158,7 +158,6 @@ mod tracing_capture;
 // file is not loaded as two modules (clippy::duplicate_mod).
 #[cfg(test)]
 mod tuning_test_support;
-mod voice_heat_runtime;
 mod voice_snapshot;
 mod website_jobs;
 #[cfg(test)]
@@ -614,6 +613,8 @@ async fn run(cli_args: &[String]) {
 
     // Filled by the gateway task; read by the shared maintenance tick.
     let automod_slot: automod_gateway::Slot = Arc::default();
+    let retention = website_jobs::retention_registration(&config);
+    let heat_bootstrap = retention.heat_guild().is_some();
     let gateway_task = if let Ok((token, url, guild_id)) = gateway_prerequisites(&config) {
         let token = token.to_owned();
         let url = url.to_owned();
@@ -934,6 +935,8 @@ async fn run(cli_args: &[String]) {
                     // the voice sink so VoiceServerUpdate/self VoiceStateUpdate
                     // feed the Lavalink pairing without touching rooms. Inert
                     // unless TWO_MUSIC=1; the tap refuses non-staging guilds.
+                    let voice =
+                        voice.or_else(|| heat_bootstrap.then(voice_snapshot::heat::bootstrap_sink));
                     let voice = music_capture::MusicVoiceTap::wrap(voice, Some(guild_id));
 
                     let intents = intents_from_env(&activation);
@@ -1026,6 +1029,7 @@ async fn run(cli_args: &[String]) {
         eventsub_receiver,
         member,
         voice_cache,
+        retention,
     );
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,

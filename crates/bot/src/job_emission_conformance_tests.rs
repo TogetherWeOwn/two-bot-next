@@ -75,10 +75,7 @@ const EMITTER_SOURCES: [(&str, &str); 12] = [
     ("lfg_jobs.rs", include_str!("lfg_jobs.rs")),
     ("automod_gateway.rs", include_str!("automod_gateway.rs")),
     ("gateway_metrics.rs", include_str!("gateway_metrics.rs")),
-    (
-        "voice_heat_runtime.rs",
-        include_str!("voice_heat_runtime.rs"),
-    ),
+    ("voice_snapshot.rs", include_str!("voice_snapshot.rs")),
 ];
 
 /// Every scrape job with a supervised emitter, paired with the file that
@@ -98,7 +95,7 @@ const LIVE_JOB_EMITTERS: [(&str, &str); 15] = [
     ("self_role_recovery", "self_role_handlers.rs"),
     ("automod_expiry", "automod_gateway.rs"),
     ("lfg_sweep", "lfg_jobs.rs"),
-    ("voice_heat", "voice_heat_runtime.rs"),
+    ("voice_heat", "voice_snapshot.rs"),
 ];
 
 /// Every `website_jobs.rs` call that schedules a live job. Naming the job in
@@ -122,7 +119,7 @@ const REGISTER_CALLS: [&str; 9] = [
 /// pins the sink together with the call, matched against the source with
 /// full-line `//` comments removed.
 const REGISTER_SINKS: [&str; 9] = [
-    "registered.push(voice_heat_runtime::job(",
+    "registered.push(heat::job(",
     "registered.push(crate::settings_jobs::job(",
     "registered.push(Job {",
     "registered.extend(scheduled)",

@@ -1198,6 +1198,15 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     }
   }
 
+  // A rollback omits heat gauges; absence is not recovery.
+  for (const [rule, name] of [
+    ["job_consecutive_failures", "two_bot_job_consecutive_failures"],
+    ["job_unknown_stale", "two_bot_job_last_success_timestamp_seconds"],
+  ] as const) {
+    const key = `${rule}:${VOICE_HEAT_JOB}`;
+    if (prev.firing.includes(key) && !samples.some((s) => s.name === name && s.labels.job === VOICE_HEAT_JOB)) firing.push(key);
+  }
+
   // An unreadable sweep retains the old gauge, not an absent sample. Its
   // supervisor failure count is therefore a veto on both firing and recovery.
   // Conservatively hold on other failed audit sweeps too, until one succeeds.

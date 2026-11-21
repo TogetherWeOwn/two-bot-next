@@ -350,7 +350,7 @@ entry, so staleness tickets via `job_unknown_stale` instead of `job_stale`.
 | `member_unban_sweep` | `member_runtime.rs` (`sweep_job`) | Member unban sweep every 30 s with an attempt timeout that may outlive its cadence; a successful sweep need not complete any unban; failure-only alerting |
 | `automod_expiry` | `automod_gateway.rs` (`expiry_job`) | Automod repeat-history expiry tick every 60 s; a gateway without built activation is a no-op success, and real expiry work runs only with the automod gate on; failure-only alerting |
 | `lfg_sweep` | `lfg_jobs.rs` (`register`) | Bounded LFG lifecycle sweep every 60 s under announcement/identity gates; at most 20 candidates, row-local failures continue, and success does not prove every row or message refresh settled; 60 s `job_stale` cadence |
-| `voice_heat` | `voice_heat_runtime.rs` (`job`) | Private five-minute sampler; a completed tick need not contain a fresh observation. Use failure streaks and the existing `job_unknown_stale` ticket, not cadence-based paging |
+| `voice_heat` | `voice_snapshot.rs` (`heat::job`) | Private five-minute sampler; a completed tick need not contain a fresh observation. Use failure streaks and the existing `job_unknown_stale` ticket, not cadence-based paging |
 
 ## Alert rules
 

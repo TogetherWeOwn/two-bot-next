@@ -69,6 +69,25 @@ test("voice heat rows are all-or-nothing without holding other jobs' failure sha
   assert.ok(evaluateMetrics(updated, state, 160).state.firing.includes("job_failure_share:rank"));
 });
 
+test("rollback holds only the missing heat gauges until healthy readings return", () => {
+  const lines = metricsLines(3);
+  const evaluate = (rows: string[], prev = EMPTY_STATE) => {
+    const samples = parseAlertScrape(rows.join("\n"));
+    assert.ok(samples);
+    return evaluateMetrics(samples, prev, 10_000).state;
+  };
+  const active = evaluate(lines.map((line) => isHeat(line)
+    ? line.replace(/^(two_bot_job_consecutive_failures.*) 0$/, "$1 3")
+      .replace(/^(two_bot_job_last_success_timestamp_seconds.*) 0$/, "$1 1") : line));
+  const heatAlerts = ["job_consecutive_failures:voice_heat", "job_unknown_stale:voice_heat"];
+  for (const key of [...heatAlerts, "job_consecutive_failures:rank"]) assert.ok(active.firing.includes(key), key);
+  const rolledBack = evaluate(metricsLines().filter((line) => !isHeat(line)), active);
+  for (const key of heatAlerts) assert.ok(rolledBack.firing.includes(key), key);
+  assert.ok(!rolledBack.firing.includes("job_consecutive_failures:rank"));
+  const healthy = evaluate(metricsLines(), rolledBack);
+  for (const key of heatAlerts) assert.ok(!healthy.firing.includes(key), key);
+});
+
 test("older exposition without the optional gauges still parses", () => {
   const older = metricsLines(3).filter((line) => !isOptionalLine(line) && !isHeat(line)).join("\n");
   const samples = parseAlertScrape(older);
