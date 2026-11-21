@@ -180,8 +180,9 @@ pub(crate) fn refresh_live<L: AutomodClaimLedger, F: AutomodFacts>(
     guild_id: &str,
     live: &two_bot_core::settings::LiveSettings,
 ) -> bool {
-    resolve_live_config(deployment, guild_id, live)
-        .is_some_and(|config| activation.apply_live_config(&config))
+    activation.preview(|runtime| runtime.admits(Some(guild_id)))
+        && resolve_live_config(deployment, guild_id, live)
+            .is_some_and(|config| activation.apply_live_config(&config))
 }
 
 fn resolve_live_config(

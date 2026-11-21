@@ -156,8 +156,7 @@ pub fn replay_exemption_knob(stored_class: &str) -> Option<&'static str> {
     }
 }
 
-/// Canonical `current at <UTC time>` rendering for one committed receipt
-/// timestamp (receipt millis since epoch). The first reply and every replay
+/// Canonical rendering for one committed invocation receipt (millis since epoch). The first reply and every replay
 /// render the stored receipt time through this function.
 #[must_use]
 pub fn format_preview_currency(receipt_ms: u64) -> String {
@@ -238,7 +237,7 @@ pub fn render_preview_reply(verdict: &PreviewVerdict, currency_iso: &str) -> Str
         }
     };
     reply.push_str(&format!(
-        "\nMode: {mode}. {}\nConfig current at {currency_iso}.\n{PREVIEW_CAVEATS}",
+        "\nMode: {mode}. {}\nInvocation received at {currency_iso}.\n{PREVIEW_CAVEATS}",
         preview_mode_sentence(verdict.dry_run)
     ));
     reply
@@ -421,7 +420,7 @@ mod tests {
                     "reply echoes input token {token:?}: {reply}"
                 );
             }
-            assert!(reply.contains(&currency), "missing currency: {reply}");
+            assert!(reply.contains(&format!("Invocation received at {currency}.")));
             assert!(reply.contains(PREVIEW_CAVEATS), "missing caveats: {reply}");
         }
         // Mode sentences differ between dry-run and enforce for the same filter.
@@ -444,7 +443,7 @@ mod tests {
         ] {
             assert!(!generic.contains("Deciding"), "generic leaks: {generic}");
             assert!(!generic.contains("dry_run") && !generic.contains("enforce"));
-            assert!(!generic.contains("current at"));
+            assert!(!generic.contains("Invocation received at"));
         }
     }
 

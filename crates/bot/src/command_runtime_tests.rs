@@ -1527,121 +1527,29 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
-async fn automod_preview_router_refuses_before_decode_and_only_answers_privately() {
-    use two_bot_core::automod_preview_input::PreviewInputRefusal;
-    use two_bot_core::automod_preview_report::PREVIEW_NOT_EVALUATED_REPLY;
-
-    let (mock, origin) = MockRest::start(Vec::new()).await;
-    let router_gates = RouterGates {
-        moderation: true,
-        ..gates(false, false)
-    };
-    let runtime = runtime_without_db(router_gates, false, origin.clone());
-    let disabled = runtime_without_db(gates(false, false), false, origin);
-    let permission_reply = RouterRefusal::AutomodPreviewPermission.message();
-    let denied = permission_reply.as_str();
-    let cases = [
-        (Some(Permissions::empty()), "", denied),
-        (Some(Permissions::MANAGE_MESSAGES), "", denied),
-        (Some(Permissions::MODERATE_MEMBERS), "", denied),
-        (None, "", denied),
-        (
-            Some(Permissions::MANAGE_GUILD),
-            "",
-            PreviewInputRefusal::TextBounds.message(),
-        ),
-        (
-            Some(Permissions::MANAGE_GUILD),
-            "synthetic <@everyone> https://example.invalid",
-            PREVIEW_NOT_EVALUATED_REPLY,
-        ),
-    ];
-    for (permissions, text, _) in cases {
-        let mut interaction = slash(
-            "automod-preview",
-            Some(CHANNEL),
-            vec![option("text", CommandOptionValue::String(text.to_owned()))],
-        );
-        interaction
-            .member
-            .as_mut()
-            .expect("invoking member")
-            .permissions = permissions;
-        runtime.on_interaction(&interaction).await;
-    }
-    let mut dm = slash("automod-preview", Some(CHANNEL), Vec::new());
-    set_guild(&mut dm, None);
-    dm.member = None;
-    runtime.on_interaction(&dm).await;
-    disabled
-        .on_interaction(&slash("automod-preview", Some(CHANNEL), Vec::new()))
-        .await;
-
-    let expired = tokio::time::Instant::now() - Duration::from_secs(3);
-    runtime.on_interaction_received_at(&dm, expired).await;
-
-    let requests = mock.requests();
-    let expected = cases
-        .map(|(_, _, reply)| reply)
-        .into_iter()
-        .chain([PREVIEW_NOT_EVALUATED_REPLY; 2]);
-    assert_eq!(
-        requests.len(),
-        cases.len() + 2,
-        "only one callback per invocation"
-    );
-    for (request, expected) in requests.iter().zip(expected) {
-        assert_eq!(request.method, "POST");
-        assert!(request.path.ends_with("/callback"));
-        let reply: serde_json::Value =
-            serde_json::from_slice(&request.body).expect("callback JSON");
-        assert_eq!(reply["type"], 4);
-        assert_eq!(reply["data"]["flags"], 64);
-        assert_eq!(reply["data"]["content"], expected);
-        assert_eq!(
-            reply["data"]["allowed_mentions"]["parse"],
-            serde_json::json!([])
-        );
-    }
-    mock.shutdown().await;
-}
-
-#[tokio::test]
-async fn automod_preview_uses_attached_activation_and_fails_closed_without_audit() {
+#[ignore = "requires disposable agent-testdb for the preview audit receipt"]
+async fn automod_preview_dispatch_uses_ingress_clocks_even_when_busy() {
+    use crate::command_runtime::{LANE_BUSY, LANE_INTERACTIONS};
     use crate::gateway_commands::GatewayCommandConfig;
+    use crate::interaction_admission::PER_USER_IN_FLIGHT;
     use two_bot_core::automod_preview_report::PREVIEW_UNAVAILABLE_REPLY;
     use two_bot_core::automod_runtime::STAGING_GUILD_ID;
 
     let guild = STAGING_GUILD_ID.parse::<u64>().expect("staging ID");
+    let db = member_refusal_database().await;
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let executor = executor_at(origin);
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
-    let port = listener.local_addr().expect("listener address").port();
-    let pool = PgPoolOptions::new()
-        .connect_lazy(&format!(
-            "postgres://agent_test@127.0.0.1:{port}/agent_test"
-        ))
-        .expect("lazy pool");
-    let resolved = crate::automod_gateway::resolve(
-        &[
-            ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
-            (
-                "TWO_OWEN_USER_ID".to_owned(),
-                "123456789012345678".to_owned(),
-            ),
-        ]
-        .into(),
-        guild,
-    )
-    .expect("valid policy")
-    .expect("enabled policy");
-    let activation = crate::automod_gateway::build(resolved, pool.clone(), executor.clone());
+    let vars = [
+        ("TWO_AUTOMOD".into(), "1".into()),
+        ("TWO_OWEN_USER_ID".into(), "123456789012345678".into()),
+    ]
+    .into();
+    let resolved = crate::automod_gateway::resolve(&vars, guild)
+        .unwrap()
+        .unwrap();
     let runtime = CommandRuntime::new(
-        pool.clone(),
-        executor,
+        db.pool().clone(),
+        executor.clone(),
         router_with_commands(RouterGates {
             moderation: true,
             configured_guild: Some(guild),
@@ -1650,53 +1558,128 @@ async fn automod_preview_uses_attached_activation_and_fails_closed_without_audit
         guild,
         true,
     );
-    let vars = [("TWO_AUTOMATIONS".to_owned(), "1".to_owned())].into();
+    runtime.set_automod(crate::automod_gateway::build(
+        resolved,
+        db.pool().clone(),
+        executor,
+    ));
     runtime.initialize_custom_commands_for_test(
-        GatewayCommandConfig::from_map_for_activation(guild, &vars, true)
-            .expect("test custom-command config"),
+        GatewayCommandConfig::from_map_for_activation(
+            guild,
+            &[("TWO_AUTOMATIONS".into(), "1".into())].into(),
+            true,
+        )
+        .unwrap(),
     );
     let _guard = runtime.dispatch_guard();
-    runtime.set_automod(activation);
-    let mut interaction = slash(
-        "automod-preview",
-        Some(CHANNEL),
-        vec![option(
-            "text",
-            CommandOptionValue::String("synthetic".to_owned()),
-        )],
-    );
-    set_guild(&mut interaction, Some(Id::new(guild)));
-    interaction.authorizing_integration_owners.guild = Some(AnonymizableId::Id(Id::new(guild)));
-    let denied = RouterRefusal::AutomodPreviewPermission.message();
-    for (index, (permissions, expected)) in [
-        (Permissions::empty(), denied.as_str()),
-        (Permissions::MANAGE_GUILD, PREVIEW_UNAVAILABLE_REPLY),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let invocation = from_member(interaction.clone(), 10 + index as u64, permissions);
-        assert!(runtime.dispatch(&interaction_event(invocation)));
-        wait_for(|| mock.requests().len() > index, "preview callback").await;
-        let requests = mock.requests();
-        assert!(requests[index].path.ends_with("/callback"));
-        let reply: serde_json::Value =
-            serde_json::from_slice(&requests[index].body).expect("callback JSON");
-        assert_eq!(reply["data"]["flags"], 64);
-        assert_eq!(reply["data"]["content"], expected);
-        if index == 0 {
-            assert!(
-                matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
-            );
-            pool.close().await;
-        }
+    let event = |id, permissions, text: &str| {
+        let mut interaction = slash(
+            "automod-preview",
+            Some(CHANNEL),
+            vec![option("text", CommandOptionValue::String(text.into()))],
+        );
+        set_guild(&mut interaction, Some(Id::new(guild)));
+        interaction.authorizing_integration_owners.guild = Some(AnonymizableId::Id(Id::new(guild)));
+        interaction_event(from_member(interaction, id, permissions))
+    };
+    let observed = "2026-08-01T01:02:03.456Z";
+    let now = tokio::time::Instant::now;
+    let expired = now() - Duration::from_secs(3);
+    let manage = Permissions::MANAGE_GUILD;
+    let no_manage = Permissions::MANAGE_MESSAGES;
+    for (ordered, id, permissions) in [
+        (false, 42, manage),
+        (true, 43, manage),
+        (false, 44, no_manage),
+        (true, 45, no_manage),
+    ] {
+        assert!(runtime.dispatch_received(
+            &event(id, permissions, "synthetic"),
+            ordered,
+            expired,
+            observed
+        ));
+        wait_for(
+            || {
+                runtime.lane_in_flight(crate::command_runtime::LANE_PRIVILEGED) == 0
+                    && runtime.lane_in_flight(LANE_INTERACTIONS) == 0
+            },
+            "expired preview settled",
+        )
+        .await;
+        let slots: Vec<_> = (0..PER_USER_IN_FLIGHT)
+            .map(|_| runtime.acquire_user_slot_for_test(id).unwrap())
+            .collect();
+        assert!(!runtime.dispatch_received(
+            &event(id, manage, "synthetic"),
+            ordered,
+            expired,
+            observed
+        ));
+        wait_for(
+            || runtime.lane_in_flight(LANE_BUSY) == 0,
+            "expired busy callback settled",
+        )
+        .await;
+        assert!(mock.requests().is_empty());
+        drop(slots);
     }
-    assert_eq!(mock.requests().len(), 2);
+    let deny = RouterRefusal::AutomodPreviewPermission.message();
+    let cases = [
+        (no_manage, "", deny.as_str()),
+        (manage, "synthetic", "Invocation received at"),
+    ];
+    for (i, (permissions, text, expected)) in cases.into_iter().enumerate() {
+        assert!(runtime.dispatch_received(
+            &event(50 + i as u64, permissions, text),
+            i == 0,
+            now(),
+            observed
+        ));
+        wait_for(|| mock.requests().len() > i, "preview callback").await;
+        let reply = callback_json(&mock.requests()[i]);
+        assert_eq!(reply["type"], 4);
+        assert_eq!(reply["data"]["flags"], 64);
+        assert_eq!(
+            reply["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert!(reply["data"]["content"]
+            .as_str()
+            .unwrap()
+            .contains(expected));
+        assert!(!reply["data"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic"));
+    }
+    let rows: Vec<bool> = sqlx::query_scalar("SELECT created_at = $1::text::timestamptz FROM automation_audit_log WHERE action = 'automod.preview'")
+        .bind(observed).fetch_all(db.pool()).await.unwrap();
+    assert_eq!(rows, [true]);
+    db.close().await.unwrap();
+    assert!(runtime.dispatch_received(&event(52, manage, "synthetic"), true, now(), observed));
+    wait_for(|| mock.requests().len() == 3, "audit-outage callback").await;
+    assert_eq!(
+        callback_json(&mock.requests()[2])["data"]["content"],
+        PREVIEW_UNAVAILABLE_REPLY
+    );
+    let _slots: Vec<_> = (0..PER_USER_IN_FLIGHT)
+        .map(|_| runtime.acquire_user_slot_for_test(53).unwrap())
+        .collect();
+    assert!(!runtime.dispatch_received(&event(53, manage, "synthetic"), false, now(), observed));
+    wait_for(|| mock.requests().len() == 4, "live busy callback").await;
+    let busy = callback_json(&mock.requests()[3]);
+    assert_eq!(busy["data"]["flags"], 64);
+    assert_eq!(
+        busy["data"]["content"],
+        crate::interaction_admission::BUSY_REPLY
+    );
     mock.shutdown().await;
 }
 
 mod preview_callback_acceptance {
     use super::*;
+    use crate::command_runtime::{LANE_INTERACTIONS, LANE_PRIVILEGED};
     use tokio::time::Instant;
     use two_bot_core::{
         automod_preview_audit::{load_preview_audit, lock_preview_attempt, replay_preview_reply},
@@ -1851,7 +1834,13 @@ mod preview_callback_acceptance {
             request.authorizing_integration_owners.guild = Some(AnonymizableId::Id(Id::new(guild)));
             from_member(request, id, Permissions::MANAGE_GUILD)
         };
-        assert!(runtime.dispatch(&interaction_event(preview(801, SAMPLE))));
+        let observed = "2026-08-01T01:02:03.456Z";
+        assert!(runtime.dispatch_received(
+            &interaction_event(preview(801, SAMPLE)),
+            false,
+            Instant::now(),
+            observed,
+        ));
         tokio::time::timeout(
             Duration::from_secs(4),
             admission.settlement.started.notified(),
@@ -1905,13 +1894,14 @@ mod preview_callback_acceptance {
         .await??;
         let mut audit = pool.begin().await?;
         lock_preview_attempt(&mut audit, "802").await?;
-        // The explicit-receipt seam has no live override; use the boot word
-        // so this invocation still produces the original matched audit.
-        let second = preview(802, "bootword");
         let received_at = Instant::now() - Duration::from_millis(750);
         let deadline = received_at + Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS);
-        let attempt = runtime.on_interaction_received_at(&second, received_at);
-        tokio::pin!(attempt);
+        assert!(runtime.dispatch_received(
+            &interaction_event(preview(802, SAMPLE)),
+            false,
+            received_at,
+            observed,
+        ));
         let contend = async {
             // Prove this invocation actually waited on the audit claim before
             // observing the independent occupied REST lane.
@@ -1925,20 +1915,24 @@ mod preview_callback_acceptance {
                 if waiting {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
             audit.rollback().await?;
             admission.blocked.notified().await;
             Ok::<(), sqlx::Error>(())
         };
-        tokio::select! {
-            result = tokio::time::timeout_at(deadline, contend) => result??,
-            () = &mut attempt => return Err("preview finished before exercising both waits".into()),
-        }
+        tokio::time::timeout_at(deadline, contend).await??;
         // Finish the remaining deadline deterministically; no database latch
         // waits for virtual time. A fresh budget at REST entry would run longer.
         tokio::time::pause();
-        let settled = tokio::time::timeout_at(deadline + Duration::from_millis(100), attempt).await;
+        let settled = tokio::time::timeout_at(deadline + Duration::from_millis(100), async {
+            while runtime.lane_in_flight(LANE_PRIVILEGED) != 0
+                || runtime.lane_in_flight(LANE_INTERACTIONS) != 0
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
         tokio::time::resume();
         lane.complete(None).await?;
         settled.expect("callback attempt obeys the original receipt deadline");

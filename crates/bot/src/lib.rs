@@ -12,6 +12,9 @@ pub mod gateway_backoff;
 // (host decision D4): the gate the T-15 ticker consults before any create.
 pub mod event_voice_category;
 
+// Pure result projection; not wired into capture or internal actions.
+pub mod event_attendance;
+
 // Worker-path runtimes: the staging-soak acceptance pins
 // `containment_runtime::{start, ContainmentSettings, SettingsSource}` as its
 // seam. The binary compiles these same source files as crate-local modules.
