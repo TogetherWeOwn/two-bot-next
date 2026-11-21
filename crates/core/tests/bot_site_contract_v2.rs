@@ -188,7 +188,6 @@ fn snapshot_refusals_require_matching_valid_correlation_ids() {
 fn unimplemented_verbs_stay_closed_until_they_land() {
     let fx = fixture();
     for name in [
-        "voice.move_member",
         "reminder.send",
         "place_offer.send",
         "event.attendance.read",
@@ -230,6 +229,9 @@ fn move_member_request_and_outcomes_match_the_closed_vocab() {
             ErrorCode::ActionNotAllowed
         );
     }
+    let mut staged = flags_empty();
+    staged.enabled.insert(action.to_owned());
+    assert_allowed(action, &staged, true, true).expect("explicit staging gate allows the verb");
     assert!(!needs_idempotency_key(action));
     let validated = VoiceMoveRequest::validate(&request).expect("valid self-move payload");
     assert_eq!(request["discord_id"], validated.discord_id());

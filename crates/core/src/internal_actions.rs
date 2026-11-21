@@ -735,7 +735,7 @@ pub fn auth_failure(log_reason: impl Into<String>) -> ActionError {
 /// (TOG-5510), plus `voice.snapshot`, the keyless gateway-cache read. Adding
 /// a verb here without deciding which side of [`NEEDS_IDEMPOTENCY_KEY`] it
 /// falls on is the mistake that set exists to prevent.
-pub const IMPLEMENTED_ACTIONS: [&str; 20] = [
+pub const IMPLEMENTED_ACTIONS: [&str; 21] = [
     "role.assign",
     "guild.add_member",
     "announcement.post",
@@ -756,6 +756,7 @@ pub const IMPLEMENTED_ACTIONS: [&str; 20] = [
     "moderation.lockdown",
     "moderation.unlock",
     "voice.snapshot",
+    "voice.move_member",
 ];
 
 /// Actions where a repeat is not harmless, so the caller must send an
@@ -2247,6 +2248,15 @@ fn authorize_burned(
                 "rate_limited_add_member",
             )
             .with_retry_after(per_action.retry_after_secs));
+        }
+    }
+
+    if action == "voice.move_member" {
+        let member = VoiceMoveRequest::validate(&body)?.discord_id();
+        let limit = buckets.take_voice_member(member, verified.guarded_ms);
+        if !limit.allowed {
+            let failure = ActionError::new(ErrorCode::RateLimited, "Slow down", "voice_move");
+            return Err(failure.with_retry_after(limit.retry_after_secs));
         }
     }
 

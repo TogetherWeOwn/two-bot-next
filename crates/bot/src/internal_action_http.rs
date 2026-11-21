@@ -43,6 +43,7 @@ use tokio::{
     net::TcpListener,
     sync::{OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinSet,
+    time::{timeout_at, Instant},
 };
 use tracing::Instrument;
 use two_bot_core::{
@@ -94,11 +95,14 @@ use two_bot_discord::{ActionExecutor, DiscordError, EventActionError, EventCall}
 
 use crate::voice_snapshot::{self, SnapshotRefusal, VoiceOccupancyClock};
 
+mod voice_move;
+
 const MAX_HEADER_BYTES: usize = 8192;
 const MAX_HEADERS: usize = 64;
 const MAX_REQUESTS: usize = 32;
 const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const VOICE_MOVE_BUDGET: Duration = Duration::from_secs(5);
 /// Headroom inside the supervisor's HTTP drain budget: the receiver's shared
 /// shutdown deadline sits this far inside it, so the receiver always runs its
 /// child-abort path and reports before the supervisor backstop — armed on the
@@ -124,7 +128,7 @@ fn internal_family(action: ActionLabel) -> &'static str {
             "event.read" | "event.upsert" | "event.cancel" => "event",
             "settings.get" | "settings.set" => "settings",
             "role.assign" | "guild.add_member" => "membership",
-            "voice.snapshot" => "voice",
+            "voice.snapshot" | "voice.move_member" => "voice",
             _ if name.starts_with("moderation.") => "moderation",
             _ => "other",
         },
@@ -929,6 +933,7 @@ struct ReceiverState {
     /// reads as `discord_unavailable` with a fresh `observed_at` never
     /// stamped on stale occupancy.
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
+    voice_move: Option<ActionExecutor>,
     clock: Mutex<ClockGuard>,
     buckets: Mutex<TokenBuckets>,
     telemetry: Mutex<RejectionTelemetry>,
@@ -979,6 +984,7 @@ impl ReceiverState {
             voice_cache: voice_snapshot::new_shared_cache(),
             voice_clock: VoiceOccupancyClock::new(),
             gateway_state: Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
+            voice_move: None,
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
             telemetry: Mutex::new(RejectionTelemetry::default()),
@@ -1486,6 +1492,8 @@ async fn receive(
     id: &str,
     permit: OwnedSemaphorePermit,
 ) -> Response {
+    // Start before reading the signed body or burning its nonce.
+    let wire_deadline = Instant::now() + VOICE_MOVE_BUDGET;
     let reject_boundary =
         |failure| state.reject(failure, KeyLabel::Invalid, ActionLabel::Unknown, id);
     if request.uri().path_and_query().map(|path| path.as_str()) != Some(ACTIONS_PATH) {
@@ -1565,7 +1573,10 @@ async fn receive(
     // The enabled set is the env-only flag gate, never the settings store: the
     // website must not be able to grant itself verbs. Verbs without a wired
     // effect adapter stay refused by the per-effect fences below.
-    let flags = InternalFlags::from_env();
+    let mut flags = InternalFlags::from_env();
+    if cfg!(test) && state.voice_move.is_some() {
+        flags.enabled.insert("voice.move_member".to_owned());
+    }
     let decision = {
         let mut buckets = state.buckets.lock().expect("buckets lock");
         burned.authorize(&flags, true, true, &mut buckets)
@@ -1590,7 +1601,8 @@ async fn receive(
     }
     // Mutating event verbs take the same durable claim/audit path as
     // announcements below, with their own validation and key mapping.
-    if supports_event_mutation(&decision.action) {
+    let move_nonce = (decision.action == "voice.move_member").then_some(headers.auth.nonce);
+    if supports_event_mutation(&decision.action) || move_nonce.is_some() {
         // Runs to its receipt even if the client has gone: a claimed create that
         // was dropped mid-flight must still register its key mapping. The child
         // is tracked under the receiver (never detached and ownerless) and
@@ -1603,6 +1615,8 @@ async fn receive(
         let task_decision = decision.clone();
         let task_raw = raw.to_vec();
         let task_idempotency = headers.idempotency.map(str::to_owned);
+        let delivery =
+            move_nonce.map(|nonce| two_bot_core::internal_actions::body_hash(nonce.as_bytes()));
         let task_id = id.to_owned();
         let task_key = key.clone();
         // Queued work inherits the request span: task spawning does not
@@ -1616,16 +1630,30 @@ async fn receive(
             children.spawn(
                 async move {
                     let _permit = permit;
-                    let response = mutate_event(
-                        &task_state,
-                        &task_decision,
-                        &task_raw,
-                        task_idempotency.as_deref(),
-                        &task_id,
-                        task_key,
-                        action,
-                    )
-                    .await;
+                    let response = if let Some(delivery) = delivery {
+                        match voice_move::respond(
+                            &task_state,
+                            &task_decision,
+                            (&delivery, &task_id),
+                            wire_deadline,
+                        )
+                        .await
+                        {
+                            Ok(result) => event_read_response(result, &task_id),
+                            Err(error) => task_state.reject(error, task_key, action, &task_id),
+                        }
+                    } else {
+                        mutate_event(
+                            &task_state,
+                            &task_decision,
+                            &task_raw,
+                            task_idempotency.as_deref(),
+                            &task_id,
+                            task_key,
+                            action,
+                        )
+                        .await
+                    };
                     let _ = done_tx.send(response);
                 }
                 .instrument(task_span),
@@ -1634,6 +1662,13 @@ async fn receive(
             // reaped failure already answered its own handler (or outlived it);
             // the runtime logs the panic itself.
             while children.try_join_next().is_some() {}
+        }
+        if move_nonce.is_some() {
+            return match timeout_at(wire_deadline, done_rx).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) => reject(Failure::code(ErrorCode::DiscordUnavailable), action),
+                Err(_) => reject(Failure::code(ErrorCode::UpstreamTimeout), action),
+            };
         }
         return match done_rx.await {
             Ok(response) => response,

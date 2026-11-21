@@ -143,6 +143,10 @@ capabilities; this table is not an instruction to create or stage them.
 | `TWO_INTERNAL_ALLOW_SETTINGS` | Settings get/set stay gated off |
 | `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | `voice.snapshot` stays gated off |
 
+`bind` never constructs the staged `voice.move_member` executor. Its tracked
+child retains capacity through the private nonce-bound receipt after disconnect;
+a forced drain can abort that write.
+
 Fixed receiver port: **8091** (health stays on `BOT_PORT` 8080, and the two may
 not be equal while the receiver is enabled). While enabled, 8091 joins the
 container's startup port checks, so a sidecar that cannot reach the receiver
