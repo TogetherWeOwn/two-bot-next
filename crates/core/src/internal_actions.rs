@@ -3994,14 +3994,14 @@ mod tests {
     fn attendance_authorization_is_opt_in_and_cannot_enable_the_serving_registry() {
         let vector = vec1();
         let now = vector.timestamp.parse::<u64>().unwrap() * 1000;
-        let signed = |raw: &[u8], setting: Option<&str>, trusted: bool| {
+        let signed = |raw: &[u8], signed_body: &[u8], setting: Option<&str>| {
             let nonce = test_nonce();
-            let secret = if trusted {
-                vector.secret.as_bytes()
-            } else {
-                b"fixture wrong key"
-            };
-            let sig = sign(secret, &vector.timestamp, &nonce, raw);
+            let sig = sign(
+                vector.secret.as_bytes(),
+                &vector.timestamp,
+                &nonce,
+                signed_body,
+            );
             let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
             let verified = AuthenticatedRequest::verify(
                 &headers,
@@ -4029,28 +4029,29 @@ mod tests {
             NonceBurnedRequest(verified).authorize_attendance_read(&flags, &mut TokenBuckets::new())
         };
         let valid = br#"{"action":"event.attendance.read","event_key":"fixture:1"}"#;
+        let tampered = br#"{"action":"event.attendance.read","event_key":"fixture:2"}"#;
         assert_eq!(
-            signed(valid, Some("1"), false).err().unwrap().code,
+            signed(tampered, valid, Some("1")).err().unwrap().code,
             ErrorCode::Unauthorized
         );
         for setting in [None, Some("0"), Some("true")] {
             assert_eq!(
-                signed(valid, setting, true).err().unwrap().code,
+                signed(valid, valid, setting).err().unwrap().code,
                 ErrorCode::ActionNotAllowed
             );
         }
         let wrong = br#"{"action":"event.read","event_key":"fixture:1"}"#;
         assert_eq!(
-            signed(wrong, Some("1"), true).err().unwrap().code,
+            signed(wrong, wrong, Some("1")).err().unwrap().code,
             ErrorCode::ActionNotAllowed
         );
         let malformed = br#"{"action":"event.attendance.read","event_key":"fixture/path"}"#;
         assert_eq!(
-            signed(malformed, Some("1"), true).err().unwrap().code,
+            signed(malformed, malformed, Some("1")).err().unwrap().code,
             ErrorCode::Malformed
         );
         assert_eq!(
-            signed(valid, Some("1"), true).unwrap().event_key(),
+            signed(valid, valid, Some("1")).unwrap().event_key(),
             "fixture:1"
         );
     }
