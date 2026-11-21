@@ -1,10 +1,9 @@
 use super::*;
 use serde_json::json;
-use time::OffsetDateTime;
 
 const GUILD: GuildId = Id::new(10);
-const BAD_CHUNK: &str = r#"{"op":0,"t":"GUILD_MEMBERS_CHUNK","d":{"guild_id":"10","nonce":"current","chunk_index":1,"chunk_count":2,"members":[{"user":{"id":"32","extra":1,"extra":2},"roles":[],"pending":false}]}}"#;
-const NOW: WireTime = WireTime(OffsetDateTime::UNIX_EPOCH);
+const BAD_CHUNK: &str = r#"{"op":0,"t":"GUILD_MEMBERS_CHUNK","d":{"guild_id":"10","nonce":"{nonce}","chunk_index":1,"chunk_count":2,"members":[{"user":{"id":"32","extra":1,"extra":2},"roles":[],"pending":false}]}}"#;
+const NOW: WireTime = WireTime(time::OffsetDateTime::UNIX_EPOCH);
 const VOICE: &str = r#"{"op":0,"t":"VOICE_STATE_UPDATE","d":{"guild_id":"10","user_id":"31","channel_id":"21",
     "session_id":"synthetic-session","deaf":false,"mute":false,"self_deaf":false,"self_mute":false,"self_video":false,"suppress":false}}"#;
 const DROP_ROOM: &str = r#"{"op":0,"t":"CHANNEL_DELETE","d":{"guild_id":"10","id":"20","type":2}}"#;
@@ -14,7 +13,11 @@ fn frame(kind: &str, body: Value) -> String {
     json!({"op":0,"t":kind,"d":body}).to_string()
 }
 
-fn start(join: &mut BaselineJoin, nonce: &str, roles: &[&str]) {
+fn fixture_nonce(generation: u8) -> String {
+    format!("{}-{generation}", std::process::id())
+}
+
+fn start(join: &mut BaselineJoin, generation: u8, roles: &[&str]) {
     let create = r#"{"op":0,"t":"GUILD_CREATE","d":{
         "id":"10","owner_id":"31","afk_channel_id":null,"member_count":2,
         "channels":[{"id":"20","name":"Initial","type":2,"permission_overwrites":[]},
@@ -22,17 +25,18 @@ fn start(join: &mut BaselineJoin, nonce: &str, roles: &[&str]) {
         "roles":[{"id":"10","permissions":"0"}],
         "voice_states":[{"user_id":"31","channel_id":"20"}],"guild_scheduled_events":[]
     }}"#;
-    assert!(matches!(join.begin(create, nonce.into()), Ok(Some(_))));
-    pending(join, &chunk(nonce, 0, "31", json!(roles)));
+    let request = join.begin(create, fixture_nonce(generation));
+    assert!(matches!(request, Ok(Some(_))));
+    pending(join, &chunk(generation, 0, "31", json!(roles)));
 }
 
 fn room(id: &str, name: &str) -> Value {
     json!({"id":id,"guild_id":"10","name":name,"type":2,"parent_id":null,"permission_overwrites":[]})
 }
 
-fn chunk(nonce: &str, index: u8, user: &str, roles: Value) -> String {
+fn chunk(generation: u8, index: u8, user: &str, roles: Value) -> String {
     let body = json!({
-        "guild_id":"10", "nonce":nonce, "chunk_index":index, "chunk_count":2,
+        "guild_id":"10", "nonce":fixture_nonce(generation), "chunk_index":index, "chunk_count":2,
         "members":[{"user":{"id":user},"roles":roles,"pending":false}]
     });
     frame("GUILD_MEMBERS_CHUNK", body)
@@ -45,7 +49,7 @@ fn pending(join: &mut BaselineJoin, raw: &str) {
 #[test]
 fn joins_changes_between_chunks_without_guessing_a_cascade() {
     let mut join = BaselineJoin::new(GUILD);
-    start(&mut join, "current", &["41"]);
+    start(&mut join, 0, &["41"]);
     let event = json!({
         "guild_id":"10", "id":"80", "channel_id":"21", "entity_type":2, "privacy_level":2,
         "status":1, "name":"Community event", "scheduled_start_time":"2026-11-21T13:00:00Z"
@@ -67,7 +71,7 @@ fn joins_changes_between_chunks_without_guessing_a_cascade() {
     ] {
         pending(&mut join, raw);
     }
-    let last = chunk("current", 1, "32", json!([]));
+    let last = chunk(0, 1, "32", json!([]));
     let topics = join.observe(&last, NOW).expect("valid topics");
     let json = serde_json::to_value(topics.expect("joined")).expect("JSON");
     assert_eq!(json["guild"], json!({"ownerId":"32","afkChannelId":"21"}));
@@ -90,10 +94,10 @@ fn a_dangling_voice_or_member_reference_consumes_the_attempt() {
         &VOICE.replace(r#""21""#, r#""99""#),
     ] {
         let mut join = BaselineJoin::new(GUILD);
-        start(&mut join, "current", &["41"]);
+        start(&mut join, 0, &["41"]);
         pending(&mut join, ADD_ROLE);
         pending(&mut join, raw);
-        let last = chunk("current", 1, "32", json!([]));
+        let last = chunk(0, 1, "32", json!([]));
         assert!(matches!(join.observe(&last, NOW), Err(InvalidTopics)));
         pending(&mut join, &last);
     }
@@ -111,34 +115,30 @@ fn malformed_rows_retire_both_collectors_before_replacement() {
         &frame("CHANNEL_UPDATE", room("20", "")),
         &frame("CHANNEL_UPDATE", room_with_duplicates),
         r#"{"op":0,"t":"GUILD_SCHEDULED_EVENT_DELETE","d":{"guild_id":"10","id":"80","extra":1,"extra":2}}"#,
-        BAD_CHUNK,
+        &BAD_CHUNK.replace("{nonce}", &fixture_nonce(0)),
     ] {
         let mut join = BaselineJoin::new(GUILD);
-        start(&mut join, "current", &[]);
+        start(&mut join, 0, &[]);
         let error = join.observe(raw, NOW).err();
         let refused = matches!(error, Some(AmbiguousDispatch | InvalidTopics));
         assert!(refused, "{raw}: {error:?}");
         pending(&mut join, &frame("CHANNEL_UPDATE", room("20", "Restored")));
-        pending(&mut join, &chunk("current", 1, "32", json!([])));
+        pending(&mut join, &chunk(0, 1, "32", json!([])));
     }
 }
 
 #[test]
 fn a_retired_generation_cannot_finish_its_replacement() {
     let mut join = BaselineJoin::new(GUILD);
-    for (raw, nonce) in [
-        r#"{"op":0,"t":"GUILD_DELETE","d":{"id":"10","unavailable":true}}"#,
-        r#"{"op":0,"t":"RESUMED","d":{}}"#,
-    ]
-    .into_iter()
-    .zip(["previous", "old"])
-    {
-        start(&mut join, nonce, &[]);
+    let unavailable = r#"{"op":0,"t":"GUILD_DELETE","d":{"id":"10","unavailable":true}}"#;
+    let resumed = r#"{"op":0,"t":"RESUMED","d":{}}"#;
+    for (generation, raw) in [(0, unavailable), (1, resumed)] {
+        start(&mut join, generation, &[]);
         pending(&mut join, raw);
-        pending(&mut join, &chunk(nonce, 1, "32", json!([])));
+        pending(&mut join, &chunk(generation, 1, "32", json!([])));
     }
-    start(&mut join, "current", &[]);
-    pending(&mut join, &BAD_CHUNK.replace("current", "old"));
-    let last = chunk("current", 1, "32", json!([]));
+    start(&mut join, 2, &[]);
+    pending(&mut join, &BAD_CHUNK.replace("{nonce}", &fixture_nonce(1)));
+    let last = chunk(2, 1, "32", json!([]));
     assert!(matches!(join.observe(&last, NOW), Ok(Some(_))));
 }
