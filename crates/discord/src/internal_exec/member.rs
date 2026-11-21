@@ -234,72 +234,61 @@ impl ActionExecutor {
         member_id: &str,
         channel_id: &str,
     ) -> Result<VoiceMovePatch, ActionError> {
+        use super::StrictTransportError::{Admission, PreWireDeadline, PreWireGuard};
+        use twilight_model::guild::Member;
+        use two_bot_core::send_admission::AdmissionError;
+        use VoiceMoveNotSent::{Blocked, Deadline, Guard, Storage};
+        use VoiceMovePatch::{NotSent, Unavailable};
+
         let request =
             voice_move::prepare_voice_move(&self.inner.factory, guild_id, member_id, channel_id)?;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(VOICE_MOVE_TIMEOUT_MS);
-        if !matches!(
-            tokio::time::timeout_at(deadline, self.admit(&request, Some(false))).await,
-            Ok(Ok(()))
-        ) {
-            return Ok(VoiceMovePatch::NotSent(VoiceMoveNotSent::Guard));
+        let deadline = Instant::now() + Duration::from_millis(VOICE_MOVE_TIMEOUT_MS);
+        match super::poll_before(deadline, self.admit(&request, Some(false))).await {
+            None => return Ok(NotSent(Deadline)),
+            Some(Err(_)) => return Ok(NotSent(Guard)),
+            Some(Ok(())) => {}
         }
-        Ok(self.send_voice_move(&request, deadline).await)
-    }
-
-    async fn send_voice_move(&self, request: &Request, deadline: Instant) -> VoiceMovePatch {
-        use super::StrictSettlement;
-        use super::StrictTransportError::{Admission, PreWireDeadline};
-        use two_bot_core::send_admission::AdmissionError;
-
         self.count();
         let transport = &self.inner.transport;
-        let pending = match transport
-            .send_strict_evidence_headers(request, deadline)
-            .await
-        {
+        let headers = transport
+            .send_strict_evidence_headers(&request, deadline)
+            .await;
+        let pending = match headers {
             Ok(pending) => pending,
-            Err(error) => {
-                return VoiceMovePatch::NotSent(match error {
-                    Admission(AdmissionError::Blocked) => VoiceMoveNotSent::Blocked,
-                    Admission(AdmissionError::Storage) => VoiceMoveNotSent::Storage,
-                    PreWireDeadline => VoiceMoveNotSent::Deadline,
-                    _ => return VoiceMovePatch::Unavailable,
-                })
-            }
+            Err(Admission(AdmissionError::Blocked)) => return Ok(NotSent(Blocked)),
+            Err(Admission(AdmissionError::Storage)) => return Ok(NotSent(Storage)),
+            Err(PreWireDeadline) => return Ok(NotSent(Deadline)),
+            Err(PreWireGuard) => return Ok(NotSent(Guard)),
+            Err(_) => return Ok(Unavailable),
         };
-        let status = pending.status();
+        let status = pending.pending.status;
         if let Some(refusal) = voice_move::header_refusal(status) {
-            pending.settle_rejection().await;
-            return refusal;
+            let _ = super::poll_before(deadline, pending.pending.settle_status()).await;
+            return Ok(refusal);
         }
-        let success = (200..300).contains(&status);
         let mut retry_after_ms = None;
         let settlement = pending
             .collect_validated_evidence(|evidence| {
                 if status == 429 {
                     let header = evidence.retry_after_header.and_then(|s| s.parse().ok());
-                    let body = evidence.body.and_then(|body| {
-                        serde_json::from_slice::<serde_json::Value>(body)
-                            .ok()?
-                            .get("retry_after")?
-                            .as_f64()
-                    });
+                    let body = evidence.response.body_retry_after_secs();
                     retry_after_ms = voice_move::retry_delay_ms(header, body);
                 }
-                success && evidence.body.is_some()
+                // Modify Guild Member documents a 200 with the updated member.
+                let parse = |body| serde_json::from_slice::<Member>(body).ok();
+                let receipt = evidence.body.filter(|_| status == 200).and_then(parse);
+                receipt.is_some_and(|member| member_id.parse::<u64>() == Ok(member.user.id.get()))
             })
             .await;
-        let settlement_confirmed = settlement == StrictSettlement::Confirmed;
-        if status == 429 {
-            VoiceMovePatch::Limited {
+        let settlement_confirmed = settlement == super::StrictSettlement::Confirmed;
+        Ok(match status {
+            429 => VoiceMovePatch::Limited {
                 retry_after_ms,
                 settlement_confirmed,
-            }
-        } else if success && settlement_confirmed {
-            VoiceMovePatch::Moved
-        } else {
-            VoiceMovePatch::Unavailable
-        }
+            },
+            200 if settlement_confirmed => VoiceMovePatch::Moved,
+            _ => Unavailable,
+        })
     }
 
     /// PUT /guilds/{g}/members/{u}. The token is a function argument and wire
