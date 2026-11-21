@@ -1,16 +1,23 @@
 use super::*;
 use crate::{
-    executor::{HyperTransport, PacingLane::Shared, PACE_INTERVAL_MS},
+    executor::{DiscordError, HyperTransport, PacingLane::Shared, PACE_INTERVAL_MS},
     strict_transport_fixture::{loopback, read_request, Admission},
 };
-use std::sync::{atomic::Ordering::Relaxed, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering::Relaxed},
+    Arc,
+};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
+    sync::Semaphore,
     time::timeout,
 };
-use two_bot_core::send_admission::{AdmissionError, SendAdmission, SendCooldown};
-use VoiceMoveNotSent::{Blocked, Deadline, Guard, Storage};
+use two_bot_core::send_admission::{
+    AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, SendCompletion, SendCooldown,
+    TokenKey,
+};
+use VoiceMoveNotSent::{Blocked, Deadline, Guard, Revalidation, Storage};
 use VoiceMovePatch::{Denied, Moved, NotSent, Stale, Unavailable};
 
 const TOKEN: &str = "voice-patch-fixture";
@@ -204,6 +211,166 @@ async fn voice_patch_uses_the_shared_paced_lane() {
     assert!(second.at.duration_since(first.at) >= Duration::from_millis(PACE_INTERVAL_MS));
     assert_eq!(action.requests(), 2);
     assert_no_socket(&listener).await;
+}
+
+// Unlike the receipt fixture, this refuses further claims until completion.
+#[derive(Debug)]
+struct ExclusiveLane {
+    key: TokenKey,
+    held: Arc<AtomicBool>,
+    acknowledge_strict: Semaphore,
+}
+
+impl ExclusiveLane {
+    fn new() -> Self {
+        Self {
+            key: TokenKey::for_bot_token(TOKEN).unwrap(),
+            held: Arc::default(),
+            acknowledge_strict: Semaphore::new(0),
+        }
+    }
+}
+
+impl SendAdmission for ExclusiveLane {
+    fn token_key(&self) -> &TokenKey {
+        &self.key
+    }
+
+    fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        Box::pin(async {
+            if self.held.swap(true, Relaxed) {
+                return Err(AdmissionError::Blocked);
+            }
+            Ok(AdmissionPermit::new(Box::new(Release(self.held.clone()))))
+        })
+    }
+
+    fn admit_strict(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        Box::pin(async {
+            let permit = self.admit().await?;
+            self.acknowledge_strict.acquire().await.unwrap().forget();
+            Ok(permit)
+        })
+    }
+}
+
+struct Release(Arc<AtomicBool>);
+
+impl SendCompletion for Release {
+    fn complete(
+        self: Box<Self>,
+        cooldown: Option<SendCooldown>,
+    ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+        Box::pin(async move {
+            assert_eq!(cooldown, None);
+            assert!(self.0.swap(false, Relaxed));
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn voice_patch_revalidates_after_admission_before_dispatch() {
+    for (answer, close_route, expected) in [
+        (Some(true), false, Moved),
+        (Some(false), false, NotSent(Revalidation)),
+        (Some(true), true, NotSent(Guard)),
+        (None, false, NotSent(Deadline)),
+    ] {
+        let (listener, origin) = loopback().await;
+        let gate = Arc::new(ExclusiveLane::new());
+        let action = executor(&origin, gate.clone());
+        let started = AtomicBool::new(false);
+        let release_check = Semaphore::new(0);
+        let deadline = Instant::now() + WAIT;
+        let mut sending =
+            std::pin::pin!(
+                action.move_voice_member_until("1", "2", "3", deadline, async {
+                    assert!(gate.held.load(Relaxed));
+                    started.store(true, Relaxed);
+                    release_check.acquire().await.unwrap().forget();
+                    answer.unwrap_or(true)
+                })
+            );
+        assert!(futures_util::poll!(&mut sending).is_pending());
+        assert!(gate.held.load(Relaxed));
+        assert!(!started.load(Relaxed), "claim not yet acknowledged");
+        gate.acknowledge_strict.add_permits(1);
+        assert!(futures_util::poll!(&mut sending).is_pending());
+        assert!(started.load(Relaxed));
+        assert_no_socket(&listener).await;
+
+        if close_route {
+            action.inner.transport.guard.observe_status(401, true);
+        }
+        if answer.is_none() {
+            tokio::time::pause();
+            tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
+        }
+        // In the cutoff case even a now-ready affirmative check is too late.
+        release_check.add_permits(1);
+        let actual = if expected == Moved {
+            let (result, ()) = tokio::join!(sending, async {
+                let (mut socket, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+                assert!(read_request(&mut socket).await.starts_with(b"PATCH "));
+                socket
+                    .write_all(response(200, "", MEMBER.len(), MEMBER).as_bytes())
+                    .await
+                    .unwrap();
+            });
+            result
+        } else {
+            sending.await
+        };
+        assert_eq!(actual.unwrap(), expected);
+        assert_no_socket(&listener).await;
+        gate.admit().await.unwrap().complete(None).await.unwrap();
+        if answer.is_none() {
+            tokio::time::resume();
+        }
+    }
+}
+
+#[tokio::test]
+async fn voice_preflight_deadline_releases_the_governed_read_lane() {
+    for identity in [true, false] {
+        let (listener, origin) = loopback().await;
+        let gate = Arc::new(ExclusiveLane::new());
+        let action = executor(&origin, gate.clone());
+        let deadline = Instant::now() + WAIT;
+        let reader = action.clone();
+        let reading = tokio::spawn(async move {
+            if identity {
+                reader.current_bot_user_id_until(deadline).await.map(|_| ())
+            } else {
+                reader
+                    .get_json_strict_until("/guilds/1", deadline)
+                    .await
+                    .map(|_| ())
+            }
+        });
+        let (mut socket, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+        let wire = read_request(&mut socket).await;
+        let path: &[u8] = if identity {
+            b"GET /api/v10/users/@me "
+        } else {
+            b"GET /api/v10/guilds/1 "
+        };
+        assert!(wire.starts_with(path));
+        assert!(matches!(gate.admit().await, Err(AdmissionError::Blocked)));
+        tokio::time::pause();
+        tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
+        assert!(matches!(reading.await.unwrap(), Err(DiscordError::Timeout)));
+        assert!(Instant::now() < deadline + Duration::from_millis(100));
+        tokio::time::resume();
+        assert_no_socket(&listener).await;
+
+        gate.acknowledge_strict.add_permits(1);
+        let (sending, mut next) = dispatch(&action, &listener).await;
+        let wire = response(200, "", MEMBER.len(), MEMBER);
+        next.write_all(wire.as_bytes()).await.unwrap();
+        assert_eq!(finish(sending).await, Moved);
+    }
 }
 
 #[cfg(feature = "db-tests")]
