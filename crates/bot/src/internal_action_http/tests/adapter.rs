@@ -310,11 +310,8 @@ async fn voice_move_signed_storage_refusal_releases_member_and_last_seat_without
     let _ = rustls::crypto::ring::default_provider().install_default();
     let lane = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
     // Only strict PATCH admission writes the pending generation; preflight GETs still work.
-    let alter = async |change: &str| {
-        let sql = format!("ALTER TABLE discord_send_admission {change}");
-        sqlx::query(&sql).execute(db.pool()).await.unwrap()
-    };
-    alter("ADD CONSTRAINT refuse CHECK (pending_settlement_generation IS NULL)").await;
+    let alter = async |sql: &'static str| sqlx::query(sql).execute(db.pool()).await.unwrap();
+    alter("ALTER TABLE discord_send_admission ADD CONSTRAINT refuse CHECK (pending_settlement_generation IS NULL)").await;
     let admitted = lane.admit_strict().await;
     assert_eq!(admitted.err(), Some(AdmissionError::Storage));
     let mut receiver = state(
@@ -360,7 +357,7 @@ async fn voice_move_signed_storage_refusal_releases_member_and_last_seat_without
             assert_eq!(send(FIRST, &nonce).await.2["error"]["code"], "replayed");
             // Each GET uses a fresh connection; zero further accepts means no PATCH socket.
             assert_eq!((mock.count(), mock.sockets.load(Ordering::SeqCst)), (6, 6));
-            alter("DROP CONSTRAINT refuse").await;
+            alter("ALTER TABLE discord_send_admission DROP CONSTRAINT refuse").await;
         } else {
             assert_eq!(response["result"]["outcome"], outcome);
         }
