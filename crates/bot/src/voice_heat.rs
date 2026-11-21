@@ -131,17 +131,12 @@ mod tests {
         // The timeout must be the first tick at NEXT, so the rewind below tests
         // that this attempt closed FIRST even though the write did not return.
         let started = tokio::time::Instant::now();
-        assert_eq!(
-            tokio::time::timeout(
-                VoiceHeat::TICK_TIMEOUT,
-                adapter.tick_with(NEXT, Some(7), async |buckets| {
-                    assert_eq!(buckets, original.as_slice());
-                    std::future::pending().await
-                }),
-            )
-            .await,
-            Ok(Err(JobErrorClass::Timeout))
-        );
+        let attempt = adapter.tick_with(NEXT, Some(7), async |buckets| {
+            assert_eq!(buckets, original.as_slice());
+            std::future::pending().await
+        });
+        let result = tokio::time::timeout(VoiceHeat::TICK_TIMEOUT, attempt).await;
+        assert_eq!(result.unwrap(), Err(JobErrorClass::Timeout));
         assert!((Duration::from_secs(60)..Duration::from_secs(61)).contains(&started.elapsed()));
         assert_eq!(adapter.accumulator.completed(NEXT), original);
 
@@ -162,10 +157,8 @@ mod tests {
         assert_eq!(adapter.tick(rewind, Some(8), &pool).await, Ok(()));
         let retained = adapter.accumulator.completed(LATER);
         assert_eq!(retained.len(), 1);
-        assert_eq!(
-            (retained[0].hour_start, retained[0].occupancy_sum),
-            (NEXT, 7)
-        );
+        assert_eq!(retained[0].hour_start, NEXT);
+        assert_eq!(retained[0].occupancy_sum, 7);
     }
 
     #[tokio::test]

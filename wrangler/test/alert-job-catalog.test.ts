@@ -205,7 +205,7 @@ const REGISTERED = [...new Set([
   ...directJobNames(memberRuntimeRs, "member_runtime.rs"),
   ...directJobNames(automodGatewayRs, "automod_gateway.rs"),
   ...directJobNames(lfgJobsRs, "lfg_jobs.rs"),
-  ...directJobNames(read("crates/bot/src/voice_heat_runtime.rs"), "voice_heat_runtime.rs"),
+  ...directJobNames(read("crates/bot/src/voice_snapshot.rs"), "voice_snapshot.rs"),
 ])];
 const real: Catalog = { jobs: JOBS, registered: REGISTERED, rust: RUST, worker: JOB_INTERVAL_SECONDS, ticker: TICKER_COVERED, exempt: UNKNOWN_STALE_JOBS };
 

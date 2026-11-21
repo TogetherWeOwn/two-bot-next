@@ -16,7 +16,6 @@ use two_bot_core::{
     WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS,
     SCHEDULED_EVENTS_INTERVAL_MS,
 };
-use two_bot_cutover::retention::RetentionMode;
 use two_bot_discord::executor::{ActionExecutor, DiscordError};
 use two_bot_discord::internal_events::canonical_snowflake;
 
@@ -426,16 +425,11 @@ pub async fn serve(
     // missing/unusable database parks the job without attempting destructive
     // work; the `/readyz` status entry exists either way.
     match retention {
-        RetentionRegistration::Active(pool, mode, heat_guild) => {
-            if let Some(guild) = heat_guild {
-                registered.push(heat::job(
-                    pool.clone(),
-                    guild,
-                    voice_cache,
-                    gateway.gateway.clone(),
-                ));
+        RetentionRegistration::Active(job, heat) => {
+            if let Some((pool, guild)) = heat {
+                registered.push(heat::job(pool, guild, voice_cache, gateway.gateway.clone()));
             }
-            registered.push(crate::retention_jobs::job(pool, mode));
+            registered.push(job);
         }
         RetentionRegistration::Parked => parked.push(crate::retention_jobs::NAME),
     }
@@ -480,20 +474,10 @@ pub async fn serve(
     serve_jobs(registered, status, shutdown.clone(), http).await
 }
 
-/// Retention registration outcome: validated inputs for an active supervised
-/// job, or a parked status entry with no job.
+/// An active retention job with optional sampler bindings, or a parked entry.
 pub(crate) enum RetentionRegistration {
-    Active(PgPool, RetentionMode, Option<u64>),
+    Active(Job, Option<(PgPool, u64)>),
     Parked,
-}
-
-impl RetentionRegistration {
-    pub(crate) fn heat_guild(&self) -> Option<u64> {
-        match self {
-            Self::Active(_, _, guild) => *guild,
-            Self::Parked => None,
-        }
-    }
 }
 
 /// Resolve the retention scheduler registration from the process environment
@@ -517,18 +501,20 @@ pub(crate) fn retention_registration(config: &Config) -> RetentionRegistration {
     let url = config
         .database_url
         .as_ref()
-        .map(|secret| secret.expose().as_str())
+        .map(|secret| secret.expose().as_str().to_owned())
         .filter(|url| !url.is_empty());
     let Some(url) = url else {
         return RetentionRegistration::Parked;
     };
-    match crate::retention_jobs::pool_from_url(url) {
+    match crate::retention_jobs::pool_from_url(&url) {
         Ok(pool) => {
-            let heat_guild = match (mode, crate::gateway_prerequisites(config)) {
-                (RetentionMode::Execute, Ok((_, _, guild))) => Some(guild),
+            let heat = match (mode, crate::gateway_prerequisites(config)) {
+                (two_bot_cutover::retention::RetentionMode::Execute, Ok((_, _, guild))) => {
+                    Some((pool.clone(), guild))
+                }
                 _ => None,
             };
-            RetentionRegistration::Active(pool, mode, heat_guild)
+            RetentionRegistration::Active(crate::retention_jobs::job(pool, mode), heat)
         }
         Err(_) => {
             tracing::warn!("retention parked: invalid database configuration");

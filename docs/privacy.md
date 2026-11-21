@@ -299,12 +299,9 @@ For hourly voice heat (`voice_heat_hours`), the same job uses a strict cutoff:
 rows whose hour starts more than 35 elapsed days before the sweep qualify.
 Dry runs count those rows without deleting; `execute` deletes them once the
 reviewed role plan grants the runtime access. Until those grants are applied,
-the runtime parks the heat sweep in both modes. The five-minute sampler is
-registered only with `TWO_RETENTION_MODE=execute`, a valid runtime database
-configuration and configured gateway prerequisites. It shares the retention
-job's database pool. A stopped gateway or incomplete cache leaves a gap;
-completed hours can still flush, and each write prunes expired rows in the
-same transaction. The website reader cannot access the underlying table.
+the runtime parks the heat sweep in both modes. With `TWO_RETENTION_MODE=execute`, a
+valid database and configured gateway, the private five-minute sampler shares the
+retention pool. Gaps still allow atomic flush/prune. No website reader has access.
 
 No other automatic age-based purger is installed: do not claim a live TTL
 beyond the windows this job enforces. Every run reports per-class metrics.

@@ -1198,13 +1198,9 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     }
   }
 
-  // A rollback omits heat gauges; absence is not recovery.
-  for (const [rule, name] of [
-    ["job_consecutive_failures", "two_bot_job_consecutive_failures"],
-    ["job_unknown_stale", "two_bot_job_last_success_timestamp_seconds"],
-  ] as const) {
-    const key = `${rule}:${VOICE_HEAT_JOB}`;
-    if (prev.firing.includes(key) && !samples.some((s) => s.name === name && s.labels.job === VOICE_HEAT_JOB)) firing.push(key);
+  // The strict scrape accepts all heat rows or none. Rollback is not recovery.
+  if (!samples.some((s) => s.name === "two_bot_job_consecutive_failures" && s.labels.job === VOICE_HEAT_JOB)) {
+    firing.push(...prev.firing.filter((key) => key === `job_consecutive_failures:${VOICE_HEAT_JOB}` || key === `job_unknown_stale:${VOICE_HEAT_JOB}`));
   }
 
   // An unreadable sweep retains the old gauge, not an absent sample. Its

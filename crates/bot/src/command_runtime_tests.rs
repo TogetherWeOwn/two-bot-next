@@ -1527,6 +1527,53 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
+async fn automod_preview_dispatch_counts_refusals_and_a_failed_callback() {
+    use two_bot_core::automod_preview_report::PREVIEW_NOT_EVALUATED_REPLY;
+
+    let (mock, origin) = MockRest::start(vec![200, 200, 200, 400]).await;
+    let manage = Permissions::MANAGE_GUILD;
+    let denied = RouterRefusal::AutomodPreviewPermission.message();
+    let interaction = slash(
+        "automod-preview",
+        Some(CHANNEL),
+        vec![option(
+            "text",
+            CommandOptionValue::String("synthetic".into()),
+        )],
+    );
+    for (configured_guild, moderation, permissions, expected) in [
+        (GUILD + 1, true, manage, PREVIEW_NOT_EVALUATED_REPLY),
+        (GUILD, false, manage, PREVIEW_NOT_EVALUATED_REPLY),
+        (GUILD, true, Permissions::empty(), denied.as_str()),
+        // Authorized handler, but this runtime has no AutoMod activation.
+        (GUILD, true, manage, PREVIEW_NOT_EVALUATED_REPLY),
+    ] {
+        let router_gates = RouterGates {
+            configured_guild: Some(configured_guild),
+            moderation,
+            ..gates(true, false)
+        };
+        let runtime = runtime_without_db(router_gates, true, origin.clone());
+        let metrics = runtime.preview_metrics.get_or_init(Default::default);
+        runtime
+            .on_interaction(&from_member(interaction.clone(), 42, permissions))
+            .await;
+        let reply = callback_json(mock.requests().last().expect("preview callback"));
+        assert_eq!(reply["data"]["content"], expected);
+        assert_eq!(reply["data"]["flags"], 64);
+        let text = metrics.render(None);
+        let mut counted = text.lines().filter(|line| {
+            line.starts_with("two_bot_automod_previews_total{") && !line.ends_with(" 0")
+        });
+        let sample = r#"two_bot_automod_previews_total{result="not_evaluated",filter="none",mode="not_evaluated"} 1"#;
+        assert_eq!(counted.next(), (permissions == manage).then_some(sample));
+        assert_eq!(counted.next(), None);
+    }
+    assert_eq!(mock.requests().len(), 4);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 #[ignore = "requires disposable agent-testdb for the preview audit receipt"]
 async fn automod_preview_dispatch_uses_ingress_clocks_even_when_busy() {
     use crate::command_runtime::{LANE_BUSY, LANE_INTERACTIONS};

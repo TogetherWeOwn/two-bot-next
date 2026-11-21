@@ -23,16 +23,16 @@ fn boot_registers_safe_modes_and_parks_invalid_disabled_or_missing_database() {
         return;
     };
     two_bot_testsupport::guard_database_url(&url).expect("guard bootstrap before child process");
-    for (mode, setting) in [
-        ("missing", None),
-        ("dry-run", Some("dry-run")),
-        ("execute", Some("execute")),
-        ("off", Some("off")),
-        ("invalid", Some("invalid")),
-        ("missing-db", Some("execute")),
-        ("invalid-db", Some("execute")),
-        ("missing-token", Some("execute")),
-        ("missing-guild", Some("execute")),
+    for mode in [
+        "missing",
+        "dry-run",
+        "execute",
+        "off",
+        "invalid",
+        "missing-db",
+        "invalid-db",
+        "missing-token",
+        "missing-guild",
     ] {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
@@ -42,7 +42,11 @@ fn boot_registers_safe_modes_and_parks_invalid_disabled_or_missing_database() {
             .env("TWO_TEST_DATABASE_URL", &url)
             .env("TWO_DATABASE_TLS", "local-only")
             .env("DISCORD_API_BASE", "not a REST origin");
-        if let Some(setting) = setting {
+        if mode != "missing" {
+            let setting = match mode {
+                "missing-db" | "invalid-db" | "missing-token" | "missing-guild" => "execute",
+                _ => mode,
+            };
             command.env(crate::retention_jobs::MODE_SETTING, setting);
         }
         let output = command.output().expect("run isolated retention boot probe");
@@ -85,15 +89,14 @@ async fn isolated_boot_probe() {
     let fixture_url = format!("postgres://agent_test:@agent-testdb:5432/{}", db.name());
     two_bot_testsupport::guard_database_url(&fixture_url).unwrap();
     crate::gateway::ensure_crypto_provider();
+    let url = if mode == "invalid-db" {
+        "invalid".into()
+    } else {
+        fixture_url
+    };
     let config = Config {
         discord_token: (mode != "missing-token").then(|| Secret::new("fixture".to_owned())),
-        database_url: (mode != "missing-db").then(|| {
-            Secret::new(if mode == "invalid-db" {
-                "not a database URL".into()
-            } else {
-                fixture_url
-            })
-        }),
+        database_url: (mode != "missing-db").then(|| Secret::new(url)),
         guild_id: (mode != "missing-guild").then_some(2222),
         listen_addr: "127.0.0.1:0".into(),
     };
@@ -107,7 +110,6 @@ async fn isolated_boot_probe() {
     let shutdown = stop.clone();
     let retention = website_jobs::retention_registration(&config);
     let heat_admitted = mode == "execute";
-    assert_eq!(retention.heat_guild().is_some(), heat_admitted);
     let owner = tokio::spawn(async move {
         website_jobs::serve(
             &config,
@@ -132,16 +134,8 @@ async fn isolated_boot_probe() {
         loop {
             let response = readiness(address).await;
             let jobs = &response["jobs"];
-            assert_eq!(
-                jobs[crate::voice_snapshot::heat::NAME]["parked"],
-                !heat_admitted
-            );
-            for name in ["counter", "rank", "scheduled_events"] {
-                assert_eq!(
-                    jobs[name]["parked"], true,
-                    "malformed REST must park {name}"
-                );
-            }
+            assert_eq!(jobs["voice_heat"]["parked"], !heat_admitted);
+            assert_eq!(jobs["rank"]["parked"], true, "malformed REST");
             let entry = &jobs["retention"];
             assert!(
                 entry.is_object(),

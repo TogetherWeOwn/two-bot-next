@@ -70,22 +70,14 @@ test("voice heat rows are all-or-nothing without holding other jobs' failure sha
 });
 
 test("rollback holds only the missing heat gauges until healthy readings return", () => {
-  const lines = metricsLines(3);
-  const evaluate = (rows: string[], prev = EMPTY_STATE) => {
-    const samples = parseAlertScrape(rows.join("\n"));
-    assert.ok(samples);
-    return evaluateMetrics(samples, prev, 10_000).state;
-  };
-  const active = evaluate(lines.map((line) => isHeat(line)
-    ? line.replace(/^(two_bot_job_consecutive_failures.*) 0$/, "$1 3")
-      .replace(/^(two_bot_job_last_success_timestamp_seconds.*) 0$/, "$1 1") : line));
-  const heatAlerts = ["job_consecutive_failures:voice_heat", "job_unknown_stale:voice_heat"];
-  for (const key of [...heatAlerts, "job_consecutive_failures:rank"]) assert.ok(active.firing.includes(key), key);
-  const rolledBack = evaluate(metricsLines().filter((line) => !isHeat(line)), active);
-  for (const key of heatAlerts) assert.ok(rolledBack.firing.includes(key), key);
-  assert.ok(!rolledBack.firing.includes("job_consecutive_failures:rank"));
-  const healthy = evaluate(metricsLines(), rolledBack);
-  for (const key of heatAlerts) assert.ok(!healthy.firing.includes(key), key);
+  const healthy = metricsLines();
+  const heat = ["job_consecutive_failures:voice_heat", "job_unknown_stale:voice_heat"];
+  const evaluate = (rows: string[], prev = EMPTY_STATE) => evaluateMetrics(parseAlertScrape(rows.join("\n"))!, prev, 10_000).state;
+  const baseline = evaluate(healthy);
+  const rollback = healthy.filter((line) => !isHeat(line)).map((line) => line.replace('incarnation{part="3"} 1', 'incarnation{part="3"} 2'));
+  const held = evaluate(rollback, { ...baseline, firing: [...heat, "job_consecutive_failures:rank"] });
+  assert.deepEqual(held.firing.filter((key) => key.startsWith("job_")), heat);
+  assert.deepEqual(evaluate(healthy, held).firing.filter((key) => key.endsWith(":voice_heat")), []);
 });
 
 test("older exposition without the optional gauges still parses", () => {

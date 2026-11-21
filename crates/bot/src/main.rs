@@ -614,7 +614,8 @@ async fn run(cli_args: &[String]) {
     // Filled by the gateway task; read by the shared maintenance tick.
     let automod_slot: automod_gateway::Slot = Arc::default();
     let retention = website_jobs::retention_registration(&config);
-    let heat_bootstrap = retention.heat_guild().is_some();
+    use website_jobs::RetentionRegistration::Active;
+    let heat_bootstrap = matches!(&retention, Active(_, Some(_)));
     let gateway_task = if let Ok((token, url, guild_id)) = gateway_prerequisites(&config) {
         let token = token.to_owned();
         let url = url.to_owned();
@@ -931,12 +932,12 @@ async fn run(cli_args: &[String]) {
                             Box::pin(async move { voice.kick_vote(interaction).await })
                         }));
                     }
+                    let voice =
+                        voice.or_else(|| heat_bootstrap.then(voice_snapshot::heat::bootstrap_sink));
                     // Staging-only music voice-update capture (dry-run): wraps
                     // the voice sink so VoiceServerUpdate/self VoiceStateUpdate
                     // feed the Lavalink pairing without touching rooms. Inert
                     // unless TWO_MUSIC=1; the tap refuses non-staging guilds.
-                    let voice =
-                        voice.or_else(|| heat_bootstrap.then(voice_snapshot::heat::bootstrap_sink));
                     let voice = music_capture::MusicVoiceTap::wrap(voice, Some(guild_id));
 
                     let intents = intents_from_env(&activation);

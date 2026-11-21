@@ -283,12 +283,12 @@ pub(crate) mod heat {
 
     use crate::{
         gateway::GatewayState,
-        jobs::{self, ErrorClass, Job},
+        jobs::{self, Job},
     };
 
     pub(crate) const NAME: &str = "voice_heat";
     const CADENCE: Duration = Duration::from_secs(300);
-
+    type Gateway = RwLock<GatewayState>;
     /// Without room actors, still ask the shard to rebuild the cache after cold replay.
     pub(crate) fn bootstrap_sink() -> Arc<dyn two_bot::voice_rooms::VoiceEventSink> {
         use twilight_cache_inmemory::DefaultInMemoryCache;
@@ -309,7 +309,7 @@ pub(crate) mod heat {
         pool: PgPool,
         guild: Snowflake,
         cache: Arc<SharedCache>,
-        gateway: Arc<RwLock<GatewayState>>,
+        gateway: Arc<Gateway>,
     ) -> Job {
         let buffer = Arc::new(Mutex::new(VoiceHeat::default()));
         Job {
@@ -323,77 +323,24 @@ pub(crate) mod heat {
                     (pool.clone(), cache.clone(), gateway.clone(), buffer.clone());
                 Box::pin(async move {
                     let mut buffer = buffer.lock().await;
-                    tick(
-                        &mut buffer,
-                        &pool,
-                        &cache,
-                        &gateway,
-                        guild,
-                        OffsetDateTime::now_utc(),
-                    )
-                    .await
+                    let total = observation(&cache, &gateway, guild);
+                    buffer.tick(OffsetDateTime::now_utc(), total, &pool).await
                 })
             }),
         }
     }
 
-    async fn tick(
-        buffer: &mut VoiceHeat,
-        pool: &PgPool,
+    pub(super) fn observation(
         cache: &SharedCache,
-        gateway: &RwLock<GatewayState>,
+        gateway: &Gateway,
         guild: Snowflake,
-        now: OffsetDateTime,
-    ) -> Result<(), ErrorClass> {
-        // Hold the gateway state stable through the fenced cache read. Neither
-        // fence waits: a transition or rebuild is a gap, and never holds up a flush.
-        let total = gateway.try_read().ok().and_then(|state| {
-            if *state != GatewayState::Connected {
-                return None;
-            }
-            let total = super::read_voice_total(cache, guild).ok()?;
-            i64::try_from(total).ok()
-        });
-        buffer.tick(now, total, pool).await
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-        use time::{macros::datetime, Duration as WallDuration};
-        use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
-
-        #[tokio::test]
-        async fn only_a_connected_complete_snapshot_adds_an_observation() {
-            let cache = crate::voice_snapshot::new_shared_cache();
-            let gateway = Arc::new(RwLock::new(GatewayState::Connected));
-            let pool =
-                PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new_without_pgpass());
-            pool.close().await;
-            let job = job(pool.clone(), 100, cache.clone(), gateway.clone());
-            assert_eq!(job.cadence, CADENCE);
-            assert_eq!(job.timeout, VoiceHeat::TICK_TIMEOUT);
-            assert_eq!((job.action)().await, Ok(()));
-
-            let mut buffer = VoiceHeat::default();
-            use GatewayState::{Armed, Connected, Draining};
-            let mut probe = async |state, hour| {
-                *gateway.write().await = state;
-                let now = datetime!(2026-11-21 00:00 UTC) + WallDuration::hours(hour);
-                tick(&mut buffer, &pool, &cache, &gateway, 100, now).await
-            };
-            assert_eq!(probe(Connected, 0).await, Ok(()));
-            cache.update(&Event::GuildCreate(Box::new(GuildCreate::Available(
-                serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json"))
-                    .expect("complete, empty guild fixture"),
-            ))));
-            // The cold and disconnected ticks did not buffer a zero.
-            assert_eq!(probe(Armed, 1).await, Ok(()));
-            assert_eq!(probe(Connected, 2).await, Ok(()));
-            // A true zero is buffered, then the next gap tries to flush it.
-            assert_eq!(probe(Draining, 3).await, Err(ErrorClass::Database));
+    ) -> Option<i64> {
+        // Keep the connected fence held through the complete cache read.
+        let state = gateway.try_read().ok()?;
+        if *state != GatewayState::Connected {
+            return None;
         }
+        i64::try_from(super::read_voice_total(cache, guild).ok()?).ok()
     }
 }
 
@@ -578,6 +525,36 @@ pub(crate) fn project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_a_connected_complete_snapshot_adds_an_observation() {
+        use crate::{gateway::GatewayState::*, jobs::ErrorClass};
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        use time::{macros::datetime, Duration};
+        use tokio::sync::RwLock;
+        use two_bot::voice_heat::VoiceHeat;
+
+        let cache = new_shared_cache();
+        let gateway = Arc::new(RwLock::new(Connected));
+        let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new_without_pgpass());
+        pool.close().await;
+        let job = heat::job(pool.clone(), 100, cache.clone(), gateway.clone());
+        assert_eq!((job.action)().await, Ok(()));
+        let mut buffer = VoiceHeat::default();
+        let mut probe = async |state, hour| {
+            *gateway.write().await = state;
+            let now = datetime!(2026-11-21 00:00 UTC) + Duration::hours(hour);
+            buffer
+                .tick(now, heat::observation(&cache, &gateway, 100), &pool)
+                .await
+        };
+        assert_eq!(probe(Connected, 0).await, Ok(()));
+        cache.update(&pipeline_guild(&[]));
+        assert_eq!(probe(Armed, 1).await, Ok(()));
+        assert_eq!(probe(Connected, 2).await, Ok(()));
+        // Neither gap created a zero; the true zero now reaches the closed pool.
+        assert_eq!(probe(Draining, 3).await, Err(ErrorClass::Database));
+    }
 
     #[test]
     fn guild_snapshot_eligibility_tracks_gateway_lifecycle() {
