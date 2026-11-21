@@ -96,3 +96,17 @@ fn generation_exhaustion_fails_closed_without_wrapping() {
     holds.observe(MEMBER, Some(TARGET), exhausted);
     assert_eq!(holds.occupancy(MEMBER, TARGET, 0), Err(HoldRefused));
 }
+
+#[test]
+fn reserved_occupancy_counts_own_seat_only_for_the_matching_pending_hold() {
+    let mut holds = VoiceMoveHolds::default();
+    assert_eq!(holds.reserved_occupancy(1, 2, 0), None);
+    holds.reserve(1, 2).unwrap();
+    holds.reserve(3, 2).unwrap();
+    holds.reserve(4, 5).unwrap();
+    assert_eq!(holds.reserved_occupancy(1, 2, 4), Some(6));
+    assert_eq!(holds.reserved_occupancy(1, 5, 0), None);
+    holds.complete(1);
+    assert_eq!(holds.reserved_occupancy(1, 2, 0), None);
+    assert_eq!(holds.reserved_occupancy(3, 2, 0), Some(2));
+}
