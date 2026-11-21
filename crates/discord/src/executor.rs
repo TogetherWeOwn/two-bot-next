@@ -5133,7 +5133,9 @@ impl two_bot_core::stream_live_store::LiveSender for ActionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strict_transport_fixture::{loopback, read_request, Admission};
     use std::sync::atomic::Ordering;
+    use tokio::time::{advance, pause, resume, timeout};
     use two_bot_core::send_admission::{
         AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, TokenKey,
     };
@@ -5780,9 +5782,6 @@ mod tests {
 
     #[tokio::test]
     async fn governed_read_cutoff_settles_only_a_ready_claim_without_dispatch() {
-        use crate::strict_transport_fixture::{loopback, Admission};
-        use tokio::time::{advance, pause, resume, timeout};
-
         for (started, acknowledged) in [(false, false), (true, true), (true, false)] {
             let (listener, origin) = loopback().await;
             let mut lane = Admission::new(READ_TOKEN, None, None);
@@ -5821,8 +5820,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_cutoff_accounts_for_already_ready_429_headers() {
-        use crate::strict_transport_fixture::{loopback, read_request, Admission};
-        use tokio::{io::AsyncWriteExt as _, sync::Notify, time};
+        use tokio::{io::AsyncWriteExt as _, sync::Notify};
         use two_bot_core::send_admission::SendCooldown;
 
         struct ReplyReady(Notify);
@@ -5850,10 +5848,11 @@ mod tests {
         let mut cx = std::task::Context::from_waker(&waker);
         assert!(read.as_mut().poll(&mut cx).is_pending());
         socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nX-RateLimit-Global: true\r\nContent-Length: 0\r\n\r\n").await.unwrap();
-        let wake = time::timeout(Duration::from_secs(1), ready.0.notified());
-        wake.await.unwrap();
-        time::pause();
-        time::advance(at - Instant::now()).await;
+        timeout(Duration::from_secs(1), ready.0.notified())
+            .await
+            .unwrap();
+        pause();
+        advance(at - Instant::now()).await;
         let (res, global) = read.await.unwrap().collect_with(Some(at)).await.unwrap();
         assert_eq!((res.status, global), (429, true));
         let completions = lane.completed.lock().unwrap();
@@ -5862,9 +5861,6 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_preflight_gets_honor_earliest_cutoff_and_release_lane() {
-        use crate::strict_transport_fixture::{loopback, read_request, Admission};
-        use tokio::time::{advance, pause, resume, timeout};
-
         for identity in [true, false] {
             for (configured, caller, effective) in [(3, 2, 2), (3, 30, 3), (30, 30, 5)] {
                 let (listener, origin) = loopback().await;

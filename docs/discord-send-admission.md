@@ -148,7 +148,8 @@ rules and the lease duration are unchanged.
 
 `get_json_strict_until` and `current_bot_user_id_until` cap the caller’s deadline
 at the moderation budget (five seconds max). At cutoff the owner only settles
-ready claims or received 429 headers; it starts no claim write or GET.
+ready claims or received 429 headers. A timed-out claim transaction discards
+its connection without flushing any buffered writes.
 
 Strict admission is an opt-in pre-wire capability. Migration 0473 adds a
 pending-settlement generation constrained to match an occupied lane. An

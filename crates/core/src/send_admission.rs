@@ -82,8 +82,8 @@ pub trait SendAdmission: Send + Sync + fmt::Debug {
     fn token_key(&self) -> &TokenKey;
     fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>>;
 
-    /// Bounded ordinary claim. Stores may recover a ready permit at cutoff
-    /// only if no new claim write can start in that poll.
+    /// Bounded ordinary claim. At cutoff, recover only a ready permit without
+    /// polling any work that may still write.
     fn admit_until(&self, at: tokio::time::Instant) -> ClaimFuture<'_> {
         Box::pin(async move { before_claim_cutoff(at, self.admit()).await? })
     }
@@ -183,14 +183,17 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn claim_wait_ready_at_cutoff_does_not_poll_write() {
+    async fn claim_cutoff_does_not_flush_buffered_commit() {
         use tokio::time::{sleep_until, Duration, Instant};
         let at = Instant::now() + Duration::from_secs(1);
-        let write = async {
+        let mut queued = false;
+        let commit = async {
+            queued = true;
             sleep_until(at).await;
-            panic!("must not submit the write");
+            panic!("must not flush COMMIT once writable at cutoff");
         };
-        let result = before_claim_cutoff(at, write).await;
+        let result = before_claim_cutoff(at, commit).await;
+        assert!(queued);
         assert!(matches!(result, Err(AdmissionError::Deadline)));
     }
 

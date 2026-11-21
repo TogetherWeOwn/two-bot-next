@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
 use crate::metrics;
-use sqlx::{postgres::PgRow, Execute, Executor, PgPool, Postgres, Row};
+use sqlx::{postgres::PgRow, Acquire, Execute, Executor, PgPool, Postgres, Row};
 use tokio::time::Instant;
 
 #[path = "strict.rs"]
@@ -126,23 +126,27 @@ impl PgSendAdmission {
         let Some(at) = at else {
             return Ok(self.pool.fetch_optional(query).await);
         };
-        // Fence checkout and DML on every poll. Drop rolls back; only a
-        // submitted COMMIT may leave the lane occupied at cutoff.
-        let mut tx = match before_claim_cutoff(at, self.pool.begin()).await? {
-            Ok(tx) => tx,
+        let mut conn = match before_claim_cutoff(at, self.pool.acquire()).await? {
+            Ok(conn) => conn,
             Err(error) => return Ok(Err(error)),
         };
-        let row = before_claim_cutoff(at, (&mut *tx).fetch_optional(query)).await?;
-        let Ok(Some(row)) = row else { return Ok(row) };
-        if Instant::now() >= at {
-            return Err(AdmissionError::Deadline);
+        let result = async {
+            let mut tx = match before_claim_cutoff(at, conn.begin()).await? {
+                Ok(tx) => tx,
+                Err(error) => return Ok(Err(error)),
+            };
+            let row = before_claim_cutoff(at, (&mut *tx).fetch_optional(query)).await?;
+            let Ok(Some(row)) = row else { return Ok(row) };
+            // SQLx can flush COMMIT on any pending poll. Only its completed
+            // result acknowledges the claim; never probe the socket at cutoff.
+            let committed = before_claim_cutoff(at, tx.commit()).await?;
+            Ok(committed.map(|()| Some(row)))
         }
-        // DML drained ReadyForQuery; subsequent COMMIT polls only await its reply.
-        let commit = tokio::time::timeout_at(at, tx.commit());
-        Ok(commit
-            .await
-            .map_err(|_| AdmissionError::Deadline)?
-            .map(|()| Some(row)))
+        .await;
+        if matches!(result, Err(AdmissionError::Deadline)) {
+            drop(conn.detach()); // Pool return can flush a buffered COMMIT.
+        }
+        result
     }
 
     fn claim(&self, at: Option<Instant>) -> ClaimFuture<'_> {
