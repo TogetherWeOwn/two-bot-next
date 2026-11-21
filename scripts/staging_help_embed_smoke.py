@@ -510,7 +510,6 @@ def fences(guild_id, token, channel_id):
 
 
 def run(payload_path, guild_id, token, channel_id, transport=None):
-    """Fences, identity, channel, then each embed round trip."""
     report = Report()
     try:
         guild, channel = fences(guild_id, token, channel_id)
@@ -526,6 +525,8 @@ def run(payload_path, guild_id, token, channel_id, transport=None):
         report.rows.append(Row("preflight", "fail", str(error)))
         return report
     for key in EMBED_KEYS:
+        if report.rows and transport is None:
+            time.sleep(1.1)
         report.rows.append(
             smoke_one(net, key, embeds[key], expected[key], application_id, channel))
         if report.rows[-1].cleanup_failed:

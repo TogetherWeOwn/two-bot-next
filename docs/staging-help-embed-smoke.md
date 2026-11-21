@@ -1,8 +1,6 @@
 # Staging help embed smoke
 
-This human-free smoke checks whether Discord serves each branded embed with
-its kit colour and footer intact. It runs after staging deploys and can also
-be dispatched by hand.
+This smoke checks Discord's branded embed readback after staging deploys or a manual dispatch.
 
 Discord creates slash-command interactions only for real users, so this smoke
 does not invoke `/help` and does not claim to prove gateway interaction
@@ -13,8 +11,7 @@ ordered fields. It does not post buttons or verify callback behavior.
 ## Flow
 
 1. CI builds `help_embed_smoke_payloads`, a Rust example in the discord crate.
-   It calls the builders below, passes Help replies through the executor
-   sanitizer, and emits the embeds and their expected kit values.
+   It sanitizes Help replies and emits the rendered embeds with their kit expectations.
 2. `scripts/staging_help_embed_smoke.py` fences the run to the staging guild
    and to a dedicated test bot (TWO Voice Synthetic (staging)): the token
    must belong to a bot account that is none of the product applications and
@@ -25,11 +22,9 @@ ordered fields. It does not post buttons or verify callback behavior.
    [the slash smoke doc](staging-slash-smoke.md#why-it-is-not-a-github-workflow).
 3. For each post, it reads `GET /channels/{channel_id}/messages/{message_id}`
    and asserts on that read-back—never the POST response—that:
-   - the single embed matches its row’s colour and footer text and icon policy;
    - the discovery footer says `Together We Own · Help · Page 1 of N`,
      where `N` is the page count; the detail footer says `Together We Own · Help`;
-   - Icon 1 rows use `BRAND_ICON_URL`, text-only footers omit it, and no
-     embed byline is expected (the message author must be the test bot);
+   - each embed matches its row’s kit colour, footer text and Icon 1 policy. The test bot authors every message.
    - the title, description and ordered fields match the sanitized payload
      after trimming outer whitespace.
 4. It deletes each message, pass or fail, and writes evidence containing
@@ -55,14 +50,10 @@ payload artifact contains only synthetic fixture embeds, not staging messages.
 | `rsvp_ok`, `rsvp_error` | `rsvp_reply_embed` (RSVP and attendance) | Ok, Danger | Events | None |
 | `voice_ok`, `voice_warn`, `voice_error` | `ephemeral_reply_embed` (shared by Voice replies) | Ok, Warn, Danger | Voice | None |
 
-Later Help pages reuse the first-page renderer; button navigation and all
-recovery copy variants have hermetic tests in `help_navigation/tests.rs`.
-Short replies and overflow handling have hermetic tests in `interactions.rs`.
-Voice outcome selection and deferred completion stay in hermetic handler tests;
-these posts only exercise the shared builder. Moderation confirmations and
-audit entries are plain text: `member_runtime.rs` and `audit.rs` test severity
-labels and the unban exception without moderating a member. Ephemeral visibility,
-event and room changes, and DM delivery require separate evidence.
+Hermetic tests cover Help navigation, recovery and overflow, plus Voice outcomes and deferred completion.
+Moderation remains text-only. The member runtime and audit tests cover severity labels and the unban exception.
+Ephemeral visibility, event and room changes, and DM delivery require separate evidence.
+CI checks Rust-generated payloads with the Python reader offline. Live sends pause 1.1 seconds between rows.
 
 ## Token source and updates
 
@@ -108,8 +99,7 @@ This is the approved Icon 1 dark 512×512 PNG, already imported as image
 `two-icon1-dark512-4469ca165f03`, served with the existing `public` variant.
 No upload, new variant or credential is needed by the bot.
 
-Help, announcement and Echo use this URL through `brand_footer_for`.
-None adds an author icon.
+Help, announcement and Echo use this URL through `brand_footer_for` and omit the author icon.
 Changing this constant does not synchronize the bot avatar.
 
 Keep `assets/brand/two-icon-1-dark-512.png` unchanged (29,035 bytes; SHA-256
@@ -230,8 +220,7 @@ python3 scripts/cargo_cache.py run -- run -p two-bot-discord --example help_embe
 - Exit `0` / `VERDICT PASS`: all read-backs matched and all test messages
   were deleted.
 - Exit `1` / `VERDICT FAIL`: identity, channel, post, read-back or brand
-  failed. The row names the first fixed-vocabulary fault; a failed
-  embed row does not stop the others.
+  failed. Later embed rows still run after successful cleanup.
 - Exit `2` / `REFUSED`: a fence stopped the run before any post, for example
   the wrong guild, a missing or malformed token, a missing channel, an
   invalid snowflake or an invalid or already-unbranded payload file.
@@ -240,8 +229,7 @@ python3 scripts/cargo_cache.py run -- run -p two-bot-discord --example help_embe
   remain in the dedicated test channel. The workflow fails at once on
   this status instead of retrying, so a later clean attempt cannot read
   green over the leftover. A lost post that reconciliation removes (or
-  proves absent) stays a retryable exit `1`. The runner stops posting after a
-  cleanup failure.
+  proves absent) stays a retryable exit `1`. Failed cleanup stops further posts.
 
 A brand mismatch in the generated payload fails before posting. A mismatch
 only on the read-back means Discord did not serve the posted brand fields as

@@ -206,9 +206,12 @@ class HelpEmbedSmokeTests(unittest.TestCase):
             source, rf'BRAND_ICON_URL: &str =\s*"{re.escape(EXPECTED["icon_url"])}";')
 
     def test_every_embed_posts_reads_back_and_deletes(self):
-        fake = FakeDiscord()
-        code, out = self.run_main(fake)
+        fake, pauses = FakeDiscord(), []
+        with (mock.patch.object(smoke, "make_transport", return_value=fake),
+              mock.patch.object(smoke.time, "sleep", side_effect=lambda delay: pauses.append((len(fake.posts()), delay)))):
+            code, out = self.run_main(None)
         self.assertEqual(0, code)
+        self.assertEqual([(count, 1.1) for count in range(1, len(ROW_CONTRACTS))], pauses)
         self.assertIn("VERDICT PASS", out)
         posts = fake.posts()
         want = payloads()["embeds"]
