@@ -109,11 +109,15 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md#production-merge-evidence).
 
 ## Modern web platform guidance
 
-This repo has no web UI yet. When a web dashboard or any other browser-facing code (HTML, CSS, components, client-side JS or TS) is added, consult Modern Web Guidance before writing or changing it. It covers current HTML, CSS and DOM APIs, accessibility, forms and performance. Skip it for the Rust bot, Workers, SQL and scripts.
+Use Modern Web Guidance before editing browser-facing HTML, CSS, or client-side
+JavaScript and TypeScript. This includes the existing [Worker ops dashboard](wrangler/src/ops-dashboard.ts)
+and any new dashboard. The Rust bot, backend Worker routes, SQL, and scripts
+are outside this guidance when they do not change browser-facing code.
 
-1. If your agent harness provides the `modern-web-guidance` skill, use it. Otherwise run the CLI directly (Node 22+):
-   `DISABLE_TELEMETRY=1 npx -y modern-web-guidance@latest search "<2-5 word capability>"`, then
-   `DISABLE_TELEMETRY=1 npx -y modern-web-guidance@latest retrieve "<id>"`.
+1. Use the harness's `modern-web-guidance` skill when available. If the CLI
+   is already installed, run `DISABLE_TELEMETRY=1 modern-web-guidance search "<2-5 word capability>"`,
+   then `DISABLE_TELEMETRY=1 modern-web-guidance retrieve "<id>"`. Otherwise use the relevant
+   official platform documentation.
    Search one capability at a time (for example `"light dismiss dialog"`), without framework or app names.
 2. Apply only the retrieved guidance that fits the task. Keep existing behavior, copy, design tokens and
    the stack the route already uses; record any guide you followed in the PR body.
