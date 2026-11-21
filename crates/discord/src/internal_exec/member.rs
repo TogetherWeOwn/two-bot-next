@@ -266,15 +266,19 @@ impl ActionExecutor {
 
         let request =
             voice_move::prepare_voice_move(&self.inner.factory, guild_id, member_id, channel_id)?;
-        match super::poll_before(deadline, self.admit(&request, Some(false))).await {
-            None => return Ok(NotSent(Deadline)),
-            Some(Err(_)) => return Ok(NotSent(Guard)),
-            Some(Ok(())) => {}
-        }
-        self.count();
-        let transport = &self.inner.transport;
-        let headers = transport
-            .send_strict_evidence_headers_after(&request, deadline, revalidate)
+        let mut pacing =
+            match super::poll_before(deadline, self.reserve_route(&request, false, false)).await {
+                None => return Ok(NotSent(Deadline)),
+                Some(Err(_)) => return Ok(NotSent(Guard)),
+                Some(Ok(pacing)) => pacing,
+            };
+        let headers = self
+            .inner
+            .transport
+            .send_strict_evidence_headers_after(&request, deadline, revalidate, move || {
+                self.stamp_paced_lane(&mut pacing, false);
+                self.count();
+            })
             .await;
         let pending = match headers {
             Ok(pending) => pending,

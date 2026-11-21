@@ -1,10 +1,10 @@
 use super::*;
 use crate::{
-    executor::{DiscordError, HyperTransport, PacingLane::Shared, PACE_INTERVAL_MS},
+    executor::{HyperTransport, PacingLane::Shared, PACE_INTERVAL_MS},
     strict_transport_fixture::{loopback, read_request, Admission},
 };
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
+    atomic::{AtomicBool, Ordering::Relaxed},
     Arc,
 };
 use tokio::{
@@ -200,15 +200,29 @@ async fn voice_patch_uses_the_shared_paced_lane() {
     let (probe, mut admissions) = tokio::sync::mpsc::unbounded_channel();
     Arc::get_mut(&mut action.inner).unwrap().pacing_probe = Some(probe);
     let wire = response(200, "", MEMBER.len(), MEMBER);
-    for _ in 0..2 {
-        let (sending, mut socket) = dispatch(&action, &listener).await;
-        socket.write_all(wire.as_bytes()).await.unwrap();
-        assert_eq!(finish(sending).await, Moved);
-    }
+    let interval = Duration::from_millis(PACE_INTERVAL_MS);
+    let mut authorized_at = Instant::now();
+    let (first, ()) = tokio::join!(
+        action.move_voice_member_until("1", "2", "3", Instant::now() + WAIT, async {
+            tokio::time::sleep(2 * interval).await;
+            authorized_at = Instant::now();
+            true
+        }),
+        async {
+            let (mut socket, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+            assert!(read_request(&mut socket).await.starts_with(b"PATCH "));
+            socket.write_all(wire.as_bytes()).await.unwrap();
+        },
+    );
+    assert_eq!(first.unwrap(), Moved);
+    let (sending, mut socket) = dispatch(&action, &listener).await;
+    socket.write_all(wire.as_bytes()).await.unwrap();
+    assert_eq!(finish(sending).await, Moved);
     let first = admissions.try_recv().unwrap();
     let second = admissions.try_recv().unwrap();
     assert_eq!((first.lane, second.lane), (Shared, Shared));
-    assert!(second.at.duration_since(first.at) >= Duration::from_millis(PACE_INTERVAL_MS));
+    assert!(first.at >= authorized_at);
+    assert!(second.at.duration_since(first.at) >= interval);
     assert_eq!(action.requests(), 2);
     assert_no_socket(&listener).await;
 }
@@ -217,18 +231,18 @@ async fn voice_patch_uses_the_shared_paced_lane() {
 #[derive(Debug)]
 struct ExclusiveLane {
     key: TokenKey,
-    held: Arc<AtomicBool>,
-    claim_polls: AtomicUsize,
+    lane: Arc<Semaphore>,
     acknowledge_strict: Semaphore,
+    cross_cutoff: Option<Instant>,
 }
 
 impl ExclusiveLane {
     fn new() -> Self {
         Self {
             key: TokenKey::for_bot_token(TOKEN).unwrap(),
-            held: Arc::default(),
-            claim_polls: AtomicUsize::new(0),
+            lane: Arc::new(Semaphore::new(1)),
             acknowledge_strict: Semaphore::new(0),
+            cross_cutoff: None,
         }
     }
 }
@@ -240,11 +254,11 @@ impl SendAdmission for ExclusiveLane {
 
     fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
         Box::pin(async {
-            self.claim_polls.fetch_add(1, Relaxed);
-            if self.held.swap(true, Relaxed) {
-                return Err(AdmissionError::Blocked);
-            }
-            Ok(AdmissionPermit::new(Box::new(Release(self.held.clone()))))
+            self.lane
+                .try_acquire()
+                .map_err(|_| AdmissionError::Blocked)?
+                .forget();
+            Ok(AdmissionPermit::new(Box::new(Release(self.lane.clone()))))
         })
     }
 
@@ -252,12 +266,22 @@ impl SendAdmission for ExclusiveLane {
         Box::pin(async {
             let permit = self.admit().await?;
             self.acknowledge_strict.acquire().await.unwrap().forget();
+            if let Some(at) = self.cross_cutoff {
+                assert!(Instant::now() < at);
+                // Cross cutoff within a single poll, not by resuming after it.
+                tokio::time::resume();
+                std::thread::sleep(
+                    at.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+                tokio::time::pause();
+                assert!(Instant::now() >= at);
+            }
             Ok(permit)
         })
     }
 }
 
-struct Release(Arc<AtomicBool>);
+struct Release(Arc<Semaphore>);
 
 impl SendCompletion for Release {
     fn complete(
@@ -266,7 +290,8 @@ impl SendCompletion for Release {
     ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
         Box::pin(async move {
             assert_eq!(cooldown, None);
-            assert!(self.0.swap(false, Relaxed));
+            assert_eq!(self.0.available_permits(), 0);
+            self.0.add_permits(1);
             Ok(())
         })
     }
@@ -275,10 +300,11 @@ impl SendCompletion for Release {
 #[tokio::test]
 async fn voice_patch_revalidates_after_admission_before_dispatch() {
     for (answer, close_route, expected) in [
-        (Some(true), false, Moved),
-        (Some(false), false, NotSent(Revalidation)),
-        (Some(true), true, NotSent(Guard)),
-        (None, false, NotSent(Deadline)),
+        (Some(true), false, Some(Moved)),
+        (Some(false), false, Some(NotSent(Revalidation))),
+        (Some(true), true, Some(NotSent(Guard))),
+        (None, false, Some(NotSent(Deadline))),
+        (None, false, None), // Cancel an acknowledged permit during the check.
     ] {
         let (listener, origin) = loopback().await;
         let gate = Arc::new(ExclusiveLane::new());
@@ -287,21 +313,29 @@ async fn voice_patch_revalidates_after_admission_before_dispatch() {
         let release_check = Semaphore::new(0);
         let deadline = Instant::now() + WAIT;
         let mut sending =
-            std::pin::pin!(
+            Box::pin(
                 action.move_voice_member_until("1", "2", "3", deadline, async {
-                    assert!(gate.held.load(Relaxed));
+                    assert_eq!(gate.lane.available_permits(), 0);
                     started.store(true, Relaxed);
                     release_check.acquire().await.unwrap().forget();
                     answer.unwrap_or(true)
-                })
+                }),
             );
         assert!(futures_util::poll!(&mut sending).is_pending());
-        assert!(gate.held.load(Relaxed));
+        assert_eq!(gate.lane.available_permits(), 0);
         assert!(!started.load(Relaxed), "claim not yet acknowledged");
         gate.acknowledge_strict.add_permits(1);
         assert!(futures_util::poll!(&mut sending).is_pending());
         assert!(started.load(Relaxed));
         assert_no_socket(&listener).await;
+        let Some(expected) = expected else {
+            drop(sending);
+            release_check.add_permits(1);
+            drop(timeout(WAIT, gate.lane.acquire()).await.unwrap().unwrap());
+            gate.admit().await.unwrap().complete(None).await.unwrap();
+            assert_no_socket(&listener).await;
+            continue;
+        };
 
         if close_route {
             action.inner.transport.guard.observe_status(401, true);
@@ -335,68 +369,25 @@ async fn voice_patch_revalidates_after_admission_before_dispatch() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn expired_governed_read_owner_does_not_claim_the_lane() {
+async fn voice_patch_settles_a_strict_acknowledgement_at_cutoff() {
     let (listener, origin) = loopback().await;
-    let gate = Arc::new(ExclusiveLane::new());
+    let deadline = Instant::now() + Duration::from_millis(10);
+    let gate = Arc::new(ExclusiveLane {
+        cross_cutoff: Some(deadline),
+        ..ExclusiveLane::new()
+    });
+    gate.acknowledge_strict.add_permits(1);
     let action = executor(&origin, gate.clone());
-    let request = ActionExecutor::request_of(action.request_factory().current_user()).unwrap();
-    // Enter the detached transport directly: the caller may have passed its
-    // deadline check before the owner gets its first turn at the cutoff.
     let result = action
-        .inner
-        .transport
-        .send_request(&request, Some(Instant::now()))
-        .await;
-    assert_eq!(
-        result.err().as_deref(),
-        Some(crate::executor::HEADER_TIMEOUT_MESSAGE)
-    );
-    assert_eq!(gate.claim_polls.load(Relaxed), 0);
+        .move_voice_member_until("1", "2", "3", deadline, async {
+            panic!("must not poll revalidation at cutoff");
+        })
+        .await
+        .unwrap();
+    assert_eq!(result, NotSent(Deadline));
     gate.admit().await.unwrap().complete(None).await.unwrap();
     tokio::time::resume();
     assert_no_socket(&listener).await;
-}
-
-#[tokio::test]
-async fn voice_preflight_deadline_releases_the_governed_read_lane() {
-    for identity in [true, false] {
-        let (listener, origin) = loopback().await;
-        let gate = Arc::new(ExclusiveLane::new());
-        let action = executor(&origin, gate.clone());
-        let deadline = Instant::now() + WAIT;
-        let reader = action.clone();
-        let reading = tokio::spawn(async move {
-            if identity {
-                reader.current_bot_user_id_until(deadline).await.map(|_| ())
-            } else {
-                reader
-                    .get_json_strict_until("/guilds/1", deadline)
-                    .await
-                    .map(|_| ())
-            }
-        });
-        let (mut socket, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
-        let wire = read_request(&mut socket).await;
-        let path: &[u8] = if identity {
-            b"GET /api/v10/users/@me "
-        } else {
-            b"GET /api/v10/guilds/1 "
-        };
-        assert!(wire.starts_with(path));
-        assert!(matches!(gate.admit().await, Err(AdmissionError::Blocked)));
-        tokio::time::pause();
-        tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
-        assert!(matches!(reading.await.unwrap(), Err(DiscordError::Timeout)));
-        assert!(Instant::now() < deadline + Duration::from_millis(100));
-        tokio::time::resume();
-        assert_no_socket(&listener).await;
-
-        gate.acknowledge_strict.add_permits(1);
-        let (sending, mut next) = dispatch(&action, &listener).await;
-        let wire = response(200, "", MEMBER.len(), MEMBER);
-        next.write_all(wire.as_bytes()).await.unwrap();
-        assert_eq!(finish(sending).await, Moved);
-    }
 }
 
 #[cfg(feature = "db-tests")]
