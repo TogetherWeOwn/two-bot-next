@@ -184,7 +184,8 @@ async fn voice_preflight_429_preserves_only_validated_timing_without_patch() {
             Box::new(guild),
         ));
         let holds = std::sync::Mutex::new(VoiceMoveHolds::default());
-        let roster = VoiceMoveRoster::new(&cache, &holds);
+        let turn = tokio::sync::Mutex::new(());
+        let roster = VoiceMoveRoster::new(&cache, &holds, &turn);
         let attempt = action.move_with_voice_evidence_until(
             ["100", "2", "3"],
             roster,
