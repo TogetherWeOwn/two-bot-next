@@ -26,7 +26,7 @@ pub enum JoinError {
 use JoinError::{AmbiguousDispatch, InvalidTopics, Roster, Topology};
 
 /// Begin on the configured guild's fresh GUILD_CREATE with a fresh nonce.
-/// One owner feeds frames in order and retires on loss, failure, timeout or session change.
+/// One owner feeds every subsequent frame in receive order and retires on loss, failure, timeout or session change.
 pub struct BaselineJoin {
     guild_id: Id<GuildMarker>,
     pending: Option<Pending>,
