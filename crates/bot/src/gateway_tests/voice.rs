@@ -374,7 +374,7 @@ async fn registered_voice_id_with_rsvp_payload_has_one_voice_callback() {
     db.close().await;
 }
 
-async fn cold_voice_gateway(release_ready: Arc<Notify>) -> MockGateway {
+async fn cold_voice_gateway(release_ready: Arc<Notify>, rooms_enabled: bool) -> MockGateway {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let gateway_url = url.clone();
@@ -409,6 +409,9 @@ async fn cold_voice_gateway(release_ready: Arc<Notify>) -> MockGateway {
                                 json!({"op":0,"s":4,"t":"RESUMED","d":{}}),
                             ] {
                                 ws.send(Message::text(packet.to_string())).await.unwrap();
+                            }
+                            if !rooms_enabled {
+                                ws.send(Message::text(leave(5).to_string())).await.unwrap();
                             }
                         } else {
                             release_ready.notified().await;
@@ -455,7 +458,7 @@ async fn cold_voice_resume(rooms_enabled: bool) {
     use crate::voice_snapshot::{new_shared_cache, read_voice_total};
     let db = TestDb::new().await;
     let release = Arc::new(Notify::new());
-    let mut mock = cold_voice_gateway(release.clone()).await;
+    let mut mock = cold_voice_gateway(release.clone(), rooms_enabled).await;
     db.store
         .commit_dispatch(
             &checkpoint("saved-session", 2, &mock.url),
@@ -517,11 +520,7 @@ async fn cold_voice_resume(rooms_enabled: bool) {
         cache.clone(),
     ));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
-    let sink: Arc<dyn VoiceEventSink> = if rooms_enabled {
-        voice.clone()
-    } else {
-        crate::voice_snapshot::heat::bootstrap_sink()
-    };
+    let sink = rooms_enabled.then(|| voice.clone() as Arc<dyn VoiceEventSink>);
     let runner = tokio::spawn(run_shard(
         shard,
         pipeline.clone(),
@@ -531,12 +530,25 @@ async fn cold_voice_resume(rooms_enabled: bool) {
         None,
         None,
         None,
-        Some(sink),
+        sink,
         std::future::pending(),
     ));
     let resume = mock.authentication().await;
     assert_eq!(resume["op"], 6);
     assert_eq!(resume["d"]["seq"], 2);
+    if !rooms_enabled {
+        // Keep processing the old session after RESUMED instead of forcing a
+        // fresh IDENTIFY for heat. A cold partial cache is still a gap.
+        wait_sequence(&db.store, 5).await;
+        wait_connected(&state).await;
+        assert_eq!(db.count().await, 3);
+        assert!(read_voice_total(&cache, VOICE_GUILD_ID).is_err());
+        runner.abort();
+        let _ = runner.await;
+        mock.task.abort();
+        db.close().await;
+        return;
+    }
     assert_eq!(mock.authentication().await["op"], 2);
     let saved = db.store.load().await.unwrap().unwrap();
     assert_eq!(
@@ -544,17 +556,6 @@ async fn cold_voice_resume(rooms_enabled: bool) {
         ("saved-session", 4)
     );
     assert_eq!(db.count().await, 2);
-    if !rooms_enabled {
-        release.notify_one();
-        wait_sequence(&db.store, 2).await;
-        wait_connected(&state).await;
-        assert_eq!(read_voice_total(&cache, VOICE_GUILD_ID), Ok(0));
-        runner.abort();
-        let _ = runner.await;
-        mock.task.abort();
-        db.close().await;
-        return;
-    }
     assert_eq!(voice.leaves.load(Ordering::Relaxed), 1);
     assert_eq!(*state.read().await, GatewayState::Armed);
     assert!(pipeline.cache().current_user().is_none());

@@ -179,7 +179,9 @@ Starts, skipped busy deadlines and shutdown cancellation are not completed
 outcomes. A returned `Ok(())` is a success even when the job is a gated/no-op tick,
 including a feed inner poll skipped by the live interval gate; each such success
 resets that job's consecutive-failure streak. These counters measure scheduler
-health, not business events or changed rows.
+health, not business events or changed rows. `voice_heat` does not force a fresh
+IDENTIFY: a cold RESUME without a complete guild snapshot produces gaps, not
+zeros. The sampler still attempts to flush completed hours during gaps.
 Failures preserve the previous success timestamp. The supervisor's `/readyz`
 status uses milliseconds; metrics convert the same completion sample to seconds.
 Errors and panic payloads are never labels.

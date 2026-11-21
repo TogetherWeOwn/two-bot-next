@@ -289,23 +289,18 @@ pub(crate) mod heat {
     pub(crate) const NAME: &str = "voice_heat";
     const CADENCE: Duration = Duration::from_secs(300);
     type Gateway = RwLock<GatewayState>;
-    /// Without room actors, still ask the shard to rebuild the cache after cold replay.
-    pub(crate) fn bootstrap_sink() -> Arc<dyn two_bot::voice_rooms::VoiceEventSink> {
-        use twilight_cache_inmemory::DefaultInMemoryCache;
-        use twilight_model::gateway::{event::Event, payload::incoming::PresenceUpdate};
-        struct Bootstrap;
-        impl two_bot::voice_rooms::VoiceEventSink for Bootstrap {
-            fn handle(&self, _: &Event, _: &DefaultInMemoryCache) {}
-            fn presence(&self, _: &PresenceUpdate) {}
-            fn disconnect(&self) {}
-            fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
-                cache.current_user().is_none()
-            }
-        }
-        Arc::new(Bootstrap)
-    }
 
     pub fn job(pool: PgPool, guild: Snowflake, cache: Arc<SharedCache>, gw: Arc<Gateway>) -> Job {
+        job_with_clock(pool, guild, cache, gw, OffsetDateTime::now_utc)
+    }
+
+    pub(super) fn job_with_clock(
+        pool: PgPool,
+        guild: Snowflake,
+        cache: Arc<SharedCache>,
+        gw: Arc<Gateway>,
+        now: impl Fn() -> OffsetDateTime + Clone + Send + Sync + 'static,
+    ) -> Job {
         let buffer = Arc::new(Mutex::new(VoiceHeat::default()));
         Job {
             name: NAME,
@@ -316,16 +311,17 @@ pub(crate) mod heat {
             action: Arc::new(move || {
                 let (pool, cache, gw, buffer) =
                     (pool.clone(), cache.clone(), gw.clone(), buffer.clone());
+                let now = now.clone();
                 Box::pin(async move {
                     let mut buffer = buffer.lock().await;
                     let total = observation(&cache, &gw, guild);
-                    buffer.tick(OffsetDateTime::now_utc(), total, &pool).await
+                    buffer.tick(now(), total, &pool).await
                 })
             }),
         }
     }
 
-    pub(super) fn observation(cache: &SharedCache, gw: &Gateway, id: Snowflake) -> Option<i64> {
+    fn observation(cache: &SharedCache, gw: &Gateway, id: Snowflake) -> Option<i64> {
         // Keep the connected fence held through the complete cache read.
         let state = gw.try_read().ok()?;
         if *state != GatewayState::Connected {
@@ -521,6 +517,7 @@ mod tests {
     async fn only_a_connected_complete_snapshot_adds_an_observation() {
         use crate::{gateway::GatewayState::*, jobs::ErrorClass};
         use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        use std::sync::atomic::{AtomicI64, Ordering};
         use time::{macros::datetime, Duration};
         use tokio::sync::RwLock;
         use two_bot::voice_heat::VoiceHeat;
@@ -529,16 +526,16 @@ mod tests {
         let gateway = Arc::new(RwLock::new(Connected));
         let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new_without_pgpass());
         pool.close().await;
-        let job = heat::job(pool.clone(), 100, cache.clone(), gateway.clone());
+        let hour = Arc::new(AtomicI64::new(0));
+        let clock = hour.clone();
+        let job = heat::job_with_clock(pool, 100, cache.clone(), gateway.clone(), move || {
+            datetime!(2026-11-21 00:00 UTC) + Duration::hours(clock.load(Ordering::Relaxed))
+        });
         assert_eq!(job.timeout, VoiceHeat::TICK_TIMEOUT);
-        assert_eq!((job.action)().await, Ok(()));
-        let mut buffer = VoiceHeat::default();
-        let mut probe = async |state, hour| {
+        let probe = async |state, tick_hour| {
             *gateway.write().await = state;
-            let now = datetime!(2026-11-21 00:00 UTC) + Duration::hours(hour);
-            buffer
-                .tick(now, heat::observation(&cache, &gateway, 100), &pool)
-                .await
+            hour.store(tick_hour, Ordering::Relaxed);
+            (job.action)().await
         };
         assert_eq!(probe(Connected, 0).await, Ok(()));
         cache.update(&pipeline_guild(&[]));

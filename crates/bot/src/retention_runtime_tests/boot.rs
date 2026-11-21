@@ -43,6 +43,9 @@ fn boot_registers_safe_modes_and_parks_invalid_disabled_or_missing_database() {
             .env("TWO_TEST_DATABASE_URL", &url)
             .env("TWO_DATABASE_TLS", "local-only")
             .env("DISCORD_API_BASE", "not a REST origin");
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
         if setting != "missing" {
             command.env(crate::retention_jobs::MODE_SETTING, setting);
         }
@@ -103,7 +106,6 @@ async fn isolated_boot_probe() {
         None,
     );
     let shutdown = stop.clone();
-    let retention = website_jobs::retention_registration(&config);
     let owner = tokio::spawn(async move {
         website_jobs::serve(
             &config,
@@ -116,7 +118,6 @@ async fn isolated_boot_probe() {
             None,
             None,
             crate::voice_snapshot::new_shared_cache(),
-            retention,
         )
         .await
     });
