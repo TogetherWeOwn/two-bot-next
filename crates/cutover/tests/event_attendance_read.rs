@@ -98,25 +98,29 @@ async fn only_finalized_mapped_observations_are_returned() {
     .await
     .unwrap();
     assert_eq!(read().await.unwrap().unwrap().sessions.len(), 2);
-    for (field, value, reset) in [
-        ("joined_at", "'-infinity'", "'2026-01-01 00:00Z'"),
-        ("left_at", "'infinity'", "NULL"),
-        ("left_at", "joined_at - INTERVAL '1 minute'", "NULL"),
-        ("name_observed_at", "'12000-01-01'", "NULL"),
-        ("joined_at", "'2026-01-01 01:16Z'", "'2026-01-01 00:00Z'"),
+    for (joined_at, left_at, name_observed_at) in [
+        ("-infinity", None, None),
+        ("2026-01-01 00:00Z", Some("infinity"), None),
+        ("2026-01-01 00:00Z", Some("2025-12-31 23:59Z"), None),
+        ("2026-01-01 00:00Z", None, Some("12000-01-01")),
+        ("2026-01-01 01:16Z", None, None),
     ] {
-        let update = |value| {
-            format!(
-                "UPDATE event_voice_sessions SET {field} = {value}
-             WHERE member_id = '300000000000000005'"
-            )
-        };
-        sqlx::query(&update(value)).execute(pool).await.unwrap();
+        // Parse these fixture values in Postgres; Rust cannot encode infinity.
+        sqlx::query(
+            "UPDATE event_voice_sessions SET joined_at = $1::text::timestamptz,
+                 left_at = $2::text::timestamptz, name_observed_at = $3::text::timestamptz
+             WHERE member_id = '300000000000000005'",
+        )
+        .bind(joined_at)
+        .bind(left_at)
+        .bind(name_observed_at)
+        .execute(pool)
+        .await
+        .unwrap();
         assert!(
             matches!(read().await, Err(InternalStoreError::Unavailable)),
-            "must refuse {field} = {value}"
+            "must refuse timestamps {joined_at}, {left_at:?}, {name_observed_at:?}"
         );
-        sqlx::query(&update(reset)).execute(pool).await.unwrap();
     }
     sqlx::query("DELETE FROM event_voice_sessions WHERE member_id = '300000000000000005'")
         .execute(pool)
@@ -170,31 +174,25 @@ async fn only_finalized_mapped_observations_are_returned() {
         .await
         .unwrap();
     assert_eq!(read().await.unwrap().unwrap().sessions.len(), 1);
-    for (replace, restore) in [
-        (
-            "instance_starts_at = '2026-01-01 00:00:00.000001Z'",
-            "instance_starts_at = '2026-01-01 00:00Z'",
-        ),
-        (
-            "event_id = '200000000000000002'",
-            "event_id = '200000000000000001'",
-        ),
+    for (event_id, instance_starts_at, expected) in [
+        ("200000000000000001", "2026-01-01 00:00:00.000001Z", false),
+        ("200000000000000001", "2026-01-01 00:00Z", true),
+        ("200000000000000002", "2026-01-01 00:00Z", false),
+        ("200000000000000001", "2026-01-01 00:00Z", true),
     ] {
-        for change in [replace, restore] {
-            let mapping = if change.starts_with("event_id") {
-                format!("UPDATE internal_event_keys SET {change};")
-            } else {
-                String::new()
-            };
-            sqlx::raw_sql(&format!(
-                "{mapping} UPDATE event_instance_windows SET {change};
-                UPDATE event_attendance_windows SET {change};"
-            ))
-            .execute(pool)
-            .await
-            .unwrap();
-            assert_eq!(read().await.unwrap().is_some(), change == restore);
-        }
+        sqlx::query(
+            "WITH mapped AS (UPDATE internal_event_keys SET event_id = $1),
+                 current_window AS (UPDATE event_instance_windows
+                     SET event_id = $1, instance_starts_at = $2::text::timestamptz)
+             UPDATE event_attendance_windows
+                 SET event_id = $1, instance_starts_at = $2::text::timestamptz",
+        )
+        .bind(event_id)
+        .bind(instance_starts_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        assert_eq!(read().await.unwrap().is_some(), expected);
     }
     sqlx::query("DELETE FROM event_voice_sessions")
         .execute(pool)
