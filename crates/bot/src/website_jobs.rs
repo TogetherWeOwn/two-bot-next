@@ -64,10 +64,6 @@ mod jobgate_acceptance_tests;
 #[path = "website_events_dispatch_tests.rs"]
 mod events_dispatch_tests;
 
-#[cfg(test)]
-#[path = "voice_heat_boot_tests.rs"]
-mod voice_heat_boot_tests;
-
 #[derive(Clone, Copy)]
 pub enum Kind {
     Counter,

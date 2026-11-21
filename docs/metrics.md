@@ -310,7 +310,7 @@ as dynamic labels.
   `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
   `scheduled_events`, `settings`, `presence_probe`, `community_scorecard`,
   `inactivity`, `audit_retry`, `scheduled_messages`, `feeds`, `self_role_recovery`,
-  `member_unban_sweep`, `automod_expiry`, `lfg_sweep`, `other`; `outcome` is `success` or `failure`.
+  `member_unban_sweep`, `automod_expiry`, `lfg_sweep`, `voice_heat`, `other`; `outcome` is `success` or `failure`.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
   `member_unban_sweep` is the 30 s unban sweep. `automod_expiry` is the 60 s
@@ -844,7 +844,7 @@ window instead: at two intervals a 15 s cadence would flap on a single slow
 scrape, and skipped busy deadlines are neither success nor failure, so
 `job_stale` and `job_consecutive_failures` cannot see a wedged ticker.
 `invite_snapshot`, `other`, `audit_retry`, `feeds`, `self_role_recovery`,
-`member_unban_sweep` and `automod_expiry` have no cadence entry; a stale
+`member_unban_sweep`, `automod_expiry` and `voice_heat` have no cadence entry; a stale
 nonzero success timestamp on any of them — or on any future label the scrape
 accepts before the catalog maps it — raises the `job_unknown_stale` ticket
 above (`UNKNOWN_JOB_STALE_SECONDS`, 7200) instead of staying silent. `other`

@@ -43,6 +43,7 @@ const UNKNOWN_STALE_JOBS = new Map<string, string>([
   ["self_role_recovery", "covered by job_unknown_stale, not job_stale: 30 s recovery sweep with 0–5 s jitter and a 25 s timeout; two intervals are too close to the ~60 s scrape cadence for safe job_stale paging. This label-only slice retains failure-only alerting rather than adding ticker_stale policy; a successful sweep need not settle every repair"],
   ["member_unban_sweep", "covered by job_unknown_stale, not job_stale: 30 s unban sweep (UNBAN_SWEEP_INTERVAL_SECONDS) with startup jitter and a 180 s attempt timeout; two intervals are too close to the ~60 s scrape cadence for safe job_stale paging, and one attempt may outlive its cadence. Failure alerting is per-label job_consecutive_failures at 3; a sweep with no completions is covered only by the coarse 2-hour fallback"],
   ["automod_expiry", "covered by job_unknown_stale, not job_stale: 60 s repeat-history expiry tick (EXPIRY_CADENCE) with startup jitter and a 5 s timeout; a gateway without built activation is a no-op success, and the job only does real work when TWO_AUTOMOD=1. Failure alerting is per-label job_consecutive_failures at 3; staleness uses the coarse 2-hour fallback, not a precise cadence"],
+  ["voice_heat", "covered by job_unknown_stale: the private sampler can complete a tick without a fresh observation; no cadence-based paging"],
   ["audit_retry", "covered by job_unknown_stale, not ticker_stale: 30 s supervisor sweep with parked/halt reporting in audit_runtime.rs (parked when unconfigured, halted sweeps still record success); a wedged sweep that keeps failing surfaces via job_consecutive_failures, and only a truly wedged sweep tickets here; not registered through the website/community schedulers this catalog parses"],
 ]);
 /** 15 s tickers covered by `ticker_stale` (TICKER_STALE_SECONDS window), not `job_stale`. */
@@ -204,6 +205,7 @@ const REGISTERED = [...new Set([
   ...directJobNames(memberRuntimeRs, "member_runtime.rs"),
   ...directJobNames(automodGatewayRs, "automod_gateway.rs"),
   ...directJobNames(lfgJobsRs, "lfg_jobs.rs"),
+  ...directJobNames(read("crates/bot/src/voice_heat_runtime.rs"), "voice_heat_runtime.rs"),
 ])];
 const real: Catalog = { jobs: JOBS, registered: REGISTERED, rust: RUST, worker: JOB_INTERVAL_SECONDS, ticker: TICKER_COVERED, exempt: UNKNOWN_STALE_JOBS };
 
@@ -211,7 +213,7 @@ test("parses the full Rust job allowlist and every registered cadence", () => {
   assert.deepEqual(JOBS, [
     "invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events",
     "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages",
-    "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "lfg_sweep", "other",
+    "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "lfg_sweep", "voice_heat", "other",
   ]);
   // Rust *_INTERVAL_MS / 1000: community_snapshots.rs:45,47, scheduled_events.rs:26,
   // presence.rs:36, community.rs:61, inactivity.rs:27.
@@ -236,7 +238,7 @@ test("feed and self-role producers retain their real cadence and explicit unknow
 });
 
 test("unban sweep and automod expiry producers retain their real cadence and explicit unknown-stale entries", () => {
-  assert.deepEqual(REGISTERED, ["feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "lfg_sweep"]);
+  assert.deepEqual(REGISTERED, ["feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "lfg_sweep", "voice_heat"]);
   assert.match(memberRuntimeRs, /UNBAN_SWEEP_INTERVAL_SECONDS/);
   assert.match(memberRuntimeRs, /Job\s*\{\s*name:\s*NAMES\[0\],\s*cadence,/);
   assert.match(automodGatewayRs, /const EXPIRY_CADENCE: Duration = Duration::from_secs\(60\);/);
