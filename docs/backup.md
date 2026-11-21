@@ -114,8 +114,15 @@ frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**, pre-seasonal **v6**
 pre-stream-ledger **v7**, pre-guild-counters **v8**, pre-epoch-claim **v9**,
 pre-tombstone **v10**, pre-registry **v11**, pre-event-voice **v12** and
 pre-starboard **v13**, pre-giveaways **v14**, pre-instance-windows **v15** and
-pre-attendance **v16**. A v16-only binary refuses v17; keep a compatible
-recovery point when planning a binary rollback. Other versions refuse.
+pre-attendance **v16**. Other versions refuse.
+
+**0480 rollback:** A pre-0480 binary refuses v17 archives and cannot run member
+erasure or drain guild purges on the migrated schema, even with empty attendance
+tables. Binary rollback leaves the schema in place; a v16 archive alone is not
+a fallback. Before applying 0480, qualify a compatible recovery build and
+archive on a migrated test database (restore, erasure and guild purge). Use
+that build for forward recovery if no compatible rollback image exists.
+
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
 source's applied migrations and `sequenceMarks`: for every serial, identity and
@@ -196,9 +203,8 @@ test fails if a covered table is not migrated. A dump from a fresh Rust schema
 has 110 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 Each readable version requires its historical inventory and waives only
-versioned additions introduced later. Every v3–v16 archive may omit
-`V17_ADDED_TABLES` (`event_attendance_windows`, `event_voice_sessions`);
-the table below lists the other omissions.
+versioned additions introduced later. In addition to the omissions below,
+v3–v16 may omit both attendance tables (`V17_ADDED_TABLES`).
 
 | Version | Tables it may omit |
 | --- | --- |
@@ -245,12 +251,9 @@ binding or timestamp alone cannot prove a live window, so a restored pre-v16
 recovery point fails closed (no instance is treated as live, and the revocation
 and order fences are gone) until a fresh accepted Discord observation
 re-establishes each instance. Use v16 or later to preserve that evidence.
-Restoring an older archive without attendance clears both omitted tables in the
-restore transaction. Accepted instance windows and voice bindings do not
-backfill attendance. The migration does not enable capture or attendance reads.
-Current v17 archives must include the monthly cap, both mirror-fence tables,
-the registry, event voice pair, starboard, giveaway, event instance window
-and attendance tables, so routine restores retain their archived state. Tombstone `deleted_at` cells must be real dates in
+Older archives without attendance clear both tables in the restore transaction
+without backfill. The migration enables neither capture nor attendance reads.
+Current v17 archives require the full inventory. Tombstone `deleted_at` cells must be real dates in
 exact `YYYY-MM-DDTHH:MM:SS.sssZ` form: inspection refuses missing, null,
 non-string or noncanonical values before restore opens a write transaction.
 Rollback-delta import enforces the same rule during parsing and revalidates the
