@@ -36,10 +36,11 @@ pub async fn read<T: Fn() -> bool>(
 
 async fn read_with<
     'a,
+    T: Fn() -> bool,
     F: Future<Output = Result<Option<FinalizedAttendance>, InternalStoreError>>,
 >(
     event_key: &'a str,
-    ticket: impl FnOnce(Snowflake) -> Option<impl Fn() -> bool>,
+    ticket: impl FnOnce(Snowflake) -> Option<T>,
     lookup: impl FnOnce(AttendanceScope<'a>) -> F,
 ) -> Result<Value, ReadRefusal> {
     let guild_id = TWO_STAGING_GUILD_ID
