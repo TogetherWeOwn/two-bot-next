@@ -41,10 +41,9 @@ ordered fields. It does not post buttons or verify callback behavior.
 
 The payload deliberately uses the maximal command registry and a wide topic
 detail, matching the Rust builder tests. It exercises pagination and overflow
-rather than simulating staging's current registry size. The topic embed is a
-staging preview: the product bot still uses the existing topic reply until
-the separate runtime change is reviewed and merged. The Actions payload
-artifact contains only synthetic fixture embeds, not staging messages.
+rather than simulating staging's current registry size. The synthetic topic
+embed uses the same renderer as the product `/help` topic reply. The Actions
+payload artifact contains only synthetic fixture embeds, not staging messages.
 
 ## Token source and updates
 
