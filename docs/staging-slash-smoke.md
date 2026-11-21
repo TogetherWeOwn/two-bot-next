@@ -92,6 +92,8 @@ rank timeout/failure; sensitive-data exclusion from JSON and Debug; and
 independent simultaneous offline runs. Local timings are fixture timings, not
 production performance measurements.
 
+On clean current-main rollouts, `verify_automod_preview` adds a readback receipt to the user-flow artifact.
+
 ## Live read-mostly smoke run
 
 `scripts/staging_smoke_run.py` is the live counterpart: one fenced, GET-only
