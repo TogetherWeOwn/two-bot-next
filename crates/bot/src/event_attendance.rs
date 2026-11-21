@@ -3,6 +3,8 @@
 use serde_json::Value;
 use two_bot_core::{funnel::format_iso_millis, Snowflake};
 
+pub mod planning;
+
 const GRACE_MS: i64 = 15 * 60 * 1_000;
 const THRESHOLD_MINUTES: u8 = 10;
 const MAX_INPUT_SESSIONS: usize = 4_096;
