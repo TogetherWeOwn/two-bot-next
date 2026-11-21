@@ -297,9 +297,10 @@ job runs on a bounded schedule: a dry run that deletes nothing unless
 
 For hourly voice heat (`voice_heat_hours`), the same job uses a strict cutoff:
 rows whose hour starts more than 35 elapsed days before the sweep qualify.
-Dry runs count those rows without deleting; `execute` deletes them. The table
-is currently accessible only to the migrator role, so the bot runtime parks
-the heat sweep in both modes and does not enforce a live 35-day TTL.
+Dry runs count those rows without deleting; `execute` deletes them once the
+reviewed role plan grants the runtime access. Until those grants are applied,
+the runtime parks the heat sweep in both modes. The role plan does not start a
+collector or grant the website reader access to the underlying table.
 
 No other automatic age-based purger is installed: do not claim a live TTL
 beyond the windows this job enforces. Every run reports per-class metrics.

@@ -177,9 +177,8 @@ mod tests {
                         .to_owned();
                     let kind = match name.as_str() {
                         "discord_send_admission" | "voice_create_reservations" => "admission",
-                        "member_erasure_audit" | "invite_campaigns" | "voice_heat_hours" => {
-                            "migrator"
-                        }
+                        "member_erasure_audit" | "invite_campaigns" => "migrator",
+                        "voice_heat_hours" => "retained_aggregate",
                         _ => "table",
                     };
                     assert!(

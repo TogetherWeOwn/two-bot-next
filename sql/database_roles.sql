@@ -163,6 +163,9 @@ BEGIN
                     EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE %s TO two_bot_runtime', target);
                     -- Read-only migration-plan identity: SELECT only, never DML/DDL.
                     EXECUTE format('GRANT SELECT ON TABLE %s TO two_bot_migrator_ro', target);
+                ELSIF obj.kind = 'retained_aggregate' THEN
+                    -- Read the cutoff key, append immutable hours and expire old rows.
+                    EXECUTE format('GRANT SELECT, INSERT, DELETE ON TABLE %s TO two_bot_runtime', target);
                 ELSIF obj.kind = 'admission' THEN
                     -- Runtime may reserve/complete holds, never erase the lane.
                     EXECUTE format('GRANT SELECT, INSERT, UPDATE ON TABLE %s TO two_bot_runtime', target);
