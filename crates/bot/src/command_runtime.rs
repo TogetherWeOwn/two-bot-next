@@ -72,8 +72,9 @@ use twilight_model::{
 };
 use two_bot::voice_rooms::voice_claims_custom_id;
 use two_bot_core::{
+    automod_preview_attempt::AttemptResult,
     automod_preview_limiter::PreviewRateLimiter,
-    automod_preview_report::PREVIEW_NOT_EVALUATED_REPLY,
+    automod_preview_report::{metric_not_evaluated, PREVIEW_NOT_EVALUATED_REPLY},
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
     custom_command_store,
@@ -1658,11 +1659,10 @@ impl CommandRuntime {
                 }
             }
         }
-        let response = match &outcome {
-            SlashOutcome::Refuse {
-                refusal: RouterRefusal::GuildRestricted | RouterRefusal::ModerationDisabled,
-            } if name == "automod-preview" => Some(preview_response(PREVIEW_NOT_EVALUATED_REPLY)),
-            _ => response_for_slash(&outcome),
+        let response = if name == "automod-preview" {
+            preview_router_response(&outcome, two_bot_core::metrics::global())
+        } else {
+            response_for_slash(&outcome)
         };
         if let Some(response) = response {
             if name == "automod-preview" {
@@ -1695,7 +1695,7 @@ impl CommandRuntime {
             self.answer_preview(
                 interaction.id.get(),
                 &interaction.token,
-                preview_response(result.reply),
+                preview_attempt_response(result, two_bot_core::metrics::global()),
                 receipt.callback_deadline(),
             )
             .await;
@@ -3516,6 +3516,36 @@ impl PreviewReceipt {
     }
 }
 
+fn preview_router_response(
+    outcome: &SlashOutcome,
+    metrics: &two_bot_core::metrics::Metrics,
+) -> Option<InteractionResponse> {
+    match outcome {
+        SlashOutcome::Refuse {
+            refusal: RouterRefusal::GuildRestricted | RouterRefusal::ModerationDisabled,
+        } => Some(preview_attempt_response(
+            AttemptResult {
+                reply: PREVIEW_NOT_EVALUATED_REPLY.to_owned(),
+                metric: Some(metric_not_evaluated()),
+            },
+            metrics,
+        )),
+        _ => response_for_slash(outcome),
+    }
+}
+
+fn preview_attempt_response(
+    result: AttemptResult,
+    metrics: &two_bot_core::metrics::Metrics,
+) -> InteractionResponse {
+    // Count the outcome once, before delivery. Callback failure or retry does
+    // not change it, and a successful replay has no metric to record.
+    if let Some(labels) = result.metric {
+        metrics.automod_preview(labels);
+    }
+    preview_response(result.reply)
+}
+
 fn preview_response(text: impl Into<String>) -> InteractionResponse {
     text_response(InteractionReply::new(text, true))
 }
@@ -3679,3 +3709,83 @@ pub(crate) fn publication_definitions(
 #[cfg(test)]
 #[path = "command_runtime_poison_acceptance.rs"]
 mod dispatch_guard_poison_acceptance;
+
+#[cfg(test)]
+mod preview_metric_tests {
+    use super::*;
+    use two_bot_core::{automod_preview_report::metric_unavailable, metrics::Metrics};
+
+    fn assert_preview_count(metrics: &Metrics, tuple: &str, count: u64) {
+        let render = metrics.render(None);
+        let nonzero: Vec<_> = render
+            .lines()
+            .filter(|line| {
+                line.starts_with("two_bot_automod_previews_total{") && !line.ends_with(" 0")
+            })
+            .collect();
+        let expected = format!("two_bot_automod_previews_total{{{tuple}}} {count}");
+        assert_eq!(nonzero, [expected.as_str()]);
+    }
+
+    #[test]
+    fn preview_router_counts_guild_and_disabled_refusals_but_not_permission() {
+        let metrics = Metrics::default();
+        for refusal in [
+            RouterRefusal::GuildRestricted,
+            RouterRefusal::ModerationDisabled,
+        ] {
+            let response = preview_router_response(&SlashOutcome::Refuse { refusal }, &metrics)
+                .expect("preview refusal has a reply");
+            let data = response.data.unwrap();
+            assert_eq!(data.content.as_deref(), Some(PREVIEW_NOT_EVALUATED_REPLY));
+            assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+        }
+        let refusal = RouterRefusal::AutomodPreviewPermission;
+        let data = preview_router_response(&SlashOutcome::Refuse { refusal }, &metrics)
+            .unwrap()
+            .data
+            .unwrap();
+        assert_eq!(data.content, Some(refusal.message()));
+        assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+        assert!(preview_router_response(
+            &SlashOutcome::Handled {
+                handler: HandlerId::AutomodPreview
+            },
+            &metrics
+        )
+        .is_none());
+        assert_preview_count(
+            &metrics,
+            r#"result="not_evaluated",filter="none",mode="not_evaluated""#,
+            2,
+        );
+    }
+
+    #[test]
+    fn preview_reply_preparation_counts_audit_failure_but_not_replay() {
+        let metrics = Metrics::default();
+        for (reply, metric) in [
+            (
+                two_bot_core::automod_preview_report::PREVIEW_UNAVAILABLE_REPLY,
+                Some(metric_unavailable(Some(true))),
+            ),
+            ("Original audited reply", None),
+        ] {
+            let response = preview_attempt_response(
+                AttemptResult {
+                    reply: reply.to_owned(),
+                    metric,
+                },
+                &metrics,
+            );
+            let data = response.data.unwrap();
+            assert_eq!(data.content.as_deref(), Some(reply));
+            assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+        }
+        assert_preview_count(
+            &metrics,
+            r#"result="unavailable",filter="none",mode="dry_run""#,
+            1,
+        );
+    }
+}
