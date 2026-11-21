@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Id, MemberBaseline,
+    MemberBaselineError::{InconsistentChunk, MalformedChunk, RetiredAttempt},
+};
 use serde_json::{json, to_value, Value};
 
 fn start(expected: u64) -> MemberBaseline {
@@ -39,9 +42,9 @@ fn requests_all_members_without_presences_and_bounds_admission() {
 #[test]
 fn requires_all_indices_and_exact_unique_member_count() {
     let mut incomplete = start(3);
-    incomplete
-        .ingest_chunk(&chunk(0, 1, &[member("11", true)]).to_string())
-        .unwrap();
+    let short = chunk(0, 1, &[member("11", true)]).to_string();
+    assert_eq!(incomplete.ingest_chunk(&short), Err(InconsistentChunk));
+    assert_eq!(incomplete.ingest_chunk(&short), Err(RetiredAttempt));
     assert!(incomplete.finish().is_none());
 
     let mut missing_index = start(2);
@@ -51,8 +54,12 @@ fn requires_all_indices_and_exact_unique_member_count() {
     assert!(missing_index.finish().is_none());
 
     let mut baseline = start(2);
+    let nick = "😀".repeat(50);
+    let mut row = member("12", false);
+    row["nick"] = json!(nick);
+    row["roles"] = json!(["42", "43"]);
     baseline
-        .ingest_chunk(&chunk(1, 2, &[member("12", false)]).to_string())
+        .ingest_chunk(&chunk(1, 2, &[row]).to_string())
         .unwrap();
     assert!(!baseline.is_complete());
     baseline
@@ -62,7 +69,7 @@ fn requires_all_indices_and_exact_unique_member_count() {
         to_value(baseline.finish().unwrap()).unwrap(),
         json!([
             {"userId": "11", "roleIds": ["42"], "nick": "Test", "bot": false, "pending": true},
-            {"userId": "12", "roleIds": ["42"], "nick": "Test", "bot": false, "pending": false}
+            {"userId": "12", "roleIds": ["42", "43"], "nick": nick, "bot": false, "pending": false}
         ])
     );
 }
@@ -83,10 +90,7 @@ fn ignores_unrelated_chunks_but_retires_on_intervening_member_changes() {
     baseline.member_changed(Id::new(20));
     assert!(baseline.is_complete());
     baseline.member_changed(Id::new(10));
-    assert_eq!(
-        baseline.ingest_chunk(&raw),
-        Err(MemberBaselineError::RetiredAttempt)
-    );
+    assert_eq!(baseline.ingest_chunk(&raw), Err(RetiredAttempt));
     assert!(baseline.finish().is_none());
 }
 
@@ -102,14 +106,8 @@ fn rejects_ambiguous_screening_even_with_one_complete_chunk() {
         chunk(0, 1, &[json!([{"id":"11"}, [], null, false])]).to_string(),
     ] {
         let mut baseline = start(1);
-        assert_eq!(
-            baseline.ingest_chunk(&raw),
-            Err(MemberBaselineError::MalformedChunk)
-        );
-        assert_eq!(
-            baseline.ingest_chunk(&valid),
-            Err(MemberBaselineError::RetiredAttempt)
-        );
+        assert_eq!(baseline.ingest_chunk(&raw), Err(MalformedChunk));
+        assert_eq!(baseline.ingest_chunk(&valid), Err(RetiredAttempt));
         assert!(baseline.finish().is_none());
     }
 }
@@ -122,7 +120,7 @@ fn enforces_discord_chunk_size_even_within_the_guild_limit() {
         .collect();
     assert_eq!(
         baseline.ingest_chunk(&chunk(0, 1, &members).to_string()),
-        Err(MemberBaselineError::InconsistentChunk)
+        Err(InconsistentChunk)
     );
     assert!(baseline.finish().is_none());
 }
@@ -132,7 +130,15 @@ fn retires_on_inconsistent_chunk_metadata_or_rows() {
     let mut not_found = chunk(1, 2, &[member("12", true)]);
     not_found["not_found"] = json!(["99"]);
     let mut oversized_roles = member("12", false);
-    oversized_roles["roles"] = json!(vec!["42"; 251]);
+    oversized_roles["roles"] = json!((1..=251).map(|id| id.to_string()).collect::<Vec<_>>());
+    let mut duplicate_roles = member("12", false);
+    duplicate_roles["roles"] = json!(["42", "42"]);
+    let bad_nick = |nick: &str| {
+        let mut row = member("12", false);
+        row["nick"] = json!(nick);
+        chunk(1, 2, &[row])
+    };
+    let valid = chunk(1, 2, &[member("12", false)]).to_string();
     for invalid in [
         chunk(1, 0, &[member("12", false)]),
         chunk(2, 2, &[member("12", false)]),
@@ -142,6 +148,10 @@ fn retires_on_inconsistent_chunk_metadata_or_rows() {
         chunk(1, 2, &[member("12", false), member("13", false)]),
         chunk(1, 2, &[]),
         chunk(1, 2, &[oversized_roles]),
+        chunk(1, 2, &[duplicate_roles]),
+        bad_nick(""),
+        bad_nick(&"a".repeat(101)),
+        bad_nick(&"😀".repeat(51)),
         not_found,
     ] {
         let mut baseline = start(2);
@@ -150,8 +160,9 @@ fn retires_on_inconsistent_chunk_metadata_or_rows() {
             .unwrap();
         assert_eq!(
             baseline.ingest_chunk(&invalid.to_string()),
-            Err(MemberBaselineError::InconsistentChunk)
+            Err(InconsistentChunk)
         );
+        assert_eq!(baseline.ingest_chunk(&valid), Err(RetiredAttempt));
         assert!(baseline.finish().is_none());
     }
 }

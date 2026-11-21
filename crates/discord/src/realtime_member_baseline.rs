@@ -188,7 +188,13 @@ impl Collection {
         }
         self.chunk_count = Some(chunk.chunk_count);
         for Object(member) in chunk.members {
-            if member.roles.len() > 250 || member.nick.as_ref().is_some_and(|nick| nick.len() > 400)
+            // Match the snapshot codec's row-local constraints.
+            let mut roles = HashSet::new();
+            if member.roles.len() > 250
+                || !member.roles.iter().all(|role| roles.insert(*role))
+                || member.nick.as_deref().is_some_and(|nick| {
+                    nick.is_empty() || nick.encode_utf16().take(101).count() > 100
+                })
             {
                 return Err(InconsistentChunk);
             }
@@ -207,6 +213,9 @@ impl Collection {
             if self.members.insert(user_id, row).is_some() {
                 return Err(InconsistentChunk);
             }
+        }
+        if self.indices.len() == chunk.chunk_count && self.members.len() != expected {
+            return Err(InconsistentChunk);
         }
         Ok(())
     }
