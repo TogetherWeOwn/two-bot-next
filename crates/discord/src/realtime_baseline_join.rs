@@ -1,6 +1,6 @@
 //! Join the six realtime topics in gateway receive order without publishing them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::Deserialize;
 use serde_json::{value::RawValue, Value};
@@ -12,7 +12,7 @@ use two_bot_core::{duplicate_keys::reject_duplicate_keys, realtime_wire as wire}
 use wire::{Change, Operation, Topics, WireTime};
 
 use crate::{
-    realtime_gateway::{self, ProjectionError},
+    realtime_gateway::{self, baseline::topology, ProjectionError},
     realtime_roster::intake::{BaselineIntake, BaselineRows, IntakeError},
 };
 
@@ -23,11 +23,11 @@ pub enum JoinError {
     AmbiguousDispatch,
     InvalidTopics,
 }
+use JoinError::{AmbiguousDispatch, InvalidTopics, Roster, Topology};
 
-/// One configured guild on a single ordered gateway owner. Call `begin` only
-/// on that guild's fresh GUILD_CREATE and feed all subsequent frames in order.
-/// The owner must retire on a missed frame, request failure, timeout or session
-/// change and use a different nonce for every request.
+/// Call `begin` on the configured guild's fresh GUILD_CREATE. One owner feeds
+/// every subsequent frame in receive order, uses a fresh nonce per request and
+/// retires on frame loss, request failure, timeout or session change.
 pub struct BaselineJoin {
     guild_id: Id<GuildMarker>,
     pending: Option<Pending>,
@@ -35,10 +35,11 @@ pub struct BaselineJoin {
 
 struct Pending {
     intake: BaselineIntake,
+    nonce: String,
     guild: wire::Guild,
-    channels: BTreeMap<wire::Id, wire::Channel>,
-    roles: BTreeMap<wire::Id, wire::Role>,
-    voice: BTreeMap<wire::Id, wire::Voice>,
+    channels: Rows<wire::Channel>,
+    roles: Rows<wire::Role>,
+    voice: Rows<wire::Voice>,
 }
 
 #[derive(Deserialize)]
@@ -49,16 +50,29 @@ struct Dispatch<'a> {
     d: Option<&'a RawValue>,
 }
 
-impl Dispatch<'_> {
-    fn body(&self) -> Result<Value, JoinError> {
-        let raw = self.d.ok_or(JoinError::AmbiguousDispatch)?.get();
-        let value: Value = serde_json::from_str(raw).map_err(|_| JoinError::AmbiguousDispatch)?;
-        if !value.is_object() || reject_duplicate_keys(raw.as_bytes()).is_err() {
-            return Err(JoinError::AmbiguousDispatch);
-        }
-        Ok(value)
-    }
+#[derive(Deserialize)]
+struct GuildRowScope {
+    id: GuildId,
 }
+#[derive(Deserialize)]
+struct GuildScope {
+    guild_id: GuildId,
+}
+#[derive(Deserialize)]
+struct ChunkNonce {
+    nonce: Option<String>,
+}
+
+type GuildId = Id<GuildMarker>;
+type Rows<T> = BTreeMap<wire::Id, T>;
+type JoinResult<T> = Result<T, JoinError>;
+
+enum Step {
+    Keep,
+    Retire,
+    Intake,
+}
+use Step::{Intake, Keep, Retire};
 
 impl BaselineJoin {
     pub fn new(guild_id: Id<GuildMarker>) -> Self {
@@ -68,56 +82,44 @@ impl BaselineJoin {
         }
     }
 
-    pub fn begin(
-        &mut self,
-        raw: &str,
-        nonce: String,
-    ) -> Result<Option<RequestGuildMembers>, JoinError> {
+    pub fn begin(&mut self, raw: &str, nonce: String) -> JoinResult<Option<RequestGuildMembers>> {
         self.retire();
-        let Some(topology) = realtime_gateway::baseline::topology(self.guild_id, raw)
-            .map_err(JoinError::Topology)?
-        else {
+        let Some(topology) = topology(self.guild_id, raw).map_err(Topology)? else {
             return Ok(None);
         };
-        if !topology.channels.iter().all(bounded_channel) {
-            return Err(JoinError::InvalidTopics);
+        reject_duplicate_keys(raw.as_bytes()).map_err(|_| AmbiguousDispatch)?;
+        if !topology.channels.iter().all(valid_channel) {
+            return Err(InvalidTopics);
         }
         let mut intake = BaselineIntake::new(self.guild_id);
-        let request = intake.begin(raw, nonce).map_err(JoinError::Roster)?;
-        if request.is_some() {
+        let request = intake.begin(raw, nonce.clone()).map_err(Roster)?;
+        Ok(request.inspect(|_| {
             self.pending = Some(Pending {
                 intake,
+                nonce,
                 guild: topology.guild,
                 channels: keyed(topology.channels, |row| row.id),
                 roles: keyed(topology.roles, |row| row.id),
                 voice: keyed(topology.voice, |row| row.user_id),
             });
-        }
-        Ok(request)
+        }))
     }
 
     pub fn retire(&mut self) {
         self.pending = None;
     }
 
-    /// Emits a candidate once, at the final matching chunk's receive position.
-    /// Consume it in that turn: this does not allocate a cursor or publish.
-    pub fn observe(
-        &mut self,
-        raw: &str,
-        observed_at: WireTime,
-    ) -> Result<Option<Topics>, JoinError> {
-        // Only an incomplete, valid attempt is restored. Errors, generation
-        // changes and completion all discard both collectors together.
+    /// Emits a candidate once at the final matching chunk, without publishing.
+    pub fn observe(&mut self, raw: &str, at: WireTime) -> JoinResult<Option<Topics>> {
         let Some(mut pending) = self.pending.take() else {
             return Ok(None);
         };
-        if pending.fold_topology(self.guild_id, raw)? {
-            return Ok(None);
-        }
-        let Some(BaselineRows { members, events }) =
-            pending.intake.observe(raw).map_err(JoinError::Roster)?
-        else {
+        let rows = match pending.fold(self.guild_id, raw)? {
+            Retire => return Ok(None),
+            Intake => pending.intake.observe(raw).map_err(Roster)?,
+            Keep => None,
+        };
+        let Some(BaselineRows { members, events }) = rows else {
             self.pending = Some(pending);
             return Ok(None);
         };
@@ -129,116 +131,123 @@ impl BaselineJoin {
             voice: pending.voice.into_values().collect(),
             events,
         };
-        // Reuse the codec to check references and size at the longest cursor.
-        // Never expose the validation bytes or guess a cascade on deletion.
-        wire::encode_snapshot(
-            wire::Id(self.guild_id.into_nonzero()),
-            wire::MAX_SEQ,
-            observed_at,
-            &topics,
-        )
-        .map(|_| Some(topics))
-        .ok_or(JoinError::InvalidTopics)
+        // The codec checks references and size at the longest cursor.
+        let guild = wire::Id(self.guild_id.into_nonzero());
+        wire::encode_snapshot(guild, wire::MAX_SEQ, at, &topics)
+            .map(|_| Some(topics))
+            .ok_or(InvalidTopics)
     }
 }
 
 impl Pending {
-    /// Returns true if the frame invalidates this gateway baseline.
-    fn fold_topology(&mut self, guild_id: Id<GuildMarker>, raw: &str) -> Result<bool, JoinError> {
-        if !raw.trim_start().starts_with('{') {
-            return Err(JoinError::AmbiguousDispatch);
+    fn fold(&mut self, guild: GuildId, raw: &str) -> JoinResult<Step> {
+        let dispatch: Dispatch<'_> = object(raw)?;
+        let kind = match (dispatch.op, dispatch.t.as_deref()) {
+            (7 | 9, _) | (0, Some("READY" | "RESUMED")) => return Ok(Retire),
+            (0, Some(kind)) => kind,
+            (0, None) => return Err(AmbiguousDispatch),
+            _ => return Ok(Keep),
+        };
+        let (guild_row, step) = match kind {
+            "GUILD_CREATE" | "GUILD_DELETE" => (true, Retire),
+            "GUILD_UPDATE" => (true, Keep),
+            "CHANNEL_CREATE" | "CHANNEL_UPDATE" | "CHANNEL_DELETE" => (false, Keep),
+            "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" | "GUILD_ROLE_DELETE" => (false, Keep),
+            "VOICE_STATE_UPDATE" => (false, Keep),
+            "GUILD_MEMBERS_CHUNK"
+            | "GUILD_MEMBER_ADD"
+            | "GUILD_MEMBER_UPDATE"
+            | "GUILD_MEMBER_REMOVE" => (false, Intake),
+            "GUILD_SCHEDULED_EVENT_CREATE"
+            | "GUILD_SCHEDULED_EVENT_UPDATE"
+            | "GUILD_SCHEDULED_EVENT_DELETE" => (false, Intake),
+            _ => return Ok(Keep),
+        };
+        // Typed headers reject duplicate scope keys before inspecting payloads.
+        let raw = dispatch.d.ok_or(AmbiguousDispatch)?.get();
+        let scope = if guild_row {
+            object::<GuildRowScope>(raw)?.id
+        } else {
+            object::<GuildScope>(raw)?.guild_id
+        };
+        if scope != guild || kind == "GUILD_MEMBERS_CHUNK" && !self.matches_nonce(raw)? {
+            return Ok(Keep);
         }
-        let dispatch: Dispatch<'_> =
-            serde_json::from_str(raw).map_err(|_| JoinError::AmbiguousDispatch)?;
-        match dispatch.op {
-            0 => {}
-            7 | 9 => return Ok(true), // reconnect or invalid session
-            _ => return Ok(false),
+        reject_duplicate_keys(raw.as_bytes()).map_err(|_| AmbiguousDispatch)?;
+        if matches!(step, Keep) {
+            self.apply(guild, kind, &object(raw)?)?;
         }
-        match dispatch.t.as_deref().ok_or(JoinError::AmbiguousDispatch)? {
-            "READY" | "RESUMED" => return Ok(true),
-            "GUILD_CREATE" | "GUILD_DELETE" => {
-                return Ok(guild_scope(&dispatch.body()?, "id")? == guild_id)
-            }
-            kind @ ("GUILD_UPDATE" | "CHANNEL_CREATE" | "CHANNEL_UPDATE" | "CHANNEL_DELETE"
-            | "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" | "GUILD_ROLE_DELETE"
-            | "VOICE_STATE_UPDATE") => {
-                self.apply(guild_id, kind, &dispatch.body()?)?;
-            }
-            _ => {}
-        }
-        Ok(false)
+        Ok(step)
     }
 
-    fn apply(
-        &mut self,
-        guild_id: Id<GuildMarker>,
-        kind: &str,
-        body: &Value,
-    ) -> Result<(), JoinError> {
-        let scope = if kind == "GUILD_UPDATE" {
-            "id"
-        } else {
-            "guild_id"
-        };
-        if guild_scope(body, scope)? != guild_id {
-            return Ok(());
-        }
-        if matches!(kind, "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE") && !body["role"].is_object()
-            || kind == "CHANNEL_UPDATE" && body.get("parent_id").is_none()
-            || body["permission_overwrites"]
-                .as_array()
-                .is_some_and(|rows| rows.iter().any(|row| !row.is_object()))
+    fn matches_nonce(&self, raw: &str) -> JoinResult<bool> {
+        Ok(object::<ChunkNonce>(raw)?.nonce.as_deref() == Some(self.nonce.as_str()))
+    }
+
+    fn apply(&mut self, guild: GuildId, kind: &str, body: &Value) -> JoinResult<()> {
+        let overwrites = body["permission_overwrites"].as_array();
+        let role_upsert = matches!(kind, "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE");
+        if role_upsert && !body["role"].is_object()
+            || overwrites.is_some_and(|rows| rows.iter().any(|row| !row.is_object()))
         {
-            return Err(JoinError::AmbiguousDispatch);
+            return Err(AmbiguousDispatch);
         }
-        match realtime_gateway::project(guild_id, kind, body).map_err(JoinError::Topology)? {
+        match realtime_gateway::project(guild, kind, body).map_err(Topology)? {
             Some(Operation::Guild(Change::Upsert { value, .. })) => self.guild = value,
-            Some(Operation::Channels(change)) => {
-                if matches!(&change, Change::Upsert { value, .. } if !bounded_channel(value)) {
-                    return Err(JoinError::InvalidTopics);
+            Some(Operation::Channels(mut change)) => {
+                if let Change::Upsert { id, value } = &mut change {
+                    if !valid_channel(value) {
+                        return Err(InvalidTopics);
+                    }
+                    let update = kind == "CHANNEL_UPDATE";
+                    // Only categories prove an absent parent without an explicit key.
+                    let category = matches!(value.kind, wire::ChannelKind::Category);
+                    if update && !category && body.get("parent_id").is_none() {
+                        return Err(AmbiguousDispatch);
+                    }
+                    if update && body.get("position").is_none() {
+                        value.position = self.channels.get(id).and_then(|row| row.position);
+                    }
                 }
                 apply_change(&mut self.channels, change, 500)?;
             }
             Some(Operation::Roles(change)) => apply_change(&mut self.roles, change, 250)?,
             Some(Operation::Voice(change)) => apply_change(&mut self.voice, change, 10_000)?,
-            // Do not mistake an unprojectable same-guild change for no change.
-            _ => return Err(JoinError::AmbiguousDispatch),
+            _ => return Err(AmbiguousDispatch),
         }
         Ok(())
     }
 }
 
-fn guild_scope(body: &Value, field: &str) -> Result<Id<GuildMarker>, JoinError> {
-    Id::deserialize(&body[field]).map_err(|_| JoinError::AmbiguousDispatch)
+fn object<'a, T: Deserialize<'a>>(raw: &'a str) -> JoinResult<T> {
+    if !raw.trim_start().starts_with('{') {
+        return Err(AmbiguousDispatch);
+    }
+    serde_json::from_str(raw).map_err(|_| AmbiguousDispatch)
 }
 
-fn bounded_channel(row: &wire::Channel) -> bool {
-    row.name.encode_utf16().take(101).count() <= 100
+fn valid_channel(row: &wire::Channel) -> bool {
+    let mut targets = HashSet::new();
+    let unique = |entry: &wire::Overwrite| targets.insert((entry.kind, entry.id));
+    !row.name.is_empty()
+        && row.name.encode_utf16().take(101).count() <= 100
         && row.overwrites.len() <= 100
+        && row.overwrites.iter().all(unique)
         && (row.parent_id.is_none() || !matches!(row.kind, wire::ChannelKind::Category))
 }
 
-fn keyed<T>(rows: Vec<T>, id: impl Fn(&T) -> wire::Id) -> BTreeMap<wire::Id, T> {
+fn keyed<T>(rows: Vec<T>, id: impl Fn(&T) -> wire::Id) -> Rows<T> {
     rows.into_iter().map(|row| (id(&row), row)).collect()
 }
 
-fn apply_change<T>(
-    rows: &mut BTreeMap<wire::Id, T>,
-    change: Change<T>,
-    limit: usize,
-) -> Result<(), JoinError> {
-    match change {
-        Change::Upsert { id, value } => {
-            if rows.len() == limit && !rows.contains_key(&id) {
-                return Err(JoinError::InvalidTopics);
-            }
-            rows.insert(id, value);
+fn apply_change<T>(rows: &mut Rows<T>, change: Change<T>, limit: usize) -> JoinResult<()> {
+    let _ = match change {
+        Change::Upsert { id, value } if rows.len() < limit || rows.contains_key(&id) => {
+            rows.insert(id, value)
         }
-        Change::Remove { id } => {
-            rows.remove(&id);
-        }
-    }
+        Change::Upsert { .. } => return Err(InvalidTopics),
+        Change::Remove { id } => rows.remove(&id),
+    };
     Ok(())
 }
 
