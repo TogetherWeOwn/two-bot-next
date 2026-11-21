@@ -271,7 +271,7 @@ class SupplyChainTests(unittest.TestCase):
     def test_all_remote_workflow_actions_are_sha_pinned(self):
         for path in (ROOT / ".github/workflows").glob("*.yml"):
             for action in re.findall(r"^\s*-?\s*uses:\s*(\S+)", path.read_text(), re.MULTILINE):
-                if not action.startswith("./"):
+                if not action.startswith(("./", "$/.github/workflows/")):
                     self.assertRegex(action, r"@[0-9a-f]{40}$", f"Unpinned action in {path}: {action}")
 
     def test_all_workflow_container_and_service_images_are_digest_pinned(self):

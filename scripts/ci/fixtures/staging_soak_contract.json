@@ -1,0 +1,290 @@
+{
+  "caller": {
+    "name": "bounded live staging soak and regression evidence",
+    "needs": "guard",
+    "if": "needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'",
+    "permissions": {
+      "contents": "read",
+      "actions": "read"
+    },
+    "uses": "$/.github/workflows/staging-soak.yml",
+    "with": {
+      "sha": "${{ needs.guard.outputs.sha }}",
+      "auto": "${{ needs.guard.outputs.auto }}",
+      "full_soak": "${{ needs.guard.outputs.auto == 'true' || (github.event_name == 'workflow_dispatch' && needs.guard.outputs.takeover == 'true' && needs.guard.outputs.allow_unstaged != 'true') }}",
+      "staging_run_id": "${{ needs.guard.outputs.staging_run_id }}",
+      "staging_attempt": "${{ needs.guard.outputs.staging_attempt }}"
+    },
+    "secrets": {
+      "STAGING_OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+      "STAGING_METRICS_SCRAPE_TOKEN": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}",
+      "TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"
+    }
+  },
+  "reusable": {
+    "name": "staging-soak",
+    "on": {
+      "workflow_call": {
+        "inputs": {
+          "sha": {
+            "type": "string",
+            "required": "true"
+          },
+          "auto": {
+            "type": "string",
+            "required": "true"
+          },
+          "full_soak": {
+            "type": "boolean",
+            "required": "true"
+          },
+          "staging_run_id": {
+            "type": "string",
+            "required": "true"
+          },
+          "staging_attempt": {
+            "type": "string",
+            "required": "true"
+          }
+        },
+        "secrets": {
+          "STAGING_OWNERSHIP_CONTROL_TOKEN": {
+            "required": "true"
+          },
+          "TWO_VOICE_SYNTHETIC_BOT_TOKEN": {
+            "required": "false"
+          },
+          "STAGING_METRICS_SCRAPE_TOKEN": {
+            "required": "true"
+          }
+        },
+        "outputs": {
+          "skip": {
+            "value": "${{ jobs.finish.outputs.skip }}"
+          },
+          "evidence": {
+            "value": "${{ jobs.finish.outputs.evidence }}"
+          }
+        }
+      }
+    },
+    "permissions": {},
+    "concurrency": {
+      "group": "${{ github.run_attempt == 1 && github.ref == 'refs/heads/main' && github.ref_protected && 'staging-lifecycle' || format('staging-soak-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
+      "cancel-in-progress": "false",
+      "queue": "max"
+    },
+    "jobs": {
+      "begin": {
+        "runs-on": "ubuntu-latest",
+        "environment": {
+          "name": "staging",
+          "deployment": "false"
+        },
+        "permissions": {
+          "contents": "read"
+        },
+        "timeout-minutes": "8",
+        "outputs": {
+          "expires_at": "${{ steps.staging-use-begin.outputs.expires_at }}",
+          "deployment_id": "${{ steps.staging-use-begin.outputs.deployment_id }}",
+          "baseline_id": "${{ steps.baseline.outputs.artifact-id }}"
+        },
+        "steps": [
+          {
+            "id": "admission",
+            "if": "always()",
+            "run": "test \"$GITHUB_RUN_ATTEMPT:$GITHUB_REF:$GITHUB_REF_PROTECTED\" = '1:refs/heads/main:true'"
+          },
+          {
+            "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "with": {
+              "ref": "${{ github.sha }}",
+              "persist-credentials": "false",
+              "fetch-depth": "1"
+            }
+          },
+          {
+            "uses": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+            "with": {
+              "node-version": "22",
+              "package-manager-cache": "false"
+            }
+          },
+          {
+            "name": "Acquire and ready the guarded staging candidate",
+            "id": "staging-use-begin",
+            "env": {
+              "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+              "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+              "STAGING_USE_EXPECTED_SHA": "${{ inputs.sha }}",
+              "STAGING_USE_MINUTES": "40",
+              "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-soak-use.ndjson"
+            },
+            "run": "node wrangler/scripts/staging-use-pipeline.mjs begin"
+          },
+          {
+            "name": "Record the soak-baseline REST counters",
+            "env": {
+              "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+              "METRICS_SCRAPE_TOKEN": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"
+            },
+            "run": "set -euo pipefail\nnode wrangler/scripts/rest-5xx-counters.mjs --metrics-url \"$STAGING_WORKER_URL\" --out \"$RUNNER_TEMP/staging-soak-baseline.json\"\n"
+          },
+          {
+            "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+            "id": "baseline",
+            "if": "always() && steps.staging-use-begin.outcome != 'skipped'",
+            "with": {
+              "name": "staging-soak-start-${{ github.run_id }}-${{ github.run_attempt }}",
+              "path": "${{ runner.temp }}/staging-soak-use.ndjson\n${{ runner.temp }}/staging-soak-baseline.json",
+              "if-no-files-found": "error",
+              "retention-days": "7"
+            }
+          }
+        ]
+      },
+      "voice": {
+        "needs": "begin",
+        "permissions": {
+          "contents": "read"
+        },
+        "uses": "$/.github/workflows/voice-synthetic.yml",
+        "with": {
+          "artifact_invocation": "soak",
+          "deploy_staging_call": "true",
+          "staging_use_sha": "${{ inputs.sha }}",
+          "staging_use_deployment": "${{ needs.begin.outputs.deployment_id }}",
+          "staging_use_expires_at": "${{ needs.begin.outputs.expires_at }}"
+        },
+        "secrets": {
+          "STAGING_OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+          "TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"
+        }
+      },
+      "finish": {
+        "needs": [
+          "begin",
+          "voice"
+        ],
+        "if": "always() && needs.begin.outputs.expires_at != ''",
+        "runs-on": "ubuntu-latest",
+        "environment": {
+          "name": "staging",
+          "deployment": "false"
+        },
+        "permissions": {
+          "contents": "read",
+          "actions": "read"
+        },
+        "timeout-minutes": "50",
+        "outputs": {
+          "skip": "${{ steps.release.outcome == 'success' && steps.judge.outputs.skip || '' }}",
+          "evidence": "${{ steps.release.outcome == 'success' && steps.judge.outputs.evidence || '' }}"
+        },
+        "steps": [
+          {
+            "id": "admission",
+            "if": "always()",
+            "run": "test \"$GITHUB_RUN_ATTEMPT:$GITHUB_REF:$GITHUB_REF_PROTECTED\" = '1:refs/heads/main:true'"
+          },
+          {
+            "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "with": {
+              "ref": "${{ github.sha }}",
+              "persist-credentials": "false",
+              "fetch-depth": "1"
+            }
+          },
+          {
+            "uses": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+            "with": {
+              "node-version": "22",
+              "package-manager-cache": "false"
+            }
+          },
+          {
+            "if": "!cancelled() && (needs.begin.result != 'success' || needs.voice.result != 'success' || needs.voice.outputs.exercised != 'true' || needs.begin.outputs.baseline_id == '')",
+            "run": "exit 1"
+          },
+          {
+            "uses": "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+            "with": {
+              "artifact-ids": "${{ needs.begin.outputs.baseline_id }}",
+              "path": "${{ runner.temp }}/soak-start"
+            }
+          },
+          {
+            "run": "mv \"$RUNNER_TEMP/soak-start/staging-soak-baseline.json\" \"$RUNNER_TEMP/staging-soak-baseline.json\""
+          },
+          {
+            "name": "Measure a fresh live staging interval",
+            "env": {
+              "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+              "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+              "STAGING_USE_SHA": "${{ inputs.sha }}",
+              "STAGING_USE_DEPLOYMENT": "${{ needs.begin.outputs.deployment_id }}",
+              "STAGING_USE_EXPIRES_AT": "${{ needs.begin.outputs.expires_at }}",
+              "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-soak-use.ndjson",
+              "FULL_SOAK": "${{ inputs.full_soak }}"
+            },
+            "run": "node wrangler/scripts/staging-soak-window.mjs"
+          },
+          {
+            "name": "Read the candidate's staging journeys and soak REST counters",
+            "id": "judge",
+            "env": {
+              "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+              "METRICS_SCRAPE_TOKEN": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}",
+              "SHA": "${{ inputs.sha }}",
+              "AUTO": "${{ inputs.auto }}",
+              "GH_TOKEN": "${{ github.token }}",
+              "RUN_ID": "${{ inputs.staging_run_id }}",
+              "RUN_ATTEMPT": "${{ inputs.staging_attempt }}"
+            },
+            "run": "set -euo pipefail\nprobe=0\npython3 scripts/staging_health_contract_probe.py --expected-sha \"$SHA\" --evidence \"$RUNNER_TEMP/staging-soak-probe.json\" || probe=$?\nif [ \"$probe\" -gt 1 ]; then echo \"::error::staging probe refused to run (exit $probe)\"; exit 1; fi\nnode wrangler/scripts/rest-5xx-counters.mjs --metrics-url \"$STAGING_WORKER_URL\" --out \"$RUNNER_TEMP/staging-soak-counters.json\"\ngh api --method GET \"repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-staging.yml/runs\" \\\n  -f branch=main -f per_page=100 -q '[.workflow_runs[] | {head_sha, head_branch, status, conclusion}]' > \"$RUNNER_TEMP/staging-runs.json\"\npython3 scripts/promotion_regression_gate.py staging \\\n  --probe \"$RUNNER_TEMP/staging-soak-probe.json\" --counters \"$RUNNER_TEMP/staging-soak-counters.json\" \\\n  --sha \"$SHA\" --auto \"$AUTO\" --run-id \"$RUN_ID\" --attempt \"$RUN_ATTEMPT\" \\\n  --staging-runs \"$RUNNER_TEMP/staging-runs.json\" --baseline-counters \"$RUNNER_TEMP/staging-soak-baseline.json\" \\\n  --out \"$RUNNER_TEMP/staging-soak-evidence.json\"\n"
+          },
+          {
+            "name": "Recheck the original grant after final sampling",
+            "env": {
+              "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+              "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+              "STAGING_USE_SHA": "${{ inputs.sha }}",
+              "STAGING_USE_DEPLOYMENT": "${{ needs.begin.outputs.deployment_id }}",
+              "STAGING_USE_EXPIRES_AT": "${{ needs.begin.outputs.expires_at }}",
+              "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-soak-use.ndjson",
+              "FULL_SOAK": "${{ inputs.full_soak }}"
+            },
+            "run": "node wrangler/scripts/staging-use-pipeline.mjs consume"
+          },
+          {
+            "name": "Release the original staging soak window",
+            "id": "release",
+            "if": "always() && needs.begin.outputs.expires_at != '' && steps.admission.outcome == 'success'",
+            "env": {
+              "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+              "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+              "STAGING_USE_SHA": "${{ inputs.sha }}",
+              "STAGING_USE_DEPLOYMENT": "${{ needs.begin.outputs.deployment_id }}",
+              "STAGING_USE_EXPIRES_AT": "${{ needs.begin.outputs.expires_at }}",
+              "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-soak-use.ndjson",
+              "FULL_SOAK": "${{ inputs.full_soak }}"
+            },
+            "run": "node wrangler/scripts/staging-use-pipeline.mjs finish\njq -es 'any(.[]; .action == \"release\" and .sha == env.STAGING_USE_SHA and .deploymentId == env.STAGING_USE_DEPLOYMENT)' \"$STAGING_USE_RECEIPT\"\n"
+          },
+          {
+            "name": "Retain staging soak lifecycle and measurement evidence",
+            "if": "always()",
+            "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+            "with": {
+              "name": "staging-soak-${{ github.run_id }}-${{ github.run_attempt }}",
+              "path": "${{ runner.temp }}/staging-soak-use.ndjson\n${{ runner.temp }}/staging-soak-*.json\n",
+              "if-no-files-found": "error",
+              "retention-days": "7"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

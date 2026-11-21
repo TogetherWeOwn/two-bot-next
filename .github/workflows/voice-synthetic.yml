@@ -43,6 +43,7 @@ on:
       staging_use_deployment:
         type: string
         required: true
+    outputs: {exercised: {value: "${{ jobs.synthetic.outputs.exercised }}"}}
     secrets:
       TWO_VOICE_SYNTHETIC_BOT_TOKEN:
         required: false
@@ -170,12 +171,14 @@ jobs:
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs: {exercised: "${{ steps.voice.outputs.exercised }}"}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: Run the staging voice synthetic
+        id: voice
         env:
           TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
           VOICE_SYNTHETIC_REQUIRED: ${{ vars.VOICE_SYNTHETIC_REQUIRED }}
@@ -207,6 +210,7 @@ jobs:
           for attempt in 1 2 3; do
             reserve_attempt 0
             if timeout -s KILL "${budget}s" python3 scripts/staging_voice_synthetic.py --evidence "voice-synthetic-$RUN_ID-$attempt.json"; then
+              printf 'exercised=true\n' >> "$GITHUB_OUTPUT"
               exit 0
             else
               case $? in 124|137) exit 1 ;; esac

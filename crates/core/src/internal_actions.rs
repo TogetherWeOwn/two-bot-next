@@ -115,17 +115,32 @@ pub fn body_hash(raw: &[u8]) -> String {
 /// `POST\n/internal/actions\n{timestamp}\n{nonce}\n{sha256_hex(body)}`.
 #[must_use]
 pub fn canonical_string(timestamp: &str, nonce: &str, raw: &[u8]) -> String {
-    format!(
-        "POST\n{ACTIONS_PATH}\n{timestamp}\n{nonce}\n{}",
-        body_hash(raw)
-    )
+    canonical_post(ACTIONS_PATH, timestamp, nonce, raw)
+}
+
+fn canonical_post(path: &'static str, timestamp: &str, nonce: &str, raw: &[u8]) -> String {
+    format!("POST\n{path}\n{timestamp}\n{nonce}\n{}", body_hash(raw))
 }
 
 /// `sha256=` + hex(HMAC-SHA256(secret, canonical)).
 #[must_use]
 pub fn sign(secret: &[u8], timestamp: &str, nonce: &str, raw: &[u8]) -> String {
+    sign_post(ACTIONS_PATH, secret, timestamp, nonce, raw)
+}
+
+/// Sign the exact bytes of a POST to the caller's fixed protocol route.
+/// The caller must select the path as a literal (never from request metadata),
+/// use a key scoped to the protocol, and validate timestamp and nonce grammar.
+#[must_use]
+pub(crate) fn sign_post(
+    path: &'static str,
+    secret: &[u8],
+    timestamp: &str,
+    nonce: &str,
+    raw: &[u8],
+) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts keys of any length");
-    mac.update(canonical_string(timestamp, nonce, raw).as_bytes());
+    mac.update(canonical_post(path, timestamp, nonce, raw).as_bytes());
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
