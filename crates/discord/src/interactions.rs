@@ -219,6 +219,30 @@ pub fn help_detail_response(detail: String) -> InteractionResponse {
     }
 }
 
+/// One immediate branded ephemeral detail or correction reply. Neutralize
+/// mentions before sizing so expansion cannot cut off the truncation notice.
+#[must_use]
+pub(crate) fn branded_help_detail_response(detail: String) -> InteractionResponse {
+    use crate::help_navigation::{help_callback, HELP_SURFACE, HELP_TITLE};
+    use two_bot_core::message_safety::{
+        neutralize_mentions, text_len, truncate, EMBED_DESCRIPTION_LIMIT,
+    };
+
+    let mut description = neutralize_mentions(&detail);
+    if text_len(&description) > EMBED_DESCRIPTION_LIMIT {
+        const NOTICE: &str = "…(detail truncated for display.)";
+        description = truncate(&description, EMBED_DESCRIPTION_LIMIT - text_len(NOTICE)) + NOTICE;
+    }
+    help_callback(
+        EmbedKind::Default,
+        HELP_TITLE,
+        &description,
+        Vec::new(),
+        crate::brand::brand_footer_for(HELP_SURFACE),
+        None,
+    )
+}
+
 #[must_use]
 pub fn deferred_response(ephemeral: bool) -> InteractionResponse {
     InteractionResponse {
@@ -1363,6 +1387,32 @@ mod help_response_tests {
     }
 
     #[test]
+    fn short_detail_uses_the_branded_ephemeral_embed() {
+        let detail = "/rank — Show your XP, level and server rank.\nUsage: /rank [member]\n";
+        let wire = serde_json::to_value(branded_help_detail_response(detail.to_owned()))
+            .expect("serializes");
+        assert_eq!(wire["type"], 4);
+        assert_eq!(wire["data"]["flags"], 64);
+        assert_eq!(
+            wire["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert!(wire["data"]["content"].is_null());
+        let embed = &wire["data"]["embeds"][0];
+        assert_eq!(embed["description"], detail);
+        assert_eq!(embed["title"], "Together We Own help");
+        assert_eq!(
+            embed["color"].as_u64(),
+            Some(u64::from(EmbedKind::Default.color()))
+        );
+        assert_eq!(
+            embed["footer"]["text"],
+            crate::brand::brand_footer_for("Help").text
+        );
+        assert_eq!(embed["footer"]["icon_url"], crate::brand::BRAND_ICON_URL);
+    }
+
+    #[test]
     fn wide_rendered_detail_preserves_its_complete_notice_through_the_adapter() {
         use two_bot_core::commands::{CommandChoice, CommandOption, CommandOptionType};
 
@@ -1416,6 +1466,22 @@ mod help_response_tests {
                 crate::brand::BRAND_ICON_URL
             );
         }
+    }
+
+    #[test]
+    fn detail_notice_survives_mention_neutralization_at_the_limit() {
+        let detail = "@everyone".repeat(EMBED_DESCRIPTION_LIMIT / 9);
+        assert!(text_len(&detail) <= EMBED_DESCRIPTION_LIMIT);
+        let safe =
+            crate::message_safety::interaction_response(&branded_help_detail_response(detail))
+                .expect("sanitized detail");
+        let wire = serde_json::to_value(safe).expect("serializes");
+        let description = wire["data"]["embeds"][0]["description"]
+            .as_str()
+            .expect("description");
+        assert!(text_len(description) <= EMBED_DESCRIPTION_LIMIT);
+        assert!(description.ends_with("…(detail truncated for display.)"));
+        assert!(!description.contains("@everyone"));
     }
 
     #[test]
