@@ -400,14 +400,14 @@ async fn poll_until_or<F: Future>(
     tokio::time::timeout_at(at, guarded).await.ok().flatten()
 }
 
-async fn bounded_poll<F: Future>(
+async fn wait_for_headers<F: Future>(
     deadline: Option<Instant>,
-    stop_at_cutoff: bool,
+    callback: bool,
     send: F,
 ) -> Option<F::Output> {
     match deadline {
         None => Some(send.await),
-        Some(at) if stop_at_cutoff => poll_until(at, send).await,
+        Some(at) if callback => poll_until(at, send).await,
         Some(at) => tokio::time::timeout_at(at, send).await.ok(),
     }
 }
@@ -894,7 +894,7 @@ impl HyperTransport {
             // poll. With resends off, later polls only check the reply channel.
             poll_until_or(at, request_fut, || captured.connection_metadata().is_some()).await
         } else {
-            bounded_poll(deadline, strict || callback, request_fut).await
+            wait_for_headers(deadline, strict || callback, request_fut).await
         };
         let response = match headers {
             Some(Ok(response)) => response,
@@ -1736,7 +1736,7 @@ impl ActionExecutor {
         deadline: Instant,
         callback_admission: CallbackAdmission,
     ) -> Result<(RawResponse, bool), DiscordError> {
-        bounded_poll(
+        wait_for_headers(
             Some(deadline),
             request.method() == Method::Get,
             self.admit(request, lane),
@@ -5397,7 +5397,7 @@ mod tests {
             }
             std::task::Poll::Pending
         });
-        let mut send = std::pin::pin!(bounded_poll(Some(deadline), true, connect_then_send));
+        let mut send = std::pin::pin!(wait_for_headers(Some(deadline), true, connect_then_send));
         assert!(futures_util::poll!(&mut send).is_pending());
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(send.await, None);

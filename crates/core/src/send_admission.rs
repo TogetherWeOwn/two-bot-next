@@ -182,21 +182,6 @@ mod tests {
         ));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn claim_cutoff_does_not_flush_buffered_commit() {
-        use tokio::time::{sleep_until, Duration, Instant};
-        let at = Instant::now() + Duration::from_secs(1);
-        let mut queued = false;
-        let commit = async {
-            queued = true;
-            sleep_until(at).await;
-            panic!("must not flush COMMIT once writable at cutoff");
-        };
-        let result = before_claim_cutoff(at, commit).await;
-        assert!(queued);
-        assert!(matches!(result, Err(AdmissionError::Deadline)));
-    }
-
     #[test]
     fn canonical_namespace_and_closed_delay_rules() {
         assert_eq!(

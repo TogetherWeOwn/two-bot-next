@@ -117,6 +117,34 @@ impl SendAdmission for PgSendAdmission {
     }
 }
 
+// The transaction future must drop its borrow before we can consume the
+// connection. Returning it to the pool could flush a buffered COMMIT.
+macro_rules! bounded_claim_transaction {
+    ($at:expr, $work:expr, $discard:expr) => {{
+        let result = before_claim_cutoff($at, $work).await.flatten();
+        if matches!(result, Err(AdmissionError::Deadline)) {
+            $discard;
+        }
+        result
+    }};
+}
+
+#[cfg(test)]
+#[tokio::test(start_paused = true)]
+async fn claim_cutoff_discards_connection_without_flushing_commit() {
+    let at = Instant::now() + std::time::Duration::from_secs(1);
+    let (mut queued, mut flushed, mut discarded) = (false, false, false);
+    let commit = async {
+        queued = true;
+        tokio::time::sleep_until(at).await;
+        flushed = true;
+        Ok(())
+    };
+    let result = bounded_claim_transaction!(at, commit, discarded = queued);
+    assert_eq!(result, Err(AdmissionError::Deadline));
+    assert!(discarded && !flushed);
+}
+
 impl PgSendAdmission {
     async fn claim_row<'q>(
         &self,
@@ -130,23 +158,17 @@ impl PgSendAdmission {
             Ok(conn) => conn,
             Err(error) => return Ok(Err(error)),
         };
-        let result = async {
-            let mut tx = match before_claim_cutoff(at, conn.begin()).await? {
+        let transaction = async {
+            let mut tx = match conn.begin().await {
                 Ok(tx) => tx,
                 Err(error) => return Ok(Err(error)),
             };
             let row = before_claim_cutoff(at, (&mut *tx).fetch_optional(query)).await?;
             let Ok(Some(row)) = row else { return Ok(row) };
-            // SQLx can flush COMMIT on any pending poll. Only its completed
-            // result acknowledges the claim; never probe the socket at cutoff.
             let committed = before_claim_cutoff(at, tx.commit()).await?;
             Ok(committed.map(|()| Some(row)))
-        }
-        .await;
-        if matches!(result, Err(AdmissionError::Deadline)) {
-            drop(conn.detach()); // Pool return can flush a buffered COMMIT.
-        }
-        result
+        };
+        bounded_claim_transaction!(at, transaction, drop(conn.detach()))
     }
 
     fn claim(&self, at: Option<Instant>) -> ClaimFuture<'_> {
