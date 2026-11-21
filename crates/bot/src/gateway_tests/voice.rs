@@ -411,7 +411,12 @@ async fn cold_voice_gateway(release_ready: Arc<Notify>, rooms_enabled: bool) -> 
                                 ws.send(Message::text(packet.to_string())).await.unwrap();
                             }
                             if !rooms_enabled {
-                                ws.send(Message::text(leave(5).to_string())).await.unwrap();
+                                let mut live_leave = leave(5);
+                                // A distinct member keeps same-millisecond leave keys distinct.
+                                live_leave["d"]["user"]["id"] = json!("78");
+                                ws.send(Message::text(live_leave.to_string()))
+                                    .await
+                                    .unwrap();
                             }
                         } else {
                             release_ready.notified().await;
@@ -541,6 +546,11 @@ async fn cold_voice_resume(rooms_enabled: bool) {
         // fresh IDENTIFY for heat. A cold partial cache is still a gap.
         wait_sequence(&db.store, 5).await;
         wait_connected(&state).await;
+        let saved = db.store.load().await.unwrap().unwrap();
+        assert_eq!(
+            (saved.session_id.as_str(), saved.sequence),
+            ("saved-session", 5)
+        );
         assert_eq!(db.count().await, 3);
         assert!(read_voice_total(&cache, VOICE_GUILD_ID).is_err());
         runner.abort();
