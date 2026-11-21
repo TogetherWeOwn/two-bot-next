@@ -91,6 +91,7 @@ pub const PRESENCE_RAW_RETENTION_DAYS: i32 = 30;
 /// Voice-session `events` rows older than this roll off.
 pub const VOICE_RAW_RETENTION_DAYS: i32 = 30;
 /// Raw attendance sessions roll off by join time, whether open or closed.
+/// Use elapsed hours in SQL so daylight-saving transitions cannot shorten it.
 const ATTENDANCE_SESSION_RETENTION_DAYS: i32 = 90;
 /// Audit-log cache rows older than this expire.
 pub const AUDIT_CACHE_RETENTION_DAYS: i32 = 45;
@@ -502,7 +503,7 @@ async fn run_retention_core(
             let voice = count_voice_raw(&mut tx).await?;
             let attendance: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM event_voice_sessions
-                 WHERE joined_at < now() - make_interval(days => $1)",
+                 WHERE joined_at < now() - make_interval(hours => $1 * 24)",
             )
             .bind(ATTENDANCE_SESSION_RETENTION_DAYS)
             .fetch_one(&mut *tx)
@@ -620,7 +621,7 @@ async fn run_retention_core(
             // the sorted lock list. Mapped windows have no age-based expiry.
             let attendance = sqlx::query(
                 "DELETE FROM event_voice_sessions
-                 WHERE joined_at < now() - make_interval(days => $1)",
+                 WHERE joined_at < now() - make_interval(hours => $1 * 24)",
             )
             .bind(ATTENDANCE_SESSION_RETENTION_DAYS)
             .execute(&mut *tx)
@@ -1368,7 +1369,7 @@ fn guild_projection_time_exclusions(table: &str, first_placeholder: usize) -> Ve
             AUDIT_CACHE_RETENTION_DAYS,
         )],
         "event_voice_sessions" => vec![(
-            format!("joined_at < now() - make_interval(days => ${first_placeholder})"),
+            format!("joined_at < now() - make_interval(hours => ${first_placeholder} * 24)"),
             ATTENDANCE_SESSION_RETENTION_DAYS,
         )],
         _ => Vec::new(),
@@ -2087,7 +2088,7 @@ mod ledger_tests {
                 .expect("event_voice_sessions needs a projection exclusion");
         assert_eq!(
             attendance_condition,
-            "joined_at < now() - make_interval(days => $2)"
+            "joined_at < now() - make_interval(hours => $2 * 24)"
         );
         assert_eq!(attendance_days, ATTENDANCE_SESSION_RETENTION_DAYS);
 
