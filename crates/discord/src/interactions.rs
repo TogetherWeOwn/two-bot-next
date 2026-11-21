@@ -230,8 +230,15 @@ pub(crate) fn branded_help_detail_response(detail: String) -> InteractionRespons
 
     let mut description = neutralize_mentions(&detail);
     if text_len(&description) > EMBED_DESCRIPTION_LIMIT {
-        const NOTICE: &str = "…(detail truncated for display.)";
-        description = truncate(&description, EMBED_DESCRIPTION_LIMIT - text_len(NOTICE)) + NOTICE;
+        // Keep the notice from the core Help renderer intact when present.
+        const CORE_NOTICE: &str = "\n…(detail truncated; /help lists every confirmed command.)\n";
+        const DISPLAY_NOTICE: &str = "…(detail truncated for display.)";
+        let (body, notice) = description
+            .strip_suffix(CORE_NOTICE)
+            .map_or((description.as_str(), DISPLAY_NOTICE), |body| {
+                (body, CORE_NOTICE)
+            });
+        description = truncate(body, EMBED_DESCRIPTION_LIMIT - text_len(notice)) + notice;
     }
     help_callback(
         EmbedKind::Default,
@@ -1482,6 +1489,34 @@ mod help_response_tests {
         assert!(text_len(description) <= EMBED_DESCRIPTION_LIMIT);
         assert!(description.ends_with("…(detail truncated for display.)"));
         assert!(!description.contains("@everyone"));
+    }
+
+    #[test]
+    fn branded_detail_preserves_the_core_notice_after_mention_expansion() {
+        use two_bot_core::message_safety::neutralize_mentions;
+
+        let notice = "\n…(detail truncated; /help lists every confirmed command.)\n";
+        let detail = CommandDefinition::new("maximum", "Valid wide definition")
+            .examples(vec![
+                "@here ".repeat(50) + &"x".repeat(3640),
+                "y".repeat(200),
+            ])
+            .help_detail_text();
+        assert!(detail.ends_with(notice));
+        assert!(text_len(&detail) <= EMBED_DESCRIPTION_LIMIT);
+        assert!(text_len(&neutralize_mentions(&detail)) > EMBED_DESCRIPTION_LIMIT);
+
+        let safe =
+            crate::message_safety::interaction_response(&branded_help_detail_response(detail))
+                .expect("sanitized detail");
+        let wire = serde_json::to_value(safe).expect("serializes");
+        let description = wire["data"]["embeds"][0]["description"]
+            .as_str()
+            .expect("description");
+        assert!(text_len(description) <= EMBED_DESCRIPTION_LIMIT);
+        assert!(description.ends_with(notice));
+        assert_eq!(description.matches("…(detail trunc").count(), 1);
+        assert!(!description.contains("@here"));
     }
 
     #[test]
