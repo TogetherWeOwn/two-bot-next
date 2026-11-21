@@ -145,11 +145,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn in_flight_attempt_stops_at_the_queue_age_deadline() {
+        let (sender, receiver) = channel();
+        assert!(sender.offer(1));
+        let remaining = Duration::from_millis(100);
+        tokio::time::advance(MAX_AGE - remaining).await;
+        assert!(sender.offer(2));
+        drop(sender);
+        let start = Instant::now();
+        let mut attempts = Vec::new();
+        receiver
+            .run(async |&seq| {
+                attempts.push((seq, start.elapsed()));
+                if seq == 1 {
+                    std::future::pending().await
+                } else {
+                    Delivery::Accepted
+                }
+            })
+            .await;
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0], (1, Duration::ZERO));
+        assert_eq!(attempts[1].0, 2);
+        assert!((remaining..ATTEMPT_TIMEOUT).contains(&attempts[1].1));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn retry_does_not_wait_past_the_expiry() {
         let (sender, receiver) = channel();
         assert!(sender.offer(1));
         drop(sender);
-        tokio::time::advance(MAX_AGE - RETRY_DELAY).await;
+        tokio::time::advance(MAX_AGE - RETRY_DELAY / 2).await;
+        let start = Instant::now();
         let mut calls = 0;
         receiver
             .run(async |_| {
@@ -158,5 +185,6 @@ mod tests {
             })
             .await;
         assert_eq!(calls, 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
     }
 }
