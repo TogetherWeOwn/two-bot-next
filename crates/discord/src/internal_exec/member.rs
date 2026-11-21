@@ -24,7 +24,7 @@ pub mod voice_move;
 pub use voice_move::{VoiceMoveNotSent, VoiceMovePatch, VOICE_MOVE_TIMEOUT_MS};
 #[path = "voice_move_reads.rs"]
 mod voice_move_reads;
-pub use voice_move_reads::{VoiceMoveEvidence, VoiceMoveTarget};
+pub use voice_move_reads::{VoiceMoveEvidence, VoiceMoveReadError, VoiceMoveTarget};
 #[path = "voice_move_coordinator.rs"]
 mod voice_move_coordinator;
 pub use voice_move_coordinator::{VoiceMoveAttempt, VoiceMoveRoster};
@@ -297,8 +297,10 @@ impl ActionExecutor {
         };
         let status = pending.pending.status;
         if let Some(refusal) = voice_move::header_refusal(status) {
-            let _ = super::poll_before(deadline, pending.pending.settle_status()).await;
-            return Ok(refusal);
+            return Ok(match pending.settle_definitive_refusal().await {
+                super::StrictSettlement::Confirmed => refusal,
+                super::StrictSettlement::Unconfirmed => VoiceMovePatch::RefusalUnsettled,
+            });
         }
         let mut retry_after_ms = None;
         let settlement = pending
@@ -451,6 +453,7 @@ impl ActionExecutor {
         if target.managed || target.id == guild_id || target.position >= highest {
             return Err(member_status_error(&RawResponse {
                 status: 403,
+                validated_retry_after_header: None,
                 retry_after_header: None,
                 body: vec![],
                 completion: None,
