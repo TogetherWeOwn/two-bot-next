@@ -83,6 +83,7 @@ jobs:
     timeout-minutes: 8
     outputs:
       expires_at: ${{ steps.begin.outputs.expires_at }}
+      checked_at: ${{ steps.clock.outputs.checked_at }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -119,6 +120,9 @@ jobs:
           path: ${{ runner.temp }}/staging-use.jsonl
           if-no-files-found: error
           retention-days: 14
+
+      - id: clock
+        run: printf 'checked_at=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
 
   # Called runs never release the parent's grant. The workflow lock covers
   # standalone begin, consumer and cleanup; native expiry covers runner loss.
@@ -167,7 +171,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - run: printf 'VOICE_JOB_DEADLINE=%s\n' "$(( $(date +%s) + 540 ))" >> "$GITHUB_ENV" # Leave one minute for runner overhead.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -179,6 +182,7 @@ jobs:
           TWO_STAGING_EMPTY_GRACE_SECONDS: ${{ vars.STAGING_EMPTY_GRACE_SECONDS || '60' }}
           RUN_ID: ${{ github.run_id }}
           GRANT_EXPIRES_AT: ${{ inputs.staging_use_expires_at || needs.staging-window.outputs.expires_at }}
+          VOICE_JOB_ANCHOR: ${{ needs.staging-window.outputs.checked_at }}
           VOICE_WORK_SECONDS: "300"
         run: |
           set -euo pipefail
@@ -190,11 +194,13 @@ jobs:
             echo "::error::TWO_VOICE_SYNTHETIC_BOT_TOKEN missing and the voice gate is required (set VOICE_SYNTHETIC_REQUIRED=false to opt out)"
             exit 1
           fi
-          # Retry a transient gateway/REST failure only if the pause and a new attempt fit.
+          # The predecessor's clock counts queues and all runner setup, with a 60 s margin.
           budget=$((VOICE_WORK_SECONDS + 150)) # Hard ceiling; includes Discord restoration.
           reserve_attempt() {
-            local finish=$(( $(date +%s) + budget + 2 + $1 ))
-            if [[ ! "$GRANT_EXPIRES_AT" =~ ^[1-9][0-9]{0,12}$ ]] || (( finish >= VOICE_JOB_DEADLINE || finish * 1000 >= GRANT_EXPIRES_AT )); then
+            local now finish
+            now=$(date +%s)
+            finish=$((now + budget + 2 + $1))
+            if [[ ! "$VOICE_JOB_ANCHOR" =~ ^[1-9][0-9]{0,9}$ || ! "$GRANT_EXPIRES_AT" =~ ^[1-9][0-9]{0,12}$ ]] || (( VOICE_JOB_ANCHOR > now || finish >= VOICE_JOB_ANCHOR + 540 || finish * 1000 >= GRANT_EXPIRES_AT )); then
               echo '::error::not enough runner or staging grant time for voice work and cleanup'; exit 1
             fi
           }

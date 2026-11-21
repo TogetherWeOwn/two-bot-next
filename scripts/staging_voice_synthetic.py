@@ -62,6 +62,7 @@ Usage:
 
 import argparse
 import base64
+import http.client
 import json
 import math
 import os
@@ -75,6 +76,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import Future
 from urllib.parse import urlsplit
 
 STAGING_GUILD_ID = "1545644954272137297"
@@ -186,6 +188,59 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _start_daemon(target):
+    thread = threading.Thread(target=target, daemon=True)
+    # Keep SIGALRM on the main I/O thread, not a heartbeat or libc resolver.
+    mask = (signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+            if hasattr(signal, "pthread_sigmask") else None)
+    try:
+        thread.start()
+    finally:
+        if mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+
+def _connect(destination, timeout, source_address=None):
+    # libc can keep resolving after SIGALRM. Only wait for its result on the
+    # main thread, and don't leave a join or socket operation in the daemon.
+    result = Future()
+
+    def resolve():
+        try:
+            result.set_result(socket.getaddrinfo(*destination, type=socket.SOCK_STREAM))
+        except OSError as exc:
+            result.set_exception(exc)
+
+    _start_daemon(resolve)
+    error = OSError("no usable address for voice synthetic connection")
+    for family, kind, proto, _, address in result.result(timeout=timeout):
+        sock = None
+        try:
+            sock = socket.socket(family, kind, proto)
+            sock.settimeout(timeout)
+            if source_address is not None:
+                sock.bind(source_address)
+            sock.connect(address)  # Numeric sockaddr; TLS still uses the hostname.
+            return sock
+        except BaseException as exc:
+            if sock is not None:
+                sock.close()
+            if not isinstance(exc, OSError):
+                raise
+            error = exc
+    raise error
+
+
+class _BoundedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        def connection(host, **kwargs):
+            conn = http.client.HTTPSConnection(host, **kwargs)
+            conn._create_connection = _connect
+            return conn
+
+        return self.do_open(connection, req, context=self._context)
+
+
 def _open_no_redirect(req, timeout):
     """One token-bearing request that never follows a redirect.
 
@@ -196,7 +251,7 @@ def _open_no_redirect(req, timeout):
     """
     opener = urllib.request.build_opener(
         urllib.request.HTTPHandler(),
-        urllib.request.HTTPSHandler(),
+        _BoundedHTTPSHandler(),
         urllib.request.HTTPErrorProcessor(),
         _NoRedirectHandler(),
     )
@@ -579,7 +634,7 @@ def metrics_snapshot(staging_url, token):
 
 class WebSocket:
     def __init__(self, host, path, timeout=30):
-        raw = socket.create_connection((host, 443), timeout=timeout)
+        raw = _connect((host, 443), timeout)
         context = ssl.create_default_context()
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         self.sock = context.wrap_socket(raw, server_hostname=host)
@@ -784,17 +839,7 @@ class Session:
             raise GatewayShapeError("gateway hello was malformed")
         self.interval = seconds
         self.seq, self.alive = None, True
-        heartbeat = threading.Thread(target=self._beat, daemon=True)
-        if hasattr(signal, "pthread_sigmask"):
-            # The thread inherits a blocked SIGALRM so the work alarm goes
-            # to the main thread even while that thread is blocked in I/O.
-            mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
-            try:
-                heartbeat.start()
-            finally:
-                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-        else:
-            heartbeat.start()
+        _start_daemon(self._beat)
         self.ws.send({"op": 2, "d": {"token": token, "intents": INTENTS,
                                      "properties": {"os": "linux", "browser": "voice-synthetic",
                                                     "device": "voice-synthetic"}}})
@@ -802,8 +847,6 @@ class Session:
     def _beat(self):
         while self.alive:
             time.sleep(self.interval)
-            if not self.alive:
-                return
             try:
                 self.ws.send({"op": 1, "d": self.seq})
             except OSError:
