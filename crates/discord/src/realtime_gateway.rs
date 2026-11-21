@@ -105,7 +105,7 @@ fn decode<'a, T: Deserialize<'a>>(payload: &'a Value) -> Result<T, ProjectionErr
 }
 
 fn permission_mask<'de, D: Deserializer<'de>>(d: D) -> Result<wire::Permissions, D::Error> {
-    let mask = <&str>::deserialize(d)?;
+    let mask = String::deserialize(d)?;
     if !mask.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(serde::de::Error::custom("permission mask is not decimal"));
     }

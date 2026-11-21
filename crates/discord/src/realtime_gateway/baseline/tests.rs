@@ -56,18 +56,16 @@ fn explicit_empty_lists_are_distinct_from_absent_or_malformed_lists() {
 
 #[test]
 fn projects_only_allowlisted_fields_and_preserves_raw_permission_masks() {
-    let mut guild = empty_guild();
     let high_bit = "9223372036854775808";
-    guild["afk_channel_id"] = json!("12");
-    guild["channels"] = json!([{
-        "id":"12", "type":2, "guild_id":"10", "name":"Lounge", "position":0, "topic":"unprojected",
-        "permission_overwrites":[{"type":0,"id":"10","allow":high_bit,"deny":"0"}]
-    }]);
-    guild["roles"] = json!([{"id":"10", "permissions":high_bit,"name":"unprojected"}]);
-    guild["voice_states"] = json!([{
-        "user_id":"99","channel_id":"12","session_id":"unprojected"
-    }]);
-    let rows = topology(GUILD, &dispatch(&guild))
+    let raw = r#"{"op":0,"t":"\u0047UILD_CREATE","s":4,"d":{
+        "id":"10", "owner_id":"99", "afk_channel_id":"12",
+        "channels":[{"id":"12", "type":2, "guild_id":"10", "name":"Lounge", "position":0,
+            "topic":"unprojected", "permission_overwrites":[
+                {"type":0,"id":"10","allow":"\u0039223372036854775808","deny":"\u0030"}]}],
+        "roles":[{"id":"10","permissions":"\u0039223372036854775808","name":"unprojected"}],
+        "voice_states":[{"user_id":"99","channel_id":"12","session_id":"unprojected"}]
+    }}"#;
+    let rows = topology(GUILD, raw)
         .expect("valid envelope")
         .expect("complete topology");
     assert_eq!(

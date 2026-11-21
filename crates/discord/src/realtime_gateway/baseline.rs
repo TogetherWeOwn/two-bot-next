@@ -20,7 +20,7 @@ pub struct Topology {
 #[derive(Deserialize)]
 struct Dispatch<'a> {
     op: u8,
-    t: Option<&'a str>,
+    t: Option<String>,
     #[serde(borrow)]
     d: Option<&'a RawValue>,
 }
@@ -69,7 +69,7 @@ struct VoiceRow {
 /// intervening dispatches in order and validate the full snapshot before use.
 pub fn topology(guild_id: Id<GuildMarker>, raw: &str) -> Result<Option<Topology>, ProjectionError> {
     let dispatch: Dispatch<'_> = object(raw.trim_start_matches([' ', '\t', '\n', '\r']))?;
-    if dispatch.op != 0 || dispatch.t != Some("GUILD_CREATE") {
+    if dispatch.op != 0 || dispatch.t.as_deref() != Some("GUILD_CREATE") {
         return Ok(None);
     }
     let body = dispatch.d.ok_or(ProjectionError::InvalidPayload)?.get();
