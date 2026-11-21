@@ -20,68 +20,14 @@ async fn heat_transaction(fixture: &TestDatabase) -> HeatTx<'_> {
         .execute(&mut *tx)
         .await
         .unwrap();
-    // Only this disposable session installs the candidate. The released
-    // contract remains unchanged until the publication slice.
-    sqlx::raw_sql(
-        "CREATE TEMP VIEW voice_heat_candidate AS
-WITH bounds AS (
-  SELECT
-    (date_trunc('day', now() AT TIME ZONE 'UTC') - interval '28 days') AT TIME ZONE 'UTC' AS window_start,
-    date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS window_end
-),
-scoped AS (
-  SELECT h.hour_start_utc, h.samples, h.occupancy_sum, h.last_observed_at
-  FROM voice_heat_hours h, bounds b
-  WHERE h.hour_start_utc >= b.window_start
-    AND h.hour_start_utc < b.window_end
-    AND h.samples > 0
-),
-provenance AS (
-  SELECT
-    (SELECT count(DISTINCT (hour_start_utc AT TIME ZONE 'UTC')::date) FROM scoped) AS sample_days,
-    (SELECT max(last_observed_at) FROM scoped) AS measured_through_ts
-),
-cells AS (
-  SELECT
-    ((EXTRACT(ISODOW FROM hour_start_utc AT TIME ZONE 'UTC'))::int - 1) AS dow,
-    (EXTRACT(HOUR FROM hour_start_utc AT TIME ZONE 'UTC'))::int AS hour,
-    sum(occupancy_sum)::double precision / NULLIF(sum(samples), 0) AS avg_in_voice,
-    sum(samples)::double precision / 48.0 AS coverage
-  FROM scoped
-  GROUP BY 1, 2
-),
-grid AS (
-  SELECT days.dow, hours.hour
-  FROM generate_series(0, 6) AS days(dow)
-  CROSS JOIN generate_series(0, 23) AS hours(hour)
-)
-SELECT
-  grid.dow,
-  grid.hour,
-  cells.avg_in_voice,
-  provenance.sample_days,
-  COALESCE(cells.coverage, 0.0) AS coverage,
-  web_v1._iso(provenance.measured_through_ts) AS measured_through,
-  CASE WHEN provenance.sample_days >= 14
-         AND (SELECT count(*) FROM cells WHERE coverage >= 0.8) = 168
-       THEN 'measured' ELSE 'insufficient' END AS source
-FROM grid
-LEFT JOIN cells ON cells.dow = grid.dow AND cells.hour = grid.hour
-CROSS JOIN provenance
-ORDER BY grid.dow, grid.hour;",
-    )
-        .execute(&mut *tx)
-        .await
-        .unwrap();
     tx
 }
 
 async fn heat_grid(tx: &mut HeatTx<'_>) -> Vec<HeatCell> {
-    let rows: Vec<HeatCell> =
-        sqlx::query_as("SELECT * FROM voice_heat_candidate ORDER BY dow, hour")
-            .fetch_all(&mut **tx)
-            .await
-            .unwrap();
+    let rows: Vec<HeatCell> = sqlx::query_as("SELECT * FROM web_v1.voice_heat ORDER BY dow, hour")
+        .fetch_all(&mut **tx)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 168);
     for (index, cell) in (0_i32..).zip(&rows) {
         assert_eq!((cell.dow, cell.hour), (index / 24, index % 24));

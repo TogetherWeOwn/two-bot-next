@@ -13,7 +13,7 @@ holds no membership path into the migrator group.
 | --- | --- | --- | --- | --- | --- |
 | `two_bot_migrator` | CONNECT, CREATE; no TEMP | Owner (DDL) | Owner | Owner | Owner |
 | `two_bot_runtime` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | Ordinary tables: SELECT, INSERT, UPDATE, DELETE; admission lanes: SELECT, INSERT, UPDATE only | USAGE, SELECT; no UPDATE | No access |
-| `two_web_reader` | CONNECT; no CREATE/TEMP | No access | No access | No access | USAGE; SELECT on ten reviewed views |
+| `two_web_reader` | CONNECT; no CREATE/TEMP | No access | No access | No access | USAGE; SELECT on eleven reviewed views |
 | `two_bot_migrator_ro` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | SELECT on bot tables, admission lanes and SQLx ledger; no DML | No access | USAGE; no view or function access |
 
 The owner-grant journal (`voice_owner_grants`) is an ordinary `table`-kind
@@ -293,8 +293,10 @@ their login status or silently removing memberships. It contains no passwords.
    start: creator-specific default ACLs belong to the group, not automatically
    to a member login; (c) the provisioning identity reapplies the reviewed full
    plan after migrations and view updates, then `verify` reads 0 findings.
-   `sql/web_v1.sql` is applied with `public` as the bot-table search
-   path before the bootstrap phase; functions stay strict in both phases.
+   Install schema-matched views and helpers before bootstrap (1.0 on pre-heat
+   targets); functions stay strict in both phases. Apply `sql/web_v1.sql` after
+   migrations and before the full role plan with `public` as the bot-table search
+   path. See the [heat reader fallback](bot-site-contract.md#5-voice-heat-map--the-now-lines-measured-truth).
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
    tables are not transferred or granted to the runtime.
@@ -316,6 +318,15 @@ also require a separately reviewed operator correction.
 Rollback is an operator-reviewed restoration of the prior ownership/ACL inventory
 and login configuration, not dropping groups or deleting data. Save that inventory
 before changing permissions. Never rotate/delete a credential as a side effect.
+
+### Voice heat staging backout
+
+For separately authorized staging recovery to a pre-heat build with
+`voice_heat_hours`, confirm the target and stop 1.1 installs and role applies.
+As the object owner, run the [atomic backout](../sql/voice_heat_staging_backout.sql);
+it restores 1.0 and revokes the grant without touching samples. Dispatch only
+if `two-bot db roles verify` at the recovery SHA is clean. To roll forward,
+reinstall 1.1, reapply the full role plan, and verify at the new SHA.
 
 ## Testing
 
