@@ -876,6 +876,8 @@ pub struct InternalFlags {
     /// Destructive automations imports need this stronger, separately
     /// configured capability on top of the base automations flag.
     pub allow_automation_overwrite: bool,
+    // Kept out of the live verb registry until the receiver is wired.
+    allow_attendance_read: bool,
 }
 
 impl InternalFlags {
@@ -924,6 +926,7 @@ impl InternalFlags {
             enabled,
             allow_automation_overwrite: flag("TWO_INTERNAL_ALLOW_AUTOMATIONS")
                 && flag("TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE"),
+            allow_attendance_read: flag("TWO_INTERNAL_ALLOW_ATTENDANCE_READ"),
         }
     }
 
@@ -1983,6 +1986,16 @@ pub struct AuthenticatedRequest<'a> {
 /// ```
 pub struct NonceBurnedRequest<'a>(AuthenticatedRequest<'a>);
 
+/// One validated, signed and replay-guarded request for the dormant adapter.
+/// No public constructor: arbitrary JSON or an `AuthDecision` cannot mint it.
+pub struct AttendanceReadRequest(String);
+
+impl AttendanceReadRequest {
+    pub fn event_key(&self) -> &str {
+        &self.0
+    }
+}
+
 impl<'a> AuthenticatedRequest<'a> {
     /// Authenticate headers and exact bytes without parsing JSON or touching
     /// replay/rate-limit state. Malformed authenticated bodies must reach the
@@ -2095,6 +2108,25 @@ impl NonceBurnedRequest<'_> {
     ) -> Result<AuthDecision, ActionError> {
         authorize_burned(self.0, flags, has_store, has_settings, buckets)
     }
+
+    /// Authorize the dormant read without widening the serving registry.
+    pub fn authorize_attendance_read(
+        self,
+        flags: &InternalFlags,
+        buckets: &mut TokenBuckets,
+    ) -> Result<AttendanceReadRequest, ActionError> {
+        let body = rate_limited_body(&self.0, buckets)?;
+        if !flags.allow_attendance_read
+            || body.get("action").and_then(Value::as_str) != Some("event.attendance.read")
+        {
+            return Err(ActionError::new(
+                ErrorCode::ActionNotAllowed,
+                "Attendance read is not allowed",
+                "attendance_not_allowed",
+            ));
+        }
+        Ok(AttendanceReadRequest(validate_event_key(&body)?.to_owned()))
+    }
 }
 
 fn replayed_nonce() -> ActionError {
@@ -2161,13 +2193,10 @@ pub fn authorize(
     NonceBurnedRequest(verified).authorize(flags, has_store, has_settings, buckets)
 }
 
-fn authorize_burned(
-    verified: AuthenticatedRequest<'_>,
-    flags: &InternalFlags,
-    has_store: bool,
-    has_settings: bool,
+fn rate_limited_body(
+    verified: &AuthenticatedRequest<'_>,
     buckets: &mut TokenBuckets,
-) -> Result<AuthDecision, ActionError> {
+) -> Result<Map<String, Value>, ActionError> {
     let per_key = buckets.take(
         &format!("key:{}", verified.key_id),
         DEFAULT_BUCKET,
@@ -2182,7 +2211,17 @@ fn authorize_burned(
         .with_retry_after(per_key.retry_after_secs));
     }
 
-    let body = parse_body_object(verified.raw)?;
+    parse_body_object(verified.raw)
+}
+
+fn authorize_burned(
+    verified: AuthenticatedRequest<'_>,
+    flags: &InternalFlags,
+    has_store: bool,
+    has_settings: bool,
+    buckets: &mut TokenBuckets,
+) -> Result<AuthDecision, ActionError> {
+    let body = rate_limited_body(&verified, buckets)?;
     let action = match body.get("action").and_then(Value::as_str) {
         Some(a) if !a.is_empty() => a.to_owned(),
         _ => {
@@ -4123,6 +4162,72 @@ mod tests {
             nonce,
             signature: sig,
         }
+    }
+
+    #[test]
+    fn attendance_authorization_is_opt_in_and_cannot_enable_the_serving_registry() {
+        let vector = vec1();
+        let now = vector.timestamp.parse::<u64>().unwrap() * 1000;
+        let signed = |raw: &[u8], signed_body: &[u8], setting: Option<&str>| {
+            let nonce = test_nonce();
+            let sig = sign(
+                vector.secret.as_bytes(),
+                &vector.timestamp,
+                &nonce,
+                signed_body,
+            );
+            let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
+            let verified = AuthenticatedRequest::verify(
+                &headers,
+                raw,
+                &ring(),
+                SKEW_SECONDS,
+                now,
+                &mut ClockGuard::new(),
+            )?;
+            let flags = InternalFlags::from_map(
+                &setting
+                    .into_iter()
+                    .map(|v| {
+                        (
+                            "TWO_INTERNAL_ALLOW_ATTENDANCE_READ".to_owned(),
+                            v.to_owned(),
+                        )
+                    })
+                    .collect(),
+            );
+            assert!(!flags.is_enabled("event.attendance.read"));
+            assert!(!is_implemented("event.attendance.read"));
+            // Model a successful nonce burn; the live receiver still has no dispatch.
+            assert!(NonceCache::new(NONCE_TTL_SECONDS).offer(&nonce, now));
+            NonceBurnedRequest(verified).authorize_attendance_read(&flags, &mut TokenBuckets::new())
+        };
+        let valid = br#"{"action":"event.attendance.read","event_key":"fixture:1"}"#;
+        let tampered = br#"{"action":"event.attendance.read","event_key":"fixture:2"}"#;
+        assert_eq!(
+            signed(tampered, valid, Some("1")).err().unwrap().code,
+            ErrorCode::Unauthorized
+        );
+        for setting in [None, Some("0"), Some("true")] {
+            assert_eq!(
+                signed(valid, valid, setting).err().unwrap().code,
+                ErrorCode::ActionNotAllowed
+            );
+        }
+        let wrong = br#"{"action":"event.read","event_key":"fixture:1"}"#;
+        assert_eq!(
+            signed(wrong, wrong, Some("1")).err().unwrap().code,
+            ErrorCode::ActionNotAllowed
+        );
+        let malformed = br#"{"action":"event.attendance.read","event_key":"fixture/path"}"#;
+        assert_eq!(
+            signed(malformed, malformed, Some("1")).err().unwrap().code,
+            ErrorCode::Malformed
+        );
+        assert_eq!(
+            signed(valid, valid, Some("1")).unwrap().event_key(),
+            "fixture:1"
+        );
     }
 
     fn authorize_for_test(

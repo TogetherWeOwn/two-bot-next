@@ -104,11 +104,13 @@ test("unlisted names, secrets and non-string values are dropped", () => {
   assert.deepEqual(forwardedFlagVars(env), { TWO_ANNOUNCEMENTS: "1" });
 });
 
-test("reserved member notification gate is never forwarded", () => {
-  const env = { TWO_INTERNAL_ACTIONS: "1", TWO_INTERNAL_ALLOW_MEMBER_NOTIFY: "1" };
-  assert.ok(Object.hasOwn(NOT_FORWARDED, "TWO_INTERNAL_ALLOW_MEMBER_NOTIFY"));
-  assert.equal(forwardedFlagVars(env).TWO_INTERNAL_ALLOW_MEMBER_NOTIFY, undefined);
-  assert.equal(containerEnv(env).TWO_INTERNAL_ALLOW_MEMBER_NOTIFY, undefined);
+test("reserved member notification and attendance gates are never forwarded", () => {
+  for (const name of ["TWO_INTERNAL_ALLOW_MEMBER_NOTIFY", "TWO_INTERNAL_ALLOW_ATTENDANCE_READ"]) {
+    const env = { TWO_INTERNAL_ACTIONS: "1", [name]: "1" };
+    assert.ok(Object.hasOwn(NOT_FORWARDED, name));
+    assert.equal(forwardedFlagVars(env)[name], undefined);
+    assert.equal(containerEnv(env)[name], undefined);
+  }
 });
 
 test("hostile settings-map typo keys stay test-only and never reach the Container", () => {
