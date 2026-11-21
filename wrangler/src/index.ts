@@ -947,7 +947,7 @@ export class TwoBotContainer extends Container<Env> {
     }
   }
 
-  private stagingReceipt(action: "acquire" | "release" | "expiry", use: StagingUse | undefined,
+  private stagingReceipt(action: "acquire" | "release" | "stop" | "expiry", use: StagingUse | undefined,
     outcome: "authorized" | "stopped" | "stop_unconfirmed"): void {
     // Project only validated finite-use correlation fields. Runner cancellation
     // cannot upload artifacts, so native expiry also leaves a runtime receipt.
@@ -1382,6 +1382,10 @@ export class TwoBotContainer extends Container<Env> {
             use = await this.stagingUse.acquire(change, identity,
               () => this.stopStagingUse(), (expiry) => this.scheduleStagingExpiry(expiry));
             this.recoveryFailed = false;
+          } else if (change.action === "stop") {
+            if (this.recoveryFailed) throw new OwnershipRefused("shutdown_unconfirmed");
+            // Keep the grant and its expiry schedule intact even if shutdown fails.
+            use = await this.stagingUse.stop(change, identity, () => this.destroyInactive());
           } else {
             use = await this.stagingUse.release(change, identity, () => this.stopStagingUse());
             this.deleteSchedules("stagingExpiry");
