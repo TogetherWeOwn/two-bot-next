@@ -20,9 +20,8 @@ its root cause needs separate reviewed schema/ACL/connectivity evidence
 FAIL: observed unready components are never E2E approval. A starting or
 down gateway does not establish a lifecycle cause.
 
-No probe may apply a migration or test production. This probe never writes or
-follows redirects. An opted-in rollout sends the ownership bearer only on the
-existing staging readiness GET and requires a matching AutoMod preview receipt.
+This staging probe never writes or follows redirects. The opt-in sends the
+ownership bearer only on the readiness GET and requires an AutoMod receipt.
 
 Body-cap refusal contract: the transport reads at most BODY_CAP+1 bytes on
 both the normal and HTTPError paths so a hidden suffix is detected. Any body

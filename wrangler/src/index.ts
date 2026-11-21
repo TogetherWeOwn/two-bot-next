@@ -1204,9 +1204,11 @@ export class TwoBotContainer extends Container<Env> {
         throw new Error("staging_preview_identity");
       }
     };
+    let readyBody: string | undefined;
     try {
       const body = await jsonText(response, MAX_PROBE_BODY_BYTES);
       serving(body);
+      readyBody = body;
       await readPreview(this.env, async (url, token) => JSON.parse(await jsonText(await send(() =>
         fetch(url, { method: "GET", redirect: "error", cache: "no-store", signal,
           headers: { authorization: `Bot ${token}` } })), 256 * 1024)));
@@ -1221,7 +1223,8 @@ export class TwoBotContainer extends Container<Env> {
         return result;
       });
     } catch {
-      return Response.json({ ready: false }, { status: 503, headers: { "cache-control": "no-store" } });
+      return new Response(readyBody ?? '{"ready":false}', { status: readyBody === undefined ? 503 : 200,
+        headers: { "content-type": "application/json", "cache-control": "no-store" } });
     }
   }
 

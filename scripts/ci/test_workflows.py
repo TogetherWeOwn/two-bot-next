@@ -1109,7 +1109,6 @@ USER_FLOW_PROBE_ENV = {
     "STAGING_USE_DEPLOYMENT": "${{ needs.deploy.outputs.staging_use_deployment }}",
 }
 
-
 def staging_qualification_assert_errors(job, job_id, entry, receipt, artifact):
     label = f"deploy-staging.yml:{job_id}"
     errors = []
@@ -1189,8 +1188,8 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
     else:
         probe = probes[0]
         run = str(probe.get("run", ""))
-        if probe.get("env") != USER_FLOW_PROBE_ENV:
-            errors.append(f"{name}:user-flow-synthetic: bind the exact origin, SHA and conditional preview authority")
+        if probe.get("env") != USER_FLOW_PROBE_ENV or re.search(r"\b(?:env|STAGING_PREVIEW_AUTHORIZATION)\b", run):
+            errors.append(f"{name}:user-flow-synthetic: preserve the exact origin, SHA and preview authority")
         if '--expected-sha "$EXPECTED_SHA"' not in run or "set -euo pipefail" not in run:
             errors.append(f"{name}:user-flow-synthetic: probe must enforce the exact deployed SHA")
         if '[ -z "$STAGING_WORKER_URL" ]' not in run or "exit 1" not in run:
@@ -8021,6 +8020,7 @@ class WorkflowTests(unittest.TestCase):
                 "run", probe(w)["run"].replace("exit 1", "exit 0")),
             "secret read": lambda w: probe(w)["env"].__setitem__("TOKEN", "${{ secrets.X }}"),
             "secret interpolation": lambda w: probe(w).__setitem__("run", probe(w)["run"] + "\necho ${{ secrets.X }}"),
+            "unset preview": lambda w: probe(w).__setitem__("run", "unset STAGING_PREVIEW_AUTHORIZATION\n" + probe(w)["run"]),
             "write grant": lambda w: w["jobs"]["user-flow-synthetic"].__setitem__(
                 "permissions", {"contents": "write"}),
             "preview token unconditional": lambda w: probe(w)["env"].update({

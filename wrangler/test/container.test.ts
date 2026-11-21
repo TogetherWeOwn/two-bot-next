@@ -299,8 +299,8 @@ test("staging preview extends readiness without extra cold lifecycle activity", 
   assert.equal(discord.mock.callCount(), 0);
   const unready = { ...report, components: report.components.map(([key, state]) => [key, key === "gateway" ? "down" : state]),
     gateway_failure: { phase: "durable_gateway", class: "checkpoint_load_failed" } };
-  for (const [change, read, calls] of [["redirect", 1, 0], ["unready", 1, 0], ["drift", 1, 0], ["drift", 2, 3],
-    ["release", 1, 0], ["release", 2, 3], ["expiry", 2, 3]] as const) {
+  for (const [change, read, status, calls] of [["redirect", 1, 500, 0], ["unready", 1, 503, 0],
+    ["drift", 1, 503, 0], ["drift", 2, 200, 3], ["release", 1, 503, 0], ["release", 2, 200, 3], ["expiry", 2, 200, 3]] as const) {
     discord.mock.resetCalls();
     queue = replies();
     h.values.set(STAGING_USE_KEY, grant);
@@ -315,7 +315,7 @@ test("staging preview extends readiness without extra cold lifecycle activity", 
     });
     const result = await send();
     assert.deepEqual([result.status, result.headers.has(PREVIEW_HEADER)],
-      [change === "redirect" ? 500 : 503, false], `${change} during readiness read ${read}`);
+      [status, false], `${change} during readiness read ${read}`);
     assert.equal(discord.mock.callCount(), calls);
     if (change === "unready") assert.deepEqual(await result.json(), unready);
   }
@@ -328,7 +328,8 @@ test("staging preview extends readiness without extra cold lifecycle activity", 
     const attempts = bad.length;
     queue = bad;
     const result = await send();
-    assert.deepEqual([result.status, result.headers.has(PREVIEW_HEADER)], [503, false]);
+    assert.deepEqual([result.status, result.headers.has(PREVIEW_HEADER)], [200, false]);
+    assert.deepEqual(await result.json(), report);
     assert.equal(discord.mock.callCount(), attempts);
   }
 });

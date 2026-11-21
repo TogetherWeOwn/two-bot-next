@@ -15,7 +15,6 @@ const OPTIONS = [
 ] satisfies Record<string, unknown>[];
 const BOUNDS = ["min_length", "max_length", "min_value", "max_value"];
 const EMPTY = ["choices", "options", "channel_types"];
-
 export async function previewRefusal(request: Request, url: URL, token?: string): Promise<Response | null> {
   const reply = (status: number, extra = {}) =>
     new Response(null, { status, headers: withSecurityHeaders({ "cache-control": "no-store", ...extra }) });
@@ -27,11 +26,9 @@ export async function previewRefusal(request: Request, url: URL, token?: string)
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
-
 function snowflake(value: unknown): value is string {
   return typeof value === "string" && /^[1-9][0-9]{16,19}$/.test(value);
 }
-
 function identity(row: Record<string, unknown> | undefined): boolean {
   return !!row && row.name === NAME && row.type === 1 && row.application_id === APP
     && (!Object.hasOwn(row, "guild_id") || row.guild_id === GUILD) && snowflake(row.version);
