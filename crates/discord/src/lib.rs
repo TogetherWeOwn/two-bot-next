@@ -60,6 +60,7 @@ pub mod onboarding_permissions;
 pub mod pipeline;
 pub mod ratelimit_guard;
 pub mod realtime_gateway;
+pub mod realtime_member_baseline;
 pub mod realtime_roster;
 #[cfg(feature = "db")]
 pub mod rsvp;
