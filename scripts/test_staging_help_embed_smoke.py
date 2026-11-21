@@ -329,9 +329,9 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         # attempt must never read green over messages left behind here.
         self.assertEqual(3, code)
         self.assertIn("cleanup delete failed", out)
-        self.assertEqual(len(ROW_CONTRACTS), len(fake.messages))
+        self.assertEqual(1, len(fake.messages))
         evidence = self.evidence_json()
-        self.assertTrue(all(row.get("cleanup_failed") for row in evidence["rows"]))
+        self.assertEqual([True], [row.get("cleanup_failed") for row in evidence["rows"]])
 
     def test_timed_out_post_is_reconciled_and_removed(self):
         # Discord committed the first post but its response timed out, so

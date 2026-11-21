@@ -240,7 +240,8 @@ python3 scripts/cargo_cache.py run -- run -p two-bot-discord --example help_embe
   remain in the dedicated test channel. The workflow fails at once on
   this status instead of retrying, so a later clean attempt cannot read
   green over the leftover. A lost post that reconciliation removes (or
-  proves absent) stays a retryable exit `1`.
+  proves absent) stays a retryable exit `1`. The runner stops posting after a
+  cleanup failure.
 
 A brand mismatch in the generated payload fails before posting. A mismatch
 only on the read-back means Discord did not serve the posted brand fields as

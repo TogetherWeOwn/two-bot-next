@@ -528,6 +528,8 @@ def run(payload_path, guild_id, token, channel_id, transport=None):
     for key in EMBED_KEYS:
         report.rows.append(
             smoke_one(net, key, embeds[key], expected[key], application_id, channel))
+        if report.rows[-1].cleanup_failed:
+            break
     return report
 
 
