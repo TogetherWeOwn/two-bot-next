@@ -40,7 +40,10 @@ def payloads(**overrides):
                                                    "icon_url": brand["icon_url"]}}
         for key, brand in expected.items()
     }
-    embeds["help"]["fields"] = [{"name": "Custom", "value": "/example"}]
+    embeds["help"]["fields"] = [
+        {"name": "Custom", "value": "/example"},
+        {"name": "Events", "value": "/events"},
+    ]
     data = {"schema": smoke.SCHEMA, "expected": expected, "embeds": embeds}
     data.update(overrides)
     return data
@@ -235,15 +238,28 @@ class HelpEmbedSmokeTests(unittest.TestCase):
                 self.assertEqual(1, code)
                 self.assertIn("VERDICT FAIL", out)
 
-    def test_discovery_group_fields_are_verified_on_read_back(self):
-        def strip_fields(message):
-            message["embeds"][0].pop("fields", None)
+    def test_discovery_layout_mismatches_fail_and_clean_up(self):
+        cases = {
+            "changed title": lambda embed: embed.update(title="Different title"),
+            "changed description": lambda embed: embed.update(
+                description="Different description"),
+            "missing fields": lambda embed: embed.pop("fields"),
+            "swapped fields": lambda embed: embed["fields"].reverse(),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                def mutate_discovery(message):
+                    embed = message["embeds"][0]
+                    if "fields" in embed:
+                        mutate(embed)
 
-        fake = FakeDiscord(mutate_read=strip_fields)
-        code, out = self.run_main(fake)
-        self.assertEqual(1, code)
-        self.assertIn("read-back title, description or fields do not match", out)
-        self.assertEqual({}, fake.messages)
+                fake = FakeDiscord(mutate_read=mutate_discovery)
+                code, out = self.run_main(fake)
+                self.assertEqual(1, code)
+                self.assertIn(
+                    "FAIL    help: read-back title, description or fields do not match", out)
+                self.assertIn("PASS    help_topic:", out)
+                self.assertEqual({}, fake.messages, "both messages are deleted")
 
     def test_one_rows_failure_still_runs_the_other(self):
         seen = []
