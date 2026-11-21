@@ -5,6 +5,7 @@ use std::{io, num::NonZeroU64};
 use serde::{ser::Error as _, Serialize, Serializer};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
+pub mod recovery;
 mod snapshot;
 mod validation;
 
