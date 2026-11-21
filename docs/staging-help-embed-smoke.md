@@ -41,9 +41,9 @@ ordered fields. It does not post buttons or verify callback behavior.
 
 The payload deliberately uses the maximal command registry and a wide topic
 detail, matching the Rust builder tests. It exercises pagination and overflow
-rather than simulating staging's current registry size. The topic fixture
-uses the same adapter as the product bot's topic reply. The Actions payload
-artifact contains only synthetic fixture embeds, not staging messages.
+rather than simulating staging's current registry size. The synthetic topic
+embed uses the same renderer as the product `/help` topic reply. The Actions
+payload artifact contains only synthetic fixture embeds, not staging messages.
 
 ## Rendered payload inventory
 
@@ -61,8 +61,8 @@ Short replies and overflow handling have hermetic tests in `interactions.rs`.
 Voice outcome selection and deferred completion stay in hermetic handler tests;
 these posts only exercise the shared builder. Moderation confirmations and
 audit entries are plain text: `member_runtime.rs` and `audit.rs` test severity
-labels and the unban exception without moderating a member. The smoke does not
-prove ephemeral visibility, real events or room changes, or unimplemented DMs.
+labels and the unban exception without moderating a member. Ephemeral visibility,
+event and room changes, and DM delivery require separate evidence.
 
 ## Token source and updates
 

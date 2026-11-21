@@ -1,5 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseStagingState, stagingUse } from "../scripts/staging-use.mjs";
 
 const NOW = Date.now();
@@ -43,6 +48,98 @@ test("staging client: acquire binds version, build, epoch, run/attempt and immut
     assert.equal(new Headers(call.init.headers).get("authorization"), `Bearer ${TOKEN}`);
     assert.ok(call.init.signal);
   }
+});
+
+test("staging client: stop requires a confirmed stop on the same epoch and active window", async () => {
+  const stop = { ...args, action: "stop" };
+  const before = { ...state, running: true };
+  const h = responses([Response.json(before), Response.json(state)]);
+  const receipt = await stagingUse(stop, h.send, async () => {}, clock);
+  assert.equal(receipt.action, "stop");
+  assert.equal(receipt.running, false);
+  assert.deepEqual(receipt.use, use);
+  assert.deepEqual(h.calls.map(({ url, init }) => [url.pathname, init.method]),
+    [["/internal/staging-use", "GET"], ["/internal/staging-use", "POST"]]);
+  assert.deepEqual(JSON.parse(String(h.calls[1].init.body)), { action: "stop", environment: "staging",
+    deploymentId: args.deploymentId, sha: SHA, expectedEpoch: 7, runId: args.runId, runAttempt: 2, expiresAt: args.expiresAt });
+
+  const unconfirmed = responses([Response.json(before), Response.json(before)]);
+  await assert.rejects(stagingUse(stop, unconfirmed.send, async () => {}, clock), /staging_stop_unconfirmed/);
+  const wrongRun = responses([Response.json({ ...before, use: { ...use, runAttempt: 3 } })]);
+  await assert.rejects(stagingUse(stop, wrongRun.send, async () => {}, clock), /staging_window_mismatch/);
+  assert.equal(wrongRun.calls.length, 1);
+});
+
+test("staging client CLI: stop defaults its timeout when the override is unset", () => {
+  const dir = mkdtempSync(join(tmpdir(), "staging-use-cli-test-"));
+  try {
+    const receipt = join(dir, "receipt.ndjson");
+    const requests = join(dir, "requests.json");
+    const cli = fileURLToPath(new URL("../scripts/staging-use.mjs", import.meta.url));
+    // Install the stub before the actual CLI entry point, so no request can reach staging.
+    const preload = `
+      import { writeFileSync } from "node:fs";
+      const calls = [];
+      const replies = ${JSON.stringify([{ ...state, running: true }, state])};
+      globalThis.fetch = async (url, init) => {
+        calls.push([url.pathname, init.method]);
+        return Response.json(replies.shift());
+      };
+      process.on("exit", () => writeFileSync(${JSON.stringify(requests)}, JSON.stringify(calls)));
+    `;
+    const result = spawnSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(preload)}`, cli, "stop"], {
+      env: { STAGING_WORKER_URL: args.url, OWNERSHIP_CONTROL_TOKEN: TOKEN, STAGING_USE_RECEIPT: receipt,
+        STAGING_USE_SHA: SHA, STAGING_USE_DEPLOYMENT: args.deploymentId, STAGING_USE_EXPIRES_AT: String(args.expiresAt),
+        GITHUB_RUN_ID: args.runId, GITHUB_RUN_ATTEMPT: String(args.runAttempt) },
+      encoding: "utf8", timeout: 5000,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(requests, "utf8")), [["/internal/staging-use", "GET"], ["/internal/staging-use", "POST"]]);
+    const rows = readFileSync(receipt, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(rows.map((row) => row.action), ["attempt", "stop"]);
+    assert.equal(rows[1].running, false);
+    assert.deepEqual(rows[1].use, use);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("staging client: stop shares a short deadline across the status read and mutation", async (t) => {
+  let elapsed = 0;
+  t.mock.method(performance, "now", () => elapsed);
+  const stop = { ...args, action: "stop", stopTimeoutMs: 15000 };
+  const before = { ...state, running: true };
+  const h = responses([Response.json(before), Response.json(state)]);
+  const receipt = await stagingUse(stop, async (url: URL, init: RequestInit) => {
+    elapsed += init.method === "GET" ? 1000 : 2000;
+    return h.send(url, init);
+  }, async () => { assert.fail("a successful status read needs no retry"); }, clock);
+  assert.equal(receipt.running, false);
+  assert.deepEqual(receipt.use, use);
+  assert.deepEqual(h.calls.map(({ init }) => init.method), ["GET", "POST"]);
+
+  elapsed = 0;
+  const expired = responses([Response.json(before)]);
+  await assert.rejects(stagingUse(stop, async (url: URL, init: RequestInit) => {
+    elapsed = stop.stopTimeoutMs;
+    return expired.send(url, init);
+  }, async () => {}, clock), /staging_request_timeout/);
+  assert.deepEqual(expired.calls.map(({ init }) => init.method), ["GET"]);
+});
+
+test("staging client: stop retries a busy status read but never retries the mutation", async () => {
+  const stop = { ...args, action: "stop", stopTimeoutMs: 50000 };
+  const busy = () => new Response(null, { status: 503 });
+  const h = responses([busy(), Response.json({ ...state, running: true }), busy()]);
+  const delays: number[] = [];
+  await assert.rejects(stagingUse(stop, h.send, async (ms: number) => { delays.push(ms); }, clock),
+    /staging_control_refused/);
+  assert.deepEqual(delays, [5000]);
+  assert.deepEqual(h.calls.map(({ init }) => init.method), ["GET", "GET", "POST"]);
+
+  const nearDeadline = responses([busy()]);
+  await assert.rejects(stagingUse({ ...stop, stopTimeoutMs: 19000 }, nearDeadline.send,
+    async () => { assert.fail("retry exceeds the stop status budget"); }, clock), /staging_control_refused/);
+  assert.deepEqual(nearDeadline.calls.map(({ init }) => init.method), ["GET"]);
 });
 
 test("staging client: a deployment resource UUID cannot replace the Worker version UUID", async () => {

@@ -22,6 +22,12 @@ pub mod store;
 #[path = "voice_move.rs"]
 pub mod voice_move;
 pub use voice_move::{VoiceMoveNotSent, VoiceMovePatch, VOICE_MOVE_TIMEOUT_MS};
+#[path = "voice_move_reads.rs"]
+mod voice_move_reads;
+pub use voice_move_reads::{VoiceMoveEvidence, VoiceMoveReadError, VoiceMoveTarget};
+#[path = "voice_move_coordinator.rs"]
+mod voice_move_coordinator;
+pub use voice_move_coordinator::{VoiceMoveAttempt, VoiceMoveRoster};
 
 #[cfg(test)]
 #[path = "voice_move_adapter_tests.rs"]
@@ -256,6 +262,18 @@ impl ActionExecutor {
         deadline: Instant,
         revalidate: impl std::future::Future<Output = bool> + Send,
     ) -> Result<VoiceMovePatch, ActionError> {
+        let ids = [guild_id, member_id, channel_id];
+        self.move_voice_member_with_commit_until(ids, deadline, revalidate, &|start| start())
+            .await
+    }
+
+    async fn move_voice_member_with_commit_until(
+        &self,
+        [guild_id, member_id, channel_id]: [&str; 3],
+        deadline: Instant,
+        revalidate: impl std::future::Future<Output = bool> + Send,
+        commit: super::FinalCommit<'_>,
+    ) -> Result<VoiceMovePatch, ActionError> {
         use super::StrictTransportError::{
             Admission, PreWireDeadline, PreWireGuard, PreWireRevalidation,
         };
@@ -275,7 +293,7 @@ impl ActionExecutor {
         let headers = self
             .inner
             .transport
-            .send_strict_evidence_headers_after(&request, deadline, revalidate, move || {
+            .send_strict_evidence_headers_after(&request, deadline, revalidate, commit, move || {
                 self.stamp_paced_lane(&mut pacing, false);
                 self.count();
             })
@@ -291,8 +309,10 @@ impl ActionExecutor {
         };
         let status = pending.pending.status;
         if let Some(refusal) = voice_move::header_refusal(status) {
-            let _ = super::poll_before(deadline, pending.pending.settle_status()).await;
-            return Ok(refusal);
+            return Ok(match pending.settle_definitive_refusal().await {
+                super::StrictSettlement::Confirmed => refusal,
+                super::StrictSettlement::Unconfirmed => VoiceMovePatch::RefusalUnsettled,
+            });
         }
         let mut retry_after_ms = None;
         let settlement = pending
@@ -445,6 +465,7 @@ impl ActionExecutor {
         if target.managed || target.id == guild_id || target.position >= highest {
             return Err(member_status_error(&RawResponse {
                 status: 403,
+                validated_retry_after_header: None,
                 retry_after_header: None,
                 body: vec![],
                 completion: None,

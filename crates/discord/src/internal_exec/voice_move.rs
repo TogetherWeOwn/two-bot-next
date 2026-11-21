@@ -29,6 +29,8 @@ pub enum VoiceMovePatch {
     Moved,
     Denied,
     Stale,
+    /// Discord refused the move, but settlement of the durable lane was not confirmed.
+    RefusalUnsettled,
     Limited {
         retry_after_ms: Option<u64>,
         settlement_confirmed: bool,

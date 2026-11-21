@@ -78,6 +78,29 @@ test("staging use: idempotent acquire cannot extend a window or steal another at
   assert.equal(h.stops(), 1);
 });
 
+test("staging use: stop requires the current active window and leaves it available for rollback", async () => {
+  const h = fixture();
+  const stop = { ...h.change, action: "stop" as const };
+  assert.deepEqual(parseStagingUseChange(stop), stop);
+  await assert.rejects(h.lifecycle.stop(stop, identity, h.stop), /staging_use_required/);
+  const grant = await h.lifecycle.acquire(h.change, identity, h.stop, h.schedule);
+  for (const patch of [{ runAttempt: 2 }, { expiresAt: grant.expiresAt + 1 }, { runId: "999" }]) {
+    await assert.rejects(h.lifecycle.stop({ ...stop, ...patch }, identity, h.stop), /staging_use_conflict/);
+  }
+  await assert.rejects(h.lifecycle.stop({ ...stop, expectedEpoch: 2 }, identity, h.stop), /epoch_conflict/);
+  assert.equal(h.stops(), 1);
+  await assert.rejects(h.lifecycle.stop(stop, identity, async () => {
+    throw new Error("stop unconfirmed");
+  }), /stop unconfirmed/);
+  assert.deepEqual(await h.lifecycle.require(identity), grant);
+  assert.deepEqual(await h.lifecycle.stop(stop, identity, h.stop), grant);
+  assert.deepEqual(await h.lifecycle.require(identity), grant);
+  assert.deepEqual(h.deadlines, [grant.expiresAt]);
+  await h.lifecycle.release({ ...stop, action: "release" }, identity, h.stop);
+  await assert.rejects(h.lifecycle.stop(stop, identity, h.stop), /staging_use_required/);
+  assert.equal(h.stops(), 3);
+});
+
 test("staging use: finite deadline, observed expiry and future-acquired state fail closed", async () => {
   const h = fixture();
   for (const expiresAt of [Date.now() - 1, Date.now(), Date.now() + MAX_STAGING_USE_MS + 60_000]) {

@@ -126,18 +126,29 @@ function window(state, args, now, phase = "active") {
 export async function stagingUse(args, send = fetch, pause = wait, now = Date.now) {
   const base = origin(args.url);
   require(typeof args.token === "string" && args.token.length >= 32, "staging_token_missing");
-  require(["status", "observe", "acquire", "assert", "ready", "release"].includes(args.action), "staging_action_invalid");
+  require(["status", "observe", "acquire", "assert", "ready", "release", "stop"].includes(args.action), "staging_action_invalid");
   // A release may be retried after expiry, but never extends that expiry.
   if (!["status", "observe"].includes(args.action)) binding(args, args.action === "release" ? Math.min(now(), args.expiresAt - 1) : now());
+  let statusRetryDeadline = args.statusRetryDeadline;
+  let stopDeadline;
+  if (args.action === "stop") {
+    const budget = args.stopTimeoutMs ?? 50000;
+    require(positive(budget), "staging_request_timeout");
+    const start = performance.now();
+    // Leave time for subprocess startup and receipt output. Reserve a full
+    // POST allowance only for optional retries, not the first status read.
+    stopDeadline = start + budget - 2000;
+    statusRetryDeadline = Math.min(start + 30000, stopDeadline - MAX_REQUEST_MS);
+  }
   const headers = { authorization: `Bearer ${args.token}`, "cache-control": "no-cache" };
   const control = async (init) => {
+    const retryDeadline = init.method === "GET" ? statusRetryDeadline : undefined;
+    let deadline = stopDeadline ?? retryDeadline ?? performance.now() + MAX_REQUEST_MS;
     for (;;) {
-      const deadline = args.statusRetryDeadline === undefined || init.method !== "GET"
-        ? performance.now() + MAX_REQUEST_MS : args.statusRetryDeadline;
       const response = await request(send, new URL(PATH, base), { ...init, headers }, deadline);
-      if (response.status === 503 && init.method === "GET" && args.statusRetryDeadline !== undefined
-        && performance.now() + 5000 < deadline) {
+      if (response.status === 503 && retryDeadline !== undefined && performance.now() + 5000 < retryDeadline) {
         await pause(5000);
+        deadline = retryDeadline;
         continue;
       }
       require(response.status === 200, "staging_control_refused");
@@ -163,7 +174,8 @@ export async function stagingUse(args, send = fetch, pause = wait, now = Date.no
   }
   identity(state, args);
   const epoch = state.epoch;
-  if (args.action === "acquire" || args.action === "release") {
+  if (args.action === "acquire" || args.action === "release" || args.action === "stop") {
+    if (args.action === "stop") window(state, args, now());
     if (args.action === "release") require(sameRunWindow(state.use, args), "staging_window_mismatch");
     const change = { action: args.action, environment: "staging", deploymentId: args.deploymentId,
       sha: args.sha, expectedEpoch: state.epoch, runId: args.runId, runAttempt: args.runAttempt, expiresAt: args.expiresAt };
@@ -172,7 +184,7 @@ export async function stagingUse(args, send = fetch, pause = wait, now = Date.no
     require(state.epoch === epoch, "staging_epoch_mismatch");
   }
   window(state, args, now(), args.action === "release" ? "released" : "active");
-  if (args.action === "release") require(!state.running, "staging_stop_unconfirmed");
+  if (args.action === "release" || args.action === "stop") require(!state.running, "staging_stop_unconfirmed");
   if (args.action === "ready") {
     // Never grant readiness beyond expiry. The existing rollout gate still
     // certifies image/digest/build/deploy IDs; this check certifies finite use.
@@ -213,6 +225,7 @@ if (isDirectInvocation(process.argv[1], import.meta.url)) {
   const runId = process.env.GITHUB_RUN_ID;
   const runAttempt = Number(process.env.GITHUB_RUN_ATTEMPT);
   const expiresAt = Number(process.env.STAGING_USE_EXPIRES_AT);
+  const stopTimeout = process.env.STAGING_STOP_TIMEOUT_MS;
   const run = { runId: typeof runId === "string" && RUN.test(runId) ? runId : null,
     runAttempt: positive(runAttempt) ? runAttempt : null, expiresAt: positive(expiresAt) ? expiresAt : null };
   const emit = (value) => {
@@ -228,7 +241,8 @@ if (isDirectInvocation(process.argv[1], import.meta.url)) {
     const result = await stagingUse({ action, url: process.env.STAGING_WORKER_URL, token: process.env.OWNERSHIP_CONTROL_TOKEN,
       sha: process.env.STAGING_USE_SHA, deploymentId: process.env.STAGING_USE_DEPLOYMENT,
       runId: process.env.GITHUB_RUN_ID, runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
-      expiresAt: Number(process.env.STAGING_USE_EXPIRES_AT) });
+      expiresAt: Number(process.env.STAGING_USE_EXPIRES_AT),
+      stopTimeoutMs: stopTimeout === undefined ? undefined : Number(stopTimeout) });
     emit(result);
     // Publish only after the validated receipt is durably retained. Missing
     // output on any error must never open a periodic reader's sample gate.

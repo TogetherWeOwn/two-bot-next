@@ -313,6 +313,7 @@ async fn poisoned_live_bare_settle_panics_without_counter() {
     // path (`observe_bare_retry_after`): silent today, loud after Builder.
     let response = crate::executor::RawResponse {
         status: 429,
+        validated_retry_after_header: None,
         retry_after_header: None,
         body: br#"{}"#.to_vec(),
         completion: None,
@@ -345,6 +346,7 @@ async fn poisoned_live_global_settle_panics_without_counter() {
     // `begin_global` expect in between): silent today, loud after Builder.
     let response = crate::executor::RawResponse {
         status: 429,
+        validated_retry_after_header: None,
         retry_after_header: None,
         body: br#"{"global":true}"#.to_vec(),
         completion: None,

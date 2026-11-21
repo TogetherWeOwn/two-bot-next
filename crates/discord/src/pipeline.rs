@@ -484,8 +484,9 @@ pub struct MessageEligibility {
 pub struct SharedCache {
     inner: InMemoryCache,
     /// Twilight can retain guild data across READY. Only a full GuildCreate
-    /// makes that guild eligible for a projection in the new session.
-    complete_guilds: RwLock<HashSet<Snowflake>>,
+    /// makes that guild eligible for a projection in the new session. A fresh
+    /// arc gives each policy epoch a distinct identity while a proof holds it.
+    complete_guilds: RwLock<HashMap<Snowflake, Arc<()>>>,
     #[cfg(test)]
     before_twilight_update: Option<tests::CacheWriteProbe>,
 }
@@ -494,7 +495,7 @@ impl Default for SharedCache {
     fn default() -> Self {
         Self {
             inner: build_cache(),
-            complete_guilds: RwLock::new(HashSet::new()),
+            complete_guilds: RwLock::new(HashMap::new()),
             #[cfg(test)]
             before_twilight_update: None,
         }
@@ -505,12 +506,18 @@ impl SharedCache {
     /// Apply one gateway event atomically with respect to guild projections.
     pub fn update(&self, event: &Event) {
         let mut complete = self.complete_guilds.write().expect("cache snapshot fence");
+        let policy_guild = voice_policy_guild(&self.inner, event);
         self.apply_twilight_event(event);
         match event {
             Event::Ready(_) => complete.clear(),
+            Event::Resumed => {
+                for epoch in complete.values_mut() {
+                    *epoch = Arc::new(());
+                }
+            }
             Event::GuildCreate(create) => match create.as_ref() {
                 twilight_model::gateway::payload::incoming::GuildCreate::Available(guild) => {
-                    complete.insert(guild.id.get());
+                    complete.insert(guild.id.get(), Arc::new(()));
                 }
                 twilight_model::gateway::payload::incoming::GuildCreate::Unavailable(guild) => {
                     complete.remove(&guild.id.get());
@@ -519,7 +526,11 @@ impl SharedCache {
             Event::GuildDelete(guild) => {
                 complete.remove(&guild.id.get());
             }
-            _ => {}
+            _ => {
+                if let Some(epoch) = policy_guild.and_then(|id| complete.get_mut(&id)) {
+                    *epoch = Arc::new(());
+                }
+            }
         }
     }
 
@@ -538,12 +549,57 @@ impl SharedCache {
         guild_id: Snowflake,
         read: impl FnOnce(&InMemoryCache) -> T,
     ) -> Option<T> {
-        let complete = self.complete_guilds.try_read().ok()?;
-        if !complete.contains(&guild_id) {
-            return None;
-        }
-        Some(read(&self.inner))
+        self.with_guild_policy_snapshot(guild_id, |cache, _| read(cache))
     }
+
+    /// Read the epoch under the same fence as the roster it qualifies.
+    pub(crate) fn with_guild_policy_snapshot<T>(
+        &self,
+        guild_id: Snowflake,
+        read: impl FnOnce(&InMemoryCache, &Arc<()>) -> T,
+    ) -> Option<T> {
+        let complete = self.complete_guilds.try_read().ok()?;
+        Some(read(&self.inner, complete.get(&guild_id)?))
+    }
+}
+
+fn voice_policy_guild(cache: &InMemoryCache, event: &Event) -> Option<Snowflake> {
+    let guild = event.guild_id()?;
+    let changed = |user, roles: &[_], timeout| {
+        cache.member(guild, user).is_none_or(|prior| {
+            prior.roles() != roles || prior.communication_disabled_until() != timeout
+        })
+    };
+    let modifies = match event {
+        // Interactions can cache invoking/resolved members and resolved roles.
+        Event::GuildUpdate(_)
+        | Event::ChannelCreate(_)
+        | Event::ChannelUpdate(_)
+        | Event::ChannelDelete(_)
+        | Event::RoleCreate(_)
+        | Event::RoleUpdate(_)
+        | Event::RoleDelete(_)
+        | Event::MemberAdd(_)
+        | Event::MemberUpdate(_)
+        | Event::MemberRemove(_)
+        | Event::InteractionCreate(_) => true,
+        Event::MemberChunk(chunk) => !chunk.members.is_empty(),
+        // Voice and message frames can overwrite the member baseline.
+        Event::VoiceStateUpdate(v) => {
+            let m = v.member.as_ref()?;
+            changed(m.user.id, &m.roles, m.communication_disabled_until)
+        }
+        _ => {
+            let msg = match event {
+                Event::MessageCreate(msg) => &msg.message,
+                Event::MessageUpdate(msg) => &msg.0,
+                _ => return None,
+            };
+            let m = msg.member.as_ref()?;
+            changed(msg.author.id, &m.roles, m.communication_disabled_until)
+        }
+    };
+    modifies.then_some(guild.get())
 }
 
 /// The S3 gateway pipeline. `S`/`L`/`F` are the core seams; `I` serves invite
@@ -1353,6 +1409,62 @@ mod tests {
     }
 
     #[test]
+    fn voice_policy_epoch_is_guild_scoped_and_never_reused_after_reseed() -> Result<(), String> {
+        let cache = SharedCache::default();
+        cache.update(&lifecycle_available_guild());
+        cache.update(&lifecycle_guild(GUILD + 1));
+        let epoch = |id| cache.with_guild_policy_snapshot(id, |_, epoch| Arc::clone(epoch));
+        let current = || epoch(GUILD);
+        let cases: Vec<(bool, &str, serde_json::Value)> =
+            serde_json::from_str(include_str!("../tests/fixtures/voice_policy_events.json"))
+                .map_err(|err| format!("policy fixture table: {err}"))?;
+        let peer = epoch(GUILD + 1).unwrap();
+        for (changed, kind, data) in cases {
+            let packet = serde_json::json!({"op": 0, "s": 1, "t": kind, "d": data});
+            let event = twilight_gateway::parse(
+                packet.to_string(),
+                twilight_gateway::EventTypeFlags::all(),
+            )
+            .map_err(|err| format!("{kind} fixture: {err}"))?
+            .ok_or_else(|| format!("{kind} fixture: missing dispatch"))?;
+            let before = current().unwrap();
+            cache.update(&Event::from(event));
+            assert_eq!(
+                !Arc::ptr_eq(&before, &current().unwrap()),
+                changed,
+                "{kind}"
+            );
+            assert!(Arc::ptr_eq(&peer, &epoch(GUILD + 1).unwrap()));
+        }
+        let initial = current().unwrap();
+        cache.update(&lifecycle_voice(GUILD, 1, 10));
+        cache.update(&lifecycle_delete(GUILD + 1, Some(11)));
+        assert!(Arc::ptr_eq(&initial, &current().expect("unchanged epoch")));
+        assert!(!Arc::ptr_eq(
+            &peer,
+            &epoch(GUILD + 1).expect("peer changed")
+        ));
+
+        let mut prior = initial;
+        for event in [
+            lifecycle_member_remove(1),
+            lifecycle_delete(GUILD, Some(10)),
+            Event::Resumed,
+            lifecycle_available_guild(),
+        ] {
+            cache.update(&event);
+            let fresh = current().expect("complete guild after policy event");
+            assert!(!Arc::ptr_eq(&prior, &fresh), "policy epoch must change");
+            prior = fresh;
+        }
+        cache.update(&lifecycle_ready());
+        assert!(current().is_none());
+        cache.update(&lifecycle_available_guild());
+        assert!(!Arc::ptr_eq(&prior, &current().expect("reseeded guild")));
+        Ok(())
+    }
+
+    #[test]
     fn idle_chains_prune_at_10k_hot_untouched() {
         const TOTAL: u64 = 10_000;
         const HOT: u64 = 100;
@@ -1784,11 +1896,15 @@ mod tests {
     }
 
     fn lifecycle_available_guild() -> Event {
+        lifecycle_guild(GUILD)
+    }
+
+    fn lifecycle_guild(id: Snowflake) -> Event {
         let mut guild: serde_json::Value =
             serde_json::from_str(include_str!("../../bot/tests/fixtures/voice_guild.json"))
                 .expect("available guild fixture");
-        guild["id"] = serde_json::json!(GUILD.to_string());
-        guild["roles"][0]["id"] = serde_json::json!(GUILD.to_string());
+        guild["id"] = serde_json::json!(id.to_string());
+        guild["roles"][0]["id"] = serde_json::json!(id.to_string());
         guild["members"] = serde_json::json!([]);
         guild["voice_states"] = serde_json::json!([]);
         Event::GuildCreate(Box::new(

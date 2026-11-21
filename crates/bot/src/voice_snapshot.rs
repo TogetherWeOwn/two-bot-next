@@ -100,7 +100,7 @@ pub(crate) struct VoiceOccupancyClock {
     rooms: Mutex<HashMap<(Snowflake, Snowflake), OccupiedRoom>>,
     // Reservation, completion and observations share this lock. Readiness
     // and cache reseeds invalidate room intervals, not move holds.
-    move_holds: Mutex<VoiceMoveHolds>,
+    pub(crate) move_holds: Mutex<VoiceMoveHolds>,
 }
 
 impl VoiceOccupancyClock {

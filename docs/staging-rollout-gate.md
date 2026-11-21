@@ -103,7 +103,7 @@ unchanged. Scheduled user-flow also observes instead of acquiring a window.
 The production promotion's live staging-soak samples use one bounded grant
 through baseline, measurement, final sampling and release; their exact-head live
 qualification remains required.
-`acquire`, `assert`, `ready` and `release` pin the intended
+`acquire`, `assert`, `ready`, `stop` and `release` pin the intended
 `STAGING_USE_SHA`, `STAGING_USE_DEPLOYMENT`, `GITHUB_RUN_ID`,
 `GITHUB_RUN_ATTEMPT` and absolute millisecond `STAGING_USE_EXPIRES_AT`. The
 origin must be the approved staging workers.dev origin, with no path, query or
@@ -263,7 +263,7 @@ become the newest outcome for the still-serving SHA and block promotion even
 with an older green run. Do not skip that failure; qualify current `main`
 with a fresh dispatch only if the match above holds. To intentionally recover a
 prior main SHA, dispatch from current `main` with the full ancestor SHA and
-`recover_prior_sha: true`.
+`recover_prior_sha: true` ([voice heat backout](database-roles.md#voice-heat-staging-backout)).
 This does not qualify as staging history. Do not rerun old workflow revisions
 with the old single-slot policy; let existing holders and waiters settle before
 using the measurement caller. Wait for all five qualifying jobs plus release
@@ -479,6 +479,15 @@ merge or an unverified deployment is not `t0`.
    rollout, and the exact Worker passes the runtime probes. On the active-lag counter
    shape, that listing-lag acceptance still requires two consecutive full passes.
    Successful stale-listing acceptance records `"application_listing_lag": true`.
+
+   After validating pinned rollout completion, require an authenticated stop receipt with
+   `running: false`, even at zero instances: an alarm may have started the prior build.
+   Only post-stop probes certify the exact Worker, revision, build and deploy ID; they can
+   cold-start the replacement. Zero or starting counters retry within the same deadline.
+   A busy status GET may retry within budget; send the stop POST once and fail if unconfirmed.
+   Stop preserves the grant and its expiry for automatic rollback and final release.
+   Historical recovery pins use their own checkout's verifier; pins predating this change
+   cannot supply fresh-stop evidence.
 
    A stale listing that is not verified as the rollout's previous image fails as
    `application_image_drift`. For a verified previous-image listing that has not
