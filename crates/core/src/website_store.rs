@@ -36,13 +36,12 @@ use super::community_snapshots::{window_bounds, CommunitySnapshot, RaidWindow, R
 use super::funnel::{format_iso_millis, parse_iso_millis};
 use super::scheduled_events::{EventStatus, ScheduledEvent, ScheduledEventsSkip};
 
-/// The contract version this build implements. Must match the row seeded in
-/// migration 0300 and the changelog in `sql/web_v1.sql`.
-pub const WEB_CONTRACT_VERSION: &str = "1.0";
+/// Migration 0300 seeds 1.0; successful view installation publishes 1.1.
+pub const WEB_CONTRACT_VERSION: &str = "1.1";
 
 /// Every view in the contract, in `sql/web_v1.sql` order. The website reads
 /// exactly these; a view added here needs a `web_v1` edit, not a migration.
-pub const WEB_CONTRACT_VIEWS: [&str; 10] = [
+pub const WEB_CONTRACT_VIEWS: [&str; 11] = [
     "contract_meta",
     "live_counts",
     "rank_counts",
@@ -53,6 +52,7 @@ pub const WEB_CONTRACT_VIEWS: [&str; 10] = [
     "next_event",
     "funnel_daily",
     "funnel_by_source",
+    "voice_heat",
 ];
 
 /// The `web_v1` contract DDL. `include_str!` (not a runtime file read) so the
@@ -573,10 +573,10 @@ impl crate::scheduled_events::ScheduledEventMirror for Pool<Postgres> {
 }
 
 /// Apply the `web_v1` contract views (legacy `applyWebContract`: the SQL file
-/// is the contract, this only runs it). Idempotent — everything in the file
-/// is `CREATE OR REPLACE` / `IF NOT EXISTS` — so the boot path can run it on
-/// every start; a `web_v1` edit that renames, reorders, removes or retypes a
-/// column fails here loudly instead of silently breaking the website.
+/// is the contract, this only runs it). Idempotent: the view DDL and guarded
+/// version update can run on every start. A `web_v1` edit that renames,
+/// reorders, removes or retypes a column fails here instead of silently
+/// breaking the website.
 pub async fn apply_web_contract(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
     // Resolve and apply on the same connection: a pool can hand out different
     // sessions, each with its own search_path.

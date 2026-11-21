@@ -234,8 +234,22 @@ mod tests {
         // `sql/web_v1.sql`, the store applier embeds
         // `crates/store/sql/web_v1.sql` (`Store::connect`). A view reverted
         // in one copy only must fail here, with no database.
-        let root_views = contract_views(include_str!("../../../sql/web_v1.sql"));
-        let store_views = contract_views(include_str!("../../store/sql/web_v1.sql"));
+        let root_sql = include_str!("../../../sql/web_v1.sql");
+        let store_sql = include_str!("../../store/sql/web_v1.sql");
+        let heat = "CREATE OR REPLACE VIEW web_v1.voice_heat AS";
+        assert_eq!(
+            root_sql
+                .split_once(heat)
+                .expect("cutover voice heat suffix")
+                .1,
+            store_sql
+                .split_once(heat)
+                .expect("store voice heat suffix")
+                .1,
+            "voice heat query and guarded version bump must match",
+        );
+        let root_views = contract_views(root_sql);
+        let store_views = contract_views(store_sql);
         assert_eq!(
             store_views, root_views,
             "store-embedded web_v1 copy drifted from sql/web_v1.sql"

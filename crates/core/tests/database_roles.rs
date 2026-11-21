@@ -342,12 +342,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     )?;
 
     exercise_voice_heat_grants(pool, roles).await?;
-    require(
-        sqlx::query_scalar::<_, bool>("SELECT to_regclass('web_v1.voice_heat') IS NULL")
-            .fetch_one(pool)
-            .await?,
-        "dormant voice heat must not publish a reader view",
-    )?;
+    denied(pool, &roles[1], "SELECT * FROM web_v1.voice_heat").await?;
+    denied(pool, &roles[3], "SELECT * FROM web_v1.voice_heat").await?;
 
     exercise_member_grants(pool, roles).await?;
     exercise_member_store(pool, &roles[1]).await?;
@@ -469,6 +465,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "next_event",
         "funnel_daily",
         "funnel_by_source",
+        "voice_heat",
     ] {
         as_role(pool, &roles[2], &format!("SELECT * FROM web_v1.{view}")).await?;
     }
@@ -1701,7 +1698,11 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         }
     }
     require(ledger == STAGING_LEDGER29.len(), "29-state incomplete").unwrap();
-    sqlx::raw_sql(include_str!("../../../sql/web_v1.sql"))
+    // This historical schema has the 1.0 views and helpers, but no heat table.
+    let (prior, _) = include_str!("../../../sql/web_v1.sql")
+        .split_once("-- Voice heat contract 1.1: trailing 28 complete UTC days; all 168 cells.")
+        .expect("heat publication suffix");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(prior))
         .execute(&provision_pool)
         .await
         .unwrap();
@@ -1713,6 +1714,14 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         .execute(&provision_pool)
         .await
         .unwrap();
+    let heat_absent: bool = sqlx::query_scalar(
+        "SELECT to_regclass('public.voice_heat_hours') IS NULL
+            AND to_regclass('web_v1.voice_heat') IS NULL",
+    )
+    .fetch_one(&provision_pool)
+    .await
+    .unwrap();
+    assert!(heat_absent);
     let ledger_rows = STAGING_LEDGER29
         .iter()
         .map(|version| format!("({version})"))
@@ -1795,6 +1804,17 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         }
     }
     require(!pending.is_empty(), "no pending migrations applied").unwrap();
+    two_bot_core::apply_web_contract(&migrator_pool)
+        .await
+        .unwrap();
+    let initial_cells: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM web_v1.voice_heat
+         WHERE source = 'insufficient' AND avg_in_voice IS NULL AND coverage = 0",
+    )
+    .fetch_one(&migrator_pool)
+    .await
+    .unwrap();
+    assert_eq!(initial_cells, 168);
     let pending_rows = pending
         .iter()
         .map(|version| format!("({version})"))
