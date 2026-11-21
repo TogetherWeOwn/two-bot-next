@@ -107,6 +107,19 @@ cannot be ruled out, require Release Manager approval on the source card for
 the full PR head SHA before merge. Production actions need separate approval.
 See [`CONTRIBUTING.md`](CONTRIBUTING.md#production-merge-evidence).
 
+## Modern web platform guidance
+
+This repo has no web UI yet. When a web dashboard or any other browser-facing code (HTML, CSS, components, client-side JS or TS) is added, consult Modern Web Guidance before writing or changing it. It covers current HTML, CSS and DOM APIs, accessibility, forms and performance. Skip it for the Rust bot, Workers, SQL and scripts.
+
+1. If your agent harness provides the `modern-web-guidance` skill, use it. Otherwise run the CLI directly (Node 22+):
+   `DISABLE_TELEMETRY=1 npx -y modern-web-guidance@latest search "<2-5 word capability>"`, then
+   `DISABLE_TELEMETRY=1 npx -y modern-web-guidance@latest retrieve "<id>"`.
+   Search one capability at a time (for example `"light dismiss dialog"`), without framework or app names.
+2. Apply only the retrieved guidance that fits the task. Keep existing behavior, copy, design tokens and
+   the stack the route already uses; record any guide you followed in the PR body.
+3. The guidance never overrides [CONSTRAINTS.md](CONSTRAINTS.md), this file, or a project decision. If they
+   conflict, follow the project and note the conflict in the PR.
+
 ## Definition of done
 
 - The behavior matches the request.
