@@ -1,6 +1,10 @@
 {
   "version": 1,
   "migrations": {
+    "crates/cutover/migrations/0481_internal_voice_move_audit.sql": {
+      "sha256": "e22546bf2b66c6cae914cda43f07889ef527aec4a8a1a9c8def14922d0a0e013",
+      "justification": "Record closed terminal voice move outcomes and scalar witnesses in the private ledger."
+    },
     "crates/store/migrations/0478_voice_heat_hours.sql": {
       "sha256": "1121359cea26d65320906a319dfabff5a31aa3dd89fab958d455220c5d964fc2",
       "justification": "Install the dormant aggregate-only voice heat table in the store chain."

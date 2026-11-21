@@ -187,7 +187,6 @@ fn snapshot_refusals_require_matching_valid_correlation_ids() {
 fn unimplemented_verbs_stay_closed_until_they_land() {
     let fx = fixture();
     for name in [
-        "voice.move_member",
         "reminder.send",
         "place_offer.send",
         "event.attendance.read",
@@ -217,6 +216,7 @@ fn move_member_request_and_outcomes_match_the_closed_vocab() {
     let v = verb(&fx, "voice.move_member");
     let request = body(&v["request"]);
     assert_eq!(request["action"], "voice.move_member");
+    assert_eq!(v["implemented"], false, "bind does not expose staged moves");
     require_snowflake(&request, "discord_id").expect("discord_id snowflake");
     require_snowflake(&request, "channel_id").expect("channel_id snowflake");
     let outcomes: Vec<&str> = v["outcomes"]

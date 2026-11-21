@@ -2,13 +2,14 @@
 //! Receiver boundary plus the real single-attempt adapter and durable send lane.
 //! Only guarded TestDatabase pools and an ephemeral loopback Discord double.
 use super::*;
-use axum::extract::State;
-use two_bot_core::send_admission::PgSendAdmission;
+use axum::{extract::State, serve::ListenerExt};
+use two_bot_core::send_admission::{AdmissionError, PgSendAdmission, SendAdmission};
 use two_bot_discord::{internal_actions::CooldownGovernor, ActionExecutor, DiscordError};
 
 struct MockDiscord {
     origin: String,
     requests: Arc<Mutex<Vec<Value>>>,
+    sockets: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -39,19 +40,25 @@ impl MockDiscord {
                         }));
                         reply
                     };
-                    (reply.0, Json(reply.1))
+                    (reply.0, [(header::CONNECTION, "close")], Json(reply.1))
                 },
             )
             .with_state(MockState {
                 requests: requests.clone(),
                 replies: Arc::new(replies),
             });
+        let sockets = Arc::new(AtomicUsize::new(0));
+        let accepted = sockets.clone();
+        let listener = listener.tap_io(move |_| {
+            accepted.fetch_add(1, Ordering::SeqCst);
+        });
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         Self {
             origin,
             requests,
+            sockets,
             task,
         }
     }
@@ -276,5 +283,108 @@ async fn real_adapter_invalid_receipt_keeps_intent_and_restart_send_lane_occupie
         "uncertain effects never grant another send"
     );
     second.close().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_move_signed_storage_refusal_releases_member_and_last_seat_without_socket() {
+    let Some(db) = database().await else { return };
+    use two_bot_discord::{NoInvites, OrderedLevelingPipeline, PipelineSnapshots};
+    const FIRST: &str = "111111111111111141";
+    const SECOND: &str = "111111111111111142";
+    const SOURCE: &str = "111111111111111131";
+    const TARGET: &str = "111111111111111135";
+    let guild = staging_guild();
+    let facts = |member| {
+        [
+            json!({"id": "43", "bot": true}),
+            json!({"id": guild, "owner_id": "43", "afk_channel_id": null, "roles": [{"id": guild, "permissions": "1049600", "position": 0}]}),
+            voice_channel(TARGET, 2, "target", 0, 1), voice_member(member, false),
+            voice_channel(SOURCE, 2, "source", 0, 0), voice_member("43", true),
+        ].map(|body| (StatusCode::OK, body))
+    };
+    let mut replies = [facts(FIRST), facts(SECOND), facts(FIRST)].concat();
+    replies.insert(12, (StatusCode::FORBIDDEN, Value::Null));
+    replies.push((StatusCode::OK, voice_member(FIRST, false)));
+    let mock = MockDiscord::start(replies).await;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let lane = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
+    // Only strict PATCH admission writes the pending generation; preflight GETs still work.
+    let alter = async |change: &str| {
+        let sql = format!("ALTER TABLE discord_send_admission {change}");
+        sqlx::query(&sql).execute(db.pool()).await.unwrap()
+    };
+    alter("ADD CONSTRAINT refuse CHECK (pending_settlement_generation IS NULL)").await;
+    let admitted = lane.admit_strict().await;
+    assert_eq!(admitted.err(), Some(AdmissionError::Storage));
+    let mut receiver = state(
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+    );
+    let inner = Arc::get_mut(&mut receiver).unwrap();
+    let pipeline = OrderedLevelingPipeline::with_shared_cache(
+        two_bot_core::MemStore::new(),
+        None,
+        NoInvites,
+        PipelineSnapshots::new(),
+        inner.voice_cache.clone(),
+    );
+    let clock = inner.voice_clock.clone();
+    pipeline.set_voice_transition_observer(clock.clone());
+    pipeline.handle(&seeded_guild_event()).await.unwrap();
+    let publish = async |member, room| {
+        let event = Event::VoiceStateUpdate(Box::new(voice_state(member, Some(room))));
+        pipeline.handle(&event).await.unwrap()
+    };
+    publish(FIRST, SOURCE).await;
+    publish(SECOND, SOURCE).await;
+    inner.gateway_state = connected_gateway();
+    inner.voice_move =
+        Some(ActionExecutor::with_admission(token(), Some(mock.origin.clone()), lane).unwrap());
+    let app = router(receiver);
+    let send = |member, nonce: &str| {
+        let raw = json!({"action":"voice.move_member","discord_id":member,"channel_id":TARGET})
+            .to_string();
+        answer(app.clone(), signed_read_with_nonce(&raw, "old", nonce))
+    };
+    for (member, outcome, status) in [
+        (FIRST, "discord_unavailable", StatusCode::BAD_GATEWAY),
+        (SECOND, "bot_not_permitted", StatusCode::OK),
+        (FIRST, "moved", StatusCode::OK),
+    ] {
+        let nonce = nonce();
+        let (code, _, response) = send(member, &nonce).await;
+        assert_eq!(code, status);
+        if status == StatusCode::BAD_GATEWAY {
+            assert_eq!(response["error"]["code"], outcome);
+            assert_eq!(send(FIRST, &nonce).await.2["error"]["code"], "replayed");
+            // Each GET uses a fresh connection; zero further accepts means no PATCH socket.
+            assert_eq!((mock.count(), mock.sockets.load(Ordering::SeqCst)), (6, 6));
+            alter("DROP CONSTRAINT refuse").await;
+        } else {
+            assert_eq!(response["result"]["outcome"], outcome);
+        }
+        if outcome == "moved" {
+            assert_eq!(response["result"]["from_channel_id"], SOURCE);
+        }
+        let audit: Vec<String> = sqlx::query_scalar("SELECT ARRAY[outcome, target_id, from_channel_id, resource_id] FROM internal_action_log WHERE request_id = $1 AND phase = 'terminal' AND intent_id IS NULL AND delivery_hash = $2")
+            .bind(response["request_id"].as_str().unwrap()).bind(two_bot_core::internal_actions::body_hash(nonce.as_bytes()))
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(audit, [outcome, member, SOURCE, TARGET]);
+    }
+    assert_eq!(mock.count(), 20);
+    assert_eq!(mock.requests.lock().unwrap()[19]["method"], "PATCH");
+    let member = FIRST.parse().unwrap();
+    let target = TARGET.parse().unwrap();
+    let held = |seen| {
+        clock
+            .move_holds
+            .lock()
+            .unwrap()
+            .occupancy(member, target, seen)
+    };
+    assert!(held(0).is_err());
+    publish(FIRST, TARGET).await;
+    assert_eq!(held(1), Ok(1));
     db.close().await.unwrap();
 }
