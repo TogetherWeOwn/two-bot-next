@@ -1,7 +1,7 @@
 //! Isolate legacy ACL prerequisites from attendance availability. These are
 //! refusal probes, not a successful erasure or a pre-expand admission receipt.
 
-use sqlx::{migrate::Migrator, Acquire, Postgres, Transaction};
+use sqlx::{migrate::Migrator, Acquire, PgPool, Postgres, Transaction};
 use two_bot_core::database_roles::{plan_for_phase, Phase};
 use two_bot_cutover::{member_erasure, staging_migrate::MIGRATOR as CUTOVER};
 use two_bot_testsupport::TestDatabase;
@@ -22,13 +22,17 @@ async fn pre_expand_runtime_cannot_delete_reservations_or_write_operator_audit()
     let db = TestDatabase::create(&url, &through(&CUTOVER, 473))
         .await
         .expect("create historical cutover fixture");
-    let result = probe(&db).await;
+    let pool = db.pool().clone();
+    let result = tokio::spawn(async move { probe(&pool).await }).await;
     db.close().await.expect("verify disposable teardown");
-    result.unwrap();
+    match result {
+        Ok(result) => result.unwrap(),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => panic!("ACL probe task failed to join: {error}"),
+    }
 }
 
-async fn probe(db: &TestDatabase) -> Result<(), sqlx::Error> {
-    let pool = db.pool();
+async fn probe(pool: &PgPool) -> Result<(), sqlx::Error> {
     let mut store = through(&two_bot_store::MIGRATOR, 465);
     store.dangerous_set_table_name(two_bot_store::TABLE_NAME);
     store.run(pool).await?;
