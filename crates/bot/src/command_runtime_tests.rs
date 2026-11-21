@@ -1700,6 +1700,7 @@ mod preview_callback_acceptance {
         pool: PgPool,
         saw_commit: std::sync::atomic::AtomicBool,
         blocked: tokio::sync::Notify,
+        hold_retries: std::sync::atomic::AtomicBool,
         settlement: Arc<SettlementGate>,
     }
 
@@ -1731,6 +1732,11 @@ mod preview_callback_acceptance {
 
         fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
             Box::pin(async {
+                // After real PostgreSQL confirms the held lane, model its
+                // continued occupancy without I/O on the paused clock.
+                if self.hold_retries.load(Ordering::Relaxed) {
+                    return Err(AdmissionError::Blocked);
+                }
                 let result = self.inner.admit().await;
                 match &result {
                     Ok(_) => {
@@ -1739,7 +1745,10 @@ mod preview_callback_acceptance {
                             .is_ok_and(|row| row.is_some());
                         self.saw_commit.store(committed, Ordering::Relaxed);
                     }
-                    Err(AdmissionError::Blocked) => self.blocked.notify_one(),
+                    Err(AdmissionError::Blocked) => {
+                        self.hold_retries.store(true, Ordering::Relaxed);
+                        self.blocked.notify_one();
+                    }
                     Err(_) => {}
                 }
                 result.map(|permit| {
@@ -1775,6 +1784,7 @@ mod preview_callback_acceptance {
             pool: pool.clone(),
             saw_commit: std::sync::atomic::AtomicBool::new(false),
             blocked: tokio::sync::Notify::new(),
+            hold_retries: std::sync::atomic::AtomicBool::new(false),
             settlement: Arc::default(),
         });
         let executor =
@@ -1830,8 +1840,10 @@ mod preview_callback_acceptance {
                     CommandOptionValue::String(sample.to_owned()),
                 )],
             );
-            set_guild(&mut request, Some(Id::new(guild)));
-            request.authorizing_integration_owners.guild = Some(AnonymizableId::Id(Id::new(guild)));
+            let guild_id = Id::new(guild);
+            set_guild(&mut request, Some(guild_id));
+            request.channel.as_mut().expect("guild channel").guild_id = Some(guild_id);
+            request.authorizing_integration_owners.guild = Some(AnonymizableId::Id(guild_id));
             from_member(request, id, Permissions::MANAGE_GUILD)
         };
         let observed = "2026-08-01T01:02:03.456Z";
@@ -1892,8 +1904,15 @@ mod preview_callback_acceptance {
             }
         })
         .await??;
+        let in_flight = || {
+            runtime.lane_in_flight(LANE_PRIVILEGED) != 0
+                || runtime.lane_in_flight(LANE_INTERACTIONS) != 0
+        };
+        wait_for(|| !in_flight(), "first preview worker to finish").await;
         let mut audit = pool.begin().await?;
         lock_preview_attempt(&mut audit, "802").await?;
+        // Model ingress delay without sleeping. A worker that replaces the
+        // supplied receipt with its own start time would get 750 ms back.
         let received_at = Instant::now() - Duration::from_millis(750);
         let deadline = received_at + Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS);
         assert!(runtime.dispatch_received(
@@ -1922,19 +1941,25 @@ mod preview_callback_acceptance {
             Ok::<(), sqlx::Error>(())
         };
         tokio::time::timeout_at(deadline, contend).await??;
-        // Finish the remaining deadline deterministically; no database latch
-        // waits for virtual time. A fresh budget at REST entry would run longer.
+        // Both real waits were observed. Only the retry timer drives this
+        // phase; no virtual-time deadline races a real PostgreSQL request.
         tokio::time::pause();
+        tokio::time::sleep_until(deadline - Duration::from_millis(20)).await;
+        let waited_before_cutoff = Instant::now() < deadline && in_flight();
+        tokio::time::sleep_until(deadline + Duration::from_millis(1)).await;
         let settled = tokio::time::timeout_at(deadline + Duration::from_millis(100), async {
-            while runtime.lane_in_flight(LANE_PRIVILEGED) != 0
-                || runtime.lane_in_flight(LANE_INTERACTIONS) != 0
-            {
+            while in_flight() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await;
         tokio::time::resume();
         lane.complete(None).await?;
+        admission.hold_retries.store(false, Ordering::Relaxed);
+        assert!(
+            waited_before_cutoff,
+            "callback must not abandon the held lane early"
+        );
         settled.expect("callback attempt obeys the original receipt deadline");
         let row = load_preview_audit(&pool, "automod-preview:802")
             .await?
