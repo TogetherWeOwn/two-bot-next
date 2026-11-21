@@ -25,7 +25,11 @@ use super::commands::{
 };
 use super::message_safety;
 
+mod catalog_pages;
+pub mod cursor;
 pub mod pages;
+
+pub use catalog_pages::plan_discovery;
 
 /// One `/help` group: commands that share an audience.
 struct HelpGroup {
@@ -161,6 +165,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Staging AutoMod preview",
+        requires: Some("Manage Server"),
+        commands: &["automod-preview"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "Game activity (private, live guild unavailable)",
         requires: Some("Manage Server"),
         commands: &["game-mix"],
@@ -244,7 +254,7 @@ pub struct HelpSection<'a> {
     pub title: &'static str,
     pub requires: Option<&'static str>,
     pub commands: Vec<&'a str>,
-    pub notes: &'static [&'static str],
+    pub notes: &'a [&'a str],
 }
 
 /// Ordered discovery content from one confirmed command publication.
@@ -906,7 +916,7 @@ impl CommandDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::merge_commands;
+    use crate::commands::{merge_commands, CustomCommand, GUILD_COMMAND_LIMIT};
     use crate::feature_commands::feature_commands;
     use crate::moderation::moderation_commands;
     use crate::router::{InteractionRouter, RouterGates};
@@ -954,9 +964,24 @@ mod tests {
     }
 
     #[test]
-    fn catalog_lists_every_name_in_a_maximum_admitted_registry() {
-        use crate::commands::{CustomCommand, GUILD_COMMAND_LIMIT};
+    fn staging_automod_preview_has_a_manage_server_hint_only_when_confirmed() {
+        let mut defs = InteractionRouter::new(all_on()).publish_set(&[]).unwrap();
+        assert!(!help_text(&defs).contains("Staging AutoMod preview"));
+        assert!(!help_text(&defs).contains("/automod-preview"));
 
+        defs.push(crate::automod_preview::automod_preview_definition());
+        let catalog = help_catalog(&defs);
+        let group = catalog
+            .sections
+            .iter()
+            .find(|section| section.title == "Staging AutoMod preview")
+            .expect("confirmed preview group");
+        assert_eq!(group.requires, Some("Manage Server"));
+        assert_eq!(group.commands, ["automod-preview"]);
+        assert_eq!(help_text(&defs).matches("/automod-preview").count(), 1);
+    }
+
+    pub(super) fn maximum_publication() -> (Vec<CommandDefinition>, Vec<CustomCommand>) {
         let router = InteractionRouter::new(all_on());
         let slots = GUILD_COMMAND_LIMIT - router.publish_set(&[]).unwrap().len();
         let rows: Vec<_> = (0..slots)
@@ -966,7 +991,12 @@ mod tests {
                 enabled: true,
             })
             .collect();
-        let defs = router.publish_set(&rows).expect("full registry");
+        (router.publish_set(&rows).expect("full registry"), rows)
+    }
+
+    #[test]
+    fn catalog_lists_every_name_in_a_maximum_admitted_registry() {
+        let (defs, rows) = maximum_publication();
         assert_eq!(defs.len(), GUILD_COMMAND_LIMIT);
         let catalog = help_catalog(&defs);
         let names = catalog.sections.iter().flat_map(|s| &s.commands);
@@ -1145,10 +1175,11 @@ mod tests {
             .collect();
         // 47 non-voice names, including inspection, clone, edit, reopen, welcome-preview, pause/resume,
         // giveaway, lfg-edit, lfg-list, feed-inspect, tempban-list, purge-preview, channel-inspect
-        // and moderation-recent, plus
-        // 23 additional voice names (voice `kick` shares the Kick group).
+        // and moderation-recent, plus 23 additional voice names (voice `kick`
+        // shares the Kick group) and one staging-only AutoMod preview.
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 70);
+        assert_eq!(grouped.len(), 71);
+        assert!(grouped.contains("automod-preview"));
         for name in [
             "rank",
             "leaderboard",

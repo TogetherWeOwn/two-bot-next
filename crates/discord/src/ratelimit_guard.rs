@@ -1043,6 +1043,15 @@ impl<'a> ResponseAccounting<'a> {
         }
     }
 
+    pub(crate) fn longest_admission_header(&self) -> Option<f64> {
+        use two_bot_core::send_admission::{cooldown_from_delays, SendCooldown};
+        [self.retry_after_header, self.reset_after_header]
+            .into_iter()
+            .flatten()
+            .filter(|&s| cooldown_from_delays(Some(s), None) != SendCooldown::Indefinite)
+            .max_by(f64::total_cmp)
+    }
+
     pub(crate) fn track_bare_bucket(&mut self, route: &str, headers: &http::HeaderMap) {
         if RateLimitGuard::has_bare_retry_after(headers) {
             self.bare_route = Some(route.to_owned());
@@ -1222,6 +1231,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(500)).await;
         accounting.finish(&crate::executor::RawResponse {
             status: 429,
+            validated_retry_after_header: None,
             retry_after_header: None,
             body: br#"{"retry_after":0.1}"#.to_vec(),
             completion: None,
@@ -1324,6 +1334,7 @@ mod tests {
             assert_eq!(guard.snapshot().pending_global_responses, 1);
             assert!(accounting.finish(&crate::executor::RawResponse {
                 status: 429,
+                validated_retry_after_header: None,
                 retry_after_header: header.map(str::to_owned),
                 body: serde_json::json!({"retry_after": body_timing})
                     .to_string()
@@ -1362,6 +1373,7 @@ mod tests {
                 if !pending {
                     accounting.finish(&crate::executor::RawResponse {
                         status: 429,
+                        validated_retry_after_header: None,
                         retry_after_header: None,
                         body: Vec::new(),
                         completion: None,
@@ -1788,6 +1800,7 @@ mod tests {
         );
         let shared = accounting.finish(&crate::executor::RawResponse {
             status: 429,
+            validated_retry_after_header: None,
             retry_after_header: None,
             body: br#"{"scope":"shared"}"#.to_vec(),
             completion: None,
@@ -1811,6 +1824,7 @@ mod tests {
         let mut accounting = ResponseAccounting::new(&guard, 429, &http::HeaderMap::new(), true);
         let global = accounting.finish(&crate::executor::RawResponse {
             status: 429,
+            validated_retry_after_header: None,
             retry_after_header: None,
             body: br#"{"global":true,"retry_after":0.5}"#.to_vec(),
             completion: None,

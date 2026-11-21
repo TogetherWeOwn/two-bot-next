@@ -1,4 +1,4 @@
-//! Inert request and evidence policy for a future voice-move executor.
+//! Request and evidence policy for the voice-move executor.
 //! Preparing a request does not authorize or prove a move.
 
 use super::numeric_id;
@@ -19,6 +19,8 @@ pub enum VoiceMoveNotSent {
     Blocked,
     Storage,
     Guard,
+    Deadline,
+    Revalidation,
 }
 
 /// A result is evidence supplied by the executor, not proof by itself.
@@ -27,7 +29,12 @@ pub enum VoiceMovePatch {
     Moved,
     Denied,
     Stale,
-    Limited { retry_after_ms: Option<u64> },
+    /// Discord refused the move, but settlement of the durable lane was not confirmed.
+    RefusalUnsettled,
+    Limited {
+        retry_after_ms: Option<u64>,
+        settlement_confirmed: bool,
+    },
     Unavailable,
     NotSent(VoiceMoveNotSent),
 }

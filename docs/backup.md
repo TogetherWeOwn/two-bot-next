@@ -102,19 +102,27 @@ upload command; argv and child output never echoed):
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v16** (including durable voice-create reservations, the retention
+write **v17** (including durable voice-create reservations, the retention
 queues, the seasonal XP projection, the event store: voice capture plus
 presence capture plus member-capture deltas plus message/reaction capture
 plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
 invite/scheduled-event capture, the stream go-live ledger, guild game-activity
 aggregates, the assistant monthly-cap ledger, the scheduled-event
 epoch-claim guard, the scheduled-event delete tombstones and the admin API
-token registry, event voice pair, three starboard tables, three giveaway tables and the event instance windows); the reader also accepts
+token registry, event voice pair, three starboard tables, three giveaway tables, the event instance windows and the attendance tables); the reader also accepts
 frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**, pre-seasonal **v6**,
 pre-stream-ledger **v7**, pre-guild-counters **v8**, pre-epoch-claim **v9**,
 pre-tombstone **v10**, pre-registry **v11**, pre-event-voice **v12** and
-pre-starboard **v13**, pre-giveaways **v14** and pre-instance-windows **v15**.
-Other versions refuse.
+pre-starboard **v13**, pre-giveaways **v14**, pre-instance-windows **v15** and
+pre-attendance **v16**. Other versions refuse.
+
+**0480 rollback:** A pre-0480 binary refuses v17 archives and cannot run member
+erasure or drain guild purges on the migrated schema, even with empty attendance
+tables. Binary rollback leaves the schema in place; a v16 archive alone is not
+a fallback. Before applying 0480, qualify a compatible recovery build and
+archive on a migrated test database (restore, erasure and guild purge). Use
+that build for forward recovery if no compatible rollback image exists.
+
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
 source's applied migrations and `sequenceMarks`: for every serial, identity and
@@ -183,16 +191,18 @@ configuration, distinct starrers and post state (`starboard_config`,
 `starboard_starrers`, `starboard_posts`: 0458/0459), plus giveaway definitions,
 entries and draw rounds (`giveaways`, `giveaway_entries`, `giveaway_draws`: 0460/0461),
 plus the non-member event instance lifecycle, order and revocation evidence
-(`event_instance_windows`: 0472).
+(`event_instance_windows`: 0472), plus dormant event attendance storage
+(`event_attendance_windows`, `event_voice_sessions`: 0480).
 The [registry contract](admin-registry.md) adds no table or archive version:
-new v16 dumps discover `holder_id` / `holder_kind` dynamically. Populated
+new dumps discover `holder_id` / `holder_kind` dynamically. Populated
 pre-holder archives refuse transactionally on the required authority columns
 instead of inventing holders; older readable archives that omit the table
 retain their versioned clearing behavior.
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 108 table entries. A missing current table refuses a dump/restore: migrate
+has 110 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
+All v3–v16 archives may also omit the attendance tables (`V17_ADDED_TABLES`).
 Each readable version requires its historical inventory and waives only
 versioned additions introduced later:
 
@@ -210,7 +220,8 @@ versioned additions introduced later:
 | v13 | `V14_ADDED_TABLES`: `starboard_config`, `starboard_starrers`, `starboard_posts`, `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (event instance windows) |
 | v14 | `V15_ADDED_TABLES`: `giveaways`, `giveaway_entries`, `giveaway_draws`, `V16_ADDED_TABLES` (event instance windows) |
 | v15 | `V16_ADDED_TABLES`: `event_instance_windows` |
-| v16 | None: the full current inventory is required |
+| v16 | No additional omissions |
+| v17 | None: the full current inventory is required |
 
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
@@ -239,10 +250,10 @@ Restoring v15 clears `event_instance_windows` and never backfills it: a
 binding or timestamp alone cannot prove a live window, so a restored pre-v16
 recovery point fails closed (no instance is treated as live, and the revocation
 and order fences are gone) until a fresh accepted Discord observation
-re-establishes each instance. Use v16 to preserve that evidence.
-Current v16 archives must include the monthly cap, both mirror-fence tables,
-the registry, event voice pair, starboard, giveaway and event instance window
-tables, so routine restores retain their archived state. Tombstone `deleted_at` cells must be real dates in
+re-establishes each instance. Use v16 or later to preserve that evidence.
+Older archives without attendance clear both tables in the restore transaction
+without backfill. The migration enables neither capture nor attendance reads.
+Current v17 archives require the full inventory. Tombstone `deleted_at` cells must be real dates in
 exact `YYYY-MM-DDTHH:MM:SS.sssZ` form: inspection refuses missing, null,
 non-string or noncanonical values before restore opens a write transaction.
 Rollback-delta import enforces the same rule during parsing and revalidates the
@@ -261,8 +272,7 @@ queue bound to a gateway session) and `automation_command_registry_resync`
 the complete custom-command set on boot regardless). `voice_heat_hours` is
 also excluded: it is derived calibration, not source data. Restore clears it
 in the same transaction without `CASCADE` if the table exists, and skips it
-on older targets. A failed restore leaves it unchanged. Archives remain v16
-and readers still accept v3–v16. The store chain's `rollback_journal` and
+on older targets. A failed restore leaves it unchanged. The store chain's `rollback_journal` and
 `rollback_watermarks` are excluded too: the journal is append-only
 cutover evidence (the `PgFunnelStore` funnel append and the production
 gateway batch writer in `crates/cutover/src/gateway_session.rs` journal each

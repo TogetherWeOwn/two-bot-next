@@ -8,6 +8,7 @@ use super::{ActionExecutor, RawResponse};
 use crate::ratelimit_guard::GuardError;
 use serde::Deserialize;
 use std::time::Duration;
+use tokio::time::Instant;
 use twilight_http::request::{Request, TryIntoRequest};
 use twilight_model::id::{marker::GenericMarker, Id};
 use two_bot_core::internal_actions::{
@@ -21,6 +22,16 @@ pub mod store;
 #[path = "voice_move.rs"]
 pub mod voice_move;
 pub use voice_move::{VoiceMoveNotSent, VoiceMovePatch, VOICE_MOVE_TIMEOUT_MS};
+#[path = "voice_move_reads.rs"]
+mod voice_move_reads;
+pub use voice_move_reads::{VoiceMoveEvidence, VoiceMoveReadError, VoiceMoveTarget};
+#[path = "voice_move_coordinator.rs"]
+mod voice_move_coordinator;
+pub use voice_move_coordinator::{VoiceMoveAttempt, VoiceMoveRoster};
+
+#[cfg(test)]
+#[path = "voice_move_adapter_tests.rs"]
+mod voice_move_adapter_tests;
 
 pub const ADD_MEMBER_TIMEOUT_MS: u64 = 1500;
 pub const ROLE_TIMEOUT_MS: u64 = 2000;
@@ -221,6 +232,113 @@ impl ActionExecutor {
             .map(|m| m.roles))
     }
 
+    /// Send one bounded voice PATCH. Authorization and occupancy fencing belong
+    /// to the receiver; this adapter never retries.
+    pub async fn move_voice_member(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+        channel_id: &str,
+    ) -> Result<VoiceMovePatch, ActionError> {
+        self.move_voice_member_until(
+            guild_id,
+            member_id,
+            channel_id,
+            Instant::now() + Duration::from_millis(VOICE_MOVE_TIMEOUT_MS),
+            std::future::ready(true),
+        )
+        .await
+    }
+
+    /// Send once within the caller's absolute wire deadline. The adapter polls
+    /// `revalidate` only after durable admission, before the final route check
+    /// and first wire poll. Use it only to check local facts, not for side effects
+    /// or governed REST calls. Await this method so the adapter can settle its permit.
+    pub async fn move_voice_member_until(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+        channel_id: &str,
+        deadline: Instant,
+        revalidate: impl std::future::Future<Output = bool> + Send,
+    ) -> Result<VoiceMovePatch, ActionError> {
+        let ids = [guild_id, member_id, channel_id];
+        self.move_voice_member_with_commit_until(ids, deadline, revalidate, &|start| start())
+            .await
+    }
+
+    async fn move_voice_member_with_commit_until(
+        &self,
+        [guild_id, member_id, channel_id]: [&str; 3],
+        deadline: Instant,
+        revalidate: impl std::future::Future<Output = bool> + Send,
+        commit: super::FinalCommit<'_>,
+    ) -> Result<VoiceMovePatch, ActionError> {
+        use super::StrictTransportError::{
+            Admission, PreWireDeadline, PreWireGuard, PreWireRevalidation,
+        };
+        use twilight_model::guild::Member;
+        use two_bot_core::send_admission::AdmissionError;
+        use VoiceMoveNotSent::{Blocked, Deadline, Guard, Revalidation, Storage};
+        use VoiceMovePatch::{NotSent, Unavailable};
+
+        let request =
+            voice_move::prepare_voice_move(&self.inner.factory, guild_id, member_id, channel_id)?;
+        let mut pacing =
+            match super::poll_before(deadline, self.reserve_route(&request, false, false)).await {
+                None => return Ok(NotSent(Deadline)),
+                Some(Err(_)) => return Ok(NotSent(Guard)),
+                Some(Ok(pacing)) => pacing,
+            };
+        let headers = self
+            .inner
+            .transport
+            .send_strict_evidence_headers_after(&request, deadline, revalidate, commit, move || {
+                self.stamp_paced_lane(&mut pacing, false);
+                self.count();
+            })
+            .await;
+        let pending = match headers {
+            Ok(pending) => pending,
+            Err(Admission(AdmissionError::Blocked)) => return Ok(NotSent(Blocked)),
+            Err(Admission(AdmissionError::Storage)) => return Ok(NotSent(Storage)),
+            Err(PreWireDeadline) => return Ok(NotSent(Deadline)),
+            Err(PreWireGuard) => return Ok(NotSent(Guard)),
+            Err(PreWireRevalidation) => return Ok(NotSent(Revalidation)),
+            Err(_) => return Ok(Unavailable),
+        };
+        let status = pending.pending.status;
+        if let Some(refusal) = voice_move::header_refusal(status) {
+            return Ok(match pending.settle_definitive_refusal().await {
+                super::StrictSettlement::Confirmed => refusal,
+                super::StrictSettlement::Unconfirmed => VoiceMovePatch::RefusalUnsettled,
+            });
+        }
+        let mut retry_after_ms = None;
+        let settlement = pending
+            .collect_validated_evidence(|evidence| {
+                if status == 429 {
+                    let header = evidence.retry_after_header.and_then(|s| s.parse().ok());
+                    let body = evidence.response.body_retry_after_secs();
+                    retry_after_ms = voice_move::retry_delay_ms(header, body);
+                }
+                // Modify Guild Member documents a 200 with the updated member.
+                let parse = |body| serde_json::from_slice::<Member>(body).ok();
+                let receipt = evidence.body.filter(|_| status == 200).and_then(parse);
+                receipt.is_some_and(|member| member_id.parse::<u64>() == Ok(member.user.id.get()))
+            })
+            .await;
+        let settlement_confirmed = settlement == super::StrictSettlement::Confirmed;
+        Ok(match status {
+            429 => VoiceMovePatch::Limited {
+                retry_after_ms,
+                settlement_confirmed,
+            },
+            200 if settlement_confirmed => VoiceMovePatch::Moved,
+            _ => Unavailable,
+        })
+    }
+
     /// PUT /guilds/{g}/members/{u}. The token is a function argument and wire
     /// body only. Source: <https://docs.discord.com/developers/resources/guild#add-guild-member>
     pub async fn add_internal_member(
@@ -347,6 +465,7 @@ impl ActionExecutor {
         if target.managed || target.id == guild_id || target.position >= highest {
             return Err(member_status_error(&RawResponse {
                 status: 403,
+                validated_retry_after_header: None,
                 retry_after_header: None,
                 body: vec![],
                 completion: None,

@@ -138,6 +138,8 @@ pub mod presence_store;
 pub mod privacy;
 pub mod raid;
 pub mod raid_removal;
+pub mod realtime_signing;
+pub mod realtime_wire;
 pub mod referral_rewards;
 pub mod rejection_telemetry;
 pub mod router;
@@ -183,6 +185,8 @@ pub mod voice_create_admission;
 pub mod voice_custom_id;
 pub mod voice_ghost_cleanup;
 pub mod voice_heat;
+#[cfg(feature = "db")]
+pub mod voice_heat_store;
 pub mod voice_logging;
 pub mod voice_move_decision;
 pub mod voice_move_facts;

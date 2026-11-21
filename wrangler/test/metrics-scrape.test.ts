@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { EMPTY_STATE, evaluateMetrics, JOB_FAILURE_SHARE_MIN_RUNS } from "../src/alert-rules.ts";
 import { ALERT_INPUT_LABELS, ALERT_OPTIONAL_INPUT_LABELS, parseAlertScrape } from "../src/metrics-scrape.ts";
 import { metricsBody, metricsLines, RUST_ALERT_AXES, rustLabels } from "./fixtures/metrics.ts";
 
@@ -26,8 +27,10 @@ const isOptionalLine = (line: string) => Object.hasOwn(ALERT_OPTIONAL_INPUT_LABE
 const isVoiceFamilyLine = (line: string) =>
   line.startsWith("two_bot_internal_actions_total{") && line.includes('family="voice"');
 
+const isHeat = (line: string) => line.includes('job="voice_heat"');
 test("every current required label combination is required, not merely one row per family", () => {
-  const lines = metricsLines().filter((line) => !isOptionalLine(line) && !isVoiceFamilyLine(line));
+  const lines = metricsLines().filter((line) => !isOptionalLine(line) && !isVoiceFamilyLine(line) && !isHeat(line));
+  assert.ok(parseAlertScrape(lines.join("\n")));
   for (let i = 0; i < lines.length; i++) {
     assert.equal(parseAlertScrape(lines.filter((_, j) => j !== i).join("\n")), null, lines[i]);
   }
@@ -52,8 +55,28 @@ test("a partially present voice family fails the scrape", () => {
   assert.ok(parseAlertScrape(lines.filter((line) => !isVoiceFamilyLine(line)).join("\n")));
 });
 
+test("only complete heat scrapes affect heat alerts, without holding unrelated jobs", () => {
+  const lines = metricsLines();
+  assert.equal(lines.filter(isHeat).length, 11);
+  for (const row of lines.filter(isHeat)) assert.ok(parseAlertScrape(lines.filter((line) => line !== row).join("\n")) === null, row);
+  const older = lines.filter((line) => !isHeat(line)).join("\n");
+  const state = evaluateMetrics(parseAlertScrape(older)!, EMPTY_STATE, 100).state;
+  const updated = parseAlertScrape(older.replace('job="rank",outcome="failure"} 0', `job="rank",outcome="failure"} ${JOB_FAILURE_SHARE_MIN_RUNS}`));
+  assert.ok(updated);
+  assert.ok(evaluateMetrics(updated, state, 160).state.firing.includes("job_failure_share:rank"));
+  const heat = ["job_consecutive_failures:voice_heat", "job_unknown_stale:voice_heat"];
+  const share = "job_failure_share:voice_heat";
+  const evaluate = (rows: string[], prev = EMPTY_STATE, now = 10_000) => evaluateMetrics(parseAlertScrape(rows.join("\n"))!, prev, now).state;
+  const rollback = older.split("\n").map((line) => line.replace('incarnation{part="3"} 1', 'incarnation{part="3"} 2'));
+  const held = evaluate(rollback, { ...evaluate(lines), firing: [...heat, share, "job_consecutive_failures:rank"] });
+  assert.deepEqual(held.firing.filter((key) => key.startsWith("job_")).sort(), [...heat, share].sort());
+  const stillHeld = evaluate(rollback, held, 10_060);
+  assert.ok(stillHeld.firing.includes(share));
+  assert.deepEqual(evaluate(lines, stillHeld, 10_120).firing.filter((key) => heat.includes(key)), []);
+});
+
 test("older exposition without the optional gauges still parses", () => {
-  const older = metricsBody(3).split("\n").filter((line) => !isOptionalLine(line)).join("\n");
+  const older = metricsLines(3).filter((line) => !isOptionalLine(line) && !isHeat(line)).join("\n");
   const samples = parseAlertScrape(older);
   assert.ok(samples);
   assert.equal(samples.find((s) => s.name === "two_bot_job_consecutive_failures" && s.labels.job === "rank")?.value, 3);

@@ -220,6 +220,22 @@ async fn current_archive(pool: &PgPool, directory: &ArchiveDirectory) -> DumpCon
     inspect(&path).unwrap()
 }
 
+const ATTENDANCE_TABLES: [&str; 2] = ["event_attendance_windows", "event_voice_sessions"];
+
+async fn pre_attendance_archive(pool: &PgPool, directory: &ArchiveDirectory) -> DumpContents {
+    let mut contents = current_archive(pool, directory).await;
+    assert_eq!(contents.manifest.version, DUMP_VERSION);
+    omit_populated_newer_tables(&mut contents, &ATTENDANCE_TABLES);
+    contents
+}
+
+fn pre_attendance_missing_tables(contents: &DumpContents) -> Vec<&'static str> {
+    let mut missing = contents.manifest.missing_tables();
+    assert!(missing.ends_with(&ATTENDANCE_TABLES));
+    missing.truncate(missing.len() - ATTENDANCE_TABLES.len());
+    missing
+}
+
 async fn seed(pool: &PgPool) {
     // raw_sql is the documented multi-statement API, executed as a transaction.
     // https://docs.rs/sqlx/0.9.0/sqlx/fn.raw_sql.html
@@ -399,6 +415,10 @@ fn omit_populated_newer_tables(contents: &mut DumpContents, names: &[&str]) {
         let rows = contents.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         contents.manifest.tables.retain(|table| table.name != name);
+        contents
+            .manifest
+            .sequence_marks
+            .retain(|mark| mark.table != name);
     }
 }
 
@@ -794,6 +814,7 @@ async fn assert_default_inserts(
         ("moderation_member_bans", "generation", "INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('post-restore:ban', '100000000000000001', '100000000000000012', 'prepared', now()) RETURNING generation"),
         ("privacy_opt_out_audit", "id", "INSERT INTO privacy_opt_out_audit (guild_id, member_id) VALUES ('100000000000000001', '100000000000000002') RETURNING id"),
         ("event_store", "id", "INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key, presence_status, activity_type) VALUES ('PRESENCE_UPDATE', '100000000000000001', 'post-restore-member', now(), 'post-restore:event-store', 'online', 0) RETURNING id"),
+        ("event_voice_sessions", "id", "INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, joined_at) VALUES ('100000000000000001', '100000000000000002', '100000000000000003', now()) RETURNING id"),
     ];
     let cases: BTreeSet<(String, String)> = inserts
         .iter()
@@ -1504,7 +1525,7 @@ async fn historical_contract_archive_preserves_installed_capability_and_restores
     .await
     .unwrap();
     let directory = ArchiveDirectory::new();
-    let current = directory.path("contract-v16.ndjson.gz");
+    let current = directory.path("contract-v17.ndjson.gz");
     dump(source.pool(), &current).await.unwrap();
     let contents = inspect(&current).unwrap();
     assert_eq!(
@@ -1513,13 +1534,12 @@ async fn historical_contract_archive_preserves_installed_capability_and_restores
     );
     let mut historical = copy_contents(&contents);
     historical.manifest.version = 15;
-    historical
-        .manifest
-        .tables
-        .retain(|t| t.name != "event_instance_windows");
-    historical
-        .buffers
-        .retain(|name, _| name != "event_instance_windows");
+    let manifest = &mut historical.manifest;
+    for name in std::iter::once("event_instance_windows").chain(ATTENDANCE_TABLES) {
+        manifest.tables.retain(|table| table.name != name);
+        manifest.sequence_marks.retain(|mark| mark.table != name);
+        historical.buffers.remove(name);
+    }
     historical.rows = historical.manifest.tables.iter().map(|t| t.count).sum();
     let old = directory.path("contract-v15.ndjson.gz");
     write_archive(&old, &historical);
@@ -1530,7 +1550,7 @@ async fn historical_contract_archive_preserves_installed_capability_and_restores
         "CREATE TABLE schema_migrations (id TEXT PRIMARY KEY);
          INSERT INTO schema_migrations VALUES ('destination-ledger-only');
          UPDATE web_contract_meta SET contract_version = '2.0';
-         DROP TABLE voice_heat_hours;",
+         ALTER TABLE voice_heat_hours RENAME TO displaced_voice_heat_hours;",
     )
     .execute(pool)
     .await
@@ -1545,15 +1565,41 @@ async fn historical_contract_archive_preserves_installed_capability_and_restores
     let guild_count =
         "SELECT human_member_count FROM guild_counters WHERE guild_id = '100000000000000001'";
 
-    // A migrated singleton alone is not an installed contract.
+    // A migrated singleton alone is not an installed contract. Restore also
+    // accepts a pre-heat target; bring its table back before installing 1.1.
     assert!(restore(pool, &old).await.unwrap().ok);
     let unpublished: String = sqlx::query_scalar("SELECT contract_version FROM web_contract_meta")
         .fetch_one(pool)
         .await
         .unwrap();
     assert_eq!(unpublished, "1.0");
+    sqlx::query("ALTER TABLE displaced_voice_heat_hours RENAME TO voice_heat_hours")
+        .execute(pool)
+        .await
+        .unwrap();
     two_bot_core::apply_web_contract(pool).await.unwrap();
-    for (path, installed) in [(&old, "2.0"), (&current, "1.0"), (&current, "2.0")] {
+    for (path, installed) in [
+        (&old, "1.1"),
+        (&old, "2.0"),
+        (&current, "1.1"),
+        (&current, "2.0"),
+    ] {
+        sqlx::query(
+            "INSERT INTO voice_heat_hours
+             SELECT h, 3, 6, h + interval '10 minutes'
+             FROM (SELECT (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+                   - interval '1 hour' AS h) latest",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let populated: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM web_v1.voice_heat WHERE avg_in_voice IS NOT NULL",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(populated, 1);
         sqlx::query("UPDATE web_contract_meta SET contract_version = $1, guild_id = 'destination'")
             .bind(installed)
             .execute(pool)
@@ -1566,6 +1612,14 @@ async fn historical_contract_archive_preserves_installed_capability_and_restores
         let report = restore(pool, path).await.unwrap();
         assert!(report.ok);
         assert!(!report.initialized_tables.contains_key("web_contract_meta"));
+        let gap_cells: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM web_v1.voice_heat WHERE avg_in_voice IS NULL
+             AND coverage = 0 AND measured_through IS NULL AND source = 'insufficient'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(gap_cells, 168);
         let meta: (String, Option<String>) =
             sqlx::query_as(meta_view).fetch_one(pool).await.unwrap();
         assert_eq!(
@@ -2407,8 +2461,7 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let mut old = current_archive(pool, &directory).await;
-    assert_eq!(old.manifest.version, 16);
+    let mut old = pre_attendance_archive(pool, &directory).await;
     let newer = [
         "game_activity_guild_aggregates",
         "assistant_monthly_builds",
@@ -2432,7 +2485,7 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     write_archive(&old_path, &old);
     let inspected = inspect(&old_path).expect("pre-change v8 archive remains readable");
     assert_eq!(inspected.manifest.version, 8);
-    assert_eq!(inspected.manifest.missing_tables(), newer);
+    assert_eq!(pre_attendance_missing_tables(&inspected), newer);
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
@@ -2454,8 +2507,7 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let mut old = current_archive(pool, &directory).await;
-    assert_eq!(old.manifest.version, 16);
+    let mut old = pre_attendance_archive(pool, &directory).await;
     let newer = [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
@@ -2477,7 +2529,7 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     write_archive(&old_path, &old);
     let inspected = inspect(&old_path).expect("pre-change v9 archive remains readable");
     assert_eq!(inspected.manifest.version, 9);
-    assert_eq!(inspected.manifest.missing_tables(), newer);
+    assert_eq!(pre_attendance_missing_tables(&inspected), newer);
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
@@ -2499,8 +2551,7 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let mut old = current_archive(pool, &directory).await;
-    assert_eq!(old.manifest.version, 16);
+    let mut old = pre_attendance_archive(pool, &directory).await;
     // Frozen claim-only v10 shape: the merged v10 writer carried the
     // epoch-claim guard but predates the delete tombstones, token registry
     // event voice pair and starboard tables.
@@ -2528,7 +2579,7 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let inspected = inspect(&old_path).expect("pre-change v10 archive remains readable");
     assert_eq!(inspected.manifest.version, 10);
     assert_eq!(
-        inspected.manifest.missing_tables(),
+        pre_attendance_missing_tables(&inspected),
         [
             "scheduled_events_tombstone",
             "event_voice_channels",
@@ -2593,8 +2644,7 @@ async fn v11_archive_restores_and_clears_newer_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let mut old = current_archive(pool, &directory).await;
-    assert_eq!(old.manifest.version, 16);
+    let mut old = pre_attendance_archive(pool, &directory).await;
     // Frozen tombstone-only v11 shape: the merged v11 writer carried the
     // delete tombstones but predates the token registry event voice pair and starboard tables.
     for name in [
@@ -2620,7 +2670,7 @@ async fn v11_archive_restores_and_clears_newer_registry() {
     let inspected = inspect(&old_path).expect("pre-change v11 archive remains readable");
     assert_eq!(inspected.manifest.version, 11);
     assert_eq!(
-        inspected.manifest.missing_tables(),
+        pre_attendance_missing_tables(&inspected),
         [
             "event_voice_channels",
             "event_voice_presence",
@@ -2683,8 +2733,7 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let mut old = current_archive(pool, &directory).await;
-    assert_eq!(old.manifest.version, 16);
+    let mut old = pre_attendance_archive(pool, &directory).await;
     for table in [
         "event_voice_channels",
         "event_voice_presence",
@@ -2707,7 +2756,7 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     let inspected = inspect(&old_path).expect("pre-change v12 archive remains readable");
     assert_eq!(inspected.manifest.version, 12);
     assert_eq!(
-        inspected.manifest.missing_tables(),
+        pre_attendance_missing_tables(&inspected),
         [
             "event_voice_channels",
             "event_voice_presence",
@@ -2768,8 +2817,7 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let mut old = current_archive(pool, &directory).await;
-    assert_eq!(old.manifest.version, 16);
+    let mut old = pre_attendance_archive(pool, &directory).await;
     // Frozen registry-present v12 shape: the released writer carried the
     // token registry but predates the event voice pair and starboard tables.
     for name in [
@@ -2800,7 +2848,7 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
     let inspected = inspect(&old_path).expect("pre-change v12 archive remains readable");
     assert_eq!(inspected.manifest.version, 12);
     assert_eq!(
-        inspected.manifest.missing_tables(),
+        pre_attendance_missing_tables(&inspected),
         [
             "event_voice_channels",
             "event_voice_presence",
@@ -2893,8 +2941,7 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let mut old = current_archive(pool, &directory).await;
-    assert_eq!(old.manifest.version, 16);
+    let mut old = pre_attendance_archive(pool, &directory).await;
     for name in [
         "starboard_config",
         "starboard_starrers",
@@ -2929,7 +2976,7 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
     assert_eq!(inspected.manifest.version, 13);
     assert_eq!(inspected.manifest.tables.len(), 101);
     assert_eq!(
-        inspected.manifest.missing_tables(),
+        pre_attendance_missing_tables(&inspected),
         [
             "starboard_config",
             "starboard_starrers",
@@ -3023,8 +3070,7 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let mut old = current_archive(pool, &directory).await;
-    assert_eq!(old.manifest.version, 16);
+    let mut old = pre_attendance_archive(pool, &directory).await;
     for name in [
         "giveaways",
         "giveaway_entries",
@@ -3048,7 +3094,7 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
     let inspected = inspect(&old_path).expect("pre-change v14 archive remains readable");
     assert_eq!(inspected.manifest.version, 14);
     assert_eq!(
-        inspected.manifest.missing_tables(),
+        pre_attendance_missing_tables(&inspected),
         [
             "giveaways",
             "giveaway_entries",
@@ -3138,12 +3184,18 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
 }
 
 #[tokio::test]
-async fn v16_archive_restores_populated_instance_windows() {
+async fn v16_archive_restores_instance_windows_and_clears_attendance() {
     let Some(db) = database().await else {
         return;
     };
     let pool = db.pool();
+    let attendance = ATTENDANCE_TABLES;
+    assert_newer_tables_cleared(pool, &attendance, 16).await;
     seed(pool).await;
+    let last_session: i64 = sqlx::query_scalar("SELECT MAX(id) FROM event_voice_sessions")
+        .fetch_one(pool)
+        .await
+        .unwrap();
     let names = vec!["event_instance_windows".to_owned()];
     let archived = snapshot(pool, &names).await;
     assert_eq!(archived[&names[0]].rows.len(), 2);
@@ -3165,7 +3217,7 @@ async fn v16_archive_restores_populated_instance_windows() {
         .collect();
     assert_eq!(released.len(), 108);
     let directory = ArchiveDirectory::new();
-    let mut old = current_archive(pool, &directory).await;
+    let mut old = pre_attendance_archive(pool, &directory).await;
     old.manifest
         .tables
         .retain(|table| released.contains(table.name.as_str()));
@@ -3176,7 +3228,9 @@ async fn v16_archive_restores_populated_instance_windows() {
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let path = directory.path("released-v16-populated.ndjson.gz");
     write_archive(&path, &old);
-    assert_eq!(inspect(&path).unwrap().manifest.version, 16);
+    let inspected = inspect(&path).unwrap();
+    assert_eq!(inspected.manifest.version, 16);
+    assert_eq!(inspected.manifest.missing_tables(), attendance);
 
     sqlx::query("DELETE FROM event_instance_windows")
         .execute(pool)
@@ -3186,6 +3240,21 @@ async fn v16_archive_restores_populated_instance_windows() {
     forget_moderation_history(pool).await;
     assert!(restore(pool, &path).await.unwrap().ok);
     assert_eq!(snapshot(pool, &names).await, archived);
+    assert_newer_tables_cleared(pool, &attendance, 16).await;
+    let safe_defaults: bool = sqlx::query_scalar(
+        "INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, joined_at)
+         VALUES ('1001', '1002', '1003', now())
+         RETURNING id > $1 AND cardinality(event_keys) = 0 AND channel_name = ''
+             AND name_observed_at IS NULL AND left_at IS NULL AND NOT is_bot AND NOT afk",
+    )
+    .bind(last_session)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        safe_defaults,
+        "restore preserves defaults and the allocator floor"
+    );
     db.close().await.unwrap();
 }
 
@@ -3212,26 +3281,21 @@ async fn v15_archive_restores_and_clears_newer_event_instance_windows_without_ba
     }
     let directory = ArchiveDirectory::new();
     let mut old = current_archive(pool, &directory).await;
-    assert_eq!(old.manifest.version, 16);
-    let windows = old.buffers.remove("event_instance_windows").unwrap();
-    assert_eq!(
-        windows.len(),
-        2,
-        "fixture must populate the instance windows"
-    );
-    old.manifest
-        .tables
-        .retain(|table| table.name != "event_instance_windows");
+    assert_eq!(old.manifest.version, DUMP_VERSION);
+    let newer = [
+        "event_instance_windows",
+        "event_attendance_windows",
+        "event_voice_sessions",
+    ];
+    assert_eq!(old.buffers["event_instance_windows"].len(), 2);
+    omit_populated_newer_tables(&mut old, &newer);
     old.manifest.version = 15;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-instance-windows-v15.ndjson.gz");
     write_archive(&old_path, &old);
     let inspected = inspect(&old_path).expect("released v15 archive remains readable");
     assert_eq!(inspected.manifest.version, 15);
-    assert_eq!(
-        inspected.manifest.missing_tables(),
-        ["event_instance_windows"]
-    );
+    assert_eq!(inspected.manifest.missing_tables(), newer);
     // The v15 archive carries no windows. A destination window must not
     // survive, and no window may be invented from the restored bindings.
     forget_moderation_history(pool).await;
@@ -3242,14 +3306,7 @@ async fn v15_archive_restores_and_clears_newer_event_instance_windows_without_ba
         archived,
         "v15 restores giveaways, mirror and voice claims"
     );
-    let windows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_instance_windows")
-        .fetch_one(pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        windows, 0,
-        "a pre-v16 restore clears the windows and never backfills liveness"
-    );
+    assert_newer_tables_cleared(pool, &newer, 15).await;
     db.close().await.unwrap();
 }
 

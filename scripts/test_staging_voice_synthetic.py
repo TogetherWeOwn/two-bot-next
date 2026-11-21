@@ -897,8 +897,7 @@ class WebSocketHandshakeTest(unittest.TestCase):
         script = _HandshakeScript(data)
         context = mock.Mock()
         context.wrap_socket.return_value = script
-        with mock.patch.object(synth.socket, "create_connection",
-                               return_value=object()), \
+        with mock.patch.object(synth, "_connect", return_value=object()), \
                 mock.patch.object(synth.ssl, "create_default_context",
                                   return_value=context):
             return synth.WebSocket("gateway.example", "/?v=10&encoding=json")

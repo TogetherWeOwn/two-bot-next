@@ -44,6 +44,7 @@ pub(super) async fn snapshot(pool: &PgPool) -> Vec<Value> {
         "retention_guild_purge_queue",
         "retention_deletion_requests",
         "internal_idempotency",
+        "event_voice_sessions",
     ] {
         let sql = format!("SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)::text), '[]'::jsonb) FROM {table} r");
         rows.push(
@@ -76,6 +77,18 @@ pub(super) async fn seed(pool: &PgPool) -> String {
         .bind(DEPARTED).bind(MEMBER).execute(pool).await.unwrap();
     handle_guild_delete(pool, DEPARTED, None).await.unwrap();
     request_user_deletion(pool, GUILD, MEMBER).await.unwrap()
+}
+
+async fn seed_expired_attendance(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, joined_at)
+         VALUES ($1, $2, '444444444444444444', now() - interval '91 days')",
+    )
+    .bind(GUILD)
+    .bind(MEMBER)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 /// Run the REAL retention action through the production spawn/cancel/join owner.
@@ -254,6 +267,7 @@ async fn game_aggregate_expiry_denied_delete_identifies_guild_horizon_mode_and_c
     let Some(db) = database().await else { return };
     let pool = db.pool();
     const DENIED_GUILD: &str = "555555555555555555";
+    seed_expired_attendance(pool).await;
     sqlx::query("INSERT INTO game_activity_guild_aggregates (guild_id, game, total_play_ms, in_voice_ms, session_count) VALUES ($1, 'Apex', 600000, 0, 2)")
         .bind(DENIED_GUILD).execute(pool).await.unwrap();
     sqlx::query("UPDATE game_activity_guild_aggregates SET updated_at = now() - make_interval(days => 100) WHERE guild_id = $1")
@@ -283,6 +297,7 @@ async fn game_aggregate_expiry_denied_delete_identifies_guild_horizon_mode_and_c
     );
     assert_no_completed_line(&logs);
     let committed = report_line(&logs);
+    field(committed, "attendance_raw_deleted", 1);
     assert!(
         committed.contains("mode=Execute") || committed.contains("mode=\"Execute\""),
         "committed report must tag the mode on a failed expiry: {committed}"
@@ -408,12 +423,15 @@ async fn dry_run_reports_candidates_and_preserves_raw_queue_requests_and_receipt
     let _serial = RUNTIME_LOCK.lock().await;
     let Some(db) = database().await else { return };
     seed(db.pool()).await;
+    seed_expired_attendance(db.pool()).await;
     let before = snapshot(db.pool()).await;
     let (result, logs) = tick(db.pool(), mode_from_setting(None).unwrap().unwrap()).await;
     result.unwrap();
     let report = report_line(&logs);
+    assert!(report.starts_with("INFO "));
     field(report, "presence_raw_deleted", 1);
     field(report, "voice_raw_deleted", 1);
+    field(report, "attendance_raw_deleted", 1);
     field(report, "audit_cache_deleted", 1);
     field(report, "guild_rows_purged", 3);
     field(report, "deletions_completed", 1);
@@ -426,6 +444,17 @@ async fn dry_run_reports_candidates_and_preserves_raw_queue_requests_and_receipt
         before,
         "dry-run must be byte-identical, including receipt and queue timestamps"
     );
+    let (result, logs) = tick(db.pool(), RetentionMode::Execute).await;
+    result.unwrap();
+    let report = report_line(&logs);
+    assert!(report.starts_with("INFO "));
+    field_str(report, "mode", "Execute");
+    field(report, "attendance_raw_deleted", 1);
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM event_voice_sessions")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
     db.close().await.unwrap();
 }
 
@@ -533,6 +562,7 @@ async fn runtime_schema_gap_defers_deletions_and_guild_purges_and_retries_after_
     let Some(db) = database().await else { return };
     let pool = db.pool();
     let id = seed(pool).await;
+    seed_expired_attendance(pool).await;
     sqlx::query("CREATE TABLE retention_uncovered_fixture (guild_id TEXT, member_id TEXT)")
         .execute(pool)
         .await
@@ -549,6 +579,7 @@ async fn runtime_schema_gap_defers_deletions_and_guild_purges_and_retries_after_
     field(report, "deletions_completed", 0);
     field(report, "presence_raw_deleted", 1);
     field(report, "voice_raw_deleted", 1);
+    field(report, "attendance_raw_deleted", 1);
     field(report, "audit_cache_deleted", 1);
     field(report, "guild_rows_purged", 0);
     field(report, "guild_purges_failed", 1);
@@ -587,5 +618,258 @@ async fn runtime_schema_gap_defers_deletions_and_guild_purges_and_retries_after_
         .await
         .unwrap();
     assert_eq!(queued, 0, "repaired run must purge the deferred guild");
+    db.close().await.unwrap();
+}
+
+fn heat_event_line<'a>(logs: &'a str, event: &str) -> &'a str {
+    let plain = format!("message={event}");
+    let quoted = format!("message=\"{event}\"");
+    let events: Vec<_> = logs
+        .lines()
+        .filter(|line| {
+            line.split_whitespace()
+                .any(|part| part == plain || part == quoted)
+        })
+        .collect();
+    assert_eq!(events.len(), 1, "expected one {event} event: {logs}");
+    events[0]
+}
+
+#[test]
+fn voice_heat_expiry_failure_selection_ignores_summary_flags() {
+    for message in [
+        "message=voice_heat_expiry_failed",
+        "message=\"voice_heat_expiry_failed\"",
+    ] {
+        let diagnostic = format!("WARN two_bot::retention_jobs {message} reason=\"database\"");
+        for failed in [false, true] {
+            let logs = format!(
+                "WARN two_bot::retention_jobs message=\"retention_run\" voice_heat_expiry_failed={failed}\n{diagnostic}\n"
+            );
+            assert_eq!(
+                heat_event_line(&logs, "voice_heat_expiry_failed"),
+                diagnostic
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn voice_heat_expiry_counts_in_dry_run_and_deletes_in_execute() {
+    let _serial = RUNTIME_LOCK.lock().await;
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    sqlx::query(
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
+         VALUES (now() - make_interval(days => 40), 12, 30, now() - make_interval(days => 40)),
+                (now() - make_interval(days => 10), 12, 24, now() - make_interval(days => 10))",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    // Dry run previews the same stale row execute will delete, and deletes
+    // nothing: both rows survive.
+    let (result, logs) = tick(pool, mode_from_setting(None).unwrap().unwrap()).await;
+    result.unwrap();
+    let preview = heat_event_line(&logs, "voice_heat_expiry");
+    field(preview, "stale_rows", 1);
+    field(preview, "horizon_days", 35);
+    assert!(
+        preview.contains("mode=DryRun") || preview.contains("mode=\"DryRun\""),
+        "dry run must tag its preview: {preview}"
+    );
+    // The game-aggregate sweep still emits its own event on the same tick.
+    let _ = expiry_line(&logs);
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, 2, "dry run deletes nothing");
+    // Execute deletes the stale row and keeps the fresh one.
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    result.unwrap();
+    let swept = heat_event_line(&logs, "voice_heat_expiry");
+    field(swept, "stale_rows", 1);
+    assert!(
+        swept.contains("mode=Execute") || swept.contains("mode=\"Execute\""),
+        "execute must tag its sweep: {swept}"
+    );
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, 1, "fresh rows survive");
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    result.unwrap();
+    field(heat_event_line(&logs, "voice_heat_expiry"), "stale_rows", 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_heat_expiry_parks_without_table_access() {
+    let _serial = RUNTIME_LOCK.lock().await;
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    let role = format!("{}_heat", db.name());
+    // Emulate the current boundary in this disposable database: ordinary
+    // retention tables are accessible but the owner-only heat table is not.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE ROLE {role};
+         GRANT USAGE ON SCHEMA public TO {role};
+         GRANT SELECT ON ALL TABLES IN SCHEMA public TO {role};
+         REVOKE SELECT ON public.voice_heat_hours FROM {role};"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+    let restricted = sqlx::postgres::PgPoolOptions::new()
+        .connect_with(
+            pool.connect_options()
+                .as_ref()
+                .clone()
+                .options([("role", role.as_str())]),
+        )
+        .await
+        .unwrap();
+    let (result, logs) = tick(&restricted, RetentionMode::DryRun).await;
+    restricted.close().await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP OWNED BY {role}; DROP ROLE {role}"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    result.unwrap();
+    let parked = heat_event_line(&logs, "voice_heat_expiry_parked");
+    field_str(parked, "reason", "no_table_access");
+    assert!(!parked.contains("stale_rows="));
+    assert!(report_line(&logs).contains("retention run completed"));
+}
+
+#[tokio::test]
+async fn voice_heat_expiry_failure_keeps_report_and_retries() {
+    let _serial = RUNTIME_LOCK.lock().await;
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    sqlx::query(
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
+         VALUES (now() - make_interval(days => 40), 12, 30, now() - make_interval(days => 40))",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql("CREATE FUNCTION voice_heat_runtime_refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic voice-heat refusal'; END $$; CREATE TRIGGER voice_heat_runtime_refuse BEFORE DELETE ON voice_heat_hours FOR EACH ROW EXECUTE FUNCTION voice_heat_runtime_refuse();").execute(pool).await.unwrap();
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    assert!(
+        matches!(result, Err(ErrorClass::Database)),
+        "a blocked voice-heat delete fails the tick as database, retryable"
+    );
+    // The committed core report still emits exactly once, with distinct text.
+    let report = report_line(&logs);
+    assert!(report.starts_with("WARN "));
+    field_str(report, "game_aggregate_expiry_failed", "false");
+    field_str(report, "voice_heat_expiry_failed", "true");
+    assert_no_completed_line(&logs);
+    assert_classified_db_error(heat_event_line(&logs, "voice_heat_expiry_failed"));
+    assert!(!logs.contains("synthetic voice-heat refusal"));
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        kept, 1,
+        "failed delete keeps the stale row for a later retry"
+    );
+    sqlx::raw_sql("DROP TRIGGER voice_heat_runtime_refuse ON voice_heat_hours; DROP FUNCTION voice_heat_runtime_refuse();").execute(pool).await.unwrap();
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    result.unwrap();
+    field(heat_event_line(&logs, "voice_heat_expiry"), "stale_rows", 1);
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, 0, "repaired run must expire the deferred row");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn game_aggregate_expiry_failure_still_expires_voice_heat_and_returns_err() {
+    let _serial = RUNTIME_LOCK.lock().await;
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    const DENIED_GUILD: &str = "555555555555555556";
+    sqlx::query("INSERT INTO game_activity_guild_aggregates (guild_id, game, total_play_ms, in_voice_ms, session_count) VALUES ($1, 'Apex', 600000, 0, 2)")
+        .bind(DENIED_GUILD).execute(pool).await.unwrap();
+    sqlx::query("UPDATE game_activity_guild_aggregates SET updated_at = now() - make_interval(days => 100) WHERE guild_id = $1")
+        .bind(DENIED_GUILD).execute(pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
+         VALUES (now() - make_interval(days => 40), 12, 30, now() - make_interval(days => 40))",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql("CREATE FUNCTION aggregate_expiry_refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic aggregate expiry refusal'; END $$; CREATE TRIGGER aggregate_expiry_refuse BEFORE DELETE ON game_activity_guild_aggregates FOR EACH ROW EXECUTE FUNCTION aggregate_expiry_refuse();").execute(pool).await.unwrap();
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    assert_eq!(
+        result,
+        Err(ErrorClass::Database),
+        "the isolated aggregate failure is still returned: {logs}"
+    );
+    assert_classified_db_error(expiry_failure_line(&logs));
+    assert_no_completed_line(&logs);
+    assert!(
+        report_line(&logs).contains("aggregate expiry failed"),
+        "committed report names the failed aggregate sweep: {logs}"
+    );
+    field(heat_event_line(&logs, "voice_heat_expiry"), "stale_rows", 1);
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        kept, 0,
+        "healthy heat expiry runs despite the aggregate error"
+    );
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM game_activity_guild_aggregates WHERE guild_id = $1",
+    )
+    .bind(DENIED_GUILD)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(kept, 1, "the denied aggregate row remains for retry");
+    // If both independent deletes fail, the committed counters still belong
+    // to exactly one retention_run report; each sweep keeps its diagnostic.
+    sqlx::query(
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
+         VALUES (now() - make_interval(days => 40), 12, 30, now() - make_interval(days => 40))",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql("CREATE FUNCTION heat_expiry_refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic heat expiry refusal'; END $$; CREATE TRIGGER heat_expiry_refuse BEFORE DELETE ON voice_heat_hours FOR EACH ROW EXECUTE FUNCTION heat_expiry_refuse();").execute(pool).await.unwrap();
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    assert_eq!(result, Err(ErrorClass::Database));
+    assert_no_completed_line(&logs);
+    assert_classified_db_error(expiry_failure_line(&logs));
+    assert_classified_db_error(heat_event_line(&logs, "voice_heat_expiry_failed"));
+    let report = report_line(&logs);
+    assert!(report.contains("aggregate expiry and voice-heat expiry failed"));
+    field_str(report, "game_aggregate_expiry_failed", "true");
+    field_str(report, "voice_heat_expiry_failed", "true");
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, 1, "failed heat expiry remains retryable");
+    sqlx::raw_sql(
+        "DROP TRIGGER heat_expiry_refuse ON voice_heat_hours; DROP FUNCTION heat_expiry_refuse();",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql("DROP TRIGGER aggregate_expiry_refuse ON game_activity_guild_aggregates; DROP FUNCTION aggregate_expiry_refuse();").execute(pool).await.unwrap();
     db.close().await.unwrap();
 }

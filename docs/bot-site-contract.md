@@ -92,7 +92,7 @@ Carried unchanged: request `{"action":"voice.snapshot"}`; result `{v, observed_a
 | `source` | **grid-wide**, identical on all 168 rows: `measured` when `sample_days ≥ 14` **and** every one of the 168 cells has `coverage ≥ 0.8` (≥ 39/48; 38/48 fails), else `insufficient`. A missing cell counts as insufficient |
 
 **The honest label, as a state machine the site must render verbatim:**
-- `source = insufficient` (or view absent) ⇒ the site keeps today's seeded grid (`src/hotzones/aggregates.ts`) and labels it **"estimate"**. Bot calibration has not happened; no copy may imply otherwise.
+- `source = insufficient`, view absent, or the aggregate read returns `insufficient_privilege` (including before the reader grant or after staging backout) ⇒ keep the seeded grid (`src/hotzones/aggregates.ts`) and label it **"estimate"**. Do not read the raw sample table or report a successful measured pull.
 - `source = measured` ⇒ the site stores the grid (site DB, overwritten daily by cron pull) and labels it **"measured · last 4 weeks"** with `measured_through` available on the freshness line.
 - The whole grid is either measured or estimate, decided once by the grid-wide `source`; **measured and estimated cells are never mixed in one grid**, and a measured grid that goes stale (>48 h without a successful pull) drops back to "estimate" labelling with the last measured values greyed, never silent freshness.
 - Joins data in hot zones is already real and stays separately labelled *(design §1)*; games stay seeded estimates until something measures them — nothing in v2 does, and the label must keep saying so.

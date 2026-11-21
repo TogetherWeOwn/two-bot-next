@@ -262,9 +262,15 @@ applies rolling nominal windows when invoked: raw presence/voice rows use a
 complete in under 72 hours with a receipt unless a replay guard is unresolved,
 in which case the request stays pending with no receipt and is reported as
 deferred (with overdue requests older than 72 hours counted separately).
-Long-term aggregates (counts,
-streaks) are never time-purged, with one exception: game-activity guild
-aggregates (`game_activity_guild_aggregates`) expire by `updated_at` age on
+Raw event attendance sessions expire strictly more than 90 elapsed days
+(2,160 hours) after `joined_at`, whether open or closed. Member erasure removes
+only that member's sessions in the requested guild. Attendance window records
+have no age-based expiry; a guild purge removes both its sessions and windows.
+This lifecycle support does not enable attendance capture or reads.
+
+Long-term aggregates (counts, streaks) are not purged by age except for game
+activity and hourly voice heat. Game-activity guild aggregates
+(`game_activity_guild_aggregates`) expire by `updated_at` age on
 the retention cadence (default 90 days, `TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`
 accepts 1..=36,500 days and any missing, malformed, or out-of-range value
 falls back to 90 days, only when `TWO_RETENTION_MODE` is exactly
@@ -293,11 +299,22 @@ queued purge). The live gateway invokes the queue/cancel paths on real
 `GUILD_DELETE`/`GUILD_CREATE` dispatches (outage payloads never queue; an
 available rejoin cancels before the next run), and the supervised retention
 job runs on a bounded schedule: a dry run that deletes nothing unless
-`TWO_RETENTION_MODE` is exactly `execute`. No other automatic age-based
-purger is installed: do not claim a live 30/90-day TTL beyond the windows
-this job enforces. Every run reports per-class metrics, with partial runs
-(deferred/overdue deletions, failed guild purges) surfaced as warnings that
-stay retryable. The existing `presence_probe`, funnel `events` and
+`TWO_RETENTION_MODE` is exactly `execute`.
+
+For hourly voice heat (`voice_heat_hours`), the same job uses a strict cutoff:
+rows whose hour starts more than 35 elapsed days before the sweep qualify.
+Dry runs count those rows without deleting; `execute` deletes them once the
+reviewed role plan grants the runtime access. Until those grants are applied,
+the runtime parks the heat sweep in both modes. The role plan does not start a
+collector or grant the website reader access to the underlying table.
+
+No other automatic age-based purger is installed: do not claim a live TTL
+beyond the windows this job enforces. Every run reports per-class metrics.
+The `retention_run` event's `attendance_raw_deleted` field counts age-based
+session deletions in execute mode and candidates in dry-run mode, without
+logging session identifiers.
+Partial runs (deferred/overdue deletions, failed guild purges) surface as
+warnings and stay retryable. The existing `presence_probe`, funnel `events` and
 `operational_audit_log` cutoffs are evaluated at each successful run; scheduling
 or database failures can retain those rows beyond their nominal windows until a
 later successful run. The cadence headroom below is specific to `event_store`.

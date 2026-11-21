@@ -286,3 +286,56 @@ LEFT JOIN members m ON m.guild_id = e.guild_id AND m.member_id = e.member_id
 WHERE e.event_type = 'member_join'
   AND NOT COALESCE(m.is_bot, FALSE)
 GROUP BY to_char(e.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD'), e.source;
+
+-- Voice heat contract 1.1: trailing 28 complete UTC days; all 168 cells.
+CREATE OR REPLACE VIEW web_v1.voice_heat AS
+WITH bounds AS (
+  SELECT
+    (date_trunc('day', now() AT TIME ZONE 'UTC') - interval '28 days') AT TIME ZONE 'UTC' AS window_start,
+    date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS window_end
+),
+scoped AS (
+  SELECT h.hour_start_utc, h.samples, h.occupancy_sum, h.last_observed_at
+  FROM voice_heat_hours h, bounds b
+  WHERE h.hour_start_utc >= b.window_start
+    AND h.hour_start_utc < b.window_end
+    AND h.samples > 0
+),
+provenance AS (
+  SELECT
+    (SELECT count(DISTINCT (hour_start_utc AT TIME ZONE 'UTC')::date) FROM scoped) AS sample_days,
+    (SELECT max(last_observed_at) FROM scoped) AS measured_through_ts
+),
+cells AS (
+  SELECT
+    ((EXTRACT(ISODOW FROM hour_start_utc AT TIME ZONE 'UTC'))::int - 1) AS dow,
+    (EXTRACT(HOUR FROM hour_start_utc AT TIME ZONE 'UTC'))::int AS hour,
+    sum(occupancy_sum)::double precision / NULLIF(sum(samples), 0) AS avg_in_voice,
+    sum(samples)::double precision / 48.0 AS coverage
+  FROM scoped
+  GROUP BY 1, 2
+),
+grid AS (
+  SELECT days.dow, hours.hour
+  FROM generate_series(0, 6) AS days(dow)
+  CROSS JOIN generate_series(0, 23) AS hours(hour)
+)
+SELECT
+  grid.dow,
+  grid.hour,
+  cells.avg_in_voice,
+  provenance.sample_days,
+  COALESCE(cells.coverage, 0.0) AS coverage,
+  web_v1._iso(provenance.measured_through_ts) AS measured_through,
+  CASE WHEN provenance.sample_days >= 14
+         AND (SELECT count(*) FROM cells WHERE coverage >= 0.8) = 168
+       THEN 'measured' ELSE 'insufficient' END AS source
+FROM grid
+LEFT JOIN cells ON cells.dow = grid.dow AND cells.hour = grid.hour
+CROSS JOIN provenance
+ORDER BY grid.dow, grid.hour;
+
+-- Publish the new capability only after the view exists. Both appliers
+-- execute this file atomically. Do not overwrite a newer or unknown version.
+UPDATE web_contract_meta SET contract_version = '1.1'
+ WHERE singleton AND contract_version = '1.0';

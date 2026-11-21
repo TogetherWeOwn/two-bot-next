@@ -1527,6 +1527,950 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
+async fn automod_preview_dispatch_counts_refusals_and_a_failed_callback() {
+    use two_bot_core::automod_preview_report::PREVIEW_NOT_EVALUATED_REPLY;
+
+    let (mock, origin) = MockRest::start(vec![200, 200, 200, 400]).await;
+    let manage = Permissions::MANAGE_GUILD;
+    let denied = RouterRefusal::AutomodPreviewPermission.message();
+    let interaction = slash(
+        "automod-preview",
+        Some(CHANNEL),
+        vec![option(
+            "text",
+            CommandOptionValue::String("synthetic".into()),
+        )],
+    );
+    for (configured_guild, moderation, permissions, expected) in [
+        (GUILD + 1, true, manage, PREVIEW_NOT_EVALUATED_REPLY),
+        (GUILD, false, manage, PREVIEW_NOT_EVALUATED_REPLY),
+        (GUILD, true, Permissions::empty(), denied.as_str()),
+        // Authorized handler, but this runtime has no AutoMod activation.
+        (GUILD, true, manage, PREVIEW_NOT_EVALUATED_REPLY),
+    ] {
+        let router_gates = RouterGates {
+            configured_guild: Some(configured_guild),
+            moderation,
+            ..gates(true, false)
+        };
+        let runtime = runtime_without_db(router_gates, true, origin.clone());
+        let metrics = runtime.preview_metrics.get_or_init(Default::default);
+        runtime
+            .on_interaction(&from_member(interaction.clone(), 42, permissions))
+            .await;
+        let reply = callback_json(mock.requests().last().expect("preview callback"));
+        assert_eq!(reply["data"]["content"], expected);
+        assert_eq!(reply["data"]["flags"], 64);
+        let text = metrics.render(None);
+        let mut counted = text.lines().filter(|line| {
+            line.starts_with("two_bot_automod_previews_total{") && !line.ends_with(" 0")
+        });
+        let sample = r#"two_bot_automod_previews_total{result="not_evaluated",filter="none",mode="not_evaluated"} 1"#;
+        assert_eq!(counted.next(), (permissions == manage).then_some(sample));
+        assert_eq!(counted.next(), None);
+    }
+    assert_eq!(mock.requests().len(), 4);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb for the preview audit receipt"]
+async fn automod_preview_dispatch_uses_ingress_clocks_even_when_busy() {
+    use crate::command_runtime::{LANE_BUSY, LANE_INTERACTIONS};
+    use crate::gateway_commands::GatewayCommandConfig;
+    use crate::interaction_admission::PER_USER_IN_FLIGHT;
+    use two_bot_core::automod_preview_report::PREVIEW_UNAVAILABLE_REPLY;
+    use two_bot_core::automod_runtime::STAGING_GUILD_ID;
+
+    let guild = STAGING_GUILD_ID.parse::<u64>().expect("staging ID");
+    let db = member_refusal_database().await;
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let executor = executor_at(origin);
+    let vars = [
+        ("TWO_AUTOMOD".into(), "1".into()),
+        ("TWO_OWEN_USER_ID".into(), "123456789012345678".into()),
+    ]
+    .into();
+    let resolved = crate::automod_gateway::resolve(&vars, guild)
+        .unwrap()
+        .unwrap();
+    let runtime = CommandRuntime::new(
+        db.pool().clone(),
+        executor.clone(),
+        router_with_commands(RouterGates {
+            moderation: true,
+            configured_guild: Some(guild),
+            ..gates(true, false)
+        }),
+        guild,
+        true,
+    );
+    runtime.set_automod(crate::automod_gateway::build(
+        resolved,
+        db.pool().clone(),
+        executor,
+    ));
+    runtime.initialize_custom_commands_for_test(
+        GatewayCommandConfig::from_map_for_activation(
+            guild,
+            &[("TWO_AUTOMATIONS".into(), "1".into())].into(),
+            true,
+        )
+        .unwrap(),
+    );
+    let _guard = runtime.dispatch_guard();
+    let event = |id, permissions, text: &str| {
+        let mut interaction = slash(
+            "automod-preview",
+            Some(CHANNEL),
+            vec![option("text", CommandOptionValue::String(text.into()))],
+        );
+        set_guild(&mut interaction, Some(Id::new(guild)));
+        interaction.authorizing_integration_owners.guild = Some(AnonymizableId::Id(Id::new(guild)));
+        interaction_event(from_member(interaction, id, permissions))
+    };
+    let observed = "2026-08-01T01:02:03.456Z";
+    let now = tokio::time::Instant::now;
+    let expired = now() - Duration::from_secs(3);
+    let manage = Permissions::MANAGE_GUILD;
+    let no_manage = Permissions::MANAGE_MESSAGES;
+    for (ordered, id, permissions) in [
+        (false, 42, manage),
+        (true, 43, manage),
+        (false, 44, no_manage),
+        (true, 45, no_manage),
+    ] {
+        assert!(runtime.dispatch_received(
+            &event(id, permissions, "synthetic"),
+            ordered,
+            expired,
+            observed
+        ));
+        wait_for(
+            || {
+                runtime.lane_in_flight(crate::command_runtime::LANE_PRIVILEGED) == 0
+                    && runtime.lane_in_flight(LANE_INTERACTIONS) == 0
+            },
+            "expired preview settled",
+        )
+        .await;
+        let slots: Vec<_> = (0..PER_USER_IN_FLIGHT)
+            .map(|_| runtime.acquire_user_slot_for_test(id).unwrap())
+            .collect();
+        assert!(!runtime.dispatch_received(
+            &event(id, manage, "synthetic"),
+            ordered,
+            expired,
+            observed
+        ));
+        wait_for(
+            || runtime.lane_in_flight(LANE_BUSY) == 0,
+            "expired busy callback settled",
+        )
+        .await;
+        assert!(mock.requests().is_empty());
+        drop(slots);
+    }
+    let deny = RouterRefusal::AutomodPreviewPermission.message();
+    let cases = [
+        (no_manage, "", deny.as_str()),
+        (manage, "synthetic", "Invocation received at"),
+    ];
+    for (i, (permissions, text, expected)) in cases.into_iter().enumerate() {
+        assert!(runtime.dispatch_received(
+            &event(50 + i as u64, permissions, text),
+            i == 0,
+            now(),
+            observed
+        ));
+        wait_for(|| mock.requests().len() > i, "preview callback").await;
+        let reply = callback_json(&mock.requests()[i]);
+        assert_eq!(reply["type"], 4);
+        assert_eq!(reply["data"]["flags"], 64);
+        assert_eq!(
+            reply["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert!(reply["data"]["content"]
+            .as_str()
+            .unwrap()
+            .contains(expected));
+        assert!(!reply["data"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic"));
+    }
+    let rows: Vec<bool> = sqlx::query_scalar("SELECT created_at = $1::text::timestamptz FROM automation_audit_log WHERE action = 'automod.preview'")
+        .bind(observed).fetch_all(db.pool()).await.unwrap();
+    assert_eq!(rows, [true]);
+    db.close().await.unwrap();
+    assert!(runtime.dispatch_received(&event(52, manage, "synthetic"), true, now(), observed));
+    wait_for(|| mock.requests().len() == 3, "audit-outage callback").await;
+    assert_eq!(
+        callback_json(&mock.requests()[2])["data"]["content"],
+        PREVIEW_UNAVAILABLE_REPLY
+    );
+    let _slots: Vec<_> = (0..PER_USER_IN_FLIGHT)
+        .map(|_| runtime.acquire_user_slot_for_test(53).unwrap())
+        .collect();
+    assert!(!runtime.dispatch_received(&event(53, manage, "synthetic"), false, now(), observed));
+    wait_for(|| mock.requests().len() == 4, "live busy callback").await;
+    let busy = callback_json(&mock.requests()[3]);
+    assert_eq!(busy["data"]["flags"], 64);
+    assert_eq!(
+        busy["data"]["content"],
+        crate::interaction_admission::BUSY_REPLY
+    );
+    mock.shutdown().await;
+}
+
+pub(crate) use preview_callback_acceptance::capture_dispatch_worker;
+
+mod preview_callback_acceptance {
+    use super::*;
+    use std::cell::Cell;
+    use tokio::{task::JoinHandle, time::Instant};
+    use two_bot_core::{
+        automod_preview_audit::{load_preview_audit, lock_preview_attempt, replay_preview_reply},
+        automod_runtime::STAGING_GUILD_ID,
+        send_admission::{
+            AdmissionError, AdmissionFuture, AdmissionPermit, PgSendAdmission, SendAdmission,
+            SendCompletion, SendCooldown, TokenKey,
+        },
+    };
+    use two_bot_cutover::settings::SettingsStore;
+    use two_bot_discord::executor::RECEIPT_ADMISSION_BUDGET_MS;
+
+    // Keep the invocation distinct from the synthetic word in the stored policy.
+    const SAMPLE: &str = "ＳyntheticCanary PreviewWord";
+
+    #[derive(Clone, Default)]
+    struct PreviewTrace(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for PreviewTrace {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("preview trace")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl PreviewTrace {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("preview trace")).into_owned()
+        }
+    }
+
+    // Seed a separate tracker through the real matcher to read the pinned
+    // toolchain's repeat digest. Don't duplicate its hashing algorithm or
+    // expose the digest through a new production API for this test.
+    fn sentinel_repeat_digest() -> u64 {
+        use two_bot_core::automod::{match_automod, AutomodMessage, AutomodPolicy, RepeatTracker};
+
+        let mut tracker = RepeatTracker::default();
+        let message = AutomodMessage {
+            guild_id: "guild".into(),
+            channel_id: "channel".into(),
+            message_id: "message".into(),
+            author_id: "author".into(),
+            author_is_bot: false,
+            role_ids: vec![],
+            content: SAMPLE.into(),
+            mentioned_user_ids: vec![],
+            attachment_names: vec![],
+            observed_timestamp_ms: 1,
+        };
+        assert!(match_automod(&message, &AutomodPolicy::default(), &mut tracker).is_none());
+        format!("{tracker:?}")
+            .split_once("digest: ")
+            .and_then(|(_, rest)| rest.split_once(','))
+            .and_then(|(digest, _)| digest.parse().ok())
+            .expect("real tracker must contain one decimal digest")
+    }
+
+    fn contains_preview_canary(sink: &str, fingerprints: &[String]) -> bool {
+        let folded = sink.to_ascii_lowercase();
+        fingerprints.iter().any(|needle| folded.contains(needle))
+    }
+
+    tokio::task_local! {
+        static DISPATCH_WORKER: Cell<Option<JoinHandle<()>>>;
+    }
+
+    // Capture the real join handle only when this test scopes one dispatch.
+    // The runtime retains its abort handle, so shard cancellation is unchanged.
+    pub(crate) fn capture_dispatch_worker(worker: JoinHandle<()>) {
+        let _ = DISPATCH_WORKER.try_with(|slot| {
+            assert!(
+                slot.replace(Some(worker)).is_none(),
+                "one worker per dispatch"
+            );
+        });
+    }
+
+    fn dispatch_worker(dispatch: impl FnOnce()) -> JoinHandle<()> {
+        DISPATCH_WORKER.sync_scope(Cell::new(None), || {
+            dispatch();
+            DISPATCH_WORKER.with(|slot| slot.take().expect("dispatch spawned a worker"))
+        })
+    }
+
+    #[derive(Debug)]
+    struct ObservedAdmission {
+        inner: PgSendAdmission,
+        pool: PgPool,
+        saw_commit: std::sync::atomic::AtomicBool,
+        blocked: tokio::sync::Notify,
+        hold_retries: std::sync::atomic::AtomicBool,
+        attempts: Mutex<Vec<Instant>>,
+        settlement: Arc<SettlementGate>,
+    }
+
+    #[derive(Debug, Default)]
+    struct SettlementGate {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    struct HeldCompletion(AdmissionPermit, Arc<SettlementGate>);
+
+    impl SendCompletion for HeldCompletion {
+        fn complete(
+            self: Box<Self>,
+            cooldown: Option<SendCooldown>,
+        ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+            Box::pin(async move {
+                self.1.started.notify_one();
+                self.1.release.notified().await;
+                self.0.complete(cooldown).await
+            })
+        }
+    }
+
+    impl SendAdmission for ObservedAdmission {
+        fn token_key(&self) -> &TokenKey {
+            self.inner.token_key()
+        }
+
+        fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+            Box::pin(async {
+                self.attempts
+                    .lock()
+                    .expect("admission trace")
+                    .push(Instant::now());
+                // After real PostgreSQL confirms the held lane, model its
+                // continued occupancy without I/O on the paused clock.
+                if self.hold_retries.load(Ordering::Relaxed) {
+                    return Err(AdmissionError::Blocked);
+                }
+                let result = self.inner.admit().await;
+                match &result {
+                    Ok(_) => {
+                        let committed = load_preview_audit(&self.pool, "automod-preview:801")
+                            .await
+                            .is_ok_and(|row| row.is_some());
+                        self.saw_commit.store(committed, Ordering::Relaxed);
+                    }
+                    Err(AdmissionError::Blocked) => {
+                        self.hold_retries.store(true, Ordering::Relaxed);
+                        self.blocked.notify_one();
+                    }
+                    Err(_) => {}
+                }
+                result.map(|permit| {
+                    AdmissionPermit::new(Box::new(HeldCompletion(permit, self.settlement.clone())))
+                })
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preview_callback_follows_commit_and_respects_receipt_under_contention(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = std::env::var("TWO_TEST_DATABASE_URL")?;
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await?;
+        let trace = PreviewTrace::default();
+        let writer = trace.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .with_span_events(
+                tracing_subscriber::fmt::format::FmtSpan::NEW
+                    | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+            )
+            .with_writer(move || writer.clone())
+            .finish();
+        // Both detached workers are polled on this test's only runtime
+        // thread, where the tracing guard remains installed until they join.
+        let guard = tracing::subscriber::set_default(subscriber);
+        let proof = tokio::spawn(verify_callbacks(db.pool().clone(), trace)).await;
+        drop(guard);
+        db.close().await?;
+        proof??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preview_dry_run_is_private_and_leaves_create_streak_unchanged(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = std::env::var("TWO_TEST_DATABASE_URL")?;
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await?;
+        let proof = tokio::spawn(verify_preview_create_parity(db.pool().clone())).await;
+        db.close().await?;
+        proof??;
+        Ok(())
+    }
+
+    async fn verify_preview_create_parity(
+        pool: PgPool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use two_bot_core::automod::AutomodMessage;
+        use two_bot_core::automod_runtime::{
+            CompletionKind, FunnelDisposition, MessageDelivery, MessageDeliveryKind, StoredOutcome,
+        };
+        use two_bot_discord::automod_activation::ActivationOutcome;
+
+        let guild = STAGING_GUILD_ID.parse::<u64>()?;
+        let actor = 901_u64;
+        let repeated = "synthetic repeat sample";
+        let (mock, origin) = MockRest::start(vec![204; 3]).await;
+        let token = "preview-parity-test-token";
+        let executor = ActionExecutor::with_admission(
+            token.to_owned(),
+            Some(origin),
+            Arc::new(PgSendAdmission::new(pool.clone(), token)?),
+        )?;
+        let deployment = [
+            ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
+            (
+                "TWO_OWEN_USER_ID".to_owned(),
+                "123456789012345678".to_owned(),
+            ),
+            ("TWO_AUTOMOD_BAD_WORDS".to_owned(), "previewword".to_owned()),
+            ("TWO_AUTOMOD_REPEAT_COUNT".to_owned(), "3".to_owned()),
+            (
+                "TWO_AUTOMOD_REPEAT_WINDOW_SECONDS".to_owned(),
+                "30".to_owned(),
+            ),
+        ]
+        .into();
+        let build = || {
+            let resolved = crate::automod_gateway::resolve(&deployment, guild)?
+                .expect("enabled dry-run policy");
+            Ok::<_, &'static str>(crate::automod_gateway::build(
+                resolved,
+                pool.clone(),
+                executor.clone(),
+            ))
+        };
+        let with_previews = build()?;
+        let control = build()?;
+        let runtime = CommandRuntime::new(
+            pool.clone(),
+            executor,
+            router_with_commands(RouterGates {
+                moderation: true,
+                configured_guild: Some(guild),
+                ..gates(true, false)
+            }),
+            guild,
+            true,
+        );
+        runtime
+            .preview_deployment
+            .set(deployment)
+            .expect("fixture deployment");
+        let (_writer, live) = two_bot_core::settings::live_channel();
+        runtime.set_live_settings(live);
+        runtime.set_automod(with_previews.clone());
+        let _guard = runtime.dispatch_guard();
+        for (id, sample, received, outcome, filter) in [
+            (801, repeated, "2026-08-01T01:02:00Z", "partial", "none"),
+            (802, repeated, "2026-08-01T01:02:06Z", "partial", "none"),
+            (803, SAMPLE, "2026-08-01T01:02:12Z", "matched", "bad_words"),
+        ] {
+            if id != 801 {
+                // Move only the admission clock; perform all database and REST I/O unpaused.
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(6)).await;
+                tokio::time::resume();
+            }
+            let mut request = from_member(
+                slash(
+                    "automod-preview",
+                    Some(CHANNEL),
+                    vec![option(
+                        "text",
+                        CommandOptionValue::String(sample.to_owned()),
+                    )],
+                ),
+                actor,
+                Permissions::MANAGE_GUILD,
+            );
+            request.id = Id::new(id);
+            request.token = format!("preview-{id}");
+            let guild_id = Id::new(guild);
+            set_guild(&mut request, Some(guild_id));
+            request.channel.as_mut().expect("guild channel").guild_id = Some(guild_id);
+            request.authorizing_integration_owners.guild = Some(AnonymizableId::Id(guild_id));
+            let worker = dispatch_worker(|| {
+                assert!(runtime.dispatch_received(
+                    &interaction_event(request),
+                    false,
+                    Instant::now(),
+                    received
+                ));
+            });
+            tokio::time::timeout(Duration::from_secs(4), worker).await??;
+            let row = load_preview_audit(&pool, &format!("automod-preview:{id}"))
+                .await?
+                .expect("detached preview committed its audit row");
+            assert_eq!(row.outcome, outcome);
+            assert_eq!(
+                row.reason.as_deref(),
+                Some(format!("filter={filter};exemption=none;mode=dry_run;len=0_50").as_str())
+            );
+            let reply = replay_preview_reply(&row.outcome, row.reason.as_deref(), &row.created_at)
+                .expect("committed preview renders");
+            assert!(reply.contains("Mode: dry_run."));
+            if outcome == "matched" {
+                assert!(reply.contains("TWO_AUTOMOD_BAD_WORDS"));
+            }
+            assert!(!reply.contains(sample));
+            let requests = mock.requests();
+            assert_eq!(
+                requests.len() as u64,
+                id - 800,
+                "one callback per invocation"
+            );
+            let request = requests.last().expect("preview callback");
+            assert_eq!(request.method, "POST");
+            assert_eq!(
+                request.path,
+                format!("/api/v10/interactions/{id}/preview-{id}/callback")
+            );
+            let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+            // Twilight omits empty role/user lists and a false reply-mention flag.
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "type": 4,
+                    "data": {
+                        "flags": 64,
+                        "allowed_mentions": {"parse": []},
+                        "content": reply,
+                    },
+                })
+            );
+        }
+        let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM automod_delivery_claims")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(claims, 0, "previews never enter real delivery processing");
+        let received = "2026-08-01T01:02:13Z";
+        let start = crate::automod_gateway::receipt_ms(received).expect("fixture receipt");
+        for (activation, base_id) in [(&control, 2000), (&with_previews, 3000)] {
+            for index in 0..3 {
+                let message_id = (base_id + index).to_string();
+                let at_ms = start + 1000 * index;
+                let snapshot = AutomodMessage {
+                    guild_id: STAGING_GUILD_ID.to_owned(),
+                    channel_id: CHANNEL_S.to_owned(),
+                    message_id: message_id.clone(),
+                    author_id: actor.to_string(),
+                    author_is_bot: false,
+                    role_ids: vec![],
+                    content: repeated.to_owned(),
+                    mentioned_user_ids: vec![],
+                    attachment_names: vec![],
+                    observed_timestamp_ms: at_ms,
+                };
+                let delivery = MessageDelivery {
+                    kind: MessageDeliveryKind::Create,
+                    guild_id: Some(STAGING_GUILD_ID.to_owned()),
+                    channel_id: CHANNEL_S.to_owned(),
+                    message_id,
+                    snapshot: Some(snapshot),
+                    create_pending_roles: None,
+                    edited_timestamp_ms: None,
+                    observed_timestamp_ms: at_ms,
+                };
+                let matched = index == 2;
+                let processed = activation.process(delivery, received).await;
+                assert_eq!(
+                    processed.disposition,
+                    if matched {
+                        FunnelDisposition::CaptureOnly
+                    } else {
+                        FunnelDisposition::Accept
+                    }
+                );
+                assert_eq!(
+                    processed.outcome,
+                    ActivationOutcome::Completed(StoredOutcome {
+                        matched,
+                        deleted: false,
+                        outcome: if matched {
+                            CompletionKind::DryRun
+                        } else {
+                            CompletionKind::Accepted
+                        },
+                    })
+                );
+            }
+        }
+        let violations: i64 = sqlx::query_scalar("SELECT count(*) FROM automod_violations")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(violations, 0);
+        assert_eq!(
+            mock.requests().len(),
+            3,
+            "no REST effects from dry-run CREATEs"
+        );
+        mock.shutdown().await;
+        Ok(())
+    }
+
+    async fn verify_callbacks(
+        pool: PgPool,
+        trace: PreviewTrace,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let guild = STAGING_GUILD_ID.parse::<u64>()?;
+        let (mock, origin) = MockRest::start(vec![204]).await;
+        let token = "preview-callback-test-token";
+        let admission = Arc::new(ObservedAdmission {
+            inner: PgSendAdmission::new(pool.clone(), token)?,
+            pool: pool.clone(),
+            saw_commit: std::sync::atomic::AtomicBool::new(false),
+            blocked: tokio::sync::Notify::new(),
+            hold_retries: std::sync::atomic::AtomicBool::new(false),
+            attempts: Mutex::default(),
+            settlement: Arc::default(),
+        });
+        let executor =
+            ActionExecutor::with_admission(token.to_owned(), Some(origin), admission.clone())
+                .expect("loopback executor");
+        let deployment = [
+            ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
+            (
+                "TWO_OWEN_USER_ID".to_owned(),
+                "123456789012345678".to_owned(),
+            ),
+            ("TWO_AUTOMOD_BAD_WORDS".to_owned(), "bootword".to_owned()),
+        ]
+        .into();
+        let resolved =
+            crate::automod_gateway::resolve(&deployment, guild)?.expect("enabled policy");
+        let activation = crate::automod_gateway::build(resolved, pool.clone(), executor.clone());
+        let runtime = CommandRuntime::new(
+            pool.clone(),
+            executor,
+            router_with_commands(RouterGates {
+                moderation: true,
+                configured_guild: Some(guild),
+                ..gates(true, false)
+            }),
+            guild,
+            true,
+        );
+        let boot = activation.preview(|engine| engine.effective_config());
+        assert_eq!(boot.policy.bad_words, vec!["bootword"]);
+        runtime
+            .preview_deployment
+            .set(deployment)
+            .expect("fixture deployment");
+        runtime.set_automod(activation.clone());
+        let store = SettingsStore::new(&pool);
+        store
+            .set(
+                &guild.to_string(),
+                "TWO_AUTOMOD_BAD_WORDS",
+                Some(serde_json::json!(["previewword"])),
+                "test",
+            )
+            .await?;
+        let (mut writer, live) = two_bot_core::settings::live_channel();
+        assert!(writer.publish(&store.load_snapshot().await?).changed);
+        runtime.set_live_settings(live);
+        assert!(runtime.preview_metrics.set(Default::default()).is_ok());
+        let _guard = runtime.dispatch_guard();
+        let preview = |id, sample: &str| {
+            let mut request = slash(
+                "automod-preview",
+                Some(CHANNEL),
+                vec![option(
+                    "text",
+                    CommandOptionValue::String(sample.to_owned()),
+                )],
+            );
+            let guild_id = Id::new(guild);
+            set_guild(&mut request, Some(guild_id));
+            request.channel.as_mut().expect("guild channel").guild_id = Some(guild_id);
+            request.authorizing_integration_owners.guild = Some(AnonymizableId::Id(guild_id));
+            from_member(request, id, Permissions::MANAGE_GUILD)
+        };
+        let observed = "2026-08-01T01:02:03.456Z";
+        let first_worker = dispatch_worker(|| {
+            assert!(runtime.dispatch_received(
+                &interaction_event(preview(801, SAMPLE)),
+                false,
+                Instant::now(),
+                observed,
+            ));
+        });
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            admission.settlement.started.notified(),
+        )
+        .await?;
+        assert!(admission.saw_commit.load(Ordering::Relaxed));
+        assert_eq!(activation.preview(|engine| engine.effective_config()), boot);
+        assert!(matches!(
+            admission.inner.admit().await,
+            Err(AdmissionError::Blocked)
+        ));
+        // Discord already answered. Force the receipt deadline to pass while
+        // completion is held, then let the real durable release run.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS + 1)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::resume();
+        admission.settlement.release.notify_one();
+        let row = load_preview_audit(&pool, "automod-preview:801")
+            .await?
+            .expect("committed before the callback");
+        assert_eq!(row.outcome, "matched");
+        let reason = row.reason.as_deref().expect("audit reason");
+        assert!(!reason.contains(SAMPLE));
+        let reply = replay_preview_reply(&row.outcome, Some(reason), &row.created_at)
+            .expect("stored verdict renders");
+        assert!(reply.contains("TWO_AUTOMOD_BAD_WORDS"));
+        assert!(!reply.contains(SAMPLE));
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].path.ends_with("/callback"));
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body)?;
+        assert_eq!(body["type"], 4);
+        assert_eq!(body["data"]["flags"], 64);
+        assert_eq!(
+            body["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert_eq!(body["data"]["content"], reply);
+
+        let lane = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match admission.inner.admit().await {
+                    Err(AdmissionError::Blocked) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await
+                    }
+                    result => break result,
+                }
+            }
+        })
+        .await??;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), first_worker)
+                .await?
+                .is_ok(),
+            "first preview worker must exit normally"
+        );
+        let mut audit = pool.begin().await?;
+        lock_preview_attempt(&mut audit, "802").await?;
+        admission.attempts.lock().expect("admission trace").clear();
+        // A blocking task inhibits Tokio's auto-advance while the real I/O
+        // runs. Its receive timeout uses wall time, not the receipt budget.
+        tokio::time::pause();
+        let (io_done, wait_for_io) = std::sync::mpsc::channel::<()>();
+        let mut watchdog =
+            tokio::task::spawn_blocking(move || wait_for_io.recv_timeout(Duration::from_secs(10)));
+        // A worker that replaces the ingress receipt with its own start time
+        // would get 750 ms back.
+        let started_at = Instant::now();
+        let received_at = started_at - Duration::from_millis(750);
+        let deadline = received_at + Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS);
+        let contended_worker = dispatch_worker(|| {
+            assert!(runtime.dispatch_received(
+                &interaction_event(preview(802, SAMPLE)),
+                false,
+                received_at,
+                observed,
+            ));
+        });
+        let contend = async {
+            // Prove this invocation actually waited on the audit claim before
+            // observing the independent occupied REST lane.
+            loop {
+                let waiting = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
+                     AND NOT granted AND pg_backend_pid() = ANY(pg_blocking_pids(pid)))",
+                )
+                .fetch_one(&mut *audit)
+                .await?;
+                if waiting {
+                    break;
+                }
+                sqlx::query("SELECT pg_sleep(0.005)")
+                    .execute(&mut *audit)
+                    .await?;
+            }
+            assert!(
+                admission
+                    .attempts
+                    .lock()
+                    .expect("admission trace")
+                    .is_empty(),
+                "callback admission must wait for the audit claim"
+            );
+            audit.rollback().await?;
+            admission.blocked.notified().await;
+            Ok::<(), sqlx::Error>(())
+        };
+        tokio::select! {
+            result = contend => result?,
+            _ = &mut watchdog => panic!("real PostgreSQL contention watchdog elapsed"),
+        }
+        assert_eq!(
+            Instant::now(),
+            started_at,
+            "receipt clock stayed frozen during I/O"
+        );
+        io_done.send(())?;
+        // Now only the in-memory refusals and retry timers drive the worker.
+        tokio::time::sleep_until(deadline - Duration::from_millis(20)).await;
+        let waited_before_cutoff = Instant::now() < deadline && !contended_worker.is_finished();
+        tokio::time::sleep_until(deadline + Duration::from_millis(1)).await;
+        let settled =
+            tokio::time::timeout_at(deadline + Duration::from_millis(100), contended_worker).await;
+        let attempts = std::mem::take(&mut *admission.attempts.lock().expect("admission trace"));
+        tokio::time::resume();
+        watchdog.await??;
+        lane.complete(None).await?;
+        assert!(
+            waited_before_cutoff,
+            "callback must not abandon the held lane early"
+        );
+        assert!(
+            attempts.len() > 1,
+            "callback must retry after the real refusal"
+        );
+        assert!(
+            attempts.iter().all(|&attempt| attempt < deadline),
+            "no callback admission may start at or after the original receipt cutoff"
+        );
+        assert!(
+            settled
+                .expect("contended worker join watchdog elapsed")
+                .is_ok(),
+            "contended preview worker must exit normally"
+        );
+        let row = load_preview_audit(&pool, "automod-preview:802")
+            .await?
+            .expect("audit committed even though callback expired");
+        assert_eq!(row.outcome, "matched");
+        assert_eq!(mock.requests().len(), 1, "no late callback or follow-up");
+        mock.shutdown().await;
+
+        let audit_rows: Vec<String> = sqlx::query_scalar(
+            "SELECT to_jsonb(a)::text FROM automation_audit_log AS a ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(audit_rows.len(), 2, "one audit row per preview");
+        let enforcement_rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM automod_violations) + \
+             (SELECT count(*) FROM automod_delivery_claims)",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            enforcement_rows, 0,
+            "preview never touches enforcement stores"
+        );
+        let metrics = runtime
+            .preview_metrics
+            .get()
+            .expect("fixture metrics")
+            .render(None);
+        assert!(metrics.lines().any(|line| {
+            line.starts_with(
+                r#"two_bot_automod_previews_total{result="matched",filter="bad_words","#,
+            ) && line.ends_with(" 2")
+        }));
+        let logs = trace.contents();
+        assert!(
+            logs.contains("automod preview callback failed"),
+            "the real detached failure diagnostic must be captured"
+        );
+
+        let normalized = two_bot_core::automod::normalize_content(SAMPLE);
+        assert_eq!(normalized, "syntheticcanary previewword");
+        let (raw_md5, normalized_md5, raw_sha256, normalized_sha256): (
+            String,
+            String,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT md5($1::text), md5($2::text), \
+                 encode(sha256(convert_to($1, 'UTF8')), 'hex'), \
+                 encode(sha256(convert_to($2, 'UTF8')), 'hex')",
+        )
+        .bind(SAMPLE)
+        .bind(&normalized)
+        .fetch_one(&pool)
+        .await?;
+        let repeat_digest = sentinel_repeat_digest();
+        let fingerprints = [
+            SAMPLE.to_ascii_lowercase(),
+            normalized,
+            raw_md5,
+            normalized_md5,
+            raw_sha256,
+            normalized_sha256,
+            repeat_digest.to_string(),
+            format!("{repeat_digest:x}"),
+        ];
+        for (name, sink) in [
+            ("logs and errors", logs),
+            ("audit rows", audit_rows.join("\n")),
+            ("metrics", metrics),
+            ("callback", String::from_utf8(requests[0].body.clone())?),
+        ] {
+            assert!(
+                !contains_preview_canary(&sink, &fingerprints),
+                "preview canary leaked in {name}"
+            );
+        }
+
+        // Positive control: leak only the actual digest, after the clean scan.
+        // Nothing modifies the repeat tracker, so immutability alone misses it.
+        trace.0.lock().expect("preview trace").clear();
+        tracing::warn!(digest = ?repeat_digest, "synthetic positive control");
+        assert!(
+            contains_preview_canary(&trace.contents(), &fingerprints),
+            "sink checker must detect a decimal repeat digest"
+        );
+        Ok(())
+    }
+}
+
+#[tokio::test]
 async fn unconfirmed_help_does_not_invent_a_live_registry() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
@@ -1584,6 +2528,141 @@ async fn help_answers_immediately_from_the_live_publish_set() {
         content.contains("needs Ban Members"),
         "marks the gate: {content}"
     );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn gateway_help_opens_a_new_private_page_from_the_confirmed_registry() {
+    use crate::command_runtime::help_ingress::{HELP_LIMIT, LANE_HELP, LANE_HELP_REFUSAL};
+    use crate::command_runtime::{DISPATCH_LIMITS, LANE_BUSY, LANE_INTERACTIONS};
+    use serde_json::{json, Value};
+    use tokio::time::Instant;
+    use two_bot_discord::brand::{EmbedKind, BRAND_ICON_URL};
+
+    let app = RestResponse {
+        body: Some(json!({"id": "1111"}).to_string()),
+        ..RestResponse::status(200)
+    };
+    let (mock, origin) = MockRest::start_script(vec![app]).await;
+    let mut gates = gates(true, true);
+    gates.scorecard = true;
+    gates.moderation = true;
+    let runtime = runtime_without_db(gates, true, origin);
+    let _guard = runtime.dispatch_guard();
+    runtime.set_identity(0, 0);
+    let application = runtime.bootstrap_application_id().await.unwrap();
+    runtime
+        .publish_registry_checked(Some(application))
+        .await
+        .unwrap();
+    let dispatch = |e: &Event, at| runtime.dispatch_received(e, true, at, "2026-01-01T00:00:00Z");
+    let first = interaction_event(slash("help", Some(CHANNEL), vec![]));
+    dispatch(&Event::Resumed, Instant::now());
+    assert!(dispatch(&first, Instant::now()));
+    assert!(dispatch(&first, Instant::now()), "duplicate");
+    let idle = |lane| runtime.help_in_flight(lane) == 0;
+    wait_for(|| idle(LANE_HELP), "initial help callback").await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1);
+    let data = &serde_json::from_slice::<Value>(&callbacks[0].body).unwrap()["data"];
+    assert_eq!(data["flags"], 64);
+    assert_eq!(data["embeds"][0]["color"], EmbedKind::Default.color());
+    assert_eq!(data["embeds"][0]["footer"]["icon_url"], BRAND_ICON_URL);
+    let button = &data["components"][0]["components"][0];
+    assert_eq!(button["label"], "Go to page 2");
+    let cursor = button["custom_id"].as_str().unwrap();
+    let click = |id, cursor: &str, flags| {
+        let mut click = stale_unknown_component(cursor, ComponentType::Button, vec![]);
+        click.id = Id::new(id);
+        let mut source = message(836, CHANNEL, true, Some(GUILD));
+        source.author.id = Id::new(1111);
+        source.flags = flags;
+        source.interaction_metadata = serde_json::from_value(json!({ "id": "7", "type": 2,
+            "user": user(88, false), "authorizing_integration_owners": {"0": GUILD.to_string()} }))
+        .unwrap();
+        let mut button = button.clone();
+        button["custom_id"] = json!(cursor);
+        source.components =
+            serde_json::from_value(json!([{"type": 1, "components": [button]}])).unwrap();
+        click.message = Some(source);
+        click
+    };
+    let private = Some(MessageFlags::EPHEMERAL);
+    let event = |id, cursor: &str, flags| interaction_event(click(id, cursor, flags));
+    let mut wrong_scope = click(835, cursor, private);
+    set_guild(&mut wrong_scope, None);
+    assert!(dispatch(&interaction_event(wrong_scope), Instant::now()));
+    assert!(dispatch(&first, Instant::now() - Duration::from_secs(3)));
+    assert!(
+        idle(LANE_HELP),
+        "an expired receipt must not admit Help work"
+    );
+    assert_eq!(runtime.dispatch_drops_total(LANE_INTERACTIONS), 0);
+    for _ in 0..DISPATCH_LIMITS[LANE_BUSY] {
+        assert!(runtime.hold_lane_for_test(LANE_BUSY, Duration::from_secs(60)));
+    }
+    assert!(dispatch(&event(835, cursor, private), Instant::now()));
+    assert!(dispatch(&event(837, cursor, None), Instant::now()));
+    assert_eq!(
+        runtime.help_in_flight(LANE_HELP_REFUSAL),
+        1,
+        "same actor is busy"
+    );
+    wait_for(
+        || idle(LANE_HELP) && idle(LANE_HELP_REFUSAL),
+        "help callbacks",
+    )
+    .await;
+    let prefix = cursor.rsplitn(3, ':').last().unwrap();
+    let hold = |actor, id| runtime.hold_help_for_test(actor, id);
+    assert_eq!(hold(88, 836), Some(LANE_HELP));
+    assert!(dispatch(
+        &event(839, &format!("{prefix}:1:2"), private),
+        Instant::now()
+    ));
+    wait_for(|| idle(LANE_HELP_REFUSAL), "expired button recovery").await;
+    let mut callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 4, "no extra callbacks");
+    callbacks[1..].sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    for (callback, id) in callbacks[1..].iter().zip([835, 837, 839]) {
+        assert!(callback
+            .path
+            .ends_with(&format!("/{id}/sticky-test-token/callback")));
+        let reply: Value = serde_json::from_slice(&callback.body).unwrap();
+        assert_eq!(reply["type"], 4, "new message, not an update or defer");
+        let data = &reply["data"];
+        assert_eq!(data["flags"], 64);
+        if id == 835 {
+            assert_eq!(data["allowed_mentions"]["parse"], json!([]));
+            assert!(data["embeds"][0]["footer"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Together We Own · Help · Page 2 of "));
+        } else {
+            assert!(data["components"].is_null());
+            let description = if id == 837 {
+                "Run `/help` to get your own list."
+            } else {
+                "Help pages last 10 minutes. Run `/help` to start again."
+            };
+            assert_eq!(data["embeds"][0]["description"], description);
+        }
+    }
+    assert_eq!(hold(88, 836), None, "render duplicate");
+    assert_eq!(hold(88, 900), Some(LANE_HELP_REFUSAL));
+    assert_eq!(hold(88, 900), None, "refusal duplicate");
+    assert_eq!(runtime.dispatch_drops_total(LANE_INTERACTIONS), 0);
+    assert_eq!(hold(88, 901), None, "one refusal per actor");
+    for i in 1..HELP_LIMIT as u64 {
+        assert_eq!(hold(i, 100 + i), Some(LANE_HELP));
+    }
+    for i in 1..HELP_LIMIT as u64 {
+        assert_eq!(hold(i, 200 + i), Some(LANE_HELP_REFUSAL));
+    }
+    assert_eq!(hold(99, 300), None, "both Help lanes are full");
+    assert_eq!(runtime.dispatch_drops_total(LANE_INTERACTIONS), 2);
+    assert_eq!(runtime.dispatch_drops_total(LANE_BUSY), 0);
+    assert_eq!(mock.requests().len(), 6);
     mock.shutdown().await;
 }
 
@@ -4718,6 +5797,110 @@ fn production_router_matches_composed_production_wiring() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn staging_preview_survives_both_runtime_registry_publishers(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use two_bot_core::automod_runtime::STAGING_GUILD_ID;
+    use two_bot_core::custom_command_store::put_command;
+    use two_bot_core::custom_commands::StoredCommand;
+
+    let url = std::env::var("TWO_TEST_DATABASE_URL")?;
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await?;
+    let pool = db.pool().clone();
+    let proof = tokio::spawn(async move {
+        let guild = STAGING_GUILD_ID.parse()?;
+        put_command(
+            &pool,
+            &StoredCommand {
+                guild_id: STAGING_GUILD_ID.to_owned(),
+                name: "registry-test".to_owned(),
+                description: "Saved command".to_owned(),
+                template: "Saved response".to_owned(),
+                text_trigger: None,
+                enabled: true,
+            },
+            "66",
+            "67",
+            "2026-10-01T00:00:00Z",
+            "2026-10-01T00:00:00Z",
+        )
+        .await?;
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        for persisted in [false, true] {
+            let executor = executor_at(origin.clone());
+            let runtime = CommandRuntime::new(
+                pool.clone(),
+                executor.clone(),
+                router_with_commands(RouterGates {
+                    configured_guild: Some(guild),
+                    moderation: true,
+                    ..gates(true, false)
+                }),
+                guild,
+                true,
+            );
+            let vars = [
+                ("TWO_AUTOMOD".into(), "1".into()),
+                ("TWO_OWEN_USER_ID".into(), "123456789012345678".into()),
+                ("TWO_AUTOMATIONS".into(), "1".into()),
+            ]
+            .into();
+            if persisted {
+                runtime.initialize_custom_commands_for_test(
+                    crate::gateway_commands::GatewayCommandConfig::from_map_for_activation(
+                        guild, &vars, true,
+                    )?,
+                );
+            }
+            runtime
+                .publish_registry_checked(Some(1111))
+                .await
+                .expect("default-dark guild replacement succeeds");
+            let activation =
+                crate::automod_gateway::resolve(&vars, guild)?.expect("active staging AutoMod");
+            runtime.set_automod(crate::automod_gateway::build(
+                activation,
+                pool.clone(),
+                executor,
+            ));
+            runtime
+                .publish_registry_checked(Some(1111))
+                .await
+                .expect("guild replacement succeeds");
+        }
+        let requests = mock.requests();
+        let expected = [(false, false), (false, true), (true, false), (true, true)];
+        assert_eq!(requests.len(), expected.len());
+        for (request, (persisted, active)) in requests.iter().zip(expected) {
+            assert_eq!(request.method, "PUT");
+            assert_eq!(
+                request.path,
+                format!("/api/v10/applications/1111/guilds/{guild}/commands")
+            );
+            let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+            let defs = body.as_array().expect("full guild registry");
+            assert_eq!(
+                defs.iter()
+                    .filter(|def| def["name"] == "automod-preview")
+                    .count(),
+                if active { 1 } else { 0 }
+            );
+            assert_eq!(
+                defs.iter().any(|def| def["name"] == "registry-test"),
+                persisted
+            );
+        }
+        mock.shutdown().await;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+    db.close().await?;
+    proof??;
+    Ok(())
 }
 
 #[tokio::test]

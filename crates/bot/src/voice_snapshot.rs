@@ -39,7 +39,7 @@ use twilight_model::id::{
     marker::{ChannelMarker, GuildMarker, UserMarker},
     Id,
 };
-use two_bot_core::Snowflake;
+use two_bot_core::{voice_move_holds::VoiceMoveHolds, Snowflake};
 
 /// Relayed-answer budget for the serialized `result` object. The Worker
 /// refuses to relay bodies over its 64 KiB bound
@@ -98,6 +98,9 @@ struct OccupiedRoom {
 #[derive(Debug, Default)]
 pub(crate) struct VoiceOccupancyClock {
     rooms: Mutex<HashMap<(Snowflake, Snowflake), OccupiedRoom>>,
+    // Reservation, completion and observations share this lock. Readiness
+    // and cache reseeds invalidate room intervals, not move holds.
+    pub(crate) move_holds: Mutex<VoiceMoveHolds>,
 }
 
 impl VoiceOccupancyClock {
@@ -150,7 +153,31 @@ impl VoiceOccupancyClock {
 }
 
 impl two_bot_discord::VoiceTransitionObserver for VoiceOccupancyClock {
+    fn begin_voice_transition(&self) -> u64 {
+        self.move_holds
+            .lock()
+            .expect("voice move holds")
+            .begin_transition()
+    }
+
     fn observe_voice_transition(&self, transition: two_bot_discord::VoiceTransitionObservation) {
+        {
+            let mut holds = self.move_holds.lock().expect("voice move holds");
+            holds.observe(
+                transition.member_id,
+                transition.current_channel_id,
+                transition.generation,
+            );
+            // A reseed can place the member in the target without settling.
+            // A later witnessed departure from it can settle the hold.
+            if transition.previous_channel_confirmed {
+                holds.observe(
+                    transition.member_id,
+                    transition.previous_channel_id,
+                    transition.generation,
+                );
+            }
+        }
         if transition.is_bot {
             return;
         }
@@ -236,12 +263,72 @@ fn total_in_voice(rooms: &[RoomDraft]) -> usize {
         .sum()
 }
 
-#[cfg(test)]
 pub(crate) fn read_voice_total(
     cache: &two_bot_discord::SharedCache,
     guild_id: Snowflake,
 ) -> Result<usize, SnapshotRefusal> {
     observe_rooms(cache, guild_id).map(|rooms| total_in_voice(&rooms))
+}
+
+/// Private five-minute sampling of the same fenced aggregate.
+pub(crate) mod heat {
+    use std::{sync::Arc, time::Duration};
+
+    use sqlx::PgPool;
+    use time::OffsetDateTime;
+    use tokio::sync::{Mutex, RwLock};
+    use two_bot::voice_heat::VoiceHeat;
+    use two_bot_core::Snowflake;
+    use two_bot_discord::SharedCache;
+
+    use crate::{
+        gateway::GatewayState,
+        jobs::{self, Job},
+    };
+
+    pub(crate) const NAME: &str = "voice_heat";
+    const CADENCE: Duration = Duration::from_secs(300);
+    type Gateway = RwLock<GatewayState>;
+
+    pub fn job(pool: PgPool, guild: Snowflake, cache: Arc<SharedCache>, gw: Arc<Gateway>) -> Job {
+        job_with_clock(pool, guild, cache, gw, OffsetDateTime::now_utc)
+    }
+
+    pub(super) fn job_with_clock(
+        pool: PgPool,
+        guild: Snowflake,
+        cache: Arc<SharedCache>,
+        gw: Arc<Gateway>,
+        now: impl Fn() -> OffsetDateTime + Clone + Send + Sync + 'static,
+    ) -> Job {
+        let buffer = Arc::new(Mutex::new(VoiceHeat::default()));
+        Job {
+            name: NAME,
+            cadence: CADENCE,
+            cadence_source: None,
+            startup_jitter: jobs::startup_jitter(CADENCE, rand::random()),
+            timeout: VoiceHeat::TICK_TIMEOUT,
+            action: Arc::new(move || {
+                let (pool, cache, gw, buffer) =
+                    (pool.clone(), cache.clone(), gw.clone(), buffer.clone());
+                let now = now.clone();
+                Box::pin(async move {
+                    let mut buffer = buffer.lock().await;
+                    let total = observation(&cache, &gw, guild);
+                    buffer.tick(now(), total, &pool).await
+                })
+            }),
+        }
+    }
+
+    fn observation(cache: &SharedCache, gw: &Gateway, id: Snowflake) -> Option<i64> {
+        // Keep the connected fence held through the complete cache read.
+        let state = gw.try_read().ok()?;
+        if *state != GatewayState::Connected {
+            return None;
+        }
+        i64::try_from(super::read_voice_total(cache, id).ok()?).ok()
+    }
 }
 
 /// Whole-second Zulu timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for `observed_at`.
@@ -426,6 +513,38 @@ pub(crate) fn project(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn only_a_connected_complete_snapshot_adds_an_observation() {
+        use crate::{gateway::GatewayState::*, jobs::ErrorClass};
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use time::{macros::datetime, Duration};
+        use tokio::sync::RwLock;
+        use two_bot::voice_heat::VoiceHeat;
+
+        let cache = new_shared_cache();
+        let gateway = Arc::new(RwLock::new(Connected));
+        let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new_without_pgpass());
+        pool.close().await;
+        let hour = Arc::new(AtomicI64::new(0));
+        let clock = hour.clone();
+        let job = heat::job_with_clock(pool, 100, cache.clone(), gateway.clone(), move || {
+            datetime!(2026-11-21 00:00 UTC) + Duration::hours(clock.load(Ordering::Relaxed))
+        });
+        assert_eq!(job.timeout, VoiceHeat::TICK_TIMEOUT);
+        let probe = async |state, tick_hour| {
+            *gateway.write().await = state;
+            hour.store(tick_hour, Ordering::Relaxed);
+            (job.action)().await
+        };
+        assert_eq!(probe(Connected, 0).await, Ok(()));
+        cache.update(&pipeline_guild(&[]));
+        assert_eq!(probe(Armed, 1).await, Ok(()));
+        assert_eq!(probe(Connected, 2).await, Ok(()));
+        // Neither gap created a zero; the true zero now reaches the closed pool.
+        assert_eq!(probe(Draining, 3).await, Err(ErrorClass::Database));
+    }
+
     #[test]
     fn guild_snapshot_eligibility_tracks_gateway_lifecycle() {
         use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
@@ -450,15 +569,7 @@ mod tests {
         assert_eq!(admitted(), Some(()));
         assert_eq!(listing().expect("warm snapshot")["total_in_voice"], 1);
         assert_eq!(scalar(), Ok(1));
-        cache.update(&Event::Ready(
-            serde_json::from_value(json!({
-                "v": 10, "session_id": "fixture", "resume_gateway_url": "ws://fixture.invalid",
-                "application": {"id": "999", "flags": 0},
-                "user": {"id": "999", "username": "fixture", "discriminator": "0", "mfa_enabled": false},
-                "guilds": [{"id": "100", "unavailable": true}]
-            }))
-            .expect("ready fixture"),
-        ));
+        cache.update(&pipeline_ready());
         assert_eq!(admitted(), None);
         assert_incomplete();
         cache.update(&pipeline_guild(&[42]));
@@ -680,9 +791,11 @@ mod tests {
         occurred_at_ms: Option<u64>,
     ) -> two_bot_discord::VoiceTransitionObservation {
         two_bot_discord::VoiceTransitionObservation {
+            generation: 0,
             guild_id: 9,
             member_id,
             previous_channel_id: previous.map(|(channel, _)| channel),
+            previous_channel_confirmed: previous.is_some(),
             current_channel_id: current.map(|(channel, _)| channel),
             previous_channel_members: previous
                 .map(|(_, members)| members.to_vec())
@@ -904,6 +1017,18 @@ mod tests {
         ))
     }
 
+    fn pipeline_ready() -> twilight_model::gateway::event::Event {
+        twilight_model::gateway::event::Event::Ready(
+            serde_json::from_value(json!({
+                "v": 10, "session_id": "fixture", "resume_gateway_url": "ws://fixture.invalid",
+                "application": {"id": "999", "flags": 0},
+                "user": {"id": "999", "username": "fixture", "discriminator": "0", "mfa_enabled": false},
+                "guilds": [{"id": "100", "unavailable": true}]
+            }))
+            .expect("ready fixture"),
+        )
+    }
+
     fn pipeline_guild(members: &[u64]) -> twilight_model::gateway::event::Event {
         use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
         let mut guild: Value =
@@ -991,6 +1116,129 @@ mod tests {
                 json!("2026-11-03T10:07:00Z")
             );
         }
+    }
+
+    struct PauseVoiceStart {
+        published: std::sync::mpsc::SyncSender<()>,
+        resume: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl two_bot_core::FactsSink for PauseVoiceStart {
+        fn record_member_join(&self, _: two_bot_core::MemberJoinFact<'_>) {}
+        fn record_rules_accepted(&self, _: two_bot_core::RulesAcceptedFact<'_>) {}
+        fn record_message(&self, _: two_bot_core::MessageFact<'_>) {}
+        fn record_voice_ended(&self, _: two_bot_core::VoiceEndedFact<'_>) {}
+
+        fn record_voice_started(&self, fact: two_bot_core::VoiceStartedFact<'_>) -> Option<String> {
+            if fact.occurred_at == PAUSED_ARRIVAL {
+                self.published.send(()).expect("signal cache publication");
+                self.resume
+                    .lock()
+                    .expect("funnel pause lock")
+                    .recv_timeout(PIPELINE_TEST_TIMEOUT)
+                    .expect("complete attempt before delivering callback");
+            }
+            None
+        }
+    }
+
+    const PAUSED_ARRIVAL: &str = "2026-11-03T10:00:00Z";
+    const PIPELINE_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn pipeline_clock_fences_holds_at_cache_publication() {
+        use two_bot_core::voice_move_holds::HoldRefused;
+
+        let cache = new_shared_cache();
+        let (published, await_publication) = std::sync::mpsc::sync_channel(1);
+        let (resume, await_completion) = std::sync::mpsc::sync_channel(1);
+        let pipeline = two_bot_discord::MemPipeline::<PauseVoiceStart>::with_shared_cache(
+            two_bot_core::MemStore::new(),
+            Some(two_bot_core::NoopLeveling),
+            Some(PauseVoiceStart {
+                published,
+                resume: Mutex::new(await_completion),
+            }),
+            two_bot_discord::ScriptedInvites::new(),
+            two_bot_discord::NoClassification,
+            two_bot_discord::PipelineSnapshots::new(),
+            cache.clone(),
+        );
+        let clock = VoiceOccupancyClock::new();
+        pipeline.set_voice_transition_observer(clock.clone());
+        let handle = |event| pipeline.handle_at(&event, "2026-11-03T10:01:00Z");
+        let target_members = || {
+            let mut members = observe_rooms(&cache, 100)
+                .expect("complete guild")
+                .into_iter()
+                .find(|room| room.channel_id == 200)
+                .expect("target room")
+                .member_ids;
+            members.sort_unstable();
+            members
+        };
+        let assert_admission = |cached: &[u64], held: &[u64], released: &[u64]| {
+            assert_eq!(target_members(), cached);
+            let holds = clock.move_holds.lock().expect("voice move holds");
+            let cached = u32::try_from(cached.len()).expect("bounded fixture");
+            let seats = cached + u32::try_from(held.len()).expect("bounded fixture");
+            assert_eq!(holds.occupancy(99, 200, cached), Ok(seats));
+            for member in held {
+                assert_eq!(holds.occupancy(*member, 200, cached), Err(HoldRefused));
+            }
+            for member in released {
+                assert_eq!(holds.occupancy(*member, 200, cached), Ok(seats));
+            }
+        };
+
+        handle(pipeline_guild(&[]));
+        clock.move_holds.lock().unwrap().reserve(7, 200).unwrap();
+        assert_admission(&[], &[7], &[]);
+        std::thread::scope(|scope| {
+            let delivery =
+                scope.spawn(|| pipeline.handle_at(&pipeline_voice(7, Some(200)), PAUSED_ARRIVAL));
+            // Facts capture runs after the cache write but before the clock
+            // callback. The held seat still counts alongside the visible join.
+            await_publication
+                .recv_timeout(PIPELINE_TEST_TIMEOUT)
+                .expect("voice start reached funnel");
+            assert_admission(&[7], &[7], &[]);
+            clock.move_holds.lock().unwrap().complete(7);
+            resume.send(()).expect("resume funnel after completion");
+            delivery.join().expect("deliver older observation");
+        });
+        assert_admission(&[7], &[7], &[]);
+        handle(pipeline_voice(7, Some(200))); // Same cached channel is not evidence.
+        handle(twilight_model::gateway::event::Event::Resumed);
+        assert_admission(&[7], &[7], &[]);
+        handle(pipeline_voice(8, Some(200))); // Another member's fresh arrival.
+        assert_admission(&[7, 8], &[7], &[]);
+        handle(pipeline_ready());
+        assert_eq!(
+            observe_rooms(&cache, 100),
+            Err(SnapshotRefusal::CacheIncomplete)
+        );
+        handle(pipeline_voice(7, None)); // An ineligible pre-READY view is not proof.
+        handle(pipeline_guild(&[7, 8])); // A reseed that agrees with the target.
+        assert_admission(&[7, 8], &[7], &[]);
+        handle(pipeline_guild(&[8]));
+        handle(pipeline_voice(7, None)); // A retained state is not a rostered departure.
+        assert_admission(&[8], &[7], &[]);
+        handle(pipeline_voice(7, Some(200))); // A newer matching arrival settles.
+        assert_admission(&[7, 8], &[], &[7]);
+
+        {
+            let mut holds = clock.move_holds.lock().unwrap();
+            holds.reserve(9, 200).unwrap();
+            holds.reserve(10, 200).unwrap();
+            holds.complete(10);
+        }
+        handle(pipeline_guild(&[7, 8, 9, 10]));
+        assert_admission(&[7, 8, 9, 10], &[9, 10], &[7]);
+        handle(pipeline_voice(9, None)); // A witnessed departure cannot settle Pending.
+        assert_admission(&[7, 8, 10], &[9, 10], &[]);
+        handle(pipeline_voice(10, None)); // A witnessed departure after completion can.
+        assert_admission(&[7, 8], &[9], &[10]);
     }
 
     #[test]

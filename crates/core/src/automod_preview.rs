@@ -99,7 +99,7 @@ pub fn exemption_knobs(exemption: PreviewExemption) -> &'static [&'static str] {
     }
 }
 
-/// Bounds for the unpublished `/automod-preview` slash (spec §3.1).
+/// Bounds for the `/automod-preview` slash (spec §3.1).
 /// Text is 1–2,000 UTF-16 units; `mentions` is a synthetic count 0–100;
 /// `attachments` is one ≤1,000-unit option carrying at most 10 bare names.
 pub const AUTOMOD_PREVIEW_TEXT_MAX_UTF16: u32 = 2000;
@@ -109,9 +109,8 @@ pub const AUTOMOD_PREVIEW_ATTACHMENTS_MAX_FILES: usize = 10;
 
 /// Slash definition for `/automod-preview` (spec slices 2–4).
 ///
-/// ManageGuild-only, guild-only, three options of §3.1. Dark until the
-/// publication slice: built here so the shape is pinned, but kept out of
-/// `publish_set` (the router still adjudicates it via the permission row).
+/// ManageGuild-only, guild-only, three options of §3.1. The router includes
+/// this in the guild registry only after the staging activation admits it.
 #[must_use]
 pub fn automod_preview_definition() -> CommandDefinition {
     CommandDefinition::new(
@@ -177,7 +176,7 @@ pub fn preview_automod(
 }
 
 /// `None` means ordered CREATE history cannot be established, not that no
-/// messages were observed. Stop at the repeat check in that case.
+/// messages were observed. Stop at repeat if the normalized text can repeat.
 #[must_use]
 pub fn preview_automod_with_history(
     message: &AutomodMessage,
@@ -205,11 +204,13 @@ pub fn preview_automod_with_history(
     if has_bad_word(&normalized, &config.policy.bad_words) {
         return matched(AutomodFilter::BadWords);
     }
-    let Some(repeats) = repeats else {
-        return PreviewVerdict::partial(config.dry_run);
-    };
-    if repeats.preview_would_match(message, &normalized, &config.policy) {
-        return matched(AutomodFilter::RepeatedMessage);
+    match repeats {
+        Some(repeats) if repeats.preview_would_match(message, &normalized, &config.policy) => {
+            return matched(AutomodFilter::RepeatedMessage);
+        }
+        // Like the live tracker, normalized-empty text cannot complete a streak.
+        None if !normalized.is_empty() => return PreviewVerdict::partial(config.dry_run),
+        _ => {}
     }
     if mention_count >= config.policy.mention_limit {
         return matched(AutomodFilter::MentionSpam);
@@ -337,6 +338,35 @@ mod tests {
             preview_automod_with_history(&blocked, mentions, &config, None).exemption,
             Some(PreviewExemption::BypassRole)
         );
+    }
+
+    #[test]
+    fn blank_samples_do_not_need_ordered_repeat_history() {
+        let config = AutomodConfig {
+            enabled: true,
+            dry_run: true,
+            policy: crate::automod::AutomodPolicy {
+                blocked_attachment_extensions: vec!["exe".into()],
+                ..crate::automod::AutomodPolicy::default()
+            },
+        };
+        let mut attachment_only = message(" \t");
+        attachment_only.attachment_names.push("sample.exe".into());
+        for (sample, mentions, filter) in [
+            (attachment_only, 0, AutomodFilter::AttachmentType),
+            (
+                message(""),
+                config.policy.mention_limit,
+                AutomodFilter::MentionSpam,
+            ),
+        ] {
+            let verdict = preview_automod_with_history(&sample, mentions, &config, None);
+            assert_eq!(verdict.filter, Some(filter));
+            assert_eq!(
+                verdict,
+                preview_automod(&sample, mentions, &config, &RepeatTracker::default())
+            );
+        }
     }
 
     #[test]
