@@ -37,6 +37,9 @@ use two_bot_core::{
 };
 use two_bot_testsupport::{guard_database_url, TestDatabase};
 
+#[path = "website_contract/voice_heat.rs"]
+mod voice_heat;
+
 const GUILD: &str = "326474832151838730";
 const OBSERVED_AT: &str = "2026-08-25T20:00:00.000Z";
 
@@ -1575,4 +1578,50 @@ async fn event_status_round_trips() {
         id: String::new(),
         excluded_member_ids: HashSet::new(),
     };
+}
+
+async fn recorded_contract_version(pool: &Pool<Postgres>) -> String {
+    sqlx::query_scalar("SELECT contract_version FROM web_contract_meta")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn cutover_view_publication_is_atomic_guarded_and_idempotent() {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").unwrap();
+    let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .unwrap();
+    let pool = fixture.pool();
+    sqlx::query("ALTER TABLE rank_ladder RENAME TO displaced_contract_dependency")
+        .execute(pool)
+        .await
+        .unwrap();
+    let error = apply_web_contract(pool).await.unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("42P01")
+    );
+    let partial_schema: bool = sqlx::query_scalar("SELECT to_regnamespace('web_v1') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(!partial_schema);
+    assert_eq!(recorded_contract_version(pool).await, "1.0");
+    sqlx::query("ALTER TABLE displaced_contract_dependency RENAME TO rank_ladder")
+        .execute(pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        apply_web_contract(pool).await.unwrap();
+        assert_eq!(recorded_contract_version(pool).await, WEB_CONTRACT_VERSION);
+    }
+    sqlx::query("UPDATE web_contract_meta SET contract_version = '2.0'")
+        .execute(pool)
+        .await
+        .unwrap();
+    apply_web_contract(pool).await.unwrap();
+    assert_eq!(recorded_contract_version(pool).await, "2.0");
+    fixture.close().await.unwrap();
 }
