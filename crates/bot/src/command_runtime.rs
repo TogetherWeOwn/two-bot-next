@@ -832,6 +832,8 @@ impl CommandRuntime {
             if handles.len() < DISPATCH_LIMITS[lane] {
                 let task = tokio::spawn(work);
                 handles.push(task.abort_handle());
+                #[cfg(test)]
+                crate::command_runtime_tests::capture_dispatch_worker(task);
                 return true;
             }
         }

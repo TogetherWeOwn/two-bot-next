@@ -1677,10 +1677,12 @@ async fn automod_preview_dispatch_uses_ingress_clocks_even_when_busy() {
     mock.shutdown().await;
 }
 
+pub(crate) use preview_callback_acceptance::capture_dispatch_worker;
+
 mod preview_callback_acceptance {
     use super::*;
-    use crate::command_runtime::{LANE_INTERACTIONS, LANE_PRIVILEGED};
-    use tokio::time::Instant;
+    use std::cell::Cell;
+    use tokio::{task::JoinHandle, time::Instant};
     use two_bot_core::{
         automod_preview_audit::{load_preview_audit, lock_preview_attempt, replay_preview_reply},
         automod_runtime::STAGING_GUILD_ID,
@@ -1693,6 +1695,28 @@ mod preview_callback_acceptance {
     use two_bot_discord::executor::RECEIPT_ADMISSION_BUDGET_MS;
 
     const SAMPLE: &str = "syntheticpreviewcanary";
+
+    tokio::task_local! {
+        static DISPATCH_WORKER: Cell<Option<JoinHandle<()>>>;
+    }
+
+    // Capture the real join handle only when this test scopes one dispatch.
+    // The runtime retains its abort handle, so shard cancellation is unchanged.
+    pub(crate) fn capture_dispatch_worker(worker: JoinHandle<()>) {
+        let _ = DISPATCH_WORKER.try_with(|slot| {
+            assert!(
+                slot.replace(Some(worker)).is_none(),
+                "one worker per dispatch"
+            );
+        });
+    }
+
+    fn dispatch_worker(dispatch: impl FnOnce()) -> JoinHandle<()> {
+        DISPATCH_WORKER.sync_scope(Cell::new(None), || {
+            dispatch();
+            DISPATCH_WORKER.with(|slot| slot.take().expect("dispatch spawned a worker"))
+        })
+    }
 
     #[derive(Debug)]
     struct ObservedAdmission {
@@ -1847,12 +1871,14 @@ mod preview_callback_acceptance {
             from_member(request, id, Permissions::MANAGE_GUILD)
         };
         let observed = "2026-08-01T01:02:03.456Z";
-        assert!(runtime.dispatch_received(
-            &interaction_event(preview(801, SAMPLE)),
-            false,
-            Instant::now(),
-            observed,
-        ));
+        let first_worker = dispatch_worker(|| {
+            assert!(runtime.dispatch_received(
+                &interaction_event(preview(801, SAMPLE)),
+                false,
+                Instant::now(),
+                observed,
+            ));
+        });
         tokio::time::timeout(
             Duration::from_secs(4),
             admission.settlement.started.notified(),
@@ -1904,23 +1930,26 @@ mod preview_callback_acceptance {
             }
         })
         .await??;
-        let in_flight = || {
-            runtime.lane_in_flight(LANE_PRIVILEGED) != 0
-                || runtime.lane_in_flight(LANE_INTERACTIONS) != 0
-        };
-        wait_for(|| !in_flight(), "first preview worker to finish").await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), first_worker)
+                .await?
+                .is_ok(),
+            "first preview worker must exit normally"
+        );
         let mut audit = pool.begin().await?;
         lock_preview_attempt(&mut audit, "802").await?;
         // Model ingress delay without sleeping. A worker that replaces the
         // supplied receipt with its own start time would get 750 ms back.
         let received_at = Instant::now() - Duration::from_millis(750);
         let deadline = received_at + Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS);
-        assert!(runtime.dispatch_received(
-            &interaction_event(preview(802, SAMPLE)),
-            false,
-            received_at,
-            observed,
-        ));
+        let contended_worker = dispatch_worker(|| {
+            assert!(runtime.dispatch_received(
+                &interaction_event(preview(802, SAMPLE)),
+                false,
+                received_at,
+                observed,
+            ));
+        });
         let contend = async {
             // Prove this invocation actually waited on the audit claim before
             // observing the independent occupied REST lane.
@@ -1945,14 +1974,10 @@ mod preview_callback_acceptance {
         // phase; no virtual-time deadline races a real PostgreSQL request.
         tokio::time::pause();
         tokio::time::sleep_until(deadline - Duration::from_millis(20)).await;
-        let waited_before_cutoff = Instant::now() < deadline && in_flight();
+        let waited_before_cutoff = Instant::now() < deadline && !contended_worker.is_finished();
         tokio::time::sleep_until(deadline + Duration::from_millis(1)).await;
-        let settled = tokio::time::timeout_at(deadline + Duration::from_millis(100), async {
-            while in_flight() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
+        let settled =
+            tokio::time::timeout_at(deadline + Duration::from_millis(100), contended_worker).await;
         tokio::time::resume();
         lane.complete(None).await?;
         admission.hold_retries.store(false, Ordering::Relaxed);
@@ -1960,7 +1985,12 @@ mod preview_callback_acceptance {
             waited_before_cutoff,
             "callback must not abandon the held lane early"
         );
-        settled.expect("callback attempt obeys the original receipt deadline");
+        assert!(
+            settled
+                .expect("callback attempt obeys the original receipt deadline")
+                .is_ok(),
+            "contended preview worker must exit normally"
+        );
         let row = load_preview_audit(&pool, "automod-preview:802")
             .await?
             .expect("audit committed even though callback expired");
