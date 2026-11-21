@@ -23,7 +23,8 @@ pub enum ProjectionError {
 #[derive(Deserialize)]
 struct Dispatch<'a> {
     op: u8,
-    t: Option<Kind>,
+    #[serde(borrow)]
+    t: Option<&'a RawValue>,
     #[serde(borrow)]
     d: Option<&'a RawValue>,
 }
@@ -102,38 +103,40 @@ struct EventMetadata {
 /// baseline rather than let stale state remain authoritative. The reducer still
 /// owns codec validation, reference cleanup, sequencing and visibility.
 pub fn project(guild_id: Id<GuildMarker>, raw: &str) -> Result<Option<Operation>, ProjectionError> {
-    let dispatch: Dispatch<'_> = decode(raw)?;
-    let Some(kind) = dispatch.t else {
+    let dispatch: Dispatch<'_> = decode(raw, '{')?;
+    if dispatch.op != 0 {
         return Ok(None);
-    };
-    if dispatch.op != 0 || matches!(kind, Kind::Other) {
+    }
+    let name = dispatch.t.ok_or(ProjectionError::MalformedDispatch)?.get();
+    let kind: Kind = decode(name, '"')?;
+    if matches!(kind, Kind::Other) {
         return Ok(None);
     }
     let body = dispatch.d.ok_or(ProjectionError::MalformedDispatch)?.get();
-    if !body.starts_with('{') {
-        return Err(ProjectionError::MalformedDispatch);
-    }
-    if decode::<GuildScope>(body)?.guild_id != guild_id {
+    if decode::<GuildScope>(body, '{')?.guild_id != guild_id {
         return Ok(None);
     }
 
     let operation = match kind {
-        Kind::GuildMemberAdd | Kind::GuildMemberUpdate => member_change(decode(body)?)?,
+        Kind::GuildMemberAdd | Kind::GuildMemberUpdate => member_change(decode(body, '{')?)?,
         Kind::GuildMemberRemove => Operation::Members(Change::Remove {
-            id: wire_id(decode::<RemovedMember>(body)?.user.id),
+            id: wire_id(decode::<RemovedMember>(body, '{')?.user.id),
         }),
         Kind::GuildScheduledEventCreate | Kind::GuildScheduledEventUpdate => {
-            event_change(decode(body)?)?
+            event_change(decode(body, '{')?)?
         }
         Kind::GuildScheduledEventDelete => Operation::Events(Change::Remove {
-            id: wire_id(decode::<RemovedEvent>(body)?.id),
+            id: wire_id(decode::<RemovedEvent>(body, '{')?.id),
         }),
         Kind::Other => return Ok(None),
     };
     Ok(Some(operation))
 }
 
-fn decode<'a, T: Deserialize<'a>>(input: &'a str) -> Result<T, ProjectionError> {
+fn decode<'a, T: Deserialize<'a>>(input: &'a str, prefix: char) -> Result<T, ProjectionError> {
+    if !input.trim_start().starts_with(prefix) {
+        return Err(ProjectionError::MalformedDispatch);
+    }
     serde_json::from_str(input).map_err(|_| ProjectionError::MalformedDispatch)
 }
 
@@ -177,6 +180,7 @@ fn event_change(input: ScheduledEventInput) -> Result<Operation, ProjectionError
         }
         _ => return Err(ProjectionError::UnsupportedEvent),
     };
+    let scheduled_end = input.scheduled_end_time.as_deref();
     Ok(Operation::Events(Change::Upsert {
         id,
         value: wire::Event {
@@ -187,11 +191,7 @@ fn event_change(input: ScheduledEventInput) -> Result<Operation, ProjectionError
             description: input.description,
             location,
             starts_at: wire_time(&input.scheduled_start_time)?,
-            ends_at: input
-                .scheduled_end_time
-                .as_deref()
-                .map(wire_time)
-                .transpose()?,
+            ends_at: scheduled_end.map(wire_time).transpose()?,
         },
     }))
 }

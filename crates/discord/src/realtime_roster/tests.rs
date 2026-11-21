@@ -159,16 +159,18 @@ fn unrelated_dispatches_are_not_projected_and_missing_scope_is_an_error() {
             "GUILD_SCHEDULED_EVENT_USER_ADD",
             json!({"guild_id": "10", "user_id": "42"}),
         ),
-        dispatch(
-            "MESSAGE_CREATE",
-            json!({"guild_id": "10", "content": "not forwarded"}),
-        ),
+        r#"{"op":0,"t":"MESSAGE_CREATE","d":{"guild_id":"10","content":"not forwarded"}}"#.into(),
         r#"{"op": 11, "d": null}"#.into(),
         r#"{"op": 11, "t": "GUILD_MEMBER_ADD", "d": null}"#.into(),
+        r#"{"op": 11, "t": 42, "d": null}"#.into(),
     ] {
-        assert!(matches!(project(GUILD_ID, &raw), Ok(None)));
+        assert!(matches!(project(GUILD_ID, &raw), Ok(None)), "{raw}");
     }
     for raw in [
+        r#"{"op":0,"d":{"guild_id":"10"}}"#.into(),
+        r#"{"op":0,"t":null,"d":{"guild_id":"10"}}"#.into(),
+        r#"{"op":0,"t":42,"d":{"guild_id":"10"}}"#.into(),
+        r#"[0,"GUILD_SCHEDULED_EVENT_DELETE",{"guild_id":"10","id":"94"}]"#.into(),
         dispatch("GUILD_MEMBER_REMOVE", json!({"user": {"id": "42"}})),
         dispatch("GUILD_SCHEDULED_EVENT_DELETE", json!(["10"])),
         r#"{"op":0,"t":"GUILD_SCHEDULED_EVENT_DELETE","d":{"guild_id":"11","guild_id":"10","id":"94"}}"#.into(),
