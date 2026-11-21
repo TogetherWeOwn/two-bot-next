@@ -427,9 +427,8 @@ class OwnedRoomBindingTest(unittest.TestCase):
         sock.recv.side_effect = lambda _n: b"\x81" if sock.recv.call_count == 1 else stall()
 
         def pump_until_delete(until, deadline):
-            if session.voices[-1:] == [(GUILD, None)]:
-                return pump_wire(session, until, deadline)
-            return pump(until, deadline)
+            return (pump_wire(session, until, deadline) if session.voices[-1:] == [(GUILD, None)]
+                    else pump(until, deadline))
 
         def read_until_stall(token, path):
             if path != f"/guilds/{GUILD}/channels":
@@ -447,6 +446,7 @@ class OwnedRoomBindingTest(unittest.TestCase):
                 mock.patch.dict(os.environ, {"VOICE_WORK_SECONDS": "300"}):
             code, _, _, evidence = run_with_fakes(["--grace", "180"], session, fake)
         self.assertEqual((code, verdicts(evidence).get("run")), (1, "FAIL"))
+        self.assertRegex(detail(evidence, "run"), r"^DeadlineExceeded:")
         self.assertEqual(fake.rooms[CREATOR]["name"], ORIGINAL_NAME)
         self.assertEqual(now[0], 300)
         self.assertTrue(session.closed)
