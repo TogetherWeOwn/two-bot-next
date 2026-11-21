@@ -486,6 +486,10 @@ pub struct BucketDecision {
 #[derive(Debug, Clone, Default)]
 pub struct TokenBuckets {
     buckets: HashMap<String, BucketState>,
+    // Refill deadlines persist only for active buckets; the clock floor
+    // survives eviction so a reinserted member cannot replay elapsed time.
+    voice_members: HashMap<String, u128>,
+    voice_clock_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -498,6 +502,50 @@ impl TokenBuckets {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    const VOICE_MEMBER_LIMIT: usize = 1024;
+    const VOICE_REFILL_MS: u128 = 50_000;
+    const VOICE_BURST_MS: u128 = 6 * Self::VOICE_REFILL_MS;
+
+    /// Charge a validated voice-move subject. Unseen subjects fail closed at
+    /// capacity unless a fully replenished entry can be discarded.
+    pub fn take_voice_member(&mut self, key: &str, now_ms: u64) -> BucketDecision {
+        self.voice_clock_ms = self.voice_clock_ms.max(now_ms);
+        let clock = u128::from(self.voice_clock_ms);
+        let wall = u128::from(now_ms);
+        let denied_until = |deadline: u128| BucketDecision {
+            allowed: false,
+            // Divide before narrowing; deadlines are at most u64::MAX + one burst.
+            retry_after_secs: (deadline.saturating_sub(wall).div_ceil(1_000) as u64).max(1),
+        };
+
+        let members = &mut self.voice_members;
+        if let Some(full_at) = members.get_mut(key) {
+            // A charge extends the full-refill deadline by one token's worth
+            // of time. This keeps partial credit exact without touching denied buckets.
+            let next_full = (*full_at).max(clock) + Self::VOICE_REFILL_MS;
+            if next_full > clock + Self::VOICE_BURST_MS {
+                return denied_until(next_full - Self::VOICE_BURST_MS);
+            }
+            *full_at = next_full;
+        } else {
+            if members.len() >= Self::VOICE_MEMBER_LIMIT {
+                let mut earliest_full = clock + Self::VOICE_BURST_MS;
+                members.retain(|_, &mut full_at| {
+                    earliest_full = earliest_full.min(full_at);
+                    full_at > clock
+                });
+                if members.len() >= Self::VOICE_MEMBER_LIMIT {
+                    return denied_until(earliest_full);
+                }
+            }
+            members.insert(key.to_owned(), clock + Self::VOICE_REFILL_MS);
+        }
+        BucketDecision {
+            allowed: true,
+            retry_after_secs: 0,
+        }
     }
 
     /// Take one token from `key`'s bucket, creating it full on first use.
@@ -1429,9 +1477,20 @@ pub struct VoiceMoveRequest<'a> {
 
 impl<'a> VoiceMoveRequest<'a> {
     pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        let canonical_id = |field| {
+            let value = require_snowflake(body, field)?;
+            if value.starts_with('0') || value.parse::<u64>().is_err() {
+                return Err(ActionError::new(
+                    ErrorCode::Malformed,
+                    "Invalid Discord id",
+                    format!("bad_{field}"),
+                ));
+            }
+            Ok(value)
+        };
         Ok(Self {
-            discord_id: require_snowflake(body, "discord_id")?,
-            channel_id: require_snowflake(body, "channel_id")?,
+            discord_id: canonical_id("discord_id")?,
+            channel_id: canonical_id("channel_id")?,
         })
     }
 
@@ -2635,6 +2694,86 @@ mod tests {
     }
 
     #[test]
+    fn voice_member_buckets_reclaim_only_full_entries() {
+        let mut buckets = TokenBuckets::new();
+        const ACTIVE: &str = "123456789012345678";
+        const NEW: &str = "123456789012349999";
+        for offset in 0..TokenBuckets::VOICE_MEMBER_LIMIT {
+            let member = (123456789012345678u64 + offset as u64).to_string();
+            assert!(buckets.take_voice_member(&member, 0).allowed);
+        }
+        for _ in 1..6 {
+            assert!(buckets.take_voice_member(ACTIVE, 0).allowed);
+        }
+        let denied = buckets.take_voice_member(NEW, 49_999);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 1);
+        assert_eq!(
+            buckets.voice_members.len(),
+            TokenBuckets::VOICE_MEMBER_LIMIT
+        );
+        assert!(buckets.take_voice_member(NEW, 50_000).allowed);
+        assert_eq!(buckets.voice_members.len(), 2);
+        assert!(buckets.take_voice_member(ACTIVE, 50_000).allowed);
+        assert!(!buckets.take_voice_member(ACTIVE, 50_000).allowed);
+    }
+
+    #[test]
+    fn voice_member_capacity_retry_waits_for_a_full_bucket() {
+        let mut buckets = TokenBuckets::new();
+        for offset in 0..TokenBuckets::VOICE_MEMBER_LIMIT {
+            let member = (123456789012345678u64 + offset as u64).to_string();
+            for _ in 0..6 {
+                assert!(buckets.take_voice_member(&member, 0).allowed);
+            }
+        }
+        let denied = buckets.take_voice_member("123456789012349999", 0);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 300);
+    }
+
+    #[test]
+    fn voice_member_refills_at_the_same_boundary_with_or_without_denials() {
+        let mut buckets = TokenBuckets::new();
+        let polled = "123456789012345678";
+        let idle = "123456789012345679";
+        for member in [polled, idle] {
+            for _ in 0..6 {
+                assert!(buckets.take_voice_member(member, 0).allowed);
+            }
+        }
+        for step in 1..10 {
+            assert!(!buckets.take_voice_member(polled, step * 5_000).allowed);
+        }
+        assert!(buckets.take_voice_member(polled, 50_000).allowed);
+        assert!(buckets.take_voice_member(idle, 50_000).allowed);
+    }
+
+    #[test]
+    fn voice_member_reinsertion_does_not_credit_clock_recovery() {
+        let mut buckets = TokenBuckets::new();
+        const FIRST: &str = "123456789012345678";
+        for offset in 0..TokenBuckets::VOICE_MEMBER_LIMIT {
+            let member = (123456789012345678u64 + offset as u64).to_string();
+            assert!(buckets.take_voice_member(&member, 100_000).allowed);
+        }
+        assert!(
+            buckets
+                .take_voice_member("123456789012349999", 150_000)
+                .allowed
+        );
+        assert!(!buckets.voice_members.contains_key(FIRST));
+        for _ in 0..6 {
+            assert!(buckets.take_voice_member(FIRST, 100_000).allowed);
+        }
+        let denied = buckets.take_voice_member(FIRST, 100_000);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 100);
+        assert!(!buckets.take_voice_member(FIRST, 150_000).allowed);
+        assert!(buckets.take_voice_member(FIRST, 200_000).allowed);
+    }
+
+    #[test]
     fn voice_move_request_names_one_member_and_one_room() {
         let body = map(json!({
             "discord_id": "123456789012345678",
@@ -2653,6 +2792,26 @@ mod tests {
                 VoiceMoveRequest::validate(&body).unwrap_err().code,
                 ErrorCode::Malformed
             );
+        }
+    }
+
+    #[test]
+    fn voice_move_request_rejects_noncanonical_snowflakes() {
+        for invalid in [
+            "00000000000000000",
+            "012345678901234567",
+            "18446744073709551616",
+        ] {
+            for (member, channel) in [
+                (invalid, "123456789012345679"),
+                ("123456789012345678", invalid),
+            ] {
+                let body = map(json!({"discord_id": member, "channel_id": channel}));
+                assert_eq!(
+                    VoiceMoveRequest::validate(&body).unwrap_err().code,
+                    ErrorCode::Malformed
+                );
+            }
         }
     }
 
