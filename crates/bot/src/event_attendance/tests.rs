@@ -1,43 +1,43 @@
 use super::*;
 use serde_json::json;
 
-const MIN: i64 = 60_000;
+const MIN: i64 = 60_000_000;
 const SCOPE: AttendanceScope<'static> = AttendanceScope {
     guild_id: 42,
     event_key: "game-night",
 };
-const WINDOW: AttendanceWindowMs<'static> = AttendanceWindowMs {
+const WINDOW: AttendanceWindowUs<'static> = AttendanceWindowUs {
     scope: SCOPE,
-    starts_ms: 60 * MIN,
-    ends_ms: 120 * MIN,
+    starts_us: 60 * MIN,
+    ends_us: 120 * MIN,
 };
 const CLOSE: i64 = 135 * MIN;
 
-fn session<'a>(member_id: Snowflake, joined_ms: i64, left_ms: i64) -> SessionMs<'a> {
-    SessionMs {
+fn session<'a>(member_id: Snowflake, joined_us: i64, left_us: i64) -> SessionUs<'a> {
+    SessionUs {
         scope: SCOPE,
         member_id,
         channel_id: 7,
         channel_name: "lobby",
-        name_observed_ns: i128::from(left_ms) * 1_000_000,
+        name_observed_ns: i128::from(left_us) * 1_000,
         is_bot: false,
         afk: false,
-        joined_ms,
-        left_ms: Some(left_ms),
+        joined_us,
+        left_us: Some(left_us),
     }
 }
 
-fn project(rows: &[SessionMs<'_>]) -> Result<Value, AttendanceRefusal> {
+fn project(rows: &[SessionUs<'_>]) -> Result<Value, AttendanceRefusal> {
     project_attendance(&WINDOW, rows, CLOSE)
 }
 
 #[test]
 fn final_v1_contains_only_scoped_positive_list_fields() {
-    let mut early = session(2, 40 * MIN, 45 * MIN + 30_000);
+    let mut early = session(2, 40 * MIN, 45 * MIN + 30_000_000);
     early.channel_name = "renamed";
     early.name_observed_ns = i128::MAX - 1;
-    let mut open = session(2, CLOSE - 30_000, CLOSE);
-    open.left_ms = None;
+    let mut open = session(2, CLOSE - 30_000_000, CLOSE);
+    open.left_us = None;
     let mut afk = session(10, 68 * MIN, 80 * MIN);
     afk.channel_id = 9;
     afk.channel_name = "quiet room";
@@ -125,10 +125,10 @@ fn no_eligible_observation_or_invalid_window_refuses() {
     let outside = session(2, 40 * MIN, 45 * MIN - 1);
     assert_eq!(project(&[]), Err(AttendanceRefusal::NoRecord));
     assert_eq!(project(&[bot, outside]), Err(AttendanceRefusal::NoRecord));
-    for (starts_ms, ends_ms) in [(1, 0), (0, i64::MAX), (i64::MIN, 0)] {
-        let window = AttendanceWindowMs {
-            starts_ms,
-            ends_ms,
+    for (starts_us, ends_us) in [(1, 0), (0, i64::MAX), (i64::MIN, 0)] {
+        let window = AttendanceWindowUs {
+            starts_us,
+            ends_us,
             scope: SCOPE,
         };
         let result = project_attendance(&window, &[], i64::MAX);
@@ -154,9 +154,9 @@ fn input_bounds_refuse_whole_result_even_with_tiny_output() {
 #[test]
 fn wire_budget_counts_escaped_utf8_and_reserves_envelope_bytes() {
     let mut row = session(1, 60 * MIN, 70 * MIN);
-    row.channel_name = "";
+    row.channel_name = "x";
     let base = project(&[row]).unwrap();
-    let spare = MAX_RESULT_BYTES - serde_json::to_vec(&base).unwrap().len();
+    let spare = MAX_RESULT_BYTES + 1 - serde_json::to_vec(&base).unwrap().len();
     let mut name = String::from("界");
     name.push_str(&"\"".repeat((spare - 3) / 2));
     name.push_str(&"x".repeat((spare - 3) % 2));
@@ -168,4 +168,23 @@ fn wire_budget_counts_escaped_utf8_and_reserves_envelope_bytes() {
     let over = format!("{name}x");
     row.channel_name = &over;
     assert_eq!(project(&[row]), Err(AttendanceRefusal::OverBudget));
+}
+
+#[test]
+fn sub_millisecond_overlap_counts_but_below_threshold_time_does_not_round_up() {
+    let ten = WINDOW.starts_us + 10 * MIN;
+    let near_threshold = session(2, WINDOW.starts_us + 900, ten + 100);
+    let mut empty_rename = session(2, ten + 100, ten + 100);
+    empty_rename.channel_name = "";
+    let mut unnamed = session(3, ten, ten + 10 * MIN);
+    unnamed.channel_id = 8;
+    unnamed.channel_name = "";
+    let result = project(&[near_threshold, empty_rename, unnamed]).unwrap();
+    assert_eq!(result["members"][0]["minutes"], 9);
+    assert_eq!(result["members"][1]["minutes"], 10);
+    assert_eq!(result["peak_concurrent"], 2);
+    assert_eq!(
+        result["rooms"],
+        json!([{"channel_id": "7", "name_at_close": "lobby"}])
+    );
 }
