@@ -21,7 +21,7 @@ Use these findings when resuming work from the November 10 snapshot below.
 - **AutoMod verdict preview:** The bounded store (#2267), audit commit gate
   (#2264), and Discord handler (#2270) are on main. The dry-run and repeat
   isolation regression (#2342) and conditional staging-guild registration
-  (#2343) also landed. [Spec §8](../automod-preview-spec.md) calls for the
+  (#2343) also landed. [Spec §9, slice 4](../automod-preview-spec.md#9-future-build-slices-each-1-day-cut-ready-not-created-here) calls for the
   exact-head Actions proof and a read-only registry receipt from the
   qualified staging artifact. Check the serving SHA and registry before
   treating publication as verified. The scope is staging only.
