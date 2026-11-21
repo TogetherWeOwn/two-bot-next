@@ -291,6 +291,8 @@ pub struct CommandRuntime {
     preview_limiter: Mutex<PreviewRateLimiter>,
     #[cfg(test)]
     pub(crate) preview_metrics: OnceLock<two_bot_core::metrics::Metrics>,
+    #[cfg(test)]
+    pub(crate) preview_deployment: OnceLock<std::collections::HashMap<String, String>>,
     tasks: Mutex<DispatchTasks>,
     giveaways: crate::giveaway_runtime::GiveawayRuntime,
     /// Interactions admitted per member; see [`crate::interaction_admission`].
@@ -401,6 +403,8 @@ impl CommandRuntime {
             preview_limiter: Mutex::default(),
             #[cfg(test)]
             preview_metrics: OnceLock::new(),
+            #[cfg(test)]
+            preview_deployment: OnceLock::new(),
             tasks: Mutex::new(DispatchTasks::default()),
             user_slots: UserSlots::default(),
             self_roles,
@@ -837,6 +841,8 @@ impl CommandRuntime {
             if handles.len() < DISPATCH_LIMITS[lane] {
                 let task = tokio::spawn(work);
                 handles.push(task.abort_handle());
+                #[cfg(test)]
+                crate::command_runtime_tests::capture_dispatch_worker(task);
                 return true;
             }
         }
@@ -1693,7 +1699,15 @@ impl CommandRuntime {
                 interaction,
                 receipt.utc_ms,
                 receipt.received_at + Duration::from_secs(2),
-                |guild| crate::automod_gateway::preview_live_config(guild, live),
+                |guild| {
+                    #[cfg(test)]
+                    if let Some(deployment) = self.preview_deployment.get() {
+                        return crate::automod_gateway::resolve_live_config(
+                            deployment, guild, live?,
+                        );
+                    }
+                    crate::automod_gateway::preview_live_config(guild, live)
+                },
             )
             .await;
             self.answer_preview(
