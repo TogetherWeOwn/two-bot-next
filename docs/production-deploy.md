@@ -310,11 +310,11 @@ the staging holder entirely. A superseded SHA refuses before acquisition;
 select the current verified candidate on the next promotion rather than
 starting a different build under the old candidate's authorization.
 
-The staging lock spans startup, baseline, measurement, final evidence and
-release in one job, including failed/cancelled cleanup. Native persisted expiry
+The reusable soak holds the non-cancelling `staging-lifecycle` lock across
+baseline, one inherited voice exercise, measurement and release. Native expiry
 is still required if the runner disappears; `always()` alone is not cleanup
 proof. The original absolute expiry never moves. The grant remains capped at
-40 minutes; the job has a 50-minute timeout, leaving ten minutes for
+40 minutes; the 50-minute finish timeout is not a lock cap. It leaves time for
 checkout/setup, stop and evidence rather than cancelling cleanup at the grant
 cap. Startup readiness can consume up to five minutes before the fresh
 30-minute interval; final sampling and original-grant readiness must still finish
@@ -328,7 +328,7 @@ fail closed, retain evidence and safely release or expire; hold and route the
 missing proof rather than renew or promote. This holder does not authorize B2.
 Lifecycle NDJSON and available
 measurement JSON are always retained as
-`staging-soak-<run_id>-<run_attempt>` for seven days. The soak runs outside the
+`staging-soak[-start]-<run_id>-<run_attempt>` for seven days. The soak runs outside the
 `deploy-production` lane — only the `production` job holds it —
 so a staging wait never queues an operator production rollback behind it. The lane keeps the default single pending slot, so a `recheck`
 job waits for the soak and both gates, then re-reads the disable, the hold,
@@ -418,7 +418,7 @@ soaked candidate on staging with production as it serves now:
   bearer). Automatic runs and manual staged takeovers measure the full fresh
   interval with `wrangler/scripts/staging-soak-window.mjs`; a manual
   cutover-hold deploy retains its distinct no-delay policy.
-- Under that same job's staging lock, it runs the final staging user-flow
+- Under that same workflow's staging lock, it runs the final staging user-flow
   probe pinned to the guarded SHA and bound to
   the guarded run-attempt build (a same-SHA redeploy no longer proves the
   candidate soaked), one `/ops/metrics` scrape, and a read-only listing of
@@ -432,7 +432,7 @@ soaked candidate on staging with production as it serves now:
   baseline and the post-soak sample, the process restarted mid-soak and the
   cumulative counters after the restart no longer cover the soak, so the
   ratio records `insufficient_data` instead of a pass. The baseline is always
-  supplied from the same bounded job, never optional historical evidence.
+  supplied by artifact ID from this run and attempt, never historical evidence.
   A post-sample original-grant readiness check and confirmed release must
   succeed before the job can pass; unknown cleanup is not a green verdict.
 - `staging-soak-evidence` only forwards that successful job's recorded

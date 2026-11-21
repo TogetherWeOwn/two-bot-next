@@ -59,7 +59,7 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
         })
 
     def test_both_policy_consumers_reject_lock_or_guard_drift(self):
-        workflows = lifecycle.load_all()
+        workflows = policy.load_workflows()
         canonical = workflows[lifecycle.DEPLOY]["concurrency"]["group"].casefold()
         self.assertEqual(policy.workflow_policy_errors(workflows), [])
         self.assertEqual(lifecycle.repository_errors(workflows, canonical), [])

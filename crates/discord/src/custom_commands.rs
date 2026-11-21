@@ -294,7 +294,8 @@ impl CustomCommandRuntime {
                 | "command-edit"
         );
         let builtin = builtin_command_names().contains(&data.name);
-        if builtin && !management {
+        // This reserved builtin is router-owned even while unpublished.
+        if data.name == "automod-preview" || (builtin && !management) {
             return Ok(false);
         }
         let guild = interaction.guild_id.expect("fenced guild").to_string();
