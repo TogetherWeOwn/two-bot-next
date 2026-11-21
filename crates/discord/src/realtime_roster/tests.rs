@@ -170,6 +170,7 @@ fn unrelated_dispatches_are_not_projected_and_missing_scope_is_an_error() {
         r#"{"op":0,"d":{"guild_id":"10"}}"#.into(),
         r#"{"op":0,"t":null,"d":{"guild_id":"10"}}"#.into(),
         r#"{"op":0,"t":42,"d":{"guild_id":"10"}}"#.into(),
+        r#"{"op":0,"t":{"GUILD_SCHEDULED_EVENT_DELETE":null},"d":{"guild_id":"10","id":"94"}}"#.into(),
         r#"[0,"GUILD_SCHEDULED_EVENT_DELETE",{"guild_id":"10","id":"94"}]"#.into(),
         dispatch("GUILD_MEMBER_REMOVE", json!({"user": {"id": "42"}})),
         dispatch("GUILD_SCHEDULED_EVENT_DELETE", json!(["10"])),
