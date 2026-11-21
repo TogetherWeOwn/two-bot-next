@@ -1,5 +1,5 @@
 Backport rhysd/actionlint@644076a59742c2d1540ebd4686eab3c308f0e562 to v1.7.12.
-Remove once a pinned release ships queue syntax and the associated checks.
+Also normalize GitHub's $/ workflow calls to the same-commit ./ spelling for linting. Remove once upstream supports both.
 
 diff --git a/ast.go b/ast.go
 --- a/ast.go
@@ -28,6 +28,10 @@ diff --git a/parse.go b/parse.go
 +	}
 +	if ret.Queue != nil && ret.CancelInProgress != nil && !ret.Queue.ContainsExpression() && ret.Queue.Value == "max" && ret.CancelInProgress.Expression == nil && ret.CancelInProgress.Value {
 +		p.errorfAt(ret.Queue.Pos, "\"queue: max\" cannot be combined with \"cancel-in-progress: true\" in \"concurrency\" section")
+@@ -1383,0 +1397,3 @@
++			if call.Uses != nil && strings.HasPrefix(call.Uses.Value, "$/.github/workflows/") {
++				call.Uses.Value = "." + call.Uses.Value[1:]
++			}
 diff --git a/rule_expression.go b/rule_expression.go
 --- a/rule_expression.go
 +++ b/rule_expression.go

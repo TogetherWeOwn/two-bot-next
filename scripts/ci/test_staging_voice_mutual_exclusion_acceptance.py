@@ -59,6 +59,7 @@ from unittest import mock
 
 import yaml
 
+from staging_soak_policy import PRODUCTION_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
     WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
@@ -180,9 +181,13 @@ def _parsed(root):
             for path in sorted(root.glob("*.yml"))}
 
 
-def load_all(root=WORKFLOWS):
+def load_all(root=WORKFLOWS, *, workflows=None):
     # Parse once; callers may mutate their copy.
-    return deepcopy(_parsed(root))
+    workflows = deepcopy(_parsed(root) if workflows is None else workflows)
+    if admitted_soak(workflows):
+        workflows[PRODUCTION]["jobs"][SOAK] = soak_view(workflows)
+        del workflows[STAGING_SOAK]
+    return workflows
 
 
 def events(workflow):
@@ -203,6 +208,8 @@ def group_values(raw, context, triggers):
         return None
     if EXPRESSION not in raw:
         return frozenset({("lit", raw.casefold())})
+    if context == "standalone" and raw == PRODUCTION_GROUP:
+        return frozenset({("lit", "deploy-production"), ("attempt", "deploy-production-refused-")})
     called = CALLED_FORM.fullmatch(raw.strip())
     if called:
         prefix, fallback = called.groups()
@@ -239,7 +246,7 @@ def may_equal(value, canonical):
     kind, text = value
     if kind == "lit":
         return text == canonical
-    return re.fullmatch(re.escape(text) + r"[0-9]+", canonical) is not None
+    return re.fullmatch(re.escape(text) + (r"[0-9]+-[0-9]+" if kind == "attempt" else r"[0-9]+"), canonical) is not None
 
 
 def may_hold(node, context, triggers, canonical):
@@ -615,6 +622,7 @@ def repository_errors(wfs, canonical):
             env = str(node.get("environment") or "")
             touches = STAGING_TOUCH.search(str(node)) or "staging" in env
             classified = (file in (DEPLOY, *CONSUMERS) or (file, name) in holders
+                          or (file == STAGING_SOAK and admitted_soak(wfs))
                           or (measurement and (name in MEASUREMENT_STAGING_JOBS or name in MEASUREMENT_CALLS))
                           or (file, name) in EXEMPT)
             if touches and not classified:
@@ -815,6 +823,7 @@ def promotion_soak_errors(wfs, canonical):
 
 
 def lifecycle_errors(wfs):
+    wfs = load_all(workflows=wfs) if STAGING_SOAK in wfs else wfs
     errors = []
     canonical = canonical_group(wfs.get(DEPLOY, {}), errors)
     if canonical is None:
