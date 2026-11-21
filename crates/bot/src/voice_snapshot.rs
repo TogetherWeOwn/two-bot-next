@@ -263,12 +263,72 @@ fn total_in_voice(rooms: &[RoomDraft]) -> usize {
         .sum()
 }
 
-#[cfg(test)]
 pub(crate) fn read_voice_total(
     cache: &two_bot_discord::SharedCache,
     guild_id: Snowflake,
 ) -> Result<usize, SnapshotRefusal> {
     observe_rooms(cache, guild_id).map(|rooms| total_in_voice(&rooms))
+}
+
+/// Private five-minute sampling of the same fenced aggregate.
+pub(crate) mod heat {
+    use std::{sync::Arc, time::Duration};
+
+    use sqlx::PgPool;
+    use time::OffsetDateTime;
+    use tokio::sync::{Mutex, RwLock};
+    use two_bot::voice_heat::VoiceHeat;
+    use two_bot_core::Snowflake;
+    use two_bot_discord::SharedCache;
+
+    use crate::{
+        gateway::GatewayState,
+        jobs::{self, Job},
+    };
+
+    pub(crate) const NAME: &str = "voice_heat";
+    const CADENCE: Duration = Duration::from_secs(300);
+    type Gateway = RwLock<GatewayState>;
+
+    pub fn job(pool: PgPool, guild: Snowflake, cache: Arc<SharedCache>, gw: Arc<Gateway>) -> Job {
+        job_with_clock(pool, guild, cache, gw, OffsetDateTime::now_utc)
+    }
+
+    pub(super) fn job_with_clock(
+        pool: PgPool,
+        guild: Snowflake,
+        cache: Arc<SharedCache>,
+        gw: Arc<Gateway>,
+        now: impl Fn() -> OffsetDateTime + Clone + Send + Sync + 'static,
+    ) -> Job {
+        let buffer = Arc::new(Mutex::new(VoiceHeat::default()));
+        Job {
+            name: NAME,
+            cadence: CADENCE,
+            cadence_source: None,
+            startup_jitter: jobs::startup_jitter(CADENCE, rand::random()),
+            timeout: VoiceHeat::TICK_TIMEOUT,
+            action: Arc::new(move || {
+                let (pool, cache, gw, buffer) =
+                    (pool.clone(), cache.clone(), gw.clone(), buffer.clone());
+                let now = now.clone();
+                Box::pin(async move {
+                    let mut buffer = buffer.lock().await;
+                    let total = observation(&cache, &gw, guild);
+                    buffer.tick(now(), total, &pool).await
+                })
+            }),
+        }
+    }
+
+    fn observation(cache: &SharedCache, gw: &Gateway, id: Snowflake) -> Option<i64> {
+        // Keep the connected fence held through the complete cache read.
+        let state = gw.try_read().ok()?;
+        if *state != GatewayState::Connected {
+            return None;
+        }
+        i64::try_from(super::read_voice_total(cache, id).ok()?).ok()
+    }
 }
 
 /// Whole-second Zulu timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for `observed_at`.
@@ -452,6 +512,38 @@ pub(crate) fn project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_a_connected_complete_snapshot_adds_an_observation() {
+        use crate::{gateway::GatewayState::*, jobs::ErrorClass};
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use time::{macros::datetime, Duration};
+        use tokio::sync::RwLock;
+        use two_bot::voice_heat::VoiceHeat;
+
+        let cache = new_shared_cache();
+        let gateway = Arc::new(RwLock::new(Connected));
+        let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new_without_pgpass());
+        pool.close().await;
+        let hour = Arc::new(AtomicI64::new(0));
+        let clock = hour.clone();
+        let job = heat::job_with_clock(pool, 100, cache.clone(), gateway.clone(), move || {
+            datetime!(2026-11-21 00:00 UTC) + Duration::hours(clock.load(Ordering::Relaxed))
+        });
+        assert_eq!(job.timeout, VoiceHeat::TICK_TIMEOUT);
+        let probe = async |state, tick_hour| {
+            *gateway.write().await = state;
+            hour.store(tick_hour, Ordering::Relaxed);
+            (job.action)().await
+        };
+        assert_eq!(probe(Connected, 0).await, Ok(()));
+        cache.update(&pipeline_guild(&[]));
+        assert_eq!(probe(Armed, 1).await, Ok(()));
+        assert_eq!(probe(Connected, 2).await, Ok(()));
+        // Neither gap created a zero; the true zero now reaches the closed pool.
+        assert_eq!(probe(Draining, 3).await, Err(ErrorClass::Database));
+    }
 
     #[test]
     fn guild_snapshot_eligibility_tracks_gateway_lifecycle() {

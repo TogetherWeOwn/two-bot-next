@@ -212,6 +212,7 @@ class FakeClient:
         self.zero_instance_first = None
         self.zero_instance_last = None
         self.calls = []
+        self.stop_staging = Mock()
 
     def respond(self, routes, key):
         if key not in routes or not routes[key]:
@@ -780,6 +781,22 @@ class IdentityAndControlPlaneTests(OfflineTestCase):
 
 
 class ClientSanitizationTests(OfflineTestCase):
+    def test_stop_subprocess_passes_only_the_bound_staging_inputs_and_deadline(self):
+        parent_env = {"PATH": "/usr/bin", "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
+                      "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2",
+                      "STAGING_USE_EXPIRES_AT": "1700000000000", "STAGING_USE_RECEIPT": "test.jsonl"}
+        client = rollout.Client(ACCOUNT, SENTINEL, deadline=128)
+        with patch.dict(os.environ, {**parent_env, "CLOUDFLARE_API_TOKEN": SENTINEL}, clear=True), \
+                patch.object(rollout.time, "monotonic", return_value=100), \
+                patch.object(rollout.subprocess, "run", return_value=Mock(returncode=0)) as run:
+            client.stop_staging(URL, VERSION, REVISION)
+        script = Path(__file__).resolve().parents[1] / "wrangler/scripts/staging-use.mjs"
+        self.assertTrue(script.is_file())
+        run.assert_called_once_with(["node", str(script), "stop"], timeout=28,
+                                    env={**parent_env, "STAGING_WORKER_URL": URL,
+                                         "STAGING_USE_DEPLOYMENT": VERSION, "STAGING_USE_SHA": REVISION,
+                                         "STAGING_STOP_TIMEOUT_MS": "28000"})
+
     def test_authenticated_api_retries_transport_failures_with_bounded_backoff(self):
         client = rollout.Client(ACCOUNT, SENTINEL)
         response = Mock(status=200, headers={})
@@ -933,6 +950,10 @@ class DeploymentWiringTests(unittest.TestCase):
         self.assertLess(steps.index(deploy[0]), steps.index(receipt[0]))
         self.assertLess(steps.index(receipt[0]), steps.index(takeover[0]))
         self.assertLess(steps.index(takeover[0]), steps.index(verify[0]))
+        use = next(step for step in steps if "staging-use-pipeline.mjs begin" in step)
+        self.assertLess(steps.index(use), steps.index(verify[0]))
+        self.assertIn("STAGING_USE_EXPIRES_AT: ${{ steps.use.outputs.expires_at }}", verify[0])
+        self.assertIn("OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}", verify[0])
         self.assertNotRegex(receipt[0], r"(?m)^\s*(?:if|continue-on-error):")
         self.assertIn("set -euo pipefail", receipt[0])
         self.assertIn('--receipt "$ROLLOUT_DIR/baseline.json"', receipt[0])
@@ -1344,6 +1365,98 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(evidence["rollout_id"], NEW_ROLLOUT)
         self.assert_no_secret_saved_or_printed()
 
+    def test_forward_replaces_the_process_started_by_an_early_alarm(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        pending = {**completed_row(), "status": "progressing"}
+        done = completed_row()
+        done["health"]["instances"].update(active=0)
+        client.api_routes[DETAIL_PATH] = [pending, done]
+        client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+        # The grant saw a stopped singleton. A pending-rollout alarm can still
+        # start the prior build before any acceptance probe runs.
+        status, headers, body = ready_response()
+        old = {**json.loads(body), "build_revision": "f" * 40}
+        alarm_start = self.clock.sleep
+
+        def start_early(seconds):
+            alarm_start(seconds)
+            if not client.stop_staging.called:
+                client.request_routes[URL + "/readyz"] = [(status, headers, json.dumps(old).encode())]
+
+        def stop(url, version, revision):
+            self.assertEqual((url, version, revision), (URL, VERSION, REVISION))
+            self.assertEqual(client.calls.count(("api", DETAIL_PATH)), 2)
+            self.assertEqual(json.loads(client.request_routes[URL + "/readyz"][0][2]), old)
+            client.request_routes[URL + "/readyz"] = [ready_response()]
+
+        client.stop_staging.side_effect = stop
+        client.deadline = 130
+        with patch.object(rollout.time, "sleep", side_effect=start_early):
+            rollout.verify(self.args, client)
+        client.stop_staging.assert_called_once()
+        evidence = json.loads(Path(self.args.evidence).read_text())
+        self.assertTrue(evidence["active_lag"])
+        self.assertTrue(evidence["application_listing_lag"])
+
+    def test_completed_zero_instance_rollout_can_cold_start_after_stop(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        client.api_routes[DETAIL_PATH] = [zero, completed_row()]
+
+        def stop(*_):
+            self.assertEqual(client.calls.count(("api", DETAIL_PATH)), 1)
+            self.assertFalse(any(kind == "request" for kind, _ in client.calls))
+
+        client.stop_staging.side_effect = stop
+        rollout.verify(self.args, client)
+        client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
+        self.assertEqual(json.loads(Path(self.args.evidence).read_text())["readyz"], 200)
+
+    def test_post_stop_counters_can_drop_before_the_exact_replacement_converges(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for counter in ("zero", "starting", "scheduling"):
+            with self.subTest(counter=counter):
+                self.args.evidence = str(self.root / f"evidence-{counter}.json")
+                client = verify_client()
+                transient = completed_row()
+                counts = transient["health"]["instances"]
+                counts.update(active=0, healthy=0)
+                if counter != "zero":
+                    counts[counter] = 1
+                # First opening read, first final recheck, then a healthy retry.
+                client.api_routes[DETAIL_PATH] = [completed_row(), transient, completed_row(), completed_row()]
+                client.deadline = self.clock.now + 20
+
+                def retry(seconds, client=client):
+                    self.assertEqual(seconds, 5)
+                    self.assertEqual(client.calls[-1], ("api", DETAIL_PATH))
+                    self.assertEqual(client.calls.count(("request", URL + "/readyz")), 1)
+                    self.assert_no_evidence()
+                    self.clock.sleep(seconds)
+
+                with patch.object(rollout.time, "sleep", side_effect=retry) as sleep:
+                    rollout.verify(self.args, client)
+                sleep.assert_called_once_with(5)
+                client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
+                self.assertEqual(client.calls.count(("api", DETAIL_PATH)), 4)
+                self.assertEqual(client.calls.count(("request", URL + "/readyz")), 2)
+                self.assertEqual(json.loads(Path(self.args.evidence).read_text())["readyz"], 200)
+
+    def test_stop_refusal_prevents_readiness_on_completed_rollout(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.stop_staging.side_effect = rollout.GateError("staging_stop_unconfirmed")
+        self.assert_gate("staging_stop_unconfirmed", rollout.verify, self.args, client)
+        self.assertFalse(any(kind == "request" for kind, _ in client.calls))
+        self.assert_no_evidence()
+
     def test_forward_mismatch_records_only_the_rejected_sample(self):
         self.prepare_baseline()
         self.write_deploy_output()
@@ -1725,24 +1838,19 @@ class OrchestrationTests(OfflineTestCase):
         self.write_deploy_output()
 
     def test_final_reread_accepts_counters_that_wobble_between_completed_shapes(self):
-        # First read lag, final read converged (and the reverse): the exact
-        # build served ready both times, so a counter wobble must not fail.
-        for first, final, active_lag_expected in [
-            (lag_row(), completed_row(), True),
-            (completed_row(), lag_row(), False),
-        ]:
-            with self.subTest(first_is_lag=active_lag_expected):
+        # A pre-stop convergence sample cannot make a post-stop lagging row
+        # pass on its own. Both directions still accept two exact lag passes.
+        for first, final in [(lag_row(), completed_row()), (completed_row(), lag_row())]:
+            with self.subTest(first=first["health"]):
                 self.fresh_baseline()
                 client = verify_client()
                 client.api_routes[ROWS_PATH] = [[old_row(), first]]
-                client.api_routes[DETAIL_PATH] = [first, final]
-                if active_lag_expected:
-                    client.api_routes[DETAIL_PATH] = [first, first, first, final]
-                    client.request_routes[URL + "/readyz"] = [ready_response()]
-                    client.deadline = 130
+                client.api_routes[DETAIL_PATH] = [first, final, lag_row(), final]
+                client.deadline = 130
                 rollout.verify(self.args, client)
                 evidence = json.loads(Path(self.args.evidence).read_text())
-                self.assertEqual(evidence.get("active_lag", False), active_lag_expected)
+                self.assertTrue(evidence["active_lag"])
+                self.assertEqual(client.calls.count(("request", URL + "/readyz")), 2)
                 Path(self.args.evidence).unlink()
 
     def test_final_reread_still_rejects_failed_starting_or_idle_counters(self):
@@ -1760,7 +1868,7 @@ class OrchestrationTests(OfflineTestCase):
         self.fresh_baseline()
         client = verify_client()
         client.api_routes[DETAIL_PATH] = [completed_row(), idle]
-        self.assert_gate("rollout_not_converged", rollout.verify, self.args, client)
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
         self.assert_no_evidence()
 
     def test_lag_without_exact_runtime_never_succeeds(self):
@@ -2583,6 +2691,8 @@ class OrchestrationTests(OfflineTestCase):
 
         client = rollout.Client(ACCOUNT, SENTINEL, deadline=clock.now + 300)
         client.opener = Opener()
+        # Exercise real HTTP deadline clamping without invoking the stop subprocess.
+        client.stop_staging = Mock()
         return client, timeouts
 
     def gate_error_at_deadline_offset(self, offset):
@@ -2632,6 +2742,7 @@ class OrchestrationTests(OfflineTestCase):
         failure = {"phase": "durable_gateway", "class": "checkpoint_load_failed"}
         client, _ = self.client_with_real_deadline_reads(failure)
         self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
         self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
         self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()

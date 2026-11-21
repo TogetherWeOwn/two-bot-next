@@ -37,6 +37,9 @@ use two_bot_core::{
 };
 use two_bot_testsupport::{guard_database_url, TestDatabase};
 
+#[path = "website_contract/voice_heat.rs"]
+mod voice_heat;
+
 const GUILD: &str = "326474832151838730";
 const OBSERVED_AT: &str = "2026-08-25T20:00:00.000Z";
 
@@ -194,7 +197,7 @@ async fn intervals_are_the_contract_values() {
     assert_eq!(LIVE_COUNTER_INTERVAL_MS, 60_000);
     assert_eq!(RANK_SNAPSHOT_INTERVAL_MS, 600_000);
     assert_eq!(SCHEDULED_EVENTS_INTERVAL_MS, 10 * 60 * 1000);
-    assert_eq!(WEB_CONTRACT_VIEWS.len(), 10);
+    assert_eq!(WEB_CONTRACT_VIEWS.len(), 11);
 }
 
 #[tokio::test]
@@ -216,7 +219,7 @@ async fn migrations_seed_ladder_version_and_views() {
             .fetch_one(&pool)
             .await
             .expect("meta row");
-    assert_eq!(version, "1.0");
+    assert_eq!(version, "1.1");
     assert_eq!(guild, None);
 
     let views: Vec<String> =
@@ -351,7 +354,7 @@ async fn contract_refuses_a_missing_or_unsafe_current_schema_before_ddl() {
             .fetch_one(&public)
             .await
             .expect("public preserved");
-    assert_eq!(public_views, 10);
+    assert_eq!(public_views, WEB_CONTRACT_VIEWS.len() as i64);
     sqlx::raw_sql("DROP SCHEMA \"tog10090-unsafe\" CASCADE;")
         .execute(&public)
         .await
@@ -1418,13 +1421,12 @@ async fn upcoming_and_next_serve_scheduled_and_active_only_as_utc() {
 
 #[tokio::test]
 async fn contract_meta_pins_version_and_view_shapes() {
-    // Any view-shape change is a contract version bump: update
-    // WEB_CONTRACT_VERSION (website_store.rs), the 0300 seed default, and
-    // this table together — or ship the change as a web_v2 schema instead.
+    // Update the published version and the view shapes together. Keep the
+    // historical migration seed at 1.0.
     let fixture = connect().await;
     let pool = fixture.pool().clone();
 
-    assert_eq!(WEB_CONTRACT_VERSION, "1.0");
+    assert_eq!(WEB_CONTRACT_VERSION, "1.1");
     let (version, _guild): (String, Option<String>) =
         sqlx::query_as("SELECT contract_version, guild_id FROM web_contract_meta")
             .fetch_one(&pool)
@@ -1439,7 +1441,7 @@ async fn contract_meta_pins_version_and_view_shapes() {
             .fetch_one(&pool)
             .await
             .expect("contract_meta");
-    assert_eq!(meta, ("1.0".to_owned(), None));
+    assert_eq!(meta, ("1.1".to_owned(), None));
 
     // Exact column shapes in ordinal order. CREATE OR REPLACE VIEW already
     // refuses renames/removes/retypes at deploy time; this pins appends too.
@@ -1511,6 +1513,18 @@ async fn contract_meta_pins_version_and_view_shapes() {
             "upcoming_events",
             &["event_id", "name", "starts_at", "channel_id", "description"],
         ),
+        (
+            "voice_heat",
+            &[
+                "dow",
+                "hour",
+                "avg_in_voice",
+                "sample_days",
+                "coverage",
+                "measured_through",
+                "source",
+            ],
+        ),
     ];
     assert_eq!(by_view.len(), expected.len(), "view count drift");
     for &(view, columns) in expected {
@@ -1575,4 +1589,50 @@ async fn event_status_round_trips() {
         id: String::new(),
         excluded_member_ids: HashSet::new(),
     };
+}
+
+async fn recorded_contract_version(pool: &Pool<Postgres>) -> String {
+    sqlx::query_scalar("SELECT contract_version FROM web_contract_meta")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn cutover_view_publication_is_atomic_guarded_and_idempotent() {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").unwrap();
+    let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .unwrap();
+    let pool = fixture.pool();
+    sqlx::query("ALTER TABLE voice_heat_hours RENAME TO displaced_contract_dependency")
+        .execute(pool)
+        .await
+        .unwrap();
+    let error = apply_web_contract(pool).await.unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("42P01")
+    );
+    let partial_schema: bool = sqlx::query_scalar("SELECT to_regnamespace('web_v1') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(!partial_schema);
+    assert_eq!(recorded_contract_version(pool).await, "1.0");
+    sqlx::query("ALTER TABLE displaced_contract_dependency RENAME TO voice_heat_hours")
+        .execute(pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        apply_web_contract(pool).await.unwrap();
+        assert_eq!(recorded_contract_version(pool).await, WEB_CONTRACT_VERSION);
+    }
+    sqlx::query("UPDATE web_contract_meta SET contract_version = '2.0'")
+        .execute(pool)
+        .await
+        .unwrap();
+    apply_web_contract(pool).await.unwrap();
+    assert_eq!(recorded_contract_version(pool).await, "2.0");
+    fixture.close().await.unwrap();
 }

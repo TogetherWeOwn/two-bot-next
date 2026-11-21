@@ -110,6 +110,35 @@ async fn migrations_contract_and_checksum_guard() {
         .unwrap();
     assert_eq!(timeout, "15s");
     assert_eq!(f.admin.options().get_max_connections(), 5);
+    sqlx::query("ALTER TABLE voice_heat_hours RENAME TO displaced_contract_dependency")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let error = two_bot_store::apply_web_contract(&f.pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("42P01")
+    );
+    let earlier_views = sqlx::query_scalar::<_, bool>("SELECT to_regnamespace($1) IS NOT NULL")
+        .bind(format!("{}_web_v1", f.schema))
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert!(!earlier_views);
+    let version_query = "SELECT contract_version FROM web_contract_meta";
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(version_query)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap(),
+        "1.0"
+    );
+    sqlx::query("ALTER TABLE displaced_contract_dependency RENAME TO voice_heat_hours")
+        .execute(&f.pool)
+        .await
+        .unwrap();
     two_bot_store::apply_web_contract(&f.pool).await.unwrap();
     two_bot_store::apply_web_contract(&f.pool).await.unwrap();
     let web = format!("{}_web_v1", f.schema);
@@ -119,7 +148,7 @@ async fn migrations_contract_and_checksum_guard() {
     .fetch_one(&f.pool)
     .await
     .unwrap();
-    assert_eq!(version, "1.0");
+    assert_eq!(version, "1.1");
     let counts: (Option<i32>, Option<i32>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT human_member_count, online_count FROM {web}.live_counts"
     )))
@@ -143,6 +172,25 @@ async fn migrations_contract_and_checksum_guard() {
     .await
     .unwrap();
     assert_eq!(ladder, 5);
+    let heat: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {web}.voice_heat WHERE coverage = 0 AND source = 'insufficient'"
+    )))
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(heat, 168);
+    sqlx::query("UPDATE web_contract_meta SET contract_version = '2.0'")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    two_bot_store::apply_web_contract(&f.pool).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(version_query)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap(),
+        "2.0"
+    );
     // Corrupt only this test's ledger: a deployed checksum mismatch must fail.
     sqlx::query(
         "UPDATE _two_bot_migrations SET checksum = decode('00', 'hex') WHERE version = 400",

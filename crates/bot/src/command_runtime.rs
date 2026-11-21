@@ -72,8 +72,9 @@ use twilight_model::{
 };
 use two_bot::voice_rooms::voice_claims_custom_id;
 use two_bot_core::{
+    automod_preview_attempt::AttemptResult,
     automod_preview_limiter::PreviewRateLimiter,
-    automod_preview_report::PREVIEW_NOT_EVALUATED_REPLY,
+    automod_preview_report::{metric_not_evaluated, PREVIEW_NOT_EVALUATED_REPLY},
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
     custom_command_store,
@@ -207,6 +208,7 @@ const SATURATION_LOG_WINDOW_SECS: u64 = 60;
 #[derive(Default)]
 struct DispatchTasks {
     stopped: bool,
+    help: help_ingress::HelpTasks,
     lanes: [Vec<tokio::task::AbortHandle>; DISPATCH_LIMITS.len()],
     /// Per-lane drops (test-visible mirror of the global
     /// `two_bot_dispatch_drops_total{lane}` counter, incremented alongside by
@@ -254,6 +256,7 @@ impl Drop for CommandDispatchGuard {
             "command_dispatch_guard",
         );
         tasks.stopped = true;
+        tasks.help.abort();
         for lane in &mut tasks.lanes {
             for handle in lane.drain(..) {
                 handle.abort();
@@ -288,6 +291,10 @@ pub struct CommandRuntime {
     channel: ChannelModerationRuntime,
     automod: OnceLock<Arc<crate::automod_gateway::ProductionAutomod>>,
     preview_limiter: Mutex<PreviewRateLimiter>,
+    #[cfg(test)]
+    pub(crate) preview_metrics: OnceLock<two_bot_core::metrics::Metrics>,
+    #[cfg(test)]
+    pub(crate) preview_deployment: OnceLock<std::collections::HashMap<String, String>>,
     tasks: Mutex<DispatchTasks>,
     giveaways: crate::giveaway_runtime::GiveawayRuntime,
     /// Interactions admitted per member; see [`crate::interaction_admission`].
@@ -396,6 +403,10 @@ impl CommandRuntime {
             channel,
             automod: OnceLock::new(),
             preview_limiter: Mutex::default(),
+            #[cfg(test)]
+            preview_metrics: OnceLock::new(),
+            #[cfg(test)]
+            preview_deployment: OnceLock::new(),
             tasks: Mutex::new(DispatchTasks::default()),
             user_slots: UserSlots::default(),
             self_roles,
@@ -608,10 +619,8 @@ impl CommandRuntime {
         // in `publish_registry_checked`. Zero means unpinned (unparseable
         // token); such a runtime never publishes on faith.
         if let Some(application_id) = activation.application_id() {
-            runtime.interactions.set_application_id(application_id);
-            runtime
-                .application_id
-                .store(application_id, Ordering::Relaxed);
+            // Cold RESUME has no READY to identify the bot user.
+            runtime.set_identity(application_id, application_id);
         }
         runtime
     }
@@ -730,6 +739,9 @@ impl CommandRuntime {
         received: Instant,
         observed_at: &str,
     ) -> bool {
+        if self.dispatch_help(event, received) {
+            return true;
+        }
         if !ordered {
             return self.dispatch_event(event, None, Some((received, observed_at)));
         }
@@ -832,6 +844,8 @@ impl CommandRuntime {
             if handles.len() < DISPATCH_LIMITS[lane] {
                 let task = tokio::spawn(work);
                 handles.push(task.abort_handle());
+                #[cfg(test)]
+                crate::command_runtime_tests::capture_dispatch_worker(task);
                 return true;
             }
         }
@@ -1658,11 +1672,10 @@ impl CommandRuntime {
                 }
             }
         }
-        let response = match &outcome {
-            SlashOutcome::Refuse {
-                refusal: RouterRefusal::GuildRestricted | RouterRefusal::ModerationDisabled,
-            } if name == "automod-preview" => Some(preview_response(PREVIEW_NOT_EVALUATED_REPLY)),
-            _ => response_for_slash(&outcome),
+        let response = if name == "automod-preview" {
+            preview_router_response(&outcome, self.preview_metrics())
+        } else {
+            response_for_slash(&outcome)
         };
         if let Some(response) = response {
             if name == "automod-preview" {
@@ -1689,13 +1702,21 @@ impl CommandRuntime {
                 interaction,
                 receipt.utc_ms,
                 receipt.received_at + Duration::from_secs(2),
-                |guild| crate::automod_gateway::preview_live_config(guild, live),
+                |guild| {
+                    #[cfg(test)]
+                    if let Some(deployment) = self.preview_deployment.get() {
+                        return crate::automod_gateway::resolve_live_config(
+                            deployment, guild, live?,
+                        );
+                    }
+                    crate::automod_gateway::preview_live_config(guild, live)
+                },
             )
             .await;
             self.answer_preview(
                 interaction.id.get(),
                 &interaction.token,
-                preview_response(result.reply),
+                preview_attempt_response(result, self.preview_metrics()),
                 receipt.callback_deadline(),
             )
             .await;
@@ -2837,6 +2858,14 @@ impl CommandRuntime {
         }
     }
 
+    fn preview_metrics(&self) -> &two_bot_core::metrics::Metrics {
+        #[cfg(test)]
+        if let Some(metrics) = self.preview_metrics.get() {
+            return metrics;
+        }
+        two_bot_core::metrics::global()
+    }
+
     async fn answer_preview(
         &self,
         id: u64,
@@ -3516,6 +3545,36 @@ impl PreviewReceipt {
     }
 }
 
+fn preview_router_response(
+    outcome: &SlashOutcome,
+    metrics: &two_bot_core::metrics::Metrics,
+) -> Option<InteractionResponse> {
+    match outcome {
+        SlashOutcome::Refuse {
+            refusal: RouterRefusal::GuildRestricted | RouterRefusal::ModerationDisabled,
+        } => Some(preview_attempt_response(
+            AttemptResult {
+                reply: PREVIEW_NOT_EVALUATED_REPLY.to_owned(),
+                metric: Some(metric_not_evaluated()),
+            },
+            metrics,
+        )),
+        _ => response_for_slash(outcome),
+    }
+}
+
+fn preview_attempt_response(
+    result: AttemptResult,
+    metrics: &two_bot_core::metrics::Metrics,
+) -> InteractionResponse {
+    // Count the outcome once, before delivery. Callback failure or retry does
+    // not change it, and a successful replay has no metric to record.
+    if let Some(labels) = result.metric {
+        metrics.automod_preview(labels);
+    }
+    preview_response(result.reply)
+}
+
 fn preview_response(text: impl Into<String>) -> InteractionResponse {
     text_response(InteractionReply::new(text, true))
 }
@@ -3653,6 +3712,9 @@ pub(crate) fn sticky_options_strict(
 #[path = "command_runtime_resumed_tests.rs"]
 mod resumed_tests;
 
+#[path = "help_ingress.rs"]
+pub(crate) mod help_ingress;
+
 /// Full-set publication: a bulk replace needs an authoritative custom-command
 /// row load, so an unknown store defers instead of deleting Discord commands.
 pub(crate) fn publication_definitions(
@@ -3679,3 +3741,45 @@ pub(crate) fn publication_definitions(
 #[cfg(test)]
 #[path = "command_runtime_poison_acceptance.rs"]
 mod dispatch_guard_poison_acceptance;
+
+#[cfg(test)]
+mod preview_metric_tests {
+    use super::*;
+    use two_bot_core::{automod_preview_report::metric_unavailable, metrics::Metrics};
+
+    #[test]
+    fn preview_reply_preparation_counts_audit_failure_but_not_replay() {
+        let metrics = Metrics::default();
+        for (reply, metric) in [
+            (
+                two_bot_core::automod_preview_report::PREVIEW_UNAVAILABLE_REPLY,
+                Some(metric_unavailable(Some(true))),
+            ),
+            ("Original audited reply", None),
+        ] {
+            let response = preview_attempt_response(
+                AttemptResult {
+                    reply: reply.to_owned(),
+                    metric,
+                },
+                &metrics,
+            );
+            let data = response.data.as_ref();
+            assert_eq!(data.and_then(|d| d.content.as_deref()), Some(reply));
+            assert_eq!(data.and_then(|d| d.flags), Some(MessageFlags::EPHEMERAL));
+        }
+        let render = metrics.render(None);
+        let nonzero: Vec<_> = render
+            .lines()
+            .filter(|line| {
+                line.starts_with("two_bot_automod_previews_total{") && !line.ends_with(" 0")
+            })
+            .collect();
+        assert_eq!(
+            nonzero,
+            [
+                r#"two_bot_automod_previews_total{result="unavailable",filter="none",mode="dry_run"} 1"#
+            ]
+        );
+    }
+}

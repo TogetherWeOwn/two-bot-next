@@ -43,6 +43,7 @@ use tokio::{
     net::TcpListener,
     sync::{OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinSet,
+    time::{timeout_at, Instant},
 };
 use tracing::Instrument;
 use two_bot_core::{
@@ -101,6 +102,7 @@ const MAX_HEADERS: usize = 64;
 const MAX_REQUESTS: usize = 32;
 const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const VOICE_MOVE_BUDGET: Duration = Duration::from_secs(5);
 /// Headroom inside the supervisor's HTTP drain budget: the receiver's shared
 /// shutdown deadline sits this far inside it, so the receiver always runs its
 /// child-abort path and reports before the supervisor backstop — armed on the
@@ -1490,6 +1492,8 @@ async fn receive(
     id: &str,
     permit: OwnedSemaphorePermit,
 ) -> Response {
+    // Start before reading the signed body or burning its nonce.
+    let wire_deadline = Instant::now() + VOICE_MOVE_BUDGET;
     let reject_boundary =
         |failure| state.reject(failure, KeyLabel::Invalid, ActionLabel::Unknown, id);
     if request.uri().path_and_query().map(|path| path.as_str()) != Some(ACTIONS_PATH) {
@@ -1626,26 +1630,30 @@ async fn receive(
             children.spawn(
                 async move {
                     let _permit = permit;
-                    if let Some(delivery) = delivery {
-                        let result =
-                            voice_move::respond(&task_state, &task_decision, &delivery, &task_id)
-                                .await;
-                        let _ = done_tx.send(match result {
+                    let response = if let Some(delivery) = delivery {
+                        match voice_move::respond(
+                            &task_state,
+                            &task_decision,
+                            (&delivery, &task_id),
+                            wire_deadline,
+                        )
+                        .await
+                        {
                             Ok(result) => event_read_response(result, &task_id),
                             Err(error) => task_state.reject(error, task_key, action, &task_id),
-                        });
-                        return;
-                    }
-                    let response = mutate_event(
-                        &task_state,
-                        &task_decision,
-                        &task_raw,
-                        task_idempotency.as_deref(),
-                        &task_id,
-                        task_key,
-                        action,
-                    )
-                    .await;
+                        }
+                    } else {
+                        mutate_event(
+                            &task_state,
+                            &task_decision,
+                            &task_raw,
+                            task_idempotency.as_deref(),
+                            &task_id,
+                            task_key,
+                            action,
+                        )
+                        .await
+                    };
                     let _ = done_tx.send(response);
                 }
                 .instrument(task_span),
@@ -1655,11 +1663,15 @@ async fn receive(
             // the runtime logs the panic itself.
             while children.try_join_next().is_some() {}
         }
+        if move_nonce.is_some() {
+            return match timeout_at(wire_deadline, done_rx).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) => reject(Failure::code(ErrorCode::DiscordUnavailable), action),
+                Err(_) => reject(Failure::code(ErrorCode::UpstreamTimeout), action),
+            };
+        }
         return match done_rx.await {
             Ok(response) => response,
-            Err(_) if move_nonce.is_some() => {
-                reject(Failure::code(ErrorCode::DiscordUnavailable), action)
-            }
             Err(_) => state.reject(Failure::reconciliation(), key, action, id),
         };
     }

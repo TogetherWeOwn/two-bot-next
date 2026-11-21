@@ -133,6 +133,7 @@ capabilities; this table is not an instruction to create or stage them.
 | --- | --- |
 | `TWO_INTERNAL_ROLE_KEYS` | No allowlisted role target; `role.assign` refuses |
 | `TWO_INTERNAL_ALLOW_ADD_MEMBER` | `guild.add_member` stays gated off |
+| `TWO_INTERNAL_ALLOW_ATTENDANCE_READ` | Reserved gate is off by default; the receiver does not dispatch `event.attendance.read` even if the bot process flag is set |
 | `TWO_INTERNAL_ALLOW_AUTOMATIONS` | Automation export/import stay gated off |
 | `TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE` | Automation overwrite stays gated off |
 | `TWO_INTERNAL_ALLOW_EVENT_CANCEL` | `event.cancel` stays gated off |

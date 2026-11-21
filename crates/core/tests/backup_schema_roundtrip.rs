@@ -1550,7 +1550,7 @@ async fn historical_contract_archive_preserves_installed_capability_and_restores
         "CREATE TABLE schema_migrations (id TEXT PRIMARY KEY);
          INSERT INTO schema_migrations VALUES ('destination-ledger-only');
          UPDATE web_contract_meta SET contract_version = '2.0';
-         DROP TABLE voice_heat_hours;",
+         ALTER TABLE voice_heat_hours RENAME TO displaced_voice_heat_hours;",
     )
     .execute(pool)
     .await
@@ -1565,15 +1565,41 @@ async fn historical_contract_archive_preserves_installed_capability_and_restores
     let guild_count =
         "SELECT human_member_count FROM guild_counters WHERE guild_id = '100000000000000001'";
 
-    // A migrated singleton alone is not an installed contract.
+    // A migrated singleton alone is not an installed contract. Restore also
+    // accepts a pre-heat target; bring its table back before installing 1.1.
     assert!(restore(pool, &old).await.unwrap().ok);
     let unpublished: String = sqlx::query_scalar("SELECT contract_version FROM web_contract_meta")
         .fetch_one(pool)
         .await
         .unwrap();
     assert_eq!(unpublished, "1.0");
+    sqlx::query("ALTER TABLE displaced_voice_heat_hours RENAME TO voice_heat_hours")
+        .execute(pool)
+        .await
+        .unwrap();
     two_bot_core::apply_web_contract(pool).await.unwrap();
-    for (path, installed) in [(&old, "2.0"), (&current, "1.0"), (&current, "2.0")] {
+    for (path, installed) in [
+        (&old, "1.1"),
+        (&old, "2.0"),
+        (&current, "1.1"),
+        (&current, "2.0"),
+    ] {
+        sqlx::query(
+            "INSERT INTO voice_heat_hours
+             SELECT h, 3, 6, h + interval '10 minutes'
+             FROM (SELECT (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+                   - interval '1 hour' AS h) latest",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let populated: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM web_v1.voice_heat WHERE avg_in_voice IS NOT NULL",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(populated, 1);
         sqlx::query("UPDATE web_contract_meta SET contract_version = $1, guild_id = 'destination'")
             .bind(installed)
             .execute(pool)
@@ -1586,6 +1612,14 @@ async fn historical_contract_archive_preserves_installed_capability_and_restores
         let report = restore(pool, path).await.unwrap();
         assert!(report.ok);
         assert!(!report.initialized_tables.contains_key("web_contract_meta"));
+        let gap_cells: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM web_v1.voice_heat WHERE avg_in_voice IS NULL
+             AND coverage = 0 AND measured_through IS NULL AND source = 'insufficient'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(gap_cells, 168);
         let meta: (String, Option<String>) =
             sqlx::query_as(meta_view).fetch_one(pool).await.unwrap();
         assert_eq!(

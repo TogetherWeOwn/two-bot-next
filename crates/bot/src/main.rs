@@ -1024,6 +1024,7 @@ async fn run(cli_args: &[String]) {
         receiver,
         eventsub_receiver,
         member,
+        voice_cache,
     );
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,

@@ -1,5 +1,6 @@
 //! Runtime services shared by the gateway and interaction server.
 
+pub mod voice_heat;
 mod voice_room_plan;
 pub mod voice_rooms;
 
@@ -23,6 +24,7 @@ pub mod containment_runtime;
 pub mod event_voice_channels;
 pub mod join_risk_runtime;
 pub mod lane_jitter;
+pub mod live_delivery;
 pub mod raid_runtime;
 
 // Shared query observer and settings fixture; one module per test crate.

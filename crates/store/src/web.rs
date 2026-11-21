@@ -43,6 +43,5 @@ pub async fn apply_web_contract(pool: &Pool<Postgres>) -> Result<(), sqlx::Error
     tx.commit().await
 }
 
-/// Contract version this build implements (matches the
-/// `web_contract_meta` seed row in migration 0003).
-pub const CONTRACT_VERSION: &str = "1.0";
+/// Contract version this build publishes after successfully installing its views.
+pub const CONTRACT_VERSION: &str = two_bot_core::WEB_CONTRACT_VERSION;

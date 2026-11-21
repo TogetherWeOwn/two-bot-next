@@ -1,4 +1,4 @@
-import { JOB_RUNS_JOBS, processIncarnation, type Sample } from "./alert-rules.ts";
+import { JOB_RUNS_JOBS, VOICE_HEAT_JOB, processIncarnation, type Sample } from "./alert-rules.ts";
 
 /** Required inputs consumed by alert rules; pinned to metrics.rs in tests. */
 export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
@@ -152,7 +152,8 @@ function combinations(axes: Record<string, readonly string[]>): Record<string, s
 // so the family is all-or-nothing — absent entirely, or complete.
 const REQUIRED_INPUTS = new Set(Object.entries(ALERT_INPUT_LABELS).flatMap(([name, axes]) =>
   combinations(axes)
-    .filter((labels) => !(name === "two_bot_internal_actions_total" && labels["family"] === "voice"))
+    .filter((labels) => labels.job !== VOICE_HEAT_JOB
+      && !(name === "two_bot_internal_actions_total" && labels["family"] === "voice"))
     .map((labels) => identity(name, labels))));
 
 // Every `voice`-family combination. When a scrape carries any of these rows
@@ -162,6 +163,11 @@ const VOICE_INTERNAL_ACTIONS_INPUTS = new Set(
   combinations(ALERT_INPUT_LABELS["two_bot_internal_actions_total"]!)
     .filter((labels) => labels["family"] === "voice")
     .map((labels) => identity("two_bot_internal_actions_total", labels)));
+
+// A pre-sampler image emits none of these rows; a newer one emits all 11.
+const HEAT_INPUTS = Object.entries(VALIDATED_INPUT_LABELS).flatMap(([name, axes]) =>
+  axes.job?.includes(VOICE_HEAT_JOB)
+    ? combinations({ ...axes, job: [VOICE_HEAT_JOB] }).map((labels) => identity(name, labels)) : []);
 
 // Prometheus numbers, not JavaScript's empty/hexadecimal/Infinity coercions.
 const NUMBER = "(?:[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?|NaN|[+-]?Inf)";
@@ -238,5 +244,7 @@ export function parseAlertScrape(text: string): Sample[] | null {
   if (incarnation.length > 0 && processIncarnation(incarnation) === undefined) return null;
   const voiceSeen = [...VOICE_INTERNAL_ACTIONS_INPUTS].some((key) => seen.has(key));
   const voiceComplete = !voiceSeen || [...VOICE_INTERNAL_ACTIONS_INPUTS].every((key) => seen.has(key));
+  if (samples.some(({ name, labels }) => labels.job === VOICE_HEAT_JOB && Object.hasOwn(VALIDATED_INPUT_LABELS, name))
+    && !HEAT_INPUTS.every((key) => seen.has(key))) return null;
   return [...REQUIRED_INPUTS].every((key) => seen.has(key)) && voiceComplete ? samples : null;
 }

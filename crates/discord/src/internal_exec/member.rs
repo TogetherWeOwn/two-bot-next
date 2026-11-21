@@ -22,6 +22,12 @@ pub mod store;
 #[path = "voice_move.rs"]
 pub mod voice_move;
 pub use voice_move::{VoiceMoveNotSent, VoiceMovePatch, VOICE_MOVE_TIMEOUT_MS};
+#[path = "voice_move_reads.rs"]
+mod voice_move_reads;
+pub use voice_move_reads::{VoiceMoveEvidence, VoiceMoveTarget};
+#[path = "voice_move_coordinator.rs"]
+mod voice_move_coordinator;
+pub use voice_move_coordinator::{VoiceMoveAttempt, VoiceMoveRoster};
 
 #[cfg(test)]
 #[path = "voice_move_adapter_tests.rs"]
@@ -234,24 +240,51 @@ impl ActionExecutor {
         member_id: &str,
         channel_id: &str,
     ) -> Result<VoiceMovePatch, ActionError> {
-        use super::StrictTransportError::{Admission, PreWireDeadline, PreWireGuard};
+        self.move_voice_member_until(
+            guild_id,
+            member_id,
+            channel_id,
+            Instant::now() + Duration::from_millis(VOICE_MOVE_TIMEOUT_MS),
+            std::future::ready(true),
+        )
+        .await
+    }
+
+    /// Send once within the caller's absolute wire deadline. The adapter polls
+    /// `revalidate` only after durable admission, before the final route check
+    /// and first wire poll. Use it only to check local facts, not for side effects
+    /// or governed REST calls. Await this method so the adapter can settle its permit.
+    pub async fn move_voice_member_until(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+        channel_id: &str,
+        deadline: Instant,
+        revalidate: impl std::future::Future<Output = bool> + Send,
+    ) -> Result<VoiceMovePatch, ActionError> {
+        use super::StrictTransportError::{
+            Admission, PreWireDeadline, PreWireGuard, PreWireRevalidation,
+        };
         use twilight_model::guild::Member;
         use two_bot_core::send_admission::AdmissionError;
-        use VoiceMoveNotSent::{Blocked, Deadline, Guard, Storage};
+        use VoiceMoveNotSent::{Blocked, Deadline, Guard, Revalidation, Storage};
         use VoiceMovePatch::{NotSent, Unavailable};
 
         let request =
             voice_move::prepare_voice_move(&self.inner.factory, guild_id, member_id, channel_id)?;
-        let deadline = Instant::now() + Duration::from_millis(VOICE_MOVE_TIMEOUT_MS);
-        match super::poll_before(deadline, self.admit(&request, Some(false))).await {
-            None => return Ok(NotSent(Deadline)),
-            Some(Err(_)) => return Ok(NotSent(Guard)),
-            Some(Ok(())) => {}
-        }
-        self.count();
-        let transport = &self.inner.transport;
-        let headers = transport
-            .send_strict_evidence_headers(&request, deadline)
+        let mut pacing =
+            match super::poll_before(deadline, self.reserve_route(&request, false, false)).await {
+                None => return Ok(NotSent(Deadline)),
+                Some(Err(_)) => return Ok(NotSent(Guard)),
+                Some(Ok(pacing)) => pacing,
+            };
+        let headers = self
+            .inner
+            .transport
+            .send_strict_evidence_headers_after(&request, deadline, revalidate, move || {
+                self.stamp_paced_lane(&mut pacing, false);
+                self.count();
+            })
             .await;
         let pending = match headers {
             Ok(pending) => pending,
@@ -259,6 +292,7 @@ impl ActionExecutor {
             Err(Admission(AdmissionError::Storage)) => return Ok(NotSent(Storage)),
             Err(PreWireDeadline) => return Ok(NotSent(Deadline)),
             Err(PreWireGuard) => return Ok(NotSent(Guard)),
+            Err(PreWireRevalidation) => return Ok(NotSent(Revalidation)),
             Err(_) => return Ok(Unavailable),
         };
         let status = pending.pending.status;

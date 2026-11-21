@@ -770,8 +770,8 @@ mod tests {
         // No duplicate specs.
         assert_eq!(specs.len(), TABLE_SPECS.len());
         let mut universe = matrix_tables();
-        // Dormant and migrator-owned, but still needs a recovery disposition.
-        assert!(MATRIX_SQL.contains("('public', 'voice_heat_hours', 'migrator')"));
+        // Runtime may flush and prune this migrator-owned aggregate; rollback re-samples it.
+        assert!(MATRIX_SQL.contains("('public', 'voice_heat_hours', 'retained_aggregate')"));
         universe.insert("voice_heat_hours".to_owned());
         for table in two_bot_core::backup::DUMP_TABLES {
             universe.insert((*table).to_owned());
