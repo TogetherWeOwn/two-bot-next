@@ -332,10 +332,9 @@ async fn run(cli_args: &[String]) {
         std::process::exit(1);
     }
 
-    // Opt-in boot command registry sync (TOG-10860) runs before opening the
-    // gateway database so a configured registry is never skipped by a later
-    // DB failure; refusal/failure exits before shard startup. Opt-out is a
-    // no-op and preserves existing server behavior.
+    // Outside canonical staging, the optional env-only registry sync runs
+    // before database init; refusal/failure exits before shard startup.
+    // Canonical staging waits for the gateway's activation-aware registry.
     if let Ok((token, _, guild_id)) = gateway_prerequisites(&config) {
         if let Err(error) = commands_cli::publish_on_boot(token, guild_id).await {
             tracing::error!(reason = %error, "boot command registry synchronization failed");

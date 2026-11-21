@@ -167,8 +167,12 @@ Cancelling an acknowledged final check also triggers bounded, storage-only
 settlement. An unacknowledged claim cannot be cleared. The opt-in
 collector retains status and retry headers but omits the body when the body cap
 or attempt deadline expires before collection finishes. Only crate-internal
-code can validate a mutation. Storage shares the attempt cutoff; evidence does
-not authorize retry. Default settlement is unchanged.
+code can validate a mutation. Storage shares the attempt cutoff except for a
+governed voice PATCH's definitive 400, 403, or 404: the adapter drops the body
+and gives the exact generation up to one fresh second to settle, reporting an
+unconfirmed settlement separately from a settled refusal. Voice preflight GETs
+carry the longest validated 429 hint to the attempt result without inventing a
+delay. None of this authorizes a retry or changes default settlement.
 
 An ordinary held lane carries a 60 s self-heal lease (`in_flight_since_ms`, migration
 0419, constant `IN_FLIGHT_LEASE_MS`). The next `admit` past the lease reclaims

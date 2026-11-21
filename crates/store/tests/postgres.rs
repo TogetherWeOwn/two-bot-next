@@ -110,7 +110,7 @@ async fn migrations_contract_and_checksum_guard() {
         .unwrap();
     assert_eq!(timeout, "15s");
     assert_eq!(f.admin.options().get_max_connections(), 5);
-    sqlx::query("ALTER TABLE rank_ladder RENAME TO displaced_contract_dependency")
+    sqlx::query("ALTER TABLE voice_heat_hours RENAME TO displaced_contract_dependency")
         .execute(&f.pool)
         .await
         .unwrap();
@@ -135,7 +135,7 @@ async fn migrations_contract_and_checksum_guard() {
             .unwrap(),
         "1.0"
     );
-    sqlx::query("ALTER TABLE displaced_contract_dependency RENAME TO rank_ladder")
+    sqlx::query("ALTER TABLE displaced_contract_dependency RENAME TO voice_heat_hours")
         .execute(&f.pool)
         .await
         .unwrap();
@@ -148,7 +148,7 @@ async fn migrations_contract_and_checksum_guard() {
     .fetch_one(&f.pool)
     .await
     .unwrap();
-    assert_eq!(version, "1.0");
+    assert_eq!(version, "1.1");
     let counts: (Option<i32>, Option<i32>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT human_member_count, online_count FROM {web}.live_counts"
     )))
@@ -172,6 +172,13 @@ async fn migrations_contract_and_checksum_guard() {
     .await
     .unwrap();
     assert_eq!(ladder, 5);
+    let heat: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {web}.voice_heat WHERE coverage = 0 AND source = 'insufficient'"
+    )))
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(heat, 168);
     sqlx::query("UPDATE web_contract_meta SET contract_version = '2.0'")
         .execute(&f.pool)
         .await

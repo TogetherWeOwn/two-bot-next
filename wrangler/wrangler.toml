@@ -168,13 +168,9 @@ EVENTSUB_INGRESS = "1"
 # configured. Rollback is unset + re-publish (PUT is a full replacement).
 TWO_AUTOMATIONS = "1"
 TWO_ANNOUNCEMENTS = "1"
-# Staging-only boot publication (docs/command-publish.md): at startup the
-# container fetches the staging guild's command registry, compares hashes and
-# sends one full replacement only when they differ. It uses the container's own
-# send-admission database, so no operator database credential is needed. The
-# application ID is the staging bot's public ID. The live-guild fence stays on
-# (TWO_COMMANDS_ALLOW_LIVE_GUILD is never set), so a live GUILD_ID refuses.
-# Never top-level and never production. Rollback: delete both lines, redeploy.
+# The canonical staging guild waits for the gateway's complete registry, even
+# with this early-sync opt-in set (docs/command-publish.md). Keep these bindings
+# staging-only; the live-guild fence still refuses early sync for a live GUILD_ID.
 TWO_COMMANDS_PUBLISH_ON_BOOT = "1"
 DISCORD_APPLICATION_ID = "1469137636663758888"
 # Staging-only temporary voice gate (docs/voice-cutover-rehearsal.md): attaches

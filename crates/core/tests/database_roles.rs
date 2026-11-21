@@ -68,11 +68,18 @@ async fn execute(pool: &PgPool, sql: String) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+const ROLE_MATRIX: &str = include_str!("../../../sql/database_role_matrix.sql");
+
 async fn findings(pool: &PgPool, roles: &[String]) -> Result<Vec<String>, sqlx::Error> {
-    let sql = include_str!("../../../sql/verify_database_roles.sql").replace(
-        "-- @matrix",
-        include_str!("../../../sql/database_role_matrix.sql"),
-    );
+    findings_for_matrix(pool, roles, ROLE_MATRIX).await
+}
+
+async fn findings_for_matrix(
+    pool: &PgPool,
+    roles: &[String],
+    matrix: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let sql = include_str!("../../../sql/verify_database_roles.sql").replace("-- @matrix", matrix);
     let mut tx = pool.begin().await?;
     sqlx::raw_sql("SET TRANSACTION READ ONLY; SET LOCAL search_path = pg_catalog, pg_temp;")
         .execute(&mut *tx)
@@ -342,12 +349,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     )?;
 
     exercise_voice_heat_grants(pool, roles).await?;
-    require(
-        sqlx::query_scalar::<_, bool>("SELECT to_regclass('web_v1.voice_heat') IS NULL")
-            .fetch_one(pool)
-            .await?,
-        "dormant voice heat must not publish a reader view",
-    )?;
+    denied(pool, &roles[1], "SELECT * FROM web_v1.voice_heat").await?;
+    denied(pool, &roles[3], "SELECT * FROM web_v1.voice_heat").await?;
 
     exercise_member_grants(pool, roles).await?;
     exercise_member_store(pool, &roles[1]).await?;
@@ -469,6 +472,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "next_event",
         "funnel_daily",
         "funnel_by_source",
+        "voice_heat",
     ] {
         as_role(pool, &roles[2], &format!("SELECT * FROM web_v1.{view}")).await?;
     }
@@ -627,7 +631,34 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         findings(pool, roles).await?.is_empty(),
         "restored matrix drifted",
     )?;
-    Ok(())
+    exercise_voice_heat_backout(pool, roles).await
+}
+
+async fn exercise_voice_heat_backout(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
+    // The pre-heat verifier uses the same SQL without the new matrix entry.
+    let prior = ROLE_MATRIX.replace("    ('web_v1', 'voice_heat', 'view'),\n", "");
+    let drift = findings_for_matrix(pool, roles, &prior).await?;
+    let heat_select = |row: &String| row.ends_with("/web_v1.voice_heat/SELECT");
+    require(
+        drift.iter().any(heat_select),
+        "pre-heat verifier missed heat grant",
+    )?;
+    let readback = || {
+        sqlx::query_as::<_, (String, Vec<String>)>(
+            "SELECT contract_version, ARRAY(SELECT h::text FROM public.voice_heat_hours h
+             ORDER BY hour_start_utc) FROM web_v1.contract_meta",
+        )
+        .fetch_one(pool)
+    };
+    let (version, before) = readback().await?;
+    require(version == "1.1" && !before.is_empty(), "no 1.1 fixture")?;
+    let backout = include_str!("../../../sql/voice_heat_staging_backout.sql");
+    execute(pool, isolated(backout, roles)).await?;
+    let drift = findings_for_matrix(pool, roles, &prior).await?;
+    require(drift.is_empty(), &format!("pre-heat role drift: {drift:?}"))?;
+    let (version, after) = readback().await?;
+    require(version == "1.0", "backout did not restore 1.0")?;
+    require(before == after, "backout changed persisted heat rows")
 }
 
 async fn exercise_voice_heat_grants(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
@@ -1701,7 +1732,11 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         }
     }
     require(ledger == STAGING_LEDGER29.len(), "29-state incomplete").unwrap();
-    sqlx::raw_sql(include_str!("../../../sql/web_v1.sql"))
+    // This historical schema has the 1.0 views and helpers, but no heat table.
+    let (prior, _) = include_str!("../../../sql/web_v1.sql")
+        .split_once("-- Voice heat contract 1.1: trailing 28 complete UTC days; all 168 cells.")
+        .expect("heat publication suffix");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(prior))
         .execute(&provision_pool)
         .await
         .unwrap();
@@ -1713,6 +1748,14 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         .execute(&provision_pool)
         .await
         .unwrap();
+    let heat_absent: bool = sqlx::query_scalar(
+        "SELECT to_regclass('public.voice_heat_hours') IS NULL
+            AND to_regclass('web_v1.voice_heat') IS NULL",
+    )
+    .fetch_one(&provision_pool)
+    .await
+    .unwrap();
+    assert!(heat_absent);
     let ledger_rows = STAGING_LEDGER29
         .iter()
         .map(|version| format!("({version})"))
@@ -1795,6 +1838,9 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         }
     }
     require(!pending.is_empty(), "no pending migrations applied").unwrap();
+    two_bot_core::apply_web_contract(&migrator_pool)
+        .await
+        .unwrap();
     let pending_rows = pending
         .iter()
         .map(|version| format!("({version})"))
@@ -1832,6 +1878,16 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         "bootstrap flow drifted",
     )
     .unwrap();
+    let reader = runtime_role_pool(&scratch_admin, &roles[2]).await.unwrap();
+    let initial_cells: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM web_v1.voice_heat
+         WHERE source = 'insufficient' AND avg_in_voice IS NULL AND coverage = 0",
+    )
+    .fetch_one(&reader)
+    .await
+    .unwrap();
+    assert_eq!(initial_cells, 168);
+    reader.close().await;
     provision_pool.close().await;
     migrator_pool.close().await;
     scratch_admin.close().await;

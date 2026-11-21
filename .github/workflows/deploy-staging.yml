@@ -528,6 +528,9 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           STAGING_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_EXPIRES_AT: ${{ steps.use.outputs.expires_at }}
+          STAGING_USE_RECEIPT: ${{ env.ROLLOUT_DIR }}/staging-use.jsonl
         run: |
           set -euo pipefail
           python3 ../scripts/staging_rollout.py verify \

@@ -170,6 +170,22 @@ class Client:
         self.zero_instance_last = None
         self.opener = build_opener(NoRedirect())
 
+    def stop_staging(self, url, version, revision):
+        """Use the deploy checkout's redacting client; never probe or renew here."""
+        timeout = min(50, self.deadline - time.monotonic())
+        require(timeout > 0, "rollout_timeout")
+        keys = ("PATH", "OWNERSHIP_CONTROL_TOKEN", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
+                "STAGING_USE_EXPIRES_AT", "STAGING_USE_RECEIPT")
+        env = {key: os.environ[key] for key in keys if key in os.environ}
+        env.update(STAGING_WORKER_URL=url, STAGING_USE_DEPLOYMENT=version, STAGING_USE_SHA=revision,
+                   STAGING_STOP_TIMEOUT_MS=str(int(timeout * 1000)))
+        script = Path(__file__).resolve().parents[1] / "wrangler/scripts/staging-use.mjs"
+        try:
+            result = subprocess.run(["node", str(script), "stop"], env=env, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            raise GateError("staging_stop_unconfirmed") from None
+        require(result.returncode == 0, "staging_stop_unconfirmed")
+
     def request(self, url, authenticated=False):
         timeout = 10 if self.deadline is None else min(10, self.deadline - time.monotonic())
         require(timeout > 0, "rollout_timeout")
@@ -1006,6 +1022,7 @@ def verify(args, client):
     image_stale = 0
     listing_seen_target = False
     drift_candidate = False
+    stopped_after_completion = False
     app = row = None
     while time.monotonic() < client.deadline:
         probed = False
@@ -1050,6 +1067,14 @@ def verify(args, client):
             if complete or lag:
                 rollout_observed_at = time.time()
                 active_worker(client, version)
+            # Shape/identity were validated above. Stop even with zero instances:
+            # counters can lag, and an alarm can start the old process after grant.
+            # Keep the finite grant, so rollback can still run if the stop fails.
+            stopped_this_poll = row["status"] == "completed" and not stopped_after_completion
+            if stopped_this_poll:
+                client.stop_staging(url, version, baseline["revision"])
+                stopped_after_completion = True
+            if complete or lag:
                 status, headers, body = client.request(url + "/readyz")
                 sample_received_at = time.time()
                 probed = True
@@ -1090,9 +1115,28 @@ def verify(args, client):
                         # and lag shapes while the exact build keeps serving, so
                         # either completed shape passes the re-read; identity,
                         # steps and failed/starting/scheduling stay exact.
-                        require(converged(final, image, pinned["target_version"])
-                                or active_lag(final, image, pinned["target_version"]),
-                                "rollout_not_converged")
+                        final_complete = converged(final, image, pinned["target_version"])
+                        if not final_complete and not active_lag(final, image, pinned["target_version"]):
+                            shape = _rollout_shape(final, image, pinned["target_version"])
+                            counts, progress_ok = shape if shape else ({}, False)
+                            # A stop deliberately drops the singleton. Retry only
+                            # its zero/starting shapes; never accept them as ready.
+                            require(progress_ok and counts["healthy"] == counts["failed"] == 0
+                                    and counts["active"] <= 1
+                                    and counts["starting"] + counts["scheduling"] <= 1,
+                                    "rollout_not_converged")
+                            row = final
+                            client.observation = rollout_observation(row)
+                            if stale:
+                                client.observation += f" application_image=stale polls={image_stale}"
+                                if image_stale > APPLICATION_IMAGE_STALE_POLLS:
+                                    raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
+                            lag_streak = 0
+                            time.sleep(max(0, min(5, client.deadline - time.monotonic())))
+                            continue
+                        if stopped_this_poll and not final_complete:
+                            # The pre-stop counters cannot skip lag confirmation.
+                            complete, lag = False, True
                         final_app = deadline_aware_read(
                             client, lambda: application(client), app, final, image,
                             drift_candidate, verification_started)
