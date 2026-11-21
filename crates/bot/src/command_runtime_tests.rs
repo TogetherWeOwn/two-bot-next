@@ -5803,7 +5803,8 @@ fn production_router_matches_composed_production_wiring() {
 async fn staging_preview_survives_both_runtime_registry_publishers(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use two_bot_core::automod_runtime::STAGING_GUILD_ID;
-    use two_bot_core::custom_command_store::{put_command, StoredCommand};
+    use two_bot_core::custom_command_store::put_command;
+    use two_bot_core::custom_commands::StoredCommand;
 
     let url = std::env::var("TWO_TEST_DATABASE_URL")?;
     let db =
