@@ -11,7 +11,7 @@ use two_bot_core::{
 use two_bot_cutover::event_attendance::{finalized_attendance, FinalizedAttendance};
 
 use super::{
-    project_attendance, AttendanceRefusal, AttendanceScope, AttendanceWindowMs, SessionMs,
+    project_attendance, AttendanceRefusal, AttendanceScope, AttendanceWindowUs, SessionUs, GRACE_US,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,25 +64,24 @@ async fn read_with<
     result
 }
 
-fn millis(value: OffsetDateTime) -> i64 {
-    value.unix_timestamp_nanos().div_euclid(1_000_000) as i64
+fn micros(value: OffsetDateTime) -> i64 {
+    value.unix_timestamp_nanos().div_euclid(1_000) as i64
 }
 
 fn project(scope: AttendanceScope<'_>, record: &FinalizedAttendance) -> Result<Value, ReadRefusal> {
-    let window = AttendanceWindowMs {
+    let window = AttendanceWindowUs {
         scope,
-        starts_ms: millis(record.starts_at),
-        ends_ms: millis(record.ends_at),
+        starts_us: micros(record.starts_at),
+        ends_us: micros(record.ends_at),
     };
     let sessions: Vec<_> = record
         .sessions
         .iter()
-        .map(|row| SessionMs {
+        .map(|row| SessionUs {
             scope,
             member_id: row.member_id,
             channel_id: row.channel_id,
             // An unknown stamp earns attendance credit, not a room name.
-            // Sort it before all real stamps so it cannot replace a known name.
             channel_name: row
                 .name_observed_at
                 .map_or("", |_| row.channel_name.as_str()),
@@ -91,17 +90,16 @@ fn project(scope: AttendanceScope<'_>, record: &FinalizedAttendance) -> Result<V
                 .map_or(i128::MIN, OffsetDateTime::unix_timestamp_nanos),
             is_bot: row.is_bot,
             afk: row.afk,
-            joined_ms: millis(row.joined_at),
-            left_ms: Some(millis(row.left_at)),
+            joined_us: micros(row.joined_at),
+            left_us: Some(micros(row.left_at)),
         })
         .collect();
-    project_attendance(&window, &sessions, millis(OffsetDateTime::now_utc())).map_err(|refusal| {
-        match refusal {
-            AttendanceRefusal::NotFinal | AttendanceRefusal::NoRecord => ReadRefusal::NotFound,
-            AttendanceRefusal::InvalidWindow | AttendanceRefusal::OverBudget => {
-                ReadRefusal::Internal
-            }
-        }
+    // The store already proved finality at the inclusive cutoff. Use that
+    // bound, not the bot clock, to project the store-authorized snapshot.
+    let cutoff = window.ends_us.saturating_add(GRACE_US);
+    project_attendance(&window, &sessions, cutoff).map_err(|refusal| match refusal {
+        AttendanceRefusal::NoRecord => ReadRefusal::NotFound,
+        _ => ReadRefusal::Internal,
     })
 }
 
@@ -111,70 +109,84 @@ mod tests {
     use std::cell::Cell;
     use two_bot_cutover::event_attendance::AttendanceSession;
 
-    #[test]
-    fn unknown_name_stamps_keep_attendance_but_never_supply_a_room_name() {
-        let scope = AttendanceScope {
-            guild_id: 1,
-            event_key: "fixture:1",
-        };
-        let starts_at = OffsetDateTime::UNIX_EPOCH;
-        let ends_at = starts_at + time::Duration::hours(1);
+    fn finalized_fixture() -> FinalizedAttendance {
+        use time::Duration;
+
+        // Pretend the store's clock has reached cutoff while the bot's hasn't.
+        let starts_at = OffsetDateTime::from_unix_timestamp(253_370_764_800).unwrap(); // Year 9999.
+        let ten = starts_at + Duration::minutes(10);
         let session =
-            |channel_id, channel_name: &str, name_observed_at, joined_at| AttendanceSession {
-                member_id: 2,
-                channel_id,
-                channel_name: channel_name.to_owned(),
-                name_observed_at,
-                is_bot: false,
-                afk: false,
-                joined_at,
-                left_at: joined_at + time::Duration::minutes(10),
+            |member_id, channel_id, channel_name: &str, stamped: bool, joined_at, left_at| {
+                AttendanceSession {
+                    member_id,
+                    channel_id,
+                    channel_name: channel_name.into(),
+                    name_observed_at: stamped.then_some(left_at),
+                    is_bot: false,
+                    afk: false,
+                    joined_at,
+                    left_at,
+                }
             };
-        let second = starts_at + time::Duration::minutes(10);
-        let third = second + time::Duration::minutes(10);
-        let result = project(
-            scope,
-            &FinalizedAttendance {
-                starts_at,
-                ends_at,
-                sessions: vec![
-                    session(3, "observed", Some(starts_at), starts_at),
-                    session(3, "unknown rename", None, second),
-                    session(4, "unknown room", None, third),
-                ],
-            },
-        )
-        .unwrap();
-        assert_eq!(result["members"][0]["minutes"], 30);
-        assert_eq!(
-            result["rooms"],
-            serde_json::json!([
-                {"channel_id": "3", "name_at_close": "observed"},
-                {"channel_id": "4", "name_at_close": ""}
-            ])
-        );
+        FinalizedAttendance {
+            starts_at,
+            ends_at: starts_at + Duration::hours(1),
+            sessions: vec![
+                session(
+                    2,
+                    3,
+                    "observed",
+                    true,
+                    starts_at + Duration::microseconds(900),
+                    ten + Duration::microseconds(100),
+                ),
+                session(
+                    3,
+                    4,
+                    "unknown room",
+                    false,
+                    ten,
+                    ten + Duration::minutes(10),
+                ),
+                session(2, 3, "unknown rename", false, ten, ten),
+                session(
+                    2,
+                    3,
+                    "",
+                    true,
+                    ten + Duration::seconds(1),
+                    ten + Duration::seconds(1),
+                ),
+            ],
+        }
     }
 
     #[tokio::test]
-    async fn readiness_and_lookup_share_the_fixed_guild_and_validated_key() {
-        let body = serde_json::json!({"event_key": "fixture:1"});
+    async fn finalized_lookup_preserves_scope_precision_and_known_names() {
+        let raw = serde_json::json!({"event_key": "fixture:1"});
         let key =
-            two_bot_core::internal_actions::validate_event_key(body.as_object().unwrap()).unwrap();
+            two_bot_core::internal_actions::validate_event_key(raw.as_object().unwrap()).unwrap();
+        let result = read_with(
+            key,
+            |guild| {
+                assert_eq!(guild.to_string(), TWO_STAGING_GUILD_ID);
+                Some(|| true)
+            },
+            |scope| async move {
+                assert_eq!(scope.guild_id.to_string(), TWO_STAGING_GUILD_ID);
+                assert_eq!(scope.event_key, "fixture:1");
+                Ok(Some(finalized_fixture()))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["final"], true);
+        assert_eq!(result["members"][0]["minutes"], 9);
+        assert_eq!(result["members"][1]["minutes"], 10);
+        assert_eq!(result["peak_concurrent"], 2);
         assert_eq!(
-            read_with(
-                key,
-                |guild| {
-                    assert_eq!(guild.to_string(), TWO_STAGING_GUILD_ID);
-                    Some(|| true)
-                },
-                |scope| async move {
-                    assert_eq!(scope.guild_id.to_string(), TWO_STAGING_GUILD_ID);
-                    assert_eq!(scope.event_key, "fixture:1");
-                    Ok(None)
-                }
-            )
-            .await,
-            Err(ReadRefusal::NotFound)
+            result["rooms"],
+            serde_json::json!([{"channel_id": "3", "name_at_close": "observed"}])
         );
     }
 
@@ -196,8 +208,6 @@ mod tests {
             .await,
             Err(ReadRefusal::Internal)
         );
-        let starts_at = OffsetDateTime::UNIX_EPOCH;
-        let ends_at = starts_at + time::Duration::hours(1);
         for found in [false, true] {
             for invalidate in [false, true] {
                 let epoch = Cell::new(0);
@@ -207,20 +217,7 @@ mod tests {
                     |_| async {
                         tokio::task::yield_now().await;
                         epoch.set(u32::from(invalidate));
-                        Ok(found.then(|| FinalizedAttendance {
-                            starts_at,
-                            ends_at,
-                            sessions: vec![AttendanceSession {
-                                member_id: 2,
-                                channel_id: 3,
-                                channel_name: "fixture".to_owned(),
-                                name_observed_at: Some(starts_at),
-                                is_bot: false,
-                                afk: false,
-                                joined_at: starts_at,
-                                left_at: ends_at,
-                            }],
-                        }))
+                        Ok(found.then(finalized_fixture))
                     },
                 )
                 .await;
