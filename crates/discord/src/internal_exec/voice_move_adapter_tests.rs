@@ -4,7 +4,7 @@ use crate::{
     strict_transport_fixture::{loopback, read_request, Admission},
 };
 use std::sync::{
-    atomic::{AtomicBool, Ordering::Relaxed},
+    atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
     Arc,
 };
 use tokio::{
@@ -218,6 +218,7 @@ async fn voice_patch_uses_the_shared_paced_lane() {
 struct ExclusiveLane {
     key: TokenKey,
     held: Arc<AtomicBool>,
+    claim_polls: AtomicUsize,
     acknowledge_strict: Semaphore,
 }
 
@@ -226,6 +227,7 @@ impl ExclusiveLane {
         Self {
             key: TokenKey::for_bot_token(TOKEN).unwrap(),
             held: Arc::default(),
+            claim_polls: AtomicUsize::new(0),
             acknowledge_strict: Semaphore::new(0),
         }
     }
@@ -238,6 +240,7 @@ impl SendAdmission for ExclusiveLane {
 
     fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
         Box::pin(async {
+            self.claim_polls.fetch_add(1, Relaxed);
             if self.held.swap(true, Relaxed) {
                 return Err(AdmissionError::Blocked);
             }
@@ -329,6 +332,29 @@ async fn voice_patch_revalidates_after_admission_before_dispatch() {
             tokio::time::resume();
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_governed_read_owner_does_not_claim_the_lane() {
+    let (listener, origin) = loopback().await;
+    let gate = Arc::new(ExclusiveLane::new());
+    let action = executor(&origin, gate.clone());
+    let request = ActionExecutor::request_of(action.request_factory().current_user()).unwrap();
+    // Enter the detached transport directly: the caller may have passed its
+    // deadline check before the owner gets its first turn at the cutoff.
+    let result = action
+        .inner
+        .transport
+        .send_request(&request, Some(Instant::now()))
+        .await;
+    assert_eq!(
+        result.err().as_deref(),
+        Some(crate::executor::HEADER_TIMEOUT_MESSAGE)
+    );
+    assert_eq!(gate.claim_polls.load(Relaxed), 0);
+    gate.admit().await.unwrap().complete(None).await.unwrap();
+    tokio::time::resume();
+    assert_no_socket(&listener).await;
 }
 
 #[tokio::test]

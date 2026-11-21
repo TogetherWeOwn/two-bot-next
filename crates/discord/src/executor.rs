@@ -833,6 +833,7 @@ impl HyperTransport {
             .body(http_body_util::Full::new(body_bytes))
             .map_err(|e| format!("build request: {e}"))?;
         let callback = !strict && is_interaction_callback(request);
+        let read = request.method() == Method::Get;
         // Durable admission shares the caller's absolute deadline: it is a
         // Postgres statement on a pooled connection, not a local lock, so an
         // unbounded admit would outlive the receipt/moderation/boot budgets.
@@ -867,9 +868,17 @@ impl HyperTransport {
                             .await
                             .ok_or_else(|| HEADER_TIMEOUT_MESSAGE.to_owned())??
                     }
-                    Some(at) => tokio::time::timeout_at(at, take)
-                        .await
-                        .map_err(|_| HEADER_TIMEOUT_MESSAGE.to_owned())??,
+                    Some(at) => tokio::time::timeout_at(at, async {
+                        // A detached read can get its first turn at cutoff.
+                        // Do not start an autocommitted claim then. Once
+                        // started, keep recovering ready acknowledgements.
+                        if read && Instant::now() >= at {
+                            return Err(HEADER_TIMEOUT_MESSAGE.to_owned().into());
+                        }
+                        take.await.map_err(StrictTransportError::from)
+                    })
+                    .await
+                    .map_err(|_| HEADER_TIMEOUT_MESSAGE.to_owned())??,
                 })
             }
         };
@@ -902,7 +911,6 @@ impl HyperTransport {
             attempt = Some(crate::executor_metrics::Attempt::new(request));
             self.inner.request(hyper_req).await
         };
-        let read = request.method() == Method::Get;
         let headers = wait_for_headers(deadline, strict || callback || read, request_fut).await;
         let response = match headers {
             Some(Ok(response)) => response,
