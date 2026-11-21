@@ -549,7 +549,7 @@ def filter_pattern_matches(pattern, path):
 
 
 def staging_dispatch_errors(workflow):
-    """Only workflow_dispatch can start staging, with seven fenced inputs.
+    """Only workflow_dispatch can start staging, with eight fenced inputs.
 
     `release_fence` exists on main (TOG-11143) so post-handoff release of an
     uninitialized/parked singleton is explicit and auditable; it defaults to
@@ -566,9 +566,9 @@ def staging_dispatch_errors(workflow):
     arm/disarm at one exact revision: an optional string, empty by default
     (empty deploys the workflow head), readable only through the pinned
     dispatch-or-head expression in staging_pinned_sha_errors. The explicit
-    `recover_prior_sha` switch defaults to false. Anything else
-    in the dispatch block (an arming switch, a deploy flag, a default of
-    true) is an unreviewed deploy route outside the pinned shape.
+    `recover_prior_sha` and read-only `verify_automod_preview` default to
+    false. Anything else in the dispatch block (an arming switch, a deploy
+    flag, a default of true) is outside the pinned shape.
     """
     name = "deploy-staging.yml"
     errors = []
@@ -578,10 +578,11 @@ def staging_dispatch_errors(workflow):
     dispatch = on["workflow_dispatch"]
     inputs = dispatch.get("inputs") if isinstance(dispatch, dict) and set(dispatch) == {"inputs"} else None
     expected_booleans = {"release_fence", "inject_gateway_failure", "inject_error_rate_spike",
-                         "inject_voice_stall", "inject_unpaired_disconnect", "recover_prior_sha"}
+                         "inject_voice_stall", "inject_unpaired_disconnect", "recover_prior_sha",
+                         "verify_automod_preview"}
     expected = expected_booleans | {"sha"}
     if not isinstance(inputs, dict) or set(inputs) != expected:
-        return [f"{name}: workflow_dispatch must carry only the release_fence, drill and sha inputs"]
+        return [f"{name}: workflow_dispatch inputs must match the reviewed staging dispatch shape"]
     for input_name in expected_booleans:
         spec = inputs[input_name]
         if (not isinstance(spec, dict) or set(spec) != {"description", "type", "default"}
@@ -1098,6 +1099,19 @@ def soak_hold_errors(workflow, name="deploy-staging.yml"):
     return errors
 
 
+PREVIEW_STEP = {
+    "name": "Verify AutoMod preview registration (GET only)",
+    "if": "inputs.verify_automod_preview && !inputs.recover_prior_sha && !inputs.inject_error_rate_spike && "
+          "needs.deploy.outputs.promotion_clean == 'true' && needs.deploy.outputs.staging_use_sha == github.sha",
+    "timeout-minutes": "2",
+    "env": {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+            "STAGING_USE_EXPIRES_AT": "${{ needs.deploy.outputs.staging_use_expires_at }}",
+            "DISCORD_STAGING_GUILD_ID": "${{ vars.DISCORD_STAGING_GUILD_ID }}",
+            "DISCORD_STAGING_BOT_TOKEN": "${{ secrets.DISCORD_STAGING_BOT_TOKEN }}"},
+    "run": "python3 -B scripts/staging_preview_readback.py",
+}
+
+
 def staging_qualification_assert_errors(job, job_id, entry, receipt, artifact):
     """Only the separate ready step may hold the staging control credential."""
     label = f"deploy-staging.yml:{job_id}"
@@ -1130,6 +1144,8 @@ def staging_qualification_assert_errors(job, job_id, entry, receipt, artifact):
                      "path": expected_env["STAGING_USE_RECEIPT"], "if-no-files-found": "error", "retention-days": "14"}}:
         errors.append(f"{label}: must always retain the assertion receipt for 14 days")
     for step in steps:
+        if job_id == "user-flow-synthetic" and step == PREVIEW_STEP:
+            continue  # Only the exact GET-only consumer may see the Discord binding.
         if step is not ready and ("secrets." in str(step) or "ownership_control" in str(step).lower()):
             errors.append(f"{label}: control credential must stay in the readiness step only")
         if job_id == "certify-promotion" and step is not ready and any(marker in str(step).lower() for marker in DEPLOY_MARKERS):
@@ -1184,6 +1200,11 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
             errors.append(f"{name}:user-flow-synthetic: probe must enforce the exact deployed SHA")
         if '[ -z "$STAGING_WORKER_URL" ]' not in run or "exit 1" not in run:
             errors.append(f"{name}:user-flow-synthetic: an unset staging origin must fail, never pass empty")
+    if (steps.count(PREVIEW_STEP) != 1 or len(probes) != 1
+            or steps.index(PREVIEW_STEP) <= steps.index(probes[0])
+            or str(workflow).count("inputs.verify_automod_preview") != 1
+            or str(workflow).count("secrets.DISCORD_STAGING_BOT_TOKEN") != 1):
+        errors.append(f"{name}:user-flow-synthetic: keep the preview GET and its credential in one pinned step after readiness")
     checkouts = [step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")]
     if len(checkouts) != 1 or (checkouts[0].get("with") or {}).get("ref") != "${{ github.sha }}" \
             or (checkouts[0].get("with") or {}).get("persist-credentials") != "false":
@@ -7995,8 +8016,10 @@ class WorkflowTests(unittest.TestCase):
     def test_user_flow_synthetic_gates_certification_on_the_exact_sha(self):
         staging = self.workflows["deploy-staging.yml"]
         self.assertEqual(user_flow_synthetic_errors(staging), [])
-        probe = lambda w: next(step for step in w["jobs"]["user-flow-synthetic"]["steps"]
+        steps = lambda w: w["jobs"]["user-flow-synthetic"]["steps"]
+        probe = lambda w: next(step for step in steps(w)
                                if "staging_health_contract_probe.py" in str(step.get("run", "")))
+        preview = lambda w: next(step for step in steps(w) if step == PREVIEW_STEP)
         mutations = {
             "renamed": lambda w: w["jobs"]["user-flow-synthetic"].__setitem__("name", "synthetic"),
             "conditional": lambda w: w["jobs"]["user-flow-synthetic"].__setitem__("if", "false"),
@@ -8009,6 +8032,14 @@ class WorkflowTests(unittest.TestCase):
             "secret read": lambda w: probe(w)["env"].__setitem__("TOKEN", "${{ secrets.X }}"),
             "write grant": lambda w: w["jobs"]["user-flow-synthetic"].__setitem__(
                 "permissions", {"contents": "write"}),
+            "preview without opt-in": lambda w: preview(w).pop("if"),
+            "preview without exact clean rollout": lambda w: preview(w).update({"if": "inputs.verify_automod_preview"}),
+            "preview without expiry": lambda w: preview(w)["env"].pop("STAGING_USE_EXPIRES_AT"),
+            "preview before readiness": lambda w: steps(w).insert(0, steps(w).pop(steps(w).index(preview(w)))),
+            "preview token outside preview": lambda w: probe(w)["env"].update({
+                "TOKEN": preview(w)["env"]["DISCORD_STAGING_BOT_TOKEN"],
+            }),
+            "preview tolerates failure": lambda w: preview(w).update({"continue-on-error": "true"}),
             "certify ignores it": lambda w: w["jobs"]["certify-promotion"].__setitem__(
                 "needs", ["deploy", "voice-synthetic", "pinned-history-guard"]),
         }
@@ -8412,6 +8443,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(dispatch["inputs"]), {
             "release_fence", "inject_gateway_failure", "inject_error_rate_spike",
             "inject_voice_stall", "inject_unpaired_disconnect", "recover_prior_sha", "sha",
+            "verify_automod_preview",
         })
         self.assertEqual(dispatch["inputs"]["sha"]["default"], "")
         self.assertEqual(dispatch["inputs"]["recover_prior_sha"]["default"], "false")
@@ -8426,6 +8458,7 @@ class WorkflowTests(unittest.TestCase):
             "required boolean": lambda on: on["workflow_dispatch"]["inputs"]["release_fence"].update({"required": True}),
             "recovery by default": lambda on: on["workflow_dispatch"]["inputs"]["recover_prior_sha"].update({"default": "true"}),
             "extra sha field": lambda on: on["workflow_dispatch"]["inputs"]["sha"].update({"options": ["main"]}),
+            "preview by default": lambda on: on["workflow_dispatch"]["inputs"]["verify_automod_preview"].update({"default": "true"}),
             "nonempty sha default": lambda on: on["workflow_dispatch"]["inputs"]["sha"].update({"default": "main"}),
         }
         for label, mutate in mutations.items():
