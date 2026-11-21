@@ -177,10 +177,16 @@ async fn voice_preflight_429_preserves_only_validated_timing_without_patch() {
         let (listener, origin) = loopback().await;
         let action = executor(&origin, Arc::new(Admission::new(TOKEN, None, None)));
         let cache = SharedCache::default();
+        let guild =
+            serde_json::from_str(include_str!("../../../bot/tests/fixtures/voice_guild.json"))
+                .expect("complete guild fixture");
+        cache.update(&twilight_model::gateway::event::Event::GuildCreate(
+            Box::new(guild),
+        ));
         let holds = std::sync::Mutex::new(VoiceMoveHolds::default());
         let roster = VoiceMoveRoster::new(&cache, &holds);
         let attempt = action.move_with_voice_evidence_until(
-            ["1", "2", "3"],
+            ["100", "2", "3"],
             roster,
             Instant::now() + WAIT,
             || Some(()),
