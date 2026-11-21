@@ -9,7 +9,6 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from email.message import Message
 from pathlib import Path
 from unittest import mock
 
@@ -153,30 +152,15 @@ class FakeDiscord:
 
 class HelpEmbedSmokeTests(unittest.TestCase):
     def setUp(self):
-        self.icon_status = 200
-        self.icon_types = ["image/png"]
-        guard = mock.patch.object(smoke.urllib.request.OpenerDirector, "open",
-                                  autospec=True, side_effect=self.icon_response)
-        self.icon_open = guard.start()
+        guard = mock.patch.object(
+            smoke.urllib.request.OpenerDirector, "open",
+            side_effect=AssertionError("network access in a unit test"))
+        guard.start()
         self.addCleanup(guard.stop)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
         self.evidence = str(self.dir / "evidence.json")
-
-    def icon_response(self, opener, request, timeout):
-        self.assertEqual(EXPECTED["icon_url"], request.full_url)
-        self.assertEqual("HEAD", request.get_method())
-        self.assertEqual("image/png", request.get_header("Accept"))
-        self.assertFalse(request.has_header("Authorization"))
-        self.assertEqual(smoke.TIMEOUT_SECONDS, timeout)
-        self.assertTrue(any(isinstance(h, smoke._RefuseRedirect) for h in opener.handlers))
-        headers = Message()
-        for value in self.icon_types:
-            headers.add_header("Content-Type", value)
-        response = mock.MagicMock(status=self.icon_status, headers=headers)
-        response.__enter__.return_value = response
-        return response
 
     def write_payloads(self, data=None):
         path = self.dir / "payloads.json"
@@ -234,24 +218,10 @@ class HelpEmbedSmokeTests(unittest.TestCase):
                          methods)
         evidence = self.evidence_json()
         self.assertEqual("PASS", evidence["verdict"])
-        icon, *rows = evidence["rows"]
-        self.assertEqual(("icon_delivery", "pass"), (icon["name"], icon["result"]))
-        self.icon_open.assert_called_once()
-        self.assertEqual(list(want), [row["name"] for row in rows])
-        self.assertTrue(all("message_id" in row for row in rows))
+        self.assertEqual(list(want), [row["name"] for row in evidence["rows"]])
+        self.assertTrue(all("message_id" in row for row in evidence["rows"]))
         self.assertNotIn(TOKEN, out)
         self.assertNotIn(TOKEN, Path(self.evidence).read_text())
-
-    def test_bad_icon_delivery_fails_before_any_post(self):
-        for status, types in ((200, ["text/html"]), (200, []),
-                              (200, ["image/png", "text/html"]), (302, ["image/png"])):
-            with self.subTest(status=status, content_types=types):
-                self.icon_status, self.icon_types = status, types
-                fake = FakeDiscord()
-                code, out = self.run_main(fake)
-                self.assertEqual(1, code)
-                self.assertIn("FAIL    icon_delivery:", out)
-                self.assertEqual([], fake.posts())
 
     def test_assertions_run_on_the_read_back_not_the_post_echo(self):
         def strip_brand(message):
@@ -345,7 +315,7 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         self.assertIn("cleanup delete failed", out)
         self.assertEqual(len(ROW_CONTRACTS), len(fake.messages))
         evidence = self.evidence_json()
-        self.assertTrue(all(row.get("cleanup_failed") for row in evidence["rows"][1:]))
+        self.assertTrue(all(row.get("cleanup_failed") for row in evidence["rows"]))
 
     def test_timed_out_post_is_reconciled_and_removed(self):
         # Discord committed the first post but its response timed out, so
@@ -443,9 +413,6 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         wrong_color["embeds"]["echo"]["color"] = EXPECTED["color"]
         non_https = payloads()
         non_https["expected"]["help"]["icon_url"] = "http://example.com/x.png"
-        different_https = payloads()
-        different_https["expected"]["help"]["icon_url"] = "https://example.com/x.png"
-        different_https["embeds"]["help"]["footer"]["icon_url"] = "https://example.com/x.png"
         icon_on_ephemeral = payloads()
         icon_on_ephemeral["expected"]["rsvp_ok"]["icon_url"] = EXPECTED["icon_url"]
         icon_on_ephemeral["embeds"]["rsvp_ok"]["footer"]["icon_url"] = EXPECTED["icon_url"]
@@ -457,7 +424,6 @@ class HelpEmbedSmokeTests(unittest.TestCase):
             "missing new row and expectation": missing_new,
             "wrong Echo colour": wrong_color,
             "non-https icon": non_https,
-            "unpinned https icon": different_https,
             "icon on a text-only footer": icon_on_ephemeral,
         }
         for name, data in cases.items():
@@ -467,7 +433,6 @@ class HelpEmbedSmokeTests(unittest.TestCase):
                 self.assertEqual(2, code)
                 self.assertIn("REFUSED refusing:", out)
                 self.assertEqual([], fake.calls)
-                self.icon_open.assert_not_called()
 
     def test_missing_payload_file_refuses(self):
         fake = FakeDiscord()

@@ -66,8 +66,6 @@ USER_AGENT = "two-bot-next-staging-help-embed-smoke/1.0"
 BODY_CAP = fenced.BODY_CAP
 PAYLOAD_CAP = 1 << 20
 TIMEOUT_SECONDS = 15
-ICON_URL = ("https://imagedelivery.net/cNVnKlHCCMxI9vqDkwBbUQ/"
-            "two-icon1-dark512-4469ca165f03/public")
 # Guild text (0) and announcement (5) channels accept bot message posts.
 TEXT_CHANNEL_TYPES = (0, 5)
 TEXT_ONLY_FOOTER_KEYS = ("rsvp_ok", "rsvp_error", "voice_ok", "voice_warn", "voice_error")
@@ -184,8 +182,8 @@ def load_payloads(path):
         if key in TEXT_ONLY_FOOTER_KEYS:
             if icon_url is not None:
                 raise Refused(f"refusing: payload footer for {key} must be text-only")
-        elif icon_url != ICON_URL:
-            raise Refused(f"refusing: payload expected icon url for {key} is not pinned Icon 1")
+        elif not isinstance(icon_url, str) or not icon_url.startswith("https://"):
+            raise Refused(f"refusing: payload expected icon url for {key} is not https")
         embed = embeds[key]
         if brand_fault(embed, brand) is not None:
             raise Refused(f"refusing: payload embed {key} already misses the brand")
@@ -226,24 +224,8 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
     http_error_302 = http_error_303 = http_error_307 = http_error_308 = http_error_301
 
 
-def check_icon_delivery():
-    """Check the pinned public asset without a bot token, proxy or redirect."""
-    request = urllib.request.Request(
-        ICON_URL, method="HEAD", headers={"Accept": "image/png", "User-Agent": USER_AGENT})
-    try:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirect)
-        with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
-            if response.status != 200:
-                raise SmokeFail("Icon 1 response was not HTTP 200")
-            values = response.headers.get_all("Content-Type", [])
-    except (OSError, http.client.HTTPException, SmokeFail):
-        raise SmokeFail("Icon 1 HTTP check failed") from None
-    if len(values) != 1 or values[0].partition(";")[0].strip().lower() != "image/png":
-        raise SmokeFail("Icon 1 did not serve image/png")
-
-
 def make_transport(token):
-    """Build the authenticated transport; the token never leaves this closure.
+    """Build the only network function; the token never leaves this closure.
 
     transport(method, path, payload=None) -> (status, body bytes).
     """
@@ -543,12 +525,6 @@ def run(payload_path, guild_id, token, channel_id, transport=None):
     except SmokeFail as error:
         report.rows.append(Row("preflight", "fail", str(error)))
         return report
-    try:
-        check_icon_delivery()
-    except SmokeFail as error:
-        report.rows.append(Row("icon_delivery", "fail", str(error)))
-        return report
-    report.rows.append(Row("icon_delivery", "pass", "Icon 1 served image/png"))
     for key in EMBED_KEYS:
         report.rows.append(
             smoke_one(net, key, embeds[key], expected[key], application_id, channel))

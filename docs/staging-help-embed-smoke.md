@@ -23,10 +23,7 @@ ordered fields. It does not post buttons or verify callback behavior.
    ordinary test-bot message. The staging product bot's token is never
    used; it stays out of GitHub by the recorded decision in
    [the slash smoke doc](staging-slash-smoke.md#why-it-is-not-a-github-workflow).
-3. Before posting, it checks the pinned Icon 1 URL separately with a public
-   HTTPS HEAD request. HTTP 200 with `Content-Type: image/png` passes; no
-   Discord credential, proxy, redirect or response body is used.
-4. For each post, it reads `GET /channels/{channel_id}/messages/{message_id}`
+3. For each post, it reads `GET /channels/{channel_id}/messages/{message_id}`
    and asserts on that read-back—never the POST response—that:
    - the single embed matches its row’s colour and footer text and icon policy;
    - the discovery footer says `Together We Own · Help · Page 1 of N`,
@@ -35,7 +32,7 @@ ordered fields. It does not post buttons or verify callback behavior.
      embed byline is expected (the message author must be the test bot);
    - the title, description and ordered fields match the sanitized payload
      after trimming outer whitespace.
-5. It deletes each message, pass or fail, and writes evidence containing
+4. It deletes each message, pass or fail, and writes evidence containing
    only row results, durations and message IDs. Before each post it records
    the channel's newest message ID as an anchor; if a post's outcome is
    lost (timeout, 5xx or an unreadable answer), it reconciles by deleting
@@ -120,8 +117,8 @@ Keep `assets/brand/two-icon-1-dark-512.png` unchanged (29,035 bytes; SHA-256
 `ff0cd5863ed02b1f405bd3f1bf22b192ea7b9e6dc657792cb6df621f8fce438a`).
 The rollback URL is
 `https://raw.githubusercontent.com/TogetherWeOwn/two-bot-next/main/assets/brand/two-icon-1-dark-512.png`.
-To roll delivery back, restore that URL in the Rust and Python constants and
-respect their exact-URL fixtures, through the normal review and release gates.
+To roll delivery back, restore that URL in the constant and its exact-URL Rust
+assertion and Python fixture, through the normal review and release gates.
 Do not delete or re-import the Images copy as part of a code rollback.
 
 Use the existing payload builder and smoke above to check the synthetic
@@ -233,7 +230,7 @@ python3 scripts/cargo_cache.py run -- run -p two-bot-discord --example help_embe
 
 - Exit `0` / `VERDICT PASS`: all read-backs matched and all test messages
   were deleted.
-- Exit `1` / `VERDICT FAIL`: identity, channel, Icon 1 HTTP, post, read-back or brand
+- Exit `1` / `VERDICT FAIL`: identity, channel, post, read-back or brand
   failed. The row names the first fixed-vocabulary fault; a failed
   embed row does not stop the others.
 - Exit `2` / `REFUSED`: a fence stopped the run before any post, for example

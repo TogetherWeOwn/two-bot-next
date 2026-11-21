@@ -14,11 +14,12 @@ use two_bot_core::commands::{
     CustomCommand, GUILD_COMMAND_LIMIT,
 };
 
-use crate::brand::{brand_footer_for, ephemeral_reply_embed, EmbedKind, BRAND_ICON_URL};
+use crate::brand::{
+    brand_footer_for, ephemeral_reply_embed, rsvp_reply_embed, EmbedKind, BRAND_ICON_URL,
+};
 use crate::help_navigation::{DiscoveryPlan, HelpRecovery, HELP_SURFACE, HELP_TITLE};
 use crate::interactions::branded_help_detail_response;
 use crate::internal_actions::announcement_embed;
-use crate::rsvp::rsvp_reply_embed;
 
 /// Versioned payload schema the Python smoke refuses anything else under.
 pub const HELP_EMBED_SMOKE_SCHEMA: &str = "help_embed_smoke.v3";
@@ -220,41 +221,23 @@ mod help_embed_smoke_tests {
     #[test]
     fn additional_rows_match_their_kit_contracts() {
         use crate::brand::brand_tokens::{
-            BRAND_DISCORD_EMBED_DANGER, BRAND_DISCORD_EMBED_DEFAULT, BRAND_DISCORD_EMBED_ECHO,
-            BRAND_DISCORD_EMBED_OK, BRAND_DISCORD_EMBED_WARN,
+            BRAND_DISCORD_EMBED_DANGER as DANGER, BRAND_DISCORD_EMBED_DEFAULT as DEFAULT,
+            BRAND_DISCORD_EMBED_ECHO as ECHO, BRAND_DISCORD_EMBED_OK as SAVED,
+            BRAND_DISCORD_EMBED_WARN as WARN,
         };
 
         let payloads = help_embed_smoke_payloads().expect("payloads build");
+        let icon = Some(BRAND_ICON_URL);
         for (key, color, surface, icon) in [
-            (
-                "help_warn",
-                BRAND_DISCORD_EMBED_WARN,
-                "Help",
-                Some(BRAND_ICON_URL),
-            ),
-            (
-                "help_error",
-                BRAND_DISCORD_EMBED_DANGER,
-                "Help",
-                Some(BRAND_ICON_URL),
-            ),
-            (
-                "announcement",
-                BRAND_DISCORD_EMBED_DEFAULT,
-                "Announcements",
-                Some(BRAND_ICON_URL),
-            ),
-            (
-                "echo",
-                BRAND_DISCORD_EMBED_ECHO,
-                "Echo",
-                Some(BRAND_ICON_URL),
-            ),
-            ("rsvp_ok", BRAND_DISCORD_EMBED_OK, "Events", None),
-            ("rsvp_error", BRAND_DISCORD_EMBED_DANGER, "Events", None),
-            ("voice_ok", BRAND_DISCORD_EMBED_OK, "Voice", None),
-            ("voice_warn", BRAND_DISCORD_EMBED_WARN, "Voice", None),
-            ("voice_error", BRAND_DISCORD_EMBED_DANGER, "Voice", None),
+            ("help_warn", WARN, "Help", icon),
+            ("help_error", DANGER, "Help", icon),
+            ("announcement", DEFAULT, "Announcements", icon),
+            ("echo", ECHO, "Echo", icon),
+            ("rsvp_ok", SAVED, "Events", None),
+            ("rsvp_error", DANGER, "Events", None),
+            ("voice_ok", SAVED, "Voice", None),
+            ("voice_warn", WARN, "Voice", None),
+            ("voice_error", DANGER, "Voice", None),
         ] {
             let footer = format!("Together We Own · {surface}");
             let expected = &payloads["expected"][key];
