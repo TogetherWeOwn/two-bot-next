@@ -262,6 +262,18 @@ impl ActionExecutor {
         deadline: Instant,
         revalidate: impl std::future::Future<Output = bool> + Send,
     ) -> Result<VoiceMovePatch, ActionError> {
+        let ids = [guild_id, member_id, channel_id];
+        self.move_voice_member_with_commit_until(ids, deadline, revalidate, &|start| start())
+            .await
+    }
+
+    async fn move_voice_member_with_commit_until(
+        &self,
+        [guild_id, member_id, channel_id]: [&str; 3],
+        deadline: Instant,
+        revalidate: impl std::future::Future<Output = bool> + Send,
+        commit: super::FinalCommit<'_>,
+    ) -> Result<VoiceMovePatch, ActionError> {
         use super::StrictTransportError::{
             Admission, PreWireDeadline, PreWireGuard, PreWireRevalidation,
         };
@@ -281,7 +293,7 @@ impl ActionExecutor {
         let headers = self
             .inner
             .transport
-            .send_strict_evidence_headers_after(&request, deadline, revalidate, move || {
+            .send_strict_evidence_headers_after(&request, deadline, revalidate, commit, move || {
                 self.stamp_paced_lane(&mut pacing, false);
                 self.count();
             })
