@@ -28,28 +28,31 @@ pub async fn read<T: Fn() -> bool>(
     pool: &sqlx::PgPool,
     ticket: impl FnOnce(Snowflake) -> Option<T>,
 ) -> Result<Value, ReadRefusal> {
+    read_with(request.event_key(), ticket, |scope| {
+        finalized_attendance(pool, scope.guild_id, scope.event_key)
+    })
+    .await
+}
+
+async fn read_with<
+    'a,
+    F: Future<Output = Result<Option<FinalizedAttendance>, InternalStoreError>>,
+>(
+    event_key: &'a str,
+    ticket: impl FnOnce(Snowflake) -> Option<impl Fn() -> bool>,
+    lookup: impl FnOnce(AttendanceScope<'a>) -> F,
+) -> Result<Value, ReadRefusal> {
     let guild_id = TWO_STAGING_GUILD_ID
         .parse()
         .map_err(|_| ReadRefusal::Internal)?;
     let scope = AttendanceScope {
         guild_id,
-        event_key: request.event_key(),
+        event_key,
     };
-    read_with(scope, ticket(guild_id), || {
-        finalized_attendance(pool, guild_id, scope.event_key)
-    })
-    .await
-}
-
-async fn read_with<F: Future<Output = Result<Option<FinalizedAttendance>, InternalStoreError>>>(
-    scope: AttendanceScope<'_>,
-    ticket: Option<impl Fn() -> bool>,
-    lookup: impl FnOnce() -> F,
-) -> Result<Value, ReadRefusal> {
-    let ticket = ticket
+    let ticket = ticket(scope.guild_id)
         .filter(|current| current())
         .ok_or(ReadRefusal::Unavailable)?;
-    let result = match lookup().await {
+    let result = match lookup(scope).await {
         Ok(Some(record)) => project(scope, &record),
         Ok(None) => Err(ReadRefusal::NotFound),
         Err(_) => Err(ReadRefusal::Internal),
@@ -152,21 +155,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readiness_and_lookup_share_the_fixed_guild_and_validated_key() {
+        let body = serde_json::json!({"event_key": "fixture:1"});
+        let key =
+            two_bot_core::internal_actions::validate_event_key(body.as_object().unwrap()).unwrap();
+        assert_eq!(
+            read_with(
+                key,
+                |guild| {
+                    assert_eq!(guild.to_string(), TWO_STAGING_GUILD_ID);
+                    Some(|| true)
+                },
+                |scope| async move {
+                    assert_eq!(scope.guild_id.to_string(), TWO_STAGING_GUILD_ID);
+                    assert_eq!(scope.event_key, "fixture:1");
+                    Ok(None)
+                }
+            )
+            .await,
+            Err(ReadRefusal::NotFound)
+        );
+    }
+
+    #[tokio::test]
     async fn absent_and_invalidated_tickets_never_release_results() {
-        let scope = AttendanceScope {
-            guild_id: 1,
-            event_key: "fixture:1",
-        };
+        let key = "fixture:1";
         for ticket in [None, Some((|| false) as fn() -> bool)] {
             assert_eq!(
-                read_with(scope, ticket, || async { panic!("lookup must not run") }).await,
+                read_with(key, |_| ticket, |_| async { panic!("lookup must not run") }).await,
                 Err(ReadRefusal::Unavailable)
             );
         }
         assert_eq!(
-            read_with(scope, Some(|| true), || async {
-                Err(InternalStoreError::Unavailable)
-            })
+            read_with(
+                key,
+                |_| Some(|| true),
+                |_| async { Err(InternalStoreError::Unavailable) }
+            )
             .await,
             Err(ReadRefusal::Internal)
         );
@@ -175,24 +200,28 @@ mod tests {
         for found in [false, true] {
             for invalidate in [false, true] {
                 let epoch = Cell::new(0);
-                let result = read_with(scope, Some(|| epoch.get() == 0), || async {
-                    tokio::task::yield_now().await;
-                    epoch.set(u32::from(invalidate));
-                    Ok(found.then(|| FinalizedAttendance {
-                        starts_at,
-                        ends_at,
-                        sessions: vec![AttendanceSession {
-                            member_id: 2,
-                            channel_id: 3,
-                            channel_name: "fixture".to_owned(),
-                            name_observed_at: Some(starts_at),
-                            is_bot: false,
-                            afk: false,
-                            joined_at: starts_at,
-                            left_at: ends_at,
-                        }],
-                    }))
-                })
+                let result = read_with(
+                    key,
+                    |_| Some(|| epoch.get() == 0),
+                    |_| async {
+                        tokio::task::yield_now().await;
+                        epoch.set(u32::from(invalidate));
+                        Ok(found.then(|| FinalizedAttendance {
+                            starts_at,
+                            ends_at,
+                            sessions: vec![AttendanceSession {
+                                member_id: 2,
+                                channel_id: 3,
+                                channel_name: "fixture".to_owned(),
+                                name_observed_at: Some(starts_at),
+                                is_bot: false,
+                                afk: false,
+                                joined_at: starts_at,
+                                left_at: ends_at,
+                            }],
+                        }))
+                    },
+                )
                 .await;
                 match (invalidate, found) {
                     (true, _) => assert_eq!(result, Err(ReadRefusal::Unavailable)),
