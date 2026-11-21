@@ -1,6 +1,7 @@
 //! Fixed-cardinality, process-local metrics; no background task or retained payloads.
 //! Text format: <https://prometheus.io/docs/instrumenting/exposition_formats/#text-format-details>
 
+use crate::automod_preview_report::PreviewMetricLabels;
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -447,6 +448,36 @@ pub const AUTOMOD_DECISION_OUTCOMES: &[&str] = &[
     "timed_out",
     "sanction_refused",
 ];
+// Valid (result, filter, mode) tuples in the AutoMod preview spec (§6).
+// Use the same table for admission and exposition: even a recognized label
+// in an invalid combination cannot create a series or increment another one.
+const AUTOMOD_PREVIEW_SERIES: [(&str, &str, &str); 24] = [
+    ("matched", "bad_words", "dry_run"),
+    ("matched", "bad_words", "enforce"),
+    ("matched", "repeated_message", "dry_run"),
+    ("matched", "repeated_message", "enforce"),
+    ("matched", "mention_spam", "dry_run"),
+    ("matched", "mention_spam", "enforce"),
+    ("matched", "invite_link", "dry_run"),
+    ("matched", "invite_link", "enforce"),
+    ("matched", "external_link", "dry_run"),
+    ("matched", "external_link", "enforce"),
+    ("matched", "attachment_type", "dry_run"),
+    ("matched", "attachment_type", "enforce"),
+    ("no_match", "none", "dry_run"),
+    ("no_match", "none", "enforce"),
+    ("exempt", "none", "dry_run"),
+    ("exempt", "none", "enforce"),
+    ("partial", "none", "dry_run"),
+    ("partial", "none", "enforce"),
+    ("rate_limited", "none", "dry_run"),
+    ("rate_limited", "none", "enforce"),
+    ("not_evaluated", "none", "not_evaluated"),
+    ("unavailable", "none", "dry_run"),
+    ("unavailable", "none", "enforce"),
+    ("unavailable", "none", "not_evaluated"),
+];
+
 /// Website-action receiver families for
 /// `two_bot_internal_actions_total{family,outcome}` (TOG-20119, roadmap
 /// M4.23). The signed receiver (`crates/bot/src/internal_action_http.rs`)
@@ -793,6 +824,7 @@ struct Values {
     feed_fetch: [u64; FEED_FETCH_OUTCOMES.len()],
     feed_fetch_errors: [u64; FEED_FETCH_ERROR_CLASSES.len()],
     automod_decisions: [u64; AUTOMOD_DECISION_OUTCOMES.len()],
+    automod_previews: [u64; AUTOMOD_PREVIEW_SERIES.len()],
     last_ready_unix: Option<u64>,
     last_resume_unix: Option<u64>,
     internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
@@ -831,8 +863,8 @@ struct Values {
 }
 
 /// Storage is fixed-size, except the per-actor voice stall map, which is
-/// bounded by the live guild-actor set. Unknown labels collapse to
-/// `other`, including hostile input. Drop-poison counts live outside the
+/// bounded by the live guild-actor set. Each metric handles unknown labels
+/// without growing the stored series. Drop-poison counts live outside the
 /// `Values` mutex in per-instance atomics: recording from a `Drop` body
 /// must complete even while another thread holds (or poisoned) that mutex,
 /// and must never block behind a scrape or an unrelated writer.
@@ -985,6 +1017,24 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter =
             &mut values.automod_decisions[bounded_index(outcome, AUTOMOD_DECISION_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// Record one AutoMod preview outcome before attempting its callback.
+    /// Reject invalid tuples entirely rather than exporting or folding them.
+    pub fn automod_preview(&self, labels: PreviewMetricLabels) {
+        let tuple = (labels.result, labels.filter, labels.mode);
+        let Some(index) = AUTOMOD_PREVIEW_SERIES
+            .iter()
+            .position(|&valid| valid == tuple)
+        else {
+            return;
+        };
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.automod_previews[index];
         *counter = counter.saturating_add(1);
     }
 
@@ -1992,6 +2042,21 @@ impl Metrics {
         }
         header(
             &mut out,
+            "two_bot_automod_previews_total",
+            "counter",
+            "Preview outcomes.",
+        );
+        for ((result, filter, mode), count) in
+            AUTOMOD_PREVIEW_SERIES.iter().zip(values.automod_previews)
+        {
+            writeln!(
+                out,
+                "two_bot_automod_previews_total{{result=\"{result}\",filter=\"{filter}\",mode=\"{mode}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
             "two_bot_gateway_latency_seconds",
             "gauge",
             "ACK latency; NaN if none.",
@@ -2576,9 +2641,6 @@ impl Metrics {
             values.audit_delivery_halt
         )
         .unwrap();
-        // Empty HELP: main sits within 131 bytes of the scrape byte budget
-        // (`eventsub_classification_growth_fits_the_scrape_byte_budget`), and
-        // this counter's three lines must fit without relaxing that headroom.
         header(&mut out, "two_bot_gateway_drain_skips_total", "counter", "");
         writeln!(
             out,
@@ -2804,20 +2866,18 @@ impl Metrics {
 }
 
 fn header(out: &mut String, name: &str, kind: &str, help: &str) {
-    if help.is_empty() {
-        // No trailing space: keeps checked-in exposition fixtures free of
-        // trailing whitespace while saving scrape bytes (see the
-        // byte-budget test below).
-        writeln!(out, "# HELP {name}\n# TYPE {name} {kind}").unwrap();
-    } else {
-        writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}").unwrap();
+    // Omit optional HELP for empty descriptions and the voice families to
+    // preserve headroom under the Worker cap. docs/metrics.md covers both.
+    let voice = name
+        .strip_prefix("two_bot_")
+        .is_some_and(|family| family.starts_with("voice_") || family.starts_with("event_voice_"));
+    if !help.is_empty() && !voice {
+        writeln!(out, "# HELP {name} {help}").unwrap();
     }
+    writeln!(out, "# TYPE {name} {kind}").unwrap();
 }
 
 fn scalar(out: &mut String, name: &str, kind: &str, value: u64) {
-    // Empty HELP: label-free scalars carry no wire description; the
-    // byte-budget test below caps the saturated exposition, and these
-    // bytes would otherwise crowd out real series.
     header(out, name, kind, "");
     writeln!(out, "{name} {value}").unwrap();
 }
@@ -2891,13 +2951,14 @@ mod tests {
     }
 
     #[test]
-    fn eventsub_classification_growth_fits_the_scrape_byte_budget() {
+    fn eventsub_and_automod_preview_fit_the_scrape_byte_budget() {
         let metrics = Metrics::default();
         let baseline = metrics.render(None);
         {
             let mut values = metrics.0.lock().unwrap();
             values.eventsub_received = u64::MAX;
             values.eventsub_classified.fill(u64::MAX);
+            values.automod_previews.fill(u64::MAX);
         }
         let full = metrics.render_with_rest_guard(
             Some((u32::MAX, usize::MAX, u32::MAX)),
@@ -2915,8 +2976,8 @@ mod tests {
             },
         );
         // Leave room for other counters to grow without relaxing any consumer's
-        // 64 KiB cap. This fixture saturates EventSub, pool and guard samples,
-        // not every process metric simultaneously.
+        // 64 KiB cap. This fixture saturates EventSub classification, preview,
+        // pool and guard samples, not every process metric simultaneously.
         assert!(
             full.len() < 65_536 - 1_024,
             "{} bytes leaves less than 1 KiB of scrape headroom",

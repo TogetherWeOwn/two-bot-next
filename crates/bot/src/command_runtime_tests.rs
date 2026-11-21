@@ -1527,6 +1527,53 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
+async fn automod_preview_dispatch_counts_refusals_and_a_failed_callback() {
+    use two_bot_core::automod_preview_report::PREVIEW_NOT_EVALUATED_REPLY;
+
+    let (mock, origin) = MockRest::start(vec![200, 200, 200, 400]).await;
+    let manage = Permissions::MANAGE_GUILD;
+    let denied = RouterRefusal::AutomodPreviewPermission.message();
+    let interaction = slash(
+        "automod-preview",
+        Some(CHANNEL),
+        vec![option(
+            "text",
+            CommandOptionValue::String("synthetic".into()),
+        )],
+    );
+    for (configured_guild, moderation, permissions, expected) in [
+        (GUILD + 1, true, manage, PREVIEW_NOT_EVALUATED_REPLY),
+        (GUILD, false, manage, PREVIEW_NOT_EVALUATED_REPLY),
+        (GUILD, true, Permissions::empty(), denied.as_str()),
+        // Authorized handler, but this runtime has no AutoMod activation.
+        (GUILD, true, manage, PREVIEW_NOT_EVALUATED_REPLY),
+    ] {
+        let router_gates = RouterGates {
+            configured_guild: Some(configured_guild),
+            moderation,
+            ..gates(true, false)
+        };
+        let runtime = runtime_without_db(router_gates, true, origin.clone());
+        let metrics = runtime.preview_metrics.get_or_init(Default::default);
+        runtime
+            .on_interaction(&from_member(interaction.clone(), 42, permissions))
+            .await;
+        let reply = callback_json(mock.requests().last().expect("preview callback"));
+        assert_eq!(reply["data"]["content"], expected);
+        assert_eq!(reply["data"]["flags"], 64);
+        let text = metrics.render(None);
+        let mut counted = text.lines().filter(|line| {
+            line.starts_with("two_bot_automod_previews_total{") && !line.ends_with(" 0")
+        });
+        let sample = r#"two_bot_automod_previews_total{result="not_evaluated",filter="none",mode="not_evaluated"} 1"#;
+        assert_eq!(counted.next(), (permissions == manage).then_some(sample));
+        assert_eq!(counted.next(), None);
+    }
+    assert_eq!(mock.requests().len(), 4);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 #[ignore = "requires disposable agent-testdb for the preview audit receipt"]
 async fn automod_preview_dispatch_uses_ingress_clocks_even_when_busy() {
     use crate::command_runtime::{LANE_BUSY, LANE_INTERACTIONS};
@@ -1675,6 +1722,372 @@ async fn automod_preview_dispatch_uses_ingress_clocks_even_when_busy() {
         crate::interaction_admission::BUSY_REPLY
     );
     mock.shutdown().await;
+}
+
+pub(crate) use preview_callback_acceptance::capture_dispatch_worker;
+
+mod preview_callback_acceptance {
+    use super::*;
+    use std::cell::Cell;
+    use tokio::{task::JoinHandle, time::Instant};
+    use two_bot_core::{
+        automod_preview_audit::{load_preview_audit, lock_preview_attempt, replay_preview_reply},
+        automod_runtime::STAGING_GUILD_ID,
+        send_admission::{
+            AdmissionError, AdmissionFuture, AdmissionPermit, PgSendAdmission, SendAdmission,
+            SendCompletion, SendCooldown, TokenKey,
+        },
+    };
+    use two_bot_cutover::settings::SettingsStore;
+    use two_bot_discord::executor::RECEIPT_ADMISSION_BUDGET_MS;
+
+    const SAMPLE: &str = "syntheticpreviewcanary";
+
+    tokio::task_local! {
+        static DISPATCH_WORKER: Cell<Option<JoinHandle<()>>>;
+    }
+
+    // Capture the real join handle only when this test scopes one dispatch.
+    // The runtime retains its abort handle, so shard cancellation is unchanged.
+    pub(crate) fn capture_dispatch_worker(worker: JoinHandle<()>) {
+        let _ = DISPATCH_WORKER.try_with(|slot| {
+            assert!(
+                slot.replace(Some(worker)).is_none(),
+                "one worker per dispatch"
+            );
+        });
+    }
+
+    fn dispatch_worker(dispatch: impl FnOnce()) -> JoinHandle<()> {
+        DISPATCH_WORKER.sync_scope(Cell::new(None), || {
+            dispatch();
+            DISPATCH_WORKER.with(|slot| slot.take().expect("dispatch spawned a worker"))
+        })
+    }
+
+    #[derive(Debug)]
+    struct ObservedAdmission {
+        inner: PgSendAdmission,
+        pool: PgPool,
+        saw_commit: std::sync::atomic::AtomicBool,
+        blocked: tokio::sync::Notify,
+        hold_retries: std::sync::atomic::AtomicBool,
+        attempts: Mutex<Vec<Instant>>,
+        settlement: Arc<SettlementGate>,
+    }
+
+    #[derive(Debug, Default)]
+    struct SettlementGate {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    struct HeldCompletion(AdmissionPermit, Arc<SettlementGate>);
+
+    impl SendCompletion for HeldCompletion {
+        fn complete(
+            self: Box<Self>,
+            cooldown: Option<SendCooldown>,
+        ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+            Box::pin(async move {
+                self.1.started.notify_one();
+                self.1.release.notified().await;
+                self.0.complete(cooldown).await
+            })
+        }
+    }
+
+    impl SendAdmission for ObservedAdmission {
+        fn token_key(&self) -> &TokenKey {
+            self.inner.token_key()
+        }
+
+        fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+            Box::pin(async {
+                self.attempts
+                    .lock()
+                    .expect("admission trace")
+                    .push(Instant::now());
+                // After real PostgreSQL confirms the held lane, model its
+                // continued occupancy without I/O on the paused clock.
+                if self.hold_retries.load(Ordering::Relaxed) {
+                    return Err(AdmissionError::Blocked);
+                }
+                let result = self.inner.admit().await;
+                match &result {
+                    Ok(_) => {
+                        let committed = load_preview_audit(&self.pool, "automod-preview:801")
+                            .await
+                            .is_ok_and(|row| row.is_some());
+                        self.saw_commit.store(committed, Ordering::Relaxed);
+                    }
+                    Err(AdmissionError::Blocked) => {
+                        self.hold_retries.store(true, Ordering::Relaxed);
+                        self.blocked.notify_one();
+                    }
+                    Err(_) => {}
+                }
+                result.map(|permit| {
+                    AdmissionPermit::new(Box::new(HeldCompletion(permit, self.settlement.clone())))
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_callback_follows_commit_and_respects_receipt_under_contention(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = std::env::var("TWO_TEST_DATABASE_URL")?;
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await?;
+        let proof = tokio::spawn(verify_callbacks(db.pool().clone())).await;
+        db.close().await?;
+        proof??;
+        Ok(())
+    }
+
+    async fn verify_callbacks(
+        pool: PgPool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let guild = STAGING_GUILD_ID.parse::<u64>()?;
+        let (mock, origin) = MockRest::start(vec![204]).await;
+        let token = "preview-callback-test-token";
+        let admission = Arc::new(ObservedAdmission {
+            inner: PgSendAdmission::new(pool.clone(), token)?,
+            pool: pool.clone(),
+            saw_commit: std::sync::atomic::AtomicBool::new(false),
+            blocked: tokio::sync::Notify::new(),
+            hold_retries: std::sync::atomic::AtomicBool::new(false),
+            attempts: Mutex::default(),
+            settlement: Arc::default(),
+        });
+        let executor =
+            ActionExecutor::with_admission(token.to_owned(), Some(origin), admission.clone())
+                .expect("loopback executor");
+        let deployment = [
+            ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
+            (
+                "TWO_OWEN_USER_ID".to_owned(),
+                "123456789012345678".to_owned(),
+            ),
+            ("TWO_AUTOMOD_BAD_WORDS".to_owned(), "bootword".to_owned()),
+        ]
+        .into();
+        let resolved =
+            crate::automod_gateway::resolve(&deployment, guild)?.expect("enabled policy");
+        let activation = crate::automod_gateway::build(resolved, pool.clone(), executor.clone());
+        let runtime = CommandRuntime::new(
+            pool.clone(),
+            executor,
+            router_with_commands(RouterGates {
+                moderation: true,
+                configured_guild: Some(guild),
+                ..gates(true, false)
+            }),
+            guild,
+            true,
+        );
+        let boot = activation.preview(|engine| engine.effective_config());
+        assert_eq!(boot.policy.bad_words, vec!["bootword"]);
+        runtime
+            .preview_deployment
+            .set(deployment)
+            .expect("fixture deployment");
+        runtime.set_automod(activation.clone());
+        let store = SettingsStore::new(&pool);
+        store
+            .set(
+                &guild.to_string(),
+                "TWO_AUTOMOD_BAD_WORDS",
+                Some(serde_json::json!([SAMPLE])),
+                "test",
+            )
+            .await?;
+        let (mut writer, live) = two_bot_core::settings::live_channel();
+        assert!(writer.publish(&store.load_snapshot().await?).changed);
+        runtime.set_live_settings(live);
+        let _guard = runtime.dispatch_guard();
+        let preview = |id, sample: &str| {
+            let mut request = slash(
+                "automod-preview",
+                Some(CHANNEL),
+                vec![option(
+                    "text",
+                    CommandOptionValue::String(sample.to_owned()),
+                )],
+            );
+            let guild_id = Id::new(guild);
+            set_guild(&mut request, Some(guild_id));
+            request.channel.as_mut().expect("guild channel").guild_id = Some(guild_id);
+            request.authorizing_integration_owners.guild = Some(AnonymizableId::Id(guild_id));
+            from_member(request, id, Permissions::MANAGE_GUILD)
+        };
+        let observed = "2026-08-01T01:02:03.456Z";
+        let first_worker = dispatch_worker(|| {
+            assert!(runtime.dispatch_received(
+                &interaction_event(preview(801, SAMPLE)),
+                false,
+                Instant::now(),
+                observed,
+            ));
+        });
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            admission.settlement.started.notified(),
+        )
+        .await?;
+        assert!(admission.saw_commit.load(Ordering::Relaxed));
+        assert_eq!(activation.preview(|engine| engine.effective_config()), boot);
+        assert!(matches!(
+            admission.inner.admit().await,
+            Err(AdmissionError::Blocked)
+        ));
+        // Discord already answered. Force the receipt deadline to pass while
+        // completion is held, then let the real durable release run.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS + 1)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::resume();
+        admission.settlement.release.notify_one();
+        let row = load_preview_audit(&pool, "automod-preview:801")
+            .await?
+            .expect("committed before the callback");
+        assert_eq!(row.outcome, "matched");
+        let reason = row.reason.as_deref().expect("audit reason");
+        assert!(!reason.contains(SAMPLE));
+        let reply = replay_preview_reply(&row.outcome, Some(reason), &row.created_at)
+            .expect("stored verdict renders");
+        assert!(reply.contains("TWO_AUTOMOD_BAD_WORDS"));
+        assert!(!reply.contains(SAMPLE));
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].path.ends_with("/callback"));
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body)?;
+        assert_eq!(body["type"], 4);
+        assert_eq!(body["data"]["flags"], 64);
+        assert_eq!(
+            body["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert_eq!(body["data"]["content"], reply);
+
+        let lane = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match admission.inner.admit().await {
+                    Err(AdmissionError::Blocked) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await
+                    }
+                    result => break result,
+                }
+            }
+        })
+        .await??;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), first_worker)
+                .await?
+                .is_ok(),
+            "first preview worker must exit normally"
+        );
+        let mut audit = pool.begin().await?;
+        lock_preview_attempt(&mut audit, "802").await?;
+        admission.attempts.lock().expect("admission trace").clear();
+        // A blocking task inhibits Tokio's auto-advance while the real I/O
+        // runs. Its receive timeout uses wall time, not the receipt budget.
+        tokio::time::pause();
+        let (io_done, wait_for_io) = std::sync::mpsc::channel::<()>();
+        let mut watchdog =
+            tokio::task::spawn_blocking(move || wait_for_io.recv_timeout(Duration::from_secs(10)));
+        // A worker that replaces the ingress receipt with its own start time
+        // would get 750 ms back.
+        let started_at = Instant::now();
+        let received_at = started_at - Duration::from_millis(750);
+        let deadline = received_at + Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS);
+        let contended_worker = dispatch_worker(|| {
+            assert!(runtime.dispatch_received(
+                &interaction_event(preview(802, SAMPLE)),
+                false,
+                received_at,
+                observed,
+            ));
+        });
+        let contend = async {
+            // Prove this invocation actually waited on the audit claim before
+            // observing the independent occupied REST lane.
+            loop {
+                let waiting = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
+                     AND NOT granted AND pg_backend_pid() = ANY(pg_blocking_pids(pid)))",
+                )
+                .fetch_one(&mut *audit)
+                .await?;
+                if waiting {
+                    break;
+                }
+                sqlx::query("SELECT pg_sleep(0.005)")
+                    .execute(&mut *audit)
+                    .await?;
+            }
+            assert!(
+                admission
+                    .attempts
+                    .lock()
+                    .expect("admission trace")
+                    .is_empty(),
+                "callback admission must wait for the audit claim"
+            );
+            audit.rollback().await?;
+            admission.blocked.notified().await;
+            Ok::<(), sqlx::Error>(())
+        };
+        tokio::select! {
+            result = contend => result?,
+            _ = &mut watchdog => panic!("real PostgreSQL contention watchdog elapsed"),
+        }
+        assert_eq!(
+            Instant::now(),
+            started_at,
+            "receipt clock stayed frozen during I/O"
+        );
+        io_done.send(())?;
+        // Now only the in-memory refusals and retry timers drive the worker.
+        tokio::time::sleep_until(deadline - Duration::from_millis(20)).await;
+        let waited_before_cutoff = Instant::now() < deadline && !contended_worker.is_finished();
+        tokio::time::sleep_until(deadline + Duration::from_millis(1)).await;
+        let settled =
+            tokio::time::timeout_at(deadline + Duration::from_millis(100), contended_worker).await;
+        let attempts = std::mem::take(&mut *admission.attempts.lock().expect("admission trace"));
+        tokio::time::resume();
+        watchdog.await??;
+        lane.complete(None).await?;
+        assert!(
+            waited_before_cutoff,
+            "callback must not abandon the held lane early"
+        );
+        assert!(
+            attempts.len() > 1,
+            "callback must retry after the real refusal"
+        );
+        assert!(
+            attempts.iter().all(|&attempt| attempt < deadline),
+            "no callback admission may start at or after the original receipt cutoff"
+        );
+        assert!(
+            settled
+                .expect("contended worker join watchdog elapsed")
+                .is_ok(),
+            "contended preview worker must exit normally"
+        );
+        let row = load_preview_audit(&pool, "automod-preview:802")
+            .await?
+            .expect("audit committed even though callback expired");
+        assert_eq!(row.outcome, "matched");
+        assert_eq!(mock.requests().len(), 1, "no late callback or follow-up");
+        mock.shutdown().await;
+        Ok(())
+    }
 }
 
 #[tokio::test]

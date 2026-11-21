@@ -27,6 +27,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_gateway_events_total{event}` | Received dispatches, including replays/duplicates, plus heartbeat ACKs and closes; fixed type allowlist, remainder `other` |
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert). Fixed three series from process start; no user, activity, application or free-text labels. Deliberately unwatched: no production callsite records this family yet (the event-store S3 producer is still cut over), so the rule lands with the producer; see the catalog |
 | `two_bot_automod_decisions_total{outcome}` | Terminal automod inspection outcomes; `outcome` is `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out` or `sanction_refused`. Recorded once per committed `StoredOutcome` by the shared activation; replays and retained claims never count. Fixed eight series from process start; no message text, excerpts or user IDs become labels. The `automod_sanction_refused` rule tickets on any `sanction_refused` increase (first sample is baseline-only, restarts re-baseline, missing family is no window); the other seven outcomes are policy working as designed and stay quiet |
+| `two_bot_automod_previews_total{result,filter,mode}` | AutoMod preview outcomes. Counts once before callback dispatch, including explicit guild and disabled refusals; a successful audited replay does not count. Audit failures count only as `unavailable`. See the 24 fixed label tuples below |
 | `two_bot_handler_duration_seconds` | Cumulative histogram over nonduplicate dispatch parse/pipeline/durable commit, including failures; seconds |
 | `two_bot_rest_requests_total{route,result}` | Executor HTTP sends, including retries; result `2xx`, `3xx`, `4xx`, `429`, `5xx` at response headers or `transport` (failure/cancellation/timeout before headers); later body failures do not hide 429/5xx |
 | `two_bot_rest_guard_invalid_requests_total` | Shared guard observations of 401, 403 or 429 response headers, across guarded REST callers |
@@ -227,13 +228,12 @@ REST clients are not silently claimed as covered.
   gateway and no database. There is no `503` or empty-body case.
 - Headers, byte-exact: `Content-Type: text/plain; version=0.0.4;
   charset=utf-8` and `Cache-Control: no-store`.
-- Body: Prometheus text exposition 0.0.4. Every family is preceded by its
-  `# HELP` / `# TYPE` lines, one sample per line, body ends with a trailing
-  newline. All families render from process start at zero/`NaN`, before any
-  gateway event or job completion. Keep HELP descriptions concise: the full
-  exposition must fit the consumers' 64 KiB body cap, not only the series-count
-  budget. A regression saturates EventSub, pool and REST-guard samples and
-  reserves 1 KiB for other value growth; it does not bound every possible
+- Body: Prometheus text exposition 0.0.4. Every family has a `# TYPE` line;
+  `# HELP` is optional. Samples use one line each, with a trailing newline.
+  All families render from process start at zero/`NaN`, before any gateway
+  event or job completion. The byte-budget regression saturates EventSub,
+  AutoMod preview, pool and REST-guard samples and reserves 1 KiB for other
+  value growth under the 64 KiB cap. It does not bound every possible
   combination of process counters at their maxima.
 
 ## Label allowlists (stable)
@@ -277,6 +277,16 @@ as dynamic labels.
   replays, retained claims, bypassed and unavailable inspections never count.
   No message text, excerpts or user IDs become labels; unrecognised outcomes
   collapse to `sanction_refused`, never to a new series.
+- `two_bot_automod_previews_total{result,filter,mode}` — [AutoMod preview spec §6](automod-preview-spec.md#6-persistence-audit-and-privacy).
+  `matched` uses `bad_words`, `repeated_message`, `mention_spam`, `invite_link`,
+  `external_link`, or `attachment_type`, with mode `dry_run` or `enforce`.
+  `no_match`, `exempt`, `partial`, and `rate_limited` use `filter=none` and either
+  effective mode. `not_evaluated` uses `filter=none,mode=not_evaluated`.
+  `unavailable` uses `filter=none` and the effective mode if known, otherwise
+  `mode=not_evaluated`. The 24 series start at zero; invalid tuples are dropped.
+  Permission denials and strict option-decode refusals do not count. Callback
+  failures and retries never add a second increment. No preview text, digests,
+  IDs, filenames, reasons, or timestamps become labels.
 - `two_bot_rest_requests_total{route,result}` — `result` is one of `2xx`,
   `3xx`, `4xx`, `429`, `5xx`, `transport`. `route` is one of the fixed
   executor route templates (`GET /channels/:channel`,
@@ -639,10 +649,10 @@ labels reach exposition. REST paths are matched to templates, never copied as
 labels: no guild/member/channel IDs, tokens, query strings, visitor data or message
 content. Unknown routes/events/jobs collapse to `other`. Histograms have eight
 fixed finite buckets and `+Inf`, sum and count. A scrape allocates a bounded-size
-text response; observations retain no input string. Wire `HELP` descriptions stay
-concise to preserve the 64 KiB scrape budget as fixed series are added; the catalog
-above retains the detailed semantics. Shortening `HELP` prose does not change
-metric names, types, labels, values or series counts.
+text response; observations retain no input string. The exporter shortens or
+omits optional wire `HELP` lines to preserve the 64 KiB scrape budget. The catalog
+above retains the detailed semantics. This does not change metric names, types,
+labels, values, or series counts.
 
 `crates/core/examples/metrics_rss.rs` fills every series, submits 100,000 unique
 unknown labels, then renders 10,000 scrapes. It reports Linux `/proc/self/status`
