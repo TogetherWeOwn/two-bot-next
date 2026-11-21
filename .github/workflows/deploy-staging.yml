@@ -728,6 +728,12 @@ jobs:
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          STAGING_PREVIEW_AUTHORIZATION: >-
+            ${{ inputs.verify_automod_preview && !inputs.recover_prior_sha && !inputs.inject_error_rate_spike &&
+            needs.deploy.outputs.promotion_clean == 'true' && needs.deploy.outputs.staging_use_sha == github.sha &&
+            format('Bearer {0}', secrets.STAGING_OWNERSHIP_CONTROL_TOKEN) || '' }}
+          STAGING_USE_DEPLOYMENT: ${{ needs.deploy.outputs.staging_use_deployment }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.deploy.outputs.staging_use_expires_at }}
         run: |
           set -euo pipefail
           if [ -z "$STAGING_WORKER_URL" ]; then
@@ -736,18 +742,6 @@ jobs:
           fi
           python3 scripts/staging_health_contract_probe.py --expected-sha "$EXPECTED_SHA" \
             --evidence "$RUNNER_TEMP/staging-user-flow-synthetic.json"
-      - name: Verify AutoMod preview registration (GET only)
-        if: >-
-          inputs.verify_automod_preview && !inputs.recover_prior_sha && !inputs.inject_error_rate_spike &&
-          needs.deploy.outputs.promotion_clean == 'true' && needs.deploy.outputs.staging_use_sha == github.sha
-        timeout-minutes: 2
-        env:
-          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          STAGING_USE_EXPIRES_AT: ${{ needs.deploy.outputs.staging_use_expires_at }}
-          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
-          STAGING_USE_SHA: ${{ needs.deploy.outputs.staging_use_sha }}
-          STAGING_USE_DEPLOYMENT: ${{ needs.deploy.outputs.staging_use_deployment }}
-        run: node wrangler/scripts/staging-use.mjs preview
       - name: Upload the user-flow synthetic evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

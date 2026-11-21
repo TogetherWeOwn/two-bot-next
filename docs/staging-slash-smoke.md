@@ -92,15 +92,11 @@ rank timeout/failure; sensitive-data exclusion from JSON and Debug; and
 independent simultaneous offline runs. Local timings are fixture timings, not
 production performance measurements.
 
-## AutoMod preview read-back
-
-On an authorized, clean current-main rollout, `verify_automod_preview` opts
-into a staging Worker GET that checks the active grant and exact serving build
-before and after reading the Discord guild registry. The existing ownership
-bearer stays in Actions and the Discord credential stays in the Worker.
-Missing evidence, identity drift, or a permission/option mismatch fails closed.
-A skipped step is not a receipt. The check never starts a container, publishes
-or invokes a command, or reads or changes any AutoMod rule.
+On a clean current-main rollout, `verify_automod_preview` adds a receipt to
+the existing user-flow `GET /readyz`, even when voice certification is disabled.
+Both sides of the Discord registry read check the active grant and serving
+build. Ordinary readiness can start or reconcile the container. The follow-up
+native readiness read adds no SDK lifecycle calls. The artifact retains the receipt.
 
 ## Live read-mostly smoke run
 

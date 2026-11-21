@@ -121,23 +121,6 @@ function window(state, args, now, phase = "active") {
   "staging_window_mismatch");
 }
 
-export async function stagingPreview(args, send = fetch, now = Date.now) {
-  const base = origin(args.url);
-  require(typeof args.token === "string" && args.token.length >= 32, "staging_token_missing");
-  const started = now();
-  binding(args, started);
-  const { deploymentId, sha, runId, runAttempt, expiresAt } = args;
-  const receipt = { registry: "pass", command: "automod-preview", deploymentId, sha, runId, runAttempt, expiresAt };
-  const result = await request(send, new URL("/internal/staging-automod-preview", base), {
-    method: "GET", headers: { authorization: `Bearer ${args.token}`, "cache-control": "no-cache",
-      "x-two-staging-preview": [deploymentId, sha, runId, runAttempt, expiresAt].join(":") },
-  }, performance.now() + Math.min(12000, expiresAt - started));
-  require(result.status === 200 && now() < expiresAt && record(result.body)
-    && Object.keys(result.body).length === Object.keys(receipt).length
-    && Object.entries(receipt).every(([key, value]) => result.body[key] === value), "staging_preview_refused");
-  return receipt;
-}
-
 /** Status never starts a container. All other actions pin caller-supplied build
  * and run identities; in particular release never stops some other run's use. */
 export async function stagingUse(args, send = fetch, pause = wait, now = Date.now) {
@@ -236,18 +219,7 @@ function receipt(action, state, at) {
   return { schema: "two-bot-staging-use.v1", action, environment: "staging", observedAt: new Date(at).toISOString(), ...state };
 }
 
-if (isDirectInvocation(process.argv[1], import.meta.url) && process.argv[2] === "preview") {
-  try {
-    require(process.env.STAGING_USE_SHA === process.env.GITHUB_SHA, "staging_identity_mismatch");
-    const receipt = await stagingPreview({ url: process.env.STAGING_WORKER_URL, token: process.env.OWNERSHIP_CONTROL_TOKEN,
-      sha: process.env.STAGING_USE_SHA, deploymentId: process.env.STAGING_USE_DEPLOYMENT, runId: process.env.GITHUB_RUN_ID,
-      runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT), expiresAt: Number(process.env.STAGING_USE_EXPIRES_AT) });
-    process.stdout.write(JSON.stringify(receipt) + "\n");
-  } catch {
-    console.error("staging_preview_refused");
-    process.exitCode = 1;
-  }
-} else if (isDirectInvocation(process.argv[1], import.meta.url)) {
+if (isDirectInvocation(process.argv[1], import.meta.url)) {
   const action = process.argv[2];
   const path = process.env.STAGING_USE_RECEIPT;
   const runId = process.env.GITHUB_RUN_ID;

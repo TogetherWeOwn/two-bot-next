@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseStagingState, stagingPreview, stagingUse } from "../scripts/staging-use.mjs";
+import { parseStagingState, stagingUse } from "../scripts/staging-use.mjs";
 
 const NOW = Date.now();
 const SHA = "a".repeat(40);
@@ -31,26 +31,6 @@ function responses(values: Response[]) {
   };
   return { calls, send };
 }
-
-test("staging client: preview prints only the matching closed receipt", async () => {
-  const receipt = { command: "automod-preview", registry: "pass", deploymentId: args.deploymentId,
-    sha: args.sha, runId: args.runId, runAttempt: args.runAttempt, expiresAt: args.expiresAt };
-  const h = responses([Response.json(receipt)]);
-  assert.deepEqual(await stagingPreview(args, h.send, clock), receipt);
-  const [call] = h.calls;
-  assert.equal(call.url.pathname, "/internal/staging-automod-preview");
-  assert.equal(call.init.method, "GET");
-  assert.equal(call.init.redirect, "error");
-  assert.equal(new Headers(call.init.headers).get("x-two-staging-preview"),
-    [args.deploymentId, args.sha, args.runId, args.runAttempt, args.expiresAt].join(":"));
-  for (const result of [{ ...receipt, runAttempt: 3 }, { ...receipt, debug: TOKEN }, null]) {
-    await assert.rejects(stagingPreview(args, responses([Response.json(result)]).send, clock), /staging_preview_refused/);
-  }
-  const refused = responses([]);
-  await assert.rejects(stagingPreview({ ...args, url: "https://example.invalid" }, refused.send, clock), /staging_origin_invalid/);
-  await assert.rejects(stagingPreview({ ...args, expiresAt: NOW }, refused.send, clock), /staging_window_invalid/);
-  assert.deepEqual(refused.calls, []);
-});
 
 test("staging client: acquire binds version, build, epoch, run/attempt and immutable expiry", async () => {
   const h = responses([Response.json({ ...state, use: null }), Response.json(state)]);

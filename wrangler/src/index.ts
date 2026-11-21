@@ -29,7 +29,7 @@ import {
   authenticated, deploymentId, readChange, readControlBody, refused,
 } from "./ownership.ts";
 import { StagingLifecycle, STAGING_USE_PATH, parseStagingUseChange, type StagingUse } from "./staging-lifecycle.ts";
-import { PREVIEW_PATH, PREVIEW_HEADER, previewRefusal, readPreview } from "./staging-preview.ts";
+import { PREVIEW_HEADER, previewRefusal, readPreview } from "./staging-preview.ts";
 import {
   TokenBuckets,
   RedirectMissCache,
@@ -841,7 +841,7 @@ export class TwoBotContainer extends Container<Env> {
 
   private readonly ownership = new OwnershipFence(this.ctx.storage);
   private readonly stagingUse = new StagingLifecycle(this.ctx.storage);
-  private initialization?: Promise<void>;
+  private readonly initialization: Promise<void>;
   private recoveryFailed = false;
   // Last container git SHA seen on /readyz this tick. Tags the keepalive
   // error events (gateway failures by class; metrics alerts by rule/content);
@@ -858,13 +858,9 @@ export class TwoBotContainer extends Container<Env> {
     if (receiverEnabled(env)) wanted.push(RECEIVER_PORT);
     if (eventsubReceiverForwarded(env)) wanted.push(EVENTSUB_RECEIVER_PORT);
     if (wanted.length > 1) this.requiredPorts = [...new Set(wanted)];
-    if (!this.boundedStaging()) void this.initialize();
-  }
-
-  private initialize(): Promise<void> {
-    // Reconcile before side-effecting ingress or alarms. A staging receipt
-    // must be able to refuse on a cold object without starting reconciliation.
-    return this.initialization ??= this.ctx.blockConcurrencyWhile(async () => {
+    // A deployment can reattach to a running old process. Reconcile before
+    // ingress or alarms are delivered, not just before the next cold start.
+    this.initialization = ctx.blockConcurrencyWhile(async () => {
       try {
         const owner = await this.ownership.require(this.id());
         if (this.boundedStaging()) {
@@ -890,7 +886,7 @@ export class TwoBotContainer extends Container<Env> {
    * https://developers.cloudflare.com/durable-objects/api/state/#blockconcurrencywhile
    */
   private async gated<T>(operation: () => Promise<T>): Promise<T> {
-    await this.initialize();
+    await this.initialization;
     const result = await this.ctx.blockConcurrencyWhile(async () => {
       try { return { ok: true as const, value: await operation() }; }
       catch (error) { return { ok: false as const, error }; }
@@ -962,12 +958,7 @@ export class TwoBotContainer extends Container<Env> {
         deployment_id: use.deploymentId, sha: use.sha, epoch: use.epoch } : {}) }));
   }
 
-  override async alarm(): Promise<void> {
-    await this.initialize();
-    await super.alarm();
-  }
-
-  /** The SDK's persisted callback re-reads authority on every wake. */
+  /** The SDK owns alarm(); its persisted callback re-reads authority on every wake. */
   public async stagingExpiry(): Promise<void> {
     if (!this.boundedStaging()) return;
     await this.gated(async () => {
@@ -1022,8 +1013,6 @@ export class TwoBotContainer extends Container<Env> {
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === PREVIEW_PATH) return this.stagingPreview(request, url);
-    await this.initialize();
     if (url.pathname === CONTROL_PATH) return this.control(request);
     if (url.pathname === STAGING_USE_PATH) return this.stagingControl(request);
     if (url.pathname === ACTIONS_PATH) return this.internalActions(request);
@@ -1038,8 +1027,12 @@ export class TwoBotContainer extends Container<Env> {
       && url.pathname !== OPS_METRICS_PATH && !OPS_JSON_PATHS.includes(url.pathname)) {
       return new Response("not found", { status: 404, headers: withSecurityHeaders() });
     }
+    const preview = url.pathname === "/readyz" && this.boundedStaging() && request.headers.has(PREVIEW_HEADER);
+    const previewDenied = preview && await previewRefusal(request, url, this.env.OWNERSHIP_CONTROL_TOKEN);
+    if (previewDenied) return previewDenied;
+    let admitted: StagingUse | undefined;
     try {
-      return await this.owned(async () => {
+      const response = await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
         // Reached only through the Worker's ops gates (see default export).
         // MCP's internal dispatch reads the Rust audit, not the DO's admin
@@ -1133,6 +1126,9 @@ export class TwoBotContainer extends Container<Env> {
         // the fixed refusal.
         const probeSignal = AbortSignal.timeout(6000);
         const probe = new Request(request, { signal: probeSignal });
+        if (preview) admitted = await this.previewUse(request);
+        probe.headers.delete(PREVIEW_HEADER);
+        probe.headers.delete("authorization");
         let probeResponse: Response;
         try {
           probeResponse = await deadlineFetch(this.containerFetch(probe), probeSignal);
@@ -1161,7 +1157,77 @@ export class TwoBotContainer extends Container<Env> {
           return containerUnavailable(this.env.CF_VERSION_METADATA?.id);
         }
       });
+      return admitted ? await this.stagingPreview(request, admitted, response) : response;
     } catch (error) { return refused(error); }
+  }
+
+  private async previewUse(request: Request): Promise<StagingUse> {
+    const id = this.id();
+    const owner = await this.ownership.require(id, request.headers.get(DEPLOYMENT_HEADER) ?? "");
+    const use = await this.stagingUse.require({ deploymentId: id, sha: this.env.CONTAINER_RELEASE ?? "", owner });
+    if (this.recoveryFailed || Date.now() >= use.expiresAt || request.headers.get(PREVIEW_HEADER)
+      !== [id, use.sha, use.runId, use.runAttempt, use.expiresAt].join(":")) {
+      throw new OwnershipRefused("staging_use_required");
+    }
+    return use;
+  }
+
+  private async stagingPreview(request: Request, admitted: StagingUse, response: Response): Promise<Response> {
+    const { deploymentId, sha, runId, runAttempt, expiresAt } = admitted;
+    const signal = AbortSignal.timeout(Math.max(0, Math.min(8_000, expiresAt - Date.now())));
+    const allowed = <T>(operation: () => T) => abortable(this.gated(async () => {
+      const use = await this.previewUse(request);
+      if (use.epoch !== admitted.epoch || use.acquiredAt !== admitted.acquiredAt || !this.ctx.container?.running) {
+        throw new OwnershipRefused("staging_use_required");
+      }
+      signal.throwIfAborted();
+      return operation();
+    }), signal);
+    // Serialize each request's admission with release, then let release run
+    // while the network is pending. Every later GET and the receipt recheck.
+    const send = async (start: () => Promise<Response>) => (await allowed(() => {
+      const work = deadlineFetch(start(), signal);
+      void work.catch(() => {}); // Admission can time out before handing off the work.
+      return { work };
+    })).work;
+    const jsonText = async (res: Response, limit: number): Promise<string> => {
+      if (res.status !== 200 || res.redirected || res.headers.has("location")) {
+        releaseBody(res);
+        throw new Error("staging_preview_unavailable");
+      }
+      return await readBoundedText(res, limit, signal) ?? "";
+    };
+    const serving = (body: string) => {
+      const report = JSON.parse(body);
+      const expected = ["process", "gateway", "database", "token_invalid"].map((name) => [name, "ready"]);
+      if (report?.build_revision !== sha || report.build_id !== `${runId}-${runAttempt}`
+        || report.error != null || report.gateway_failure != null
+        || !report.jobs || typeof report.jobs !== "object" || Array.isArray(report.jobs)
+        || JSON.stringify(report.components) !== JSON.stringify(expected)) {
+        throw new Error("staging_preview_identity");
+      }
+    };
+    try {
+      const body = await jsonText(response, MAX_PROBE_BODY_BYTES);
+      serving(body);
+      await readPreview(this.env, async (url, token) => JSON.parse(await jsonText(await send(() =>
+        fetch(url, { method: "GET", redirect: "error", cache: "no-store", signal,
+          headers: { authorization: `Bot ${token}` } })), 256 * 1024)));
+      // A native port GET rechecks the process without running the SDK's
+      // auto-start, activity renewal or keepalive arming a second time.
+      serving(await jsonText(await send(() => this.ctx.container!.getTcpPort(this.defaultPort).fetch(
+        new Request("http://c/readyz", { method: "GET", redirect: "manual", signal }),
+      )), MAX_PROBE_BODY_BYTES));
+      return await allowed(() => {
+        const result = new Response(body, response);
+        result.headers.set("cache-control", "no-store");
+        result.headers.set(PREVIEW_HEADER, JSON.stringify({ registry: "pass", command: "automod-preview",
+          deploymentId, sha, runId, runAttempt, expiresAt }));
+        return result;
+      });
+    } catch {
+      return Response.json({ ready: false }, { status: 503, headers: { "cache-control": "no-store" } });
+    }
   }
 
   /**
@@ -1367,67 +1433,6 @@ export class TwoBotContainer extends Container<Env> {
       // Logs the closed ownership reason; the caller only sees the envelope.
       refused(error);
       return envelope(503, "unavailable", true, {}, requestId);
-    }
-  }
-
-  private async stagingPreview(request: Request, url: URL): Promise<Response> {
-    const refusal = await previewRefusal(request, url, this.env);
-    if (refusal) return refusal;
-    try {
-      const id = this.id();
-      const sha = this.env.CONTAINER_RELEASE ?? "";
-      const container = this.ctx.container;
-      if (!container) throw new Error("staging_preview_unavailable");
-      const bound = request.headers.get(PREVIEW_HEADER);
-      const check = async (): Promise<StagingUse> => {
-        const owner = await this.ownership.require(id, request.headers.get(DEPLOYMENT_HEADER) ?? "");
-        const use = await this.stagingUse.require({ deploymentId: id, sha, owner });
-        if (!container.running || this.recoveryFailed || Date.now() >= use.expiresAt
-          || bound !== [id, sha, use.runId, use.runAttempt, use.expiresAt].join(":")) {
-          throw new OwnershipRefused("staging_use_required");
-        }
-        return use;
-      };
-      const admitted = await check();
-      const signal = AbortSignal.timeout(Math.max(0, Math.min(8_000, admitted.expiresAt - Date.now())));
-      const stillAdmitted = async () => {
-        const current = await check();
-        if (current.epoch !== admitted.epoch || current.acquiredAt !== admitted.acquiredAt) {
-          throw new OwnershipRefused("staging_use_required");
-        }
-        signal.throwIfAborted();
-      };
-      const json = async (send: () => Promise<Response>, limit: number): Promise<unknown> => {
-        await stillAdmitted();
-        const response = await deadlineFetch(send(), signal);
-        if (response.status !== 200 || response.redirected) {
-          releaseBody(response);
-          throw new Error("staging_preview_unavailable");
-        }
-        return JSON.parse(await readBoundedText(response, limit, signal) ?? "");
-      };
-      const serving = async () => {
-        // The native port does not go through the SDK's auto-start path.
-        const report = await json(() => container.getTcpPort(this.defaultPort).fetch(
-          new Request("http://c/readyz", { method: "GET", redirect: "manual", signal }),
-        ), MAX_PROBE_BODY_BYTES) as Record<string, unknown> | null;
-        if (report?.build_revision !== sha || report.build_id !== `${admitted.runId}-${admitted.runAttempt}`
-          || !Array.isArray(report.components) || !gatewayComponentReady(report.components)
-          || !report.components.every((row) => Array.isArray(row) && row.length === 2 && row[1] === "ready")) {
-          throw new Error("staging_preview_identity");
-        }
-      };
-      await serving();
-      await readPreview(this.env, (url, token) => json(() => fetch(url, { method: "GET", redirect: "error",
-        cache: "no-store", signal, headers: { authorization: `Bot ${token}` } }), 256 * 1024));
-      await serving();
-      await stillAdmitted();
-      return Response.json({ registry: "pass", command: "automod-preview", deploymentId: id,
-        sha, runId: admitted.runId, runAttempt: admitted.runAttempt, expiresAt: admitted.expiresAt }, {
-        headers: withSecurityHeaders({ "cache-control": "no-store" }),
-      });
-    } catch {
-      return new Response(null, { status: 503, headers: withSecurityHeaders({ "cache-control": "no-store" }) });
     }
   }
 
@@ -2153,15 +2158,6 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === PREVIEW_PATH) {
-      const refusal = await previewRefusal(request, url, env);
-      if (refusal) return refusal;
-      try {
-        const forwarded = new Request(request);
-        forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
-        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
-      } catch { return refused(new Error("staging_preview_unavailable")); }
-    }
     if (url.pathname === STAGING_USE_PATH
       && (env.TWO_DEPLOY_ENV !== "staging" || env.STAGING_RUNTIME_POLICY !== "bounded")) return notFound();
     if (url.pathname === CONTROL_PATH || url.pathname === STAGING_USE_PATH) {
@@ -2308,6 +2304,10 @@ export default {
           }),
         });
       }
+      const preview = url.pathname === "/readyz" && request.headers.has(PREVIEW_HEADER)
+        && env.TWO_DEPLOY_ENV === "staging" && env.STAGING_RUNTIME_POLICY === "bounded";
+      const previewDenied = preview && await previewRefusal(request, url, env.OWNERSHIP_CONTROL_TOKEN);
+      if (previewDenied) return previewDenied;
       // Sanitize the forwarded probe: keep the origin (Host) the Container
       // expects, but drop the query, caller headers and body. The DO sees the
       // Worker-stamped deployment id the fence requires, plus the validated
@@ -2328,6 +2328,10 @@ export default {
           method: request.method,
           headers: { [DEPLOYMENT_HEADER]: deployment, [REQUEST_ID_HEADER]: probeId },
         });
+        if (preview) {
+          sanitized.headers.set(PREVIEW_HEADER, request.headers.get(PREVIEW_HEADER)!);
+          sanitized.headers.set("authorization", request.headers.get("authorization")!);
+        }
         const upstream = await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         // SDK startup failures arrive as responses rather than rejections.
         // Cancel without reading: a huge non-bot body must not bypass the
@@ -2346,6 +2350,7 @@ export default {
       // The outer Worker owns provenance, not the container or DO version.
       // Copy the response to get mutable headers without changing status/body.
       const result = new Response(response.body, response);
+      if (!preview) result.headers.delete(PREVIEW_HEADER);
       if (env.CF_VERSION_METADATA) {
         result.headers.set("x-two-worker-version", env.CF_VERSION_METADATA.id);
       } else {

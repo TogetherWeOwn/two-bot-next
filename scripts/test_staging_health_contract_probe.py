@@ -84,6 +84,27 @@ class HealthContractProbeTests(unittest.TestCase):
         self.assertIn(reason, results["FAIL readyz"])
         self.assertIn("no readyz body", results["FAIL build"])
 
+    def test_preview_requires_a_closed_receipt_on_the_only_readiness_get(self):
+        sha = READY["build_revision"]
+        authority = "Bearer " + "synthetic".ljust(32, "0")
+        env = dict(STAGING_PREVIEW_AUTHORIZATION=authority, GITHUB_SHA=sha, GITHUB_RUN_ID="1",
+                   GITHUB_RUN_ATTEMPT="1", STAGING_USE_DEPLOYMENT="worker-A", STAGING_USE_EXPIRES_AT="2000000000000")
+        receipt = dict(registry="pass", command="automod-preview", deploymentId="worker-A", sha=sha,
+                       runId="1", runAttempt=1, expiresAt=2000000000000)
+        def fake(url, *, headers=None):
+            self.requested.append((url, headers and headers["Authorization"]))
+            if url.endswith("/health"):
+                return body({"status": "ok"})
+            return 200, {"x-two-worker-version": "worker-A", probe.PREVIEW_HEADER: json.dumps(
+                value, separators=(",", ":"))}, body(READY)[2]
+        for value in (receipt, {**receipt, "runAttempt": 2}, {**receipt, "debug": authority}, None):
+            self.requested.clear()
+            with mock.patch.dict(os.environ, env, clear=True), redirect_stdout(io.StringIO()):
+                code = probe.main(["--staging-url", STAGING, "--expected-sha", sha, "--evidence", self.evidence], fetch_fn=fake)
+            self.assertEqual(self.requested, [(STAGING + "/health", None), (STAGING + "/readyz", authority)])
+            expected = (0, receipt) if value is receipt else (1, None)
+            self.assertEqual((code, json.loads(Path(self.evidence).read_text()).get("automod_preview")), expected)
+
     def test_production_origin_refuses_before_any_request(self):
         routes = {}
         code, _, _ = self.drive(routes, "--staging-url",

@@ -1,7 +1,6 @@
 import { authenticated } from "./ownership.ts";
 import { withSecurityHeaders } from "./security-headers.ts";
 
-export const PREVIEW_PATH = "/internal/staging-automod-preview";
 export const PREVIEW_HEADER = "x-two-staging-preview";
 // Match the pinned staging application and guild in the bot command registry.
 const APP = "1469137636663758888";
@@ -17,16 +16,13 @@ const OPTIONS = [
 const BOUNDS = ["min_length", "max_length", "min_value", "max_value"];
 const EMPTY = ["choices", "options", "channel_types"];
 
-export async function previewRefusal(request: Request, url: URL, env: {
-  TWO_DEPLOY_ENV?: string; STAGING_RUNTIME_POLICY?: string; OWNERSHIP_CONTROL_TOKEN?: string;
-}): Promise<Response | null> {
+export async function previewRefusal(request: Request, url: URL, token?: string): Promise<Response | null> {
   const reply = (status: number, extra = {}) => new Response(null, {
     status, headers: withSecurityHeaders({ "cache-control": "no-store", ...extra }),
   });
-  if (env.TWO_DEPLOY_ENV !== "staging" || env.STAGING_RUNTIME_POLICY !== "bounded") return reply(404);
   if (request.method !== "GET") return reply(405, { allow: "GET" });
-  if (!await authenticated(request, env.OWNERSHIP_CONTROL_TOKEN)) return reply(401);
-  return url.search || request.body || !request.headers.has(PREVIEW_HEADER) ? reply(400) : null;
+  if (!await authenticated(request, token)) return reply(401);
+  return url.search || request.body ? reply(400) : null;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {

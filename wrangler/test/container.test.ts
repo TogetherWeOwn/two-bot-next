@@ -13,8 +13,10 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
+import { Container } from "@cloudflare/containers";
+import detail from "./fixtures/staging-automod-preview.json" with { type: "json" };
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
-import { PREVIEW_HEADER, PREVIEW_PATH } from "../src/staging-preview.ts";
+import { PREVIEW_HEADER } from "../src/staging-preview.ts";
 import { STAGING_USE_PATH, STAGING_USE_KEY, type StagingWindow } from "../src/staging-lifecycle.ts";
 import { EMPTY_STATE, LOG_QUERY_URL, type MetricsAlertState } from "../src/alert-rules.ts";
 import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
@@ -114,12 +116,13 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
   }
   const starts: StartConfig[] = [];
   const requests: { pathname: string; port: number }[] = [];
+  const alarms: (number | null)[] = [];
   const values = options instanceof Map ? options
     : flags.values ?? new Map<string, unknown>([[OWNER_KEY, "owner" in flags ? flags.owner : ACTIVE_OWNER]]);
   const gates: Promise<unknown>[] = [];
   let listenerPort = 8080;
   let probeStatus = 503;
-  let probeResponse: ((status: number) => Response) | undefined;
+  let probeResponse: ((status: number, pathname: string) => Response) | undefined;
   const runtime = {
     running: flags.running ?? false,
     destroys: 0,
@@ -139,14 +142,18 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
     // A running container's monitor stays pending until it stops.
     monitor: () => new Promise<void>(() => {}),
     getTcpPort: (port: number) => ({
-      async fetch(input: string | Request) {
+      async fetch(input: string | Request, init?: RequestInit) {
         const pathname = new URL(typeof input === "string" ? input : input.url).pathname;
         requests.push({ pathname, port });
+        if (pathname === "/readyz") {
+          const headers = new Headers((input instanceof Request ? input : init)?.headers);
+          assert.equal(headers.has("authorization") || headers.has(PREVIEW_HEADER), false);
+        }
         if (port !== listenerPort) throw new Error("connection refused: wrong container port");
         // Liveness is not readiness, even with a configured token. Preserve
         // gateway-down; a synthetic env fixture is NOT proof of a READY event.
         const status = pathname === "/readyz" ? probeStatus : 200;
-        const response = probeResponse?.(status)
+        const response = probeResponse?.(status, pathname)
           ?? Response.json({ ready: status === 200, gateway_connected: status === 200 }, { status });
         Object.defineProperty(response, "webSocket", { value: null });
         return response;
@@ -180,8 +187,8 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
           return database.prepare(query).all(...bindings);
         },
       },
-      setAlarm: async () => {},
-      deleteAlarm: async () => {},
+      setAlarm: async (time: number) => { alarms.push(time); },
+      deleteAlarm: async () => { alarms.push(null); },
       sync: async () => {},
     },
     blockConcurrencyWhile<T>(callback: () => Promise<T>) {
@@ -196,9 +203,9 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
   );
   await Promise.all(gates);
   return {
-    bot, runtime, starts, requests, logs, values, ctx, database,
+    bot, runtime, starts, requests, logs, values, ctx, database, alarms,
     setProbeStatus: (status: number) => { probeStatus = status; },
-    setProbeResponse: (factory: (status: number) => Response) => { probeResponse = factory; },
+    setProbeResponse: (factory: NonNullable<typeof probeResponse>) => { probeResponse = factory; },
     pending: () => database.prepare("SELECT * FROM container_schedules WHERE callback = 'keepalive'").all(),
   };
 }
@@ -225,90 +232,97 @@ function stagingWindow(): StagingWindow {
   return { environment: "staging", runId: "123456", runAttempt: 1, expiresAt: Date.now() + 120_000 };
 }
 
-test("staging preview: GET-only fixed registry receipt, with no lifecycle writes", async (t) => {
-  const app = "1469137636663758888", guild = "1545644954272137297";
+test("staging preview extends readiness without extra cold lifecycle activity", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"] });
+  const { application_id: app, guild_id: guild, name, id } = detail;
   const env = { ...BOUNDED_STAGING_ENV, GUILD_ID: guild, DISCORD_APPLICATION_ID: app };
-  const window = stagingWindow();
-  const sha = env.CONTAINER_RELEASE;
+  const window = stagingWindow(), sha = env.CONTAINER_RELEASE;
   const grant = { ...window, deploymentId: ID, sha, epoch: 1, acquiredAt: Date.now(), phase: "active" };
-  const h = await harness(t, env, { running: true });
-  const ready = () => Response.json({ components: [["gateway", "ready"]], build_revision: sha,
-    build_id: `${window.runId}-${window.runAttempt}` });
-  h.setProbeResponse(ready);
-  const entry = { name: "automod-preview", id: "123456789012345678", version: "223456789012345678",
-    application_id: app, guild_id: guild, type: 1 };
-  const detail = { ...entry, default_member_permissions: "32", ignored: "never project this", options: [
-    { name: "text", type: 3, required: true, min_length: 1, max_length: 2000 },
-    { name: "mentions", type: 4, min_value: 0, max_value: 100 },
-    { name: "attachments", type: 3, max_length: 1000 },
-  ] };
-  const listUrl = `https://discord.com/api/v10/applications/${app}/guilds/${guild}/commands`;
-  const urls = ["https://discord.com/api/v10/users/@me", listUrl, `${listUrl}/${entry.id}`];
-  const outputs = (registry: unknown) => [Response.json({ id: app, bot: true }), Response.json([entry]), Response.json(registry)];
-  let replies: Response[] = [];
+  const report = { components: ["process", "gateway", "database", "token_invalid"].map((name) => [name, "ready"]),
+    jobs: {}, build_revision: sha, build_id: `${window.runId}-${window.runAttempt}` };
+  const list = `https://discord.com/api/v10/applications/${app}/guilds/${guild}/commands`;
+  const urls = ["https://discord.com/api/v10/users/@me", list, `${list}/${id}`];
+  const replies = (end: unknown = detail) => [Response.json({ id: app, bot: true }), Response.json([detail]), Response.json(end)];
+  let queue = replies();
   const discord = t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
     assert.equal(url, urls[discord.mock.callCount() % 3]);
     assert.equal(init.method, "GET");
     assert.equal(init.redirect, "error");
     assert.ok(init.signal);
     assert.equal(new Headers(init.headers).get("authorization"), `Bot ${env.DISCORD_TOKEN}`);
-    return replies.shift() ?? Response.error();
+    return queue.shift() ?? Response.error();
   });
-  const request = (patch = {}, method = "GET", suffix = "") => new Request(`https://worker.invalid${PREVIEW_PATH}${suffix}`, {
-    method, headers: { authorization: `Bearer ${CONTROL_TOKEN}`,
-      [PREVIEW_HEADER]: [ID, sha, window.runId, window.runAttempt, window.expiresAt].join(":"), ...patch },
+  const binding = [ID, sha, window.runId, window.runAttempt, window.expiresAt].join(":");
+  const request = (headers = {}, method = "GET", query = "") =>
+    new Request(`https://worker.invalid/readyz${query}`, { method, headers: { ...headers, "cf-connecting-ip": "preview-fixture" } });
+  const opted = (patch = {}, method = "GET", query = "") =>
+    request({ authorization: `Bearer ${CONTROL_TOKEN}`, [PREVIEW_HEADER]: binding, ...patch }, method, query);
+  const renew = t.mock.method(Container.prototype, "renewActivityTimeout");
+  const cold = (use: unknown, running: boolean) =>
+    harness(t, env, { values: new Map<string, unknown>([[OWNER_KEY, ACTIVE_OWNER], [STAGING_USE_KEY, use]]), running });
+  const edge = (h: Awaited<ReturnType<typeof cold>>) => ({ ...env,
+    TWO_BOT: { getByName: () => h.bot } }) as unknown as Env;
+  const effects = (h: Awaited<ReturnType<typeof cold>>) => ({
+    alarms: h.alarms, starts: h.starts.length, stops: h.runtime.destroys, storage: h.values,
+    renewals: renew.mock.calls.filter((call) => call.this === h.bot).length,
+    schedules: h.database.prepare("SELECT callback, time, payload FROM container_schedules ORDER BY callback").all(),
   });
-  const edge = { ...env, TWO_BOT: { getByName: () => ({ fetch: (req: Request) => h.bot.fetch(req) }) } } as unknown as Env;
-  const send = (req = request()) => worker.fetch(req, edge);
-  assert.equal((await worker.fetch(request(), { ...edge, TWO_DEPLOY_ENV: "production" })).status, 404);
-  assert.equal((await send(request({ authorization: "Bearer incorrect" }))).status, 401);
-  assert.equal((await send(request({}, "POST"))).status, 405);
-  assert.equal((await send(request({}, "GET", "?guild=anything"))).status, 400);
-  assert.equal((await send(request({ [PREVIEW_HEADER]: "wrong run attempt" }))).status, 503);
-  assert.equal((await h.bot.fetch(request({ [DEPLOYMENT_HEADER]: "stale-worker" }))).status, 503);
-  assert.equal((await send()).status, 503, "cold refusal with no lease");
-  assert.equal(h.runtime.destroys, 0, "a cold refusal is not reconciliation");
+  for (const [use, running] of [[grant, false], [undefined, true]] as const) {
+    const ordinary = await cold(use, running), preview = await cold(use, running);
+    ordinary.setProbeResponse(() => Response.json(report));
+    preview.setProbeResponse(() => Response.json(report));
+    const normal = await worker.fetch(request(), edge(ordinary));
+    const withPreview = await worker.fetch(opted(), edge(preview));
+    assert.equal(withPreview.status, normal.status);
+    assert.ok(ordinary.alarms.some((time) => typeof time === "number"), "pinned SDK writes on cold construction");
+    assert.deepEqual(effects(preview), effects(ordinary));
+    if (use) {
+      assert.equal(ordinary.starts.length, 1);
+      assert.equal(discord.mock.callCount(), 3);
+      assert.deepEqual(await withPreview.json(), await normal.json());
+      assert.deepEqual(JSON.parse(withPreview.headers.get(PREVIEW_HEADER)!), { registry: "pass", command: name,
+        deploymentId: ID, sha, runId: window.runId, runAttempt: window.runAttempt, expiresAt: window.expiresAt });
+    } else assert.equal(withPreview.headers.has(PREVIEW_HEADER), false);
+  }
+  const h = await cold(grant, true);
+  const send = (req = opted()) => worker.fetch(req, edge(h));
+  discord.mock.resetCalls();
+  for (const [req, status] of [[opted({ authorization: "Bearer incorrect" }), 401], [opted({}, "POST"), 405],
+    [opted({}, "GET", "?guild=other"), 400], [opted({ [PREVIEW_HEADER]: "wrong-attempt" }), 503]] as const) {
+    assert.equal((await send(req)).status, status);
+  }
+  assert.equal((await worker.fetch(opted(), { ...edge(h), CF_VERSION_METADATA: { id: "stale-edge" } } as Env)).status, 503);
   h.values.set(STAGING_USE_KEY, { ...grant, acquiredAt: Date.now() - 2000, expiresAt: Date.now() - 1000 });
   assert.equal((await send()).status, 503);
-  h.values.set(STAGING_USE_KEY, grant);
-  assert.equal((await worker.fetch(request(), { ...edge, CF_VERSION_METADATA: { id: "stale-edge" } } as Env)).status, 503);
   assert.equal(discord.mock.callCount(), 0);
-  assert.equal(h.requests.length, 0);
-  replies = outputs(detail);
-  const pass = await send(request({ [DEPLOYMENT_HEADER]: "spoofed" }));
-  assert.equal(pass.status, 200);
-  assert.deepEqual(await pass.json(), { registry: "pass", command: entry.name, deploymentId: ID, sha,
-    runId: window.runId, runAttempt: window.runAttempt, expiresAt: window.expiresAt });
-  assert.deepEqual(h.requests.map((r) => r.pathname), ["/readyz", "/readyz"]);
-
-  for (const bad of [{ ...detail, default_member_permissions: "0" }, { ...detail, options: [] },
-    { ...detail, version: "323456789012345678" }]) {
-    replies = outputs(bad);
-    const refused = await send();
-    assert.equal(refused.status, 503);
-    assert.equal(await refused.text(), "");
-  }
-  replies = [Response.json({ id: app, bot: true }), Response.json([])];
-  assert.equal((await send()).status, 503);
-  discord.mock.resetCalls();
-  replies = [Response.json({ id: app, bot: true }), new Response("x".repeat(256 * 1024 + 1))];
-  assert.equal((await send()).status, 503);
-  for (const [change, read, discordCalls] of [["drift", 2, 3], ["release", 1, 0], ["release", 2, 3]] as const) {
+  const refusals = [["drift", 1, 0], ["drift", 2, 3], ["release", 1, 0], ["release", 2, 3], ["expiry", 2, 3]] as const;
+  for (const [change, read, calls] of refusals) {
     discord.mock.resetCalls();
-    replies = outputs(detail);
+    queue = replies();
     h.values.set(STAGING_USE_KEY, grant);
     let probes = 0;
-    h.setProbeResponse(() => {
-      if (++probes !== read) return ready();
-      if (change === "drift") return Response.json({ build_revision: sha, build_id: "another-attempt" });
-      h.values.set(STAGING_USE_KEY, { ...grant, phase: "released" });
-      return ready();
+    h.setProbeResponse((_, path) => {
+      if (path !== "/readyz" || ++probes !== read) return Response.json(report);
+      if (change === "release") h.values.set(STAGING_USE_KEY, { ...grant, phase: "released" });
+      if (change === "expiry") t.mock.timers.setTime(grant.expiresAt);
+      return Response.json(change === "drift" ? { ...report, build_id: "9-9" } : report);
     });
-    assert.equal((await send()).status, 503, `${change} during readiness read ${read}`);
-    assert.equal(discord.mock.callCount(), discordCalls, `Discord calls before ${change} on readiness read ${read}`);
+    const result = await send();
+    assert.deepEqual([result.status, result.headers.has(PREVIEW_HEADER)], [503, false], `${change} during readiness read ${read}`);
+    assert.equal(discord.mock.callCount(), calls);
   }
-  assert.equal(h.starts.length + h.runtime.destroys, 0);
-  assert.deepEqual(await h.bot.listSchedules("stagingExpiry"), []);
+  t.mock.timers.setTime(grant.acquiredAt);
+  h.setProbeResponse(() => Response.json(report));
+  for (const bad of [replies({ ...detail, default_member_permissions: "0" }), replies({ ...detail, options: [] }),
+    replies({ ...detail, version: "323456789012345678" }), [replies()[0]!, Response.json([])],
+    [replies()[0]!, new Response("x".repeat(256 * 1024 + 1))]]) {
+    discord.mock.resetCalls();
+    const attempts = bad.length;
+    queue = bad;
+    const result = await send();
+    assert.deepEqual([result.status, result.headers.has(PREVIEW_HEADER)], [503, false]);
+    assert.equal(discord.mock.callCount(), attempts);
+  }
 });
 
 for (const path of ["/health", "/readyz", "/version"]) {
@@ -542,9 +556,9 @@ test("bounded staging: DO reconstruction after expiry stops a reattached process
   assert.equal((await h.bot.fetch(stagingUseRequest("acquire", stagingWindow()))).status, 200);
   t.mock.timers.tick(120_001);
   const reconstructed = await harness(t, BOUNDED_STAGING_ENV, { values: h.values, running: true }, h.database);
-  assert.equal((await reconstructed.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 503);
   assert.equal(reconstructed.runtime.running, false);
   assert.equal(reconstructed.runtime.destroys, 1);
+  assert.equal((await reconstructed.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 503);
   assert.equal(reconstructed.starts.length, 0);
   await reconstructed.bot.stagingExpiry();
   assert.equal((await reconstructed.bot.listSchedules("stagingExpiry")).length, 0);
@@ -564,10 +578,9 @@ test("bounded staging: first activation drains a running predecessor and its ung
 
   const activated = await harness(t, BOUNDED_STAGING_ENV,
     { values: predecessor.values, running: true }, predecessor.database);
-  await activated.bot.alarm();
-  assert.equal(activated.runtime.running, false, "reconciliation drains before alarm delivery");
+  assert.equal(activated.runtime.running, false, "construction drains before ingress or alarm delivery");
   assert.equal(activated.runtime.destroys, 1);
-  assert.equal(activated.pending().length, 0, "reconciliation deletes persisted legacy rows");
+  assert.equal(activated.pending().length, 0, "construction deletes persisted legacy rows");
   assert.equal((await activated.bot.listSchedules("stagingExpiry")).length, 0);
   assert.equal(activated.starts.length, 0);
   assert.equal(activated.requests.length, 0);
