@@ -910,6 +910,9 @@ async fn run(cli_args: &[String]) {
                             let mode = resolved.mode();
                             let automod = automod_gateway::build(resolved, pool, executor);
                             let _ = slot.set(Arc::clone(&automod));
+                            if let Some(runtime) = &runtime {
+                                runtime.set_automod(Arc::clone(&automod));
+                            }
                             info!(mode, "automod activation wired into the gateway loop");
                             Some(automod)
                         }

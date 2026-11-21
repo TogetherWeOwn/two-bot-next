@@ -34,6 +34,16 @@ Register the DB-only job through `website_jobs::serve`, even when the Discord ga
 
 The real action must call the existing cutover retention operation. Every successful report has one structured `retention_run` event with `mode` and all `RetentionReport` counters, including `schema_gap_deferrals`. A partial `Ok(report)` with deferred/overdue deletions or failed guild purges must be visible at WARN, not silently reduced to scheduler success. Schema-coverage gaps defer as `Ok` (gap-deferred deletions in `schema_gap_deferrals` with the gap list in the warn log, queued guilds kept in `guild_purges_failed`) and retry after the plan is repaired; only SQL/connection failures return `ErrorClass::Database` to the supervisor. The tests accept the existing report field names; they do not invent a second erasure algorithm.
 
+On each active tick, voice heat expiry follows the paged game-aggregate sweep,
+even if that sweep returned an error. For a pool with access to `voice_heat_hours`,
+dry run counts rows strictly older than 35 elapsed days and execute deletes them.
+`voice_heat_expiry` reports the count even when it is zero. The dormant role
+matrix grants runtime neither SELECT nor DELETE, so that pool reports
+`voice_heat_expiry_parked` instead of attempting heat SQL. An attempted sweep
+failure emits a classified diagnostic and fails the tick. If either sweep fails
+after core retention commits, one `retention_run` warning carries the committed
+counters and both failure flags. `off` still parks the entire job.
+
 ## Gateway contract
 
 Use the actual serial dispatch/checkpoint path. Preserve `GuildDelete.unavailable: Option<bool>`: absent and false queue a purge, true never queues. All three still remove the live voice actor without deleting durable room rows or performing Discord writes. An available `GuildCreate` cancels the purge before its checkpoint; an unavailable create is not a rejoin.
