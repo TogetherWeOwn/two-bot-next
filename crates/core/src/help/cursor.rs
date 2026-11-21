@@ -80,6 +80,17 @@ impl Cursor {
         )
     }
 
+    /// Recognize the reserved component namespace, even for malformed cursors.
+    pub fn is_help_control(id: &str) -> bool {
+        id.strip_prefix(NAMESPACE)
+            .is_some_and(|suffix| suffix.starts_with(':'))
+    }
+
+    /// Compare against the authoritative interaction actor before building a plan.
+    pub const fn is_for_actor(self, actor: u64) -> bool {
+        self.actor == actor
+    }
+
     /// Decode exactly the emitted grammar. The caller still needs to validate
     /// the actual Discord source message and use the authoritative actor.
     pub fn parse(id: &str) -> Option<Self> {
@@ -121,7 +132,7 @@ impl Cursor {
         current: Revision,
         page_count: usize,
     ) -> Result<(usize, u64), CursorError> {
-        if actor != self.actor || self.page >= page_count {
+        if !self.is_for_actor(actor) || self.page >= page_count {
             return Err(CursorError::Invalid);
         }
         if current != self.revision {
