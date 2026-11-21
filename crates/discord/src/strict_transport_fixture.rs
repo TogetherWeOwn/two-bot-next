@@ -23,6 +23,7 @@ pub(crate) struct Admission {
     pub strict: Option<AdmissionError>,
     pub completion: Result<(), AdmissionError>,
     pub stall_completion: bool,
+    pub resume_strict: Option<tokio::sync::Semaphore>,
     pub strict_admitted: AtomicUsize,
     /// Completion attempts, not durable commits.
     pub completed: Arc<Mutex<Vec<Option<SendCooldown>>>>,
@@ -40,6 +41,7 @@ impl Admission {
             strict,
             completion: Ok(()),
             stall_completion: false,
+            resume_strict: None,
             strict_admitted: AtomicUsize::new(0),
             completed: Arc::default(),
         }
@@ -68,6 +70,9 @@ impl SendAdmission for Admission {
         Box::pin(async {
             let permit = self.permit(self.strict)?;
             self.strict_admitted.fetch_add(1, Ordering::Relaxed);
+            if let Some(resume) = &self.resume_strict {
+                resume.acquire().await.unwrap().forget();
+            }
             Ok(permit)
         })
     }

@@ -341,12 +341,34 @@ class RollbackReadinessProbeTests(unittest.TestCase):
         self.assertEqual(code, 0, results)
         self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v15", results["PASS manifest"])
 
-    def test_current_dump_version_17_manifest_passes(self):
-        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=17)),
+    def test_current_dump_version_16_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=16)),
                               mtime=2_160_000_000)
         code, results, _ = self.probe()
         self.assertEqual(code, 0, results)
-        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v17", results["PASS manifest"])
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v16", results["PASS manifest"])
+
+    def test_v17_writer_sequence_marks_cover_only_the_matching_allocator(self):
+        head = manifest(version=17)
+        del head["sequences"]
+        table = "event_voice_sessions"
+        head["tables"].append({"name": table, "columns": ["id"], "count": 0})
+        session = {"table": table, "column": "id", "sequence": "public.event_voice_sessions_id_seq",
+                   "last_value": None, "readable": True}
+        marks = [dict(table=row["table"], column="id", lastValue=value, isCalled=called, increment=1)
+                 for row, value, called in zip([*LIVE, session], [42, 7, 1], [True, True, False])]
+        head["sequenceMarks"] = marks
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(head), mtime=2_160_000_000)
+        self.fx.write_live([*LIVE, session])
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("v17", results["PASS manifest"])
+        self.assertIn("covers all 3 live sequences", results["PASS sequences"])
+        with self.assertRaisesRegex(probe.ProbeError, "event_voice_sessions.other .*no manifest high-water"):
+            probe.check_sequences(head, [dict(session, column="other")])
+        for live in (1, 2):
+            with self.assertRaisesRegex(probe.ProbeError, "event_voice_sessions.id .*would rewind"):
+                probe.check_sequences(head, [dict(session, last_value=live)])
 
     def assert_invalid_created_at(self, value):
         self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz",

@@ -290,6 +290,8 @@ def validate_manifest(obj):
             raise ProbeError(f"manifest table {name} has an invalid column list")
         if not is_int(table.get("count"), high=(1 << 64) - 1):
             raise ProbeError(f"manifest table {name} has an invalid row count")
+    if "sequenceMarks" in obj:
+        sequence_positions(obj["sequenceMarks"], names)
     return obj
 
 
@@ -369,24 +371,46 @@ def load_live_sequences(path):
     return rows
 
 
+def sequence_positions(marks, tables):
+    if not isinstance(marks, list):
+        raise ProbeError("manifest has invalid sequenceMarks")
+    positions = {}
+    for mark in marks:
+        if (not isinstance(mark, dict) or not isinstance(mark.get("table"), str)
+                or mark["table"] not in tables or not isinstance(mark.get("column"), str)
+                or not mark["column"] or not is_int(mark.get("lastValue"), low=-I64_MAX - 1)
+                or not isinstance(mark.get("isCalled"), bool)
+                or not is_int(mark.get("increment"), low=-I64_MAX - 1) or mark["increment"] == 0):
+            raise ProbeError("manifest has an invalid sequence mark")
+        key = (mark["table"], mark["column"])
+        if key in positions:
+            raise ProbeError(f"manifest sequence mark {key[0]}.{key[1]} is duplicated")
+        positions[key] = (mark["lastValue"], mark["isCalled"], mark["increment"])
+    return positions
+
+
 def check_sequences(manifest, rows):
     tables = {t["name"] for t in manifest["tables"]}
-    marks = manifest.get("sequences", {})
+    modern = "sequenceMarks" in manifest
+    marks = sequence_positions(manifest.get("sequenceMarks", []), tables)
+    legacy = manifest.get("sequences", {})
     problems = []
     for row in rows:
-        where = f"{row['table']}.{row['column']}"
-        mark = marks.get(row["table"])
-        if mark is None and (row["table"], row["column"]) == ("events", "id"):
-            # MAX(events.id) at dump time (crates/core/src/backup/dump.rs).
-            mark = manifest["eventsSequence"]
+        key = (row["table"], row["column"])
+        where = ".".join(key)
+        mark, called, increment = marks.get(key, (None, True, 1))
+        if not modern:
+            mark = legacy.get(key[0], manifest["eventsSequence"] if key == ("events", "id") else None)
         if row["table"] not in tables:
             problems.append(f"{where} (table not in the backup)")
         elif not row["readable"]:
             problems.append(f"{where} (no SELECT/USAGE on {row['sequence']})")
         elif mark is None:
             problems.append(f"{where} (no manifest high-water)")
-        elif row["last_value"] is not None and row["last_value"] > mark:
-            problems.append(f"{where} (live {row['last_value']} > manifest {mark}, would rewind)")
+        elif (live := row["last_value"]) is not None and (
+                (live - mark) * increment > 0 or (live == mark and not called)):
+            direction = "=" if live == mark else (">" if increment > 0 else "<")
+            problems.append(f"{where} (live {row['last_value']} {direction} manifest {mark}, would rewind)")
     if problems:
         shown = ", ".join(problems[:3]) + (f", +{len(problems) - 3} more" if len(problems) > 3 else "")
         raise ProbeError(f"{len(problems)} of {len(rows)} live sequences not covered: {shown}")

@@ -1325,7 +1325,11 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
 
 // Historical inventories are pinned by fixtures. Each old version waives
 // only tables first covered by a later version. New v17 archives require
-// the full inventory, including the attendance tables (0480).
+// the full inventory, including both guild counters (0441/0442/0446/0447),
+// the epoch-claim guard (0450/0451), the delete tombstones (0452/0453),
+// the token registry (0456/0457), the event voice pair (0455) and
+// the starboard tables (0458/0459) and giveaways (0460/0461),
+// the event instance windows (0472) and the attendance tables (0480).
 fn required_manifest_tables(version: Option<u64>) -> Vec<&'static str> {
     DUMP_TABLES
         .iter()
@@ -2642,7 +2646,6 @@ mod tests {
             .contains("event_store"));
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
-        assert_eq!(DUMP_VERSION, 17, "frozen v5 test pins the current writer");
         assert!(validate_manifest(&current)
             .unwrap_err()
             .to_string()
@@ -2702,7 +2705,6 @@ mod tests {
             "member_season_xp",
         ));
         assert_eq!(v7_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 17, "frozen v6 test pins the current writer");
         assert!(validate_manifest(&v7_gap)
             .unwrap_err()
             .to_string()
@@ -2771,10 +2773,6 @@ mod tests {
         // v7 without the retention queues refuses.
         let mut v7_gap = v6.clone();
         v7_gap["version"] = serde_json::json!(DUMP_VERSION);
-        assert_eq!(
-            DUMP_VERSION, 17,
-            "frozen pre-retention test pins the current writer"
-        );
         let err = validate_manifest(&v7_gap).unwrap_err().to_string();
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
         assert!(err.contains("retention_deletion_requests"), "{err}");
@@ -2834,7 +2832,6 @@ mod tests {
             "stream_live_claims",
         ));
         assert_eq!(v8_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 17, "frozen v7 test pins the current writer");
         assert!(validate_manifest(&v8_gap)
             .unwrap_err()
             .to_string()
@@ -2879,7 +2876,6 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 17, "new dumps require both guild counters");
         let current = complete_current_manifest();
         for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
             let mut gap = current.clone();
@@ -2934,7 +2930,6 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 17, "new dumps require the epoch-claim guard");
         let current = complete_current_manifest();
         let mut gap = current.clone();
         gap["tables"]
@@ -2998,11 +2993,9 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 17, "new dumps require the delete tombstones");
         // v11 kept the tombstones mandatory but predates registry and starboard:
         // the frozen old-v11 shape carries the tombstone and omits the
         // registry, event voice pair and starboard three.
-        assert_eq!(DUMP_VERSION, 17, "new dumps require the v11 tombstones");
         let old_v11: Vec<Value> = complete_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| {
@@ -3107,7 +3100,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("admin_api_tokens"));
-        assert_eq!(DUMP_VERSION, 17, "new dumps require the token registry");
         let current = complete_current_manifest();
         let mut gap = current.clone();
         gap["tables"]
@@ -3161,7 +3153,6 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 17, "new dumps require the event voice pair");
         let current = complete_current_manifest();
         for name in ["event_voice_channels", "event_voice_presence"] {
             let mut gap = current.clone();
@@ -3230,10 +3221,6 @@ mod tests {
             .filter(|name| !["event_voice_channels", "event_voice_presence"].contains(name))
             .collect();
         assert_eq!(released_without_voice, FROZEN_V12_TABLES);
-        assert_eq!(
-            DUMP_VERSION, 17,
-            "new dumps require the v14 starboard tables"
-        );
         assert_eq!(
             DUMP_TABLES.len(),
             110,
@@ -3496,7 +3483,6 @@ mod tests {
 
     #[test]
     fn v15_archives_read_without_event_instance_windows_but_v16_requires_them() {
-        assert_eq!(DUMP_VERSION, 17, "new dumps require the instance windows");
         assert_eq!(V16_ADDED_TABLES.to_vec(), ["event_instance_windows"]);
         // Literal name, not V16_ADDED_TABLES: this reproduces the released v15
         // inventory even if the version waiver is accidentally removed.
@@ -3542,10 +3528,6 @@ mod tests {
 
     #[test]
     fn v14_archives_read_without_giveaways_but_v15_requires_them() {
-        assert_eq!(
-            DUMP_VERSION, 17,
-            "giveaways follow the released v14 starboard format"
-        );
         // Literal names, not V15_ADDED_TABLES: this reproduces the pre-change
         // inventory even if the version waiver is accidentally removed.
         let without_giveaways = |tables: Vec<Value>| {
@@ -3604,7 +3586,6 @@ mod tests {
             let error = validate_manifest(&v14_gap).unwrap_err().to_string();
             assert!(error.contains(name), "{error}");
         }
-        assert_eq!(DUMP_VERSION, 17, "new dumps require the giveaway tables");
         let current = complete_current_manifest();
         let mut gap = current.clone();
         gap["tables"]

@@ -208,20 +208,16 @@ otherwise the loop is unchanged.
   the trigger verdict is `Accept` (an inspected clean create). Matched,
   unavailable, timed-out and uninspected (`Bypassed`) creates are rejected for
   automations as well as for XP/activity.
-- **Funnel-vs-trigger verdicts.** Each delivery gets one `WorkerVerdict`
-  (`crates/bot/src/automod_gateway.rs:305-308`): `funnel` is its single call
-  into the funnel and `trigger` is the verdict prefix triggers act on. A
-  delivery automod did not inspect, or whose completion was not recorded, keeps
-  its funnel disposition but its trigger verdict is capture-only
-  (`crates/bot/src/automod_gateway.rs:300-303`).
-  `verdict_of` (`crates/bot/src/automod_gateway.rs:310-319`) forces the trigger to `CaptureOnly` when the
-  outcome is `Bypassed` or `Retained(_)`, and otherwise copies the funnel. A
-  `process` timeout keeps raw capture only for both (`crates/bot/src/automod_gateway.rs:330-339`). The worker
-  hands the funnel disposition to
-  `handle_at_with_message_disposition` exactly once and fires the message hook
-  only when `runs_text_automations` passes the trigger verdict — `None`
-  (automod inactive) or `Accept` (`crates/bot/src/automod_gateway.rs:343-347`,
-  `crates/bot/src/gateway.rs:52-72`). The hook carries
+- **Funnel-vs-trigger verdicts.** Each delivery gets one `WorkerVerdict` in
+  [the automod gateway](../crates/bot/src/automod_gateway.rs): `funnel` is
+  the disposition passed to the funnel, and `trigger` is the verdict prefix
+  triggers act on. `verdict_of` keeps the funnel disposition but forces the
+  trigger to `CaptureOnly` for `Bypassed` or `Retained(_)`; otherwise it
+  copies the funnel disposition. A timeout in `process` keeps raw capture
+  only for both. The [gateway worker](../crates/bot/src/gateway.rs) hands the
+  funnel disposition to `handle_at_with_message_disposition` exactly once and
+  fires the message hook only when `runs_text_automations` accepts the trigger
+  verdict — `None` (automod inactive) or `Accept`. The hook carries
   the trigger verdict into the trigger handler, where a missing verdict fails
   closed (`CommandRuntime::dispatch_with_verdict` in
   `crates/bot/src/command_runtime.rs`, `acceptance_for_verdict`

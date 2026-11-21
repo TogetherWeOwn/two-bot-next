@@ -377,6 +377,54 @@ async fn running_activation_applies_live_policy_without_restart() {
         !refresh_live(&activation, &deployment, &guild, &live),
         "unchanged snapshot is a no-op"
     );
+
+    // The foreign delivery has a valid, different policy; the admitted guild
+    // rejects its next revision and must keep its own last good policy.
+    let foreign = "987654321098765432";
+    let row = |guild: &str, key: &str, value| two_bot_core::settings::SettingRow {
+        guild_id: guild.into(),
+        key: key.into(),
+        value,
+        version: 2,
+    };
+    writer.publish(&two_bot_core::settings::SettingsSnapshot {
+        revision: 2,
+        rows: vec![
+            row(foreign, "TWO_AUTOMOD_BAD_WORDS", json!(["foreignword"])),
+            row(&guild, "TWO_AUTOMOD_SANCTIONS", json!("2:warn")),
+        ],
+    });
+    assert_eq!(
+        resolve_live_config(&deployment, foreign, &live)
+            .unwrap()
+            .policy
+            .bad_words,
+        ["foreignword"]
+    );
+    assert!(!refresh_live(&activation, &deployment, foreign, &live));
+    assert!(resolve_live_config(&deployment, &guild, &live).is_none());
+    assert!(!refresh_live(&activation, &deployment, &guild, &live));
+    assert_eq!(
+        activation
+            .preview(|runtime| runtime.effective_config())
+            .policy
+            .bad_words,
+        ["spamword"]
+    );
+    let sample = two_bot_core::automod::AutomodMessage {
+        guild_id: guild,
+        channel_id: "8".into(),
+        message_id: "9".into(),
+        author_id: "10".into(),
+        author_is_bot: false,
+        role_ids: vec![],
+        content: "spamword".into(),
+        mentioned_user_ids: vec![],
+        attachment_names: vec![],
+        observed_timestamp_ms: 1,
+    };
+    let verdict = activation.preview(|runtime| runtime.preview(&sample, 0));
+    assert_eq!(verdict.filter, Some(AutomodFilter::BadWords));
 }
 
 /// One bad stored value does not take the whole policy down: the offending
