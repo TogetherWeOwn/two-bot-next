@@ -136,25 +136,26 @@ fn owner_afk_and_role_changes_preserve_authorization_inputs() {
 
 #[test]
 fn decode_preserves_unmodeled_permission_bits() {
-    let role = serde_json::from_str(
-        r#"{"guild_id":"10","role":{"id":"31","permissions":"9223372036854776832"}}"#,
-    )
-    .expect("gateway role payload");
-    let channel = serde_json::from_str(r#"{"guild_id":"10","id":"20","name":"Lobby","type":2,
-        "permission_overwrites":[{"type":0,"id":"10","allow":"9223372036854777856","deny":"18446744073709551615"}]}"#)
-        .expect("gateway channel payload");
+    let high_bit = 1_u64 << 63;
+    let permissions = (high_bit | 1024).to_string();
+    let allow = (high_bit | 2048).to_string();
+    let deny = u64::MAX.to_string();
+    let role = json!({"guild_id": "10", "role": {"id": "31", "permissions": permissions}});
+    let channel = json!({"guild_id": "10", "id": "20", "name": "Lobby", "type": 2,
+        "permission_overwrites": [{"type": 0, "id": "10", "allow": allow, "deny": deny}]});
     assert_eq!(
         operation("GUILD_ROLE_UPDATE", &role)["value"]["permissions"],
-        "9223372036854776832"
+        permissions
     );
     let overwrites = &operation("CHANNEL_UPDATE", &channel)["value"]["overwrites"];
-    assert_eq!(overwrites[0]["allow"], "9223372036854777856");
-    assert_eq!(overwrites[0]["deny"], "18446744073709551615");
+    assert_eq!(overwrites[0]["allow"], allow);
+    assert_eq!(overwrites[0]["deny"], deny);
 }
 
 #[test]
 fn malformed_permission_masks_cannot_replace_rows() {
-    for mask in [Value::Null, json!("+0"), json!("18446744073709551616")] {
+    let overflow = (u128::from(u64::MAX) + 1).to_string();
+    for mask in [Value::Null, json!("+0"), json!(overflow)] {
         let role = json!({"guild_id": "10", "role": {"id": "31", "permissions": mask}});
         let mut channel = channel(2);
         channel["permission_overwrites"][0]["deny"] = mask;
