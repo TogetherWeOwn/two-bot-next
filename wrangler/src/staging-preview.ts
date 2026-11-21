@@ -33,7 +33,6 @@ function identity(row: Record<string, unknown> | undefined): boolean {
   return !!row && row.name === NAME && row.type === 1 && row.application_id === APP
     && (!Object.hasOwn(row, "guild_id") || row.guild_id === GUILD) && snowflake(row.version);
 }
-
 export async function readPreview(env: { GUILD_ID?: string; DISCORD_APPLICATION_ID?: string; DISCORD_TOKEN?: string },
   get: (url: string, token: string) => Promise<unknown>): Promise<void> {
   const token = env.DISCORD_TOKEN;

@@ -93,7 +93,6 @@ independent simultaneous offline runs. Local timings are fixture timings, not
 production performance measurements.
 
 On clean current-main rollouts, `verify_automod_preview` adds a readback receipt to the user-flow artifact.
-The opt-in drains the existing `GET /readyz` before registry GETs and a final native readiness read.
 
 ## Live read-mostly smoke run
 

@@ -1187,44 +1187,47 @@ export class TwoBotContainer extends Container<Env> {
       void work.catch(() => {}); // Admission can time out before handing off the work.
       return { work };
     })).work;
-    const jsonText = async (res: Response, limit: number): Promise<string> => {
-      if (res.status !== 200 || res.redirected || res.headers.has("location")) {
+    const jsonText = async (res: Response, limit: number, readiness = false): Promise<string> => {
+      if (!(readiness ? isBotProbeResponse(res) : res.status === 200) || res.redirected || res.headers.has("location")) {
         releaseBody(res);
         throw new Error("staging_preview_unavailable");
       }
       return await readBoundedText(res, limit, signal) ?? "";
     };
-    const serving = (body: string) => {
-      const report = JSON.parse(body);
-      const expected = ["process", "gateway", "database", "token_invalid"].map((name) => [name, "ready"]);
+    const serving = (body: string, status = 200) => {
+      const report = JSON.parse(body), rows = report?.components;
+      const names = ["process", "gateway", "database", "token_invalid"];
       if (report?.build_revision !== sha || report.build_id !== `${runId}-${runAttempt}`
-        || report.error != null || report.gateway_failure != null
+        || report.error != null || (status === 200 && report.gateway_failure != null)
         || !report.jobs || typeof report.jobs !== "object" || Array.isArray(report.jobs)
-        || JSON.stringify(report.components) !== JSON.stringify(expected)) {
+        || !Array.isArray(rows) || rows.length !== names.length || !rows.every((row, i) =>
+          Array.isArray(row) && row.length === 2 && row[0] === names[i] && ["ready", "starting", "down"].includes(row[1]))
+        || rows.every((row) => row[1] === "ready") !== (status === 200)) {
         throw new Error("staging_preview_identity");
       }
     };
-    let readyBody: string | undefined;
+    const readyReply = (body: string, status: number) => new Response(body, { status,
+      headers: { "content-type": "application/json", "cache-control": "no-store" } });
     try {
       const body = await jsonText(response, MAX_PROBE_BODY_BYTES);
       serving(body);
-      readyBody = body;
-      await readPreview(this.env, async (url, token) => JSON.parse(await jsonText(await send(() =>
+      const registryOk = await readPreview(this.env, async (url, token) => JSON.parse(await jsonText(await send(() =>
         fetch(url, { method: "GET", redirect: "error", cache: "no-store", signal,
-          headers: { authorization: `Bot ${token}` } })), 256 * 1024)));
-      serving(await jsonText(await send(() => this.ctx.container!.getTcpPort(this.defaultPort).fetch(
-        new Request("http://c/readyz", { method: "GET", redirect: "manual", signal }),
-      )), MAX_PROBE_BODY_BYTES));
+          headers: { authorization: `Bot ${token}` } })), 256 * 1024))).then(() => true, () => false);
+      if (!registryOk) return readyReply(body, 200);
+      const final = await send(() => this.ctx.container!.getTcpPort(this.defaultPort).fetch(
+        new Request("http://c/readyz", { method: "GET", redirect: "manual", signal })));
+      const finalBody = await jsonText(final, MAX_PROBE_BODY_BYTES, true);
+      serving(finalBody, final.status);
+      if (final.status === 503) return readyReply(finalBody, 503);
       return await allowed(() => {
-        const result = new Response(body, response);
-        result.headers.set("cache-control", "no-store");
+        const result = readyReply(finalBody, 200);
         result.headers.set(PREVIEW_HEADER, JSON.stringify({ registry: "pass", command: "automod-preview",
           deploymentId, sha, runId, runAttempt, expiresAt }));
         return result;
       });
     } catch {
-      return new Response(readyBody ?? '{"ready":false}', { status: readyBody === undefined ? 503 : 200,
-        headers: { "content-type": "application/json", "cache-control": "no-store" } });
+      return readyReply('{"ready":false}', 503);
     }
   }
 

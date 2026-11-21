@@ -299,8 +299,8 @@ test("staging preview extends readiness without extra cold lifecycle activity", 
   assert.equal(discord.mock.callCount(), 0);
   const unready = { ...report, components: report.components.map(([key, state]) => [key, key === "gateway" ? "down" : state]),
     gateway_failure: { phase: "durable_gateway", class: "checkpoint_load_failed" } };
-  for (const [change, read, status, calls] of [["redirect", 1, 500, 0], ["unready", 1, 503, 0],
-    ["drift", 1, 503, 0], ["drift", 2, 200, 3], ["release", 1, 503, 0], ["release", 2, 200, 3], ["expiry", 2, 200, 3]] as const) {
+  for (const [change, read, status, calls] of [["redirect", 1, 500, 0], ["unready", 1, 503, 0], ["unready", 2, 503, 3],
+    ["drift", 1, 503, 0], ["drift", 2, 503, 3], ["release", 1, 503, 0], ["release", 2, 503, 3], ["expiry", 2, 503, 3]] as const) {
     discord.mock.resetCalls();
     queue = replies();
     h.values.set(STAGING_USE_KEY, grant);

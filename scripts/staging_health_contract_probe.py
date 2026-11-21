@@ -370,7 +370,6 @@ def run(args, fetch_fn=fetch):
                               http_status=status if status is not None else error.http_status))
     results.append(check_build(report, args.expected_sha))
     if preview:
-        # Match the complete wire receipt. No response-supplied fields reach evidence.
         passed = (all(result.ok for result in results) and expected_receipt is not None
                   and header(headers, PREVIEW_HEADER) == json.dumps(expected_receipt, separators=(",", ":"))
                   and header(headers, "x-two-worker-version") == expected_receipt["deploymentId"]
