@@ -1586,9 +1586,15 @@ async fn automod_preview_dispatch_uses_ingress_clocks_even_when_busy() {
     let now = tokio::time::Instant::now;
     let expired = now() - Duration::from_secs(3);
     let manage = Permissions::MANAGE_GUILD;
-    for (ordered, id) in [(false, 42), (true, 43)] {
+    let no_manage = Permissions::MANAGE_MESSAGES;
+    for (ordered, id, permissions) in [
+        (false, 42, manage),
+        (true, 43, manage),
+        (false, 44, no_manage),
+        (true, 45, no_manage),
+    ] {
         assert!(runtime.dispatch_received(
-            &event(id, manage, "synthetic"),
+            &event(id, permissions, "synthetic"),
             ordered,
             expired,
             observed
@@ -1620,7 +1626,7 @@ async fn automod_preview_dispatch_uses_ingress_clocks_even_when_busy() {
     }
     let deny = RouterRefusal::AutomodPreviewPermission.message();
     let cases = [
-        (Permissions::MANAGE_MESSAGES, "", deny.as_str()),
+        (no_manage, "", deny.as_str()),
         (manage, "synthetic", "Invocation received at"),
     ];
     for (i, (permissions, text, expected)) in cases.into_iter().enumerate() {

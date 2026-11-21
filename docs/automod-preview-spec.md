@@ -88,19 +88,19 @@ Inspected at the commit this file lands with; line refs are to that tree.
   (`crates/core/src/automod.rs:816-877`). Ten hot keys — three content
   lists (bad words, allowed domains, blocked attachment extensions), the
   mention limit, repeat count and window, sanctions, bypass/exempt ids,
-  and the enforce flag (`crates/bot/src/automod_gateway.rs:113-127`) — are layered
-  store-first over the boot env from the live settings snapshot and applied
-  per delivery (`crates/bot/src/automod_gateway.rs:172-223`, `:328`;
-  `crates/core/src/automod_runtime.rs:205-216`). An unusable stored value
-  falls back to its boot value, and a sanctions-shape error keeps the last
-  good policy. Any preview that re-parses env on its own can answer for a
-  config that is not in force.
+  and the enforce flag (`LIVE_KEYS` in
+  [the automod gateway](../crates/bot/src/automod_gateway.rs)) — are layered
+  store-first over the boot env from the live settings snapshot. `process`
+  calls `refresh_from_poller` for each delivery, and `refresh_live` applies
+  the resulting policy only for a guild the activation admits. An unusable
+  stored value falls back to its boot value, and a sanctions-shape error
+  keeps the last good policy. Any preview that re-parses env on its own can
+  answer for a config that is not in force.
 - **Scope is staging-only.** `AutomodScope::permits` allows only the
   configured staging guild unless an externally supplied live approval
-  exists, and production wiring builds the scope with `live_approved: false`
-  (`crates/core/src/automod_runtime.rs:23-36`,
-  `crates/bot/src/automod_gateway.rs:102-110`). This proposal preserves that
-  statement exactly; see §5.
+  exists (`crates/core/src/automod_runtime.rs:23-36`). The gateway's `resolve`
+  builds the scope with `live_approved: false`. The preview preserves this
+  boundary; see §5.
 - **Sanctions are a separate, later decision.** A match leads to target
   resolution, protection checks, violation counting, and only then a plan
   (`crates/core/src/automod_runtime.rs:323-405`). In dry-run, a match is
@@ -400,61 +400,32 @@ preview must therefore never call `AutomodRuntime::inspect` or
 `RepeatTracker::expire` or advance `newest_observation_ms`
 (`crates/core/src/automod_runtime.rs:232-241`, `:281-302`).
 
-Resolved semantics:
-
-1. The preview evaluates the repeat filter **read-only against the
-   invoker's own live CREATE history**: "would this be the Nth identical
-   message inside the window if I posted it now?" The codebase already
-   contains the non-mutating shape this needs — non-CREATE observations
-   compute the same window predicate, counting the candidate once,
-   without inserting, replacing, or pruning any row
-   (`crates/core/src/automod.rs:442-447`). Slice 1 exposes that as an
-   explicit preview entry point rather than abusing the edit path. The
-   synthetic message id is namespaced to the interaction —
-   `preview:<interaction_id>` — because the window predicate excludes
-   rows whose message id equals the candidate's
-   (`crates/core/src/automod.rs:425-441`): an id that could ever equal a
-   real snowflake would silently drop that row and undercount. The
-   namespaced id cannot collide with a Discord snowflake and never
-   reaches a log.
-2. **Correctness gate, not an assumption.** Slice 1 must prove, over the
-   golden corpus plus generated histories, that preview verdict ==
-   CREATE verdict computed on a *cloned* tracker (including the
-   inclusive window edge: exactly `window` old counts, 1 ms older does
-   not — [repeat-window acceptance](automod-repeat-expiry.md)), and that
-   the live tracker is byte-identical after any preview. If that
-   equivalence cannot be shown for the cloned-CREATE reference, the
-   fallback is to report the repeat filter as `indeterminate` and label
-   the whole reply partial — never to silently fall through to
-   `no_match` or a later filter as if repeats were evaluated. Text that
-   normalizes to empty cannot repeat; a blank attachment-only or mention-only
-   sample does not need a history read to reach its later filters.
-3. **Previews never accumulate.** Because nothing is recorded, previewing
-   the same text 3 times cannot manufacture a `repeated_message` verdict,
-   and a preview between two real identical posts neither extends nor
-   breaks the real streak. The fixed caveat says so: *preview recorded
-   nothing; only repeat-eligible real posts count toward repeat history
-   (not text that normalizes to empty)*. Exemptions and `bad_words` still
-   short-circuit before preview reads or live writes repeat history.
-4. **Cross-member isolation.** The tracker key is `guild:author`
-   (`crates/core/src/automod.rs:422`) and the synthetic author is the
-   invoker (§3.1), so a preview can only ever read the invoker's own
-   recent-message digests — information they already have. Another
-   member's repeat state is unobservable through this surface by
-   construction, and a test must pin it (§8).
-5. **Serialization.** The read runs under the same runtime lock the
-   gateway worker uses, synchronously, never held across an await
-   (the existing activation contract,
-   [runtime handoff](automod-runtime.md)), or on a snapshot of only the
-   invoker's rows taken under that lock. Stale unswept rows need no
-   expiry call: the window predicate already ignores rows outside the
-   cutoff relative to the preview timestamp.
-6. `mention_spam` is stateless once the count is an input (§3.1); it
-   reads no history and writes none. All other filters are pure over
-   text/names. The preview path creates **no** delivery claim, no
-   preserved decision, no violation record, no funnel disposition, and
-   no XP/capture side effect — it does not enter
-   `AutomodActivation::process` at all.
+1. **The detached command reads no repeat history.** It can overtake an
+   earlier gateway CREATE, so even a tracker snapshot taken under the
+   runtime lock would not establish gateway order. The
+   [Discord handler](../crates/discord/src/automod_preview_handler.rs) passes
+   `None` to `preview_automod_with_history`: unknown history, not an empty
+   streak. Exemptions and `bad_words` still return complete verdicts before
+   the repeat check. If repeat-eligible text reaches that check, the reply
+   is `partial` and repeat evaluation is `indeterminate`; the matcher does
+   not fall through to a later filter or `no_match`. Normalized-empty text
+   cannot repeat, so attachment-only and mention-only inputs can reach
+   their later filters.
+2. **Core parity tests are separate from the command.** When given ordered
+   history explicitly, [the core evaluator](../crates/core/src/automod_preview.rs)
+   can check repeats without changing the tracker. Tests compare it against
+   a CREATE on a cloned tracker, including the inclusive
+   [repeat-window edge](automod-repeat-expiry.md). The synthetic id
+   `preview:<interaction_id>` cannot collide with a real post ID, so the
+   repeat predicate cannot mistake a real row for this candidate. The
+   detached command does not use the supplied-history path for any member.
+3. **Previews never accumulate.** A preview between real posts never extends
+   or breaks a streak. The fixed caveat says so: *preview recorded nothing;
+   only repeat-eligible real posts count toward repeat history (not text
+   that normalizes to empty)*. `mention_spam` is stateless once supplied the
+   count (§3.1). The command does not enter `AutomodActivation::process`:
+   no delivery claim, preserved decision, violation record, funnel
+   disposition, or XP/capture side effect.
 
 ### 5.2 Dry-run and enforce describe consequences, not different verdicts
 
@@ -619,8 +590,8 @@ until slice 4. Each row names the proof, not a vague area.
 
 | # | Scenario | Expected proof |
 | --- | --- | --- |
-| T1 | Golden corpus replayed through preview | Same verdict as `match_automod` on cloned tracker for every corpus row |
-| T2 | Repeat equivalence | Generated histories (counts 2–20, window edge ±1 ms, out-of-order, duplicate ids): preview == cloned-CREATE verdict; live tracker unchanged after (rows compared) |
+| T1 | Golden corpus with explicit history at the core boundary | Same verdict as `match_automod` on a cloned tracker for every corpus row |
+| T2 | Core repeat equivalence with explicit history | Generated histories (counts 2–20, window edge ±1 ms, out-of-order, duplicate ids): preview == cloned-CREATE verdict; supplied tracker unchanged (rows compared) |
 | T3 | Preview storm then real posts | N previews of identical text, then real CREATEs: streak counts only the real posts |
 | T4 | Order masking | Text matching `bad_words` + invite + repeats → `bad_words` only; text matching mention + invite → `mention_spam` only |
 | T5 | Cross-author isolation | Author B's real repeat streak never affects author A's preview verdict |
@@ -638,7 +609,7 @@ until slice 4. Each row names the proof, not a vague area.
 | T16 | Injection | Text with `<@everyone>`, markdown, URLs → reply byte-shape is a fixed template, `allowed_mentions` empty |
 | T17 | Redelivery and recovery | Successful non-exempt sequential/concurrent delivery: matcher call count 1, one audit row, one actor charge, one guild charge, both replies equal the committed row. Repeat all T6 exemption cases: matcher count 0, stored class/derived knob identical on replay even after config/roles change; no extra charges. Missing/invalid stored class → unavailable without evaluation. Advance the clock between receipt, insert, commit, and replay; replay read includes `created_at`, and first/replayed invocation receipt times equal the stored receipt timestamp at database precision. Crash/failure before commit then redelivery: retry succeeds without a stranded claim; failed evaluations disclose nothing; idempotent actor/guild charges do not double in the same limiter lifetime. Unknown commit outcome: replay if committed, retry only if the locked read proves no row (§6) |
 | T18 | Registration scope | Publish set contains `automod-preview` only for the configured guild when the automod scope admits it; absent for the live guild without approval (§5.0) |
-| T19 | Unproven repeat equivalence | When repeat equivalence cannot be proven and execution reaches that check: repeat status `indeterminate`, reply result `partial` with fixed explanation and no deciding filter/knob; later filters not evaluated; audit `outcome=partial,filter=none` and effective mode/length; metric `result=partial,filter=none` and effective mode; redelivery renders the same partial reply. Earlier exemption/`bad_words` short-circuits remain complete |
+| T19 | Detached command without ordered history | When repeat-eligible text reaches the repeat check: repeat status `indeterminate`, reply result `partial` with fixed explanation and no deciding filter/knob; later filters not evaluated; audit `outcome=partial,filter=none` and effective mode/length; metric `result=partial,filter=none` and effective mode; redelivery renders the same partial reply. Earlier exemption/`bad_words` short-circuits remain complete |
 
 ## 9. Future build slices (each ≤1 day, cut-ready; not created here)
 
@@ -649,10 +620,9 @@ slices (2–4) carry the CISO comment-gate.
 
 1. **Core preview in `crates/core`** — preview entry point over a
    synthetic message + mention count + cloned config: first-match verdict,
-   exemption class, deciding-knob names, mode; read-only repeat path per
-   §5.1. Tests T1–T6, T9 (struct shape), T19. Stop/go: if T2 equivalence fails,
-   implement the `indeterminate` fallback or stop — do not ship silent
-   fall-through.
+   exemption class, deciding-knob names, mode; read-only repeat evaluation
+   with supplied history and `partial` when ordered history is unavailable
+   (§5.1). Tests T1–T6, T9 (struct shape), T19.
 2. **Command definition + permission row (unpublished)** —
    `CommandDefinition` (ManageGuild, guild-only, options of §3.1), next
    free `command_permissions` parity row, router refusal text, help/
