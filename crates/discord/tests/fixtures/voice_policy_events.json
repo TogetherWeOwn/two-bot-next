@@ -93,5 +93,14 @@
       "colors": {"primary_color": 0, "secondary_color": null, "tertiary_color": null},
       "hoist": false, "managed": false, "mentionable": false, "position": 1, "permissions": "1024", "flags": 0}
   }],
-  [true, "GUILD_ROLE_DELETE", {"guild_id": "7", "role_id": "12"}]
+  [true, "GUILD_ROLE_DELETE", {"guild_id": "7", "role_id": "12"}],
+  [true, "GUILD_UPDATE", {
+    "id": "7", "name": "test guild", "owner_id": "997",
+    "afk_timeout": 300, "default_message_notifications": 0, "explicit_content_filter": 0,
+    "features": [], "emojis": [], "mfa_level": 0, "nsfw_level": 0, "preferred_locale": "en-US",
+    "premium_progress_bar_enabled": false, "premium_tier": 0, "system_channel_flags": 0,
+    "verification_level": 0, "roles": [{"id": "7", "name": "everyone", "color": 0,
+      "colors": {"primary_color": 0, "secondary_color": null, "tertiary_color": null},
+      "hoist": false, "managed": false, "mentionable": false, "position": 0, "permissions": "0", "flags": 0}]
+  }]
 ]

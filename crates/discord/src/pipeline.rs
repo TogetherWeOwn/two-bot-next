@@ -1409,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_policy_epoch_is_guild_scoped_and_never_reused_after_reseed() {
+    fn voice_policy_epoch_is_guild_scoped_and_never_reused_after_reseed() -> Result<(), String> {
         let cache = SharedCache::default();
         cache.update(&lifecycle_available_guild());
         cache.update(&lifecycle_guild(GUILD + 1));
@@ -1417,7 +1417,7 @@ mod tests {
         let current = || epoch(GUILD);
         let cases: Vec<(bool, &str, serde_json::Value)> =
             serde_json::from_str(include_str!("../tests/fixtures/voice_policy_events.json"))
-                .unwrap();
+                .map_err(|err| format!("policy fixture table: {err}"))?;
         let peer = epoch(GUILD + 1).unwrap();
         for (changed, kind, data) in cases {
             let packet = serde_json::json!({"op": 0, "s": 1, "t": kind, "d": data});
@@ -1425,8 +1425,8 @@ mod tests {
                 packet.to_string(),
                 twilight_gateway::EventTypeFlags::all(),
             )
-            .unwrap_or_else(|err| panic!("{kind} fixture: {err}"))
-            .expect("dispatch fixture");
+            .map_err(|err| format!("{kind} fixture: {err}"))?
+            .ok_or_else(|| format!("{kind} fixture: missing dispatch"))?;
             let before = current().unwrap();
             cache.update(&Event::from(event));
             assert_eq!(
@@ -1461,6 +1461,7 @@ mod tests {
         assert!(current().is_none());
         cache.update(&lifecycle_available_guild());
         assert!(!Arc::ptr_eq(&prior, &current().expect("reseeded guild")));
+        Ok(())
     }
 
     #[test]
