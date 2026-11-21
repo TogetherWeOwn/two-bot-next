@@ -293,13 +293,12 @@ their login status or silently removing memberships. It contains no passwords.
    start: creator-specific default ACLs belong to the group, not automatically
    to a member login; (c) the provisioning identity reapplies the reviewed full
    plan after migrations and view updates, then `verify` reads 0 findings.
-   Before the bootstrap phase, install the views and helpers appropriate to
-   the existing schema. On a historical pre-heat target, use the 1.0 view
-   definitions; install the current `sql/web_v1.sql` after pending migrations
-   and before the full role plan, with `public` as the bot-table search path.
-   The full 1.1 install publishes its version with the heat view; the web
-   reader gets the view only, not `voice_heat_hours`. Functions stay strict
-   in both role-plan phases.
+   Install schema-matched views and helpers before bootstrap (1.0 on pre-heat
+   targets). Install current `sql/web_v1.sql` after pending migrations and before
+   the full role plan, using `public` as the bot-table search path. The plan grants
+   the heat view, not `voice_heat_hours`. If a 1.1 heat read returns insufficient
+   privilege before the grant, use the insufficient-data fallback. Functions stay
+   strict in both phases.
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
    tables are not transferred or granted to the runtime.
@@ -321,6 +320,15 @@ also require a separately reviewed operator correction.
 Rollback is an operator-reviewed restoration of the prior ownership/ACL inventory
 and login configuration, not dropping groups or deleting data. Save that inventory
 before changing permissions. Never rotate/delete a credential as a side effect.
+
+### Voice heat staging backout
+
+For separately authorized staging recovery to a pre-heat build with
+`voice_heat_hours`, confirm the target and stop 1.1 installs and role applies.
+As the object owner, run the [atomic backout](../sql/voice_heat_staging_backout.sql);
+it restores 1.0 and revokes the grant without touching samples. Dispatch only
+if `two-bot db roles verify` at the recovery SHA is clean. To roll forward,
+reinstall 1.1, reapply the full role plan, and verify at the new SHA.
 
 ## Testing
 

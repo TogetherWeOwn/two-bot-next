@@ -68,11 +68,18 @@ async fn execute(pool: &PgPool, sql: String) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+const ROLE_MATRIX: &str = include_str!("../../../sql/database_role_matrix.sql");
+
 async fn findings(pool: &PgPool, roles: &[String]) -> Result<Vec<String>, sqlx::Error> {
-    let sql = include_str!("../../../sql/verify_database_roles.sql").replace(
-        "-- @matrix",
-        include_str!("../../../sql/database_role_matrix.sql"),
-    );
+    findings_for_matrix(pool, roles, ROLE_MATRIX).await
+}
+
+async fn findings_for_matrix(
+    pool: &PgPool,
+    roles: &[String],
+    matrix: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let sql = include_str!("../../../sql/verify_database_roles.sql").replace("-- @matrix", matrix);
     let mut tx = pool.begin().await?;
     sqlx::raw_sql("SET TRANSACTION READ ONLY; SET LOCAL search_path = pg_catalog, pg_temp;")
         .execute(&mut *tx)
@@ -624,7 +631,26 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         findings(pool, roles).await?.is_empty(),
         "restored matrix drifted",
     )?;
-    Ok(())
+    exercise_voice_heat_backout(pool, roles).await
+}
+
+async fn exercise_voice_heat_backout(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
+    // The pre-heat verifier uses the same SQL without the new matrix entry.
+    let prior = ROLE_MATRIX.replace("    ('web_v1', 'voice_heat', 'view'),\n", "");
+    let drift = findings_for_matrix(pool, roles, &prior).await?;
+    let heat_select = |row: &String| row.ends_with("/web_v1.voice_heat/SELECT");
+    require(
+        drift.iter().any(heat_select),
+        "pre-heat verifier missed heat grant",
+    )?;
+    let backout = include_str!("../../../sql/voice_heat_staging_backout.sql");
+    execute(pool, isolated(backout, roles)).await?;
+    let drift = findings_for_matrix(pool, roles, &prior).await?;
+    require(drift.is_empty(), &format!("pre-heat role drift: {drift:?}"))?;
+    let version: String = sqlx::query_scalar("SELECT contract_version FROM web_v1.contract_meta")
+        .fetch_one(pool)
+        .await?;
+    require(version == "1.0", "backout did not restore 1.0")
 }
 
 async fn exercise_voice_heat_grants(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {

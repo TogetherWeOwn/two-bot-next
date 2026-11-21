@@ -263,7 +263,7 @@ become the newest outcome for the still-serving SHA and block promotion even
 with an older green run. Do not skip that failure; qualify current `main`
 with a fresh dispatch only if the match above holds. To intentionally recover a
 prior main SHA, dispatch from current `main` with the full ancestor SHA and
-`recover_prior_sha: true`.
+`recover_prior_sha: true` ([voice heat backout](database-roles.md#voice-heat-staging-backout)).
 This does not qualify as staging history. Do not rerun old workflow revisions
 with the old single-slot policy; let existing holders and waiters settle before
 using the measurement caller. Wait for all five qualifying jobs plus release
