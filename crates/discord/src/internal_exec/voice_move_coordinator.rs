@@ -1,7 +1,10 @@
 //! Ordered gateway evidence around a single governed voice PATCH.
 use std::sync::{Arc, Mutex};
 
-use tokio::time::Instant;
+use tokio::{
+    sync::Mutex as AsyncMutex,
+    time::{timeout_at, Instant},
+};
 use twilight_model::id::Id;
 use two_bot_core::{
     internal_actions::VoiceMoveOutcome as Outcome, voice_move_decision::VoiceMoveDecision,
@@ -16,6 +19,7 @@ use crate::{pipeline::SharedCache, DiscordError};
 pub struct VoiceMoveRoster<'a> {
     cache: &'a SharedCache,
     holds: &'a Mutex<VoiceMoveHolds>,
+    turn: &'a AsyncMutex<()>,
 }
 
 type VoiceMoveProof = (Snowflake, u32, Arc<()>);
@@ -57,9 +61,14 @@ impl From<VoiceMoveReadError> for VoiceMoveAttempt {
 }
 
 impl<'a> VoiceMoveRoster<'a> {
+    /// Share one `turn` across all moves for this guild; it does not guard audit I/O.
     #[must_use]
-    pub const fn new(cache: &'a SharedCache, holds: &'a Mutex<VoiceMoveHolds>) -> Self {
-        Self { cache, holds }
+    pub const fn new(
+        cache: &'a SharedCache,
+        holds: &'a Mutex<VoiceMoveHolds>,
+        turn: &'a AsyncMutex<()>,
+    ) -> Self {
+        Self { cache, holds, turn }
     }
 
     fn policy_epoch(self, guild: Snowflake) -> Option<Arc<()>> {
@@ -73,7 +82,7 @@ impl<'a> VoiceMoveRoster<'a> {
         expected_epoch: &Arc<()>,
         use_roster: impl FnOnce(Option<Snowflake>, u32, &mut VoiceMoveHolds) -> Option<T>,
     ) -> Option<T> {
-        let Self { cache, holds } = self;
+        let Self { cache, holds, .. } = self;
         let mut holds = holds.lock().ok()?;
         cache.with_guild_policy_snapshot(guild, |cache, epoch| {
             Arc::ptr_eq(epoch, expected_epoch).then_some(())?;
@@ -115,6 +124,10 @@ impl ActionExecutor {
                 .filter(|n| *n != 0 && n.to_string() == id)
         };
         let [Some(guild), Some(member), Some(target)] = ids.map(parse) else {
+            return no_evidence;
+        };
+        // Only the queue wait can be cancelled here. The owner settles its own send.
+        let Ok(_turn) = timeout_at(deadline, roster.turn.lock()).await else {
             return no_evidence;
         };
         let ids_numeric = [guild, member, target];
