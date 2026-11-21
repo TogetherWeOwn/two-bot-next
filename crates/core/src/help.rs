@@ -1175,10 +1175,11 @@ mod tests {
             .collect();
         // 47 non-voice names, including inspection, clone, edit, reopen, welcome-preview, pause/resume,
         // giveaway, lfg-edit, lfg-list, feed-inspect, tempban-list, purge-preview, channel-inspect
-        // and moderation-recent, plus
-        // 23 additional voice names (voice `kick` shares the Kick group).
+        // and moderation-recent, plus 23 additional voice names (voice `kick`
+        // shares the Kick group) and one staging-only AutoMod preview.
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 70);
+        assert_eq!(grouped.len(), 71);
+        assert!(grouped.contains("automod-preview"));
         for name in [
             "rank",
             "leaderboard",
