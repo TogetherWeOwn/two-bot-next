@@ -2617,7 +2617,10 @@ that recovery evidence and the [reviewed ACL sequence](database-roles.md) to the
 producing read-only plan. On the source task, obtain an accepted board
 `request_confirmation` naming the full source SHA, producing plan run ID,
 both pending lists, both manifest digests and the recovery reference. A change to
-those inputs needs a fresh confirmation. Do not dispatch apply before confirmation:
+those inputs needs a fresh confirmation. Before submitting `mode: apply`, compare
+its actual inputs with the authenticated producing manifest and run ID, including
+the pinned staging host, database and branch ID, `recovery_evidence_ref` and
+`acl_plan_ref`. Do not dispatch if any value differs or confirmation is missing.
 GitHub does not pause this staging job for human approval.
 
 For `mode: apply`, the `claim` job validates the dispatch against its fresh
@@ -2625,8 +2628,9 @@ read-only plan and uploads `staging-migrate-apply-claim.json` as the
 `staging-migrate-apply-claim` artifact. It has no environment or database binding.
 The `apply` job runs only after a green plan **and claim** and reads its binding
 from `staging-migrate-apply`. It verifies the producing plan before DDL. The
-[claim contract](staging-migrate-claim.md) defines the exact fields, proof checks
-and distinction between the claim and the board decision. This gate applies
+operator's post-dispatch claim comparison is audit evidence, not an approval
+gate; apply does not wait for it. The [claim contract](staging-migrate-claim.md)
+defines the exact fields and proof checks. This gate applies
 only to staging; it does not change production approval or protection.
 After apply, follow the reviewed ACL sequence so other shared-database services
 keep their access. Real SQLx proof runs only against disposable CI services

@@ -138,9 +138,18 @@ SHA, producing plan run ID, both pending lists, both manifest digests and the
 recovery reference. Dispatch only after the board accepts that exact binding.
 Hash equality does not substitute for confirmation.
 
-After dispatch, verify the claim came from the successful `staging-migrate (claim)`
-job on that apply run and attempt, agrees with the workflow-head SHA and matches
-the confirmed inputs. The apply job downloads the separate producing run's
-manifest, and the runner checks its pending sets, hashes and provenance **before
-DDL**. The claim neither replaces those checks nor weakens read-only/apply
-credential separation, main-only protections or shell failure propagation.
+Before submitting `mode: apply` on `main`, compare the actual dispatch inputs
+with the authenticated producing manifest and its run ID. Match the source SHA,
+both pending lists, both digests, the pinned target (`staging_host`,
+`staging_database`, `staging_branch_id`) and both evidence references
+(`recovery_evidence_ref`, `acl_plan_ref`). The digests do not cover the target or
+either reference. Do not dispatch if any value differs.
+
+After dispatch, verify that the claim came from the successful
+`staging-migrate (claim)` job on that run and attempt, agrees with the
+workflow-head SHA and matches the pre-dispatch inputs. This operator comparison
+is audit evidence, not an approval gate; apply does not wait for it. The apply
+job downloads the separate producing run's manifest, and the runner checks its
+pending sets, hashes and provenance **before DDL**. The claim neither replaces
+those checks nor weakens read-only/apply credential separation, main-only
+protections or shell failure propagation.
