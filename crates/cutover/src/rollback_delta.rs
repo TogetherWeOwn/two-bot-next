@@ -109,6 +109,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "containment_incidents", measure: TableMeasure::Columns(&["started_at"]) },
     // Same shape as guild_counters: one read-time per count, no updated_at.
     TableSpec { table: "counter_snapshots", measure: TableMeasure::Columns(&["human_member_count_at", "online_count_at"]) },
+    TableSpec { table: "event_attendance_windows", measure: TableMeasure::Columns(&["changed_at"]) },
     // Event instance windows (0472): durable lifecycle, order and revocation
     // evidence for accepted Discord event observations. Confirmed lifecycle
     // writes stamp observed_at/revoked_at; status-only omissions stamp omitted_at
@@ -132,6 +133,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // leave rewrites left_at from NULL without touching joined_at, so the
     // maximum across both is the row's last write (same shape as tickets).
     TableSpec { table: "event_voice_presence", measure: TableMeasure::Columns(&["joined_at", "left_at"]) },
+    TableSpec { table: "event_voice_sessions", measure: TableMeasure::Columns(&["changed_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "game_activity_guild_aggregates", measure: TableMeasure::Columns(&["updated_at"]) },

@@ -1267,6 +1267,7 @@ const EVENT_INSTANCE_GUILD_PURGE_TABLES: &[&str] = &[
     "event_voice_channels",
     "internal_event_keys",
     "event_instance_windows",
+    "event_attendance_windows",
 ];
 
 /// Guild-scope predicate for one erasure-plan table: child tables without

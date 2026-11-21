@@ -202,6 +202,8 @@ BEGIN
         VALUES (g, 'ev-' || k, 'fixture', '2026-11-01T20:00:00Z', NULL, NULL, 'scheduled', '2026-10-01T00:00:00Z');
       INSERT INTO event_voice_presence (event_id, instance, user_id, joined_at, left_at)
         VALUES ('ev-' || k, '2026-11-01T20:00:00Z', u, '2026-11-01T20:00:00Z', NULL);
+      INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, joined_at, left_at)
+        VALUES (g, u, 'v-' || k, '2026-11-01T20:00:00Z', '2026-11-01T21:00:00Z');
       -- Three S8 event_store rows per member, each binding the member in exactly
       -- one of actor_id, target_id and user_id (the others NULL) with distinct
       -- dedup_keys, so each erasure predicate branch is exercised
