@@ -95,7 +95,7 @@ fn no_mentions(body: &Value) {
     assert_ne!(body["allowed_mentions"]["replied_user"], true);
 }
 
-fn private_reply(requests: &[RestRequest]) -> String {
+fn private_payload(requests: &[RestRequest]) -> Value {
     assert!(!requests.is_empty(), "inspect cannot disappear into a stub");
     assert!(
         requests.iter().all(|request| {
@@ -129,8 +129,13 @@ fn private_reply(requests: &[RestRequest]) -> String {
         assert_eq!(requests.len(), 1);
         ack["data"].clone()
     };
-    assert!(body["embeds"].is_null() || body["embeds"] == json!([]));
     assert!(body["attachments"].is_null() || body["attachments"] == json!([]));
+    body
+}
+
+fn private_reply(requests: &[RestRequest]) -> String {
+    let body = private_payload(requests);
+    assert!(body["embeds"].is_null() || body["embeds"] == json!([]));
     let content = body["content"].as_str().expect("plain private content");
     assert!(!content.is_empty());
     assert!(
@@ -428,7 +433,11 @@ async fn inspect_eligibility_help_details_explain_saved_state_versus_conditional
     drop(guard);
     drop(runtime);
     mock.shutdown().await;
-    let content = private_reply(&requests).to_lowercase();
+    assert_eq!(requests.len(), 1, "immediate private help");
+    let body = private_payload(&requests);
+    let description = help_embed_description(&body);
+    assert!(!description.is_empty() && description.encode_utf16().count() <= 2000);
+    let content = description.to_lowercase();
     assert!(
         content.contains("saved")
             && content.contains("eligib")

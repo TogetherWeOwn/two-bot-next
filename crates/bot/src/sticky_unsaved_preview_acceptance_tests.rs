@@ -45,7 +45,7 @@ async fn closed_runtime(
 
 // Accept either an immediate private response or the existing private defer/edit
 // lifecycle. Extra REST calls (including channel reads/writes) are forbidden.
-fn private_reply(mock: &MockRest) -> String {
+fn private_payload(mock: &MockRest) -> serde_json::Value {
     let requests = mock.requests();
     assert!(!requests.is_empty(), "interaction must receive an answer");
     let callback: serde_json::Value =
@@ -77,9 +77,19 @@ fn private_reply(mock: &MockRest) -> String {
             .is_none_or(Vec::is_empty));
     }
     assert_ne!(payload["allowed_mentions"]["replied_user"], true);
+    payload
+}
+
+fn private_reply(mock: &MockRest) -> String {
+    let payload = private_payload(mock);
     let text = payload["content"]
         .as_str()
         .expect("plain-text sticky response");
+    assert_safe_text(text);
+    text.into()
+}
+
+fn assert_safe_text(text: &str) {
     assert!(!text.is_empty());
     assert!(text.encode_utf16().count() <= 2000, "Discord UTF-16 limit");
     assert!(!text.contains('\u{fffd}'), "never split a Unicode scalar");
@@ -89,7 +99,6 @@ fn private_reply(mock: &MockRest) -> String {
             "neutralize {unsafe_mention}"
         );
     }
-    text.into()
 }
 
 fn assert_preview(text: &str, debounce: u64) {
@@ -359,7 +368,11 @@ async fn private_help_discovers_preview_without_executing_sticky() {
             )],
         ))
         .await;
-    let text = private_reply(&mock).to_lowercase();
+    assert_eq!(mock.requests().len(), 1, "immediate private help");
+    let payload = private_payload(&mock);
+    let description = help_embed_description(&payload);
+    assert_safe_text(description);
+    let text = description.to_lowercase();
     for token in ["/sticky", "preview", "optional", "boolean"] {
         assert!(text.contains(token), "help exposes {token}: {text}");
     }

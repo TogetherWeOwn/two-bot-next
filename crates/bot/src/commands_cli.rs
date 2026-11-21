@@ -313,10 +313,15 @@ fn boot_sync_error(source: &DiscordError) -> String {
     )
 }
 
-/// Publication did not previously run on boot. Keep it opt-in while the shared
-/// interaction runtime is being wired; the default server remains unchanged.
-/// Live opt-in is separate from boot opt-in and checked before DB or REST I/O.
+/// Optional early sync outside canonical staging. Live opt-in is separate
+/// from boot opt-in and checked before DB or REST I/O.
 pub async fn publish_on_boot(token: &str, guild: u64) -> Result<(), String> {
+    // Only the gateway knows the attached AutoMod scope and the saved commands.
+    // An env-only replacement would delete them on restart, even before a
+    // subsequent gateway publication could preserve or deliberately withdraw them.
+    if two_bot_core::automod_runtime::STAGING_GUILD_ID.parse::<u64>() == Ok(guild) {
+        return Ok(());
+    }
     let vars: HashMap<String, String> = std::env::vars().collect();
     if vars
         .get("TWO_COMMANDS_PUBLISH_ON_BOOT")

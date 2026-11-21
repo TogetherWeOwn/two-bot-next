@@ -934,9 +934,12 @@ struct ReceiverState {
     /// stamped on stale occupancy.
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
     voice_move: Option<ActionExecutor>,
+    voice_move_turn: tokio::sync::Mutex<()>,
     clock: Mutex<ClockGuard>,
     buckets: Mutex<TokenBuckets>,
     telemetry: Mutex<RejectionTelemetry>,
+    #[cfg(test)]
+    response_metrics: Box<metrics::Metrics>,
     capacity: Arc<Semaphore>,
     event_gate: tokio::sync::Mutex<()>,
     event_gate_wait: Duration,
@@ -985,9 +988,12 @@ impl ReceiverState {
             voice_clock: VoiceOccupancyClock::new(),
             gateway_state: Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
             voice_move: None,
+            voice_move_turn: tokio::sync::Mutex::new(()),
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
             telemetry: Mutex::new(RejectionTelemetry::default()),
+            #[cfg(test)]
+            response_metrics: Box::default(),
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
             event_gate: tokio::sync::Mutex::new(()),
             event_gate_wait: EVENT_GATE_WAIT,
@@ -1028,13 +1034,23 @@ impl ReceiverState {
         self
     }
 
+    fn action_metrics(&self) -> &metrics::Metrics {
+        #[cfg(test)]
+        {
+            &self.response_metrics
+        }
+        #[cfg(not(test))]
+        metrics::global()
+    }
+
     fn reject(&self, failure: Failure, key: KeyLabel, action: ActionLabel, id: &str) -> Response {
         // Bounded receiver counter (TOG-20119): family from the bounded action
         // label, outcome from the refusal class. Labels are closed sets only;
         // the warn-summary below stays sampled as-is.
         let family = internal_family(action);
         let class = RejectionClass::classify(failure.class_code, &key, action);
-        metrics::global().internal_action(family, class.as_str());
+        self.action_metrics()
+            .internal_action(family, class.as_str());
         let records = self
             .telemetry
             .lock()
@@ -1493,7 +1509,8 @@ async fn receive(
     permit: OwnedSemaphorePermit,
 ) -> Response {
     // Start before reading the signed body or burning its nonce.
-    let wire_deadline = Instant::now() + VOICE_MOVE_BUDGET;
+    let (started, unknown) = (Instant::now(), ActionLabel::Unknown);
+    let wire_deadline = started + VOICE_MOVE_BUDGET;
     let reject_boundary =
         |failure| state.reject(failure, KeyLabel::Invalid, ActionLabel::Unknown, id);
     if request.uri().path_and_query().map(|path| path.as_str()) != Some(ACTIONS_PATH) {
@@ -1566,9 +1583,17 @@ async fn receive(
         Ok(verified) => verified,
         Err(error) => return reject(Failure::from_action(error), ActionLabel::Unknown),
     };
-    let burned = match verified.burn_durably(&state.store).await {
-        Ok(burned) => burned,
-        Err(error) => return reject(Failure::from_action(error), ActionLabel::Unknown),
+    // Bound the common nonce burn without parsing the action before commitment.
+    let burn = verified.burn_durably(&state.store);
+    let cutoff = if state.voice_move.is_some() {
+        wire_deadline
+    } else {
+        started + REQUEST_TIMEOUT
+    };
+    let burned = match timeout_at(cutoff, burn).await {
+        Ok(Ok(burned)) => burned,
+        Ok(Err(error)) => return reject(Failure::from_action(error), unknown),
+        Err(_) => return reject(Failure::code(ErrorCode::UpstreamTimeout), unknown),
     };
     // The enabled set is the env-only flag gate, never the settings store: the
     // website must not be able to grant itself verbs. Verbs without a wired
@@ -1599,10 +1624,26 @@ async fn receive(
     if decision.action == "voice.snapshot" {
         return read_voice_snapshot(state, id, key, action).await;
     }
+    if decision.action == "voice.move_member" {
+        return match voice_move::execute(
+            state,
+            decision,
+            permit,
+            (id, headers.auth.nonce),
+            wire_deadline,
+        )
+        .await
+        {
+            Ok(result) => {
+                state.action_metrics().internal_action("voice", "executed");
+                event_read_response(result, id)
+            }
+            Err(error) => reject(error, action),
+        };
+    }
     // Mutating event verbs take the same durable claim/audit path as
     // announcements below, with their own validation and key mapping.
-    let move_nonce = (decision.action == "voice.move_member").then_some(headers.auth.nonce);
-    if supports_event_mutation(&decision.action) || move_nonce.is_some() {
+    if supports_event_mutation(&decision.action) {
         // Runs to its receipt even if the client has gone: a claimed create that
         // was dropped mid-flight must still register its key mapping. The child
         // is tracked under the receiver (never detached and ownerless) and
@@ -1615,8 +1656,6 @@ async fn receive(
         let task_decision = decision.clone();
         let task_raw = raw.to_vec();
         let task_idempotency = headers.idempotency.map(str::to_owned);
-        let delivery =
-            move_nonce.map(|nonce| two_bot_core::internal_actions::body_hash(nonce.as_bytes()));
         let task_id = id.to_owned();
         let task_key = key.clone();
         // Queued work inherits the request span: task spawning does not
@@ -1630,30 +1669,16 @@ async fn receive(
             children.spawn(
                 async move {
                     let _permit = permit;
-                    let response = if let Some(delivery) = delivery {
-                        match voice_move::respond(
-                            &task_state,
-                            &task_decision,
-                            (&delivery, &task_id),
-                            wire_deadline,
-                        )
-                        .await
-                        {
-                            Ok(result) => event_read_response(result, &task_id),
-                            Err(error) => task_state.reject(error, task_key, action, &task_id),
-                        }
-                    } else {
-                        mutate_event(
-                            &task_state,
-                            &task_decision,
-                            &task_raw,
-                            task_idempotency.as_deref(),
-                            &task_id,
-                            task_key,
-                            action,
-                        )
-                        .await
-                    };
+                    let response = mutate_event(
+                        &task_state,
+                        &task_decision,
+                        &task_raw,
+                        task_idempotency.as_deref(),
+                        &task_id,
+                        task_key,
+                        action,
+                    )
+                    .await;
                     let _ = done_tx.send(response);
                 }
                 .instrument(task_span),
@@ -1662,13 +1687,6 @@ async fn receive(
             // reaped failure already answered its own handler (or outlived it);
             // the runtime logs the panic itself.
             while children.try_join_next().is_some() {}
-        }
-        if move_nonce.is_some() {
-            return match timeout_at(wire_deadline, done_rx).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(_)) => reject(Failure::code(ErrorCode::DiscordUnavailable), action),
-                Err(_) => reject(Failure::code(ErrorCode::UpstreamTimeout), action),
-            };
         }
         return match done_rx.await {
             Ok(response) => response,

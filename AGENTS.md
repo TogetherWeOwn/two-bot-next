@@ -15,6 +15,19 @@ tested and reviewable.
 4. [`SECURITY.md`](SECURITY.md): private vulnerability reporting and secret handling.
 5. [`CONSTRAINTS.md`](CONSTRAINTS.md): the quality bar. Read it before writing code. Do not weaken it to make a change pass.
 
+## Resume from the repo alone
+
+Durable product and engineering knowledge lives in the repo. To resume
+work without any external tracker, read in this order:
+[`docs/handoff.md`](docs/handoff.md) (dated snapshot, checks, next
+step), [`docs/plans/current-state-2026-11.md`](docs/plans/current-state-2026-11.md)
+(approved vs deferred scope), [`docs/adr/0002-m2-m3-sequencing.md`](docs/adr/0002-m2-m3-sequencing.md)
+and [`docs/adr/0003-m3-deferred.md`](docs/adr/0003-m3-deferred.md)
+(material decisions). Accepted specs live flat in `docs/`; deploy and
+rollback procedures live in `docs/production-deploy.md` and
+`docs/runbook.md`. Specs, plans and decisions change in the same PR as
+the work they describe.
+
 Browse the [documentation map](docs/README.md) before searching individual guides.
 When adding a doc, add its purpose/link there; run `python3 scripts/check_docs_index.py --json`.
 The index merges with union (`.gitattributes`); after rebasing a docs change, run `python3 scripts/check_docs_index.py --dedupe --json` and repair any rows it still reports instead of hand-merging the index.

@@ -169,54 +169,10 @@ pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
     }
 }
 
-/// One immediate ephemeral detail reply for `/help command:name` (or its
-/// unknown-name correction). Short detail stays in content; longer detail
-/// moves to one embed description, truncated with an explicit notice past
-/// Discord's description ceiling. The executor sanitizer stays the final
-/// mention/length backstop.
+/// One immediate branded ephemeral reply for `/help command:name` or its correction.
 #[must_use]
 pub fn help_detail_response(detail: String) -> InteractionResponse {
-    if two_bot_core::message_safety::text_len(&detail)
-        <= two_bot_core::message_safety::CONTENT_LIMIT
-    {
-        return text_response(InteractionReply::new(detail, true));
-    }
-    let mut description = detail;
-    if two_bot_core::message_safety::text_len(&description)
-        > two_bot_core::message_safety::EMBED_DESCRIPTION_LIMIT
-    {
-        description = two_bot_core::message_safety::truncate(
-            &description,
-            two_bot_core::message_safety::EMBED_DESCRIPTION_LIMIT - 64,
-        ) + "…(detail truncated for display.)";
-    }
-    InteractionResponse {
-        kind: InteractionResponseType::ChannelMessageWithSource,
-        data: Some(InteractionResponseData {
-            allowed_mentions: Some(Default::default()),
-            embeds: Some(vec![brand_embed(
-                EmbedKind::Default,
-                Embed {
-                    author: None,
-                    color: None,
-                    description: Some(description),
-                    fields: Vec::new(),
-                    flags: None,
-                    footer: None,
-                    image: None,
-                    kind: "rich".to_owned(),
-                    provider: None,
-                    thumbnail: None,
-                    timestamp: None,
-                    title: None,
-                    url: None,
-                    video: None,
-                },
-            )]),
-            flags: Some(MessageFlags::EPHEMERAL),
-            ..Default::default()
-        }),
-    }
+    branded_help_detail_response(detail)
 }
 
 /// One immediate branded ephemeral detail or correction reply. Neutralize
@@ -1379,25 +1335,10 @@ mod help_response_tests {
     }
 
     #[test]
-    fn short_detail_stays_in_ephemeral_content() {
+    fn short_detail_uses_the_branded_ephemeral_embed() {
         let detail = "/rank — Show your XP, level and server rank.\nUsage: /rank [member]\n";
         let wire =
             serde_json::to_value(help_detail_response(detail.to_owned())).expect("serializes");
-        assert_eq!(wire["type"], 4);
-        assert_eq!(wire["data"]["flags"], 64);
-        assert_eq!(
-            wire["data"]["allowed_mentions"]["parse"],
-            serde_json::json!([])
-        );
-        assert_eq!(wire["data"]["content"], detail);
-        assert!(wire["data"]["embeds"].is_null());
-    }
-
-    #[test]
-    fn short_detail_uses_the_branded_ephemeral_embed() {
-        let detail = "/rank — Show your XP, level and server rank.\nUsage: /rank [member]\n";
-        let wire = serde_json::to_value(branded_help_detail_response(detail.to_owned()))
-            .expect("serializes");
         assert_eq!(wire["type"], 4);
         assert_eq!(wire["data"]["flags"], 64);
         assert_eq!(
@@ -1417,6 +1358,13 @@ mod help_response_tests {
             crate::brand::brand_footer_for("Help").text
         );
         assert_eq!(embed["footer"]["icon_url"], crate::brand::BRAND_ICON_URL);
+        assert!(wire["data"]["components"].is_null());
+        assert_eq!(
+            wire,
+            serde_json::to_value(branded_help_detail_response(detail.to_owned()))
+                .expect("preview serializes"),
+            "the topic callback uses the exact renderer exercised by the preview"
+        );
     }
 
     #[test]

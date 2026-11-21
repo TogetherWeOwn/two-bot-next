@@ -10,7 +10,29 @@ use two_bot_core::{
     Snowflake,
 };
 
-use super::super::{ActionExecutor, DiscordError};
+use super::super::{throw_for_status, ActionExecutor, DiscordError, RawResponse};
+use super::voice_move::retry_delay_ms;
+
+#[derive(Debug, thiserror::Error)]
+pub enum VoiceMoveReadError {
+    #[error("discord rate-limited the voice evidence request")]
+    RateLimited(Option<u64>),
+    #[error(transparent)]
+    Discord(#[from] DiscordError),
+}
+
+impl VoiceMoveReadError {
+    fn from_status(response: &RawResponse) -> Self {
+        if response.status == 429 {
+            Self::RateLimited(retry_delay_ms(
+                response.validated_retry_after_header,
+                response.body_retry_after_secs(),
+            ))
+        } else {
+            throw_for_status(response).into()
+        }
+    }
+}
 
 /// A validated eligible destination and the guild facts needed for permission checks.
 pub struct VoiceMoveTarget {
@@ -47,8 +69,10 @@ impl ActionExecutor {
         guild: Snowflake,
         target: Snowflake,
         deadline: Instant,
-    ) -> Result<Option<VoiceMoveTarget>, DiscordError> {
-        let bot = self.current_bot_user_id_until(deadline).await?;
+    ) -> Result<Option<VoiceMoveTarget>, VoiceMoveReadError> {
+        let bot = self
+            .current_bot_user_id_until_map(deadline, VoiceMoveReadError::from_status)
+            .await?;
         let doc = self
             .required_voice_read(&format!("/guilds/{guild}"), deadline)
             .await?;
@@ -56,7 +80,11 @@ impl ActionExecutor {
             return Err(incomplete());
         }
         let Some(room) = self
-            .get_json_strict_until(&format!("/channels/{target}"), deadline)
+            .get_json_strict_until_map(
+                &format!("/channels/{target}"),
+                deadline,
+                VoiceMoveReadError::from_status,
+            )
             .await?
         else {
             return Ok(None);
@@ -90,7 +118,7 @@ impl ActionExecutor {
         member_id: Snowflake,
         from: Snowflake,
         deadline: Instant,
-    ) -> Result<VoiceMoveEvidence, DiscordError> {
+    ) -> Result<VoiceMoveEvidence, VoiceMoveReadError> {
         let VoiceMoveTarget {
             guild,
             owner,
@@ -137,8 +165,8 @@ impl ActionExecutor {
         &self,
         path: &str,
         deadline: Instant,
-    ) -> Result<Value, DiscordError> {
-        self.get_json_strict_until(path, deadline)
+    ) -> Result<Value, VoiceMoveReadError> {
+        self.get_json_strict_until_map(path, deadline, VoiceMoveReadError::from_status)
             .await?
             .ok_or_else(incomplete)
     }
@@ -149,7 +177,7 @@ impl ActionExecutor {
         id: Snowflake,
         require_timeout: bool,
         deadline: Instant,
-    ) -> Result<Member, DiscordError> {
+    ) -> Result<Member, VoiceMoveReadError> {
         let doc = self
             .required_voice_read(&format!("/guilds/{guild}/members/{id}"), deadline)
             .await?;
@@ -163,8 +191,8 @@ impl ActionExecutor {
     }
 }
 
-fn incomplete() -> DiscordError {
-    DiscordError::Unavailable("voice_move_evidence_incomplete".into())
+fn incomplete() -> VoiceMoveReadError {
+    DiscordError::Unavailable("voice_move_evidence_incomplete".into()).into()
 }
 
 fn number(value: &Value) -> Option<Snowflake> {

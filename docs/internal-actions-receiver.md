@@ -143,7 +143,10 @@ capabilities; this table is not an instruction to create or stage them.
 | `TWO_INTERNAL_ALLOW_SETTINGS` | Settings get/set stay gated off |
 | `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | `voice.snapshot` stays gated off |
 
-`bind` never constructs the staged `voice.move_member` executor. Its tracked
+`bind` never constructs the staged `voice.move_member` executor. In the staged
+receiver, the five-second move budget includes the common signed nonce burn
+without parsing the action before committing the nonce. Moves serialize for the
+fixed guild through adapter settlement, not receipt persistence. The tracked
 child retains capacity through the private nonce-bound receipt after disconnect;
 a forced drain can abort that write.
 

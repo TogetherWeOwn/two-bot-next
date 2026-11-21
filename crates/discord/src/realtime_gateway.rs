@@ -13,6 +13,8 @@ use twilight_model::{
 use two_bot_core::realtime_wire as wire;
 use wire::{Change, Operation};
 
+pub mod baseline;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectionError {
     InvalidPayload,
@@ -103,7 +105,7 @@ fn decode<'a, T: Deserialize<'a>>(payload: &'a Value) -> Result<T, ProjectionErr
 }
 
 fn permission_mask<'de, D: Deserializer<'de>>(d: D) -> Result<wire::Permissions, D::Error> {
-    let mask = <&str>::deserialize(d)?;
+    let mask = String::deserialize(d)?;
     if !mask.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(serde::de::Error::custom("permission mask is not decimal"));
     }
@@ -147,7 +149,22 @@ struct OverwriteRow {
 
 fn channel_change(payload: &Value, delete: bool) -> Result<Option<Operation>, ProjectionError> {
     let channel: ChannelKey = decode(payload)?;
-    let kind = match channel.kind {
+    let Some(kind) = channel_kind(channel.kind)? else {
+        return Ok(None);
+    };
+    let id = wire_id(channel.id);
+    if delete {
+        return Ok(Some(Operation::Channels(Change::Remove { id })));
+    }
+
+    Ok(Some(Operation::Channels(Change::Upsert {
+        id,
+        value: channel_row(id, kind, decode(payload)?)?,
+    })))
+}
+
+fn channel_kind(kind: ChannelType) -> Result<Option<wire::ChannelKind>, ProjectionError> {
+    Ok(Some(match kind {
         ChannelType::GuildVoice => wire::ChannelKind::Voice,
         ChannelType::GuildStageVoice => wire::ChannelKind::Stage,
         ChannelType::GuildCategory => wire::ChannelKind::Category,
@@ -162,13 +179,14 @@ fn channel_change(payload: &Value, delete: bool) -> Result<Option<Operation>, Pr
         | ChannelType::PublicThread
         | ChannelType::PrivateThread => return Ok(None),
         _ => return Err(ProjectionError::UnknownChannelKind),
-    };
-    let id = wire_id(channel.id);
-    if delete {
-        return Ok(Some(Operation::Channels(Change::Remove { id })));
-    }
+    }))
+}
 
-    let channel: ChannelRow = decode(payload)?;
+fn channel_row(
+    id: wire::Id,
+    kind: wire::ChannelKind,
+    channel: ChannelRow,
+) -> Result<wire::Channel, ProjectionError> {
     let name = channel.name.ok_or(ProjectionError::IncompleteChannel)?;
     let overwrites = channel
         .permission_overwrites
@@ -194,17 +212,14 @@ fn channel_change(payload: &Value, delete: bool) -> Result<Option<Operation>, Pr
         .transpose()
         .map_err(|_| ProjectionError::InvalidPosition)?;
 
-    Ok(Some(Operation::Channels(Change::Upsert {
+    Ok(wire::Channel {
         id,
-        value: wire::Channel {
-            id,
-            name,
-            kind,
-            parent_id: channel.parent_id.map(wire_id),
-            position,
-            overwrites,
-        },
-    })))
+        name,
+        kind,
+        parent_id: channel.parent_id.map(wire_id),
+        position,
+        overwrites,
+    })
 }
 
 #[cfg(test)]

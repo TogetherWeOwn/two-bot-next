@@ -14,6 +14,7 @@ use two_bot_core::realtime_wire as wire;
 use wire::{Change, Operation};
 
 mod baseline;
+pub mod intake;
 pub use baseline::scheduled_events;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,12 +41,17 @@ impl Dispatch<'_> {
         let name = self.t.ok_or(ProjectionError::MalformedDispatch)?.get();
         decode(name, '"').map(Some)
     }
+
+    fn body(&self) -> Result<&str, ProjectionError> {
+        Ok(self.d.ok_or(ProjectionError::MalformedDispatch)?.get())
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum Kind {
     GuildCreate,
+    GuildMembersChunk,
     GuildMemberAdd,
     GuildMemberUpdate,
     GuildMemberRemove,
@@ -118,13 +124,22 @@ struct EventMetadata {
 /// owns codec validation, reference cleanup, sequencing and visibility.
 pub fn project(guild_id: Id<GuildMarker>, raw: &str) -> Result<Option<Operation>, ProjectionError> {
     let dispatch: Dispatch<'_> = decode(raw, '{')?;
-    let Some(kind) = dispatch.kind()? else {
-        return Ok(None);
+    project_dispatch(guild_id, dispatch.kind()?, &dispatch, |body| {
+        event_change(decode(body, '{')?)
+    })
+}
+
+fn project_dispatch(
+    guild_id: Id<GuildMarker>,
+    kind: Option<Kind>,
+    dispatch: &Dispatch<'_>,
+    project_event: impl FnOnce(&str) -> Result<Change<wire::Event>, ProjectionError>,
+) -> Result<Option<Operation>, ProjectionError> {
+    let kind = match kind {
+        None | Some(Kind::GuildCreate | Kind::GuildMembersChunk | Kind::Other) => return Ok(None),
+        Some(kind) => kind,
     };
-    if matches!(kind, Kind::GuildCreate | Kind::Other) {
-        return Ok(None);
-    }
-    let body = dispatch.d.ok_or(ProjectionError::MalformedDispatch)?.get();
+    let body = dispatch.body()?;
     if decode::<GuildScope>(body, '{')?.guild_id != guild_id {
         return Ok(None);
     }
@@ -135,12 +150,12 @@ pub fn project(guild_id: Id<GuildMarker>, raw: &str) -> Result<Option<Operation>
             id: wire_id(decode::<RemovedMember>(body, '{')?.user.id),
         }),
         Kind::GuildScheduledEventCreate | Kind::GuildScheduledEventUpdate => {
-            Operation::Events(event_change(decode(body, '{')?)?)
+            Operation::Events(project_event(body)?)
         }
         Kind::GuildScheduledEventDelete => Operation::Events(Change::Remove {
             id: wire_id(decode::<RemovedEvent>(body, '{')?.id),
         }),
-        Kind::GuildCreate | Kind::Other => return Ok(None),
+        Kind::GuildCreate | Kind::GuildMembersChunk | Kind::Other => return Ok(None),
     };
     Ok(Some(operation))
 }

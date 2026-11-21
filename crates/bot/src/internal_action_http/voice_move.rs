@@ -1,15 +1,48 @@
 //! Signed, keyless terminal receipt for a staged move.
 use super::{json, AuthDecision, ErrorCode, Failure, ReceiverState, Value};
 use crate::gateway::GatewayState;
-use std::sync::atomic::Ordering;
-use tokio::time::Instant;
+use std::sync::{atomic::Ordering, Arc};
+use tokio::{
+    sync::OwnedSemaphorePermit,
+    time::{timeout_at, Instant},
+};
+use tracing::Instrument;
 use two_bot_core::{
     backup::guild_config::TWO_STAGING_GUILD_ID as GUILD,
     internal_actions::{body_hash, VoiceMoveOutcome as Outcome, VoiceMoveRequest},
 };
 use two_bot_discord::executor::member::VoiceMoveRoster;
 
-pub(super) async fn respond(
+pub(super) async fn execute(
+    state: &Arc<ReceiverState>,
+    decision: AuthDecision,
+    permit: OwnedSemaphorePermit,
+    (id, nonce): (&str, &str),
+    deadline: Instant,
+) -> Result<Value, Failure> {
+    let (done, receipt) = tokio::sync::oneshot::channel();
+    let (task_state, id, delivery) = (state.clone(), id.to_owned(), body_hash(nonce.as_bytes()));
+    {
+        let mut children = state.children.lock().await;
+        // Hold receiver capacity through audit even if the caller times out.
+        children.spawn(
+            async move {
+                let _permit = permit;
+                let _ =
+                    done.send(respond(&task_state, &decision, (&delivery, &id), deadline).await);
+            }
+            .in_current_span(),
+        );
+        while children.try_join_next().is_some() {}
+    }
+    match timeout_at(deadline, receipt).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(Failure::code(ErrorCode::DiscordUnavailable)),
+        Err(_) => Err(Failure::code(ErrorCode::UpstreamTimeout)),
+    }
+}
+
+async fn respond(
     state: &ReceiverState,
     decision: &AuthDecision,
     (delivery, request_id): (&str, &str),
@@ -23,7 +56,11 @@ pub(super) async fn respond(
         .ok_or_else(unavailable)?;
     let ids = [request.discord_id(), request.channel_id()];
     let api = state.voice_move.as_ref().ok_or_else(unavailable)?;
-    let roster = VoiceMoveRoster::new(&state.voice_cache, &state.voice_clock.move_holds);
+    let roster = VoiceMoveRoster::new(
+        &state.voice_cache,
+        &state.voice_clock.move_holds,
+        &state.voice_move_turn,
+    );
     let attempt = api
         .move_with_voice_evidence_until([GUILD, ids[0], ids[1]], roster, deadline, || {
             let gateway = state.gateway_state.try_read().ok()?;
@@ -32,6 +69,9 @@ pub(super) async fn respond(
         })
         .await;
     let outcome = attempt.outcome;
+    if outcome == Outcome::BotNotPermitted {
+        tracing::warn!("voice move denied by bot permissions");
+    }
     let from = attempt.from.map(|id| id.to_string());
     sqlx::query("INSERT INTO internal_action_log (caller_hash, delivery_hash, action, phase, \
         guild_id, target_id, response_code, http_status, affected, outcome, evidence_code, from_channel_id, resource_id, request_id) \

@@ -1921,6 +1921,232 @@ mod preview_callback_acceptance {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn preview_dry_run_is_private_and_leaves_create_streak_unchanged(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = std::env::var("TWO_TEST_DATABASE_URL")?;
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await?;
+        let proof = tokio::spawn(verify_preview_create_parity(db.pool().clone())).await;
+        db.close().await?;
+        proof??;
+        Ok(())
+    }
+
+    async fn verify_preview_create_parity(
+        pool: PgPool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use two_bot_core::automod::AutomodMessage;
+        use two_bot_core::automod_runtime::{
+            CompletionKind, FunnelDisposition, MessageDelivery, MessageDeliveryKind, StoredOutcome,
+        };
+        use two_bot_discord::automod_activation::ActivationOutcome;
+
+        let guild = STAGING_GUILD_ID.parse::<u64>()?;
+        let actor = 901_u64;
+        let repeated = "synthetic repeat sample";
+        let (mock, origin) = MockRest::start(vec![204; 3]).await;
+        let token = "preview-parity-test-token";
+        let executor = ActionExecutor::with_admission(
+            token.to_owned(),
+            Some(origin),
+            Arc::new(PgSendAdmission::new(pool.clone(), token)?),
+        )?;
+        let deployment = [
+            ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
+            (
+                "TWO_OWEN_USER_ID".to_owned(),
+                "123456789012345678".to_owned(),
+            ),
+            ("TWO_AUTOMOD_BAD_WORDS".to_owned(), "previewword".to_owned()),
+            ("TWO_AUTOMOD_REPEAT_COUNT".to_owned(), "3".to_owned()),
+            (
+                "TWO_AUTOMOD_REPEAT_WINDOW_SECONDS".to_owned(),
+                "30".to_owned(),
+            ),
+        ]
+        .into();
+        let build = || {
+            let resolved = crate::automod_gateway::resolve(&deployment, guild)?
+                .expect("enabled dry-run policy");
+            Ok::<_, &'static str>(crate::automod_gateway::build(
+                resolved,
+                pool.clone(),
+                executor.clone(),
+            ))
+        };
+        let with_previews = build()?;
+        let control = build()?;
+        let runtime = CommandRuntime::new(
+            pool.clone(),
+            executor,
+            router_with_commands(RouterGates {
+                moderation: true,
+                configured_guild: Some(guild),
+                ..gates(true, false)
+            }),
+            guild,
+            true,
+        );
+        runtime
+            .preview_deployment
+            .set(deployment)
+            .expect("fixture deployment");
+        let (_writer, live) = two_bot_core::settings::live_channel();
+        runtime.set_live_settings(live);
+        runtime.set_automod(with_previews.clone());
+        let _guard = runtime.dispatch_guard();
+        for (id, sample, received, outcome, filter) in [
+            (801, repeated, "2026-08-01T01:02:00Z", "partial", "none"),
+            (802, repeated, "2026-08-01T01:02:06Z", "partial", "none"),
+            (803, SAMPLE, "2026-08-01T01:02:12Z", "matched", "bad_words"),
+        ] {
+            if id != 801 {
+                // Move only the admission clock; perform all database and REST I/O unpaused.
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(6)).await;
+                tokio::time::resume();
+            }
+            let mut request = from_member(
+                slash(
+                    "automod-preview",
+                    Some(CHANNEL),
+                    vec![option(
+                        "text",
+                        CommandOptionValue::String(sample.to_owned()),
+                    )],
+                ),
+                actor,
+                Permissions::MANAGE_GUILD,
+            );
+            request.id = Id::new(id);
+            request.token = format!("preview-{id}");
+            let guild_id = Id::new(guild);
+            set_guild(&mut request, Some(guild_id));
+            request.channel.as_mut().expect("guild channel").guild_id = Some(guild_id);
+            request.authorizing_integration_owners.guild = Some(AnonymizableId::Id(guild_id));
+            let worker = dispatch_worker(|| {
+                assert!(runtime.dispatch_received(
+                    &interaction_event(request),
+                    false,
+                    Instant::now(),
+                    received
+                ));
+            });
+            tokio::time::timeout(Duration::from_secs(4), worker).await??;
+            let row = load_preview_audit(&pool, &format!("automod-preview:{id}"))
+                .await?
+                .expect("detached preview committed its audit row");
+            assert_eq!(row.outcome, outcome);
+            assert_eq!(
+                row.reason.as_deref(),
+                Some(format!("filter={filter};exemption=none;mode=dry_run;len=0_50").as_str())
+            );
+            let reply = replay_preview_reply(&row.outcome, row.reason.as_deref(), &row.created_at)
+                .expect("committed preview renders");
+            assert!(reply.contains("Mode: dry_run."));
+            if outcome == "matched" {
+                assert!(reply.contains("TWO_AUTOMOD_BAD_WORDS"));
+            }
+            assert!(!reply.contains(sample));
+            let requests = mock.requests();
+            assert_eq!(
+                requests.len() as u64,
+                id - 800,
+                "one callback per invocation"
+            );
+            let request = requests.last().expect("preview callback");
+            assert_eq!(request.method, "POST");
+            assert_eq!(
+                request.path,
+                format!("/api/v10/interactions/{id}/preview-{id}/callback")
+            );
+            let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+            // Twilight omits empty role/user lists and a false reply-mention flag.
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "type": 4,
+                    "data": {
+                        "flags": 64,
+                        "allowed_mentions": {"parse": []},
+                        "content": reply,
+                    },
+                })
+            );
+        }
+        let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM automod_delivery_claims")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(claims, 0, "previews never enter real delivery processing");
+        let received = "2026-08-01T01:02:13Z";
+        let start = crate::automod_gateway::receipt_ms(received).expect("fixture receipt");
+        for (activation, base_id) in [(&control, 2000), (&with_previews, 3000)] {
+            for index in 0..3 {
+                let message_id = (base_id + index).to_string();
+                let at_ms = start + 1000 * index;
+                let snapshot = AutomodMessage {
+                    guild_id: STAGING_GUILD_ID.to_owned(),
+                    channel_id: CHANNEL_S.to_owned(),
+                    message_id: message_id.clone(),
+                    author_id: actor.to_string(),
+                    author_is_bot: false,
+                    role_ids: vec![],
+                    content: repeated.to_owned(),
+                    mentioned_user_ids: vec![],
+                    attachment_names: vec![],
+                    observed_timestamp_ms: at_ms,
+                };
+                let delivery = MessageDelivery {
+                    kind: MessageDeliveryKind::Create,
+                    guild_id: Some(STAGING_GUILD_ID.to_owned()),
+                    channel_id: CHANNEL_S.to_owned(),
+                    message_id,
+                    snapshot: Some(snapshot),
+                    create_pending_roles: None,
+                    edited_timestamp_ms: None,
+                    observed_timestamp_ms: at_ms,
+                };
+                let matched = index == 2;
+                let processed = activation.process(delivery, received).await;
+                assert_eq!(
+                    processed.disposition,
+                    if matched {
+                        FunnelDisposition::CaptureOnly
+                    } else {
+                        FunnelDisposition::Accept
+                    }
+                );
+                assert_eq!(
+                    processed.outcome,
+                    ActivationOutcome::Completed(StoredOutcome {
+                        matched,
+                        deleted: false,
+                        outcome: if matched {
+                            CompletionKind::DryRun
+                        } else {
+                            CompletionKind::Accepted
+                        },
+                    })
+                );
+            }
+        }
+        let violations: i64 = sqlx::query_scalar("SELECT count(*) FROM automod_violations")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(violations, 0);
+        assert_eq!(
+            mock.requests().len(),
+            3,
+            "no REST effects from dry-run CREATEs"
+        );
+        mock.shutdown().await;
+        Ok(())
+    }
+
     async fn verify_callbacks(
         pool: PgPool,
         trace: PreviewTrace,
@@ -4464,6 +4690,13 @@ fn help_focus_selector_rejects_duplicate_command_with_a_path() {
     assert_eq!(help_focus_selector(&root_only), HelpSubcommand::Absent);
 }
 
+fn help_embed_description(data: &serde_json::Value) -> &str {
+    assert!(data["content"].is_null());
+    let embeds = data["embeds"].as_array().expect("help embeds");
+    assert_eq!(embeds.len(), 1);
+    embeds[0]["description"].as_str().expect("help description")
+}
+
 #[tokio::test]
 async fn help_focused_dispatch_rejects_duplicate_roots_in_both_orders() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
@@ -4521,7 +4754,7 @@ async fn help_focused_dispatch_rejects_duplicate_roots_in_both_orders() {
             reply["data"]["allowed_mentions"]["parse"],
             serde_json::json!([])
         );
-        let content = reply["data"]["content"].as_str().expect("help content");
+        let content = help_embed_description(&reply["data"]);
         if roots.len() == 1 {
             assert!(
                 content.contains("Usage: /privacy deletion-status <request-id>"),
@@ -5571,6 +5804,110 @@ fn production_router_matches_composed_production_wiring() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn staging_preview_survives_both_runtime_registry_publishers(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use two_bot_core::automod_runtime::STAGING_GUILD_ID;
+    use two_bot_core::custom_command_store::put_command;
+    use two_bot_core::custom_commands::StoredCommand;
+
+    let url = std::env::var("TWO_TEST_DATABASE_URL")?;
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await?;
+    let pool = db.pool().clone();
+    let proof = tokio::spawn(async move {
+        let guild = STAGING_GUILD_ID.parse()?;
+        put_command(
+            &pool,
+            &StoredCommand {
+                guild_id: STAGING_GUILD_ID.to_owned(),
+                name: "registry-test".to_owned(),
+                description: "Saved command".to_owned(),
+                template: "Saved response".to_owned(),
+                text_trigger: None,
+                enabled: true,
+            },
+            "66",
+            "67",
+            "2026-10-01T00:00:00Z",
+            "2026-10-01T00:00:00Z",
+        )
+        .await?;
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        for persisted in [false, true] {
+            let executor = executor_at(origin.clone());
+            let runtime = CommandRuntime::new(
+                pool.clone(),
+                executor.clone(),
+                router_with_commands(RouterGates {
+                    configured_guild: Some(guild),
+                    moderation: true,
+                    ..gates(true, false)
+                }),
+                guild,
+                true,
+            );
+            let vars = [
+                ("TWO_AUTOMOD".into(), "1".into()),
+                ("TWO_OWEN_USER_ID".into(), "123456789012345678".into()),
+                ("TWO_AUTOMATIONS".into(), "1".into()),
+            ]
+            .into();
+            if persisted {
+                runtime.initialize_custom_commands_for_test(
+                    crate::gateway_commands::GatewayCommandConfig::from_map_for_activation(
+                        guild, &vars, true,
+                    )?,
+                );
+            }
+            runtime
+                .publish_registry_checked(Some(1111))
+                .await
+                .expect("default-dark guild replacement succeeds");
+            let activation =
+                crate::automod_gateway::resolve(&vars, guild)?.expect("active staging AutoMod");
+            runtime.set_automod(crate::automod_gateway::build(
+                activation,
+                pool.clone(),
+                executor,
+            ));
+            runtime
+                .publish_registry_checked(Some(1111))
+                .await
+                .expect("guild replacement succeeds");
+        }
+        let requests = mock.requests();
+        let expected = [(false, false), (false, true), (true, false), (true, true)];
+        assert_eq!(requests.len(), expected.len());
+        for (request, (persisted, active)) in requests.iter().zip(expected) {
+            assert_eq!(request.method, "PUT");
+            assert_eq!(
+                request.path,
+                format!("/api/v10/applications/1111/guilds/{guild}/commands")
+            );
+            let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+            let defs = body.as_array().expect("full guild registry");
+            assert_eq!(
+                defs.iter()
+                    .filter(|def| def["name"] == "automod-preview")
+                    .count(),
+                if active { 1 } else { 0 }
+            );
+            assert_eq!(
+                defs.iter().any(|def| def["name"] == "registry-test"),
+                persisted
+            );
+        }
+        mock.shutdown().await;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+    db.close().await?;
+    proof??;
+    Ok(())
 }
 
 #[tokio::test]

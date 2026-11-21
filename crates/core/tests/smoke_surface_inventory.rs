@@ -1,4 +1,4 @@
-//! Staging-smoke surface inventory: the fixture pins the full built-in set.
+//! Staging-smoke surface inventory: the fixture pins the default built-in set.
 //!
 //! The all-gates-on `publish_set` output (names, descriptions, permission
 //! bitfields, registry bounds, choices, DM availability) must match
@@ -86,6 +86,83 @@ fn option_type_name(kind: u8) -> &'static str {
         6 => "user",
         8 => "role",
         other => panic!("document new command option type {other}"),
+    }
+}
+
+#[test]
+fn staging_automod_preview_is_opt_in_and_keeps_custom_capacity() {
+    use two_bot_core::automod_runtime::{
+        AutomodRuntime, AutomodScope, LIVE_GUILD_ID, STAGING_GUILD_ID,
+    };
+    use two_bot_core::commands::GUILD_COMMAND_LIMIT;
+    use two_bot_core::{AutomodConfig, CustomCommand};
+
+    let staging = STAGING_GUILD_ID.parse().expect("staging guild");
+    let live = LIVE_GUILD_ID.parse().expect("live guild");
+    let config = AutomodConfig::from_map(&[("TWO_AUTOMOD".into(), "1".into())].into())
+        .expect("enabled config");
+    let fixture = fixture();
+    let row = &fixture["staging_only_commands"][0];
+    for (guild, moderation, admitted_scope, expected) in [
+        (staging, true, None, false),
+        (staging, true, Some(LIVE_GUILD_ID), false),
+        (live, true, Some(LIVE_GUILD_ID), false),
+        (1, true, Some(STAGING_GUILD_ID), false),
+        (staging, false, Some(STAGING_GUILD_ID), false),
+        (staging, true, Some(STAGING_GUILD_ID), true),
+    ] {
+        let router = InteractionRouter::new(RouterGates {
+            configured_guild: Some(guild),
+            moderation,
+            ..all_on_router().gates()
+        });
+        let baseline = router.publish_set(&[]).expect("baseline inventory");
+        if let Some(scope) = admitted_scope {
+            router.enable_staging_automod_preview(&AutomodRuntime::new(
+                config.clone(),
+                AutomodScope {
+                    guild_id: scope.to_owned(),
+                    live_approved: true,
+                },
+            ));
+        }
+        let (defs, withheld) = router
+            .publish_set_capacity_deferred(&[])
+            .expect("guild inventory");
+        assert_eq!(withheld, None);
+        assert_eq!(defs.len(), baseline.len() + if expected { 1 } else { 0 });
+        assert_eq!(&defs[..baseline.len()], baseline.as_slice());
+        if expected {
+            let def = defs.last().expect("staging preview row");
+            assert_eq!(def.name, row["name"].as_str().expect("fixture name"));
+            assert_eq!(
+                def.dm_permission,
+                row["dm_permission"].as_bool().expect("fixture DM gate")
+            );
+            assert_eq!(
+                def.default_member_permissions.as_deref(),
+                row["default_member_permissions"].as_str()
+            );
+
+            let customs: Vec<_> = (0..GUILD_COMMAND_LIMIT - baseline.len())
+                .map(|idx| CustomCommand {
+                    name: format!("registry-test-{idx}"),
+                    description: "Saved command".to_owned(),
+                    enabled: true,
+                })
+                .collect();
+            let (full, withheld) = router
+                .publish_set_capacity_deferred(&customs)
+                .expect("full guild inventory");
+            assert_eq!(withheld, None);
+            assert_eq!(full.len(), GUILD_COMMAND_LIMIT);
+            assert!(full.iter().all(|def| def.name != "automod-preview"));
+            assert!(customs
+                .iter()
+                .all(|custom| full.iter().any(|def| def.name == custom.name)));
+        } else {
+            assert!(defs.iter().all(|def| def.name != "automod-preview"));
+        }
     }
 }
 
