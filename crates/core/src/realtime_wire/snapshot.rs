@@ -10,6 +10,8 @@ use super::{
 };
 
 const SNAPSHOT_BYTES: usize = 1024 * 1024;
+/// Maximum number of current scheduled events in a v1 snapshot.
+pub const MAX_SNAPSHOT_EVENTS: usize = 100;
 
 #[derive(Serialize)]
 pub struct Topics {
@@ -59,7 +61,7 @@ fn valid_topics(guild_id: Id, state: &Topics) -> bool {
         || state.roles.len() > 250
         || state.members.len() > 10_000
         || state.voice.len() > 10_000
-        || state.events.len() > 100
+        || state.events.len() > MAX_SNAPSHOT_EVENTS
     {
         return false;
     }

@@ -36,7 +36,13 @@ pub fn scheduled_events(
     guild_id: Id<GuildMarker>,
     raw: &str,
 ) -> Result<Option<Vec<wire::Event>>, ProjectionError> {
-    let dispatch: Dispatch<'_> = decode(raw, '{')?;
+    events_from_dispatch(guild_id, &decode(raw, '{')?)
+}
+
+pub(super) fn events_from_dispatch(
+    guild_id: Id<GuildMarker>,
+    dispatch: &Dispatch<'_>,
+) -> Result<Option<Vec<wire::Event>>, ProjectionError> {
     if !matches!(dispatch.kind()?, Some(Kind::GuildCreate)) {
         return Ok(None);
     }
