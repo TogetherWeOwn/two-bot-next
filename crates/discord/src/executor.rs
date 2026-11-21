@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
-use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::connect::{capture_connection, HttpConnector};
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use twilight_http::request::{AuditLogReason, Method, Request, TryIntoRequest};
@@ -381,9 +381,18 @@ async fn complete_early_release(
 // Tokio's timeout polls work before its timer. Never start another I/O poll
 // at the cutoff, but retain evidence obtained by a poll that started in time.
 async fn poll_until<F: Future>(at: Instant, work: F) -> Option<F::Output> {
+    poll_until_or(at, work, || false).await
+}
+
+async fn poll_until_or<F: Future>(
+    at: Instant,
+    work: F,
+    may_recover: impl Fn() -> bool,
+) -> Option<F::Output> {
     let mut work = std::pin::pin!(work);
+    let mut recover_once = Some(may_recover);
     let guarded = std::future::poll_fn(|cx| {
-        if Instant::now() >= at {
+        if Instant::now() >= at && !recover_once.take().is_some_and(|recover| recover()) {
             return std::task::Poll::Ready(None);
         }
         work.as_mut().poll(cx).map(Some)
@@ -391,7 +400,7 @@ async fn poll_until<F: Future>(at: Instant, work: F) -> Option<F::Output> {
     tokio::time::timeout_at(at, guarded).await.ok().flatten()
 }
 
-async fn wait_for_headers<F: Future>(
+async fn bounded_poll<F: Future>(
     deadline: Option<Instant>,
     stop_at_cutoff: bool,
     send: F,
@@ -804,7 +813,7 @@ impl HyperTransport {
             }
         }
         let body_bytes: bytes::Bytes = request.body().unwrap_or(&[]).to_vec().into();
-        let hyper_req = builder
+        let mut hyper_req = builder
             .body(http_body_util::Full::new(body_bytes))
             .map_err(|e| format!("build request: {e}"))?;
         let callback = !strict && is_interaction_callback(request);
@@ -813,13 +822,22 @@ impl HyperTransport {
         // Postgres statement on a pooled connection, not a local lock, so an
         // unbounded admit would outlive the receipt/moderation/boot budgets.
         // A timed-out claim may have committed. Never release it without a permit.
-        let permit = match &self.admission {
-            None if strict => {
+        let permit = match (&self.admission, deadline) {
+            (None, _) if strict => {
                 return Err(two_bot_core::send_admission::AdmissionError::Configuration.into())
             }
             // Constructor restricts ungoverned transport to loopback fixtures.
-            None => None,
-            Some(admission) => {
+            (None, _) => None,
+            (Some(admission), Some(at)) if read && !strict => {
+                use two_bot_core::send_admission::AdmissionError;
+                Some(match admission.admit_until(at).await {
+                    Err(AdmissionError::Deadline) => {
+                        return Err(HEADER_TIMEOUT_MESSAGE.to_owned().into())
+                    }
+                    result => result?,
+                })
+            }
+            (Some(admission), _) => {
                 let take = if strict {
                     admission.admit_strict()
                 } else {
@@ -841,19 +859,9 @@ impl HyperTransport {
                             .await
                             .ok_or_else(|| HEADER_TIMEOUT_MESSAGE.to_owned())??
                     }
-                    Some(at) => tokio::time::timeout_at(at, async {
-                        // A detached GET owner can start at cutoff. Refuse its
-                        // first claim poll then, but recover a ready permit
-                        // if a claim started earlier. Pending is not rollback.
-                        if read && Instant::now() >= at {
-                            return Err(StrictTransportError::Transport(
-                                HEADER_TIMEOUT_MESSAGE.to_owned(),
-                            ));
-                        }
-                        take.await.map_err(StrictTransportError::from)
-                    })
-                    .await
-                    .map_err(|_| HEADER_TIMEOUT_MESSAGE.to_owned())??,
+                    Some(at) => tokio::time::timeout_at(at, take)
+                        .await
+                        .map_err(|_| HEADER_TIMEOUT_MESSAGE.to_owned())??,
                 })
             }
         };
@@ -875,12 +883,20 @@ impl HyperTransport {
         // caller's absolute deadline — so no outer backstop races it. A GET
         // cannot mutate, so release it here; other methods keep the permit
         // held by dropping it uncompleted (uncertain).
+        let captured =
+            (read && !strict && deadline.is_some()).then(|| capture_connection(&mut hyper_req));
         let request_fut = async {
             attempt = Some(crate::executor_metrics::Attempt::new(request));
             self.inner.request(hyper_req).await
         };
-        let stop_at_cutoff = strict || callback || read;
-        let response = match wait_for_headers(deadline, stop_at_cutoff, request_fut).await {
+        let headers = if let (Some(at), Some(captured)) = (deadline, captured) {
+            // Hyper captures the connection and queues the GET in the same
+            // poll. With resends off, later polls only check the reply channel.
+            poll_until_or(at, request_fut, || captured.connection_metadata().is_some()).await
+        } else {
+            bounded_poll(deadline, strict || callback, request_fut).await
+        };
+        let response = match headers {
             Some(Ok(response)) => response,
             None if strict && attempt.is_none() => {
                 return Err(StrictTransportError::PreWireDeadline)
@@ -1720,17 +1736,19 @@ impl ActionExecutor {
         deadline: Instant,
         callback_admission: CallbackAdmission,
     ) -> Result<(RawResponse, bool), DiscordError> {
-        tokio::time::timeout_at(deadline, self.admit(request, lane))
-            .await
-            .map_err(|_| GuardError::AdmissionTimeout)??;
+        bounded_poll(
+            Some(deadline),
+            request.method() == Method::Get,
+            self.admit(request, lane),
+        )
+        .await
+        .ok_or(GuardError::AdmissionTimeout)??;
         // The wire phase takes whatever is left of the caller's deadline, so
         // guard admission, durable admission, headers and body together stay
         // inside it (the receipt window refuses to land past it). No outer
         // backstop: the transport's timers share the absolute deadline, and a
         // stalled GET releases its lane where the permit is in scope.
-        if (is_interaction_callback(request) || request.method() == Method::Get)
-            && Instant::now() >= deadline
-        {
+        if is_interaction_callback(request) && Instant::now() >= deadline {
             return Err(DiscordError::Timeout);
         }
         self.send_admitted_for(request, SendBudget::Absolute(deadline, callback_admission))
@@ -1738,11 +1756,8 @@ impl ActionExecutor {
     }
 
     fn preflight_read_cutoff(&self) -> Instant {
-        Instant::now()
-            + self
-                .inner
-                .moderation_timeout
-                .min(Duration::from_millis(MODERATION_TIMEOUT_MS))
+        let budget = self.inner.moderation_timeout;
+        Instant::now() + budget.min(Duration::from_millis(MODERATION_TIMEOUT_MS))
     }
 
     async fn send_preflight_read(
@@ -1750,15 +1765,10 @@ impl ActionExecutor {
         request: &Request,
         deadline: Instant,
     ) -> Result<RawResponse, DiscordError> {
-        let (response, _) = self
-            .send_with_deadline(
-                request,
-                Some(false),
-                deadline.min(self.preflight_read_cutoff()),
-                CallbackAdmission::RecoverReady,
-            )
-            .await?;
-        Ok(response)
+        let at = deadline.min(self.preflight_read_cutoff());
+        self.send_with_deadline(request, Some(false), at, CallbackAdmission::RecoverReady)
+            .await
+            .map(|(response, _)| response)
     }
 
     /// Singular role mutations use status only. A truncated/stalled provider
@@ -2654,9 +2664,8 @@ impl ActionExecutor {
             .await
     }
 
-    /// Like [`Self::get_json_strict`], with an absolute deadline capped by the
-    /// moderation budget (at most five seconds). The governed transport owns
-    /// settlement, which can continue for up to one second after wire cutoff.
+    /// Deadline-aware [`Self::get_json_strict`], capped by the moderation
+    /// budget (five seconds max), plus up to one second for settlement.
     pub async fn get_json_strict_until(
         &self,
         path: &str,
@@ -5124,10 +5133,9 @@ impl two_bot_core::stream_live_store::LiveSender for ActionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     use two_bot_core::send_admission::{
-        AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, SendCompletion,
-        SendCooldown, TokenKey,
+        AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, TokenKey,
     };
     use two_bot_core::MAX_BACKFILL_RETRY_AFTER_MS;
 
@@ -5387,7 +5395,7 @@ mod tests {
             }
             std::task::Poll::Pending
         });
-        let mut send = std::pin::pin!(wait_for_headers(Some(deadline), true, connect_then_send));
+        let mut send = std::pin::pin!(bounded_poll(Some(deadline), true, connect_then_send));
         assert!(futures_util::poll!(&mut send).is_pending());
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(send.await, None);
@@ -5761,211 +5769,150 @@ mod tests {
         assert_eq!(executor.requests(), 1);
     }
 
-    // An ordinary claim can commit before its acknowledgement is observed.
-    // Only the returned completion capability can clear its exact generation.
-    #[derive(Debug)]
-    struct ReadLane {
-        key: TokenKey,
-        claimed: Arc<AtomicUsize>,
-        polls: AtomicUsize,
-        acknowledge: tokio::sync::Semaphore,
-    }
-
     const READ_TOKEN: &str = "fixture-preflight-read";
 
-    impl ReadLane {
-        fn new(ready: bool) -> Self {
-            Self {
-                key: TokenKey::for_bot_token(READ_TOKEN).unwrap(),
-                claimed: Arc::default(),
-                polls: AtomicUsize::new(0),
-                acknowledge: tokio::sync::Semaphore::new(usize::from(ready)),
-            }
-        }
-
-        fn transport(self: &Arc<Self>, origin: &str) -> HyperTransport {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            HyperTransport::with_admission(
-                READ_TOKEN.to_owned(),
-                Some(origin.to_owned()),
-                self.clone(),
-            )
+    fn read_transport(origin: &str, lane: Arc<dyn SendAdmission>) -> HyperTransport {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        HyperTransport::with_admission(READ_TOKEN.to_owned(), Some(origin.to_owned()), lane)
             .unwrap()
             .with_test_guard()
-        }
-    }
-
-    impl SendAdmission for ReadLane {
-        fn token_key(&self) -> &TokenKey {
-            &self.key
-        }
-
-        fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
-            Box::pin(async {
-                let generation = self.polls.fetch_add(1, Ordering::Relaxed) + 1;
-                self.claimed
-                    .compare_exchange(0, generation, Ordering::Relaxed, Ordering::Relaxed)
-                    .map_err(|_| AdmissionError::Blocked)?;
-                self.acknowledge.acquire().await.unwrap().forget();
-                Ok(AdmissionPermit::new(Box::new(ReadRelease {
-                    claimed: self.claimed.clone(),
-                    generation,
-                })))
-            })
-        }
-    }
-
-    struct ReadRelease {
-        claimed: Arc<AtomicUsize>,
-        generation: usize,
-    }
-
-    impl SendCompletion for ReadRelease {
-        fn complete(
-            self: Box<Self>,
-            cooldown: Option<SendCooldown>,
-        ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
-            Box::pin(async move {
-                assert_eq!(cooldown, None);
-                assert_eq!(
-                    self.claimed.compare_exchange(
-                        self.generation,
-                        0,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed
-                    ),
-                    Ok(self.generation),
-                    "complete exactly the acknowledged claim, once"
-                );
-                Ok(())
-            })
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn expired_governed_read_owner_does_not_claim_the_lane() {
-        let (_listener, origin) = crate::strict_transport_fixture::loopback().await;
-        let lane = Arc::new(ReadLane::new(true));
-        let request = Request::from_route(&Route::GetCurrentUser);
-        // Bypass the executor's earlier deadline check to exercise an owner
-        // that gets its first turn after the caller's deadline check passed.
-        let result = lane
-            .transport(&origin)
-            .send_request(&request, Some(Instant::now()))
-            .await;
-        assert_eq!(result.unwrap_err(), HEADER_TIMEOUT_MESSAGE);
-        assert_eq!(lane.polls.load(Ordering::Relaxed), 0);
-        assert_eq!(lane.claimed.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn governed_read_cutoff_settles_only_a_ready_claim_without_dispatch() {
-        use crate::strict_transport_fixture::loopback;
+        use crate::strict_transport_fixture::{loopback, Admission};
+        use tokio::time::{advance, pause, resume, timeout};
 
-        for acknowledged in [true, false] {
+        for (started, acknowledged) in [(false, false), (true, true), (true, false)] {
             let (listener, origin) = loopback().await;
-            let lane = Arc::new(ReadLane::new(false));
-            let transport = lane.transport(&origin);
+            let mut lane = Admission::new(READ_TOKEN, None, None);
+            lane.resume_strict = Some(tokio::sync::Semaphore::new(0));
+            let lane = Arc::new(lane);
+            let transport = read_transport(&origin, lane.clone());
             let request = Request::from_route(&Route::GetCurrentUser);
-            tokio::time::pause();
-            let budget = Duration::from_secs(1);
+            pause();
+            let budget = Duration::from_secs(u64::from(started));
             let cutoff = Instant::now() + budget;
-            // Poll the owner's work directly so the claim cannot consume the
-            // deadline wake until after we choose whether it can acknowledge.
             let mut read = std::pin::pin!(transport.send_request_inner(
                 &request,
                 Some(cutoff),
                 CallbackAdmission::RecoverReady,
             ));
-            assert!(futures_util::poll!(&mut read).is_pending());
-            assert_eq!(lane.claimed.load(Ordering::Relaxed), 1);
-            tokio::time::advance(budget).await;
-            assert_eq!(Instant::now(), cutoff);
+            if started {
+                assert!(futures_util::poll!(&mut read).is_pending());
+                advance(budget).await;
+            }
             if acknowledged {
-                lane.acknowledge.add_permits(1);
+                lane.resume_strict.as_ref().unwrap().add_permits(1);
             }
             assert_eq!(read.await.unwrap_err(), HEADER_TIMEOUT_MESSAGE);
-            assert_eq!(lane.polls.load(Ordering::Relaxed), 1);
             assert_eq!(
-                lane.claimed.load(Ordering::Relaxed),
-                usize::from(!acknowledged)
+                lane.strict_admitted.load(Ordering::Relaxed),
+                usize::from(started)
             );
-            tokio::time::resume();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(20), listener.accept())
-                    .await
-                    .is_err()
-            );
+            let completions = lane.completed.lock().unwrap().clone();
+            assert_eq!(completions, vec![None; usize::from(acknowledged)]);
+            resume();
+            assert!(timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err());
         }
     }
 
     #[tokio::test]
+    async fn read_cutoff_accounts_for_already_ready_429_headers() {
+        use crate::strict_transport_fixture::{loopback, read_request, Admission};
+        use tokio::{io::AsyncWriteExt as _, sync::Notify, time};
+        use two_bot_core::send_admission::SendCooldown;
+
+        struct ReplyReady(Notify);
+        impl std::task::Wake for ReplyReady {
+            fn wake(self: Arc<Self>) {
+                self.0.notify_one();
+            }
+        }
+        let (listener, origin) = loopback().await;
+        let lane = Arc::new(Admission::new(READ_TOKEN, None, None));
+        let transport = read_transport(&origin, lane.clone());
+        let request = Request::from_route(&Route::GetCurrentUser);
+        let at = Instant::now() + Duration::from_secs(5);
+        let mut read = std::pin::pin!(transport.send_request_headers(&request, Some(at)));
+        let mut socket = tokio::select! {
+            _ = &mut read => panic!("read ended before reply"),
+            socket = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert!(read_request(&mut socket).await.starts_with(b"GET "));
+                socket
+            } => socket,
+        };
+        let ready = Arc::new(ReplyReady(Notify::new()));
+        let waker = std::task::Waker::from(ready.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nX-RateLimit-Global: true\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        let wake = time::timeout(Duration::from_secs(1), ready.0.notified());
+        wake.await.unwrap();
+        time::pause();
+        time::advance(at - Instant::now()).await;
+        let (res, global) = read.await.unwrap().collect_with(Some(at)).await.unwrap();
+        assert_eq!((res.status, global), (429, true));
+        let completions = lane.completed.lock().unwrap();
+        assert_eq!(*completions, vec![Some(SendCooldown::FiniteMs(1_000))]);
+    }
+
+    #[tokio::test]
     async fn stalled_preflight_gets_honor_earliest_cutoff_and_release_lane() {
-        use crate::strict_transport_fixture::{loopback, read_request};
+        use crate::strict_transport_fixture::{loopback, read_request, Admission};
         use tokio::time::{advance, pause, resume, timeout};
 
         for identity in [true, false] {
-            // Earlier caller instant, shorter configured budget, hard ceiling.
             for (configured, caller, effective) in [(3, 2, 2), (3, 30, 3), (30, 30, 5)] {
                 let (listener, origin) = loopback().await;
-                let lane = Arc::new(ReadLane::new(true));
+                let lane = Arc::new(Admission::new(READ_TOKEN, None, None));
                 let executor = ActionExecutor::assemble_with_timeout(
                     READ_TOKEN.to_owned(),
                     Some(origin.clone()),
-                    lane.transport(&origin),
+                    read_transport(&origin, lane.clone()),
                     Duration::from_secs(configured),
                 )
                 .unwrap();
-
                 pause();
                 let start = Instant::now();
-                let deadline = start + Duration::from_secs(caller);
-                let mut read = std::pin::pin!(async {
+                let read_at = async |at| {
                     if identity {
-                        executor
-                            .current_bot_user_id_until(deadline)
-                            .await
-                            .map(|_| ())
+                        executor.current_bot_user_id_until(at).await.map(drop)
                     } else {
                         executor
-                            .get_json_strict_until("/guilds/1", deadline)
+                            .get_json_strict_until("/guilds/1", at)
                             .await
-                            .map(|_| ())
+                            .map(drop)
                     }
-                });
+                };
+                let lane_stamp = *executor.inner.pace_last_at.lock().await;
+                let expired = GuardError::AdmissionTimeout.into();
+                assert_eq!(read_at(start).await, Err(expired));
+                assert_eq!(*executor.inner.pace_last_at.lock().await, lane_stamp);
+                let guard = &executor.inner.transport.guard;
+                let mut turn = std::pin::pin!(guard.admit_route("GET /fixture", false));
+                use std::task::Poll::Ready;
+                assert_eq!(futures_util::poll!(&mut turn), Ready(Ok(())));
+                let mut read = std::pin::pin!(read_at(start + Duration::from_secs(caller)));
                 assert!(futures_util::poll!(&mut read).is_pending());
                 resume();
-                let (mut socket, _) = timeout(Duration::from_secs(2), listener.accept())
+                let (mut socket, _) = timeout(Duration::from_secs(1), listener.accept())
                     .await
                     .unwrap()
                     .unwrap();
-                let path: &[u8] = if identity {
-                    b"GET /api/v10/users/@me "
-                } else {
-                    b"GET /api/v10/guilds/1 "
-                };
-                assert!(read_request(&mut socket).await.starts_with(path));
-                assert!(matches!(lane.admit().await, Err(AdmissionError::Blocked)));
-
+                assert!(read_request(&mut socket).await.starts_with(b"GET "));
                 pause();
                 let cutoff = start + Duration::from_secs(effective);
-                let just_before = cutoff - Duration::from_millis(10);
-                assert!(Instant::now() < just_before);
-                advance(just_before - Instant::now()).await;
+                advance(cutoff - Instant::now() - Duration::from_millis(10)).await;
                 assert!(futures_util::poll!(&mut read).is_pending());
-                assert_eq!(lane.claimed.load(Ordering::Relaxed), 1);
                 advance(Duration::from_millis(10)).await;
-                // No headers arrive; verify the result near the wire deadline
-                // without letting the paused clock jump to the caller's cap.
-                assert_eq!(
-                    timeout(Duration::from_millis(25), read).await.unwrap(),
-                    Err(DiscordError::Timeout)
-                );
-                assert_eq!(lane.claimed.load(Ordering::Relaxed), 0);
+                let timed_out = timeout(Duration::from_millis(25), read).await.unwrap();
+                assert_eq!(timed_out, Err(DiscordError::Timeout));
+                assert_eq!(lane.completed.lock().unwrap().as_slice(), &[None]);
                 resume();
-                lane.acknowledge.add_permits(1);
-                lane.admit().await.unwrap().complete(None).await.unwrap();
-                assert_eq!(lane.polls.load(Ordering::Relaxed), 3, "no detached retry");
             }
         }
     }

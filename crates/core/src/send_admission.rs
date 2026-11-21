@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::{fmt, future::Future, pin::Pin};
 
 pub type AdmissionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type ClaimFuture<'a> = AdmissionFuture<'a, Result<AdmissionPermit, AdmissionError>>;
 
 /// Domain-separated fingerprint of the canonical Bot authorization credential.
 /// Never accept caller-selected namespaces or store/log the credential itself.
@@ -52,6 +53,8 @@ pub enum AdmissionError {
     Configuration,
     #[error("Discord send admission claim is stale")]
     StaleClaim,
+    #[error("Discord send admission deadline expired")]
+    Deadline,
 }
 
 /// All channel/bucket cooldowns are conservatively promoted to token-wide.
@@ -79,10 +82,32 @@ pub trait SendAdmission: Send + Sync + fmt::Debug {
     fn token_key(&self) -> &TokenKey;
     fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>>;
 
+    /// Bounded ordinary claim. Stores may recover a ready permit at cutoff
+    /// only if no new claim write can start in that poll.
+    fn admit_until(&self, at: tokio::time::Instant) -> ClaimFuture<'_> {
+        Box::pin(async move { before_claim_cutoff(at, self.admit()).await? })
+    }
+
     /// Strict admission must never fall back to an ordinary, lease-reclaimable claim.
     fn admit_strict(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
         Box::pin(async { Err(AdmissionError::Configuration) })
     }
+}
+
+async fn before_claim_cutoff<F: Future>(
+    at: tokio::time::Instant,
+    work: F,
+) -> Result<F::Output, AdmissionError> {
+    let mut work = std::pin::pin!(work);
+    let guarded = std::future::poll_fn(|cx| {
+        if tokio::time::Instant::now() >= at {
+            return std::task::Poll::Ready(Err(AdmissionError::Deadline));
+        }
+        work.as_mut().poll(cx).map(Ok)
+    });
+    tokio::time::timeout_at(at, guarded)
+        .await
+        .map_err(|_| AdmissionError::Deadline)?
 }
 
 pub trait SendCompletion: Send {
@@ -155,6 +180,18 @@ mod tests {
             gate.admit_strict().await,
             Err(AdmissionError::Configuration)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn claim_wait_ready_at_cutoff_does_not_poll_write() {
+        use tokio::time::{sleep_until, Duration, Instant};
+        let at = Instant::now() + Duration::from_secs(1);
+        let write = async {
+            sleep_until(at).await;
+            panic!("must not submit the write");
+        };
+        let result = before_claim_cutoff(at, write).await;
+        assert!(matches!(result, Err(AdmissionError::Deadline)));
     }
 
     #[test]

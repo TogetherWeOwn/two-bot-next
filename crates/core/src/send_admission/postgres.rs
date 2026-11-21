@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
 use crate::metrics;
-use sqlx::{PgPool, Row};
+use sqlx::{postgres::PgRow, Execute, Executor, PgPool, Postgres, Row};
+use tokio::time::Instant;
 
 #[path = "strict.rs"]
 mod strict;
@@ -108,13 +109,47 @@ impl SendAdmission for PgSendAdmission {
     }
 
     fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        self.claim(None)
+    }
+
+    fn admit_until(&self, at: Instant) -> ClaimFuture<'_> {
+        self.claim(Some(at))
+    }
+}
+
+impl PgSendAdmission {
+    async fn claim_row<'q>(
+        &self,
+        at: Option<Instant>,
+        query: impl Execute<'q, Postgres> + 'q,
+    ) -> Result<Result<Option<PgRow>, sqlx::Error>, AdmissionError> {
+        let Some(at) = at else {
+            return Ok(self.pool.fetch_optional(query).await);
+        };
+        // Fence checkout and DML on every poll. Drop rolls back; only a
+        // submitted COMMIT may leave the lane occupied at cutoff.
+        let mut tx = match before_claim_cutoff(at, self.pool.begin()).await? {
+            Ok(tx) => tx,
+            Err(error) => return Ok(Err(error)),
+        };
+        let row = before_claim_cutoff(at, (&mut *tx).fetch_optional(query)).await?;
+        let Ok(Some(row)) = row else { return Ok(row) };
+        if Instant::now() >= at {
+            return Err(AdmissionError::Deadline);
+        }
+        // DML drained ReadyForQuery; subsequent COMMIT polls only await its reply.
+        let commit = tokio::time::timeout_at(at, tx.commit());
+        Ok(commit
+            .await
+            .map_err(|_| AdmissionError::Deadline)?
+            .map(|()| Some(row)))
+    }
+
+    fn claim(&self, at: Option<Instant>) -> ClaimFuture<'_> {
         Box::pin(async move {
-            // One autocommitted statement, not a transaction held over HTTP.
-            // Commit precedes sending. Losing/cancelling this query can only
-            // leave a durable occupied row; it cannot grant another sender.
-            // Each take stamps the database clock so a dead holder's lane is
-            // reclaimable past the lease (second statement below).
-            let row = sqlx::query(
+            // Commit precedes sending. An unconfirmed commit cannot grant another sender.
+            // Stamp the database clock to allow later reclaim after the lease.
+            let query = sqlx::query(
                 "INSERT INTO public.discord_send_admission \
                    (token_key, in_flight, generation, in_flight_since_ms) \
                  VALUES ($1, TRUE, 1, \
@@ -130,14 +165,12 @@ impl SendAdmission for PgSendAdmission {
                      (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
                  RETURNING generation",
             )
-            .bind(&self.key.0)
-            .fetch_optional(&self.pool)
-            .await;
-            let row = match row {
+            .bind(&self.key.0);
+            let row = match self.claim_row(at, query).await? {
                 Ok(row) => row,
                 Err(error) if is_undefined_column(&error) => {
                     warn_legacy_lane();
-                    return self.admit_legacy().await;
+                    return self.admit_legacy(at).await;
                 }
                 Err(_) => {
                     metrics::global().db_error("admission");
@@ -164,7 +197,7 @@ impl SendAdmission for PgSendAdmission {
             // stamp gives the new holder its own full lease. The reclaim is
             // one atomic statement, so racing reclaimers elect exactly one
             // winner. Indefinite and finite-cooldown holds never reclaim.
-            let row = sqlx::query(
+            let query = sqlx::query(
                 "UPDATE public.discord_send_admission SET \
                    in_flight = TRUE, \
                    generation = generation + 1, \
@@ -180,10 +213,8 @@ impl SendAdmission for PgSendAdmission {
                  RETURNING generation",
             )
             .bind(&self.key.0)
-            .bind(IN_FLIGHT_LEASE_MS)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|_| {
+            .bind(IN_FLIGHT_LEASE_MS);
+            let row = self.claim_row(at, query).await?.map_err(|_| {
                 metrics::global().db_error("admission");
                 metrics::global().send_admission("storage_error");
                 AdmissionError::Storage
@@ -215,9 +246,9 @@ impl PgSendAdmission {
     /// and no reclaim is attempted. Only reached when the lease column is
     /// absent (build deployed ahead of its migration); behavior matches the
     /// lane exactly as it was before the lease change.
-    fn admit_legacy(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+    fn admit_legacy(&self, at: Option<Instant>) -> ClaimFuture<'_> {
         Box::pin(async move {
-            let row = sqlx::query(
+            let query = sqlx::query(
                 "INSERT INTO public.discord_send_admission (token_key, in_flight, generation) \
                  VALUES ($1, TRUE, 1) ON CONFLICT (token_key) DO UPDATE SET \
                    in_flight = TRUE, generation = discord_send_admission.generation + 1 \
@@ -227,10 +258,8 @@ impl PgSendAdmission {
                      (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
                  RETURNING generation",
             )
-            .bind(&self.key.0)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|_| {
+            .bind(&self.key.0);
+            let row = self.claim_row(at, query).await?.map_err(|_| {
                 metrics::global().db_error("admission");
                 metrics::global().send_admission("storage_error");
                 AdmissionError::Storage

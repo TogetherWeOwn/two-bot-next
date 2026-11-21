@@ -146,12 +146,9 @@ the bound and leaves any unconfirmed durable outcome occupied; process loss
 still uses the lease below. Mutations, generic permit Drop, shutdown publication
 rules and the lease duration are unchanged.
 
-`get_json_strict_until` and `current_bot_user_id_until` also cap the caller's
-absolute deadline at the configured moderation budget (at most five seconds),
-including local pacing and durable admission. At cutoff a governed GET does not
-start a fresh claim or poll the socket again. If a previously polled claim
-returns its permit at cutoff, the owner completes that exact claim without
-sending; an unacknowledged claim remains subject to the ordinary lease.
+`get_json_strict_until` and `current_bot_user_id_until` cap the caller’s deadline
+at the moderation budget (five seconds max). At cutoff the owner only settles
+ready claims or received 429 headers; it starts no claim write or GET.
 
 Strict admission is an opt-in pre-wire capability. Migration 0473 adds a
 pending-settlement generation constrained to match an occupied lane. An
