@@ -1,5 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseStagingState, stagingUse } from "../scripts/staging-use.mjs";
 
 const NOW = Date.now();
@@ -63,6 +68,39 @@ test("staging client: stop requires a confirmed stop on the same epoch and activ
   const wrongRun = responses([Response.json({ ...before, use: { ...use, runAttempt: 3 } })]);
   await assert.rejects(stagingUse(stop, wrongRun.send, async () => {}, clock), /staging_window_mismatch/);
   assert.equal(wrongRun.calls.length, 1);
+});
+
+test("staging client CLI: stop defaults its timeout when the override is unset", () => {
+  const dir = mkdtempSync(join(tmpdir(), "staging-use-cli-test-"));
+  try {
+    const receipt = join(dir, "receipt.ndjson");
+    const requests = join(dir, "requests.json");
+    const cli = fileURLToPath(new URL("../scripts/staging-use.mjs", import.meta.url));
+    // Install the stub before the actual CLI entry point, so no request can reach staging.
+    const preload = `
+      import { writeFileSync } from "node:fs";
+      const calls = [];
+      const replies = ${JSON.stringify([{ ...state, running: true }, state])};
+      globalThis.fetch = async (url, init) => {
+        calls.push([url.pathname, init.method]);
+        return Response.json(replies.shift());
+      };
+      process.on("exit", () => writeFileSync(${JSON.stringify(requests)}, JSON.stringify(calls)));
+    `;
+    const result = spawnSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(preload)}`, cli, "stop"], {
+      env: { STAGING_WORKER_URL: args.url, OWNERSHIP_CONTROL_TOKEN: TOKEN, STAGING_USE_RECEIPT: receipt,
+        STAGING_USE_SHA: SHA, STAGING_USE_DEPLOYMENT: args.deploymentId, STAGING_USE_EXPIRES_AT: String(args.expiresAt),
+        GITHUB_RUN_ID: args.runId, GITHUB_RUN_ATTEMPT: String(args.runAttempt) },
+      encoding: "utf8", timeout: 5000,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(requests, "utf8")), [["/internal/staging-use", "GET"], ["/internal/staging-use", "POST"]]);
+    const rows = readFileSync(receipt, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(rows.map((row) => row.action), ["attempt", "stop"]);
+    assert.equal(rows[1].running, false);
+    assert.deepEqual(rows[1].use, use);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("staging client: stop shares a short deadline across the status read and mutation", async (t) => {

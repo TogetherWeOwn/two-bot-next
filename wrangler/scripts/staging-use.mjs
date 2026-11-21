@@ -225,6 +225,7 @@ if (isDirectInvocation(process.argv[1], import.meta.url)) {
   const runId = process.env.GITHUB_RUN_ID;
   const runAttempt = Number(process.env.GITHUB_RUN_ATTEMPT);
   const expiresAt = Number(process.env.STAGING_USE_EXPIRES_AT);
+  const stopTimeout = process.env.STAGING_STOP_TIMEOUT_MS;
   const run = { runId: typeof runId === "string" && RUN.test(runId) ? runId : null,
     runAttempt: positive(runAttempt) ? runAttempt : null, expiresAt: positive(expiresAt) ? expiresAt : null };
   const emit = (value) => {
@@ -241,7 +242,7 @@ if (isDirectInvocation(process.argv[1], import.meta.url)) {
       sha: process.env.STAGING_USE_SHA, deploymentId: process.env.STAGING_USE_DEPLOYMENT,
       runId: process.env.GITHUB_RUN_ID, runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
       expiresAt: Number(process.env.STAGING_USE_EXPIRES_AT),
-      stopTimeoutMs: Number(process.env.STAGING_STOP_TIMEOUT_MS) });
+      stopTimeoutMs: stopTimeout === undefined ? undefined : Number(stopTimeout) });
     emit(result);
     // Publish only after the validated receipt is durably retained. Missing
     // output on any error must never open a periodic reader's sample gate.
