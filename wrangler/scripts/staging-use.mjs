@@ -126,7 +126,7 @@ function window(state, args, now, phase = "active") {
 export async function stagingUse(args, send = fetch, pause = wait, now = Date.now) {
   const base = origin(args.url);
   require(typeof args.token === "string" && args.token.length >= 32, "staging_token_missing");
-  require(["status", "observe", "acquire", "assert", "ready", "release"].includes(args.action), "staging_action_invalid");
+  require(["status", "observe", "acquire", "assert", "ready", "release", "stop"].includes(args.action), "staging_action_invalid");
   // A release may be retried after expiry, but never extends that expiry.
   if (!["status", "observe"].includes(args.action)) binding(args, args.action === "release" ? Math.min(now(), args.expiresAt - 1) : now());
   const headers = { authorization: `Bearer ${args.token}`, "cache-control": "no-cache" };
@@ -163,7 +163,8 @@ export async function stagingUse(args, send = fetch, pause = wait, now = Date.no
   }
   identity(state, args);
   const epoch = state.epoch;
-  if (args.action === "acquire" || args.action === "release") {
+  if (args.action === "acquire" || args.action === "release" || args.action === "stop") {
+    if (args.action === "stop") window(state, args, now());
     if (args.action === "release") require(sameRunWindow(state.use, args), "staging_window_mismatch");
     const change = { action: args.action, environment: "staging", deploymentId: args.deploymentId,
       sha: args.sha, expectedEpoch: state.epoch, runId: args.runId, runAttempt: args.runAttempt, expiresAt: args.expiresAt };
@@ -172,7 +173,7 @@ export async function stagingUse(args, send = fetch, pause = wait, now = Date.no
     require(state.epoch === epoch, "staging_epoch_mismatch");
   }
   window(state, args, now(), args.action === "release" ? "released" : "active");
-  if (args.action === "release") require(!state.running, "staging_stop_unconfirmed");
+  if (args.action === "release" || args.action === "stop") require(!state.running, "staging_stop_unconfirmed");
   if (args.action === "ready") {
     // Never grant readiness beyond expiry. The existing rollout gate still
     // certifies image/digest/build/deploy IDs; this check certifies finite use.

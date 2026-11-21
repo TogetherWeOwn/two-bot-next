@@ -213,7 +213,7 @@ const BOUNDED_STAGING_ENV = {
   ...WORKER_ENV, TWO_DEPLOY_ENV: "staging", STAGING_RUNTIME_POLICY: "bounded", CONTAINER_RELEASE: "a".repeat(40),
 };
 
-function stagingUseRequest(action: "acquire" | "release", window: StagingWindow): Request {
+function stagingUseRequest(action: "acquire" | "release" | "stop", window: StagingWindow): Request {
   return probeRequest(`https://worker.invalid${STAGING_USE_PATH}`, {
     method: "POST", headers: { authorization: `Bearer ${CONTROL_TOKEN}` },
     body: JSON.stringify({ ...window, action, expectedEpoch: 1, deploymentId: ID, sha: BOUNDED_STAGING_ENV.CONTAINER_RELEASE }),
@@ -239,6 +239,32 @@ for (const path of ["/health", "/readyz", "/version"]) {
     assert.equal(h.starts.length, 0, "all native SDK start paths are fenced");
   });
 }
+
+test("bounded staging: stop tears down the live process without spending its grant", async (t) => {
+  const h = await harness(t, BOUNDED_STAGING_ENV);
+  const window = stagingWindow();
+  const action = () => h.bot.fetch(stagingUseRequest("stop", window));
+  const acquired = await h.bot.fetch(stagingUseRequest("acquire", window));
+  assert.equal(acquired.status, 200);
+  const grant = await acquired.json() as { running: boolean; use: unknown };
+  await h.bot.fetch(probeRequest("https://worker.invalid/health")).then((r) => r.arrayBuffer());
+  assert.equal(h.runtime.running, true);
+  const failure = t.mock.method(h.runtime, "destroy", async () => { throw new Error("stop failed"); });
+  assert.equal((await action()).status, 503);
+  assert.equal(h.runtime.running, true);
+  assert.deepEqual(h.values.get(STAGING_USE_KEY), grant.use);
+  failure.mock.restore();
+  const stopped = await action();
+  assert.equal(stopped.status, 200);
+  assert.deepEqual(await stopped.json(), { ...grant, running: false });
+  assert.equal(h.runtime.running, false);
+  assert.equal(h.pending().length, 0);
+  assert.equal((await h.bot.listSchedules("stagingExpiry"))[0]?.time, Math.ceil(window.expiresAt / 1000));
+  await h.bot.fetch(probeRequest("https://worker.invalid/health")).then((r) => r.arrayBuffer());
+  assert.equal(h.starts.length, 2);
+  assert.equal((await h.bot.fetch(stagingUseRequest("release", window))).status, 200);
+  assert.equal(h.runtime.running, false);
+});
 
 test("bounded staging: authenticated acquire authorizes exact identity without starting; release is idempotent", async (t) => {
   const h = await harness(t, BOUNDED_STAGING_ENV);

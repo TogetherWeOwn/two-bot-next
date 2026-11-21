@@ -45,6 +45,26 @@ test("staging client: acquire binds version, build, epoch, run/attempt and immut
   }
 });
 
+test("staging client: stop requires a confirmed stop on the same epoch and active window", async () => {
+  const stop = { ...args, action: "stop" };
+  const before = { ...state, running: true };
+  const h = responses([Response.json(before), Response.json(state)]);
+  const receipt = await stagingUse(stop, h.send, async () => {}, clock);
+  assert.equal(receipt.action, "stop");
+  assert.equal(receipt.running, false);
+  assert.deepEqual(receipt.use, use);
+  assert.deepEqual(h.calls.map(({ url, init }) => [url.pathname, init.method]),
+    [["/internal/staging-use", "GET"], ["/internal/staging-use", "POST"]]);
+  assert.deepEqual(JSON.parse(String(h.calls[1].init.body)), { action: "stop", environment: "staging",
+    deploymentId: args.deploymentId, sha: SHA, expectedEpoch: 7, runId: args.runId, runAttempt: 2, expiresAt: args.expiresAt });
+
+  const unconfirmed = responses([Response.json(before), Response.json(before)]);
+  await assert.rejects(stagingUse(stop, unconfirmed.send, async () => {}, clock), /staging_stop_unconfirmed/);
+  const wrongRun = responses([Response.json({ ...before, use: { ...use, runAttempt: 3 } })]);
+  await assert.rejects(stagingUse(stop, wrongRun.send, async () => {}, clock), /staging_window_mismatch/);
+  assert.equal(wrongRun.calls.length, 1);
+});
+
 test("staging client: a deployment resource UUID cannot replace the Worker version UUID", async () => {
   const versionId = "11111111-1111-4111-8111-111111111111";
   const deploymentResourceId = "22222222-2222-4222-8222-222222222222";

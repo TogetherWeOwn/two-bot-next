@@ -103,7 +103,7 @@ unchanged. Scheduled user-flow also observes instead of acquiring a window.
 The production promotion's live staging-soak samples use one bounded grant
 through baseline, measurement, final sampling and release; their exact-head live
 qualification remains required.
-`acquire`, `assert`, `ready` and `release` pin the intended
+`acquire`, `assert`, `ready`, `stop` and `release` pin the intended
 `STAGING_USE_SHA`, `STAGING_USE_DEPLOYMENT`, `GITHUB_RUN_ID`,
 `GITHUB_RUN_ATTEMPT` and absolute millisecond `STAGING_USE_EXPIRES_AT`. The
 origin must be the approved staging workers.dev origin, with no path, query or
@@ -479,6 +479,17 @@ merge or an unverified deployment is not `t0`.
    rollout, and the exact Worker passes the runtime probes. On the active-lag counter
    shape, that listing-lag acceptance still requires two consecutive full passes.
    Successful stale-listing acceptance records `"application_listing_lag": true`.
+
+   Once the exact pinned rollout reports completion with validated steps and
+   identity, the verifier stops the singleton under the existing staging grant.
+   This also runs when the instance counters read zero: an alarm can have
+   started the prior build since acquisition. Only the authenticated stop
+   receipt with `running: false` opens the runtime acceptance path. Earlier
+   warm-up and diagnostic probes do not count. The next probe can cold-start
+   the replacement and still checks the exact Worker, revision, build and
+   deploy ID. The stop does not release or renew the grant: automatic rollback
+   and final release still use the original expiry. An unconfirmed stop fails
+   the rollout gate.
 
    A stale listing that is not verified as the rollout's previous image fails as
    `application_image_drift`. For a verified previous-image listing that has not

@@ -212,6 +212,7 @@ class FakeClient:
         self.zero_instance_first = None
         self.zero_instance_last = None
         self.calls = []
+        self.stop_staging = Mock()
 
     def respond(self, routes, key):
         if key not in routes or not routes[key]:
@@ -933,6 +934,10 @@ class DeploymentWiringTests(unittest.TestCase):
         self.assertLess(steps.index(deploy[0]), steps.index(receipt[0]))
         self.assertLess(steps.index(receipt[0]), steps.index(takeover[0]))
         self.assertLess(steps.index(takeover[0]), steps.index(verify[0]))
+        use = next(step for step in steps if "staging-use-pipeline.mjs begin" in step)
+        self.assertLess(steps.index(use), steps.index(verify[0]))
+        self.assertIn("STAGING_USE_EXPIRES_AT: ${{ steps.use.outputs.expires_at }}", verify[0])
+        self.assertIn("OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}", verify[0])
         self.assertNotRegex(receipt[0], r"(?m)^\s*(?:if|continue-on-error):")
         self.assertIn("set -euo pipefail", receipt[0])
         self.assertIn('--receipt "$ROLLOUT_DIR/baseline.json"', receipt[0])
@@ -1343,6 +1348,67 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(evidence["image"], IMAGE)
         self.assertEqual(evidence["rollout_id"], NEW_ROLLOUT)
         self.assert_no_secret_saved_or_printed()
+
+    def test_forward_replaces_the_process_started_by_an_early_alarm(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        pending = {**completed_row(), "status": "progressing"}
+        done = completed_row()
+        done["health"]["instances"].update(active=0)
+        client.api_routes[DETAIL_PATH] = [pending, done]
+        client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+        # The grant saw a stopped singleton. A pending-rollout alarm can still
+        # start the prior build before any acceptance probe runs.
+        status, headers, body = ready_response()
+        old = {**json.loads(body), "build_revision": "f" * 40}
+        alarm_start = self.clock.sleep
+
+        def start_early(seconds):
+            alarm_start(seconds)
+            if not client.stop_staging.called:
+                client.request_routes[URL + "/readyz"] = [(status, headers, json.dumps(old).encode())]
+
+        def stop(url, version, revision):
+            self.assertEqual((url, version, revision), (URL, VERSION, REVISION))
+            self.assertEqual(client.calls.count(("api", DETAIL_PATH)), 2)
+            self.assertEqual(json.loads(client.request_routes[URL + "/readyz"][0][2]), old)
+            client.request_routes[URL + "/readyz"] = [ready_response()]
+
+        client.stop_staging.side_effect = stop
+        client.deadline = 130
+        with patch.object(rollout.time, "sleep", side_effect=start_early):
+            rollout.verify(self.args, client)
+        client.stop_staging.assert_called_once()
+        evidence = json.loads(Path(self.args.evidence).read_text())
+        self.assertTrue(evidence["active_lag"])
+        self.assertTrue(evidence["application_listing_lag"])
+
+    def test_completed_zero_instance_rollout_can_cold_start_after_stop(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        client.api_routes[DETAIL_PATH] = [zero, completed_row()]
+
+        def stop(*_):
+            self.assertEqual(client.calls.count(("api", DETAIL_PATH)), 1)
+            self.assertFalse(any(kind == "request" for kind, _ in client.calls))
+
+        client.stop_staging.side_effect = stop
+        rollout.verify(self.args, client)
+        client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
+        self.assertEqual(json.loads(Path(self.args.evidence).read_text())["readyz"], 200)
+
+    def test_stop_refusal_prevents_readiness_on_completed_rollout(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.stop_staging.side_effect = rollout.GateError("staging_stop_unconfirmed")
+        self.assert_gate("staging_stop_unconfirmed", rollout.verify, self.args, client)
+        self.assertFalse(any(kind == "request" for kind, _ in client.calls))
+        self.assert_no_evidence()
 
     def test_forward_mismatch_records_only_the_rejected_sample(self):
         self.prepare_baseline()

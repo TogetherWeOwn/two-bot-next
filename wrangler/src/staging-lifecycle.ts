@@ -29,7 +29,7 @@ export interface StagingIdentity {
 }
 
 export interface StagingUseChange extends StagingWindow {
-  action: "acquire" | "release";
+  action: "acquire" | "release" | "stop";
   expectedEpoch: number;
   deploymentId: string;
   sha: string;
@@ -56,7 +56,7 @@ function validIdentity(v: { deploymentId: unknown; sha: unknown; epoch: unknown 
 export function parseStagingUseChange(value: unknown): StagingUseChange | null {
   if (!validWindow(value)) return null;
   const v = value as StagingUseChange;
-  if ((v.action !== "acquire" && v.action !== "release")
+  if ((v.action !== "acquire" && v.action !== "release" && v.action !== "stop")
     || !validIdentity({ ...v, epoch: v.expectedEpoch })) return null;
   return {
     environment: "staging", action: v.action, runId: v.runId, runAttempt: v.runAttempt,
@@ -131,6 +131,15 @@ export class StagingLifecycle {
     const active = { ...pending, phase: "active" as const };
     await this.write(active);
     return active;
+  }
+
+  /** Stop under the DO gate without consuming the grant needed by rollback. */
+  async stop(change: StagingUseChange, identity: StagingIdentity, stop: () => Promise<void>): Promise<StagingUse> {
+    this.checkIdentity(change, identity);
+    const use = await this.require(identity);
+    if (!sameWindow(use, change)) throw new OwnershipRefused("staging_use_conflict");
+    await stop();
+    return use;
   }
 
   async release(change: StagingUseChange, identity: StagingIdentity, stop: () => Promise<void>): Promise<StagingUse> {
