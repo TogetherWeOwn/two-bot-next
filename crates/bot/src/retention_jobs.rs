@@ -18,7 +18,10 @@ use std::{
 };
 
 use sqlx::PgPool;
-use two_bot_core::game_activity_store;
+use two_bot_core::{
+    game_activity_store,
+    voice_heat_store::{self, VoiceHeatStoreError},
+};
 use two_bot_cutover::retention::{run_retention, RetentionMode, RETENTION_CADENCE_SECONDS};
 
 use crate::backfill_retention_chains::render_retention_failure;
@@ -213,7 +216,22 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                 // has already committed, the committed counters still get one
                 // structured `retention_run` WARN with distinct text before
                 // returning, so the report is never dropped.
-                if let Err(expiry) = expire_stale_game_aggregates(&pool, mode).await {
+                let game_expiry = expire_stale_game_aggregates(&pool, mode).await;
+                // Voice-heat hourly rows expire on this same cadence: a single
+                // whole-table predicate delete (rows carry no guild scope), so
+                // no page or cursor. Runs after the game-aggregate sweep even
+                // when that sweep failed, so a failed tick keeps the same
+                // committed-counters report shape.
+                let heat_expiry = expire_stale_voice_heat(&pool, mode).await;
+                let failure = match (game_expiry.is_err(), heat_expiry.is_err()) {
+                    (true, true) => Some(
+                        "retention run committed; aggregate expiry and voice-heat expiry failed",
+                    ),
+                    (true, false) => Some("retention run committed; aggregate expiry failed"),
+                    (false, true) => Some("retention run committed; voice-heat expiry failed"),
+                    (false, false) => None,
+                };
+                if let Some(failure) = failure {
                     tracing::warn!(
                         message = "retention_run",
                         mode = ?mode,
@@ -232,10 +250,14 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                         deletions_overdue = report.deletions_overdue,
                         pending_truncated = report.pending_truncated,
                         duration_ms = report.duration_ms,
-                        "retention run committed; aggregate expiry failed",
+                        game_aggregate_expiry_failed = game_expiry.is_err(),
+                        voice_heat_expiry_failed = heat_expiry.is_err(),
+                        "{failure}",
                     );
-                    return Err(expiry);
                 }
+                // Independent sweeps: a game-aggregate failure never skips the
+                // heat expiry; the first failure is returned once both ran.
+                game_expiry.and(heat_expiry)?;
                 let partial = report.guild_purges_failed > 0
                     || report.guild_purges_deferred > 0
                     || report.deletions_deferred > 0
@@ -473,6 +495,74 @@ async fn expire_stale_game_aggregates(
         return Err(ErrorClass::Database);
     }
     Ok(())
+}
+
+/// Sweep the global hourly heat table without a page or cursor. Keep a
+/// successful zero-row sweep distinct from a parked or failed attempt.
+async fn expire_stale_voice_heat(pool: &PgPool, mode: RetentionMode) -> Result<(), ErrorClass> {
+    let horizon = voice_heat_store::VOICE_HEAT_RETENTION_DAYS;
+    match sweep_voice_heat(pool, mode, horizon).await {
+        Ok(Some(stale)) => tracing::info!(
+            message = "voice_heat_expiry",
+            stale_rows = stale,
+            horizon_days = horizon,
+            mode = ?mode,
+            "sweep",
+        ),
+        Ok(None) => tracing::info!(
+            message = "voice_heat_expiry_parked",
+            horizon_days = horizon,
+            mode = ?mode,
+            reason = "no_table_access",
+            "voice-heat expiry not attempted",
+        ),
+        Err(err) => {
+            let (class, reason) = voice_heat_error_class(&err);
+            tracing::warn!(
+                message = "voice_heat_expiry_failed",
+                horizon_days = horizon,
+                mode = ?mode,
+                reason,
+                "voice-heat expiry failed",
+            );
+            return Err(class);
+        }
+    }
+    Ok(())
+}
+
+async fn sweep_voice_heat(
+    pool: &PgPool,
+    mode: RetentionMode,
+    horizon: i32,
+) -> Result<Option<u64>, VoiceHeatStoreError> {
+    let mut conn = pool.acquire().await?;
+    // The dormant table is deliberately migrator-only. Do not attempt heat
+    // SQL on a pool with neither privilege, or treat an attempted failure as
+    // parked. Partial grants and probe errors are not silently swallowed.
+    let has_access: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege('public.voice_heat_hours', 'SELECT, DELETE')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if !has_access {
+        return Ok(None);
+    }
+    let stale = match mode {
+        RetentionMode::DryRun => {
+            voice_heat_store::count_stale_voice_heat(&mut *conn, horizon).await?
+        }
+        RetentionMode::Execute => voice_heat_store::prune_voice_heat(&mut *conn, horizon).await?,
+    };
+    Ok(Some(stale))
+}
+
+/// SQLx errors can carry statement detail; log only a fixed reason token.
+fn voice_heat_error_class(err: &VoiceHeatStoreError) -> (ErrorClass, &'static str) {
+    match err {
+        VoiceHeatStoreError::InvalidHorizon => (ErrorClass::Configuration, "invalid_horizon"),
+        VoiceHeatStoreError::Db(inner) => (ErrorClass::Database, db_class(inner)),
+    }
 }
 
 /// Classify an aggregate-expiry store failure without its internals: the raw
