@@ -3,18 +3,18 @@ import json
 from pathlib import Path
 
 SOAK = "staging-soak.yml"
-PRODUCTION = "deploy-production.yml"
+PRODUCTION_GROUP = "${{ github.run_attempt != 1 && needs.guard.outputs.mode != 'rollback' && needs.guard.outputs.allow_unstaged != 'true' && format('deploy-production-refused-{0}-{1}', github.run_id, github.run_attempt) || 'deploy-production' }}"
 CONTRACT = json.loads((Path(__file__).parent / "fixtures/staging_soak_contract.json").read_text())
 
 
 def admitted_soak(workflows):
-    return {"caller": workflows.get(PRODUCTION, {}).get("jobs", {}).get("soak"),
+    return {"caller": workflows.get("deploy-production.yml", {}).get("jobs", {}).get("soak"),
             "reusable": workflows.get(SOAK)} == CONTRACT
 
 
 def soak_view(workflows):
     begin, finish = (workflows[SOAK]["jobs"][job] for job in ("begin", "finish"))
-    caller = workflows[PRODUCTION]["jobs"]["soak"]
+    caller = workflows["deploy-production.yml"]["jobs"]["soak"]
     steps = json.loads(json.dumps(begin["steps"][1:5] + finish["steps"][-5:]).replace(
         "inputs.", "needs.guard.outputs.").replace("needs.begin.outputs.", "steps.staging-use-begin.outputs."))
     steps[4]["env"]["FULL_SOAK"] = caller["with"]["full_soak"]

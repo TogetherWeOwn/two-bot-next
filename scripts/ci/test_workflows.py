@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import yaml
 
-from staging_soak_policy import SOAK as STAGING_SOAK, admitted_soak, soak_view
+from staging_soak_policy import PRODUCTION_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, GUARDS as MEASUREMENT_GUARDS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
     TARGET as MEASUREMENT_TARGET, WORKFLOW as MEASUREMENT, is_measurement_caller,
@@ -2914,8 +2914,6 @@ def daily_digest_errors(workflow):
             errors.append(f"{name}:alert: missing pin {required}")
     return errors
 
-
-PRODUCTION_GROUP = "${{ github.run_attempt != 1 && needs.guard.outputs.mode != 'rollback' && needs.guard.outputs.allow_unstaged != 'true' && format('deploy-production-refused-{0}-{1}', github.run_id, github.run_attempt) || 'deploy-production' }}"
 
 def production_errors(workflow):
     """deploy-production is the one live route: dispatch, green-staging completion or schedule, chained to staging."""

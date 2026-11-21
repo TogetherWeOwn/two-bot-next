@@ -117,14 +117,12 @@ def run_blocks():
 
 TOP = children(LINES, 0)
 JOBS = children(TOP["jobs"][1:], 2)
-# Project the split sequence for step-local checks; the workflow-policy tests pin the actual graph.
 SOAK = children(WORKFLOW.with_name("staging-soak.yml").read_text().splitlines(), 0)
 BEGIN, FINISH = (children(SOAK["jobs"][1:], 2)[job] for job in ("begin", "finish"))
 CALL = children(JOBS["soak"][1:], 4)
 FINISH_FIELDS = children(FINISH[1:], 4)
 GRANT_ENV = next(step[1:-1] for step in steps(FINISH) if "        env: &grant" in step)
-SOAK_BODY = "\n".join(sum(steps(BEGIN)[1:5] + steps(FINISH)[-5:], []))
-SOAK_BODY = SOAK_BODY.replace("        env: *grant", "\n".join(GRANT_ENV))
+SOAK_BODY = "\n".join(sum(steps(BEGIN)[1:5] + steps(FINISH)[-5:], [])).replace("        env: *grant", "\n".join(GRANT_ENV))
 SOAK_BODY = (re.sub(r': "(\$\{\{ [^"\n]+? \}\}(?:/staging-soak-use\.ndjson)?)"', r': \1', SOAK_BODY)
              .replace("inputs.full_soak", value(children(CALL["with"][1:], 6)["full_soak"])[4:-3])
              .replace("inputs.", "needs.guard.outputs.")

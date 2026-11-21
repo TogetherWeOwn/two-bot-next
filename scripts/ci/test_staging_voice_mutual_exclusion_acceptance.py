@@ -59,7 +59,7 @@ from unittest import mock
 
 import yaml
 
-from staging_soak_policy import SOAK as STAGING_SOAK, admitted_soak, soak_view
+from staging_soak_policy import PRODUCTION_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
     WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
@@ -208,6 +208,8 @@ def group_values(raw, context, triggers):
         return None
     if EXPRESSION not in raw:
         return frozenset({("lit", raw.casefold())})
+    if context == "standalone" and raw == PRODUCTION_GROUP:
+        return frozenset({("lit", "deploy-production"), ("attempt", "deploy-production-refused-")})
     called = CALLED_FORM.fullmatch(raw.strip())
     if called:
         prefix, fallback = called.groups()
@@ -244,7 +246,7 @@ def may_equal(value, canonical):
     kind, text = value
     if kind == "lit":
         return text == canonical
-    return re.fullmatch(re.escape(text) + r"[0-9]+", canonical) is not None
+    return re.fullmatch(re.escape(text) + (r"[0-9]+-[0-9]+" if kind == "attempt" else r"[0-9]+"), canonical) is not None
 
 
 def may_hold(node, context, triggers, canonical):
