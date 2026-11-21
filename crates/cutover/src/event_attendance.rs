@@ -145,7 +145,7 @@ pub async fn finalized_attendance(
                 left_at: row.left_at,
             })
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, InternalStoreError>>()?;
     Ok(Some(FinalizedAttendance {
         starts_at,
         ends_at,
