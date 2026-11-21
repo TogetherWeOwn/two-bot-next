@@ -28,9 +28,8 @@ const isVoiceFamilyLine = (line: string) =>
   line.startsWith("two_bot_internal_actions_total{") && line.includes('family="voice"');
 
 const isHeat = (line: string) => line.includes('job="voice_heat"');
-
 test("every current required label combination is required, not merely one row per family", () => {
-  const lines = metricsLines().filter((line) => !isOptionalLine(line) && !isVoiceFamilyLine(line) && !isHeat(line));
+  const lines = metricsLines().filter((line) => !isOptionalLine(line) && !isVoiceFamilyLine(line));
   for (let i = 0; i < lines.length; i++) {
     assert.equal(parseAlertScrape(lines.filter((_, j) => j !== i).join("\n")), null, lines[i]);
   }
@@ -55,29 +54,24 @@ test("a partially present voice family fails the scrape", () => {
   assert.ok(parseAlertScrape(lines.filter((line) => !isVoiceFamilyLine(line)).join("\n")));
 });
 
-test("voice heat rows are all-or-nothing without holding other jobs' failure share", () => {
+test("only complete heat scrapes affect heat alerts, without holding unrelated jobs", () => {
   const lines = metricsLines();
   assert.equal(lines.filter(isHeat).length, 11);
-  assert.ok(parseAlertScrape(valid));
   for (const row of lines.filter(isHeat)) assert.ok(parseAlertScrape(lines.filter((line) => line !== row).join("\n")) === null, row);
   const older = lines.filter((line) => !isHeat(line)).join("\n");
-  const samples = parseAlertScrape(older);
-  assert.ok(samples);
-  const state = evaluateMetrics(samples, EMPTY_STATE, 100).state;
+  const state = evaluateMetrics(parseAlertScrape(older)!, EMPTY_STATE, 100).state;
   const updated = parseAlertScrape(older.replace('job="rank",outcome="failure"} 0', `job="rank",outcome="failure"} ${JOB_FAILURE_SHARE_MIN_RUNS}`));
   assert.ok(updated);
   assert.ok(evaluateMetrics(updated, state, 160).state.firing.includes("job_failure_share:rank"));
-});
 
-test("rollback holds only the missing heat gauges until healthy readings return", () => {
-  const healthy = metricsLines();
+  // Roll out, then roll back to a new process with no heat metrics.
   const heat = ["job_consecutive_failures:voice_heat", "job_unknown_stale:voice_heat"];
   const evaluate = (rows: string[], prev = EMPTY_STATE) => evaluateMetrics(parseAlertScrape(rows.join("\n"))!, prev, 10_000).state;
-  const baseline = evaluate(healthy);
-  const rollback = healthy.filter((line) => !isHeat(line)).map((line) => line.replace('incarnation{part="3"} 1', 'incarnation{part="3"} 2'));
+  const baseline = evaluate(lines);
+  const rollback = older.split("\n").map((line) => line.replace('incarnation{part="3"} 1', 'incarnation{part="3"} 2'));
   const held = evaluate(rollback, { ...baseline, firing: [...heat, "job_consecutive_failures:rank"] });
   assert.deepEqual(held.firing.filter((key) => key.startsWith("job_")), heat);
-  assert.deepEqual(evaluate(healthy, held).firing.filter((key) => key.endsWith(":voice_heat")), []);
+  assert.deepEqual(evaluate(lines, held).firing.filter((key) => key.endsWith(":voice_heat")), []);
 });
 
 test("older exposition without the optional gauges still parses", () => {

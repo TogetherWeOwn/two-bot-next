@@ -305,12 +305,7 @@ pub(crate) mod heat {
         Arc::new(Bootstrap)
     }
 
-    pub(crate) fn job(
-        pool: PgPool,
-        guild: Snowflake,
-        cache: Arc<SharedCache>,
-        gateway: Arc<Gateway>,
-    ) -> Job {
+    pub fn job(pool: PgPool, guild: Snowflake, cache: Arc<SharedCache>, gw: Arc<Gateway>) -> Job {
         let buffer = Arc::new(Mutex::new(VoiceHeat::default()));
         Job {
             name: NAME,
@@ -319,28 +314,24 @@ pub(crate) mod heat {
             startup_jitter: jobs::startup_jitter(CADENCE, rand::random()),
             timeout: VoiceHeat::TICK_TIMEOUT,
             action: Arc::new(move || {
-                let (pool, cache, gateway, buffer) =
-                    (pool.clone(), cache.clone(), gateway.clone(), buffer.clone());
+                let (pool, cache, gw, buffer) =
+                    (pool.clone(), cache.clone(), gw.clone(), buffer.clone());
                 Box::pin(async move {
                     let mut buffer = buffer.lock().await;
-                    let total = observation(&cache, &gateway, guild);
+                    let total = observation(&cache, &gw, guild);
                     buffer.tick(OffsetDateTime::now_utc(), total, &pool).await
                 })
             }),
         }
     }
 
-    pub(super) fn observation(
-        cache: &SharedCache,
-        gateway: &Gateway,
-        guild: Snowflake,
-    ) -> Option<i64> {
+    pub(super) fn observation(cache: &SharedCache, gw: &Gateway, id: Snowflake) -> Option<i64> {
         // Keep the connected fence held through the complete cache read.
-        let state = gateway.try_read().ok()?;
+        let state = gw.try_read().ok()?;
         if *state != GatewayState::Connected {
             return None;
         }
-        i64::try_from(super::read_voice_total(cache, guild).ok()?).ok()
+        i64::try_from(super::read_voice_total(cache, id).ok()?).ok()
     }
 }
 
@@ -539,6 +530,7 @@ mod tests {
         let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new_without_pgpass());
         pool.close().await;
         let job = heat::job(pool.clone(), 100, cache.clone(), gateway.clone());
+        assert_eq!(job.timeout, VoiceHeat::TICK_TIMEOUT);
         assert_eq!((job.action)().await, Ok(()));
         let mut buffer = VoiceHeat::default();
         let mut probe = async |state, hour| {

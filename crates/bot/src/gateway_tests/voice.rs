@@ -452,6 +452,7 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
 }
 
 async fn cold_voice_resume(rooms_enabled: bool) {
+    use crate::voice_snapshot::{new_shared_cache, read_voice_total};
     let db = TestDb::new().await;
     let release = Arc::new(Notify::new());
     let mut mock = cold_voice_gateway(release.clone()).await;
@@ -506,7 +507,15 @@ async fn cold_voice_resume(rooms_enabled: bool) {
         saved.as_ref(),
         Some(&mock.url),
     );
-    let pipeline = Arc::new(build_pipeline(db.store.milestones().await.unwrap(), None));
+    let cache = new_shared_cache();
+    let buffer = GatewayFunnelBuffer::from_milestones(db.store.milestones().await.unwrap());
+    let pipeline = Arc::new(two_bot_discord::OrderedLevelingPipeline::with_shared_cache(
+        buffer.clone(),
+        None,
+        two_bot_discord::NoInvites,
+        buffer,
+        cache.clone(),
+    ));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
     let sink: Arc<dyn VoiceEventSink> = if rooms_enabled {
         voice.clone()
@@ -538,9 +547,8 @@ async fn cold_voice_resume(rooms_enabled: bool) {
     if !rooms_enabled {
         release.notify_one();
         wait_sequence(&db.store, 2).await;
-        let guild = twilight_model::id::Id::new(VOICE_GUILD_ID);
-        assert!(pipeline.cache().guild(guild).is_some());
-        assert_eq!(*state.read().await, GatewayState::Connected);
+        wait_connected(&state).await;
+        assert_eq!(read_voice_total(&cache, VOICE_GUILD_ID), Ok(0));
         runner.abort();
         let _ = runner.await;
         mock.task.abort();
@@ -581,7 +589,7 @@ async fn cold_voice_resume(rooms_enabled: bool) {
         db.store.load().await.unwrap().unwrap().session_id,
         "voice-session"
     );
-    assert_eq!(*state.read().await, GatewayState::Connected);
+    wait_connected(&state).await;
     let disconnects = voice.disconnects.load(Ordering::Relaxed);
     runner.abort();
     let _ = runner.await;

@@ -289,7 +289,8 @@ fn admission_pool(url: &str) -> Result<PgPool, String> {
     admission_pool_with_tls(url, tls).map_err(|_| "invalid admission authority".to_owned())
 }
 
-/// Boot-composed supervisor for the listeners, gateway-backed jobs and DB jobs.
+/// Boot-composed single call: the parameters are the full supervised
+/// surface (config, listener, gateway, shutdown plus one slot per consumer).
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     config: &Config,
@@ -424,14 +425,11 @@ pub async fn serve(
     // Discord gateway is unconfigured. Missing/invalid/`off` mode or a
     // missing/unusable database parks the job without attempting destructive
     // work; the `/readyz` status entry exists either way.
-    match retention {
-        RetentionRegistration::Active(job, heat) => {
-            if let Some((pool, guild)) = heat {
-                registered.push(heat::job(pool, guild, voice_cache, gateway.gateway.clone()));
-            }
-            registered.push(job);
+    if let RetentionRegistration::Active(job, heat) = retention {
+        if let Some((pool, guild)) = heat {
+            registered.push(heat::job(pool, guild, voice_cache, gateway.gateway.clone()));
         }
-        RetentionRegistration::Parked => parked.push(crate::retention_jobs::NAME),
+        registered.push(job);
     }
 
     if let Some(service) = self_roles {
@@ -474,7 +472,8 @@ pub async fn serve(
     serve_jobs(registered, status, shutdown.clone(), http).await
 }
 
-/// An active retention job with optional sampler bindings, or a parked entry.
+/// Retention registration outcome: an active supervised job, or a parked
+/// status entry with no job (safe mode, disabled, or no database).
 pub(crate) enum RetentionRegistration {
     Active(Job, Option<(PgPool, u64)>),
     Parked,

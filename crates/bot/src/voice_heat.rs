@@ -135,7 +135,9 @@ mod tests {
             assert_eq!(buckets, original.as_slice());
             std::future::pending().await
         });
-        let result = tokio::time::timeout(VoiceHeat::TICK_TIMEOUT, attempt).await;
+        // Model 1 ms of scheduler time spent before the flush starts.
+        let deadline = VoiceHeat::TICK_TIMEOUT - Duration::from_millis(1);
+        let result = tokio::time::timeout(deadline, attempt).await;
         assert_eq!(result.unwrap(), Err(JobErrorClass::Timeout));
         assert!((Duration::from_secs(60)..Duration::from_secs(61)).contains(&started.elapsed()));
         assert_eq!(adapter.accumulator.completed(NEXT), original);
