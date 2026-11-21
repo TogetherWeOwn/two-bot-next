@@ -573,10 +573,10 @@ impl crate::scheduled_events::ScheduledEventMirror for Pool<Postgres> {
 }
 
 /// Apply the `web_v1` contract views (legacy `applyWebContract`: the SQL file
-/// is the contract, this only runs it). Idempotent: the view DDL and guarded
-/// version update can run on every start. A `web_v1` edit that renames,
-/// reorders, removes or retypes a column fails here instead of silently
-/// breaking the website.
+/// is the contract, this only runs it). The view DDL and guarded version
+/// update are idempotent so the boot path can run it on
+/// every start; a `web_v1` edit that renames, reorders, removes or retypes a
+/// column fails here loudly instead of silently breaking the website.
 pub async fn apply_web_contract(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
     // Resolve and apply on the same connection: a pool can hand out different
     // sessions, each with its own search_path.

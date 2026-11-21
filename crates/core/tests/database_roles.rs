@@ -1878,6 +1878,16 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         "bootstrap flow drifted",
     )
     .unwrap();
+    let reader = runtime_role_pool(&scratch_admin, &roles[2]).await.unwrap();
+    let initial_cells: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM web_v1.voice_heat
+         WHERE source = 'insufficient' AND avg_in_voice IS NULL AND coverage = 0",
+    )
+    .fetch_one(&reader)
+    .await
+    .unwrap();
+    assert_eq!(initial_cells, 168);
+    reader.close().await;
     provision_pool.close().await;
     migrator_pool.close().await;
     scratch_admin.close().await;

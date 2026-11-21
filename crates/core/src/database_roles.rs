@@ -237,17 +237,9 @@ mod tests {
         let root_sql = include_str!("../../../sql/web_v1.sql");
         let store_sql = include_str!("../../store/sql/web_v1.sql");
         let heat = "CREATE OR REPLACE VIEW web_v1.voice_heat AS";
-        assert_eq!(
-            root_sql
-                .split_once(heat)
-                .expect("cutover voice heat suffix")
-                .1,
-            store_sql
-                .split_once(heat)
-                .expect("store voice heat suffix")
-                .1,
-            "voice heat query and guarded version bump must match",
-        );
+        let [root_heat, store_heat] =
+            [root_sql, store_sql].map(|sql| sql.split_once(heat).expect("voice heat suffix").1);
+        assert_eq!(root_heat, store_heat, "voice heat publication drifted");
         let root_views = contract_views(root_sql);
         let store_views = contract_views(store_sql);
         assert_eq!(
