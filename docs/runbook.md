@@ -2545,8 +2545,8 @@ prints that list in the manifest (`pending_before`) and changes nothing.
 `--apply` requires `--expected-pending` (the workflow input of the same name)
 and refuses before any DDL unless it equals the computed pending list exactly,
 so apply can only run the pending set a reviewed plan already showed. `--apply`
-additionally requires `--plan-manifest-sha256` and `--plan-run-id`: the SHA-256
-of the reviewed plan run's uploaded `staging-migrate-manifest.json` and the run
+additionally requires `--plan-manifest-sha256` and `--plan-run-id`: the cutover
+projection digest embedded in `staging-migrate-manifest.json` and the run
 that produced it, plus `--plan-manifest-path`: the producing run's
 downloaded `staging-migrate-manifest.json`, which the workflow fetches back
 from the `plan_run_id` run before the runner starts. The runner recomputes
@@ -2601,44 +2601,36 @@ SHA, per-migration SHA-384, ledger before/after, applied count, plus its own
 `plan_manifest_sha256` and the bound `plan_run_id`) is the evidence;
 on failure the ledger-after is preserved, not repaired.
 
-The workflow runs only when dispatched from `main` and splits into three jobs.
-The `plan` job always runs and reads the binding from the `staging-migrate-plan`
-GitHub environment, which carries no reviewer because planning changes nothing;
-it uploads `staging-migrate-manifest.json` as the `staging-migrate-manifest`
-run artifact (14-day retention), which is where the reviewer reads
-`plan_manifest_sha256`/`plan_run_id` for the apply dispatch. The digest is the
-embedded source/pending/migration projection, **not** SHA-256 of the JSON or ZIP.
-For `mode: apply`, the unprotected `claim` job validates this dispatch's read-only
-plan against the request and uploads `staging-migrate-apply-claim.json` as the
-`staging-migrate-apply-claim` artifact, before apply waits for environment approval.
-It has no database secrets or environment; a step inside the waiting apply job
-cannot publish evidence before approval. Both artifact uploads disable compression
-for the bounded stored-ZIP reader. The [claim contract](staging-migrate-claim.md)
-defines the exact versioned fields, serialization vector and consumer requirements.
-The claim is a request, not proof of producer provenance or CEO GO; the independent
-protection-rule consumer must authenticate both runs and the prior plan artifact.
-The `apply` job runs only for `mode: apply`, after a green plan **and claim**, and
-reads the binding from the `staging-migrate-apply` environment, which must have a
-required reviewer and a main-only deployment-branch rule. Both bindings must be
-environment secrets, not repository secrets; otherwise a workflow edited on
-another branch could read them. This change does not create the environments or
-the secrets: create both before dispatch, or the jobs fail instead of running.
+The workflow runs only when dispatched from `main`. Both GitHub environments
+have a main-only deployment-branch rule and separate environment-scoped
+bindings; do not use repository secrets for either binding. The `plan` job
+always runs and uploads `staging-migrate-manifest.json` as the
+`staging-migrate-manifest` artifact (14-day retention). Read both embedded
+source/pending/migration projection digests from that manifest, **not** the
+SHA-256 of the JSON or ZIP.
 
-Prerequisites the legitimate principal must verify **before dispatch** (the
-runner cannot, and this change does not claim them): the real staging Neon
-identity; that both dedicated bindings already exist, each in its own
-environment: `TWO_BOT_STAGING_PLAN_DATABASE_URL` (a login holding only
-`two_bot_migrator_ro`) in `staging-migrate-plan` for the `plan` job, and
-`TWO_BOT_STAGING_MIGRATOR_DATABASE_URL` in `staging-migrate-apply` for the
-`apply` job, since the two jobs never share a credential; the
-`staging-migrate-plan` / `staging-migrate-apply` environment protections
-above; and a complete
-recovery set covering the Next schema, `_sqlx_migrations` ledger, object
-ownership, ACLs and logins. The generic legacy backup omits Next tables and the
-SQLx history, and unverified Neon PITR is not a working recovery. Apply the
-reviewed ACL sequence in `docs/database-roles.md` so other shared-database
-services keep their access. Real SQLx proof runs only against disposable CI
-services (`crates/cutover/tests/staging_migrate_db.rs`).
+Before dispatching **apply**, verify the pinned staging identity and the
+complete pre-change recovery set: the Next schema, both migration ledgers,
+object ownership, ACLs and logins. The generic legacy backup omits Next tables
+and the SQLx history, and unverified Neon PITR is not a working recovery. Bind
+that recovery evidence and the [reviewed ACL sequence](database-roles.md) to the
+producing read-only plan. On the source task, obtain an accepted board
+`request_confirmation` naming the full source SHA, producing plan run ID,
+both pending lists, both manifest digests and the recovery reference. A change to
+those inputs needs a fresh confirmation. Do not dispatch apply before confirmation:
+GitHub does not pause this staging job for human approval.
+
+For `mode: apply`, the `claim` job validates the dispatch against its fresh
+read-only plan and uploads `staging-migrate-apply-claim.json` as the
+`staging-migrate-apply-claim` artifact. It has no environment or database binding.
+The `apply` job runs only after a green plan **and claim** and reads its binding
+from `staging-migrate-apply`. It verifies the producing plan before DDL. The
+[claim contract](staging-migrate-claim.md) defines the exact fields, proof checks
+and distinction between the claim and the board decision. This gate applies
+only to staging; it does not change production approval or protection.
+After apply, follow the reviewed ACL sequence so other shared-database services
+keep their access. Real SQLx proof runs only against disposable CI services
+(`crates/cutover/tests/staging_migrate_db.rs`).
 
 The plan login must hold only `two_bot_migrator_ro`: `--plan` refuses, before it
 reads the ledger, when the login is a member of `two_bot_migrator` (directly,
