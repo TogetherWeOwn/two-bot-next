@@ -113,6 +113,7 @@ fn malformed_rows_retire_both_collectors_before_replacement() {
         r#"{"op":0,"t":"CHANNEL_DELETE","d":{"guild_id":"10","guild_id":"11","id":"20","type":2}}"#,
         r#"{"op":0,"t":"CHANNEL_DELETE","d":{"id":"20","type":2}}"#,
         r#"{"op":0,"t":"CHANNEL_UPDATE","d":{"guild_id":"10","id":"20","type":2,"name":"Room","permission_overwrites":[]}}"#,
+        r#"{"op":0,"t":"CHANNEL_UPDATE","d":{"guild_id":"10","id":"20","type":11}}"#,
         &frame("CHANNEL_UPDATE", room("20", "")),
         &frame("CHANNEL_UPDATE", room_with_duplicates),
         r#"{"op":0,"t":"GUILD_SCHEDULED_EVENT_DELETE","d":{"guild_id":"10","id":"80","extra":1,"extra":2}}"#,
