@@ -1,0 +1,97 @@
+[
+  [true, "VOICE_STATE_UPDATE", {
+    "guild_id": "7", "user_id": "1", "channel_id": "10", "session_id": "fixture",
+    "deaf": false, "mute": false, "self_deaf": false, "self_mute": false,
+    "self_video": false, "suppress": false,
+    "member": {"user": {"id": "1", "username": "member", "discriminator": "0"},
+      "roles": ["12"], "deaf": false, "mute": false, "flags": 0}
+  }],
+  [false, "VOICE_STATE_UPDATE", {
+    "guild_id": "7", "user_id": "1", "channel_id": "10", "session_id": "fixture",
+    "deaf": false, "mute": false, "self_deaf": false, "self_mute": false,
+    "self_video": false, "suppress": false,
+    "member": {"user": {"id": "1", "username": "member", "discriminator": "0"},
+      "roles": ["12"], "deaf": false, "mute": false, "flags": 0}
+  }],
+  [true, "VOICE_STATE_UPDATE", {
+    "guild_id": "7", "user_id": "1", "channel_id": "10", "session_id": "fixture",
+    "deaf": false, "mute": false, "self_deaf": false, "self_mute": false,
+    "self_video": false, "suppress": false,
+    "member": {"user": {"id": "1", "username": "member", "discriminator": "0"},
+      "roles": ["12", "13"], "deaf": false, "mute": false, "flags": 0}
+  }],
+  [true, "VOICE_STATE_UPDATE", {
+    "guild_id": "7", "user_id": "1", "channel_id": "10", "session_id": "fixture",
+    "deaf": false, "mute": false, "self_deaf": false, "self_mute": false,
+    "self_video": false, "suppress": false,
+    "member": {"user": {"id": "1", "username": "member", "discriminator": "0"},
+      "roles": ["12", "13"], "deaf": false, "mute": false, "flags": 0,
+      "communication_disabled_until": "2026-09-30T00:00:00.000000+00:00"}
+  }],
+  [true, "MESSAGE_CREATE", {
+    "guild_id": "7", "channel_id": "10", "id": "50", "type": 0, "content": "fixture",
+    "author": {"id": "1", "username": "member", "discriminator": "0"},
+    "member": {"roles": ["12"], "deaf": false, "mute": false, "flags": 0,
+      "communication_disabled_until": "2026-09-30T00:00:00.000000+00:00"},
+    "timestamp": "2026-09-01T10:00:00.000000+00:00", "tts": false, "mention_everyone": false,
+    "mentions": [], "mention_roles": [], "attachments": [], "embeds": [], "pinned": false
+  }],
+  [false, "MESSAGE_CREATE", {
+    "guild_id": "7", "channel_id": "10", "id": "51", "type": 0, "content": "fixture",
+    "author": {"id": "1", "username": "member", "discriminator": "0"},
+    "member": {"roles": ["12"], "deaf": false, "mute": false, "flags": 0,
+      "communication_disabled_until": "2026-09-30T00:00:00.000000+00:00"},
+    "timestamp": "2026-09-01T10:00:00.000000+00:00", "tts": false, "mention_everyone": false,
+    "mentions": [], "mention_roles": [], "attachments": [], "embeds": [], "pinned": false
+  }],
+  [true, "MESSAGE_UPDATE", {
+    "guild_id": "7", "channel_id": "10", "id": "50", "type": 0, "content": "first edit",
+    "author": {"id": "1", "username": "member", "discriminator": "0"},
+    "member": {"roles": ["12"], "deaf": false, "mute": false, "flags": 0},
+    "timestamp": "2026-09-01T10:00:00.000000+00:00", "tts": false, "mention_everyone": false,
+    "mentions": [], "mention_roles": [], "attachments": [], "embeds": [], "pinned": false
+  }],
+  [false, "MESSAGE_UPDATE", {
+    "guild_id": "7", "channel_id": "10", "id": "50", "type": 0, "content": "second edit",
+    "author": {"id": "1", "username": "member", "discriminator": "0"},
+    "member": {"roles": ["12"], "deaf": false, "mute": false, "flags": 0},
+    "timestamp": "2026-09-01T10:00:00.000000+00:00", "tts": false, "mention_everyone": false,
+    "mentions": [], "mention_roles": [], "attachments": [], "embeds": [], "pinned": false
+  }],
+  [true, "GUILD_MEMBER_ADD", {
+    "guild_id": "7", "user": {"id": "2", "username": "second", "discriminator": "0"},
+    "roles": ["12"], "deaf": false, "mute": false, "flags": 0
+  }],
+  [true, "GUILD_MEMBER_UPDATE", {
+    "guild_id": "7", "user": {"id": "2", "username": "second", "discriminator": "0"},
+    "roles": []
+  }],
+  [false, "GUILD_MEMBERS_CHUNK", {
+    "guild_id": "7", "chunk_count": 1, "chunk_index": 0, "members": []
+  }],
+  [true, "GUILD_MEMBERS_CHUNK", {
+    "guild_id": "7", "chunk_count": 1, "chunk_index": 0,
+    "members": [{"user": {"id": "1", "username": "member", "discriminator": "0"},
+      "roles": ["13"], "deaf": false, "mute": false, "flags": 0}]
+  }],
+  [true, "INTERACTION_CREATE", {
+    "application_id": "4", "attachment_size_limit": 10485760, "authorizing_integration_owners": {"0": "7"},
+    "id": "60", "token": "fixture", "type": 2, "version": 1, "guild_id": "7", "entitlements": [],
+    "member": {"user": {"id": "1", "username": "member", "discriminator": "0"},
+      "roles": [], "deaf": false, "mute": false, "flags": 0, "permissions": "0"},
+    "data": {"id": "61", "name": "fixture", "type": 1, "guild_id": "7", "options": []}
+  }],
+  [true, "CHANNEL_CREATE", {"guild_id": "7", "id": "10", "type": 2, "name": "source", "user_limit": 0}],
+  [true, "CHANNEL_UPDATE", {"guild_id": "7", "id": "10", "type": 2, "name": "source", "user_limit": 4}],
+  [true, "GUILD_ROLE_CREATE", {
+    "guild_id": "7", "role": {"id": "12", "name": "fixture", "color": 0,
+      "colors": {"primary_color": 0, "secondary_color": null, "tertiary_color": null},
+      "hoist": false, "managed": false, "mentionable": false, "position": 1, "permissions": "0", "flags": 0}
+  }],
+  [true, "GUILD_ROLE_UPDATE", {
+    "guild_id": "7", "role": {"id": "12", "name": "fixture", "color": 0,
+      "colors": {"primary_color": 0, "secondary_color": null, "tertiary_color": null},
+      "hoist": false, "managed": false, "mentionable": false, "position": 1, "permissions": "1024", "flags": 0}
+  }],
+  [true, "GUILD_ROLE_DELETE", {"guild_id": "7", "role_id": "12"}]
+]

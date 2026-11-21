@@ -37,7 +37,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use twilight_cache_inmemory::{DefaultInMemoryCache, InMemoryCache};
 use twilight_model::gateway::event::Event;
-use twilight_model::id::Id;
 use twilight_model::util::Timestamp;
 use two_bot_core::automod_runtime::FunnelDisposition;
 use two_bot_core::{
@@ -565,38 +564,30 @@ impl SharedCache {
 }
 
 fn voice_policy_guild(cache: &InMemoryCache, event: &Event) -> Option<Snowflake> {
-    let changed = |guild: Option<Id<_>>, user, roles: &[_], timeout| {
-        let guild = guild?;
-        cache
-            .member(guild, user)
-            .is_none_or(|prior| {
-                prior.roles() != roles || prior.communication_disabled_until() != timeout
-            })
-            .then_some(guild.get())
+    let guild = event.guild_id()?;
+    let changed = |user, roles: &[_], timeout| {
+        cache.member(guild, user).is_none_or(|prior| {
+            prior.roles() != roles || prior.communication_disabled_until() != timeout
+        })
     };
-    match event {
-        Event::GuildUpdate(guild) => Some(guild.id.get()),
-        Event::ChannelCreate(channel) => channel.guild_id.map(Id::get),
-        Event::ChannelUpdate(channel) => channel.guild_id.map(Id::get),
-        Event::ChannelDelete(channel) => channel.guild_id.map(Id::get),
-        Event::RoleCreate(role) => Some(role.guild_id.get()),
-        Event::RoleUpdate(role) => Some(role.guild_id.get()),
-        Event::RoleDelete(role) => Some(role.guild_id.get()),
-        Event::MemberAdd(member) => Some(member.guild_id.get()),
-        Event::MemberUpdate(member) => Some(member.guild_id.get()),
-        Event::MemberRemove(member) => Some(member.guild_id.get()),
-        Event::MemberChunk(chunk) if !chunk.members.is_empty() => Some(chunk.guild_id.get()),
-        // Twilight may cache both the invoking/resolved members and resolved roles.
-        Event::InteractionCreate(interaction) => interaction.guild_id.map(Id::get),
+    let modifies = match event {
+        // Interactions can cache invoking/resolved members and resolved roles.
+        Event::GuildUpdate(_)
+        | Event::ChannelCreate(_)
+        | Event::ChannelUpdate(_)
+        | Event::ChannelDelete(_)
+        | Event::RoleCreate(_)
+        | Event::RoleUpdate(_)
+        | Event::RoleDelete(_)
+        | Event::MemberAdd(_)
+        | Event::MemberUpdate(_)
+        | Event::MemberRemove(_)
+        | Event::InteractionCreate(_) => true,
+        Event::MemberChunk(chunk) => !chunk.members.is_empty(),
         // Voice and message frames can overwrite the member baseline.
         Event::VoiceStateUpdate(v) => {
             let m = v.member.as_ref()?;
-            changed(
-                v.guild_id,
-                m.user.id,
-                &m.roles,
-                m.communication_disabled_until,
-            )
+            changed(m.user.id, &m.roles, m.communication_disabled_until)
         }
         _ => {
             let msg = match event {
@@ -605,14 +596,10 @@ fn voice_policy_guild(cache: &InMemoryCache, event: &Event) -> Option<Snowflake>
                 _ => return None,
             };
             let m = msg.member.as_ref()?;
-            changed(
-                msg.guild_id,
-                msg.author.id,
-                &m.roles,
-                m.communication_disabled_until,
-            )
+            changed(msg.author.id, &m.roles, m.communication_disabled_until)
         }
-    }
+    };
+    modifies.then_some(guild.get())
 }
 
 /// The S3 gateway pipeline. `S`/`L`/`F` are the core seams; `I` serves invite
@@ -1428,21 +1415,28 @@ mod tests {
         cache.update(&lifecycle_guild(GUILD + 1));
         let epoch = |id| cache.with_guild_policy_snapshot(id, |_, epoch| Arc::clone(epoch));
         let current = || epoch(GUILD);
-        let Event::VoiceStateUpdate(mut voice) = lifecycle_voice(GUILD, 1, 10) else {
-            unreachable!("voice fixture");
-        };
-        voice.0.member = Some(
-            serde_json::from_value(serde_json::json!({
-                "user": {"id": "1", "username": "member", "discriminator": "0"},
-                "roles": ["12"], "deaf": false, "mute": false, "flags": 0
-            }))
-            .expect("voice member fixture"),
-        );
-        let unchanged = Event::VoiceStateUpdate(voice);
-        cache.update(&unchanged);
-        let initial = current().expect("complete guild");
-        let peer = epoch(GUILD + 1).expect("complete peer");
-        cache.update(&unchanged);
+        let cases: Vec<(bool, &str, serde_json::Value)> =
+            serde_json::from_str(include_str!("../tests/fixtures/voice_policy_events.json"))
+                .unwrap();
+        let peer = epoch(GUILD + 1).unwrap();
+        for (changed, kind, data) in cases {
+            let packet = serde_json::json!({"op": 0, "s": 1, "t": kind, "d": data});
+            let event = twilight_gateway::parse(
+                packet.to_string(),
+                twilight_gateway::EventTypeFlags::all(),
+            )
+            .unwrap_or_else(|err| panic!("{kind} fixture: {err}"))
+            .expect("dispatch fixture");
+            let before = current().unwrap();
+            cache.update(&Event::from(event));
+            assert_eq!(
+                !Arc::ptr_eq(&before, &current().unwrap()),
+                changed,
+                "{kind}"
+            );
+            assert!(Arc::ptr_eq(&peer, &epoch(GUILD + 1).unwrap()));
+        }
+        let initial = current().unwrap();
         cache.update(&lifecycle_voice(GUILD, 1, 10));
         cache.update(&lifecycle_delete(GUILD + 1, Some(11)));
         assert!(Arc::ptr_eq(&initial, &current().expect("unchanged epoch")));
@@ -1451,13 +1445,8 @@ mod tests {
             &epoch(GUILD + 1).expect("peer changed")
         ));
 
-        let role = Event::RoleDelete(twilight_model::gateway::payload::incoming::RoleDelete {
-            guild_id: Id::new(GUILD),
-            role_id: Id::new(12),
-        });
         let mut prior = initial;
         for event in [
-            role,
             lifecycle_member_remove(1),
             lifecycle_delete(GUILD, Some(10)),
             Event::Resumed,
