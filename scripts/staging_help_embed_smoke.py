@@ -4,12 +4,11 @@
 Discord creates interactions only for real users, so a bot token cannot
 invoke /help and capture its reply. This smoke proves the rendered half
 that unit tests cannot: the exact embeds the two help builders produce
-(help_response for /help, help_detail_response for /help <topic>, emitted
+(discovery page one and /help <topic>, emitted
 after the executor sanitizer by the `help_embed_smoke_payloads` example in
 crates/discord) are posted to one staging test channel as ordinary
 messages, read back with GET channels/{id}/messages/{id}, and asserted to
-carry the brand colour, footer text and footer icon URL that the payload
-file names. Both messages are deleted afterwards, pass or fail. It proves
+carry the expected branding and rendered text and fields. Both messages are deleted afterwards, pass or fail. It proves
 a rendered Discord message serves the builder payload with the brand
 intact; it is not a slash-command invocation proof (no human-free one
 exists) and claims nothing about the gateway path.
@@ -28,8 +27,8 @@ Fences, all before the first request:
   * the test bot token comes only from $TWO_VOICE_SYNTHETIC_BOT_TOKEN and
     is never printed, logged or written to evidence; a 401 refuses with a
     fixed message and no substitute credential is ever tried;
-  * the payload file must carry schema help_embed_smoke.v1, both embeds
-    and the expected colour/footer/icon, and each payload embed must
+  * the payload file must carry schema help_embed_smoke.v2, both embeds
+    and each row’s expected colour/footer/icon, and each payload embed must
     already match those expectations;
   * the channel id must be a canonical snowflake. Its staging-guild and
     text-type membership is then verified with GET channels/{id} before
@@ -69,7 +68,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import staging_automation_read_smoke as fenced
 
 API = fenced.API
-SCHEMA = "help_embed_smoke.v1"
+SCHEMA = "help_embed_smoke.v2"
 USER_AGENT = "two-bot-next-staging-help-embed-smoke/1.0"
 BODY_CAP = fenced.BODY_CAP
 PAYLOAD_CAP = 1 << 20
@@ -173,20 +172,23 @@ def load_payloads(path):
     embeds = payloads.get("embeds")
     if not isinstance(expected, dict) or not isinstance(embeds, dict):
         raise Refused("refusing: payload carries no expectations or embeds")
-    color = expected.get("color")
-    footer_text = expected.get("footer_text")
-    icon_url = expected.get("icon_url")
-    if type(color) is not int or not (0 <= color <= 0xFFFFFF):
-        raise Refused("refusing: payload expected colour is not a Discord colour")
-    if not isinstance(footer_text, str) or not footer_text:
-        raise Refused("refusing: payload expected footer text is missing")
-    if not isinstance(icon_url, str) or not icon_url.startswith("https://"):
-        raise Refused("refusing: payload expected icon url is not https")
     for key in EMBED_KEYS:
+        brand = expected.get(key)
+        if not isinstance(brand, dict):
+            raise Refused(f"refusing: payload expectations for {key} are missing")
+        color = brand.get("color")
+        footer_text = brand.get("footer_text")
+        icon_url = brand.get("icon_url")
+        if type(color) is not int or not (0 <= color <= 0xFFFFFF):
+            raise Refused("refusing: payload expected colour is not a Discord colour")
+        if not isinstance(footer_text, str) or not footer_text:
+            raise Refused("refusing: payload expected footer text is missing")
+        if not isinstance(icon_url, str) or not icon_url.startswith("https://"):
+            raise Refused("refusing: payload expected icon url is not https")
         embed = embeds.get(key)
         if not isinstance(embed, dict):
             raise Refused(f"refusing: payload embed {key} is missing")
-        if brand_fault(embed, expected) is not None:
+        if brand_fault(embed, brand) is not None:
             raise Refused(f"refusing: payload embed {key} already misses the brand")
         description = embed.get("description")
         if not isinstance(description, str) or not description:
@@ -315,8 +317,21 @@ def check_channel(transport, channel_id, guild_id):
         raise SmokeFail("channel is not a guild text channel")
 
 
-def assert_message(message, expected, application_id, channel_id, message_id):
-    """Bind one read-back message to the post and assert the brand triple."""
+def rendered_text(embed):
+    """Project text and ordered fields, ignoring only outer Discord whitespace."""
+    def trim(text):
+        return text.strip() if isinstance(text, str) else None
+
+    fields = embed.get("fields", [])
+    if not isinstance(fields, list) or any(not isinstance(field, dict) for field in fields):
+        return None
+    return (trim(embed.get("title")), trim(embed.get("description")),
+            [(trim(field.get("name")), trim(field.get("value")), field.get("inline", False))
+             for field in fields])
+
+
+def assert_message(message, embed, expected, application_id, channel_id, message_id):
+    """Bind one read-back message to the post and assert branding and layout."""
     if not isinstance(message, dict):
         raise SmokeFail("read-back answered without an object")
     if message.get("id") != message_id:
@@ -332,6 +347,9 @@ def assert_message(message, expected, application_id, channel_id, message_id):
     fault = brand_fault(embeds[0], expected)
     if fault is not None:
         raise SmokeFail("read-back " + fault)
+    actual = rendered_text(embeds[0])
+    if actual is None or actual != rendered_text(embed):
+        raise SmokeFail("read-back title, description or fields do not match")
 
 
 def latest_message_id(transport, channel_id):
@@ -433,7 +451,7 @@ def smoke_one(transport, row_name, embed, expected, application_id, channel_id):
         message_id = posted["id"]
         read_back = call_json(
             transport, "GET", f"/channels/{channel_id}/messages/{message_id}")
-        assert_message(read_back, expected, application_id, channel_id, message_id)
+        assert_message(read_back, embed, expected, application_id, channel_id, message_id)
     except UncertainOutcome as error:
         failure = str(error)
         if message_id is None:
@@ -462,7 +480,7 @@ def smoke_one(transport, row_name, embed, expected, application_id, channel_id):
             failure = cleanup if failure is None else f"{failure}; {cleanup}"
     if failure is not None:
         return done("fail", failure)
-    return done("pass", "read-back colour, footer text and icon url match; message deleted")
+    return done("pass", "read-back branding, text and fields match; message deleted")
 
 
 def fences(guild_id, token, channel_id):
@@ -507,7 +525,7 @@ def run(payload_path, guild_id, token, channel_id, transport=None):
         return report
     for key in EMBED_KEYS:
         report.rows.append(
-            smoke_one(net, key, embeds[key], expected, application_id, channel))
+            smoke_one(net, key, embeds[key], expected[key], application_id, channel))
     return report
 
 

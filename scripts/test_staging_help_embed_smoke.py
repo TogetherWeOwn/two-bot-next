@@ -29,15 +29,22 @@ EXPECTED = {"color": 0xFF9C36, "footer_text": "Together We Own",
                         "two-icon1-dark512-4469ca165f03/public"}
 
 
-def embed(description):
-    return {"type": "rich", "description": description, "color": EXPECTED["color"],
-            "footer": {"text": EXPECTED["footer_text"], "icon_url": EXPECTED["icon_url"]}}
-
-
 def payloads(**overrides):
-    data = {"schema": smoke.SCHEMA, "expected": dict(EXPECTED),
-            "embeds": {"help": embed("help text " * 300),
-                       "help_topic": embed("topic text " * 300)}}
+    expected = {
+        "help": {**EXPECTED, "footer_text": EXPECTED["footer_text"] + " · Help · Page 1 of 2"},
+        "help_topic": {**EXPECTED, "footer_text": EXPECTED["footer_text"] + " · Help"},
+    }
+    embeds = {
+        key: {"type": "rich", "title": "Together We Own help", "description": key,
+              "color": brand["color"], "footer": {"text": brand["footer_text"],
+                                                   "icon_url": brand["icon_url"]}}
+        for key, brand in expected.items()
+    }
+    embeds["help"]["fields"] = [
+        {"name": "Custom", "value": "/example"},
+        {"name": "Events", "value": "/events"},
+    ]
+    data = {"schema": smoke.SCHEMA, "expected": expected, "embeds": embeds}
     data.update(overrides)
     return data
 
@@ -231,6 +238,29 @@ class HelpEmbedSmokeTests(unittest.TestCase):
                 self.assertEqual(1, code)
                 self.assertIn("VERDICT FAIL", out)
 
+    def test_discovery_layout_mismatches_fail_and_clean_up(self):
+        cases = {
+            "changed title": lambda embed: embed.update(title="Different title"),
+            "changed description": lambda embed: embed.update(
+                description="Different description"),
+            "missing fields": lambda embed: embed.pop("fields"),
+            "swapped fields": lambda embed: embed["fields"].reverse(),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                def mutate_discovery(message):
+                    embed = message["embeds"][0]
+                    if "fields" in embed:
+                        mutate(embed)
+
+                fake = FakeDiscord(mutate_read=mutate_discovery)
+                code, out = self.run_main(fake)
+                self.assertEqual(1, code)
+                self.assertIn(
+                    "FAIL    help: read-back title, description or fields do not match", out)
+                self.assertIn("PASS    help_topic:", out)
+                self.assertEqual({}, fake.messages, "both messages are deleted")
+
     def test_one_rows_failure_still_runs_the_other(self):
         seen = []
 
@@ -355,8 +385,11 @@ class HelpEmbedSmokeTests(unittest.TestCase):
             "wrong schema": payloads(schema="help_embed_smoke.v0"),
             "unbranded payload embed": unbranded,
             "missing topic embed": missing,
-            "non-https icon": payloads(
-                expected={**EXPECTED, "icon_url": "http://example.com/x.png"}),
+            "missing per-embed expectation": payloads(expected={"help": payloads()["expected"]["help"]}),
+            "non-https icon": payloads(expected={
+                **payloads()["expected"],
+                "help": {**EXPECTED, "icon_url": "http://example.com/x.png"},
+            }),
         }
         for name, data in cases.items():
             with self.subTest(name=name):

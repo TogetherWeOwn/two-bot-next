@@ -7,13 +7,13 @@ staging deploy and can also be dispatched by hand.
 Discord creates slash-command interactions only for real users, so this smoke
 does not invoke `/help` and does not claim to prove gateway interaction
 delivery. It proves the rendered-message half that offline builder tests
-cannot: the exact payloads produced by the Rust builders survive a Discord
-post and read-back unchanged.
+cannot: Discord returns the sanitized embeds’ branding, title, description and
+ordered fields. It does not post buttons or verify callback behavior.
 
 ## Flow
 
 1. CI builds `help_embed_smoke_payloads`, a Rust example in the discord crate.
-   It calls `help_response` and `help_detail_response`, passes both replies
+   It calls `DiscoveryPlan::first` and `branded_help_detail_response`, passes both replies
    through the executor sanitizer, and emits their single embeds plus the
    expected brand values from `brand.rs`.
 2. `scripts/staging_help_embed_smoke.py` fences the run to the staging guild
@@ -26,9 +26,12 @@ post and read-back unchanged.
    [the slash smoke doc](staging-slash-smoke.md#why-it-is-not-a-github-workflow).
 3. For each post, it reads `GET /channels/{channel_id}/messages/{message_id}`
    and asserts on that read-back—never the POST response—that:
-   - `embeds[0].color == 16751670` (`0xFF9C36`, kit ember default);
-   - `embeds[0].footer.text == "Together We Own"`;
-   - `embeds[0].footer.icon_url == BRAND_ICON_URL`.
+   - both colours match the generated kit ember default;
+   - the discovery footer says `Together We Own · Help · Page 1 of N`,
+     where `N` is the page count; the detail footer says `Together We Own · Help`;
+   - `embeds[0].footer.icon_url == BRAND_ICON_URL`;
+   - the title, description and ordered fields match the sanitized payload
+     after trimming outer whitespace.
 4. It deletes both messages, pass or fail, and writes evidence containing
    only row results, durations and message IDs. Before each post it records
    the channel's newest message ID as an anchor; if a post's outcome is
@@ -37,10 +40,11 @@ post and read-back unchanged.
    left behind by a later green run.
 
 The payload deliberately uses the maximal command registry and a wide topic
-detail, matching the Rust builder tests. Short `/help` and short
-`/help <topic>` replies are intentionally plain ephemeral content and cannot
-carry an embed footer; this smoke exercises the embed path of both builders,
-rather than simulating staging's current registry size.
+detail, matching the Rust builder tests. It exercises pagination and overflow
+rather than simulating staging's current registry size. The topic embed is a
+staging preview: the product bot still uses the existing topic reply until
+the separate runtime change is reviewed and merged. The Actions payload
+artifact contains only synthetic fixture embeds, not staging messages.
 
 ## Token source and updates
 
@@ -51,8 +55,8 @@ from `TogetherWeOwn/two-design-kit` `v0.2.0`. The kit's
 The upstream generated header stays unchanged, with the tag recorded in the
 enclosing module's documentation instead. `/help` uses `EmbedKind::Default`,
 the kit ember action colour. Live, echo, ok, warn, danger and neutral kinds
-share the same helper. Icon 1 (the asset) and the `Together We Own` footer text are unchanged; Icon 1 is delivered through Cloudflare Images (see below);
-`brand_footer_for` provides the kit's suffixed form for future surfaces.
+share the same helper. `brand_footer_for` supplies the Help suffix and Icon 1.
+Cloudflare Images serves the icon (see below).
 
 The Rust drift test and `scripts/vendor_brand_tokens.py --check` recompute
 the pinned digest offline. Python fixtures prove a hand-edited colour fails
@@ -86,11 +90,9 @@ This is the approved Icon 1 dark 512×512 PNG, already imported as image
 `two-icon1-dark512-4469ca165f03`, served with the existing `public` variant.
 No upload, new variant or credential is needed by the bot.
 
-The real consumers are the footer icons on the embed branches of
-`help_response` and `help_detail_response` in `crates/discord/src/interactions.rs`,
-via `brand_embed` → `brand_footer`. Neither builder adds an author icon.
-This delivery change does not alter the colour mapping, footer text, body or layout. Plain-content help replies
-still have no footer. Changing this constant does not synchronize the bot avatar.
+The discovery renderer and `branded_help_detail_response` use this URL in their
+footer through `brand_footer_for`. Neither builder adds an author icon.
+Changing this constant does not synchronize the bot avatar.
 
 Keep `assets/brand/two-icon-1-dark-512.png` unchanged (29,035 bytes; SHA-256
 `ff0cd5863ed02b1f405bd3f1bf22b192ea7b9e6dc657792cb6df621f8fce438a`).
@@ -101,7 +103,7 @@ assertion and Python fixture, through the normal review and release gates.
 Do not delete or re-import the Images copy as part of a code rollback.
 
 Use the existing payload builder and smoke above to check the synthetic
-round-trip on the changed SHA: `expected.icon_url` and both read-back footers
+round-trip on the changed SHA: both per-embed `icon_url` expectations and read-back footers
 must contain the Images URL. Record that SHA and smoke run as synthetic evidence
 only: the separate test bot posts these payloads, so a pass does not prove
 that the deployed product bot adopted the Images URL.

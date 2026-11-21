@@ -7391,6 +7391,15 @@ class WorkflowTests(unittest.TestCase):
             mutate(changed)
             self.assertNotEqual(help_embed_synthetic_errors(changed), [])
 
+    def test_help_embed_artifact_carries_the_synthetic_builder_output(self):
+        steps = self.workflows["help-embed-synthetic.yml"]["jobs"]["help-embed-smoke"]["steps"]
+        self.assertIn(
+            'cp "$RUNNER_TEMP/help-embed-payloads.json" '
+            '"help-embed-synthetic-$GITHUB_RUN_ID-rendered.json"',
+            steps[3]["run"],
+        )
+        self.assertEqual(steps[-1]["with"]["path"], "help-embed-synthetic-${{ github.run_id }}-*.json")
+
     def test_help_prepared_profile_and_consumer_diagnostics(self):
         import copy
         workflow = self.workflows["help-embed-synthetic.yml"]
