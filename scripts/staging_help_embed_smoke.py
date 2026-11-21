@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Live staging embed smoke: post, read back, assert the brand (stdlib only).
 
-The Rust renderer emits Help, announcement/Echo, RSVP and Voice embeds.
-The smoke posts them as ordinary staging messages, verifies branding and
-rendered text and fields on read-back, then deletes each message. It does
-not invoke commands, publish a real event or prove ephemeral delivery.
+The smoke posts Rust-rendered Help, announcement/Echo, RSVP and Voice embeds to staging.
+It verifies branding, rendered text and fields on read-back, then deletes each message.
+Command delivery, event publication and ephemeral visibility are outside this check.
 
 The posting identity is the dedicated staging test bot (TWO Voice
 Synthetic (staging), the same bot the voice synthetic drives), never the

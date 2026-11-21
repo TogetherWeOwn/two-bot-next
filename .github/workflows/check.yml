@@ -528,6 +528,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps --locked
+      - name: Verify generated branded smoke payloads offline
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: >-
+          cargo run --locked -p two-bot-discord --example help_embed_smoke_payloads -- "${RUNNER_TEMP:?}/help-embed-payloads.json" &&
+          PYTHONPATH=scripts python3 -B -c 'import sys; from staging_help_embed_smoke import load_payloads; load_payloads(sys.argv[1])' "$RUNNER_TEMP/help-embed-payloads.json"
 
       # NOTE: cargo-deny runs before the toolchain install and every compile
       # step (disk hygiene); do not re-add it later in this job.
@@ -977,10 +982,6 @@ jobs:
           --skip normal_uses_round_trip_byte_identical
           --skip exact_i32_max_writes_without_saturation_warn
 
-      - name: Verify generated branded smoke payloads offline
-        run: >-
-          cargo run --locked -p two-bot-discord --features two-bot-core/db --example help_embed_smoke_payloads -- "${RUNNER_TEMP:?}/help-embed-payloads.json" &&
-          PYTHONPATH=scripts python3 -B -c 'import sys; from staging_help_embed_smoke import load_payloads; load_payloads(sys.argv[1])' "$RUNNER_TEMP/help-embed-payloads.json"
       - name: Verify synthetic RSVP reply capture
         if: steps.rsvp_reply_capture.outputs.directory != ''
         run: |
