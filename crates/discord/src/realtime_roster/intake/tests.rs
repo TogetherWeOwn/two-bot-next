@@ -11,10 +11,8 @@ fn dispatch(kind: &str, data: Value) -> String {
 }
 
 fn guild(count: u64, events: Value) -> String {
-    dispatch(
-        "GUILD_CREATE",
-        json!({"id": "10", "member_count": count, "guild_scheduled_events": events}),
-    )
+    let data = json!({"id": "10", "member_count": count, "guild_scheduled_events": events});
+    dispatch("GUILD_CREATE", data)
 }
 
 fn event(id: usize, title: &str) -> Value {
@@ -26,13 +24,11 @@ fn event(id: usize, title: &str) -> Value {
 }
 
 fn chunk(nonce: &str, index: u8, count: u8, user_id: &str) -> String {
-    dispatch(
-        "GUILD_MEMBERS_CHUNK",
-        json!({
-            "guild_id": "10", "nonce": nonce, "chunk_index": index, "chunk_count": count,
-            "members": [{"user": {"id": user_id}, "roles": [], "pending": false}]
-        }),
-    )
+    let data = json!({
+        "guild_id": "10", "nonce": nonce, "chunk_index": index, "chunk_count": count,
+        "members": [{"user": {"id": user_id}, "roles": [], "pending": false}]
+    });
+    dispatch("GUILD_MEMBERS_CHUNK", data)
 }
 
 fn start(intake: &mut BaselineIntake, count: u64, events: Value, nonce: &str) {
@@ -55,18 +51,14 @@ fn joins_the_roster_with_events_at_the_final_chunks_receive_position() {
     let mut intake = BaselineIntake::new(GUILD);
     let initial = json!([event(91, "Old"), event(92, "Gone")]);
     start(&mut intake, 2, initial, "first");
+    let deleted = json!({"guild_id":"10", "id":"92"});
+    let foreign = json!({"guild_id":"11", "user":{"id":"32"}});
     for frame in [
         chunk("first", 1, 2, "32"),
-        dispatch(
-            "GUILD_SCHEDULED_EVENT_DELETE",
-            json!({"guild_id":"10", "id":"92"}),
-        ),
+        dispatch("GUILD_SCHEDULED_EVENT_DELETE", deleted),
         dispatch("GUILD_SCHEDULED_EVENT_UPDATE", event(91, "Replaced")),
         dispatch("GUILD_SCHEDULED_EVENT_CREATE", event(91, "New")),
-        dispatch(
-            "GUILD_MEMBER_REMOVE",
-            json!({"guild_id":"11", "user":{"id":"32"}}),
-        ),
+        dispatch("GUILD_MEMBER_REMOVE", foreign),
     ] {
         assert!(matches!(intake.observe(&frame), Ok(None)));
     }
@@ -83,14 +75,9 @@ fn joins_the_roster_with_events_at_the_final_chunks_receive_position() {
 fn member_changes_and_retirement_prevent_late_chunks_from_finishing() {
     let mut intake = BaselineIntake::new(GUILD);
     start(&mut intake, 1, json!([]), "one");
-    let remove = dispatch(
-        "GUILD_MEMBER_REMOVE",
-        json!({"guild_id":"10", "user":{"id":"31"}}),
-    );
-    assert_eq!(
-        intake.observe(&remove).err(),
-        Some(IntakeError::MemberChanged)
-    );
+    let member = json!({"guild_id":"10", "user":{"id":"31"}});
+    let result = intake.observe(&dispatch("GUILD_MEMBER_REMOVE", member));
+    assert_eq!(result.err(), Some(IntakeError::MemberChanged));
     assert_late_chunk_ignored(&mut intake, "one");
 
     start(&mut intake, 1, json!([]), "two");
@@ -114,18 +101,18 @@ fn replacement_requires_explicit_count_and_events_from_the_same_dispatch() {
         assert_late_chunk_ignored(&mut intake, "old");
     }
     let mut intake = BaselineIntake::new(GUILD);
-    assert!(matches!(
-        intake.begin(&guild(0, json!([])), "empty".into()),
-        Ok(None)
-    ));
+    let empty = intake.begin(&guild(0, json!([])), "empty".into());
+    assert!(matches!(empty, Ok(None)));
     let invalid = intake.begin(&guild(1, json!([event(91, "")])), "invalid".into());
-    assert_eq!(invalid.err(), Some(InvalidEvents));
+    assert_eq!(invalid.err(), Some(Projection(UnsupportedEvent)));
 }
 
 #[test]
 fn invalid_input_cannot_be_repaired_by_a_later_chunk() {
-    let mut terminal = event(91, "Cancelled");
-    terminal["status"] = json!(4);
+    let mut empty_terminal = event(91, "");
+    empty_terminal["status"] = json!(4);
+    let mut terminal = empty_terminal.clone();
+    terminal["name"] = json!("Cancelled");
     terminal["scheduled_start_time"] = json!("not-a-date");
     let mut external = event(91, "External");
     let fields = external.as_object_mut().expect("event object");
@@ -140,9 +127,10 @@ fn invalid_input_cannot_be_repaired_by_a_later_chunk() {
         (bad_chunk.into(), Chunk(MalformedChunk)),
         (chunk("one", 0, 2, "31"), Chunk(InconsistentChunk)),
         (r#"{"op":0,"d":{}}"#.into(), Projection(MalformedDispatch)),
-        (empty_title, InvalidEvents),
+        (empty_title, Projection(UnsupportedEvent)),
         (incomplete, Projection(MalformedDispatch)),
         (update(terminal), Projection(MalformedDispatch)),
+        (update(empty_terminal), Projection(UnsupportedEvent)),
         (update(external), Projection(UnsupportedEvent)),
     ] {
         let mut intake = BaselineIntake::new(GUILD);

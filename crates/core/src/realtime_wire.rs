@@ -10,6 +10,7 @@ mod snapshot;
 mod validation;
 
 pub use snapshot::{encode_snapshot, Topics, MAX_SNAPSHOT_EVENTS};
+pub use validation::event_text_is_valid;
 
 const DELTA_BYTES: usize = 64 * 1024;
 pub const MAX_SEQ: u64 = (1 << 53) - 1;
@@ -129,14 +130,6 @@ pub struct Event {
     pub location: Option<String>,
     pub starts_at: WireTime,
     pub ends_at: Option<WireTime>,
-}
-
-impl Event {
-    /// Check row-local bounds before retaining an event in producer state.
-    /// This does not validate channel references or the encoded body size.
-    pub fn is_valid(&self) -> bool {
-        validation::event(self)
-    }
 }
 
 #[derive(Serialize)]

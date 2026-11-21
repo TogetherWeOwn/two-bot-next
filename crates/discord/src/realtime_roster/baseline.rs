@@ -36,12 +36,13 @@ pub fn scheduled_events(
     guild_id: Id<GuildMarker>,
     raw: &str,
 ) -> Result<Option<Vec<wire::Event>>, ProjectionError> {
-    events_from_dispatch(guild_id, &decode(raw, '{')?)
+    events_from_dispatch(guild_id, &decode(raw, '{')?, false)
 }
 
 pub(super) fn events_from_dispatch(
     guild_id: Id<GuildMarker>,
     dispatch: &Dispatch<'_>,
+    check_text: bool,
 ) -> Result<Option<Vec<wire::Event>>, ProjectionError> {
     if !matches!(dispatch.kind()?, Some(Kind::GuildCreate)) {
         return Ok(None);
@@ -58,7 +59,7 @@ pub(super) fn events_from_dispatch(
     let mut seen = HashSet::new();
     let mut events = Vec::new();
     for row in rows {
-        let (id, event) = match strict_event_change(guild_id, row.get())? {
+        let (id, event) = match strict_event_change(guild_id, row.get(), check_text)? {
             Change::Upsert { id, value } => (id, Some(value)),
             Change::Remove { id } => (id, None),
         };
@@ -70,11 +71,11 @@ pub(super) fn events_from_dispatch(
     Ok(Some(events))
 }
 
-// Validate the full row before projection can discard terminal events or
-// fields that are not part of the wire shape. Leave delta semantics unchanged.
+// Intake checks wire text bounds even for rows that project to removals.
 pub(super) fn strict_event_change(
     guild_id: Id<GuildMarker>,
     body: &str,
+    check_text: bool,
 ) -> Result<Change<wire::Event>, ProjectionError> {
     let header: RowHeader<'_> = decode(body, '{')?;
     if header.guild_id != guild_id
@@ -86,6 +87,14 @@ pub(super) fn strict_event_change(
     }
     let input = decode(body, '{')?;
     validate_baseline_row(&input)?;
+    if check_text {
+        let metadata = input.entity_metadata.as_ref();
+        let location = metadata.and_then(|meta| meta.location.as_deref());
+        let description = input.description.as_deref().unwrap_or_default();
+        if !wire::event_text_is_valid(&input.name, description, location) {
+            return Err(ProjectionError::UnsupportedEvent);
+        }
+    }
     event_change(input)
 }
 

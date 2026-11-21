@@ -61,26 +61,24 @@ impl BaselineIntake {
     ) -> Result<Option<RequestGuildMembers>, IntakeError> {
         self.retire();
         let dispatch: Dispatch<'_> = decode(raw, '{').map_err(IntakeError::Projection)?;
-        let Some(events) =
-            events_from_dispatch(self.guild_id, &dispatch).map_err(IntakeError::Projection)?
+        let Some(events) = events_from_dispatch(self.guild_id, &dispatch, true)
+            .map_err(IntakeError::Projection)?
         else {
             return Ok(None);
         };
         let body = dispatch.body().map_err(IntakeError::Projection)?;
         let count: MemberCount = decode(body, '{').map_err(IntakeError::Projection)?;
-        if events.len() > wire::MAX_SNAPSHOT_EVENTS || !events.iter().all(wire::Event::is_valid) {
+        if events.len() > wire::MAX_SNAPSHOT_EVENTS {
             return Err(IntakeError::InvalidEvents);
         }
-        let Some((members, request)) =
-            MemberBaseline::start(self.guild_id, count.member_count, nonce)
-        else {
-            return Ok(None);
-        };
-        self.pending = Some(Pending {
-            members,
-            events: events.into_iter().map(|event| (event.id, event)).collect(),
-        });
-        Ok(Some(request))
+        let attempt = MemberBaseline::start(self.guild_id, count.member_count, nonce);
+        Ok(attempt.map(|(members, request)| {
+            self.pending = Some(Pending {
+                members,
+                events: events.into_iter().map(|event| (event.id, event)).collect(),
+            });
+            request
+        }))
     }
 
     /// Discard on guild unavailability, gateway generation change, missed
@@ -99,27 +97,23 @@ impl BaselineIntake {
         let kind = dispatch.kind().map_err(IntakeError::Projection)?;
         if matches!(kind, Some(Kind::GuildMembersChunk)) {
             let body = dispatch.body().map_err(IntakeError::Projection)?;
-            pending
-                .members
-                .ingest_chunk(body)
-                .map_err(IntakeError::Chunk)?;
-            if pending.members.is_complete() {
+            let members = &mut pending.members;
+            members.ingest_chunk(body).map_err(IntakeError::Chunk)?;
+            if members.is_complete() {
                 return Ok(pending.members.finish().map(|members| BaselineRows {
                     members,
                     events: pending.events.into_values().collect(),
                 }));
             }
         } else {
-            match project_dispatch(self.guild_id, kind, &dispatch, |body| {
-                strict_event_change(self.guild_id, body)
-            })
-            .map_err(IntakeError::Projection)?
-            {
+            let event = |body: &str| strict_event_change(self.guild_id, body, true);
+            let change = project_dispatch(self.guild_id, kind, &dispatch, event)
+                .map_err(IntakeError::Projection)?;
+            match change {
                 Some(Operation::Members(_)) => return Err(IntakeError::MemberChanged),
                 Some(Operation::Events(Change::Upsert { id, value })) => {
-                    if !value.is_valid()
-                        || (pending.events.len() == wire::MAX_SNAPSHOT_EVENTS
-                            && !pending.events.contains_key(&id))
+                    if pending.events.len() == wire::MAX_SNAPSHOT_EVENTS
+                        && !pending.events.contains_key(&id)
                     {
                         return Err(IntakeError::InvalidEvents);
                     }
