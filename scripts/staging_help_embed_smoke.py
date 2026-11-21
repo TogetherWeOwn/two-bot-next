@@ -86,21 +86,6 @@ PRODUCT_APPLICATION_IDS = (
 # (no-retry exit 3) past this many pages.
 RECONCILE_PAGE_SIZE = 10
 RECONCILE_MAX_PAGES = 10
-# The product applications a test-bot token must never turn out to be:
-# staging product bot (the shared fence value), live bot and the superseded
-# staging bot (public ids from two_bot_core::backup::guild_config).
-PRODUCT_APPLICATION_IDS = (
-    fenced.STAGING_APPLICATION_ID,
-    "1539711683898118154",
-    "1537629682449649724",
-)
-# Reconciliation pages newest-first through the range newer than the
-# pre-post anchor. Reaching the anchor — or a short page at the start of
-# the channel — proves the whole range was inspected; a full page proves
-# nothing, so traversal continues with a `before` cursor and gives up
-# (no-retry exit 3) past this many pages.
-RECONCILE_PAGE_SIZE = 10
-RECONCILE_MAX_PAGES = 10
 
 
 class Refused(Exception):
