@@ -94,19 +94,13 @@ production performance measurements.
 
 ## AutoMod preview read-back
 
-On an authorized, clean current-main staging rollout, `verify_automod_preview`
-in `deploy-staging.yml` opts into a receipt. The existing staging user-flow
-job checks the exact serving SHA and run attempt before and after the guild
-command list and detail GETs. The step runs only on a matching clean rollout;
-a skipped step is not a receipt. A success log contains only validated command
-and build identifiers and the result. The regular inventory stays default-dark.
-
-The step expects the staging Environment secret `DISCORD_STAGING_BOT_TOKEN`
-and variable `DISCORD_STAGING_GUILD_ID`. Confirm both are bound for the staging
-application and guild before requesting the receipt. Missing bindings, window
-expiry, mismatched identity, wrong Manage Server permission or option drift
-fail the check. No slash interaction, command write, rule inspection or rule
-change is performed.
+On an authorized, clean current-main rollout, `verify_automod_preview` opts
+into a staging Worker GET that checks the active grant and exact serving build
+before and after reading the Discord guild registry. The existing ownership
+bearer stays in Actions and the Discord credential stays in the Worker.
+Missing evidence, identity drift, or a permission/option mismatch fails closed.
+A skipped step is not a receipt. The check never starts a container, publishes
+or invokes a command, or reads or changes any AutoMod rule.
 
 ## Live read-mostly smoke run
 

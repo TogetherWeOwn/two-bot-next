@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
+import { PREVIEW_HEADER, PREVIEW_PATH } from "../src/staging-preview.ts";
 import { STAGING_USE_PATH, STAGING_USE_KEY, type StagingWindow } from "../src/staging-lifecycle.ts";
 import { EMPTY_STATE, LOG_QUERY_URL, type MetricsAlertState } from "../src/alert-rules.ts";
 import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
@@ -223,6 +224,92 @@ function stagingUseRequest(action: "acquire" | "release" | "stop", window: Stagi
 function stagingWindow(): StagingWindow {
   return { environment: "staging", runId: "123456", runAttempt: 1, expiresAt: Date.now() + 120_000 };
 }
+
+test("staging preview: GET-only fixed registry receipt, with no lifecycle writes", async (t) => {
+  const app = "1469137636663758888", guild = "1545644954272137297";
+  const env = { ...BOUNDED_STAGING_ENV, GUILD_ID: guild, DISCORD_APPLICATION_ID: app };
+  const window = stagingWindow();
+  const sha = env.CONTAINER_RELEASE;
+  const grant = { ...window, deploymentId: ID, sha, epoch: 1, acquiredAt: Date.now(), phase: "active" };
+  const h = await harness(t, env, { running: true });
+  const ready = () => Response.json({ components: [["gateway", "ready"]], build_revision: sha,
+    build_id: `${window.runId}-${window.runAttempt}` });
+  h.setProbeStatus(200);
+  h.setProbeResponse(ready);
+  const entry = { name: "automod-preview", id: "123456789012345678", version: "223456789012345678",
+    application_id: app, guild_id: guild, type: 1 };
+  const detail = { ...entry, default_member_permissions: "32", ignored: "never project this", options: [
+    { name: "text", type: 3, required: true, min_length: 1, max_length: 2000 },
+    { name: "mentions", type: 4, min_value: 0, max_value: 100 },
+    { name: "attachments", type: 3, max_length: 1000 },
+  ] };
+  const listUrl = `https://discord.com/api/v10/applications/${app}/guilds/${guild}/commands`;
+  const urls = ["https://discord.com/api/v10/users/@me", listUrl, `${listUrl}/${entry.id}`];
+  let replies: Response[] = [];
+  const discord = t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+    assert.equal(url, urls[discord.mock.callCount() % 3]);
+    assert.equal(init.method, "GET");
+    assert.equal(init.redirect, "error");
+    assert.ok(init.signal);
+    assert.equal(new Headers(init.headers).get("authorization"), `Bot ${env.DISCORD_TOKEN}`);
+    return replies.shift() ?? Response.error();
+  });
+  const request = (patch = {}, method = "GET", suffix = "") => new Request(`https://worker.invalid${PREVIEW_PATH}${suffix}`, {
+    method, headers: { authorization: `Bearer ${CONTROL_TOKEN}`,
+      [PREVIEW_HEADER]: [ID, sha, window.runId, window.runAttempt, window.expiresAt].join(":"), ...patch },
+  });
+  const edge = { ...env, TWO_BOT: { getByName: () => ({ fetch: (req: Request) => h.bot.fetch(req) }) } } as unknown as Env;
+  const send = (req = request()) => worker.fetch(req, edge);
+  assert.equal((await worker.fetch(request(), { ...edge, TWO_DEPLOY_ENV: "production" })).status, 404);
+  assert.equal((await send(request({ authorization: "Bearer incorrect" }))).status, 401);
+  assert.equal((await send(request({}, "POST"))).status, 405);
+  assert.equal((await send(request({}, "GET", "?guild=anything"))).status, 400);
+  assert.equal((await send(request({ [PREVIEW_HEADER]: "wrong run attempt" }))).status, 503);
+  assert.equal((await h.bot.fetch(request({ [DEPLOYMENT_HEADER]: "stale-worker" }))).status, 503);
+  assert.equal((await send()).status, 503, "cold refusal with no lease");
+  assert.equal(h.runtime.destroys, 0, "a cold refusal is not reconciliation");
+  h.values.set(STAGING_USE_KEY, { ...grant, acquiredAt: Date.now() - 2000, expiresAt: Date.now() - 1000 });
+  assert.equal((await send()).status, 503);
+  h.values.set(STAGING_USE_KEY, grant);
+  assert.equal((await worker.fetch(request(), { ...edge, CF_VERSION_METADATA: { id: "stale-edge" } } as Env)).status, 503);
+  assert.equal(discord.mock.callCount(), 0);
+  assert.equal(h.requests.length, 0);
+
+  const outputs = (registry: unknown) => [Response.json({ id: app, bot: true }), Response.json([entry]), Response.json(registry)];
+  replies = outputs(detail);
+  const pass = await send(request({ [DEPLOYMENT_HEADER]: "spoofed" }));
+  assert.equal(pass.status, 200);
+  assert.deepEqual(await pass.json(), { registry: "pass", command: entry.name, deploymentId: ID, sha,
+    runId: window.runId, runAttempt: window.runAttempt, expiresAt: window.expiresAt });
+  assert.deepEqual(h.requests.map((r) => r.pathname), ["/readyz", "/readyz"]);
+
+  for (const bad of [{ ...detail, default_member_permissions: "0" }, { ...detail, options: [] },
+    { ...detail, version: "323456789012345678" }]) {
+    replies = outputs(bad);
+    const refused = await send();
+    assert.equal(refused.status, 503);
+    assert.equal(await refused.text(), "");
+  }
+  replies = [Response.json({ id: app, bot: true }), Response.json([])];
+  assert.equal((await send()).status, 503);
+  discord.mock.resetCalls();
+  replies = [Response.json({ id: app, bot: true }), new Response("x".repeat(256 * 1024 + 1))];
+  assert.equal((await send()).status, 503);
+  discord.mock.resetCalls();
+  replies = outputs(detail);
+  let probes = 0;
+  h.setProbeResponse(() => ++probes === 1 ? ready() : Response.json({ build_revision: sha, build_id: "another-attempt" }));
+  assert.equal((await send()).status, 503);
+  discord.mock.resetCalls();
+  h.setProbeResponse(() => {
+    h.values.set(STAGING_USE_KEY, { ...grant, phase: "released" });
+    return ready();
+  });
+  assert.equal((await send()).status, 503);
+  assert.equal(discord.mock.callCount(), 0, "a released grant cannot send Discord traffic");
+  assert.equal(h.starts.length + h.runtime.destroys, 0);
+  assert.deepEqual(await h.bot.listSchedules("stagingExpiry"), []);
+});
 
 for (const path of ["/health", "/readyz", "/version"]) {
   test(`bounded staging: idle ${path} cannot start or arm keepalive`, async (t) => {
@@ -455,9 +542,9 @@ test("bounded staging: DO reconstruction after expiry stops a reattached process
   assert.equal((await h.bot.fetch(stagingUseRequest("acquire", stagingWindow()))).status, 200);
   t.mock.timers.tick(120_001);
   const reconstructed = await harness(t, BOUNDED_STAGING_ENV, { values: h.values, running: true }, h.database);
+  assert.equal((await reconstructed.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 503);
   assert.equal(reconstructed.runtime.running, false);
   assert.equal(reconstructed.runtime.destroys, 1);
-  assert.equal((await reconstructed.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 503);
   assert.equal(reconstructed.starts.length, 0);
   await reconstructed.bot.stagingExpiry();
   assert.equal((await reconstructed.bot.listSchedules("stagingExpiry")).length, 0);
@@ -477,9 +564,10 @@ test("bounded staging: first activation drains a running predecessor and its ung
 
   const activated = await harness(t, BOUNDED_STAGING_ENV,
     { values: predecessor.values, running: true }, predecessor.database);
-  assert.equal(activated.runtime.running, false, "construction drains before ingress or alarm delivery");
+  await activated.bot.alarm();
+  assert.equal(activated.runtime.running, false, "reconciliation drains before alarm delivery");
   assert.equal(activated.runtime.destroys, 1);
-  assert.equal(activated.pending().length, 0, "construction deletes persisted legacy rows");
+  assert.equal(activated.pending().length, 0, "reconciliation deletes persisted legacy rows");
   assert.equal((await activated.bot.listSchedules("stagingExpiry")).length, 0);
   assert.equal(activated.starts.length, 0);
   assert.equal(activated.requests.length, 0);

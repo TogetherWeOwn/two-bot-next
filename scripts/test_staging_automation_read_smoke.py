@@ -9,14 +9,11 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
-from importlib import import_module
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-smoke = import_module("staging_automation_read_smoke")
-preview = import_module("staging_preview_readback")
+import staging_automation_read_smoke as smoke  # noqa: E402
 
 STAGING_GUILD = "1545644954272137297"
 LIVE_GUILD = "326474832151838730"
@@ -404,102 +401,6 @@ class RedirectTransportTests(unittest.TestCase):
         self.assertEqual(len(server.hits), 1)
         self.assertNotIn(TOKEN, str(raised.exception))
         self.assertNotIn("BODY_SENTINEL", str(raised.exception))
-
-
-class PreviewReadbackTests(unittest.TestCase):
-    def test_unexpected_transport_error_is_redacted(self):
-        stdout = io.StringIO()
-        with mock.patch.dict(os.environ, {"STAGING_USE_EXPIRES_AT": "90000"}, clear=True), \
-                mock.patch.object(preview.time, "time", return_value=1), redirect_stdout(stdout), \
-                mock.patch.object(preview, "observe", side_effect=ValueError(TOKEN)), \
-                self.assertRaisesRegex(SystemExit, "invalid transport or response") as error:
-            preview.main()
-        self.assertNotIn(TOKEN, str(error.exception))
-        self.assertEqual(stdout.getvalue(), "")
-
-    def test_in_flight_window_expiry_emits_no_receipt(self):
-        stdout = io.StringIO()
-        with mock.patch.dict(os.environ, {"STAGING_USE_EXPIRES_AT": "90000"}, clear=True), \
-                mock.patch.object(preview.time, "time", return_value=1), redirect_stdout(stdout), \
-                mock.patch.object(preview, "observe", side_effect=lambda *_:
-                                  preview.signal.raise_signal(preview.signal.SIGALRM)), \
-                self.assertRaisesRegex(SystemExit, "staging window expired"):
-            preview.main()
-        self.assertEqual(stdout.getvalue(), "")
-
-    def test_exact_staging_preview_receipt(self):
-        for fault, expected_reads in (("none", 3), ("live-guild", 0), ("missing-token", 0),
-                                      ("expired", 0), ("wrong-sha", 0), ("wrong-attempt", 0),
-                                      ("wrong-app", 1), ("absent-command", 2), ("conflicting-version", 3),
-                                      ("permission", 3), ("malformed-option", 3), ("wrong-bounds", 3),
-                                      ("autocomplete", 3), ("drift", 3)):
-            with self.subTest(fault=fault):
-                self.check_case(fault, expected_reads)
-
-    def check_case(self, fault, expected_reads):
-        case = SimpleNamespace(expected_sha="a" * 40, build_id="123-1", expires_at=90_000,
-                               guild_id=STAGING_GUILD,
-                               staging_url="https://two-bot-next-staging.example.workers.dev")
-        command = {**COMMANDS[0], "name": "automod-preview", "default_member_permissions": "32",
-                   "description": TOKEN, "options": [
-                       {"name": "text", "type": 3, "required": True, "min_length": 1, "max_length": 2000},
-                       {"name": "mentions", "type": 4, "min_value": 0, "max_value": 100},
-                       {"name": "attachments", "type": 3, "required": False, "max_length": 1000},
-                   ]}
-        endpoint = f"{smoke.API}/applications/{STAGING_APP}/guilds/{STAGING_GUILD}/commands"
-        detail = dict(command)
-        reads = []
-        health_reads = []
-        if fault == "live-guild":
-            case.guild_id = LIVE_GUILD
-        if fault == "permission":
-            detail["default_member_permissions"] = None
-        if fault == "conflicting-version":
-            detail["version"] = "1000000000000000099"
-        option_faults = {"malformed-option": {"required": 1}, "wrong-bounds": {"max_length": 2001},
-                         "autocomplete": {"autocomplete": True}}
-        if fault in option_faults:
-            detail["options"] = [{**command["options"][0], **option_faults[fault]}, *command["options"][1:]]
-
-        def health_fetch(url):
-            health_reads.append(url)
-            if url.endswith("/health"):
-                return 200, {}, b'{"status":"ok"}'
-            wrong = fault == "wrong-attempt" or (fault == "drift" and len(health_reads) == 4)
-            return 200, {}, json.dumps({
-                "components": [[n, "ready"] for n in preview.health.REQUIRED_COMPONENTS],
-                "jobs": {}, "build_revision": "b" * 40 if fault == "wrong-sha" else case.expected_sha,
-                "build_id": "123-2" if wrong else case.build_id,
-            }).encode()
-
-        def discord_fetch(url):
-            reads.append(url)
-            values = {smoke.API + "/users/@me": {"id": OTHER_APP if fault == "wrong-app" else STAGING_APP},
-                      endpoint: [] if fault == "absent-command" else [command],
-                      f"{endpoint}/{command['id']}": detail}
-            return 200, json.dumps(values[url]).encode()
-
-        clock = lambda: 89 if fault == "expired" else 1
-        token = "" if fault == "missing-token" else TOKEN
-        if fault == "none":
-            receipt = preview.observe(case, token, clock=clock, health_fetch=health_fetch,
-                                      make_fetch=lambda _: discord_fetch)
-            self.assertEqual(receipt, {
-                "build_revision": case.expected_sha, "build_id": case.build_id, "command": "automod-preview",
-                "command_id": command["id"], "version": command["version"], "registry": "pass",
-                "transport": "GET-only", "invocation": False,
-            })
-            self.assertEqual(health_reads, [case.staging_url + path for path in ("/health", "/readyz") * 2])
-            self.assertEqual(reads, [smoke.API + "/users/@me", endpoint, f"{endpoint}/{command['id']}"])
-            self.assertNotIn(TOKEN, json.dumps(receipt))
-        else:
-            with self.assertRaises((ValueError, smoke.SmokeError)) as error:
-                preview.observe(case, token, clock=clock, health_fetch=health_fetch,
-                                make_fetch=lambda _: discord_fetch)
-            self.assertNotIn(TOKEN, str(error.exception))
-            if fault in {"live-guild", "missing-token", "expired"}:
-                self.assertEqual(health_reads, [])
-        self.assertEqual(len(reads), expected_reads)
 
 
 if __name__ == "__main__":

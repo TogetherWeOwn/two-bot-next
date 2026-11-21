@@ -29,6 +29,7 @@ import {
   authenticated, deploymentId, readChange, readControlBody, refused,
 } from "./ownership.ts";
 import { StagingLifecycle, STAGING_USE_PATH, parseStagingUseChange, type StagingUse } from "./staging-lifecycle.ts";
+import { PREVIEW_PATH, PREVIEW_HEADER, previewRefusal, readPreview } from "./staging-preview.ts";
 import {
   TokenBuckets,
   RedirectMissCache,
@@ -840,7 +841,7 @@ export class TwoBotContainer extends Container<Env> {
 
   private readonly ownership = new OwnershipFence(this.ctx.storage);
   private readonly stagingUse = new StagingLifecycle(this.ctx.storage);
-  private readonly initialization: Promise<void>;
+  private initialization?: Promise<void>;
   private recoveryFailed = false;
   // Last container git SHA seen on /readyz this tick. Tags the keepalive
   // error events (gateway failures by class; metrics alerts by rule/content);
@@ -857,9 +858,13 @@ export class TwoBotContainer extends Container<Env> {
     if (receiverEnabled(env)) wanted.push(RECEIVER_PORT);
     if (eventsubReceiverForwarded(env)) wanted.push(EVENTSUB_RECEIVER_PORT);
     if (wanted.length > 1) this.requiredPorts = [...new Set(wanted)];
-    // A deployment can reattach to a running old process. Reconcile before
-    // ingress or alarms are delivered, not just before the next cold start.
-    this.initialization = ctx.blockConcurrencyWhile(async () => {
+    if (!this.boundedStaging()) void this.initialize();
+  }
+
+  private initialize(): Promise<void> {
+    // Reconcile before side-effecting ingress or alarms. A staging receipt
+    // must be able to refuse on a cold object without starting reconciliation.
+    return this.initialization ??= this.ctx.blockConcurrencyWhile(async () => {
       try {
         const owner = await this.ownership.require(this.id());
         if (this.boundedStaging()) {
@@ -885,7 +890,7 @@ export class TwoBotContainer extends Container<Env> {
    * https://developers.cloudflare.com/durable-objects/api/state/#blockconcurrencywhile
    */
   private async gated<T>(operation: () => Promise<T>): Promise<T> {
-    await this.initialization;
+    await this.initialize();
     const result = await this.ctx.blockConcurrencyWhile(async () => {
       try { return { ok: true as const, value: await operation() }; }
       catch (error) { return { ok: false as const, error }; }
@@ -957,7 +962,12 @@ export class TwoBotContainer extends Container<Env> {
         deployment_id: use.deploymentId, sha: use.sha, epoch: use.epoch } : {}) }));
   }
 
-  /** The SDK owns alarm(); its persisted callback re-reads authority on every wake. */
+  override async alarm(): Promise<void> {
+    await this.initialize();
+    await super.alarm();
+  }
+
+  /** The SDK's persisted callback re-reads authority on every wake. */
   public async stagingExpiry(): Promise<void> {
     if (!this.boundedStaging()) return;
     await this.gated(async () => {
@@ -1012,6 +1022,8 @@ export class TwoBotContainer extends Container<Env> {
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === PREVIEW_PATH) return this.stagingPreview(request, url);
+    await this.initialize();
     if (url.pathname === CONTROL_PATH) return this.control(request);
     if (url.pathname === STAGING_USE_PATH) return this.stagingControl(request);
     if (url.pathname === ACTIONS_PATH) return this.internalActions(request);
@@ -1355,6 +1367,67 @@ export class TwoBotContainer extends Container<Env> {
       // Logs the closed ownership reason; the caller only sees the envelope.
       refused(error);
       return envelope(503, "unavailable", true, {}, requestId);
+    }
+  }
+
+  private async stagingPreview(request: Request, url: URL): Promise<Response> {
+    const refusal = await previewRefusal(request, url, this.env);
+    if (refusal) return refusal;
+    try {
+      const id = this.id();
+      const sha = this.env.CONTAINER_RELEASE ?? "";
+      const container = this.ctx.container;
+      if (!container) throw new Error("staging_preview_unavailable");
+      const bound = request.headers.get(PREVIEW_HEADER);
+      const check = async (): Promise<StagingUse> => {
+        const owner = await this.ownership.require(id, request.headers.get(DEPLOYMENT_HEADER) ?? "");
+        const use = await this.stagingUse.require({ deploymentId: id, sha, owner });
+        if (!container.running || this.recoveryFailed || Date.now() >= use.expiresAt
+          || bound !== [id, sha, use.runId, use.runAttempt, use.expiresAt].join(":")) {
+          throw new OwnershipRefused("staging_use_required");
+        }
+        return use;
+      };
+      const admitted = await check();
+      const signal = AbortSignal.timeout(Math.max(0, Math.min(8_000, admitted.expiresAt - Date.now())));
+      const stillAdmitted = async () => {
+        const current = await check();
+        if (current.epoch !== admitted.epoch || current.acquiredAt !== admitted.acquiredAt) {
+          throw new OwnershipRefused("staging_use_required");
+        }
+        signal.throwIfAborted();
+      };
+      const json = async (send: () => Promise<Response>, limit: number): Promise<unknown> => {
+        await stillAdmitted();
+        const response = await deadlineFetch(send(), signal);
+        if (response.status !== 200 || response.redirected) {
+          releaseBody(response);
+          throw new Error("staging_preview_unavailable");
+        }
+        return JSON.parse(await readBoundedText(response, limit, signal) ?? "");
+      };
+      const serving = async () => {
+        // The native port does not go through the SDK's auto-start path.
+        const report = await json(() => container.getTcpPort(this.defaultPort).fetch(
+          new Request("http://c/readyz", { method: "GET", redirect: "manual", signal }),
+        ), MAX_PROBE_BODY_BYTES) as Record<string, unknown> | null;
+        if (report?.build_revision !== sha || report.build_id !== `${admitted.runId}-${admitted.runAttempt}`
+          || !Array.isArray(report.components) || !gatewayComponentReady(report.components)
+          || !report.components.every((row) => Array.isArray(row) && row.length === 2 && row[1] === "ready")) {
+          throw new Error("staging_preview_identity");
+        }
+      };
+      await serving();
+      await readPreview(this.env, (url, token) => json(() => fetch(url, { method: "GET", redirect: "error",
+        cache: "no-store", signal, headers: { authorization: `Bot ${token}` } }), 256 * 1024));
+      await serving();
+      await stillAdmitted();
+      return Response.json({ registry: "pass", command: "automod-preview", deploymentId: id,
+        sha, runId: admitted.runId, runAttempt: admitted.runAttempt, expiresAt: admitted.expiresAt }, {
+        headers: withSecurityHeaders({ "cache-control": "no-store" }),
+      });
+    } catch {
+      return new Response(null, { status: 503, headers: withSecurityHeaders({ "cache-control": "no-store" }) });
     }
   }
 
@@ -2080,6 +2153,15 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
 
+    if (url.pathname === PREVIEW_PATH) {
+      const refusal = await previewRefusal(request, url, env);
+      if (refusal) return refusal;
+      try {
+        const forwarded = new Request(request);
+        forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
+        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+      } catch { return refused(new Error("staging_preview_unavailable")); }
+    }
     if (url.pathname === STAGING_USE_PATH
       && (env.TWO_DEPLOY_ENV !== "staging" || env.STAGING_RUNTIME_POLICY !== "bounded")) return notFound();
     if (url.pathname === CONTROL_PATH || url.pathname === STAGING_USE_PATH) {

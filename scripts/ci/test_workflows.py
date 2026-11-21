@@ -770,8 +770,8 @@ def staging_error_rate_gate_errors(workflows):
                 errors.append(f"{name}: error-rate gate marker {marker} outside deploy-staging/deploy-production")
     staging = workflows.get("deploy-staging.yml") or {}
     text = str(staging)
-    if text.count("inputs.inject_error_rate_spike") != 3:
-        errors.append("deploy-staging.yml: rehearsal input belongs only to its identity, hold and error gate")
+    if text.count("inputs.inject_error_rate_spike") != 4:
+        errors.append("deploy-staging.yml: rehearsal input belongs only to identity, hold, error gate and preview exclusion")
     if staging.get("run-name") != REHEARSAL_RUN_NAME:
         errors.append("deploy-staging.yml: rehearsal identity must be pinned to the dispatch-only switch")
     hold = ((staging.get("jobs") or {}).get("soak-hold") or {}).get("steps") or []
@@ -945,10 +945,10 @@ def staging_pinned_sha_errors(workflows):
             if needle not in run:
                 errors.append(f"deploy-staging.yml:{job_id}: SHA step must contain {needle}")
         if job_id == "deploy":
-            if (str(staging).count("inputs.recover_prior_sha") != 1
+            if (str(staging).count("inputs.recover_prior_sha") != 2
                     or step.get("env", {}).get("RECOVER_PRIOR_SHA") != "${{ inputs.recover_prior_sha }}"
                     or {"if", "continue-on-error"} & step.keys()):
-                errors.append("deploy-staging.yml:deploy: recovery opt-in must be bound only to the required SHA step")
+                errors.append("deploy-staging.yml:deploy: recovery opt-in must be bound only to the SHA step and preview exclusion")
         # Flipping any refusal green, including the ancestry check, trips this count.
         if run.count("exit 1") != (7 if job_id == "deploy" else 5):
             errors.append(f"deploy-staging.yml:{job_id}: SHA step must preserve every pinned refusal")
@@ -1104,22 +1104,22 @@ PREVIEW_STEP = {
     "if": "inputs.verify_automod_preview && !inputs.recover_prior_sha && !inputs.inject_error_rate_spike && "
           "needs.deploy.outputs.promotion_clean == 'true' && needs.deploy.outputs.staging_use_sha == github.sha",
     "timeout-minutes": "2",
-    "env": {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+    "env": {**STAGING_CONTROL_ENV,
             "STAGING_USE_EXPIRES_AT": "${{ needs.deploy.outputs.staging_use_expires_at }}",
-            "DISCORD_STAGING_GUILD_ID": "${{ vars.DISCORD_STAGING_GUILD_ID }}",
-            "DISCORD_STAGING_BOT_TOKEN": "${{ secrets.DISCORD_STAGING_BOT_TOKEN }}"},
-    "run": "python3 -B scripts/staging_preview_readback.py",
+            "STAGING_USE_SHA": "${{ needs.deploy.outputs.staging_use_sha }}",
+            "STAGING_USE_DEPLOYMENT": "${{ needs.deploy.outputs.staging_use_deployment }}"},
+    "run": "node wrangler/scripts/staging-use.mjs preview",
 }
 
 
 def staging_qualification_assert_errors(job, job_id, entry, receipt, artifact):
-    """Only the separate ready step may hold the staging control credential."""
+    """Only the pinned ready and opt-in preview steps may hold the staging control credential."""
     label = f"deploy-staging.yml:{job_id}"
     errors = []
     if job.get("environment") != "staging" or "env" in job or "continue-on-error" in job:
         errors.append(f"{label}: must use staging with no shared env or tolerated failure")
     steps = job.get("steps") or []
-    assertions = [step for step in steps if any(
+    assertions = [step for step in steps if not (job_id == "user-flow-synthetic" and step == PREVIEW_STEP) and any(
         script in str(step.get("run", ""))
         for script in ("staging-use.mjs", "staging-use-pipeline.mjs"))]
     if len(assertions) != 1:
@@ -1145,9 +1145,9 @@ def staging_qualification_assert_errors(job, job_id, entry, receipt, artifact):
         errors.append(f"{label}: must always retain the assertion receipt for 14 days")
     for step in steps:
         if job_id == "user-flow-synthetic" and step == PREVIEW_STEP:
-            continue  # Only the exact GET-only consumer may see the Discord binding.
+            continue  # Only the exact GET-only reader may also see the staging control bearer.
         if step is not ready and ("secrets." in str(step) or "ownership_control" in str(step).lower()):
-            errors.append(f"{label}: control credential must stay in the readiness step only")
+            errors.append(f"{label}: unexpected step can access the staging control credential")
         if job_id == "certify-promotion" and step is not ready and any(marker in str(step).lower() for marker in DEPLOY_MARKERS):
             errors.append(f"{label}: only the exact readiness step may probe staging")
     if any(marker in str(job).lower() for marker in DEPLOY_MARKERS[:4]):
@@ -1203,7 +1203,7 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
     if (steps.count(PREVIEW_STEP) != 1 or len(probes) != 1
             or steps.index(PREVIEW_STEP) <= steps.index(probes[0])
             or str(workflow).count("inputs.verify_automod_preview") != 1
-            or str(workflow).count("secrets.DISCORD_STAGING_BOT_TOKEN") != 1):
+            or "DISCORD_STAGING_BOT_TOKEN" in str(workflow)):
         errors.append(f"{name}:user-flow-synthetic: keep the preview GET and its credential in one pinned step after readiness")
     checkouts = [step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")]
     if len(checkouts) != 1 or (checkouts[0].get("with") or {}).get("ref") != "${{ github.sha }}" \
@@ -8037,7 +8037,7 @@ class WorkflowTests(unittest.TestCase):
             "preview without expiry": lambda w: preview(w)["env"].pop("STAGING_USE_EXPIRES_AT"),
             "preview before readiness": lambda w: steps(w).insert(0, steps(w).pop(steps(w).index(preview(w)))),
             "preview token outside preview": lambda w: probe(w)["env"].update({
-                "TOKEN": preview(w)["env"]["DISCORD_STAGING_BOT_TOKEN"],
+                "TOKEN": preview(w)["env"]["OWNERSHIP_CONTROL_TOKEN"],
             }),
             "preview tolerates failure": lambda w: preview(w).update({"continue-on-error": "true"}),
             "certify ignores it": lambda w: w["jobs"]["certify-promotion"].__setitem__(
