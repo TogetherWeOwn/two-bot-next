@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 800 samples
+## Cardinality budget: 835 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -37,8 +37,8 @@ table and the test are updated together.
 | `two_bot_voice_join_to_move_seconds` | 11 | label-free; 8 buckets + `+Inf` + sum + count |
 | `two_bot_rest_requests_total{route,result}` | 180 | 30 route templates x 6 results |
 | `two_bot_rest_guard_*` | 11 | Fixed, label-free shared admission-guard counters and gauges |
-| job runs, timestamps, failure streaks | 68 | 17 jobs x (2 outcomes + timestamp + streak) |
-| `two_bot_job_last_error_class{job,class}` | 119 | 17 jobs x 7 classes (`database`, `rest`, `configuration`, `timeout`, `panic`, `feed`, `recovery_required`) |
+| job runs, timestamps, failure streaks | 72 | 18 jobs x (2 outcomes + timestamp + streak) |
+| `two_bot_job_last_error_class{job,class}` | 126 | 18 jobs x 7 classes (`database`, `rest`, `configuration`, `timeout`, `panic`, `feed`, `recovery_required`) |
 | voice ops, reconcile, dead-letters, state | 60 | 3x6 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans + 7 join-refused reasons + 2 queue lanes + halted + oldest-age + live-not-ready age + live self-heals + rest-age + creator-map generation + creator-map age + backoff-capped + dispatch-timeouts + watchdog-stucks + halt-recoveries + inbox-turn bound + inbox turns + dispatch turns + inbox-overflow drops + opt-in queue-overflow drops |
 | `two_bot_voice_join_occupancy_total{occupancy}` | 8 | seeding-TEST occupancy buckets `0`-`6` + `7+`; fixed vocabulary, no per-channel/member labels |
 | pool gauges | 4 | configured, size, idle, max |
@@ -59,6 +59,7 @@ table and the test are updated together.
 | `two_bot_community_facts_drain_failures_total{reason}` | 3 | `error`, `timeout`, `other` |
 | `two_bot_presence_capture_total{outcome}` | 3 | `inserted`, `duplicate`, `rejected` |
 | `two_bot_automod_decisions_total{outcome}` | 8 | `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out`, `sanction_refused`; no message text, excerpts or user IDs in labels |
+| `two_bot_automod_previews_total{result,filter,mode}` | 24 | Only the valid [AutoMod preview tuples](metrics.md#label-allowlists-stable); no content or identity labels |
 | `two_bot_audit_delivery_halt` | 1 | label-free gauge: 1 engaged, 0 cleared |
 | `two_bot_event_store_consumer_lag_seconds` | 1 | label-free gauge: seconds of consumer lag, 0 when unobserved |
 | `two_bot_eventsub_received_total` | 1 | label-free counter: deliveries accepted for verification, including tampered signatures |
@@ -73,7 +74,7 @@ table and the test are updated together.
 | `two_bot_retention_replay_needed_total` | 1 | label-free counter: skipped retention purges needing Operator replay (one per real guild removal whose purge-queue write hit the schema gap); resets on process restart |
 | `two_bot_ticket_lifecycle_total{event,outcome}` | 22 | per-event subsets (2 `retire` + 3 `abandon` + 13 `purge` + 2 `claim` + 2 `close`): each event renders its success outcomes plus the `query` collapse trapdoor, and `purge` adds the 12 `db_cause` classes; closed vocabulary, no `other` row, no member text, channel names, ticket ids or error strings in labels |
 | `two_bot_ticket_component_drops_total` | 1 | label-free counter: ticket components refused before spawning (runtime or per-member saturated); resets on process restart |
-| `# HELP` / `# TYPE` headers | 174 | 87 families x 2 |
+| `# HELP` / `# TYPE` headers | 114 | 88 types plus 26 optional HELP lines |
 
 ## Per-event caps (gateway metric labels)
 
@@ -144,6 +145,7 @@ Both counters are class steady and never shed.
 Dispatch-lane saturation (TOG-19878) follows the same shed-meter shape: every
 `spawn_first` refusal increments `two_bot_dispatch_drops_total{lane}` per
 attempted lane, while the `warn!` samples the first drop per 60 s per runtime.
+Capacity drops from either Help lane count under `interactions`.
 A burst is O(1) log lines with N counter increments. The six lane labels are
 class steady and never shed; growth means a lane is undersized or a burst
 needs the M2.1 alert rule, not a new label. The `reactions` lane additionally

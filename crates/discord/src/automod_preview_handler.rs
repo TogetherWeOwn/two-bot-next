@@ -16,6 +16,7 @@ use {
     tokio::time::Instant,
     twilight_model::application::interaction::{InteractionData, InteractionType},
     two_bot_core::{
+        automod_preview::preview_automod_with_history,
         automod_preview_attempt::{attempt_preview, AttemptContext, AttemptResult},
         automod_preview_flow::{plan_pre_claim, PreClaimPlan},
         automod_preview_input::build_preview_message,
@@ -24,6 +25,7 @@ use {
         automod_preview_store::SqlPreviewStore,
         automod_runtime::AutomodClaimLedger,
         funnel::format_iso_millis,
+        AutomodConfig,
     },
 };
 
@@ -89,7 +91,8 @@ pub fn decode_interaction_options(
     decode_preview_input(&map_preview_options(data))
 }
 
-/// Drive an authorized invocation with a refreshed activation and its UTC receipt.
+/// Drive an authorized invocation with its UTC receipt. Resolve the preview
+/// policy after decode and scope, without changing the gateway activation.
 /// The caller owns ephemeral delivery and reserves time for it after `deadline`.
 #[cfg(feature = "db")]
 pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
@@ -99,7 +102,11 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     interaction: &Interaction,
     receipt_ms: u64,
     deadline: Instant,
+    resolve_live: impl FnOnce(&str) -> Option<AutomodConfig>,
 ) -> AttemptResult {
+    if Instant::now() >= deadline {
+        return unavailable(None);
+    }
     let (InteractionType::ApplicationCommand, Some(InteractionData::ApplicationCommand(data))) =
         (interaction.kind, interaction.data.as_ref())
     else {
@@ -109,12 +116,26 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
         return unavailable(None);
     };
     let decoded = decode_interaction_options(data);
-    let scoped = decoded.as_ref().ok().and_then(|input| {
-        let (active, guild) = activation.zip(request.guild_id.as_deref())?;
-        let snapshot =
-            active.preview(|runtime| runtime.preview_snapshot(guild, &request.actor_id))?;
-        Some((guild, input, snapshot))
-    });
+    let candidate = decoded
+        .as_ref()
+        .ok()
+        .zip(activation.zip(request.guild_id.as_deref()));
+    let scoped = if let Some((input, (active, guild))) = candidate {
+        match resolve_admitted_policy(
+            || active.preview(|runtime| runtime.admits(Some(guild))),
+            deadline,
+            Instant::now,
+            || {
+                resolve_live(guild)
+                    .unwrap_or_else(|| active.preview(|runtime| runtime.effective_config()))
+            },
+        ) {
+            Ok(config) => config.map(|config| (guild, input, config)),
+            Err(result) => return result,
+        }
+    } else {
+        None
+    };
     let plan = plan_pre_claim(
         decoded.as_ref().map_err(|refusal| *refusal),
         scoped.is_some(),
@@ -124,9 +145,10 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     if let PreClaimPlan::AnswerNow { reply, metric } = plan {
         return AttemptResult { reply, metric };
     }
-    let Some((guild_id, input, (dry_run, evaluate))) = scoped else {
+    let Some((guild_id, input, config)) = scoped else {
         return unavailable(None);
     };
+    let dry_run = config.dry_run;
     let Ok(message) = build_preview_message(
         input,
         guild_id,
@@ -154,8 +176,26 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
             .unwrap_or_else(PoisonError::into_inner)
             .admit_before(actor_id, guild_id, id, deadline)
     };
-    let evaluate = || evaluate(&message, input.mention_count);
+    // Detached interactions can overtake earlier gateway CREATEs.
+    let evaluate = || preview_automod_with_history(&message, input.mention_count, &config, None);
     attempt_preview(plan, context, store, admit, evaluate).await
+}
+
+#[cfg(feature = "db")]
+fn resolve_admitted_policy(
+    admit: impl FnOnce() -> bool,
+    deadline: Instant,
+    now: impl FnOnce() -> Instant,
+    resolve: impl FnOnce() -> AutomodConfig,
+) -> Result<Option<AutomodConfig>, AttemptResult> {
+    if !admit() {
+        return Ok(None);
+    }
+    // Admission can wait for the activation lock and exhaust the budget.
+    if now() >= deadline {
+        return Err(unavailable(None));
+    }
+    Ok(Some(resolve()))
 }
 
 #[cfg(feature = "db")]
@@ -193,6 +233,35 @@ mod tests {
             json!({"id": "1", "type": 1, "name": "automod-preview", "options": options}),
         )
         .expect("synthetic command data")
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn deadline_reached_during_admission_skips_policy_resolution() {
+        let now = std::cell::Cell::new(Instant::now());
+        let deadline = now.get() + std::time::Duration::from_secs(1);
+        let resolver_called = std::cell::Cell::new(false);
+        let result = resolve_admitted_policy(
+            || {
+                assert!(now.get() < deadline);
+                now.set(deadline);
+                true
+            },
+            deadline,
+            || now.get(),
+            || {
+                resolver_called.set(true);
+                AutomodConfig {
+                    enabled: true,
+                    dry_run: true,
+                    policy: Default::default(),
+                }
+            },
+        );
+        assert!(!resolver_called.get(), "expired preview resolved policy");
+        let result = result.expect_err("expired preview must return unavailable");
+        assert_eq!(result.reply, PREVIEW_UNAVAILABLE_REPLY);
+        assert_eq!(result.metric, Some(metric_unavailable(None)));
     }
 
     #[test]

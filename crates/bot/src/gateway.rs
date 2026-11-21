@@ -1506,14 +1506,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
     // Without the command runtime, keep the ordered builtins-only sync.
     match (interactions.as_ref(), runtime.as_ref()) {
         (Some(ordered), Some(commands)) => {
-            let application_id =
-                commands
-                    .executor()
-                    .current_application_id()
-                    .await
-                    .map_err(|_| {
-                        sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
-                    })?;
+            let application_id = commands.bootstrap_application_id().await.map_err(|_| {
+                sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
+            })?;
             ordered.set_application_id(application_id);
             commands
                 .publish_registry_checked(Some(application_id))
@@ -1750,11 +1745,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         // disposition: rejected creates never reach automations.
                         if let (Some(runtime), Some(dispatch)) = (runtime.as_ref(), dispatch.as_ref()) {
                             if !(automod_enabled && matches!(dispatch.event, Event::MessageCreate(_))) {
-                                if interactions.is_some() {
-                                    runtime.dispatch_remaining(&dispatch.event);
-                                } else {
-                                    runtime.dispatch(&dispatch.event);
-                                }
+                                runtime.dispatch_received(&dispatch.event, interactions.is_some(), dispatch.received, &dispatch.observed_at);
                             }
                         }
                         // The ordered runtime is a separate instance from the

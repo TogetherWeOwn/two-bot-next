@@ -1,10 +1,10 @@
 name: help-embed-synthetic
 
 # Live staging /help embed smoke (docs/staging-help-embed-smoke.md): the
-# dedicated staging test bot posts the exact embeds the two help builders
+# dedicated staging test bot posts embeds the branded builders
 # produce to a staging test channel and scripts/staging_help_embed_smoke.py
 # asserts the brand colour, footer text and footer icon URL on the
-# read-back, then deletes both messages, so no human Discord client is
+# read-back, then deletes the messages, so no human Discord client is
 # needed to prove a rendered message carries the brand. Payloads come from
 # the reviewed Rust builders (help_embed_smoke_payloads example), never
 # from a Python copy. Staging only; the script refuses any other guild, a
@@ -205,6 +205,7 @@ jobs:
           set -euo pipefail
           cargo run --locked -p two-bot-discord --example help_embed_smoke_payloads -- "$RUNNER_TEMP/help-embed-payloads.json"
           test -s "$RUNNER_TEMP/help-embed-payloads.json"
+          cp "$RUNNER_TEMP/help-embed-payloads.json" "help-embed-synthetic-$GITHUB_RUN_ID-rendered.json"
       - name: Run the staging help embed smoke
         if: steps.gate.outputs.configured == 'true'
         env:

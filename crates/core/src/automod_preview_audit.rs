@@ -31,7 +31,7 @@ pub fn parse_preview_audit_id(id: &str) -> Option<&str> {
 
 /// One visible preview audit row: outcome, reason, and the stored
 /// `created_at` text. The timestamp text is used verbatim as the reply's
-/// `current at` currency, so the first reply and every replay render the
+/// invocation receipt time, so the first reply and every replay render the
 /// same string at database precision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewAuditRow {
@@ -69,7 +69,7 @@ fn parse_preview_reason(reason: &str) -> Option<ParsedPreviewReason<'_>> {
 }
 
 /// Reconstruct a supported reply from a committed row without evaluation.
-/// `created_at` is the pre-rendered stored currency timestamp, not a new clock
+/// `created_at` is the pre-rendered stored invocation receipt, not a new clock
 /// reading. Unsupported outcomes, invalid reasons, and empty timestamps fail closed.
 #[must_use]
 pub fn replay_preview_reply(

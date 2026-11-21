@@ -4328,6 +4328,31 @@ async fn website_channel_executor_disabled_records_one_refused_sample() {
 }
 
 #[tokio::test]
+async fn attendance_read_is_not_dispatched_even_with_the_flag_set() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    let api = MockEventApi::start().await;
+    let app = read_app(db.pool().clone(), &api);
+    let raw = r#"{"action":"event.attendance.read","event_key":"fixture:1"}"#;
+    let nonce = nonce();
+    let flag = "TWO_INTERNAL_ALLOW_ATTENDANCE_READ";
+    let previous = std::env::var_os(flag);
+    std::env::set_var(flag, "1");
+    let (status, _, body) = answer(app.clone(), signed_read_with_nonce(raw, "old", &nonce)).await;
+    let (replay, _, replay_body) = answer(app, signed_read_with_nonce(raw, "old", &nonce)).await;
+    match previous {
+        Some(value) => std::env::set_var(flag, value),
+        None => std::env::remove_var(flag),
+    }
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(replay, StatusCode::CONFLICT);
+    assert_eq!(replay_body["error"]["code"], "replayed");
+    assert_eq!(api.count(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn event_read_flag_off_is_refused_before_any_discord_call() {
     let Some(db) = database().await else { return };
     let _flag = INTERNAL_FLAG_LOCK.lock().await;

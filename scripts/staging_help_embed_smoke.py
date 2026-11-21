@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Live staging embed smoke: post, read back, assert the brand (stdlib only).
 
-The `help_embed_smoke_payloads` example in crates/discord emits embeds
-from the Help, announcement/Echo, RSVP and Voice builders. The smoke posts
-them as ordinary messages in one staging test channel, asserts the colour,
-footer text and footer icon policy on read-back, then deletes each message.
-It does not invoke slash commands, publish a real event or prove ephemeral
-interaction delivery or the gateway path.
+The Rust renderer emits Help, announcement/Echo, RSVP and Voice embeds.
+The smoke posts them as ordinary staging messages, verifies branding and
+rendered text and fields on read-back, then deletes each message. It does
+not invoke commands, publish a real event or prove ephemeral delivery.
 
 The posting identity is the dedicated staging test bot (TWO Voice
 Synthetic (staging), the same bot the voice synthetic drives), never the
@@ -22,9 +20,9 @@ Fences, all before the first request:
   * the test bot token comes only from $TWO_VOICE_SYNTHETIC_BOT_TOKEN and
     is never printed, logged or written to evidence; a 401 refuses with a
     fixed message and no substitute credential is ever tried;
-  * the payload file must carry the current schema, every required embed
-    and its expected colour/footer/icon policy, and each payload embed
-    must already match those expectations;
+  * the payload file must carry schema help_embed_smoke.v3, every required embed
+    and each row’s expected colour/footer/icon, and each payload embed must
+    already match those expectations;
   * the channel id must be a canonical snowflake. Its staging-guild and
     text-type membership is then verified with GET channels/{id} before
     anything is posted, and the token must belong to a bot that is none
@@ -71,7 +69,23 @@ TIMEOUT_SECONDS = 15
 # Guild text (0) and announcement (5) channels accept bot message posts.
 TEXT_CHANNEL_TYPES = (0, 5)
 TEXT_ONLY_FOOTER_KEYS = ("rsvp_ok", "rsvp_error", "voice_ok", "voice_warn", "voice_error")
-EMBED_KEYS = ("help", "help_topic", "announcement", "echo", *TEXT_ONLY_FOOTER_KEYS)
+EMBED_KEYS = ("help", "help_topic", "help_warn", "help_error",
+              "announcement", "echo", *TEXT_ONLY_FOOTER_KEYS)
+# The product applications a test-bot token must never turn out to be:
+# staging product bot (the shared fence value), live bot and the superseded
+# staging bot (public ids from two_bot_core::backup::guild_config).
+PRODUCT_APPLICATION_IDS = (
+    fenced.STAGING_APPLICATION_ID,
+    "1539711683898118154",
+    "1537629682449649724",
+)
+# Reconciliation pages newest-first through the range newer than the
+# pre-post anchor. Reaching the anchor — or a short page at the start of
+# the channel — proves the whole range was inspected; a full page proves
+# nothing, so traversal continues with a `before` cursor and gives up
+# (no-retry exit 3) past this many pages.
+RECONCILE_PAGE_SIZE = 10
+RECONCILE_MAX_PAGES = 10
 # The product applications a test-bot token must never turn out to be:
 # staging product bot (the shared fence value), live bot and the superseded
 # staging bot (public ids from two_bot_core::backup::guild_config).
@@ -210,6 +224,8 @@ def brand_fault(embed, expected):
         return "footer text does not match"
     if footer.get("icon_url") != expected["icon_url"]:
         return "footer icon url does not match"
+    if embed.get("author") is not None:
+        return "embed has an unexpected author"
     return None
 
 
@@ -318,8 +334,21 @@ def check_channel(transport, channel_id, guild_id):
         raise SmokeFail("channel is not a guild text channel")
 
 
-def assert_message(message, expected, application_id, channel_id, message_id):
-    """Bind one read-back message to the post and assert the brand triple."""
+def rendered_text(embed):
+    """Project text and ordered fields, ignoring only outer Discord whitespace."""
+    def trim(text):
+        return text.strip() if isinstance(text, str) else None
+
+    fields = embed.get("fields", [])
+    if not isinstance(fields, list) or any(not isinstance(field, dict) for field in fields):
+        return None
+    return (trim(embed.get("title")), trim(embed.get("description")),
+            [(trim(field.get("name")), trim(field.get("value")), field.get("inline", False))
+             for field in fields])
+
+
+def assert_message(message, embed, expected, application_id, channel_id, message_id):
+    """Bind one read-back message to the post and assert branding and layout."""
     if not isinstance(message, dict):
         raise SmokeFail("read-back answered without an object")
     if message.get("id") != message_id:
@@ -335,6 +364,9 @@ def assert_message(message, expected, application_id, channel_id, message_id):
     fault = brand_fault(embeds[0], expected)
     if fault is not None:
         raise SmokeFail("read-back " + fault)
+    actual = rendered_text(embeds[0])
+    if actual is None or actual != rendered_text(embed):
+        raise SmokeFail("read-back title, description or fields do not match")
 
 
 def latest_message_id(transport, channel_id):
@@ -436,7 +468,7 @@ def smoke_one(transport, row_name, embed, expected, application_id, channel_id):
         message_id = posted["id"]
         read_back = call_json(
             transport, "GET", f"/channels/{channel_id}/messages/{message_id}")
-        assert_message(read_back, expected, application_id, channel_id, message_id)
+        assert_message(read_back, embed, expected, application_id, channel_id, message_id)
     except UncertainOutcome as error:
         failure = str(error)
         if message_id is None:
@@ -465,7 +497,7 @@ def smoke_one(transport, row_name, embed, expected, application_id, channel_id):
             failure = cleanup if failure is None else f"{failure}; {cleanup}"
     if failure is not None:
         return done("fail", failure)
-    return done("pass", "read-back colour, footer text and icon url match; message deleted")
+    return done("pass", "read-back branding, text and fields match; message deleted")
 
 
 def fences(guild_id, token, channel_id):
@@ -493,7 +525,7 @@ def fences(guild_id, token, channel_id):
 
 
 def run(payload_path, guild_id, token, channel_id, transport=None):
-    """Fences, identity, channel, then the required embed round trips."""
+    """Fences, identity, channel, then each embed round trip."""
     report = Report()
     try:
         guild, channel = fences(guild_id, token, channel_id)

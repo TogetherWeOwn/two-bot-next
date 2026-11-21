@@ -80,6 +80,17 @@ impl Cursor {
         )
     }
 
+    /// Recognize the reserved component namespace, even for malformed cursors.
+    pub fn is_help_control(id: &str) -> bool {
+        id.strip_prefix(NAMESPACE)
+            .is_some_and(|suffix| suffix.starts_with(':'))
+    }
+
+    /// Compare against the authoritative interaction actor before building a plan.
+    pub const fn is_for_actor(self, actor: u64) -> bool {
+        self.actor == actor
+    }
+
     /// Decode exactly the emitted grammar. The caller still needs to validate
     /// the actual Discord source message and use the authoritative actor.
     pub fn parse(id: &str) -> Option<Self> {
@@ -112,6 +123,11 @@ impl Cursor {
         Self::new(Revision(bytes), actor, expires_at, page)
     }
 
+    /// The original navigation lifetime never extends on a later click.
+    pub fn is_expired(self, now: u64) -> bool {
+        now >= self.expires_at || self.expires_at > now.saturating_add(LIFETIME_SECONDS)
+    }
+
     /// Use only after checking the component's source message and guild. The
     /// returned expiry must be kept unchanged in descendant controls.
     pub fn target(
@@ -121,13 +137,13 @@ impl Cursor {
         current: Revision,
         page_count: usize,
     ) -> Result<(usize, u64), CursorError> {
-        if actor != self.actor || self.page >= page_count {
+        if !self.is_for_actor(actor) || self.page >= page_count {
             return Err(CursorError::Invalid);
         }
         if current != self.revision {
             return Err(CursorError::Stale);
         }
-        if now >= self.expires_at || self.expires_at > now.saturating_add(LIFETIME_SECONDS) {
+        if self.is_expired(now) {
             return Err(CursorError::Expired);
         }
         Ok((self.page, self.expires_at))

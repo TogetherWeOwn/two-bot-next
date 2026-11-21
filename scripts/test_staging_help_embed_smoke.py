@@ -30,8 +30,10 @@ EXPECTED = {"color": 0xFF9C36, "footer_text": "Together We Own",
 
 
 ROW_CONTRACTS = {
-    "help": ("DEFAULT", 0xFF9C36, "", True, "help text " * 300),
-    "help_topic": ("DEFAULT", 0xFF9C36, "", True, "topic text " * 300),
+    "help": ("DEFAULT", 0xFF9C36, "Help · Page 1 of 2", True, "Example discovery"),
+    "help_topic": ("DEFAULT", 0xFF9C36, "Help", True, "Example topic"),
+    "help_warn": ("WARN", 0xF2C14E, "Help", True, "Example expired page"),
+    "help_error": ("DANGER", 0xFF7A6B, "Help", True, "Example build failure"),
     "announcement": ("DEFAULT", 0xFF9C36, "Announcements", True, "Example announcement"),
     "echo": ("ECHO", 0x9D6AFF, "Echo", True, "Example Echo"),
     "rsvp_ok": ("OK", 0x5FD39A, "Events", False, "Example RSVP saved"),
@@ -45,12 +47,15 @@ ROW_CONTRACTS = {
 def payloads(**overrides):
     expected, embeds = {}, {}
     for key, (_, color, surface, has_icon, description) in ROW_CONTRACTS.items():
-        text = EXPECTED["footer_text"] + (f" · {surface}" if surface else "")
+        text = f'{EXPECTED["footer_text"]} · {surface}'
         icon = EXPECTED["icon_url"] if has_icon else None
         expected[key] = {"color": color, "footer_text": text, "icon_url": icon}
         footer = {"text": text, **({"icon_url": icon} if has_icon else {})}
         embeds[key] = {"type": "rich", "description": description,
                        "color": color, "footer": footer}
+    for key in ("help", "help_topic"):
+        embeds[key]["title"] = "Together We Own help"
+    embeds["help"]["fields"] = [{"name": "Custom", "value": "/example"}]
     return {"schema": smoke.SCHEMA, "expected": expected, "embeds": embeds,
             **overrides}
 
@@ -262,6 +267,7 @@ class HelpEmbedSmokeTests(unittest.TestCase):
             "footer missing": lambda m: m["embeds"][0].pop("footer"),
             "no embeds": lambda m: m.update(embeds=[]),
             "two embeds": lambda m: m["embeds"].append(m["embeds"][0]),
+            "embed author": lambda m: m["embeds"][0].update(author={"name": "Other"}),
             "wrong author": lambda m: m["author"].update(id=OTHER_APP),
         }
         for name, mutate in cases.items():
@@ -269,6 +275,16 @@ class HelpEmbedSmokeTests(unittest.TestCase):
                 code, out = self.run_main(FakeDiscord(mutate_read=mutate))
                 self.assertEqual(1, code)
                 self.assertIn("VERDICT FAIL", out)
+
+    def test_discovery_group_fields_are_verified_on_read_back(self):
+        def strip_fields(message):
+            message["embeds"][0].pop("fields", None)
+
+        fake = FakeDiscord(mutate_read=strip_fields)
+        code, out = self.run_main(fake)
+        self.assertEqual(1, code)
+        self.assertIn("read-back title, description or fields do not match", out)
+        self.assertEqual({}, fake.messages)
 
     def test_one_rows_failure_still_runs_the_other(self):
         seen = []
@@ -404,6 +420,7 @@ class HelpEmbedSmokeTests(unittest.TestCase):
             "wrong schema": payloads(schema="help_embed_smoke.v0"),
             "unbranded payload embed": unbranded,
             "missing topic embed": missing,
+            "missing per-embed expectation": payloads(expected={"help": payloads()["expected"]["help"]}),
             "missing new row and expectation": missing_new,
             "wrong Echo colour": wrong_color,
             "non-https icon": non_https,

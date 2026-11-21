@@ -6,12 +6,10 @@
 //! generator. No token, network or environment input is involved.
 
 use std::io::Write as _;
+use two_bot_discord::help_embed_smoke::{help_embed_smoke_payloads, HELP_EMBED_SMOKE_SCHEMA};
 
 fn report(status: &str, code: Option<&str>) -> String {
-    let mut line = format!(
-        "{{\"schema\":\"{}\",\"status\":\"",
-        two_bot_discord::help_embed_smoke::HELP_EMBED_SMOKE_SCHEMA
-    );
+    let mut line = format!("{{\"schema\":\"{HELP_EMBED_SMOKE_SCHEMA}\",\"status\":\"");
     line.push_str(status);
     line.push('"');
     if let Some(code) = code {
@@ -24,7 +22,7 @@ fn report(status: &str, code: Option<&str>) -> String {
 }
 
 fn emit() -> Result<(), &'static str> {
-    let payloads = two_bot_discord::help_embed_smoke::help_embed_smoke_payloads()?;
+    let payloads = help_embed_smoke_payloads()?;
     let bytes = serde_json::to_vec(&payloads).map_err(|_| "payload_encode_failed")?;
     let output = std::env::args().nth(1);
     match output {

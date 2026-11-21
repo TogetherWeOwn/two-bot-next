@@ -4,8 +4,9 @@ use serde_json::Value;
 use two_bot_core::{funnel::format_iso_millis, Snowflake};
 
 pub mod planning;
+pub mod read;
 
-const GRACE_MS: i64 = 15 * 60 * 1_000;
+const GRACE_US: i64 = 15 * 60 * 1_000_000;
 const THRESHOLD_MINUTES: u8 = 10;
 const MAX_INPUT_SESSIONS: usize = 4_096;
 const MAX_INPUT_NAME_BYTES: usize = 1024 * 1024;
@@ -19,16 +20,16 @@ pub struct AttendanceScope<'a> {
     pub event_key: &'a str,
 }
 
-pub struct AttendanceWindowMs<'a> {
+pub struct AttendanceWindowUs<'a> {
     pub scope: AttendanceScope<'a>,
-    pub starts_ms: i64,
-    pub ends_ms: i64,
+    pub starts_us: i64,
+    pub ends_us: i64,
 }
 
-/// One event-tagged observation. `left_ms` carries any upstream credit cap.
+/// One event-tagged observation. `left_us` carries any upstream credit cap.
 /// This input is deliberately neither serializable nor debug-printable.
 #[derive(Clone, Copy)]
-pub struct SessionMs<'a> {
+pub struct SessionUs<'a> {
     pub scope: AttendanceScope<'a>,
     pub member_id: Snowflake,
     pub channel_id: Snowflake,
@@ -36,8 +37,8 @@ pub struct SessionMs<'a> {
     pub name_observed_ns: i128,
     pub is_bot: bool,
     pub afk: bool,
-    pub joined_ms: i64,
-    pub left_ms: Option<i64>,
+    pub joined_us: i64,
+    pub left_us: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,18 +86,18 @@ struct AttendanceResult<'a> {
 /// Below-threshold humans stay listed; AFK time earns minutes but not peak.
 /// An over-budget result is refused whole rather than truncated.
 pub fn project_attendance(
-    window: &AttendanceWindowMs<'_>,
-    sessions: &[SessionMs<'_>],
-    now_ms: i64,
+    window: &AttendanceWindowUs<'_>,
+    sessions: &[SessionUs<'_>],
+    now_us: i64,
 ) -> Result<Value, AttendanceRefusal> {
-    let (open_ms, close_ms) = match (
-        window.starts_ms.checked_sub(GRACE_MS),
-        window.ends_ms.checked_add(GRACE_MS),
+    let (open_us, close_us) = match (
+        window.starts_us.checked_sub(GRACE_US),
+        window.ends_us.checked_add(GRACE_US),
     ) {
-        (Some(open), Some(close)) if window.starts_ms < window.ends_ms => (open, close),
+        (Some(open), Some(close)) if window.starts_us < window.ends_us => (open, close),
         _ => return Err(AttendanceRefusal::InvalidWindow),
     };
-    if now_ms < close_ms {
+    if now_us < close_us {
         return Err(AttendanceRefusal::NotFinal);
     }
     let mut name_lengths = sessions.iter().map(|row| row.channel_name.len());
@@ -117,17 +118,18 @@ pub fn project_attendance(
         .filter(|(_, row)| {
             row.scope == window.scope
                 && !row.is_bot
-                && row.joined_ms.max(open_ms) <= row.left_ms.unwrap_or(close_ms).min(close_ms)
+                && row.joined_us.max(open_us) <= row.left_us.unwrap_or(close_us).min(close_us)
         })
         .collect();
     if observations.is_empty() {
         return Err(AttendanceRefusal::NoRecord);
     }
     observations.sort_unstable_by_key(|&(index, row)| (row.member_id, index));
-    let (members, peak_concurrent) = project_members(&observations, open_ms, close_ms);
+    let (members, peak_concurrent) = project_members(&observations, open_us, close_us);
 
     // Reuse the buffer. Sorting stamps then input positions makes equal
     // timestamps keep the last input observation, as in the donor.
+    observations.retain(|(_, row)| !row.channel_name.is_empty());
     observations
         .sort_unstable_by_key(|&(index, row)| (row.channel_id, row.name_observed_ns, index));
     let rooms = observations
@@ -142,8 +144,8 @@ pub fn project_attendance(
         v: 1,
         event_key: window.scope.event_key,
         window: AttendanceResultWindow {
-            starts_at: format_iso_millis(window.starts_ms),
-            ends_at: format_iso_millis(window.ends_ms),
+            starts_at: format_iso_millis(window.starts_us.div_euclid(1_000)),
+            ends_at: format_iso_millis(window.ends_us.div_euclid(1_000)),
         },
         threshold_minutes: THRESHOLD_MINUTES,
         peak_concurrent,
@@ -160,9 +162,9 @@ pub fn project_attendance(
 }
 
 fn project_members(
-    observations: &[(usize, &SessionMs<'_>)],
-    open_ms: i64,
-    close_ms: i64,
+    observations: &[(usize, &SessionUs<'_>)],
+    open_us: i64,
+    close_us: i64,
 ) -> (Vec<AttendanceMember>, i64) {
     let mut sweep = Vec::new();
     let members = observations
@@ -170,11 +172,11 @@ fn project_members(
         .map(|rows| {
             let mut intervals = Vec::new();
             let mut non_afk_intervals = Vec::new();
-            let mut first_joined_ms = i64::MAX;
+            let mut first_joined_us = i64::MAX;
             for (_, row) in rows {
-                first_joined_ms = first_joined_ms.min(row.joined_ms);
-                let from = row.joined_ms.max(open_ms);
-                let to = row.left_ms.unwrap_or(close_ms).min(close_ms);
+                first_joined_us = first_joined_us.min(row.joined_us);
+                let from = row.joined_us.max(open_us);
+                let to = row.left_us.unwrap_or(close_us).min(close_us);
                 if from < to {
                     intervals.push((from, to));
                     if !row.afk {
@@ -182,7 +184,7 @@ fn project_members(
                     }
                 }
             }
-            let duration_ms: u64 = union_intervals(intervals)
+            let duration_us: u64 = union_intervals(intervals)
                 .into_iter()
                 .map(|(from, to)| to.abs_diff(from))
                 .sum();
@@ -192,9 +194,9 @@ fn project_members(
             }
             AttendanceMember {
                 discord_id: rows[0].1.member_id.to_string(),
-                minutes: duration_ms / 60_000,
+                minutes: duration_us / 60_000_000,
                 sessions: rows.len(),
-                first_joined_at: format_iso_millis(first_joined_ms),
+                first_joined_at: format_iso_millis(first_joined_us.div_euclid(1_000)),
             }
         })
         .collect();

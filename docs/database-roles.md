@@ -40,9 +40,12 @@ read-only SELECT for the migrator-plan role, and rejects extra erase or public a
 Member erasure is the operator-only path that writes the migrator-only audit
 table, so it deletes reservation rows as the migrator, never as runtime.
 
-`voice_heat_hours` is dormant and migrator-only (`migrator` kind). Restore
-can clear it; runtime, the website reader, and the read-only migrator gain
-no access. There is no heat view or change to the web contract version.
+`voice_heat_hours` is a migrator-owned `retained_aggregate`. The role plan
+lets runtime select, insert and delete hourly rows for immutable flushes and
+expiry. It grants no runtime UPDATE, TRUNCATE or grant option. Restore can
+clear the table; the website reader, read-only migrator and PUBLIC cannot
+access it. These grants do not register a collector, install a heat view or
+change the web contract version.
 
 Two other migrator-only tables, `member_erasure_audit` (operator
 accountability) and `invite_campaigns` (go.two.gg redirect store), have
@@ -122,6 +125,10 @@ durable lifecycle, order and revocation evidence keyed by guild, event and
 instance start, with no member column, so there is nothing to erase and no
 reader grant beyond the app pool. Backups archive it (v16); an old-format
 restore clears it and never backfills liveness.
+
+The dormant attendance tables and session ID sequence use the reviewed grants,
+with no web reader access. Member erasure removes scoped sessions; guild purge
+removes both tables' rows for the guild.
 
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's

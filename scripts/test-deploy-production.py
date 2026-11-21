@@ -117,6 +117,22 @@ def run_blocks():
 
 TOP = children(LINES, 0)
 JOBS = children(TOP["jobs"][1:], 2)
+SOAK = children(WORKFLOW.with_name("staging-soak.yml").read_text().splitlines(), 0)
+BEGIN, FINISH = (children(SOAK["jobs"][1:], 2)[job] for job in ("begin", "finish"))
+CALL = children(JOBS["soak"][1:], 4)
+FINISH_FIELDS = children(FINISH[1:], 4)
+GRANT_ENV = next(step[1:-1] for step in steps(FINISH) if "        env: &grant" in step)
+SOAK_BODY = "\n".join(sum(steps(BEGIN)[1:5] + steps(FINISH)[-5:], [])).replace("        env: *grant", "\n".join(GRANT_ENV))
+SOAK_BODY = (re.sub(r': "(\$\{\{ [^"\n]+? \}\}(?:/staging-soak-use\.ndjson)?)"', r': \1', SOAK_BODY)
+             .replace("inputs.full_soak", value(children(CALL["with"][1:], 6)["full_soak"])[4:-3])
+             .replace("inputs.", "needs.guard.outputs.")
+             .replace("needs.begin.outputs.", "steps.staging-use-begin.outputs."))
+JOBS["soak"] = (JOBS["soak"][:4] + CALL["permissions"] + FINISH_FIELDS["runs-on"] + FINISH_FIELDS["timeout-minutes"]
+                + ["    environment:", "      name: staging", "      deployment: false", "    concurrency:"]
+                + ["      " + value for value in ("group: staging-lifecycle", "cancel-in-progress: false", "queue: max")]
+                + ["    outputs:", "      skip: ${{ steps.judge.outputs.skip }}", "      evidence: ${{ steps.judge.outputs.evidence }}",
+                   "    steps:"] + SOAK_BODY.splitlines())
+LINES += SOAK_BODY.splitlines()
 GUARD = inline_script(GUARD_STEP)
 RECHECK_STEP = "Re-read the promotion hold and the live revision"
 RECHECK = inline_script(RECHECK_STEP)
@@ -372,7 +388,7 @@ class StaticGuardTests(unittest.TestCase):
         # jobs are never cancelled (cancel-in-progress is false).
         self.assertNotIn("concurrency", TOP)
         conc = children(JOBS["production"][1:], 4).get("concurrency", [])
-        self.assertIn("group: deploy-production", "\n".join(conc))
+        self.assertIn("|| 'deploy-production' }}", "\n".join(conc))
         self.assertIn("cancel-in-progress: false", "\n".join(conc))
         for job in ("guard", "schema-gate", "roles-gate", "staging-soak-evidence", "recheck"):
             self.assertNotIn("concurrency", children(JOBS[job][1:], 4))
@@ -422,7 +438,7 @@ class StaticGuardTests(unittest.TestCase):
         uses = [line.split("uses:", 1)[1].strip() for line in LINES if "uses:" in line]
         self.assertTrue(uses)
         for ref in uses:
-            self.assertRegex(ref, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}(\s|$)", ref)
+            self.assertRegex(ref, r"^(?:\$/\.github/workflows/staging-soak\.yml$|[\w.-]+/[\w.-]+@[0-9a-f]{40}(?:,?\s|$))", ref)
         staging = {
             line.split("uses:", 1)[1].split()[0]
             for line in STAGING.read_text().splitlines() if WRANGLER_ACTION in line
@@ -749,13 +765,13 @@ class StaticGuardTests(unittest.TestCase):
         # Release is unconditional on failure but only once a grant was published.
         release = self.soak_step(order[5])
         self.assertEqual([line.strip() for line in release if line.strip().startswith("if:")],
-                         ["if: always() && steps.staging-use-begin.outputs.expires_at != ''"])
+                         ["if: always() && steps.staging-use-begin.outputs.expires_at != '' && steps.admission.outcome == 'success'"])
         self.assertIn("node wrangler/scripts/staging-use-pipeline.mjs finish", "\n".join(release))
         # Lifecycle and measurement evidence is retained even on failure.
         upload = self.soak_step(order[6])
         upload_text = "\n".join(upload)
         self.assertEqual([line.strip() for line in upload if line.strip().startswith("if:")], ["if: always()"])
-        for needle in ("name: staging-soak-${{ github.run_id }}-${{ github.run_attempt }}",
+        for needle in ('name: "staging-soak-${{ github.run_id }}-${{ github.run_attempt }}"',
                        "${{ runner.temp }}/staging-soak-use.ndjson", "${{ runner.temp }}/staging-soak-*.json",
                        "if-no-files-found: error", "retention-days: 7"):
             self.assertIn(needle, upload_text)

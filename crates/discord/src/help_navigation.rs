@@ -1,6 +1,7 @@
 //! Render confirmed discovery pages as new, private Discord callbacks.
 
-use twilight_model::channel::message::component::{ActionRow, Button, ButtonStyle};
+use twilight_model::application::interaction::{Interaction, InteractionData, InteractionType};
+use twilight_model::channel::message::component::{ActionRow, Button, ButtonStyle, ComponentType};
 use twilight_model::channel::message::embed::{Embed, EmbedField, EmbedFooter};
 use twilight_model::channel::message::{Component, MessageFlags};
 use twilight_model::http::interaction::{
@@ -15,9 +16,63 @@ use two_bot_core::CommandDefinition;
 use crate::brand::{brand_embed, brand_footer_for, EmbedKind, BRAND_KIT_TAG};
 
 pub const HELP_TITLE: &str = "Together We Own help";
-const HELP_SURFACE: &str = "Help";
+pub(crate) const HELP_SURFACE: &str = "Help";
 // Bump when page chrome, navigation labels, or control behavior changes.
 const RENDER_VERSION: &str = "discovery-v1";
+
+/// Read a cursor only from a button on the app's own private reply to this actor.
+/// Call after the router admits the guild. Pass the bot and application IDs
+/// from runtime identity, not from the clicked message or custom ID.
+pub fn source_cursor(
+    interaction: &Interaction,
+    application: u64,
+    bot_user: u64,
+) -> Option<(Cursor, u64)> {
+    let (InteractionType::MessageComponent, Some(InteractionData::MessageComponent(data))) =
+        (&interaction.kind, interaction.data.as_ref())
+    else {
+        return None;
+    };
+    let guild = interaction.guild_id?;
+    let actor = interaction.author_id()?;
+    let message = interaction.message.as_ref()?;
+    let metadata = message.interaction_metadata.as_ref()?;
+    if interaction.application_id.get() != application
+        || data.component_type != ComponentType::Button
+        || !data.values.is_empty()
+        || !message.author.bot
+        || message.author.id.get() != bot_user
+        || message
+            .application_id
+            .is_some_and(|id| id.get() != application)
+        || message.guild_id.is_some_and(|id| id != guild)
+        || !message
+            .flags
+            .is_some_and(|flags| flags.contains(MessageFlags::EPHEMERAL))
+        || metadata.user.id != actor
+        || metadata.original_response_message_id.is_some()
+        || !matches!(
+            metadata.kind,
+            InteractionType::ApplicationCommand | InteractionType::MessageComponent
+        )
+    {
+        return None;
+    }
+    let cursor = Cursor::parse(&data.custom_id)?;
+    if !cursor.is_for_actor(actor.get()) {
+        return None;
+    }
+    let on_source = message.components.iter().any(|component| {
+        let Component::ActionRow(row) = component else {
+            return false;
+        };
+        row.components.iter().any(|component| {
+            matches!(component, Component::Button(button)
+                if !button.disabled && button.custom_id.as_deref() == Some(data.custom_id.as_str()))
+        })
+    });
+    on_source.then_some((cursor, actor.get()))
+}
 
 pub struct DiscoveryPlan {
     pages: Vec<Page>,
@@ -37,6 +92,10 @@ impl DiscoveryPlan {
         let version = format!("{RENDER_VERSION}:{BRAND_KIT_TAG}");
         let revision = Revision::for_pages(guild, application, &version, &pages);
         Ok(Self { pages, revision })
+    }
+
+    pub(crate) fn page_count(&self) -> usize {
+        self.pages.len()
     }
 
     /// Render page one with an expiry fixed by the original help invocation.
@@ -181,7 +240,7 @@ impl HelpRecovery {
     }
 }
 
-fn help_callback(
+pub(crate) fn help_callback(
     kind: EmbedKind,
     title: &str,
     description: &str,
