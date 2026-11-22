@@ -15,7 +15,7 @@ const operators = new Map(Object.entries({
 }));
 
 export function edits(source, lines) {
-  const root = parse(source, { sourceType: "module", plugins: ["typescript"] });
+  const root = parse(source, { sourceType: "module", plugins: ["typescript"], tokens: true });
   const candidates = [];
   function visit(node) {
     if (!node || typeof node.type !== "string" || node.type === "TSLiteralType") return;
@@ -23,22 +23,19 @@ export function edits(source, lines) {
       candidates.push({ line: node.loc.start.line, start: node.start, end: node.end,
         replacement: node.value ? "false" : "true" });
     }
-    if (node.type === "BinaryExpression" || node.type === "LogicalExpression") {
-      const between = source.slice(node.left.end, node.right.start);
-      if (between.trim() === node.operator && operators.has(node.operator)) {
-        const offset = between.indexOf(node.operator);
-        const line = node.left.loc.end.line + between.slice(0, offset).split("\n").length - 1;
-        const start = node.left.end + offset;
-        if (lines.has(line)) candidates.push({ line, start, end: start + node.operator.length,
-          replacement: operators.get(node.operator) });
-      }
+    if ((node.type === "BinaryExpression" || node.type === "LogicalExpression") && operators.has(node.operator)) {
+      const token = root.tokens.find(({ start, end }) => start >= node.left.end && end <= node.right.start &&
+        source.slice(start, end) === node.operator);
+      if (token && lines.has(token.loc.start.line)) candidates.push({
+        line: token.loc.start.line, start: token.start, end: token.end, replacement: operators.get(node.operator),
+      });
     }
     for (const value of Object.values(node)) {
       if (Array.isArray(value)) value.forEach(visit);
       else visit(value);
     }
   }
-  visit(root);
+  visit(root.program);
   return candidates;
 }
 

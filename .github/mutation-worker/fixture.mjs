@@ -6,7 +6,7 @@ import { measure, verdict } from "./run.mjs";
 if (process.env.GITHUB_ACTIONS !== "true") throw new Error("mutation fixtures run only in GitHub Actions");
 const root = mkdtempSync(join(process.env.RUNNER_TEMP, "worker-mutation-fixture-"));
 const file = "wrangler/src/rule.ts";
-const source = "export const legacy = (n: number) => n > 99;\nexport const eligible = (n: number) => n >=\n  3;\n";
+const source = "export const legacy = (n: number) => n > 99;\nexport const eligible = (n: number) => (n) /* input */ >=\n  3;\n";
 try {
   mkdirSync(join(root, "wrangler/src"), { recursive: true });
   writeFileSync(join(root, file), source);
