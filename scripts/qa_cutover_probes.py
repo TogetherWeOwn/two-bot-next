@@ -139,6 +139,13 @@ from build_identity import (
     is_build_revision_shape,
 )
 
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 BODY_CAP = 64 << 10
 DEFAULT_TIMEOUT_SECONDS = 10
 # Per-request timeout cap: --timeout must be finite and within (0, 60].
@@ -260,23 +267,12 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def decode_strict(body):
     """Decode JSON while refusing duplicate object keys at any depth."""
-    return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+    return decode_legacy_json(body, object_pairs_hook=_reject_duplicate_keys)
 
 
 @dataclass(frozen=True)
@@ -376,21 +372,16 @@ def normalize_base(url):
     return f"{parts.scheme}://{host}{port_suffix}"
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None  # urllib then raises the 3xx as an HTTPError
-
-
 def fetch(url, timeout):
     """One GET without redirects; returns (status, body bytes)."""
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = no_redirect_opener()
     try:
         with opener.open(urllib.request.Request(url, headers={"User-Agent": USER_AGENT},
                                                method="GET"),
                          timeout=timeout) as response:
-            return response.status, response.read(BODY_CAP + 1)
+            return response.status, read_with_overflow(response, BODY_CAP)
     except urllib.error.HTTPError as e:
-        return e.code, e.read(BODY_CAP + 1)
+        return e.code, read_with_overflow(e, BODY_CAP)
 
 
 # Keeps every decoded walk far below the interpreter's recursion limit.

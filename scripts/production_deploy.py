@@ -32,6 +32,13 @@ from build_identity import (
     parse_deploy_id,
 )
 
+from script_intake import (
+    decode_legacy_json,
+    json_depth_exceeds as _json_depth_exceeds,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 EXCERPT_BYTES = 2048
 MAX_READYZ_BYTES = 64 * 1024
 
@@ -39,46 +46,12 @@ MAX_READYZ_BYTES = 64 * 1024
 # than this is refused up front with an explicit stack instead of recursing.
 MAX_READYZ_DEPTH = 100
 
-# Strings are skipped whole, so brackets inside them never count. An
-# unterminated string runs to the end, which keeps the scan linear.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
-
-
-def _json_depth_exceeds(text, limit):
-    """Lexical nesting pre-scan, run before json.loads.
-
-    The decoder's own RecursionError is no longer a reliable bound: newer
-    CPython sizes it from the real C stack and decodes 10,000 levels.
-    """
-    depth = 0
-    for match in JSON_TOKEN.finditer(text):
-        token = match.group()
-        if token in "[{":
-            depth += 1
-            if depth > limit:
-                return True
-        elif token in "]}":
-            depth -= 1
-    return False
-
-
 class DuplicateKeyError(ValueError):
     """A JSON object repeats a key; the message never carries key/value data."""
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def _too_deeply_nested(record, limit=MAX_READYZ_DEPTH):
@@ -219,7 +192,7 @@ def readyz(args):
             return reject("readyz: immutable promotion or serving identity refused")
     try:
         with open(args.body, "rb") as handle:
-            raw = handle.read(MAX_READYZ_BYTES + 1)
+            raw = read_with_overflow(handle, MAX_READYZ_BYTES)
         # The sentinel detects a hidden suffix; size wins over all parser
         # verdicts, without decoding or echoing any oversized remote input.
         if len(raw) > MAX_READYZ_BYTES:
@@ -227,7 +200,7 @@ def readyz(args):
         text = raw.decode("utf-8")
         if _json_depth_exceeds(text, MAX_READYZ_DEPTH):
             return reject("/readyz JSON is too deeply nested")
-        report = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+        report = decode_legacy_json(text, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         return reject("/readyz carries duplicate JSON object keys")
     except RecursionError:
@@ -298,7 +271,7 @@ def readyz(args):
 
 def response_version(path):
     with open(path, "rb") as handle:
-        raw = handle.read(MAX_READYZ_BYTES + 1)
+        raw = read_with_overflow(handle, MAX_READYZ_BYTES)
     if len(raw) > MAX_READYZ_BYTES:
         raise ValueError("response headers over cap")
     values = [line.split(b":", 1)[1].strip().decode("ascii")
@@ -325,7 +298,7 @@ def _promoted_runtime_ready(client, url, version, receipt):
             return False
         if suffix == "readyz":
             try:
-                report = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+                report = decode_legacy_json(body, object_pairs_hook=_reject_duplicate_keys)
             except (ValueError, UnicodeError, RecursionError):
                 return False
             build = receipt["build"]
@@ -368,10 +341,10 @@ def serving(args):
         snapshot = getattr(args, "snapshot", None)
         if snapshot:
             with open(snapshot, "rb") as handle:
-                raw = handle.read(MAX_READYZ_BYTES + 1)
+                raw = read_with_overflow(handle, MAX_READYZ_BYTES)
             if len(raw) > MAX_READYZ_BYTES:
                 raise ValueError("snapshot over cap")
-            previous = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+            previous = decode_legacy_json(raw, object_pairs_hook=_reject_duplicate_keys)
             if (not isinstance(previous, dict)
                     or previous.get("worker") != rollback.WORKERS["production"]
                     or previous.get("application") != PRODUCTION_APP
@@ -486,7 +459,7 @@ def serving(args):
 def excerpt(args):
     try:
         with open(args.body, "rb") as handle:
-            head = handle.read(EXCERPT_BYTES + 1)
+            head = read_with_overflow(handle, EXCERPT_BYTES)
     except OSError:
         print("no body was written")
         return 0

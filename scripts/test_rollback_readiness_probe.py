@@ -606,7 +606,8 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                 self.assertEqual(self.requested, [])
 
     def test_default_fetch_never_follows_redirects(self):
-        handler = probe._NoRedirect()
+        handler = next(handler for handler in probe.no_redirect_opener().handlers
+                       if isinstance(handler, probe.urllib.request.HTTPRedirectHandler))
         self.assertIsNone(handler.redirect_request(None, None, 302, "Found", {}, "https://elsewhere"))
 
     def test_rejects_non_two_require_key(self):
