@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { measure, verdict } from "./run.mjs";
+import { edits, measure, verdict } from "./run.mjs";
 
 if (process.env.GITHUB_ACTIONS !== "true") throw new Error("mutation fixtures run only in GitHub Actions");
 const root = mkdtempSync(join(process.env.RUNNER_TEMP, "worker-mutation-fixture-"));
@@ -30,6 +30,7 @@ try {
   assert.deepEqual(operandOnly.map((entry) => entry.status), ["unsupported"]);
 
   const adjacent = "export const total = (n: number) => n+-2;\n";
+  assert.deepEqual(edits(adjacent, new Set([1])).map((edit) => edit.replacement), [" - "]);
   writeFileSync(join(root, file), adjacent);
   writeFileSync(join(root, "wrangler/rule.test.mjs"),
     "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { total } from './src/rule.ts';\ntest('adjacent operators', () => assert.equal(total(3), 1));\n");
