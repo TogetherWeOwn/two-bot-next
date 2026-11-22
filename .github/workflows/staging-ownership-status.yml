@@ -1,14 +1,15 @@
 name: staging-ownership-status
 
-# Manual, staging-only ownership status read.
-# Independently invocable, read-only: one bounded GET /internal/ownership
-# through the existing `staging` environment credential pair, emitting only a
-# validated owner id and a UTC observation timestamp. No deploy, no drill, no
-# takeover/fence/transition, no permission or environment change, no secret
-# operation, no grant, no spend and no production path. Never dispatched to
-# obtain deploy/drill evidence; the deploy/drill workflows are untouched.
+# Manual, staging-only ownership read. Inventory mode brackets the no-start
+# ownership GET with read-only Worker and container provider samples.
 on:
   workflow_dispatch:
+    inputs:
+      inventory:
+        description: Read the serving Worker and configured container rollout
+        type: boolean
+        required: false
+        default: false
 
 permissions: {}
 
@@ -19,7 +20,7 @@ concurrency:
 jobs:
   status:
     name: staging ownership status (read-only)
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && !inputs.inventory
     permissions:
       contents: read # checkout only; the read authenticates with `staging` environment secrets
     # Runner routing: see the note on `check` in check.yml.
@@ -51,3 +52,39 @@ jobs:
           set -euo pipefail
           node scripts/staging-ownership-status.mjs | tee "$RUNNER_TEMP/staging-ownership-status.json"
           python3 -c 'import json,os,re; p=os.environ["RUNNER_TEMP"]+"/staging-ownership-status.json"; d=json.load(open(p)); assert set(d)=={"owner_id","observed_at"}, d; assert d["owner_id"] is None or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", d["owner_id"] or ""); assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z", d["observed_at"]) and __import__("datetime").datetime.fromisoformat(d["observed_at"].replace("Z","+00:00")); print(json.dumps(d, sort_keys=True))'
+
+  inventory:
+    name: staging recovery inventory (read-only)
+    if: github.repository_id == '1396224242' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && inputs.inventory
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    environment: {name: staging, deployment: false}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify the dispatch is on current main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/staging_recovery_status.py verify-main
+      - name: Bracket the no-start staging status read
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+        run: python3 scripts/staging_recovery_status.py inventory > "$RUNNER_TEMP/staging-recovery-status.json"
+      - name: Recheck current main before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/staging_recovery_status.py verify-main
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-recovery-status-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-recovery-status.json
+          if-no-files-found: error
+          retention-days: 14

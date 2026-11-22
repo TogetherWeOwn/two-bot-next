@@ -135,6 +135,7 @@ EXEMPT = {
     ("gradual-promote-proof.yml", "proof"): "passive: target lock refuses before any Cloudflare call",
     ("slow-burn-tracker.yml", "tracker"): "read-only /ops/metrics scrape",
     ("staging-ownership-status.yml", "status"): "read-only ownership GET; never starts a container",
+    ("staging-ownership-status.yml", "inventory"): "read-only ownership and provider GETs; never starts a container",
     ("staging-events-read.yml", "read"): "database read only",
     ("staging-fixture-census.yml", "fixture-census"): "database read only",
     ("staging-migrate.yml", "plan"): "database plan only",

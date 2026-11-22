@@ -94,7 +94,7 @@ JOB_INVENTORY = {
     # Manual read-only authenticated MCP prove-out (TOG-23456); pinned shape below.
     "staging-mcp-proveout.yml": {"proveout"},
     # Manual read-only staging ownership status read; pinned shape below.
-    "staging-ownership-status.yml": {"status"},
+    "staging-ownership-status.yml": {"status", "inventory"},
     "production-ownership-status.yml": {"guard", "status"},
     # Manual gradual-promote proof caller (passive until the synthetic
     # fixture lands); pinned shape below.
@@ -2502,17 +2502,7 @@ OWNERSHIP_STATUS_ENV = {
 
 
 def staging_ownership_status_errors(workflow):
-    """Manual staging-only read-only ownership status read.
-
-    Dispatch-only with no inputs. One job runs only from main through the
-    `staging` environment, on the public-hosted runner for job `status`, with its
-    own non-cancelling concurrency group and a 10 minute timeout. Exactly
-    four unconditional steps: pinned checkout without persisted credentials,
-    pinned setup-node, the ownership-control preflight, and one Run step that
-    calls the reviewed status script with the existing staging pair via the
-    environment only and validates the allowlisted owner/timestamp output.
-    No deploy, drill, takeover, fence, production or Cloudflare route.
-    """
+    """Pin the legacy ownership GET and the optional protected inventory."""
     name = "staging-ownership-status.yml"
     errors = []
     if "env" in workflow:
@@ -2520,23 +2510,33 @@ def staging_ownership_status_errors(workflow):
     on = workflow.get("on") or {}
     if set(on) != {"workflow_dispatch"}:
         errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
-    elif on.get("workflow_dispatch") not in (None, {}, ""):
-        errors.append(f"{name}: workflow_dispatch must take no inputs")
+    else:
+        dispatch = on.get("workflow_dispatch") or {}
+        inputs = dispatch.get("inputs") or {}
+        inventory = inputs.get("inventory") or {}
+        if (set(dispatch) != {"inputs"} or set(inputs) != {"inventory"}
+                or set(inventory) != {"description", "type", "required", "default"}
+                or inventory.get("type") != "boolean" or inventory.get("required") != "false"
+                or inventory.get("default") != "false"):
+            errors.append(f"{name}: dispatch must take only the optional inventory switch")
     if workflow.get("permissions") != {}:
         errors.append(f"{name}: top-level permissions must stay empty")
     if workflow.get("concurrency") != {"group": "staging-ownership-status", "cancel-in-progress": "false"}:
         errors.append(f"{name}: must use its own staging-ownership-status group without cancelling")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"status"}:
-        errors.append(f"{name}: jobs must be exactly status")
+    if set(jobs) != {"status", "inventory"}:
+        errors.append(f"{name}: jobs must be exactly status and inventory")
         return errors
+    inventory = Path(__file__).with_name("fixtures") / "staging_recovery_status_workflow.json"
+    if jobs["inventory"] != json.loads(inventory.read_text()):
+        errors.append(f"{name}: inventory must retain its protected read scope, exact steps and receipt")
     job = jobs["status"]
     if job.get("name") != "staging ownership status (read-only)":
         errors.append(f"{name}:status: job name must stay read-only")
     if job.get("environment") != "staging":
         errors.append(f"{name}:status: must read only the staging Environment binding")
-    if job.get("if") != "github.ref == 'refs/heads/main'":
-        errors.append(f"{name}:status: must run only from main")
+    if job.get("if") != "github.ref == 'refs/heads/main' && !inputs.inventory":
+        errors.append(f"{name}:status: must run only from main for ownership-only dispatches")
     if job.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:status: must keep contents:read only")
     if job.get("timeout-minutes") != "10":
@@ -2551,7 +2551,7 @@ def staging_ownership_status_errors(workflow):
     text = str(job).lower().replace(" ", "")
     for marker in ("wrangler-action", "wranglerdeploy", "wranglerpublish", "production",
                    "cloudflare_api_token", "cloudflare_account_id", "tojson(secrets", "secrets[",
-                   "set-x", "setx", "xtrace", "takeover", "fence", "transition", "inputs."):
+                   "set-x", "setx", "xtrace", "takeover", "fence", "transition"):
         if marker in text:
             errors.append(f"{name}:status: must not contain {marker!r}")
     secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
