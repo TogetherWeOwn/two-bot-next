@@ -18,7 +18,7 @@ WITH RECURSIVE expected AS (
 ), relations AS (
     SELECT c.*, s.nspname AS schema_name
     FROM pg_class c JOIN schemas s ON s.oid = c.relnamespace
-    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f', 'c')
       AND (s.nspname = 'web_v1' OR pg_get_userbyid(c.relowner) = 'two_bot_migrator'
            OR EXISTS (SELECT 1 FROM expected e WHERE e.schema_name = s.nspname
                       AND e.name = c.relname AND e.kind <> 'function'))
@@ -75,8 +75,13 @@ SELECT jsonb_build_object(
               AND p.kind = CASE WHEN e.kind IN ('sequence', 'view', 'function')
                                 THEN e.kind ELSE 'table' END)
         ORDER BY e.schema_name, e.name),
-    'unsupported', EXISTS (SELECT 1 FROM relations WHERE relkind = 'f')
+    'unsupported', EXISTS (SELECT 1 FROM relations WHERE relkind IN ('f', 'c'))
         OR EXISTS (SELECT 1 FROM routines WHERE prokind = 'a')
+        OR EXISTS (SELECT 1 FROM pg_shdepend d JOIN pg_database b ON b.oid = d.dbid
+            WHERE b.datname = current_database() AND d.deptype = 'o'
+              AND d.refobjid = 'two_bot_migrator'::regrole::oid
+              AND d.classid NOT IN ('pg_class'::regclass, 'pg_proc'::regclass, 'pg_type'::regclass,
+                  'pg_namespace'::regclass, 'pg_extension'::regclass, 'pg_default_acl'::regclass))
         OR EXISTS (SELECT 1 FROM pg_type t JOIN schemas s ON s.oid = t.typnamespace
             WHERE t.typrelid = 0 AND t.typelem = 0
               AND (s.nspname = 'web_v1' OR pg_get_userbyid(t.typowner) = 'two_bot_migrator')
@@ -131,7 +136,9 @@ SELECT jsonb_build_object(
                 FROM unnest(p.polroles) AS member(role_oid) ORDER BY 1),
             'using', pg_get_expr(p.polqual, c.oid), 'check', pg_get_expr(p.polwithcheck, c.oid))
             FROM pg_policy p WHERE p.polrelid = c.oid ORDER BY p.polname),
-        'sequence', (SELECT to_jsonb(s) - 'seqrelid' FROM pg_sequence s WHERE s.seqrelid = c.oid),
+        'sequence', (SELECT (to_jsonb(s) - ARRAY['seqrelid', 'seqtypid'])
+            || jsonb_build_object('type', format_type(seqtypid, NULL))
+            FROM pg_sequence s WHERE s.seqrelid = c.oid),
         'sequence_owned_by', (SELECT format('%s.%I', d.refobjid::regclass, a.attname)
             FROM pg_depend d JOIN pg_attribute a
                 ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
