@@ -700,6 +700,24 @@ async fn voice_move_signed_uncertain_patch_holds_until_newer_gateway_evidence() 
 }
 
 #[tokio::test]
+async fn receiver_bind_matches_the_voice_move_gate() {
+    let _moderation = MODERATION_FLAG_LOCK.lock().await;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let enabled = InternalFlags::from_env().is_enabled("voice.move_member");
+    let receiver = bind(
+        config(),
+        lazy_pool(),
+        &token(),
+        voice_snapshot::new_shared_cache(),
+        VoiceOccupancyClock::new(),
+        connected_gateway(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receiver.state.voice_move.is_some(), enabled);
+}
+
+#[tokio::test]
 async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_member() {
     const MEMBER: &str = "111111111111111141";
     const OTHER: &str = "111111111111111142";

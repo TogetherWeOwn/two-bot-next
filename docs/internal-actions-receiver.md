@@ -24,9 +24,8 @@ catalogue's broader defaults. Every other verb stays refused by the per-effect
 fences.
 The public health/readiness/metrics router has no action route. The shipped
 Worker exposes only the staging ingress below, dark until separately enabled.
-Its explicit container wiring forwards one optional capability, the default-off
-staging gate for `voice.move_member`. `role.assign` has no configured role target.
-The other optional gates stay off. The ungated `announcement.post` and
+Its container wiring forwards the default-off staging gate for `voice.move_member`.
+Other optional gates and role targets stay absent. The ungated `announcement.post` and
 `event.upsert` paths remain subject to receiver authentication, target validation
 and durable execution fences; this is not evidence that either has run.
 Adding secrets cannot enable unforwarded role/capability gates. Do not stage
@@ -144,17 +143,14 @@ capabilities; this table is not an instruction to create or stage them.
 | `TWO_INTERNAL_ALLOW_SETTINGS` | Settings get/set stay gated off |
 | `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | `voice.snapshot` stays gated off |
 
-The self-move executor is attached at bind only with the staging opt-in.
-Before enabling it, verify the
+Before enabling self-move, verify the receiver can write terminal receipts and the
 [voice receipt migration](../crates/cutover/migrations/0481_internal_voice_move_audit.sql)
-is applied and the receiver can write terminal receipts. Use the existing
-exclusive finite staging window with verified serving and rollback identities,
-a dedicated account and channels, and cleanup within the same window.
-Attaching it applies the five-second nonce deadline to all signed verbs. The
-guild turn ends at adapter settlement. The child holds receiver capacity through
-the terminal audit, with up to five seconds beyond the wire deadline to confirm
-the write. A failed or timed-out audit write is logged as unconfirmed. The
-caller can time out before the audit completes, and a forced drain can interrupt it.
+is applied. Use the existing exclusive finite staging window with verified serving and
+rollback identities, a dedicated account and channels, and cleanup within that window.
+Attaching the executor gives all signed verbs a five-second nonce deadline. The guild turn
+ends at adapter settlement. The child holds capacity through the audit, with up to five
+seconds beyond the wire deadline. An audit failure or timeout is logged as unconfirmed.
+A caller can time out before the audit finishes, and a forced drain can interrupt it.
 
 Fixed receiver port: **8091** (health stays on `BOT_PORT` 8080, and the two may
 not be equal while the receiver is enabled). While enabled, 8091 joins the
@@ -446,23 +442,18 @@ Success (`200` only, `result` always an object, no `error` key):
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
 | moderation.\* | `{outcome[, affected]}` | |
 
-The trusted website signer derives `discord_id` from the authenticated end-user
-session and signs it with `channel_id`. The bot accepts one subject and uses it
-for the rate limit, permission checks, PATCH and terminal audit. Session ownership
-is a signer responsibility. The member bucket allows a burst of six and refills
-one token every 50 seconds.
+The website signer derives `discord_id` from the authenticated session and signs it with `channel_id`.
+The bot uses that subject for rate limits, permissions, the PATCH and terminal audit.
+The member bucket allows a burst of six and refills one token every 50 seconds.
 
-A request needs fresh gateway occupancy and destination permission evidence.
-`not_permitted` and `not_connected` are determined before a PATCH. A move sends
-at most one PATCH. A finite cooldown returns HTTP 429 `rate_limited` with a
-validated `Retry-After`. An indefinite PATCH cooldown retains the durable send
-fence and returns HTTP 502 `discord_unavailable`. A lost reply can leave the
-move unconfirmed. A fresh, bounded attempt for the same intent uses a new nonce
-and can return `already_in_room` once newer gateway evidence clears the member's
-hold. A preserved hold can still return `discord_unavailable`.
-An arrival observed before local PATCH settlement can count as both a cached
-occupant and a reserved seat. A move can return `room_full` until a newer
-transition for the same member reconciles the reservation.
+A move requires fresh gateway occupancy and destination permissions. The receiver decides
+`not_permitted` and `not_connected` before sending a PATCH and sends at most one PATCH.
+Finite cooldowns return HTTP 429 `rate_limited` with a validated `Retry-After`. An indefinite
+PATCH cooldown keeps the durable send fence and returns HTTP 502 `discord_unavailable`.
+A lost reply leaves the move unconfirmed. A bounded retry uses a new nonce and can return
+`already_in_room` after newer gateway evidence clears the member hold, or `discord_unavailable`
+if the hold persists. An arrival before PATCH settlement can count as both occupant and reserved
+seat, so a move can return `room_full` until a newer transition reconciles that member's hold.
 
 Snapshot event links use accepted, non-member `event_instance_windows`
 evidence (migration 0472), not channel-claim dates or the continued existence
