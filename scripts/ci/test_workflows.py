@@ -28,11 +28,12 @@ ROOT = Path(__file__).resolve().parents[2]
 _HISTORY_SPEC = importlib.util.spec_from_file_location(
     "synthetic_alert_history", ROOT / "scripts/synthetic_alert_history.py")
 _HISTORY_MODULE = importlib.util.module_from_spec(_HISTORY_SPEC)
-_HISTORY_SPEC.loader.exec_module(_HISTORY_MODULE)
 _TRACKER_SPEC = importlib.util.spec_from_file_location(
     "slow_burn_tracker", ROOT / "scripts/slow_burn_tracker.py")
 _TRACKER_MODULE = importlib.util.module_from_spec(_TRACKER_SPEC)
-_TRACKER_SPEC.loader.exec_module(_TRACKER_MODULE)
+with patch.object(sys, "path", [str(ROOT / "scripts"), *sys.path]):
+    _HISTORY_SPEC.loader.exec_module(_HISTORY_MODULE)
+    _TRACKER_SPEC.loader.exec_module(_TRACKER_MODULE)
 ALERT_STEPS = _HISTORY_MODULE.ALERT_STEPS
 DECIDE_STEPS = _HISTORY_MODULE.DECIDE_STEPS
 JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
