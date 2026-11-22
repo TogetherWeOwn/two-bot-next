@@ -398,6 +398,16 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(
                     inputs.main(["--base-ref", "a", "--head-ref", "b"]), 2)
 
+    def test_db_compatibility_scope_includes_removed_and_quoted_paths(self):
+        for path in ("migrations.lock", "crates/cutover/migrations/0480_é.sql",
+                     "crates/store/migrations/0480_fixture.sql", "crates/store/sql/web_v1.sql",
+                     "sql/database_roles.sql", "sql/database_role_matrix.sql",
+                     "scripts/ci/fixtures/db_compatibility.rs", ".github/workflows/check.yml"):
+            with self.subTest(path=path):
+                self.assertTrue(inputs.db_compat_selected([path]))
+        self.assertFalse(inputs.db_compat_selected(
+            ["docs/database-roles.md", "wrangler/src/index.ts", "crates/core/src/lib.rs"]))
+
 
 class DocsIndexWiringTests(unittest.TestCase):
     def test_docs_index_inputs_and_ungated_execution(self):

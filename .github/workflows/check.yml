@@ -3039,6 +3039,7 @@ jobs:
       supply: ${{ steps.select.outputs.supply }}
       docs: ${{ steps.select.outputs.docs }}
       voice: ${{ steps.select.outputs.voice }}
+      db-compat: ${{ steps.db-compat.outputs.selected }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -3073,6 +3074,62 @@ jobs:
             "$rust" "$worker" "$parity" "$supply" "$docs" "$voice" "$EVENT_NAME"
           printf 'rust=%s\nworker=%s\nparity=%s\nsupply=%s\ndocs=%s\nvoice=%s\n' \
             "$rust" "$worker" "$parity" "$supply" "$docs" "$voice" >>"$GITHUB_OUTPUT"
+
+      - name: Select PR database compatibility
+        id: db-compat
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          selected=false
+          if [[ $GITHUB_EVENT_NAME == pull_request ]]; then
+            [[ $PR_BASE_SHA =~ ^[0-9a-f]{40}$ && $PR_HEAD_SHA =~ ^[0-9a-f]{40}$ ]]
+            prior=$(git merge-base --all "$PR_BASE_SHA" "$PR_HEAD_SHA")
+            [[ $prior =~ ^[0-9a-f]{40}$ ]]
+            selected=$(python3 scripts/job-inputs.py --base-ref "$prior" --head-ref "$PR_HEAD_SHA" --job db-compat)
+            [[ $selected == true || $selected == false ]]
+          fi
+          printf 'selected=%s\n' "$selected" >> "$GITHUB_OUTPUT"
+
+  db-compatibility:
+    name: prior revision database compatibility
+    needs: [job-inputs]
+    if: github.event_name == 'pull_request' && needs.job-inputs.outputs.db-compat != 'false'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: rust:1.100-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+    services:
+      agent-testdb:
+        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U agent_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_DEV_INCREMENTAL: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install disposable database client
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends postgresql-client
+      - name: Verify the merge-base CLI and stores on candidate migrations and grants
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash scripts/ci/db_compatibility.sh
 
   # Dependency-aware selector for the container job (TOG-12056): PRs that
   # touch only docs, worker UI or unrelated CI tooling skip the ~15-minute
@@ -3843,7 +3900,7 @@ jobs:
     name: ci-ok
     permissions:
       contents: read
-    needs: [job-inputs, container-inputs, supply-chain, check, rust-tests, coverage-plan, coverage-shard, patch-coverage, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db, fuzz-compile, nextest]
+    needs: [job-inputs, container-inputs, supply-chain, check, rust-tests, coverage-plan, coverage-shard, patch-coverage, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db, fuzz-compile, nextest, db-compatibility]
     # A skipped or cancelled dependency must not read as green.
     if: ${{ always() }}
     # Runner routing: see the note on the first job above.
@@ -3875,6 +3932,8 @@ jobs:
           MODERATION_DB_RESULT: ${{ needs.moderation-db.result }}
           FUZZ_COMPILE_RESULT: ${{ needs.fuzz-compile.result }}
           NEXTEST_RESULT: ${{ needs.nextest.result }}
+          DB_COMPAT_RESULT: ${{ needs.db-compatibility.result }}
+          DB_COMPAT_SELECTED: ${{ needs.job-inputs.outputs.db-compat }}
         run: |
           python3 - <<'PY'
           import os
@@ -3911,6 +3970,7 @@ jobs:
                   ("ignored-db-runtime", "IGNORED_DB_RUNTIME_RESULT", "RUST_SELECTED"),
                   ("fuzz-compile", "FUZZ_COMPILE_RESULT", "RUST_SELECTED"),
                   ("nextest", "NEXTEST_RESULT", "RUST_SELECTED"),
+                  ("db-compatibility", "DB_COMPAT_RESULT", "DB_COMPAT_SELECTED"),
               ]
               for job, result_var, sel_var in gated:
                   result = os.environ.get(result_var, "")

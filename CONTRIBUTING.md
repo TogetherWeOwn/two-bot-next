@@ -248,6 +248,23 @@ in `scripts/ci/test_required_checks.py`. Advisory `container smoke` is exempt
 because the SBOM job gates image security. `ci-evidence` is exempt because
 it publishes links after the aggregate verdict.
 
+The PR-only `prior revision database compatibility` job also gates `ci-ok`
+when the merge-base diff touches migrations, schema SQL, the grant plan or
+the lane itself. It upgrades a disposable copy of the merge-base database
+with both candidate migration chains, the web contract and candidate grants.
+The merge-base CLI verifies privileges and restores a populated merge-base
+archive. A separately authenticated runtime login reads raid evidence and
+leases a scheduled message through merge-base store code. The web reader
+queries the contract metadata view. The verifier keeps every prior matrix
+entry and can extend it for new objects only. The job repeats the checks with
+additive schema and grants, then requires a specific missing-grant finding
+after a synthetic revoke. The job summary records both source revisions.
+
+This is a small rollback smoke on synthetic data. It covers the named store
+queries, a normal prior-format restore and the reviewed groups' catalog
+privileges. It does not exercise every runtime query, older archive formats,
+Discord, or provider-specific roles and data.
+
 Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
 HARD, required voice synthetic, test-target inventory HARD) run as steps of
 the `check` lane on standard GitHub-hosted `ubuntu-latest`; see
