@@ -67,6 +67,13 @@ class CheckSqlxPoolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "successful build"):
             self.check(success=False)
 
+    def test_bad_record_preserves_later_compiler_diagnostics(self):
+        output = io.StringIO()
+        later = diagnostic("crates/store/src/new.rs", 9, message="later error", code="E0308")
+        with self.assertRaisesRegex(ValueError, "invalid Cargo diagnostic stream"):
+            gate.check(["{", json.dumps(later)], set(), Counter(), output)
+        self.assertIn("later error", output.getvalue())
+
     def test_rollout_reports_new_constructor_without_blocking(self):
         path = "crates/store/src/new.rs"
         records = [

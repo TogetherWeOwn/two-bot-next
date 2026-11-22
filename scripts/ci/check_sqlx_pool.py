@@ -47,37 +47,44 @@ def check(lines, added, expected_fixture, output):
     violations = set()
     grandfathered = set()
     completed = False
+    protocol_error = None
     for line in lines:
-        record = json.loads(line)
-        if record["reason"] == "build-finished":
-            completed = record["success"] is True
-        if record["reason"] != "compiler-message":
-            continue
-        diagnostic = record["message"]
-        rendered = diagnostic["rendered"]
-        if (diagnostic["code"] or {}).get("code") != LINT:
-            if rendered:
-                output.write(rendered)
-            continue
-        spans = list(source_spans(diagnostic))
-        if not spans:
-            raise ValueError("SQLx lint diagnostic has no workspace location")
-        path, primary = spans[0]
-        location = (path, primary["line_start"])
-        if path == FIXTURE:
-            fixture[primary["line_start"]] += 1
-        elif owner_constructor(diagnostic, path, primary):
-            owner_lines.add(location)
-        elif any(
-            (path, number) in added
-            for path, span in spans
-            for number in range(span["line_start"], span["line_end"] + 1)
-        ):
-            if location not in violations:
-                output.write(rendered)
-            violations.add(location)
-        else:
-            grandfathered.add(location)
+        try:
+            record = json.loads(line)
+            if record["reason"] == "build-finished":
+                completed = record["success"] is True
+            if record["reason"] != "compiler-message":
+                continue
+            diagnostic = record["message"]
+            rendered = diagnostic["rendered"]
+            if (diagnostic["code"] or {}).get("code") != LINT:
+                if rendered:
+                    output.write(rendered)
+                continue
+            spans = list(source_spans(diagnostic))
+            if not spans:
+                raise ValueError("SQLx lint diagnostic has no workspace location")
+            path, primary = spans[0]
+            location = (path, primary["line_start"])
+            if path == FIXTURE:
+                fixture[primary["line_start"]] += 1
+            elif owner_constructor(diagnostic, path, primary):
+                owner_lines.add(location)
+            elif any(
+                (path, number) in added
+                for path, span in spans
+                for number in range(span["line_start"], span["line_end"] + 1)
+            ):
+                if location not in violations:
+                    output.write(rendered)
+                violations.add(location)
+            else:
+                grandfathered.add(location)
+        except (KeyError, TypeError, ValueError) as error:
+            protocol_error = protocol_error or error
+
+    if protocol_error:
+        raise ValueError(f"invalid Cargo diagnostic stream: {protocol_error}")
 
     if not completed:
         raise ValueError("Cargo did not report a successful build")
@@ -100,21 +107,22 @@ def main():
     parser.add_argument("--mode", choices=("warn", "hard"), required=True)
     args = parser.parse_args()
     hard = args.mode == "hard"
+    added, expected, setup_error = set(), Counter(), ""
     try:
         add_lines = runpy.run_path(str(ROOT / "scripts/ci/check-patch-coverage.py"))["added_lines"]
-        added, error = add_lines(args.base_ref, args.head_ref)
+        added, setup_error = add_lines(args.base_ref, args.head_ref)
         expected = Counter(
             number for number, line in enumerate(FIXTURE_SOURCE.read_text().splitlines(), 1)
             if line.endswith("// disallowed")
         )
+    except (KeyError, OSError) as error:
+        setup_error = str(error)
+    try:
         violations = check(sys.stdin, added or set(), expected, sys.stderr)
-        if error or not expected:
-            raise ValueError(error or "SQLx lint fixture is empty")
-    except (KeyError, OSError, TypeError, ValueError) as error:
-        # Leave Cargo's exit status independent of the policy verdict.
-        for _ in sys.stdin:
-            pass
-        print(f"SQLx pool lint could not verify the build: {error}", file=sys.stderr)
+        if setup_error or not expected:
+            raise ValueError(setup_error or "SQLx lint fixture is empty")
+    except ValueError as error:
+        print(f"SQLx pool lint could not verify the build: {setup_error or error}", file=sys.stderr)
         print(f"::{'error' if hard else 'warning'}::SQLx pool lint evidence is incomplete", file=sys.stderr)
         return hard
     if violations:
