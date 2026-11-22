@@ -55,8 +55,7 @@ class EvidenceTests(unittest.TestCase):
         link = f"https://github.com/{REPO}/actions/runs/12/job/34"
         for changed, problem in (
                 (body.replace("test_present", "test_gone"), "no unique matching test"),
-                (body.replace("test_present", "test_gone") + "\n## attestation", "no unique matching test"),
-                (body.replace("- Ran the evidence fixtures.", "-") + "\n## verification\n- Alternate account.", "Verification"),
+                (body.replace("test_present", "test_gone") + "\n## attestation", "canonical Verification"),
                 (body.replace("Ran the evidence fixtures.", link) + fenced, "can go stale"),
                 (body.replace("- Ran the evidence fixtures.", "```\npython3 -m unittest\n```") + fenced, "Verification"),
                 (body.replace("- Ran the evidence fixtures.", "-\n##\tNotes\n- Ran tests."), "Verification")):
@@ -64,6 +63,9 @@ class EvidenceTests(unittest.TestCase):
                 evidence.validate(policy, changed, files, read)
         with self.assertRaisesRegex(evidence.EvidenceError, "test_file_not_in_head_diff"):
             evidence.validate(policy, body, [{"filename": "test_sample.py", "status": "removed"}], read)
+        for alias in ("## verification", "## Verification ##", "# Verification", "## **Verification**"):
+            with self.assertRaisesRegex(evidence.EvidenceError, "canonical Verification"):
+                evidence.validate(policy, body + f"\n{alias}\n{link}", files, read)
         for heading in ("## Verification\n", "## Attestation\n"):
             blocks = (f"> `<!--` {link} `-->`",
                       f"```\n    ```\n## Notes\n```\n\n    ```\n\n{link}",

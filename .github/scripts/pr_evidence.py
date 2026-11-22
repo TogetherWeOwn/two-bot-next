@@ -50,19 +50,19 @@ def publish(repo, event, head, run, attempt, workflow):
 
 def evidence_sections(body):
     from markdown_it import MarkdownIt
-
     body = CUBIC_FOOTER.sub("", body).replace("\r\n", "\n").replace("\r", "\n")
     lines, tokens = body.split("\n"), MarkdownIt().parse(body)
-    headings = [token.map for token in tokens
+    headings = [(token.map, tokens[index + 1].children) for index, token in enumerate(tokens)
                 if token.type == "heading_open" and token.level == 0 and token.tag in {"h1", "h2"}]
-    stops = [start for start, _ in headings[1:]] + [len(lines)]
+    stops = [span[0] for span, _ in headings[1:]] + [len(lines)]
     sections = {}
-    for (start, content), stop in zip(headings, stops):
-        title = lines[start].strip()
+    for ((start, content), children), stop in zip(headings, stops):
+        label = "".join(child.content for child in children if child.type in {"text", "code_inline"})
+        title = "## " + label.strip().title()
         if title not in {"## Verification", "## Attestation"}:
             continue
-        if title in sections:
-            raise EvidenceError("Evidence headings must be unique.")
+        if lines[start].strip() != title or title in sections:
+            raise EvidenceError("Use unique canonical Verification and Attestation headings.")
         sections[title] = "\n".join(lines[content:stop]).strip()
     return sections.get("## Verification"), sections.get("## Attestation")
 
@@ -139,11 +139,9 @@ def named_tests(path, source):
 
 def validate(policy, body, files, read):
     verification, attestation = evidence_sections(body)
-    if not any(
+    if attestation is None or not any(
             policy.meaningful(line.strip("-* ")) for line in policy.visible_lines(verification or "")):
-        raise EvidenceError("Fill in the visible Verification section with commands and results.")
-    if attestation is None:
-        raise EvidenceError("Add a visible Attestation heading.")
+        raise EvidenceError("Fill in Verification with visible commands and results and include Attestation.")
     if RUN_LINK.search(verification) or RUN_LINK.search(attestation):
         raise EvidenceError("Actions URLs in Verification or Attestation can go stale. Use the job summary.")
     report = policy.validate(CUBIC_FOOTER.sub("", body), files)
