@@ -60,12 +60,11 @@ def rendered_lines(body):
 def evidence_sections(policy, body, *, include_blocks=False):
     body = CUBIC_FOOTER.sub("", body)
     text = "\n".join(rendered_lines(body) if include_blocks else policy.visible_lines(body))
-
-    def section(heading):
+    def section(heading, boundary):
         tail = f"\n{text}\n".partition(f"\n## {heading}\n")[2]
-        return re.split(r"^#{1,2} ", tail, maxsplit=1, flags=re.M)[0].strip()
+        return re.split(boundary, tail, maxsplit=1, flags=re.M)[0].strip()
 
-    return section("Verification"), section("Attestation")
+    return section("Verification", r"^#{1,2}(?:[ \t]|$)"), section("Attestation", r"^#{1,2} ")
 
 
 def sources(base, head):
