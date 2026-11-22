@@ -1,5 +1,3 @@
-"""Publish immutable Actions links and validate test declarations on a PR head."""
-
 import ast
 import hashlib
 import html
@@ -20,7 +18,6 @@ MAX_SOURCE = 2 * 1024 * 1024
 
 class EvidenceError(ValueError):
     """A refusal safe to expose in Actions."""
-
 
 def command(*args):
     return subprocess.check_output(args, stderr=subprocess.DEVNULL, timeout=30).decode()
@@ -51,11 +48,21 @@ def publish(repo, event, head, run, attempt, workflow):
     return "\n".join(summary) + "\n"
 
 
-def evidence_sections(policy, body):
-    visible = "\n".join(policy.visible_lines(CUBIC_FOOTER.sub("", body)))
+def rendered_lines(body):
+    fence = ""
+    for line in re.sub(r"<!--[\s\S]*?(?:-->|$)", "", body).splitlines():
+        marker = re.fullmatch(r"(`{3,}|~{3,})(.*)", line.strip())
+        yield " " + line if fence or line.startswith(("    ", "\t", ">")) else line.strip()
+        if marker and (not fence or (marker[1].startswith(fence) and not marker[2].strip())):
+            fence = "" if fence else marker[1]
+
+
+def evidence_sections(policy, body, *, include_blocks=False):
+    body = CUBIC_FOOTER.sub("", body)
+    text = "\n".join(rendered_lines(body) if include_blocks else policy.visible_lines(body))
 
     def section(heading):
-        tail = f"\n{visible}\n".partition(f"\n## {heading}\n")[2]
+        tail = f"\n{text}\n".partition(f"\n## {heading}\n")[2]
         return re.split(r"^#{1,2} ", tail, maxsplit=1, flags=re.M)[0].strip()
 
     return section("Verification"), section("Attestation")
@@ -73,11 +80,9 @@ def sources(base, head):
 
 def source_blob(head, path):
     row = command("git", "ls-tree", "-l", "-z", head, "--", f":(literal){path}")
-    if not row.startswith(("100644 blob ", "100755 blob ")):
-        raise EvidenceError("An attested test path is not a source file on this head.")
-    _, _, obj, size = row.split("\t", 1)[0].split()
-    if int(size) > MAX_SOURCE:
-        raise EvidenceError("An attested source exceeds the size limit.")
+    mode, kind, obj, size = row.split("\t", 1)[0].split()
+    if mode not in {"100644", "100755"} or kind != "blob" or int(size) > MAX_SOURCE:
+        raise EvidenceError("An attested source must be a regular file within the size limit.")
     return command("git", "cat-file", "blob", obj)
 
 
@@ -142,7 +147,7 @@ def validate(policy, body, files, read):
     if headings != ["## Verification"] or not any(
             policy.meaningful(line.strip("-* ")) for line in verification.splitlines()):
         raise EvidenceError("Fill in the visible Verification section with commands and results.")
-    if RUN_LINK.search(verification + "\n" + attestation):
+    if RUN_LINK.search("\n".join(evidence_sections(policy, body, include_blocks=True))):
         raise EvidenceError("Actions URLs in Verification or Attestation can go stale. Use the job summary.")
     report = policy.validate(CUBIC_FOOTER.sub("", body), files)
     if report["issues"]:
@@ -175,7 +180,7 @@ def check(policy, reader, number, repo, base, head):
 
     body = snapshot()
     baseline = Path(__file__).with_name("pr-evidence-baseline.txt").read_text().splitlines()
-    digest = hashlib.sha256(repr(evidence_sections(policy, body)).encode()).hexdigest()
+    digest = hashlib.sha256(repr(evidence_sections(policy, body, include_blocks=True)).encode()).hexdigest()
     grandfathered = f"{number} {head} {digest}" in baseline
     if not grandfathered:
         validate(policy, body, sources(base, head), lambda path: source_blob(head, path))

@@ -18,16 +18,12 @@ jobs:
     timeout-minutes: 5
     env:
       BOOTSTRAP: ${{ github.event.pull_request.number == 2357 && github.repository == 'TogetherWeOwn/two-bot-next' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.ref == 'main' }}
+      EVIDENCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+      PR_BASE: ${{ github.event.pull_request.base.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name == 'pull_request' && env.BOOTSTRAP != 'true'
         with:
-          ref: refs/heads/main
-          sparse-checkout: .github/scripts
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name == 'push' || env.BOOTSTRAP == 'true'
-        with:
+          ref: ${{ (github.event_name == 'push' || env.BOOTSTRAP == 'true') && github.sha || 'refs/heads/main' }}
           sparse-checkout: .github/scripts
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,15 +37,10 @@ jobs:
         with: {python-version: '3.12'}
       - run: 'python3 -m pip --isolated install --no-deps --only-binary=:all: --require-hashes -r .github/scripts/pr-evidence-requirements.txt'
       - if: github.event_name == 'pull_request'
-        env:
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-        run: git fetch --quiet --no-tags --unshallow origin "$PR_HEAD" "$PR_BASE"
+        run: git fetch --quiet --no-tags --unshallow origin "$EVIDENCE_HEAD" "$PR_BASE"
       - name: Verify and publish evidence
         env:
           GH_TOKEN: ${{ github.token }}
-          EVIDENCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
         run: python3 -I .github/scripts/pr_evidence.py verify
       - run: python3 -I -m unittest discover -s .github/scripts -p test_pr_evidence.py -v
