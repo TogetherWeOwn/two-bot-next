@@ -1,4 +1,5 @@
 """Synthetic transport regressions; no network requests are made."""
+from email.message import Message
 import http.client
 import importlib.util
 import io
@@ -6,6 +7,8 @@ from pathlib import Path
 import unittest
 from unittest import mock
 from urllib.error import HTTPError, URLError
+from urllib.request import HTTPSHandler, ProxyHandler, getproxies
+from urllib.response import addinfourl
 
 
 spec = importlib.util.spec_from_file_location(
@@ -103,8 +106,23 @@ class MetadataTransport(unittest.TestCase):
         self.assertTrue(stream.closed)
 
     def test_redirect_handler_refuses_redirects(self):
-        handler = transport._NoRedirect()
-        self.assertIsNone(handler.redirect_request(None, None, 302, "", {}, "https://example.invalid"))
+        self.reader = transport.RestReader("org/repo", "synthetic-token")
+        headers = Message()
+        headers["Location"] = "https://other.example/"
+        url = "https://api.github.com/repos/org/repo/pulls/1"
+        response = addinfourl(io.BytesIO(b"fixture"), headers, url, 302)
+        response.msg = "redirect"
+        with mock.patch.object(HTTPSHandler, "https_open", return_value=response) as send:
+            self.refused("repos/org/repo/pulls/1")
+            send.assert_called_once()
+        self.assertTrue(response.fp.closed)
+
+    def test_metadata_opener_disables_environment_proxies(self):
+        with mock.patch.dict("os.environ", {"HTTPS_PROXY": "http://proxy.example/"}, clear=True):
+            self.assertIn("https", getproxies())
+            reader = transport.RestReader("org/repo", "synthetic-token")
+            active = [handler.proxies for handler in reader._opener.handlers if isinstance(handler, ProxyHandler)]
+        self.assertFalse(any(active))
 
 
 if __name__ == "__main__":

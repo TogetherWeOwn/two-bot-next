@@ -28,11 +28,11 @@ def json_depth_exceeds(text, limit):
 
 
 def unique_object(pairs, *, error=ValueError, message="duplicate JSON object key"):
-    """Reject repeated decoded member names, including escaped spellings."""
+    """Reject repeated decoded names with a fixed message or local diagnostic."""
     result = {}
     for key, value in pairs:
         if key in result:
-            raise error(message)
+            raise error(message(key) if callable(message) else message)
         result[key] = value
     return result
 
