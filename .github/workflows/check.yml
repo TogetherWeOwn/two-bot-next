@@ -235,6 +235,12 @@ jobs:
       - name: Source-level CI gate regressions
         run: PYTHONPATH="$RUNNER_TEMP/zizmor" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
 
+      - name: Ratchet Python script intake
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
+        env:
+          INTAKE_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: python3 scripts/ci/check-python-intake.py "$INTAKE_BASE"
+
       - name: Reject hard-coded source snowflakes
         run: python3 scripts/ci/check-src-snowflakes.py
 
