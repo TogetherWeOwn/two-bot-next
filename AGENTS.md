@@ -63,19 +63,20 @@ its remaining findings, then push the resolution before expecting GitHub to merg
 
 ## T3 Code workflow
 
-The lead manages the queue, dependencies and at most four active task threads per project.
-Each owns one PR through merge. Continue its published branch and use the T3 Code PR watch.
-Report the squash SHA and verification, then settle the thread.
+The lead manages the queue, dependencies and up to four active task threads per project.
+Each owns one PR through merge. Continue its published branch and use the T3 PR watch.
+Report verification and the squash SHA, then settle.
 
-Use the [risk tiers in CONTRIBUTING.md](CONTRIBUTING.md#independent-review).
-Standard changes require one independent cross-model review. Critical changes
-require two in parallel, including a security review. Resolve findings on the published PR head.
+Follow the [risk tiers](CONTRIBUTING.md#independent-review). Standard changes need one independent
+cross-model review. Critical changes need two in parallel, including security. Resolve findings on the published head.
 
 T3 selects provider, model and effort per thread from the project default,
 launch `modelSelection` or reviewer `target`. Pair GPT/Sol with `codex-cliproxy`
-and Claude with `claude-cliproxy`. Prefer Sol for implementation and Opus for design.
-Choose reviewers from a different family. Default to high effort and use xhigh only
-when the brief justifies it. Never use max or ultra or pin models in harness files or hooks.
+and Claude with `claude-cliproxy`. Prefer Sol for implementation and Opus for design. Default to high effort
+and use xhigh only when the brief justifies it. Never use max or ultra. Keep model selection out of harness files and hooks.
+
+Never use `rm -f`, `rm -rf` or `rm --force`, including in `trap` cleanups and `bash -lc` strings.
+Use `rm -r -- "$dir"` for a directory and `rm -- "$file"` for a file.
 
 ## Test and build commands
 
@@ -113,10 +114,9 @@ tests use only disposable test services, never staging or production; retain
 all guards in [`CONTRIBUTING.md`](CONTRIBUTING.md#database-tests).
 
 Record the full PR head SHA and matching Actions run/job URLs in Verification.
-Use local transcripts for focused reproductions. The task owner normally
-squash-merges the pinned head after required checks and reviews pass. If a
-merge would deploy production or deployment cannot be ruled out, get owner
-approval for the full PR head SHA before merging. Production actions need separate owner approval.
+Keep focused reproduction transcripts. Normally the task owner squash-merges the pinned head after checks and reviews pass.
+Get owner approval for the full PR head SHA before any merge that could deploy production, including when effects are uncertain.
+Production actions need separate owner approval.
 See [`CONTRIBUTING.md`](CONTRIBUTING.md#production-merge-evidence).
 
 ## Modern web platform guidance
