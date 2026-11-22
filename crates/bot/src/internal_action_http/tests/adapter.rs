@@ -48,8 +48,8 @@ impl MockDiscord {
             .fallback(
                 |State(state): State<MockState>, request: Request| async move {
                     let (parts, body) = request.into_parts();
-                    let raw = to_bytes(body, 8192).await.unwrap();
-                    let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+                    let payload = to_bytes(body, 8192).await.unwrap();
+                    let body: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
                     let index = {
                         let mut seen = state.requests.lock().unwrap();
                         let index = seen.len();
@@ -711,36 +711,57 @@ async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_mem
     denied[2].1["permission_overwrites"] =
         json!([{ "id": MEMBER, "type": 1, "allow": "0", "deny": "1048576" }]);
     let disconnected = facts.iter().take(3).cloned().collect::<Vec<_>>();
+    let allowed = || {
+        facts
+            .clone()
+            .into_iter()
+            .chain([(StatusCode::OK, voice_member(MEMBER, false))])
+    };
     let mock = MockDiscord::start(
         denied
             .into_iter()
             .chain(disconnected)
-            .chain(facts)
-            .chain([(StatusCode::OK, voice_member(MEMBER, false))])
+            .chain(allowed())
+            .chain(allowed())
             .collect(),
     )
     .await;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let lane = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
-    let mut receiver = state(
-        db.pool().clone(),
-        Arc::new(MockEffect::new(MockOutcome::Success)),
-    );
-    let raw =
+    let executor =
+        ActionExecutor::with_admission(token(), Some(mock.origin.clone()), lane).unwrap();
+    let state_for = |deploy_env: &str| {
+        let flags = InternalFlags::from_map(&HashMap::from([
+            ("TWO_DEPLOY_ENV".to_owned(), deploy_env.to_owned()),
+            ("TWO_INTERNAL_ALLOW_VOICE_MOVE".to_owned(), "1".to_owned()),
+        ]));
+        let mut receiver = state(
+            db.pool().clone(),
+            Arc::new(MockEffect::new(MockOutcome::Success)),
+        );
+        Arc::get_mut(&mut receiver)
+            .unwrap()
+            .configure_voice_move(&flags, executor.clone());
+        receiver
+    };
+    let payload =
         json!({"action":"voice.move_member","discord_id":MEMBER,"channel_id":TARGET}).to_string();
-    let (status, _, body) = answer(router(receiver.clone()), signed_read(&raw, "old")).await;
+    let (status, _, body) = answer(
+        router(state_for("production")),
+        signed_read(&payload, "old"),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"]["code"], "action_not_allowed");
     mock.assert_wires(0);
+    let mut receiver = state_for("staging");
     let inner = Arc::get_mut(&mut receiver).unwrap();
     let clock = inner.voice_clock.clone();
     let pipeline = seed_move_pipeline(inner.voice_cache.clone(), clock.clone()).await;
     inner.gateway_state = connected_gateway();
-    inner.voice_move =
-        Some(ActionExecutor::with_admission(token(), Some(mock.origin.clone()), lane).unwrap());
     let app = router(receiver);
-    let (parts, _) = signed_read(&raw, "old").into_parts();
-    let tampered = Request::from_parts(parts, Body::from(raw.replace(MEMBER, OTHER)));
+    let (parts, _) = signed_read(&payload, "old").into_parts();
+    let tampered = Request::from_parts(parts, Body::from(payload.replace(MEMBER, OTHER)));
     assert_eq!(
         answer(app.clone(), tampered).await.0,
         StatusCode::UNAUTHORIZED
@@ -753,8 +774,11 @@ async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_mem
     ] {
         publish_move_room(&pipeline, MEMBER, room).await;
         let delivery = nonce();
-        let (status, _, body) =
-            answer(app.clone(), signed_read_with_nonce(&raw, "old", &delivery)).await;
+        let (status, _, body) = answer(
+            app.clone(),
+            signed_read_with_nonce(&payload, "old", &delivery),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["result"], json!({"outcome": outcome}));
         let receipt: (String, String, Option<i64>) = sqlx::query_as(
@@ -782,7 +806,7 @@ async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_mem
     }
 
     publish_move_room(&pipeline, MEMBER, Some(SOURCE)).await;
-    let (status, _, body) = answer(app, signed_read(&raw, "old")).await;
+    let (status, _, body) = answer(app.clone(), signed_read(&payload, "old")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["result"],
@@ -796,6 +820,22 @@ async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_mem
         .unwrap()
         .ends_with(&format!("/guilds/{}/members/{MEMBER}", staging_guild())));
     assert_eq!(patch["body"], json!({"channel_id": TARGET}));
+
+    // A confirmed PATCH followed by a failed receipt write never reports success.
+    publish_move_room(&pipeline, MEMBER, Some(TARGET)).await;
+    publish_move_room(&pipeline, MEMBER, Some(SOURCE)).await;
+    sqlx::query(
+        "ALTER TABLE internal_action_log ADD CHECK (action <> 'voice.move_member') NOT VALID",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let (status, _, body) = answer(app, signed_read(&payload, "old")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"]["code"], "discord_unavailable");
+    assert_eq!(body["error"]["retryable"], true);
+    mock.assert_wires(23);
+    mock.assert_patch_indices(&[15, 22]);
     db.close().await.unwrap();
 }
 
@@ -847,9 +887,9 @@ async fn signed_voice_move(uncertain: bool, with_retry_after: bool) {
     );
     let app = router(receiver.clone());
     let move_to = |member, nonce: &str| {
-        let raw = json!({"action":"voice.move_member","discord_id":member,"channel_id":TARGET})
+        let payload = json!({"action":"voice.move_member","discord_id":member,"channel_id":TARGET})
             .to_string();
-        answer(app.clone(), signed_read_with_nonce(&raw, "old", nonce))
+        answer(app.clone(), signed_read_with_nonce(&payload, "old", nonce))
     };
     assert_eq!(move_to("0", &nonce()).await.2["error"]["code"], "malformed");
     for (statement, expected_children) in [

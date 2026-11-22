@@ -1034,6 +1034,10 @@ impl ReceiverState {
         self
     }
 
+    fn configure_voice_move(&mut self, flags: &InternalFlags, executor: ActionExecutor) {
+        self.voice_move = flags.is_enabled("voice.move_member").then_some(executor);
+    }
+
     fn action_metrics(&self) -> &metrics::Metrics {
         #[cfg(test)]
         {
@@ -1285,9 +1289,6 @@ pub async fn bind(
         .map_err(|_| {
             std::io::Error::other("internal-action event executor configuration invalid")
         })?;
-    let voice_move = InternalFlags::from_env()
-        .is_enabled("voice.move_member")
-        .then(|| events.clone());
     // Membership shares the same admitted transport as event reads: one
     // token-wide lane for every Discord send. Cloned before the read wrapper
     // takes ownership; role hierarchy and add-member PUTs hold the same lane.
@@ -1314,14 +1315,14 @@ pub async fn bind(
         Arc::new(executor),
         Arc::new(member),
         Arc::new(EventReadExecutor::new(events.clone(), pool.clone())),
-        Arc::new(EventMutationExecutor::new(events, pool)),
+        Arc::new(EventMutationExecutor::new(events.clone(), pool)),
         Arc::new(moderation),
         Arc::new(channel),
     )
     .with_voice_cache(voice_cache)
     .with_voice_clock(voice_clock)
     .with_gateway_state(gateway_state);
-    state.voice_move = voice_move;
+    state.configure_voice_move(&InternalFlags::from_env(), events);
     Ok(BoundReceiver {
         listener,
         state: Arc::new(state),
