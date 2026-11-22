@@ -261,7 +261,9 @@ applies rolling nominal windows when invoked: raw presence/voice rows use a
 30-day window and the audit-log cache uses 45 days. The 72-hour receipt target
 requires full schema coverage, scoped reservation deletion and settled replay
 guards. The runtime lacks reservation DELETE, so both drains keep work queued
-and report overdue requests. Standalone erasure also needs migrator-only audit access.
+and report overdue requests. Standalone erasure needs migrator-only audit access.
+Store's history backfill records author IDs without a guild key, so it also
+blocks both drains until its rows can be scoped safely.
 Raw event attendance sessions expire strictly more than 90 elapsed days
 (2,160 hours) after `joined_at`, whether open or closed. Member erasure removes
 only that member's sessions in the requested guild. Attendance window records

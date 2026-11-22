@@ -190,7 +190,6 @@ async fn runtime_privacy_boundaries_across_0480_and_v17_restore() {
     let fixture_name = name.clone();
     let result = tokio::spawn(async move { exercise_transition(&pool, &fixture_name).await }).await;
     db.close().await.expect("verify disposable teardown");
-
     let bootstrap = url.rsplit_once('/').unwrap().1;
     let mut cleanup = PgConnection::connect_with(&options.as_ref().clone().database(bootstrap))
         .await
@@ -292,10 +291,11 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     .unwrap();
     restore_v17(&migrator, name).await;
     assert_counts(&runtime, &[(SESSIONS, 3), (WINDOWS, 2)]).await;
-    assert_runtime_refusal(&runtime, &request, "42501").await;
     assert_eq!(count(&migrator, AUDITS).await, 0);
-
+    let denied = fulfill_user_deletion(&runtime, &request).await.unwrap_err();
+    assert_eq!(denied.to_string(), "erasure schema coverage incomplete");
     assert_hidden_schema_and_replay_refusals(&runtime, &migrator, &request).await;
+    assert_runtime_refusal(&runtime, &request, "42501").await;
     let blocked = run_retention(&runtime, RetentionMode::Execute)
         .await
         .unwrap();
@@ -308,7 +308,6 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     assert_eq!(receipt.receipt_id, format!("rcpt-{request}"));
     assert!(fulfill_user_deletion(&migrator, &request).await.is_err());
     assert_counts(&runtime, &[(RECEIPTS, 1), (SESSIONS, 2), (RESERVATIONS, 2)]).await;
-
     let drained = run_retention(&migrator, RetentionMode::Execute)
         .await
         .unwrap();
@@ -396,10 +395,9 @@ async fn assert_hidden_schema_and_replay_refusals(
     let gaps = member_erasure::schema_gaps(&mut runtime.acquire().await.unwrap())
         .await
         .unwrap();
-    assert_eq!(
-        gaps,
-        ["uncovered identity: privacy_hidden_fixture.owner_id"]
-    );
+    let backfill = "uncovered identity: backfill_history_messages.author_id";
+    let hidden = "uncovered identity: privacy_hidden_fixture.owner_id";
+    assert_eq!(gaps, [backfill, hidden]);
     for mode in [RetentionMode::DryRun, RetentionMode::Execute] {
         let report = run_retention(runtime, mode).await.unwrap();
         assert_eq!(
@@ -412,8 +410,9 @@ async fn assert_hidden_schema_and_replay_refusals(
         );
     }
     assert_preserved(runtime).await;
+    // Isolate the role and replay controls after proving full-schema refusal.
     sqlx::raw_sql(
-        "DROP TABLE privacy_hidden_fixture;
+        "DROP TABLE privacy_hidden_fixture, backfill_history_messages;
          INSERT INTO moderation_idempotency
             (guild_id, idempotency_key, action, request_hash, state, claimed_at)
          SELECT DISTINCT guild_id, 'guard-200000000000000001', 'warn', 'fixture', 'claimed', now()
