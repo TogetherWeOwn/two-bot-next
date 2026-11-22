@@ -10,8 +10,8 @@ from mutation_scope import added_lines, git, pr_diff, python_lines
 
 MODULE = "scripts/rule.py"
 TESTS = "scripts/test_rule.py"
-OLD = "def legacy(n): return n > 99\ndef eligible(n): return n > 3\n"
-NEW = OLD.replace("n > 3", "n >= 3")
+OLD = "def legacy(n): return n > 99\ndef eligible(n):\n    return ((n)  # Compare the input\n        > 3)\n"
+NEW = OLD.replace("> 3", ">= 3")
 HEADER = "import unittest\nfrom rule import eligible, legacy\n\nclass RuleTests(unittest.TestCase):\n"
 
 
@@ -37,14 +37,14 @@ def main():
             head = commit(root, label)
             _, patch = pr_diff(root, base, head)
             changed = python_lines(added_lines(patch))
-            assert changed == {MODULE: {2}}, changed
+            assert changed == {MODULE: {4}}, changed
             with tempfile.TemporaryDirectory(dir=scratch) as temporary:
                 copy = snapshot(root, Path(temporary))
                 results = measure(copy, changed, {MODULE: (TESTS,)})
                 assert (copy / MODULE).read_text() == NEW
             assert len(results) == 1 and results[0]["status"] == status, results
             if status in ("killed", "survived"):
-                assert results[0]["line"] == 2, results
+                assert results[0]["line"] == 4, results
             assert verdict({"results": results}, "hard") == expected
             assert verdict({"results": results}, "warn") == 0
             print(f"Python fixture {label}: {status}, HARD exit {expected}")
