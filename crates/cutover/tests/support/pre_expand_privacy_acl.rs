@@ -169,6 +169,7 @@ const MEMBERS: &str = "SELECT count(*) FROM members";
 const QUEUE: &str = "SELECT count(*) FROM retention_guild_purge_queue";
 const SESSIONS: &str = "SELECT count(*) FROM event_voice_sessions";
 const WINDOWS: &str = "SELECT count(*) FROM event_attendance_windows";
+const AUDITS: &str = "SELECT count(*) FROM member_erasure_audit";
 const RECEIPTS: &str =
     "SELECT count(*) FROM retention_deletion_requests WHERE receipt_id IS NOT NULL";
 
@@ -185,8 +186,7 @@ async fn runtime_privacy_boundaries_across_0480_and_v17_restore() {
     let result = tokio::spawn(async move { exercise_transition(&pool, &fixture_name).await }).await;
     db.close().await.expect("verify disposable teardown");
 
-    // The committed role plan creates cluster roles. After dropping their
-    // disposable database, remove those names from the guarded bootstrap DB.
+    // Committed cluster roles outlive their disposable database.
     let bootstrap = url.rsplit_once('/').unwrap().1;
     let mut cleanup = PgConnection::connect_with(&options.as_ref().clone().database(bootstrap))
         .await
@@ -259,12 +259,10 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
         .is_err());
     assert_preserved(&runtime).await;
 
-    // The production order commits Cutover before Store. No new web contract
-    // or ACL runs inside the window being probed here.
+    // Cutover commits before Store, web contract and grants.
     through(&CUTOVER, 480).run(&migrator).await.unwrap();
     assert_ledgers(&migrator, 480, 465).await;
-    assert_eq!(count(&migrator, SESSIONS).await, 0);
-    assert_eq!(count(&migrator, WINDOWS).await, 0);
+    assert_counts(&migrator, &[(SESSIONS, 0), (WINDOWS, 0)]).await;
     assert_runtime_refusal(&runtime, &request, "42501").await;
     assert!(run_retention(&runtime, RetentionMode::Execute)
         .await
@@ -289,35 +287,24 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     .await
     .unwrap();
     restore_v17(&migrator, name).await;
-    assert_eq!(count(&runtime, SESSIONS).await, 3);
-    assert_eq!(count(&runtime, WINDOWS).await, 2);
+    assert_counts(&runtime, &[(SESSIONS, 3), (WINDOWS, 2)]).await;
     assert_runtime_refusal(&runtime, &request, "42501").await;
-    assert_preserved(&runtime).await;
-    assert_eq!(
-        count(&migrator, "SELECT count(*) FROM member_erasure_audit").await,
-        0
-    );
+    assert_eq!(count(&migrator, AUDITS).await, 0);
 
     assert_hidden_schema_and_replay_refusals(&runtime, &migrator, &request).await;
-    // With the request still pending, settle it using the existing operator
-    // role to isolate the queued guild failure under runtime privileges.
-    let receipt = fulfill_user_deletion(&migrator, &request).await.unwrap();
-    assert_eq!(receipt.receipt_id, format!("rcpt-{request}"));
-    assert!(fulfill_user_deletion(&migrator, &request).await.is_err());
-    assert_eq!(count(&runtime, RECEIPTS).await, 1);
-    assert_eq!(count(&runtime, MEMBERS).await, 2);
-    assert_eq!(count(&runtime, SESSIONS).await, 2);
-    assert_eq!(count(&runtime, WINDOWS).await, 2);
-    let failed = run_retention(&runtime, RetentionMode::Execute)
+    let blocked = run_retention(&runtime, RetentionMode::Execute)
         .await
         .unwrap();
     assert_eq!(
-        (failed.guild_rows_purged, failed.guild_purges_failed),
-        (0, 1)
+        (blocked.schema_gap_deferrals, blocked.guild_purges_failed),
+        (1, 1)
     );
-    assert_eq!(count(&runtime, QUEUE).await, 1);
-    assert_eq!(count(&runtime, RESERVATIONS).await, 2);
-    assert_eq!(count(&runtime, SESSIONS).await, 2);
+    assert_preserved(&runtime).await;
+    // The existing operator role supplies the positive continuity control.
+    let receipt = fulfill_user_deletion(&migrator, &request).await.unwrap();
+    assert_eq!(receipt.receipt_id, format!("rcpt-{request}"));
+    assert!(fulfill_user_deletion(&migrator, &request).await.is_err());
+    assert_counts(&runtime, &[(RECEIPTS, 1), (SESSIONS, 2), (RESERVATIONS, 2)]).await;
 
     let drained = run_retention(&migrator, RetentionMode::Execute)
         .await
@@ -333,34 +320,29 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
         survivors,
         [(GUILD.to_owned(), "200000000000000002".to_owned())]
     );
-    assert_eq!(count(&runtime, WINDOWS).await, 1);
-    assert_eq!(count(&runtime, RESERVATIONS).await, 1);
+    assert_counts(&runtime, &[(WINDOWS, 1), (RESERVATIONS, 1)]).await;
     assert_eq!(count(&runtime, "SELECT count(*) FROM moderation_idempotency WHERE state = 'done' AND outcome = 'operator_released'").await, 2);
 }
 
 async fn assert_runtime_refusal(runtime: &PgPool, request: &str, state: &str) {
-    assert_sqlstate(
-        &erase_member(
-            runtime,
-            GUILD,
-            MEMBER,
-            ErasureMode::Execute { actor: "fixture" },
-        )
+    let mode = ErasureMode::Execute { actor: "fixture" };
+    let standalone = erase_member(runtime, GUILD, MEMBER, mode)
         .await
-        .unwrap_err(),
-        state,
-    );
-    assert_sqlstate(
-        &fulfill_user_deletion(runtime, request).await.unwrap_err(),
-        state,
-    );
+        .unwrap_err();
+    let queued = fulfill_user_deletion(runtime, request).await.unwrap_err();
+    assert_sqlstate(&standalone, state);
+    assert_sqlstate(&queued, state);
 }
 
 async fn assert_preserved(runtime: &PgPool) {
-    assert_eq!(count(runtime, MEMBERS).await, 3);
-    assert_eq!(count(runtime, RESERVATIONS).await, 3);
-    assert_eq!(count(runtime, QUEUE).await, 1);
-    assert_eq!(count(runtime, RECEIPTS).await, 0);
+    let expected = [(MEMBERS, 3), (RESERVATIONS, 3), (QUEUE, 1), (RECEIPTS, 0)];
+    assert_counts(runtime, &expected).await;
+}
+
+async fn assert_counts(pool: &PgPool, expected: &[(&'static str, i64)]) {
+    for &(query, rows) in expected {
+        assert_eq!(count(pool, query).await, rows, "{query}");
+    }
 }
 
 async fn restore_v17(migrator: &PgPool, name: &str) {
@@ -443,7 +425,7 @@ async fn assert_hidden_schema_and_replay_refusals(
             .contains("unresolved erasure replay guard"),
         "{refusal}"
     );
-    let report = run_retention(runtime, RetentionMode::Execute)
+    let report = run_retention(migrator, RetentionMode::Execute)
         .await
         .unwrap();
     assert_eq!(
@@ -451,8 +433,7 @@ async fn assert_hidden_schema_and_replay_refusals(
         (1, 1)
     );
     assert_preserved(runtime).await;
-    // Synthetic settled fence with the same redacted markers used by the
-    // operator release path.
+    // Match the operator release path's redacted markers.
     sqlx::query(
         "UPDATE moderation_idempotency SET state = 'done', outcome = 'operator_released',
           completed_at = now(), request_hash = 'operator_released', claim_token = 'operator_released'"
