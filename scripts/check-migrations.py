@@ -10,7 +10,9 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from script_intake import decode_legacy_json, unique_object
+sys.path.pop(0)
 
 ROOT = Path(__file__).resolve().parents[1]
 PATH = re.compile(r"crates/[^/]+/migrations/([0-9]{4})_[a-z][a-z0-9_]*\.sql")

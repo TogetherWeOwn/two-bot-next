@@ -6,6 +6,7 @@ import io
 import json
 import os
 import runpy
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -55,6 +56,34 @@ class SyntheticOpener:
 
 
 class AttestationIntegration(unittest.TestCase):
+    def test_sparse_fixture_loads_intake_from_the_verified_checkout(self):
+        root = Path(__file__).resolve().parents[2]
+        fixture = yaml.safe_load((root / "scripts/ci/fixtures/base-attestation.yml").read_text())
+        checkout_step = fixture["jobs"]["metadata"]["steps"][0]["with"]
+        source = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root,
+                                         text=True, timeout=10).strip()
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "checkout"
+            subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(root), str(checkout)],
+                           check=True, timeout=20)
+            subprocess.run(["git", "sparse-checkout", "set", "--no-cone", "--stdin"], cwd=checkout,
+                           input=checkout_step["sparse-checkout"], text=True, check=True, timeout=10)
+            subprocess.run(["git", "checkout", "--quiet", "--detach", source], cwd=checkout,
+                           check=True, timeout=20)
+            self.assertFalse((checkout / "scripts" / "bot_promotion.py").exists())
+            program = """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path.cwd() / ".github/scripts"))
+from base_attestation_gate import decode_legacy_json
+
+print(Path(sys.modules[decode_legacy_json.__module__].__file__).resolve())
+"""
+            actual = subprocess.check_output([sys.executable, "-I", "-B", "-c", program],
+                                             cwd=checkout, text=True, timeout=10).strip()
+            self.assertEqual(Path(actual), (checkout / "scripts/script_intake.py").resolve())
+
     def run_gate(self, body, mutation=None):
         data = metadata(body)
         opener = SyntheticOpener(data, mutation)
