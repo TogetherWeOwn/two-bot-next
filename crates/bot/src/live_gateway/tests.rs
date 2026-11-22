@@ -68,26 +68,27 @@ async fn voice_only_is_encoded_once_in_receive_order_and_retried_unchanged() {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut retry = true;
-    let worker = tokio::spawn(receiver.run(async move |body| {
+    let worker = receiver.run(async move |body| {
         tx.send(body.to_vec()).expect("fixture receiver");
         if std::mem::take(&mut retry) {
             Delivery::Retry
         } else {
             Delivery::Accepted
         }
-    }));
-    let first = rx.recv().await.expect("join");
-    assert_eq!(rx.recv().await.expect("retry"), first);
-    let expected = include_str!("../../tests/fixtures/live_gateway_deltas.json");
-    let moved = rx.recv().await.expect("move");
-    let left = rx.recv().await.expect("leave");
-    assert_eq!(
-        json!([decoded(&first), decoded(&moved), decoded(&left)]),
-        decoded(expected.as_bytes())
-    );
-    assert!(rx.try_recv().is_err());
-    drop(live);
-    worker.await.expect("worker exits");
+    });
+    tokio::join!(worker, async {
+        let first = rx.recv().await.expect("join");
+        assert_eq!(rx.recv().await.expect("retry"), first);
+        let expected = include_str!("../../tests/fixtures/live_gateway_deltas.json");
+        let moved = rx.recv().await.expect("move");
+        let left = rx.recv().await.expect("leave");
+        assert_eq!(
+            json!([decoded(&first), decoded(&moved), decoded(&left)]),
+            decoded(expected.as_bytes())
+        );
+        assert!(rx.try_recv().is_err());
+        drop(live);
+    });
 }
 
 #[tokio::test(start_paused = true)]
@@ -112,15 +113,17 @@ async fn rejected_or_superseded_baselines_cannot_send() {
     receive(&mut live, VOICE);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let worker = tokio::spawn(receiver.run(async move |body| {
+    let worker = receiver.run(async move |body| {
         tx.send(decoded(body)).expect("fixture receiver");
         std::future::pending().await
-    }));
-    assert_eq!(rx.recv().await.expect("current delta")["seq"], 5);
-    let retired_at = Instant::now();
-    live.disconnect();
-    drop(live);
-    worker.await.expect("retirement cancels the attempt");
+    });
+    let (_, retired_at) = tokio::join!(worker, async {
+        assert_eq!(rx.recv().await.expect("current delta")["seq"], 5);
+        let retired_at = Instant::now();
+        live.disconnect();
+        drop(live);
+        retired_at
+    });
     assert_eq!(retired_at.elapsed(), Duration::ZERO);
     assert!(rx.try_recv().is_err());
 }

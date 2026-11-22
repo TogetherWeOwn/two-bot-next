@@ -109,16 +109,15 @@ impl LiveGateway {
 }
 
 impl LiveReceiver {
-    /// Attempts see the same encoded bytes on retry. Retiring a baseline also
-    /// cancels its pending attempts and suppresses its queued deltas.
+    /// Drive this borrowing worker alongside its receive owner. Every retry
+    /// uses the same bytes, and retirement cancels pending attempts.
     pub async fn run(self, mut attempt: impl AsyncFnMut(&[u8]) -> Delivery) {
         self.0
             .run(async |delta| {
                 let mut generation = delta.generation.clone();
-                let retired = futures_util::FutureExt::boxed(generation.changed());
                 tokio::select! {
                     biased;
-                    _ = retired => Delivery::Rejected,
+                    _ = generation.changed() => Delivery::Rejected,
                     result = attempt(&delta.body) => result,
                 }
             })
@@ -195,15 +194,14 @@ impl Intake {
         let Some(active) = &self.active else {
             return Ok(());
         };
-        let scope = match (kind, kind.rsplit_once('_')) {
-            ("GUILD_UPDATE", _) => object::<GuildRow>(body.ok_or(())?.get())?.id,
-            ("VOICE_STATE_UPDATE", _)
-            | (
-                _,
-                Some((
+        let scope = match kind.rsplit_once('_') {
+            Some(("GUILD", "UPDATE")) => object::<GuildRow>(body.ok_or(())?.get())?.id,
+            Some(
+                ("VOICE_STATE", "UPDATE")
+                | (
                     "CHANNEL" | "GUILD_ROLE" | "GUILD_MEMBER" | "GUILD_SCHEDULED_EVENT",
                     "CREATE" | "UPDATE" | "DELETE" | "ADD" | "REMOVE",
-                )),
+                ),
             ) => object::<GuildScope>(body.ok_or(())?.get())?.guild_id,
             _ => return Ok(()),
         };
@@ -234,7 +232,6 @@ impl Intake {
             &[Operation::Voice(change)],
         )
         .ok_or(())?;
-        // A full queue drops this delta and leaves its number consumed.
         self.sender.offer(QueuedDelta { body, generation });
         Ok(())
     }
