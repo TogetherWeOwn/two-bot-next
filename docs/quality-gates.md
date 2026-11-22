@@ -137,6 +137,13 @@ reporter excludes file-only passes, and the fixture covers an empty test
 file along with strong, weak and failing assertions. Unsupported edits and
 failed measurements have their own verdicts.
 
+Before making the lane required, collect exact-head WARN receipts for
+representative PRs in all three languages. Check that real suites run,
+database-backed Rust coverage is accounted for, and the engine jobs complete
+within their budgets. The required check must use reviewed gate policy and
+fail closed on missing or incomplete measurements. Fixture coverage of the
+HARD exit codes is one part of that evidence.
+
 ## Scanner dependency triage (review by 2026-11-16)
 
 The hash-pinned `scripts/ci/semgrep-requirements.txt` targets CI's CPython 3.11

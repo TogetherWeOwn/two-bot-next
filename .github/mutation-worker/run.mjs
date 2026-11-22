@@ -6,6 +6,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse } from "@babel/parser";
 
 const MAX_MUTANTS = 50;
+const RUN_MILLISECONDS = 22 * 60_000;
+const TEST_MILLISECONDS = 60_000;
 const reporter = fileURLToPath(new URL("./reporter.mjs", import.meta.url));
 const operators = new Map(Object.entries({
   "<": "<=", "<=": "<", ">": ">=", ">=": ">", "===": "!==", "!==": "===",
@@ -40,7 +42,7 @@ export function edits(source, lines) {
   return candidates;
 }
 
-function testResult(root, args) {
+function testResult(root, args, timeoutMs) {
   return new Promise((done) => {
     const child = spawn(process.execPath, [`--test-reporter=${reporter}`, ...args], {
       cwd: root, detached: true, stdio: ["ignore", "pipe", "ignore"],
@@ -57,7 +59,7 @@ function testResult(root, args) {
         try { process.kill(-child.pid, "SIGKILL"); }
         catch (error) { if (error.code !== "ESRCH") done("infrastructure_error"); }
       }
-    }, 60_000);
+    }, timeoutMs);
     child.once("error", () => {
       clearTimeout(timeout);
       done("infrastructure_error");
@@ -76,6 +78,7 @@ function testResult(root, args) {
 }
 
 export async function measure(root, changed, testArgs) {
+  const deadline = performance.now() + RUN_MILLISECONDS;
   const results = [];
   const plans = [];
   for (const [file, added] of Object.entries(changed)) {
@@ -93,17 +96,19 @@ export async function measure(root, changed, testArgs) {
   if (count > MAX_MUTANTS) return [{ status: "infrastructure_error", reason: "Worker candidate budget exceeded" }];
   if (count === 0) return results;
   const testRoot = join(root, "wrangler");
-  const baseline = await testResult(testRoot, testArgs);
+  const baseline = await testResult(testRoot, testArgs, TEST_MILLISECONDS);
   if (baseline !== "passed") return [{
     status: baseline === "unsupported" ? baseline : "infrastructure_error",
     reason: baseline === "unsupported" ? "baseline ran zero tests" : "unmutated Worker suite failed",
   }];
   for (const { file, path, source, candidates } of plans) {
     for (const { line, start, end, replacement } of candidates) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) return [...results, { status: "infrastructure_error", reason: "Worker run budget exceeded" }];
       let test;
       try {
         writeFileSync(path, source.slice(0, start) + replacement + source.slice(end));
-        test = await testResult(testRoot, testArgs);
+        test = await testResult(testRoot, testArgs, Math.min(TEST_MILLISECONDS, remaining));
       } finally {
         writeFileSync(path, source);
       }
@@ -127,7 +132,7 @@ async function main([root, plan, receipt, mode]) {
   let results;
   try {
     const files = JSON.parse(readFileSync(plan, "utf8"));
-    const tests = readdirSync(join(root, "wrangler/test")).filter((file) => file.endsWith(".test.ts"));
+    const tests = readdirSync(join(root, "wrangler/test")).filter((file) => file.endsWith(".test.ts")).sort();
     if (tests.length === 0) throw new Error("Worker test inventory is empty");
     results = await measure(realpathSync(root), files, ["--import", "./test/cloudflare-loader.mjs",
       "--test", ...tests.map((file) => `test/${file}`)]);
