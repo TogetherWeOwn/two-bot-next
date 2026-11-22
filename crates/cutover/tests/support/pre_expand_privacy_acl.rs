@@ -157,7 +157,7 @@ fn assert_sqlstate(error: &sqlx::Error, expected: &str) {
     );
 }
 
-async fn count(db: impl sqlx::PgExecutor<'_>, sql: &'static str) -> i64 {
+async fn count<'e>(db: impl sqlx::PgExecutor<'e>, sql: &'static str) -> i64 {
     sqlx::query_scalar(sql).fetch_one(db).await.unwrap()
 }
 
@@ -343,7 +343,7 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     );
     assert_eq!(count(&runtime, WINDOWS).await, 1);
     assert_eq!(count(&runtime, RESERVATIONS).await, 1);
-    assert_eq!(count(&runtime, "SELECT count(*) FROM moderation_idempotency WHERE state = 'done' AND outcome = 'operator_released'").await, 1);
+    assert_eq!(count(&runtime, "SELECT count(*) FROM moderation_idempotency WHERE state = 'done' AND outcome = 'operator_released'").await, 2);
 }
 
 async fn assert_runtime_refusal(runtime: &PgPool, request: &str, state: &str) {
@@ -438,14 +438,25 @@ async fn assert_hidden_schema_and_replay_refusals(
         "DROP TABLE privacy_hidden_fixture;
          INSERT INTO moderation_idempotency
             (guild_id, idempotency_key, action, request_hash, state, claimed_at)
-         VALUES ('100000000000000001', 'guard-200000000000000001', 'warn', 'fixture', 'claimed', now());"
-    ).execute(migrator).await.unwrap();
+         SELECT DISTINCT guild_id, 'guard-200000000000000001', 'warn', 'fixture', 'claimed', now()
+         FROM members;",
+    )
+    .execute(migrator)
+    .await
+    .unwrap();
     let refusal = fulfill_user_deletion(runtime, request).await.unwrap_err();
     assert!(
         refusal
             .to_string()
             .contains("unresolved erasure replay guard"),
         "{refusal}"
+    );
+    let report = run_retention(runtime, RetentionMode::Execute)
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.deletions_deferred, report.guild_purges_deferred),
+        (1, 1)
     );
     assert_preserved(runtime).await;
     // Synthetic settled fence with the same redacted markers used by the
