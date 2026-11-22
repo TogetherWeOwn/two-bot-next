@@ -57,7 +57,8 @@ def check(lines, added, expected_fixture, output):
                 continue
             diagnostic = record["message"]
             rendered = diagnostic["rendered"]
-            if (diagnostic["code"] or {}).get("code") != LINT:
+            code = diagnostic["code"]
+            if code is None or code["code"] != LINT:
                 if rendered:
                     output.write(rendered)
                 continue
