@@ -45,6 +45,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from script_intake import (
+    decode_legacy_json,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 # Exact hosts only. The staging Worker is `two-bot-next-staging` (wrangler
 # `--env staging`) on the account's workers.dev subdomain.
 STAGING_HOSTS = frozenset({"two-bot-next-staging.5150.workers.dev"})
@@ -102,18 +108,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def is_production_host(host: str) -> bool:
@@ -184,7 +179,7 @@ def make_fetch(origin: str, timeout: float = 20.0) -> Fetch:
         try:
             conn.request(method, path, headers={"user-agent": USER_AGENT, "accept": "*/*"})
             response = conn.getresponse()
-            raw = response.read(MAX_BODY_BYTES + 1)
+            raw = read_with_overflow(response, MAX_BODY_BYTES)
             if len(raw) > MAX_BODY_BYTES:
                 raise BodyTooLarge("response body over the size cap")
             headers = {name.lower(): value for name, value in response.getheaders()}
@@ -261,7 +256,7 @@ class Probe:
 
 def parse_json(reply: Reply) -> object:
     try:
-        return json.loads(reply.body, object_pairs_hook=_reject_duplicate_keys)
+        return decode_legacy_json(reply.body, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         raise
     except (ValueError, RecursionError):

@@ -279,7 +279,8 @@ class RedirectSmokeTests(unittest.TestCase):
         self.assertEqual(code, 0, out.getvalue())
 
     def test_default_fetch_never_follows_redirects(self):
-        handler = smoke._NoRedirect()
+        handler = next(handler for handler in smoke.no_redirect_opener().handlers
+                       if isinstance(handler, smoke.urllib.request.HTTPRedirectHandler))
         self.assertIsNone(handler.redirect_request(None, None, 302, "Found", {},
                                                    "https://elsewhere"))
 

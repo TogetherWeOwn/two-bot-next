@@ -68,6 +68,13 @@ import urllib.request
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 UA = "two-bot-next-staging-rollout/1.0"
 DEFAULT_URL = "https://two-bot-next-staging.5150.workers.dev/mcp"
 TOKEN_ENV = "STAGING_MCP_TOKEN"
@@ -113,20 +120,6 @@ WRONG_BEARER = "wrong-bearer-probe-0000"
 
 class BodyTooLarge(ValueError):
     """A response body exceeds MAX_BODY_BYTES (fixed vocabulary only)."""
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Refuse redirects so the bearer never leaves STAGING_MCP_URL.
-
-    The default opener follows 301/302/303 by re-issuing a GET to the
-    Location URL with every non-content header copied, including
-    Authorization, without checking host or scheme. Returning None makes
-    the opener surface the 3xx as an HTTPError, which do_post records as
-    a probe failure instead of forwarding the bearer.
-    """
-
-    def redirect_request(self, *args, **kwargs):
-        return None
 
 
 def fail_refusal(message):
@@ -181,18 +174,18 @@ def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
         headers["Authorization"] = f"Bearer {token_or_none}"
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        opener = urllib.request.build_opener(NoRedirect)
+        opener = no_redirect_opener()
         with opener.open(req, timeout=timeout) as resp:
             status = resp.status
             resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-            raw = resp.read(MAX_BODY_BYTES + 1)
+            raw = read_with_overflow(resp, MAX_BODY_BYTES)
             if len(raw) > MAX_BODY_BYTES:
                 raise BodyTooLarge("response body over the size cap")
             body = raw.decode("utf-8", errors="replace")
             return status, resp_headers, body
     except urllib.error.HTTPError as e:
         try:
-            raw = e.read(MAX_BODY_BYTES + 1)
+            raw = read_with_overflow(e, MAX_BODY_BYTES)
             if len(raw) > MAX_BODY_BYTES:
                 raise BodyTooLarge("response body over the size cap")
             body = raw.decode("utf-8", errors="replace")
@@ -220,7 +213,7 @@ def _bounded_text_fallback(body, secret=None):
         def redact_literal(match):
             literal = match.group()
             try:
-                decoded = json.loads(literal, strict=False)
+                decoded = decode_legacy_json(literal, strict=False)
             except ValueError:
                 return '"***"'
             return json.dumps(decoded.replace(secret, "***")) if secret in decoded else literal
@@ -296,16 +289,11 @@ class DuplicateJsonKey(ValueError):
 
 
 def _unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise DuplicateJsonKey("duplicate JSON member")
-        result[key] = value
-    return result
+    return _unique_json_object(pairs, error=DuplicateJsonKey, message='duplicate JSON member')
 
 
 def _decode_bounded_json(body):
-    parsed = json.loads(body, parse_constant=_reject_json_constant,
+    parsed = decode_legacy_json(body, parse_constant=_reject_json_constant,
                         object_pairs_hook=_unique_object)
     # Decoder and encoder recursion limits differ. Check iteratively before
     # handing parsed containers to either the stdout or artifact encoder.

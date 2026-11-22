@@ -53,6 +53,8 @@ import re
 import sys
 import time
 
+from script_intake import decode_legacy_json
+
 # Pinned identity guards. Sources: crates/core/src/backup/guild_config.rs
 # (TWO_STAGING_GUILD_ID, STAGING_BOT_APPLICATION_ID) and
 # crates/cutover/src/lib.rs (LIVE_GUILD_ID). No snowflake may be added here
@@ -68,33 +70,12 @@ MOCK_TRANSPORT = "mock-local-fixtures"
 BODY_CAP = 64 << 10
 
 
-# Strings are skipped whole, so brackets inside them never count. An
-# unterminated string runs to the end, which keeps the scan linear.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 # CPython's old default recursion limit, which bounded the C JSON decoder.
 MAX_JSON_DEPTH = 1000
 
 
 def _loads_bounded(raw, **kwargs):
-    """json.loads with a lexical nesting bound that raises RecursionError.
-
-    Newer CPython sizes the decoder's recursion guard from the real C stack
-    and decodes 10,000 levels, so the bound no longer depends on the
-    interpreter: existing RecursionError refusals keep working unchanged.
-    """
-    # Decode bytes exactly as json.loads would, then scan and parse that text.
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
-    depth = 0
-    for match in JSON_TOKEN.finditer(raw):
-        token = match.group()
-        if token in "[{":
-            depth += 1
-            if depth > MAX_JSON_DEPTH:
-                raise RecursionError("JSON nesting exceeds the decoder bound")
-        elif token in "]}":
-            depth -= 1
-    return json.loads(raw, **kwargs)
+    return decode_legacy_json(raw, max_depth=MAX_JSON_DEPTH, **kwargs)
 
 
 class PrepError(Exception):

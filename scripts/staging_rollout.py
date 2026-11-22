@@ -16,10 +16,17 @@ import tempfile
 import time
 import tomllib
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, HTTPRedirectHandler, build_opener
+from urllib.request import Request
 
 from build_identity import (UNSTAMPED, is_build_id_shape, is_build_revision_shape,
                             is_deploy_id_shape, parse_deploy_id)
+
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
 
 WORKER = "two-bot-next-staging"
 APPLICATION = "two-bot-next-twobotcontainer-staging"
@@ -74,33 +81,12 @@ UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 IMAGE = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}@sha256:[0-9a-f]{{64}}"
 
 
-# Strings are skipped whole, so brackets inside them never count. An
-# unterminated string runs to the end, which keeps the scan linear.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 # CPython's old default recursion limit, which bounded the C JSON decoder.
 MAX_JSON_DEPTH = 1000
 
 
 def _loads_bounded(raw, **kwargs):
-    """json.loads with a lexical nesting bound that raises RecursionError.
-
-    Newer CPython sizes the decoder's recursion guard from the real C stack
-    and decodes 10,000 levels, so the bound no longer depends on the
-    interpreter: existing RecursionError refusals keep working unchanged.
-    """
-    # Decode bytes exactly as json.loads would, then scan and parse that text.
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
-    depth = 0
-    for match in JSON_TOKEN.finditer(raw):
-        token = match.group()
-        if token in "[{":
-            depth += 1
-            if depth > MAX_JSON_DEPTH:
-                raise RecursionError("JSON nesting exceeds the decoder bound")
-        elif token in "]}":
-            depth -= 1
-    return json.loads(raw, **kwargs)
+    return decode_legacy_json(raw, max_depth=MAX_JSON_DEPTH, **kwargs)
 
 
 class GateError(Exception):
@@ -151,11 +137,6 @@ def number(value):
     return value
 
 
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        raise GateError("unexpected_redirect")
-
-
 class Client:
     def __init__(self, account, token, deadline=None):
         require(isinstance(account, str) and re.fullmatch(r"[0-9a-f]{32}", account), "invalid_account")
@@ -168,7 +149,7 @@ class Client:
         self.zero_instance_polls = 0
         self.zero_instance_first = None
         self.zero_instance_last = None
-        self.opener = build_opener(NoRedirect())
+        self.opener = no_redirect_opener()
 
     def stop_staging(self, url, version, revision):
         """Use the deploy checkout's redacting client; never probe or renew here."""
@@ -192,12 +173,20 @@ class Client:
         headers = {"Cache-Control": "no-cache", "User-Agent": USER_AGENT}
         if authenticated:
             headers["Authorization"] = f"Bearer {self.token}"
+        request = Request(url, headers=headers)
         try:
-            with self.opener.open(Request(url, headers=headers), timeout=timeout) as response:
-                body = response.read(MAX_BODY + 1)
+            with self.opener.open(request, timeout=timeout) as response:
+                body = read_with_overflow(response, MAX_BODY)
                 require(len(body) <= MAX_BODY, "response_too_large")
                 return response.status, response.headers, body
         except HTTPError as error:
+            # Preserve the distinct verdict for redirects that urllib could
+            # otherwise follow. Missing or unsupported targets remain HTTP errors.
+            if (error.code in (301, 302, 303, 307, 308)
+                    and error.url == request.full_url and error.headers is not None
+                    and ("location" in error.headers or "uri" in error.headers)):
+                error.close()
+                raise GateError("unexpected_redirect") from None
             # Even Cloudflare's error envelope may include configuration values.
             if authenticated:
                 raise GateError("api_http_failure") from None
@@ -207,7 +196,7 @@ class Client:
             media = (headers.get("content-type") or "").split(";")[0].strip().lower()
             if url.endswith("/readyz") and error.code in (500, 503) and media == "application/json":
                 try:
-                    body = error.read(MAX_BODY + 1)
+                    body = read_with_overflow(error, MAX_BODY)
                 except (OSError, ValueError):
                     return error.code, {}, b""
                 if len(body) <= MAX_BODY:
@@ -244,13 +233,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins, at any depth."""
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def decode(body):
