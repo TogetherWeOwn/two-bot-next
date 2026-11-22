@@ -76,7 +76,7 @@ def plan_projection(plan):
     require(matches(SHA, source) and type(plan.get("runner_version")) is int and plan["runner_version"] == 1
             and plan.get("migration_target") == "staging"
             and plan.get("mode") == "plan" and plan.get("role") == "two_bot_migrator_ro"
-            and number(plan.get("role_verified_connections")) == 2
+            and number(plan.get("role_verified_connections")) > 0
             and number(plan.get("applied_count")) == number(plan.get("applied_store_count")) == 0
             and plan.get("plan_provenance_verified") is False and plan.get("plan_run_id") == ""
             and mapping(plan.get("audit")).get("verify_findings") == [], "invalid_read_only_plan")

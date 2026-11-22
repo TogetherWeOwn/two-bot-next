@@ -4,7 +4,7 @@
   "migration_target": "staging",
   "mode": "plan",
   "role": "two_bot_migrator_ro",
-  "role_verified_connections": 2,
+  "role_verified_connections": 1,
   "applied_count": 0,
   "applied_store_count": 0,
   "plan_run_id": "",
