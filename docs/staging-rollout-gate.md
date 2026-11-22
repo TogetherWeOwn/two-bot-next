@@ -670,9 +670,17 @@ no-start ownership GET with two provider reads. Both samples must agree on the
 100% serving Worker version, bounded policy, Durable Object namespace, and
 newest completed rollout with a digest matching the application's configured
 image. The serving Worker must be the active owner. The receipt records
-its epoch and whether the container was running. `provider_only` leaves runtime
-database identity unresolved. Recovery requires an exact read-only plan and a
-compatible predecessor.
+its epoch and whether the container was running.
+
+Supply `plan_run_id` to authenticate the exact plan artifact and both clean
+ledgers. The bounded staging Worker fingerprints the host, database and
+branch of the direct PlanetScale URL it forwards to the container without
+connecting. It refuses routing overrides and pooled ports. A match yields `full_tuple`.
+
+`provider_only` attests provider and owner data when the Worker lacks
+fingerprint support or the plan is omitted. A mismatch on a supporting
+Worker fails the read. If every retained candidate fails ledger admission,
+qualify the first baseline through the separately authorized transition.
 
 ## Verification boundaries
 

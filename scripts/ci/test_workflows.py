@@ -2514,11 +2514,14 @@ def staging_ownership_status_errors(workflow):
         dispatch = on.get("workflow_dispatch") or {}
         inputs = dispatch.get("inputs") or {}
         inventory = inputs.get("inventory") or {}
-        if (set(dispatch) != {"inputs"} or set(inputs) != {"inventory"}
+        plan = inputs.get("plan_run_id") or {}
+        if (set(dispatch) != {"inputs"} or set(inputs) != {"inventory", "plan_run_id"}
+                or set(plan) != {"description", "type", "required"}
+                or plan.get("type") != "string" or plan.get("required") != "false"
                 or set(inventory) != {"description", "type", "required", "default"}
                 or inventory.get("type") != "boolean" or inventory.get("required") != "false"
                 or inventory.get("default") != "false"):
-            errors.append(f"{name}: dispatch must take only the optional inventory switch")
+            errors.append(f"{name}: dispatch must take only the optional inventory switch and plan run ID")
     if workflow.get("permissions") != {}:
         errors.append(f"{name}: top-level permissions must stay empty")
     if workflow.get("concurrency") != {"group": "staging-ownership-status", "cancel-in-progress": "false"}:
@@ -2535,7 +2538,7 @@ def staging_ownership_status_errors(workflow):
         errors.append(f"{name}:status: job name must stay read-only")
     if job.get("environment") != "staging":
         errors.append(f"{name}:status: must read only the staging Environment binding")
-    if job.get("if") != "github.ref == 'refs/heads/main' && !inputs.inventory":
+    if job.get("if") != "github.ref == 'refs/heads/main' && !inputs.inventory && inputs.plan_run_id == ''":
         errors.append(f"{name}:status: must run only from main for ownership-only dispatches")
     if job.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:status: must keep contents:read only")
@@ -10981,7 +10984,9 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "read", "actions": "read", "deployments": "write"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
-                    elif name == "production-ownership-status.yml":
+                    elif name == "production-ownership-status.yml" or (name, job_id) == (
+                        "staging-ownership-status.yml", "inventory"
+                    ):
                         expected["actions"] = "read"
                     elif (name, job_id) == ("deploy-production.yml", "recheck"):
                         # Reads workflow runs to skip while an operator

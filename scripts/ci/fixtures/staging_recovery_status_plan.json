@@ -1,0 +1,71 @@
+{
+  "runner_version": 1,
+  "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "migration_target": "staging",
+  "mode": "plan",
+  "role": "two_bot_migrator_ro",
+  "role_verified_connections": 2,
+  "applied_count": 0,
+  "applied_store_count": 0,
+  "plan_run_id": "",
+  "plan_provenance_verified": false,
+  "target": {
+    "host": "fixture.pg.psdb.cloud",
+    "database": "postgres",
+    "branch_id": "fixture_branch"
+  },
+  "audit": {
+    "verify_findings": [],
+    "private": "must-not-reach-any-receipt"
+  },
+  "source_migrations": [
+    {
+      "version": 481,
+      "description": "disposable",
+      "sha384": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  ],
+  "pending_before": [],
+  "ledger_before": [
+    {
+      "version": 481,
+      "description": "disposable",
+      "sha384": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "success": true
+    }
+  ],
+  "ledger_after": [
+    {
+      "version": 481,
+      "description": "disposable",
+      "sha384": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "success": true
+    }
+  ],
+  "source_store_migrations": [
+    {
+      "version": 478,
+      "description": "disposable",
+      "sha384": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  ],
+  "pending_store_before": [],
+  "ledger_store_before": [
+    {
+      "version": 478,
+      "description": "disposable",
+      "sha384": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "success": true
+    }
+  ],
+  "ledger_store_after": [
+    {
+      "version": 478,
+      "description": "disposable",
+      "sha384": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "success": true
+    }
+  ],
+  "plan_manifest_sha256": "720228bf4ea82a421e9d8409786a0865c2263539fbef5e142e34e179995dd94a",
+  "store_plan_manifest_sha256": "103637397b204ffbaefc7dc19128c67ab5037cfde34af56c9c6ff0af4eeba9e4"
+}

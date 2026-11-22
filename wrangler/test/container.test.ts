@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
@@ -220,6 +221,49 @@ async function tickKeepalive(bot: TwoBotContainer) {
 const BOUNDED_STAGING_ENV = {
   ...WORKER_ENV, TWO_DEPLOY_ENV: "staging", STAGING_RUNTIME_POLICY: "bounded", CONTAINER_RELEASE: "a".repeat(40),
 };
+
+test("authenticated bounded staging ownership GET attests the forwarded target without container I/O", async (t) => {
+  const host = "fixture.pg.psdb.cloud";
+  const databaseUrl = `postgres://synthetic_role.fixture_branch:synthetic_password@${host}/postgres`;
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify({ branch_id: "fixture_branch", database: "postgres", host })).digest("hex");
+  const url = `https://worker.invalid${CONTROL_PATH}?runtime_db_fingerprint=${fingerprint}`;
+  const stage = await harness(t, { ...BOUNDED_STAGING_ENV, DATABASE_URL: databaseUrl });
+  const values = structuredClone(stage.values);
+  const alarms = [...stage.alarms];
+  const destroys = stage.runtime.destroys;
+  const request = probeRequest(url, { headers: { authorization: `Bearer ${CONTROL_TOKEN}` } });
+  const response = await stage.bot.fetch(request);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const state = await response.json();
+  assert.deepEqual(state, {
+    deploymentId: ID, owner: ACTIVE_OWNER, running: false, runtimeDatabaseFingerprint: fingerprint,
+  });
+  assert.equal(stage.bot.envVars.DATABASE_URL, databaseUrl);
+  assert.deepEqual(stage.values, values);
+  assert.deepEqual(stage.alarms, alarms);
+  assert.equal(stage.runtime.destroys, destroys);
+  assert.deepEqual(stage.starts, []);
+  assert.deepEqual(stage.requests, []);
+  assert.equal((await stage.bot.fetch(probeRequest(url))).status, 401);
+});
+
+test("ordinary and non-staging ownership control omit runtime DB evidence", async (t) => {
+  const host = "fixture.pg.psdb.cloud";
+  const databaseUrl = `postgres://synthetic_role.fixture_branch:synthetic_password@${host}/postgres`;
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify({ branch_id: "fixture_branch", database: "postgres", host })).digest("hex");
+  const normalPath = `https://worker.invalid${CONTROL_PATH}`;
+  const stage = await harness(t, { ...BOUNDED_STAGING_ENV, DATABASE_URL: databaseUrl });
+  const prod = await harness(t, { ...WORKER_ENV, TWO_DEPLOY_ENV: "production", DATABASE_URL: databaseUrl });
+  for (const [bot, url] of [[stage.bot, normalPath],
+    [prod.bot, normalPath + `?runtime_db_fingerprint=${fingerprint}`]] as const) {
+    const response = await bot.fetch(probeRequest(url, { headers: { authorization: `Bearer ${CONTROL_TOKEN}` } }));
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { deploymentId: ID, owner: ACTIVE_OWNER, running: false });
+  }
+});
 
 function stagingUseRequest(action: "acquire" | "release" | "stop", window: StagingWindow): Request {
   return probeRequest(`https://worker.invalid${STAGING_USE_PATH}`, {
