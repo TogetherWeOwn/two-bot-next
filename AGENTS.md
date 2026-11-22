@@ -114,10 +114,11 @@ JavaScript and TypeScript. This includes the existing [Worker ops dashboard](wra
 and any new dashboard. The Rust bot, backend Worker routes, SQL, and scripts
 are outside this guidance when they do not change browser-facing code.
 
-1. Use the harness's `modern-web-guidance` skill when available. If the CLI
-   is already installed, run `DISABLE_TELEMETRY=1 modern-web-guidance search "<2-5 word capability>"`,
-   then `DISABLE_TELEMETRY=1 modern-web-guidance retrieve "<id>"`. Otherwise use the relevant
-   official platform documentation.
+1. Use the `modern-web-guidance` skill through an installed or version-pinned CLI.
+   Use official platform documentation when either the skill or a direct CLI
+   invocation would fetch or execute an unpinned package.
+   For an installed CLI, run `DISABLE_TELEMETRY=1 modern-web-guidance search "<2-5 word capability>"`,
+   then `DISABLE_TELEMETRY=1 modern-web-guidance retrieve "<id>"`.
    Search one capability at a time (for example `"light dismiss dialog"`), without framework or app names.
 2. Apply only the retrieved guidance that fits the task. Keep existing behavior, copy, design tokens and
    the stack the route already uses; record any guide you followed in the PR body.
