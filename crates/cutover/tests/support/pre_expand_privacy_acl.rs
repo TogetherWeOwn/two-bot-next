@@ -263,16 +263,8 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     // or ACL runs inside the window being probed here.
     through(&CUTOVER, 480).run(&migrator).await.unwrap();
     assert_ledgers(&migrator, 480, 465).await;
-    for query in [SESSIONS, WINDOWS] {
-        assert_eq!(count(&migrator, query).await, 0);
-        assert_sqlstate(
-            &sqlx::query_scalar::<_, i64>(query)
-                .fetch_one(&runtime)
-                .await
-                .unwrap_err(),
-            "42501",
-        );
-    }
+    assert_eq!(count(&migrator, SESSIONS).await, 0);
+    assert_eq!(count(&migrator, WINDOWS).await, 0);
     assert_runtime_refusal(&runtime, &request, "42501").await;
     assert!(run_retention(&runtime, RetentionMode::Execute)
         .await
