@@ -170,6 +170,16 @@ pub fn ephemeral_reply_embed(kind: EmbedKind, surface: &str, text: String) -> Em
     embed
 }
 
+/// Render RSVP outcomes without the database-backed interaction machinery.
+pub(crate) fn rsvp_reply_embed(result: Result<String, String>) -> Embed {
+    let (kind, text) = match result {
+        Ok(text) => (EmbedKind::Ok, text),
+        Err(text) => (EmbedKind::Danger, text),
+    };
+    // Preserve the existing content sanitizer and its 2000-character bound.
+    ephemeral_reply_embed(kind, "Events", two_bot_core::message_safety::content(&text))
+}
+
 #[cfg(test)]
 mod brand_tests {
     use super::*;
