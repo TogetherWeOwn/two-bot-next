@@ -189,9 +189,9 @@ SBOM dry-run and standalone database jobs. Both selectors and lint must always
 succeed; a heavy lane may skip only when selection explicitly deselects it.
 A job added to `check.yml` must go into `ci-ok`'s `needs:`, result env and result
 evaluation, or carry a reviewed `# ci-ok: exempt <reason>` marker with a pin
-in `scripts/ci/test_required_checks.py`. Only advisory `container smoke` is
-exempt: it can take up to 30 minutes, and image security stays gated through
-the SBOM job. The legacy `required-checks` aggregate is removed.
+in `scripts/ci/test_required_checks.py`. Advisory `container smoke` is exempt
+because the SBOM job gates image security. `ci-evidence` is exempt because
+it publishes links after the aggregate verdict.
 
 Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
 HARD, required voice synthetic, test-target inventory HARD) run as steps of
@@ -350,15 +350,10 @@ and any authorized manual Actions run also stay on GitHub.
 
 ### Exact-head CI evidence
 
-Record the PR URL, full head SHA, Actions run URL
-(`https://github.com/TogetherWeOwn/two-bot-next/actions/runs/<run-id>`) and relevant
-job URLs (`.../job/<job-id>`) in Verification and the task evidence. Confirm the
-run's `headSha` matches the PR's current head and inspect its jobs and results;
-an older green run, a cancelled run, or a local transcript is not CI evidence for
-a new head. Reviewers and the owner use these exact-head Actions links,
-including `ci-ok` and relevant selected jobs, alongside the other required checks
-and release evidence. Report pending/failed/skipped work honestly. Never claim a
-local reproduction is a full CI pass.
+Record commands and results in Verification. Follow the summary links to confirm attested tests and report skips or omissions.
+`pr-evidence` resolves Python and Rust declarations and literal `.ts`, `.js`, `.mjs`, and `.cjs` titles.
+Use paths for generated names and other formats. Organization path floors and repository review tiers apply.
+Register through a protected workflow after queue verification and green main and two later PR runs (SHA and run/job URLs).
 
 The toolchain remains pinned in `rust-toolchain.toml`. CI runs
 `python3 scripts/generate_command_reference.py` to generate ignored

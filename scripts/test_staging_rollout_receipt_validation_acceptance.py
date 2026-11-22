@@ -123,7 +123,7 @@ class OfflineTestCase(unittest.TestCase):
     def setUp(self):
         opener = Mock()
         opener.open.side_effect = AssertionError("live HTTP forbidden in offline tests")
-        self.enterContext(patch.object(rollout, "build_opener", return_value=opener))
+        self.enterContext(patch.object(rollout, "no_redirect_opener", return_value=opener))
         self.enterContext(patch.object(rollout.subprocess, "run",
                                       side_effect=AssertionError("live Docker forbidden")))
 

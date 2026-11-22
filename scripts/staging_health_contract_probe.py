@@ -54,6 +54,13 @@ from urllib.parse import urlsplit
 
 from build_identity import UNSTAMPED, is_build_id_shape, is_build_revision_shape
 
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
 BODY_CAP = 64 << 10
 TIMEOUT_SECONDS = 10
@@ -108,18 +115,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 @dataclass(frozen=True)
@@ -155,14 +151,9 @@ def staging_origin(url):
     return f"https://{parts.hostname}"
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None  # urllib then raises the 3xx as an HTTPError
-
-
 def fetch(url, *, headers=None):
     """One GET without redirects; returns (status, headers, body bytes)."""
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = no_redirect_opener()
     request = urllib.request.Request(url, method="GET",
                                      headers={"User-Agent": USER_AGENT,
                                               "Cache-Control": "no-cache", **(headers or {})})
@@ -171,10 +162,10 @@ def fetch(url, *, headers=None):
         try:
             with opener.open(request, timeout=16 if headers else TIMEOUT_SECONDS) as response:
                 status = response.status
-                return status, response.headers, response.read(BODY_CAP + 1)
+                return status, response.headers, read_with_overflow(response, BODY_CAP)
         except urllib.error.HTTPError as error:
             status = error.code
-            return status, error.headers or {}, error.read(BODY_CAP + 1)
+            return status, error.headers or {}, read_with_overflow(error, BODY_CAP)
     except (OSError, http.client.HTTPException):
         raise TransportError(status) from None
 
@@ -207,7 +198,7 @@ def get_json(fetch_fn, url, name):
     if len(body) > BODY_CAP:
         raise ProbeError(f"{name} probe answered over the body cap", http_status=status)
     try:
-        value = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+        value = decode_legacy_json(body, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         raise ProbeError(f"{name} probe carries duplicate JSON object keys",
                          http_status=status) from None
