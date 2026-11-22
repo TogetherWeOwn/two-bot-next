@@ -14,11 +14,12 @@ import unittest
 from collections import Counter
 from io import BytesIO
 from pathlib import Path, PurePosixPath
+from time import monotonic
 
 from mutation_rust import verdict
 from mutation_scope import added_lines, python_lines
 
-# Bind only stdlib suites verified to exercise the script with offline fixtures.
+# Bind offline suites from the existing CI lanes.
 SUITES = {
     "scripts/container-inputs.py": ("scripts/test_container_inputs.py",),
     "scripts/job-inputs.py": ("scripts/test_job_inputs.py",),
@@ -35,6 +36,10 @@ SUITES = {
     "scripts/ci/check-unwrap-request-paths.py": ("scripts/ci/test_check_unwrap_request_paths.py",),
 }
 MAX_MUTANTS = 80
+RUN_SECONDS = 7 * 60
+TEST_SECONDS = 30
+UNTESTED = 5
+TEST_FAILURE = 10
 REPLACEMENTS = {b"==": b"!=", b"!=": b"==", b">": b">=", b">=": b">", b"<": b"<=",
                 b"<=": b"<", b"and": b"or", b"or": b"and", b"+": b"-", b"-": b"+"}
 
@@ -67,14 +72,17 @@ def edits(source, changed):
     return sorted(replacements)
 
 
-def run_tests(root, suites):
+def run_tests(root, suites, timeout):
     command = [sys.executable, "-B", str(Path(__file__).resolve()), "--tests", *suites]
     with subprocess.Popen(command, cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                          start_new_session=True) as process:
+                          env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}, start_new_session=True) as process:
         try:
-            return process.wait(timeout=30)
+            return process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             process.wait(timeout=5)
             return 2
 
@@ -85,11 +93,20 @@ def unittest_exit(paths):
         suite.addTests(unittest.TestLoader().discover(str(path.parent), pattern=path.name))
     result = unittest.TextTestRunner(verbosity=0).run(suite)
     if not result.wasSuccessful():
-        return 1
-    return 0 if result.testsRun > len(result.skipped) else 5
+        return TEST_FAILURE
+    return 0 if result.testsRun > len(result.skipped) else UNTESTED
+
+
+def snapshot(repository, temporary):
+    archive, root = temporary / "head.tar", temporary / "head"
+    subprocess.run(["git", "archive", "-o", str(archive), "HEAD"], cwd=repository, check=True, timeout=60)
+    with tarfile.open(archive) as contents:
+        contents.extractall(root, filter="data")
+    return root
 
 
 def measure(root, files, bindings=SUITES):
+    deadline = monotonic() + RUN_SECONDS
     results, plans = [], []
     for relative, changed in sorted(files.items()):
         file = root / relative
@@ -110,21 +127,28 @@ def measure(root, files, bindings=SUITES):
         return [{"status": "infrastructure_error", "reason": "Python candidate budget exceeded"}]
     for file, suites, source, candidates in plans:
         relative = file.relative_to(root).as_posix()
-        baseline = run_tests(root, suites)
+        if monotonic() >= deadline:
+            results.append({"status": "infrastructure_error", "reason": "Python run budget exceeded"})
+            break
+        baseline = run_tests(root, suites, min(TEST_SECONDS, deadline - monotonic()))
         if baseline:
-            results.append({"file": relative, "status": "unsupported" if baseline == 5 else "infrastructure_error",
-                            "reason": "baseline ran zero tests" if baseline == 5 else "unmutated suite failed"})
+            reasons = {UNTESTED: "baseline ran zero tests", 2: "unmutated suite timed out"}
+            results.append({"file": relative, "status": "unsupported" if baseline == UNTESTED else "infrastructure_error",
+                            "reason": reasons.get(baseline, "unmutated suite failed")})
             continue
         lines = source.splitlines(keepends=True)
         for line, start, end, replacement in candidates:
+            if monotonic() >= deadline:
+                results.append({"status": "infrastructure_error", "reason": "Python run budget exceeded"})
+                return results
             row = lines[line - 1]
             mutant = row[:start] + replacement + row[end:]
             try:
                 file.write_bytes(b"".join([*lines[:line - 1], mutant, *lines[line:]]))
-                result = run_tests(root, suites)
+                result = run_tests(root, suites, min(TEST_SECONDS, deadline - monotonic()))
             finally:
                 file.write_bytes(source)
-            outcome = {0: "survived", 1: "killed"}.get(result, "infrastructure_error")
+            outcome = {0: "survived", TEST_FAILURE: "killed"}.get(result, "infrastructure_error")
             results.append({"file": relative, "line": line, "byte_offset": start, "status": outcome})
     return results
 
@@ -147,11 +171,7 @@ def main():
         if not files:
             raise ValueError("measurement has no Python additions")
         with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as temporary:
-            archive = Path(temporary, "head.tar")
-            root = Path(temporary, "head")
-            subprocess.run(["git", "archive", "-o", str(archive), "HEAD"], check=True, timeout=60)
-            with tarfile.open(archive) as contents:
-                contents.extractall(root, filter="data")
+            root = snapshot(Path.cwd(), Path(temporary))
             results = measure(root, files)
     except (OSError, SyntaxError, ValueError, subprocess.SubprocessError, tarfile.TarError):
         results = [{"status": "infrastructure_error", "reason": "Python scope, engine, or report failed"}]
