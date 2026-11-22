@@ -73,9 +73,9 @@ require two in parallel, including a security review. Resolve findings on the pu
 
 T3 selects provider, model and effort per thread from the project default,
 launch `modelSelection` or reviewer `target`. Pair GPT/Sol with `codex-cliproxy`
-and Claude with `claude-cliproxy`. Use Sol for implementation and Opus for design
-and security review. Default to high effort, use xhigh only when the brief justifies
-it, and never use max or ultra. Keep model selection out of harness files and hooks.
+and Claude with `claude-cliproxy`. Prefer Sol for implementation and Opus for design.
+Choose reviewers from a different family. Default to high effort and use xhigh only
+when the brief justifies it. Never use max or ultra or pin models in harness files or hooks.
 
 ## Test and build commands
 
@@ -112,11 +112,11 @@ rewrites tracked configuration or independent publication fixtures. Database
 tests use only disposable test services, never staging or production; retain
 all guards in [`CONTRIBUTING.md`](CONTRIBUTING.md#database-tests).
 
-Record the full PR head SHA and Actions run/job URLs in Verification.
+Record the full PR head SHA and matching Actions run/job URLs in Verification.
 Use local transcripts for focused reproductions. The task owner normally
 squash-merges the pinned head after required checks and reviews pass. If a
 merge would deploy production or deployment cannot be ruled out, get owner
-approval for the full PR head SHA. Production actions need separate owner approval.
+approval for the full PR head SHA before merging. Production actions need separate owner approval.
 See [`CONTRIBUTING.md`](CONTRIBUTING.md#production-merge-evidence).
 
 ## Modern web platform guidance

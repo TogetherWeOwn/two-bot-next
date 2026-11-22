@@ -71,21 +71,21 @@ the behavior warrants it. Changes to `AGENTS.md`, `CLAUDE.md`,
 | T1 standard | One independent, read-only cross-model review and required CI. |
 | T0 critical | Two independent, read-only cross-model reviews in parallel, one general and one security-focused, and required CI. |
 
-T0 includes auth, sessions, permissions, secrets, crypto, payments, database
-and migration changes, backups, erasure, gateway and voice behavior, deployment
-paths, dependencies, lockfiles, CI workflows, security policy and gate config
+T0 includes auth, sessions, permissions, secrets, crypto, payments, databases,
+migrations, backups, erasure, moderation, gateway, voice, signed internal actions,
+deploy paths, dependencies, lockfiles, CI workflows and security policy or gate config
 (including CODEOWNERS and allowlists). Approval, review and safety procedures are T0 even in docs.
 The [sensitivity map's](.github/review-tiers.yml) content triggers also require T0.
 Security review checks secret exposure, authorization, data integrity and input bounds.
 
 In T3 Code, start each review as a separate read-only delegated task. For an
 AI-authored change, use a model family different from the author's. Provide the
-PR URL and full published head SHA. Reviewers inspect the pinned diff and
-report the SHA, findings, and limits of their inspection. Record those in the
-PR using public-safe evidence. Follow [SECURITY.md](SECURITY.md) for sensitive
-findings. Get fresh independent review after a material change. For a minor
-revision, record both SHAs, what changed and why the prior review still covers
-the new head. Run required CI on every new head.
+PR URL and full published head SHA. Reviewers confirm the tier, inspect the
+pinned diff and report the SHA, findings and inspection limits. Record those
+in the PR using public-safe evidence. Follow [SECURITY.md](SECURITY.md) for
+sensitive findings. Material changes, including any T0 control change, require
+fresh independent review. For minor revisions, record both SHAs, what changed
+and why the prior review still applies. Run required CI on every new head.
 
 ### Complete PR inventories
 
