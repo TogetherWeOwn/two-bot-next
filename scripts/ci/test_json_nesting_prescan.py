@@ -1,4 +1,4 @@
-"""Regressions for the lexical JSON nesting pre-scan copied into each parser.
+"""Regressions for the shared JSON nesting scan and its callers.
 
 The scan must stay linear on hostile strings (an unterminated string used
 to rescan to the end from every later quote), and bytes must be scanned in
@@ -15,8 +15,11 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent.parent
 
 # Helpers that take a str and a limit and return True when it is too deep.
-DEPTH_EXCEEDS = ["production_deploy.py", "soak_evidence.py",
-                 "release-sbom-target.py", "vulnerability-preflight.py"]
+DEPTH_EXCEEDS = {
+    "script_intake.py": "json_depth_exceeds",
+    **dict.fromkeys(("production_deploy.py", "soak_evidence.py", "release-sbom-target.py",
+                     "vulnerability-preflight.py"), "_json_depth_exceeds"),
+}
 # Helpers that wrap json.loads and raise RecursionError past MAX_JSON_DEPTH.
 LOADS_BOUNDED = ["staging_rollout.py", "synthetic_alert_history.py",
                  "staging_automation_read_smoke.py", "staging_guild_e2e_prep.py",
@@ -46,20 +49,20 @@ def load(relative):
 
 class DepthExceedsTests(unittest.TestCase):
     def test_hostile_strings_scan_in_linear_time(self):
-        for relative in DEPTH_EXCEEDS:
-            module = load(relative)
+        for relative, name in DEPTH_EXCEEDS.items():
+            scan = getattr(load(relative), name)
             for text in HOSTILE:
                 with self.subTest(relative, size=len(text)):
                     started = time.monotonic()
-                    self.assertFalse(module._json_depth_exceeds(text, 100))
+                    self.assertFalse(scan(text, 100))
                     self.assertLess(time.monotonic() - started, SECONDS)
 
     def test_brackets_inside_strings_do_not_count(self):
-        for relative in DEPTH_EXCEEDS:
-            module = load(relative)
+        for relative, name in DEPTH_EXCEEDS.items():
+            scan = getattr(load(relative), name)
             with self.subTest(relative):
-                self.assertFalse(module._json_depth_exceeds('["[[[\\"[[", "]"]', 2))
-                self.assertTrue(module._json_depth_exceeds("[[[1]]]", 2))
+                self.assertFalse(scan('["[[[\\"[[", "]"]', 2))
+                self.assertTrue(scan("[[[1]]]", 2))
 
 
 class LoadsBoundedTests(unittest.TestCase):

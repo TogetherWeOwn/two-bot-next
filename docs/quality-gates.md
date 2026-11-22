@@ -7,6 +7,12 @@ legs, the `coverage-shard` matrix runs them alongside per-shard disposable
 Postgres services, and `patch-coverage` merges and gates — rather than the
 lint-only `check` lane.
 
+- Python intake (HARD) runs in `check` on PRs, merge-queue runs and pushes.
+  It compares stdlib intake calls in `scripts/` and `.github/scripts/`
+  against the checked-out base. Test files are exempt. Moving a call within
+  its file keeps it at baseline. New calls and argument changes must use
+  `scripts/script_intake.py`.
+
 - Patch coverage (HARD): `cargo llvm-cov --workspace --lib --bins --tests
   --features two-bot-core/db -- --include-ignored` plus
   `scripts/ci/check-patch-coverage.py` requires 80% line coverage over the

@@ -59,6 +59,8 @@ import urllib.request
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import staging_automation_read_smoke as fenced
 
+from script_intake import decode_legacy_json, no_redirect_opener, read_with_overflow
+
 API = fenced.API
 SCHEMA = "help_embed_smoke.v3"
 USER_AGENT = "two-bot-next-staging-help-embed-smoke/1.0"
@@ -213,16 +215,6 @@ def brand_fault(embed, expected):
     return None
 
 
-class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
-    """Never replay the bot token to a redirect target; body stays unread."""
-
-    def http_error_301(self, req, fp, code, msg, headers):
-        fp.close()
-        raise SmokeFail("authenticated request answered a redirect (not followed)")
-
-    http_error_302 = http_error_303 = http_error_307 = http_error_308 = http_error_301
-
-
 def make_transport(token):
     """Build the only network function; the token never leaves this closure.
 
@@ -239,11 +231,14 @@ def make_transport(token):
         try:
             request = urllib.request.Request(
                 API + path, data=data, method=method, headers=headers)
-            with urllib.request.build_opener(_RefuseRedirect).open(
+            with no_redirect_opener(
+                redirect_error=lambda: SmokeFail(
+                    "authenticated request answered a redirect (not followed)"),
+            ).open(
                     request, timeout=TIMEOUT_SECONDS) as response:
-                return response.status, response.read(BODY_CAP + 1)
+                return response.status, read_with_overflow(response, BODY_CAP)
         except urllib.error.HTTPError as error:
-            return error.code, error.read(BODY_CAP + 1)
+            return error.code, read_with_overflow(error, BODY_CAP)
         except ValueError:
             # Header validation/encoding failures name the header value in
             # the exception text; never let that reach a traceback or log.

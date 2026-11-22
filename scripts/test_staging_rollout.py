@@ -251,9 +251,22 @@ class OfflineTestCase(unittest.TestCase):
         # Fail loudly if a new test accidentally tries real HTTP or Docker.
         opener = Mock()
         opener.open.side_effect = AssertionError("live HTTP forbidden in offline tests")
-        self.enterContext(patch.object(rollout, "build_opener", return_value=opener))
+        self.enterContext(patch.object(rollout, "no_redirect_opener", return_value=opener))
         self.enterContext(patch.object(rollout.subprocess, "run",
                                       side_effect=AssertionError("live Docker forbidden")))
+
+    def test_location_redirect_and_missing_target_keep_distinct_verdicts(self):
+        url = "https://api.cloudflare.com/client/v4/accounts/fixture/"
+        client = rollout.Client(ACCOUNT, SENTINEL)
+        for has_location, verdict in ((True, "unexpected_redirect"), (False, "api_http_failure")):
+            with self.subTest(has_location=has_location):
+                headers = Message()
+                if has_location:
+                    headers["Location"] = "https://other.example/"
+                client.opener.open.side_effect = HTTPError(url, 302, "redirect", headers,
+                                                          io.BytesIO(b"fixture"))
+                with self.assertRaisesRegex(rollout.GateError, f"^{verdict}$"):
+                    client.request(url, authenticated=True)
 
     def assert_gate(self, code, function, *args):
         with self.assertRaises(rollout.GateError) as caught:

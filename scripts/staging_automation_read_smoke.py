@@ -71,6 +71,13 @@ import time
 import urllib.error
 import urllib.request
 
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 # Pinned identity guards. Sources: crates/core/src/backup/guild_config.rs
 # (TWO_STAGING_GUILD_ID, STAGING_BOT_APPLICATION_ID) and
 # crates/cutover/src/lib.rs (LIVE_GUILD_ID). No snowflake may be added here
@@ -92,33 +99,12 @@ SLASH_COMMAND_TYPE = 1
 NOT_REGISTERED = "not registered in the staging guild"
 
 
-# Strings are skipped whole, so brackets inside them never count. An
-# unterminated string runs to the end, which keeps the scan linear.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 # CPython's old default recursion limit, which bounded the C JSON decoder.
 MAX_JSON_DEPTH = 1000
 
 
 def _loads_bounded(raw, **kwargs):
-    """json.loads with a lexical nesting bound that raises RecursionError.
-
-    Newer CPython sizes the decoder's recursion guard from the real C stack
-    and decodes 10,000 levels, so the bound no longer depends on the
-    interpreter: existing RecursionError refusals keep working unchanged.
-    """
-    # Decode bytes exactly as json.loads would, then scan and parse that text.
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
-    depth = 0
-    for match in JSON_TOKEN.finditer(raw):
-        token = match.group()
-        if token in "[{":
-            depth += 1
-            if depth > MAX_JSON_DEPTH:
-                raise RecursionError("JSON nesting exceeds the decoder bound")
-        elif token in "]}":
-            depth -= 1
-    return json.loads(raw, **kwargs)
+    return decode_legacy_json(raw, max_depth=MAX_JSON_DEPTH, **kwargs)
 
 
 class SmokeError(Exception):
@@ -130,13 +116,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins, at any depth."""
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def is_snowflake(value):
@@ -174,20 +154,6 @@ def require_token(token):
     return token
 
 
-class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
-    """Authenticated reads never follow a redirect, even to the same origin.
-
-    Raising here stops urllib before it builds the second request, so the bot
-    token is never replayed; the Location and body are never read.
-    """
-
-    def http_error_301(self, req, fp, code, msg, headers):
-        fp.close()
-        raise SmokeError("refusing: authenticated read answered a redirect (not followed)")
-
-    http_error_302 = http_error_303 = http_error_307 = http_error_308 = http_error_301
-
-
 def make_fetch(token):
     """Build the only network function; the token never leaves this closure."""
 
@@ -200,11 +166,14 @@ def make_fetch(token):
                      "Cache-Control": "no-cache"},
         )
         try:
-            with urllib.request.build_opener(_RefuseRedirect).open(
+            with no_redirect_opener(
+                redirect_error=lambda: SmokeError(
+                    "refusing: authenticated read answered a redirect (not followed)"),
+            ).open(
                     request, timeout=TIMEOUT_SECONDS) as response:
-                return response.status, response.read(BODY_CAP + 1)
+                return response.status, read_with_overflow(response, BODY_CAP)
         except urllib.error.HTTPError as error:
-            return error.code, error.read(BODY_CAP + 1)
+            return error.code, read_with_overflow(error, BODY_CAP)
 
     return fetch
 
