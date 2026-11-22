@@ -68,23 +68,21 @@ def decode_json(raw, *, max_depth=64):
 
 
 def read_with_overflow(stream, byte_limit):
-    """Read at most byte_limit + 1 bytes so callers can detect overflow."""
+    """Read byte_limit + 1 bytes at most from a buffered stream or HTTP body."""
     if byte_limit < 0:
         raise ValueError("negative input byte limit")
     return stream.read(byte_limit + 1)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def __init__(self, error):
-        self._error = error
-
     def redirect_request(self, request, response, code, message, headers, new_url):
-        if self._error is not None:
-            raise self._error()
         return None
 
 
 class _EarlyRefusal(_NoRedirect):
+    def __init__(self, error):
+        self._error = error
+
     def http_error_302(self, request, response, code, message, headers):
         # Some callers treat a redirect as refusal without inspecting Location
         # or reading the body, even when the response has no target.
@@ -94,21 +92,16 @@ class _EarlyRefusal(_NoRedirect):
     http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
-def no_redirect_opener(*, https_handler=None, use_proxy=True, redirect_error=None,
-                       inspect_location=False):
-    """Build an opener that leaves redirect status handling to the caller.
+def no_redirect_opener(*, https_handler=None, use_proxy=True, redirect_error=None):
+    """Refuse redirects with HTTPError or a caller-supplied exception factory.
 
-    By default, urllib surfaces a redirect as HTTPError. A redirect_error
-    factory supplies a caller's fixed diagnostic instead. inspect_location
-    preserves urllib's Location handling before invoking that factory.
+    Validate the destination, including its scheme, before opening it.
+    urllib's environment proxy configuration applies unless use_proxy=False.
     """
     handlers = []
     if https_handler is not None:
         handlers.append(https_handler)
     if not use_proxy:
         handlers.append(urllib.request.ProxyHandler({}))
-    redirect_handler = _NoRedirect
-    if redirect_error is not None and not inspect_location:
-        redirect_handler = _EarlyRefusal
-    handlers.append(redirect_handler(redirect_error))
+    handlers.append(_NoRedirect() if redirect_error is None else _EarlyRefusal(redirect_error))
     return urllib.request.build_opener(*handlers)

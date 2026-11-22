@@ -10,8 +10,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 INTAKE = "scripts/script_intake.py"
-APIS = {"json.load", "json.loads", "json.*",
-        "urllib.request.urlopen", "urllib.request.build_opener", "urllib.request.*"}
+APIS = {"json.load", "json.loads", "json.JSONDecoder", "json.decoder.JSONDecoder", "json.*",
+        "urllib.request.urlopen", "urllib.request.build_opener", "urllib.request.urlretrieve",
+        "urllib.request.OpenerDirector", "urllib.request.install_opener", "urllib.request.*"}
 
 
 def aliases(nodes):
@@ -23,7 +24,13 @@ def aliases(nodes):
                 bindings[name.asname or root] = name.name if name.asname else root
         elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
             for name in node.names:
-                bindings[name.asname or name.name] = f"{node.module}.{name.name}"
+                if name.name == "*":
+                    for api in APIS:
+                        module, _, attr = api.rpartition(".")
+                        if module == node.module and attr != "*":
+                            bindings.setdefault(attr, api)
+                else:
+                    bindings[name.asname or name.name] = f"{node.module}.{name.name}"
     return bindings
 
 
@@ -70,7 +77,7 @@ def additions(before, after, path):
 
 
 def git(root, *args):
-    return subprocess.check_output(["git", *args], cwd=root)
+    return subprocess.check_output(["git", *args], cwd=root, stderr=subprocess.PIPE)
 
 
 def check(root, base_ref, head_ref):
@@ -81,7 +88,7 @@ def check(root, base_ref, head_ref):
                   "-z", base, head, "--", "scripts/", ".github/scripts/")
     fields = changes.decode("utf-8", "surrogateescape").split("\0")[:-1]
     for status, path in zip(fields[::2], fields[1::2], strict=True):
-        if path == INTAKE or not path.endswith(".py") or Path(path).name.startswith("test"):
+        if path == INTAKE or not path.endswith(".py") or Path(path).name.startswith(("test_", "test-")):
             continue
         before = b"" if status == "A" else git(root, "show", f"{base}:{path}")
         after = git(root, "show", f"{head}:{path}")

@@ -28,6 +28,8 @@ recv = http.urlopen
 transport.build_opener()
 read(stream)
 getattr(wire, "loads")(payload)
+wire.JSONDecoder().decode(payload)
+http.urlretrieve(url)
 """
         self.assertEqual(list(guard.additions("", source, "scripts/read.py")), [
             (4, "json.load"),
@@ -36,6 +38,8 @@ getattr(wire, "loads")(payload)
             (9, "urllib.request.build_opener"),
             (10, "json.load"),
             (11, "json.loads"),
+            (12, "json.JSONDecoder"),
+            (13, "urllib.request.urlretrieve"),
         ])
 
     def test_existing_uses_stay_at_baseline_and_safe_calls_pass(self):

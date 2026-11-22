@@ -238,7 +238,7 @@ jobs:
       - name: Ratchet Python script intake
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
         env:
-          INTAKE_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          INTAKE_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before }}
         run: python3 scripts/ci/check-python-intake.py "$INTAKE_BASE"
 
       - name: Reject hard-coded source snowflakes
