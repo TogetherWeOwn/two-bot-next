@@ -1,6 +1,8 @@
 """Bad and good fixtures for the Python intake ratchet."""
 
 import importlib.util
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 import subprocess
 import sys
@@ -56,6 +58,47 @@ payload = json.dumps(new)
         self.assertEqual(list(guard.additions(before, after + "json.loads(data)\n",
                                               "scripts/read.py")), [(7, "json.loads")])
 
+    def test_local_rename_keeps_one_baseline_use(self):
+        before = """\
+import urllib.request
+
+def fetch(url):
+    request = build_request(url)
+    return urllib.request.urlopen(request, timeout=10)
+"""
+        renamed = before.replace("request =", "headers = {}\n    probe_request =").replace(
+            "urlopen(request", "urlopen(probe_request")
+        path = "scripts/read.py"
+        self.assertEqual(list(guard.additions(before, renamed, path)), [])
+        added = renamed.replace("    return ", "    urllib.request.urlopen(probe_request, timeout=10)\n    return ")
+        self.assertEqual(list(guard.additions(before, added, path)), [(7, "urllib.request.urlopen")])
+        changed = renamed.replace("timeout=10", "timeout=20")
+        self.assertEqual(list(guard.additions(before, changed, path)), [])
+
+    def test_two_refactored_calls_keep_their_two_allowances(self):
+        before = """\
+import json
+def first(payload):
+    return json.loads(payload)
+def second(records):
+    payload = records[0]
+    return json.loads(payload)
+"""
+        after = before.replace("first(payload)", "first(raw)").replace(
+            "return json.loads(payload)", "return json.loads(raw)", 1).replace(
+            "    payload = records[0]", "    earlier = 0\n    payload = records[earlier]")
+        self.assertEqual(list(guard.additions(before, after, "scripts/read.py")), [])
+
+    def test_removing_an_import_does_not_allow_an_extra_call(self):
+        before = "from json import loads\nloads(data)\n"
+        after = "import json\njson.loads(data)\njson.loads(extra)\n"
+        self.assertEqual(list(guard.additions(before, after, "scripts/read.py")), [(3, "json.loads")])
+
+    def test_identical_call_moved_to_a_generator_keeps_its_baseline(self):
+        before = "import json\ndef records(lines):\n    for line in lines:\n        yield json.loads(line)\n"
+        after = "import json\ndef records(lines):\n    yield from (json.loads(line) for line in lines)\n"
+        self.assertEqual(list(guard.additions(before, after, "scripts/read.py")), [])
+
     def test_git_range_warn_and_hard_modes(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -84,3 +127,33 @@ payload = json.dumps(new)
         self.git(root, "add", ".")
         self.git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.org",
                  "-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
+
+    def test_unreadable_python_does_not_hide_other_findings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.git(root, "init", "-q")
+            scripts = root / "scripts"
+            scripts.mkdir()
+            (scripts / "clean.py").write_text("value = 1\n")
+            linked = scripts / "linked.py"
+            linked.write_text("value = 2\n")
+            self.commit(root)
+            base = self.git(root, "rev-parse", "HEAD").strip()
+            (scripts / "bad.py").write_text("def syntax_error(\n")
+            linked.unlink()
+            linked.symlink_to("clean.py")
+            (scripts / "new.py").write_text("import json\njson.loads(raw)\n")
+            self.commit(root)
+            self.assertEqual(list(guard.check(root, base)), [
+                ("scripts/bad.py", 1, None), ("scripts/linked.py", 1, None),
+                ("scripts/new.py", 2, "json.loads"),
+            ])
+
+    def test_actions_warning_escapes_path_properties(self):
+        output = StringIO()
+        with patch.dict(guard.os.environ, {"GITHUB_ACTIONS": "true"}), redirect_stdout(output):
+            guard.report("synthetic diagnostic", hard=False, path="scripts/a,\x1bb.py", line=2)
+            guard.report("synthetic error", hard=True)
+        self.assertEqual(output.getvalue(),
+                         "::warning file=scripts/a%2C\\x1bb.py,line=2::synthetic diagnostic\n"
+                         "::error::synthetic error\n")

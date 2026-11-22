@@ -5463,10 +5463,10 @@ class WorkflowTests(unittest.TestCase):
 
     def test_python_intake_ratchet_runs_in_check_against_the_checked_out_base(self):
         steps = self.workflows["check.yml"]["jobs"]["check"]["steps"]
-        [step] = [step for step in steps if step.get("name") == "Ratchet Python script intake (WARN)"]
+        [step] = [step for step in steps if step.get("name") == "Ratchet Python script intake (HARD)"]
         expected = "${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before }}"
         self.assertEqual(step["env"]["INTAKE_BASE"], expected)
-        self.assertEqual(step["run"], 'python3 scripts/ci/check-python-intake.py "$INTAKE_BASE"')
+        self.assertEqual(step["run"], 'python3 scripts/ci/check-python-intake.py --hard "$INTAKE_BASE"')
         self.assertEqual(step["if"], "github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'")
         self.assertNotIn("continue-on-error", step)
 
