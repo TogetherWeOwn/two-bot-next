@@ -26,14 +26,14 @@ Full rules: CONTRIBUTING.md, "Pull request standards".
 
 ## Verification
 
-<!-- Commands you ran and their results, so a reviewer can repeat them. -->
+<!-- State commands and results outside code fences. Use the CI evidence summary for Actions links. -->
 
 -
 
 
 ## Attestation
 
-<!-- SHADOW / WARN only. Fill every field; retain the exact heading/field/bullet syntax.
+<!-- Fill every field and retain the exact heading/field/bullet syntax.
 T0 = critical paths, T1 = standard changes, T2 = docs-only. Declaring a higher risk is OK.
 T0 directories at any depth: migrations, sql, db, database, drizzle.
 T0 directory/module words: auth, authn, authz, authentication, authorization, oauth,
@@ -51,6 +51,7 @@ branch), crates/cutover/**, and wrangler .toml/.json/.jsonc
 configs at any depth (including wrangler.production.toml); prose like docs/wrangler.md
 is not a config. Deploy scripts outside these paths still require a declared T0 when critical.
 Renames inspect both old and new paths; deleting a T0 file is still T0.
+.github/workflows/pr-evidence.yml, .github/scripts/pr_evidence.py and its requirements and baseline are T0.
 T2 requires only root or docs/ .md/.rst files or explicitly allowlisted text basenames:
 README.txt, LICENSE.txt, NOTICE.txt, CHANGELOG.txt, CONTRIBUTING.txt, CODE_OF_CONDUCT.txt,
 SECURITY.txt, SUPPORT.txt, AUTHORS.txt (case-insensitive). Critical directory floors win.
@@ -68,7 +69,7 @@ belong in Verification, not this field. Duplicate mapping lines for multiple tes
 failed_before=yes|no|not-run describes what you actually observed. No invented red-before proof.
 proof= names the command/result/mutant or other evidence; never executes from this text.
 Only T2 may replace all test lines with: - none | reason=Documentation-only; no behavior changed.
-The validator checks shape and changed-file references, NOT test execution or truth of claims.
+The evidence check validates changed-file references and named declarations on the PR head.
 
 High-risk checklist: keep D1-D8. Replace each placeholder with evidence or
 not-applicable plus a concrete reason. For T0 all boxes must be checked; never blindly check them.

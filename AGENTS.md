@@ -113,7 +113,7 @@ rewrites tracked configuration or independent publication fixtures. Database
 tests use only disposable test services, never staging or production; retain
 all guards in [`CONTRIBUTING.md`](CONTRIBUTING.md#database-tests).
 
-Record the full PR head SHA and matching Actions run/job URLs in Verification.
+Record the full PR head SHA and matching Actions run/job URLs in task evidence.
 Keep focused reproduction transcripts. Normally the task owner squash-merges the pinned head after checks and reviews pass.
 Get owner approval for the full PR head SHA before any merge that could deploy production, including when effects are uncertain.
 Production actions need separate owner approval.

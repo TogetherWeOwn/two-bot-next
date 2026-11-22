@@ -42,7 +42,7 @@ JOB_INVENTORY = {
     # The nextest branch adds its required lane; main adds the production schema gate.
     # The inventory pin must retain both changes.
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
-                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok",
+                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok", "ci-evidence",
                   # `check` is now the lint lane; the test steps it used to
                   # carry run in these parallel lanes, all gated by ci-ok.
                   # The HARD patch-coverage measurement is sharded: the plan
@@ -99,6 +99,7 @@ JOB_INVENTORY = {
     # fixture lands); pinned shape below.
     "gradual-promote-proof.yml": {"proof"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
+    "pr-evidence.yml": {"pr-evidence"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
     # runs the local validation/evidence/preflight scripts without ever
@@ -10939,6 +10940,10 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "read", "actions": "read", "issues": "write"}
                     elif (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
+                    elif (name, job_id) == ("pr-evidence.yml", "pr-evidence"):
+                        expected.update({"actions": "read", "pull-requests": "read"})
+                    elif (name, job_id) == ("check.yml", "ci-evidence"):
+                        expected["actions"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
                         # Marker-label actor audit via the issue-events API.
                         expected["pull-requests"] = "read"
