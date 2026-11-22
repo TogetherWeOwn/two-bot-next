@@ -70,12 +70,12 @@ Report verification and the squash SHA, then settle.
 Follow the [risk tiers](CONTRIBUTING.md#independent-review). Standard changes need one independent
 cross-model review. Critical changes need two in parallel, including security. Resolve findings on the published head.
 
-T3 selects provider, model and effort per thread from the project default,
-launch `modelSelection` or reviewer `target`. Pair GPT/Sol with `codex-cliproxy`
-and Claude with `claude-cliproxy`. Prefer Sol for implementation and Opus for design. Default to high effort
-and use xhigh only when the brief justifies it. Never use max or ultra. Keep model selection out of harness files and hooks.
+New T3 threads inherit the project default. The owner chooses a harness that offers the model.
+Prefer Sol for implementation and Opus for design. Use high effort by default and
+xhigh only when the brief justifies it. Never use max or ultra. Keep model and effort
+selection out of harness files and hooks.
 
-Never use `rm -f`, `rm -rf` or `rm --force`, including in `trap` cleanups and `bash -lc` strings.
+In commands you run, never use `rm -f`, `rm -rf` or `rm --force`, including in `trap` cleanups and `bash -lc` strings.
 Use `rm -r -- "$dir"` for a directory and `rm -- "$file"` for a file.
 
 ## Test and build commands
