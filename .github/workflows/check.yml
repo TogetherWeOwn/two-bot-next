@@ -27,5 +27,7 @@ jobs:
           persist-credentials: false
       - name: Bind disposable service alias
         run: printf '127.0.0.1 agent-testdb\n' | sudo tee -a /etc/hosts > /dev/null
+      - name: Fetch the comparison query
+        run: git fetch --no-tags --depth=1 origin 81bd7999086c3790852031e7fcda4b63600b0ca2
       - name: Exercise the recovery inventory
         run: python3 scripts/ci/staging_recovery_catalog_fixture.py

@@ -94,6 +94,10 @@ def inventory():
     return capture.decode_inventory(psql("SET SESSION AUTHORIZATION fixture_reader;\n" + query))
 
 
+previous_query = subprocess.check_output(
+    ["git", "show", "81bd7999086c3790852031e7fcda4b63600b0ca2:scripts/staging_recovery_inventory.sql"],
+    text=True,
+).replace("-- @matrix", matrix)
 baseline = inventory()
 assert baseline["role"] == "two_bot_migrator_ro"
 assert not baseline["unsupported"] and not baseline["missing_expected"]
@@ -107,6 +111,9 @@ assert {"fixture_outsider", "fixture_parent", "fixture_grandparent"} <= {r["name
 for type_name in ("fixture_foreign", "fixture_nested", "fixture_enum", "fixture_scalar_domain",
                   "fixture_range", "fixture_outside_row"):
     psql(f"ALTER TABLE public.fixture_main ADD COLUMN bad public.{type_name};")
+    if type_name in ("fixture_foreign", "fixture_nested", "fixture_enum"):
+        previous = capture.decode_inventory(psql("SET SESSION AUTHORIZATION fixture_reader;\n" + previous_query))
+        assert not previous["unsupported"], f"comparison query unexpectedly refused {type_name}"
     assert inventory()["unsupported"], f"uncaptured dependency {type_name} was accepted"
     psql("ALTER TABLE public.fixture_main DROP COLUMN bad;")
 psql("""
@@ -132,3 +139,4 @@ assert errors.getvalue().strip() == "the recipient does not match the reviewed c
 print("PASS: uncaptured OUT type refused and unreviewed recipient rejected with the pinned-certificate error")
 psql("SET SESSION AUTHORIZATION fixture_misbound;\n" + query, success=False)
 print("PASS: real read-only catalog query, ordinary in-scope row and extension types, direct and nested composites, enum, domain, range, outside row and routine refusal, inherited default ACLs and misbound refusal")
+print("PASS: identical fixtures distinguish the reviewed query from the prior query for direct composite, nested composite and enum dependencies")
