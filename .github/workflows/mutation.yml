@@ -81,3 +81,48 @@ jobs:
           path: ${{ runner.temp }}/rust-mutation.json
           retention-days: 14
           if-no-files-found: error
+
+  python-mutation:
+    name: Python changed-line mutation (WARN)
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Plan changed source lines
+        id: plan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/mutation_scope.py
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        if: steps.plan.outputs.python_fixture == 'true'
+        with:
+          python-version: '3.12.16'
+      - name: Install the pinned Python suite dependency
+        if: steps.plan.outputs.python_fixture == 'true'
+        run: |
+          printf '%s\n' 'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' > "$RUNNER_TEMP/mutation-requirements.txt"
+          python3 -m pip --isolated install --only-binary=:all: --no-deps --require-hashes -r "$RUNNER_TEMP/mutation-requirements.txt"
+      - name: Prove changed-line mutation with offline unittest fixtures
+        if: steps.plan.outputs.python_fixture == 'true'
+        run: python3 .github/scripts/mutation_python_fixture.py
+      - name: Measure Python PR additions
+        if: steps.plan.outputs.python == 'true'
+        run: |
+          python3 .github/scripts/mutation_python.py --mode warn \
+            --patch "$RUNNER_TEMP/mutation.diff" --report "$RUNNER_TEMP/python-mutation.json"
+      - name: Upload Python verdicts
+        if: ${{ always() && steps.plan.outputs.python == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-mutation
+          overwrite: true
+          path: ${{ runner.temp }}/python-mutation.json
+          retention-days: 14
+          if-no-files-found: error
