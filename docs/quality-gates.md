@@ -135,6 +135,25 @@ an offline binding, edits without a supported operator and suites that
 execute zero tests are reported as unsupported. The Actions fixture also
 checks that an unchanged operator stays outside the sample.
 
+The Worker lane also runs in WARN for added TypeScript lines under
+`wrangler/src/`. The locked Babel TypeScript parser locates comparison,
+standalone logical, arithmetic and boolean edits. It excludes chained
+logical operators to preserve grouping. The lane uses the Worker Node test
+entry point with a counts-only reporter in a disposable snapshot. The
+reporter excludes file-only passes, and cancelled tests give an infrastructure
+verdict. The fixture covers an empty test
+file along with strong, weak and failing assertions. Unsupported edits and
+failed measurements have their own verdicts.
+The Worker suite has four minutes per execution and the lane records partial
+results with an infrastructure error if it reaches its 22-minute budget.
+
+Before making the lane required, collect exact-head WARN receipts for
+representative PRs in all three languages. Check that real suites run,
+database-backed Rust coverage is accounted for, and the engine jobs complete
+within their budgets. The required check must use reviewed gate policy and
+fail closed on missing or incomplete measurements. Fixture coverage of the
+HARD exit codes is one part of that evidence.
+
 ## Scanner dependency triage (review by 2026-11-16)
 
 The hash-pinned `scripts/ci/semgrep-requirements.txt` targets CI's CPython 3.11

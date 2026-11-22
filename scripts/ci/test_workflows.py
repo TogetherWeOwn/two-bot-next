@@ -66,7 +66,7 @@ JOB_INVENTORY = {
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep-plan",
                     "sweep-partition", "sweep-guarded", "sweep-docs", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
-    "mutation.yml": {"rust-mutation", "python-mutation"},
+    "mutation.yml": {"rust-mutation", "python-mutation", "worker-mutation"},
     # One-off read-only reference writer for the fixed source snapshot.
     "configuration-reference.yml": {"configuration-reference"},
     "release.yml": {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"},
