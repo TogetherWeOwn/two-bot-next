@@ -50,9 +50,9 @@ def main():
         (root / "src").mkdir(parents=True)
         git(root, "init", "-q")
         (root / "Cargo.toml").write_text('[package]\nname = "mutation-fixture"\nversion = "0.1.0"\nedition = "2021"\n')
-        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root, check=True, timeout=30)
         source = root / "src/lib.rs"
         source.write_text(OLD_SOURCE)
+        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root, check=True, timeout=30)
         (root / "uncovered.rs").write_text("pub fn untouched() -> bool { true }\n")
         base = commit(root, "baseline")
         git(root, "mv", "uncovered.rs", "src/uncovered.rs")
