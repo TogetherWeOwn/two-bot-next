@@ -37,8 +37,7 @@ class EvidenceTests(unittest.TestCase):
             "sample.ts": ("test('actual', () => {}); /* test('stale', () => {}); */", "actual"),
         }
         for path, (source, name) in fixtures.items():
-            with self.subTest(path=path):
-                self.assertEqual(list(evidence.named_tests(path, source)), [name])
+            self.assertEqual(list(evidence.named_tests(path, source)), [name], path)
 
     def test_stale_evidence_and_test_name_block(self):
         body = "\n".join([

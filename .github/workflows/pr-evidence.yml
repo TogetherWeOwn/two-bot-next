@@ -21,15 +21,21 @@ jobs:
       pull-requests: read
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      BOOTSTRAP: ${{ github.event_name == 'pull_request' && github.event.pull_request.number == 2357 && github.event.pull_request.base.sha == '1580ea94bc192a0631c6c62ccd8dc264fed8675e' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request' && env.BOOTSTRAP != 'true'
         with:
-          # Bootstrap only in the implementation PR. Subsequent PRs run the base policy.
-          ref: ${{ (github.event.pull_request.number == 2357 && github.event.pull_request.base.sha == '1580ea94bc192a0631c6c62ccd8dc264fed8675e') && github.sha || (github.event_name == 'pull_request' && 'refs/heads/main') || github.sha }}
+          ref: refs/heads/main
           sparse-checkout: .github/scripts
           persist-credentials: false
-      - name: Fetch immutable PR source history
-        if: "!inputs.publish-only && github.event_name == 'pull_request'"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'push' || env.BOOTSTRAP == 'true'
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - if: "!inputs.publish-only && github.event_name == 'pull_request'"
         env:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
@@ -43,24 +49,21 @@ jobs:
           path: attestation-policy
           sparse-checkout: .github/scripts
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        if: "!inputs.publish-only"
+        with:
+          python-version: '3.12'
       - name: Install hash-pinned source parsers
         if: "!inputs.publish-only"
-        run: |
-          python3.12 -m venv "$RUNNER_TEMP/evidence"
-          "$RUNNER_TEMP/evidence/bin/python" -m pip --isolated install --no-deps --only-binary=:all: --require-hashes -r .github/scripts/pr-evidence-requirements.txt
+        run: python3 -m pip --isolated install --no-deps --only-binary=:all: --require-hashes -r .github/scripts/pr-evidence-requirements.txt
       - name: Verify and publish evidence
         env:
           GH_TOKEN: ${{ github.token }}
           EVIDENCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PUBLISH_ONLY: ${{ inputs.publish-only }}
-        run: |
-          if [[ "$PUBLISH_ONLY" == true ]]; then
-            python3 -I .github/scripts/pr_evidence.py publish
-          else
-            "$RUNNER_TEMP/evidence/bin/python" -I .github/scripts/pr_evidence.py verify
-          fi
+          EVIDENCE_MODE: ${{ inputs.publish-only && 'publish' || 'verify' }}
+        run: python3 -I .github/scripts/pr_evidence.py "$EVIDENCE_MODE"
       - name: Run evidence fixtures
         if: "!inputs.publish-only"
-        run: '"$RUNNER_TEMP/evidence/bin/python" -I -m unittest discover -s .github/scripts -p test_pr_evidence.py -v'
+        run: python3 -I -m unittest discover -s .github/scripts -p test_pr_evidence.py -v

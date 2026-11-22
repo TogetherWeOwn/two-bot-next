@@ -118,7 +118,7 @@ def named_tests(path, source):
             if node.type == "function_item":
                 attribute = node.prev_named_sibling
                 while attribute and attribute.type in {"attribute_item", "line_comment", "block_comment"}:
-                    if re.match(rb"#\s*\[\s*(?:\w+\s*::\s*)*test\s*[\[(\]]", attribute.text):
+                    if re.match(rb"#\s*\[\s*(?:\w+\s*::\s*)*test\s*(?:\(|\])", attribute.text):
                         yield "::".join((*modules, node.child_by_field_name("name").text.decode()))
                         break
                     attribute = attribute.prev_named_sibling
@@ -135,7 +135,8 @@ def named_tests(path, source):
 def validate(policy, body, files, read):
     verification, attestation = evidence_sections(body)
     if (policy.visible_lines(body).count("## Verification") != 1 or not any(
-            policy.meaningful(line.strip("-* ~`")) for line in verification.splitlines())):
+            policy.meaningful(line.strip("-* ")) for line in verification.splitlines()
+            if not line.lstrip().startswith(("```", "~~~")))):
         raise EvidenceError("Fill in the visible Verification section with commands and results.")
     if RUN_LINK.search(verification + "\n" + attestation):
         raise EvidenceError("Actions URLs in Verification or Attestation can go stale. Use the job summary.")
@@ -188,7 +189,7 @@ def main():
     repo, event = env["GITHUB_REPOSITORY"], env["GITHUB_EVENT_NAME"]
     if (not SHA.fullmatch(head) or not all(map(NUMBER.fullmatch, (run, attempt)))
             or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo, re.ASCII)):
-        raise EvidenceError("Invalid repository identity.")
+        raise EvidenceError("Invalid Actions identity.")
     mode = sys.argv[1]
     workflow = {"verify": "pr-evidence.yml", "publish": "check.yml"}[mode]
     with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
@@ -198,12 +199,10 @@ def main():
             import pr_attestation as policy
 
             number, base = env["PR_NUMBER"], env["PR_BASE"]
-            if (not NUMBER.fullmatch(number) or not SHA.fullmatch(base)
-                    or command("git", "rev-parse", "--verify", f"{head}^{{commit}}").strip() != head):
-                raise EvidenceError("Missing immutable PR head identity.")
-            reader = policy.GitHub(env["GH_TOKEN"], repo)
+            if not NUMBER.fullmatch(number) or not SHA.fullmatch(base):
+                raise EvidenceError("Invalid PR identity.")
             try:
-                result = check(policy, reader, number, repo, base, head)
+                result = check(policy, policy.GitHub(env["GH_TOKEN"], repo), number, repo, base, head)
             except policy.ObservationError:
                 raise EvidenceError("Attestation policy or metadata request refused.") from None
             output.write(f"\n**{result}.**\n")

@@ -352,9 +352,8 @@ and any authorized manual Actions run also stay on GitHub.
 
 Use Verification for commands and results. The `ci-evidence` summary
 publishes the head SHA and Actions links for task evidence.
-`pr-evidence` checks named tests in changed source. Use a Python function or
-`Class.method`, a Rust function or inline module path, or a literal JS/TS
-title. Use the file alone for generated names.
+`pr-evidence` resolves Python functions or `Class.method`, Rust test
+functions and literal JS/TS titles. Use the changed file alone for generated names.
 
 The baseline covers unchanged PR heads and evidence. Before making
 `pr-evidence` required, record SHA and run/job URLs for green main and two later PRs.
