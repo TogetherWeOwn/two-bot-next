@@ -711,8 +711,9 @@ class WebSocket:
                 parts.append(data)
                 if fin:
                     try:
-                        return decode_legacy_json(b"".join(parts),
-                                          object_pairs_hook=_reject_duplicate_keys)
+                        return decode_legacy_json(
+                            b"".join(parts), object_pairs_hook=_reject_duplicate_keys,
+                        )
                     except DuplicateKeyError:
                         raise ValueError(
                             "gateway frame carries duplicate JSON object keys") from None
