@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import ssl
 import subprocess
 import sys
@@ -53,13 +52,9 @@ def main():
         if hashlib.sha256(der_certificate).hexdigest() != RECIPIENT_SHA256:
             raise Refused("the recipient does not match the reviewed certificate")
         pg, host, database = database_target(os.environ)
-        psql = shutil.which("psql")
-        if not psql:
-            raise Refused("psql is unavailable")
-
         query = (ROOT / "scripts/staging_recovery_inventory.sql").read_text(encoding="utf-8")
         matrix = (ROOT / "sql/database_role_matrix.sql").read_text(encoding="utf-8")
-        output = run_psql(psql, psql_environment(pg, os.environ),
+        output = run_psql("psql", psql_environment(pg, os.environ),
                           query.replace("-- @matrix", matrix))
         report = decode_inventory(output)
         if (report["database"]["name"] != database or report["role"] != DB_ROLE
@@ -85,7 +80,6 @@ def main():
         print("staging recovery capture failed", file=sys.stderr)
         return 1
 
-    print("Encrypted a staging recovery inventory.")
     print(f"Plaintext SHA-256: {hashlib.sha256(payload).hexdigest()}")
     return 0
 

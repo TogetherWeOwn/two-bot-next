@@ -55,8 +55,17 @@ WITH RECURSIVE expected AS (
 ), scoped_roles AS (
     SELECT oid FROM principals
     UNION SELECT m.member FROM pg_auth_members m JOIN scoped_roles r ON m.roleid = r.oid
+), app_defaults AS (
+    SELECT d.*, s.nspname FROM pg_default_acl d LEFT JOIN schemas s ON s.oid = d.defaclnamespace
+    WHERE (d.defaclnamespace = 0 OR s.oid IS NOT NULL)
+      AND (d.defaclrole IN (SELECT oid FROM scoped_roles) OR EXISTS (
+          SELECT 1 FROM aclexplode(d.defaclacl) a
+          WHERE a.grantee = 0 OR a.grantee IN (SELECT oid FROM scoped_roles)))
 ), reported_roles AS (
     SELECT oid FROM scoped_roles
+    UNION SELECT defaclrole FROM app_defaults
+    UNION SELECT grantor FROM app_defaults CROSS JOIN LATERAL aclexplode(defaclacl)
+    UNION SELECT grantee FROM app_defaults CROSS JOIN LATERAL aclexplode(defaclacl)
     UNION SELECT m.roleid FROM pg_auth_members m JOIN reported_roles r ON m.member = r.oid
 )
 SELECT jsonb_build_object(
@@ -151,12 +160,9 @@ SELECT jsonb_build_object(
         'definition', CASE WHEN p.prokind <> 'a' THEN pg_get_functiondef(p.oid) END)
         FROM routines p ORDER BY p.schema_name, p.signature),
     'default_acls', ARRAY(SELECT jsonb_build_object(
-        'schema', n.nspname, 'owner', pg_get_userbyid(d.defaclrole),
+        'schema', d.nspname, 'owner', pg_get_userbyid(d.defaclrole),
         'object_type', d.defaclobjtype, 'acl', d.defaclacl)
-        FROM pg_default_acl d LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
-        WHERE d.defaclrole IN (SELECT oid FROM scoped_roles)
-          AND (d.defaclnamespace = 0 OR n.nspname IN ('public', 'web_v1'))
-        ORDER BY n.nspname, pg_get_userbyid(d.defaclrole), d.defaclobjtype),
+        FROM app_defaults d ORDER BY d.nspname, pg_get_userbyid(d.defaclrole), d.defaclobjtype),
     'roles', ARRAY(SELECT jsonb_build_object(
         'name', rolname, 'login', rolcanlogin, 'inherit', rolinherit,
         'superuser', rolsuper, 'create_role', rolcreaterole, 'create_database', rolcreatedb,
