@@ -60,8 +60,9 @@ exact head commit. Never bypass or weaken a check.
 
 ### Independent review
 
-Use the PR template's `risk_tier` and path floors. Declare the higher tier
-when the behavior warrants it. Changes to `AGENTS.md`, `CLAUDE.md`,
+Use the `risk_tier` and complete path floors in the
+[PR template](.github/pull_request_template.md). Declare the higher tier when
+the behavior warrants it. Changes to `AGENTS.md`, `CLAUDE.md`,
 `CONTRIBUTING.md`, `REVIEW.md`, `.claude/**` and `.github/**` are at least T1.
 
 | Tier | Review before merge |
@@ -77,12 +78,12 @@ data integrity and input bounds as applicable.
 
 In T3 Code, start each review as a separate read-only delegated task. For an
 AI-authored change, use a model family different from the author's. Provide the
-PR URL and full published head SHA. Reviewers inspect the pinned diff and report the SHA,
-findings, and limits of their inspection. Record findings and dispositions in the
+PR URL and full published head SHA. Reviewers inspect the pinned diff and
+report the SHA, findings, and limits of their inspection. Record those in the
 PR using public-safe evidence. Follow [SECURITY.md](SECURITY.md) for sensitive
-findings. Get a fresh independent review after substantive fixes or other
-material changes, and record why any prior review still covers a minor revision.
-Run required CI on every new head.
+findings. Get fresh independent review after a material change. For a minor
+revision, record both SHAs, what changed and why the prior review still covers
+the new head. Run required CI on every new head.
 
 ### Complete PR inventories
 

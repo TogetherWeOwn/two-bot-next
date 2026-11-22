@@ -15,10 +15,12 @@ def load_role(name):
 
 
 class AgentRoleContractTests(unittest.TestCase):
-    def test_existing_routes_and_tools_are_preserved(self):
+    def test_claude_code_models_and_tools(self):
         expected = {
-            "cross-reviewer": ("gpt-6.1-sol", "Read, Grep, Glob, Bash"),
-            "builder": ("claude/claude-sonnet-5-5", "Read, Grep, Glob, Bash, Edit, Write"),
+            "Explore": ("haiku", "Read, Grep, Glob, Bash"),
+            "scout": ("haiku", "Read, Grep, Glob, Bash"),
+            "cross-reviewer": ("opus", "Read, Grep, Glob, Bash"),
+            "builder": ("sonnet", "Read, Grep, Glob, Bash, Edit, Write"),
         }
         for name, (model, tools) in expected.items():
             with self.subTest(role=name):
@@ -28,16 +30,15 @@ class AgentRoleContractTests(unittest.TestCase):
                 self.assertEqual(metadata["tools"], tools)
                 self.assertEqual(set(metadata), {"name", "description", "model", "tools"})
 
-    def test_cross_review_is_independent_concurrent_and_pinned(self):
+    def test_cross_review_is_independent_and_pinned(self):
         metadata, body = load_role("cross-reviewer")
-        self.assertIn("alongside the primary assessment", metadata["description"])
+        self.assertIn("authored by a different model family", metadata["description"])
         for requirement in (
-            "independently and concurrently",
-            "same pinned head",
-            "base and head commit SHAs",
-            "Withhold preliminary conclusions until independent findings are recorded",
-            "reconcile before decisions",
-            "changed head requires applicable revalidation",
+            "risk-tier policy in CONTRIBUTING.md",
+            "base and published head SHAs",
+            "record findings before reading any other review of that head",
+            "Decline cross-model review if the executed model is from the author's model family",
+            "The caller verifies model identity",
             "concrete failing input or scenario",
             "the evidence establishing it",
             "unverified hypotheses",
@@ -63,7 +64,7 @@ class AgentRoleContractTests(unittest.TestCase):
             "keep small cohesive work together",
             "metadata alone does not prove qualification",
             "Architecture, debugging, primary code review and specialist decisions",
-            "No design work or Security or Release Manager authority is delegated",
+            "No design, security approval or production approval authority is delegated",
             "caller remains the accountable integrator",
             "file/output ownership and integration boundaries before parallel writes",
             "verified native task-owned isolated workspaces",
@@ -72,19 +73,19 @@ class AgentRoleContractTests(unittest.TestCase):
             "full suites and required checks on GitHub Actions for the exact head",
             "never run a local full suite or CI mirror",
             "one failing test or crate",
-            "Never commit, push, open PRs or change Paperclip issues",
+            "Leave commits, pushes and PR management to the caller",
         ):
             with self.subTest(requirement=requirement):
                 self.assertIn(requirement, body)
 
-    def test_both_roles_keep_native_gates_and_experimental_no_go(self):
+    def test_both_roles_keep_model_and_release_controls(self):
         for name in ("builder", "cross-reviewer"):
             _, body = load_role(name)
             for requirement in (
-                "active-participant authority", "stage/participant IDs",
-                "executor exclusion", "review rounds", "release gates",
-                "never pass an Agent model override", "runtime settings",
-                "Experimental review-panel, annotated-diff and hill-climb work remains NO-GO",
+                "required checks", "release gates",
+                "Never override this Claude Code role's model",
+                "runtime settings, tools and permissions",
+                "Experimental review-panel, annotated-diff and hill-climb work remains on hold",
             ):
                 with self.subTest(role=name, requirement=requirement):
                     self.assertIn(requirement, body)

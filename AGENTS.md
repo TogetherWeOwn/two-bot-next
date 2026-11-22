@@ -141,7 +141,7 @@ are outside this guidance when they do not change browser-facing code.
 - Relevant tests pass in GitHub Actions, with exact-head run/job links recorded.
 - Any permitted focused reproduction and checks not run are disclosed.
 - CI is green on the exact head commit.
-- Review is complete on that same head commit.
+- Required review evidence covers that same head under the [review policy](CONTRIBUTING.md#independent-review).
 - The PR is squash-merged.
 - The docs the change makes stale are updated.
 
