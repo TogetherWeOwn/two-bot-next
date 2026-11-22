@@ -339,12 +339,11 @@ check above before dispatch; stop if the intended merged SHA no longer matches
   was red, since the policy bindings are what matter. The unchanged 18-pass stable
   restore gate still applies to it.
 
-Keep exact-head Actions, Security then QA, fresh inventory of the actual
+Keep exact-head Actions, applicable independent reviews, fresh inventory of the actual
 database, shared policy and applied migration ledger, exact-head qualification,
-and the `t0`, pre-7-day and post-7-day evidence below. Verified non-deploying
-bot merges need no standing Release Manager confirmation. A merge that would
-deploy production or whose deployment cannot be ruled out needs exact-head
-Release Manager approval on the source card; see
+and the `t0`, pre-7-day and post-7-day evidence below. A merge that would
+deploy production or whose deployment cannot be ruled out needs owner approval
+for the full PR head SHA. See
 [production merge evidence](../CONTRIBUTING.md#production-merge-evidence).
 The bootstrap sequence is a technical recovery decision, not approval to merge,
 deploy production or waive missing qualification. Exact-SHA staging qualification

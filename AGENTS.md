@@ -61,6 +61,23 @@ its remaining findings, then push the resolution before expecting GitHub to merg
   comment that names what replaced it.
 - Never bypass a required check, a ruleset or a failing test.
 
+## T3 Code workflow
+
+The lead manages the queue, dependencies and up to four active task threads per project.
+Each owns one PR through merge. Continue its published branch and use the T3 PR watch.
+Report verification and the squash SHA, then settle.
+
+Follow the [risk tiers](CONTRIBUTING.md#independent-review). Standard changes need one independent
+cross-model review. Critical changes need two in parallel, including security. Resolve findings on the published head.
+
+New T3 threads inherit the project default. The owner chooses a harness that offers the model.
+Prefer Sol for implementation and Opus for design. Use high effort by default and
+xhigh only when the brief justifies it. Never use max or ultra. Keep model and effort
+selection out of harness files and hooks.
+
+In commands you run, never use `rm -f`, `rm -rf` or `rm --force`, including in `trap` cleanups and `bash -lc` strings.
+Use `rm -r -- "$dir"` for a directory and `rm -- "$file"` for a file.
+
 ## Test and build commands
 
 Full test suites and CI gates run on **GitHub Actions**, not the shared host.
@@ -96,16 +113,29 @@ rewrites tracked configuration or independent publication fixtures. Database
 tests use only disposable test services, never staging or production; retain
 all guards in [`CONTRIBUTING.md`](CONTRIBUTING.md#database-tests).
 
-Record the PR's full head SHA and matching Actions run/job URLs for reviewers
-and the Release Manager. Local transcripts are focused reproduction evidence,
-not CI evidence. The final-stage reviewer merges the pinned settled head before
-final approval (the author merges only without a review stage). Verified
-non-deploying bot merges need no standing Release Manager confirmation; all
-exact-head checks and required review stages, including Security before QA
-where applicable, still apply. If a merge would deploy production or deployment
-cannot be ruled out, require Release Manager approval on the source card for
-the full PR head SHA before merge. Production actions need separate approval.
+Record the full PR head SHA and matching Actions run/job URLs in Verification.
+Keep focused reproduction transcripts. Normally the task owner squash-merges the pinned head after checks and reviews pass.
+Get owner approval for the full PR head SHA before any merge that could deploy production, including when effects are uncertain.
+Production actions need separate owner approval.
 See [`CONTRIBUTING.md`](CONTRIBUTING.md#production-merge-evidence).
+
+## Modern web platform guidance
+
+Use Modern Web Guidance before editing browser-facing HTML, CSS, or client-side
+JavaScript and TypeScript. This includes the existing [Worker ops dashboard](wrangler/src/ops-dashboard.ts)
+and any new dashboard. The Rust bot, backend Worker routes, SQL, and scripts
+are outside this guidance when they do not change browser-facing code.
+
+1. Use the `modern-web-guidance` skill through an installed or version-pinned CLI.
+   Use official platform documentation when either the skill or a direct CLI
+   invocation would fetch or execute an unpinned package.
+   For an installed CLI, run `DISABLE_TELEMETRY=1 modern-web-guidance search "<2-5 word capability>"`,
+   then `DISABLE_TELEMETRY=1 modern-web-guidance retrieve "<id>"`.
+   Search one capability at a time (for example `"light dismiss dialog"`), without framework or app names.
+2. Apply only the retrieved guidance that fits the task. Keep existing behavior, copy, design tokens and
+   the stack the route already uses; record any guide you followed in the PR body.
+3. The guidance never overrides [CONSTRAINTS.md](CONSTRAINTS.md), this file, or a project decision. If they
+   conflict, follow the project and note the conflict in the PR.
 
 ## Definition of done
 
@@ -113,14 +143,14 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md#production-merge-evidence).
 - Relevant tests pass in GitHub Actions, with exact-head run/job links recorded.
 - Any permitted focused reproduction and checks not run are disclosed.
 - CI is green on the exact head commit.
-- Review is complete on that same head commit.
+- Required review evidence covers that same head under the [review policy](CONTRIBUTING.md#independent-review).
 - The PR is squash-merged.
 - The docs the change makes stale are updated.
 
 ## Controller builds
 
 Only for a permitted non-heavy focused failure reproduction/fallback on the
-persistent Paperclip controller, run Cargo through
+persistent build controller, run Cargo through
 `python3 scripts/cargo_cache.py run -- <check|test|clippy|build> ...` from your own
 isolated workspace. Pick one failing test or crate, never the full workspace.
 This cache wrapper is not an alternative location for CI or heavy builds.
@@ -134,8 +164,8 @@ cooperative temporary output in quota-covered lease scratch, not container `/tmp
 Run permitted focused commands in the foreground with a timeout covering the
 command; read the result in the same run. Interrupted partial output stays in
 the slot and counts against its budget. A missing pool/quota/scratch-coverage
-receipt needs the Operator rollout; a full pool needs safe retention/continuation,
-not another cache. Agents must not
+receipt needs an operator to complete rollout. Use safe retention or resume when
+capacity is available if the pool is full. Agents must not
 clear crash sentinels, delete host caches, mount filesystems or restart services.
 
 `cargo fmt --all -- --check` does not compile and can run directly. Cache

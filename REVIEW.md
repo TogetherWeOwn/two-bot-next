@@ -2,8 +2,11 @@
 
 ## Role
 
-Advisory first pass in English. Find defects this PR introduces or makes
-reachable. Independent review and required CI are the merge gate. Do not
+Review the published PR head independently and report its full SHA. Find
+defects this PR introduces or makes reachable. Apply the
+[review requirements for the PR's risk tier](CONTRIBUTING.md#independent-review).
+For critical changes, keep the general and security-focused reviews independent
+and record both before addressing their findings. Do not
 approve, merge, enable auto-merge, edit code, or start fix sessions. This file
 guides analysis only; it is not a permission boundary.
 
@@ -34,22 +37,13 @@ Retain exact-SHA receipts; this is not pre-merge staging or permission to act
 through a hold.
 
 Before merge, verify required GitHub Actions checks and Devin Review on the
-exact PR head, Security before QA where required, other applicable review, and
-finding dispositions. A verified non-deploying bot merge needs no standing
-Release Manager confirmation. If a merge would deploy production or deployment
-cannot be ruled out, require exact-head Release Manager approval on the source
-card, with the migration ledger entry (or `no migration`) and rollback target.
-Preserve all incident, freeze, identity/capability and other holds, red staging
-drills, and other deterministic gates. A new head needs fresh review and check
-evidence and, when required, fresh Release Manager approval. Historical
-rejections are not approvals; meet their remaining conditions before resubmitting.
-
-The final-stage reviewer performs the SHA-pinned squash merge before final
-approval and records the squash SHA and any applicable PR approval in the release
-log. The author merges only without a review stage. Record the production
-decision separately when the Release Manager accepts the full release SHA.
-This policy claims no staging pass or hold lift and authorizes no pipeline skip,
-no-op implementation, deployment or other production action.
+exact PR head, applicable independent reviews and finding dispositions.
+Preserve incident, freeze and identity/capability holds, red staging drills and
+other deterministic gates. If deployment would follow or cannot be ruled out,
+verify explicit owner approval for the full PR head SHA with the migration
+ledger entry (or `no migration`) and rollback target. Production actions need
+separate approval for the exact release SHA as applicable. Follow the contribution
+policy for who performs the SHA-pinned merge and records the release evidence.
 
 ## What merits a finding
 
@@ -234,7 +228,7 @@ A missing test alone is not a runtime bug. These are blocking findings:
 
 ## Dependency-bump PRs
 - For Dependabot/Renovate PRs, generated-body omissions alone are not code defects. Cite the applicable repository or adoption requirement when reporting missing Verification/Attestation evidence; do not assume a bot-wide exemption.
-- The adopting agent must supply real Verification, truthful Attestation and Model Used, preserving bot authorship and provenance. Set the attestation `risk_tier` to the applicable T0/T1/T2 template tier (including the T0 floor); dependency changes retain separate Sensitive Security → QA review routing. Missing required adoption evidence remains a review/gate finding even if the checker returns early; never attest to unperformed work.
+- The adopting agent must supply real Verification, truthful Attestation and Model Used, preserving bot authorship and provenance. Dependency changes require T0 and its two independent reviews. Flag missing adoption evidence even if the checker returns early. Attest only to work performed.
 - T0 attestation remains mandatory: PR-standards enforces it before the Dependabot/Renovate early return. That return does not waive adopter evidence or review requirements.
 - For a version bump, compare the changelog with actual repository call sites. Request a new behavior-regression test only for a named affected call site and a concrete adverse behavior change; existing mandatory testing, security and regression-evidence obligations remain unchanged. Report concrete install, build, output and other regression defects too.
 - Read the repository's actual `.github/dependabot.yml`: a deliberately excluded lockfile is not a missed update. Do not infer exclusions from another repository or assume all standalone lockfiles are excluded. Cargo updates include `/fuzz`.

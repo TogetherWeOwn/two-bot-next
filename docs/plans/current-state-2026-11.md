@@ -107,5 +107,3 @@ it does not make a feature active.
 - No broader moderation oracle, reason-bearing warning search/export,
   or expanded template language.
 - No wider permissions or live-guild scope changes.
-- No migration off Paperclip, bulk export or sync plugin; Paperclip
-  stays the live work queue (assignments, dependencies, status).

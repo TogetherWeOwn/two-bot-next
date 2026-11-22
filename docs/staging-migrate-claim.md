@@ -2,8 +2,8 @@
 
 The claim is non-secret evidence of the staging apply request, not an approval
 or permission to apply migrations. The staging gate combines the `main`-only
-GitHub environment branch rule, a successful claim job and a board confirmation
-recorded on the source task **before** dispatch. See the
+GitHub environment branch rule, a successful claim job and explicit owner
+approval recorded **before** dispatch. See the
 [staging migration runbook](runbook.md#staging-only-migration-runner) for recovery
 and ACL prerequisites. Production has its own approval and protection rules:
 `production-migrate.yml` with `scripts/ci/production_migrate_claim.py`, which
@@ -34,7 +34,7 @@ artifact and runs `scripts/ci/staging_migrate_claim.py`. Inputs enter through
 step environment variables, not shell interpolation. Refusal fails the job;
 there is no continue-on-error or upload-on-failure path.
 
-The `apply` job needs **both** `plan` and `claim`. Board confirmation precedes
+The `apply` job needs **both** `plan` and `claim`. Owner approval precedes
 workflow dispatch, so it reviews the producing plan, not this later claim.
 The `staging-migrate-apply` environment restricts deployment to `main`; do not
 expect a GitHub reviewer or custom protection rule to pause the job.
@@ -133,17 +133,17 @@ recovery/ACL references. Recompute both projection digests losslessly and
 compare them with the embedded digests. Do not dispatch if the artifact is
 missing, expired, ambiguous or cannot be authenticated.
 
-Request a board `request_confirmation` on the source task with the full source
-SHA, producing plan run ID, both pending lists, both manifest digests and the
-recovery reference. Dispatch only after the board accepts that exact binding.
-Hash equality does not substitute for confirmation.
+Before dispatch, verify and retain [direct owner approval](../CONTRIBUTING.md#production-merge-evidence)
+for the full source SHA, producing plan run ID, both pending lists, both manifest
+digests and the recovery reference. Keep restricted evidence in the private task
+thread. Require fresh approval for any changed input, even when hashes match.
 
 Before submitting `mode: apply` on `main`, compare the actual dispatch inputs
 with the authenticated producing manifest and its run ID. Match the source SHA,
 both pending lists, both digests, the pinned target (`staging_host`,
 `staging_database`, `staging_branch_id`) and both evidence references
 (`recovery_evidence_ref`, `acl_plan_ref`). The digests do not cover the target or
-either reference. Do not dispatch if any value differs.
+either reference. Do not dispatch if any value differs, the exact binding lacks approval or a hold applies.
 
 After dispatch, verify that the claim came from the successful
 `staging-migrate (claim)` job on that run and attempt, agrees with the
