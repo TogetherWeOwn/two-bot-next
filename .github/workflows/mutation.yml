@@ -161,6 +161,7 @@ jobs:
         if: steps.plan.outputs.worker == 'true'
         shell: bash
         run: |
+          npm audit --prefix wrangler --audit-level=high --include=dev
           npm ci --prefix wrangler
           sandbox=$(mktemp -d "$RUNNER_TEMP/mutation-worker.XXXXXX")
           git archive HEAD | tar -x -C "$sandbox"

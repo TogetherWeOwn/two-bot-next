@@ -7,7 +7,7 @@ import { parse } from "@babel/parser";
 
 const MAX_MUTANTS = 50;
 const RUN_MILLISECONDS = 22 * 60_000;
-const TEST_MILLISECONDS = 60_000;
+const TEST_MILLISECONDS = 4 * 60_000;
 const reporter = fileURLToPath(new URL("./reporter.mjs", import.meta.url));
 const operators = new Map(Object.entries({
   "<": "<=", "<=": "<", ">": ">=", ">=": ">", "===": "!==", "!==": "===",
@@ -24,12 +24,12 @@ export function edits(source, lines) {
         replacement: node.value ? "false" : "true" });
     }
     if (node.type === "BinaryExpression" || node.type === "LogicalExpression") {
-      const line = node.left.loc.end.line;
       const between = source.slice(node.left.end, node.right.start);
-      if (line === node.right.loc.start.line && lines.has(line) && between.trim() === node.operator &&
-          operators.has(node.operator)) {
-        const start = node.left.end + between.indexOf(node.operator);
-        candidates.push({ line, start, end: start + node.operator.length,
+      if (between.trim() === node.operator && operators.has(node.operator)) {
+        const offset = between.indexOf(node.operator);
+        const line = node.left.loc.end.line + between.slice(0, offset).split("\n").length - 1;
+        const start = node.left.end + offset;
+        if (lines.has(line)) candidates.push({ line, start, end: start + node.operator.length,
           replacement: operators.get(node.operator) });
       }
     }
@@ -68,8 +68,9 @@ function testResult(root, args, timeoutMs) {
       clearTimeout(timeout);
       const pass = summary.get("pass");
       const fail = summary.get("fail");
-      if (expired || summary.get("cancelled") !== 0) done("infrastructure_error");
+      if (expired) done("timeout");
       else if (code === 1 && fail > 0) done("failed");
+      else if (summary.get("cancelled") !== 0) done("infrastructure_error");
       else if (code === 0 && fail === 0 && pass > 0) done("passed");
       else if (code === 0 && fail === 0 && pass === 0) done("unsupported");
       else done("infrastructure_error");
@@ -99,7 +100,8 @@ export async function measure(root, changed, testArgs) {
   const baseline = await testResult(testRoot, testArgs, TEST_MILLISECONDS);
   if (baseline !== "passed") return [{
     status: baseline === "unsupported" ? baseline : "infrastructure_error",
-    reason: baseline === "unsupported" ? "baseline ran zero tests" : "unmutated Worker suite failed",
+    reason: { unsupported: "baseline ran zero tests", timeout: "unmutated Worker suite timed out" }[baseline]
+      ?? "unmutated Worker suite failed",
   }];
   for (const { file, path, source, candidates } of plans) {
     for (const { line, start, end, replacement } of candidates) {
@@ -113,7 +115,8 @@ export async function measure(root, changed, testArgs) {
         writeFileSync(path, source);
       }
       const status = { passed: "survived", failed: "killed" }[test] ?? "infrastructure_error";
-      results.push({ file, line, offset: start, status });
+      results.push({ file, line, offset: start, status,
+        ...(test === "timeout" ? { reason: "mutant test run timed out" } : {}) });
     }
   }
   return results;
