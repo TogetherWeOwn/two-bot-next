@@ -99,6 +99,9 @@ async fn voice_patch_requires_a_confirmed_member_receipt() {
         (500, "", 0, false, false, Unavailable, false),
         (0, "", 0, true, false, Unavailable, false), // Dispatched; stalled headers.
         (0, "", 0, false, false, Unavailable, false),
+        (400, "{", 10, false, false, Stale, true), // Truncated body after headers.
+        (403, "{", 10, false, false, Denied, true),
+        (404, "{", 10, false, false, Stale, true),
         (400, "", 10, true, false, Stale, true),
         (403, "", 10, true, false, Denied, true),
         (404, "", 10, true, false, Stale, true),
@@ -576,6 +579,53 @@ mod postgres {
         db.close().await.unwrap();
     }
 
+    async fn assert_voice_fence_survives_lease_expiry(
+        db: &TestDatabase,
+        listener: &TcpListener,
+        origin: &str,
+    ) {
+        let fenced = lane(db).await;
+        assert_eq!(fenced, (fenced.0, true, Some(fenced.0), false));
+        sqlx::query("UPDATE public.discord_send_admission SET in_flight_since_ms = 0")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let restart = db.independent_pool().await.unwrap();
+        let gate = Arc::new(PgSendAdmission::new(restart.clone(), TOKEN).unwrap());
+        let restarted = executor(origin, gate);
+        assert_eq!(move_member(&restarted).await, NotSent(Blocked));
+        assert_eq!(restarted.requests(), 0);
+        assert_eq!(lane(db).await, fenced);
+        assert_no_socket(listener).await;
+        restart.close().await;
+    }
+
+    #[tokio::test]
+    async fn admission_voice_ambiguous_patch_keeps_durable_fence_after_lease_expiry() {
+        let url = std::env::var("TWO_TEST_DATABASE_URL").expect("TWO_TEST_DATABASE_URL");
+        for wire in [
+            String::new(), // Connection closes before response headers.
+            response(503, "", 0, ""),
+            response(307, "Location: /api/v10/guilds/1/members/9\r\n", 0, ""),
+        ] {
+            let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+                .await
+                .unwrap();
+            let sender = db.independent_pool().await.unwrap();
+            let (listener, origin) = loopback().await;
+            let gate = Arc::new(PgSendAdmission::new(sender.clone(), TOKEN).unwrap());
+            let action = executor(&origin, gate);
+            let (sending, mut socket) = dispatch(&action, &listener).await;
+            socket.write_all(wire.as_bytes()).await.unwrap();
+            drop(socket);
+            assert_eq!(finish(sending).await, Unavailable);
+            assert_eq!(action.requests(), 1);
+            assert_voice_fence_survives_lease_expiry(&db, &listener, &origin).await;
+            sender.close().await;
+            db.close().await.unwrap();
+        }
+    }
+
     async fn voice_fence(fail: bool) {
         let url = std::env::var("TWO_TEST_DATABASE_URL").expect("TWO_TEST_DATABASE_URL");
         let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
@@ -596,20 +646,8 @@ mod postgres {
         socket.write_all(wire.as_bytes()).await.unwrap();
         let result = finish(sending).await;
         assert_eq!(result, limited(fail.then_some(10_000), false));
-        let fenced = lane(&db).await;
-        assert_eq!(fenced, (fenced.0, true, Some(fenced.0), false));
-        sqlx::query("UPDATE public.discord_send_admission SET in_flight_since_ms = 0")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        let restart = db.independent_pool().await.unwrap();
-        let gate = Arc::new(PgSendAdmission::new(restart.clone(), TOKEN).unwrap());
-        let restarted = executor(&origin, gate);
-        assert_eq!(move_member(&restarted).await, NotSent(Blocked));
-        assert_eq!(lane(&db).await, fenced);
-        assert_no_socket(&listener).await;
+        assert_voice_fence_survives_lease_expiry(&db, &listener, &origin).await;
         drop(socket);
-        restart.close().await;
         sender.close().await;
         db.close().await.unwrap();
     }
