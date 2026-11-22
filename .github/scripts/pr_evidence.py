@@ -54,9 +54,10 @@ def publish(repo, event, head, run, attempt, workflow):
     return "\n".join(summary) + "\n"
 
 
-def evidence_sections(body):
-    sections = parse_sections(CUBIC_FOOTER.sub("", body))
-    return tuple(sections.get(name, "") for name in ("verification", "attestation"))
+def evidence_sections(policy, body):
+    body = CUBIC_FOOTER.sub("", body)
+    visible = parse_sections("\n".join(policy.visible_lines(body)))
+    return parse_sections(body).get("verification", ""), visible.get("attestation", "")
 
 
 def sources(base, head):
@@ -83,12 +84,13 @@ def named_tests(path, source):
     suffix = Path(path).suffix
     if suffix == ".py":
         functions = (ast.FunctionDef, ast.AsyncFunctionDef)
+        test_cases = {"TestCase", "IsolatedAsyncioTestCase"}
         for node in ast.parse(source).body:
             if isinstance(node, functions) and node.name.startswith("test_"):
                 yield node.name
             if isinstance(node, ast.ClassDef) and (
-                    node.name.startswith("Test") or node.name.endswith("Tests") or any(
-                        ast.unparse(base).endswith("TestCase") for base in node.bases)):
+                    any(ast.unparse(base).rsplit(".", 1)[-1] in test_cases for base in node.bases)):
+                test_cases.add(node.name)
                 for method in node.body:
                     if isinstance(method, functions) and method.name.startswith("test_"):
                         yield f"{node.name}.{method.name}"
@@ -133,7 +135,7 @@ def named_tests(path, source):
 
 
 def validate(policy, body, files, read):
-    verification, attestation = evidence_sections(body)
+    verification, attestation = evidence_sections(policy, body)
     if (policy.visible_lines(body).count("## Verification") != 1 or not any(
             policy.meaningful(line.strip("-* ")) for line in verification.splitlines()
             if not line.lstrip().startswith(("```", "~~~")))):
@@ -144,9 +146,9 @@ def validate(policy, body, files, read):
     if report["issues"]:
         raise EvidenceError("Attestation issues: " + ", ".join(report["issues"]))
     titles = {}
-    tests = [line for line in policy.visible_lines(attestation) if policy.TEST.fullmatch(line)]
-    for index, line in enumerate(tests, start=1):
-        path, _, selector = policy.TEST.fullmatch(line)[2].strip().partition("::")
+    tests = filter(None, map(policy.TEST.fullmatch, attestation.splitlines()))
+    for index, test in enumerate(tests, start=1):
+        path, _, selector = test[2].strip().partition("::")
         if not selector:
             read(path)
             continue
@@ -171,7 +173,7 @@ def check(policy, reader, number, repo, base, head):
 
     body = snapshot()
     baseline = Path(__file__).with_name("pr-evidence-baseline.txt").read_text().splitlines()
-    digest = hashlib.sha256(repr(evidence_sections(body)).encode()).hexdigest()
+    digest = hashlib.sha256(repr(evidence_sections(policy, body)).encode()).hexdigest()
     grandfathered = f"{number} {head} {digest}" in baseline
     if not grandfathered:
         validate(policy, body, sources(base, head), lambda path: source_blob(head, path))

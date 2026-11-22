@@ -29,7 +29,8 @@ class EvidenceTests(unittest.TestCase):
 
     def test_test_name_matches_declaration_only(self):
         fixtures = {
-            "sample.py": ("class TestDemo:\n    def test_actual(self): pass\n"
+            "sample.py": ("class DemoBase(TestCase): pass\nclass TestDemo(DemoBase):\n    def test_actual(self): pass\n"
+                          "class HelperTests:\n    def test_helper(self): pass\n"
                           "# def test_stale(): pass\n", "TestDemo.test_actual"),
             "sample.rs": ('mod checks { #[tokio::test] async fn actual() {} }'
                           'const SAMPLE: &str = r#"#[test] fn stale() {}"#;'
@@ -42,12 +43,13 @@ class EvidenceTests(unittest.TestCase):
     def test_stale_evidence_and_test_name_block(self):
         body = "\n".join([
             "## Verification", "- Ran the evidence fixtures.",
-            "## Attestation", "risk_tier: T1", "### Claims", "- C1: Verifies a declaration.",
+            "## Attestation", "risk_tier: T1", "```md\n## Example heading\n```",
+            "### Claims", "- C1: Verifies a declaration.",
             "### Tests", "- C1 | test=test_sample.py::test_present | failed_before=not-run | proof=fixture",
             "### High-risk checklist", *(f"- [ ] D{i}: Fixture only." for i in range(1, 9)),
         ])
         files = [{"filename": "test_sample.py", "status": "modified"}]
-        read = lambda _: "class ExampleTests:\n    def test_present(self): pass"
+        read = lambda _: "class ExampleTests(TestCase):\n    def test_present(self): pass"
         evidence.validate(policy, body, files, read)
         for changed, problem in (
                 (body.replace("test_present", "test_gone"), "no unique matching test"),
