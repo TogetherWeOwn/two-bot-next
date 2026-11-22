@@ -48,7 +48,6 @@ from dataclasses import dataclass
 from datetime import date, time
 import gzip
 import http.client
-import json
 import os
 from pathlib import Path
 import re
@@ -58,6 +57,13 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 import zlib
+
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "wrangler/wrangler.toml"
@@ -127,33 +133,12 @@ WHERE t.seq IS NOT NULL;
 """
 
 
-# Strings are skipped whole, so brackets inside them never count. An
-# unterminated string runs to the end, which keeps the scan linear.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 # CPython's old default recursion limit, which bounded the C JSON decoder.
 MAX_JSON_DEPTH = 1000
 
 
 def _loads_bounded(raw, **kwargs):
-    """json.loads with a lexical nesting bound that raises RecursionError.
-
-    Newer CPython sizes the decoder's recursion guard from the real C stack
-    and decodes 10,000 levels, so the bound no longer depends on the
-    interpreter: existing RecursionError refusals keep working unchanged.
-    """
-    # Decode bytes exactly as json.loads would, then scan and parse that text.
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
-    depth = 0
-    for match in JSON_TOKEN.finditer(raw):
-        token = match.group()
-        if token in "[{":
-            depth += 1
-            if depth > MAX_JSON_DEPTH:
-                raise RecursionError("JSON nesting exceeds the decoder bound")
-        elif token in "]}":
-            depth -= 1
-    return json.loads(raw, **kwargs)
+    return decode_legacy_json(raw, max_depth=MAX_JSON_DEPTH, **kwargs)
 
 
 class ProbeError(Exception):
@@ -175,18 +160,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def decode_strict(body):
@@ -346,7 +320,7 @@ def load_live_sequences(path):
         raise ProbeError("no live sequences query result given (--sequences FILE)")
     try:
         with open(path, "rb") as f:
-            data = f.read(SEQUENCES_FILE_CAP + 1)
+            data = read_with_overflow(f, SEQUENCES_FILE_CAP)
     except OSError as e:
         raise ProbeError(f"cannot read {path} ({e.__class__.__name__})")
     if len(data) > SEQUENCES_FILE_CAP:
@@ -435,21 +409,16 @@ def staging_readyz_url(url):
     return f"https://{parts.hostname}/readyz"
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None  # urllib then raises the 3xx as an HTTPError
-
-
 def fetch(url):
     """One GET without redirects; returns (status, body bytes)."""
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = no_redirect_opener()
     try:
         with opener.open(urllib.request.Request(url, headers={"User-Agent": USER_AGENT},
                                                method="GET"),
                          timeout=READYZ_TIMEOUT_SECONDS) as response:
-            return response.status, response.read(READYZ_BODY_CAP + 1)
+            return response.status, read_with_overflow(response, READYZ_BODY_CAP)
     except urllib.error.HTTPError as e:
-        return e.code, e.read(READYZ_BODY_CAP + 1)
+        return e.code, read_with_overflow(e, READYZ_BODY_CAP)
 
 
 def readyz_state(status, body):
@@ -501,7 +470,7 @@ def check_readyz(url, fetch_fn):
 def check_deploy_config(config, envs, extra_keys):
     try:
         with open(config, "rb") as f:
-            data = f.read(CONFIG_FILE_CAP + 1)
+            data = read_with_overflow(f, CONFIG_FILE_CAP)
     except OSError as e:
         raise ProbeError(f"cannot read {config} ({e.__class__.__name__})")
     if len(data) > CONFIG_FILE_CAP:

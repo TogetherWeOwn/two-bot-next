@@ -5460,6 +5460,15 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(step["env"][base_key], expected_base)
                 self.assertEqual(step["env"][head_key], expected_head)
 
+    def test_python_intake_ratchet_runs_in_check_against_the_checked_out_base(self):
+        steps = self.workflows["check.yml"]["jobs"]["check"]["steps"]
+        [step] = [step for step in steps if step.get("name") == "Ratchet Python script intake (WARN)"]
+        expected = "${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before }}"
+        self.assertEqual(step["env"]["INTAKE_BASE"], expected)
+        self.assertEqual(step["run"], 'python3 scripts/ci/check-python-intake.py "$INTAKE_BASE"')
+        self.assertEqual(step["if"], "github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'")
+        self.assertNotIn("continue-on-error", step)
+
     def test_rust_tests_timeout_leaves_headroom_for_the_suite(self):
         # Suite-only since the HARD patch-coverage measurement split out of
         # this lane: the combined job outgrew 60 minutes (59m54s on main, one
@@ -9308,7 +9317,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(daily_digest_errors(changed))
         spec = importlib.util.spec_from_file_location("rollback_proof", ROOT / "scripts/rollback_proof.py")
         proof = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(proof)
+        with patch.object(sys, "path", [str(ROOT / "scripts"), *sys.path]):
+            spec.loader.exec_module(proof)
         deploy = self.workflows["deploy-staging.yml"]["jobs"]["deploy"]
         self.assertEqual(deploy["name"], "wrangler deploy + intended rollout gate")
         expected_steps = {

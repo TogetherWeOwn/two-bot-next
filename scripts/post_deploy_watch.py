@@ -49,6 +49,8 @@ import staging_rollout as base
 import worker_container_rollback as wcr
 from production_deploy import MAX_READYZ_BYTES, _gateway_ready
 
+from script_intake import decode_legacy_json, read_with_overflow
+
 GateError = base.GateError
 WORKER = wcr.WORKERS["production"]
 USER_AGENT = "two-bot-next-production-rollout/1.0"
@@ -69,10 +71,10 @@ def fetch(url):
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            return response.status, response.read(MAX_READYZ_BYTES + 1)
+            return response.status, read_with_overflow(response, MAX_READYZ_BYTES)
     except urllib.error.HTTPError as error:
         try:
-            return error.code, error.read(MAX_READYZ_BYTES + 1)
+            return error.code, read_with_overflow(error, MAX_READYZ_BYTES)
         except OSError:
             return error.code, b""
     except (OSError, ValueError):
@@ -90,7 +92,7 @@ def ready(url, sha, fetch_fn=fetch):
     if len(body) > MAX_READYZ_BYTES:
         return False, "readyz_over_cap"
     try:
-        report = json.loads(body.decode("utf-8"), object_pairs_hook=wcr._reject_duplicate_keys)
+        report = decode_legacy_json(body.decode("utf-8"), object_pairs_hook=wcr._reject_duplicate_keys)
     except (ValueError, UnicodeDecodeError, RecursionError):
         return False, "readyz_not_json"
     if not isinstance(report, dict) or not _gateway_ready(report):
@@ -125,7 +127,7 @@ class Gate:
             return None
         self.child = None
         try:
-            receipt = json.loads(self.evidence.read_text(), object_pairs_hook=wcr._reject_duplicate_keys)
+            receipt = decode_legacy_json(self.evidence.read_text(), object_pairs_hook=wcr._reject_duplicate_keys)
             verdict = receipt.get("verdict")
             if receipt.get("sha") != self.sha or receipt.get("mode") not in ("live", "skip"):
                 return "error"

@@ -34,6 +34,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import staging_rollout as rollout  # noqa: E402
 from staging_drill_use import StagingDrillUse
 
+from script_intake import (
+    decode_legacy_json,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 GateError = rollout.GateError
 require = rollout.require
 
@@ -43,18 +49,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 WORKER = rollout.WORKER
@@ -79,13 +74,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins, at any depth."""
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 class DrillClient(rollout.Client):
@@ -101,7 +90,7 @@ class DrillClient(rollout.Client):
         try:
             with self.opener.open(request, timeout=timeout) as response:
                 require(response.status == 200, "api_http_failure", f"status={response.status}")
-                body = response.read(rollout.MAX_BODY + 1)
+                body = read_with_overflow(response, rollout.MAX_BODY)
                 require(len(body) <= rollout.MAX_BODY, "response_too_large")
                 return response.status, response.headers, body
         except HTTPError as error:
@@ -117,7 +106,7 @@ class DrillClient(rollout.Client):
                      "User-Agent": rollout.USER_AGENT})
         try:
             with self.opener.open(request, timeout=20) as response:
-                raw = response.read(rollout.MAX_BODY + 1)
+                raw = read_with_overflow(response, rollout.MAX_BODY)
                 status = response.status
         except HTTPError as error:
             # Cloudflare's error envelope may carry configuration values: keep only

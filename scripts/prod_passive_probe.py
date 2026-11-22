@@ -56,6 +56,13 @@ from urllib.parse import urlsplit
 
 from build_identity import UNSTAMPED, is_build_id_shape, is_build_revision_shape
 
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 PROD_HOST = re.compile(r"(?:two-bot-next|two-bot-next-production)\.[a-z0-9-]+\.workers\.dev")
 STAGING_LABEL = "two-bot-next-staging"
 BODY_CAP = 64 << 10
@@ -97,18 +104,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 @dataclass(frozen=True)
@@ -144,22 +140,17 @@ def prod_origin(url):
     return f"https://{host}"
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None  # urllib then raises the 3xx as an HTTPError
-
-
 def fetch(url):
     """One GET without redirects; returns (status, headers, body bytes)."""
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = no_redirect_opener()
     request = urllib.request.Request(url, method="GET",
                                      headers={"User-Agent": USER_AGENT,
                                               "Cache-Control": "no-cache"})
     try:
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
-            return response.status, response.headers, response.read(BODY_CAP + 1)
+            return response.status, response.headers, read_with_overflow(response, BODY_CAP)
     except urllib.error.HTTPError as error:
-        return error.code, error.headers or {}, error.read(BODY_CAP + 1)
+        return error.code, error.headers or {}, read_with_overflow(error, BODY_CAP)
 
 
 def header(headers, name):
@@ -188,7 +179,7 @@ def get_json(fetch_fn, url, name):
     if len(body) > BODY_CAP:
         raise ProbeError(f"{name} probe answered over the body cap")
     try:
-        value = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+        value = decode_legacy_json(body, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         raise ProbeError(f"{name} probe carries duplicate JSON object keys") from None
     except (ValueError, UnicodeDecodeError, RecursionError):

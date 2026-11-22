@@ -207,7 +207,7 @@ class RollbackInputLimitsAcceptanceTests(unittest.TestCase):
             with self.subTest(valid_json=raw.startswith(b"[")):
                 self.fx.sequences.write_bytes(raw)
                 decoded = []
-                real_loads = probe.json.loads
+                real_loads = json.loads
 
                 def loads(value, *args, **kwargs):
                     text = value.decode() if isinstance(value, bytes) else value
@@ -215,7 +215,7 @@ class RollbackInputLimitsAcceptanceTests(unittest.TestCase):
                         decoded.append(True)
                     return real_loads(value, *args, **kwargs)
 
-                with mock.patch.object(probe.json, "loads", side_effect=loads):
+                with mock.patch.object(json, "loads", side_effect=loads):
                     self.assert_refuses("sequences", SEQUENCES_REASON)
                 self.assertEqual(decoded, [], "over-cap sequences reached JSON decode")
 

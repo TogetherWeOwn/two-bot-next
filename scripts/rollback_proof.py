@@ -24,6 +24,8 @@ import sys
 import time
 import zipfile
 
+from script_intake import decode_legacy_json, unique_object as _unique_json_object
+
 REPO = "TogetherWeOwn/two-bot-next"
 WORKFLOW = ".github/workflows/deploy-staging.yml"
 PROOF_WORKFLOW = ".github/workflows/staging-rollback-drill.yml"
@@ -58,11 +60,7 @@ def require(condition, code):
 
 
 def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        require(key not in result, "duplicate_json_key")
-        result[key] = value
-    return result
+    return _unique_json_object(pairs, error=ProofError, message="duplicate_json_key")
 
 
 def gh(path, *, body=None, binary=False):
@@ -110,7 +108,7 @@ def gh(path, *, body=None, binary=False):
     if binary:
         return bytes(output)
     try:
-        return json.loads(output, object_pairs_hook=unique_object)
+        return decode_legacy_json(output, object_pairs_hook=unique_object)
     except (ValueError, RecursionError):
         raise ProofError("github_invalid_json") from None
 
@@ -156,10 +154,10 @@ def artifact_files(run_id, name):
                     require(name not in files, "artifact_duplicate_filename")
                     content = bundle.read(item)
                     if name.endswith(".jsonl"):
-                        files[name] = [json.loads(line, object_pairs_hook=unique_object)
+                        files[name] = [decode_legacy_json(line, object_pairs_hook=unique_object)
                                        for line in content.splitlines() if line.strip()]
                     else:
-                        files[name] = json.loads(content, object_pairs_hook=unique_object)
+                        files[name] = decode_legacy_json(content, object_pairs_hook=unique_object)
             return files
     except (ValueError, OSError, zipfile.BadZipFile, RuntimeError, RecursionError):
         raise ProofError("artifact_invalid_archive") from None

@@ -1,6 +1,7 @@
 """Rollback-readiness probe regressions: local fixtures only, no network or databases."""
 
 import contextlib
+from email.message import Message
 import gzip
 import io
 import json
@@ -11,6 +12,8 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from urllib.request import HTTPSHandler
+from urllib.response import addinfourl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rollback_readiness_probe as probe  # noqa: E402
@@ -605,10 +608,6 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                 self.assertIn("refusing: not the two-bot-next-staging workers.dev origin", readyz.reason)
                 self.assertEqual(self.requested, [])
 
-    def test_default_fetch_never_follows_redirects(self):
-        handler = probe._NoRedirect()
-        self.assertIsNone(handler.redirect_request(None, None, 302, "Found", {}, "https://elsewhere"))
-
     def test_rejects_non_two_require_key(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             probe.parse_args(["--require", "DATABASE_URL"])
@@ -664,6 +663,19 @@ class UserAgentTests(unittest.TestCase):
             probe.fetch("https://two-bot-next-staging.example-sub.workers.dev/readyz")
         self.assertEqual(seen, [probe.USER_AGENT])
         self.assertFalse(seen[0].startswith("Python-urllib"))
+
+
+class RedirectTransportTests(unittest.TestCase):
+    def test_default_fetch_never_follows_redirects(self):
+        url = STAGING + "/readyz"
+        headers = Message()
+        headers["Location"] = "https://other.example/"
+        response = addinfourl(io.BytesIO(b"fixture"), headers, url, 302)
+        response.msg = "redirect"
+        with (mock.patch("socket.create_connection", side_effect=AssertionError("unexpected socket")),
+              mock.patch.object(HTTPSHandler, "https_open", return_value=response) as send):
+            self.assertEqual(probe.fetch(url), (302, b"fixture"))
+            send.assert_called_once()
 
 
 class DeepNestingRefusalTests(unittest.TestCase):

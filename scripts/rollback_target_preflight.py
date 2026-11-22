@@ -51,6 +51,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import staging_rollout as base
 import worker_container_rollback as wcr
 
+from script_intake import decode_legacy_json
+
 GateError = base.GateError
 require = base.require
 
@@ -326,7 +328,7 @@ def load_receipt(path):
         raise GateError("snapshot_unreadable") from None
     require(len(raw) <= SNAPSHOT_MAX_BYTES, "snapshot_too_large")
     try:
-        snapshot = json.loads(raw.decode("utf-8"), object_pairs_hook=wcr._reject_duplicate_keys)
+        snapshot = decode_legacy_json(raw.decode("utf-8"), object_pairs_hook=wcr._reject_duplicate_keys)
     except (ValueError, UnicodeDecodeError):
         raise GateError("snapshot_unreadable") from None
     require(isinstance(snapshot, dict), "snapshot_unreadable")
@@ -367,7 +369,7 @@ def image_in_registry(image, account, run=command):
     """Raise unless the registry still serves the image's manifest by digest."""
     require(image.split("/", 2)[1] == account, "rollback_image_wrong_account")
     try:
-        creds = json.loads(run(
+        creds = decode_legacy_json(run(
             ["npx", "--no-install", "wrangler", "containers", "registries", "credentials",
              REGISTRY_HOST, "--pull", "--expiration-minutes", "15", "--json"]).decode("utf-8"),
             object_pairs_hook=wcr._reject_duplicate_keys)
@@ -387,7 +389,7 @@ def image_in_registry(image, account, run=command):
         # bytes against the digest, so a parsed answer proves the image is
         # still stored. A missing manifest exits non-zero.
         try:
-            manifest = json.loads(run(["docker", "manifest", "inspect", image], env=env).decode("utf-8"))
+            manifest = decode_legacy_json(run(["docker", "manifest", "inspect", image], env=env).decode("utf-8"))
         except (GateError, ValueError, UnicodeDecodeError):
             raise GateError("rollback_image_missing") from None
     require(isinstance(manifest, dict) and manifest.get("schemaVersion") == 2, "rollback_image_missing")
