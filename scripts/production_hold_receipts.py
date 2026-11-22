@@ -16,6 +16,8 @@ import re
 
 import incident_issue
 
+from script_intake import decode_legacy_json
+
 
 KEY = "production-held"
 
@@ -92,7 +94,7 @@ def verified_content(text, pattern):
     if not content.endswith("\n"):
         return None
     try:
-        value = json.loads(match[1], object_pairs_hook=incident_issue._reject_duplicate_keys)
+        value = decode_legacy_json(match[1], object_pairs_hook=incident_issue._reject_duplicate_keys)
         content = content[:-1]
         if not isinstance(value, dict) or value.get("content_sha256") != content_digest(content):
             return None

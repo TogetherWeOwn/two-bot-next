@@ -28,6 +28,8 @@ from pathlib import Path
 
 import incident_issue
 
+from script_intake import read_with_overflow
+
 ROOT = Path(__file__).resolve().parents[1]
 
 GIT_TIMEOUT_SECONDS = 30
@@ -107,7 +109,7 @@ def _git(root, args, *, ok=(0,)):
     timer = threading.Timer(GIT_TIMEOUT_SECONDS, expire)
     timer.start()
     try:
-        data = proc.stdout.read(MAX_OUTPUT_BYTES + 1)
+        data = read_with_overflow(proc.stdout, MAX_OUTPUT_BYTES)
         too_big = len(data) > MAX_OUTPUT_BYTES
         if too_big:
             proc.kill()

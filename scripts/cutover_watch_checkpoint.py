@@ -37,6 +37,8 @@ import prod_passive_probe as prod_probe
 import production_deploy as deploy_gate  # noqa: E402
 import rollback_readiness_probe as probe  # noqa: E402
 
+from script_intake import decode_legacy_json, unique_object as _unique_json_object
+
 # Thresholds and wire constants are read from the existing probe/deploy
 # config, never redefined here: the component vocabulary and parked set come
 # from the M1.2 probe, the SHA/build identity shapes from the production
@@ -94,23 +96,12 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def decode_strict(body):
     """Decode JSON while refusing duplicate object keys at any depth."""
-    return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+    return decode_legacy_json(body, object_pairs_hook=_reject_duplicate_keys)
 
 
 def production_readyz_url(url):

@@ -24,6 +24,8 @@ import sys
 import incident_issue
 from synthetic_alert_history import HistoryError, _loads_bounded, previous_probe_outcomes, transition
 
+from script_intake import decode_legacy_json, unique_object as _unique_json_object
+
 RUNBOOK_URL = ("https://github.com/TogetherWeOwn/two-bot-next"
                "/blob/main/docs/runbook-observability.md")
 MAX_CONTENT = 1900
@@ -38,18 +40,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def load_evidence(path):

@@ -153,7 +153,7 @@ class ReaderContractTests(unittest.TestCase):
                 args, kwargs = build.return_value.open.call_args
                 self.assertEqual(args[0].get_method(), "GET")
                 self.assertEqual(kwargs["timeout"], 10)
-                self.assertTrue(any(isinstance(handler, incident_issue._NoRedirectHandler)
+                self.assertTrue(any(isinstance(handler, incident_issue.urllib.request.HTTPRedirectHandler)
                                     for handler in build.call_args.args))
 
     def test_shared_transport_refuses_redirect(self):
@@ -163,7 +163,9 @@ class ReaderContractTests(unittest.TestCase):
             build.return_value.open.side_effect = error
             with self.assertRaisesRegex(incident_issue.IncidentError, "refused redirect"):
                 reader.get("x")
-        self.assertIsNone(incident_issue._NoRedirectHandler().redirect_request(None, None, 302, "", {}, "https://example.invalid"))
+        handler = next(handler for handler in incident_issue.no_redirect_opener().handlers
+                       if isinstance(handler, incident_issue.urllib.request.HTTPRedirectHandler))
+        self.assertIsNone(handler.redirect_request(None, None, 302, "", {}, "https://example.invalid"))
 
     def test_consumers_exhaust_reader_and_share_budget(self):
         reader = hold.History(ENV)

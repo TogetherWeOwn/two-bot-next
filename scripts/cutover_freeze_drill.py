@@ -34,6 +34,13 @@ import time
 import urllib.error
 import urllib.request
 
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 # Pinned identity guards. Sources: crates/core/src/backup/guild_config.rs
 # (TWO_STAGING_GUILD_ID, STAGING_BOT_APPLICATION_ID) and
 # crates/cutover/src/lib.rs (LIVE_GUILD_ID). No snowflake may be added here
@@ -72,18 +79,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def guild_fence(guild_id):
@@ -240,21 +236,14 @@ def mock_transport(state=None):
     return call
 
 
-class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
-    """Stop before urllib can replay a bot token on a follow-up request."""
-
-    def http_error_301(self, req, fp, code, msg, headers):
-        fp.close()
-        raise DrillError("refusing: authenticated Discord request answered a redirect (not followed)")
-
-    http_error_302 = http_error_303 = http_error_307 = http_error_308 = http_error_301
-
-
 def live_transport(token):
     """Real Discord REST transport. Token stays in memory; never logged."""
     if not token:
         raise DrillError("refusing: no staging bot token in the environment")
-    opener = urllib.request.build_opener(_RefuseRedirect)
+    opener = no_redirect_opener(
+        redirect_error=lambda: DrillError(
+            "refusing: authenticated Discord request answered a redirect (not followed)"),
+    )
 
     def request(method, url, payload=None, expect=dict):
         data = json.dumps(payload).encode() if payload is not None else None
@@ -264,7 +253,7 @@ def live_transport(token):
                      "Content-Type": "application/json"})
         try:
             with opener.open(req, timeout=20) as resp:
-                body = resp.read(BODY_CAP + 1)
+                body = read_with_overflow(resp, BODY_CAP)
         except DrillError:
             raise
         except urllib.error.HTTPError as error:
@@ -276,7 +265,7 @@ def live_transport(token):
         if len(body) > BODY_CAP:
             raise DrillError("discord answered over the body cap")
         try:
-            value = (json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+            value = (decode_legacy_json(body, object_pairs_hook=_reject_duplicate_keys)
                      if body else expect())
         except DuplicateKeyError:
             raise DrillError(
@@ -299,13 +288,13 @@ def live_transport(token):
                      "Content-Type": "application/json"})
         try:
             with opener.open(req, timeout=20) as resp:
-                body = resp.read(BODY_CAP + 1)
+                body = read_with_overflow(resp, BODY_CAP)
         except DrillError:
             raise
         except urllib.error.HTTPError as error:
             code = error.code
             try:
-                body = error.read(BODY_CAP + 1)
+                body = read_with_overflow(error, BODY_CAP)
             except Exception:
                 body = b""
             finally:
@@ -314,7 +303,7 @@ def live_transport(token):
                 if len(body) > BODY_CAP:
                     raise DrillError("discord answered over the body cap")
                 try:
-                    value = (json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+                    value = (decode_legacy_json(body, object_pairs_hook=_reject_duplicate_keys)
                              if body else {})
                 except DuplicateKeyError:
                     raise DrillError(
@@ -330,7 +319,7 @@ def live_transport(token):
         if len(body) > BODY_CAP:
             raise DrillError("discord answered over the body cap")
         try:
-            value = (json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+            value = (decode_legacy_json(body, object_pairs_hook=_reject_duplicate_keys)
                      if body else {})
         except DuplicateKeyError:
             raise DrillError(

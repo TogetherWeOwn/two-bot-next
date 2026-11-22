@@ -59,6 +59,13 @@ import urllib.error
 import urllib.request
 import uuid
 
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 SCHEMA_VERSION = 1
 API_BASE = "https://api.cloudflare.com/client/v4"
 TOKEN_ENV = "CLOUDFLARE_API_TOKEN"
@@ -133,18 +140,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def redact(text):
@@ -245,11 +241,6 @@ def build_query(service, start, end, limit, contains, query_id):
     }
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None  # urllib then raises the 3xx as an HTTPError; the token goes nowhere else
-
-
 class HttpTransport:
     """The only network path. `base` is a constructor argument for loopback tests;
     the command line cannot change it."""
@@ -258,7 +249,7 @@ class HttpTransport:
         self._token = token
         self._base = base
         self._timeout = timeout
-        self._opener = urllib.request.build_opener(_NoRedirect)
+        self._opener = no_redirect_opener()
 
     def __call__(self, method, path, body=None):
         allowed = ((method == "GET" and body is None and ACCOUNTS_PATH_RE.fullmatch(path))
@@ -273,7 +264,7 @@ class HttpTransport:
         request = urllib.request.Request(self._base + path, data=data, method=method, headers=headers)
         try:
             with self._opener.open(request, timeout=self._timeout) as response:
-                status, raw = response.status, response.read(MAX_RESPONSE_BYTES + 1)
+                status, raw = response.status, read_with_overflow(response, MAX_RESPONSE_BYTES)
         except urllib.error.HTTPError as error:
             status, raw = error.code, b""
             error.close()
@@ -284,7 +275,7 @@ class HttpTransport:
         if status != 200:
             raise ReadFailed(status_class(status))
         try:
-            return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+            return decode_legacy_json(raw, object_pairs_hook=_reject_duplicate_keys)
         except (ValueError, RecursionError):
             raise ReadFailed("bad_response") from None
 

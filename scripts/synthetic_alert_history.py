@@ -2,12 +2,17 @@
 """Decide synthetic alert transitions from this workflow's recent probe runs."""
 
 import http.client
-import json
 import os
-import re
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
 
 API = "https://api.github.com"
 WORKFLOW = "synthetic-user-flow.yml"
@@ -63,33 +68,12 @@ MAX_HISTORY_RUNS = 200
 MAX_RESPONSE_BYTES = 1 << 20
 
 
-# Strings are skipped whole, so brackets inside them never count. An
-# unterminated string runs to the end, which keeps the scan linear.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 # CPython's old default recursion limit, which bounded the C JSON decoder.
 MAX_JSON_DEPTH = 1000
 
 
 def _loads_bounded(raw, **kwargs):
-    """json.loads with a lexical nesting bound that raises RecursionError.
-
-    Newer CPython sizes the decoder's recursion guard from the real C stack
-    and decodes 10,000 levels, so the bound no longer depends on the
-    interpreter: existing RecursionError refusals keep working unchanged.
-    """
-    # Decode bytes exactly as json.loads would, then scan and parse that text.
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
-    depth = 0
-    for match in JSON_TOKEN.finditer(raw):
-        token = match.group()
-        if token in "[{":
-            depth += 1
-            if depth > MAX_JSON_DEPTH:
-                raise RecursionError("JSON nesting exceeds the decoder bound")
-        elif token in "]}":
-            depth -= 1
-    return json.loads(raw, **kwargs)
+    return decode_legacy_json(raw, max_depth=MAX_JSON_DEPTH, **kwargs)
 
 
 class HistoryError(Exception):
@@ -166,25 +150,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Turn every redirect into an HTTPError without contacting its target."""
-
-    def redirect_request(self, request, response, code, message, headers, new_url):
-        return None
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def _advance(state, outcome, delivery):
@@ -299,15 +265,10 @@ def _get(path, token):
     # Bearer token to the redirect target. Reject redirects at the opener
     # so only the api.github.com URL is ever contacted (same policy as the
     # alert POST in synthetic_alert.py).
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPHandler(),
-        urllib.request.HTTPSHandler(),
-        urllib.request.HTTPErrorProcessor(),
-        _NoRedirectHandler(),
-    )
+    opener = no_redirect_opener()
     try:
         with opener.open(request, timeout=10) as response:
-            body = response.read(MAX_RESPONSE_BYTES + 1)
+            body = read_with_overflow(response, MAX_RESPONSE_BYTES)
     except urllib.error.HTTPError as error:
         if error.code in (301, 302, 303, 307, 308):
             raise HistoryError(
