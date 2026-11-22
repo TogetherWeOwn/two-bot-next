@@ -108,24 +108,17 @@ lint-only `check` lane.
 
 ## Changed-line mutation testing
 
-The Rust mutation lane is in WARN. It runs on GitHub Actions pull-request
-heads with additions in `src/` or `crates/*/src/`, after checking the
-existing job selector. It uses the merge-base diff so unrelated changes on
-`main` are outside the scope. Pure deletions and renames add no candidates.
-
-Pinned `cargo mutants --in-diff` discovers candidates. The runner executes
-only mutations whose entire edit is on added lines. It runs the affected
-package's non-ignored Cargo tests serially with all features enabled and
-without database credentials. A passing unmutated
-baseline is required before it records a killed or surviving mutant.
+The Rust lane runs in WARN on GitHub Actions pull-request heads. It checks
+the existing job selector and uses the merge-base diff. Pure deletions and
+renames add no candidates. Pinned `cargo mutants --in-diff` discovers edits
+in `src/` and `crates/*/src/`. The lane runs edits contained in added lines.
+It first verifies the unmutated baseline. Then it runs the affected package's
+non-ignored Cargo tests serially with all features and disposable Postgres.
 Unviable edits are unsupported. Timeouts, excess work and incomplete reports
-are infrastructure errors. The Actions log and verdict artifact record the
-outcome without publishing mutant source or test output.
-
-The workflow also runs a tiny crate fixture when Rust additions or mutation
-wiring change. It verifies a killed mutant, a surviving mutant, a failing
-baseline and the exclusion of unchanged lines. Review exact-head fixture
-and representative PR receipts before making the check required.
+are infrastructure errors. Receipts distinguish outcomes without publishing
+mutant source or test output. The small fixture covers killed and surviving
+mutants, a failing baseline, and scope. Review exact-head fixture and
+representative PR receipts before making the check required.
 
 ## Scanner dependency triage (review by 2026-11-16)
 

@@ -55,6 +55,7 @@ def main():
         )
         source = root / "src/lib.rs"
         source.write_text(OLD_SOURCE)
+        (root / ".gitattributes").write_text("*.rs -diff\n")
         subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root, check=True, timeout=30)
         (root / "uncovered.rs").write_text("pub fn untouched() -> bool { true }\n")
         base = commit(root, "baseline")
@@ -68,13 +69,7 @@ def main():
             assert "src/uncovered.rs" not in added_lines(patch)
             patch_file = output / "fixture.diff"
             patch_file.write_text(patch)
-            try:
-                report = measure(root, patch_file, output)
-            except (ValueError, subprocess.SubprocessError):
-                baseline_log = output / "mutants.out/log/baseline.log"
-                if baseline_log.is_file():
-                    print(baseline_log.read_text()[-4000:])
-                raise
+            report = measure(root, patch_file, output)
             assert report["out_of_scope"] > 0, report
             assert {(row["file"], row["line"]) for row in report["results"]} == {("src/lib.rs", 4)}, report
             assert {row["status"] for row in report["results"]} == {status}, report
@@ -88,6 +83,8 @@ def main():
             measure(root, patch_file, output)
         except ValueError as error:
             assert "exit 4" in str(error), error
+            report = {"status": "infrastructure_error", "results": []}
+            assert verdict(report, "warn") == 0 and verdict(report, "hard") == 2
             print("Rust fixture: failing baseline is an infrastructure error")
         else:
             raise AssertionError("failing Rust baseline was accepted")

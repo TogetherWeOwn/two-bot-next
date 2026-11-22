@@ -29,7 +29,7 @@ def pr_diff(root, base, head):
     return merge_base, git(
         root, "-c", "core.quotePath=true", "diff", "--no-color", "--no-ext-diff",
         "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/",
-        "--unified=0", merge_base, head, "--",
+        "--text", "--unified=0", merge_base, head, "--", "*.rs", "*.py", "*.ts",
     )
 
 
@@ -68,7 +68,7 @@ def main():
     if rust and not jobs["rust"]:
         raise ValueError("Rust additions disagree with job-inputs")
     fixture = rust or any(path.startswith((".github/scripts/mutation_", "tests/fixtures/mutation/"))
-                          or path == ".github/workflows/mutation.yml" for path in paths)
+                          or path in (".gitattributes", ".github/workflows/mutation.yml") for path in paths)
     Path(os.environ["RUNNER_TEMP"], "mutation.diff").write_bytes(patch.encode("utf-8", "surrogateescape"))
     print(f"Mutation scope HEAD {head} merge base {base}")
     with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:

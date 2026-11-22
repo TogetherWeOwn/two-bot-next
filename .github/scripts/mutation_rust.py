@@ -1,6 +1,7 @@
 """Run only cargo-mutants edits contained in added PR lines."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -78,7 +79,8 @@ def measure(root, patch, output):
             raise ValueError("unexpected or out-of-scope Rust mutation")
         expected.remove(mutant["name"])
         path, line, _ = location(mutant)
-        results.append({"file": path, "line": line, "genre": mutant["genre"],
+        identity = hashlib.sha256(mutant["name"].encode()).hexdigest()
+        results.append({"file": path, "line": line, "genre": mutant["genre"], "id": identity,
                         "status": OUTCOMES[outcome["summary"]]})
     if expected:
         raise ValueError("Rust report is missing selected mutations")
@@ -86,12 +88,12 @@ def measure(root, patch, output):
 
 
 def verdict(report, mode):
+    if mode == "warn":
+        return 0
     counts = Counter(result["status"] for result in report["results"])
-    if counts["infrastructure_error"]:
+    if report.get("status") == "infrastructure_error" or counts["infrastructure_error"]:
         return 2
-    if counts["survived"] and mode == "hard":
-        return 1
-    return 0
+    return int(counts["survived"] > 0)
 
 
 def main():
@@ -117,7 +119,6 @@ def main():
     ))
     if report["status"] == "infrastructure_error" or counts["infrastructure_error"]:
         print("::warning::Rust mutation measurement is incomplete; see the receipt")
-        return 2
     if counts["survived"]:
         print("::warning::Rust mutations survived on added PR lines; see the receipt")
     return verdict(report, args.mode)
