@@ -337,8 +337,8 @@ disable set, a hold set, a target gone live or stale, or an operator dispatch qu
 progress while the gates built or the soak slept skips green instead of
 deploying through the incident. A failed soak fails closed into no deploy, an unreadable
 dispatch list skips green (the backstop retries), and a cancelled run never
-deploys. The residual race is a dispatch queued in the seconds between the
-recheck and the lane entry: watch the lane when recovering. The run then
+deploys. Inside the lane, the recheck fails red before mutation if promotion
+is blocked or the serving snapshot has no stamped SHA. The run then
 deploys through the same schema gate, roles gate, readyz gate and error-rate
 gate as a manual dispatch. Automatic runs need either
 `PRODUCTION_AUTO_APPROVE=true` or Environment reviewers (which pause the run
@@ -871,7 +871,7 @@ takeover order apply to the revert.
 
 After deploy runs using the old queue policy finish, dispatch
 **Actions → production-ownership-status** on `main` with no inputs. Cancel
-any waiting status run when recovery needs the lane. Find the receipt under
+any waiting status run or blocking promotion when recovery needs the lane. Find the receipt under
 **Read bracketed production ownership status** in the job log.
 
 ## `PRODUCTION_AUTO_APPROVE`

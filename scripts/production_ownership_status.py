@@ -17,8 +17,7 @@ from worker_container_rollback import VERSION_ID as UUID
 
 REPO = "TogetherWeOwn/two-bot-next"
 REF = "refs/heads/main"
-WORKER = WORKERS["production"]
-APPLICATION = APPLICATIONS["production"]
+WORKER, APPLICATION = WORKERS["production"], APPLICATIONS["production"]
 PRODUCTION_URL = f"https://{WORKER}.5150.workers.dev"
 NAMESPACE = re.compile(r"[0-9a-f]{32}")
 CI_ACTOR = re.compile(r"github-actions:[1-9][0-9]{0,19}:[0-9a-f]{40}")
@@ -46,8 +45,7 @@ def verify_dispatch(env, event, api=github_get):
             and matches(SHA, sha) and env.get("GITHUB_WORKFLOW_SHA") == sha,
             "invalid_dispatch_context")
     event = mapping(event)
-    require(event.get("ref") in ("main", REF) and event.get("inputs") in (None, {}),
-            "invalid_dispatch_payload")
+    require(event.get("ref") in ("main", REF) and event.get("inputs") in (None, {}), "invalid_dispatch_payload")
     commit = mapping(api("git/ref/heads/main").get("object"))
     require(commit.get("type") == "commit" and commit.get("sha") == sha, "dispatch_is_not_current_main")
 
@@ -60,8 +58,8 @@ def environment_policy(auto_approve, api=github_get):
             and policy.get("protected_branches") is False and number(branches.get("total_count")) == 1
             and [(mapping(row).get("type", "branch"), row.get("name")) for row in sequence(branches.get("branch_policies"))]
             == [("branch", "main")], "production_environment_not_main_only")
-    rules = sequence(settings.get("protection_rules"))
-    require(sum(mapping(rule).get("type") == "branch_policy" for rule in rules) == 1, "branch_rule_missing")
+    rules = [mapping(rule) for rule in sequence(settings.get("protection_rules"))]
+    require(sum(rule.get("type") == "branch_policy" for rule in rules) == 1, "branch_rule_missing")
     reviewers = [sequence(rule.get("reviewers")) for rule in rules if rule.get("type") == "required_reviewers"]
     require(all(reviewers) if reviewers else auto_approve == "true", "production_environment_approval_missing")
     return hashlib.sha256(json.dumps([rules, branches, auto_approve], sort_keys=True).encode()).hexdigest()
@@ -167,7 +165,6 @@ def main(argv, env):
         reason = str(error) if isinstance(error, GateError) else "invalid_read"
         print(f"::error::Production status refused ({reason})", file=sys.stderr)
     return 1
-
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:], os.environ))

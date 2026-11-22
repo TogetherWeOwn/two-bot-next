@@ -1,9 +1,7 @@
 name: production-ownership-status
 on: {workflow_dispatch: null}
 permissions: {}
-
 concurrency: {group: production-ownership-status, cancel-in-progress: false}
-
 jobs:
   guard:
     if: github.repository_id == '1396224242' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1
@@ -24,6 +22,7 @@ jobs:
 
   status:
     needs: guard
+    if: github.run_attempt == 1
     concurrency:
       group: deploy-production
       cancel-in-progress: false

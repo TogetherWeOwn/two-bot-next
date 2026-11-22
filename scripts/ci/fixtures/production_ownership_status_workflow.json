@@ -42,6 +42,7 @@
     },
     "status": {
       "needs": "guard",
+      "if": "github.run_attempt == 1",
       "concurrency": {
         "group": "deploy-production",
         "cancel-in-progress": "false",
