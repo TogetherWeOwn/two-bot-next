@@ -48,30 +48,28 @@ def publish(repo, event, head, run, attempt, workflow):
     return "\n".join(summary) + "\n"
 
 
-def rendered_lines(body):
-    fence = ""
-    for line in re.sub(r"<!--[\s\S]*?(?:-->|$)", "", body).splitlines():
-        marker = re.fullmatch(r"(`{3,}|~{3,})(.*)", line.strip())
-        yield " " + line if fence or line.startswith(("    ", "\t", ">")) else line.strip()
-        if marker and (not fence or (marker[1].startswith(fence) and not marker[2].strip())):
-            fence = "" if fence else marker[1]
+def evidence_sections(body):
+    from markdown_it import MarkdownIt
 
-
-def evidence_sections(policy, body, *, include_blocks=False):
-    body = CUBIC_FOOTER.sub("", body)
-    text = "\n".join(rendered_lines(body) if include_blocks else policy.visible_lines(body))
-    def section(heading, boundary):
-        tail = f"\n{text}\n".partition(f"\n## {heading}\n")[2]
-        return re.split(boundary, tail, maxsplit=1, flags=re.M)[0].strip()
-
-    return section("Verification", r"^#{1,2}(?:[ \t]|$)"), section("Attestation", r"^#{1,2} ")
+    body = CUBIC_FOOTER.sub("", body).replace("\r\n", "\n").replace("\r", "\n")
+    lines, tokens = body.split("\n"), MarkdownIt().parse(body)
+    headings = [token.map for token in tokens
+                if token.type == "heading_open" and token.level == 0 and token.tag in {"h1", "h2"}]
+    stops = [start for start, _ in headings[1:]] + [len(lines)]
+    sections = {}
+    for (start, content), stop in zip(headings, stops):
+        title = lines[start].strip()
+        if title not in {"## Verification", "## Attestation"}:
+            continue
+        if title in sections:
+            raise EvidenceError("Evidence headings must be unique.")
+        sections[title] = "\n".join(lines[content:stop]).strip()
+    return sections.get("## Verification"), sections.get("## Attestation")
 
 
 def sources(base, head):
     diff = command("git", "diff", "--no-ext-diff", "--no-renames", "--ignore-submodules=none",
                    "--name-status", "-z", f"{base}...{head}", "--").rstrip("\0").split("\0")
-    if len(diff) < 2 or len(diff) % 2:
-        raise EvidenceError("Unable to establish the changed-file inventory.")
     kinds = {"A": "added", "M": "modified", "D": "removed", "T": "modified"}
     return [{"filename": path, "status": kinds[status]}
             for status, path in zip(diff[::2], diff[1::2], strict=True)]
@@ -140,19 +138,21 @@ def named_tests(path, source):
 
 
 def validate(policy, body, files, read):
-    verification, attestation = evidence_sections(policy, body)
-    headings = [line for line in policy.visible_lines(body)
-                if re.fullmatch(r"##\s+verification\s*#*", line, re.I)]
-    if headings != ["## Verification"] or not any(
-            policy.meaningful(line.strip("-* ")) for line in verification.splitlines()):
+    verification, attestation = evidence_sections(body)
+    if not any(
+            policy.meaningful(line.strip("-* ")) for line in policy.visible_lines(verification or "")):
         raise EvidenceError("Fill in the visible Verification section with commands and results.")
-    if RUN_LINK.search("\n".join(evidence_sections(policy, body, include_blocks=True))):
+    if attestation is None:
+        raise EvidenceError("Add a visible Attestation heading.")
+    if RUN_LINK.search(verification) or RUN_LINK.search(attestation):
         raise EvidenceError("Actions URLs in Verification or Attestation can go stale. Use the job summary.")
     report = policy.validate(CUBIC_FOOTER.sub("", body), files)
     if report["issues"]:
         raise EvidenceError("Attestation issues: " + ", ".join(report["issues"]))
     titles = {}
-    tests = filter(None, map(policy.TEST.fullmatch, attestation.splitlines()))
+    visible = "\n".join(policy.visible_lines(CUBIC_FOOTER.sub("", body)))
+    tail = f"\n{visible}\n".partition("\n## Attestation\n")[2]
+    tests = filter(None, map(policy.TEST.fullmatch, re.split(r"^#{1,2} ", tail, maxsplit=1, flags=re.M)[0].splitlines()))
     for index, test in enumerate(tests, start=1):
         path, _, selector = test[2].strip().partition("::")
         if not selector:
@@ -179,7 +179,7 @@ def check(policy, reader, number, repo, base, head):
 
     body = snapshot()
     baseline = Path(__file__).with_name("pr-evidence-baseline.txt").read_text().splitlines()
-    digest = hashlib.sha256(repr(evidence_sections(policy, body, include_blocks=True)).encode()).hexdigest()
+    digest = hashlib.sha256(repr(evidence_sections(body)).encode()).hexdigest()
     grandfathered = f"{number} {head} {digest}" in baseline
     if not grandfathered:
         validate(policy, body, sources(base, head), lambda path: source_blob(head, path))

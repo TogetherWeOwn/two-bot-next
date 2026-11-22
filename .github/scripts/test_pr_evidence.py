@@ -56,7 +56,7 @@ class EvidenceTests(unittest.TestCase):
         for changed, problem in (
                 (body.replace("test_present", "test_gone"), "no unique matching test"),
                 (body.replace("test_present", "test_gone") + "\n## attestation", "no unique matching test"),
-                (body + "\n## verification\n- Alternate account.", "Verification"),
+                (body.replace("- Ran the evidence fixtures.", "-") + "\n## verification\n- Alternate account.", "Verification"),
                 (body.replace("Ran the evidence fixtures.", link) + fenced, "can go stale"),
                 (body.replace("- Ran the evidence fixtures.", "```\npython3 -m unittest\n```") + fenced, "Verification"),
                 (body.replace("- Ran the evidence fixtures.", "-\n##\tNotes\n- Ran tests."), "Verification")):
@@ -65,6 +65,9 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(evidence.EvidenceError, "test_file_not_in_head_diff"):
             evidence.validate(policy, body, [{"filename": "test_sample.py", "status": "removed"}], read)
         for heading in ("## Verification\n", "## Attestation\n"):
-            for block in (f"> [Old CI]({link})", f"```\n{link}\n```", f"    {link}"):
+            blocks = (f"> `<!--` {link} `-->`",
+                      f"```\n    ```\n## Notes\n```\n\n    ```\n\n{link}",
+                      f"<details>\n## Notes\n</details>\n\n    {link}")
+            for block in blocks:
                 with self.assertRaisesRegex(evidence.EvidenceError, "can go stale"):
                     evidence.validate(policy, body.replace(heading, f"{heading}{block}\n"), files, read)

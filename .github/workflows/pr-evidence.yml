@@ -1,19 +1,14 @@
 name: PR evidence
 on:
-  pull_request:
-    types: [opened, edited, synchronize, reopened, ready_for_review]
-  push:
-    branches: [main]
+  pull_request: {types: [opened, edited, synchronize, reopened, ready_for_review]}
+  push: {branches: [main]}
 permissions: {}
 concurrency:
   group: pr-evidence-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   pr-evidence:
-    permissions:
-      actions: read
-      contents: read
-      pull-requests: read
+    permissions: {actions: read, contents: read, pull-requests: read}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
