@@ -87,6 +87,7 @@ JOB_INVENTORY = {
     # Manual read-only staging fixture-scope census (counts, digests and one
     # observation timestamp only, log only); pinned shape below.
     "staging-fixture-census.yml": {"fixture-census"},
+    "staging-recovery-capture.yml": {"capture"},
     # Manual read-only authenticated MCP prove-out (TOG-23456); pinned shape below.
     "staging-mcp-proveout.yml": {"proveout"},
     # Manual read-only staging ownership status read; pinned shape below.
@@ -2300,6 +2301,31 @@ def staging_retention_census_errors(workflow):
 
 FIXTURE_CENSUS_COMMAND = ("set -o pipefail\n"
                           "python3 scripts/staging_retention_census.py fixture-scope\n")
+
+
+def staging_recovery_capture_errors(workflow):
+    name = "staging-recovery-capture"
+    recipient = {"description": "Base64 DER public certificate for the encrypted recovery inventory",
+                 "required": "true", "type": "string"}
+    capture = {
+        "if": "github.ref == 'refs/heads/main'",
+        "permissions": {"contents": "read"},
+        "environment": "staging-migrate-plan",
+        "runs-on": PUBLIC_RUNNER,
+        "timeout-minutes": "5",
+        "steps": [
+            {"uses": STAGING_CHECKOUT_USES, "with": {"persist-credentials": "false", "fetch-depth": "1"}},
+            {"env": {**CENSUS_ENV, "RECOVERY_RECIPIENT": "${{ inputs.recipient_certificate }}"},
+             "run": "python3 scripts/staging_recovery_capture.py"},
+            {"uses": STAGING_UPLOAD_USES,
+             "with": {"name": name, "path": "staging-recovery.cms",
+                      "if-no-files-found": "error", "retention-days": "14"}},
+        ],
+    }
+    expected = {"name": name, "on": {"workflow_dispatch": {"inputs": {"recipient_certificate": recipient}}},
+                "permissions": {}, "concurrency": {"group": name, "cancel-in-progress": "false"},
+                "jobs": {"capture": capture}}
+    return [] if workflow == expected else [f"{name}.yml: read-only capture shape changed"]
 
 
 def staging_fixture_census_errors(workflow):
@@ -4711,6 +4737,9 @@ def workflow_policy_errors(workflows):
             # generic environment scan below would flag its Environment
             # binding.
             errors.extend(staging_fixture_census_errors(workflow))
+            continue
+        if name == "staging-recovery-capture.yml":
+            errors.extend(staging_recovery_capture_errors(workflow))
             continue
         if name == "staging-mcp-proveout.yml":
             # Manual read-only authenticated MCP prove-out: pinned shape

@@ -140,6 +140,7 @@ EXEMPT = {
     ("staging-migrate.yml", "plan"): "database plan only",
     ("staging-migrate.yml", "apply"): "database migration; staging-migrate lane",
     ("staging-privacy-verify-read.yml", "read"): "database read only",
+    ("staging-recovery-capture.yml", "capture"): "read-only database recovery inventory",
     ("staging-retention-census.yml", "census"): "database read only",
 }
 STAGING_TOUCH = re.compile(r"STAGING_WORKER_URL|STAGING_OWNERSHIP_CONTROL_TOKEN|"
