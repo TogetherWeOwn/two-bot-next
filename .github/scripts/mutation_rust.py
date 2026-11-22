@@ -13,6 +13,10 @@ from pathlib import Path
 
 from mutation_scope import added_lines, rust_lines
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from script_intake import decode_legacy_json
+sys.path.pop(0)
+
 MAX_MUTANTS = 100
 OUTCOMES = {"CaughtMutant": "killed", "MissedMutant": "survived",
             "Unviable": "unsupported", "Timeout": "infrastructure_error"}
@@ -47,7 +51,7 @@ def measure(root, patch, output):
     discovery = subprocess.run(command + ["--list", "--json"], cwd=root, capture_output=True,
                                check=True, timeout=120)
     # cargo-mutants exits 0 without writing a JSON array when the diff matches nothing.
-    listed = json.loads(discovery.stdout or b"[]")
+    listed = decode_legacy_json(discovery.stdout or b"[]")
     selected = [mutant for mutant in listed if in_scope(mutant, added)]
     omitted = len(listed) - len(selected)
     if not selected:
@@ -64,7 +68,7 @@ def measure(root, patch, output):
                          capture_output=True, timeout=32 * 60)
     if run.returncode not in (0, 2, 3):
         raise ValueError(f"cargo-mutants failed before a complete verdict (exit {run.returncode})")
-    report = json.loads((output / "mutants.out/outcomes.json").read_bytes())
+    report = decode_legacy_json((output / "mutants.out/outcomes.json").read_bytes())
     baseline, *mutations = report["outcomes"]
     if baseline["scenario"] != "Baseline" or baseline["summary"] != "Success":
         raise ValueError("Rust baseline did not pass")
