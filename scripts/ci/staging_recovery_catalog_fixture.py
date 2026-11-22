@@ -1,11 +1,14 @@
 """Supplemental fixture on an isolated GitHub Actions PostgreSQL service."""
 
+from contextlib import redirect_stderr
+import io
 from pathlib import Path
 import subprocess
 import sys
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from staging_recovery_capture import decode_inventory
+import staging_recovery_capture as capture
 
 ROOT = Path(__file__).resolve().parents[2]
 URL = "postgresql://agent_test:@agent-testdb:5432/two_bot_test_local"
@@ -88,7 +91,7 @@ query = (ROOT / "scripts/staging_recovery_inventory.sql").read_text().replace("-
 
 
 def inventory():
-    return decode_inventory(psql("SET SESSION AUTHORIZATION fixture_reader;\n" + query))
+    return capture.decode_inventory(psql("SET SESSION AUTHORIZATION fixture_reader;\n" + query))
 
 
 baseline = inventory()
@@ -113,5 +116,19 @@ ALTER FUNCTION public.fixture_enum_result() OWNER TO two_bot_migrator;
 """)
 assert inventory()["unsupported"], "uncaptured routine return type was accepted"
 psql("DROP FUNCTION public.fixture_enum_result();")
+psql("""
+CREATE FUNCTION public.fixture_enum_out(OUT valid boolean, OUT value public.fixture_enum)
+    LANGUAGE SQL AS 'SELECT false, NULL::public.fixture_enum';
+ALTER FUNCTION public.fixture_enum_out() OWNER TO two_bot_migrator;
+""")
+assert inventory()["unsupported"], "uncaptured OUT type was accepted"
+psql("DROP FUNCTION public.fixture_enum_out();")
+with patch.dict(capture.os.environ, {"RECOVERY_RECIPIENT": "YQ=="}, clear=True), \
+        patch.object(capture, "database_target") as database_target, \
+        redirect_stderr(io.StringIO()) as errors:
+    assert capture.main() == 1
+    database_target.assert_not_called()
+assert errors.getvalue().strip() == "the recipient does not match the reviewed certificate"
+print("PASS: uncaptured OUT type refused and unreviewed recipient rejected with the pinned-certificate error")
 psql("SET SESSION AUTHORIZATION fixture_misbound;\n" + query, success=False)
 print("PASS: real read-only catalog query, ordinary in-scope row and extension types, direct and nested composites, enum, domain, range, outside row and routine refusal, inherited default ACLs and misbound refusal")
