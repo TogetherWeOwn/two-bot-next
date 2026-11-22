@@ -872,7 +872,7 @@ takeover order apply to the revert.
 After deploy runs using the old queue policy finish, dispatch
 **Actions → production-ownership-status** on `main` with no inputs. Cancel
 any waiting status run when recovery needs the lane. Find the receipt under
-**Read bracketed production ownership status**. Changing rollout counters refuse it.
+**Read bracketed production ownership status** in the job log.
 
 ## `PRODUCTION_AUTO_APPROVE`
 

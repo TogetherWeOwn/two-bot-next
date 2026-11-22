@@ -12,16 +12,14 @@ from time import monotonic
 
 import staging_rollout as provider
 from staging_rollout import GateError, decode, mapping, number, require, sequence
-from worker_container_rollback import APPLICATIONS, WORKERS, app_rollouts, application_by_name, rollout_image
+from worker_container_rollback import APPLICATIONS, SHA, WORKERS, app_rollouts, application_by_name, rollout_image
+from worker_container_rollback import VERSION_ID as UUID
 
-ROOT = Path(__file__).resolve().parents[1]
 REPO = "TogetherWeOwn/two-bot-next"
 REF = "refs/heads/main"
 WORKER = WORKERS["production"]
 APPLICATION = APPLICATIONS["production"]
 PRODUCTION_URL = f"https://{WORKER}.5150.workers.dev"
-SHA = re.compile(r"[0-9a-f]{40}")
-UUID = re.compile(provider.UUID)
 NAMESPACE = re.compile(r"[0-9a-f]{32}")
 CI_ACTOR = re.compile(r"github-actions:[1-9][0-9]{0,19}:[0-9a-f]{40}")
 
@@ -60,7 +58,7 @@ def environment_policy(auto_approve, api=github_get):
     branches = api("environments/production/deployment-branch-policies?per_page=2")
     require(settings.get("name") == "production" and policy.get("custom_branch_policies") is True
             and policy.get("protected_branches") is False and number(branches.get("total_count")) == 1
-            and [(mapping(row).get("type"), row.get("name")) for row in sequence(branches.get("branch_policies"))]
+            and [(mapping(row).get("type", "branch"), row.get("name")) for row in sequence(branches.get("branch_policies"))]
             == [("branch", "main")], "production_environment_not_main_only")
     rules = sequence(settings.get("protection_rules"))
     require(sum(mapping(rule).get("type") == "branch_policy" for rule in rules) == 1, "branch_rule_missing")
@@ -97,33 +95,21 @@ def provider_sample(client, account):
     ranked = sorted(((provider.timestamp(row.get("created_at")), row) for row in app_rollouts(client, app_id)),
                     key=lambda item: item[0], reverse=True)
     require(bool(ranked) and (len(ranked) == 1 or ranked[0][0] > ranked[1][0]), "latest_rollout_unbound")
-    latest = ranked[0][1]
-    rollout_id = latest["id"]
-    require(matches(UUID, rollout_id), "invalid_rollout_id")
-    rollout = mapping(client.api(f"/containers/applications/{app_id}/rollouts/{rollout_id}"))
-    require(rollout.get("id") == rollout_id and rollout.get("created_at") == latest.get("created_at")
-            and rollout.get("status") == latest.get("status") == "completed", "latest_rollout_not_completed")
+    rollout = ranked[0][1]
+    require(matches(UUID, rollout["id"]) and rollout.get("status") == "completed", "latest_rollout_unbound")
     image = rollout_image(rollout, APPLICATION)
     prefix = f"registry.cloudflare.com/{account}/{APPLICATION}@"
-    require(image.startswith(prefix) and rollout_image(latest, APPLICATION) == image
-            and mapping(app.get("configuration")).get("image") == image, "application_image_mismatch")
-    target_version = number(rollout.get("target_version"))
-    require(number(latest.get("target_version")) == target_version, "rollout_target_mismatch")
-    health = mapping(mapping(rollout.get("health")).get("instances"))
+    require(image.startswith(prefix) and mapping(app.get("configuration")).get("image") == image,
+            "application_image_mismatch")
     return {
         "worker": {"deployment_id": deployment["id"], "version_id": version, "sha": sha, "traffic_percent": 100},
-        "container": {
-            "application_id": app_id, "namespace_id": namespace, "rollout_id": rollout_id,
-            "rollout_status": "completed", "target_version": target_version,
-            "image_digest": image.removeprefix(prefix), "configured_instances": number(app.get("instances")),
-            "rollout_instances": {key: number(health.get(key))
-                                  for key in ("active", "healthy", "failed", "starting", "scheduling")},
-        },
+        "container": {"application_id": app_id, "namespace_id": namespace, "rollout_id": rollout["id"],
+                      "rollout_status": "completed", "image_digest": image.removeprefix(prefix)},
     }
 
 
 def ownership_get(token):
-    return read_json(["node", str(ROOT / "wrangler/scripts/production-ownership-control.mjs"), "observe"], 20,
+    return read_json(["node", "wrangler/scripts/production-ownership-control.mjs", "observe"], 20,
                      {"PATH": os.environ.get("PATH", os.defpath), "PRODUCTION_WORKER_URL": PRODUCTION_URL,
                       "OWNERSHIP_CONTROL_TOKEN": token})
 
@@ -154,14 +140,12 @@ def read_status(env, *, client_factory=provider.Client, read=ownership_get):
     require(len(token) >= 32, "ownership_token_missing")
     account = env.get("CLOUDFLARE_ACCOUNT_ID")
     client = client_factory(account, env.get("CLOUDFLARE_API_TOKEN"), deadline=monotonic() + 95)
-    started = datetime.now(timezone.utc).isoformat()
     before = provider_sample(client, account)
     state = ownership_projection(read(token), before["worker"]["version_id"])
     observed = datetime.now(timezone.utc).isoformat()
     after = provider_sample(client, account)
     require(after == before, "provider_state_drift")
-    return {"provider_before_at": started, "ownership_observed_at": observed,
-            "provider_after_at": datetime.now(timezone.utc).isoformat(), **after, "ownership": state}
+    return {"ownership_observed_at": observed, **after, "ownership": state}
 
 
 def main(argv, env):

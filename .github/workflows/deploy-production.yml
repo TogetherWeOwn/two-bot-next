@@ -103,7 +103,12 @@ permissions: {}
 
 # No workflow-level concurrency: only the `production` job below holds the
 # `deploy-production` lane (through its post-deploy watch). The guard, gates, soak and recheck jobs run outside it, so a sleeping automatic promotion can never queue an
-# operator rollback behind it. The shared lane preserves queued jobs.
+# operator rollback behind it. The lane keeps more than one pending
+# slot, so the `recheck` job skips an automatic run while an operator
+# dispatch is active — otherwise the automatic `production` job would enter
+# the lane alongside queued recovery work. A
+# dispatch queued in the seconds between the recheck and the lane entry is
+# covered by the in-lane recheck.
 
 jobs:
   guard:
@@ -1122,7 +1127,9 @@ jobs:
     outputs:
       skip: ${{ steps.recheck.outputs.skip }}
     steps:
-      - name: Re-read the promotion hold and the live revision
+      - &automatic_recheck
+        name: Re-read the promotion hold and the live revision
+        if: needs.guard.outputs.auto == 'true'
         id: recheck
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1271,13 +1278,21 @@ jobs:
               elif dispatch == "unreadable":
                   skip = "dispatch-check-unreadable"
               else:
-                  live = recheck_live_revision()
+                  if os.environ.get("MODE") == "deploy":
+                      with open(os.path.join(os.environ["RUNNER_TEMP"], "production-rollback-snapshot.json")) as snapshot:
+                          live = json.load(snapshot)["serving_sha"]
+                      if not re.fullmatch(r"[0-9a-f]{40}", live or ""):
+                          refuse("serving SHA absent from the production snapshot")
+                  else:
+                      live = recheck_live_revision()
                   if live == sha:
                       skip = "live"
                   elif (live and re.fullmatch(r"[0-9a-f]{40}", live)
                           and recheck_live_contains(sha, live)):
                       skip = "older-than-live"
 
+          if skip and os.environ.get("MODE") == "deploy":
+              refuse(skip)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"skip={skip}\n")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
@@ -1350,7 +1365,13 @@ jobs:
     # no deploy), and a skipped recheck counts only for manual runs — an
     # automatic run always needs a fresh recheck pass with no skip.
     if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
-    # The guard, gates, soak and recheck stay outside the shared lane.
+    # The protected status read shares the deploy-production lane.
+    # Outside this job, the guard, gates, soak and recheck
+    # jobs carry no concurrency, so recovery
+    # dispatches are never queued behind a sleeping promotion. The lane keeps
+    # pending recoveries, preserving their place,
+    # so automatic runs recheck for an active operator dispatch first and skip
+    # instead of entering the lane behind one.
     concurrency:
       group: ${{ github.run_attempt != 1 && needs.guard.outputs.mode != 'rollback' && needs.guard.outputs.allow_unstaged != 'true' && format('deploy-production-refused-{0}-{1}', github.run_id, github.run_attempt) || 'deploy-production' }}
       cancel-in-progress: false
@@ -1585,6 +1606,7 @@ jobs:
           PY
           fi
           echo "PRODUCTION_DEPLOY_CONFIG=$config" >> "$GITHUB_ENV"
+      - *automatic_recheck
       - name: Deploy to production
         id: deploy
         if: env.MODE == 'deploy'

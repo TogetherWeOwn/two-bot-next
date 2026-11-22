@@ -1,7 +1,7 @@
 {
   "name": "production-ownership-status",
   "on": {
-    "workflow_dispatch": ""
+    "workflow_dispatch": "null"
   },
   "permissions": {},
   "concurrency": {

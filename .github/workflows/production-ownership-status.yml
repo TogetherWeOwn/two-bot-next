@@ -1,8 +1,5 @@
 name: production-ownership-status
-
-on:
-  workflow_dispatch:
-
+on: {workflow_dispatch: null}
 permissions: {}
 
 concurrency: {group: production-ownership-status, cancel-in-progress: false}
