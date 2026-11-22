@@ -1,0 +1,221 @@
+"""Publish immutable Actions links and validate test declarations on a PR head."""
+
+import ast
+import hashlib
+import html
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+SHA = re.compile(r"[0-9a-f]{40}")
+NUMBER = re.compile(r"[1-9][0-9]*")
+RUN_LINK = re.compile(r"\bgithub\.com/[^/\s]+/[^/\s]+/actions/runs/", re.I)
+MAX_SOURCE = 2 * 1024 * 1024
+
+
+class EvidenceError(ValueError):
+    """A refusal safe to expose in Actions."""
+
+
+def command(*args):
+    return subprocess.check_output(args, stderr=subprocess.DEVNULL, timeout=30).decode()
+
+
+def publish(repo, event, head, run, attempt, workflow):
+    prefix = f"repos/{repo}/actions/runs/{run}"
+    identity = command("gh", "api", f"{prefix}/attempts/{attempt}", "--jq",
+                       "[.head_sha,.event,.path,.id,.run_attempt] | @tsv").strip().split("\t")
+    if identity != [head, event, f".github/workflows/{workflow}", run, attempt]:
+        raise EvidenceError("Actions run does not match the event head, workflow and attempt.")
+    rows = command("gh", "api", "--paginate", f"{prefix}/attempts/{attempt}/jobs?per_page=100",
+                   "--jq", ".jobs[] | [.id,.head_sha,.run_id,.run_attempt,"
+                   " (.conclusion // .status),.name] | @tsv").splitlines()
+    if not rows:
+        raise EvidenceError("Actions returned no jobs for this attempt.")
+    url = f"https://github.com/{repo}/actions/runs/{run}"
+    summary = [f"## Actions evidence for `{head}`", "",
+               f"[Workflow run, attempt {attempt}]({url}/attempts/{attempt})", ""]
+    for row in rows:
+        job, job_head, job_run, job_attempt, status, name = row.split("\t", 5)
+        if (not NUMBER.fullmatch(job) or (job_head, job_run, job_attempt) != (head, run, attempt)
+                or not re.fullmatch(r"[a-z_]+", status)):
+            raise EvidenceError("Actions returned a job outside this head or attempt.")
+        label = html.escape(name).replace("[", "&#91;").replace("]", "&#93;")
+        summary.append(f"- [{label}]({url}/job/{job}) ({status} at publication)")
+    return "\n".join(summary) + "\n"
+
+
+def evidence_sections(policy, body):
+    lines = policy.visible_lines(body)
+    sections = {"Verification": [], "Attestation": []}
+    active = None
+    for line in lines:
+        if re.match(r"^#{1,2}\s", line):
+            active = line[3:] if line.startswith("## ") else None
+        if active in sections:
+            sections[active].append(line)
+    return sections
+
+
+def fingerprint(sections):
+    return hashlib.sha256(repr(sections).encode()).hexdigest()
+
+
+def sources(base, head):
+    diff = command("git", "diff", "--no-ext-diff", "--no-renames", "--ignore-submodules=none",
+                   "--name-status", "-z", f"{base}...{head}", "--").rstrip("\0").split("\0")
+    if len(diff) < 2 or len(diff) % 2:
+        raise EvidenceError("Unable to establish the changed-file inventory.")
+    kinds = {"A": "added", "M": "modified", "D": "removed", "T": "modified"}
+    return [{"filename": path, "status": kinds[status]}
+            for status, path in zip(diff[::2], diff[1::2], strict=True)]
+
+
+def source_blob(head, path):
+    row = command("git", "ls-tree", "-z", head, "--", f":(literal){path}")
+    if not row.startswith(("100644 blob ", "100755 blob ")):
+        raise EvidenceError("An attested test path is not a source file on this head.")
+    obj = row.split("\t", 1)[0].split()[2]
+    if int(command("git", "cat-file", "-s", obj)) > MAX_SOURCE:
+        raise EvidenceError("An attested source exceeds the size limit.")
+    return command("git", "cat-file", "blob", obj)
+
+
+def named_tests(path, source):
+    suffix = Path(path).suffix
+    if suffix == ".py":
+        functions = (ast.FunctionDef, ast.AsyncFunctionDef)
+        for node in ast.parse(source).body:
+            if isinstance(node, functions) and node.name.startswith("test_"):
+                yield node.name
+            if isinstance(node, ast.ClassDef) and (
+                    node.name.startswith("Test") or any(
+                        ast.unparse(base).split(".")[-1] == "TestCase" for base in node.bases)):
+                for method in node.body:
+                    if isinstance(method, functions) and method.name.startswith("test_"):
+                        yield f"{node.name}.{method.name}"
+        return
+    if suffix not in {".rs", ".ts", ".js", ".mjs", ".cjs"}:
+        return
+
+    from tree_sitter import Language, Parser
+
+    if suffix == ".rs":
+        import tree_sitter_rust
+        language = tree_sitter_rust.language()
+    else:
+        import tree_sitter_typescript
+        language = tree_sitter_typescript.language_typescript()
+    root = Parser(Language(language)).parse(source.encode()).root_node
+    if root.has_error:
+        raise EvidenceError("An attested source could not be parsed.")
+    nodes = [(root, ())]
+    while nodes:
+        node, modules = nodes.pop()
+        if suffix == ".rs":
+            if node.type == "mod_item":
+                modules = (*modules, node.child_by_field_name("name").text.decode())
+            if node.type in {"source_file", "mod_item", "declaration_list"}:
+                nodes.extend((child, modules) for child in node.named_children)
+            if node.type == "function_item":
+                attribute = node.prev_named_sibling
+                while attribute and attribute.type == "attribute_item":
+                    if re.match(rb"#\s*\[\s*(?:(?:\w+)\s*::\s*)*test\s*(?:\(|\])", attribute.text):
+                        yield "::".join((*modules, node.child_by_field_name("name").text.decode()))
+                        break
+                    attribute = attribute.prev_named_sibling
+        else:
+            nodes.extend((child, ()) for child in node.named_children)
+            if node.type == "call_expression" and node.child_by_field_name("function").text in {
+                    b"test", b"it", b"test.skip", b"it.skip", b"test.todo", b"it.todo", b"t.test"}:
+                args = node.child_by_field_name("arguments").named_children
+                if args and args[0].type == "string" and b"\\" not in args[0].text:
+                    yield args[0].text[1:-1].decode()
+
+
+def validate(policy, body, files, read):
+    sections = evidence_sections(policy, body)
+    verification = sections["Verification"]
+    if (verification.count("## Verification") != 1
+            or not any(policy.meaningful(line.lstrip("-* ")) for line in verification[1:])):
+        raise EvidenceError("Fill in the visible Verification section with commands and results.")
+    if RUN_LINK.search("\n".join(verification + sections["Attestation"])):
+        raise EvidenceError("Actions URLs in Verification or Attestation can go stale. Use the job summary.")
+    report = policy.validate(body, files)
+    if report["issues"]:
+        raise EvidenceError("Attestation issues: " + ", ".join(report["issues"]))
+    titles = {}
+    tests = [line for line in sections["Attestation"] if policy.TEST.fullmatch(line)]
+    for index, line in enumerate(tests, start=1):
+        path, _, selector = policy.TEST.fullmatch(line)[2].strip().partition("::")
+        if path not in titles:
+            source = read(path)
+            titles[path] = list(named_tests(path, source)) if selector else None
+        if selector:
+            if titles[path] is None:
+                titles[path] = list(named_tests(path, read(path)))
+            names = titles[path]
+            matches = names.count(selector)
+            if "::" not in selector and Path(path).suffix == ".rs":
+                matches = sum(name.rsplit("::", 1)[-1] == selector for name in names)
+            if matches != 1:
+                raise EvidenceError(f"Attestation test entry {index} has no unique matching test on this head.")
+
+
+def check(policy, reader, number, repo, base, head):
+    def snapshot():
+        pr = reader.get(f"pulls/{number}")
+        if (pr["state"], pr["base"]["repo"]["full_name"], pr["base"]["sha"], pr["head"]["sha"]) != (
+                "open", repo, base, head):
+            raise EvidenceError("PR identity moved or does not match this run.")
+        return pr["body"] or "", pr["head"]["ref"], pr["user"]["login"]
+
+    body, branch, author = snapshot()
+    baseline = Path(__file__).with_name("pr-evidence-baseline.txt").read_text().splitlines()
+    entry = f"{number} {head} {fingerprint(evidence_sections(policy, body))}"
+    if branch.startswith("release-please--") and author.endswith("[bot]"):
+        result = "Generated release PR"
+    elif entry in baseline:
+        result = "Existing PR with grandfathered head and evidence"
+    else:
+        validate(policy, body, sources(base, head), lambda path: source_blob(head, path))
+        result = "Verification and Attestation passed"
+    if snapshot() != (body, branch, author):
+        raise EvidenceError("PR evidence changed during validation. Use the newer run.")
+    return result
+
+
+def main():
+    env = os.environ
+    head, run, attempt = (env[key] for key in ("EVIDENCE_HEAD", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
+    repo, event = env["GITHUB_REPOSITORY"], env["GITHUB_EVENT_NAME"]
+    if not SHA.fullmatch(head) or not all(map(NUMBER.fullmatch, (run, attempt))):
+        raise EvidenceError("Missing Actions identity.")
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo, re.ASCII):
+        raise EvidenceError("Invalid repository identity.")
+    mode = sys.argv[1]
+    workflow = {"verify": "pr-evidence.yml", "publish": "check.yml"}[mode]
+    with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+        output.write(publish(repo, event, head, run, attempt, workflow))
+        if mode == "verify" and event == "pull_request":
+            sys.path.insert(0, str(Path("attestation-policy/.github/scripts").resolve()))
+            import pr_attestation as policy
+
+            number, base = env["PR_NUMBER"], env["PR_BASE"]
+            if (not NUMBER.fullmatch(number) or not SHA.fullmatch(base)
+                    or command("git", "rev-parse", "HEAD").strip() != head):
+                raise EvidenceError("Checkout does not match the immutable PR head.")
+            reader = policy.GitHub(env["GH_TOKEN"], repo)
+            result = check(policy, reader, number, repo, base, head)
+            output.write(f"\n**{result}.**\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except EvidenceError as error:
+        raise SystemExit(str(error)) from None
+    except (KeyError, OSError, SyntaxError, ValueError, subprocess.SubprocessError):
+        raise SystemExit("Could not read the exact-head evidence or attested source.") from None

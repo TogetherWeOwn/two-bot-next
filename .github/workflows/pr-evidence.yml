@@ -1,0 +1,49 @@
+name: PR evidence
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: pr-evidence-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pr-evidence:
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read pinned organization attestation policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: TogetherWeOwn/.github
+          ref: bfdaf1532e1605281d366186e4ed9e8cfa0113fc
+          path: attestation-policy
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - name: Install hash-pinned source parsers
+        run: |
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/evidence"
+          "$RUNNER_TEMP/evidence/bin/python" -m pip --isolated install --no-deps --only-binary=:all: --require-hashes -r .github/scripts/pr-evidence-requirements.txt
+      - name: Run evidence fixtures
+        run: '"$RUNNER_TEMP/evidence/bin/python" -I -m unittest discover -s .github/scripts -p test_pr_evidence.py -v'
+      - name: Verify and publish evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: '"$RUNNER_TEMP/evidence/bin/python" -I .github/scripts/pr_evidence.py verify'

@@ -96,6 +96,7 @@ JOB_INVENTORY = {
     # fixture lands); pinned shape below.
     "gradual-promote-proof.yml": {"proof"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
+    "pr-evidence.yml": {"pr-evidence"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
     # runs the local validation/evidence/preflight scripts without ever

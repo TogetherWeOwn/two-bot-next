@@ -350,15 +350,23 @@ and any authorized manual Actions run also stay on GitHub.
 
 ### Exact-head CI evidence
 
-Record the PR URL, full head SHA, Actions run URL
-(`https://github.com/TogetherWeOwn/two-bot-next/actions/runs/<run-id>`) and relevant
-job URLs (`.../job/<job-id>`) in Verification and the task evidence. Confirm the
-run's `headSha` matches the PR's current head and inspect its jobs and results;
-an older green run, a cancelled run, or a local transcript is not CI evidence for
-a new head. Reviewers and the owner use these exact-head Actions links,
-including `ci-ok` and relevant selected jobs, alongside the other required checks
-and release evidence. Report pending/failed/skipped work honestly. Never claim a
-local reproduction is a full CI pass.
+Record commands and observed results in Verification. Use the `ci-ok` job
+summary for the full head SHA and Actions run and job links. Check the linked
+jobs for their final results, and record the relevant links in task evidence.
+Report pending, failed and skipped work accurately.
+
+The `pr-evidence` job enforces Verification and Attestation on PR updates
+and publishes its own run and job links. Named tests use a Python function
+or `Class.method`, a Rust test function or inline module path, or the literal
+title of a JavaScript or TypeScript test. Omit the name for generated tests
+that require a runner to discover. The test source must be changed and present
+at the head. Source validation confirms a declaration. Execution is evidenced
+by the linked CI jobs.
+
+Existing PRs keep their recorded exception while the head and evidence sections
+match the rollout baseline. Before registering `pr-evidence` as a required
+check, record a passing main run and passing runs from two later PRs, each with
+the full SHA, run URL and job URL.
 
 The toolchain remains pinned in `rust-toolchain.toml`. CI runs
 `python3 scripts/generate_command_reference.py` to generate ignored
