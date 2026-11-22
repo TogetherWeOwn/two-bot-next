@@ -45,7 +45,8 @@ def measure(root, patch, output):
     if not added:
         raise ValueError("Rust measurement was selected without source additions")
     command = ["cargo", "mutants", "--workspace", "--no-config", "--in-diff", str(patch),
-               "--gitignore=false", "--cargo-arg=--locked", "--build-timeout=540", "--timeout=90"]
+               "--all-features", "--gitignore=false", "--cargo-arg=--locked",
+               "--build-timeout=720", "--timeout=90"]
     discovery = subprocess.run(command + ["--list", "--json"], cwd=root, capture_output=True,
                                check=True, timeout=120)
     # cargo-mutants exits 0 without writing a JSON array when the diff matches nothing.
@@ -60,9 +61,10 @@ def measure(root, patch, output):
     if len(expected) != len(selected):
         raise ValueError("Rust discovery returned duplicate mutation identities")
     filters = [f"--re={exact_regex(name)}" for name in sorted(expected)]
-    # Use the regular non-ignored tests and run them serially to avoid process-global races.
-    run = subprocess.run(command + filters + ["--output", str(output), "--", "--test-threads=1"],
-                         cwd=root, capture_output=True, timeout=22 * 60)
+    # The standard package tests run serially to avoid process-global races.
+    run = subprocess.run(command + filters + ["--output", str(output)],
+                         cwd=root, env={**os.environ, "RUST_TEST_THREADS": "1"},
+                         capture_output=True, timeout=32 * 60)
     if run.returncode not in (0, 2, 3):
         raise ValueError(f"cargo-mutants failed before a complete verdict (exit {run.returncode})")
     report = read_json(output / "mutants.out/outcomes.json")

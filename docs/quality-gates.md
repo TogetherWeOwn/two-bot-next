@@ -114,8 +114,9 @@ existing job selector. It uses the merge-base diff so unrelated changes on
 `main` are outside the scope. Pure deletions and renames add no candidates.
 
 Pinned `cargo mutants --in-diff` discovers candidates. The runner executes
-only mutations whose entire edit is on added lines. It runs non-ignored
-Cargo tests serially without database credentials. A passing unmutated
+only mutations whose entire edit is on added lines. It runs the affected
+package's non-ignored Cargo tests serially with all features enabled and
+without database credentials. A passing unmutated
 baseline is required before it records a killed or surviving mutant.
 Unviable edits are unsupported. Timeouts, excess work and incomplete reports
 are infrastructure errors. The Actions log and verdict artifact record the

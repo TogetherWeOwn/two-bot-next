@@ -15,7 +15,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,7 +47,6 @@ jobs:
         if: steps.plan.outputs.rust == 'true'
         env:
           CARGO_PROFILE_DEV_DEBUG: '0'
-          CARGO_INCREMENTAL: '0'
         run: |
           python3 scripts/generate_command_reference.py
           python3 .github/scripts/mutation_rust.py --mode warn \

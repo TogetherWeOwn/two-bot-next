@@ -8,7 +8,8 @@ from pathlib import Path
 from mutation_rust import measure, verdict
 from mutation_scope import added_lines, git, pr_diff
 
-OLD_SOURCE = """pub fn eligible(value: i32) -> bool {
+OLD_SOURCE = """#[cfg(feature = "db")]
+pub fn eligible(value: i32) -> bool {
     let positive = value > 0;
     positive && value > 3
 }
@@ -49,7 +50,9 @@ def main():
         root = output / "crate"
         (root / "src").mkdir(parents=True)
         git(root, "init", "-q")
-        (root / "Cargo.toml").write_text('[package]\nname = "mutation-fixture"\nversion = "0.1.0"\nedition = "2021"\n')
+        (root / "Cargo.toml").write_text(
+            '[package]\nname = "mutation-fixture"\nversion = "0.1.0"\nedition = "2021"\n[features]\ndb = []\n'
+        )
         source = root / "src/lib.rs"
         source.write_text(OLD_SOURCE)
         subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root, check=True, timeout=30)
@@ -73,10 +76,10 @@ def main():
                     print(baseline_log.read_text()[-4000:])
                 raise
             assert report["out_of_scope"] > 0, report
-            assert {(row["file"], row["line"]) for row in report["results"]} == {("src/lib.rs", 3)}, report
+            assert {(row["file"], row["line"]) for row in report["results"]} == {("src/lib.rs", 4)}, report
             assert {row["status"] for row in report["results"]} == {status}, report
             assert verdict(report, "warn") == 0 and verdict(report, "hard") == hard_code
-            print(f"Rust fixture {label}: {len(report['results'])} {status} on line 3; HARD exit {hard_code}")
+            print(f"Rust fixture {label}: {len(report['results'])} {status} on line 4; HARD exit {hard_code}")
         source.write_text(NEW_SOURCE + '\n#[test]\nfn broken() { assert!(!eligible(3)); }\n')
         head = commit(root, "broken baseline")
         _, patch = pr_diff(root, base, head)
