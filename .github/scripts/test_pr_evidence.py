@@ -47,7 +47,7 @@ class EvidenceTests(unittest.TestCase):
             "### High-risk checklist", *(f"- [ ] D{i}: Fixture only." for i in range(1, 9)),
         ])
         files = [{"filename": "test_sample.py", "status": "modified"}]
-        read = lambda _: "def test_present(): pass"
+        read = lambda _: "class ExampleTests:\n    def test_present(self): pass"
         evidence.validate(policy, body, files, read)
         for changed, problem in (
                 (body.replace("test_present", "test_gone"), "no unique matching test"),

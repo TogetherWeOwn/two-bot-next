@@ -153,9 +153,11 @@ def validate(policy, body, files, read):
         if path not in titles:
             titles[path] = list(named_tests(path, read(path)))
         names, suffix = titles[path], Path(path).suffix
-        if "::" not in selector and suffix == ".rs":
-            names = [name.rsplit("::", 1)[-1] for name in names]
-        if names.count(selector.replace("::", ".") if suffix == ".py" else selector) != 1:
+        separator = {".py": ".", ".rs": "::"}.get(suffix)
+        selector = selector.replace("::", ".") if suffix == ".py" else selector
+        if separator and separator not in selector:
+            names = [name.rsplit(separator, 1)[-1] for name in names]
+        if names.count(selector) != 1:
             raise EvidenceError(f"Attestation test entry {index} has no unique matching test on this head.")
 
 
@@ -199,10 +201,8 @@ def main():
             number, base = env["PR_NUMBER"], env["PR_BASE"]
             if not NUMBER.fullmatch(number) or not SHA.fullmatch(base):
                 raise EvidenceError("Invalid PR identity.")
-            try:
-                result = check(policy, policy.GitHub(env["GH_TOKEN"], repo), number, repo, base, head)
-            except policy.ObservationError:
-                raise EvidenceError("Attestation policy or metadata request refused.") from None
+            reader = policy.GitHub(env["GH_TOKEN"], repo)
+            result = check(policy, reader, number, repo, base, head)
             output.write(f"\n**{result}.**\n")
 
 
@@ -211,5 +211,5 @@ if __name__ == "__main__":
         main()
     except EvidenceError as error:
         raise SystemExit(str(error)) from None
-    except (AttributeError, KeyError, OSError, RecursionError, SyntaxError, ValueError, subprocess.SubprocessError):
+    except Exception:
         raise SystemExit("Could not read the exact-head evidence or attested source.") from None
