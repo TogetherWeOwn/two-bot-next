@@ -19,6 +19,8 @@ import tomllib
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 from urllib.error import HTTPError, URLError
+from urllib.request import HTTPSHandler
+from urllib.response import addinfourl
 
 
 # staging_rollout imports its sibling build_identity module; the spec import
@@ -255,24 +257,27 @@ class OfflineTestCase(unittest.TestCase):
         self.enterContext(patch.object(rollout.subprocess, "run",
                                       side_effect=AssertionError("live Docker forbidden")))
 
-    def test_location_redirect_and_missing_target_keep_distinct_verdicts(self):
-        url = "https://api.cloudflare.com/client/v4/accounts/fixture/"
-        client = rollout.Client(ACCOUNT, SENTINEL)
-        for has_location, verdict in ((True, "unexpected_redirect"), (False, "api_http_failure")):
-            with self.subTest(has_location=has_location):
-                headers = Message()
-                if has_location:
-                    headers["Location"] = "https://other.example/"
-                client.opener.open.side_effect = HTTPError(url, 302, "redirect", headers,
-                                                          io.BytesIO(b"fixture"))
-                with self.assertRaisesRegex(rollout.GateError, f"^{verdict}$"):
-                    client.request(url, authenticated=True)
-
     def assert_gate(self, code, function, *args):
         with self.assertRaises(rollout.GateError) as caught:
             function(*args)
         self.assertEqual(str(caught.exception), code)
         self.assertNotIn(SENTINEL, str(caught.exception))
+
+
+class RedirectTests(unittest.TestCase):
+    def test_location_redirect_and_missing_target_keep_distinct_verdicts(self):
+        url = "https://api.cloudflare.com/client/v4/accounts/fixture/"
+        cases = (("https://other.example/", "unexpected_redirect"), (None, "api_http_failure"))
+        for location, verdict in cases:
+            headers = Message()
+            if location is not None:
+                headers["Location"] = location
+            response = addinfourl(io.BytesIO(b"fixture"), headers, url, 302)
+            response.msg = "redirect"
+            with self.subTest(location=location), patch.object(HTTPSHandler, "https_open", return_value=response) as send:
+                with self.assertRaisesRegex(rollout.GateError, f"^{verdict}$"):
+                    rollout.Client(ACCOUNT, SENTINEL).request(url, authenticated=True)
+                send.assert_called_once()
 
 
 class DeployReceiptTests(OfflineTestCase):
