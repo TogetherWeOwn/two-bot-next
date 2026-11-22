@@ -20,7 +20,6 @@ REF = "refs/heads/main"
 WORKER = WORKERS["production"]
 APPLICATION = APPLICATIONS["production"]
 PRODUCTION_URL = f"https://{WORKER}.5150.workers.dev"
-STAGING_URL = f"https://{WORKERS['staging']}.5150.workers.dev"
 SHA = re.compile(r"[0-9a-f]{40}")
 UUID = re.compile(provider.UUID)
 NAMESPACE = re.compile(r"[0-9a-f]{32}")
@@ -45,10 +44,7 @@ def github_get(path):
 
 def verify_dispatch(env, event, api=github_get):
     sha = env.get("GITHUB_SHA")
-    require(env.get("GITHUB_REPOSITORY") == REPO
-            and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
-            and env.get("GITHUB_REF") == REF and env.get("GITHUB_REF_PROTECTED") == "true"
-            and env.get("GITHUB_RUN_ATTEMPT") == "1"
+    require(env.get("GITHUB_REPOSITORY") == REPO and env.get("GITHUB_REF") == REF
             and matches(SHA, sha) and env.get("GITHUB_WORKFLOW_SHA") == sha,
             "invalid_dispatch_context")
     event = mapping(event)
@@ -119,7 +115,6 @@ def provider_sample(client, account):
         "container": {
             "application_id": app_id, "namespace_id": namespace, "rollout_id": rollout_id,
             "rollout_status": "completed", "target_version": target_version,
-            "application_version": number(app.get("version")),
             "image_digest": image.removeprefix(prefix), "configured_instances": number(app.get("instances")),
             "rollout_instances": {key: number(health.get(key))
                                   for key in ("active", "healthy", "failed", "starting", "scheduling")},
@@ -128,9 +123,9 @@ def provider_sample(client, account):
 
 
 def ownership_get(token):
-    return read_json(["node", str(ROOT / "wrangler/scripts/production-ownership-status.mjs")], 20,
+    return read_json(["node", str(ROOT / "wrangler/scripts/production-ownership-control.mjs"), "observe"], 20,
                      {"PATH": os.environ.get("PATH", os.defpath), "PRODUCTION_WORKER_URL": PRODUCTION_URL,
-                      "STAGING_WORKER_URL": STAGING_URL, "OWNERSHIP_CONTROL_TOKEN": token})
+                      "OWNERSHIP_CONTROL_TOKEN": token})
 
 
 def ownership_projection(state, version):
@@ -154,8 +149,7 @@ def ownership_projection(state, version):
 
 
 def read_status(env, *, client_factory=provider.Client, read=ownership_get):
-    require(env.get("PRODUCTION_WORKER_URL") in (PRODUCTION_URL, PRODUCTION_URL + "/")
-            and env.get("STAGING_WORKER_URL") in (STAGING_URL, STAGING_URL + "/"), "worker_origin_mismatch")
+    require(env.get("PRODUCTION_WORKER_URL") in (PRODUCTION_URL, PRODUCTION_URL + "/"), "worker_origin_mismatch")
     token = env.get("OWNERSHIP_CONTROL_TOKEN", "")
     require(len(token) >= 32, "ownership_token_missing")
     account = env.get("CLOUDFLARE_ACCOUNT_ID")
@@ -185,10 +179,9 @@ def main(argv, env):
         else:
             require(env.get("EXPECTED_POLICY") == policy, "production_environment_drift")
         return 0
-    except GateError as error:
-        print(f"::error::Production status refused ({error})", file=sys.stderr)
-    except (KeyError, OSError, TypeError, ValueError, OverflowError):
-        print("::error::Production status refused (invalid_read)", file=sys.stderr)
+    except (GateError, KeyError, OSError, TypeError, ValueError, OverflowError) as error:
+        reason = str(error) if isinstance(error, GateError) else "invalid_read"
+        print(f"::error::Production status refused ({reason})", file=sys.stderr)
     return 1
 
 

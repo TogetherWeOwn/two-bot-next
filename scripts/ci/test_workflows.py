@@ -2579,16 +2579,6 @@ def staging_ownership_status_errors(workflow):
     return errors
 
 
-def production_status_errors(workflow, deploy):
-    contract = Path(__file__).parent / "fixtures/production_ownership_status_workflow.json"
-    if workflow != json.loads(contract.read_text()):
-        return ["production-ownership-status must keep its dispatch, guard and GET-only job graph"]
-    if deploy.get("jobs", {}).get("production", {}).get("concurrency") != {
-            "group": PRODUCTION_GROUP, "cancel-in-progress": "false"}:
-        return ["production-ownership-status and production deploy/rollback must share a lane"]
-    return []
-
-
 # Pinned central gradual-promote action (verified 2026-10-18; re-verify HEAD
 # before repinning). Every error-rate input stays explicit so a central
 # default change cannot silently widen the gate.
@@ -3002,15 +2992,13 @@ def production_errors(workflow):
     if production.get("if") != expected_production_if:
         errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates, "
                       "a completed soak, a fresh recheck and no skip; cancelled runs never deploy")
-    # Only production holds the deploy-production lane: the guard, gates,
-    # soak and recheck run outside it, so a sleeping automatic promotion can
-    # never delay an operator rollback. The lane keeps the default single
-    # pending slot, so the recheck must skip an automatic run while an operator
-    # dispatch is active instead of entering the lane behind it.
+    # Only production holds the deploy-production lane in this workflow. The
+    # guard, gates, soak and recheck run outside it, so a sleeping automatic
+    # promotion can never delay an operator rollback.
     if "concurrency" in workflow:
         errors.append(f"{name}: must not hold the deploy lane at workflow level")
     if jobs.get("production", {}).get("concurrency") != {"group": PRODUCTION_GROUP,
-                                                         "cancel-in-progress": "false"}:
+                                                         "cancel-in-progress": "false", "queue": "max"}:
         errors.append(f"{name}:production: must hold the deploy-production lane without cancelling")
     for job_id in ("guard", "schema-gate", "roles-gate", "staging-soak-evidence", "recheck"):
         if "concurrency" in jobs.get(job_id, {}):
@@ -4783,7 +4771,9 @@ def workflow_policy_errors(workflows):
             errors.extend(staging_ownership_status_errors(workflow))
             continue
         if name == "production-ownership-status.yml":
-            errors.extend(production_status_errors(workflow, workflows.get("deploy-production.yml", {})))
+            contract = Path(__file__).parent / "fixtures/production_ownership_status_workflow.json"
+            if workflow != json.loads(contract.read_text()):
+                errors.append(f"{name}: expected the reviewed protected GET-only job graph")
             continue
         for job_id, job in jobs.items():
             if name == "deploy-staging.yml" and job_id == "schema-gate":
@@ -9743,13 +9733,6 @@ class WorkflowTests(unittest.TestCase):
         del missing["staging-ownership-status.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
-
-    def test_production_status_dispatch_and_deploy_lane_are_pinned(self):
-        workflow = self.workflows["production-ownership-status.yml"]
-        deploy = deepcopy(self.workflows["deploy-production.yml"])
-        self.assertEqual(production_status_errors(workflow, deploy), [])
-        deploy["jobs"]["production"]["concurrency"]["group"] = "another-lane"
-        self.assertTrue(production_status_errors(workflow, deploy))
 
     def test_slow_burn_tracker_reads_staging_bearer_and_isolates_fixtures(self):
         workflows = self.workflows

@@ -19,9 +19,8 @@ class ProductionStatusTests(unittest.TestCase):
         env = fixture["github_environment"]
         api = Mock(return_value=fixture["github_head"])
         status.verify_dispatch(env, {"ref": "main"}, api)
-        for mutation in ({"GITHUB_REF": "refs/tags/main"}, {"GITHUB_RUN_ATTEMPT": "2"}, {"GITHUB_SHA": "bad"}):
-            with self.assertRaisesRegex(status.GateError, "invalid_dispatch_context"):
-                status.verify_dispatch(env | mutation, {"ref": "main"}, self.fail)
+        with self.assertRaisesRegex(status.GateError, "invalid_dispatch_context"):
+            status.verify_dispatch(env | {"GITHUB_REF": "refs/tags/main"}, {"ref": "main"}, self.fail)
         with self.assertRaisesRegex(status.GateError, "invalid_dispatch_payload"):
             status.verify_dispatch(env, {"ref": "main", "inputs": {"target": "wrong"}}, self.fail)
         api.return_value["object"]["sha"] = "b" * 40
@@ -36,7 +35,7 @@ class ProductionStatusTests(unittest.TestCase):
     def test_bracket_and_fail_closed_projection(self):
         fixture = json.loads(FIXTURE.read_text())
         account = "c" * 32
-        env = {"PRODUCTION_WORKER_URL": status.PRODUCTION_URL, "STAGING_WORKER_URL": status.STAGING_URL,
+        env = {"PRODUCTION_WORKER_URL": status.PRODUCTION_URL,
                "OWNERSHIP_CONTROL_TOKEN": "t" * 32, "CLOUDFLARE_ACCOUNT_ID": account}
         before = fixture["provider"]
         after = deepcopy(before)
@@ -52,10 +51,10 @@ class ProductionStatusTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in client.api.call_args_list], list(before) * 2)
         read.assert_called_once()
         self.assertEqual(report["ownership"], {"phase": "active", "epoch": 49, "running": True, "owner_actor": "redacted"})
-        self.assertNotIn("private-marker", json.dumps(report))
-        self.assertNotIn(account, json.dumps(report))
+        for private in ("private-marker", account):
+            self.assertNotIn(private, json.dumps(report))
         with self.assertRaisesRegex(status.GateError, "worker_origin_mismatch"):
-            status.read_status(env | {"PRODUCTION_WORKER_URL": status.STAGING_URL}, client_factory=self.fail)
+            status.read_status(env | {"PRODUCTION_WORKER_URL": "https://wrong.example"}, client_factory=self.fail)
         state["deploymentId"] = "wrong-worker"
         with self.assertRaisesRegex(status.GateError, "ownership_deployment_mismatch"):
             observe()

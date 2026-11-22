@@ -381,15 +381,13 @@ class StaticGuardTests(unittest.TestCase):
     def test_concurrency_queues_instead_of_cancelling(self):
         # Job-level concurrency on production only: the guard, gates, soak
         # and recheck run outside the lane, so an automatic run can never
-        # delay an operator rollback behind a sleeping promotion. The lane
-        # keeps the default single pending slot (a third arrival cancels the
-        # queued run), so the recheck skips an automatic run while an operator
-        # dispatch is active instead of entering the lane behind it. Running
+        # delay an operator rollback behind a sleeping promotion. Running
         # jobs are never cancelled (cancel-in-progress is false).
         self.assertNotIn("concurrency", TOP)
         conc = children(JOBS["production"][1:], 4).get("concurrency", [])
         self.assertIn("|| 'deploy-production' }}", "\n".join(conc))
         self.assertIn("cancel-in-progress: false", "\n".join(conc))
+        self.assertIn("queue: max", "\n".join(conc))
         for job in ("guard", "schema-gate", "roles-gate", "staging-soak-evidence", "recheck"):
             self.assertNotIn("concurrency", children(JOBS[job][1:], 4))
         # The soak is the one job that holds the canonical staging lifecycle

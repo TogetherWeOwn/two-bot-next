@@ -329,14 +329,13 @@ missing proof rather than renew or promote. This holder does not authorize B2.
 Lifecycle NDJSON and available
 measurement JSON are always retained as
 `staging-soak[-start]-<run_id>-<run_attempt>` for seven days. The soak runs outside the
-`deploy-production` lane — only the `production` job holds it —
-so a staging wait never queues an operator production rollback behind it. The lane keeps the default single pending slot, so a `recheck`
+`deploy-production` lane — only the `production` job holds it in this workflow —
+so a staging wait never queues an operator production rollback behind it. A `recheck`
 job waits for the soak and both gates, then re-reads the disable, the hold,
 the live revision and the active dispatches immediately before the deploy: a
 disable set, a hold set, a target gone live or stale, or an operator dispatch queued, waiting or in
 progress while the gates built or the soak slept skips green instead of
-deploying through the incident — or entering the lane behind a recovery run
-and cancelling it. A failed soak fails closed into no deploy, an unreadable
+deploying through the incident. A failed soak fails closed into no deploy, an unreadable
 dispatch list skips green (the backstop retries), and a cancelled run never
 deploys. The residual race is a dispatch queued in the seconds between the
 recheck and the lane entry: watch the lane when recovering. The run then
@@ -483,7 +482,7 @@ container image, with takeover) through the same reviewed
 red. If the watch cannot read Cloudflare it fails red without rolling back.
 Because the watch runs inside the `production` job, the `deploy-production`
 lane stays held from the deploy to the end of the watch: no newer deploy
-lands mid-watch and no separate job re-enters the single pending slot. An
+lands mid-watch. An
 operator who needs the lane sooner cancels the run. The GitHub Deployment
 record is written before the watch; a watch rollback shows in the run
 summary and its evidence artifact. As after a manual rollback, set
@@ -870,13 +869,10 @@ takeover order apply to the revert.
 
 ### Read production ownership without starting the bot
 
-An authorized operator can run **Actions → production-ownership-status**
-from `main` with a fresh dispatch and no inputs. The job rechecks current main
-and `production` Environment policy inside the deploy and rollback lane.
-
-Open **Read bracketed production ownership status** in the job log for matching
-Worker and Container rollout samples around one authenticated ownership GET.
-Per-instance digests, historical rollouts and writer exclusivity need separate evidence.
+After deploy runs using the old queue policy finish, dispatch
+**Actions → production-ownership-status** on `main` with no inputs. Cancel
+any waiting status run when recovery needs the lane. Find the receipt under
+**Read bracketed production ownership status**. Changing rollout counters refuse it.
 
 ## `PRODUCTION_AUTO_APPROVE`
 
