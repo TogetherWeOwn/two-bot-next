@@ -239,8 +239,8 @@ fn governed_executor(
 /// preflight `admission_transport` and the commands CLI `executor`
 /// (threat-model F6).
 pub(crate) const ADMISSION_POOL_MAX: u32 = 2;
-pub(crate) const ADMISSION_STATEMENT_TIMEOUT_MS: u64 = 15_000;
-pub(crate) const ADMISSION_ACQUIRE_TIMEOUT_SECS: u64 = 10;
+pub(crate) const ADMISSION_STATEMENT_TIMEOUT_MS: u64 = two_bot_store::STATEMENT_TIMEOUT_MS;
+pub(crate) const ADMISSION_ACQUIRE_TIMEOUT_SECS: u64 = two_bot_store::pool::ACQUIRE_TIMEOUT_SECS;
 
 /// Read the one TLS policy setting; an unset value is `Required`.
 pub(crate) fn admission_tls_policy_from_env() -> Result<TlsPolicy, &'static str> {

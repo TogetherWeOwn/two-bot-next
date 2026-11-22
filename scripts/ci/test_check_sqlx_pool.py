@@ -2,6 +2,7 @@ import io
 import json
 import unittest
 from collections import Counter
+from unittest.mock import patch
 
 import check_sqlx_pool as gate
 
@@ -40,11 +41,17 @@ class CheckSqlxPoolTests(unittest.TestCase):
 
     def test_grandfathered_call_passes_and_unrelated_diagnostic_is_visible(self):
         path = "crates/store/tests/legacy.rs"
+        eager = diagnostic(
+            gate.OWNER, 23,
+            message="use of a disallowed method `sqlx_core::pool::PoolOptions::connect_with`",
+            text=".connect_with(options)",
+        )
         result, output = self.check(
             {(path, 10), (gate.OWNER, 24)},
-            [diagnostic(path, 7), diagnostic(path, 10, message="unrelated error", code="E0308")],
+            [eager, diagnostic(path, 7), diagnostic(path, 10, message="unrelated error", code="E0308")],
         )
         self.assertFalse(result)
+        self.assertIn("2 grandfathered lines", output)
         self.assertNotIn(f"{path}:7", output)
         self.assertIn(f"{path}:10 unrelated error", output)
 
@@ -59,3 +66,24 @@ class CheckSqlxPoolTests(unittest.TestCase):
             self.check(diagnostics=[diagnostic(gate.FIXTURE, 15)])
         with self.assertRaisesRegex(ValueError, "successful build"):
             self.check(success=False)
+
+    def test_rollout_reports_new_constructor_without_blocking(self):
+        path = "crates/store/src/new.rs"
+        records = [
+            diagnostic(gate.OWNER, 24, message=gate.LAZY_METHOD, text=".connect_lazy_with(options))"),
+            diagnostic(path, 9),
+        ]
+        for line, source in enumerate(gate.FIXTURE_SOURCE.read_text().splitlines(), 1):
+            if source.endswith("// disallowed"):
+                records.append(diagnostic(gate.FIXTURE, line))
+        records.append({"reason": "build-finished", "success": True})
+        for mode, blocked in (("warn", False), ("hard", True)):
+            with (
+                self.subTest(mode=mode),
+                patch.object(gate.sys, "argv", ["gate", "--base-ref", "base", "--head-ref", "head", "--mode", mode]),
+                patch.object(gate.sys, "stdin", iter(map(json.dumps, records))),
+                patch.object(gate.sys, "stderr", io.StringIO()) as output,
+                patch.object(gate.runpy, "run_path", return_value={"added_lines": lambda *_: ({(path, 9)}, "")}),
+            ):
+                self.assertEqual(gate.main(), blocked)
+                self.assertIn("1 new violations", output.getvalue())

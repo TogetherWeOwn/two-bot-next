@@ -16,6 +16,8 @@ use two_bot_core::database_tls::{self, TlsPolicy};
 pub const DB_POOL_MAX: u32 = 5;
 /// Legacy statement timeout (`statementTimeoutMillis ?? 15_000`).
 pub const STATEMENT_TIMEOUT_MS: u64 = 15_000;
+/// Runtime bound for acquiring a connection, including opening a new socket.
+pub const ACQUIRE_TIMEOUT_SECS: u64 = 10;
 
 /// Pool construction failure. Messages never include the URL (it may carry
 /// credentials).
@@ -126,7 +128,7 @@ pub async fn connect_pool_with_tls(
     // its own bound so a dead host fails the boot probe instead of hanging it.
     let pool = PgPoolOptions::new()
         .max_connections(DB_POOL_MAX)
-        .acquire_timeout(Duration::from_secs(10))
+        .acquire_timeout(Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
         .connect_with(options)
         .await?;
     Ok(pool)
@@ -141,8 +143,13 @@ pub fn connect_lazy_pool_with_tls(
     let options = runtime_connect_options(url, tls)?;
     Ok(PgPoolOptions::new()
         .max_connections(max_connections)
-        .acquire_timeout(Duration::from_secs(10))
+        .acquire_timeout(Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
         .connect_lazy_with(options))
+}
+
+/// Ping the database: `true` when a trivial query answers.
+pub async fn ping(pool: &Pool<Postgres>) -> bool {
+    sqlx::query("SELECT 1").fetch_one(pool).await.is_ok()
 }
 
 fn runtime_connect_options(url: &str, tls: TlsPolicy) -> Result<PgConnectOptions, ConnectError> {
@@ -160,9 +167,4 @@ fn runtime_connect_options(url: &str, tls: TlsPolicy) -> Result<PgConnectOptions
         two_bot_core::database_url::connect_options(url).map_err(|_| ConnectError::InvalidUrl)?;
     Ok(database_tls::apply(parsed, tls)
         .options([("statement_timeout", format!("{STATEMENT_TIMEOUT_MS}ms"))]))
-}
-
-/// Ping the database: `true` when a trivial query answers.
-pub async fn ping(pool: &Pool<Postgres>) -> bool {
-    sqlx::query("SELECT 1").fetch_one(pool).await.is_ok()
 }

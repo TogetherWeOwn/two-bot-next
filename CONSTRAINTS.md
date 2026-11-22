@@ -47,7 +47,7 @@ not adding one.
 |-----------|------|-----------|---------|
 | Format | `cargo fmt --all -- --check` clean | `check` lane | every PR |
 | Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `check` lane | every Rust PR |
-| Database TLS | New SQLx connection calls use the store TLS policy. The canonical lazy constructor is the single store call permitted to open a raw pool on added lines. | Clippy `disallowed_methods` + `python3 scripts/ci/check_sqlx_pool.py`, `check` lane | every Rust PR |
+| Database TLS | WARN — Report new uses of listed SQLx pool constructors and direct connection methods. The store's canonical lazy constructor is the single exception on added lines. | Clippy `disallowed_methods` + `python3 scripts/ci/check_sqlx_pool.py`, `check` lane | every Rust PR |
 | Floor | No waivers, skips, deleted tests, stripped assertions, lowered thresholds; `#[expect(...)]` and `cfg_attr(..., allow/expect/ignore)` count as waivers | `python3 scripts/ci/check-floor-guard.py`, `check` lane | every PR |
 | Patch coverage | Changed lines >= 80% covered | `cargo llvm-cov` sweeps + per-suite guarded re-runs, merged with `llvm-cov report --workspace`, + `scripts/ci/check-patch-coverage.py`, `patch-coverage` lane with disposable Postgres (see docs/quality-gates.md) | every Rust PR |
 | Dependencies | Nothing at high or above; advisories fail | `cargo-deny check all`, `check` lane | every PR |

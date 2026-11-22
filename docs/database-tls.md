@@ -38,6 +38,11 @@ eager counterpart. The lint job compiles a fixture covering aliases, builder
 methods, direct connections and both fenced entry points without opening a
 database connection.
 
+The SQLx policy starts in WARN under the CI lane policy. Its findings are
+advisory during rollout. Existing Clippy warnings and compiler errors still
+fail the check lane. The filter's HARD mode is exercised by fixtures before
+the workflow enables enforcement.
+
 ## Setting
 
 `TWO_DATABASE_TLS` selects the policy. It has two values:

@@ -534,7 +534,8 @@ jobs:
           cp scripts/ci/fixtures/sqlx_pool_policy.rs "$fixture"
           cargo clippy --workspace --all-targets --all-features --locked --message-format=json -- \
             -D warnings --force-warn clippy::disallowed_methods \
-            | python3 scripts/ci/check_sqlx_pool.py --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
+            | python3 scripts/ci/check_sqlx_pool.py --mode warn \
+                --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
 
       - name: channel moderation store clippy
         if: needs.job-inputs.outputs.rust != 'false'

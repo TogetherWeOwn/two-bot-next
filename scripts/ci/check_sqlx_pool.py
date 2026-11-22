@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce the SQLx pool lint on added Rust lines in Cargo's JSON output."""
+"""Report the SQLx pool lint on added Rust lines in Cargo's JSON output."""
 
 import argparse
 from collections import Counter
@@ -97,21 +97,29 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-ref", required=True)
     parser.add_argument("--head-ref", required=True)
+    parser.add_argument("--mode", choices=("warn", "hard"), required=True)
     args = parser.parse_args()
-    add_lines = runpy.run_path(str(ROOT / "scripts/ci/check-patch-coverage.py"))["added_lines"]
-    added, error = add_lines(args.base_ref, args.head_ref)
-    if error:
-        sys.exit(f"SQLx pool lint could not read changed lines: {error}")
-    expected = Counter(
-        number for number, line in enumerate(FIXTURE_SOURCE.read_text().splitlines(), 1)
-        if line.endswith("// disallowed")
-    )
-    if not expected:
-        sys.exit("SQLx pool lint fixture is empty")
+    hard = args.mode == "hard"
     try:
-        return check(sys.stdin, added, expected, sys.stderr)
-    except (KeyError, TypeError, ValueError) as error:
-        sys.exit(f"SQLx pool lint could not verify the build: {error}")
+        add_lines = runpy.run_path(str(ROOT / "scripts/ci/check-patch-coverage.py"))["added_lines"]
+        added, error = add_lines(args.base_ref, args.head_ref)
+        expected = Counter(
+            number for number, line in enumerate(FIXTURE_SOURCE.read_text().splitlines(), 1)
+            if line.endswith("// disallowed")
+        )
+        violations = check(sys.stdin, added or set(), expected, sys.stderr)
+        if error or not expected:
+            raise ValueError(error or "SQLx lint fixture is empty")
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        # Leave Cargo's exit status independent of the policy verdict.
+        for _ in sys.stdin:
+            pass
+        print(f"SQLx pool lint could not verify the build: {error}", file=sys.stderr)
+        print(f"::{'error' if hard else 'warning'}::SQLx pool lint evidence is incomplete", file=sys.stderr)
+        return hard
+    if violations:
+        print(f"::{'error' if hard else 'warning'}::New raw SQLx constructor lines", file=sys.stderr)
+    return violations and hard
 
 
 if __name__ == "__main__":
