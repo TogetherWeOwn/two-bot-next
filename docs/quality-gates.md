@@ -106,6 +106,20 @@ lint-only `check` lane.
   `cfg_attr(..., allow/expect/ignore)` count as waivers. The
   guard reads that table from the base branch, so a PR cannot exempt itself.
 
+## Changed-line mutation testing
+
+The Rust lane runs in WARN on GitHub Actions pull-request heads. It checks
+the existing job selector and uses the merge-base diff. Pure deletions and
+renames add no candidates. Pinned `cargo mutants --in-diff` discovers edits
+in `src/` and `crates/*/src/`. The lane runs edits contained in added lines.
+It first verifies the unmutated baseline. Then it runs the affected package's
+non-ignored Cargo tests serially with all features and disposable Postgres.
+Unviable edits are unsupported. Timeouts, excess work and incomplete reports
+are infrastructure errors. Receipts distinguish outcomes without publishing
+mutant source or test output. The small fixture covers killed and surviving
+mutants, a failing baseline, and scope. Review exact-head fixture and
+representative PR receipts before making the check required.
+
 ## Scanner dependency triage (review by 2026-11-16)
 
 The hash-pinned `scripts/ci/semgrep-requirements.txt` targets CI's CPython 3.11
