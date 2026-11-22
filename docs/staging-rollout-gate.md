@@ -672,15 +672,17 @@ newest completed rollout with a digest matching the application's configured
 image. The serving Worker must be the active owner. The receipt records
 its epoch and whether the container was running.
 
-Supply `plan_run_id` to authenticate the exact plan artifact and both clean
-ledgers. The bounded staging Worker fingerprints the host, database and
-branch of the direct PlanetScale URL it forwards to the container without
-connecting. It refuses routing overrides and pooled ports. A match yields `full_tuple`.
+Supply `plan_run_id` to authenticate the plan and both clean ledgers through
+cutover 0481 and store 0478 or later. The Worker fingerprints the host,
+database and exact branch pin of its direct `*.pg.psdb.cloud` binding
+without connecting. Only `sslmode` and `channel_binding` options are
+supported. A match yields `full_tuple`.
 
 `provider_only` attests provider and owner data when the Worker lacks
-fingerprint support or the plan is omitted. A mismatch on a supporting
-Worker fails the read. If every retained candidate fails ledger admission,
-qualify the first baseline through the separately authorized transition.
+fingerprint support or the plan is omitted. A supporting Worker refuses
+a mismatch. Recovery requires a fresh plan and a separate check of the
+predecessor against both ledgers. If none qualifies, use the separately
+authorized baseline transition.
 
 ## Verification boundaries
 

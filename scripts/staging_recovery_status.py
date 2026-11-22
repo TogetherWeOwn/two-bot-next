@@ -71,9 +71,10 @@ def plan_manifest(raw, digest):
         raise GateError("invalid_plan_archive") from None
 
 
-def plan_projection(plan, source):
-    require(type(plan.get("runner_version")) is int and plan["runner_version"] == 1
-            and plan.get("source_sha") == source and plan.get("migration_target") == "staging"
+def plan_projection(plan):
+    source = plan.get("source_sha")
+    require(matches(SHA, source) and type(plan.get("runner_version")) is int and plan["runner_version"] == 1
+            and plan.get("migration_target") == "staging"
             and plan.get("mode") == "plan" and plan.get("role") == "two_bot_migrator_ro"
             and number(plan.get("role_verified_connections")) == 2
             and number(plan.get("applied_count")) == number(plan.get("applied_store_count")) == 0
@@ -129,8 +130,7 @@ def verified_plan(run_id, api=github):
             and 0 < number(artifact.get("size_in_bytes")) <= MAX_PLAN, "invalid_plan_artifact")
     digest = artifact.get("digest")
     plan = plan_manifest(api(f"actions/artifacts/{artifact_id}/zip", binary=True), digest)
-    return {"run_id": int(run_id), "artifact_id": artifact_id, "archive_digest": digest,
-            **plan_projection(plan, run["head_sha"])}
+    return {"run_id": int(run_id), "artifact_id": artifact_id, "archive_digest": digest, **plan_projection(plan)}
 
 
 def checked_plan_summary(value):

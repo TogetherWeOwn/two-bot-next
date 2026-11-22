@@ -30,8 +30,8 @@ ROLLOUT_DETAIL = f"{APPS}/{APP}/rollouts/{ROLLOUT}"
 SECRET_SENTINEL = "must-not-reach-any-receipt"
 
 
-TARGET = {"host": "fixture.pg.psdb.cloud", "database": "postgres", "branch_id": "fixture_branch"}
-FINGERPRINT = sha256(json.dumps(TARGET, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+FINGERPRINT_FIXTURE = Path(__file__).resolve().parents[2] / "wrangler/test/fixtures/staging-database-fingerprint.json"
+FINGERPRINT = json.loads(FINGERPRINT_FIXTURE.read_text())["fingerprint"]
 
 
 def plan_fixture():
@@ -52,7 +52,7 @@ def github_fixture():
     raw = archive_fixture(json.dumps(plan_fixture()))
     return {
         route: {"id": 13, "path": status.PLAN_WORKFLOW, "event": "workflow_dispatch", "head_branch": "main",
-                "head_sha": SOURCE, "status": "completed", "conclusion": "success", "run_attempt": 1,
+                "head_sha": "b" * 40, "status": "completed", "conclusion": "success", "run_attempt": 1,
                 "repository": repo, "head_repository": repo},
         f"{route}/attempts/1/jobs?per_page=4": {"total_count": 3, "jobs": [
             {"name": f"staging-migrate ({name})", "conclusion": verdict}
@@ -73,7 +73,7 @@ def provider_fixture():
 
 class StagingRecoveryStatusTests(unittest.TestCase):
     def setUp(self):
-        self.plan = status.plan_projection(plan_fixture(), SOURCE)
+        self.plan = status.plan_projection(plan_fixture())
         self.routes = provider_fixture()
         self.state = {
             "deploymentId": VERSION, "running": False,
@@ -182,18 +182,21 @@ class StagingRecoveryStatusTests(unittest.TestCase):
     def test_plan_authenticates_attempt_jobs_zip_and_exact_ledger_projections(self):
         paths = github_fixture()
         receipt = status.verified_plan("13", lambda path, **kwargs: paths[path])
-        self.assertEqual((receipt["run_id"], receipt["artifact_id"]), (13, 17))
+        self.assertEqual((receipt["run_id"], receipt["artifact_id"], receipt["source_sha"]), (13, 17, SOURCE))
         self.assertEqual(receipt["target_fingerprint"], FINGERPRINT)
         self.assertEqual((receipt["cutover_version"], receipt["store_version"]), (481, 478))
         self.assertNotIn("fixture.pg.psdb.cloud", json.dumps(receipt))
         self.assertNotIn(SECRET_SENTINEL, json.dumps(receipt))
+        self.assertEqual(status.checked_plan_summary(receipt), receipt)
+        with self.assertRaisesRegex(status.GateError, "^invalid_plan_summary$"):
+            status.checked_plan_summary(dict(receipt, raw=SECRET_SENTINEL))
         paths["actions/runs/13/attempts/1/jobs?per_page=4"]["jobs"][2]["conclusion"] = "success"
         with self.assertRaisesRegex(status.GateError, "^invalid_plan_jobs$"):
             status.verified_plan("13", lambda path, **kwargs: paths[path])
         manifest = plan_fixture()
         manifest["store_plan_manifest_sha256"] = "f" * 64
         with self.assertRaisesRegex(status.GateError, "^plan_projection_mismatch$"):
-            status.plan_projection(manifest, SOURCE)
+            status.plan_projection(manifest)
 
     def test_plan_archive_refuses_wrong_digest_malformed_and_oversized_members(self):
         for raw, code in ((archive_fixture(b"{}"), "plan_archive_digest_mismatch"),
