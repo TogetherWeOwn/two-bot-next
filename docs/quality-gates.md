@@ -137,9 +137,11 @@ checks that an unchanged operator stays outside the sample.
 
 The Worker lane also runs in WARN for added TypeScript lines under
 `wrangler/src/`. The locked Babel TypeScript parser locates comparison,
-logical, arithmetic and boolean edits. The lane uses the Worker Node test
+standalone logical, arithmetic and boolean edits. It excludes chained
+logical operators to preserve grouping. The lane uses the Worker Node test
 entry point with a counts-only reporter in a disposable snapshot. The
-reporter excludes file-only passes, and the fixture covers an empty test
+reporter excludes file-only passes, and cancelled tests give an infrastructure
+verdict. The fixture covers an empty test
 file along with strong, weak and failing assertions. Unsupported edits and
 failed measurements have their own verdicts.
 The Worker suite has four minutes per execution and the lane records partial

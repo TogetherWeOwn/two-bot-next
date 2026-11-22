@@ -17,13 +17,15 @@ const operators = new Map(Object.entries({
 export function edits(source, lines) {
   const root = parse(source, { sourceType: "module", plugins: ["typescript"], tokens: true });
   const candidates = [];
-  function visit(node) {
+  function visit(node, parent) {
     if (!node || typeof node.type !== "string" || node.type === "TSLiteralType") return;
     if (node.type === "BooleanLiteral" && lines.has(node.loc.start.line)) {
       candidates.push({ line: node.loc.start.line, start: node.start, end: node.end,
         replacement: node.value ? "false" : "true" });
     }
-    if ((node.type === "BinaryExpression" || node.type === "LogicalExpression") && operators.has(node.operator)) {
+    const standaloneLogic = node.type === "LogicalExpression" &&
+      ![parent, node.left, node.right].some((operand) => operand?.type === "LogicalExpression");
+    if ((node.type === "BinaryExpression" || standaloneLogic) && operators.has(node.operator)) {
       const token = root.tokens.find(({ start, end }) => start >= node.left.end && end <= node.right.start &&
         source.slice(start, end) === node.operator);
       if (token && lines.has(token.loc.start.line)) candidates.push({
@@ -31,8 +33,8 @@ export function edits(source, lines) {
       });
     }
     for (const value of Object.values(node)) {
-      if (Array.isArray(value)) value.forEach(visit);
-      else visit(value);
+      if (Array.isArray(value)) value.forEach((child) => visit(child, node));
+      else visit(value, node);
     }
   }
   visit(root.program);
@@ -66,8 +68,8 @@ function testResult(root, args, timeoutMs) {
       const pass = summary.get("pass");
       const fail = summary.get("fail");
       if (expired) done("timeout");
-      else if (code === 1 && fail > 0) done("failed");
       else if (summary.get("cancelled") !== 0) done("infrastructure_error");
+      else if (code === 1 && fail > 0) done("failed");
       else if (code === 0 && fail === 0 && pass > 0) done("passed");
       else if (code === 0 && fail === 0 && pass === 0) done("unsupported");
       else done("infrastructure_error");

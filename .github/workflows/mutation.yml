@@ -144,7 +144,9 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 .github/scripts/mutation_scope.py
+        run: |
+          python3 .github/scripts/mutation_scope.py
+          printf '%s\n' '{"results":[{"status":"infrastructure_error","reason":"Worker setup or audit did not complete"}]}' > "$RUNNER_TEMP/worker-mutation.json"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: steps.plan.outputs.worker_fixture == 'true'
         with:
@@ -163,7 +165,10 @@ jobs:
         if: steps.plan.outputs.worker == 'true'
         shell: bash
         run: |
-          npm audit --prefix wrangler --audit-level=high --include=dev
+          if ! npm audit --prefix wrangler --audit-level=high --include=dev; then
+            echo "::warning::Worker mutation measurement blocked by the dependency audit"
+            exit 0
+          fi
           npm ci --prefix wrangler
           sandbox=$(mktemp -d "$RUNNER_TEMP/mutation-worker.XXXXXX")
           git archive HEAD | tar -x -C "$sandbox"

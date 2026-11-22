@@ -81,10 +81,10 @@ def worker_lines(added):
             if path.startswith("wrangler/src/") and path.endswith(".ts") and not path.endswith(".d.ts")}
 
 
-def main():
+def main(root=ROOT):
     head = os.environ["HEAD_SHA"]
-    base, patch = pr_diff(ROOT, os.environ["BASE_SHA"], head)
-    paths = selector["changed_files"](base, head)
+    base, patch = pr_diff(root, os.environ["BASE_SHA"], head)
+    paths = selector["changed_files"](base, head, root=root)
     jobs = selector["selection"](paths)
     lines = added_lines(patch)
     rust, python = bool(rust_lines(lines)), bool(python_lines(lines))
