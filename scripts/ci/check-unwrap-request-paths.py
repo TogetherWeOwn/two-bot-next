@@ -41,16 +41,23 @@ MAX_ANNOTATIONS = 10
 
 # The schema ast-grep rules report the full literal. Match their SQL token
 # pattern here to find the actual DDL lines within a multiline literal.
+SQL_TRIVIA = (
+    r'(?:\s|\\[nrt]|\\\r?\n'
+    r'|--(?:[^\r\n\\]|\\[^\r\nn])*(?:\r?\n|\\n)'
+    r'|/\*[^*]*(?:\*+[^*/][^*]*)*\*+/)'
+)
 SCHEMA_DDL = re.compile(
-    r'(?i)(?:\A(?:r#*)?"|;)(?:\s|\\[nrt]|\\\r?\n)*(create(?:\s|\\[nrt]|\\\r?\n)+schema)\b'
+    rf'(?ix)(?:\A(?:r\#*)?"|;){SQL_TRIVIA}*(create){SQL_TRIVIA}+(schema)\b'
 )
 
 
 def schema_ddl_lines(literal, first_line):
     for match in SCHEMA_DDL.finditer(literal):
         start = first_line + literal.count("\n", 0, match.start(1))
-        end = first_line + literal.count("\n", 0, match.end(1))
-        yield from range(start, end + 1)
+        end = first_line + literal.count("\n", 0, match.start(2))
+        yield start
+        if end != start:
+            yield end
 
 
 def run_scan(ast_grep, all_rules=False):

@@ -5,6 +5,7 @@ message: Use two_bot_testsupport::create_test_schema for scratch schemas.
 ignores:
 - 'crates/testsupport/**'
 - '**/tests/**/*.rs'
+- '**/*_tests/**/*.rs'
 - '**/tests.rs'
 - '**/test_*.rs'
 - '**/*_test*.rs'
@@ -12,15 +13,41 @@ rule:
   any:
   - kind: string_literal
   - kind: raw_string_literal
-  regex: '(?i)(?:\A(?:r#*)?"|;)(?:\s|\\[nrt]|\\\r?\n)*create(?:\s|\\[nrt]|\\\r?\n)+schema\b'
+  regex: >-
+    (?ix)(?:\A(?:r\#*)?"|;)
+    (?:\s|\\[nrt]|\\\r?\n|--(?:[^\r\n\\]|\\[^\r\nn])*(?:\r?\n|\\n)|/\*[^*]*(?:\*+[^*/][^*]*)*\*+/)*
+    create
+    (?:\s|\\[nrt]|\\\r?\n|--(?:[^\r\n\\]|\\[^\r\nn])*(?:\r?\n|\\n)|/\*[^*]*(?:\*+[^*/][^*]*)*\*+/)+
+    schema\b
+  not:
+    all:
+    - regex: '(?i)\A(?:r#*)?"\s*create\s+schema\s*"#*\z'
+    - not:
+        inside:
+          kind: arguments
+          not:
+            inside:
+              kind: call_expression
+              has:
+                field: function
+                regex: '\.(?:expect|context|contains|starts_with|ends_with)$'
   inside:
     stopBy: end
-    follows:
-      kind: attribute_item
-      regex: '^#\[\s*(?:cfg\s*\(\s*(?:test\s*\)|all\s*\(\s*(?:[^,()]+,\s*)*test\s*[,)])|(?:\w+::)*test\b)'
-      stopBy:
-        not:
-          any:
-          - kind: attribute_item
-          - kind: line_comment
-          - kind: block_comment
+    any:
+    - follows:
+        kind: attribute_item
+        any:
+        - matches: test-cfg
+        - regex: '^#\[\s*(?:\w+::)*test\b'
+        stopBy:
+          not:
+            any:
+            - kind: attribute_item
+            - kind: line_comment
+            - kind: block_comment
+    - has:
+        kind: inner_attribute_item
+        matches: test-cfg
+utils:
+  test-cfg:
+    regex: '^#!?\[\s*cfg\s*\(\s*(?:test\s*\)|all\s*\(\s*(?:[^,()]+,\s*)*test\s*[,)])'

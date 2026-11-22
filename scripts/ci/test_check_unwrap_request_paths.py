@@ -414,12 +414,12 @@ class GateTests(unittest.TestCase):
                   'let schema = two_bot_testsupport::create_test_schema(&pool).await?;\n'
         })
         head = commit(root, {
-            path: f'{legacy}\nSELECT 2;\nCREATE\nSCHEMA new;\n"#;\n'
+            path: f'{legacy}\nSELECT 2;\n-- setup\nCREATE\n/* trivia */\nSCHEMA new;\n"#;\n'
                   'let schema = two_bot_testsupport::create_test_schema(&pool).await?;\n'
         })
         for ref, literal, end_line, expected in [
             (allowed, 'r#"CREATE SCHEMA old;\nSELECT 2;\n"#', 2, 0),
-            (head, 'r#"CREATE SCHEMA old;\nSELECT 2;\nCREATE\nSCHEMA new;\n"#', 4, 1),
+            (head, 'r#"CREATE SCHEMA old;\nSELECT 2;\n-- setup\nCREATE\n/* trivia */\nSCHEMA new;\n"#', 6, 1),
         ]:
             with self.subTest(expected=expected):
                 code, output = self.run_gate([{
@@ -431,9 +431,11 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(code, expected, output)
                 self.assertNotIn(f"{path}:1 adds", output)
                 self.assertNotIn(f"{path}:2 adds", output)
+                self.assertNotIn(f"{path}:3 adds", output)
+                self.assertNotIn(f"{path}:5 adds", output)
                 if expected:
-                    self.assertIn(f"{path}:3 adds CREATE SCHEMA", output)
                     self.assertIn(f"{path}:4 adds CREATE SCHEMA", output)
+                    self.assertIn(f"{path}:6 adds CREATE SCHEMA", output)
 
     def test_fresh_unwrap_inside_macro_fails(self):
         tmp, root = make_repo()

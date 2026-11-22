@@ -6,18 +6,72 @@ snapshots:
       style: primary
       start: 24
       end: 40
+  sqlx::query("-- setup\nCREATE SCHEMA scratch");:
+    labels:
+    - source: '"-- setup\nCREATE SCHEMA scratch"'
+      style: primary
+      start: 12
+      end: 45
   sqlx::query("select 1; cReAtE\tScHeMa if not exists scratch");:
     labels:
     - source: '"select 1; cReAtE\tScHeMa if not exists scratch"'
       style: primary
       start: 12
       end: 60
+  sqlx::query(ddl("CREATE SCHEMA", &schema));:
+    labels:
+    - source: '"CREATE SCHEMA"'
+      style: primary
+      start: 16
+      end: 31
   sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {name}")));:
     labels:
     - source: '"CREATE SCHEMA {name}"'
       style: primary
       start: 40
       end: 62
+  ? |
+    sqlx::raw_sql(r#"
+        SELECT 1;
+        /* fixture setup */
+        -- schema for this test
+        CREATE
+        /* statement trivia */
+        SCHEMA scratch;
+    "#);
+  : labels:
+    - source: |-
+        r#"
+            SELECT 1;
+            /* fixture setup */
+            -- schema for this test
+            CREATE
+            /* statement trivia */
+            SCHEMA scratch;
+        "#
+      style: primary
+      start: 14
+      end: 144
+  ? |
+    sqlx::raw_sql(r#"
+        SELECT 1;
+        /* fixture setup */
+        -- schema for this test
+        CREATE
+        SCHEMA scratch;
+    "#);
+  : labels:
+    - source: |-
+        r#"
+            SELECT 1;
+            /* fixture setup */
+            -- schema for this test
+            CREATE
+            SCHEMA scratch;
+        "#
+      style: primary
+      start: 14
+      end: 117
   ? |
     sqlx::raw_sql(r#"
         SELECT 1;

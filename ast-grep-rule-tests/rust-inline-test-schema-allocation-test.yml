@@ -8,6 +8,7 @@ valid:
   #[cfg(test)]
   mod tests {
       fn setup() { sqlx::raw_sql(include_str!("fixtures/schema_behavior.sql")); }
+      fn guard() { let banned = ["CREATE SCHEMA", "DROP SCHEMA"]; }
   }
 invalid:
 - |
@@ -24,3 +25,6 @@ invalid:
   #[tokio::test(flavor = "multi_thread")]
   #[ignore = "requires disposable test database"]
   async fn example() { sqlx::query("CREATE SCHEMA scratch"); }
+- |
+  #![cfg(test)]
+  fn setup() { sqlx::query("/* setup */ CREATE SCHEMA scratch"); }
