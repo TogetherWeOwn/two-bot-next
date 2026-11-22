@@ -19,11 +19,6 @@ WITH RECURSIVE expected AS (
       AND (s.nspname = 'web_v1' OR pg_get_userbyid(c.relowner) = 'two_bot_migrator'
            OR EXISTS (SELECT 1 FROM expected e WHERE e.schema_name = s.nspname
                       AND e.name = c.relname AND e.kind <> 'function'))
-), column_types AS (
-    SELECT atttypid FROM pg_attribute WHERE attrelid IN (SELECT oid FROM relations)
-      AND attnum > 0 AND NOT attisdropped
-    UNION SELECT child.oid FROM column_types c JOIN pg_type t ON t.oid = c.atttypid
-    CROSS JOIN LATERAL unnest(ARRAY[t.typelem, t.typbasetype]) child(oid) WHERE child.oid <> 0
 ), routines AS (
     SELECT p.*, s.nspname AS schema_name,
            format('%s(%s)', p.proname, oidvectortypes(p.proargtypes)) AS signature
@@ -32,6 +27,13 @@ WITH RECURSIVE expected AS (
        OR EXISTS (SELECT 1 FROM expected e WHERE e.schema_name = s.nspname
                   AND e.name = format('%s(%s)', p.proname, oidvectortypes(p.proargtypes))
                   AND e.kind = 'function')
+), used_types AS (
+    SELECT atttypid AS oid FROM pg_attribute WHERE attrelid IN (SELECT oid FROM relations)
+      AND attnum > 0 AND NOT attisdropped
+    UNION SELECT prorettype FROM routines
+    UNION SELECT unnest(coalesce(proallargtypes, proargtypes::oid[])) FROM routines
+    UNION SELECT child.oid FROM used_types u JOIN pg_type t ON t.oid = u.oid
+    CROSS JOIN LATERAL unnest(ARRAY[t.typelem, t.typbasetype]) child(oid) WHERE child.oid <> 0
 ), present AS (
     SELECT schema_name, relname::text AS name, CASE relkind
         WHEN 'S' THEN 'sequence' WHEN 'v' THEN 'view'
@@ -90,17 +92,18 @@ SELECT jsonb_build_object(
                                 THEN e.kind ELSE 'table' END)
         ORDER BY e.schema_name, e.name),
     'unsupported', EXISTS (SELECT 1 FROM relations WHERE relkind IN ('f', 'c'))
-        OR EXISTS (SELECT 1 FROM column_types u JOIN pg_type t ON t.oid = u.atttypid
-            JOIN pg_class c ON c.oid = t.typrelid WHERE c.relkind = 'c')
         OR EXISTS (SELECT 1 FROM routines WHERE prokind = 'a')
         OR EXISTS (SELECT 1 FROM pg_shdepend d JOIN pg_database b ON b.oid = d.dbid
             WHERE b.datname = current_database() AND d.deptype = 'o'
               AND d.refobjid = 'two_bot_migrator'::regrole::oid
               AND d.classid NOT IN ('pg_class'::regclass, 'pg_proc'::regclass, 'pg_type'::regclass,
                   'pg_namespace'::regclass, 'pg_extension'::regclass, 'pg_default_acl'::regclass))
-        OR EXISTS (SELECT 1 FROM pg_type t JOIN schemas s ON s.oid = t.typnamespace
-            WHERE t.typrelid = 0 AND t.typelem = 0
-              AND (s.nspname = 'web_v1' OR pg_get_userbyid(t.typowner) = 'two_bot_migrator')
+        OR EXISTS (SELECT 1 FROM pg_type t LEFT JOIN schemas s ON s.oid = t.typnamespace
+            -- FirstNormalObjectId excludes PostgreSQL's built-in types.
+            WHERE t.oid >= 16384 AND t.typrelid NOT IN (SELECT oid FROM relations)
+              AND t.oid NOT IN (SELECT typarray FROM pg_type)
+              AND (t.oid IN (SELECT oid FROM used_types) OR (s.oid IS NOT NULL
+                   AND (s.nspname = 'web_v1' OR pg_get_userbyid(t.typowner) = 'two_bot_migrator')))
               AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_type'::regclass
                               AND d.objid = t.oid AND d.deptype = 'e')),
     'extensions', ARRAY(SELECT jsonb_build_object(

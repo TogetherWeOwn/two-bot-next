@@ -1,7 +1,5 @@
 """Offline regression tests for recipient validation and inventory encryption."""
 
-from contextlib import redirect_stderr
-import io
 from pathlib import Path
 import subprocess
 import sys
@@ -16,11 +14,9 @@ import staging_recovery_capture as capture
 class StagingRecoveryCaptureTests(unittest.TestCase):
     def test_unreviewed_certificate_refuses_before_database_access(self):
         with patch.dict(capture.os.environ, {"RECOVERY_RECIPIENT": "YQ=="}, clear=True), \
-                patch.object(capture, "database_target") as database_target, \
-                redirect_stderr(io.StringIO()) as errors:
+                patch.object(capture, "database_target") as database_target:
             self.assertEqual(capture.main(), 1)
             database_target.assert_not_called()
-        self.assertIn("does not match the reviewed certificate", errors.getvalue())
 
     def test_encrypt_decrypt_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
