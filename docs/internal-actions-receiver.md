@@ -24,9 +24,9 @@ catalogue's broader defaults. Every other verb stays refused by the per-effect
 fences.
 The public health/readiness/metrics router has no action route. The shipped
 Worker exposes only the staging ingress below, dark until separately enabled.
-Its explicit container wiring carries neither role keys nor the optional
-`TWO_INTERNAL_ALLOW_*` gates: `role.assign` has no configured role target, and
-the gated verbs above stay refused. The ungated `announcement.post` and
+Its explicit container wiring forwards one optional capability, the default-off
+staging gate for `voice.move_member`. `role.assign` has no configured role target.
+The other optional gates stay off. The ungated `announcement.post` and
 `event.upsert` paths remain subject to receiver authentication, target validation
 and durable execution fences; this is not evidence that either has run.
 Adding secrets cannot enable unforwarded role/capability gates. Do not stage
@@ -124,6 +124,7 @@ only while `TWO_INTERNAL_ACTIONS` is exactly `1`:
 | `TWO_INTERNAL_CONTAINER` | Worker constant `1`: the Worker sets it to mark the process as running inside the container network, where the wildcard bind is reachable only via `containerFetch` and the startup port check. That network is presumed private but unverified. The marker is a deployment claim, not a proof: the bot trusts it only because the Worker (not the Operator) sets it. A wildcard bind without exactly this marker is refused. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Worker secret, e.g. `smoke-throwaway:<channel snowflake in the TWO Staging guild>` |
 | `TWO_INTERNAL_KEYS` | Worker secret `web-staging:<64 hex>`; never a var, never logged |
+| `TWO_INTERNAL_ALLOW_VOICE_MOVE` | Optional staging Worker secret. Forwarded only as exactly `1` with the private receiver enabled and `TWO_DEPLOY_ENV=staging`. The container repeats the staging and exact-value checks at bind. |
 
 `NOT_FORWARDED` in `wrangler/src/container-env.ts` deliberately excludes the
 following. Setting them as Worker secrets cannot change the container's
@@ -143,11 +144,12 @@ capabilities; this table is not an instruction to create or stage them.
 | `TWO_INTERNAL_ALLOW_SETTINGS` | Settings get/set stay gated off |
 | `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | `voice.snapshot` stays gated off |
 
-`bind` leaves `voice.move_member` off. Attaching the executor applies its five-second
-nonce deadline to all signed verbs. The guild turn ends at adapter settlement. The
-child holds capacity through the private terminal receipt unless force-drained.
-An indefinite PATCH cooldown retains the durable hold and returns `discord_unavailable`.
-A `rate_limited` reply carries a validated `Retry-After`.
+The self-move executor is attached at bind only with the staging opt-in.
+Attaching it applies the five-second nonce deadline to all signed verbs. The
+guild turn ends at adapter settlement. The child holds receiver capacity through
+the terminal audit, with up to five seconds beyond the wire deadline to confirm
+the write. A failed or timed-out audit write is logged as unconfirmed. The
+caller can time out before the audit completes, and a forced drain can interrupt it.
 
 Fixed receiver port: **8091** (health stays on `BOT_PORT` 8080, and the two may
 not be equal while the receiver is enabled). While enabled, 8091 joins the
@@ -182,7 +184,7 @@ in `docs/production-deploy.md`).
    readiness, wait for a separately authorized bounded staging-use window for
    that same deployment; do not probe idle staging. A merge alone does not
    prove deployment. `/health` and `/readyz` are unchanged.
-2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values), only under the separately authorized enablement contract; no role keys or optional capability gates travel through this Worker.
+2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values), only under the separately authorized enablement contract. Keep the optional voice-move gate off during receiver setup.
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
 4. Operator applies migrations `0423` (settings CAS) and `0424` (event outcome) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
 5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete --env staging TWO_INTERNAL_ACTIONS --message <sha>`, same precheck and stamp as above), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
@@ -434,9 +436,25 @@ Success (`200` only, `result` always an object, no `error` key):
 | event.read | full observed event | behind its allowlist flag |
 | voice.snapshot | live voice-room listing | behind its allowlist flag; refuses `discord_unavailable` unless the gateway is connected, so a warm cache never serves stale occupancy mid-reconnect. A rebuilding, unavailable or busy cache also refuses instead of serving a partial listing. Each room carries `occupied_since` (Zulu instant the current continuous occupancy began, or `null` when unknown — empty rooms and joins the gateway never witnessed are unknown, never guessed) and, only on the room bound to a currently-windowed event's voice channel, `event_key` (absent means unlinked). A store error behind the key map refuses `internal` instead of serving key-omitted rooms |
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
+| voice.move_member | `{outcome, from_channel_id}` for `moved`, `{outcome}` for `already_in_room`, `not_connected`, `not_permitted`, `room_full`, `room_gone` or `bot_not_permitted` | Keyless and limited to the staging guild. Domain refusals have zero affected members. |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
 | moderation.\* | `{outcome[, affected]}` | |
+
+The trusted website signer derives `discord_id` from the authenticated end-user
+session and signs it with `channel_id`. The bot accepts one subject and uses it
+for the rate limit, permission checks, PATCH and terminal audit. Session ownership
+is a signer responsibility. The member bucket allows a burst of six and refills
+one token every 50 seconds.
+
+A request needs fresh gateway occupancy and destination permission evidence.
+`not_permitted` and `not_connected` are determined before a PATCH. A move sends
+at most one PATCH. A finite cooldown returns HTTP 429 `rate_limited` with a
+validated `Retry-After`. An indefinite PATCH cooldown retains the durable send
+fence and returns HTTP 502 `discord_unavailable`. A lost reply can leave the
+move unconfirmed. A fresh, bounded attempt for the same intent uses a new nonce
+and can return `already_in_room` once newer gateway evidence clears the member's
+hold. A preserved hold can still return `discord_unavailable`.
 
 Snapshot event links use accepted, non-member `event_instance_windows`
 evidence (migration 0472), not channel-claim dates or the continued existence
@@ -489,7 +507,7 @@ the human gloss):
 
 | Situation | Next action |
 | --- | --- |
-| `retryable: true` (408, 409 `in_progress`, 429, 500, 502 `discord_unavailable`, 503 `busy`, 504) | Retry the same `Idempotency-Key`; never mint a new key for an unknown outcome. Honor `Retry-After` when present. |
+| `retryable: true` (408, 409 `in_progress`, 429, 500, 502 `discord_unavailable`, 503 `busy`, 504) | For keyed actions retry the same `Idempotency-Key`. For keyless self-moves use fresh signing headers. Honor `Retry-After` when present. |
 | `needs_reconciliation` (409) | Reconcile by hand first (see the event rules above); never re-submit under a new key. |
 | `replayed` / `version_conflict` (409) | Same key already decided or superseded: read the stored outcome, use a new key only for a new intent. |
 | 401 / 403 | Fix the caller: signing key, timestamp/nonce freshness, action allowlist. Do not retry the bytes. |

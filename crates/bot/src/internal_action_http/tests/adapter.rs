@@ -699,6 +699,106 @@ async fn voice_move_signed_uncertain_patch_holds_until_newer_gateway_evidence() 
     signed_voice_move(true, true).await;
 }
 
+#[tokio::test]
+async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_member() {
+    const MEMBER: &str = "111111111111111141";
+    const OTHER: &str = "111111111111111142";
+    const SOURCE: &str = "111111111111111131";
+    const TARGET: &str = "111111111111111135";
+    let Some(db) = database().await else { return };
+    let facts = move_facts([MEMBER, SOURCE, TARGET]);
+    let mut denied = facts.clone();
+    denied[2].1["permission_overwrites"] =
+        json!([{ "id": MEMBER, "type": 1, "allow": "0", "deny": "1048576" }]);
+    let disconnected = facts.iter().take(3).cloned().collect::<Vec<_>>();
+    let mock = MockDiscord::start(
+        denied
+            .into_iter()
+            .chain(disconnected)
+            .chain(facts)
+            .chain([(StatusCode::OK, voice_member(MEMBER, false))])
+            .collect(),
+    )
+    .await;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let lane = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
+    let mut receiver = state(
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+    );
+    let raw =
+        json!({"action":"voice.move_member","discord_id":MEMBER,"channel_id":TARGET}).to_string();
+    let (status, _, body) = answer(router(receiver.clone()), signed_read(&raw, "old")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    mock.assert_wires(0);
+    let inner = Arc::get_mut(&mut receiver).unwrap();
+    let clock = inner.voice_clock.clone();
+    let pipeline = seed_move_pipeline(inner.voice_cache.clone(), clock.clone()).await;
+    inner.gateway_state = connected_gateway();
+    inner.voice_move =
+        Some(ActionExecutor::with_admission(token(), Some(mock.origin.clone()), lane).unwrap());
+    let app = router(receiver);
+    let (parts, _) = signed_read(&raw, "old").into_parts();
+    let tampered = Request::from_parts(parts, Body::from(raw.replace(MEMBER, OTHER)));
+    assert_eq!(
+        answer(app.clone(), tampered).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    mock.assert_wires(0);
+
+    for (room, outcome, wires) in [
+        (Some(SOURCE), "not_permitted", 6),
+        (None, "not_connected", 9),
+    ] {
+        publish_move_room(&pipeline, MEMBER, room).await;
+        let delivery = nonce();
+        let (status, _, body) =
+            answer(app.clone(), signed_read_with_nonce(&raw, "old", &delivery)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"], json!({"outcome": outcome}));
+        let receipt: (String, String, Option<i64>) = sqlx::query_as(
+            "SELECT outcome, target_id, affected FROM internal_action_log \
+             WHERE request_id = $1 AND delivery_hash = $2 AND phase = 'terminal'",
+        )
+        .bind(body["request_id"].as_str().unwrap())
+        .bind(two_bot_core::internal_actions::body_hash(
+            delivery.as_bytes(),
+        ))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipt, (outcome.to_owned(), MEMBER.to_owned(), Some(0)));
+        mock.assert_wires(wires);
+        mock.assert_patch_indices(&[]);
+        assert_eq!(
+            clock.move_holds.lock().unwrap().occupancy(
+                MEMBER.parse().unwrap(),
+                TARGET.parse().unwrap(),
+                0
+            ),
+            Ok(0)
+        );
+    }
+
+    publish_move_room(&pipeline, MEMBER, Some(SOURCE)).await;
+    let (status, _, body) = answer(app, signed_read(&raw, "old")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"],
+        json!({"outcome":"moved", "from_channel_id":SOURCE})
+    );
+    mock.assert_wires(16);
+    mock.assert_patch_indices(&[15]);
+    let patch = mock.requests.lock().unwrap()[15].clone();
+    assert!(patch["path"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("/guilds/{}/members/{MEMBER}", staging_guild())));
+    assert_eq!(patch["body"], json!({"channel_id": TARGET}));
+    db.close().await.unwrap();
+}
+
 async fn signed_voice_move(uncertain: bool, with_retry_after: bool) {
     use VoiceMoveOutcome::{BotNotPermitted, DiscordUnavailable, Moved, RateLimited};
     const FIRST: &str = "111111111111111141";

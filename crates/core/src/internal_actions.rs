@@ -911,6 +911,11 @@ impl InternalFlags {
         if flag("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT") {
             enabled.insert("voice.snapshot".to_owned());
         }
+        if flag("TWO_INTERNAL_ALLOW_VOICE_MOVE")
+            && vars.get("TWO_DEPLOY_ENV").is_some_and(|v| v == "staging")
+        {
+            enabled.insert("voice.move_member".to_owned());
+        }
         // Merely shipping the implementation must not widen the allowlist.
         if flag("TWO_INTERNAL_ALLOW_AUTOMATIONS") {
             enabled.insert("automations.import".to_owned());
@@ -1509,7 +1514,7 @@ impl<'a> VoiceMoveRequest<'a> {
     }
 }
 
-/// Closed result words for a future self-only voice move.
+/// Closed result words for a self-only voice move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceMoveOutcome {
     Moved,
