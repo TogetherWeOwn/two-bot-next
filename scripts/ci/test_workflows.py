@@ -148,7 +148,6 @@ JOB_INVENTORY = {
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
 REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
-                   ("check.yml", "ci-evidence"): "./.github/workflows/pr-evidence.yml",
                    ("deploy-production.yml", "soak"): "$/.github/workflows/staging-soak.yml",
                    (STAGING_SOAK, "voice"): "$/.github/workflows/voice-synthetic.yml",
                    ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",

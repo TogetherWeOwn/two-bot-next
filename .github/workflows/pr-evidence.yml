@@ -5,13 +5,11 @@ on:
     types: [opened, edited, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
-  workflow_call:
-    inputs:
-      publish-only:
-        type: boolean
-        default: false
-
 permissions: {}
+
+concurrency:
+  group: pr-evidence-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   pr-evidence:
@@ -35,13 +33,7 @@ jobs:
         with:
           sparse-checkout: .github/scripts
           persist-credentials: false
-      - if: "!inputs.publish-only && github.event_name == 'pull_request'"
-        env:
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-        run: git fetch --quiet --no-tags --unshallow origin "$PR_HEAD" "$PR_BASE"
       - name: Read pinned organization attestation policy
-        if: "!inputs.publish-only"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: TogetherWeOwn/.github
@@ -50,20 +42,21 @@ jobs:
           sparse-checkout: .github/scripts
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-        if: "!inputs.publish-only"
         with:
           python-version: '3.12'
       - name: Install hash-pinned source parsers
-        if: "!inputs.publish-only"
         run: 'python3 -m pip --isolated install --no-deps --only-binary=:all: --require-hashes -r .github/scripts/pr-evidence-requirements.txt'
+      - if: github.event_name == 'pull_request'
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: git fetch --quiet --no-tags --unshallow origin "$PR_HEAD" "$PR_BASE"
       - name: Verify and publish evidence
         env:
           GH_TOKEN: ${{ github.token }}
           EVIDENCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
-          EVIDENCE_MODE: ${{ inputs.publish-only && 'publish' || 'verify' }}
-        run: python3 -I .github/scripts/pr_evidence.py "$EVIDENCE_MODE"
+        run: python3 -I .github/scripts/pr_evidence.py verify
       - name: Run evidence fixtures
-        if: "!inputs.publish-only"
         run: python3 -I -m unittest discover -s .github/scripts -p test_pr_evidence.py -v
