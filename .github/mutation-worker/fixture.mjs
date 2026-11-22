@@ -30,8 +30,20 @@ try {
   const changed = JSON.parse(readFileSync(join(root, "worker-mutation-plan.json"), "utf8"));
   assert.deepEqual(changed, { [file]: [2] });
   assert.match(readFileSync(join(root, "outputs"), "utf8"), /^worker=true$/m);
-  assert.equal(JSON.parse(readFileSync(join(process.env.RUNNER_TEMP, "worker-mutation.json"), "utf8"))
-    .results[0].status, "infrastructure_error");
+  const receipt = join(process.env.RUNNER_TEMP, "worker-mutation.json");
+  const fallback = readFileSync(receipt, "utf8");
+  assert.equal(JSON.parse(fallback).results[0].status, "infrastructure_error");
+  const auditCalls = join(root, "audit-calls");
+  writeFileSync(join(root, "npm"),
+    '#!/bin/sh\nprintf "%s\\n" "$*" >> "$WORKER_MUTATION_AUDIT_FIXTURE_CALLS"\nexit 1\n', { mode: 0o700 });
+  const auditWarning = execFileSync("bash", [fileURLToPath(new URL("./measure.sh", import.meta.url))], {
+    cwd: root, encoding: "utf8", timeout: 30_000,
+    env: { ...process.env, PATH: `${root}:${process.env.PATH}`, WORKER_MUTATION_AUDIT_FIXTURE_CALLS: auditCalls },
+  });
+  assert.match(auditWarning, /::warning::Worker mutation measurement blocked by the dependency audit/);
+  assert.equal(readFileSync(auditCalls, "utf8"), "audit --prefix wrangler --audit-level=high --include=dev\n");
+  assert.equal(readFileSync(receipt, "utf8"), fallback);
+  console.log("Worker fixture: refused dependency audit preserved the infrastructure receipt");
   for (const [label, body, status, expected] of [
     ["strong", "test('boundary', () => assert.equal(eligible(3), true));", "killed", 0],
     ["weak", "test('legacy', () => assert.equal(legacy(100), true));", "survived", 1],
