@@ -1,6 +1,7 @@
 """Rollback-readiness probe regressions: local fixtures only, no network or databases."""
 
 import contextlib
+from email.message import Message
 import gzip
 import io
 import json
@@ -11,6 +12,8 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from urllib.request import HTTPSHandler
+from urllib.response import addinfourl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rollback_readiness_probe as probe  # noqa: E402
@@ -606,9 +609,14 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                 self.assertEqual(self.requested, [])
 
     def test_default_fetch_never_follows_redirects(self):
-        handler = next(handler for handler in probe.no_redirect_opener().handlers
-                       if isinstance(handler, probe.urllib.request.HTTPRedirectHandler))
-        self.assertIsNone(handler.redirect_request(None, None, 302, "Found", {}, "https://elsewhere"))
+        url = STAGING + "/readyz"
+        headers = Message()
+        headers["Location"] = "https://other.example/"
+        response = addinfourl(io.BytesIO(b"fixture"), headers, url, 302)
+        response.msg = "redirect"
+        with mock.patch.object(HTTPSHandler, "https_open", return_value=response) as send:
+            self.assertEqual(probe.fetch(url), (302, b"fixture"))
+            send.assert_called_once()
 
     def test_rejects_non_two_require_key(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
