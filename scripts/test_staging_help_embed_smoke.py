@@ -29,24 +29,38 @@ EXPECTED = {"color": 0xFF9C36, "footer_text": "Together We Own",
                         "two-icon1-dark512-4469ca165f03/public"}
 
 
+ROW_CONTRACTS = {
+    "help": ("DEFAULT", 0xFF9C36, "Help · Page 1 of 2", True, "Example discovery"),
+    "help_topic": ("DEFAULT", 0xFF9C36, "Help", True, "Example topic"),
+    "help_warn": ("WARN", 0xF2C14E, "Help", True, "Example expired page"),
+    "help_error": ("DANGER", 0xFF7A6B, "Help", True, "Example build failure"),
+    "announcement": ("DEFAULT", 0xFF9C36, "Announcements", True, "Example announcement"),
+    "echo": ("ECHO", 0x9D6AFF, "Echo", True, "Example Echo"),
+    "rsvp_ok": ("OK", 0x5FD39A, "Events", False, "Example RSVP saved"),
+    "rsvp_error": ("DANGER", 0xFF7A6B, "Events", False, "Example RSVP failed"),
+    "voice_ok": ("OK", 0x5FD39A, "Voice", False, "Example room updated"),
+    "voice_warn": ("WARN", 0xF2C14E, "Voice", False, "Example room still updating"),
+    "voice_error": ("DANGER", 0xFF7A6B, "Voice", False, "Example room update failed"),
+}
+
+
 def payloads(**overrides):
-    expected = {
-        "help": {**EXPECTED, "footer_text": EXPECTED["footer_text"] + " · Help · Page 1 of 2"},
-        "help_topic": {**EXPECTED, "footer_text": EXPECTED["footer_text"] + " · Help"},
-    }
-    embeds = {
-        key: {"type": "rich", "title": "Together We Own help", "description": key,
-              "color": brand["color"], "footer": {"text": brand["footer_text"],
-                                                   "icon_url": brand["icon_url"]}}
-        for key, brand in expected.items()
-    }
+    expected, embeds = {}, {}
+    for key, (_, color, surface, has_icon, description) in ROW_CONTRACTS.items():
+        text = f'{EXPECTED["footer_text"]} · {surface}'
+        icon = EXPECTED["icon_url"] if has_icon else None
+        expected[key] = {"color": color, "footer_text": text, "icon_url": icon}
+        footer = {"text": text, **({"icon_url": icon} if has_icon else {})}
+        embeds[key] = {"type": "rich", "description": description,
+                       "color": color, "footer": footer}
+    for key in ("help", "help_topic"):
+        embeds[key]["title"] = "Together We Own help"
     embeds["help"]["fields"] = [
         {"name": "Custom", "value": "/example"},
         {"name": "Events", "value": "/events"},
     ]
-    data = {"schema": smoke.SCHEMA, "expected": expected, "embeds": embeds}
-    data.update(overrides)
-    return data
+    return {"schema": smoke.SCHEMA, "expected": expected, "embeds": embeds,
+            **overrides}
 
 
 class FakeDiscord:
@@ -179,35 +193,38 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         # so a brand change that skips the fixture is visible offline.
         source = (ROOT / "crates/discord/src/brand.rs").read_text()
         tokens = (ROOT / "crates/discord/src/brand_tokens.rs").read_text()
-        default = re.search(
-            r"pub const BRAND_DISCORD_EMBED_DEFAULT: u32 = (0x[0-9A-F]+);", tokens
-        )
-        self.assertIsNotNone(default, "the generated kit must define the default embed colour")
-        self.assertEqual(int(default.group(1), 16), EXPECTED["color"])
+        for key, (kind, color, _, _, _) in ROW_CONTRACTS.items():
+            with self.subTest(row=key):
+                token = re.search(
+                    rf"pub const BRAND_DISCORD_EMBED_{kind}: u32 = (0x[0-9A-F]+);", tokens
+                )
+                self.assertIsNotNone(token, f"the generated kit must define {kind}")
+                self.assertEqual(int(token.group(1), 16), color)
         self.assertIn("Self::Default => BRAND_DISCORD_EMBED_DEFAULT", source)
         self.assertIn(f'BRAND_FOOTER_TEXT: &str = "{EXPECTED["footer_text"]}"', source)
         self.assertRegex(
             source, rf'BRAND_ICON_URL: &str =\s*"{re.escape(EXPECTED["icon_url"])}";')
 
-    def test_both_embeds_post_read_back_assert_and_delete(self):
-        fake = FakeDiscord()
-        code, out = self.run_main(fake)
+    def test_every_embed_posts_reads_back_and_deletes(self):
+        fake, pauses = FakeDiscord(), []
+        with (mock.patch.object(smoke, "make_transport", return_value=fake),
+              mock.patch.object(smoke.time, "sleep", side_effect=lambda delay: pauses.append((len(fake.posts()), delay)))):
+            code, out = self.run_main(None)
         self.assertEqual(0, code)
+        self.assertEqual([(count, 1.1) for count in range(1, len(ROW_CONTRACTS))], pauses)
         self.assertIn("VERDICT PASS", out)
         posts = fake.posts()
-        self.assertEqual(2, len(posts))
         want = payloads()["embeds"]
-        self.assertEqual([want["help"]], posts[0][2]["embeds"])
-        self.assertEqual([want["help_topic"]], posts[1][2]["embeds"])
-        self.assertEqual({"parse": []}, posts[0][2]["allowed_mentions"])
-        self.assertEqual({}, fake.messages, "both messages are deleted")
+        self.assertEqual([[embed] for embed in want.values()],
+                         [post[2]["embeds"] for post in posts])
+        self.assertTrue(all(post[2]["allowed_mentions"] == {"parse": []} for post in posts))
+        self.assertEqual({}, fake.messages, "all messages are deleted")
         methods = [call[0] for call in fake.calls]
-        self.assertEqual(["GET", "GET", "GET", "GET", "POST", "GET", "DELETE",
-                          "GET", "POST", "GET", "DELETE"], methods)
+        self.assertEqual(["GET", "GET", "GET"] + ["GET", "POST", "GET", "DELETE"] * len(want),
+                         methods)
         evidence = self.evidence_json()
         self.assertEqual("PASS", evidence["verdict"])
-        self.assertEqual(["help", "help_topic"],
-                         [row["name"] for row in evidence["rows"]])
+        self.assertEqual(list(want), [row["name"] for row in evidence["rows"]])
         self.assertTrue(all("message_id" in row for row in evidence["rows"]))
         self.assertNotIn(TOKEN, out)
         self.assertNotIn(TOKEN, Path(self.evidence).read_text())
@@ -222,6 +239,32 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         self.assertIn("read-back colour is 0", out)
         self.assertEqual({}, fake.messages, "failed rows still clean up")
 
+    def test_echo_read_back_rejects_the_correct_colour_for_the_wrong_surface(self):
+        def change_echo(message):
+            embed = message["embeds"][0]
+            if embed["footer"]["text"].endswith(" · Echo"):
+                embed["color"] = EXPECTED["color"]
+
+        fake = FakeDiscord(mutate_read=change_echo)
+        code, out = self.run_main(fake)
+        self.assertEqual(1, code)
+        self.assertIn("FAIL    echo: read-back colour", out)
+        self.assertIn("PASS    announcement:", out)
+        self.assertIn("PASS    rsvp_ok:", out)
+        self.assertEqual({}, fake.messages)
+
+    def test_text_only_footers_reject_icons_on_read_back(self):
+        def add_icon(message):
+            footer = message["embeds"][0]["footer"]
+            footer.setdefault("icon_url", EXPECTED["icon_url"])
+
+        fake = FakeDiscord(mutate_read=add_icon)
+        code, out = self.run_main(fake)
+        self.assertEqual(1, code)
+        for key in ("rsvp_ok", "rsvp_error", "voice_ok", "voice_warn", "voice_error"):
+            self.assertIn(f"FAIL    {key}: read-back footer icon url does not match", out)
+        self.assertEqual({}, fake.messages)
+
     def test_each_brand_field_mismatch_fails(self):
         cases = {
             "footer text": lambda m: m["embeds"][0]["footer"].update(text="Other"),
@@ -230,6 +273,7 @@ class HelpEmbedSmokeTests(unittest.TestCase):
             "footer missing": lambda m: m["embeds"][0].pop("footer"),
             "no embeds": lambda m: m.update(embeds=[]),
             "two embeds": lambda m: m["embeds"].append(m["embeds"][0]),
+            "embed author": lambda m: m["embeds"][0].update(author={"name": "Other"}),
             "wrong author": lambda m: m["author"].update(id=OTHER_APP),
         }
         for name, mutate in cases.items():
@@ -288,9 +332,9 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         # attempt must never read green over messages left behind here.
         self.assertEqual(3, code)
         self.assertIn("cleanup delete failed", out)
-        self.assertEqual(2, len(fake.messages))
+        self.assertEqual(1, len(fake.messages))
         evidence = self.evidence_json()
-        self.assertTrue(all(row.get("cleanup_failed") for row in evidence["rows"]))
+        self.assertEqual([True], [row.get("cleanup_failed") for row in evidence["rows"]])
 
     def test_timed_out_post_is_reconciled_and_removed(self):
         # Discord committed the first post but its response timed out, so
@@ -381,15 +425,25 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         unbranded["embeds"]["help"] = {"type": "rich", "description": "x"}
         missing = payloads()
         missing["embeds"].pop("help_topic")
+        missing_new = payloads()
+        for key in ("expected", "embeds"):
+            missing_new[key].pop("echo")
+        wrong_color = payloads()
+        wrong_color["embeds"]["echo"]["color"] = EXPECTED["color"]
+        non_https = payloads()
+        non_https["expected"]["help"]["icon_url"] = "http://example.com/x.png"
+        icon_on_ephemeral = payloads()
+        icon_on_ephemeral["expected"]["rsvp_ok"]["icon_url"] = EXPECTED["icon_url"]
+        icon_on_ephemeral["embeds"]["rsvp_ok"]["footer"]["icon_url"] = EXPECTED["icon_url"]
         cases = {
             "wrong schema": payloads(schema="help_embed_smoke.v0"),
             "unbranded payload embed": unbranded,
             "missing topic embed": missing,
             "missing per-embed expectation": payloads(expected={"help": payloads()["expected"]["help"]}),
-            "non-https icon": payloads(expected={
-                **payloads()["expected"],
-                "help": {**EXPECTED, "icon_url": "http://example.com/x.png"},
-            }),
+            "missing new row and expectation": missing_new,
+            "wrong Echo colour": wrong_color,
+            "non-https icon": non_https,
+            "icon on a text-only footer": icon_on_ephemeral,
         }
         for name, data in cases.items():
             with self.subTest(name=name):

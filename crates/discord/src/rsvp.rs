@@ -20,7 +20,7 @@ use two_bot_core::{
 };
 
 use crate::{
-    brand::{ephemeral_reply_embed, EmbedKind},
+    brand::rsvp_reply_embed,
     executor::{ActionExecutor, DiscordError},
     interactions::{response_for_slash, route_interaction, RoutedInteraction},
 };
@@ -161,20 +161,10 @@ pub async fn complete_rsvp_interaction(
     Ok(true)
 }
 
-fn rsvp_reply_embed(
-    result: Result<String, String>,
-) -> twilight_model::channel::message::embed::Embed {
-    let (kind, text) = match result {
-        Ok(text) => (EmbedKind::Ok, text),
-        Err(text) => (EmbedKind::Danger, text),
-    };
-    // Preserve the existing content sanitizer and its 2000-character bound.
-    ephemeral_reply_embed(kind, "Events", two_bot_core::message_safety::content(&text))
-}
-
 #[cfg(test)]
 mod reply_embed_tests {
     use super::*;
+    use crate::brand::EmbedKind;
 
     #[test]
     fn outcomes_keep_the_existing_bound_and_text_only_footer() {
