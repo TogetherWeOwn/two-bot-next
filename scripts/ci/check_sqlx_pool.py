@@ -3,13 +3,16 @@
 
 import argparse
 from collections import Counter
-import json
 from pathlib import Path
 import runpy
 import sys
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+from script_intake import decode_json
+sys.path.pop(0)
+
 FIXTURE = "crates/store/tests/sqlx_pool_policy_fixture.rs"
 FIXTURE_SOURCE = ROOT / "scripts/ci/fixtures/sqlx_pool_policy.rs"
 OWNER = "crates/store/src/pool.rs"
@@ -50,7 +53,7 @@ def check(lines, added, expected_fixture, output):
     protocol_error = None
     for line in lines:
         try:
-            record = json.loads(line)
+            record = decode_json(line)
             if record["reason"] == "build-finished":
                 completed = record["success"] is True
             if record["reason"] != "compiler-message":
@@ -81,7 +84,7 @@ def check(lines, added, expected_fixture, output):
                 violations.add(location)
             else:
                 grandfathered.add(location)
-        except (KeyError, TypeError, ValueError) as error:
+        except (KeyError, RecursionError, TypeError, ValueError) as error:
             protocol_error = protocol_error or error
 
     if protocol_error:
