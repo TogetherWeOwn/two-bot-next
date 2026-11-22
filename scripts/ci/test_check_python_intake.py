@@ -66,16 +66,33 @@ def fetch(url):
     request = build_request(url)
     return urllib.request.urlopen(request, timeout=10)
 """
-        renamed = before.replace("request =", "probe_request =").replace(
+        renamed = before.replace("request =", "headers = {}\n    probe_request =").replace(
             "urlopen(request", "urlopen(probe_request")
         path = "scripts/read.py"
         self.assertEqual(list(guard.additions(before, renamed, path)), [])
         added = renamed.replace("    return ", "    urllib.request.urlopen(probe_request, timeout=10)\n    return ")
-        self.assertEqual(list(guard.additions(before, added, path)), [(6, "urllib.request.urlopen")])
+        self.assertEqual(list(guard.additions(before, added, path)), [(7, "urllib.request.urlopen")])
         changed = renamed.replace("timeout=10", "timeout=20")
-        self.assertEqual(list(guard.additions(before, changed, path)), [(5, "urllib.request.urlopen")])
-        switched = before.replace("urlopen(request", "urlopen(url")
-        self.assertEqual(list(guard.additions(before, switched, path)), [(5, "urllib.request.urlopen")])
+        self.assertEqual(list(guard.additions(before, changed, path)), [])
+
+    def test_two_refactored_calls_keep_their_two_allowances(self):
+        before = """\
+import json
+def first(payload):
+    return json.loads(payload)
+def second(records):
+    payload = records[0]
+    return json.loads(payload)
+"""
+        after = before.replace("first(payload)", "first(raw)").replace(
+            "return json.loads(payload)", "return json.loads(raw)", 1).replace(
+            "    payload = records[0]", "    earlier = 0\n    payload = records[earlier]")
+        self.assertEqual(list(guard.additions(before, after, "scripts/read.py")), [])
+
+    def test_removing_an_import_does_not_allow_an_extra_call(self):
+        before = "from json import loads\nloads(data)\n"
+        after = "import json\njson.loads(data)\njson.loads(extra)\n"
+        self.assertEqual(list(guard.additions(before, after, "scripts/read.py")), [(3, "json.loads")])
 
     def test_identical_call_moved_to_a_generator_keeps_its_baseline(self):
         before = "import json\ndef records(lines):\n    for line in lines:\n        yield json.loads(line)\n"

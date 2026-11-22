@@ -2,8 +2,7 @@
 
 import argparse
 import ast
-from collections import defaultdict, deque
-from copy import deepcopy
+from collections import Counter, defaultdict
 import os
 from pathlib import Path
 import subprocess
@@ -16,14 +15,12 @@ INTAKE = "scripts/script_intake.py"
 APIS = {"json.load", "json.loads", "json.JSONDecoder", "json.decoder.JSONDecoder", "json.*",
         "urllib.request.urlopen", "urllib.request.build_opener", "urllib.request.urlretrieve",
         "urllib.request.OpenerDirector", "urllib.request.install_opener", "urllib.request.*"}
-FUNCTION_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-OTHER_SCOPES = (ast.ClassDef, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
 class Use(NamedTuple):
     api: str
-    exact: str
-    renamed: str
+    kind: str
+    shape: str
     line: int
 
 
@@ -56,55 +53,17 @@ def qualified(node, bindings):
     return set()
 
 
-def function_locals(nodes):
-    scopes = {}
-    bound = defaultdict(list)
-    external = defaultdict(set)
-    for node in nodes:
-        scope = scopes.get(node)
-        if scope is not None:
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                bound[scope].append(node.id)
-            elif isinstance(node, (ast.Global, ast.Nonlocal)):
-                external[scope].update(node.names)
-        if isinstance(node, FUNCTION_SCOPES):
-            args = node.args
-            parameters = (*args.posonlyargs, *args.args, args.vararg, *args.kwonlyargs, args.kwarg)
-            bound[node].extend(arg.arg for arg in parameters if arg is not None)
-            body = {node.body} if isinstance(node, ast.Lambda) else set(node.body)
-            scopes.update((child, node if child in body else scope) for child in ast.iter_child_nodes(node))
-        elif not isinstance(node, OTHER_SCOPES):
-            scopes.update((child, scope) for child in ast.iter_child_nodes(node))
-    locals_by_scope = {
-        scope: {name: index for index, name in enumerate(dict.fromkeys(names))
-                if name not in external[scope]}
-        for scope, names in bound.items()
-    }
-    return scopes, locals_by_scope
-
-
-def call_shape(node, locals_in_scope):
-    """Keep argument shape and refer to locals by their scope binding order."""
-    if not locals_in_scope:
-        return ast.dump(node)
-    clone = deepcopy(node)
-    for reference in ast.walk(clone):
-        if isinstance(reference, ast.Name) and reference.id in locals_in_scope:
-            reference.id = f"<local {locals_in_scope[reference.id]}>"
-    return ast.dump(clone)
-
-
 def uses(source, path):
     tree = ast.parse(source, filename=path)
     nodes = list(ast.walk(tree))
     bindings = aliases(nodes)
     call_by_target = {node.func: node for node in nodes if isinstance(node, ast.Call)}
-    scopes, locals_by_scope = function_locals(nodes)
 
     def use(api, target):
-        node = call_by_target.get(target, target)
-        renamed = call_shape(node, locals_by_scope.get(scopes.get(node), {}))
-        return Use(api, ast.dump(node), renamed, target.lineno)
+        call = call_by_target.get(target)
+        if call is not None:
+            return Use(api, "call", ast.dump(call), target.lineno)
+        return Use(api, "reference", ast.dump(target), target.lineno)
 
     for node in nodes:
         if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
@@ -114,7 +73,7 @@ def uses(source, path):
             for name in node.names:
                 api = f"{node.module}.{name.name}"
                 if api in APIS:
-                    yield use(api, name)
+                    yield Use(api, "import", ast.dump(name), name.lineno)
         elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
               and node.func.id == "getattr" and len(node.args) in (2, 3)
               and isinstance(node.args[1], ast.Constant)):
@@ -123,30 +82,27 @@ def uses(source, path):
                 yield use(api, node)
 
 
-def unmatched(before, after, key):
-    backlog = defaultdict(deque)
-    for use in before:
-        backlog[key(use)].append(use)
-    added = []
-    for use in after:
-        matches = backlog.get(key(use))
-        if matches:
-            matches.popleft()
-        else:
-            added.append(use)
-    return [use for matches in backlog.values() for use in matches], added
-
-
 def additions(before, after, path):
-    old = uses(before, path)
-    new = sorted(uses(after, path), key=lambda use: use.line)
-    # Save unchanged matches first. A scope change can alter the normalized
-    # shape of an identical call, so spend a rename allowance only afterwards.
-    old, new = unmatched(old, new, lambda use: (use.api, use.exact, use.renamed))
-    old, new = unmatched(old, new, lambda use: (use.api, use.exact))
-    _, new = unmatched(old, new, lambda use: (use.api, use.renamed))
-    for use in new:
-        yield use.line, use.api
+    exact = Counter((use.api, use.kind, use.shape) for use in uses(before, path))
+    changed = []
+    # Spend identical occurrences first so excess uses normally point at the
+    # added line. The verdict depends only on counts per API and kind.
+    for use in sorted(uses(after, path), key=lambda use: use.line):
+        key = (use.api, use.kind, use.shape)
+        if exact[key]:
+            exact[key] -= 1
+        else:
+            changed.append(use)
+
+    remaining = Counter()
+    for (api, kind, _), count in exact.items():
+        remaining[api, kind] += count
+    for use in changed:
+        key = (use.api, use.kind)
+        if remaining[key]:
+            remaining[key] -= 1
+        else:
+            yield use.line, use.api
 
 
 def git(root, *args):
