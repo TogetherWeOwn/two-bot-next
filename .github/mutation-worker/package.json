@@ -1,0 +1,8 @@
+{
+  "name": "two-bot-next-mutation-worker",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@babel/parser": "8.1.3"
+  }
+}

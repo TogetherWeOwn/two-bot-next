@@ -129,6 +129,14 @@ an offline binding, edits without a supported operator and suites that
 execute zero tests are reported as unsupported. The Actions fixture also
 checks that an unchanged operator stays outside the sample.
 
+The Worker lane also runs in WARN for added TypeScript lines under
+`wrangler/src/`. The locked Babel TypeScript parser locates comparison,
+logical, arithmetic and boolean edits. The lane uses the Worker Node test
+entry point with a counts-only reporter in a disposable snapshot. The
+reporter excludes file-only passes, and the fixture covers an empty test
+file along with strong, weak and failing assertions. Unsupported edits and
+failed measurements have their own verdicts.
+
 ## Scanner dependency triage (review by 2026-11-16)
 
 The hash-pinned `scripts/ci/semgrep-requirements.txt` targets CI's CPython 3.11
