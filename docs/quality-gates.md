@@ -120,6 +120,15 @@ mutant source or test output. The small fixture covers killed and surviving
 mutants, a failing baseline, and scope. Review exact-head fixture and
 representative PR receipts before making the check required.
 
+The Python lane also runs in WARN. It uses the same merge-base diff for
+`scripts/` source, and a pinned Python runtime to mutate comparisons,
+boolean expressions and arithmetic on added lines. For each source file
+with an explicit offline unittest binding, it runs that suite against a
+disposable checkout and then reruns it for each candidate. Files without
+an offline binding, edits without a supported operator and suites that
+execute zero tests are reported as unsupported. The Actions fixture also
+checks that an unchanged operator stays outside the sample.
+
 ## Scanner dependency triage (review by 2026-11-16)
 
 The hash-pinned `scripts/ci/semgrep-requirements.txt` targets CI's CPython 3.11

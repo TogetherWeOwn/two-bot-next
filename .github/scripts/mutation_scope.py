@@ -59,20 +59,30 @@ def rust_lines(added):
     return {path: lines for path, lines in added.items() if SOURCE.fullmatch(path)}
 
 
+def python_lines(added):
+    return {path: lines for path, lines in added.items()
+            if path.startswith("scripts/") and path.endswith(".py")
+            and not any(part in ("tests", "fixtures") for part in Path(path).parts)
+            and not Path(path).name.startswith("test_") and not Path(path).name.startswith("test-")}
+
+
 def main():
     head = os.environ["HEAD_SHA"]
     base, patch = pr_diff(ROOT, os.environ["BASE_SHA"], head)
     paths = selector["changed_files"](base, head)
     jobs = selector["selection"](paths)
-    rust = bool(rust_lines(added_lines(patch)))
-    if rust and not jobs["rust"]:
-        raise ValueError("Rust additions disagree with job-inputs")
-    fixture = rust or any(path.startswith((".github/scripts/mutation_", "tests/fixtures/mutation/"))
-                          or path in (".gitattributes", ".github/workflows/mutation.yml") for path in paths)
+    lines = added_lines(patch)
+    rust, python = bool(rust_lines(lines)), bool(python_lines(lines))
+    if (rust or python) and not jobs["rust"]:
+        raise ValueError("Rust or Python additions disagree with job-inputs")
+    common = {".gitattributes", ".github/scripts/mutation_scope.py", ".github/workflows/mutation.yml"}
+    fixture = rust or any(path in common or path.startswith(".github/scripts/mutation_rust") for path in paths)
+    python_fixture = python or any(path in common or path.startswith(".github/scripts/mutation_python") for path in paths)
     Path(os.environ["RUNNER_TEMP"], "mutation.diff").write_bytes(patch.encode("utf-8", "surrogateescape"))
     print(f"Mutation scope HEAD {head} merge base {base}")
     with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
-        print(f"rust={str(rust).lower()}\nfixture={str(fixture).lower()}", file=output)
+        for name, selected in (("rust", rust), ("fixture", fixture), ("python", python), ("python_fixture", python_fixture)):
+            print(f"{name}={str(selected).lower()}", file=output)
 
 
 if __name__ == "__main__":
