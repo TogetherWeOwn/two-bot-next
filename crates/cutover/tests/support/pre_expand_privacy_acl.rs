@@ -106,7 +106,8 @@ async fn probe(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(&mut *tx)
         .await?;
 
-    // Positive control: runtime can create and read a scoped reservation.
+    // Positive control: the runtime can create and read the exact row the
+    // member and guild paths must erase. No probe runs as the DB owner.
     sqlx::query(
         "INSERT INTO public.voice_create_reservations (guild_id, user_id, created_at)
          VALUES ('1', '2', now())",
@@ -130,7 +131,12 @@ async fn probe(pool: &PgPool) -> Result<(), sqlx::Error> {
     ] {
         require_denied(&mut tx, statement).await?;
     }
-    assert_eq!(count(&mut *tx, RESERVATIONS).await, 1);
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public.voice_create_reservations WHERE guild_id = '1' AND user_id = '2'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    assert_eq!(remaining, 1);
     tx.rollback().await
 }
 
@@ -253,7 +259,8 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
         .unwrap();
     assert_runtime_refusal(&runtime, &request, "42P01").await;
     let result = run_retention(&runtime, RetentionMode::Execute).await;
-    assert_eq!(result.unwrap_err().step().as_str(), "expiry");
+    let err = result.unwrap_err();
+    assert_eq!((err.step().as_str(), err.cause()), ("expiry", "database"));
     assert_preserved(&runtime).await;
 
     // Cutover commits before Store, web contract and grants.
@@ -262,7 +269,8 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     assert_counts(&migrator, &[(SESSIONS, 0), (WINDOWS, 0)]).await;
     assert_runtime_refusal(&runtime, &request, "42501").await;
     let result = run_retention(&runtime, RetentionMode::Execute).await;
-    assert_eq!(result.unwrap_err().step().as_str(), "expiry");
+    let err = result.unwrap_err();
+    assert_eq!((err.step().as_str(), err.cause()), ("expiry", "database"));
     assert_preserved(&runtime).await;
 
     CUTOVER.run(&migrator).await.unwrap();

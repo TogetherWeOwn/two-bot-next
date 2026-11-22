@@ -530,13 +530,12 @@ in the actor label or capture credential-bearing environment variables.
 ## Coverage regression and acceptance tests
 
 The integration suite applies **all** embedded migrations to its own disposable
-database through `two-bot-testsupport`, then queries `information_schema.columns`.
+database through `two-bot-testsupport`, then checks PostgreSQL's catalog.
 Member/user names (including new `*_user_id`/`*_member_id` columns), legacy actor,
 inviter/target aliases and `*_by` attribution require a manifest entry or a
 nonempty, column-specific retention reason. Stale entries also fail. Both runtime
-modes refuse an incomplete visible schema. The schema check is a naming tripwire,
-not semantic proof of arbitrary JSON/prose or tables invisible to the DB identity;
-operators need read access to the complete application schema.
+modes refuse incomplete coverage, including ungranted relations in the active
+schema. The naming check covers columns. Identity in JSON or prose needs review.
 
 Fixtures seed two members in two guilds across every deletion-plan table and seed
 retained settings/audit/control records. Tests prove equal dry/execute counts,
