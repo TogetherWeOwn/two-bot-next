@@ -2,12 +2,18 @@
 
 import json
 import os
+from pathlib import Path
 import stat
 import subprocess
+import sys
 from datetime import datetime, timezone
 
 from voice_lifecycle_evidence import unique_object, validate as validate_lifecycle
 from voice_measurement_cleanup import cleanup_verified, read_cleanup_receipt
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from script_intake import decode_legacy_json, read_with_overflow
+sys.path.pop(0)
 
 
 JOBS = (
@@ -72,10 +78,10 @@ def read_matching_grant(path, run_id, attempt, expires_at, sha, deployment_id):
         with os.fdopen(fd, "rb") as source:
             if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
                 return None
-            data = source.read(4097)
+            data = read_with_overflow(source, 4096)
         if len(data) > 4096:
             return None
-        metadata = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
+        metadata = decode_legacy_json(data.decode("utf-8"), object_pairs_hook=unique_object)
         expiry = datetime.fromtimestamp(expires_at / 1000, timezone.utc).isoformat(timespec="milliseconds")
         expected = {"runId": run_id, "runAttempt": str(attempt), "sha": sha,
                     "deploymentId": deployment_id, "expiresAt": expiry.replace("+00:00", "Z")}
@@ -120,8 +126,6 @@ def evaluate_terminal(results, second_required, run_id, attempt, expires_at, sha
 
 def main():
     """Write a fixed terminal verdict; absent or invalid inputs always refuse."""
-    import sys
-
     if len(sys.argv) != 2:
         return 1
     verdict = "refused"

@@ -8,8 +8,9 @@ and enforce all other staging, initial-gate and watch requirements separately.
 A successful result means only that the supplied series are continuous.
 """
 
-import json
 import re
+
+from script_intake import decode_legacy_json, unique_object
 
 MAX_SAMPLES = 128
 MAX_SERIES = 512
@@ -38,15 +39,8 @@ def parse_samples(raw):
     """Decode bounded UTF-8 JSON without allowing duplicate object fields."""
     _require(type(raw) is bytes and len(raw) <= 65536)
 
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            _require(key not in result)
-            result[key] = value
-        return result
-
     try:
-        return json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
+        return decode_legacy_json(raw.decode("utf-8"), object_pairs_hook=unique_object)
     except (UnicodeError, ValueError, RecursionError):
         raise EvidenceError("invalid or unverified REST evidence") from None
 

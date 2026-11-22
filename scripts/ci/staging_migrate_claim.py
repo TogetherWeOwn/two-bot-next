@@ -12,6 +12,10 @@ from pathlib import Path
 import re
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from script_intake import decode_legacy_json, unique_object as _unique_json_object
+sys.path.pop(0)
+
 REPOSITORY = "TogetherWeOwn/two-bot-next"
 WORKFLOW_PATH = ".github/workflows/staging-migrate.yml"
 CLAIM_KIND = "staging-migrate-apply-claim"
@@ -222,11 +226,7 @@ def build_claim(manifest, env):
 
 
 def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        require(key not in result, "manifest has duplicate fields")
-        result[key] = value
-    return result
+    return _unique_json_object(pairs, error=Refused, message='manifest has duplicate fields')
 
 
 def main():
@@ -236,7 +236,7 @@ def main():
     args = parser.parse_args()
     try:
         require(args.manifest.stat().st_size <= MAX_MANIFEST_BYTES, "manifest is too large")
-        manifest = json.loads(args.manifest.read_text(), object_pairs_hook=unique_object)
+        manifest = decode_legacy_json(args.manifest.read_text(), object_pairs_hook=unique_object)
         claim = build_claim(manifest, os.environ)
         # Exclusive create: a refusal never leaves a claim, nor reuses an old one.
         with args.output.open("x") as output:

@@ -26,6 +26,8 @@ from pathlib import Path
 
 import compare_pipeline_bench as bench
 
+from script_intake import decode_legacy_json
+
 
 METRIC = ("db_round_trips_per_event",)
 OBSERVER_TRANSACTIONS = 2
@@ -193,7 +195,7 @@ def main(argv=None):
     except bench.IntakeRefused as refused:
         return bench._invalid(refused.code)
     try:
-        reports = [json.loads(text, object_pairs_hook=bench._reject_duplicate_keys) for text in texts]
+        reports = [decode_legacy_json(text, object_pairs_hook=bench._reject_duplicate_keys) for text in texts]
     except bench.DuplicateKeyError:
         return bench._invalid("duplicate_keys")
     except (ValueError, RecursionError):

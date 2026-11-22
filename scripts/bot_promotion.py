@@ -81,6 +81,12 @@ from pathlib import Path, PurePosixPath
 
 import build_identity
 
+from script_intake import (
+    decode_legacy_json,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 REPO = "TogetherWeOwn/two-bot-next"
 STAGING_WORKFLOW = ".github/workflows/deploy-staging.yml"
 STAGING_BRANCH = "main"
@@ -116,13 +122,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins."""
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def _refuse(reason):
@@ -264,14 +264,14 @@ def _check_evidence_staging(evidence, sha, build_id, deploy_id):
 
 def _read_local_capped(path):
     with open(path, "rb") as handle:
-        raw = handle.read(MAX_LOCAL_BYTES + 1)
+        raw = read_with_overflow(handle, MAX_LOCAL_BYTES)
     if len(raw) > MAX_LOCAL_BYTES:
         raise PromotionError("local input over the body cap")
     return raw
 
 
 def _parse_json_capped(raw):
-    return json.loads(raw.decode("utf-8"),
+    return decode_legacy_json(raw.decode("utf-8"),
                       object_pairs_hook=_reject_duplicate_keys)
 
 
@@ -410,11 +410,11 @@ def _validate_package(blob, sha, run_id, attempt, repo_id):
         if receipt_info.file_size > MAX_RECEIPT_BYTES:
             raise PromotionError("receipt over the body cap")
         with archive.open("promotion-receipt.json") as handle:
-            raw = handle.read(MAX_RECEIPT_BYTES + 1)
+            raw = read_with_overflow(handle, MAX_RECEIPT_BYTES)
         if len(raw) > MAX_RECEIPT_BYTES:
             raise PromotionError("receipt over the body cap")
         try:
-            receipt = json.loads(raw.decode("utf-8"),
+            receipt = decode_legacy_json(raw.decode("utf-8"),
                                  object_pairs_hook=_reject_duplicate_keys)
         except (DuplicateKeyError, ValueError, RecursionError):
             raise PromotionError("receipt is not strict JSON") from None
@@ -432,7 +432,7 @@ def _validate_package(blob, sha, run_id, attempt, repo_id):
             if info.file_size > MAX_MEMBER_BYTES:
                 raise PromotionError("artifact member over the cap")
             with archive.open(info.filename) as handle:
-                data = handle.read(MAX_MEMBER_BYTES + 1)
+                data = read_with_overflow(handle, MAX_MEMBER_BYTES)
             if len(data) > MAX_MEMBER_BYTES:
                 raise PromotionError("artifact member over the cap")
             total += len(data)
@@ -469,7 +469,7 @@ def _collect_modules(modules_dir):
             if not _safe_module_path(rel):
                 raise PromotionError("bundle carries an unsafe member")
             with full.open("rb") as handle:
-                data = handle.read(MAX_MEMBER_BYTES + 1)
+                data = read_with_overflow(handle, MAX_MEMBER_BYTES)
             if len(data) > MAX_MEMBER_BYTES:
                 raise PromotionError("bundle member over the cap")
             collected[rel] = data
@@ -879,7 +879,7 @@ def load_admitted(path, sha, *, verify_modules=False):
     """
     raw = _read_local_capped(path)
     try:
-        admitted = json.loads(raw.decode("utf-8"),
+        admitted = decode_legacy_json(raw.decode("utf-8"),
                               object_pairs_hook=_reject_duplicate_keys)
     except (DuplicateKeyError, ValueError, RecursionError):
         raise PromotionError("admission is not strict JSON") from None

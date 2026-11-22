@@ -10,6 +10,10 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from script_intake import decode_legacy_json, unique_object as _unique_json_object
+sys.path.pop(0)
+
 I64_MAX = 2**63 - 1
 SOURCE_SHA = re.compile(r"[0-9a-f]{40}")
 # Stable terminal vocabulary; never derive diagnostics or actions from input.
@@ -29,33 +33,12 @@ RESULTS = {
 }
 
 
-# Strings are skipped whole, so brackets inside them never count. An
-# unterminated string runs to the end, which keeps the scan linear.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 # CPython's old default recursion limit, which bounded the C JSON decoder.
 MAX_JSON_DEPTH = 1000
 
 
 def _loads_bounded(raw, **kwargs):
-    """json.loads with a lexical nesting bound that raises RecursionError.
-
-    Newer CPython sizes the decoder's recursion guard from the real C stack
-    and decodes 10,000 levels, so the bound no longer depends on the
-    interpreter: existing RecursionError refusals keep working unchanged.
-    """
-    # Decode bytes exactly as json.loads would, then scan and parse that text.
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
-    depth = 0
-    for match in JSON_TOKEN.finditer(raw):
-        token = match.group()
-        if token in "[{":
-            depth += 1
-            if depth > MAX_JSON_DEPTH:
-                raise RecursionError("JSON nesting exceeds the decoder bound")
-        elif token in "]}":
-            depth -= 1
-    return json.loads(raw, **kwargs)
+    return decode_legacy_json(raw, max_depth=MAX_JSON_DEPTH, **kwargs)
 
 
 class Refused(ValueError):
@@ -89,12 +72,7 @@ def validate_source_sha(source_sha):
 
 
 def unique_object(pairs):
-    """Refuse duplicate fields at every depth, including escaped key spellings."""
-    result = {}
-    for key, value in pairs:
-        require(key not in result, "plan manifest has duplicate fields")
-        result[key] = value
-    return result
+    return _unique_json_object(pairs, error=Refused, message='plan manifest has duplicate fields')
 
 
 def invalid_constant(value):

@@ -11,6 +11,12 @@ import datetime as dt
 import json
 import sys
 
+from script_intake import (
+    decode_legacy_json,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 MAX_RECEIPTS = 60
 MAX_INPUT_BYTES = 1024 * 1024
 EVENT_TYPES = frozenset((
@@ -30,23 +36,12 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def sanitize(text):
     try:
-        raw = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+        raw = decode_legacy_json(text, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         raise Refused("rows carry duplicate JSON object keys") from None
     except (ValueError, RecursionError):
@@ -83,7 +78,7 @@ def sanitize(text):
 
 def main():
     try:
-        text = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+        text = read_with_overflow(sys.stdin.buffer, MAX_INPUT_BYTES)
         if len(text) > MAX_INPUT_BYTES:
             raise Refused("input exceeds byte cap")
         packet = sanitize(text)

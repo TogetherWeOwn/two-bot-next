@@ -361,7 +361,7 @@ class StagingPackagingOutputIsolationTests(unittest.TestCase):
         (root / "workspace" / "wrangler").mkdir(parents=True)
         tooling = root / "workspace" / "tooling" / "scripts"
         tooling.mkdir(parents=True)
-        for helper in ("bot_promotion.py", "build_identity.py"):
+        for helper in ("bot_promotion.py", "build_identity.py", "script_intake.py"):
             shutil.copy2(Path(__file__).resolve().parent / helper,
                          tooling / helper)
         rollout = root / "rollout"

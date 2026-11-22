@@ -73,6 +73,8 @@ import re
 import sys
 from pathlib import Path
 
+from script_intake import decode_legacy_json, read_with_overflow
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SCHEMA = ROOT / "docs" / "staging-e2e-run-record.schema.json"
 
@@ -197,7 +199,7 @@ def load_json(text):
         return value
 
     try:
-        raw = json.loads(text, object_pairs_hook=_ObjectPairs)
+        raw = decode_legacy_json(text, object_pairs_hook=_ObjectPairs)
     except json.JSONDecodeError:
         raise
     except RecursionError:
@@ -215,7 +217,7 @@ def load_document(path):
     # so a post-read length check is too late. The size refusal wins over
     # decoding and parsing, and counts encoded bytes, not characters.
     with Path(path).open("rb") as handle:
-        data = handle.read(MAX_DOCUMENT_BYTES + 1)
+        data = read_with_overflow(handle, MAX_DOCUMENT_BYTES)
     if len(data) > MAX_DOCUMENT_BYTES:
         raise DocumentTooLargeError(BYTE_LIMIT_MESSAGE)
     try:

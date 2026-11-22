@@ -1,13 +1,18 @@
 """Bind release inventories to the peeled tag commit; dry-runs never publish."""
 
 import argparse
-import json
 import math
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+
+from script_intake import (
+    decode_legacy_json,
+    json_depth_exceeds as _json_depth_exceeds,
+    unique_object as _unique_json_object,
+)
 
 
 SHAPE_REASON = "Release tag response has invalid shape"
@@ -23,29 +28,6 @@ RESPONSE_CAP = 1 << 20
 # Real ref responses nest two levels deep.
 MAX_DEPTH = 32
 
-# Strings are skipped whole, so brackets inside them never count. An
-# unterminated string runs to the end, which keeps the scan linear.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
-
-
-def _json_depth_exceeds(text, limit):
-    """Lexical nesting pre-scan, run before json.loads.
-
-    The decoder's own RecursionError is no longer a reliable bound: newer
-    CPython sizes it from the real C stack and decodes 10,000 levels.
-    """
-    depth = 0
-    for match in JSON_TOKEN.finditer(text):
-        token = match.group()
-        if token in "[{":
-            depth += 1
-            if depth > limit:
-                return True
-        elif token in "]}":
-            depth -= 1
-    return False
-
-
 def require_env(name):
     value = os.environ.get(name)
     if value is None:
@@ -54,12 +36,7 @@ def require_env(name):
 
 
 def _reject_duplicate_keys(pairs):
-    seen = set()
-    for key, _ in pairs:
-        if key in seen:
-            raise ValueError(DUP_KEYS)
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, message=DUP_KEYS)
 
 
 def _reject_constant(value):
@@ -79,7 +56,7 @@ def parse_response(raw):
     if _json_depth_exceeds(raw, MAX_DEPTH):
         raise ValueError(TOO_DEEP)
     try:
-        return json.loads(
+        return decode_legacy_json(
             raw,
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_constant,
