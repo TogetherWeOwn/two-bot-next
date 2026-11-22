@@ -302,6 +302,11 @@ the queries, so no per-run value ever crosses the dispatch boundary.
 Do not dispatch until the security review for the fixture queries is
 recorded. Procedure: `docs/staging-fixture-census.md`.
 
+`staging-recovery-capture.yml` uses the same plan binding from `main` for a
+read-only schema, ledger, ownership, ACL and role inventory. The workflow
+guard pins the checkout, binding and encrypted upload. The capture script
+requires the certificate fingerprint committed in reviewed source.
+
 ## Production route
 
 `deploy-production.yml` (main #243) is the one live deployment workflow. The

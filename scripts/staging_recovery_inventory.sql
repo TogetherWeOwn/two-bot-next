@@ -10,7 +10,7 @@ SELECT 1 / ((current_user = 'two_bot_migrator_ro'
     AND NOT pg_has_role(session_user, 'two_bot_migrator', 'MEMBER'))::integer) AS guard
 \gset
 
-WITH expected AS (
+WITH RECURSIVE expected AS (
     -- @matrix
 ), schemas AS (
     SELECT oid, nspname, nspowner, nspacl
@@ -31,8 +31,33 @@ WITH expected AS (
                   AND e.name = format('%s(%s)', p.proname, oidvectortypes(p.proargtypes))
                   AND e.kind = 'function')
 ), present AS (
-    SELECT schema_name, relname::text AS name FROM relations
-    UNION ALL SELECT schema_name, signature FROM routines
+    SELECT schema_name, relname::text AS name, CASE relkind
+        WHEN 'S' THEN 'sequence' WHEN 'v' THEN 'view'
+        WHEN 'r' THEN 'table' WHEN 'p' THEN 'table' END AS kind FROM relations
+    UNION ALL SELECT schema_name, signature, 'function' FROM routines WHERE prokind = 'f'
+), principals AS (
+    SELECT oid FROM pg_roles WHERE rolname IN (session_user, 'two_bot_migrator',
+        'two_bot_migrator_ro', 'two_bot_runtime', 'two_web_reader')
+    UNION SELECT datdba FROM pg_database WHERE datname = current_database()
+    UNION SELECT nspowner FROM schemas
+    UNION SELECT relowner FROM relations
+    UNION SELECT proowner FROM routines
+    UNION SELECT d.refobjid FROM pg_shdepend d
+    JOIN pg_database b ON b.datname = current_database()
+    WHERE d.refclassid = 'pg_authid'::regclass AND (
+        (d.dbid = 0 AND d.classid = 'pg_database'::regclass AND d.objid = b.oid)
+        OR (d.dbid = b.oid AND CASE d.classid
+            WHEN 'pg_class'::regclass THEN d.objid IN (SELECT oid FROM relations)
+            WHEN 'pg_proc'::regclass THEN d.objid IN (SELECT oid FROM routines)
+            WHEN 'pg_namespace'::regclass THEN d.objid IN (SELECT oid FROM schemas)
+            ELSE false END)
+    )
+), scoped_roles AS (
+    SELECT oid FROM principals
+    UNION SELECT m.member FROM pg_auth_members m JOIN scoped_roles r ON m.roleid = r.oid
+), reported_roles AS (
+    SELECT oid FROM scoped_roles
+    UNION SELECT m.roleid FROM pg_auth_members m JOIN reported_roles r ON m.member = r.oid
 )
 SELECT jsonb_build_object(
     'observed_at', transaction_timestamp(),
@@ -46,7 +71,9 @@ SELECT jsonb_build_object(
         FROM schemas ORDER BY nspname),
     'missing_expected', ARRAY(SELECT e.schema_name || '.' || e.name FROM expected e
         WHERE NOT EXISTS (SELECT 1 FROM present p
-            WHERE p.schema_name = e.schema_name AND p.name = e.name)
+            WHERE p.schema_name = e.schema_name AND p.name = e.name
+              AND p.kind = CASE WHEN e.kind IN ('sequence', 'view', 'function')
+                                THEN e.kind ELSE 'table' END)
         ORDER BY e.schema_name, e.name),
     'unsupported', EXISTS (SELECT 1 FROM relations WHERE relkind = 'f')
         OR EXISTS (SELECT 1 FROM routines WHERE prokind = 'a')
@@ -120,19 +147,21 @@ SELECT jsonb_build_object(
         'schema', n.nspname, 'owner', pg_get_userbyid(d.defaclrole),
         'object_type', d.defaclobjtype, 'acl', d.defaclacl)
         FROM pg_default_acl d LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
-        WHERE d.defaclnamespace = 0 OR n.nspname IN ('public', 'web_v1')
+        WHERE d.defaclrole IN (SELECT oid FROM scoped_roles)
+          AND (d.defaclnamespace = 0 OR n.nspname IN ('public', 'web_v1'))
         ORDER BY n.nspname, pg_get_userbyid(d.defaclrole), d.defaclobjtype),
     'roles', ARRAY(SELECT jsonb_build_object(
         'name', rolname, 'login', rolcanlogin, 'inherit', rolinherit,
         'superuser', rolsuper, 'create_role', rolcreaterole, 'create_database', rolcreatedb,
         'replication', rolreplication, 'bypass_rls', rolbypassrls,
         'connection_limit', rolconnlimit, 'valid_until', rolvaliduntil)
-        FROM pg_roles ORDER BY rolname),
+        FROM pg_roles WHERE oid IN (SELECT oid FROM reported_roles) ORDER BY rolname),
     'memberships', ARRAY(SELECT jsonb_build_object(
         'group', pg_get_userbyid(roleid), 'member', pg_get_userbyid(member),
         'grantor', pg_get_userbyid(grantor), 'admin', admin_option,
-        'inherit', inherit_option, 'set', set_option)
-        FROM pg_auth_members ORDER BY pg_get_userbyid(roleid),
+        'inherit', to_jsonb(m)->'inherit_option', 'set', to_jsonb(m)->'set_option')
+        FROM pg_auth_members m WHERE member IN (SELECT oid FROM reported_roles)
+        ORDER BY pg_get_userbyid(roleid),
             pg_get_userbyid(member), pg_get_userbyid(grantor)),
     'cutover_ledger', ARRAY(SELECT jsonb_build_object(
         'version', version, 'description', description, 'success', success,
