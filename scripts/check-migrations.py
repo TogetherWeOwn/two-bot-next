@@ -5,11 +5,12 @@ No database access or third-party Python packages. See docs/migrations.md.
 
 import argparse
 import hashlib
-import json
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
+
+from script_intake import decode_legacy_json, unique_object
 
 ROOT = Path(__file__).resolve().parents[1]
 PATH = re.compile(r"crates/[^/]+/migrations/([0-9]{4})_[a-z][a-z0-9_]*\.sql")
@@ -53,7 +54,7 @@ def read_migrations(root):
 
 def read_lock(contents):
     try:
-        lock = json.loads(contents, object_pairs_hook=unique_keys)
+        lock = decode_legacy_json(contents, object_pairs_hook=unique_keys)
     except (ValueError, UnicodeError) as error:
         raise MigrationError(f"migrations.lock: {error}") from error
     if not isinstance(lock, dict) or set(lock) != {"version", "migrations"} or type(lock["version"]) is not int or lock["version"] != 1:
@@ -75,12 +76,7 @@ def read_lock(contents):
 
 
 def unique_keys(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise MigrationError(f"duplicate JSON key {key!r}")
-        result[key] = value
-    return result
+    return unique_object(pairs, error=MigrationError, message=lambda key: f"duplicate JSON key {key!r}")
 
 
 def git(root, *args):

@@ -65,7 +65,7 @@ class AttestationIntegration(unittest.TestCase):
             event = Path(directory) / "event.json"
             event.write_text(json.dumps(data), encoding="utf-8")
             with mock.patch.dict(os.environ, env, clear=True), \
-                    mock.patch.object(transport, "build_opener", return_value=opener), \
+                    mock.patch.object(transport, "no_redirect_opener", return_value=opener), \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
                 result = gate.main(["--event", str(event)])
         self.assertNotIn("SENTINEL-TOKEN", output.getvalue() + errors.getvalue())
@@ -96,7 +96,7 @@ class AttestationIntegration(unittest.TestCase):
                 output, errors = io.StringIO(), io.StringIO()
                 with mock.patch.dict(os.environ, env, clear=True), \
                         mock.patch("subprocess.check_output", return_value=checkout_sha + "\n"), \
-                        mock.patch.object(transport, "build_opener", return_value=opener), \
+                        mock.patch.object(transport, "no_redirect_opener", return_value=opener), \
                         mock.patch.object(runpy, "run_path", wraps=runpy.run_path) as run, \
                         mock.patch.object(sys, "path", list(sys.path)), \
                         mock.patch.object(sys, "argv", list(sys.argv)), \
