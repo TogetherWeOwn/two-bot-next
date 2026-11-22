@@ -1,0 +1,62 @@
+name: changed-line mutation (WARN)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+concurrency:
+  group: mutation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  rust-mutation:
+    name: Rust changed-line mutation (WARN)
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Plan changed source lines
+        id: plan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/mutation_scope.py
+      - name: Install pinned cargo-mutants
+        if: steps.plan.outputs.fixture == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/mutation-bin"
+          archive="$RUNNER_TEMP/cargo-mutants.tar.gz"
+          curl --fail --silent --show-error --location --max-time 60 --output "$archive" \
+            https://github.com/sourcefrog/cargo-mutants/releases/download/v27.1.0/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz
+          printf 'dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  %s\n' "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP/mutation-bin" cargo-mutants
+          printf '%s\n' "$RUNNER_TEMP/mutation-bin" >>"$GITHUB_PATH"
+      - name: Prove changed-line scope and verdicts with a tiny crate
+        if: steps.plan.outputs.fixture == 'true'
+        env:
+          CARGO_NET_OFFLINE: 'true'
+        run: python3 .github/scripts/mutation_rust_fixture.py
+      - name: Measure Rust PR additions
+        if: steps.plan.outputs.rust == 'true'
+        env:
+          CARGO_PROFILE_DEV_DEBUG: '0'
+          CARGO_INCREMENTAL: '0'
+        run: |
+          python3 scripts/generate_command_reference.py
+          python3 .github/scripts/mutation_rust.py --mode warn \
+            --patch "$RUNNER_TEMP/mutation.diff" --report "$RUNNER_TEMP/rust-mutation.json"
+      - name: Upload Rust verdicts
+        if: ${{ always() && steps.plan.outputs.rust == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rust-mutation
+          path: ${{ runner.temp }}/rust-mutation.json
+          retention-days: 14
+          if-no-files-found: error
