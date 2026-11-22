@@ -143,7 +143,7 @@ with the authenticated producing manifest and its run ID. Match the source SHA,
 both pending lists, both digests, the pinned target (`staging_host`,
 `staging_database`, `staging_branch_id`) and both evidence references
 (`recovery_evidence_ref`, `acl_plan_ref`). The digests do not cover the target or
-either reference. Dispatch requires the exact approved binding and clearance of all holds.
+either reference. Do not dispatch if any value differs, the exact binding lacks approval or a hold applies.
 
 After dispatch, verify that the claim came from the successful
 `staging-migrate (claim)` job on that run and attempt, agrees with the
