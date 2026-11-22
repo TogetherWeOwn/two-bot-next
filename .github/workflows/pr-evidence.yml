@@ -33,8 +33,7 @@ jobs:
         with:
           sparse-checkout: .github/scripts
           persist-credentials: false
-      - name: Read pinned organization attestation policy
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: TogetherWeOwn/.github
           ref: bfdaf1532e1605281d366186e4ed9e8cfa0113fc
@@ -44,8 +43,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
-      - name: Install hash-pinned source parsers
-        run: 'python3 -m pip --isolated install --no-deps --only-binary=:all: --require-hashes -r .github/scripts/pr-evidence-requirements.txt'
+      - run: 'python3 -m pip --isolated install --no-deps --only-binary=:all: --require-hashes -r .github/scripts/pr-evidence-requirements.txt'
       - if: github.event_name == 'pull_request'
         env:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
@@ -58,5 +56,4 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
         run: python3 -I .github/scripts/pr_evidence.py verify
-      - name: Run evidence fixtures
-        run: python3 -I -m unittest discover -s .github/scripts -p test_pr_evidence.py -v
+      - run: python3 -I -m unittest discover -s .github/scripts -p test_pr_evidence.py -v

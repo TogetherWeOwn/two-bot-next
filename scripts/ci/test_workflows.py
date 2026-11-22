@@ -10874,6 +10874,10 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "read", "actions": "read", "issues": "write"}
                     elif (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
+                    elif (name, job_id) == ("pr-evidence.yml", "pr-evidence"):
+                        expected.update({"actions": "read", "pull-requests": "read"})
+                    elif (name, job_id) == ("check.yml", "ci-evidence"):
+                        expected["actions"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
                         # Marker-label actor audit via the issue-events API.
                         expected["pull-requests"] = "read"
