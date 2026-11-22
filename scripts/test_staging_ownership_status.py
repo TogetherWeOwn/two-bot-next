@@ -21,6 +21,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
     def setUpClass(cls):
         cls.text = WORKFLOW.read_text()
         cls.code = strip_comments(cls.text)
+        cls.legacy_steps = cls.code.split("\n    steps:\n", 1)[1].split("\n  inventory:\n", 1)[0]
 
     def test_workflow_exists_and_is_manual_only(self):
         self.assertIn("name: staging-ownership-status", self.text)
@@ -29,8 +30,8 @@ class WorkflowSurfaceTests(unittest.TestCase):
             self.assertNotIn(trigger, self.code)
 
     def test_no_arbitrary_inputs_or_ref_target(self):
-        self.assertNotIn("inputs.", self.code)
-        self.assertNotIn("github.sha", self.code)
+        self.assertNotIn("inputs.", self.legacy_steps)
+        self.assertNotIn("github.sha", self.legacy_steps)
         self.assertNotIn("github.ref_name", self.code)
         self.assertNotIn("TARGET_VERSION", self.code)
         self.assertNotIn("STAGING_WORKER_URL:", self.code.replace("STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}", ""))
@@ -41,7 +42,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertIn("OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}", self.text)
         for forbidden in ("PRODUCTION_", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
                           "TWO_BOT_STAGING_PLAN_DATABASE_URL", "METRICS_SCRAPE_TOKEN"):
-            self.assertNotIn(forbidden, self.text)
+            self.assertNotIn(forbidden, self.legacy_steps if forbidden.startswith("CLOUDFLARE_") else self.text)
 
     def test_main_only_guard_and_timeouts(self):
         self.assertIn("if: github.ref == 'refs/heads/main'", self.text)

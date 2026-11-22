@@ -12,7 +12,6 @@ import staging_recovery_status as status
 
 SOURCE = "a" * 40
 ACCOUNT = "b" * 32
-NAMESPACE = "c" * 32
 CLOUDFLARE = {"CLOUDFLARE_ACCOUNT_ID": ACCOUNT, "CLOUDFLARE_API_TOKEN": "provider-fixture"}
 CONTROL = {"STAGING_WORKER_URL": status.ORIGIN, "OWNERSHIP_CONTROL_TOKEN": "synthetic-ownership-token-of-valid-length"}
 ENV = {**CLOUDFLARE, **CONTROL, "GITHUB_SHA": SOURCE, "GITHUB_RUN_ID": "19"}
@@ -82,6 +81,7 @@ class StagingRecoveryStatusTests(unittest.TestCase):
     def test_split_wrong_namespace_missing_progressing_and_unconverged_rollouts_refuse(self):
         mutations = {
             "split_traffic_deployment": lambda: self.routes[DEPLOYMENTS]["deployments"][0]["versions"].append({}),
+            "staging_policy_unproved": lambda: self.routes[VERSION_DETAIL]["resources"]["bindings"][0].update(text="other"),
             "application_namespace_mismatch": lambda: self.routes[APPS][0]["durable_objects"].update(
                 namespace_id="e" * 32),
             "newest_rollout_unproved": lambda: self.routes[ROLLOUTS].clear(),
