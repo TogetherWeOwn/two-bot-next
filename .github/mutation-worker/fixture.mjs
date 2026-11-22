@@ -63,7 +63,8 @@ try {
     const results = await measure(root, changed, tests);
     assert.equal(readFileSync(join(root, file), "utf8"), source);
     assert.deepEqual(results.map((entry) => entry.status), [status]);
-    if (status === "survived" || status === "killed") assert.equal(results[0].line, 2);
+    const attempted = ["strong", "weak", "cancelled", "wrapper-failed"].includes(label);
+    assert.equal(results[0].line, attempted ? 2 : undefined);
     assert.equal(verdict(results, "warn"), 0);
     assert.equal(verdict(results, "hard"), expected);
     console.log(`Worker fixture ${label}: ${status}, HARD exit ${expected}`);
