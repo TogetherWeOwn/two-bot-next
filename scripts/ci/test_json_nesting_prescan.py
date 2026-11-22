@@ -48,6 +48,7 @@ class DepthExceedsTests(unittest.TestCase):
     def test_shared_scan_refuses_depth_and_handles_hostile_strings(self):
         scan = load("script_intake.py").json_depth_exceeds
         self.assertTrue(scan("[[[0]]]", 2))
+        self.assertFalse(scan('["[[[", {"x": "{"}]', 2))
         for text in HOSTILE:
             with self.subTest(size=len(text)):
                 started = time.monotonic()
