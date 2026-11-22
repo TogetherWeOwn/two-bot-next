@@ -664,15 +664,14 @@ saved as artifacts. Temporary baseline/config/NDJSON files stay in runner scratc
 
 ## Read-only recovery inventory
 
-Dispatch `staging-ownership-status.yml` on current protected `main` with
-`inventory=true`. It uses the staging Environment to bracket an authenticated
+Freshly dispatch `staging-ownership-status.yml` on protected current `main`
+with `inventory=true` for each receipt. The staging job brackets an authenticated
 no-start ownership GET with two provider reads. Both samples must agree on the
 100% serving Worker version, bounded policy, Durable Object namespace, and
 newest completed rollout with a digest matching the application's configured
 image. The serving Worker must be the active owner. The receipt records
-its epoch and whether the container was running. `provider_only` attests
-these facts and leaves runtime database
-identity unresolved. Recovery still requires an exact read-only plan and a
+its epoch and whether the container was running. `provider_only` leaves runtime
+database identity unresolved. Recovery requires an exact read-only plan and a
 compatible predecessor.
 
 ## Verification boundaries

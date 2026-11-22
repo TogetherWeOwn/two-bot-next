@@ -11,7 +11,7 @@ from urllib.request import Request
 
 from rollback_proof import REPO, ProofError, gh
 from script_intake import no_redirect_opener, read_with_overflow
-from staging_rollout import CLASS, Client, GateError, decode, mapping, number, require, sequence, timestamp
+from staging_rollout import CLASS, USER_AGENT, Client, GateError, decode, mapping, number, require, sequence, timestamp
 from worker_container_rollback import APPLICATIONS, SHA, VERSION_ID, WORKERS
 from worker_container_rollback import app_rollouts, application_by_name, replaced_converged, rollout_image
 
@@ -101,7 +101,8 @@ def provider_sample(client, account):
 
 def read_ownership(token, *, opener=None):
     endpoint = ORIGIN + "/internal/ownership"
-    request = Request(endpoint, headers={"Authorization": f"Bearer {token}", "Cache-Control": "no-cache"})
+    headers = {"Authorization": f"Bearer {token}", "Cache-Control": "no-cache", "User-Agent": USER_AGENT}
+    request = Request(endpoint, headers=headers)
     opener = opener or no_redirect_opener(use_proxy=False)
     try:
         with opener.open(request, timeout=15) as response:

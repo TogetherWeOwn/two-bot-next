@@ -110,6 +110,7 @@ class StagingRecoveryStatusTests(unittest.TestCase):
             class Opener:
                 def open(self, request, timeout):
                     case.assertEqual(request.get_method(), "GET")
+                    case.assertEqual(request.get_header("User-agent"), status.USER_AGENT)
                     case.assertEqual(request.full_url, f"{status.ORIGIN}/internal/ownership")
                     case.assertEqual(timeout, 15)
                     return Response(raw)
