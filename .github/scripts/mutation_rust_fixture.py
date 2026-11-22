@@ -14,24 +14,18 @@ pub fn eligible(value: i32) -> bool {
     positive && value > 3
 }
 
-pub fn legacy(value: i32) -> bool {
-    value != 10
-}
+pub fn legacy(value: i32) -> bool { value != 10 }
 """
 NEW_SOURCE = OLD_SOURCE.replace("value > 3", "value >= 3")
 STRONG_TEST = """
 #[test]
 fn boundary() {
-    for (value, expected) in [(1, false), (2, false), (3, true), (4, true)] {
-        assert_eq!(eligible(value), expected);
-    }
+    assert_eq!([1, 2, 3, 4].map(eligible), [false, false, true, true]);
 }
 """
 WEAK_TEST = """
 #[test]
-fn unrelated() {
-    assert!(legacy(9));
-}
+fn unrelated() { assert!(legacy(9)); }
 """
 
 
@@ -57,9 +51,10 @@ def main():
         source.write_text(OLD_SOURCE)
         (root / ".gitattributes").write_text("*.rs -diff\n")
         subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root, check=True, timeout=30)
-        (root / "uncovered.rs").write_text("pub fn untouched() -> bool { true }\n")
+        (root / "uncovered.inc").write_text("pub fn untouched() -> bool { true }\n")
         base = commit(root, "baseline")
-        git(root, "mv", "uncovered.rs", "src/uncovered.rs")
+        git(root, "mv", "uncovered.inc", "src/uncovered.rs")
+        (root / "café.py").write_text("value = 3\n", encoding="utf-8")
         for label, test, status, hard_code in (
             ("strong", STRONG_TEST, "killed", 0), ("weak", WEAK_TEST, "survived", 1),
         ):
@@ -67,6 +62,7 @@ def main():
             head = commit(root, label)
             _, patch = pr_diff(root, base, head)
             assert "src/uncovered.rs" not in added_lines(patch)
+            assert added_lines(patch)["café.py"] == {1}
             patch_file = output / "fixture.diff"
             patch_file.write_text(patch)
             report = measure(root, patch_file, output)
