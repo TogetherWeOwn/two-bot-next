@@ -91,25 +91,15 @@ fn sticky_test_options_require_the_approved_container() {
     }
 }
 
-async fn scratch_pool(name: &str) -> (PgPool, PgConnectOptions, String) {
+async fn scratch_pool() -> (PgPool, PgConnectOptions, String) {
     let url = std::env::var("STICKY_TEST_DATABASE_URL").unwrap_or_else(|_| TEST_URL.to_owned());
     let options = test_options(&url).expect("only documented agent-testdb options are allowed");
-    assert!(name.bytes().all(|byte| byte.is_ascii_lowercase()));
-    let schema = format!(
-        "sticky_tog10082_{}_{}_{}",
-        std::process::id(),
-        now_ms(),
-        name
-    );
     let admin = PgPoolOptions::new()
         .max_connections(1)
         .connect_with(options.clone())
         .await
         .expect("connect agent-testdb (see crate docs for the expected credential)");
-    // Audited: schema consists only of a fixed prefix, digits and the
-    // validated lowercase test name; no caller-supplied URL enters SQL.
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-        .execute(&admin)
+    let schema = two_bot_testsupport::create_test_schema(&admin)
         .await
         .expect("create scratch schema");
     admin.close().await;
@@ -139,7 +129,7 @@ async fn cleanup(pool: PgPool, options: PgConnectOptions, schema: String) {
 #[tokio::test]
 #[ignore = "requires reachable agent-testdb (STICKY_TEST_DATABASE_URL override); CI runs --ignored in ignored-db-stores"]
 async fn sticky_live_round_trip() {
-    let (pool, options, schema) = scratch_pool("fresh").await;
+    let (pool, options, schema) = scratch_pool().await;
 
     // The checked-in migration is what gets applied.
     sqlx::raw_sql(DDL)
@@ -337,7 +327,7 @@ async fn sticky_live_round_trip() {
 #[tokio::test]
 #[ignore = "requires reachable agent-testdb (STICKY_TEST_DATABASE_URL override); CI runs --ignored in ignored-db-stores"]
 async fn sticky_live_legacy_upgrade() {
-    let (pool, options, schema) = scratch_pool("legacy").await;
+    let (pool, options, schema) = scratch_pool().await;
     sqlx::raw_sql(include_str!("fixtures/legacy_sticky.sql"))
         .execute(&pool)
         .await
@@ -488,7 +478,7 @@ async fn sticky_live_legacy_upgrade() {
 #[tokio::test]
 #[ignore = "requires reachable agent-testdb (STICKY_TEST_DATABASE_URL override); CI runs --ignored in ignored-db-stores"]
 async fn sticky_live_uncertainty_fence() {
-    let (pool, options, schema) = scratch_pool("fence").await;
+    let (pool, options, schema) = scratch_pool().await;
     sqlx::raw_sql(DDL)
         .execute(&pool)
         .await

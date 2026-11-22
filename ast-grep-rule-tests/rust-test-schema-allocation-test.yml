@@ -1,0 +1,17 @@
+id: rust-test-schema-allocation
+valid:
+- 'let schema = two_bot_testsupport::create_test_schema(&mut conn).await?;'
+- 'sqlx::raw_sql(include_str!("fixtures/schema_behavior.sql"));'
+- 'static MIGRATOR: Migrator = sqlx::migrate!("./migrations");'
+- '// CREATE SCHEMA belongs in the allocator.'
+- 'let description = "A CREATE SCHEMA statement needs a role.";'
+invalid:
+- 'sqlx::QueryBuilder::new("CREATE SCHEMA ");'
+- 'sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {name}")));'
+- 'sqlx::query("select 1; cReAtE\tScHeMa if not exists scratch");'
+- |
+  sqlx::raw_sql(r#"
+      SELECT 1;
+      CREATE
+      SCHEMA scratch;
+  "#);

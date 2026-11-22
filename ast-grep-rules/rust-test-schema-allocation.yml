@@ -1,0 +1,16 @@
+id: rust-test-schema-allocation
+language: Rust
+severity: warning
+message: Use two_bot_testsupport::create_test_schema for scratch schemas.
+files:
+- '**/tests/**/*.rs'
+- '**/tests.rs'
+- '**/test_*.rs'
+- '**/*_test*.rs'
+ignores:
+- 'crates/testsupport/**'
+rule:
+  any:
+  - kind: string_literal
+  - kind: raw_string_literal
+  regex: '(?i)(?:\A(?:r#*)?"|;)(?:\s|\\[nrt]|\\\r?\n)*create(?:\s|\\[nrt]|\\\r?\n)+schema\b'

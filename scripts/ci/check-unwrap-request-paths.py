@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HARD gate: no new `.unwrap()` in request-path source files.
+"""HARD gate for request-path unwraps and ad hoc scratch schemas in Rust tests.
 
 The request-path rules are defined by
 ``ast-grep-rules/no-unwrap-request-paths.yml`` (direct ``$X.unwrap()`` calls)
@@ -7,13 +7,15 @@ and ``ast-grep-rules/no-unwrap-request-paths-in-macros.yml`` (``unwrap``
 inside macro token trees, which the base pattern cannot see because ast-grep
 parses macro arguments as opaque ``token_tree``). Both share the request-path
 file globs with test files/dirs ignored; inline ``#[cfg(test)]`` modules are
-included. Six additional Rust advisories and their fixtures come from the
+included. The schema rules cover Rust test files and inline tests outside
+testsupport. Migration and schema-behavior SQL fixtures can be loaded from
+SQL files. Six additional Rust advisories and their fixtures come from the
 shared meta-only assets. The script runs ``ast-grep scan --json --warning``
 and intersects all reported hits with
 the lines the PR adds (``git diff -U0 base head``), so only newly added
 findings fail. Existing unwrap hits are listed in ``docs/unwrap-backlog.md``.
 
-HARD mode: a newly added `.unwrap()` in scope prints ``::error::``
+HARD mode: a newly added unwrap or schema allocation in scope prints ``::error::``
 annotations and the script exits 1. Findings from the six shared advisory
 rules stay WARN-only (``::warning::``, exit still 0 when they are the only
 fresh hits). A blind gate (missing binary, failed/empty scan, malformed
@@ -31,9 +33,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RULE_ID = "no-unwrap-request-paths"
 MACRO_RULE_ID = "no-unwrap-request-paths-in-macros"
-ENFORCED_RULE_IDS = frozenset({RULE_ID, MACRO_RULE_ID})
+UNWRAP_RULE_IDS = frozenset({RULE_ID, MACRO_RULE_ID})
+SCHEMA_RULE_IDS = frozenset({"rust-test-schema-allocation", "rust-inline-test-schema-allocation"})
+ENFORCED_RULE_IDS = UNWRAP_RULE_IDS | SCHEMA_RULE_IDS
 BACKLOG_NAME = "docs/unwrap-backlog.md"
 MAX_ANNOTATIONS = 10
+
+# The schema ast-grep rules report the full literal. Match their SQL token
+# pattern here to find the actual DDL lines within a multiline literal.
+SCHEMA_DDL = re.compile(
+    r'(?i)(?:\A(?:r#*)?"|;)(?:\s|\\[nrt]|\\\r?\n)*(create(?:\s|\\[nrt]|\\\r?\n)+schema)\b'
+)
+
+
+def schema_ddl_lines(literal, first_line):
+    for match in SCHEMA_DDL.finditer(literal):
+        start = first_line + literal.count("\n", 0, match.start(1))
+        end = first_line + literal.count("\n", 0, match.end(1))
+        yield from range(start, end + 1)
 
 
 def run_scan(ast_grep, all_rules=False):
@@ -86,9 +103,19 @@ def run_scan(ast_grep, all_rules=False):
             end = location.get("end")
             if not isinstance(end, dict):
                 return None, "ast-grep scan contains an invalid finding location"
-            line = end.get("line")
-            if type(line) is not int or line < start.get("line"):
+            end_line = end.get("line")
+            if type(end_line) is not int or end_line < line:
                 return None, "ast-grep scan contains an invalid finding location"
+            if rule_id in SCHEMA_RULE_IDS:
+                literal = finding.get("text")
+                if not isinstance(literal, str) or literal.count("\n") != end_line - line:
+                    return None, "ast-grep scan contains an invalid schema literal"
+                ddl_lines = list(schema_ddl_lines(literal, line + 1))
+                if not ddl_lines:
+                    return None, "ast-grep schema finding has no matching DDL"
+                hits.extend((rule_id, path, n) if all_rules else (path, n) for n in ddl_lines)
+                continue
+            line = end_line
         line += 1
         hits.append((rule_id, path, line) if all_rules else (path, line))
     return hits, ""
@@ -168,9 +195,11 @@ def main(argv=None):
     if hits is None:
         error(f"ast-grep HARD gate is blind ({scan_error}); failing closed")
         return 1
-    unwrap_hits = [hit for hit in hits if hit[0] in ENFORCED_RULE_IDS]
+    unwrap_hits = [hit for hit in hits if hit[0] in UNWRAP_RULE_IDS]
+    schema_hits = [hit for hit in hits if hit[0] in SCHEMA_RULE_IDS]
     print(f"unwrap request-path gate: {len(unwrap_hits)} enforced-scope hit(s)")
-    print(f"ast-grep advisory gate: {len(hits) - len(unwrap_hits)} other rule hit(s)")
+    print(f"test schema allocation gate: {len(schema_hits)} enforced-scope line hit(s)")
+    print(f"ast-grep advisory gate: {len(hits) - len(unwrap_hits) - len(schema_hits)} other rule hit(s)")
 
     added, diff_error = added_lines(args.base_ref, args.head_ref)
     if added is None:
@@ -181,19 +210,26 @@ def main(argv=None):
     if not fresh:
         print("ast-grep HARD gate: no added findings in scope")
         return 0
-    unwrap_fresh = [hit for hit in fresh if hit[0] in ENFORCED_RULE_IDS]
+    unwrap_fresh = [hit for hit in fresh if hit[0] in UNWRAP_RULE_IDS]
+    schema_fresh = [hit for hit in fresh if hit[0] in SCHEMA_RULE_IDS]
     for rule_id, path, line in fresh[:MAX_ANNOTATIONS]:
-        if rule_id in ENFORCED_RULE_IDS:
+        if rule_id in UNWRAP_RULE_IDS:
             error(f"{path}:{line} adds .unwrap() in a request-path source file "
                   "(inline test modules are included)")
+        elif rule_id in SCHEMA_RULE_IDS:
+            error(f"{path}:{line} adds CREATE SCHEMA in a Rust test. "
+                  "Use two_bot_testsupport::create_test_schema for scratch schemas.")
         else:
             warn(f"{path}:{line} matches ast-grep rule {rule_id}")
     if len(fresh) > MAX_ANNOTATIONS:
-        (error if unwrap_fresh else warn)(
+        (error if unwrap_fresh or schema_fresh else warn)(
             f"... and {len(fresh) - MAX_ANNOTATIONS} more new finding(s)")
     if unwrap_fresh:
         error(f"unwrap request-path gate: {len(unwrap_fresh)} added .unwrap() call(s) in scope "
               f"(existing backlog in {BACKLOG_NAME})")
+    if schema_fresh:
+        error(f"test schema allocation gate: {len(schema_fresh)} added CREATE SCHEMA line(s)")
+    if unwrap_fresh or schema_fresh:
         return 1
     warn(f"ast-grep advisory gate: {len(fresh)} new finding(s) (WARN only)")
     return 0

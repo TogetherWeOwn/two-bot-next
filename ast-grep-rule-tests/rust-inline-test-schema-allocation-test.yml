@@ -1,0 +1,26 @@
+id: rust-inline-test-schema-allocation
+valid:
+- 'fn runtime() { sqlx::query("CREATE SCHEMA runtime"); }'
+- |
+  #[cfg(not(test))]
+  fn runtime() { sqlx::query("CREATE SCHEMA runtime"); }
+- |
+  #[cfg(test)]
+  mod tests {
+      fn setup() { sqlx::raw_sql(include_str!("fixtures/schema_behavior.sql")); }
+  }
+invalid:
+- |
+  #[cfg(test)]
+  mod tests {
+      fn setup() { sqlx::query("CREATE SCHEMA scratch"); }
+  }
+- |
+  #[cfg(all(feature = "db", test))]
+  mod tests {
+      fn setup() { sqlx::query("CREATE SCHEMA scratch"); }
+  }
+- |
+  #[tokio::test(flavor = "multi_thread")]
+  #[ignore = "requires disposable test database"]
+  async fn example() { sqlx::query("CREATE SCHEMA scratch"); }

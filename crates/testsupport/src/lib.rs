@@ -189,7 +189,7 @@ async fn run_migrations_with_retry(
 // outside the unchanged SQL deadline instead of making concurrent drops race it.
 // Cargo runs test binaries sequentially; tests inside each binary share this gate.
 static DATABASE_DDL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
+static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 // A DNS blip on the disposable Postgres service fails every fixture created
 // while it lasts (each connect fails fast, so a whole suite goes red in
@@ -232,16 +232,30 @@ where
     }
 }
 
-fn database_name() -> String {
+fn fixture_name() -> String {
     let time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock before epoch")
         .as_nanos();
-    let sequence = NEXT_DATABASE.fetch_add(1, Ordering::Relaxed);
+    let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     format!(
         "two_bot_test_{:x}_{time:x}_{sequence:x}",
         std::process::id()
     )
+}
+
+/// Allocate a scratch schema through a caller's disposable Postgres executor.
+/// The caller owns setup and teardown, including the search path and any roles.
+pub async fn create_test_schema<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+) -> Result<String, sqlx::Error> {
+    let schema = fixture_name();
+    // The internal name contains only ASCII identifier characters and fits
+    // PostgreSQL's 63-byte limit (prefix, PID, timestamp and sequence in hex).
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(executor)
+        .await?;
+    Ok(schema)
 }
 
 struct Cleanup {
@@ -458,7 +472,7 @@ impl TestDatabase {
         )
         .await
         .context("connect to test bootstrap database")?;
-        let name = database_name();
+        let name = fixture_name();
         if let Err(error) = create_database_with_retry(&admin, &name, &SETUP_DDL_RETRY_DELAYS).await
         {
             admin.close().await;
@@ -965,8 +979,8 @@ mod tests {
 
     #[test]
     fn generated_names_are_unique_and_guarded() {
-        let first = database_name();
-        let second = database_name();
+        let first = fixture_name();
+        let second = fixture_name();
         assert_ne!(first, second);
         for name in [first, second] {
             guard_database_url(&format!("postgres://agent_test:@agent-testdb:5432/{name}"))

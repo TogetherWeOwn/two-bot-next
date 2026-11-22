@@ -1,0 +1,55 @@
+id: rust-inline-test-schema-allocation
+snapshots:
+  ? |
+    #[cfg(all(feature = "db", test))]
+    mod tests {
+        fn setup() { sqlx::query("CREATE SCHEMA scratch"); }
+    }
+  : labels:
+    - source: '"CREATE SCHEMA scratch"'
+      style: primary
+      start: 75
+      end: 98
+    - source: '#[cfg(all(feature = "db", test))]'
+      style: secondary
+      start: 0
+      end: 33
+    - source: '#[cfg(all(feature = "db", test))]'
+      style: secondary
+      start: 0
+      end: 33
+  ? |
+    #[cfg(test)]
+    mod tests {
+        fn setup() { sqlx::query("CREATE SCHEMA scratch"); }
+    }
+  : labels:
+    - source: '"CREATE SCHEMA scratch"'
+      style: primary
+      start: 54
+      end: 77
+    - source: '#[cfg(test)]'
+      style: secondary
+      start: 0
+      end: 12
+    - source: '#[cfg(test)]'
+      style: secondary
+      start: 0
+      end: 12
+  ? |
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires disposable test database"]
+    async fn example() { sqlx::query("CREATE SCHEMA scratch"); }
+  : labels:
+    - source: '"CREATE SCHEMA scratch"'
+      style: primary
+      start: 121
+      end: 144
+    - source: '#[tokio::test(flavor = "multi_thread")]'
+      style: secondary
+      start: 0
+      end: 39
+    - source: '#[tokio::test(flavor = "multi_thread")]'
+      style: secondary
+      start: 0
+      end: 39
