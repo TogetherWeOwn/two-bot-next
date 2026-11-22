@@ -23,6 +23,7 @@ spec = importlib.util.spec_from_file_location(
 container_drill = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(container_drill)
 GateError = container_drill.GateError
+from staging_cloudflare_fixture import CloudflareFake, LAG_COUNTERS
 # The finite-use adapter module the drill imports; its subprocess is the only
 # thing the lifecycle fixtures replace, so the real adapter logic still runs.
 USE_MODULE = sys.modules[container_drill.StagingDrillUse.__module__]
@@ -64,15 +65,15 @@ def pin(**changes):
     return base
 
 
-class World:
+class World(CloudflareFake):
     """One staging singleton: Worker versions, app, rollouts, probes, deploy."""
 
     def __init__(self, history=(PRE, BACKOUT_WORKER), phase="active", epoch=7,
                  ready_polls=1):
-        self.history = list(history)  # newest first
         self.phase, self.epoch, self.running = phase, epoch, phase == "active"
-        self.serving_image = PRE_IMAGE
-        self.rollouts = [
+        app = {"id": "app1", "name": APP, "durable_objects": {"namespace_id": "ns1"},
+               "configuration": {"image": PRE_IMAGE}}
+        rows = [
             {"id": "r-pre", "created_at": "2026-10-04T21:00:00Z",
              "status": "completed",
              "target_configuration": {"image": PRE_IMAGE},
@@ -94,6 +95,7 @@ class World:
                           "total_instances": 1, "updated_instances": 1},
              "steps": [{"status": "completed"}]},
         ]
+        super().__init__(history, app, rows, split_versions=(PRE, BACKOUT_WORKER))
         self.namespaces = {PRE: "ns1", BACKOUT_WORKER: "ns1"}
         # Immutable Worker version metadata: the `workers/message` annotation
         # and the plain_text bindings the bounded-staging proof reads.
@@ -162,27 +164,19 @@ class FakeClient:
             if path.startswith(prefix):
                 raise error
         if path == DEPLOYMENTS_PATH:
-            rows = []
-            for version in world.history:
-                versions = [{"version_id": version, "percentage": 100}] if version else \
-                    [{"version_id": PRE, "percentage": 50},
-                     {"version_id": BACKOUT_WORKER, "percentage": 50}]
-                rows.append({"id": "d", "versions": versions})
-            return {"deployments": rows}
+            return world.deployments()
         if path == APPLICATIONS_PATH:
-            return [{"id": "app1", "name": APP,
-                     "durable_objects": {"namespace_id": "ns1"},
-                     "configuration": {"image": world.serving_image}}]
+            return world.application_listing()
         if path == ROLLOUTS_PATH:
-            return [dict(row) for row in world.rollouts]
+            return world.rollout_listing()
         if path.startswith("/containers/applications/app1/rollouts/"):
             rid = path.rsplit("/", 1)[1]
-            matches = [row for row in world.rollouts if row["id"] == rid]
-            if not matches:
-                raise GateError("api_failure")
-            row = dict(matches[0])
+            try:
+                row = world.rollout_detail(rid)
+            except KeyError as error:
+                raise GateError("api_failure") from error
             if world.never_converge:
-                row = dict(row, status="progressing")
+                row["status"] = "progressing"
             return row
         if path.startswith("/workers/scripts/two-bot-next-staging/versions/"):
             version = path.rsplit("/", 1)[1]
@@ -212,12 +206,13 @@ class FakeClient:
             return (200 if world.phase == "active" else 503), {}, b""
         # Readiness follows the serving image (the Rust build reports its own
         # revision), not the Worker version id, so one leg can stay dark.
+        image = world.ready_image()
         up = (world.phase == "active" and world.running
-              and world.serving_image not in world.never_ready)
+              and image not in world.never_ready)
         if up and world.polls_left > 0:
             world.polls_left -= 1
             up = False
-        revision, build = world.revision_for(world.serving_image)
+        revision, build = world.revision_for(image)
         body = json.dumps({"components": [["process", "ready"],
                                            ["gateway", "ready" if up else "starting"],
                                            ["database", "ready"]],
@@ -291,9 +286,8 @@ def world_deploy(world):
         world.version_vars[version] = {**staging.get("vars", {}),
                                        **world.deploy_vars_override}
         world.namespaces[version] = "ns1"
-        world.history.insert(0, version)
-        world.serving_image = image
-        world.rollouts.append(rollout_row(world, f"r-{len(world.rollouts)}", image))
+        world.deploy_worker(version)
+        world.start_rollout(rollout_row(world, f"r-{len(world.rollouts)}", image))
         return 0
     return deploy
 
@@ -912,30 +906,26 @@ class WranglerEnvTests(unittest.TestCase):
 
 
 class LagToleranceTests(unittest.TestCase):
-    def test_wait_ready_probes_during_active_lag(self):
-        # Run-7 diagnosis: the platform steady state is the lag shape, so
-        # wait_ready must probe it like verify() does instead of demanding
-        # strict converged() with probes=0.
-        world = World()
-        lag_row = rollout_row(world, "r-lag", BACKOUT_IMAGE)
-        lag_row["health"] = {"instances": {"active": 0, "healthy": 1,
-                                           "failed": 0, "starting": 0,
-                                           "scheduling": 0}}
-        world.rollouts = [lag_row]
-        world.serving_image = BACKOUT_IMAGE
-        world.history = [BACKOUT_WORKER, PRE]
-        world.ready_polls = 0
-        logs = []
+    def wait_fixture(self, **lag):
+        world = World(ready_polls=0)
+        world.deploy_worker(BACKOUT_WORKER)
+        world.start_rollout(rollout_row(world, "r-new", BACKOUT_IMAGE), **lag)
         instance = container_drill.Drill(
             FakeClient(world), make_control(world), URL, "1",
-            ("x", lambda p: 0, "y"),
-            now=lambda: world.t, sleep=world.tick, log=logs.append)
-        instance.evidence["rollout_ids_before"] = []
-        moment, counts, timeline = instance.wait_ready(
-            BACKOUT_WORKER, BACKOUT_SHA, BACKOUT_BUILD, BACKOUT_IMAGE,
-            world.t)
-        self.assertGreaterEqual(counts["probes"], 1)
-        self.assertTrue(any(entry[2] and entry[3] for entry in timeline))
+            ("unused", lambda path: 0, "unused"),
+            now=lambda: world.t, sleep=world.tick, log=lambda message: None)
+        instance.evidence["rollout_ids_before"] = ["r-pre", "r-backout"]
+        return world, instance
+
+    def test_wait_ready_probes_during_active_lag(self):
+        for active, healthy in LAG_COUNTERS:
+            with self.subTest(active=active, healthy=healthy):
+                world, instance = self.wait_fixture(counters=(active, healthy), previous_probes=1)
+                _, counts, timeline = instance.wait_ready(
+                    BACKOUT_WORKER, BACKOUT_SHA, BACKOUT_BUILD, BACKOUT_IMAGE, world.t)
+                self.assertEqual(timeline[0][1:], (200, True, False, True))
+                self.assertEqual(counts["probes"], 2 + container_drill.CONFIRM_PROBES)
+                self.assertTrue(all(entry[1:] == (200, True, True, True) for entry in timeline[1:]))
 
     def test_failed_wait_preserves_timeline_and_last_observation(self):
         # A ready_timeout must keep the wait timeline plus the last
@@ -966,30 +956,20 @@ class LagToleranceTests(unittest.TestCase):
         # Run-8: backout rollout accepted active_lag/converged while the
         # application listing trailed for 5 polls (> old budget 3). The wait
         # must survive the lag then probe the exact version once converged.
-        world = World()
-        world.rollouts = [rollout_row(world, "r-new", BACKOUT_IMAGE)]
-        world.serving_image = PRE_IMAGE  # stale listing
-        world.history = [BACKOUT_WORKER, PRE]
-        world.ready_polls = 0
-        calls = [0]
+        world, instance = self.wait_fixture(application_reads=5, rollout_list_reads=1)
+        _, counts, timeline = instance.wait_ready(
+            BACKOUT_WORKER, BACKOUT_SHA, BACKOUT_BUILD, BACKOUT_IMAGE, world.t)
+        self.assertEqual(counts["probes"], 1 + container_drill.CONFIRM_PROBES)
+        self.assertEqual(timeline[0][1:], (0, False, False, False))
+        self.assertEqual([entry[1:] for entry in timeline[1:5]], [(0, False, False, True)] * 4)
+        self.assertTrue(all(entry[1:] == (200, True, True, True) for entry in timeline[5:]))
 
-        def sleep_with_lag(seconds):
-            calls[0] += 1
-            world.tick(seconds)
-            if calls[0] == 5:
-                world.serving_image = BACKOUT_IMAGE
-
-        logs = []
-        instance = container_drill.Drill(
-            FakeClient(world), make_control(world), URL, "1",
-            ("x", lambda p: 0, "y"),
-            now=lambda: world.t, sleep=sleep_with_lag, log=logs.append)
-        instance.evidence["rollout_ids_before"] = []
-        _moment, counts, timeline = instance.wait_ready(
-            BACKOUT_WORKER, BACKOUT_SHA, BACKOUT_BUILD, BACKOUT_IMAGE,
-            world.t)
-        self.assertGreaterEqual(counts["probes"], 1)
-        self.assertTrue(any(entry[2] and entry[3] for entry in timeline))
+    def test_wait_refuses_persistent_listing_without_probing(self):
+        world, instance = self.wait_fixture(application_reads=None, counters=LAG_COUNTERS[1])
+        with self.assertRaisesRegex(GateError, "^application_image_drift$"):
+            instance.wait_ready(
+                BACKOUT_WORKER, BACKOUT_SHA, BACKOUT_BUILD, BACKOUT_IMAGE, world.t)
+        self.assertIn("probes=0", instance._last_wait_observation)
 
     def test_drill_leg_refuses_drifted_live_listing(self):
         world = World()

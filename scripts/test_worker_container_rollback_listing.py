@@ -80,8 +80,9 @@ class ImageRestoreListingTests(unittest.TestCase):
 
     def test_target_version_can_be_pinned_by_a_later_poll(self):
         routes = self.routes(self.row())
-        routes[("POST", f"/containers/applications/{fixtures.APP_ID}/rollouts")] = \
-            lambda _body: {"id": "r-new"}
+        route = ("POST", f"/containers/applications/{fixtures.APP_ID}/rollouts")
+        post = routes[route]
+        routes[route] = lambda body: {"id": post(body)["id"]}
         rb, _, _ = fixtures.make_rollback(routes)
         result = rb.run(fixtures.GOOD_VERSION, fixtures.good_image())
         self.assertEqual(result["restored_rollout_id"], "r-new")

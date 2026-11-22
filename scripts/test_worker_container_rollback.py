@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # then imports the sibling module under test (no linter runs on scripts/).
 import staging_rollout as base
 import worker_container_rollback as rollback
+from staging_cloudflare_fixture import CloudflareFake, LAG_COUNTERS
 
 ACCOUNT = "a" * 32
 WORKER = "two-bot-next-staging"
@@ -502,53 +503,48 @@ class RollbackRunTests(unittest.TestCase):
         rb.run(GOOD_VERSION, good_image())
         self.assertEqual(gate_started, [900.0])
 
-    def routes(self, serving=BAD_VERSION, *, stale_reads=0, listing_lag=False):
+    def routes(self, serving=BAD_VERSION, *, stale_reads=0, listing_lag=False,
+               counters=None, previous_probes=0):
         prev = rollout_row("r-prev", good_image(), created="2026-10-14T00:00:00Z")
-        created = {"n": 0}
+        app = {"id": APP_ID, "name": APPLICATION,
+               "durable_objects": {"namespace_id": NAMESPACE},
+               "configuration": {"image": bad_image()}}
+        history = [serving, GOOD_VERSION] if serving != GOOD_VERSION else [serving]
+        cloudflare = CloudflareFake(history, app, [prev])
 
         def post_rollouts(body):
-            created["n"] += 1
-            return {"id": "r-new", "target_version": 9}
-
-        def get_rollout():
-            # Converged once the new rollout record exists.
-            status = "completed" if created["n"] else "progressing"
-            row = rollout_row("r-new", good_image(), created="2026-10-15T01:00:00Z",
-                              status=status, target_version=9)
-            row["current_configuration"]["image"] = bad_image()
-            return {"success": True, "result": row}
+            row = rollout_row("r-new", body["target_configuration"]["image"],
+                              created="2026-10-15T01:00:00Z", target_version=9)
+            cloudflare.start_rollout(row, application_reads=None if listing_lag else 0,
+                                     counters=counters, previous_probes=previous_probes)
+            return {"id": row["id"], "target_version": row["target_version"]}
 
         def post_deployments(body):
-            routes_state["serving"] = body["versions"][0]["version_id"]
+            cloudflare.deploy_worker(body["versions"][0]["version_id"], deployment_reads=stale_reads)
             return {"ok": True}
 
-        def get_deployments():
-            nonlocal stale_reads
-            versions = [routes_state["serving"]]
-            if routes_state["serving"] != serving and stale_reads:
-                stale_reads -= 1
-                versions.insert(0, serving)  # The target in history is not confirmation.
-            rows = [{"versions": [{"version_id": version, "percentage": 100}]}
-                    for version in versions]
-            return {"success": True, "result": {"deployments": rows}}
+        def readyz():
+            image = cloudflare.ready_image()
+            revision = SHA if image == good_image() else "f" * 40
+            probe, _ = ready_probe(cloudflare.history[0], revision)
+            return probe()
 
-        routes_state = {"serving": serving}
-        handler, health = ready_probe(GOOD_VERSION)
+        def envelope(read):
+            return lambda: {"success": True, "result": read()}
+
         routes = {
-            ("GET", f"/workers/scripts/{WORKER}/deployments"): get_deployments,
+            ("GET", f"/workers/scripts/{WORKER}/deployments"): envelope(cloudflare.deployments),
             ("POST", f"/workers/scripts/{WORKER}/deployments"): post_deployments,
             ("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100"):
-                lambda: {"success": True, "result": [prev]},
+                envelope(cloudflare.rollout_listing),
             ("POST", f"/containers/applications/{APP_ID}/rollouts"): post_rollouts,
-            ("GET", f"/containers/applications/{APP_ID}/rollouts/r-new"): get_rollout,
-            ("GET", "/containers/applications"): lambda: {
-                "success": True, "result": [{"id": APP_ID, "name": APPLICATION,
-                                             "durable_objects": {"namespace_id": NAMESPACE},
-                                             "configuration": {"image": bad_image() if listing_lag else good_image()}}]},
-            ("PROBE", "readyz"): handler,
-            ("PROBE", "health"): health,
+            ("GET", f"/containers/applications/{APP_ID}/rollouts/r-new"):
+                envelope(lambda: cloudflare.rollout_detail("r-new")),
+            ("GET", "/containers/applications"): envelope(cloudflare.application_listing),
+            ("PROBE", "readyz"): readyz,
+            ("PROBE", "health"): ready_probe(GOOD_VERSION)[1],
         }
-        return routes, routes_state
+        return routes, cloudflare
 
     def test_full_restore_posts_worker_and_image_then_hands_over(self):
         routes, state = self.routes()
@@ -574,7 +570,7 @@ class RollbackRunTests(unittest.TestCase):
         self.assertEqual(calls[-1][2], GOOD_VERSION)
         self.assertEqual(evidence["restored_version"], GOOD_VERSION)
         self.assertEqual(evidence["from_version"], BAD_VERSION)
-        self.assertEqual(state["serving"], GOOD_VERSION)
+        self.assertEqual(state.history[0], GOOD_VERSION)
 
     def test_production_waits_through_stale_worker_readback_before_image_restore(self):
         routes, _ = self.routes(stale_reads=2)
@@ -753,23 +749,28 @@ class RollbackRunTests(unittest.TestCase):
                 self.assertEqual(sum(call[0] == "POST" for call in client.calls), 2)
 
     def test_image_restore_accepts_the_steady_state_lag_shape(self):
-        # Under durable_object scheduling the completed rollout can read
-        # active:1/healthy:0 while the exact build serves ready; staging
-        # verify accepts that shape, so the restore must not time out on it.
-        routes, _ = self.routes(listing_lag=True)
-        lag = routes[("GET", f"/containers/applications/{APP_ID}/rollouts/r-new")]()["result"]
-        lag["status"] = "completed"
-        lag["health"]["instances"] = {"active": 1, "healthy": 0, "failed": 0,
-                                      "starting": 0, "scheduling": 0}
-        self.assertTrue(base.active_lag(lag, good_image(), 9))
-        routes[(f"GET", f"/containers/applications/{APP_ID}/rollouts/r-new")] = \
-            lambda: {"success": True, "result": lag}
-        control, _ = control_stub()
-        rb, client, _ = make_rollback(routes, control=control)
-        evidence = rb.run(GOOD_VERSION, good_image())
-        self.assertEqual(evidence["restored_rollout_id"], "r-new")
-        posts = [call for call in client.calls if call[0] == "POST"]
-        self.assertTrue(any("rollouts" in path for _, path, _ in posts))
+        for active, healthy in LAG_COUNTERS:
+            with self.subTest(active=active, healthy=healthy):
+                routes, _ = self.routes(stale_reads=2, listing_lag=True,
+                                        counters=(active, healthy), previous_probes=1)
+                rb, client, log = make_rollback(routes)
+                evidence = rb.run(GOOD_VERSION, good_image())
+                self.assertEqual(evidence["restored_rollout_id"], "r-new")
+                self.assertEqual(evidence["stable_polls"], rollback.STABLE_PASSES + 1)
+                self.assertIn("readyz=200 identity=mismatch", log.getvalue())
+                posts = [call for call in client.calls if call[0] == "POST"]
+                self.assertTrue(any("rollouts" in path for _, path, _ in posts))
+
+    def test_staging_refuses_previous_container_after_worker_and_rollout_converge(self):
+        routes, _ = self.routes(stale_reads=2, counters=LAG_COUNTERS[1],
+                                previous_probes=None)
+        rb, _, log = make_rollback(routes)
+        with self.assertRaisesRegex(base.GateError, "^gate_timeout$"):
+            rb.run(GOOD_VERSION, good_image())
+        self.assertIn("readyz=200 identity=mismatch", log.getvalue())
+        self.assertEqual(rb.evidence["restored_rollout_id"], "r-new")
+        self.assertNotIn("restored_version", rb.evidence)
+        self.assertNotIn("gate", rb.evidence)
 
     def test_production_variant_fences_then_takes_over_with_epoch(self):
         routes, _ = self.routes()
