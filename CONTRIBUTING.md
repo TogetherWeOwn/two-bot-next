@@ -354,9 +354,8 @@ Use Verification for commands and results. The `ci-evidence` summary
 publishes the head SHA and Actions links for task evidence.
 `pr-evidence` resolves Python functions or `Class.method`, Rust test
 functions and literal JS/TS titles. Use the changed file alone for generated names.
-
-The baseline covers unchanged PR heads and evidence. Before making
-`pr-evidence` required, record SHA and run/job URLs for green main and two later PRs.
+The baseline covers unchanged PR heads and evidence. Before registration, record
+SHA and run/job URLs for green main and two later PRs, and check merge-queue compatibility.
 
 The toolchain remains pinned in `rust-toolchain.toml`. CI runs
 `python3 scripts/generate_command_reference.py` to generate ignored

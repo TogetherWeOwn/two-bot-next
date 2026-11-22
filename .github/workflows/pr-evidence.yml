@@ -55,7 +55,7 @@ jobs:
           python-version: '3.12'
       - name: Install hash-pinned source parsers
         if: "!inputs.publish-only"
-        run: python3 -m pip --isolated install --no-deps --only-binary=:all: --require-hashes -r .github/scripts/pr-evidence-requirements.txt
+        run: 'python3 -m pip --isolated install --no-deps --only-binary=:all: --require-hashes -r .github/scripts/pr-evidence-requirements.txt'
       - name: Verify and publish evidence
         env:
           GH_TOKEN: ${{ github.token }}

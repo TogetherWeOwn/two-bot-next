@@ -165,20 +165,18 @@ def check(policy, reader, number, repo, base, head):
         if (pr["state"], pr["base"]["repo"]["full_name"], pr["base"]["sha"], pr["head"]["sha"]) != (
                 "open", repo, base, head):
             raise EvidenceError("PR identity moved or does not match this run.")
-        return pr["body"] or "", pr["head"]["ref"], pr["user"]["login"]
+        return pr["body"] or ""
 
-    body, branch, author = snapshot()
+    body = snapshot()
     baseline = Path(__file__).with_name("pr-evidence-baseline.txt").read_text().splitlines()
     digest = hashlib.sha256(repr(evidence_sections(body)).encode()).hexdigest()
     entry = f"{number} {head} {digest}"
-    if branch.startswith("release-please--") and author.endswith("[bot]"):
-        result = "Generated release PR"
-    elif entry in baseline:
-        result = "Existing PR with grandfathered head and evidence"
+    if entry in baseline:
+        result = "Existing PR with recorded head and evidence"
     else:
         validate(policy, body, sources(base, head), lambda path: source_blob(head, path))
         result = "Verification and Attestation passed"
-    if snapshot() != (body, branch, author):
+    if snapshot() != body:
         raise EvidenceError("PR evidence changed during validation. Use the newer run.")
     return result
 
@@ -213,5 +211,5 @@ if __name__ == "__main__":
         main()
     except EvidenceError as error:
         raise SystemExit(str(error)) from None
-    except (KeyError, OSError, SyntaxError, ValueError, subprocess.SubprocessError):
+    except (AttributeError, KeyError, OSError, RecursionError, SyntaxError, ValueError, subprocess.SubprocessError):
         raise SystemExit("Could not read the exact-head evidence or attested source.") from None

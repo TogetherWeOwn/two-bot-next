@@ -289,6 +289,7 @@ class AttestationFloor(unittest.TestCase):
         # pass itself. The supply-chain pr-lint job enforces this with the
         # already-merged copy of the gate.
         for changed in (".github/scripts/pr_standards.py",
+                        ".github/workflows/pr-evidence.yml", ".github/scripts/pr_evidence.py",
                         ".github/workflows/supply-chain.yml"):
             with self.subTest(changed=changed):
                 f = ps.evaluate(env(BODY=GOOD_BODY, CHANGED_FILES=changed))
