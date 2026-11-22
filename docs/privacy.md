@@ -258,10 +258,10 @@ step summary.
 
 The retention module (`two-bot-cutover::retention`, migration `0438`)
 applies rolling nominal windows when invoked: raw presence/voice rows use a
-30-day window, the audit-log cache uses 45 days, and user deletion requests
-complete in under 72 hours with a receipt unless a replay guard is unresolved,
-in which case the request stays pending with no receipt and is reported as
-deferred (with overdue requests older than 72 hours counted separately).
+30-day window and the audit-log cache uses 45 days. The 72-hour receipt target
+requires full schema coverage, scoped reservation deletion and settled replay
+guards. The runtime lacks reservation DELETE, so both drains keep work queued
+and report overdue requests. Standalone erasure also needs migrator-only audit access.
 Raw event attendance sessions expire strictly more than 90 elapsed days
 (2,160 hours) after `joined_at`, whether open or closed. Member erasure removes
 only that member's sessions in the requested guild. Attendance window records

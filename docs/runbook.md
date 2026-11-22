@@ -1806,6 +1806,9 @@ is not the schema), when the error lines name `42501` on rejoins (the ACL
 plan is still unapplied and the cursor stays held), or when a skip coincides
 with DB-error or pool-saturation alerts suggesting a wider database incident.
 
+The warning `privacy DELETE unavailable: voice_create_reservations` means the drain lacks authorization.
+Escalate overdue requests to the Operator and keep their queue evidence intact.
+
 #### Alert: voice dispatch timeouts
 
 `two_bot_voice_dispatch_timeouts_total` increased between two keepalive

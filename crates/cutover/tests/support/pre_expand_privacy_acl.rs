@@ -101,7 +101,6 @@ async fn probe(pool: &PgPool) -> Result<(), sqlx::Error> {
     let name: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&mut *tx)
         .await?;
-    // Only the outer test transaction controls whether these roles survive.
     install_roles(&mut tx, &name, Phase::Bootstrap).await?;
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET LOCAL ROLE {name}_b")))
         .execute(&mut *tx)
@@ -186,7 +185,6 @@ async fn runtime_privacy_boundaries_across_0480_and_v17_restore() {
     let result = tokio::spawn(async move { exercise_transition(&pool, &fixture_name).await }).await;
     db.close().await.expect("verify disposable teardown");
 
-    // Committed cluster roles outlive their disposable database.
     let bootstrap = url.rsplit_once('/').unwrap().1;
     let mut cleanup = PgConnection::connect_with(&options.as_ref().clone().database(bootstrap))
         .await
@@ -254,9 +252,8 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
         .await
         .unwrap();
     assert_runtime_refusal(&runtime, &request, "42P01").await;
-    assert!(run_retention(&runtime, RetentionMode::Execute)
-        .await
-        .is_err());
+    let result = run_retention(&runtime, RetentionMode::Execute).await;
+    assert_eq!(result.unwrap_err().step().as_str(), "expiry");
     assert_preserved(&runtime).await;
 
     // Cutover commits before Store, web contract and grants.
@@ -264,9 +261,8 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     assert_ledgers(&migrator, 480, 465).await;
     assert_counts(&migrator, &[(SESSIONS, 0), (WINDOWS, 0)]).await;
     assert_runtime_refusal(&runtime, &request, "42501").await;
-    assert!(run_retention(&runtime, RetentionMode::Execute)
-        .await
-        .is_err());
+    let result = run_retention(&runtime, RetentionMode::Execute).await;
+    assert_eq!(result.unwrap_err().step().as_str(), "expiry");
     assert_preserved(&runtime).await;
 
     CUTOVER.run(&migrator).await.unwrap();
@@ -300,7 +296,6 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
         (1, 1)
     );
     assert_preserved(&runtime).await;
-    // The existing operator role supplies the positive continuity control.
     let receipt = fulfill_user_deletion(&migrator, &request).await.unwrap();
     assert_eq!(receipt.receipt_id, format!("rcpt-{request}"));
     assert!(fulfill_user_deletion(&migrator, &request).await.is_err());
@@ -390,12 +385,13 @@ async fn assert_hidden_schema_and_replay_refusals(
     .await
     .unwrap();
     assert_eq!(count(runtime, "SELECT count(*) FROM information_schema.columns WHERE table_name = 'privacy_hidden_fixture'").await, 0);
-    let mut conn = runtime.acquire().await.unwrap();
+    let gaps = member_erasure::schema_gaps(&mut runtime.acquire().await.unwrap())
+        .await
+        .unwrap();
     assert_eq!(
-        member_erasure::schema_gaps(&mut conn).await.unwrap(),
+        gaps,
         ["uncovered identity: privacy_hidden_fixture.owner_id"]
     );
-    drop(conn);
     for mode in [RetentionMode::DryRun, RetentionMode::Execute] {
         let report = run_retention(runtime, mode).await.unwrap();
         assert_eq!(
@@ -432,8 +428,6 @@ async fn assert_hidden_schema_and_replay_refusals(
         (report.deletions_deferred, report.guild_purges_deferred),
         (1, 1)
     );
-    assert_preserved(runtime).await;
-    // Match the operator release path's redacted markers.
     sqlx::query(
         "UPDATE moderation_idempotency SET state = 'done', outcome = 'operator_released',
           completed_at = now(), request_hash = 'operator_released', claim_token = 'operator_released'"

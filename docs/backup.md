@@ -123,13 +123,6 @@ a fallback. Before applying 0480, qualify a compatible recovery build and
 archive on a migrated test database (restore, erasure and guild purge). Use
 that build for forward recovery if no compatible rollback image exists.
 
-Runtime privacy continuity also requires authorization to erase scoped
-`voice_create_reservations` rows. The current runtime role lacks that grant
-and cannot lock or write the standalone `member_erasure_audit`. A v17 restore
-under the migrator role does not resolve either restriction. The interval
-between attendance DDL and grants also requires a same-session writer fence
-before a gateway can treat inaccessible attendance tables as empty.
-
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
 source's applied migrations and `sequenceMarks`: for every serial, identity and
