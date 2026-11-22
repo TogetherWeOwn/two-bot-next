@@ -65,7 +65,13 @@ def main():
             assert "src/uncovered.rs" not in added_lines(patch)
             patch_file = output / "fixture.diff"
             patch_file.write_text(patch)
-            report = measure(root, patch_file, output)
+            try:
+                report = measure(root, patch_file, output)
+            except (ValueError, subprocess.SubprocessError):
+                baseline_log = output / "mutants.out/log/baseline.log"
+                if baseline_log.is_file():
+                    print(baseline_log.read_text()[-4000:])
+                raise
             assert report["out_of_scope"] > 0, report
             assert {(row["file"], row["line"]) for row in report["results"]} == {("src/lib.rs", 3)}, report
             assert {row["status"] for row in report["results"]} == {status}, report
