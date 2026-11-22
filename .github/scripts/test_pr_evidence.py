@@ -60,7 +60,7 @@ class EvidenceTests(unittest.TestCase):
                 (body.replace("Ran the evidence fixtures.", link) + fenced, "can go stale"),
                 (policy_only.replace("proof=fixture", f"proof={link}"), "can go stale"),
                 (body.replace("- Ran the evidence fixtures.", "```\npython3 -m unittest\n```") + fenced, "Verification"),
-                (body.replace("- Ran the evidence fixtures.", "-\n##\tNotes\n- Ran tests."), "Verification")):
+                (body.replace("- Ran the evidence fixtures.", "    python3 -m unittest\n##\tNotes\n- Ran tests."), "Verification")):
             with self.assertRaisesRegex(evidence.EvidenceError, problem):
                 evidence.validate(policy, changed, files, read)
         with self.assertRaisesRegex(evidence.EvidenceError, "test_file_not_in_head_diff"):

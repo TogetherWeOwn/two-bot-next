@@ -63,7 +63,7 @@ def evidence_sections(policy, body):
             continue
         if lines[start].strip() != title or title in sections:
             raise EvidenceError("Use unique canonical Verification and Attestation headings.")
-        sections[title] = "\n".join(lines[content:stop]).strip()
+        sections[title] = "\n".join(lines[content:stop]).strip("\n")
     visible = "\n".join(policy.visible_lines(body))
     tail = f"\n{visible}\n".partition("\n## Attestation\n")[2]
     return sections.get("## Verification"), sections.get("## Attestation"), re.split(r"^#{1,2} ", tail, maxsplit=1, flags=re.M)[0]
