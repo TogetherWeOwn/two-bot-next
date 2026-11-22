@@ -26,10 +26,19 @@ def pr_diff(root, base, head):
     if git(root, "rev-parse", "HEAD").strip() != head:
         raise ValueError("checkout differs from PR head")
     merge_base = git(root, "merge-base", base, head).strip()
+    changes = iter(git(root, "diff", "--find-renames", "--name-status", "-z", merge_base, head).split("\0")[:-1])
+    paths = set()
+    for status in changes:
+        previous = next(changes)
+        current = next(changes) if status[0] in "RC" else previous
+        if current.endswith((".rs", ".py", ".ts")):
+            paths.update((previous, current))
+    if not paths:
+        return merge_base, ""
     return merge_base, git(
-        root, "-c", "core.quotePath=true", "diff", "--no-color", "--no-ext-diff",
+        root, "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff",
         "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/",
-        "--text", "--unified=0", merge_base, head, "--", "*.rs", "*.py", "*.ts",
+        "--text", "--unified=0", merge_base, head, "--", *(f":(literal){path}" for path in sorted(paths)),
     )
 
 
