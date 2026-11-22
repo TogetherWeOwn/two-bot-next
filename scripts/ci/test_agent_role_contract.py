@@ -15,20 +15,20 @@ def load_role(name):
 
 
 class AgentRoleContractTests(unittest.TestCase):
-    def test_claude_code_models_and_tools(self):
+    def test_claude_import_and_roles_have_no_model_overrides(self):
+        self.assertEqual((ROOT / "CLAUDE.md").read_text(), "@AGENTS.md\n")
         expected = {
-            "Explore": ("haiku", "Read, Grep, Glob, Bash"),
-            "scout": ("haiku", "Read, Grep, Glob, Bash"),
-            "cross-reviewer": ("opus", "Read, Grep, Glob, Bash"),
-            "builder": ("sonnet", "Read, Grep, Glob, Bash, Edit, Write"),
+            "Explore": "Read, Grep, Glob, Bash",
+            "scout": "Read, Grep, Glob, Bash",
+            "cross-reviewer": "Read, Grep, Glob, Bash",
+            "builder": "Read, Grep, Glob, Bash, Edit, Write",
         }
-        for name, (model, tools) in expected.items():
+        for name, tools in expected.items():
             with self.subTest(role=name):
                 metadata, _ = load_role(name)
                 self.assertEqual(metadata["name"], name)
-                self.assertEqual(metadata["model"], model)
                 self.assertEqual(metadata["tools"], tools)
-                self.assertEqual(set(metadata), {"name", "description", "model", "tools"})
+                self.assertEqual(set(metadata), {"name", "description", "tools"})
 
     def test_cross_review_is_independent_and_pinned(self):
         metadata, body = load_role("cross-reviewer")
@@ -79,12 +79,11 @@ class AgentRoleContractTests(unittest.TestCase):
             with self.subTest(requirement=requirement):
                 self.assertIn(requirement, body)
 
-    def test_both_roles_keep_model_and_release_controls(self):
+    def test_both_roles_keep_runtime_and_release_controls(self):
         for name in ("builder", "cross-reviewer"):
             _, body = load_role(name)
             for requirement in (
                 "required checks", "release gates",
-                "Never override this Claude Code role's model",
                 "runtime settings, tools and permissions",
                 "Experimental review-panel, annotated-diff and hill-climb work remains on hold",
             ):

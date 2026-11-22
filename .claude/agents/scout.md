@@ -1,7 +1,6 @@
 ---
 name: scout
 description: Fast read-only scout. Use for search, grep, finding files, inventories, log triage and short or mechanical summaries. Prefer this over Explore. Returns conclusions with file:line references, not file dumps.
-model: haiku
 tools: Read, Grep, Glob, Bash
 ---
 
