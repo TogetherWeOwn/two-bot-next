@@ -34,7 +34,7 @@ class AgentRoleContractTests(unittest.TestCase):
         metadata, body = load_role("cross-reviewer")
         self.assertIn("authored by a different model family", metadata["description"])
         for requirement in (
-            "risk-tier policy in CONTRIBUTING.md",
+            "Get fresh independent review after a material change to the head",
             "base and published head SHAs",
             "record findings before reading any other review of that head",
             "Decline cross-model review if the executed model is from the author's model family",

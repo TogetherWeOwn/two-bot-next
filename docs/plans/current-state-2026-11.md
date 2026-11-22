@@ -91,8 +91,8 @@ it does not make a feature active.
   [`CONTRIBUTING.md`](../../CONTRIBUTING.md#pre-push-checklist), meet
   the applicable production merge requirements in
   [`CONTRIBUTING.md`](../../CONTRIBUTING.md#production-merge-evidence), and
-  link the exact-head CI results in the PR body. Require owner
-  approval for the full PR head SHA if the merge would deploy to production or
+  link the exact-head CI results in the PR body. Require Release Manager
+  approval on the exact head if the merge would deploy to production or
   if production deployment cannot be ruled out.
 - Before activating: stage, exercise the behavior once on staging and
   attach evidence.

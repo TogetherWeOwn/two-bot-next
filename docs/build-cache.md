@@ -633,8 +633,8 @@ this mismatch is a finding, not evidence that the host has recovered.
 This is a documentation/checklist contract, **not authorization for a live host
 rehearsal or removal**. A designated maintainer prepares the handoff, an
 independent reviewer checks the evidence, and the operator alone performs
-separately authorized host actions. Keep host details and readiness packets in
-the restricted remediation record. This procedure authorizes no new service,
+separately authorized host actions. Keep host details and readiness packets
+in the restricted remediation record outside public PRs and issues. This procedure authorizes no new service,
 cleanup tool, unattended deletion or waiver.
 
 ### Applicability before preparation
@@ -696,8 +696,8 @@ preparation.
 Only after that review passes may the handoff owner create **one**
 confirmation request to the designated human operator in the restricted handoff
 record. Bind it to the exact packet revision, canonical target, procedure and
-merged guard SHA. Record the operator's explicit response and return it to the
-assigned executor.
+merged guard SHA. Verify the response came directly from the designated human
+operator and retain it for the assigned executor.
 
 Acceptance is **neither execution evidence nor a waiver**, and does not supply
 missing normal authorization for host action. Never backfill a packet to imply

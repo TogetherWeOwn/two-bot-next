@@ -2614,10 +2614,10 @@ complete pre-change recovery set: the Next schema, both migration ledgers,
 object ownership, ACLs and logins. The generic legacy backup omits Next tables
 and the SQLx history, and unverified Neon PITR is not a working recovery. Bind
 that recovery evidence and the [reviewed ACL sequence](database-roles.md) to the
-producing read-only plan. Record explicit owner approval naming the full source
-SHA, producing plan run ID, both pending lists, both manifest digests and the
-recovery reference. Any change to those inputs needs fresh approval. Before
-submitting `mode: apply`, compare its inputs with the authenticated manifest and run ID, including
+producing read-only plan. Verify and retain [direct owner approval](staging-migrate-claim.md#verify-the-plan-before-dispatch-and-the-claim-after-dispatch) for the full source SHA, producing plan run ID, both pending
+lists, both manifest digests and the recovery reference. Changes to those inputs
+need fresh approval. Before submitting `mode: apply`, compare its inputs with
+the authenticated manifest and run ID, including
 the pinned staging host, database and branch ID, `recovery_evidence_ref` and
 `acl_plan_ref`. Do not dispatch if any value differs, approval is missing or a hold applies.
 GitHub does not pause this staging job for human approval.

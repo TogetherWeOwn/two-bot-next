@@ -71,10 +71,12 @@ the behavior warrants it. Changes to `AGENTS.md`, `CLAUDE.md`,
 | T1 standard | One independent, read-only cross-model review and required CI. |
 | T0 critical | Two independent, read-only cross-model reviews in parallel, one general and one security-focused, and required CI. |
 
-Treat auth, sessions, permissions, secrets, crypto, payments, database and
-migration changes, backups, erasure, gateway and voice behavior, and deployment
-paths as critical. The security review checks secret exposure, authorization,
-data integrity and input bounds as applicable.
+T0 includes auth, sessions, permissions, secrets, crypto, payments, database
+and migration changes, backups, erasure, gateway and voice behavior, deployment
+paths, dependencies, lockfiles and CI workflows. It also covers changes to
+approval, review or safety requirements in docs, including deploy, migration
+and rollback procedures. Use the [sensitive path map](.github/review-tiers.yml).
+Security review checks secret exposure, authorization, data integrity and input bounds.
 
 In T3 Code, start each review as a separate read-only delegated task. For an
 AI-authored change, use a model family different from the author's. Provide the
@@ -115,12 +117,12 @@ head/base change; a stale check does not validate a new head.
 
 ### Production merge evidence
 
-The task owner squash-merges after all required checks and reviews pass and
-each finding is fixed or answered with evidence. Pin the merge to the full PR
-head SHA. Record the squash SHA and any applicable PR approval in the release
-log. The repository owner holds production approval authority, called Release
-Manager in the release runbooks. Record the production decision separately
-when the owner approves the release candidate.
+The task owner squash-merges the full PR head SHA after required checks and
+reviews pass and every finding is resolved. The owner (`Rick7C2` on GitHub)
+is the Release Manager. Keep approvals in the private task thread or on GitHub
+for public-safe evidence. Verify that the owner's account directly authored
+the approval for the exact binding. Record the squash SHA and any applicable
+PR approval in the release log. Record production approval separately.
 
 Before merging, verify live that `PRODUCTION_AUTO_PROMOTE_DISABLED=true` and
 inspect the change for paths from merge to production. Apply the same check

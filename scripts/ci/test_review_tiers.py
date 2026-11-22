@@ -97,14 +97,14 @@ class ReviewTierTests(unittest.TestCase):
                 with self.subTest(path=path, pattern=pattern):
                     self.assertFalse(matches(path, pattern))
 
-    def test_content_escalation_and_security_review_are_retained(self):
+    def test_content_escalation_and_review_policy_reference(self):
         for rule in [
             "Content triggers escalate any tier to sensitive",
             "auth/authz/session", "crypto/keys", "secrets/credentials",
             "permission checks", "SQL/schema/migrations",
             "dependency or", "lockfile changes", "CI/workflow changes",
-            "weakened test assertions", "QA verifies", "may",
-            "escalate any PR", "This file itself is always sensitive",
+            "weakened test assertions", "CONTRIBUTING.md defines the required",
+            "risk tiers and reviews", "This file itself is always sensitive",
         ]:
             with self.subTest(rule=rule):
                 self.assertIn(rule, self.text)

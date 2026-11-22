@@ -133,9 +133,10 @@ recovery/ACL references. Recompute both projection digests losslessly and
 compare them with the embedded digests. Do not dispatch if the artifact is
 missing, expired, ambiguous or cannot be authenticated.
 
-Record explicit owner approval for the full source SHA, producing plan run ID,
-both pending lists, both manifest digests and the recovery reference.
-Dispatch requires approval of that exact binding and clearance of applicable holds.
+Before dispatch, verify and retain [direct owner approval](../CONTRIBUTING.md#production-merge-evidence)
+for the full source SHA, producing plan run ID, both pending lists, both manifest
+digests and the recovery reference. Keep restricted evidence in the private task
+thread. Dispatch requires approval of the current binding and clearance of all applicable holds.
 
 Before submitting `mode: apply` on `main`, compare the actual dispatch inputs
 with the authenticated producing manifest and its run ID. Match the source SHA,
