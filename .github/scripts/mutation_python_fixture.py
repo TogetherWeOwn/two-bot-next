@@ -4,7 +4,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from mutation_python import measure, verdict
+from mutation_python import measure, snapshot, verdict
 from mutation_rust_fixture import commit
 from mutation_scope import added_lines, git, pr_diff, python_lines
 
@@ -19,7 +19,8 @@ def main():
     if os.environ.get("GITHUB_ACTIONS") != "true":
         raise SystemExit("mutation fixtures run only in GitHub Actions")
     with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as scratch:
-        root = Path(scratch)
+        root = Path(scratch, "repo")
+        root.mkdir()
         git(root, "init", "-q")
         (root / "scripts").mkdir()
         module, tests = root / MODULE, root / TESTS
@@ -37,8 +38,10 @@ def main():
             _, patch = pr_diff(root, base, head)
             changed = python_lines(added_lines(patch))
             assert changed == {MODULE: {2}}, changed
-            results = measure(root, changed, {MODULE: (TESTS,)})
-            assert module.read_text() == NEW
+            with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+                copy = snapshot(root, Path(temporary))
+                results = measure(copy, changed, {MODULE: (TESTS,)})
+                assert (copy / MODULE).read_text() == NEW
             assert len(results) == 1 and results[0]["status"] == status, results
             if status in ("killed", "survived"):
                 assert results[0]["line"] == 2, results

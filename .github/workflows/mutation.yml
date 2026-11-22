@@ -102,6 +102,11 @@ jobs:
         if: steps.plan.outputs.python_fixture == 'true'
         with:
           python-version: '3.12.16'
+      - name: Install the pinned Python suite dependency
+        if: steps.plan.outputs.python == 'true'
+        run: |
+          printf '%s\n' 'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' > "$RUNNER_TEMP/mutation-requirements.txt"
+          python3 -m pip --isolated install --only-binary=:all: --no-deps --require-hashes -r "$RUNNER_TEMP/mutation-requirements.txt"
       - name: Prove changed-line mutation with offline unittest fixtures
         if: steps.plan.outputs.python_fixture == 'true'
         run: python3 .github/scripts/mutation_python_fixture.py
