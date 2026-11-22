@@ -9,9 +9,15 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pr_standards import parse_sections
+
 SHA = re.compile(r"[0-9a-f]{40}")
 NUMBER = re.compile(r"[1-9][0-9]*")
 RUN_LINK = re.compile(r"\bgithub\.com/[^/\s]+/[^/\s]+/actions/runs/", re.I)
+CUBIC_FOOTER = re.compile(
+    r'\n<!-- This is an auto-generated description by cubic\. -->\n'
+    r'<a href="https://cubic\.dev/pr/[^\n]+\n<!-- End of auto-generated description by cubic\. -->\s*\Z')
 MAX_SOURCE = 2 * 1024 * 1024
 
 
@@ -39,28 +45,18 @@ def publish(repo, event, head, run, attempt, workflow):
                f"[Workflow run, attempt {attempt}]({url}/attempts/{attempt})", ""]
     for row in rows:
         job, job_head, job_run, job_attempt, status, name = row.split("\t", 5)
-        if (not NUMBER.fullmatch(job) or (job_head, job_run, job_attempt) != (head, run, attempt)
+        if (not NUMBER.fullmatch(job) or (job_head, job_run) != (head, run)
+                or not NUMBER.fullmatch(job_attempt) or int(job_attempt) > int(attempt)
                 or not re.fullmatch(r"[a-z_]+", status)):
             raise EvidenceError("Actions returned a job outside this head or attempt.")
         label = html.escape(name).replace("[", "&#91;").replace("]", "&#93;")
-        summary.append(f"- [{label}]({url}/job/{job}) ({status} at publication)")
+        summary.append(f"- [{label}]({url}/job/{job}) ({status}, attempt {job_attempt})")
     return "\n".join(summary) + "\n"
 
 
-def evidence_sections(policy, body):
-    lines = policy.visible_lines(body)
-    sections = {"Verification": [], "Attestation": []}
-    active = None
-    for line in lines:
-        if re.match(r"^#{1,2}\s", line):
-            active = line[3:] if line.startswith("## ") else None
-        if active in sections:
-            sections[active].append(line)
-    return sections
-
-
-def fingerprint(sections):
-    return hashlib.sha256(repr(sections).encode()).hexdigest()
+def evidence_sections(body):
+    sections = parse_sections(CUBIC_FOOTER.sub("", body))
+    return tuple(sections.get(name, "") for name in ("verification", "attestation"))
 
 
 def sources(base, head):
@@ -91,8 +87,8 @@ def named_tests(path, source):
             if isinstance(node, functions) and node.name.startswith("test_"):
                 yield node.name
             if isinstance(node, ast.ClassDef) and (
-                    node.name.startswith("Test") or any(
-                        ast.unparse(base).split(".")[-1] == "TestCase" for base in node.bases)):
+                    node.name.startswith("Test") or node.name.endswith("Tests") or any(
+                        ast.unparse(base).endswith("TestCase") for base in node.bases)):
                 for method in node.body:
                     if isinstance(method, functions) and method.name.startswith("test_"):
                         yield f"{node.name}.{method.name}"
@@ -121,47 +117,45 @@ def named_tests(path, source):
                 nodes.extend((child, modules) for child in node.named_children)
             if node.type == "function_item":
                 attribute = node.prev_named_sibling
-                while attribute and attribute.type == "attribute_item":
-                    if re.match(rb"#\s*\[\s*(?:(?:\w+)\s*::\s*)*test\s*(?:\(|\])", attribute.text):
+                while attribute and attribute.type in {"attribute_item", "line_comment", "block_comment"}:
+                    if re.match(rb"#\s*\[\s*(?:\w+\s*::\s*)*test\s*[\[(\]]", attribute.text):
                         yield "::".join((*modules, node.child_by_field_name("name").text.decode()))
                         break
                     attribute = attribute.prev_named_sibling
         else:
             nodes.extend((child, ()) for child in node.named_children)
             if node.type == "call_expression" and node.child_by_field_name("function").text in {
-                    b"test", b"it", b"test.skip", b"it.skip", b"test.todo", b"it.todo", b"t.test"}:
+                    b"test", b"it", b"t.test"}:
                 args = node.child_by_field_name("arguments").named_children
-                if args and args[0].type == "string" and b"\\" not in args[0].text:
-                    yield args[0].text[1:-1].decode()
+                if len(args) > 1 and args[0].type in {"string", "template_string"}:
+                    if not any(child.type == "template_substitution" for child in args[0].named_children):
+                        yield re.sub(r"""\\(['"`\\])""", r"\1", args[0].text[1:-1].decode())
 
 
 def validate(policy, body, files, read):
-    sections = evidence_sections(policy, body)
-    verification = sections["Verification"]
-    if (verification.count("## Verification") != 1
-            or not any(policy.meaningful(line.lstrip("-* ")) for line in verification[1:])):
+    verification, attestation = evidence_sections(body)
+    if (policy.visible_lines(body).count("## Verification") != 1 or not any(
+            policy.meaningful(line.strip("-* ~`")) for line in verification.splitlines())):
         raise EvidenceError("Fill in the visible Verification section with commands and results.")
-    if RUN_LINK.search("\n".join(verification + sections["Attestation"])):
+    if RUN_LINK.search(verification + "\n" + attestation):
         raise EvidenceError("Actions URLs in Verification or Attestation can go stale. Use the job summary.")
-    report = policy.validate(body, files)
+    report = policy.validate(CUBIC_FOOTER.sub("", body), files)
     if report["issues"]:
         raise EvidenceError("Attestation issues: " + ", ".join(report["issues"]))
     titles = {}
-    tests = [line for line in sections["Attestation"] if policy.TEST.fullmatch(line)]
+    tests = [line for line in policy.visible_lines(attestation) if policy.TEST.fullmatch(line)]
     for index, line in enumerate(tests, start=1):
         path, _, selector = policy.TEST.fullmatch(line)[2].strip().partition("::")
+        if not selector:
+            read(path)
+            continue
         if path not in titles:
-            source = read(path)
-            titles[path] = list(named_tests(path, source)) if selector else None
-        if selector:
-            if titles[path] is None:
-                titles[path] = list(named_tests(path, read(path)))
-            names = titles[path]
-            matches = names.count(selector)
-            if "::" not in selector and Path(path).suffix == ".rs":
-                matches = sum(name.rsplit("::", 1)[-1] == selector for name in names)
-            if matches != 1:
-                raise EvidenceError(f"Attestation test entry {index} has no unique matching test on this head.")
+            titles[path] = list(named_tests(path, read(path)))
+        names, suffix = titles[path], Path(path).suffix
+        if "::" not in selector and suffix == ".rs":
+            names = [name.rsplit("::", 1)[-1] for name in names]
+        if names.count(selector.replace("::", ".") if suffix == ".py" else selector) != 1:
+            raise EvidenceError(f"Attestation test entry {index} has no unique matching test on this head.")
 
 
 def check(policy, reader, number, repo, base, head):
@@ -174,7 +168,8 @@ def check(policy, reader, number, repo, base, head):
 
     body, branch, author = snapshot()
     baseline = Path(__file__).with_name("pr-evidence-baseline.txt").read_text().splitlines()
-    entry = f"{number} {head} {fingerprint(evidence_sections(policy, body))}"
+    digest = hashlib.sha256(repr(evidence_sections(body)).encode()).hexdigest()
+    entry = f"{number} {head} {digest}"
     if branch.startswith("release-please--") and author.endswith("[bot]"):
         result = "Generated release PR"
     elif entry in baseline:
@@ -191,9 +186,8 @@ def main():
     env = os.environ
     head, run, attempt = (env[key] for key in ("EVIDENCE_HEAD", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
     repo, event = env["GITHUB_REPOSITORY"], env["GITHUB_EVENT_NAME"]
-    if not SHA.fullmatch(head) or not all(map(NUMBER.fullmatch, (run, attempt))):
-        raise EvidenceError("Missing Actions identity.")
-    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo, re.ASCII):
+    if (not SHA.fullmatch(head) or not all(map(NUMBER.fullmatch, (run, attempt)))
+            or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo, re.ASCII)):
         raise EvidenceError("Invalid repository identity.")
     mode = sys.argv[1]
     workflow = {"verify": "pr-evidence.yml", "publish": "check.yml"}[mode]
@@ -205,10 +199,13 @@ def main():
 
             number, base = env["PR_NUMBER"], env["PR_BASE"]
             if (not NUMBER.fullmatch(number) or not SHA.fullmatch(base)
-                    or command("git", "rev-parse", "HEAD").strip() != head):
-                raise EvidenceError("Checkout does not match the immutable PR head.")
+                    or command("git", "rev-parse", "--verify", f"{head}^{{commit}}").strip() != head):
+                raise EvidenceError("Missing immutable PR head identity.")
             reader = policy.GitHub(env["GH_TOKEN"], repo)
-            result = check(policy, reader, number, repo, base, head)
+            try:
+                result = check(policy, reader, number, repo, base, head)
+            except policy.ObservationError:
+                raise EvidenceError("Attestation policy or metadata request refused.") from None
             output.write(f"\n**{result}.**\n")
 
 

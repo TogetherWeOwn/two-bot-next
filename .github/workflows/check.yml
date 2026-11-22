@@ -3822,7 +3822,6 @@ jobs:
   ci-ok:
     name: ci-ok
     permissions:
-      actions: read
       contents: read
     needs: [job-inputs, container-inputs, supply-chain, check, rust-tests, coverage-plan, coverage-shard, patch-coverage, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db, fuzz-compile, nextest]
     # A skipped or cancelled dependency must not read as green.
@@ -3914,15 +3913,14 @@ jobs:
           print("ci-ok passed")
           PY
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'push') }}
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          sparse-checkout: .github/scripts
-          persist-credentials: false
-      - name: Publish exact-head CI links
-        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'push') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVIDENCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: python3 -I .github/scripts/pr_evidence.py publish
+  ci-evidence:
+    # ci-ok: exempt Evidence publication depends on ci-ok and has its own verdict.
+    needs: ci-ok
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'push') }}
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    uses: ./.github/workflows/pr-evidence.yml # zizmor: ignore[self-repository] Same-repo call pinned by test_workflows.
+    with:
+      publish-only: true

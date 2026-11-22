@@ -189,9 +189,9 @@ SBOM dry-run and standalone database jobs. Both selectors and lint must always
 succeed; a heavy lane may skip only when selection explicitly deselects it.
 A job added to `check.yml` must go into `ci-ok`'s `needs:`, result env and result
 evaluation, or carry a reviewed `# ci-ok: exempt <reason>` marker with a pin
-in `scripts/ci/test_required_checks.py`. Only advisory `container smoke` is
-exempt: it can take up to 30 minutes, and image security stays gated through
-the SBOM job. The legacy `required-checks` aggregate is removed.
+in `scripts/ci/test_required_checks.py`. Advisory `container smoke` is exempt
+because the SBOM job gates image security. `ci-evidence` is exempt because
+it publishes links after the aggregate verdict.
 
 Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
 HARD, required voice synthetic, test-target inventory HARD) run as steps of
@@ -350,23 +350,14 @@ and any authorized manual Actions run also stay on GitHub.
 
 ### Exact-head CI evidence
 
-Record commands and observed results in Verification. Use the `ci-ok` job
-summary for the full head SHA and Actions run and job links. Check the linked
-jobs for their final results, and record the relevant links in task evidence.
-Report pending, failed and skipped work accurately.
+Use Verification for commands and results. The `ci-evidence` summary
+publishes the head SHA and Actions links for task evidence.
+`pr-evidence` checks named tests in changed source. Use a Python function or
+`Class.method`, a Rust function or inline module path, or a literal JS/TS
+title. Use the file alone for generated names.
 
-The `pr-evidence` job enforces Verification and Attestation on PR updates
-and publishes its own run and job links. Named tests use a Python function
-or `Class.method`, a Rust test function or inline module path, or the literal
-title of a JavaScript or TypeScript test. Omit the name for generated tests
-that require a runner to discover. The test source must be changed and present
-at the head. Source validation confirms a declaration. Execution is evidenced
-by the linked CI jobs.
-
-Existing PRs keep their recorded exception while the head and evidence sections
-match the rollout baseline. Before registering `pr-evidence` as a required
-check, record a passing main run and passing runs from two later PRs, each with
-the full SHA, run URL and job URL.
+The baseline covers unchanged PR heads and evidence. Before making
+`pr-evidence` required, record SHA and run/job URLs for green main and two later PRs.
 
 The toolchain remains pinned in `rust-toolchain.toml`. CI runs
 `python3 scripts/generate_command_reference.py` to generate ignored

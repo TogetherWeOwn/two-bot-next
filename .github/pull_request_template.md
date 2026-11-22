@@ -26,7 +26,7 @@ Full rules: CONTRIBUTING.md, "Pull request standards".
 
 ## Verification
 
-<!-- Commands and observed results. The ci-ok summary publishes the head SHA and Actions links. -->
+<!-- Commands and observed results. Use the CI evidence summary for Actions links. -->
 
 -
 
@@ -69,7 +69,6 @@ failed_before=yes|no|not-run describes what you actually observed. No invented r
 proof= names the command/result/mutant or other evidence; never executes from this text.
 Only T2 may replace all test lines with: - none | reason=Documentation-only; no behavior changed.
 The evidence check validates changed-file references and named declarations on the PR head.
-Use the ci-ok summary for current Actions URLs. Test discovery alone does not prove execution.
 
 High-risk checklist: keep D1-D8. Replace each placeholder with evidence or
 not-applicable plus a concrete reason. For T0 all boxes must be checked; never blindly check them.

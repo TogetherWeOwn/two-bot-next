@@ -1,5 +1,3 @@
-"""Offline fixtures for PR evidence and exact-head test declarations."""
-
 import sys
 import unittest
 from unittest.mock import patch
@@ -19,11 +17,11 @@ class EvidenceTests(unittest.TestCase):
         job = f"34\t{HEAD}\t12\t2\tsuccess\tworker check"
         for actual_run, actual_job in ((run.replace(HEAD, OLD), job),
                                        (run, job.replace(HEAD, OLD)),
-                                       (run, job.replace("\t2\t", "\t1\t"))):
+                                       (run, job.replace("\t2\t", "\t3\t"))):
             with patch.object(evidence, "command", side_effect=[actual_run, actual_job]):
                 with self.assertRaisesRegex(evidence.EvidenceError, "head"):
                     evidence.publish(REPO, "pull_request", HEAD, "12", "2", "check.yml")
-        with patch.object(evidence, "command", side_effect=[run, job]):
+        with patch.object(evidence, "command", side_effect=[run, job.replace("\t2\t", "\t1\t")]):
             summary = evidence.publish(REPO, "pull_request", HEAD, "12", "2", "check.yml")
         self.assertIn(HEAD, summary)
         self.assertIn("/actions/runs/12/attempts/2", summary)

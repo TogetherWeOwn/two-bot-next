@@ -41,7 +41,7 @@ JOB_INVENTORY = {
     # The nextest branch adds its required lane; main adds the production schema gate.
     # The inventory pin must retain both changes.
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
-                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok",
+                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok", "ci-evidence",
                   # `check` is now the lint lane; the test steps it used to
                   # carry run in these parallel lanes, all gated by ci-ok.
                   # The HARD patch-coverage measurement is sharded: the plan
@@ -148,6 +148,7 @@ JOB_INVENTORY = {
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
 REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
+                   ("check.yml", "ci-evidence"): "./.github/workflows/pr-evidence.yml",
                    ("deploy-production.yml", "soak"): "$/.github/workflows/staging-soak.yml",
                    (STAGING_SOAK, "voice"): "$/.github/workflows/voice-synthetic.yml",
                    ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
