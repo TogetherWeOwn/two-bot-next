@@ -353,8 +353,7 @@ and any authorized manual Actions run also stay on GitHub.
 Record commands and results in Verification. Follow the summary links to confirm attested tests and report skips or omissions.
 `pr-evidence` resolves Python and Rust declarations and literal `.ts`, `.js`, `.mjs`, and `.cjs` titles.
 Use paths for generated names and other formats. Organization path floors and repository review tiers apply.
-Before registration, record SHA and run/job URLs for green main and two later PRs.
-Verify merge-queue compatibility and bind a protected workflow.
+Register through a protected workflow after queue verification and green main and two later PR runs (SHA and run/job URLs).
 
 The toolchain remains pinned in `rust-toolchain.toml`. CI runs
 `python3 scripts/generate_command_reference.py` to generate ignored

@@ -53,6 +53,8 @@ class EvidenceTests(unittest.TestCase):
         evidence.validate(policy, body, files, read)
         for changed, problem in (
                 (body.replace("test_present", "test_gone"), "no unique matching test"),
+                (body.replace("test_present", "test_gone") + "\n## attestation", "no unique matching test"),
+                (body + "\n## verification\n- Alternate account.", "Verification"),
                 (body.replace("Ran the evidence fixtures.", f"https://github.com/{REPO}/actions/runs/12/job/34"),
                  "can go stale"),
                 (body.replace("- Ran the evidence fixtures.", "-"), "Verification")):

@@ -56,8 +56,9 @@ def publish(repo, event, head, run, attempt, workflow):
 
 def evidence_sections(policy, body):
     body = CUBIC_FOOTER.sub("", body)
-    visible = parse_sections("\n".join(policy.visible_lines(body)))
-    return parse_sections(body).get("verification", ""), visible.get("attestation", "")
+    visible = "\n".join(policy.visible_lines(body))
+    attestation = f"\n{visible}\n".partition("\n## Attestation\n")[2]
+    return parse_sections(body).get("verification", ""), re.split(r"^#{1,2} ", attestation, 1, re.M)[0].strip()
 
 
 def sources(base, head):
@@ -136,7 +137,9 @@ def named_tests(path, source):
 
 def validate(policy, body, files, read):
     verification, attestation = evidence_sections(policy, body)
-    if (policy.visible_lines(body).count("## Verification") != 1 or not any(
+    headings = [line for line in policy.visible_lines(body)
+                if re.fullmatch(r"##\s+verification\s*#*", line, re.I)]
+    if (headings != ["## Verification"] or not any(
             policy.meaningful(line.strip("-* ")) for line in verification.splitlines()
             if not line.lstrip().startswith(("```", "~~~")))):
         raise EvidenceError("Fill in the visible Verification section with commands and results.")
