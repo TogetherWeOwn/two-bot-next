@@ -522,7 +522,7 @@ async fn run_retention_core(
             // of the guild purge, so those rows must not be counted again as
             // guild rows. Guard-deferred requests stay pending, and any
             // unresolved guard in the guild defers its purge too.
-            let gaps = crate::member_erasure::schema_gaps(&mut tx).await?;
+            let gaps = retention_coverage_gaps(&mut tx).await?;
             let schema_gap = !gaps.is_empty();
             let selected = select_pending(&mut tx, schema_gap).await?;
             let deferred = selected.deferred;
@@ -646,7 +646,7 @@ async fn run_retention_core(
             // every pending request defers and every queued guild stays
             // queued; the exact gaps ride the warn logs for the code fix.
             *active_step = RetentionStep::DeletionIntake;
-            let schema_gaps = crate::member_erasure::schema_gaps(&mut tx).await?;
+            let schema_gaps = retention_coverage_gaps(&mut tx).await?;
             let schema_gapped = !schema_gaps.is_empty();
             // Pending deletions drain BEFORE guild purges so a departed
             // guild's pending receipts complete against pre-purge rows.
@@ -802,6 +802,24 @@ async fn run_retention_core(
     Ok(report)
 }
 
+async fn retention_coverage_gaps(
+    conn: &mut sqlx::PgConnection,
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut gaps = crate::member_erasure::schema_gaps(conn).await?;
+    // The role matrix deliberately withholds DELETE on this admission
+    // table. Keep both drains queued and let independent expiry proceed.
+    if gaps.is_empty()
+        && !sqlx::query_scalar::<_, bool>(
+            "SELECT pg_catalog.has_table_privilege('voice_create_reservations', 'DELETE')",
+        )
+        .fetch_one(conn)
+        .await?
+    {
+        gaps.push("privacy DELETE unavailable: voice_create_reservations".to_owned());
+    }
+    Ok(gaps)
+}
+
 /// Count the full bounded-policy backlog for the lifecycle's dry-run report.
 /// Execute deletes at most one capped batch of this eligible set per run; the
 /// read-only projection must not report only the first batch as the total
@@ -836,9 +854,7 @@ async fn count_raw_expiry_candidates(
     // Mirror the dry-run core's preceding-stage settlement: a schema-coverage
     // gap defers every pending deletion and every queued guild purge, so with
     // gaps nothing precedes the raw batch and no row is excluded.
-    let schema_gapped = !crate::member_erasure::schema_gaps(&mut tx)
-        .await?
-        .is_empty();
+    let schema_gapped = !retention_coverage_gaps(&mut tx).await?.is_empty();
     let mut eligible_pairs: Vec<(String, String)> = Vec::new();
     let mut queued_unguarded: Vec<String> = Vec::new();
     if !schema_gapped {
