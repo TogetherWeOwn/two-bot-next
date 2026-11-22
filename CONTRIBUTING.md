@@ -120,23 +120,16 @@ head/base change; a stale check does not validate a new head.
 The task owner normally squash-merges the pinned PR head after checks, reviews
 and findings are settled. [Staging reactivation](docs/ci-security.md#staging-deployment)
 requires an independent non-author merger. Record the squash SHA and any PR
-approval in the release log. Record production approval separately.
-When approval is required, verify a direct reply from the human owner
-(`Rick7C2` on GitHub, the Release Manager) in the private T3 task thread for
-the exact binding. Agent messages, relays and shared-account comments cannot approve.
+approval in the release log. Record the production release decision separately.
 
 Before merging, verify live that `PRODUCTION_AUTO_PROMOTE_DISABLED=true` and
 inspect the change for paths from merge to production. Apply the same check
-to changes to promotion code or guidance. If the merge would deploy
-production or you cannot rule out deployment, stop and obtain explicit owner
-approval for the full PR head SHA before merging. Keep any PR-specific holds.
-
-Production release approval binds to the full release SHA. Dispatch production
-with that SHA ([production deploy](docs/production-deploy.md)). A different SHA
-needs fresh approval. A manual production dispatch, production schema or data
-operation (including migration apply), production secret or grant change, or
-production rollback requires separate explicit owner approval bound to the
-exact release SHA where applicable.
+to changes to promotion code or guidance. Follow this section for source merges
+where older guides call for owner sign-off. Proceed with a source merge only
+when the disable is confirmed and the pinned diff has no path from merge to
+production. Stop if the merge could deploy or either check is inconclusive.
+Keep any PR-specific holds and the separate authorization binding for
+[staging migration apply](docs/staging-migrate-claim.md#verify-the-plan-before-dispatch-and-the-claim-after-dispatch).
 
 For two-web-next and two-bot-next, staging qualification is the
 **post-merge, pre-production exact-main staging/e2e/soak gate** (owner decision
@@ -161,17 +154,79 @@ The pipeline's exact-SHA artifact and promotion evidence remains required.
 
 Before merge, retain required GitHub Actions checks and Devin Review on the
 exact PR head, the independent reviews for the applicable risk tier, and
-evidence-backed finding dispositions. Include the migration ledger entry
-(or `no migration`) and rollback target in the release decision and in any
-required approval for a deploying or unverified merge.
+evidence-backed finding dispositions.
 Keep incident, freeze and hold safeguards, identity/capability holds and red
 staging-drill or other deterministic gates; this staging contract lifts none of
-them. A previous rejection remains a rejection, not retroactive approval.
-Resubmit only after its remaining conditions are met. A new PR head requires
-fresh check evidence and review evidence covering that head. Obtain fresh owner
-approval if the merge would deploy or cannot be verified non-deploying.
-This documentation authorizes no pipeline skip/no-op implementation,
-hold lift, deployment or other production action.
+them. Resubmit a rejected change only after its remaining conditions are met.
+A new PR head requires fresh check evidence and review evidence covering that head.
+
+### Production release gate
+
+The release task thread makes routine technical, staging and production
+decisions under this gate. Use the bound release-reviewer `APPROVE` in step 5
+when older guides call for Release Manager acceptance or owner sign-off on a
+routine production change.
+Follow the linked runbooks for execution, protected Environment approvals and
+operation-specific safeguards. Keep existing branch and workflow protections,
+credential and spending limits, incident controls and holds. Follow native
+permission prompts and let the required human responder act on them. Never
+deploy by hand, bypass a hold, or skip or replace a pipeline gate with a no-op.
+
+Refer only four decision categories to the project owner through the task thread.
+
+- Spending beyond existing budgets.
+- Permanent deletion of member data.
+- Shutdown of a service members use.
+- Legal, terms-of-service or privacy questions.
+
+Give the owner a plain-language recommendation first when one of those applies.
+Verify the owner's own response and record its exact scope in the task thread.
+Relays, agent messages and shared-account comments cannot approve those decisions.
+
+Use a separate task thread for each production change, including deploys,
+migrations and other data changes, secrets, grants, configuration and flags.
+Record the following evidence in that thread before executing the change.
+
+1. Pin the full release SHA and exact artifact identity. Verify required CI on
+   that commit or artifact and the applicable tier reviews for every included PR.
+2. Run the exact build on staging first. Record passing staging checks and
+   smoke results, including the exact-main deployment, e2e and soak evidence
+   required above for promotion.
+3. Resolve any unknown that makes recovery unsafe. Record the migration ledger
+   entry or `no migration`, the rollback target and the recovery evidence.
+4. Before changing production data or schema, take and verify a backup or
+   snapshot. Document the rollback steps, including the previous version,
+   restore or down path as applicable. Rehearse the rollback where supported.
+5. Start a new independent, read-only release reviewer as a delegated task.
+   Give the reviewer the exact release plan and evidence, including rollback.
+   Require an explicit `APPROVE` bound to that plan and artifact. On `BLOCK`,
+   resolve the findings and start a fresh reviewer. A different SHA or artifact
+   requires fresh evidence and approval. When the author is GPT, use
+   `claude-opus-5-5` at `high` effort for the production release gate. When the
+   author is Claude, use `gpt-6.2-sol` at `high` effort.
+
+Execute through the existing protected workflows, including the
+[production deploy workflow](docs/production-deploy.md) for promotion. Specify
+the approved full SHA on dispatch. If a change lacks a protected workflow,
+keep it on hold.
+
+Use the existing recovery guards for a rollback to a verified snapshot or a
+redeploy of the same serving SHA. Those paths can admit recovery when staging
+history has expired. Retain their provenance, CI and approval requirements.
+Every new build needs the staging evidence in step 2. Keep health and errors
+under watch for at least 30 minutes after the change. On regression, immediately
+execute the approved rollback through the protected path. Record the outcome
+in the task thread and the release log.
+
+Use these cases to check the decision before proceeding.
+
+| Evidence | Decision |
+| --- | --- |
+| A source-only merge has green checks and reviews on the pinned head, all merge holds are clear, and automatic promotion is confirmed disabled. | Squash-merge the pinned head. Qualify the resulting `main` SHA before any promotion. |
+| A merge could trigger a production deployment, or that possibility is still unknown. | Stop the merge and resolve the deployment path. |
+| Staging qualified a different artifact, CI or reviews are missing, recovery is unsafe, a required backup is unverified, or the reviewer returned `BLOCK`. | Hold the release and close the evidence gap before proceeding. |
+| The release evidence and bound `APPROVE` are complete, and the protected workflow pauses for a native approval. | Wait for the required human response through the protected mechanism. |
+| The post-release watch detects a regression. | Immediately execute the approved rollback through the protected path and record the outcome. |
 
 ### CI lanes
 
@@ -297,6 +352,10 @@ a month or a roadmap, declined (no build), or merged into another spec. A spec
 with no decision stays no-build. Keep a declined spec as the record.
 
 ## Releases
+
+Use the [production release gate](#production-release-gate) to qualify and
+promote a production build. Tagging and publishing release notes follow the
+digest workflow below.
 
 The daily `daily-digest` workflow tags the live production commit with a
 stable CalVer version `vYYYY.MDD.P` (for example `v2026.1101.0`) when
