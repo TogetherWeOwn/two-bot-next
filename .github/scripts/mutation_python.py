@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import tokenize
 import unittest
+from bisect import bisect_left
 from collections import Counter
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -40,8 +41,8 @@ RUN_SECONDS = 7 * 60
 TEST_SECONDS = 30
 UNTESTED = 5
 TEST_FAILURE = 10
-REPLACEMENTS = {b"==": b"!=", b"!=": b"==", b">": b">=", b">=": b">", b"<": b"<=",
-                b"<=": b"<", b"and": b"or", b"or": b"and", b"+": b"-", b"-": b"+"}
+REPLACEMENTS = {"==": b"!=", "!=": b"==", ">": b">=", ">=": b">", "<": b"<=",
+                "<=": b"<", "and": b"or", "or": b"and", "+": b"-", "-": b"+"}
 
 
 def edits(source, changed):
@@ -49,7 +50,13 @@ def edits(source, changed):
     if encoding != "utf-8" or b"\r" in source.replace(b"\r\n", b""):
         return []
     tree = ast.parse(source)
-    lines = source.splitlines(keepends=True)
+    positions, operators = [], []
+    for token in tokenize.tokenize(BytesIO(source).readline):
+        if token.type in (tokenize.OP, tokenize.NAME) and token.string in REPLACEMENTS:
+            line, column = token.start
+            start = len(token.line[:column].encode("utf-8"))
+            positions.append((line, start))
+            operators.append((len(token.string), REPLACEMENTS[token.string]))
     replacements = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and type(node.value) is bool and node.lineno in changed:
@@ -63,12 +70,12 @@ def edits(source, changed):
             else:
                 operands = (node.left, node.right)
             for left, right in zip(operands, operands[1:]):
-                line, start, end = left.end_lineno, left.end_col_offset, right.col_offset
-                if line != right.lineno or line not in changed:
-                    continue
-                operator = lines[line - 1][start:end].strip()
-                if operator in REPLACEMENTS:
-                    replacements.add((line, start, end, b" " + REPLACEMENTS[operator] + b" "))
+                index = bisect_left(positions, (left.end_lineno, left.end_col_offset))
+                if index < len(positions) and positions[index] < (right.lineno, right.col_offset):
+                    line, start = positions[index]
+                    if line in changed:
+                        width, replacement = operators[index]
+                        replacements.add((line, start, start + width, b" " + replacement + b" "))
     return sorted(replacements)
 
 

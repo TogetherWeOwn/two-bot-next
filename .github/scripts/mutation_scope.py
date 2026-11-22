@@ -77,7 +77,7 @@ def main():
         raise ValueError("Rust or Python additions disagree with job-inputs")
     common = {".gitattributes", ".github/scripts/mutation_scope.py", ".github/workflows/mutation.yml"}
     fixture = rust or any(path in common or path.startswith(".github/scripts/mutation_rust") for path in paths)
-    python_fixture = python or any(path in common or path.startswith(".github/scripts/mutation_python") for path in paths)
+    python_fixture = fixture or python or any(path.startswith(".github/scripts/mutation_python") for path in paths)
     Path(os.environ["RUNNER_TEMP"], "mutation.diff").write_bytes(patch.encode("utf-8", "surrogateescape"))
     print(f"Mutation scope HEAD {head} merge base {base}")
     with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
