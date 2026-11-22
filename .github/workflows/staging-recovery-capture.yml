@@ -6,7 +6,6 @@ on:
         description: Base64 DER public certificate for the encrypted recovery inventory
         required: true
         type: string
-
 permissions: {}
 concurrency:
   group: staging-recovery-capture

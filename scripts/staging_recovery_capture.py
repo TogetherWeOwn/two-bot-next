@@ -23,7 +23,6 @@ from staging_retention_census import (
     run_psql,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 CAPTURE = Path("staging-recovery.cms")
 MAX_CAPTURE_BYTES = 4 * 1024 * 1024
@@ -34,13 +33,12 @@ def encrypt(payload, certificate):
     with tempfile.TemporaryDirectory() as directory:
         recipient = Path(directory) / "recipient.pem"
         recipient.write_text(certificate, encoding="ascii")
-        result = subprocess.run(
+        return subprocess.run(
             ["openssl", "cms", "-encrypt", "-binary", "-outform", "DER",
              "-aes-256-gcm", "-recip", str(recipient),
              "-keyopt", "rsa_padding_mode:oaep", "-keyopt", "rsa_oaep_md:sha256"],
             input=payload, capture_output=True, timeout=10, check=True, env={"PATH": os.defpath},
-        )
-    return result.stdout
+        ).stdout
 
 
 def main():
@@ -58,10 +56,9 @@ def main():
                           query.replace("-- @matrix", matrix))
         report = decode_inventory(output)
         if (report["database"]["name"] != database or report["role"] != DB_ROLE
-                or report["missing_expected"] or report["unsupported"]):
+                or report["missing_expected"] or report["unsupported"]
+                or not (report["cutover_ledger"] and report["store_ledger"])):
             raise ReadFailed("catalog inventory could not cover the reviewed scope")
-        if not report["cutover_ledger"] or not report["store_ledger"]:
-            raise ReadFailed("catalog inventory is missing a migration ledger")
         report["target"] = {"host": host, "database": database,
                             "branch_id": os.environ.get(BRANCH_ENV, "").strip()}
         report["workflow_sha"] = os.environ["GITHUB_SHA"]

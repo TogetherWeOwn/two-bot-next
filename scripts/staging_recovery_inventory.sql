@@ -4,12 +4,9 @@ SET LOCAL search_path = pg_catalog, pg_temp;
 SET LOCAL statement_timeout = '20s';
 SET LOCAL lock_timeout = '5s';
 SET LOCAL TIME ZONE 'UTC';
-
--- ON_ERROR_STOP refuses a misbound login before the inventory statement.
 SELECT 1 / ((current_user = 'two_bot_migrator_ro'
     AND NOT pg_has_role(session_user, 'two_bot_migrator', 'MEMBER'))::integer) AS guard
 \gset
-
 WITH RECURSIVE expected AS (
     -- @matrix
 ), schemas AS (
@@ -22,6 +19,11 @@ WITH RECURSIVE expected AS (
       AND (s.nspname = 'web_v1' OR pg_get_userbyid(c.relowner) = 'two_bot_migrator'
            OR EXISTS (SELECT 1 FROM expected e WHERE e.schema_name = s.nspname
                       AND e.name = c.relname AND e.kind <> 'function'))
+), column_types AS (
+    SELECT atttypid FROM pg_attribute WHERE attrelid IN (SELECT oid FROM relations)
+      AND attnum > 0 AND NOT attisdropped
+    UNION SELECT child.oid FROM column_types c JOIN pg_type t ON t.oid = c.atttypid
+    CROSS JOIN LATERAL unnest(ARRAY[t.typelem, t.typbasetype]) child(oid) WHERE child.oid <> 0
 ), routines AS (
     SELECT p.*, s.nspname AS schema_name,
            format('%s(%s)', p.proname, oidvectortypes(p.proargtypes)) AS signature
@@ -88,6 +90,8 @@ SELECT jsonb_build_object(
                                 THEN e.kind ELSE 'table' END)
         ORDER BY e.schema_name, e.name),
     'unsupported', EXISTS (SELECT 1 FROM relations WHERE relkind IN ('f', 'c'))
+        OR EXISTS (SELECT 1 FROM column_types u JOIN pg_type t ON t.oid = u.atttypid
+            JOIN pg_class c ON c.oid = t.typrelid WHERE c.relkind = 'c')
         OR EXISTS (SELECT 1 FROM routines WHERE prokind = 'a')
         OR EXISTS (SELECT 1 FROM pg_shdepend d JOIN pg_database b ON b.oid = d.dbid
             WHERE b.datname = current_database() AND d.deptype = 'o'
