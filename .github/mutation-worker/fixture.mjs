@@ -44,16 +44,23 @@ try {
   assert.equal(readFileSync(auditCalls, "utf8"), "audit --prefix wrangler --audit-level=high --include=dev\n");
   assert.equal(readFileSync(receipt, "utf8"), fallback);
   console.log("Worker fixture: refused dependency audit preserved the infrastructure receipt");
+  writeFileSync(join(root, "wrangler/initialization.test.mjs"),
+    "import { eligible } from './src/rule.ts';\nif (!eligible(3)) throw new Error('fixture module load failed');\n");
   for (const [label, body, status, expected] of [
     ["strong", "test('boundary', () => assert.equal(eligible(3), true));", "killed", 0],
     ["weak", "test('legacy', () => assert.equal(legacy(100), true));", "survived", 1],
     ["broken", "test('bad baseline', () => assert.equal(eligible(3), false));", "infrastructure_error", 2],
     ["cancelled", "test('pending mutant test', () => eligible(3) ? undefined : new Promise(() => {}));", "infrastructure_error", 2],
+    ["wrapper-failed", "test('boundary', () => assert.equal(eligible(3), true));", "infrastructure_error", 2],
+    ["skipped", "test('skipped', (t) => t.skip(''));", "unsupported", 0],
+    ["todo", "test('todo', (t) => t.todo(''));", "unsupported", 0],
     ["empty", "", "unsupported", 0],
   ]) {
     writeFileSync(join(root, "wrangler/rule.test.mjs"),
       `import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { eligible, legacy } from './src/rule.ts';\n${body}\n`);
-    const results = await measure(root, changed, ["--test", "rule.test.mjs"]);
+    const tests = ["--test", "rule.test.mjs"];
+    if (label === "wrapper-failed") tests.push("initialization.test.mjs");
+    const results = await measure(root, changed, tests);
     assert.equal(readFileSync(join(root, file), "utf8"), source);
     assert.deepEqual(results.map((entry) => entry.status), [status]);
     if (status === "survived" || status === "killed") assert.equal(results[0].line, 2);

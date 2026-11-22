@@ -49,7 +49,7 @@ function testResult(root, args, timeoutMs) {
     const summary = new Map();
     let expired = false;
     createInterface({ input: child.stdout }).on("line", (line) => {
-      const match = /^# (pass|fail|cancelled) (\d+)$/.exec(line);
+      const match = /^# (pass|fail|cancelled|wrapper-fail) (\d+)$/.exec(line);
       if (match) summary.set(match[1], Number(match[2]));
     });
     const timeout = setTimeout(() => {
@@ -68,7 +68,7 @@ function testResult(root, args, timeoutMs) {
       const pass = summary.get("pass");
       const fail = summary.get("fail");
       if (expired) done("timeout");
-      else if (summary.get("cancelled") !== 0) done("infrastructure_error");
+      else if (summary.get("cancelled") !== 0 || summary.get("wrapper-fail") !== 0) done("infrastructure_error");
       else if (code === 1 && fail > 0) done("failed");
       else if (code === 0 && fail === 0 && pass > 0) done("passed");
       else if (code === 0 && fail === 0 && pass === 0) done("unsupported");
