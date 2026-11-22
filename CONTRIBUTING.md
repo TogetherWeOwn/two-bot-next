@@ -124,10 +124,12 @@ approval in the release log. Record the production release decision separately.
 
 Before merging, verify live that `PRODUCTION_AUTO_PROMOTE_DISABLED=true` and
 inspect the change for paths from merge to production. Apply the same check
-to changes to promotion code or guidance. Proceed with a source merge only
+to changes to promotion code or guidance. Follow this section for source merges
+where older guides call for owner sign-off. Proceed with a source merge only
 when the disable is confirmed and the pinned diff has no path from merge to
 production. Stop if the merge could deploy or either check is inconclusive.
-Keep any PR-specific holds.
+Keep any PR-specific holds and the separate authorization binding for
+[staging migration apply](docs/staging-migrate-claim.md#verify-the-plan-before-dispatch-and-the-claim-after-dispatch).
 
 For two-web-next and two-bot-next, staging qualification is the
 **post-merge, pre-production exact-main staging/e2e/soak gate** (owner decision
@@ -161,14 +163,16 @@ A new PR head requires fresh check evidence and review evidence covering that he
 ### Production release gate
 
 The release task thread makes routine technical, staging and production
-decisions under this gate. This section governs routine release authorization.
+decisions under this gate. Use the bound release-reviewer `APPROVE` in step 5
+when older guides call for Release Manager acceptance or owner sign-off on a
+routine production change.
 Follow the linked runbooks for execution, protected Environment approvals and
 operation-specific safeguards. Keep existing branch and workflow protections,
 credential and spending limits, incident controls and holds. Follow native
 permission prompts and let the required human responder act on them. Never
 deploy by hand, bypass a hold, or skip or replace a pipeline gate with a no-op.
 
-Refer only four decision categories to the owner through the task thread.
+Refer only four decision categories to the project owner through the task thread.
 
 - Spending beyond existing budgets.
 - Permanent deletion of member data.
@@ -203,11 +207,16 @@ Record the following evidence in that thread before executing the change.
 
 Execute through the existing protected workflows, including the
 [production deploy workflow](docs/production-deploy.md) for promotion. Specify
-the approved full SHA on dispatch. Follow existing execution guards for rollback
-and other recovery paths. Keep health and errors under watch for at least 30
-minutes after the change. On regression, immediately execute the approved
-rollback through the protected path. Record the outcome in the task thread and
-the release log.
+the approved full SHA on dispatch. If a change lacks a protected workflow,
+keep it on hold.
+
+Use the existing recovery guards for a rollback to a verified snapshot or a
+redeploy of the same serving SHA. Those paths can admit recovery when staging
+history has expired. Retain their provenance, CI and approval requirements.
+Every new build needs the staging evidence in step 2. Keep health and errors
+under watch for at least 30 minutes after the change. On regression, immediately
+execute the approved rollback through the protected path. Record the outcome
+in the task thread and the release log.
 
 Use these cases to check the decision before proceeding.
 
