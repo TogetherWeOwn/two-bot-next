@@ -141,26 +141,13 @@ pub fn mode_from_setting(value: Option<&str>) -> Result<Option<RetentionMode>, E
 /// bounded opportunity) when the database is unreachable. An invalid URL or
 /// TLS refusal is a configuration error at registration time.
 pub(crate) fn pool_from_url(url: &str) -> Result<PgPool, ErrorClass> {
-    use sqlx::postgres::PgPoolOptions;
     use two_bot_core::database_tls::{self, TlsPolicy};
 
-    two_bot_core::database_url::validate(url).map_err(|_| ErrorClass::Configuration)?;
     let tls = std::env::var_os(database_tls::POLICY_SETTING);
     let tls = TlsPolicy::from_setting(tls.as_ref().and_then(|v| v.to_str()))
         .map_err(|_| ErrorClass::Configuration)?;
-    database_tls::enforce(url, tls).map_err(|_| ErrorClass::Configuration)?;
-    let options =
-        two_bot_core::database_url::connect_options(url).map_err(|_| ErrorClass::Configuration)?;
-    let options = database_tls::apply(options, tls);
-    // The statement timeout rides the connection options (server-side setting
-    // per connection), so a blocked statement fails on its own even outside
-    // the per-guild `SET LOCAL` deletes below. Same 15 s as the other runtime
-    // pools; the acquire timeout still bounds a stuck TCP connect.
-    let options = options.options([("statement_timeout", "15000ms")]);
-    Ok(PgPoolOptions::new()
-        .max_connections(2)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect_lazy_with(options))
+    two_bot_store::pool::connect_lazy_pool_with_tls(url, tls, 2)
+        .map_err(|_| ErrorClass::Configuration)
 }
 
 /// The supervised retention job: fixed-phase [`CADENCE`], jittered start,

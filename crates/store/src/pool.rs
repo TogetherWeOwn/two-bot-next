@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Pool, Postgres};
 use thiserror::Error;
 use two_bot_core::database_tls::{self, TlsPolicy};
@@ -121,6 +121,31 @@ pub async fn connect_pool_with_tls(
     if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
         return Err(ConnectError::NotPostgres);
     }
+    let options = runtime_connect_options(url, tls)?;
+    // `statement_timeout` only guards statements; a stuck TCP connect needs
+    // its own bound so a dead host fails the boot probe instead of hanging it.
+    let pool = PgPoolOptions::new()
+        .max_connections(DB_POOL_MAX)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect_with(options)
+        .await?;
+    Ok(pool)
+}
+
+/// Apply the runtime pool policy now and open sockets on first use.
+pub fn connect_lazy_pool_with_tls(
+    url: &str,
+    tls: TlsPolicy,
+    max_connections: u32,
+) -> Result<Pool<Postgres>, ConnectError> {
+    let options = runtime_connect_options(url, tls)?;
+    Ok(PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect_lazy_with(options))
+}
+
+fn runtime_connect_options(url: &str, tls: TlsPolicy) -> Result<PgConnectOptions, ConnectError> {
     two_bot_core::database_url::validate(url).map_err(|message| match message {
         "unsupported database URL parameter" => ConnectError::UnsupportedParameter,
         _ => ConnectError::InvalidUrl,
@@ -133,16 +158,8 @@ pub async fn connect_pool_with_tls(
     // Validation already passed, so a residual parse failure is an invalid URL.
     let parsed =
         two_bot_core::database_url::connect_options(url).map_err(|_| ConnectError::InvalidUrl)?;
-    let mut options = database_tls::apply(parsed, tls);
-    options = options.options([("statement_timeout", format!("{STATEMENT_TIMEOUT_MS}ms"))]);
-    // `statement_timeout` only guards statements; a stuck TCP connect needs
-    // its own bound so a dead host fails the boot probe instead of hanging it.
-    let pool = PgPoolOptions::new()
-        .max_connections(DB_POOL_MAX)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect_with(options)
-        .await?;
-    Ok(pool)
+    Ok(database_tls::apply(parsed, tls)
+        .options([("statement_timeout", format!("{STATEMENT_TIMEOUT_MS}ms"))]))
 }
 
 /// Ping the database: `true` when a trivial query answers.

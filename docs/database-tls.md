@@ -20,6 +20,24 @@ target pool bounds acquisition only. It adds no statement timeout, since DDL
 such as an index build can legitimately exceed the application's 15 s limit.
 Operator-supplied or server-default statement timeouts remain in effect.
 
+## Connection entry points
+
+Use `two_bot_store::pool::connect_pool_with_tls` for an eager runtime pool.
+Admission and retention use `connect_lazy_pool_with_tls` to apply the same
+URL and TLS policy without opening a socket during registration. Both use a
+15 s statement timeout and 10 s acquire timeout.
+
+The required Rust lint lane checks Clippy's resolved SQLx pool and direct
+connection diagnostics against added source lines, including macro call sites
+reported by Clippy. Existing constructor lines are grandfathered. These
+include disposable test fixtures and specialized restore, migration and
+cutover paths with their own connection requirements. When changing a
+grandfathered constructor, use a fenced entry point. The store connector owns
+the one new raw lazy constructor and uses the same validated options as its
+eager counterpart. The lint job compiles a fixture covering aliases, builder
+methods, direct connections and both fenced entry points without opening a
+database connection.
+
 ## Setting
 
 `TWO_DATABASE_TLS` selects the policy. It has two values:
