@@ -3422,6 +3422,7 @@ mod tests {
         for key in [
             "TWO_INTERNAL_KEYS",
             "TWO_INTERNAL_ALLOW_MODERATION",
+            "TWO_INTERNAL_ALLOW_VOICE_MOVE",
             "TWO_MODERATION",
             "DISCORD_TOKEN",
             "TWO_OWEN_USER_ID",
@@ -3477,10 +3478,11 @@ mod tests {
         // voice.snapshot read adds one env-only key
         // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT). The reserved member notification
         // gate adds one env-only key without wiring notification delivery.
+        // The staging self-move gate adds one env-only key.
         for (class, expected) in [
             (SettingClass::Hot, 52),
             (SettingClass::Cold, 18),
-            (SettingClass::EnvOnly, 68),
+            (SettingClass::EnvOnly, 69),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
