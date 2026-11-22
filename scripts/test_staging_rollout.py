@@ -1162,8 +1162,9 @@ class OrchestrationTests(OfflineTestCase):
         def readyz():
             status, headers, body = ready_response()
             if cloudflare.ready_image() == OLD_IMAGE:
-                body = json.dumps(dict(json.loads(body), build_revision="f" * 40,
-                                       build_id="123455-1")).encode()
+                revision = "f" * 40
+                body = json.dumps(dict(json.loads(body), build_revision=revision,
+                                       build_id="123455-1", deploy_id=f"2026.10.20.1+{revision[:7]}")).encode()
             return status, headers, body
 
         client = verify_client()
