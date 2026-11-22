@@ -523,7 +523,7 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
-          QUALITY_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || (github.event_name == 'workflow_dispatch' && 'origin/main') || 'HEAD^' }}
+          QUALITY_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && 'origin/main') || 'HEAD^' }}
           QUALITY_HEAD: ${{ github.sha }}
         run: |
           set -euo pipefail

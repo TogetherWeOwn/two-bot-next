@@ -86,13 +86,15 @@ class CheckSqlxPoolTests(unittest.TestCase):
             if source.endswith("// disallowed"):
                 records.append(diagnostic(gate.FIXTURE, line))
         records.append({"reason": "build-finished", "success": True})
-        for mode, blocked in (("warn", False), ("hard", True)):
+        for mode, diff_error in (("warn", ""), ("hard", ""), ("warn", "diff failed"), ("hard", "diff failed")):
+            diff = (None, diff_error) if diff_error else ({(path, 9)}, "")
             with (
-                self.subTest(mode=mode),
+                self.subTest(mode=mode, diff_error=diff_error),
                 patch.object(gate.sys, "argv", ["gate", "--base-ref", "base", "--head-ref", "head", "--mode", mode]),
                 patch.object(gate.sys, "stdin", iter(map(json.dumps, records))),
                 patch.object(gate.sys, "stderr", io.StringIO()) as output,
-                patch.object(gate.runpy, "run_path", return_value={"added_lines": lambda *_: ({(path, 9)}, "")}),
+                patch.object(gate.runpy, "run_path", return_value={"added_lines": lambda *_: diff}),
             ):
-                self.assertEqual(gate.main(), blocked)
-                self.assertIn("1 new violations", output.getvalue())
+                self.assertEqual(gate.main(), mode == "hard")
+                self.assertIn("evidence is incomplete" if diff_error else "1 new violations", output.getvalue())
+                self.assertNotIn("0 new violations", output.getvalue())

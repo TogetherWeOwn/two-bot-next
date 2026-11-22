@@ -53,7 +53,7 @@ def check(lines, added, expected_fixture, output):
     protocol_error = None
     for line in lines:
         try:
-            record = decode_json(line)
+            record = decode_json(line, max_depth=512)
             if record["reason"] == "build-finished":
                 completed = record["success"] is True
             if record["reason"] != "compiler-message":
@@ -74,7 +74,7 @@ def check(lines, added, expected_fixture, output):
                 fixture[primary["line_start"]] += 1
             elif owner_constructor(diagnostic, path, primary):
                 owner_lines.add(location)
-            elif any(
+            elif added is not None and any(
                 (path, number) in added
                 for path, span in spans
                 for number in range(span["line_start"], span["line_end"] + 1)
@@ -84,7 +84,7 @@ def check(lines, added, expected_fixture, output):
                 violations.add(location)
             else:
                 grandfathered.add(location)
-        except (KeyError, RecursionError, TypeError, ValueError) as error:
+        except (AttributeError, KeyError, RecursionError, TypeError, ValueError) as error:
             protocol_error = protocol_error or error
 
     if protocol_error:
@@ -92,6 +92,8 @@ def check(lines, added, expected_fixture, output):
 
     if not completed:
         raise ValueError("Cargo did not report a successful build")
+    if added is None or not expected_fixture:
+        raise ValueError("changed lines or SQLx lint fixture are unavailable")
     if len(owner_lines) != 1:
         raise ValueError("expected exactly one canonical lazy SQLx constructor")
     if fixture != expected_fixture:
@@ -119,12 +121,10 @@ def main():
             number for number, line in enumerate(FIXTURE_SOURCE.read_text().splitlines(), 1)
             if line.endswith("// disallowed")
         )
-    except (KeyError, OSError) as error:
+    except (KeyError, OSError, ValueError) as error:
         setup_error = str(error)
     try:
-        violations = check(sys.stdin, added or set(), expected, sys.stderr)
-        if setup_error or not expected:
-            raise ValueError(setup_error or "SQLx lint fixture is empty")
+        violations = check(sys.stdin, None if setup_error else added, expected, sys.stderr)
     except ValueError as error:
         print(f"SQLx pool lint could not verify the build: {setup_error or error}", file=sys.stderr)
         print(f"::{'error' if hard else 'warning'}::SQLx pool lint evidence is incomplete", file=sys.stderr)
