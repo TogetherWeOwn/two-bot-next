@@ -67,6 +67,8 @@ import os
 import sys
 from datetime import datetime, timezone
 
+from script_intake import decode_legacy_json, unique_object as _unique_json_object
+
 SCHEMA_VERSION = 1
 
 # Gate 5 acceptance: recovery strictly under 60 s from outage start.
@@ -163,10 +165,7 @@ def parse_ts(value):
 
 
 def _reject_duplicate_keys(pairs):
-    keys = [key for key, _ in pairs]
-    if len(keys) != len(set(keys)):
-        raise ValueError("duplicate key in record")
-    return dict(pairs)
+    return _unique_json_object(pairs, message='duplicate key in record')
 
 
 def _display_seconds(seconds):
@@ -206,7 +205,7 @@ def summarize(lines, interval_start=None, interval_end=None):
         if not line:
             continue
         try:
-            record = json.loads(line, object_pairs_hook=_reject_duplicate_keys)
+            record = decode_legacy_json(line, object_pairs_hook=_reject_duplicate_keys)
         except (ValueError, RecursionError):
             note_unknown(None, None, f"malformed line {lineno}: not JSON or repeats a key")
             continue

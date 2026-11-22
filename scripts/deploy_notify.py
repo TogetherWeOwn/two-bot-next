@@ -36,6 +36,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from script_intake import decode_legacy_json, no_redirect_opener
+
 REPO = "two-bot-next"
 EVENTS = ("deploy", "rollback")
 OUTCOMES = ("success", "rolled_back", "failed")
@@ -46,11 +48,6 @@ RUN_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actio
 TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 REASON = re.compile(r"[A-Za-z0-9 _:;,./()-]{1,200}")
 TIMEOUT_SECONDS = 15
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None
 
 
 def only(pattern, value):
@@ -85,7 +82,7 @@ GATES = (("GATE_OUTCOME", "readyz gate"),
 def read_json(path):
     try:
         with open(path, encoding="utf-8") as handle:
-            value = json.load(handle)
+            value = decode_legacy_json(handle.read())
     except (OSError, ValueError):
         return {}
     return value if isinstance(value, dict) else {}
@@ -169,7 +166,7 @@ def send(url, secret, record, *, now=time.time, opener=None):
         "X-Paperclip-Timestamp": timestamp,
         "X-Paperclip-Signature": sign(secret, timestamp, body),
     })
-    opener = opener or urllib.request.build_opener(NoRedirect())
+    opener = opener or no_redirect_opener()
     try:
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
             return response.status

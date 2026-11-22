@@ -79,6 +79,13 @@ import urllib.request
 from concurrent.futures import Future
 from urllib.parse import urlsplit
 
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 STAGING_GUILD_ID = "1545644954272137297"
 LIVE_GUILD_ID = "326474832151838730"
 # Staging "Create a Lobby" creator (the only creator; "Join to Create" is retired).
@@ -160,18 +167,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 class GatewayShapeError(ValueError):
@@ -179,13 +175,6 @@ class GatewayShapeError(ValueError):
 
     Fixed vocabulary only, like BodyTooLarge and RedirectRefused.
     """
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Turn every redirect into an HTTPError without contacting its target."""
-
-    def redirect_request(self, request, response, code, message, headers, new_url):
-        return None
 
 
 def _start_daemon(target):
@@ -249,12 +238,7 @@ def _open_no_redirect(req, timeout):
     intended URL is ever contacted. A 3xx surfaces as HTTPError so each
     reader reports its fixed-vocabulary redirect refusal.
     """
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPHandler(),
-        _BoundedHTTPSHandler(),
-        urllib.request.HTTPErrorProcessor(),
-        _NoRedirectHandler(),
-    )
+    opener = no_redirect_opener(https_handler=_BoundedHTTPSHandler())
     return opener.open(req, timeout=timeout)
 
 
@@ -611,12 +595,12 @@ def metrics_snapshot(staging_url, token):
         "Authorization": f"Bearer {token}", "User-Agent": "two-bot-voice-synthetic (staging)"})
     try:
         with _open_no_redirect(req, timeout=20) as resp:
-            raw = resp.read(MAX_BODY_BYTES + 1)
+            raw = read_with_overflow(resp, MAX_BODY_BYTES)
     except urllib.error.HTTPError as exc:
         if exc.code in REDIRECT_STATUSES:
             raise RedirectRefused(
                 f"metrics read refused redirect with status {exc.code}") from None
-        raw = exc.read(MAX_BODY_BYTES + 1)
+        raw = read_with_overflow(exc, MAX_BODY_BYTES)
         if len(raw) > MAX_BODY_BYTES:
             raise BodyTooLarge("metrics read answered over the body cap") from None
         return None, None
@@ -727,8 +711,9 @@ class WebSocket:
                 parts.append(data)
                 if fin:
                     try:
-                        return json.loads(b"".join(parts),
-                                          object_pairs_hook=_reject_duplicate_keys)
+                        return decode_legacy_json(
+                            b"".join(parts), object_pairs_hook=_reject_duplicate_keys,
+                        )
                     except DuplicateKeyError:
                         raise ValueError(
                             "gateway frame carries duplicate JSON object keys") from None
@@ -749,19 +734,19 @@ def rest(token, path, timeout=20):
         "Authorization": f"Bot {token}", "User-Agent": "two-bot-voice-synthetic (staging)"})
     try:
         with _open_no_redirect(req, timeout=timeout) as resp:
-            raw = resp.read(MAX_BODY_BYTES + 1)
+            raw = read_with_overflow(resp, MAX_BODY_BYTES)
     except urllib.error.HTTPError as exc:
         if exc.code in REDIRECT_STATUSES:
             raise RedirectRefused(
                 f"Discord REST read refused redirect with status {exc.code}") from None
-        raw = exc.read(MAX_BODY_BYTES + 1)
+        raw = read_with_overflow(exc, MAX_BODY_BYTES)
         if len(raw) > MAX_BODY_BYTES:
             raise BodyTooLarge("Discord REST read answered over the body cap") from None
         raise
     if len(raw) > MAX_BODY_BYTES:
         raise BodyTooLarge("Discord REST read answered over the body cap")
     try:
-        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+        return decode_legacy_json(raw, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         raise ValueError("Discord REST read carries duplicate JSON object keys") from None
 
@@ -779,20 +764,20 @@ def rest_patch(token, path, payload, timeout=20):
         "Content-Type": "application/json"}, method="PATCH")
     try:
         with _open_no_redirect(req, timeout=timeout) as resp:
-            raw = resp.read(MAX_BODY_BYTES + 1)
+            raw = read_with_overflow(resp, MAX_BODY_BYTES)
             status = resp.status
     except urllib.error.HTTPError as exc:
         if exc.code in REDIRECT_STATUSES:
             raise RedirectRefused(
                 f"Discord REST read refused redirect with status {exc.code}") from None
-        raw = exc.read(MAX_BODY_BYTES + 1)
+        raw = read_with_overflow(exc, MAX_BODY_BYTES)
         if len(raw) > MAX_BODY_BYTES:
             raise BodyTooLarge("Discord REST read answered over the body cap") from None
         return exc.code, None
     if len(raw) > MAX_BODY_BYTES:
         raise BodyTooLarge("Discord REST read answered over the body cap")
     try:
-        return status, json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+        return status, decode_legacy_json(raw, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         raise ValueError("Discord REST read carries duplicate JSON object keys") from None
 
@@ -804,12 +789,12 @@ def metrics_value(staging_url, token):
         "Authorization": f"Bearer {token}", "User-Agent": "two-bot-voice-synthetic (staging)"})
     try:
         with _open_no_redirect(req, timeout=20) as resp:
-            raw = resp.read(MAX_BODY_BYTES + 1)
+            raw = read_with_overflow(resp, MAX_BODY_BYTES)
     except urllib.error.HTTPError as exc:
         if exc.code in REDIRECT_STATUSES:
             raise RedirectRefused(
                 f"metrics read refused redirect with status {exc.code}") from None
-        raw = exc.read(MAX_BODY_BYTES + 1)
+        raw = read_with_overflow(exc, MAX_BODY_BYTES)
         if len(raw) > MAX_BODY_BYTES:
             raise BodyTooLarge("metrics read answered over the body cap") from None
         return None

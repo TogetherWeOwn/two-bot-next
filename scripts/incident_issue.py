@@ -24,6 +24,13 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _reject_duplicate_keys,
+)
+
 API = "https://api.github.com"
 LABEL = "incident"
 KEY = re.compile(r"[a-z0-9][a-z0-9:._-]{0,79}")
@@ -39,22 +46,6 @@ TIMEOUT_SECONDS = 10
 
 class IncidentError(Exception):
     """A fixed-vocabulary sink failure (never carries the token or a URL)."""
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Turn every redirect into an HTTPError so the token never leaves api.github.com."""
-
-    def redirect_request(self, request, response, code, message, headers, new_url):
-        return None
-
-
-def _reject_duplicate_keys(pairs):
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise ValueError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
 
 
 def marker(key):
@@ -78,15 +69,10 @@ def _request(method, path, token, body=None):
                  "X-GitHub-Api-Version": "2022-11-28",
                  "Content-Type": "application/json",
                  "User-Agent": "two-bot-next-incident-issue/1"})
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPHandler(),
-        urllib.request.HTTPSHandler(),
-        urllib.request.HTTPErrorProcessor(),
-        _NoRedirectHandler(),
-    )
+    opener = no_redirect_opener()
     try:
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
+            raw = read_with_overflow(response, MAX_RESPONSE_BYTES)
     except urllib.error.HTTPError as error:
         if error.code in (301, 302, 303, 307, 308):
             raise IncidentError(f"incident issue {method} refused redirect with status {error.code}") from None
@@ -96,7 +82,7 @@ def _request(method, path, token, body=None):
     if len(raw) > MAX_RESPONSE_BYTES:
         raise IncidentError(f"incident issue {method} response exceeds the size cap")
     try:
-        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys) if raw else None
+        return decode_legacy_json(raw, object_pairs_hook=_reject_duplicate_keys) if raw else None
     except (ValueError, RecursionError):
         raise IncidentError(f"incident issue {method} response is not valid JSON") from None
 
