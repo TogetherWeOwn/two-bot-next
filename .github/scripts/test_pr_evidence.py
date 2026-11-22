@@ -53,10 +53,12 @@ class EvidenceTests(unittest.TestCase):
         evidence.validate(policy, body, files, read)
         fenced = "\n## Notes\n```md\n## Verification\n- Looks verified.\n```"
         link = f"https://github.com/{REPO}/actions/runs/12/job/34"
+        policy_only = body.replace("### Tests", "### Tests\n    ```\n## Notes\n    ```")
         for changed, problem in (
                 (body.replace("test_present", "test_gone"), "no unique matching test"),
                 (body.replace("test_present", "test_gone") + "\n## attestation", "canonical Verification"),
                 (body.replace("Ran the evidence fixtures.", link) + fenced, "can go stale"),
+                (policy_only.replace("proof=fixture", f"proof={link}"), "can go stale"),
                 (body.replace("- Ran the evidence fixtures.", "```\npython3 -m unittest\n```") + fenced, "Verification"),
                 (body.replace("- Ran the evidence fixtures.", "-\n##\tNotes\n- Ran tests."), "Verification")):
             with self.assertRaisesRegex(evidence.EvidenceError, problem):
