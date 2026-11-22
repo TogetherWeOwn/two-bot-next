@@ -3,16 +3,14 @@
 import importlib.util
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
-
-SPEC = importlib.util.spec_from_file_location(
-    "check_python_intake", Path(__file__).with_name("check-python-intake.py")
-)
+SPEC = importlib.util.spec_from_file_location("check_python_intake", Path(__file__).with_name("check-python-intake.py"))
 guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
-
 
 class IntakeRatchetTests(unittest.TestCase):
     def test_raw_uses_include_aliases_and_indirect_references(self):
@@ -30,6 +28,8 @@ read(stream)
 getattr(wire, "loads")(payload)
 wire.JSONDecoder().decode(payload)
 http.urlretrieve(url)
+def helper():
+    import harmless as wire
 """
         self.assertEqual(list(guard.additions("", source, "scripts/read.py")), [
             (4, "json.load"),
@@ -47,7 +47,6 @@ http.urlretrieve(url)
         after = """\
 from script_intake import decode_json, no_redirect_opener
 import json
-
 old = json.loads(data)
 new = decode_json(payload)
 opener = no_redirect_opener()
@@ -55,29 +54,30 @@ payload = json.dumps(new)
 """
         self.assertEqual(list(guard.additions(before, after, "scripts/read.py")), [])
         self.assertEqual(list(guard.additions(before, after + "json.loads(data)\n",
-                                              "scripts/read.py")), [(8, "json.loads")])
+                                              "scripts/read.py")), [(7, "json.loads")])
 
-    def test_git_range_scopes_files_and_preserves_existing_backlog(self):
+    def test_git_range_warn_and_hard_modes(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.git(root, "init", "-q")
             (root / "scripts").mkdir()
-            (root / ".github" / "scripts").mkdir(parents=True)
             raw = "import json\njson.loads(data)\n"
             existing = root / "scripts" / "existing.py"
             existing.write_text(raw)
             self.commit(root)
             base = self.git(root, "rev-parse", "HEAD").strip()
-            existing.write_text("# Move the line without changing the call.\n" + raw)
-            (root / guard.INTAKE).write_text(raw)
-            (root / "scripts" / "test_fixture.py").write_text(raw)
-            (root / ".github/scripts/new.py").write_text(raw)
+            existing.rename(root / "scripts" / "renamed.py")
+            (root / guard.INTAKE).write_text(raw.replace("data", "shared"))
+            (root / "scripts" / "test_fixture.py").write_text(raw.replace("data", "fixture"))
+            (root / "scripts" / "new.py").write_text(raw.replace("data", "new_data"))
             self.commit(root)
-            self.assertEqual(list(guard.check(root, base, "HEAD")),
-                             [(".github/scripts/new.py", 2, "json.loads")])
+            self.assertEqual(list(guard.check(root, base)), [("scripts/new.py", 2, "json.loads")])
+            with patch.object(guard, "ROOT", root), patch.object(sys, "argv", ["guard", base]):
+                self.assertEqual(guard.main(), 0)
+                sys.argv.append("--hard")
+                self.assertEqual(guard.main(), 1)
 
-    @staticmethod
-    def git(root, *args):
+    def git(self, root, *args):
         return subprocess.check_output(["git", *args], cwd=root, text=True)
 
     def commit(self, root):

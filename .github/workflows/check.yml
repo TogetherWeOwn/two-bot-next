@@ -235,7 +235,7 @@ jobs:
       - name: Source-level CI gate regressions
         run: PYTHONPATH="$RUNNER_TEMP/zizmor" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
 
-      - name: Ratchet Python script intake
+      - name: Ratchet Python script intake (WARN)
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
         env:
           INTAKE_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before }}

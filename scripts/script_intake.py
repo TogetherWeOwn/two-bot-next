@@ -98,9 +98,7 @@ def no_redirect_opener(*, https_handler=None, use_proxy=True, redirect_error=Non
     Validate the destination, including its scheme, before opening it.
     urllib's environment proxy configuration applies unless use_proxy=False.
     """
-    handlers = []
-    if https_handler is not None:
-        handlers.append(https_handler)
+    handlers = [] if https_handler is None else [https_handler]
     if not use_proxy:
         handlers.append(urllib.request.ProxyHandler({}))
     handlers.append(_NoRedirect() if redirect_error is None else _EarlyRefusal(redirect_error))
