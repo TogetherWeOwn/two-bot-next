@@ -90,7 +90,7 @@ def steps(job):
 
 
 def inline_script(name):
-    start = LINES.index(f"      - name: {name}")
+    start = next(i for i, line in enumerate(LINES) if line.strip() in (f"- name: {name}", f"name: {name}"))
     start = next(i for i in range(start, len(LINES)) if LINES[i].startswith("        run: |")) + 1
     end = start
     while end < len(LINES) and (not LINES[end].strip() or LINES[end].startswith("          ")):
@@ -381,15 +381,15 @@ class StaticGuardTests(unittest.TestCase):
     def test_concurrency_queues_instead_of_cancelling(self):
         # Job-level concurrency on production only: the guard, gates, soak
         # and recheck run outside the lane, so an automatic run can never
-        # delay an operator rollback behind a sleeping promotion. The lane
-        # keeps the default single pending slot (a third arrival cancels the
-        # queued run), so the recheck skips an automatic run while an operator
-        # dispatch is active instead of entering the lane behind it. Running
+        # delay an operator rollback behind a sleeping promotion. Running
         # jobs are never cancelled (cancel-in-progress is false).
         self.assertNotIn("concurrency", TOP)
         conc = children(JOBS["production"][1:], 4).get("concurrency", [])
         self.assertIn("|| 'deploy-production' }}", "\n".join(conc))
         self.assertIn("cancel-in-progress: false", "\n".join(conc))
+        self.assertIn("queue: max", "\n".join(conc))
+        production = JOBS["production"]
+        self.assertLess(production.index("      - *automatic_recheck"), production.index("      - name: Deploy to production"))
         for job in ("guard", "schema-gate", "roles-gate", "staging-soak-evidence", "recheck"):
             self.assertNotIn("concurrency", children(JOBS[job][1:], 4))
         # The soak is the one job that holds the canonical staging lifecycle

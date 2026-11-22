@@ -103,12 +103,12 @@ permissions: {}
 
 # No workflow-level concurrency: only the `production` job below holds the
 # `deploy-production` lane (through its post-deploy watch). The guard, gates, soak and recheck jobs run outside it, so a sleeping automatic promotion can never queue an
-# operator rollback behind it. The lane keeps the default single pending
+# operator rollback behind it. The lane keeps more than one pending
 # slot, so the `recheck` job skips an automatic run while an operator
 # dispatch is active — otherwise the automatic `production` job would enter
-# the lane as a new pending job and cancel the queued recovery run. A
+# the lane alongside queued recovery work. A
 # dispatch queued in the seconds between the recheck and the lane entry is
-# the residual race; it needs the operator's eye on the lane, as before.
+# covered by the in-lane recheck.
 
 jobs:
   guard:
@@ -1108,7 +1108,7 @@ jobs:
   # happens after the last long build, immediately before the deploy: a hold
   # set mid-run, an already-live target, a target the live build already
   # contains, or an active operator dispatch skips green instead of deploying
-  # through the incident — or cancelling a queued recovery run on lane entry.
+  # through the incident.
   # Manual dispatches skip this job (they ignore the hold, and a live-SHA
   # redeploy is a legitimate manual cure). A cancelled run never rechecks:
   # `!cancelled()` still bypasses skipped gates for rollback and live-SHA
@@ -1127,7 +1127,9 @@ jobs:
     outputs:
       skip: ${{ steps.recheck.outputs.skip }}
     steps:
-      - name: Re-read the promotion hold and the live revision
+      - &automatic_recheck
+        name: Re-read the promotion hold and the live revision
+        if: needs.guard.outputs.auto == 'true'
         id: recheck
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1231,10 +1233,7 @@ jobs:
           def recheck_dispatch_state():
               """Whether an operator dispatch of this workflow is active.
 
-              The lane holds a single pending job: if this automatic run's
-              production job entered it while a recovery dispatch is queued
-              or running, it would arrive as a new pending job and cancel the
-              queued run. Returns "active" when any workflow_dispatch run is
+              Returns "active" when any workflow_dispatch run is
               queued, waiting or in progress, "idle" when none is, and
               "unreadable" when the runs cannot be listed — which also skips,
               so a blind run never risks the lane. The backstop retries the
@@ -1279,13 +1278,21 @@ jobs:
               elif dispatch == "unreadable":
                   skip = "dispatch-check-unreadable"
               else:
-                  live = recheck_live_revision()
+                  if os.environ.get("MODE") == "deploy":
+                      with open(os.path.join(os.environ["RUNNER_TEMP"], "production-rollback-snapshot.json")) as snapshot:
+                          live = json.load(snapshot)["serving_sha"]
+                      if not re.fullmatch(r"[0-9a-f]{40}", live or ""):
+                          refuse("serving SHA absent from the production snapshot")
+                  else:
+                      live = recheck_live_revision()
                   if live == sha:
                       skip = "live"
                   elif (live and re.fullmatch(r"[0-9a-f]{40}", live)
                           and recheck_live_contains(sha, live)):
                       skip = "older-than-live"
 
+          if skip and os.environ.get("MODE") == "deploy":
+              refuse(skip)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"skip={skip}\n")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
@@ -1358,16 +1365,17 @@ jobs:
     # no deploy), and a skipped recheck counts only for manual runs — an
     # automatic run always needs a fresh recheck pass with no skip.
     if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
-    # The only job holding the deploy-production lane: only a running or
-    # pending production job occupies it. The guard, gates, soak and recheck
+    # The protected status read shares the deploy-production lane.
+    # Outside this job, the guard, gates, soak and recheck
     # jobs carry no concurrency, so recovery
     # dispatches are never queued behind a sleeping promotion. The lane keeps
-    # the default single pending slot: a third arrival cancels the queued run,
+    # pending recoveries, preserving their place,
     # so automatic runs recheck for an active operator dispatch first and skip
     # instead of entering the lane behind one.
     concurrency:
       group: ${{ github.run_attempt != 1 && needs.guard.outputs.mode != 'rollback' && needs.guard.outputs.allow_unstaged != 'true' && format('deploy-production-refused-{0}-{1}', github.run_id, github.run_attempt) || 'deploy-production' }}
       cancel-in-progress: false
+      queue: max
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ubuntu-latest
     # Sized for the worst case: a ~442 s deploy, a failing readyz gate
@@ -1598,6 +1606,7 @@ jobs:
           PY
           fi
           echo "PRODUCTION_DEPLOY_CONFIG=$config" >> "$GITHUB_ENV"
+      - *automatic_recheck
       - name: Deploy to production
         id: deploy
         if: env.MODE == 'deploy'
@@ -2052,8 +2061,7 @@ jobs:
       # promotion gate for 30 minutes after an ordinary takeover promotion.
       # They run inside this job, so the deploy-production lane stays held
       # from the deploy to the end of the watch: no newer deploy lands
-      # mid-watch, and no separate job re-enters the single pending slot. A
-      # breach re-reads the serving version and restores the pre-deploy
+      # mid-watch. A breach re-reads the serving version and restores the pre-deploy
       # snapshot (Worker version AND container image) only if the promoted
       # version still serves; the run then fails red. Cancel the run to free
       # the lane for an urgent operator dispatch.

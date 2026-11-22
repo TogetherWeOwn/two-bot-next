@@ -312,10 +312,8 @@ and carry exactly the pinned condition (not cancelled, guard success, no skip, a
 skipped recheck on manual runs only — and both gates green unless a
 rollback or live-SHA redeploy waives them); any other condition fails the regression. The `recheck`
 job must need `guard`, `soak`, `schema-gate` and `roles-gate` so its fresh hold/live/dispatch read happens after the last long build,
-and must skip while an operator dispatch is active (the lane's single pending slot would otherwise let the
-automatic arrival cancel a queued recovery run). Only
-`production` and `release` hold the `deploy-production` lane (a job-level
-concurrency group, never workflow-level); the guard, gates, soak and recheck
+and must skip while an operator dispatch is active. Deploy and ownership status share the
+bounded `deploy-production` queue. The guard, gates, soak and recheck
 carry none, so a sleeping promotion can never delay a rollback behind it.
 The `guard` job may not have an environment, call a reusable workflow, or contain
 deploy/probe steps. Its script must still require a deploy-staging run with

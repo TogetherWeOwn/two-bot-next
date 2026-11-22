@@ -1,6 +1,7 @@
 """Offline workflow policy fixtures; never dispatch, deploy or probe staging."""
 
 import ast
+from contextlib import nullcontext
 from copy import deepcopy
 import importlib.util
 import json
@@ -13,7 +14,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import yaml
 
@@ -93,6 +94,7 @@ JOB_INVENTORY = {
     "staging-mcp-proveout.yml": {"proveout"},
     # Manual read-only staging ownership status read; pinned shape below.
     "staging-ownership-status.yml": {"status"},
+    "production-ownership-status.yml": {"guard", "status"},
     # Manual gradual-promote proof caller (passive until the synthetic
     # fixture lands); pinned shape below.
     "gradual-promote-proof.yml": {"proof"},
@@ -2992,15 +2994,13 @@ def production_errors(workflow):
     if production.get("if") != expected_production_if:
         errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates, "
                       "a completed soak, a fresh recheck and no skip; cancelled runs never deploy")
-    # Only production holds the deploy-production lane: the guard, gates,
+    # The production job shares its lane with the protected status read. The guard, gates,
     # soak and recheck run outside it, so a sleeping automatic promotion can
-    # never delay an operator rollback. The lane keeps the default single
-    # pending slot, so the recheck must skip an automatic run while an operator
-    # dispatch is active instead of entering the lane behind it.
+    # never delay an operator rollback.
     if "concurrency" in workflow:
         errors.append(f"{name}: must not hold the deploy lane at workflow level")
     if jobs.get("production", {}).get("concurrency") != {"group": PRODUCTION_GROUP,
-                                                         "cancel-in-progress": "false"}:
+                                                         "cancel-in-progress": "false", "queue": "max"}:
         errors.append(f"{name}:production: must hold the deploy-production lane without cancelling")
     for job_id in ("guard", "schema-gate", "roles-gate", "staging-soak-evidence", "recheck"):
         if "concurrency" in jobs.get(job_id, {}):
@@ -4772,6 +4772,11 @@ def workflow_policy_errors(workflows):
             # Environment binding.
             errors.extend(staging_ownership_status_errors(workflow))
             continue
+        if name == "production-ownership-status.yml":
+            contract = Path(__file__).parent / "fixtures/production_ownership_status_workflow.json"
+            if workflow != json.loads(contract.read_text()):
+                errors.append(f"{name}: expected the reviewed protected GET-only job graph")
+            continue
         for job_id, job in jobs.items():
             if name == "deploy-staging.yml" and job_id == "schema-gate":
                 continue  # pre-deploy drift gate: pinned by schema_gate_errors above;
@@ -4830,6 +4835,66 @@ CACHE_JOBS = (("nightly.yml", "sweep-plan", "nightly-cargo"),
               ("nightly.yml", "sweep-docs", "nightly-cargo"),
               ("pipeline-benchmark.yml", "benchmark", "pipeline-bench"))
 CACHE_PATHS = "~/.cargo/registry\n~/.cargo/git\ntarget\n"
+
+
+class ProductionStatusTests(unittest.TestCase):
+    def setUp(self):
+        with patch.object(sys, "path", [str(ROOT / "scripts"), *sys.path]):
+            import production_ownership_status as status
+        self.status = status
+        self.fixture = json.loads((Path(__file__).parent / "fixtures/production_ownership_status_provider.json").read_text())
+
+    def test_wrong_dispatch_and_environment_refuse(self):
+        status, fixture = self.status, self.fixture
+        for case in fixture["dispatch_cases"]:
+            env = fixture["github_environment"] | case.get("env", {})
+            head = deepcopy(fixture["github_head"])
+            head["object"]["sha"] = case.get("main_sha", head["object"]["sha"])
+            refusal = self.assertRaisesRegex(status.GateError, case["refuse"]) if "refuse" in case else nullcontext()
+            with self.subTest(case=case), refusal:
+                status.verify_dispatch(env, case["event"], Mock(return_value=head))
+        settings, branches = (fixture[key] for key in ("github_production_environment", "github_branches"))
+        branches["branch_policies"][0].pop("type")
+        status.environment_policy("true", Mock(side_effect=[settings, branches]))
+        branches["branch_policies"][0]["type"] = "tag"
+        with self.assertRaisesRegex(status.GateError, "production_environment_not_main_only"):
+            status.environment_policy("true", Mock(side_effect=[settings, branches]))
+
+    def test_bracket_and_fail_closed_projection(self):
+        status, fixture = self.status, self.fixture
+        account = "c" * 32
+        env = {"PRODUCTION_WORKER_URL": status.PRODUCTION_URL,
+               "OWNERSHIP_CONTROL_TOKEN": "t" * 32, "CLOUDFLARE_ACCOUNT_ID": account}
+        deployments = f"/workers/scripts/{status.WORKER}/deployments"
+        before = fixture["provider"]
+        after = deepcopy(before)
+        state = fixture["ownership"]
+        client, read = Mock(), Mock(return_value=state)
+        client.api.side_effect = lambda path: (after if read.called else before)[path]
+
+        def observe():
+            read.reset_mock()
+            return status.read_status(env, client_factory=Mock(return_value=client), read=read)
+
+        report = observe()
+        self.assertEqual([call.args[0] for call in client.api.call_args_list], list(before) * 2)
+        read.assert_called_once()
+        self.assertEqual(report["ownership"], {"phase": "active", "epoch": 49, "running": True, "owner_actor": "redacted"})
+        for private in ("private-marker", account):
+            self.assertNotIn(private, json.dumps(report))
+        with self.assertRaisesRegex(status.GateError, "worker_origin_mismatch"):
+            status.read_status(env | {"PRODUCTION_WORKER_URL": "https://wrong.example"}, client_factory=self.fail)
+        state["deploymentId"] = "wrong-worker"
+        with self.assertRaisesRegex(status.GateError, "ownership_deployment_mismatch"):
+            observe()
+        state["deploymentId"] = state["owner"]["deploymentId"]
+        after[deployments]["deployments"][0]["id"] = state["deploymentId"]
+        with self.assertRaisesRegex(status.GateError, "provider_state_drift"):
+            observe()
+        before[deployments]["deployments"][0]["versions"] = None
+        with self.assertRaisesRegex(status.GateError, "invalid_api_schema"):
+            observe()
+        read.assert_not_called()
 
 
 class ProductionPromotionSkipTests(unittest.TestCase):
@@ -10900,6 +10965,8 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "read", "actions": "read", "deployments": "write"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
+                    elif name == "production-ownership-status.yml":
+                        expected["actions"] = "read"
                     elif (name, job_id) == ("deploy-production.yml", "recheck"):
                         # Reads workflow runs to skip while an operator
                         # dispatch is active; the compare read needs contents.
