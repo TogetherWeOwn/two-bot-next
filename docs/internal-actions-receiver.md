@@ -143,12 +143,11 @@ capabilities; this table is not an instruction to create or stage them.
 | `TWO_INTERNAL_ALLOW_SETTINGS` | Settings get/set stay gated off |
 | `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | `voice.snapshot` stays gated off |
 
-`bind` leaves the staged `voice.move_member` executor off. Its five-second
-budget includes nonce burn before action parsing. The fixed-guild turn ends
-after adapter settlement. The tracked child holds capacity through the private
-nonce-bound receipt unless a forced drain aborts it.
-An indefinite cooldown retains the durable hold and returns
-`discord_unavailable`. A `rate_limited` reply carries a validated `Retry-After`.
+`bind` leaves `voice.move_member` off. Attaching the executor applies its five-second
+nonce deadline to all signed verbs. The guild turn ends at adapter settlement. The
+child holds capacity through the private terminal receipt unless force-drained.
+An indefinite PATCH cooldown retains the durable hold and returns `discord_unavailable`.
+A `rate_limited` reply carries a validated `Retry-After`.
 
 Fixed receiver port: **8091** (health stays on `BOT_PORT` 8080, and the two may
 not be equal while the receiver is enabled). While enabled, 8091 joins the
