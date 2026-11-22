@@ -27,7 +27,7 @@ export function edits(source, lines) {
       const token = root.tokens.find(({ start, end }) => start >= node.left.end && end <= node.right.start &&
         source.slice(start, end) === node.operator);
       if (token && lines.has(token.loc.start.line)) candidates.push({
-        line: token.loc.start.line, start: token.start, end: token.end, replacement: operators.get(node.operator),
+        line: token.loc.start.line, start: token.start, end: token.end, replacement: ` ${operators.get(node.operator)} `,
       });
     }
     for (const value of Object.values(node)) {

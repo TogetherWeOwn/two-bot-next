@@ -26,6 +26,17 @@ try {
     assert.equal(verdict(results, "hard"), expected);
     console.log(`Worker fixture ${label}: ${status}, HARD exit ${expected}`);
   }
+  const operandOnly = await measure(root, { [file]: [3] }, ["--test", "rule.test.mjs"]);
+  assert.deepEqual(operandOnly.map((entry) => entry.status), ["unsupported"]);
+
+  const adjacent = "export const total = (n: number) => n+-2;\n";
+  writeFileSync(join(root, file), adjacent);
+  writeFileSync(join(root, "wrangler/rule.test.mjs"),
+    "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { total } from './src/rule.ts';\ntest('adjacent operators', () => assert.equal(total(3), 1));\n");
+  const arithmetic = await measure(root, { [file]: [1] }, ["--test", "rule.test.mjs"]);
+  assert.deepEqual(arithmetic.map((entry) => entry.status), ["killed"]);
+  assert.equal(readFileSync(join(root, file), "utf8"), adjacent);
+  console.log("Worker fixture: adjacent unary operator remained valid; mutant killed");
 } finally {
   rmSync(root, { recursive: true });
 }
