@@ -34,7 +34,7 @@ artifact and runs `scripts/ci/staging_migrate_claim.py`. Inputs enter through
 step environment variables, not shell interpolation. Refusal fails the job;
 there is no continue-on-error or upload-on-failure path.
 
-The `apply` job needs **both** `plan` and `claim`. Board confirmation precedes
+The `apply` job needs **both** `plan` and `claim`. Owner approval precedes
 workflow dispatch, so it reviews the producing plan, not this later claim.
 The `staging-migrate-apply` environment restricts deployment to `main`; do not
 expect a GitHub reviewer or custom protection rule to pause the job.
@@ -136,14 +136,14 @@ missing, expired, ambiguous or cannot be authenticated.
 Before dispatch, verify and retain [direct owner approval](../CONTRIBUTING.md#production-merge-evidence)
 for the full source SHA, producing plan run ID, both pending lists, both manifest
 digests and the recovery reference. Keep restricted evidence in the private task
-thread. Dispatch requires approval of the current binding and clearance of all applicable holds.
+thread. Require fresh approval for any changed input, even when hashes match.
 
 Before submitting `mode: apply` on `main`, compare the actual dispatch inputs
 with the authenticated producing manifest and its run ID. Match the source SHA,
 both pending lists, both digests, the pinned target (`staging_host`,
 `staging_database`, `staging_branch_id`) and both evidence references
 (`recovery_evidence_ref`, `acl_plan_ref`). The digests do not cover the target or
-either reference. Do not dispatch if any value differs.
+either reference. Dispatch requires the exact approved binding and clearance of all holds.
 
 After dispatch, verify that the claim came from the successful
 `staging-migrate (claim)` job on that run and attempt, agrees with the

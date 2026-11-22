@@ -63,16 +63,14 @@ its remaining findings, then push the resolution before expecting GitHub to merg
 
 ## T3 Code workflow
 
-Assign one task thread to each PR-sized change. The lead coordinates the queue
-and dependencies and keeps at most four task threads active per project. The
-task thread continues any existing PR on its published branch and owns
-implementation through merge. Use the T3 Code PR watch for check and review
-updates. Report the squash SHA and verification, then settle the thread.
+The lead manages the queue and dependencies, with at most four active task
+threads per project. Each thread owns one PR-sized change through merge and
+continues existing PRs on their published branches. Use the T3 Code PR watch.
+Report the squash SHA and verification, then settle the thread.
 
 Use the [risk tiers in CONTRIBUTING.md](CONTRIBUTING.md#independent-review).
 Standard changes require one independent cross-model review. Critical changes
-require two in parallel, including a security-focused review. Give reviewers
-the full published PR head SHA and address their findings before merging.
+require two in parallel, including a security review. Resolve findings on the published PR head.
 
 ## Test and build commands
 

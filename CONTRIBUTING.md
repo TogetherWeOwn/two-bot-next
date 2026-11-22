@@ -73,9 +73,9 @@ the behavior warrants it. Changes to `AGENTS.md`, `CLAUDE.md`,
 
 T0 includes auth, sessions, permissions, secrets, crypto, payments, database
 and migration changes, backups, erasure, gateway and voice behavior, deployment
-paths, dependencies, lockfiles and CI workflows. It also covers changes to
-approval, review or safety requirements in docs, including deploy, migration
-and rollback procedures. Use the [sensitive path map](.github/review-tiers.yml).
+paths, dependencies, lockfiles, CI workflows, security policy and gate config
+(including CODEOWNERS and allowlists). Approval, review and safety procedures are T0 even in docs.
+The [sensitivity map's](.github/review-tiers.yml) content triggers also require T0.
 Security review checks secret exposure, authorization, data integrity and input bounds.
 
 In T3 Code, start each review as a separate read-only delegated task. For an
@@ -118,11 +118,11 @@ head/base change; a stale check does not validate a new head.
 ### Production merge evidence
 
 The task owner squash-merges the full PR head SHA after required checks and
-reviews pass and every finding is resolved. The owner (`Rick7C2` on GitHub)
-is the Release Manager. Keep approvals in the private task thread or on GitHub
-for public-safe evidence. Verify that the owner's account directly authored
-the approval for the exact binding. Record the squash SHA and any applicable
-PR approval in the release log. Record production approval separately.
+reviews pass and every finding is resolved. The human owner (`Rick7C2` on GitHub)
+is the Release Manager. Verify a direct owner response in the private T3 task
+thread approving the exact binding. Agent messages, relays and shared-account
+comments cannot supply approval. Record the squash SHA and any applicable PR
+approval in the release log. Record production approval separately.
 
 Before merging, verify live that `PRODUCTION_AUTO_PROMOTE_DISABLED=true` and
 inspect the change for paths from merge to production. Apply the same check

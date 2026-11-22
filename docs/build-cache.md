@@ -2,7 +2,7 @@
 
 Incident: on 2026-09-30 the controller's **/home**, not its root filesystem,
 exhausted user-available bytes. Per-worktree Rust output accumulated even on
-completed tasks. A completed task can still have a live workspace reference.
+completed cards. A completed card can still have a live workspace reference.
 This procedure is TWO Bot Next only; it does not touch services or databases.
 
 ## Local builds
@@ -187,7 +187,7 @@ pre-policy scratch-coverage receipt and post-policy adoption evidence on the
    to the Director of Engineering. Stop further invocations until resolved; do not
    release the rollout restriction.
 
-Only after items 1–3 are verified and retained may the operator set
+Only after items 1–3 are verified and retained may the Operator set
 `scratch_coverage_receipt` in the step-3 `policy.json`. The receipt attests that
 pre-policy coverage, not completed adoption; record item 4 as pending, then append
 its actual results on the same record. This permits only the narrow new-pool wrapper

@@ -98,6 +98,7 @@ class ReviewTierTests(unittest.TestCase):
                     self.assertFalse(matches(path, pattern))
 
     def test_content_escalation_and_review_policy_reference(self):
+        self.assertIn("content triggers also require T0.", (ROOT / "CONTRIBUTING.md").read_text())
         for rule in [
             "Content triggers escalate any tier to sensitive",
             "auth/authz/session", "crypto/keys", "secrets/credentials",
