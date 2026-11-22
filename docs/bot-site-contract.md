@@ -31,7 +31,7 @@ Existing verbs (`role.assign`, `guild.add_member`, `announcement.post`, `event.u
 | Verb | Dir | Gate flag | Idem-Key | Mode | Status |
 |---|---|---|---|---|---|
 | `voice.snapshot` | bot→site read | `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | no | sync read, site-cached | merged; §3 adds fields |
-| `voice.move_member` | site→bot | `TWO_INTERNAL_ALLOW_VOICE_MOVE` | no (natural no-op) | sync | in flight at the time of decision |
+| `voice.move_member` | site→bot | `TWO_INTERNAL_ALLOW_VOICE_MOVE` | no (natural no-op) | sync | Staging-only source, default off. The signer derives the subject from its authenticated session. [Wire contract](internal-actions-receiver.md#relayed-answer-contract) |
 | `reminder.send` | site→bot | `TWO_INTERNAL_ALLOW_MEMBER_NOTIFY` | **required** | site job queue | in flight at the time of decision; §7 adds consent + bucket |
 | `place_offer.send` | site→bot | same | **required** | site job queue | in flight at the time of decision |
 | `event.attendance.read` | bot→site read | `TWO_INTERNAL_ALLOW_ATTENDANCE_READ` | no | site cron pull | in flight at the time of decision |

@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { TwoBotContainer, type Env } from "../src/index.ts";
-import { NOT_FORWARDED } from "../src/container-env.ts";
+import { FORWARDED_FLAGS, NOT_FORWARDED } from "../src/container-env.ts";
 import {
   ACTIONS_PATH, BODY_TIMEOUT_MS, CONTENT_TYPE_MAX_BYTES, IDEMPOTENCY_HEADER, REQUEST_TIMEOUT_MS, SIGNING_HEADERS,
   allowlistedHeaders, handleActionsIngress, resetIngressLimits,
@@ -25,8 +25,10 @@ const headers = {
   "idempotency-key": `intent-${randomBytes(6).toString("hex")}`,
   [REQUEST_ID_HEADER]: id,
 };
+const voiceMove = "TWO_INTERNAL_ALLOW_VOICE_MOVE";
 const blocked = Object.entries(NOT_FORWARDED).filter(([key, reason]) =>
-  (key.startsWith("TWO_INTERNAL_ALLOW_") || key === "TWO_INTERNAL_ROLE_KEYS") && !reason.includes("test-only"))
+  (key.startsWith("TWO_INTERNAL_ALLOW_") || key === "TWO_INTERNAL_ROLE_KEYS") &&
+    key !== voiceMove && !reason.includes("test-only"))
   .map(([key]) => key);
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -35,7 +37,7 @@ function post(body: BodyInit): Request {
   return new Request(`https://worker.invalid${ACTIONS_PATH}`, init);
 }
 
-function startupEnv(): Record<string, string> {
+function startupEnv(overrides: Partial<Env> = {}): Record<string, string> {
   const database = new DatabaseSync(":memory:");
   try {
     const ctx = {
@@ -48,12 +50,27 @@ function startupEnv(): Record<string, string> {
       TWO_INTERNAL_CHANNEL_KEYS: "fixture:123456789012345678",
       TWO_INTERNAL_KEYS: `fixture:${randomBytes(32).toString("hex")}`,
       ...Object.fromEntries(blocked.map((key) => [key, key.endsWith("ROLE_KEYS") ? "member:123456789012345678" : "1"])),
+      ...overrides,
     };
     return new TwoBotContainer(ctx as unknown as DurableObjectState, env as unknown as Env).envVars;
   } finally {
     database.close();
   }
 }
+
+test("voice move forwards only as an exact staging receiver opt-in", () => {
+  const staging = { TWO_DEPLOY_ENV: "staging" };
+  assert.ok(Object.hasOwn(NOT_FORWARDED, voiceMove));
+  assert.ok(!(FORWARDED_FLAGS as readonly string[]).includes(voiceMove));
+  assert.equal(startupEnv(staging)[voiceMove], undefined);
+  assert.equal(startupEnv({ ...staging, [voiceMove]: "01" })[voiceMove], undefined);
+  assert.equal(startupEnv({ [voiceMove]: "1" })[voiceMove], undefined);
+  for (const TWO_DEPLOY_ENV of ["production", "Staging"]) {
+    assert.equal(startupEnv({ TWO_DEPLOY_ENV, [voiceMove]: "1" })[voiceMove], undefined);
+  }
+  assert.equal(startupEnv({ ...staging, TWO_INTERNAL_ACTIONS: "0", [voiceMove]: "1" })[voiceMove], undefined);
+  assert.equal(startupEnv({ ...staging, [voiceMove]: "1" })[voiceMove], "1");
+});
 
 function table(markdown: string, heading: string): string[][] {
   const lines = markdown.split("\n");
@@ -142,7 +159,8 @@ async function observe(t: TestContext): Promise<Evidence> {
   assert.equal(log["release"], normalizeRelease("not-a-sha"));
   assert.equal(log["log_url"], LOG_QUERY_URL);
   assert.equal(log["request_id"], id);
-  return { intake, forwarding, forwardedHeaders: [...checked.headers.keys()], log, env: startupEnv() };
+  return { intake, forwarding, forwardedHeaders: [...checked.headers.keys()], log,
+    env: startupEnv({ TWO_DEPLOY_ENV: "staging", [voiceMove]: "1" }) };
 }
 
 function conforms(markdown: string, evidence: Evidence): void {

@@ -3,14 +3,12 @@
 //! Hermetic: `tests/fixtures/bot-site-contract-v2.json` holds golden
 //! request/result pairs per verb; this file only drives the production
 //! validators in `two_bot_core::internal_actions` and checks shapes.
-//! `voice.snapshot` validates against the allowlist, the flag gate and the
-//! field validators. The other five verbs have no implementation yet, so the
-//! test pins `is_implemented == false` and checks shapes only — landing an
-//! implementation must flip the pin and tighten these checks.
+//! The voice verbs exercise the allowlist and flag gates. The remaining verbs
+//! have shape checks until their implementations land.
 
 use std::collections::HashMap;
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use two_bot_core::community_snapshots::RankKey;
 use two_bot_core::internal_actions::{
     assert_allowed, is_implemented, is_request_id, is_snowflake, needs_idempotency_key,
@@ -219,19 +217,29 @@ fn move_member_request_and_outcomes_match_the_closed_vocab() {
     let request = body(&v["request"]);
     let action = "voice.move_member";
     assert_eq!(request["action"], action);
-    assert_eq!(v["implemented"], false, "bind does not expose staged moves");
-    // Use the published flag as an input without declaring it as a runtime
-    // environment variable; the staged verb still has no flag loader.
+    assert_eq!(v["implemented"], true);
+    assert!(is_implemented(action));
     let gate_flag = v["gate_flag"].as_str().expect("voice move gate flag");
-    for flags in [flags_empty(), flags_with(gate_flag)] {
+    assert_eq!(gate_flag, "TWO_INTERNAL_ALLOW_VOICE_MOVE");
+    let stage_flags = |env: &str, value: &str| {
+        InternalFlags::from_map(&HashMap::from([
+            ("TWO_DEPLOY_ENV".to_owned(), env.to_owned()),
+            (gate_flag.to_owned(), value.to_owned()),
+        ]))
+    };
+    for flags in [
+        flags_empty(),
+        flags_with(gate_flag),
+        stage_flags("staging", "01"),
+        stage_flags("production", "1"),
+    ] {
         assert_eq!(
             assert_allowed(action, &flags, true, true).unwrap_err().code,
             ErrorCode::ActionNotAllowed
         );
     }
-    let mut staged = flags_empty();
-    staged.enabled.insert(action.to_owned());
-    assert_allowed(action, &staged, true, true).expect("explicit staging gate allows the verb");
+    assert_allowed(action, &stage_flags("staging", "1"), true, true)
+        .expect("explicit staging gate allows the verb");
     assert!(!needs_idempotency_key(action));
     let validated = VoiceMoveRequest::validate(&request).expect("valid self-move payload");
     assert_eq!(request["discord_id"], validated.discord_id());
@@ -257,17 +265,35 @@ fn move_member_request_and_outcomes_match_the_closed_vocab() {
         ]
         .map(VoiceMoveOutcome::as_str)
     );
-    for (name, result) in v["results"].as_object().expect("results object") {
-        let outcome = result["outcome"].as_str().expect("outcome str");
-        assert_eq!(outcome, name, "golden key names its outcome");
-        assert!(outcomes.contains(&outcome), "{outcome} is a closed outcome");
-        if outcome == "moved" {
-            assert!(is_snowflake(
-                result["from_channel_id"]
-                    .as_str()
-                    .expect("moved carries from_channel_id")
-            ));
-        }
+    let moved_result = &v["results"][Moved.as_str()];
+    assert_eq!(moved_result["outcome"], Moved.as_str());
+    assert!(is_snowflake(
+        moved_result["from_channel_id"].as_str().unwrap()
+    ));
+    let results = v["results"].as_object().expect("results object");
+    assert_eq!(results.len(), 7);
+    for outcome in [
+        AlreadyInRoom,
+        NotConnected,
+        NotPermitted,
+        RoomFull,
+        RoomGone,
+        BotNotPermitted,
+    ] {
+        let name = outcome.as_str();
+        assert_eq!(results[name], json!({"outcome": name}));
+    }
+    let refusals = v["refusals"].as_object().expect("refusals object");
+    assert_eq!(refusals.len(), 2);
+    for outcome in [DiscordUnavailable, RateLimited] {
+        let name = outcome.as_str();
+        assert_eq!(
+            refusals[name],
+            json!({"status": outcome.status(), "body": {
+                "ok": false, "request_id": "00000000000000000000000001",
+                "error": {"code": name, "message": "request refused", "retryable": true}
+            }})
+        );
     }
 }
 

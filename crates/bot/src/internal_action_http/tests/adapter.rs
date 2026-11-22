@@ -48,8 +48,8 @@ impl MockDiscord {
             .fallback(
                 |State(state): State<MockState>, request: Request| async move {
                     let (parts, body) = request.into_parts();
-                    let raw = to_bytes(body, 8192).await.unwrap();
-                    let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+                    let payload = to_bytes(body, 8192).await.unwrap();
+                    let body: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
                     let index = {
                         let mut seen = state.requests.lock().unwrap();
                         let index = seen.len();
@@ -699,6 +699,176 @@ async fn voice_move_signed_uncertain_patch_holds_until_newer_gateway_evidence() 
     signed_voice_move(true, true).await;
 }
 
+#[tokio::test]
+async fn receiver_bind_matches_the_voice_move_gate() {
+    let _moderation = MODERATION_FLAG_LOCK.lock().await;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let enabled = InternalFlags::from_env().is_enabled("voice.move_member");
+    let receiver = bind(
+        config(),
+        lazy_pool(),
+        &token(),
+        voice_snapshot::new_shared_cache(),
+        VoiceOccupancyClock::new(),
+        connected_gateway(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receiver.state.voice_move.is_some(), enabled);
+}
+
+#[tokio::test]
+async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_member() {
+    const MEMBER: &str = "111111111111111141";
+    const OTHER: &str = "111111111111111142";
+    const SOURCE: &str = "111111111111111131";
+    const TARGET: &str = "111111111111111135";
+    let Some(db) = database().await else { return };
+    let facts = move_facts([MEMBER, SOURCE, TARGET]);
+    let mut denied = facts.clone();
+    denied[2].1["permission_overwrites"] =
+        json!([{ "id": MEMBER, "type": 1, "allow": "0", "deny": "1048576" }]);
+    let disconnected = facts.iter().take(3).cloned().collect::<Vec<_>>();
+    let allowed = || {
+        facts
+            .clone()
+            .into_iter()
+            .chain([(StatusCode::OK, voice_member(MEMBER, false))])
+    };
+    let mock = MockDiscord::start(
+        denied
+            .into_iter()
+            .chain(disconnected)
+            .chain(allowed())
+            .chain(allowed())
+            .collect(),
+    )
+    .await;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let lane = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
+    let executor =
+        ActionExecutor::with_admission(token(), Some(mock.origin.clone()), lane).unwrap();
+    let state_for = |deploy_env: &str| {
+        let flags = InternalFlags::from_map(&HashMap::from([
+            ("TWO_DEPLOY_ENV".to_owned(), deploy_env.to_owned()),
+            ("TWO_INTERNAL_ALLOW_VOICE_MOVE".to_owned(), "1".to_owned()),
+        ]));
+        let receiver = Arc::into_inner(state(
+            db.pool().clone(),
+            Arc::new(MockEffect::new(MockOutcome::Success)),
+        ))
+        .unwrap();
+        Arc::new(receiver.with_voice_move(&flags, executor.clone()))
+    };
+    let payload =
+        json!({"action":"voice.move_member","discord_id":MEMBER,"channel_id":TARGET}).to_string();
+    let (status, _, body) = answer(
+        router(state_for("production")),
+        signed_read(&payload, "old"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    mock.assert_wires(0);
+    let mut receiver = state_for("staging");
+    let inner = Arc::get_mut(&mut receiver).unwrap();
+    let clock = inner.voice_clock.clone();
+    let pipeline = seed_move_pipeline(inner.voice_cache.clone(), clock.clone()).await;
+    inner.gateway_state = connected_gateway();
+    let app = router(receiver);
+    let (parts, _) = signed_read(&payload, "old").into_parts();
+    let tampered = Request::from_parts(parts, Body::from(payload.replace(MEMBER, OTHER)));
+    assert_eq!(
+        answer(app.clone(), tampered).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    mock.assert_wires(0);
+
+    for (room, outcome, wires) in [
+        (Some(SOURCE), "not_permitted", 6),
+        (None, "not_connected", 9),
+    ] {
+        publish_move_room(&pipeline, MEMBER, room).await;
+        let delivery = nonce();
+        let (status, _, body) = answer(
+            app.clone(),
+            signed_read_with_nonce(&payload, "old", &delivery),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"], json!({"outcome": outcome}));
+        let receipt: (String, String, Option<i64>) = sqlx::query_as(
+            "SELECT outcome, target_id, affected FROM internal_action_log \
+             WHERE request_id = $1 AND delivery_hash = $2 AND phase = 'terminal'",
+        )
+        .bind(body["request_id"].as_str().unwrap())
+        .bind(two_bot_core::internal_actions::body_hash(
+            delivery.as_bytes(),
+        ))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipt, (outcome.to_owned(), MEMBER.to_owned(), Some(0)));
+        mock.assert_wires(wires);
+        mock.assert_patch_indices(&[]);
+        assert_eq!(
+            clock.move_holds.lock().unwrap().occupancy(
+                MEMBER.parse().unwrap(),
+                TARGET.parse().unwrap(),
+                0
+            ),
+            Ok(0)
+        );
+    }
+
+    publish_move_room(&pipeline, MEMBER, Some(SOURCE)).await;
+    let (status, _, body) = answer(app.clone(), signed_read(&payload, "old")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"],
+        json!({"outcome":"moved", "from_channel_id":SOURCE})
+    );
+    mock.assert_wires(16);
+    mock.assert_patch_indices(&[15]);
+    let patch = mock.requests.lock().unwrap()[15].clone();
+    assert!(patch["path"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("/guilds/{}/members/{MEMBER}", staging_guild())));
+    assert_eq!(patch["body"], json!({"channel_id": TARGET}));
+
+    // A confirmed PATCH followed by a failed receipt write never reports success.
+    publish_move_room(&pipeline, MEMBER, Some(TARGET)).await;
+    publish_move_room(&pipeline, MEMBER, Some(SOURCE)).await;
+    sqlx::query(
+        "ALTER TABLE internal_action_log ADD CHECK (action <> 'voice.move_member') NOT VALID",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let (status, _, body) = answer(app, signed_read(&payload, "old")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"]["code"], "discord_unavailable");
+    assert_eq!(body["error"]["retryable"], true);
+    mock.assert_wires(23);
+    mock.assert_patch_indices(&[15, 22]);
+    let audited: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM internal_action_log WHERE request_id = $1)",
+    )
+    .bind(body["request_id"].as_str().unwrap())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(!audited);
+    assert!(clock
+        .move_holds
+        .lock()
+        .unwrap()
+        .occupancy(MEMBER.parse().unwrap(), TARGET.parse().unwrap(), 0)
+        .is_err());
+    db.close().await.unwrap();
+}
+
 async fn signed_voice_move(uncertain: bool, with_retry_after: bool) {
     use VoiceMoveOutcome::{BotNotPermitted, DiscordUnavailable, Moved, RateLimited};
     const FIRST: &str = "111111111111111141";
@@ -747,9 +917,9 @@ async fn signed_voice_move(uncertain: bool, with_retry_after: bool) {
     );
     let app = router(receiver.clone());
     let move_to = |member, nonce: &str| {
-        let raw = json!({"action":"voice.move_member","discord_id":member,"channel_id":TARGET})
+        let payload = json!({"action":"voice.move_member","discord_id":member,"channel_id":TARGET})
             .to_string();
-        answer(app.clone(), signed_read_with_nonce(&raw, "old", nonce))
+        answer(app.clone(), signed_read_with_nonce(&payload, "old", nonce))
     };
     assert_eq!(move_to("0", &nonce()).await.2["error"]["code"], "malformed");
     for (statement, expected_children) in [
@@ -766,16 +936,27 @@ async fn signed_voice_move(uncertain: bool, with_retry_after: bool) {
         assert_eq!(body["error"]["code"], "upstream_timeout");
         assert_eq!(receiver.children.lock().await.len(), expected_children);
         mock.assert_wires(expected_children);
+        if expected_children == 1 && !with_retry_after {
+            let mut children = receiver.children.lock().await;
+            tokio::time::timeout(Duration::from_secs(6), children.join_next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(receiver.capacity.available_permits(), MAX_REQUESTS);
+        }
         blocked.rollback().await.unwrap();
     }
-    receiver
-        .children
-        .lock()
-        .await
-        .join_next()
-        .await
-        .unwrap()
-        .unwrap();
+    if with_retry_after {
+        receiver
+            .children
+            .lock()
+            .await
+            .join_next()
+            .await
+            .unwrap()
+            .unwrap();
+    }
     let metrics = |outcome, count| {
         assert!(receiver.action_metrics().render(None).contains(&format!(
             "two_bot_internal_actions_total{{family=\"voice\",outcome=\"{outcome}\"}} {count}\n"

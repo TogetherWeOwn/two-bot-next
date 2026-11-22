@@ -1,7 +1,10 @@
 //! Signed, keyless terminal receipt for a staged move.
 use super::{json, AuthDecision, ErrorCode, Failure, ReceiverState, Value};
 use crate::gateway::GatewayState;
-use std::sync::{atomic::Ordering, Arc};
+use std::{
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 use tokio::{
     sync::OwnedSemaphorePermit,
     time::{timeout_at, Instant},
@@ -12,6 +15,8 @@ use two_bot_core::{
     internal_actions::{body_hash, VoiceMoveOutcome as Outcome, VoiceMoveRequest},
 };
 use two_bot_discord::executor::member::VoiceMoveRoster;
+
+const AUDIT_GRACE: Duration = Duration::from_secs(5);
 
 pub(super) async fn execute(
     state: &Arc<ReceiverState>,
@@ -76,13 +81,20 @@ async fn respond(
         tracing::warn!("voice move denied by bot permissions");
     }
     let from = attempt.from.map(|id| id.to_string());
-    sqlx::query("INSERT INTO internal_action_log (caller_hash, delivery_hash, action, phase, \
+    let audit = sqlx::query("INSERT INTO internal_action_log (caller_hash, delivery_hash, action, phase, \
         guild_id, target_id, response_code, http_status, affected, outcome, evidence_code, from_channel_id, resource_id, request_id) \
         VALUES ($1, $2, 'voice.move_member', 'terminal', $3, $4, $5, $6, $7, $8, 'executor', $9, $10, $11)")
         .bind(body_hash(caller.as_bytes())).bind(delivery)
         .bind(GUILD).bind(ids[0]).bind(outcome.response_code()).bind(i32::from(outcome.status()))
         .bind(outcome.affected()).bind(outcome.as_str()).bind(&from).bind(ids[1]).bind(request_id)
-        .execute(state.store.pool()).await.map_err(|_| unavailable())?;
+        .execute(state.store.pool());
+    if !matches!(timeout_at(deadline + AUDIT_GRACE, audit).await, Ok(Ok(_))) {
+        tracing::warn!(
+            error_class = "voice_move_audit_unconfirmed",
+            "voice move terminal receipt unconfirmed"
+        );
+        return Err(unavailable());
+    }
     match outcome {
         Outcome::DiscordUnavailable => Err(unavailable()),
         Outcome::RateLimited => Err(Failure {

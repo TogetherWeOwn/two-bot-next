@@ -911,6 +911,11 @@ impl InternalFlags {
         if flag("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT") {
             enabled.insert("voice.snapshot".to_owned());
         }
+        if flag("TWO_INTERNAL_ALLOW_VOICE_MOVE")
+            && vars.get("TWO_DEPLOY_ENV").is_some_and(|v| v == "staging")
+        {
+            enabled.insert("voice.move_member".to_owned());
+        }
         // Merely shipping the implementation must not widen the allowlist.
         if flag("TWO_INTERNAL_ALLOW_AUTOMATIONS") {
             enabled.insert("automations.import".to_owned());
@@ -1509,7 +1514,7 @@ impl<'a> VoiceMoveRequest<'a> {
     }
 }
 
-/// Closed result words for a future self-only voice move.
+/// Closed result words for a self-only voice move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceMoveOutcome {
     Moved,
@@ -3417,6 +3422,7 @@ mod tests {
         for key in [
             "TWO_INTERNAL_KEYS",
             "TWO_INTERNAL_ALLOW_MODERATION",
+            "TWO_INTERNAL_ALLOW_VOICE_MOVE",
             "TWO_MODERATION",
             "DISCORD_TOKEN",
             "TWO_OWEN_USER_ID",
@@ -3472,10 +3478,11 @@ mod tests {
         // voice.snapshot read adds one env-only key
         // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT). The reserved member notification
         // gate adds one env-only key without wiring notification delivery.
+        // The staging self-move gate adds one env-only key.
         for (class, expected) in [
             (SettingClass::Hot, 52),
             (SettingClass::Cold, 18),
-            (SettingClass::EnvOnly, 68),
+            (SettingClass::EnvOnly, 69),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),

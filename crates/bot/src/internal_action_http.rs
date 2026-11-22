@@ -1034,6 +1034,11 @@ impl ReceiverState {
         self
     }
 
+    fn with_voice_move(mut self, flags: &InternalFlags, executor: ActionExecutor) -> Self {
+        self.voice_move = flags.is_enabled("voice.move_member").then_some(executor);
+        self
+    }
+
     fn action_metrics(&self) -> &metrics::Metrics {
         #[cfg(test)]
         {
@@ -1314,13 +1319,14 @@ pub async fn bind(
                 Arc::new(executor),
                 Arc::new(member),
                 Arc::new(EventReadExecutor::new(events.clone(), pool.clone())),
-                Arc::new(EventMutationExecutor::new(events, pool)),
+                Arc::new(EventMutationExecutor::new(events.clone(), pool)),
                 Arc::new(moderation),
                 Arc::new(channel),
             )
             .with_voice_cache(voice_cache)
             .with_voice_clock(voice_clock)
-            .with_gateway_state(gateway_state),
+            .with_gateway_state(gateway_state)
+            .with_voice_move(&InternalFlags::from_env(), events),
         ),
     })
 }
@@ -1600,8 +1606,11 @@ async fn receive(
     // website must not be able to grant itself verbs. Verbs without a wired
     // effect adapter stay refused by the per-effect fences below.
     let mut flags = InternalFlags::from_env();
-    if cfg!(test) && state.voice_move.is_some() {
+    // The move gate is fixed at bind time with its executor and deadline.
+    if state.voice_move.is_some() {
         flags.enabled.insert("voice.move_member".to_owned());
+    } else {
+        flags.enabled.remove("voice.move_member");
     }
     let decision = {
         let mut buckets = state.buckets.lock().expect("buckets lock");
