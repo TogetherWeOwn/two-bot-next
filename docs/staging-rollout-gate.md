@@ -662,6 +662,18 @@ version, target application version, immutable image digest, build revision/ID a
 HTTP statuses. Raw Cloudflare configurations can include env values and are never
 saved as artifacts. Temporary baseline/config/NDJSON files stay in runner scratch.
 
+## Read-only recovery inventory
+
+Dispatch `staging-ownership-status.yml` on current protected `main` with
+`inventory=true`. It uses the staging Environment to bracket an authenticated
+no-start ownership GET with two provider reads. Both samples must agree on the
+100% serving Worker version, bounded policy, Durable Object namespace, and
+newest completed rollout with a digest matching the application's configured
+image. The receipt records the observed owner epoch and whether the container
+was running. `provider_only` attests these facts and leaves runtime database
+identity unresolved. Recovery still requires an exact read-only plan and a
+compatible predecessor.
+
 ## Verification boundaries
 
 Offline standard-library fixtures exercise selection, schema/error handling,

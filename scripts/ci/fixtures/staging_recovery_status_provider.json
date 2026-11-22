@@ -1,0 +1,93 @@
+{
+  "/workers/scripts/two-bot-next-staging/deployments": {
+    "deployments": [
+      {
+        "id": "22222222-2222-2222-2222-222222222222",
+        "versions": [
+          {
+            "version_id": "11111111-1111-1111-1111-111111111111",
+            "percentage": 100
+          }
+        ]
+      }
+    ]
+  },
+  "/workers/scripts/two-bot-next-staging/versions/11111111-1111-1111-1111-111111111111": {
+    "id": "11111111-1111-1111-1111-111111111111",
+    "annotations": {
+      "workers/message": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "resources": {
+      "bindings": [
+        {
+          "name": "STAGING_RUNTIME_POLICY",
+          "type": "plain_text",
+          "text": "bounded"
+        },
+        {
+          "name": "TWO_DEPLOY_ENV",
+          "type": "plain_text",
+          "text": "staging"
+        },
+        {
+          "name": "CONTAINER_RELEASE",
+          "type": "plain_text",
+          "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "name": "unrelated",
+          "type": "plain_text",
+          "text": "must-not-reach-any-receipt"
+        },
+        {
+          "name": "TWO_BOT",
+          "type": "durable_object_namespace",
+          "class_name": "TwoBotContainer",
+          "namespace_id": "cccccccccccccccccccccccccccccccc"
+        }
+      ]
+    }
+  },
+  "/containers/applications": [
+    {
+      "name": "two-bot-next-twobotcontainer-staging",
+      "id": "33333333-3333-3333-3333-333333333333",
+      "durable_objects": {
+        "namespace_id": "cccccccccccccccccccccccccccccccc"
+      },
+      "configuration": {
+        "image": "registry.cloudflare.com/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/two-bot-next-twobotcontainer-staging@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
+    }
+  ],
+  "/containers/applications/33333333-3333-3333-3333-333333333333/rollouts?limit=100": [
+    {
+      "id": "44444444-4444-4444-4444-444444444444",
+      "created_at": "2026-11-22T20:00:00Z",
+      "status": "completed",
+      "target_configuration": {
+        "image": "registry.cloudflare.com/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/two-bot-next-twobotcontainer-staging@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "unrelated": "must-not-reach-any-receipt"
+      }
+    }
+  ],
+  "/containers/applications/33333333-3333-3333-3333-333333333333/rollouts/44444444-4444-4444-4444-444444444444": {
+    "id": "44444444-4444-4444-4444-444444444444",
+    "created_at": "2026-11-22T20:00:00Z",
+    "status": "completed",
+    "target_configuration": {
+      "image": "registry.cloudflare.com/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/two-bot-next-twobotcontainer-staging@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "unrelated": "must-not-reach-any-receipt"
+    },
+    "steps": [
+      {
+        "status": "completed"
+      }
+    ],
+    "progress": {
+      "total_steps": 1,
+      "total_instances": 1,
+      "updated_instances": 1
+    }
+  }
+}
