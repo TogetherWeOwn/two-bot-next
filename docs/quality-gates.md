@@ -9,9 +9,10 @@ lint-only `check` lane.
 
 - Python intake (HARD) runs in `check` on PRs, merge-queue runs and pushes.
   It compares stdlib intake calls in `scripts/` and `.github/scripts/`
-  against the checked-out base. Test files are exempt. Moving an existing call
-  within its file, renaming its local variables, or renaming the file keeps it
-  at baseline. New uses must call `scripts/script_intake.py`. An uninspectable
+  against the checked-out base. Test files are exempt. Identical calls keep
+  their baseline when moved within a file or when the file is renamed. A name
+  bound directly in a function can be renamed in place without counting as an
+  addition. New uses must call `scripts/script_intake.py`. An uninspectable
   changed script fails the gate.
 
 - Patch coverage (HARD): `cargo llvm-cov --workspace --lib --bins --tests

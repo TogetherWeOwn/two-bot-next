@@ -2,12 +2,13 @@
 
 import argparse
 import ast
-from collections import Counter, defaultdict
+from collections import defaultdict, deque
 from copy import deepcopy
 import os
 from pathlib import Path
 import subprocess
 import sys
+from typing import NamedTuple
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -17,6 +18,13 @@ APIS = {"json.load", "json.loads", "json.JSONDecoder", "json.decoder.JSONDecoder
         "urllib.request.OpenerDirector", "urllib.request.install_opener", "urllib.request.*"}
 FUNCTION_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 OTHER_SCOPES = (ast.ClassDef, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+class Use(NamedTuple):
+    api: str
+    exact: str
+    renamed: str
+    line: int
 
 
 def aliases(nodes):
@@ -50,36 +58,39 @@ def qualified(node, bindings):
 
 def function_locals(nodes):
     scopes = {}
-    bound = defaultdict(set)
+    bound = defaultdict(list)
     external = defaultdict(set)
     for node in nodes:
         scope = scopes.get(node)
         if scope is not None:
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                bound[scope].add(node.id)
-            elif isinstance(node, ast.arg):
-                bound[scope].add(node.arg)
+                bound[scope].append(node.id)
             elif isinstance(node, (ast.Global, ast.Nonlocal)):
                 external[scope].update(node.names)
         if isinstance(node, FUNCTION_SCOPES):
+            args = node.args
+            parameters = (*args.posonlyargs, *args.args, args.vararg, *args.kwonlyargs, args.kwarg)
+            bound[node].extend(arg.arg for arg in parameters if arg is not None)
             body = {node.body} if isinstance(node, ast.Lambda) else set(node.body)
-            body.add(node.args)
             scopes.update((child, node if child in body else scope) for child in ast.iter_child_nodes(node))
         elif not isinstance(node, OTHER_SCOPES):
             scopes.update((child, scope) for child in ast.iter_child_nodes(node))
-    return scopes, {scope: names - external[scope] for scope, names in bound.items()}
+    locals_by_scope = {
+        scope: {name: index for index, name in enumerate(dict.fromkeys(names))
+                if name not in external[scope]}
+        for scope, names in bound.items()
+    }
+    return scopes, locals_by_scope
 
 
 def call_shape(node, locals_in_scope):
-    """Keep argument structure and literals while ignoring local spelling."""
+    """Keep argument shape and refer to locals by their scope binding order."""
     if not locals_in_scope:
         return ast.dump(node)
     clone = deepcopy(node)
-    names = {}
     for reference in ast.walk(clone):
         if isinstance(reference, ast.Name) and reference.id in locals_in_scope:
-            index = names.setdefault(reference.id, len(names))
-            reference.id = f"<local {index}>"
+            reference.id = f"<local {locals_in_scope[reference.id]}>"
     return ast.dump(clone)
 
 
@@ -90,34 +101,52 @@ def uses(source, path):
     call_by_target = {node.func: node for node in nodes if isinstance(node, ast.Call)}
     scopes, locals_by_scope = function_locals(nodes)
 
-    def shape(target):
+    def use(api, target):
         node = call_by_target.get(target, target)
-        return call_shape(node, locals_by_scope.get(scopes.get(node), ()))
+        renamed = call_shape(node, locals_by_scope.get(scopes.get(node), {}))
+        return Use(api, ast.dump(node), renamed, target.lineno)
 
     for node in nodes:
         if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
             for api in sorted(qualified(node, bindings) & APIS):
-                yield api, shape(node), node.lineno
+                yield use(api, node)
         elif isinstance(node, ast.ImportFrom) and not node.level:
             for name in node.names:
                 api = f"{node.module}.{name.name}"
                 if api in APIS:
-                    yield api, ast.dump(name), name.lineno
+                    yield use(api, name)
         elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
               and node.func.id == "getattr" and len(node.args) in (2, 3)
               and isinstance(node.args[1], ast.Constant)):
             names = {f"{owner}.{node.args[1].value}" for owner in qualified(node.args[0], bindings)}
             for api in sorted(names & APIS):
-                yield api, shape(node), node.lineno
+                yield use(api, node)
+
+
+def unmatched(before, after, key):
+    backlog = defaultdict(deque)
+    for use in before:
+        backlog[key(use)].append(use)
+    added = []
+    for use in after:
+        matches = backlog.get(key(use))
+        if matches:
+            matches.popleft()
+        else:
+            added.append(use)
+    return [use for matches in backlog.values() for use in matches], added
 
 
 def additions(before, after, path):
-    backlog = Counter((api, shape) for api, shape, _ in uses(before, path))
-    for api, shape, line in sorted(uses(after, path), key=lambda use: use[2]):
-        if backlog[api, shape]:
-            backlog[api, shape] -= 1
-        else:
-            yield line, api
+    old = uses(before, path)
+    new = sorted(uses(after, path), key=lambda use: use.line)
+    # Save unchanged matches first. A scope change can alter the normalized
+    # shape of an identical call, so spend a rename allowance only afterwards.
+    old, new = unmatched(old, new, lambda use: (use.api, use.exact, use.renamed))
+    old, new = unmatched(old, new, lambda use: (use.api, use.exact))
+    _, new = unmatched(old, new, lambda use: (use.api, use.renamed))
+    for use in new:
+        yield use.line, use.api
 
 
 def git(root, *args):

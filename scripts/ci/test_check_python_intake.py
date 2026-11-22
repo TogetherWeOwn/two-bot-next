@@ -62,8 +62,8 @@ payload = json.dumps(new)
         before = """\
 import urllib.request
 
-def fetch():
-    request = build_request()
+def fetch(url):
+    request = build_request(url)
     return urllib.request.urlopen(request, timeout=10)
 """
         renamed = before.replace("request =", "probe_request =").replace(
@@ -74,6 +74,13 @@ def fetch():
         self.assertEqual(list(guard.additions(before, added, path)), [(6, "urllib.request.urlopen")])
         changed = renamed.replace("timeout=10", "timeout=20")
         self.assertEqual(list(guard.additions(before, changed, path)), [(5, "urllib.request.urlopen")])
+        switched = before.replace("urlopen(request", "urlopen(url")
+        self.assertEqual(list(guard.additions(before, switched, path)), [(5, "urllib.request.urlopen")])
+
+    def test_identical_call_moved_to_a_generator_keeps_its_baseline(self):
+        before = "import json\ndef records(lines):\n    for line in lines:\n        yield json.loads(line)\n"
+        after = "import json\ndef records(lines):\n    yield from (json.loads(line) for line in lines)\n"
+        self.assertEqual(list(guard.additions(before, after, "scripts/read.py")), [])
 
     def test_git_range_warn_and_hard_modes(self):
         with tempfile.TemporaryDirectory() as temp:
