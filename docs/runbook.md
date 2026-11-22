@@ -1806,7 +1806,9 @@ is not the schema), when the error lines name `42501` on rejoins (the ACL
 plan is still unapplied and the cursor stays held), or when a skip coincides
 with DB-error or pool-saturation alerts suggesting a wider database incident.
 
-The warning `privacy DELETE unavailable: voice_create_reservations` means the drain lacks authorization.
+#### Scheduled retention drain deferrals
+
+When coverage is otherwise complete, `privacy DELETE unavailable: voice_create_reservations` identifies a grant missing from the scheduled drain.
 Escalate overdue requests to the Operator and keep their queue evidence intact.
 
 #### Alert: voice dispatch timeouts

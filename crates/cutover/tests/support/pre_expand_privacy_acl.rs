@@ -266,12 +266,15 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     through(&CUTOVER, 480).run(&migrator).await.unwrap();
     assert_ledgers(&migrator, 480, 465).await;
     assert_counts(&migrator, &[(SESSIONS, 0), (WINDOWS, 0)]).await;
+    for query in [SESSIONS, WINDOWS] {
+        let error = sqlx::query(query).execute(&runtime).await.unwrap_err();
+        assert_sqlstate(&error, "42501");
+    }
     assert_runtime_refusal(&runtime, &request, "42501").await;
     let result = run_retention(&runtime, RetentionMode::Execute).await;
     let err = result.unwrap_err();
     assert_eq!((err.step().as_str(), err.cause()), ("expiry", "database"));
     assert_preserved(&runtime).await;
-
     CUTOVER.run(&migrator).await.unwrap();
     two_bot_store::migrate(&migrator).await.unwrap();
     two_bot_core::apply_web_contract(&migrator).await.unwrap();
@@ -296,13 +299,12 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     assert_eq!(denied.to_string(), "erasure schema coverage incomplete");
     assert_hidden_schema_and_replay_refusals(&runtime, &migrator, &request).await;
     assert_runtime_refusal(&runtime, &request, "42501").await;
-    let blocked = run_retention(&runtime, RetentionMode::Execute)
-        .await
-        .unwrap();
-    assert_eq!(
-        (blocked.schema_gap_deferrals, blocked.guild_purges_failed),
-        (1, 1)
-    );
+    for mode in [RetentionMode::DryRun, RetentionMode::Execute] {
+        let report = run_retention(&runtime, mode).await.unwrap();
+        assert_eq!(report.schema_gap_deferrals, 1);
+        assert_eq!(report.guild_purges_failed, 1);
+        assert_eq!(report.presence_raw_deleted, 1);
+    }
     assert_preserved(&runtime).await;
     let receipt = fulfill_user_deletion(&migrator, &request).await.unwrap();
     assert_eq!(receipt.receipt_id, format!("rcpt-{request}"));
@@ -328,12 +330,10 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
 
 async fn assert_runtime_refusal(runtime: &PgPool, request: &str, state: &str) {
     let mode = ErasureMode::Execute { actor: "fixture" };
-    let standalone = erase_member(runtime, GUILD, MEMBER, mode)
-        .await
-        .unwrap_err();
-    let queued = fulfill_user_deletion(runtime, request).await.unwrap_err();
-    assert_sqlstate(&standalone, state);
-    assert_sqlstate(&queued, state);
+    let standalone = erase_member(runtime, GUILD, MEMBER, mode).await;
+    let queued = fulfill_user_deletion(runtime, request).await;
+    assert_sqlstate(&standalone.unwrap_err(), state);
+    assert_sqlstate(&queued.unwrap_err(), state);
 }
 
 async fn assert_preserved(runtime: &PgPool) {
@@ -369,14 +369,10 @@ async fn restore_v17(migrator: &PgPool, name: &str) {
 }
 
 async fn assert_ledgers(migrator: &PgPool, cutover: i64, store: i64) {
-    assert_eq!(
-        count(migrator, "SELECT max(version) FROM _sqlx_migrations").await,
-        cutover
-    );
-    assert_eq!(
-        count(migrator, "SELECT max(version) FROM _two_bot_migrations").await,
-        store
-    );
+    let versions: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT max(version) FROM _sqlx_migrations), (SELECT max(version) FROM _two_bot_migrations)"
+    ).fetch_one(migrator).await.unwrap();
+    assert_eq!(versions, (cutover, store));
 }
 
 async fn assert_hidden_schema_and_replay_refusals(
@@ -435,8 +431,10 @@ async fn assert_hidden_schema_and_replay_refusals(
         (report.deletions_deferred, report.guild_purges_deferred),
         (1, 1)
     );
-    sqlx::query(
+    sqlx::raw_sql(
         "UPDATE moderation_idempotency SET state = 'done', outcome = 'operator_released',
-          completed_at = now(), request_hash = 'operator_released', claim_token = 'operator_released'"
+          completed_at = now(), request_hash = 'operator_released', claim_token = 'operator_released';
+         INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key)
+         VALUES ('PRESENCE_UPDATE', '100000000000000001', '200000000000000001', now() - interval '40 days', 'fixture')"
     ).execute(migrator).await.unwrap();
 }
