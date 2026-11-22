@@ -233,16 +233,17 @@
 
 ## Staging
 
-- [Soak lifecycle](staging-soak.md)
+- [Soak](staging-soak.md)
 - [Soak plan](soak-checklist.md)
-- [Soak entry gates](soak-entry-gates.md)
+- [Soak gates](soak-entry-gates.md)
 - [Evidence route](evidence-route.md)
 - [Expected joins](expected-joins-acceptance.md)
 - [E2E matrix](staging-e2e-command-matrix.md)
 - [E2E record](staging-e2e-run-record.md)
-- [Fixture census](staging-fixture-census.md)
-- [Health probe](staging-health-contract-probe.md)
+- [Census](staging-fixture-census.md)
+- [Health](staging-health-contract-probe.md)
 - [Migration claim](staging-migrate-claim.md)
+- [0481 recovery](staging-0481-recovery.md)
 - [Rollout gate](staging-rollout-gate.md)
 - [Slash smoke](staging-slash-smoke.md)
 - [Help embeds](staging-help-embed-smoke.md)
