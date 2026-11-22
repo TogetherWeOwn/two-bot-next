@@ -1,7 +1,7 @@
 ---
 name: Explore
 description: Read-only search agent for broad fan-out searches across many files, directories or naming conventions when only the conclusion is needed. Locates code; does not review it.
-model: claude/claude-haiku-5-5
+model: haiku
 tools: Read, Grep, Glob, Bash
 ---
 

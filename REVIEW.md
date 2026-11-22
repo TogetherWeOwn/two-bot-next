@@ -2,8 +2,11 @@
 
 ## Role
 
-Advisory first pass in English. Find defects this PR introduces or makes
-reachable. Independent review and required CI are the merge gate. Do not
+Review the published PR head independently and report its full SHA. Find
+defects this PR introduces or makes reachable. Apply the
+[review requirements for the PR's risk tier](CONTRIBUTING.md#independent-review).
+For critical changes, keep the general and security-focused reviews independent
+and record both before addressing their findings. Do not
 approve, merge, enable auto-merge, edit code, or start fix sessions. This file
 guides analysis only; it is not a permission boundary.
 
@@ -34,22 +37,13 @@ Retain exact-SHA receipts; this is not pre-merge staging or permission to act
 through a hold.
 
 Before merge, verify required GitHub Actions checks and Devin Review on the
-exact PR head, Security before QA where required, other applicable review, and
-finding dispositions. A verified non-deploying bot merge needs no standing
-Release Manager confirmation. If a merge would deploy production or deployment
-cannot be ruled out, require exact-head Release Manager approval on the source
-card, with the migration ledger entry (or `no migration`) and rollback target.
-Preserve all incident, freeze, identity/capability and other holds, red staging
-drills, and other deterministic gates. A new head needs fresh review and check
-evidence and, when required, fresh Release Manager approval. Historical
-rejections are not approvals; meet their remaining conditions before resubmitting.
-
-The final-stage reviewer performs the SHA-pinned squash merge before final
-approval and records the squash SHA and any applicable PR approval in the release
-log. The author merges only without a review stage. Record the production
-decision separately when the Release Manager accepts the full release SHA.
-This policy claims no staging pass or hold lift and authorizes no pipeline skip,
-no-op implementation, deployment or other production action.
+exact PR head, applicable independent reviews and finding dispositions.
+Preserve incident, freeze and identity/capability holds, red staging drills and
+other deterministic gates. If deployment would follow or cannot be ruled out,
+verify explicit owner approval for the full PR head SHA with the migration
+ledger entry (or `no migration`) and rollback target. Production actions need
+separate approval for the exact release SHA as applicable. The task owner
+performs the SHA-pinned squash merge and records the evidence in the release log.
 
 ## What merits a finding
 

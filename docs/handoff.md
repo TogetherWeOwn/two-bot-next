@@ -1,9 +1,8 @@
 # Handoff — 2026-11-10 (UTC)
 
-Dated snapshot for resuming work from this repo alone. This is not a
-live queue: Paperclip stays the authority for assignments,
-dependencies and current status. If this file and the live queue
-disagree, the live queue wins and this file needs a dated update.
+Dated snapshot for resuming work from this repo alone. Confirm current
+assignments, dependencies and status with the project lead and live GitHub
+PRs and issues. Record corrections as dated updates.
 
 ## Where to read first
 

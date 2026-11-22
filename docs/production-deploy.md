@@ -55,8 +55,8 @@ names a missing Environment makes GitHub create it with no protection, so the
 guard checks before the deploy job can run. This repository is public, so
 required reviewers work on every plan; no Enterprise plan is needed.
 
-**Deploy.** Dispatch with `sha` set to the exact full SHA the Release Manager
-accepted; a different SHA needs fresh acceptance. The guard's empty-`sha` mode
+**Deploy.** Dispatch with `sha` set to the full SHA the owner approved for
+production. Get fresh owner approval for a different SHA. The guard's empty-`sha` mode
 (Leave `sha` empty to promote the commit of the latest successful
 `deploy-staging` run on `main`) is not a release route: that commit can be newer
 than the accepted SHA. The newest `main` commit may not have a qualifying

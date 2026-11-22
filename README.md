@@ -192,22 +192,19 @@ configuration validation, then runs read-only tests.
 Squash-merge only; PR titles follow Conventional Commits and the body follows the
 [PR template](.github/pull_request_template.md). This repo is public, so keep
 internal tracker IDs out of titles, bodies, commits and branch names. The rulesets
-require `ci-ok`, `gitleaks`, `pr-lint` and `Devin Review` on the exact head commit;
-CodeRabbit is advisory, but its findings still need answers. Native task review
-stages remain required. Full suites and CI gates run on **GitHub Actions**, never
-as a local CI mirror. Push the PR branch and keep the PR a draft while incomplete.
-Record the full head SHA and matching Actions run/job links, not local transcripts,
-for reviewers and the Release Manager. The single `ci-ok` aggregate in
+enforce the [required checks](CONTRIBUTING.md#required-checks).
+Follow the [risk-tier review policy](CONTRIBUTING.md#independent-review).
+Run full suites and CI gates on **GitHub Actions**. Push the PR branch and keep
+the PR a draft while incomplete. Record the full head SHA and matching Actions
+run/job links in Verification. The single `ci-ok` aggregate in
 `.github/workflows/check.yml` gates both selectors, lint (`check`: fmt, clippy
 -D warnings, cargo-deny), every selected Rust/database lane and `worker check`
 (including the runbook command-drift test).
 
-The final-stage reviewer squash-merges the pinned settled head before final
-approval; the author merges only without a review stage. Verified non-deploying
-bot merges need no standing Release Manager confirmation. When a merge would
-deploy production or deployment cannot be ruled out, require exact-head Release
-Manager approval on the source card. Production release acceptance is bound to
-the full release SHA, which dispatch must pin. For web/bot, staging
+The task owner squash-merges the pinned head after required checks and reviews
+pass. When a merge would deploy production or deployment cannot be ruled out,
+get owner approval for the full PR head SHA. Production dispatch needs separate
+owner approval for the full release SHA it will deploy. For web/bot, staging
 qualification is the **post-merge, pre-production exact-main staging/e2e/soak
 gate**, enforced by the promotion guard. Staging accepts only main-ancestor
 SHAs; unmerged-head staging and artifact-equality proofs are not substitute
@@ -218,8 +215,7 @@ If evidence is absent, keep promotion held and follow the separately authorized
 [qualification/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
 without bypassing holds. See
 [Production merge evidence](CONTRIBUTING.md#production-merge-evidence) for the
-full contract. Exact-head Actions and Devin Review, Security before QA where
-required, other applicable review, existing holds, migration and rollback
+full contract. Exact-head checks and reviews, existing holds, migration and rollback
 evidence, and release-log recording remain required. Production schema/data
 operations and rollback need separate authorization. Neither this policy nor CI
 evidence claims a staging pass or hold lift, or replaces post-merge

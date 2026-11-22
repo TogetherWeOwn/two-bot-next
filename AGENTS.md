@@ -61,6 +61,19 @@ its remaining findings, then push the resolution before expecting GitHub to merg
   comment that names what replaced it.
 - Never bypass a required check, a ruleset or a failing test.
 
+## T3 Code workflow
+
+Assign one task thread to each PR-sized change. The lead coordinates the queue
+and dependencies and keeps at most four task threads active per project. The
+task thread continues any existing PR on its published branch and owns
+implementation through merge. Use the T3 Code PR watch for check and review
+updates. Report the squash SHA and verification, then settle the thread.
+
+Use the [risk tiers in CONTRIBUTING.md](CONTRIBUTING.md#independent-review).
+Standard changes require one independent cross-model review. Critical changes
+require two in parallel, including a security-focused review. Give reviewers
+the full published PR head SHA and address their findings before merging.
+
 ## Test and build commands
 
 Full test suites and CI gates run on **GitHub Actions**, not the shared host.
@@ -96,15 +109,12 @@ rewrites tracked configuration or independent publication fixtures. Database
 tests use only disposable test services, never staging or production; retain
 all guards in [`CONTRIBUTING.md`](CONTRIBUTING.md#database-tests).
 
-Record the PR's full head SHA and matching Actions run/job URLs for reviewers
-and the Release Manager. Local transcripts are focused reproduction evidence,
-not CI evidence. The final-stage reviewer merges the pinned settled head before
-final approval (the author merges only without a review stage). Verified
-non-deploying bot merges need no standing Release Manager confirmation; all
-exact-head checks and required review stages, including Security before QA
-where applicable, still apply. If a merge would deploy production or deployment
-cannot be ruled out, require Release Manager approval on the source card for
-the full PR head SHA before merge. Production actions need separate approval.
+Record the PR's full head SHA and matching Actions run/job URLs in Verification.
+Use local transcripts for focused reproduction evidence. The task owner
+squash-merges the pinned head after required checks and reviews pass. If a
+merge would deploy production or deployment cannot be ruled out, get owner
+approval for the full PR head SHA before merging. Production actions need
+separate owner approval.
 See [`CONTRIBUTING.md`](CONTRIBUTING.md#production-merge-evidence).
 
 ## Modern web platform guidance
@@ -138,7 +148,7 @@ are outside this guidance when they do not change browser-facing code.
 ## Controller builds
 
 Only for a permitted non-heavy focused failure reproduction/fallback on the
-persistent Paperclip controller, run Cargo through
+persistent build controller, run Cargo through
 `python3 scripts/cargo_cache.py run -- <check|test|clippy|build> ...` from your own
 isolated workspace. Pick one failing test or crate, never the full workspace.
 This cache wrapper is not an alternative location for CI or heavy builds.
@@ -152,8 +162,8 @@ cooperative temporary output in quota-covered lease scratch, not container `/tmp
 Run permitted focused commands in the foreground with a timeout covering the
 command; read the result in the same run. Interrupted partial output stays in
 the slot and counts against its budget. A missing pool/quota/scratch-coverage
-receipt needs the Operator rollout; a full pool needs safe retention/continuation,
-not another cache. Agents must not
+receipt needs an operator to complete rollout. Use safe retention or resume when
+capacity is available if the pool is full. Agents must not
 clear crash sentinels, delete host caches, mount filesystems or restart services.
 
 `cargo fmt --all -- --check` does not compile and can run directly. Cache

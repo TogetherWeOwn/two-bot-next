@@ -58,7 +58,7 @@ rustup toolchain install nightly --component rust-src
 cargo install cargo-fuzz --locked
 ```
 
-**Do not run these compiling commands on the persistent Paperclip controller.**
+**Do not run these compiling commands on the persistent build controller.**
 Controller commands must use `scripts/cargo_cache.py`; its current command allowlist
 does not support `cargo fuzz`. A missing/refused pool is not permission to run
 Cargo directly, use an external target, install a replacement cache or remove a
