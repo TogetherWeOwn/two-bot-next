@@ -521,7 +521,21 @@ jobs:
 
       - name: cargo clippy -D warnings
         if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        shell: bash
+        env:
+          QUALITY_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && 'origin/main') || 'HEAD^' }}
+          QUALITY_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          export CLIPPY_CONF_DIR="$GITHUB_WORKSPACE/scripts/ci/sqlx-pool"
+          fixture=crates/store/tests/sqlx_pool_policy_fixture.rs
+          test ! -e "$fixture"
+          trap 'rm -- "$fixture"' EXIT
+          cp scripts/ci/fixtures/sqlx_pool_policy.rs "$fixture"
+          cargo clippy --workspace --all-targets --all-features --locked --message-format=json -- \
+            -D warnings --force-warn clippy::disallowed_methods \
+            | python3 scripts/ci/check_sqlx_pool.py --mode warn \
+                --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
 
       - name: channel moderation store clippy
         if: needs.job-inputs.outputs.rust != 'false'

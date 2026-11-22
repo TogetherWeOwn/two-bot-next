@@ -1,0 +1,15 @@
+# Use the defining types so aliases, re-exports and method syntax resolve to
+# the same lint rule. Constructing options or acquiring an existing pool is OK.
+disallowed-methods = [
+    { path = "sqlx_core::pool::Pool::connect", reason = "use two_bot_store::pool::connect_pool_with_tls" },
+    { path = "sqlx_core::pool::Pool::connect_with", reason = "use two_bot_store::pool::connect_pool_with_tls" },
+    { path = "sqlx_core::pool::Pool::connect_lazy", reason = "use two_bot_store::pool::connect_lazy_pool_with_tls" },
+    { path = "sqlx_core::pool::Pool::connect_lazy_with", reason = "use two_bot_store::pool::connect_lazy_pool_with_tls" },
+    { path = "sqlx_core::pool::PoolOptions::connect", reason = "use two_bot_store::pool::connect_pool_with_tls" },
+    { path = "sqlx_core::pool::PoolOptions::connect_with", reason = "use two_bot_store::pool::connect_pool_with_tls" },
+    { path = "sqlx_core::pool::PoolOptions::connect_lazy", reason = "use two_bot_store::pool::connect_lazy_pool_with_tls" },
+    { path = "sqlx_core::pool::PoolOptions::connect_lazy_with", reason = "use two_bot_store::pool::connect_lazy_pool_with_tls" },
+    { path = "sqlx_core::connection::Connection::connect", reason = "open a TLS-fenced pool and acquire a connection from it" },
+    { path = "sqlx_core::connection::Connection::connect_with", reason = "open a TLS-fenced pool and acquire a connection from it" },
+    { path = "sqlx_core::connection::ConnectOptions::connect", reason = "open a TLS-fenced pool and acquire a connection from it" },
+]
