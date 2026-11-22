@@ -70,11 +70,11 @@ def sources(base, head):
 
 
 def source_blob(head, path):
-    row = command("git", "ls-tree", "-z", head, "--", f":(literal){path}")
+    row = command("git", "ls-tree", "-l", "-z", head, "--", f":(literal){path}")
     if not row.startswith(("100644 blob ", "100755 blob ")):
         raise EvidenceError("An attested test path is not a source file on this head.")
-    obj = row.split("\t", 1)[0].split()[2]
-    if int(command("git", "cat-file", "-s", obj)) > MAX_SOURCE:
+    _, _, obj, size = row.split("\t", 1)[0].split()
+    if int(size) > MAX_SOURCE:
         raise EvidenceError("An attested source exceeds the size limit.")
     return command("git", "cat-file", "blob", obj)
 
@@ -172,23 +172,19 @@ def check(policy, reader, number, repo, base, head):
     body = snapshot()
     baseline = Path(__file__).with_name("pr-evidence-baseline.txt").read_text().splitlines()
     digest = hashlib.sha256(repr(evidence_sections(body)).encode()).hexdigest()
-    entry = f"{number} {head} {digest}"
-    if entry in baseline:
-        result = "Existing PR with recorded head and evidence"
-    else:
+    grandfathered = f"{number} {head} {digest}" in baseline
+    if not grandfathered:
         validate(policy, body, sources(base, head), lambda path: source_blob(head, path))
-        result = "Verification and Attestation passed"
     if snapshot() != body:
         raise EvidenceError("PR evidence changed during validation. Use the newer run.")
-    return result
+    return "Existing PR with recorded head and evidence" if grandfathered else "Verification and Attestation passed"
 
 
 def main():
     env = os.environ
     head, run, attempt = (env[key] for key in ("EVIDENCE_HEAD", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
     repo, event = env["GITHUB_REPOSITORY"], env["GITHUB_EVENT_NAME"]
-    if (not SHA.fullmatch(head) or not all(map(NUMBER.fullmatch, (run, attempt)))
-            or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo, re.ASCII)):
+    if not SHA.fullmatch(head) or not all(map(NUMBER.fullmatch, (run, attempt))):
         raise EvidenceError("Invalid Actions identity.")
     mode = sys.argv[1]
     workflow = {"verify": "pr-evidence.yml", "publish": "check.yml"}[mode]

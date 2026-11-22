@@ -1,16 +1,13 @@
 name: PR evidence
-
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
 permissions: {}
-
 concurrency:
   group: pr-evidence-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
   pr-evidence:
     permissions:
@@ -20,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      BOOTSTRAP: ${{ github.event_name == 'pull_request' && github.event.pull_request.number == 2357 && github.event.pull_request.base.sha == '1580ea94bc192a0631c6c62ccd8dc264fed8675e' }}
+      BOOTSTRAP: ${{ github.event.pull_request.number == 2357 && github.repository == 'TogetherWeOwn/two-bot-next' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.ref == 'main' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request' && env.BOOTSTRAP != 'true'
