@@ -42,8 +42,8 @@ Preserve incident, freeze and identity/capability holds, red staging drills and
 other deterministic gates. If deployment would follow or cannot be ruled out,
 verify explicit owner approval for the full PR head SHA with the migration
 ledger entry (or `no migration`) and rollback target. Production actions need
-separate approval for the exact release SHA as applicable. The task owner
-performs the SHA-pinned squash merge and records the evidence in the release log.
+separate approval for the exact release SHA as applicable. Follow the contribution
+policy for who performs the SHA-pinned merge and records the release evidence.
 
 ## What merits a finding
 

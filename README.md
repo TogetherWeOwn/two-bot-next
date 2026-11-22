@@ -201,7 +201,7 @@ run/job links in Verification. The single `ci-ok` aggregate in
 -D warnings, cargo-deny), every selected Rust/database lane and `worker check`
 (including the runbook command-drift test).
 
-The task owner squash-merges the pinned head after required checks and reviews
+The task owner normally squash-merges the pinned head after required checks and reviews
 pass. When a merge would deploy production or deployment cannot be ruled out,
 get owner approval for the full PR head SHA. Production dispatch needs separate
 owner approval for the full release SHA it will deploy. For web/bot, staging

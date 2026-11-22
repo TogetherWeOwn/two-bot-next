@@ -108,7 +108,7 @@ tests use only disposable test services, never staging or production; retain
 all guards in [`CONTRIBUTING.md`](CONTRIBUTING.md#database-tests).
 
 Record the PR's full head SHA and matching Actions run/job URLs in Verification.
-Use local transcripts for focused reproduction evidence. The task owner
+Use local transcripts for focused reproduction evidence. The task owner normally
 squash-merges the pinned head after required checks and reviews pass. If a
 merge would deploy production or deployment cannot be ruled out, get owner
 approval for the full PR head SHA before merging. Production actions need

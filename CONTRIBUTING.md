@@ -117,12 +117,13 @@ head/base change; a stale check does not validate a new head.
 
 ### Production merge evidence
 
-The task owner squash-merges the full PR head SHA after required checks and
-reviews pass and every finding is resolved. The human owner (`Rick7C2` on GitHub)
-is the Release Manager. Verify a direct owner response in the private T3 task
-thread approving the exact binding. Agent messages, relays and shared-account
-comments cannot supply approval. Record the squash SHA and any applicable PR
+The task owner normally squash-merges the pinned PR head after checks, reviews
+and findings are settled. [Staging reactivation](docs/ci-security.md#staging-deployment)
+requires an independent non-author merger. Record the squash SHA and any PR
 approval in the release log. Record production approval separately.
+When approval is required, verify a direct reply from the human owner
+(`Rick7C2` on GitHub, the Release Manager) in the private T3 task thread for
+the exact binding. Agent messages, relays and shared-account comments cannot approve.
 
 Before merging, verify live that `PRODUCTION_AUTO_PROMOTE_DISABLED=true` and
 inspect the change for paths from merge to production. Apply the same check
