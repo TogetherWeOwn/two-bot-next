@@ -71,8 +71,11 @@ Follow the [risk tiers](CONTRIBUTING.md#independent-review). Standard changes ne
 cross-model review. Critical changes need two in parallel, including security. Resolve findings on the published head.
 
 New T3 threads inherit the project default. The owner chooses a harness that offers the model.
-Prefer Sol for implementation and Opus for design. Use high effort by default and
-xhigh only when the brief justifies it. Never use max or ultra. Keep model and effort
+Prefer `gpt-6.2-sol` for implementation and `claude-opus-5-5` for design. Whenever
+using Opus, select exactly `claude-opus-5-5` and specify `medium` effort explicitly
+unless the brief gives a reason for `high` or `xhigh`. Sol defaults to `high`, with
+`xhigh` only when the brief justifies it. Never use `max`, `ultra` or `ultrathink`.
+Use these model and effort rules in task and review briefs. Keep model and effort
 selection out of harness files and hooks.
 
 In commands you run, never use `rm -f`, `rm -rf` or `rm --force`, including in `trap` cleanups and `bash -lc` strings.
@@ -114,10 +117,19 @@ tests use only disposable test services, never staging or production; retain
 all guards in [`CONTRIBUTING.md`](CONTRIBUTING.md#database-tests).
 
 Record the full PR head SHA and matching Actions run/job URLs in task evidence.
-Keep focused reproduction transcripts. Normally the task owner squash-merges the pinned head after checks and reviews pass.
-Get owner approval for the full PR head SHA before any merge that could deploy production, including when effects are uncertain.
-Production actions need separate owner approval.
-See [`CONTRIBUTING.md`](CONTRIBUTING.md#production-merge-evidence).
+Keep focused reproduction transcripts. Normally the task owner squash-merges the
+pinned head after checks and reviews pass. Verify automatic promotion is disabled
+and the merge cannot deploy production. Stop if either check is inconclusive.
+
+Handle production changes in their own task thread under the
+[production release gate](CONTRIBUTING.md#production-release-gate). Record exact
+artifact identity, green CI and tier reviews, staging checks and smoke, recovery
+evidence and a fresh independent `APPROVE`. Use the protected workflow, watch
+health and errors for at least 30 minutes, and roll back immediately on regression.
+The task thread makes routine release decisions and honors native permission prompts.
+Refer only spending beyond existing budgets, permanent deletion of member data,
+shutdown of a service members use, and legal, terms-of-service or privacy decisions
+to the owner.
 
 ## Modern web platform guidance
 
