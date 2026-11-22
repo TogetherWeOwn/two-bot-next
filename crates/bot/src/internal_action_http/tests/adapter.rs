@@ -687,3 +687,201 @@ async fn governed_voice_move_checks_the_ordered_roster_and_reuses_unsent_lane() 
     mock.assert_patch_indices(&[first_patch, second_patch]);
     db.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn voice_move_signed_storage_refusal_releases_member_and_last_seat_without_socket() {
+    signed_voice_move(false, true).await;
+    signed_voice_move(false, false).await;
+}
+
+#[tokio::test]
+async fn voice_move_signed_uncertain_patch_holds_until_newer_gateway_evidence() {
+    signed_voice_move(true, true).await;
+}
+
+async fn signed_voice_move(uncertain: bool, with_retry_after: bool) {
+    use VoiceMoveOutcome::{BotNotPermitted, DiscordUnavailable, Moved, RateLimited};
+    const FIRST: &str = "111111111111111141";
+    const SECOND: &str = "111111111111111142";
+    const SOURCE: &str = "111111111111111131";
+    const TARGET: &str = "111111111111111135";
+    let Some(db) = database().await else { return };
+    let thread = json!({"id":TARGET,"guild_id":staging_guild(),"type":11});
+    let patch = Arc::new(Pause::default());
+    let facts = |member| move_facts([member, SOURCE, TARGET]);
+    let mut replies = vec![(StatusCode::OK, Value::Null)];
+    replies.extend([facts(FIRST), facts(SECOND)].concat());
+    replies.push((StatusCode::FORBIDDEN, Value::Null));
+    replies.extend(facts(FIRST));
+    let patch_at = replies.len();
+    let receipt = if uncertain {
+        Value::Null
+    } else {
+        voice_member(FIRST, false)
+    };
+    replies.push((StatusCode::OK, receipt));
+    replies.extend(facts(FIRST).into_iter().take(2));
+    let cooldown = json!({"retry_after":with_retry_after.then_some(1.0)});
+    replies.push((StatusCode::OK, thread));
+    replies.push((StatusCode::TOO_MANY_REQUESTS, cooldown));
+    let mut pauses = vec![(0, Arc::default())];
+    pauses.extend(uncertain.then(|| (patch_at, patch.clone())));
+    let mock = MockDiscord::start_with_pauses(replies, pauses).await;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let lane = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
+    let sql = sqlx::query;
+    let mut receiver = state(
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+    );
+    let inner = Arc::get_mut(&mut receiver).unwrap();
+    let clock = inner.voice_clock.clone();
+    let pipeline = seed_move_pipeline(inner.voice_cache.clone(), clock.clone()).await;
+    let publish = |member, room| publish_move_room(&pipeline, member, Some(room));
+    for member in [FIRST, SECOND] {
+        publish(member, SOURCE).await;
+    }
+    inner.gateway_state = connected_gateway();
+    inner.voice_move = Some(
+        ActionExecutor::with_admission(token(), Some(mock.origin.clone()), lane.clone()).unwrap(),
+    );
+    let app = router(receiver.clone());
+    let move_to = |member, nonce: &str| {
+        let raw = json!({"action":"voice.move_member","discord_id":member,"channel_id":TARGET})
+            .to_string();
+        answer(app.clone(), signed_read_with_nonce(&raw, "old", nonce))
+    };
+    assert_eq!(move_to("0", &nonce()).await.2["error"]["code"], "malformed");
+    for (statement, expected_children) in [
+        ("LOCK TABLE internal_nonces IN ACCESS EXCLUSIVE MODE", 0),
+        ("LOCK TABLE internal_action_log IN ACCESS EXCLUSIVE MODE", 1),
+    ] {
+        let mut blocked = db.pool().begin().await.unwrap();
+        sql(statement).execute(&mut *blocked).await.unwrap();
+        let (status, _, body) =
+            tokio::time::timeout(Duration::from_secs(7), move_to(SECOND, &nonce()))
+                .await
+                .unwrap();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert_eq!(body["error"]["code"], "upstream_timeout");
+        assert_eq!(receiver.children.lock().await.len(), expected_children);
+        mock.assert_wires(expected_children);
+        blocked.rollback().await.unwrap();
+    }
+    receiver
+        .children
+        .lock()
+        .await
+        .join_next()
+        .await
+        .unwrap()
+        .unwrap();
+    let metrics = |outcome, count| {
+        assert!(receiver.action_metrics().render(None).contains(&format!(
+            "two_bot_internal_actions_total{{family=\"voice\",outcome=\"{outcome}\"}} {count}\n"
+        )));
+    };
+    metrics(RejectionClass::Upstream.as_str(), 1);
+    assert_eq!(mock.requests.lock().unwrap()[0]["method"], "GET");
+    let permit = lane.admit_strict().await.unwrap();
+    permit.complete(None).await.unwrap();
+
+    sql("ALTER TABLE discord_send_admission ADD CONSTRAINT refuse CHECK (pending_settlement_generation IS NULL)").execute(db.pool()).await.unwrap();
+    assert_eq!(
+        lane.admit_strict().await.err(),
+        Some(AdmissionError::Storage)
+    );
+    let held = || {
+        let holds = clock.move_holds.lock().unwrap();
+        let seats =
+            |member: &str| holds.occupancy(member.parse().unwrap(), TARGET.parse().unwrap(), 0);
+        (seats(FIRST).is_err(), seats(SECOND))
+    };
+    let audit = async |body: &Value, nonce: &str, outcome: VoiceMoveOutcome, member, from| {
+        let row: Vec<Option<String>> = sqlx::query_scalar("SELECT ARRAY[outcome,target_id,from_channel_id,resource_id] FROM internal_action_log WHERE request_id = $1 AND phase = 'terminal' AND intent_id IS NULL AND delivery_hash = $2")
+            .bind(body["request_id"].as_str().unwrap()).bind(two_bot_core::internal_actions::body_hash(nonce.as_bytes()))
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(
+            row.iter().map(Option::as_deref).collect::<Vec<_>>(),
+            [Some(outcome.as_str()), Some(member), from, Some(TARGET)]
+        );
+    };
+    let refused_nonce = nonce();
+    let refused = move_to(FIRST, &refused_nonce).await;
+    mock.assert_wires(7);
+    assert_eq!(
+        move_to(FIRST, &refused_nonce).await.2["error"]["code"],
+        "replayed"
+    );
+    mock.assert_wires(7);
+    sql("ALTER TABLE discord_send_admission DROP CONSTRAINT refuse")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let queued_nonce = nonce();
+    let recovered = move_to(SECOND, &queued_nonce).await;
+    assert_eq!(refused.0.as_u16(), DiscordUnavailable.status());
+    assert_eq!(refused.2["error"]["code"], DiscordUnavailable.as_str());
+    assert_eq!(recovered.2["result"]["outcome"], BotNotPermitted.as_str());
+    for (body, nonce, outcome, member) in [
+        (&refused.2, &refused_nonce, DiscordUnavailable, FIRST),
+        (&recovered.2, &queued_nonce, BotNotPermitted, SECOND),
+    ] {
+        audit(body, nonce, outcome, member, Some(SOURCE)).await;
+    }
+    mock.assert_wires(14);
+
+    let delivery = nonce();
+    let pending = move_to(FIRST, &delivery);
+    let (status, _, body) = if uncertain {
+        let release = async {
+            patch.entered.notified().await;
+            publish(FIRST, TARGET).await;
+            assert_eq!(held(), (true, Ok(1)));
+            patch.resume.notify_one();
+        };
+        tokio::time::timeout(Duration::from_secs(7), async {
+            tokio::join!(pending, release)
+        })
+        .await
+        .unwrap()
+        .0
+    } else {
+        pending.await
+    };
+    let outcome = if uncertain { DiscordUnavailable } else { Moved };
+    assert_eq!(status.as_u16(), outcome.status());
+    audit(&body, &delivery, outcome, FIRST, Some(SOURCE)).await;
+    mock.assert_wires(patch_at + 1);
+    assert_eq!(held(), (true, Ok(1)));
+    if uncertain {
+        publish(SECOND, TARGET).await;
+        assert_eq!(held(), (true, Ok(1)));
+        publish(FIRST, SOURCE).await; // Newer departure witnesses the previous target.
+    } else {
+        publish(FIRST, TARGET).await;
+        assert_eq!(body["result"]["from_channel_id"], SOURCE);
+        metrics("executed", 2);
+        assert_eq!(
+            move_to(FIRST, &nonce()).await.2["result"]["outcome"],
+            "room_gone"
+        );
+        let nonce = nonce();
+        let (status, headers, body) = move_to(FIRST, &nonce).await;
+        let retry_after = with_retry_after.then(|| HeaderValue::from_static("1"));
+        let limited = retry_after
+            .as_ref()
+            .map_or(DiscordUnavailable, |_| RateLimited);
+        assert_eq!(status.as_u16(), limited.status());
+        assert_eq!(headers.get(header::RETRY_AFTER), retry_after.as_ref());
+        assert_eq!(body["error"]["code"], limited.as_str());
+        audit(&body, &nonce, limited, FIRST, None).await;
+        if !with_retry_after {
+            assert!(lane.admit_strict().await.err() == Some(AdmissionError::Blocked));
+        }
+        mock.assert_wires(patch_at + 5);
+    }
+    mock.assert_patch_indices(&[13, patch_at]);
+    assert_eq!(held(), (false, Ok(0)));
+    db.close().await.unwrap();
+}
