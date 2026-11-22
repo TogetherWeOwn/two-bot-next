@@ -175,6 +175,7 @@ const QUEUE: &str = "SELECT count(*) FROM retention_guild_purge_queue";
 const SESSIONS: &str = "SELECT count(*) FROM event_voice_sessions";
 const WINDOWS: &str = "SELECT count(*) FROM event_attendance_windows";
 const AUDITS: &str = "SELECT count(*) FROM member_erasure_audit";
+const CAPTURE: &str = "SELECT count(*) FROM event_store WHERE dedup_key = 'fixture'";
 const RECEIPTS: &str =
     "SELECT count(*) FROM retention_deletion_requests WHERE receipt_id IS NOT NULL";
 
@@ -261,7 +262,6 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     let err = result.unwrap_err();
     assert_eq!((err.step().as_str(), err.cause()), ("expiry", "database"));
     assert_preserved(&runtime).await;
-
     // Cutover commits before Store, web contract and grants.
     through(&CUTOVER, 480).run(&migrator).await.unwrap();
     assert_ledgers(&migrator, 480, 465).await;
@@ -303,7 +303,8 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
         let report = run_retention(&runtime, mode).await.unwrap();
         assert_eq!(report.schema_gap_deferrals, 1);
         assert_eq!(report.guild_purges_failed, 1);
-        assert_eq!(report.presence_raw_deleted, 1);
+        let expiry = (report.presence_raw_deleted, count(&runtime, CAPTURE).await);
+        assert_eq!(expiry, (1, i64::from(mode == RetentionMode::DryRun)));
     }
     assert_preserved(&runtime).await;
     let receipt = fulfill_user_deletion(&migrator, &request).await.unwrap();
@@ -314,7 +315,6 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
         .await
         .unwrap();
     assert!(drained.guild_rows_purged > 0);
-    assert_eq!(count(&runtime, QUEUE).await, 0);
     let survivors: Vec<(String, String)> =
         sqlx::query_as("SELECT guild_id, member_id FROM event_voice_sessions")
             .fetch_all(&runtime)
@@ -324,7 +324,7 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
         survivors,
         [(GUILD.to_owned(), "200000000000000002".to_owned())]
     );
-    assert_counts(&runtime, &[(WINDOWS, 1), (RESERVATIONS, 1)]).await;
+    assert_counts(&runtime, &[(WINDOWS, 1), (RESERVATIONS, 1), (QUEUE, 0)]).await;
     assert_eq!(count(&runtime, "SELECT count(*) FROM moderation_idempotency WHERE state = 'done' AND outcome = 'operator_released'").await, 2);
 }
 
