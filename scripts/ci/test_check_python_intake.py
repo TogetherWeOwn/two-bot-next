@@ -1,6 +1,8 @@
 """Bad and good fixtures for the Python intake ratchet."""
 
 import importlib.util
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 import subprocess
 import sys
@@ -84,3 +86,26 @@ payload = json.dumps(new)
         self.git(root, "add", ".")
         self.git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.org",
                  "-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
+
+    def test_unreadable_python_does_not_hide_other_findings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.git(root, "init", "-q")
+            scripts = root / "scripts"
+            scripts.mkdir()
+            (scripts / "clean.py").write_text("value = 1\n")
+            self.commit(root)
+            base = self.git(root, "rev-parse", "HEAD").strip()
+            (scripts / "bad.py").write_text("def syntax_error(\n")
+            (scripts / "new.py").write_text("import json\njson.loads(raw)\n")
+            self.commit(root)
+            self.assertEqual(list(guard.check(root, base)), [
+                ("scripts/bad.py", 1, None), ("scripts/new.py", 2, "json.loads"),
+            ])
+
+    def test_actions_warning_escapes_path_properties(self):
+        output = StringIO()
+        with patch.dict(guard.os.environ, {"GITHUB_ACTIONS": "true"}), redirect_stdout(output):
+            guard.report("synthetic diagnostic", hard=False, path="scripts/a,b.py", line=2)
+        self.assertEqual(output.getvalue(),
+                         "::warning file=scripts/a%2Cb.py,line=2::synthetic diagnostic\n")

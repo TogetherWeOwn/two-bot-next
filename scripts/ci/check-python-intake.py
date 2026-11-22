@@ -3,6 +3,7 @@
 import argparse
 import ast
 from collections import Counter, defaultdict
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -87,18 +88,44 @@ def scanned(path):
 def check(root, base_ref):
     base = git(root, "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}").decode().strip()
     base = git(root, "merge-base", base, "HEAD").decode().strip()
-    changes = git(root, "diff", "--find-renames", "--name-status", "--diff-filter=AMRT",
+    changes = git(root, "diff", "--find-renames", "--raw", "--no-abbrev", "--diff-filter=AMRT",
                   "-z", base, "HEAD", "--", "scripts/", ".github/scripts/")
     fields = iter(changes.decode("utf-8", "surrogateescape").split("\0")[:-1])
-    for status in fields:
+    regular_modes = {"100644", "100755"}
+    for header in fields:
+        old_mode, new_mode, old_blob, new_blob, status = header.removeprefix(":").split()
         old_path = next(fields)
         path = next(fields) if status.startswith("R") else old_path
         if not scanned(path):
             continue
-        before = b"" if status == "A" or not scanned(old_path) else git(root, "show", f"{base}:{old_path}")
-        after = git(root, "show", f"HEAD:{path}")
-        for line, api in additions(before, after, path):
-            yield path, line, api
+        if new_mode not in regular_modes:
+            yield path, 1, None
+            continue
+        try:
+            before = b""
+            if old_mode in regular_modes and scanned(old_path):
+                before = git(root, "cat-file", "blob", old_blob)
+            after = git(root, "cat-file", "blob", new_blob)
+            for line, api in additions(before, after, path):
+                yield path, line, api
+        except (OSError, subprocess.CalledProcessError, SyntaxError, ValueError, RecursionError):
+            yield path, 1, None
+
+
+def report(message, *, hard, path=None, line=None):
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        prefix = "" if path is None else f"{path!r}:{line}: "
+        print(prefix + message, file=sys.stderr)
+        return
+    level = "error" if hard else "warning"
+    if path is None:
+        print(f"::{level}::{message}")
+        return
+    path = path.encode("utf-8", "backslashreplace").decode("utf-8")
+    for raw, escaped in (("%", "%25"), ("\r", "%0D"), ("\n", "%0A"),
+                         (":", "%3A"), (",", "%2C")):
+        path = path.replace(raw, escaped)
+    print(f"::{level} file={path},line={line}::{message}")
 
 
 def main():
@@ -109,10 +136,11 @@ def main():
     try:
         violations = list(check(ROOT, args.base))
     except (OSError, subprocess.CalledProcessError, SyntaxError, ValueError, RuntimeError):
-        print("Python intake: could not inspect both Git revisions", file=sys.stderr)
+        report("Python intake: could not inspect both Git revisions", hard=args.hard)
         return args.hard
     for path, line, api in violations:
-        print(f"{path!r}:{line}: use {INTAKE} instead of {api}", file=sys.stderr)
+        message = "Python intake: could not scan source" if api is None else f"use {INTAKE} instead of {api}"
+        report(message, hard=args.hard, path=path, line=line)
     return args.hard and bool(violations)
 
 
