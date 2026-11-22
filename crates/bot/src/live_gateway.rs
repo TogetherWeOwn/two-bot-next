@@ -115,9 +115,10 @@ impl LiveReceiver {
         self.0
             .run(async |delta| {
                 let mut generation = delta.generation.clone();
+                let retired = futures_util::FutureExt::boxed(generation.changed());
                 tokio::select! {
                     biased;
-                    _ = generation.changed() => Delivery::Rejected,
+                    _ = retired => Delivery::Rejected,
                     result = attempt(&delta.body) => result,
                 }
             })
@@ -209,7 +210,6 @@ impl Intake {
         if scope != self.guild {
             return Ok(());
         }
-        // Changes outside voice can invalidate the baseline's references.
         if kind != "VOICE_STATE_UPDATE" {
             return Err(());
         }
