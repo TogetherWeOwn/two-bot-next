@@ -3,6 +3,7 @@
 import argparse
 import ast
 from collections import Counter, defaultdict
+from copy import deepcopy
 import os
 from pathlib import Path
 import subprocess
@@ -14,6 +15,8 @@ INTAKE = "scripts/script_intake.py"
 APIS = {"json.load", "json.loads", "json.JSONDecoder", "json.decoder.JSONDecoder", "json.*",
         "urllib.request.urlopen", "urllib.request.build_opener", "urllib.request.urlretrieve",
         "urllib.request.OpenerDirector", "urllib.request.install_opener", "urllib.request.*"}
+FUNCTION_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+OTHER_SCOPES = (ast.ClassDef, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
 def aliases(nodes):
@@ -45,15 +48,56 @@ def qualified(node, bindings):
     return set()
 
 
+def function_locals(nodes):
+    scopes = {}
+    bound = defaultdict(set)
+    external = defaultdict(set)
+    for node in nodes:
+        scope = scopes.get(node)
+        if scope is not None:
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                bound[scope].add(node.id)
+            elif isinstance(node, ast.arg):
+                bound[scope].add(node.arg)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                external[scope].update(node.names)
+        if isinstance(node, FUNCTION_SCOPES):
+            body = {node.body} if isinstance(node, ast.Lambda) else set(node.body)
+            body.add(node.args)
+            scopes.update((child, node if child in body else scope) for child in ast.iter_child_nodes(node))
+        elif not isinstance(node, OTHER_SCOPES):
+            scopes.update((child, scope) for child in ast.iter_child_nodes(node))
+    return scopes, {scope: names - external[scope] for scope, names in bound.items()}
+
+
+def call_shape(node, locals_in_scope):
+    """Keep argument structure and literals while ignoring local spelling."""
+    if not locals_in_scope:
+        return ast.dump(node)
+    clone = deepcopy(node)
+    names = {}
+    for reference in ast.walk(clone):
+        if isinstance(reference, ast.Name) and reference.id in locals_in_scope:
+            index = names.setdefault(reference.id, len(names))
+            reference.id = f"<local {index}>"
+    return ast.dump(clone)
+
+
 def uses(source, path):
     tree = ast.parse(source, filename=path)
     nodes = list(ast.walk(tree))
     bindings = aliases(nodes)
     call_by_target = {node.func: node for node in nodes if isinstance(node, ast.Call)}
+    scopes, locals_by_scope = function_locals(nodes)
+
+    def shape(target):
+        node = call_by_target.get(target, target)
+        return call_shape(node, locals_by_scope.get(scopes.get(node), ()))
+
     for node in nodes:
         if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
             for api in sorted(qualified(node, bindings) & APIS):
-                yield api, ast.dump(call_by_target.get(node, node)), node.lineno
+                yield api, shape(node), node.lineno
         elif isinstance(node, ast.ImportFrom) and not node.level:
             for name in node.names:
                 api = f"{node.module}.{name.name}"
@@ -64,7 +108,7 @@ def uses(source, path):
               and isinstance(node.args[1], ast.Constant)):
             names = {f"{owner}.{node.args[1].value}" for owner in qualified(node.args[0], bindings)}
             for api in sorted(names & APIS):
-                yield api, ast.dump(call_by_target.get(node, node)), node.lineno
+                yield api, shape(node), node.lineno
 
 
 def additions(before, after, path):
@@ -121,7 +165,7 @@ def report(message, *, hard, path=None, line=None):
     if path is None:
         print(f"::{level}::{message}")
         return
-    path = path.encode("utf-8", "backslashreplace").decode("utf-8")
+    path = "".join(c if c.isprintable() or c in "\r\n" else ascii(c)[1:-1] for c in path)
     for raw, escaped in (("%", "%25"), ("\r", "%0D"), ("\n", "%0A"),
                          (":", "%3A"), (",", "%2C")):
         path = path.replace(raw, escaped)

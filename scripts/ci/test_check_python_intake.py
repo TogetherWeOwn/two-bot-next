@@ -58,6 +58,23 @@ payload = json.dumps(new)
         self.assertEqual(list(guard.additions(before, after + "json.loads(data)\n",
                                               "scripts/read.py")), [(7, "json.loads")])
 
+    def test_local_rename_keeps_one_baseline_use(self):
+        before = """\
+import urllib.request
+
+def fetch():
+    request = build_request()
+    return urllib.request.urlopen(request, timeout=10)
+"""
+        renamed = before.replace("request =", "probe_request =").replace(
+            "urlopen(request", "urlopen(probe_request")
+        path = "scripts/read.py"
+        self.assertEqual(list(guard.additions(before, renamed, path)), [])
+        added = renamed.replace("    return ", "    urllib.request.urlopen(probe_request, timeout=10)\n    return ")
+        self.assertEqual(list(guard.additions(before, added, path)), [(6, "urllib.request.urlopen")])
+        changed = renamed.replace("timeout=10", "timeout=20")
+        self.assertEqual(list(guard.additions(before, changed, path)), [(5, "urllib.request.urlopen")])
+
     def test_git_range_warn_and_hard_modes(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -94,18 +111,25 @@ payload = json.dumps(new)
             scripts = root / "scripts"
             scripts.mkdir()
             (scripts / "clean.py").write_text("value = 1\n")
+            linked = scripts / "linked.py"
+            linked.write_text("value = 2\n")
             self.commit(root)
             base = self.git(root, "rev-parse", "HEAD").strip()
             (scripts / "bad.py").write_text("def syntax_error(\n")
+            linked.unlink()
+            linked.symlink_to("clean.py")
             (scripts / "new.py").write_text("import json\njson.loads(raw)\n")
             self.commit(root)
             self.assertEqual(list(guard.check(root, base)), [
-                ("scripts/bad.py", 1, None), ("scripts/new.py", 2, "json.loads"),
+                ("scripts/bad.py", 1, None), ("scripts/linked.py", 1, None),
+                ("scripts/new.py", 2, "json.loads"),
             ])
 
     def test_actions_warning_escapes_path_properties(self):
         output = StringIO()
         with patch.dict(guard.os.environ, {"GITHUB_ACTIONS": "true"}), redirect_stdout(output):
-            guard.report("synthetic diagnostic", hard=False, path="scripts/a,b.py", line=2)
+            guard.report("synthetic diagnostic", hard=False, path="scripts/a,\x1bb.py", line=2)
+            guard.report("synthetic error", hard=True)
         self.assertEqual(output.getvalue(),
-                         "::warning file=scripts/a%2Cb.py,line=2::synthetic diagnostic\n")
+                         "::warning file=scripts/a%2C\\x1bb.py,line=2::synthetic diagnostic\n"
+                         "::error::synthetic error\n")
