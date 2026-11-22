@@ -1,6 +1,6 @@
 use super::*;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 const GUILD: GuildId = Id::new(10);
 const AT: WireTime = WireTime(time::OffsetDateTime::UNIX_EPOCH);
@@ -25,12 +25,6 @@ fn begin(live: &mut LiveGateway) -> String {
 fn complete(live: &mut LiveGateway, nonce: &str) {
     receive(live, &json!({"op":0,"t":"GUILD_MEMBERS_CHUNK","d":{"guild_id":"10","nonce":nonce,
         "chunk_index":0,"chunk_count":1,"members":[{"user":{"id":"31"},"roles":[],"pending":false}]}}).to_string());
-}
-
-fn arm(live: &mut LiveGateway) {
-    receive(live, READY);
-    let nonce = begin(live);
-    complete(live, &nonce);
 }
 
 fn decoded(body: &[u8]) -> Value {
@@ -100,7 +94,9 @@ async fn rejected_or_superseded_baselines_cannot_send() {
         VOICE.replace(r#""guild_id":"10""#, r#""guild_id":"10","guild_id":"11""#),
         r#"{"op":0,"t":"GUILD_MEMBER_REMOVE","d":{"guild_id":"10","user":{"id":"31"}}}"#.into(),
     ] {
-        arm(&mut live);
+        receive(&mut live, READY);
+        let nonce = begin(&mut live);
+        complete(&mut live, &nonce);
         receive(&mut live, VOICE);
         receive(&mut live, &invalid);
         receive(&mut live, VOICE);
@@ -113,7 +109,10 @@ async fn rejected_or_superseded_baselines_cannot_send() {
     receive(&mut live, VOICE);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let (attempt, cancelled) = oneshot::channel::<()>();
+    let mut attempt = Some(attempt);
     let worker = receiver.run(async move |body| {
+        let _in_flight = attempt.take();
         tx.send(decoded(body)).expect("fixture receiver");
         std::future::pending().await
     });
@@ -121,6 +120,7 @@ async fn rejected_or_superseded_baselines_cannot_send() {
         assert_eq!(rx.recv().await.expect("current delta")["seq"], 5);
         let retired_at = Instant::now();
         live.disconnect();
+        assert!(cancelled.await.is_err());
         drop(live);
         retired_at
     });
