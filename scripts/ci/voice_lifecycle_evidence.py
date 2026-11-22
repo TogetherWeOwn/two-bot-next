@@ -6,14 +6,13 @@ import os
 from pathlib import Path
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from script_intake import decode_legacy_json, unique_object as _unique_json_object
+sys.path.pop(0)
+
 
 def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate object key")
-        result[key] = value
-    return result
+    return _unique_json_object(pairs, message='duplicate object key')
 
 
 def validate(root, run_id):
@@ -31,7 +30,7 @@ def validate(root, run_id):
         if path.is_symlink() or not path.is_file() or path.stat().st_size > 262144:
             return "evidence_invalid", [expected]
         with path.open(encoding="utf-8") as source:
-            checks = json.load(source, object_pairs_hook=unique_object)["checks"]
+            checks = decode_legacy_json(source.read(), object_pairs_hook=unique_object)["checks"]
         if not isinstance(checks, list):
             raise ValueError("invalid checks")
         verdicts = {}

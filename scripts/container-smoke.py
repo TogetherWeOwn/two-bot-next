@@ -19,6 +19,8 @@ import time
 from urllib.parse import urlsplit
 import uuid
 
+from script_intake import decode_legacy_json, read_with_overflow
+
 MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
 # Recalibrated for the linked S4 self-role runtime: PR head measured
@@ -155,7 +157,7 @@ def inspect_state(name):
     is never echoed into the failure.
     """
     try:
-        entries = json.loads(docker("inspect", name).stdout)
+        entries = decode_legacy_json(docker("inspect", name).stdout)
     except ValueError:
         raise RuntimeError("docker inspect output is not valid JSON") from None
     require(isinstance(entries, list) and entries, "docker inspect returned no entries")
@@ -243,7 +245,7 @@ def http_response(url):
         response = connection.getresponse()
         # Bounded read: a status line alone is an answer, a body past the cap
         # is a refusal raised before any decoding (not caught below).
-        raw = response.read(MAX_BODY_BYTES + 1)
+        raw = read_with_overflow(response, MAX_BODY_BYTES)
         if len(raw) > MAX_BODY_BYTES:
             raise BodyTooLarge("loopback response body exceeds the 64 KiB cap")
         if response.length:
@@ -252,7 +254,7 @@ def http_response(url):
             # still a transport miss for the caller to retry.
             raise http.client.IncompleteRead(raw, response.length)
         try:
-            return response.status, json.loads(raw)
+            return response.status, decode_legacy_json(raw)
         except ValueError:
             # A status with no JSON body (e.g. a bare 3xx) is still an
             # answer; the caller's exact status/body assertions reject it.
@@ -267,7 +269,7 @@ def http_response(url):
 
 
 def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BYTES):
-    image_entries = json.loads(docker("image", "inspect", image).stdout)
+    image_entries = decode_legacy_json(docker("image", "inspect", image).stdout)
     require(isinstance(image_entries, list) and image_entries,
             "docker image inspect returned no entries")
     require(isinstance(image_entries[0], dict),

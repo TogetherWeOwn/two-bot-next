@@ -60,6 +60,17 @@ class SchemaGateContractTests(unittest.TestCase):
                     self.terminal(outcome, "manifest_invalid")
                     self.assertIsNone(outcome.saved)
 
+    def test_decoded_duplicate_fields_refuse_otherwise_valid_manifests(self):
+        for target in ("staging", "production"):
+            with self.subTest(target=target):
+                payload = fixtures.report(target)
+                payload["audit"] = {"read": 1}
+                self.terminal(fixtures.invoke(target, payload), "schema_clean")
+                wire = json.dumps(payload).replace('{"read": 1}', r'{"read": 1, "\u0072ead": 2}')
+                outcome = fixtures.invoke(target, stdout=wire)
+                self.terminal(outcome, "manifest_invalid")
+                self.assertIsNone(outcome.saved)
+
     def test_exponent_overflow_wire_float_is_refused_as_malformed_output(self):
         for target in ("staging", "production"):
             with self.subTest(target=target, field="extra_metric"):

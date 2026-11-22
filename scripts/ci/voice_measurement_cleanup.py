@@ -1,10 +1,15 @@
 """Validate a bounded staging measurement cleanup receipt."""
 
-import json
 import os
+from pathlib import Path
 import stat
+import sys
 
 from voice_lifecycle_evidence import unique_object
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from script_intake import decode_legacy_json, read_with_overflow
+sys.path.pop(0)
 
 
 MAX_RECEIPT_BYTES = 65536
@@ -17,14 +22,14 @@ def read_cleanup_receipt(path):
         with os.fdopen(fd, "rb") as source:
             if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
                 return None
-            data = source.read(MAX_RECEIPT_BYTES + 1)
+            data = read_with_overflow(source, MAX_RECEIPT_BYTES)
         if len(data) > MAX_RECEIPT_BYTES:
             return None
         lines = data.decode("utf-8").splitlines()
         if len(lines) != 3 or any(not line.strip() for line in lines):
             return None
-        return [json.loads(line, object_pairs_hook=unique_object,
-                           parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+        return [decode_legacy_json(line, object_pairs_hook=unique_object,
+                                   parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
                 for line in lines]
     except (OSError, TypeError, ValueError, UnicodeError, RecursionError):
         return None

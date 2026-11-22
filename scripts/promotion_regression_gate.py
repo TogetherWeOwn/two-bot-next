@@ -47,6 +47,8 @@ from pathlib import Path
 import re
 import sys
 
+from script_intake import decode_legacy_json, unique_object as _unique_json_object
+
 RATIO_MARGIN = 1.5
 FLOOR_RATIO = 0.05
 MIN_REQUESTS = 10  # REST_5XX_MIN_REQUESTS in wrangler/src/alert-rules.ts
@@ -63,17 +65,12 @@ class GateError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise GateError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=GateError)
 
 
 def parse(text):
     try:
-        value = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+        value = decode_legacy_json(text, object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, RecursionError):
         raise GateError("unreadable") from None
     if not isinstance(value, dict):
@@ -182,7 +179,7 @@ def read_runs(path):
     if len(raw) > MAX_BYTES:
         raise GateError("oversize")
     try:
-        value = json.loads(raw.decode("utf-8", "replace"))
+        value = decode_legacy_json(raw.decode("utf-8", "replace"))
     except ValueError:
         return ()
     return value if isinstance(value, list) else ()
