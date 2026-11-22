@@ -59,7 +59,7 @@ import urllib.request
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import staging_automation_read_smoke as fenced
 
-from script_intake import decode_legacy_json, no_redirect_opener, read_with_overflow
+from script_intake import no_redirect_opener, read_with_overflow
 
 API = fenced.API
 SCHEMA = "help_embed_smoke.v3"
