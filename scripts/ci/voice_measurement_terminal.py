@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 from datetime import datetime, timezone
 
 from voice_lifecycle_evidence import unique_object, validate as validate_lifecycle
@@ -125,8 +126,6 @@ def evaluate_terminal(results, second_required, run_id, attempt, expires_at, sha
 
 def main():
     """Write a fixed terminal verdict; absent or invalid inputs always refuse."""
-    import sys
-
     if len(sys.argv) != 2:
         return 1
     verdict = "refused"
