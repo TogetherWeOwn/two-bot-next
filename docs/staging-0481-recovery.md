@@ -21,6 +21,9 @@ matched the digest printed by the capture job. A protected copy retains
 the full target pins, definitions, ownership, object and default ACLs,
 login flags, memberships, and ledger metadata. The target fingerprint
 hashes the UTF-8 JSON object with sorted keys and compact separators.
+The Actions artifact expires after 14 days. The authorized staging
+operator can retrieve the protected copy through the private migration
+handoff and verify its inventory digest against this receipt.
 
 The inventory records 151 relations in scope, 1,037 columns, 1,095
 constraints, 219 indexes, six routines, two extensions, 24 roles and 26
