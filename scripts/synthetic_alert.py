@@ -24,7 +24,7 @@ import sys
 import incident_issue
 from synthetic_alert_history import HistoryError, _loads_bounded, previous_probe_outcomes, transition
 
-from script_intake import decode_legacy_json, unique_object as _unique_json_object
+from script_intake import unique_object as _unique_json_object
 
 RUNBOOK_URL = ("https://github.com/TogetherWeOwn/two-bot-next"
                "/blob/main/docs/runbook-observability.md")
