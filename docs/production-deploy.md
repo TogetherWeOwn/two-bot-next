@@ -868,6 +868,16 @@ reopening, then revert traffic with a `rollback=<previous version-id>`
 dispatch from the watch header. The same guard, Environment approval and
 takeover order apply to the revert.
 
+### Read production ownership without starting the bot
+
+An authorized operator can run **Actions → production-ownership-status**
+from `main` with a fresh dispatch and no inputs. The job rechecks current main
+and `production` Environment policy inside the deploy and rollback lane.
+
+Open **Read bracketed production ownership status** in the job log for matching
+Worker and Container rollout samples around one authenticated ownership GET.
+Per-instance digests, historical rollouts and writer exclusivity need separate evidence.
+
 ## `PRODUCTION_AUTO_APPROVE`
 
 The repository variable `PRODUCTION_AUTO_APPROVE` is unset by default. Only the

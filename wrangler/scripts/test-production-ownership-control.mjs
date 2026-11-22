@@ -5,6 +5,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { REFUSAL_REASONS, control } from './production-ownership-control.mjs';
+import { readStatus } from './production-ownership-status.mjs';
 
 const PRODUCTION = 'https://two-bot-next-production.5150.workers.dev/';
 const STAGING = 'https://two-bot-next-staging.5150.workers.dev/';
@@ -53,6 +54,18 @@ const http = (status, reason = 'deployment_mismatch') => ({ status, body: { erro
 const timeout = () => ({ throws: new DOMException('The operation timed out', 'TimeoutError') });
 const abort = () => ({ throws: new DOMException('The operation was aborted', 'AbortError') });
 const transport = (text = 'fetch failed') => ({ throws: new TypeError(text) });
+
+test('the standalone read makes one bounded GET and refuses denial or malformed bodies', async () => {
+  for (const [status, body] of [[403, 'denied'], [302, 'redirect'], [200, '{'], [200, ' '.repeat(4097)]]) {
+    let count = 0;
+    await assert.rejects(readStatus({ url: PRODUCTION, token: TOKEN }, async (url, init) => {
+      count += 1;
+      assert.deepEqual([url.href, init.method, init.redirect], [PRODUCTION + 'internal/ownership', 'GET', 'error']);
+      return new Response(body, { status });
+    }));
+    assert.equal(count, 1);
+  }
+});
 
 test('status succeeds first try without waiting', async () => {
   const f = fixture([ok(80)]);

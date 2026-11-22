@@ -1,0 +1,92 @@
+{
+  "name": "production-ownership-status",
+  "on": {
+    "workflow_dispatch": ""
+  },
+  "permissions": {},
+  "jobs": {
+    "guard": {
+      "if": "github.repository_id == '1396224242' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1",
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": "3",
+      "permissions": {
+        "contents": "read",
+        "actions": "read"
+      },
+      "outputs": {
+        "policy": "${{ steps.guard.outputs.policy }}"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": "false",
+            "fetch-depth": "1"
+          }
+        },
+        {
+          "name": "Verify dispatch and production Environment before admission",
+          "id": "guard",
+          "env": {
+            "GH_TOKEN": "${{ github.token }}",
+            "AUTO_APPROVE": "${{ vars.PRODUCTION_AUTO_APPROVE }}"
+          },
+          "run": "python3 scripts/production_ownership_status.py guard"
+        }
+      ]
+    },
+    "status": {
+      "needs": "guard",
+      "concurrency": {
+        "group": "deploy-production",
+        "cancel-in-progress": "false",
+        "queue": "max"
+      },
+      "environment": "production",
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": "4",
+      "permissions": {
+        "contents": "read",
+        "actions": "read"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": "false",
+            "fetch-depth": "1"
+          }
+        },
+        {
+          "uses": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+          "with": {
+            "node-version": "22",
+            "package-manager-cache": "false"
+          }
+        },
+        {
+          "name": "Recheck current main and production Environment",
+          "env": {
+            "GH_TOKEN": "${{ github.token }}",
+            "AUTO_APPROVE": "${{ vars.PRODUCTION_AUTO_APPROVE }}",
+            "EXPECTED_POLICY": "${{ needs.guard.outputs.policy }}"
+          },
+          "run": "python3 scripts/production_ownership_status.py recheck"
+        },
+        {
+          "name": "Read bracketed production ownership status",
+          "env": {
+            "CLOUDFLARE_API_TOKEN": "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+            "CLOUDFLARE_ACCOUNT_ID": "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}",
+            "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}",
+            "PRODUCTION_WORKER_URL": "${{ vars.PRODUCTION_WORKER_URL }}",
+            "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"
+          },
+          "run": "python3 scripts/production_ownership_status.py status"
+        }
+      ]
+    }
+  }
+}

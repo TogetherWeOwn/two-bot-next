@@ -1,0 +1,154 @@
+{
+  "github_environment": {
+    "GITHUB_REPOSITORY": "TogetherWeOwn/two-bot-next",
+    "GITHUB_REPOSITORY_ID": "1396224242",
+    "GITHUB_SERVER_URL": "https://github.com",
+    "GITHUB_EVENT_NAME": "workflow_dispatch",
+    "GITHUB_REF": "refs/heads/main",
+    "GITHUB_REF_PROTECTED": "true",
+    "GITHUB_RUN_ATTEMPT": "1",
+    "GITHUB_SHA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "GITHUB_WORKFLOW_SHA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "GITHUB_WORKFLOW_REF": "TogetherWeOwn/two-bot-next/.github/workflows/production-ownership-status.yml@refs/heads/main"
+  },
+  "github_head": {
+    "ref": "refs/heads/main",
+    "object": {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "type": "commit"
+    }
+  },
+  "github_production_environment": {
+    "name": "production",
+    "protection_rules": [
+      {
+        "type": "branch_policy"
+      }
+    ],
+    "deployment_branch_policy": {
+      "custom_branch_policies": true,
+      "protected_branches": false
+    }
+  },
+  "github_branches": {
+    "total_count": 1,
+    "branch_policies": [
+      {
+        "name": "main",
+        "type": "branch"
+      }
+    ]
+  },
+  "ownership": {
+    "deploymentId": "11111111-1111-1111-1111-111111111111",
+    "running": true,
+    "owner": {
+      "deploymentId": "11111111-1111-1111-1111-111111111111",
+      "phase": "active",
+      "epoch": 49,
+      "actor": "private-marker"
+    }
+  },
+  "provider": {
+    "/workers/scripts/two-bot-next-production/deployments": {
+      "deployments": [
+        {
+          "id": "22222222-2222-2222-2222-222222222222",
+          "versions": [
+            {
+              "version_id": "11111111-1111-1111-1111-111111111111",
+              "percentage": 100
+            }
+          ]
+        }
+      ]
+    },
+    "/workers/scripts/two-bot-next-production/versions/11111111-1111-1111-1111-111111111111": {
+      "id": "11111111-1111-1111-1111-111111111111",
+      "annotations": {
+        "workers/message": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "resources": {
+        "bindings": [
+          {
+            "name": "TWO_BOT",
+            "type": "durable_object_namespace",
+            "class_name": "TwoBotContainer",
+            "namespace_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          {
+            "name": "SOME_OTHER_BINDING",
+            "type": "plain_text",
+            "text": "private-marker-that-must-not-print"
+          }
+        ]
+      }
+    },
+    "/containers/applications": [
+      {
+        "name": "two-bot-next-twobotcontainer-production",
+        "id": "33333333-3333-3333-3333-333333333333",
+        "configuration": {
+          "image": "registry.cloudflare.com/cccccccccccccccccccccccccccccccc/two-bot-next-twobotcontainer-production@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "instances": 1,
+        "version": 11,
+        "durable_objects": {
+          "namespace_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      }
+    ],
+    "/containers/applications/33333333-3333-3333-3333-333333333333/rollouts?limit=100": [
+      {
+        "id": "44444444-4444-4444-4444-444444444444",
+        "created_at": "2026-11-20T00:00:00Z",
+        "status": "completed",
+        "target_version": 11,
+        "target_configuration": {
+          "image": "registry.cloudflare.com/cccccccccccccccccccccccccccccccc/two-bot-next-twobotcontainer-production@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "secrets": [
+            "private-marker-that-must-not-print"
+          ]
+        },
+        "progress": {
+          "total_instances": 1,
+          "updated_instances": 1
+        },
+        "health": {
+          "instances": {
+            "active": 0,
+            "healthy": 0,
+            "failed": 0,
+            "starting": 0,
+            "scheduling": 0
+          }
+        }
+      }
+    ],
+    "/containers/applications/33333333-3333-3333-3333-333333333333/rollouts/44444444-4444-4444-4444-444444444444": {
+      "id": "44444444-4444-4444-4444-444444444444",
+      "created_at": "2026-11-20T00:00:00Z",
+      "status": "completed",
+      "target_version": 11,
+      "target_configuration": {
+        "image": "registry.cloudflare.com/cccccccccccccccccccccccccccccccc/two-bot-next-twobotcontainer-production@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "secrets": [
+          "private-marker-that-must-not-print"
+        ]
+      },
+      "progress": {
+        "total_instances": 1,
+        "updated_instances": 1
+      },
+      "health": {
+        "instances": {
+          "active": 0,
+          "healthy": 0,
+          "failed": 0,
+          "starting": 0,
+          "scheduling": 0
+        }
+      }
+    }
+  }
+}
