@@ -55,14 +55,17 @@ WITH RECURSIVE expected AS (
 ), scoped_roles AS (
     SELECT oid FROM principals
     UNION SELECT m.member FROM pg_auth_members m JOIN scoped_roles r ON m.roleid = r.oid
+), role_groups AS (
+    SELECT oid FROM scoped_roles
+    UNION SELECT m.roleid FROM pg_auth_members m JOIN role_groups r ON m.member = r.oid
 ), app_defaults AS (
     SELECT d.*, s.nspname FROM pg_default_acl d LEFT JOIN schemas s ON s.oid = d.defaclnamespace
     WHERE (d.defaclnamespace = 0 OR s.oid IS NOT NULL)
-      AND (d.defaclrole IN (SELECT oid FROM scoped_roles) OR EXISTS (
+      AND (d.defaclrole IN (SELECT oid FROM role_groups) OR EXISTS (
           SELECT 1 FROM aclexplode(d.defaclacl) a
-          WHERE a.grantee = 0 OR a.grantee IN (SELECT oid FROM scoped_roles)))
+          WHERE a.grantee = 0 OR a.grantee IN (SELECT oid FROM role_groups)))
 ), reported_roles AS (
-    SELECT oid FROM scoped_roles
+    SELECT oid FROM role_groups
     UNION SELECT defaclrole FROM app_defaults
     UNION SELECT grantor FROM app_defaults CROSS JOIN LATERAL aclexplode(defaclacl)
     UNION SELECT grantee FROM app_defaults CROSS JOIN LATERAL aclexplode(defaclacl)

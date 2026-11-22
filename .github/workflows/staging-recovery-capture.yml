@@ -1,5 +1,4 @@
 name: staging-recovery-capture
-
 on:
   workflow_dispatch:
     inputs:
@@ -9,11 +8,9 @@ on:
         type: string
 
 permissions: {}
-
 concurrency:
   group: staging-recovery-capture
   cancel-in-progress: false
-
 jobs:
   capture:
     if: github.ref == 'refs/heads/main'
