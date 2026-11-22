@@ -9,9 +9,6 @@ import re
 import subprocess
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from pr_standards import parse_sections
-
 SHA = re.compile(r"[0-9a-f]{40}")
 NUMBER = re.compile(r"[1-9][0-9]*")
 RUN_LINK = re.compile(r"\bgithub\.com/[^/\s]+/[^/\s]+/actions/runs/", re.I)
@@ -55,10 +52,13 @@ def publish(repo, event, head, run, attempt, workflow):
 
 
 def evidence_sections(policy, body):
-    body = CUBIC_FOOTER.sub("", body)
-    visible = "\n".join(policy.visible_lines(body))
-    attestation = f"\n{visible}\n".partition("\n## Attestation\n")[2]
-    return parse_sections(body).get("verification", ""), re.split(r"^#{1,2} ", attestation, 1, re.M)[0].strip()
+    visible = "\n".join(policy.visible_lines(CUBIC_FOOTER.sub("", body)))
+
+    def section(heading):
+        tail = f"\n{visible}\n".partition(f"\n## {heading}\n")[2]
+        return re.split(r"^#{1,2} ", tail, maxsplit=1, flags=re.M)[0].strip()
+
+    return section("Verification"), section("Attestation")
 
 
 def sources(base, head):
@@ -139,9 +139,8 @@ def validate(policy, body, files, read):
     verification, attestation = evidence_sections(policy, body)
     headings = [line for line in policy.visible_lines(body)
                 if re.fullmatch(r"##\s+verification\s*#*", line, re.I)]
-    if (headings != ["## Verification"] or not any(
-            policy.meaningful(line.strip("-* ")) for line in verification.splitlines()
-            if not line.lstrip().startswith(("```", "~~~")))):
+    if headings != ["## Verification"] or not any(
+            policy.meaningful(line.strip("-* ")) for line in verification.splitlines()):
         raise EvidenceError("Fill in the visible Verification section with commands and results.")
     if RUN_LINK.search(verification + "\n" + attestation):
         raise EvidenceError("Actions URLs in Verification or Attestation can go stale. Use the job summary.")

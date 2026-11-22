@@ -26,7 +26,7 @@ Full rules: CONTRIBUTING.md, "Pull request standards".
 
 ## Verification
 
-<!-- Commands and observed results. Use the CI evidence summary for Actions links. -->
+<!-- State commands and results outside code fences. Use the CI evidence summary for Actions links. -->
 
 -
 
