@@ -37,10 +37,6 @@ def exact_regex(name):
     return r"\A" + escaped + r"\z"
 
 
-def read_json(path):
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def measure(root, patch, output):
     added = rust_lines(added_lines(patch.read_text(encoding="utf-8", errors="surrogateescape")))
     if not added:
@@ -68,7 +64,7 @@ def measure(root, patch, output):
                          capture_output=True, timeout=32 * 60)
     if run.returncode not in (0, 2, 3):
         raise ValueError(f"cargo-mutants failed before a complete verdict (exit {run.returncode})")
-    report = read_json(output / "mutants.out/outcomes.json")
+    report = json.loads((output / "mutants.out/outcomes.json").read_bytes())
     baseline, *mutations = report["outcomes"]
     if baseline["scenario"] != "Baseline" or baseline["summary"] != "Success":
         raise ValueError("Rust baseline did not pass")

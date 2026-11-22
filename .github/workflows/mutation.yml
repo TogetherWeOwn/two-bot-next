@@ -44,6 +44,7 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           python3 .github/scripts/mutation_scope.py
+          printf '%s\n' '{"status":"infrastructure_error","reason":"Rust setup or fixture did not complete","results":[]}' > "$RUNNER_TEMP/rust-mutation.json"
       - name: Install pinned cargo-mutants
         if: steps.plan.outputs.fixture == 'true'
         run: |
@@ -64,6 +65,7 @@ jobs:
         env:
           CARGO_PROFILE_DEV_DEBUG: '0'
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          TWO_RSVP_RUNTIME_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
           TWO_DATABASE_TLS: local-only
         run: |
           createdb -h agent-testdb -U agent_test agent_test
@@ -103,7 +105,7 @@ jobs:
         with:
           python-version: '3.12.16'
       - name: Install the pinned Python suite dependency
-        if: steps.plan.outputs.python == 'true'
+        if: steps.plan.outputs.python_fixture == 'true'
         run: |
           printf '%s\n' 'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' > "$RUNNER_TEMP/mutation-requirements.txt"
           python3 -m pip --isolated install --only-binary=:all: --no-deps --require-hashes -r "$RUNNER_TEMP/mutation-requirements.txt"
