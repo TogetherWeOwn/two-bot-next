@@ -145,6 +145,11 @@ capabilities; this table is not an instruction to create or stage them.
 | `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | `voice.snapshot` stays gated off |
 
 The self-move executor is attached at bind only with the staging opt-in.
+Before enabling it, verify the
+[voice receipt migration](../crates/cutover/migrations/0481_internal_voice_move_audit.sql)
+is applied and the receiver can write terminal receipts. Use the existing
+exclusive finite staging window with verified serving and rollback identities,
+a dedicated account and channels, and cleanup within the same window.
 Attaching it applies the five-second nonce deadline to all signed verbs. The
 guild turn ends at adapter settlement. The child holds receiver capacity through
 the terminal audit, with up to five seconds beyond the wire deadline to confirm
@@ -455,6 +460,9 @@ fence and returns HTTP 502 `discord_unavailable`. A lost reply can leave the
 move unconfirmed. A fresh, bounded attempt for the same intent uses a new nonce
 and can return `already_in_room` once newer gateway evidence clears the member's
 hold. A preserved hold can still return `discord_unavailable`.
+An arrival observed before local PATCH settlement can count as both a cached
+occupant and a reserved seat. A move can return `room_full` until a newer
+transition for the same member reconciles the reservation.
 
 Snapshot event links use accepted, non-member `event_instance_windows`
 evidence (migration 0472), not channel-claim dates or the continued existence

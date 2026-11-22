@@ -1034,8 +1034,9 @@ impl ReceiverState {
         self
     }
 
-    fn configure_voice_move(&mut self, flags: &InternalFlags, executor: ActionExecutor) {
+    fn with_voice_move(mut self, flags: &InternalFlags, executor: ActionExecutor) -> Self {
         self.voice_move = flags.is_enabled("voice.move_member").then_some(executor);
+        self
     }
 
     fn action_metrics(&self) -> &metrics::Metrics {
@@ -1309,23 +1310,24 @@ pub async fn bind(
         std::io::Error::other("internal-action channel executor configuration invalid")
     })?;
     let listener = TcpListener::bind(config.listen_addr()).await?;
-    let mut state = ReceiverState::new(
-        config,
-        pool.clone(),
-        Arc::new(executor),
-        Arc::new(member),
-        Arc::new(EventReadExecutor::new(events.clone(), pool.clone())),
-        Arc::new(EventMutationExecutor::new(events.clone(), pool)),
-        Arc::new(moderation),
-        Arc::new(channel),
-    )
-    .with_voice_cache(voice_cache)
-    .with_voice_clock(voice_clock)
-    .with_gateway_state(gateway_state);
-    state.configure_voice_move(&InternalFlags::from_env(), events);
     Ok(BoundReceiver {
         listener,
-        state: Arc::new(state),
+        state: Arc::new(
+            ReceiverState::new(
+                config,
+                pool.clone(),
+                Arc::new(executor),
+                Arc::new(member),
+                Arc::new(EventReadExecutor::new(events.clone(), pool.clone())),
+                Arc::new(EventMutationExecutor::new(events.clone(), pool)),
+                Arc::new(moderation),
+                Arc::new(channel),
+            )
+            .with_voice_cache(voice_cache)
+            .with_voice_clock(voice_clock)
+            .with_gateway_state(gateway_state)
+            .with_voice_move(&InternalFlags::from_env(), events),
+        ),
     })
 }
 

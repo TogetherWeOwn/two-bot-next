@@ -735,14 +735,12 @@ async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_mem
             ("TWO_DEPLOY_ENV".to_owned(), deploy_env.to_owned()),
             ("TWO_INTERNAL_ALLOW_VOICE_MOVE".to_owned(), "1".to_owned()),
         ]));
-        let mut receiver = state(
+        let receiver = Arc::into_inner(state(
             db.pool().clone(),
             Arc::new(MockEffect::new(MockOutcome::Success)),
-        );
-        Arc::get_mut(&mut receiver)
-            .unwrap()
-            .configure_voice_move(&flags, executor.clone());
-        receiver
+        ))
+        .unwrap();
+        Arc::new(receiver.with_voice_move(&flags, executor.clone()))
     };
     let payload =
         json!({"action":"voice.move_member","discord_id":MEMBER,"channel_id":TARGET}).to_string();
@@ -836,6 +834,20 @@ async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_mem
     assert_eq!(body["error"]["retryable"], true);
     mock.assert_wires(23);
     mock.assert_patch_indices(&[15, 22]);
+    let audited: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM internal_action_log WHERE request_id = $1)",
+    )
+    .bind(body["request_id"].as_str().unwrap())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(!audited);
+    assert!(clock
+        .move_holds
+        .lock()
+        .unwrap()
+        .occupancy(MEMBER.parse().unwrap(), TARGET.parse().unwrap(), 0)
+        .is_err());
     db.close().await.unwrap();
 }
 
@@ -906,16 +918,27 @@ async fn signed_voice_move(uncertain: bool, with_retry_after: bool) {
         assert_eq!(body["error"]["code"], "upstream_timeout");
         assert_eq!(receiver.children.lock().await.len(), expected_children);
         mock.assert_wires(expected_children);
+        if expected_children == 1 && !with_retry_after {
+            let mut children = receiver.children.lock().await;
+            tokio::time::timeout(Duration::from_secs(6), children.join_next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(receiver.capacity.available_permits(), MAX_REQUESTS);
+        }
         blocked.rollback().await.unwrap();
     }
-    receiver
-        .children
-        .lock()
-        .await
-        .join_next()
-        .await
-        .unwrap()
-        .unwrap();
+    if with_retry_after {
+        receiver
+            .children
+            .lock()
+            .await
+            .join_next()
+            .await
+            .unwrap()
+            .unwrap();
+    }
     let metrics = |outcome, count| {
         assert!(receiver.action_metrics().render(None).contains(&format!(
             "two_bot_internal_actions_total{{family=\"voice\",outcome=\"{outcome}\"}} {count}\n"
