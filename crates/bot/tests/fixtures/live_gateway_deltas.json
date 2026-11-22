@@ -1,0 +1,23 @@
+[
+  {
+    "v": 1,
+    "guild_id": "10",
+    "seq": 41,
+    "occurred_at": "1970-01-01T00:00:00Z",
+    "ops": [{"topic": "voice", "op": "upsert", "id": "31", "value": {"userId": "31", "channelId": "20"}}]
+  },
+  {
+    "v": 1,
+    "guild_id": "10",
+    "seq": 42,
+    "occurred_at": "1970-01-01T00:00:00Z",
+    "ops": [{"topic": "voice", "op": "upsert", "id": "31", "value": {"userId": "31", "channelId": "21"}}]
+  },
+  {
+    "v": 1,
+    "guild_id": "10",
+    "seq": 43,
+    "occurred_at": "1970-01-01T00:00:00Z",
+    "ops": [{"topic": "voice", "op": "remove", "id": "31"}]
+  }
+]

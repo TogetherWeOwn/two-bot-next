@@ -1,0 +1,18 @@
+{
+  "op": 0,
+  "t": "GUILD_CREATE",
+  "d": {
+    "id": "10",
+    "owner_id": "31",
+    "afk_channel_id": null,
+    "member_count": 1,
+    "channels": [
+      {"id": "20", "name": "Voice", "type": 2, "permission_overwrites": []},
+      {"id": "21", "name": "Stage", "type": 13, "permission_overwrites": []},
+      {"id": "22", "name": "Text", "type": 0, "permission_overwrites": []}
+    ],
+    "roles": [{"id": "10", "permissions": "0"}],
+    "voice_states": [],
+    "guild_scheduled_events": []
+  }
+}

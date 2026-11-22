@@ -1576,8 +1576,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
             CHECKPOINT_IO_MAX,
             crate::gateway_metrics::Observer::default(),
             None::<tokio::sync::oneshot::Receiver<()>>,
+            two_bot::live_gateway::LiveGateway::default(),
         ),
-        move |(mut shard, mut received, mut deadline, mut observer, mut bootstrap)| {
+        move |(mut shard, mut received, mut deadline, mut observer, mut bootstrap, mut live)| {
             let state = Arc::clone(&receive_state);
             let generation = Arc::clone(&receive_generation);
             let generation_wake = Arc::clone(&receive_generation_wake);
@@ -1601,6 +1602,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         if committed.await.is_err() {
                             return Ok(None);
                         }
+                        live.disconnect();
                         transport_disconnected(&state, &generation, &generation_wake).await;
                         voice_disconnected(voice.as_ref());
                         // Twilight consumes the boot session from config on
@@ -1620,6 +1622,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         let message = match item {
                             Ok(message) => message,
                             Err(error) if matches!(error.kind(), twilight_gateway::error::ReceiveMessageErrorType::Reconnect) => {
+                                live.disconnect();
                                 transport_disconnected(&state, &generation, &generation_wake).await;
                                 voice_disconnected(voice.as_ref());
                                 // Twilight already backed off the failed connect.
@@ -1640,6 +1643,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         };
                         observer.observe(&message, &shard);
                         let Message::Text(text) = message else {
+                            live.disconnect();
                             crate::logging::shard_closed(&message);
                             transport_disconnected(&state, &generation, &generation_wake).await;
                             voice_disconnected(voice.as_ref());
@@ -1651,6 +1655,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         };
                         let observed_at = two_bot_core::now_iso();
                         let header: Header = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway header".into()))?;
+                        if matches!(header.op, 7 | 9) { live.disconnect(); }
                         if header.op == 10 {
                             let hello: HelloPacket = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway hello".into()))?;
                             if hello.d.heartbeat_interval == 0 { return Err(sqlx::Error::InvalidArgument("zero heartbeat interval".into())); }
@@ -1699,6 +1704,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         if missed > 0 {
                             two_bot_core::metrics::global().gateway_missed_events(missed);
                         }
+                        if missed > 0 || received.as_ref().is_none_or(|prev| prev.session_id != checkpoint.session_id) {
+                            live.disconnect();
+                        }
                         // A duplicate key in a MESSAGE_UPDATE refuses the
                         // automod edit below; selection is by decoded `t` so
                         // escaped spellings still match. The same bytes must
@@ -1727,6 +1735,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         } else {
                             None
                         };
+                        let live_raw = live.enabled().then(|| text.clone());
                         let parsed = if duplicate_refused {
                             None
                         } else {
@@ -1736,6 +1745,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                 Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
                             }
                         };
+                        if let Some(raw) = live_raw {
+                            let at = two_bot_core::realtime_wire::WireTime(time::OffsetDateTime::now_utc());
+                            live.receive(&raw, at, |request| shard.sender().command(request).is_ok());
+                        }
                         received = Some(checkpoint.clone());
                         let mut dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at, received: received_at, completion: None }));
                         // Detached command ingress must not wait behind the
@@ -1878,14 +1891,17 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     }
                     Ok(None)
                 }.await;
+                if work.is_err() {
+                    live.disconnect();
+                }
                 match work {
                     Ok(Some(work)) => {
-                        Some((work, (shard, received, deadline, observer, bootstrap)))
+                        Some((work, (shard, received, deadline, observer, bootstrap, live)))
                     }
                     Ok(None) => None,
                     Err(error) => Some((
                         ReceivedWork::Failed(error),
-                        (shard, received, deadline, observer, bootstrap),
+                        (shard, received, deadline, observer, bootstrap, live),
                     )),
                 }
             }
