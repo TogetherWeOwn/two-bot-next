@@ -751,7 +751,7 @@ class JobSelectorTests(TimeoutPolicyAssertions, unittest.TestCase):
 
         def recording(command, **kwargs):
             seen.append((command, kwargs))
-            return _ok_text(stdout="docs/a.md\n")
+            return _ok_text(stdout="docs/a.md\0")
 
         with mock.patch.object(job.subprocess, "run", side_effect=recording):
             job.git_diff_names("a", "b", root=Path("/tmp"), diff_filter="ACMRTUXB")
@@ -759,11 +759,11 @@ class JobSelectorTests(TimeoutPolicyAssertions, unittest.TestCase):
             job.git_diff_names("a", "b", root=Path("/tmp"))
         self.assertEqual(
             [command for command, _ in seen],
-            [["git", "-C", "/tmp", "diff", "--name-only", "--no-renames",
+            [["git", "-C", "/tmp", "diff", "--name-only", "--no-renames", "-z",
               "--diff-filter=ACMRTUXB", "a..b"],
-             ["git", "-C", "/tmp", "diff", "--name-only", "--no-renames",
+             ["git", "-C", "/tmp", "diff", "--name-only", "--no-renames", "-z",
               "--diff-filter=D", "a..b"],
-             ["git", "-C", "/tmp", "diff", "--name-only", "--no-renames", "a..b"]],
+             ["git", "-C", "/tmp", "diff", "--name-only", "--no-renames", "-z", "a..b"]],
             "diff argv variants must be preserved exactly",
         )
         for _, kwargs in seen:
@@ -771,12 +771,18 @@ class JobSelectorTests(TimeoutPolicyAssertions, unittest.TestCase):
             self.assertTrue(kwargs.get("text"), "must stay in text mode")
             self.assertTrue(kwargs.get("check"), "must keep check=True")
 
+    def test_db_selector_keeps_non_ascii_and_newlines_in_paths(self):
+        path = "crates/cutover/migrations/0480_é\n.sql"
+        with mock.patch.object(job.subprocess, "run", return_value=_ok_text(stdout=f"{path}\0")):
+            self.assertEqual(job.git_diff_names("a", "b"), [path])
+            self.assertTrue(job.db_compat_selected(job.git_diff_names("a", "b")))
+
     def test_both_main_calls_are_bounded_with_one_policy_value(self):
         calls = []
 
         def recording(command, **kwargs):
             calls.append(kwargs)
-            return _ok_text(stdout="docs/a.md\n")
+            return _ok_text(stdout="docs/a.md\0")
 
         out = io.StringIO()
         with mock.patch.object(job.subprocess, "run", side_effect=recording), \
@@ -844,7 +850,7 @@ class JobSelectorTests(TimeoutPolicyAssertions, unittest.TestCase):
 
     def test_second_diff_failure_selects_full_jobs(self):
         out, err = io.StringIO(), io.StringIO()
-        effects = [_ok_text(stdout="docs/a.md\n"),
+        effects = [_ok_text(stdout="docs/a.md\0"),
                    subprocess.TimeoutExpired("git", 30)]
         with mock.patch.object(job.subprocess, "run", side_effect=effects), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -860,7 +866,7 @@ class JobSelectorTests(TimeoutPolicyAssertions, unittest.TestCase):
                           "must emit no selection line (second diff)")
 
     def test_valid_docs_diff_output_unchanged(self):
-        code, out, _ = self._run_main([_ok_text(stdout="docs/runbook.md\n"),
+        code, out, _ = self._run_main([_ok_text(stdout="docs/runbook.md\0"),
                                        _ok_text(stdout="")])
         self.assertEqual(code, 0)
         # Proven classification: an ordinary docs page selects the worker job
@@ -872,7 +878,7 @@ class JobSelectorTests(TimeoutPolicyAssertions, unittest.TestCase):
 
     def test_valid_rust_diff_output_unchanged(self):
         code, out, _ = self._run_main(
-            [_ok_text(stdout="crates/core/src/lib.rs\n"), _ok_text(stdout="")])
+            [_ok_text(stdout="crates/core/src/lib.rs\0"), _ok_text(stdout="")])
         self.assertEqual(code, 0)
         self.assertIn("rust=true", out)
         self.assertIn("worker=true", out)

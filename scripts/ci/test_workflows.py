@@ -56,7 +56,7 @@ JOB_INVENTORY = {
                   "fuzz-compile",
                   # Promoted nextest lane (shared reusable), gated by ci-ok
                   # like the Rust lanes.
-                  "nextest"},
+                  "nextest", "db-compatibility"},
     STAGING_SOAK: {"begin", "voice", "finish"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
                               "promotion-skipped", "production"},

@@ -15,14 +15,22 @@ printf 'PR head %s, event base %s, merge base %s\n' "$PR_HEAD_SHA" "$PR_BASE_SHA
 [[ $(git -C "$prior_tree" rev-parse HEAD) == "$prior_sha" ]]
 
 build() {
-  local tree=$1 label=$2 example=crates/cutover/examples/db_compatibility.rs
+  local tree=$1 label=$2 fixtures=$1/scripts/ci/fixtures name example
+  # The first PR bootstraps bases that predate this lane. Later bases must
+  # supply their own adapters so a head API change can update its own copy.
+  if [[ $label == prior && ! -e $tree/scripts/ci/db_compatibility.sh ]]; then
+    fixtures=$head_tree/scripts/ci/fixtures
+  fi
   (
     cd "$tree"
-    [[ ! -e $example && ! -L $example ]]
-    mkdir -p "$(dirname "$example")"
-    cp "$head_tree/scripts/ci/fixtures/db_compatibility.rs" "$example"
+    mkdir -p crates/cutover/examples
+    for name in db_compatibility_schema db_compatibility_smoke; do
+      example=crates/cutover/examples/$name.rs
+      [[ -s $fixtures/$name.rs && ! -e $example && ! -L $example ]]
+      cp "$fixtures/$name.rs" "$example"
+    done
     export CARGO_TARGET_DIR="$scratch/build-$label"
-    cargo build --locked -p two-bot-cutover --example db_compatibility
+    cargo build --locked -p two-bot-cutover --example db_compatibility_schema --example db_compatibility_smoke
     if [[ $label == prior ]]; then cargo build --locked -p two-bot --bin two-bot; fi
     git diff --exit-code HEAD
   )
@@ -39,8 +47,8 @@ url() { printf 'postgres://%s:@agent-testdb:5432/%s' "$1" "$2"; }
 sql() {
   local login=$1 database=$2
   shift 2
-  env -i PATH="$PATH" PGCONNECT_TIMEOUT=5 PGPASSFILE=/dev/null PGSSLMODE=disable \
-    psql "$(url "$login" "$database")" -XqnwAt -v ON_ERROR_STOP=1 "$@"
+  env -i PATH="$PATH" psql "$(url "$login" "$database")?connect_timeout=5&passfile=/dev/null&sslmode=disable" \
+    -XqnwAt -v ON_ERROR_STOP=1 "$@"
 }
 admin() { sql agent_test "$@"; }
 with_db() {
@@ -67,7 +75,7 @@ CREATE DATABASE two_bot_test_compat_source;
 GRANT CONNECT, CREATE ON DATABASE two_bot_test_compat_source TO two_bot_migrator;
 SQL
 admin "$source_db" -c 'ALTER SCHEMA public OWNER TO two_bot_migrator'
-with_db TWO_DATABASE_URL compat_migrate "$source_db" "$prior/examples/db_compatibility" source
+with_db TWO_DATABASE_URL compat_migrate "$source_db" "$prior/examples/db_compatibility_schema" source
 "$prior/two-bot" db roles plan | admin "$source_db"
 with_db TWO_DATABASE_URL compat_audit "$source_db" "$prior/two-bot" db roles verify
 
@@ -75,8 +83,8 @@ with_db TWO_DATABASE_URL compat_audit "$source_db" "$prior/two-bot" db roles ver
 # real ledgers and grants, and no destination moderation history.
 admin postgres -c "CREATE DATABASE $target_db TEMPLATE $source_db"
 admin postgres -c "GRANT CONNECT, CREATE ON DATABASE $target_db TO two_bot_migrator"
-with_db TWO_DATABASE_URL compat_migrate "$target_db" "$head/examples/db_compatibility" target
-env -i PATH="$PATH" GITHUB_ACTIONS=true "$head/examples/db_compatibility" plan | admin "$target_db"
+with_db TWO_DATABASE_URL compat_migrate "$target_db" "$head/examples/db_compatibility_schema" target
+env -i PATH="$PATH" GITHUB_ACTIONS=true "$head/examples/db_compatibility_schema" plan | admin "$target_db"
 [[ $(sql compat_audit "$target_db" -c 'SELECT current_user') == two_bot_migrator_ro ]]
 [[ $(sql compat_web "$target_db" -c 'SELECT current_user') == two_web_reader ]]
 
@@ -192,7 +200,7 @@ round_trip() {
   [[ $(tail -n 1 "$scratch/restore-$label") == 'RESTORE VERIFIED' ]]
   [[ $(sql compat_runtime "$target_db" -c "SELECT count(*) FROM events WHERE idempotency_key = 'compat-event'") == 1 ]]
   [[ $(sql compat_web "$target_db" -c 'SELECT count(*) FROM web_v1.contract_meta') == 1 ]]
-  with_db TWO_DATABASE_URL compat_runtime "$target_db" "$prior/examples/db_compatibility" smoke |
+  with_db TWO_DATABASE_URL compat_runtime "$target_db" "$prior/examples/db_compatibility_smoke" |
     tee "$scratch/smoke-$label"
   [[ $(tail -n 1 "$scratch/smoke-$label") == 'PRIOR DB SMOKE VERIFIED' ]]
 }
@@ -218,7 +226,9 @@ if verify_prior >"$scratch/revoked.log" 2>&1; then
   exit 1
 fi
 cat "$scratch/revoked.log"
-grep -Fx 'drift: missing table privilege: two_bot_runtime/public.scheduled_messages/UPDATE' "$scratch/revoked.log"
+# The strict CLI prefixes findings with "drift: ". Require the separate
+# result from the expanded verifier so an inspection error cannot pass.
+grep -Fx 'missing table privilege: two_bot_runtime/public.scheduled_messages/UPDATE' "$scratch/revoked.log"
 {
   printf '### Database rollback compatibility\n\n'
   printf 'Candidate %s upgraded from merge base %s (event base %s).\n\n' "$PR_HEAD_SHA" "$prior_sha" "$PR_BASE_SHA"

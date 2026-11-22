@@ -405,11 +405,15 @@ def db_compat_selected(paths):
     """Select schema inputs and changes to the compatibility proof itself."""
     for path in paths:
         parts = Path(path).parts
-        if (path.startswith(("sql/", "scripts/ci/db_compatibility"))
+        if (path.startswith(("sql/", "scripts/ci/db_compatibility", "scripts/ci/fixtures/db_compatibility_"))
                 or {"migrations", "sql"}.intersection(parts[:-1])
                 or path in {"migrations.lock", ".github/workflows/check.yml",
-                            "scripts/ci/fixtures/db_compatibility.rs",
                             "scripts/job-inputs.py", "crates/core/src/database_roles.rs",
+                            "crates/core/src/database_tls.rs", "crates/core/src/database_url.rs",
+                            "crates/core/src/scheduled_store.rs", "crates/core/src/website_store.rs",
+                            "crates/cutover/src/raid_tools.rs",
+                            "crates/cutover/src/db.rs", "crates/cutover/src/staging_migrate.rs",
+                            "crates/store/src/migrations.rs", "crates/store/src/pool.rs",
                             "crates/bot/src/database_roles_cli.rs", "crates/store/src/web.rs"}):
             return True
     return False
