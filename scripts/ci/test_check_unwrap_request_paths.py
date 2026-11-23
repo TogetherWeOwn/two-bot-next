@@ -306,16 +306,14 @@ class DiffTests(unittest.TestCase):
 
 
 class GateTests(unittest.TestCase):
-    def run_gate(self, scan, base, head):
+    def run_gate(self, scan, base, head, root=Path(".")):
         tmp, binary = fake_ast_grep(json.dumps(scan))
-        real_root, gate.ROOT = gate.ROOT, Path(".")
         out = io.StringIO()
         try:
-            with redirect_stdout(out):
+            with patch.object(gate, "ROOT", root), redirect_stdout(out):
                 code = gate.main(["--base-ref", base, "--head-ref", head,
                                   "--ast-grep", binary])
         finally:
-            gate.ROOT = real_root
             tmp.cleanup()
         return code, out.getvalue()
 
@@ -404,6 +402,40 @@ class GateTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("::error::", out.getvalue())
         self.assertIn("gateway_commands.rs:2", out.getvalue())
+
+    def test_schema_ratchet_grandfathers_old_ddl_and_rejects_new_ddl(self):
+        tmp, root = make_repo()
+        self.addCleanup(tmp.cleanup)
+        path = "crates/example/tests/schema.rs"
+        legacy = 'let sql = r#"CREATE SCHEMA old;'
+        base = commit(root, {path: f'{legacy}\nSELECT 1;\n"#;\n'})
+        allowed = commit(root, {
+            path: f'{legacy}\nSELECT 2;\n"#;\n'
+                  'let schema = two_bot_testsupport::create_test_schema(&pool).await?;\n'
+        })
+        head = commit(root, {
+            path: f'{legacy}\nSELECT 2;\n-- setup\nCREATE\n/* trivia */\nSCHEMA new;\n"#;\n'
+                  'let schema = two_bot_testsupport::create_test_schema(&pool).await?;\n'
+        })
+        for ref, literal, end_line, expected in [
+            (allowed, 'r#"CREATE SCHEMA old;\nSELECT 2;\n"#', 2, 0),
+            (head, 'r#"CREATE SCHEMA old;\nSELECT 2;\n-- setup\nCREATE\n/* trivia */\nSCHEMA new;\n"#', 6, 1),
+        ]:
+            with self.subTest(expected=expected):
+                code, output = self.run_gate([{
+                    "ruleId": "rust-test-schema-allocation",
+                    "file": path,
+                    "text": literal,
+                    "range": {"start": {"line": 0}, "end": {"line": end_line}},
+                }], base, ref, root)
+                self.assertEqual(code, expected, output)
+                self.assertNotIn(f"{path}:1 adds", output)
+                self.assertNotIn(f"{path}:2 adds", output)
+                self.assertNotIn(f"{path}:3 adds", output)
+                self.assertNotIn(f"{path}:5 adds", output)
+                if expected:
+                    self.assertIn(f"{path}:4 adds CREATE SCHEMA", output)
+                    self.assertIn(f"{path}:6 adds CREATE SCHEMA", output)
 
     def test_fresh_unwrap_inside_macro_fails(self):
         tmp, root = make_repo()
