@@ -1052,6 +1052,7 @@ async fn first_close_time_tag_respects_persisted_recovery_floor() {
         .unwrap();
     assert!(!allows(instance, before_floor).await);
     assert!(allows(instance, floor).await);
+    assert!(allows(instance, floor + Duration::seconds(1)).await);
     assert!(!allows(instance + Duration::seconds(1), floor).await);
 
     upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:03:00.000Z", &event)
