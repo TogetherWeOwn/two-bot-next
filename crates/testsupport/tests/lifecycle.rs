@@ -1,5 +1,5 @@
 use std::time::Duration;
-use two_bot_testsupport::TestDatabase;
+use two_bot_testsupport::{create_test_schema, TestDatabase};
 
 async fn assert_statement_timeout(pool: &sqlx::PgPool) {
     let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
@@ -30,6 +30,38 @@ async fn process_database_count(pool: &sqlx::PgPool, prefix: &str) -> i64 {
         .unwrap()
 }
 
+async fn concurrently_allocated_schemas_are_isolated(db: &TestDatabase) {
+    let mut connection = db.pool().acquire().await.unwrap();
+    let (a, b) = tokio::join!(
+        create_test_schema(db.pool()),
+        create_test_schema(&mut *connection),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_ne!(a, b);
+
+    let mut pools = Vec::new();
+    for (schema, marker) in [(&a, 1), (&b, 2)] {
+        let pool = db.pool_with_search_path(schema).await.unwrap();
+        sqlx::query("CREATE TABLE fixture_probe (marker integer NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO fixture_probe VALUES ($1)")
+            .bind(marker)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pools.push(pool);
+    }
+    for (pool, marker) in pools.iter().zip([1, 2]) {
+        let actual: Vec<i32> = sqlx::query_scalar("SELECT marker FROM fixture_probe")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        assert_eq!(actual, [marker]);
+    }
+}
+
 #[tokio::test]
 async fn databases_are_migrated_isolated_and_removed_even_after_setup_failure() {
     let url = match std::env::var("TWO_TEST_DATABASE_URL") {
@@ -45,6 +77,7 @@ async fn databases_are_migrated_isolated_and_removed_even_after_setup_failure() 
     let a = a.unwrap();
     let b = b.unwrap();
     assert_ne!(a.name(), b.name());
+    concurrently_allocated_schemas_are_isolated(&a).await;
     let (migration_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM _sqlx_migrations")
         .fetch_one(a.pool())
         .await

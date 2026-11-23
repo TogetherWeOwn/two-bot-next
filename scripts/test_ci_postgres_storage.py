@@ -88,7 +88,7 @@ class PostgresStorageTests(unittest.TestCase):
         # with only the exact integration/coverage collector added. Compare
         # complete services so a storage/durability change still fails.
         self.assertEqual(WORKFLOW_TEXT.count("--tmpfs /var/lib/postgresql:"), 4)
-        self.assertEqual(WORKFLOW_TEXT.count("image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722"), 4)
+        self.assertEqual(WORKFLOW_TEXT.count("image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722"), 5)
         bounded = [service for service in SERVICES if "--tmpfs" in service]
         self.assertEqual(len(bounded), 4)
         collector = (

@@ -1,20 +1,45 @@
 use super::*;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
+use twilight_model::id::marker::ScheduledEventMarker;
 
 const GUILD: GuildId = Id::new(10);
 const AT: WireTime = WireTime(time::OffsetDateTime::UNIX_EPOCH);
 const READY: &str = r#"{"op":0,"t":"READY","d":{}}"#;
 const CREATE: &str = include_str!("../../tests/fixtures/live_gateway_guild_create.json");
 const VOICE: &str = include_str!("../../tests/fixtures/live_gateway_voice_state_update.json");
+const TOPOLOGY: &[u8] = include_bytes!("../../tests/fixtures/live_gateway_topology.json");
+
+fn event_row(id: u64) -> Value {
+    let mut row: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/live_gateway_scheduled_event.json"
+    ))
+    .expect("scheduled event fixture");
+    row["id"] = json!(id.to_string());
+    row
+}
+
+fn event(live: &mut LiveGateway, kind: &str, row: Value) {
+    let frame = json!({"op": 0, "s": 1, "t": kind, "d": row}).to_string();
+    assert!(
+        twilight_gateway::parse(frame.clone(), twilight_gateway::EventTypeFlags::all())
+            .is_ok_and(|parsed| parsed.is_some()),
+        "{kind} fixture must pass the shard parser"
+    );
+    receive(live, &frame);
+}
 
 fn receive(live: &mut LiveGateway, raw: &str) {
     live.receive(raw, AT, |_| panic!("unexpected member request"));
 }
 
 fn begin(live: &mut LiveGateway) -> String {
+    begin_with(live, CREATE)
+}
+
+fn begin_with(live: &mut LiveGateway, create: &str) -> String {
     let mut nonce = None;
-    live.receive(CREATE, AT, |request| {
+    live.receive(create, AT, |request| {
         assert_eq!(request.d.guild_id, GUILD);
         nonce.clone_from(&request.d.nonce);
         true
@@ -38,9 +63,140 @@ fn default_dispatches_and_cold_resume_make_no_requests() {
     for frame in [READY, CREATE, VOICE, "invalid"] {
         receive(&mut disabled, frame);
     }
+    event(&mut disabled, "GUILD_SCHEDULED_EVENT_CREATE", event_row(90));
+    assert!(!disabled.enabled());
     let (mut live, _) = LiveGateway::for_guild(GUILD, 0);
     receive(&mut live, r#"{"op":0,"t":"RESUMED","d":{}}"#);
     receive(&mut live, CREATE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn scheduled_events_share_voice_order_and_emit_only_allowlisted_fields() {
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, 40);
+    receive(&mut live, READY);
+    event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(90));
+    let nonce = begin(&mut live);
+    event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(90));
+    complete(&mut live, &nonce);
+    let baseline = live
+        .0
+        .as_ref()
+        .and_then(|intake| intake.active.as_ref())
+        .expect("completed baseline");
+    assert_eq!(baseline.events.len(), 1);
+    let joined_event = wire::Id(Id::<ScheduledEventMarker>::new(90).into_nonzero());
+    assert!(baseline.events.contains_key(&joined_event));
+
+    let mut foreign = event_row(92);
+    foreign["guild_id"] = json!("11");
+    event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", foreign);
+    event(
+        &mut live,
+        "GUILD_SCHEDULED_EVENT_USER_ADD",
+        json!({"guild_id": "10", "user_id": "31", "guild_scheduled_event_id": "91"}),
+    );
+    event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(91));
+    receive(&mut live, VOICE);
+    let mut active = event_row(91);
+    active["status"] = json!(2);
+    active["channel_id"] = json!("21");
+    active["entity_type"] = json!(1);
+    event(&mut live, "GUILD_SCHEDULED_EVENT_UPDATE", active.clone());
+    active["status"] = json!(3);
+    event(&mut live, "GUILD_SCHEDULED_EVENT_UPDATE", active);
+    event(&mut live, "GUILD_SCHEDULED_EVENT_DELETE", event_row(90));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let worker = receiver.run(async move |body| {
+        tx.send(decoded(body)).expect("fixture receiver");
+        Delivery::Accepted
+    });
+    tokio::join!(worker, async {
+        let mut value = json!({
+            "id": "91", "channelId": "20", "status": "scheduled", "title": "Fixture event",
+            "description": null, "location": null, "startsAt": "2026-11-21T13:00:00Z", "endsAt": null
+        });
+        let created = json!({"topic": "events", "op": "upsert", "id": "91", "value": value});
+        value["channelId"] = json!("21");
+        value["status"] = json!("active");
+        let updated = json!({"topic": "events", "op": "upsert", "id": "91", "value": value});
+        let expected = [
+            created,
+            json!({"topic": "voice", "op": "upsert", "id": "31",
+                   "value": {"userId": "31", "channelId": "20"}}),
+            updated,
+            json!({"topic": "events", "op": "remove", "id": "91"}),
+            json!({"topic": "events", "op": "remove", "id": "90"}),
+        ];
+        for (seq, op) in (41..).zip(expected) {
+            let delta = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("timely delta")
+                .expect("queued delta");
+            assert_eq!(
+                delta,
+                json!({"v": 1, "guild_id": "10", "seq": seq,
+                       "occurred_at": "1970-01-01T00:00:00Z", "ops": [op]})
+            );
+        }
+        assert!(rx.try_recv().is_err());
+        drop(live);
+    });
+}
+
+#[test]
+fn scheduled_event_limit_counts_baseline_rows_and_releases_removed_rows() {
+    let (mut live, _receiver) = LiveGateway::for_guild(GUILD, 0);
+    receive(&mut live, READY);
+    let mut create = decoded(CREATE.as_bytes());
+    let mut events = (1000..1100).map(event_row).collect::<Vec<_>>();
+    events[0]["channel_id"] = json!("21");
+    events[0]["entity_type"] = json!(1);
+    create["d"]["guild_scheduled_events"] = json!(events);
+    let nonce = begin_with(&mut live, &create.to_string());
+    complete(&mut live, &nonce);
+
+    event(&mut live, "GUILD_SCHEDULED_EVENT_UPDATE", event_row(1001));
+    event(
+        &mut live,
+        "CHANNEL_DELETE",
+        json!({"guild_id":"10","id":"21","type":13}),
+    );
+    event(&mut live, "GUILD_SCHEDULED_EVENT_DELETE", event_row(1001));
+    event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(1100));
+    event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(1101));
+    assert!(live.0.as_ref().expect("intake").active.is_some());
+    event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(1102));
+    receive(&mut live, VOICE);
+    let intake = live.0.as_ref().expect("intake");
+    assert!(intake.active.is_none());
+    assert_eq!(intake.seq, 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn topology_and_roster_share_receive_order_with_voice_and_events() {
+    let fixture = decoded(TOPOLOGY);
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, 40);
+    receive(&mut live, READY);
+    let nonce = begin(&mut live);
+    complete(&mut live, &nonce);
+    let mut disabled = LiveGateway::default();
+    for row in fixture["dispatches"].as_array().expect("dispatches") {
+        let kind = row[0].as_str().expect("dispatch type");
+        event(&mut disabled, kind, row[1].clone());
+        event(&mut live, kind, row[1].clone());
+    }
+    assert!(!disabled.enabled());
+
+    let mut deltas = Vec::new();
+    let worker = receiver.run(async |body| {
+        deltas.push(decoded(body));
+        Delivery::Accepted
+    });
+    assert!(tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .is_err());
+    assert_eq!(&deltas, fixture["deltas"].as_array().expect("deltas"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -88,19 +244,45 @@ async fn voice_only_is_encoded_once_in_receive_order_and_retried_unchanged() {
 #[tokio::test(start_paused = true)]
 async fn rejected_or_superseded_baselines_cannot_send() {
     let (mut live, receiver) = LiveGateway::for_guild(GUILD, 0);
-    for invalid in [
+    let scheduled_event = |field: &str, value: Value| {
+        let mut row = event_row(91);
+        row[field] = value;
+        json!({"op": 0, "t": "GUILD_SCHEDULED_EVENT_UPDATE", "d": row}).to_string()
+    };
+    let invalidations = [
         VOICE.replace(r#""20""#, r#""22""#),
         VOICE.replace(r#""31""#, r#""99""#),
         VOICE.replace(r#""guild_id":"10""#, r#""guild_id":"10","guild_id":"11""#),
         r#"{"op":0,"t":"GUILD_MEMBER_REMOVE","d":{"guild_id":"10","user":{"id":"31"}}}"#.into(),
-    ] {
+        scheduled_event("channel_id", json!("22")),
+        scheduled_event("channel_id", json!("99")),
+        scheduled_event("privacy_level", json!(99)),
+        scheduled_event("entity_metadata", json!(["forbidden shape"])),
+        r#"{"op":0,"t":"GUILD_SCHEDULED_EVENT_DELETE","d":{"guild_id":"10","id":"91","id":"90"}}"#
+            .into(),
+    ];
+    let fixture = decoded(TOPOLOGY);
+    let extra = fixture["invalid"].as_array().expect("invalid dispatches");
+    let current_seq = invalidations.len() + extra.len() + 2;
+    let invalidations = invalidations
+        .into_iter()
+        .chain(extra.iter().map(Value::to_string));
+    for invalid in invalidations {
         receive(&mut live, READY);
-        let nonce = begin(&mut live);
+        let nonce = begin_with(&mut live, &fixture["rejection_baseline"].to_string());
         complete(&mut live, &nonce);
         receive(&mut live, VOICE);
         receive(&mut live, &invalid);
+        assert!(live.0.as_ref().expect("intake").active.is_none());
         receive(&mut live, VOICE);
     }
+    let stale = begin(&mut live);
+    complete(&mut live, &stale);
+    receive(&mut live, VOICE);
+    let member = fixture["missing_screening"].clone();
+    event(&mut live, "GUILD_MEMBER_ADD", member);
+    assert!(live.0.as_ref().expect("intake").active.is_none());
+    receive(&mut live, VOICE);
     let stale = begin(&mut live);
     let current = begin(&mut live);
     complete(&mut live, &stale);
@@ -117,7 +299,7 @@ async fn rejected_or_superseded_baselines_cannot_send() {
         std::future::pending().await
     });
     let (_, retired_at) = tokio::join!(worker, async {
-        assert_eq!(rx.recv().await.expect("current delta")["seq"], 5);
+        assert_eq!(rx.recv().await.expect("current delta")["seq"], current_seq);
         let retired_at = Instant::now();
         live.disconnect();
         assert!(cancelled.await.is_err());

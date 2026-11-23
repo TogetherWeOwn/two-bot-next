@@ -77,7 +77,7 @@ struct UserInput {
 
 // Serde's derived struct deserializer also accepts positional arrays. Require
 // named fields so a member row must explicitly supply the `pending` key.
-struct Object<T>(T);
+pub(super) struct Object<T>(pub(super) T);
 
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {

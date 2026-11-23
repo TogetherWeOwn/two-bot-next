@@ -1,7 +1,7 @@
 //! Project member and scheduled-event dispatches into realtime v1 operations. No I/O.
 
 use serde::Deserialize;
-use serde_json::value::RawValue;
+use serde_json::{value::RawValue, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use twilight_model::{
     guild::scheduled_event::{EntityType, PrivacyLevel, Status},
@@ -12,6 +12,8 @@ use twilight_model::{
 };
 use two_bot_core::realtime_wire as wire;
 use wire::{Change, Operation};
+
+use crate::realtime_member_baseline::Object;
 
 mod baseline;
 pub mod intake;
@@ -69,7 +71,7 @@ struct GuildScope {
 
 #[derive(Deserialize)]
 struct MemberInput {
-    user: UserInput,
+    user: Object<UserInput>,
     roles: Vec<Id<RoleMarker>>,
     nick: Option<String>,
     // Twilight defaults an omitted `pending` to false. Do not trust that
@@ -80,13 +82,17 @@ struct MemberInput {
 #[derive(Deserialize)]
 struct UserInput {
     id: Id<UserMarker>,
-    #[serde(default)] // Discord omits `bot` on human users.
-    bot: bool,
+    #[serde(default, deserialize_with = "present_bot")]
+    bot: Option<bool>,
+}
+
+fn present_bot<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize)]
 struct RemovedMember {
-    user: RemovedUser,
+    user: Object<RemovedUser>,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +135,49 @@ pub fn project(guild_id: Id<GuildMarker>, raw: &str) -> Result<Option<Operation>
     })
 }
 
+/// Merge a live update into a known member of the guild validated by the caller.
+/// Omission of the screening flag does not prove that screening was passed.
+pub fn project_member_update<'a>(
+    body: &Value,
+    known: impl FnOnce(wire::Id) -> Option<&'a wire::Member>,
+) -> Result<Operation, ProjectionError> {
+    let mut input =
+        MemberInput::deserialize(body).map_err(|_| ProjectionError::MalformedDispatch)?;
+    let previous = known(wire_id(input.user.0.id)).ok_or(ProjectionError::MalformedDispatch)?;
+    if body.get("pending").is_none() {
+        input.pending = Some(previous.pending);
+    }
+    if body.get("nick").is_none() {
+        input.nick.clone_from(&previous.nick);
+    }
+    input.user.0.bot.get_or_insert(previous.bot);
+    member_change(input)
+}
+
+/// Project only scheduled-event creates, updates and deletes, with the same
+/// row checks as baseline intake. The caller checks duplicate keys and
+/// validates references against the active baseline before encoding.
+pub fn project_scheduled_event(
+    guild_id: Id<GuildMarker>,
+    raw: &str,
+) -> Result<Option<Operation>, ProjectionError> {
+    let dispatch: Dispatch<'_> = decode(raw, '{')?;
+    let kind = dispatch.kind()?;
+    if !matches!(
+        kind,
+        Some(
+            Kind::GuildScheduledEventCreate
+                | Kind::GuildScheduledEventUpdate
+                | Kind::GuildScheduledEventDelete
+        )
+    ) {
+        return Ok(None);
+    }
+    project_dispatch(guild_id, kind, &dispatch, |body| {
+        baseline::strict_event_change(guild_id, body, true)
+    })
+}
+
 fn project_dispatch(
     guild_id: Id<GuildMarker>,
     kind: Option<Kind>,
@@ -147,7 +196,7 @@ fn project_dispatch(
     let operation = match kind {
         Kind::GuildMemberAdd | Kind::GuildMemberUpdate => member_change(decode(body, '{')?)?,
         Kind::GuildMemberRemove => Operation::Members(Change::Remove {
-            id: wire_id(decode::<RemovedMember>(body, '{')?.user.id),
+            id: wire_id(decode::<RemovedMember>(body, '{')?.user.0.id),
         }),
         Kind::GuildScheduledEventCreate | Kind::GuildScheduledEventUpdate => {
             Operation::Events(project_event(body)?)
@@ -172,14 +221,14 @@ fn wire_id<M>(id: Id<M>) -> wire::Id {
 }
 
 fn member_change(input: MemberInput) -> Result<Operation, ProjectionError> {
-    let id = wire_id(input.user.id);
+    let id = wire_id(input.user.0.id);
     Ok(Operation::Members(Change::Upsert {
         id,
         value: wire::Member {
             user_id: id,
             role_ids: input.roles.into_iter().map(wire_id).collect(),
             nick: input.nick,
-            bot: input.user.bot,
+            bot: input.user.0.bot.unwrap_or(false), // Discord omits `bot` on human users.
             pending: input
                 .pending
                 .ok_or(ProjectionError::MissingScreeningState)?,
