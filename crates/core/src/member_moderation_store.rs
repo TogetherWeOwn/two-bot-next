@@ -14,6 +14,9 @@ use crate::member_moderation::{
     StoreError, UnbanJob, UnbanResolution, UncertainKind, UncertainRow,
 };
 
+mod warning_history;
+pub use warning_history::{WarningHistoryCursor, WarningHistoryEntry, WarningHistoryPage};
+
 #[derive(Clone)]
 pub struct PgMemberModerationStore {
     pool: PgPool,

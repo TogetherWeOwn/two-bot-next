@@ -1,6 +1,10 @@
 {
   "version": 1,
   "migrations": {
+    "crates/cutover/migrations/0482_moderation_warning_history_order.sql": {
+      "sha256": "2062bc87ad80080c638ef0dd4774dde6ef396124e653aa6e8113590a52ffd73b",
+      "justification": "Extend the existing warning lookup order with a deterministic C-collated tie-breaker."
+    },
     "crates/cutover/migrations/0481_internal_voice_move_audit.sql": {
       "sha256": "63e729a45a7af53e629c86bff0014b9ae8387dbe6c3a77ec39a60b390b3008e3",
       "justification": "Record closed terminal voice move outcomes and scalar witnesses in the private ledger."
