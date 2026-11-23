@@ -92,10 +92,8 @@ async fn exercise_writer(pool: PgPool) {
         .await
         .unwrap();
     assert!(unused, "refusals must not write historical windows");
-    let foreign = VoiceObservation {
-        guild_id: OTHER_GUILD,
-        ..frame
-    };
+    let mut foreign = frame;
+    foreign.guild_id = OTHER_GUILD;
     assert!(write(pool, foreign).await);
     assert!(opt_back_in(&privacy, &guild, &member).await.unwrap());
 
@@ -106,16 +104,19 @@ async fn exercise_writer(pool: PgPool) {
     let id = sqlx::query_scalar(
         "SELECT id FROM event_voice_sessions
          WHERE guild_id = $1 AND member_id = $2 AND channel_id = $3
-           AND joined_at = $4 AND name_observed_at = $4 AND afk AND event_keys = $5",
+           AND joined_at = $4 AND name_observed_at = $4 AND afk AND event_keys = $5
+           AND 2 = (SELECT count(*) FROM event_attendance_windows
+                    WHERE guild_id = $1 AND event_key IN ('alias', 'show') AND starts_at = $6)",
     )
     .bind(&guild)
     .bind(&member)
     .bind(CHANNEL.to_string())
     .bind(at)
     .bind(&tags[..])
+    .bind(starts)
     .fetch_one(pool)
     .await
-    .expect("scoped span must keep the exact join, AFK state and occurrence tags");
+    .expect("span and capture history must retain the join, occurrence and rescheduled start");
     let next = VoiceObservation {
         previous: Some(CHANNEL),
         current: Some(CHANNEL + 1),
