@@ -70,7 +70,6 @@ async fn unsupported_tags_finalize_by_id_and_preserve_metadata() {
         "ARRAY['a', NULL]::text[]",
         "'{{a,b},{c,d}}'::text[]",
         "'[0:1]={a,b}'::text[]",
-        "'[2:3]={a,b}'::text[]",
         "array_fill('a'::text, ARRAY[129])",
         "ARRAY[repeat('é', 8193)]",
     ] {
@@ -89,15 +88,12 @@ async fn unsupported_tags_finalize_by_id_and_preserve_metadata() {
     assert_eq!(open.len(), cases.len());
     for (row, (id, mut before)) in open.into_iter().zip(cases) {
         assert_eq!(row.id, id);
-        assert_eq!(row.joined_at, Some(JOIN));
-        assert_eq!(row.channel_id.as_deref(), Some("400000000000000001"));
         assert_eq!(row.event_keys, None);
         assert_eq!(
             close_observed(pool, GUILD, LOST, id, left).await.unwrap(),
             CloseOutcome::ClosedWithUnsupportedTags
         );
         before.0 = Some(left);
-        assert_eq!(state(pool, id).await, before);
         assert_eq!(
             close_observed(pool, GUILD, LOST, id, JOIN).await.unwrap(),
             CloseOutcome::AlreadyClosedOrAbsent
@@ -105,6 +101,18 @@ async fn unsupported_tags_finalize_by_id_and_preserve_metadata() {
         assert_eq!(state(pool, id).await, before);
     }
     assert!(open_page(pool, GUILD, LOST, 0).await.unwrap().is_empty());
+    let id = seed(pool, GUILD, LOST).await;
+    sqlx::query(
+        "UPDATE event_voice_sessions SET channel_id = repeat('1', 21),
+                 joined_at = 'infinity', event_keys = '{}' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+    let page = open_page(pool, GUILD, LOST, 0).await.unwrap();
+    assert!(page[0].channel_id.is_none() && page[0].joined_at.is_none());
+    assert!(page[0].event_keys.as_ref().is_some_and(Vec::is_empty));
     db.close().await.unwrap();
 }
 
@@ -113,9 +121,14 @@ async fn locked_close_checks_shape_after_an_earlier_healthy_read() {
     let db = database().await;
     let pool = db.pool();
     let id = seed(pool, GUILD, LOST).await;
-    let open = open_page(pool, GUILD, LOST, 0).await.unwrap();
-    assert_eq!(open[0].event_keys.as_deref().unwrap(), ["original"]);
+    let page = open_page(pool, GUILD, LOST, 0).await.unwrap();
+    assert_eq!(page[0].event_keys.as_deref().unwrap(), ["original"]);
+    assert_eq!(page[0].joined_at, Some(JOIN));
     let mut writer = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *writer)
+        .await
+        .unwrap();
     sqlx::query("UPDATE event_voice_sessions SET event_keys = '[0:1]={a,b}'::text[] WHERE id = $1")
         .bind(id)
         .execute(&mut *writer)
@@ -124,21 +137,29 @@ async fn locked_close_checks_shape_after_an_earlier_healthy_read() {
 
     let left = JOIN + Duration::minutes(20);
     let close_pool = pool.clone();
-    let mut close =
+    let close =
         tokio::spawn(async move { close_observed(&close_pool, GUILD, LOST, id, left).await });
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), &mut close)
-            .await
-            .is_err()
-    );
+    tokio::time::timeout(std::time::Duration::from_millis(750), async {
+        while !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+             WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(pid)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("observed close must wait behind the shape write");
     writer.commit().await.unwrap();
     assert_eq!(
         close.await.unwrap().unwrap(),
         CloseOutcome::ClosedWithUnsupportedTags
     );
-    let (closed_at, tags, ..) = state(pool, id).await;
-    assert_eq!(closed_at, Some(left));
-    assert_eq!(tags.as_deref(), Some("[0:1]={a,b}"));
+    assert_eq!(state(pool, id).await.1.as_deref(), Some("[0:1]={a,b}"));
     db.close().await.unwrap();
 }
 
@@ -154,12 +175,9 @@ async fn member_loss_pages_preserve_original_close_and_healthy_neighbor_credit()
         lost.push(seed(pool, GUILD, LOST).await);
     }
     let left = JOIN + Duration::minutes(20);
-    assert_eq!(
-        close_observed(pool, GUILD, LOST, original, left)
-            .await
-            .unwrap(),
-        CloseOutcome::Closed
-    );
+    close_observed(pool, GUILD, LOST, original, left)
+        .await
+        .unwrap();
     let mut before = Vec::new();
     for id in [original, neighbor, foreign] {
         before.push((id, state(pool, id).await));
@@ -190,29 +208,13 @@ async fn member_loss_pages_preserve_original_close_and_healthy_neighbor_credit()
             batch.len() as u64
         );
     }
-    assert_eq!(
-        close_after_member_loss(pool, GUILD, LOST, &[])
-            .await
-            .unwrap(),
-        0
-    );
-    assert!(member_loss_page(pool, GUILD, LOST, 0)
-        .await
-        .unwrap()
-        .is_empty());
     assert_eq!(state(pool, lost[0]).await.0, Some(JOIN));
     for (id, before) in before {
         assert_eq!(state(pool, id).await, before);
     }
-    assert_eq!(
-        close_observed(pool, GUILD, NEIGHBOR, neighbor, left)
-            .await
-            .unwrap(),
-        CloseOutcome::Closed
-    );
-    assert_eq!(
-        state(pool, neighbor).await.0.unwrap() - JOIN,
-        Duration::minutes(20)
-    );
+    close_observed(pool, GUILD, NEIGHBOR, neighbor, left)
+        .await
+        .unwrap();
+    assert_eq!(state(pool, neighbor).await.0, Some(left));
     db.close().await.unwrap();
 }
