@@ -16,6 +16,7 @@ import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
 import { Container } from "@cloudflare/containers";
 import detail from "./fixtures/staging-automod-preview.json" with { type: "json" };
+import databaseTargets from "./fixtures/staging-database-fingerprint.json" with { type: "json" };
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
 import { PREVIEW_HEADER } from "../src/staging-preview.ts";
 import { STAGING_USE_PATH, STAGING_USE_KEY, type StagingWindow } from "../src/staging-lifecycle.ts";
@@ -275,6 +276,46 @@ function stagingUseRequest(action: "acquire" | "release" | "stop", window: Stagi
 function stagingWindow(): StagingWindow {
   return { environment: "staging", runId: "123456", runAttempt: 1, expiresAt: Date.now() + 120_000 };
 }
+
+test("protected staging refuses missing or different database bindings before grant or SDK start", async (t) => {
+  for (const database of [undefined, "postgres://fixture.other_branch:synthetic@fixture.pg.psdb.cloud/postgres"]) {
+    const stage = await harness(t, { ...BOUNDED_STAGING_ENV, DATABASE_URL: database,
+      STAGING_RECOVERY_DB_FINGERPRINT: databaseTargets.fingerprint });
+    const response = await stage.bot.fetch(stagingUseRequest("acquire", stagingWindow()));
+    assert.equal(response.status, 503);
+    assert.equal((await response.json() as { reason: string }).reason, "staging_database_unverified");
+    assert.equal(stage.values.has(STAGING_USE_KEY), false);
+    await assert.rejects(stage.bot.start(), /staging_database_unverified/);
+    await assert.rejects(stage.bot.startAndWaitForPorts(), /staging_database_unverified/);
+    await assert.rejects(stage.bot.containerFetch("http://c/health"), /staging_database_unverified/);
+    assert.deepEqual(stage.starts, []);
+    assert.deepEqual(stage.requests, []);
+  }
+});
+
+test("protected staging attests its effective binding and admits only the checked startup environment", async (t) => {
+  const database = "postgres://fixture.fixture_branch:synthetic@fixture.pg.psdb.cloud/postgres";
+  const stage = await harness(t, { ...BOUNDED_STAGING_ENV, DATABASE_URL: database,
+    STAGING_RECOVERY_DB_FINGERPRINT: databaseTargets.fingerprint });
+  const response = await stage.bot.fetch(probeRequest(
+    `https://worker.invalid${CONTROL_PATH}?runtime_db_fingerprint=${databaseTargets.fingerprint}`,
+    { headers: { authorization: `Bearer ${CONTROL_TOKEN}` } },
+  ));
+  assert.deepEqual(await response.json(), { deploymentId: ID, owner: ACTIVE_OWNER, running: false,
+    runtimeDatabaseFingerprint: databaseTargets.fingerprint, runtimeDatabaseStartupGuard: true });
+  assert.deepEqual(stage.starts, []);
+  assert.equal((await stage.bot.fetch(stagingUseRequest("acquire", stagingWindow()))).status, 200);
+  const override = { envVars: { DATABASE_URL: "different" } };
+  await assert.rejects(stage.bot.start(override), /staging_start_options_refused/);
+  await assert.rejects(stage.bot.startAndWaitForPorts(8080, undefined, override), /staging_start_options_refused/);
+  await assert.rejects(stage.bot.startAndWaitForPorts({ ports: 8080, startOptions: { entrypoint: ["other"] } }),
+    /staging_start_options_refused/);
+  assert.deepEqual(stage.starts, []);
+  await stage.bot.startAndWaitForPorts(8080);
+  assert.equal(stage.starts.length, 1);
+  assert.equal(stage.starts[0]?.env?.DATABASE_URL, database);
+  assert.equal(stage.starts[0]?.env?.STAGING_RECOVERY_DB_FINGERPRINT, undefined);
+});
 
 test("staging preview extends readiness without extra cold lifecycle activity", async (t) => {
   t.mock.timers.enable({ apis: ["Date"] });

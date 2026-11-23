@@ -628,6 +628,21 @@ SOAK_HOLD_ENV = {"HOLD_UNTIL": "${{ vars.STAGING_SOAK_HOLD_UNTIL }}",
                  "EVENT": "${{ github.event_name }}",
                  "REHEARSAL": "${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'true' || 'false' }}"}
 REHEARSAL_RUN_NAME = "${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'staging rollback proof' || github.workflow }}"
+RECOVERY_DRILL_CHECK = "${{ inputs.inject_gateway_failure || inputs.inject_error_rate_spike || inputs.inject_voice_stall || inputs.inject_unpaired_disconnect }}"
+
+
+def staging_drill_consumers(staging):
+    # The exact additional read may only refuse a mixed recovery/drill dispatch.
+    # Keep applying the existing count guards to every other reference.
+    steps = ((staging.get("jobs") or {}).get("deploy") or {}).get("steps") or []
+    for step in steps:
+        if (isinstance(step, dict) and step.get("name") == "Require a clean current-main recovery dispatch"
+                and step.get("if") == "${{ inputs.recovery_mode != 'standard' }}"
+                and step.get("env") == {"RECOVERY_DRILL": RECOVERY_DRILL_CHECK}
+                and step.get("run") == 'test "$DEPLOY_SHA" = "$GITHUB_SHA" && test "$RECOVERY_DRILL" = false'
+                and "continue-on-error" not in step):
+            return str(staging).replace(RECOVERY_DRILL_CHECK, "", 1)
+    return str(staging)
 
 
 def staging_gateway_injection_errors(workflows):
@@ -649,7 +664,7 @@ def staging_gateway_injection_errors(workflows):
             if marker in text:
                 errors.append(f"{name}: gateway-failure injection marker {marker} outside deploy-staging")
     staging = workflows.get("deploy-staging.yml") or {}
-    text = str(staging)
+    text = staging_drill_consumers(staging)
     if text.count("inputs.inject_gateway_failure") != 1:
         errors.append("deploy-staging.yml: inject_gateway_failure must be read exactly once")
     steps = ((staging.get("jobs") or {}).get("deploy") or {}).get("steps") or []
@@ -774,7 +789,7 @@ def staging_error_rate_gate_errors(workflows):
             if marker in text:
                 errors.append(f"{name}: error-rate gate marker {marker} outside deploy-staging/deploy-production")
     staging = workflows.get("deploy-staging.yml") or {}
-    text = str(staging)
+    text = staging_drill_consumers(staging)
     if text.count("inputs.inject_error_rate_spike") != 4:
         errors.append("deploy-staging.yml: rehearsal input belongs only to identity, hold, error gate and preview exclusion")
     if staging.get("run-name") != REHEARSAL_RUN_NAME:
@@ -828,7 +843,7 @@ def staging_fault_injection_errors(workflows):
             if marker in text:
                 errors.append(f"{name}: remediation-fault marker {marker} outside deploy-staging")
     staging = workflows.get("deploy-staging.yml") or {}
-    text = str(staging)
+    text = staging_drill_consumers(staging)
     for input_name in ("inject_voice_stall", "inject_unpaired_disconnect"):
         if text.count(f"inputs.{input_name}") != 1:
             errors.append(f"deploy-staging.yml: {input_name} must be read exactly once")
@@ -3356,10 +3371,14 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
     if "schema-gate" not in needs:
         errors.append(f"{name}:deploy: must needs the schema-gate (drift must block the deploy)")
     steps = gate.get("steps") or []
-    if len(steps) != 4:
-        errors.append(f"{name}:schema-gate: must run exactly checkout, SHA check, build and the gate")
+    if len(steps) != 5:
+        errors.append(f"{name}:schema-gate: must run exactly checkout, SHA check, build, gate and recovery proof")
         return errors
-    checkout, sha_check, build, run = steps
+    checkout, sha_check, build, run, proof = steps
+    if proof != {"name": "Verify the recovery plan and both ledgers", "id": "recovery-plan",
+                 "if": "${{ inputs.recovery_mode != 'standard' }}", "env": {"DEPLOY_SHA": DEPLOY_SHA_EXPRESSION},
+                 "run": "python3 scripts/staging_bootstrap.py plan"}:
+        errors.append(f"{name}:schema-gate: recovery proof must read only the successful gate's local plan")
     if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
             or (checkout.get("with") or {}).get("persist-credentials") != "false" \
             or (checkout.get("with") or {}).get("fetch-depth") != "0":
@@ -7646,6 +7665,20 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(steps[preflights[0]].get("if"), "${{ !inputs.release_fence }}")
         self.assertFalse(steps[preflights[0]].get("continue-on-error", False))
         self.assertNotIn("if", steps[deploy])
+
+    def test_protected_staging_recovery_checks_binding_before_ownership_and_excludes_bootstrap_restore(self):
+        workflow = self.workflows["deploy-staging.yml"]
+        self.assertEqual(workflow["on"]["workflow_dispatch"]["inputs"]["recovery_mode"]["default"], "standard")
+        steps = workflow["jobs"]["deploy"]["steps"]
+        labels = [step.get("id") or step.get("name") for step in steps]
+        names = ["snapshot", "Check the stopped recovery predecessor and pin the approved target", "deploy",
+                 "Prove the serving Worker database before ownership or startup", "takeover", "use"]
+        self.assertEqual([name for name in labels if name in names], names)
+        self.assertNotIn("continue-on-error", steps[labels.index(names[3])])
+        self.assertIn(" && inputs.recovery_mode != 'bootstrap' && ", steps[labels.index("auto_rollback")]["if"])
+        exclude = steps[labels.index("Keep the bootstrap baseline out of staging qualification")]
+        self.assertEqual(exclude["if"], "${{ inputs.recovery_mode == 'bootstrap' }}")
+        self.assertIn("exit 1", exclude["run"])
 
     def test_staging_takeover_fence_hint_is_scoped_to_the_fenced_refusal(self):
         # Execute the actual workflow shell with a stub control client. This

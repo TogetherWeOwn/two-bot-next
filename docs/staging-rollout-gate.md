@@ -684,11 +684,32 @@ a mismatch. Recovery requires a fresh plan and a separate check of the
 predecessor against both ledgers. If none qualifies, use the separately
 authorized baseline transition.
 
-With a verified clean plan, run `scripts/ci/staging_rollback_compatibility.py`
-against the plan, forward and recovery source SHAs to check both migration
-trees byte for byte. This is an operator-run preflight. Automatic rollback
-enforcement requires wiring it into the protected workflow before the first
-restore mutation. The workflow also owns binding, artifact and runtime acceptance.
+Use `scripts/ci/staging_rollback_compatibility.py` to compare both migration
+trees of each recovery candidate against the verified plan. The protected
+`verified` mode requires this comparison before replacing the predecessor.
+
+### Recover a baseline when the serving pair is incompatible
+
+1. Confirm the approved fingerprint in a protected read-only plan for the
+   intended source. Require successful cutover entries for 0475 and 0481 and
+   store entry 0478. If 0475 is pending, use the separate migration decision
+   and require a fresh clean plan after any authorized apply.
+2. Confirm the predecessor is stopped and its window is released or expired.
+   Dispatch `bootstrap` on current `main`. The plan supplies the fingerprint.
+   After publication, an authenticated GET must prove the exact serving Worker
+   would forward the approved target and enforce it at startup. The gate must
+   pass before takeover or acquisition. Missing proof or a mismatch refuses.
+3. Bootstrap excludes the previous snapshot and deliberately stays red to
+   exclude downstream qualification. After a failure or ambiguous publication,
+   reconcile the actual pair with protected read-only inventory and roll forward.
+   If a window was acquired, confirm release or native expiry and stopped state.
+   Resolve a binding failure through the scoped staging credential path.
+4. After rollout, readiness, error-rate and release checks pass, authenticate
+   the protected rollout artifact and use
+   its Worker UUID and image digest as `recovery_pair` (`UUID@sha256:digest`).
+   Dispatch `verified` to check both migration trees and the pinned stopped pair
+   before replacement. It checks the new binding before startup and permits
+   paired rollback only to that predecessor within the original expiry.
 
 ## Verification boundaries
 
