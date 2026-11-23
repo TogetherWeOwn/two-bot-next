@@ -8,6 +8,7 @@ const AT: WireTime = WireTime(time::OffsetDateTime::UNIX_EPOCH);
 const READY: &str = r#"{"op":0,"t":"READY","d":{}}"#;
 const CREATE: &str = include_str!("../../tests/fixtures/live_gateway_guild_create.json");
 const VOICE: &str = include_str!("../../tests/fixtures/live_gateway_voice_state_update.json");
+const TOPOLOGY: &[u8] = include_bytes!("../../tests/fixtures/live_gateway_topology.json");
 
 fn event_row(id: u64) -> Value {
     let mut row: Value = serde_json::from_str(include_str!(
@@ -174,9 +175,7 @@ fn scheduled_event_limit_counts_baseline_rows_and_releases_removed_rows() {
 
 #[tokio::test(start_paused = true)]
 async fn topology_and_roster_share_receive_order_with_voice_and_events() {
-    let fixture = decoded(include_bytes!(
-        "../../tests/fixtures/live_gateway_topology.json"
-    ));
+    let fixture = decoded(TOPOLOGY);
     let (mut live, receiver) = LiveGateway::for_guild(GUILD, 40);
     receive(&mut live, READY);
     let nonce = begin(&mut live);
@@ -262,9 +261,7 @@ async fn rejected_or_superseded_baselines_cannot_send() {
         r#"{"op":0,"t":"GUILD_SCHEDULED_EVENT_DELETE","d":{"guild_id":"10","id":"91","id":"90"}}"#
             .into(),
     ];
-    let fixture = decoded(include_bytes!(
-        "../../tests/fixtures/live_gateway_topology.json"
-    ));
+    let fixture = decoded(TOPOLOGY);
     let extra = fixture["invalid"].as_array().expect("invalid dispatches");
     let current_seq = invalidations.len() + extra.len() + 2;
     let invalidations = invalidations
@@ -276,6 +273,7 @@ async fn rejected_or_superseded_baselines_cannot_send() {
         complete(&mut live, &nonce);
         receive(&mut live, VOICE);
         receive(&mut live, &invalid);
+        assert!(live.0.as_ref().expect("intake").active.is_none());
         receive(&mut live, VOICE);
     }
     let stale = begin(&mut live);
@@ -283,6 +281,7 @@ async fn rejected_or_superseded_baselines_cannot_send() {
     receive(&mut live, VOICE);
     let member = fixture["missing_screening"].clone();
     event(&mut live, "GUILD_MEMBER_ADD", member);
+    assert!(live.0.as_ref().expect("intake").active.is_none());
     receive(&mut live, VOICE);
     let stale = begin(&mut live);
     let current = begin(&mut live);
