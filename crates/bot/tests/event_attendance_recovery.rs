@@ -118,7 +118,10 @@ async fn turn_deadline_includes_pool_wait_and_keeps_original_evidence() {
     tokio::time::pause();
     let started = tokio::time::Instant::now();
     assert!(matches!(actor.turn(pool).await, Err(TurnError::Deadline)));
-    assert_eq!(started.elapsed(), std::time::Duration::from_millis(1_000));
+    let elapsed = started.elapsed();
+    // Tokio rounds deadlines up to the next millisecond tick.
+    assert!(elapsed >= std::time::Duration::from_millis(1_000));
+    assert!(elapsed <= std::time::Duration::from_millis(1_001));
     tokio::time::resume();
     drop(held);
 
@@ -151,6 +154,9 @@ async fn thirty_third_loss_latches_capture_stop_without_sweeping() {
     }
     assert!(actor.capture_allowed());
 
+    for member in LOST..unknown {
+        seed(pool, member, 1).await;
+    }
     for member in LOST..=unknown {
         fence.record_loss(member);
     }
@@ -160,7 +166,7 @@ async fn thirty_third_loss_latches_capture_stop_without_sweeping() {
     actor.turn(pool).await.unwrap();
     assert!(!actor.capture_allowed());
     for member in LOST..unknown {
-        assert_eq!(counts(pool, member, departure).await, (0, 1, 0));
+        assert_eq!(counts(pool, member, departure).await, (0, 2, 0));
     }
     for member in [unknown, healthy] {
         assert_eq!(counts(pool, member, departure).await, (1, 0, 0));

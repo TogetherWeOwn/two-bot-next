@@ -106,12 +106,14 @@ impl AttendanceRecovery {
         }
     }
 
+    /// Readiness for a fresh observation. This does not admit an open from a
+    /// retained departure, including one closed with unsupported stored tags.
     pub fn capture_allowed(&self) -> bool {
         self.departure.is_none() && self.fence.capture_allowed()
     }
 
-    /// Retain a trustworthy departure before any await. If one is already
-    /// pending, only the member of the skipped observation loses continuity.
+    /// Retain a trustworthy departure before any await. While a departure or
+    /// loss is pending, a skipped observation adds loss for its member only.
     pub fn retain_departure(
         &mut self,
         member: Snowflake,
@@ -146,6 +148,8 @@ impl AttendanceRecovery {
             let exhausted = page.len() <= CLOSES_PER_TURN;
             for row in page.into_iter().take(CLOSES_PER_TURN) {
                 if row.channel_id.as_ref() == Some(&departure.channel) && row.joined_at.is_some() {
+                    // Both healthy and unsupported tags close in storage. This
+                    // continuation never uses a close to open a new session.
                     close_observed(pool, &self.guild, &member, row.id, departure.observed_at)
                         .await?;
                 } else {
