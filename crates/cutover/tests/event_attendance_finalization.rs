@@ -124,6 +124,7 @@ async fn locked_close_checks_shape_after_an_earlier_healthy_read() {
     let page = open_page(pool, GUILD, LOST, 0).await.unwrap();
     assert_eq!(page[0].event_keys.as_deref().unwrap(), ["original"]);
     assert_eq!(page[0].joined_at, Some(JOIN));
+    assert_eq!(page[0].channel_id.as_deref(), Some("400000000000000001"));
     let mut writer = pool.begin().await.unwrap();
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *writer)
@@ -212,9 +213,10 @@ async fn member_loss_pages_preserve_original_close_and_healthy_neighbor_credit()
     for (id, before) in before {
         assert_eq!(state(pool, id).await, before);
     }
-    close_observed(pool, GUILD, NEIGHBOR, neighbor, left)
+    let outcome = close_observed(pool, GUILD, NEIGHBOR, neighbor, left)
         .await
         .unwrap();
+    assert_eq!(outcome, CloseOutcome::Closed);
     assert_eq!(state(pool, neighbor).await.0, Some(left));
     db.close().await.unwrap();
 }
