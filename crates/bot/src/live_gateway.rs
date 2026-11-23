@@ -1,4 +1,4 @@
-//! Ordered, dormant gateway intake for realtime voice deltas.
+//! Ordered, dormant gateway intake for realtime voice and scheduled-event deltas.
 
 use std::{collections::HashSet, time::Duration};
 
@@ -10,7 +10,7 @@ use twilight_model::{
     id::{marker::GuildMarker, Id},
 };
 use two_bot_core::{duplicate_keys::reject_duplicate_keys, realtime_wire as wire};
-use two_bot_discord::{realtime_baseline_join::BaselineJoin, realtime_gateway};
+use two_bot_discord::{realtime_baseline_join::BaselineJoin, realtime_gateway, realtime_roster};
 use wire::{Change, ChannelKind, Operation, WireTime};
 
 use crate::live_delivery::{self, Delivery};
@@ -34,14 +34,15 @@ struct Intake {
     identified: bool,
     join: BaselineJoin,
     pending_until: Option<Instant>,
-    active: Option<VoiceFence>,
+    active: Option<BaselineFence>,
     seq: u64,
     sender: live_delivery::Sender<QueuedDelta>,
 }
 
-struct VoiceFence {
+struct BaselineFence {
     members: HashSet<wire::Id>,
     rooms: HashSet<wire::Id>,
+    events: HashSet<wire::Id>,
     lifetime: watch::Sender<()>,
 }
 
@@ -170,7 +171,7 @@ impl Intake {
             }
             _ if self.pending_until.is_some() => {
                 if let Some(topics) = self.join.observe(raw, at).map_err(|_| ())? {
-                    self.active = Some(VoiceFence {
+                    self.active = Some(BaselineFence {
                         members: topics.members.into_iter().map(|row| row.user_id).collect(),
                         rooms: topics
                             .channels
@@ -180,20 +181,23 @@ impl Intake {
                             })
                             .map(|row| row.id)
                             .collect(),
+                        events: topics.events.into_iter().map(|row| row.id).collect(),
                         lifetime: watch::channel(()).0,
                     });
                     self.pending_until = None;
                 }
             }
-            _ => self.forward(kind, dispatch.d, at)?,
+            _ => self.forward(raw, &dispatch, at)?,
         }
         Ok(None)
     }
 
-    fn forward(&mut self, kind: &str, body: Option<&RawValue>, at: WireTime) -> Result<(), ()> {
-        let Some(active) = &self.active else {
+    fn forward(&mut self, raw: &str, dispatch: &Dispatch<'_>, at: WireTime) -> Result<(), ()> {
+        let Some(active) = &mut self.active else {
             return Ok(());
         };
+        let kind = dispatch.t.as_str();
+        let body = dispatch.d;
         let scope = match kind.rsplit_once('_') {
             Some(("GUILD", "UPDATE")) => object::<GuildRow>(body.ok_or(())?.get())?.id,
             Some(
@@ -208,31 +212,54 @@ impl Intake {
         if scope != self.guild {
             return Ok(());
         }
-        if kind != "VOICE_STATE_UPDATE" {
-            return Err(());
-        }
-        let raw = body.ok_or(())?.get();
-        reject_duplicate_keys(raw.as_bytes()).map_err(|_| ())?;
-        let op = realtime_gateway::project(self.guild, kind, &object(raw)?).map_err(|_| ())?;
-        let Some(Operation::Voice(change)) = op else {
-            return Err(());
-        };
-        match &change {
-            Change::Upsert { id, value }
-                if active.members.contains(id) && active.rooms.contains(&value.channel_id) => {}
-            Change::Remove { id } if active.members.contains(id) => {}
+        let payload = body.ok_or(())?.get();
+        reject_duplicate_keys(payload.as_bytes()).map_err(|_| ())?;
+        let operation = match kind {
+            "VOICE_STATE_UPDATE" => {
+                realtime_gateway::project(self.guild, kind, &object(payload)?).map_err(|_| ())?
+            }
+            "GUILD_SCHEDULED_EVENT_CREATE"
+            | "GUILD_SCHEDULED_EVENT_UPDATE"
+            | "GUILD_SCHEDULED_EVENT_DELETE" => {
+                realtime_roster::project_scheduled_event(self.guild, raw).map_err(|_| ())?
+            }
             _ => return Err(()),
-        }
+        };
+        let operation = operation.ok_or(())?;
+        active.apply(&operation)?;
         let generation = active.lifetime.subscribe();
         self.seq = self.seq.checked_add(1).ok_or(())?;
         let body = wire::encode_delta(
             wire::Id(self.guild.into_nonzero()),
             self.seq,
             at,
-            &[Operation::Voice(change)],
+            &[operation],
         )
         .ok_or(())?;
         self.sender.offer(QueuedDelta { body, generation });
+        Ok(())
+    }
+}
+
+impl BaselineFence {
+    fn apply(&mut self, operation: &Operation) -> Result<(), ()> {
+        match operation {
+            Operation::Voice(Change::Upsert { id, value })
+                if self.members.contains(id) && self.rooms.contains(&value.channel_id) => {}
+            Operation::Voice(Change::Remove { id }) if self.members.contains(id) => {}
+            Operation::Events(Change::Upsert { id, value }) => {
+                if value.channel_id.is_some_and(|id| !self.rooms.contains(&id))
+                    || (self.events.len() == wire::MAX_SNAPSHOT_EVENTS && !self.events.contains(id))
+                {
+                    return Err(());
+                }
+                self.events.insert(*id);
+            }
+            Operation::Events(Change::Remove { id }) => {
+                self.events.remove(id);
+            }
+            _ => return Err(()),
+        }
         Ok(())
     }
 }

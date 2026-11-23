@@ -129,6 +129,30 @@ pub fn project(guild_id: Id<GuildMarker>, raw: &str) -> Result<Option<Operation>
     })
 }
 
+/// Project only scheduled-event creates, updates and deletes, with the same
+/// row checks as baseline intake. The caller checks duplicate keys and
+/// validates references against the active baseline before encoding.
+pub fn project_scheduled_event(
+    guild_id: Id<GuildMarker>,
+    raw: &str,
+) -> Result<Option<Operation>, ProjectionError> {
+    let dispatch: Dispatch<'_> = decode(raw, '{')?;
+    let kind = dispatch.kind()?;
+    if !matches!(
+        kind,
+        Some(
+            Kind::GuildScheduledEventCreate
+                | Kind::GuildScheduledEventUpdate
+                | Kind::GuildScheduledEventDelete
+        )
+    ) {
+        return Ok(None);
+    }
+    project_dispatch(guild_id, kind, &dispatch, |body| {
+        baseline::strict_event_change(guild_id, body, true)
+    })
+}
+
 fn project_dispatch(
     guild_id: Id<GuildMarker>,
     kind: Option<Kind>,
