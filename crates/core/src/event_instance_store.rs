@@ -6,6 +6,7 @@
 //! never advances an occurrence. There is deliberately no inferred recurrence.
 
 use sqlx::{PgConnection, PgPool};
+use time::OffsetDateTime;
 
 use crate::scheduled_events::ScheduledEvent;
 
@@ -28,6 +29,33 @@ pub async fn lock_event(connection: &mut PgConnection, event_id: &str) -> Result
         .execute(connection)
         .await?;
     Ok(())
+}
+
+/// Check the lifecycle floor before adding a first attendance tag at close.
+/// Use the original join time under the caller's guild lifecycle lock.
+/// Window overlap, continuity, and privacy are separate admission checks.
+pub async fn attendance_close_follows_recovery_in(
+    connection: &mut PgConnection,
+    guild_id: &str,
+    event_id: &str,
+    instance_starts_at: OffsetDateTime,
+    joined_at: OffsetDateTime,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM event_instance_windows
+             WHERE guild_id = $1 AND event_id = $2 AND instance_starts_at = $3
+               AND is_current AND NOT identity_ambiguous AND revoked_at IS NULL
+               AND status IN ('scheduled', 'active', 'completed')
+               AND (attendance_recovered_at IS NULL OR attendance_recovered_at <= $4)
+         )",
+    )
+    .bind(guild_id)
+    .bind(event_id)
+    .bind(instance_starts_at)
+    .bind(joined_at)
+    .fetch_one(connection)
+    .await
 }
 
 /// Synchronize an accepted mirror row in its writer's transaction. An absent
