@@ -3,12 +3,14 @@
 
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+import os
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
-from staging_rollback_compatibility import MIGRATION_PATHS, Refused, main, verify
+from staging_rollback_compatibility import MIGRATION_PATHS, Refused, git_environment, main, verify
 
 
 class StagingRollbackCompatibilityTests(unittest.TestCase):
@@ -36,6 +38,7 @@ class StagingRollbackCompatibilityTests(unittest.TestCase):
     def git(self, *args):
         return subprocess.run(
             ["git", "-C", self.repo, *args], check=True, capture_output=True,
+            env={**git_environment(), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
             text=True, timeout=10,
         ).stdout.strip()
 
@@ -83,6 +86,16 @@ class StagingRollbackCompatibilityTests(unittest.TestCase):
         self.git("replace", self.prior, self.plan)
         with self.assertRaisesRegex(Refused, "^recovery_migration_source_mismatch$"):
             verify(self.repo, self.plan, self.forward, self.prior)
+
+    def test_finds_both_migration_trees_from_a_checkout_subdirectory(self):
+        verify(self.cutover.parent, self.plan, self.forward, self.plan)
+
+    def test_ambient_git_routing_cannot_redirect_fixture_or_preflight(self):
+        redirected = self.repo / "absent"
+        with patch.dict(os.environ, {"GIT_DIR": str(redirected), "GIT_WORK_TREE": str(redirected),
+                                     "GIT_OBJECT_DIRECTORY": str(redirected)}):
+            self.assertEqual(self.git("rev-parse", "HEAD"), self.forward)
+            verify(self.repo, self.plan, self.forward, self.plan)
 
 
 if __name__ == "__main__":

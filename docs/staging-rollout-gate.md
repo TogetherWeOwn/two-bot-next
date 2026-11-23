@@ -686,8 +686,9 @@ authorized baseline transition.
 
 With a verified clean plan, run `scripts/ci/staging_rollback_compatibility.py`
 against the plan, forward and recovery source SHAs to check both migration
-trees byte for byte. Keep binding, artifact and runtime acceptance in the
-protected staging workflow.
+trees byte for byte. This is an operator-run preflight. Automatic rollback
+enforcement requires wiring it into the protected workflow before the first
+restore mutation. The workflow also owns binding, artifact and runtime acceptance.
 
 ## Verification boundaries
 

@@ -22,11 +22,16 @@ class Refused(ValueError):
     """A refusal whose message is safe to emit in workflow logs."""
 
 
+def git_environment():
+    # Repository and object routing come from the explicit checkout path.
+    return {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+
+
 def git(repo, *args):
     try:
         return subprocess.run(
             ["git", "--no-replace-objects", "-C", repo, *args],
-            env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
+            env={**git_environment(), "GIT_NO_LAZY_FETCH": "1"},
             check=True, capture_output=True, timeout=10,
         ).stdout
     except (OSError, subprocess.SubprocessError):
@@ -38,7 +43,7 @@ def migration_trees(repo, sha):
         raise Refused("invalid_source_sha")
     if git(repo, "cat-file", "-t", sha) != b"commit\n":
         raise Refused("invalid_source_commit")
-    entries = git(repo, "ls-tree", "-z", sha, "--", *MIGRATION_PATHS).split(b"\0")
+    entries = git(repo, "ls-tree", "--full-tree", "-z", sha, "--", *MIGRATION_PATHS).split(b"\0")
     if len(entries) != len(MIGRATION_PATHS) + 1 or entries[-1] != b"":
         raise Refused("migration_tree_unavailable")
     trees = []
