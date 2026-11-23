@@ -1,0 +1,22 @@
+{
+  "fingerprint": "1daf27da1b95e841441a76682903f146ec462d7af7ce78d185b14411ad84033f",
+  "matching": [
+    "postgresql://fixture_role.fixture_branch:fixture-pass@fixture.pg.psdb.cloud/postgres?sslmode=verify-full",
+    "postgres://other_role.fixture_branch:other%40pass@FIXTURE.PG.PSDB.CLOUD:5432/postgres?channel_binding=require&sslmode=require"
+  ],
+  "refused": [
+    null,
+    "postgresql://fixture_role.other_branch:fixture-pass@fixture.pg.psdb.cloud/postgres?sslmode=verify-full",
+    "postgresql://other_role:fixture-pass@fixture.pg.psdb.cloud/postgres?sslmode=verify-full",
+    "postgresql://fixture_role.fixture_branch:fixture-pass@other.pg.psdb.cloud/postgres?sslmode=verify-full",
+    "postgresql://fixture_role.fixture_branch:fixture-pass@fixture.pg.psdb.cloud/other?sslmode=verify-full",
+    "postgresql://fixture_role.fixture_branch:fixture-pass@fixture.pg.psdb.cloud/before/../postgres?sslmode=verify-full",
+    "postgresql://fixture_role.fixture_branch:fixture-pass@fixture.pg.psdb.cloud/%70ostgres?sslmode=verify-full",
+    "postgresql://fixture_role.fixture_branch:fixture-pass@fixture.pg.psdb.cloud:6432/postgres?sslmode=verify-full",
+    "postgresql://fixture_role.fixture_branch:fixture-pass@fixture.pg.psdb.cloud/postgres?sslmode=verify-full&host=other.pg.psdb.cloud",
+    "postgresql://fixture_role.fixture_branch:fixture-pass@fixture.pg.psdb.cloud/postgres?sslmode=verify-full&user=other_role.other_branch",
+    "postgresql://fixture_role.fixture_branch:fixture-pass@fixture.pg.psdb.cloud/postgres?sslmode=verify-full&dbname=other",
+    "postgresql://fixture_role.fixture_branch:fixture-pass@fixture.pg.psdb.cloud/postgres?sslmode=verify-full&sslmode=verify-full",
+    "postgresql://fixture_role.fixture_branch:fixture-pass@fixture.pg.psdb.cloud/postgres?sslmode=verify-full#fragment"
+  ]
+}

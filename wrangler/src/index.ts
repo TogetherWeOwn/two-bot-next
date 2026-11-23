@@ -29,6 +29,7 @@ import {
   authenticated, deploymentId, readChange, readControlBody, refused,
 } from "./ownership.ts";
 import { StagingLifecycle, STAGING_USE_PATH, parseStagingUseChange, type StagingUse } from "./staging-lifecycle.ts";
+import { stagingDatabaseEvidence } from "./staging-database-fingerprint.ts";
 import { PREVIEW_HEADER, previewRefusal, readPreview } from "./staging-preview.ts";
 import {
   TokenBuckets,
@@ -1503,8 +1504,12 @@ export class TwoBotContainer extends Container<Env> {
         if (request.headers.get(DEPLOYMENT_HEADER) !== id) throw new OwnershipRefused("deployment_mismatch");
         if (!change) {
           const owner = await this.ownership.read();
+          const evidence = this.boundedStaging()
+            ? await stagingDatabaseEvidence(new URL(request.url).search, this.envVars["DATABASE_URL"])
+            : {};
           // Takeover does not start the gateway. A subsequent owned probe does.
-          return Response.json({ deploymentId: id, owner: owner ?? null, running: this.ctx.container?.running ?? false }, {
+          return Response.json({ deploymentId: id, owner: owner ?? null,
+            running: this.ctx.container?.running ?? false, ...evidence }, {
             headers: withSecurityHeaders({ "cache-control": "no-store" }),
           });
         }

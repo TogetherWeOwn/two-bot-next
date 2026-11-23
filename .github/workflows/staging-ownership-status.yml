@@ -10,6 +10,10 @@ on:
         type: boolean
         required: false
         default: false
+      plan_run_id:
+        description: Exact successful staging-migrate plan run for runtime database verification
+        type: string
+        required: false
 
 permissions: {}
 
@@ -20,7 +24,7 @@ concurrency:
 jobs:
   status:
     name: staging ownership status (read-only)
-    if: github.ref == 'refs/heads/main' && !inputs.inventory
+    if: github.ref == 'refs/heads/main' && !inputs.inventory && inputs.plan_run_id == ''
     permissions:
       contents: read # checkout only; the read authenticates with `staging` environment secrets
     # Runner routing: see the note on `check` in check.yml.
@@ -55,9 +59,10 @@ jobs:
 
   inventory:
     name: staging recovery inventory (read-only)
-    if: github.repository_id == '1396224242' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && inputs.inventory
+    if: github.repository_id == '1396224242' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && (inputs.inventory || inputs.plan_run_id != '')
     permissions:
       contents: read
+      actions: read
     runs-on: ubuntu-latest
     environment: {name: staging, deployment: false}
     timeout-minutes: 5
@@ -67,10 +72,11 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
-      - name: Verify the dispatch is on current main
+      - name: Verify current main and authenticate the supplied plan
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/staging_recovery_status.py verify-main
+          PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+        run: python3 scripts/staging_recovery_status.py plan > "$RUNNER_TEMP/staging-status-plan.json"
       - name: Bracket the no-start staging status read
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

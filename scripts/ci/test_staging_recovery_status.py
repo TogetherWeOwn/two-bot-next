@@ -1,11 +1,13 @@
 """Disposable provider, ownership and dispatch evidence for the protected inventory."""
 
 from copy import deepcopy
+from hashlib import sha256
 from io import BytesIO
 import json
 from pathlib import Path
 import sys
 import unittest
+from zipfile import ZIP_DEFLATED, ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import staging_recovery_status as status
@@ -28,6 +30,42 @@ ROLLOUT_DETAIL = f"{APPS}/{APP}/rollouts/{ROLLOUT}"
 SECRET_SENTINEL = "must-not-reach-any-receipt"
 
 
+FINGERPRINT_FIXTURE = Path(__file__).resolve().parents[2] / "wrangler/test/fixtures/staging-database-fingerprint.json"
+FINGERPRINT = json.loads(FINGERPRINT_FIXTURE.read_text())["fingerprint"]
+
+
+def plan_fixture():
+    path = Path(__file__).with_name("fixtures") / "staging_recovery_status_plan.json"
+    return json.loads(path.read_text())
+
+
+def archive_fixture(content):
+    info = BytesIO()
+    with ZipFile(info, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr("staging-migrate-manifest.json", content)
+    return info.getvalue()
+
+
+def github_fixture():
+    route = "actions/runs/13"
+    repo = {"full_name": status.REPO}
+    raw = archive_fixture(json.dumps(plan_fixture()))
+    return {
+        route: {"id": 13, "path": status.PLAN_WORKFLOW, "event": "workflow_dispatch", "head_branch": "main",
+                "head_sha": "b" * 40, "status": "completed", "conclusion": "success", "run_attempt": 1,
+                "repository": repo, "head_repository": repo},
+        f"{route}/attempts/1/jobs?per_page=4": {"total_count": 3, "jobs": [
+            {"name": f"staging-migrate ({name})", "conclusion": verdict}
+            for name, verdict in (("plan", "success"), ("claim", "skipped"), ("apply", "skipped"))
+        ]},
+        f"{route}/artifacts?per_page=2": {"total_count": 1, "artifacts": [
+            {"name": status.PLAN_ARTIFACT, "id": 17, "expired": False, "size_in_bytes": len(raw),
+             "digest": f"sha256:{sha256(raw).hexdigest()}"}
+        ]},
+        "actions/artifacts/17/zip": raw,
+    }
+
+
 def provider_fixture():
     path = Path(__file__).with_name("fixtures") / "staging_recovery_status_provider.json"
     return json.loads(path.read_text())
@@ -35,6 +73,7 @@ def provider_fixture():
 
 class StagingRecoveryStatusTests(unittest.TestCase):
     def setUp(self):
+        self.plan = status.plan_projection(plan_fixture())
         self.routes = provider_fixture()
         self.state = {
             "deploymentId": VERSION, "running": False,
@@ -50,23 +89,45 @@ class StagingRecoveryStatusTests(unittest.TestCase):
                 reads.append(path)
                 return deepcopy(routes[path])
 
-        def ownership(token):
-            self.assertEqual(token, CONTROL["OWNERSHIP_CONTROL_TOKEN"])
+        def ownership(token, fingerprint):
+            expected = FINGERPRINT if self.plan is not None else None
+            self.assertEqual((token, fingerprint), (CONTROL["OWNERSHIP_CONTROL_TOKEN"], expected))
             self.assertEqual(reads, [DEPLOYMENTS, VERSION_DETAIL, APPS, ROLLOUTS, ROLLOUT_DETAIL])
             update()
             return self.state
 
-        return status.read_status(ENV, client_factory=lambda *args, **kwargs: Provider(), read=ownership)
+        return status.read_status(ENV, self.plan, client_factory=lambda *args, **kwargs: Provider(), read=ownership)
 
     def test_bracket_projects_only_provider_and_ownership_evidence(self):
+        self.plan = None
         receipt = self.observe()
         self.assertEqual(set(receipt), {"schema_version", "workflow_sha", "workflow_run_id", "observed_at",
-                                        "verification", "worker", "container", "ownership"})
+                                        "verification", "worker", "container", "ownership", "runtime_database", "plan"})
         self.assertEqual(receipt["verification"], "provider_only")
+        self.assertIsNone(receipt["plan"])
+        self.assertEqual(receipt["runtime_database"], "plan_not_supplied")
         self.assertEqual(receipt["worker"]["version_id"], VERSION)
         self.assertEqual(receipt["container"]["image_digest"], IMAGE.split("@")[1])
         self.assertEqual(receipt["ownership"], {"phase": "active", "epoch": 7, "running": False})
         self.assertNotIn(SECRET_SENTINEL, json.dumps(receipt))
+
+    def test_supported_worker_full_tuple_binds_the_exact_plan_fingerprint(self):
+        self.state["runtimeDatabaseFingerprint"] = FINGERPRINT
+        receipt = self.observe()
+        self.assertEqual((receipt["verification"], receipt["runtime_database"]), ("full_tuple", "verified"))
+        self.assertEqual(receipt["plan"]["target_fingerprint"], FINGERPRINT)
+
+    def test_unsupported_old_worker_can_only_report_provider_evidence(self):
+        receipt = self.observe()
+        self.assertEqual(receipt["verification"], "provider_only")
+        self.assertEqual(receipt["runtime_database"], "worker_unsupported")
+
+    def test_wrong_runtime_target_and_invalid_fingerprints_refuse(self):
+        for fingerprint in (None, "f" * 64, "", [], SECRET_SENTINEL):
+            with self.subTest(fingerprint=fingerprint):
+                self.state["runtimeDatabaseFingerprint"] = fingerprint
+                with self.assertRaisesRegex(status.GateError, "^runtime_database_target_unproved$"):
+                    self.observe()
 
     def test_provider_and_ownership_disagreement_refuse(self):
         def drift():
@@ -111,12 +172,39 @@ class StagingRecoveryStatusTests(unittest.TestCase):
                 def open(self, request, timeout):
                     case.assertEqual(request.get_method(), "GET")
                     case.assertEqual(request.get_header("User-agent"), status.USER_AGENT)
-                    case.assertEqual(request.full_url, f"{status.ORIGIN}/internal/ownership")
+                    case.assertEqual(request.full_url, f"{status.ORIGIN}/internal/ownership?runtime_db_fingerprint={FINGERPRINT}")
                     case.assertEqual(timeout, 15)
                     return Response(raw)
 
             with self.subTest(code=code), self.assertRaisesRegex(status.GateError, f"^{code}$"):
-                status.read_ownership(CONTROL["OWNERSHIP_CONTROL_TOKEN"], opener=Opener())
+                status.read_ownership(CONTROL["OWNERSHIP_CONTROL_TOKEN"], FINGERPRINT, opener=Opener())
+
+    def test_plan_authenticates_attempt_jobs_zip_and_exact_ledger_projections(self):
+        paths = github_fixture()
+        receipt = status.verified_plan("13", lambda path, **kwargs: paths[path])
+        self.assertEqual((receipt["run_id"], receipt["artifact_id"], receipt["source_sha"]), (13, 17, SOURCE))
+        self.assertEqual(receipt["target_fingerprint"], FINGERPRINT)
+        self.assertEqual((receipt["cutover_version"], receipt["store_version"]), (481, 478))
+        self.assertNotIn("fixture.pg.psdb.cloud", json.dumps(receipt))
+        self.assertNotIn(SECRET_SENTINEL, json.dumps(receipt))
+        self.assertEqual(status.checked_plan_summary(receipt), receipt)
+        with self.assertRaisesRegex(status.GateError, "^invalid_plan_summary$"):
+            status.checked_plan_summary(dict(receipt, raw=SECRET_SENTINEL))
+        paths["actions/runs/13/attempts/1/jobs?per_page=4"]["jobs"][2]["conclusion"] = "success"
+        with self.assertRaisesRegex(status.GateError, "^invalid_plan_jobs$"):
+            status.verified_plan("13", lambda path, **kwargs: paths[path])
+        manifest = plan_fixture()
+        manifest["store_plan_manifest_sha256"] = "f" * 64
+        with self.assertRaisesRegex(status.GateError, "^plan_projection_mismatch$"):
+            status.plan_projection(manifest)
+
+    def test_plan_archive_refuses_wrong_digest_malformed_and_oversized_members(self):
+        for raw, code in ((archive_fixture(b"{}"), "plan_archive_digest_mismatch"),
+                          (archive_fixture(b'{"role":0,"role":1}'), "invalid_json"),
+                          (archive_fixture(b" " * (status.MAX_PLAN + 1)), "invalid_plan_archive")):
+            digest = "f" * 64 if code == "plan_archive_digest_mismatch" else sha256(raw).hexdigest()
+            with self.subTest(code=code), self.assertRaisesRegex(status.GateError, f"^{code}$"):
+                status.plan_manifest(raw, f"sha256:{digest}")
 
     def test_dispatch_must_be_attempt_one_from_the_current_protected_workflow_head(self):
         context = {**ENV, "GITHUB_REPOSITORY": status.REPO, "GITHUB_REPOSITORY_ID": "1396224242",

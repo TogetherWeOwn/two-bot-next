@@ -670,9 +670,19 @@ no-start ownership GET with two provider reads. Both samples must agree on the
 100% serving Worker version, bounded policy, Durable Object namespace, and
 newest completed rollout with a digest matching the application's configured
 image. The serving Worker must be the active owner. The receipt records
-its epoch and whether the container was running. `provider_only` leaves runtime
-database identity unresolved. Recovery requires an exact read-only plan and a
-compatible predecessor.
+its epoch and whether the container was running.
+
+Supply `plan_run_id` to authenticate the plan and both clean ledgers through
+cutover 0481 and store 0478 or later. The Worker fingerprints the host,
+database and exact branch pin of its direct `*.pg.psdb.cloud` binding
+without connecting. Only `sslmode` and `channel_binding` options are
+supported. A match yields `full_tuple`.
+
+`provider_only` attests provider and owner data when the Worker lacks
+fingerprint support or the plan is omitted. A supporting Worker refuses
+a mismatch. Recovery requires a fresh plan and a separate check of the
+predecessor against both ledgers. If none qualifies, use the separately
+authorized baseline transition.
 
 ## Verification boundaries
 
