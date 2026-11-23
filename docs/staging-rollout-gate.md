@@ -705,11 +705,10 @@ trees of each recovery candidate against the verified plan. The protected
    If a window was acquired, confirm release or native expiry and stopped state.
    Resolve a binding failure through the scoped staging credential path.
 4. After rollout, readiness, error-rate and release checks pass, authenticate
-   the protected rollout artifact and use
-   its Worker UUID and image digest as `recovery_pair` (`UUID@sha256:digest`).
+   the protected artifact and set `recovery_pair` to its `UUID@sha256:digest`.
    Dispatch `verified` to check both migration trees and the pinned stopped pair
-   before replacement. It checks the new binding before startup and permits
-   paired rollback only to that predecessor within the original expiry.
+   before replacement. Roll forward on a failure before acquisition. Once a
+   window is acquired, rollback can restore the pinned pair within that expiry.
 
 ## Verification boundaries
 
