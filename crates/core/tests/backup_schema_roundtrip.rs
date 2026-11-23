@@ -3291,7 +3291,8 @@ async fn v16_archive_restores_instance_windows_and_clears_attendance() {
 }
 
 fn assert_archive_omits_recovery_boundary(archive: &DumpContents) {
-    assert!(!archive.manifest.applied_cutover(475));
+    // Later migrations may be recorded while 0475 is still missing.
+    assert!(!archive.manifest.cutover_migrations.contains(&475));
     let windows = archive
         .manifest
         .tables
@@ -3369,7 +3370,7 @@ async fn pre_0475_v17_archive_and_migration_fence_event_instance_windows() {
     dump(pool, &path).await.unwrap();
     let old = inspect(&path).unwrap();
     assert_eq!(old.manifest.version, 17);
-    assert!(old.manifest.applied_cutover(480));
+    assert!(old.manifest.cutover_migrations.contains(&480));
     assert!(old.manifest.missing_tables().is_empty());
     assert_archive_omits_recovery_boundary(&old);
     for name in ATTENDANCE_TABLES {

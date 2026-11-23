@@ -251,6 +251,13 @@ binding or timestamp alone cannot prove a live window, so a restored pre-v16
 recovery point fails closed (no instance is treated as live, and the revocation
 and order fences are gone) until a fresh accepted Discord observation
 re-establishes each instance. Use v16 or later to preserve that evidence.
+
+On a target with migration 0475, an archive that lacks
+`event_instance_windows.attendance_recovered_at` receives a restore-time
+timestamp for each restored window. Restore uses the archive's column list.
+Higher migration versions can precede 0475 in an applied ledger, so use exact
+version membership when checking for 0475.
+
 Older archives without attendance clear both tables in the restore transaction
 without backfill. The migration enables neither capture nor attendance reads.
 Current v17 archives require the full inventory. Tombstone `deleted_at` cells must be real dates in
