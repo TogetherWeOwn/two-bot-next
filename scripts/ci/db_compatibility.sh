@@ -14,13 +14,20 @@ git worktree add --detach "$prior_tree" "$prior_sha"
 printf 'PR head %s, event base %s, merge base %s\n' "$PR_HEAD_SHA" "$PR_BASE_SHA" "$prior_sha"
 [[ $(git -C "$prior_tree" rev-parse HEAD) == "$prior_sha" ]]
 
+adapter_source() {
+  # A base that already has the lane must supply its own adapters.
+  if [[ -f $1/scripts/ci/db_compatibility.sh ]]; then printf '%s\n' "$1"; else printf '%s\n' "$head_tree"; fi
+}
+
+# Exercise the future merge-base route even on the bootstrap PR.
+probe=$scratch/adapter-selection
+mkdir -p "$probe/scripts/ci"
+touch "$probe/scripts/ci/db_compatibility.sh"
+[[ $(adapter_source "$probe") == "$probe" ]]
+
 build() {
-  local tree=$1 label=$2 fixtures=$1/scripts/ci/fixtures name example
-  # The first PR bootstraps bases that predate this lane. Later bases must
-  # supply their own adapters so a head API change can update its own copy.
-  if [[ $label == prior && ! -e $tree/scripts/ci/db_compatibility.sh ]]; then
-    fixtures=$head_tree/scripts/ci/fixtures
-  fi
+  local tree=$1 label=$2 fixtures name example
+  fixtures=$(adapter_source "$tree")/scripts/ci/fixtures
   (
     cd "$tree"
     mkdir -p crates/cutover/examples
@@ -43,7 +50,6 @@ head="$scratch/build-head/debug"
 source_db=two_bot_test_compat_source
 target_db=two_bot_test_compat_target
 url() { printf 'postgres://%s:@agent-testdb:5432/%s' "$1" "$2"; }
-# Strip ambient credentials and connection overrides. The service is job-local.
 sql() {
   local login=$1 database=$2
   shift 2
@@ -79,8 +85,7 @@ with_db TWO_DATABASE_URL compat_migrate "$source_db" "$prior/examples/db_compati
 "$prior/two-bot" db roles plan | admin "$source_db"
 with_db TWO_DATABASE_URL compat_audit "$source_db" "$prior/two-bot" db roles verify
 
-# Clone before seeding so the target starts with an installed prior schema,
-# real ledgers and grants, and no destination moderation history.
+# Clone the migrated database before adding source archive rows.
 admin postgres -c "CREATE DATABASE $target_db TEMPLATE $source_db"
 admin postgres -c "GRANT CONNECT, CREATE ON DATABASE $target_db TO two_bot_migrator"
 with_db TWO_DATABASE_URL compat_migrate "$target_db" "$head/examples/db_compatibility_schema" target
@@ -226,8 +231,7 @@ if verify_prior >"$scratch/revoked.log" 2>&1; then
   exit 1
 fi
 cat "$scratch/revoked.log"
-# The strict CLI prefixes findings with "drift: ". Require the separate
-# result from the expanded verifier so an inspection error cannot pass.
+# Only the expanded verifier prints the finding without the "drift: " prefix.
 grep -Fx 'missing table privilege: two_bot_runtime/public.scheduled_messages/UPDATE' "$scratch/revoked.log"
 {
   printf '### Database rollback compatibility\n\n'
