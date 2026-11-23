@@ -63,7 +63,7 @@ fn gates(enabled: bool) -> RouterGates {
 fn interaction(id: u64, command: &str, options: Value) -> Interaction {
     serde_json::from_value(json!({
         "id": id.to_string(), "application_id": "1111", "type": 2,
-        "token": format!("clone-fixture-{id}"), "version": 1,
+        "token": format!("clone-fixture-{id}"), "version": 1, "attachment_size_limit": 10485760,
         "guild_id": GUILD, "channel": {"id": "4444", "type": 0},
         "authorizing_integration_owners": {"0": GUILD}, "entitlements": [],
         "member": {

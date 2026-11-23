@@ -109,6 +109,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "containment_incidents", measure: TableMeasure::Columns(&["started_at"]) },
     // Same shape as guild_counters: one read-time per count, no updated_at.
     TableSpec { table: "counter_snapshots", measure: TableMeasure::Columns(&["human_member_count_at", "online_count_at"]) },
+    TableSpec { table: "event_attendance_windows", measure: TableMeasure::Columns(&["changed_at"]) },
     // Event instance windows (0472): durable lifecycle, order and revocation
     // evidence for accepted Discord event observations. Confirmed lifecycle
     // writes stamp observed_at/revoked_at; status-only omissions stamp omitted_at
@@ -132,6 +133,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // leave rewrites left_at from NULL without touching joined_at, so the
     // maximum across both is the row's last write (same shape as tickets).
     TableSpec { table: "event_voice_presence", measure: TableMeasure::Columns(&["joined_at", "left_at"]) },
+    TableSpec { table: "event_voice_sessions", measure: TableMeasure::Columns(&["changed_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "game_activity_guild_aggregates", measure: TableMeasure::Columns(&["updated_at"]) },
@@ -285,6 +287,10 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec {
         table: "voice_creators",
         measure: TableMeasure::Unmeasurable("no timestamp column; creator configuration is upserted in place (see PgRoomStore::add_creator)", DISPOSITION_ACCEPT_WITH_REASON),
+    },
+    TableSpec {
+        table: "voice_heat_hours",
+        measure: TableMeasure::Unmeasurable("timestamps record observations, not writes; derived calibration is excluded from backups and discarded on restore", DISPOSITION_ACCEPT_WITH_REASON),
     },
     // V3 block list (0416): one row per blocked member, stamped on insert; an
     // unblock deletes the row, so only additions are measurable.
@@ -511,6 +517,25 @@ pub struct DeltaReport {
     pub tables: Vec<TableDelta>,
 }
 
+async fn table_exists(tx: &mut Transaction<'_, Postgres>, table: &str) -> Result<bool, DeltaError> {
+    // Resolve through the same search_path as the COUNT, without reading rows.
+    Ok(sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(table)
+        .fetch_one(&mut **tx)
+        .await?)
+}
+
+fn missing_table(table: &str) -> TableDelta {
+    TableDelta {
+        table: table.to_owned(),
+        status: "missing".to_owned(),
+        columns: None,
+        count: None,
+        reason: Some("table not present in this database".to_owned()),
+        disposition: None,
+    }
+}
+
 /// Count one measured table inside the caller's read-only transaction. A
 /// missing table (partially migrated database) is reported, not an error.
 async fn count_table(
@@ -519,21 +544,8 @@ async fn count_table(
     since: &str,
 ) -> Result<TableDelta, DeltaError> {
     let table = quote(spec.table)?;
-    // Unqualified on purpose: it resolves through the same search_path as the
-    // COUNT below, so schema-isolated test databases behave like production.
-    let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-        .bind(spec.table)
-        .fetch_one(&mut **tx)
-        .await?;
-    if !exists {
-        return Ok(TableDelta {
-            table: spec.table.to_owned(),
-            status: "missing".to_owned(),
-            columns: None,
-            count: None,
-            reason: Some("table not present in this database".to_owned()),
-            disposition: None,
-        });
+    if !table_exists(tx, spec.table).await? {
+        return Ok(missing_table(spec.table));
     }
     let predicate = recency_predicate(spec)?;
     // Table and column names are static constants validated by `quote`;
@@ -577,6 +589,11 @@ async fn report_at(
         })?;
     let mut tables = Vec::with_capacity(TABLE_SPECS.len());
     for spec in TABLE_SPECS {
+        // Pre-heat targets lack this migrator-only table; probe only the catalog.
+        if spec.table == "voice_heat_hours" && !table_exists(&mut tx, spec.table).await? {
+            tables.push(missing_table(spec.table));
+            continue;
+        }
         match spec.measure {
             TableMeasure::Unmeasurable(reason, disposition) => tables.push(TableDelta {
                 table: spec.table.to_owned(),
@@ -753,6 +770,9 @@ mod tests {
         // No duplicate specs.
         assert_eq!(specs.len(), TABLE_SPECS.len());
         let mut universe = matrix_tables();
+        // Runtime may flush and prune this migrator-owned aggregate; rollback re-samples it.
+        assert!(MATRIX_SQL.contains("('public', 'voice_heat_hours', 'retained_aggregate')"));
+        universe.insert("voice_heat_hours".to_owned());
         for table in two_bot_core::backup::DUMP_TABLES {
             universe.insert((*table).to_owned());
         }

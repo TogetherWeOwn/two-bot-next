@@ -216,7 +216,7 @@ fn identity_interaction(
 ) -> twilight_model::application::interaction::Interaction {
     serde_json::from_value(json!({
         "id": "7000", "application_id": APP_ID.to_string(), "type": 2,
-        "token": "registry-identity-fixture", "authorizing_integration_owners": {},
+        "token": "registry-identity-fixture", "attachment_size_limit": 10485760, "authorizing_integration_owners": {},
         "entitlements": [], "guild_id": GUILD_ID.to_string(),
         "data": {"id": id.to_string(), "name": name, "type": 1, "guild_id": GUILD_ID.to_string()}
     }))

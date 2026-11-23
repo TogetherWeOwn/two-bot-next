@@ -124,10 +124,37 @@ no permanent staging keepalive, host timer or new always-on cost is authorized.
   PR's code is not deployed to staging before merge, so a live run would test
   main, not the PR.
 
-Each live run retries twice after 60 s; three failures fail it. The longer
-window covers the documented 95-139 s per-deploy gateway drop as well as a
-transient gateway/REST hiccup. Evidence JSON is
-uploaded as the `voice-synthetic-<run id>` artifact for 14 days.
+Live runs retry up to twice after 60 s only when the pause and another
+450-second attempt fit the original staging grant and the runner budget
+anchored before job setup. The 300-second work cutoff supports the 180-second
+empty-room grace and leaves 150 seconds for separately bounded restoration.
+Evidence JSON is uploaded as the `voice-synthetic-<run id>` artifact for 14 days. A reusable
+workflow caller can provide the optional `artifact_invocation` label to append
+`-<label>` to that artifact and the `staging-use-voice-start-<run id>-<attempt>`
+receipt. An omitted or empty label preserves the original names. Callers with
+multiple invocations must use distinct fixed labels; the label does not change
+file paths, retries or staging ownership.
+
+### REST counter measurement
+
+Use a **fresh** `voice-rest-measurement.yml` dispatch on protected `main` when
+staging serves that commit. Keep case variants of `main` outside branch
+protection: Actions compares ref names case-insensitively, so the lock selector
+also requires `github.ref_protected`. Other refs and reruns fail without entering
+the staging queue. An admitted run holds the shared `staging-lifecycle` lock
+through cleanup and uses one 45-minute staging grant.
+It calls the voice synthetic once, and a second time only if the first valid
+all-label counter delta is below 10. The deltas include all REST attempts
+recorded by the staging bot during the interval, not just voice requests.
+The caller never renews the grant.
+
+The bounded `queue: max` preserves pending staging work. Let runs using the old
+single-slot policy settle before dispatching. Treat a cancelled or failed run,
+or a missing or refused verdict, as inconclusive. Read the per-label deltas from
+`voice-measurement-candidate-<run id>-1` **only** after the matching run succeeds
+and `voice-measurement-terminal-<run id>-1` reports `accepted`. The terminal
+verdict checks the same-grant bookends, lifecycle evidence and cleanup;
+a standalone synthetic or a candidate artifact alone is not a measurement.
 
 ## Identity
 

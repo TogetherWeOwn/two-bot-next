@@ -1,8 +1,9 @@
 # Intended staging rollout acceptance
 
-`deploy-staging.yml` runs `scripts/staging_rollout.py` before and after a
-successful Wrangler deployment (the `deploy` job was re-enabled by
-the earlier deploy re-enable). Order: ownership-control `preflight`,
+`deploy-staging.yml` starts only on `workflow_dispatch`; a merge never starts
+it. Dispatch is not accepted-SHA admission, and staging migration remains a
+separate workflow. `scripts/staging_rollout.py` gates the intended Wrangler
+deployment. Order: ownership-control `preflight`,
 `prepare`, Wrangler deploy, `receipt`, ownership-control `deployment-takeover`,
 `verify`. `preflight` and `deployment-takeover` live outside
 `staging_rollout.py`. Readiness cannot be proven before the takeover, because a
@@ -15,10 +16,11 @@ and `snapshot` steps succeeded and a later step fails (receipt validation,
 ownership takeover, `verify`, or the error-rate gate);
 `scripts/staging_rollout.py` itself performs
 no rollback. On success the pre-deploy Worker version **and** container image
-are restored (with takeover, which releases an intentional fence onto the
-restored version after a fenced takeover refusal), and the run still stays red — the restore
+are restored before takeover and the run stays red — the restore
 recovers service, it never certifies the failed build. Without a successful
 deploy and snapshot there is nothing to restore, so no rollback is attempted.
+Routine deploys refuse a fenced or uninitialized owner before replacing either
+component. Use the authorized `release_fence` path to restore a staging baseline.
 The helper additionally requires a proven finite-policy target and the original
 run's grant. Receipt/takeover failures precede grant acquisition, so their
 conditional rollback invocation refuses before mutation with
@@ -33,6 +35,21 @@ ordered restore plan for a receipt without any mutation via
 `scripts/worker_container_rollback.py rollback ... --dry-run`, which validates
 the receipt identically to the live path and exits 0.
 
+If the forward gate rejects a `/readyz` 200 with `serving_worker_mismatch` or
+`serving_image_mismatch`, the `staging-rollout-evidence` artifact may include
+`evidence.readyz-mismatch.json`. This sidecar is best-effort: a write failure
+never changes the original rejection. Pinned drills use the deployed commit's
+verifier, so older pins may not produce it.
+
+The sidecar records the child run/attempt, sample receipt time in UTC, and
+expected and observed identities (`absent` or `invalid` where applicable).
+Multiple Worker version headers are ambiguous and recorded as `invalid`.
+`request_id` is the response's `x-request-id` only if it matches the existing
+format; the gate does not generate one.
+The control-plane timestamp is when the runner observed the completed rollout,
+not when it completed. Its target digest does not identify the serving image.
+This file is diagnostic only, not `evidence.json` or a qualification receipt.
+
 ## No-always-on staging rule and activation hold
 
 Idle staging/preview must carry **no recurring always-on runtime cost**. Start
@@ -43,15 +60,12 @@ cleanup is useful but cannot be the cancellation/runner-loss backstop. Productio
 behavior, probes and release gates are unchanged. Never add a host timer, idle
 keepalive or scheduled probe that resurrects staging outside an authorized window.
 
-**Rollout status: activation by merge, not yet verified.** The staging-use
-protocol in `wrangler/src/staging-lifecycle.ts` is gated by the staging-only
-`STAGING_RUNTIME_POLICY=bounded` configuration. The policy ships in the staging
-vars of the activating change, so merging it activates the policy through the
-ordinary `deploy-staging` push run. Nothing here records that activation as done.
-Source, a merge or a sleeping container is not evidence of the bounded lifecycle:
-only the live qualification, rollback proof and measurement gates below establish
-it. Claim no savings until they pass. See
-[First activation roll-forward bootstrap](#first-activation-roll-forward-bootstrap).
+**Rollout status: activation is not verified.** A merge does not deploy staging,
+start a qualification window or prove activation. The staging-use protocol in
+`wrangler/src/staging-lifecycle.ts` is gated by `STAGING_RUNTIME_POLICY=bounded`.
+An authorized manual staging deployment and the live qualification, rollback
+proof and measurement gates below remain necessary. Claim no savings until they
+pass. See [First activation roll-forward bootstrap](#first-activation-roll-forward-bootstrap).
 
 The protocol binds a finite window to staging, an exact Worker deployment and
 container SHA, the current ownership epoch, and a workflow run/attempt. It
@@ -89,7 +103,7 @@ unchanged. Scheduled user-flow also observes instead of acquiring a window.
 The production promotion's live staging-soak samples use one bounded grant
 through baseline, measurement, final sampling and release; their exact-head live
 qualification remains required.
-`acquire`, `assert`, `ready` and `release` pin the intended
+`acquire`, `assert`, `ready`, `stop` and `release` pin the intended
 `STAGING_USE_SHA`, `STAGING_USE_DEPLOYMENT`, `GITHUB_RUN_ID`,
 `GITHUB_RUN_ATTEMPT` and absolute millisecond `STAGING_USE_EXPIRES_AT`. The
 origin must be the approved staging workers.dev origin, with no path, query or
@@ -161,8 +175,8 @@ The deploy, reusable voice/help, manual Worker/container drills, MCP proof and
 production staging-soak workflows now declare the bounded contract. Scheduled
 user-flow and slow-burn readers observe authority without starting or extending
 it; confirmed idle skips live sampling and incident decisions, not active-use
-checks. This is source integration whose merge is the activation trigger, not a recorded
-activation or live qualification. Exact-head Actions, live inventory, the
+checks. This is source integration; its merge is not an activation trigger,
+recorded activation or live qualification. Exact-head Actions, live inventory, the
 first-activation bootstrap and rollback proof, and independent review still gate
 rollout. The wrappers replace no existing qualification. The binding checker
 permits only an absent policy or the exact `"bounded"` value in staging with
@@ -182,8 +196,8 @@ an `authorized` receipt is not startup/readiness or zero-cost proof.
 The required pipeline integration must hold one window and full-window exclusion
 through **all** `deploy`, `user-flow-synthetic`, `voice-synthetic`,
 `help-embed-synthetic` and `certify-promotion` jobs in the same `deploy-staging`
-run, including a push run reused by a post-merge drill. Reusable consumers must
-assert the caller's window without taking the caller's lock or releasing it.
+dispatch run. Reusable consumers must assert the caller's window without taking
+the caller's lock or releasing it.
 Standalone consumers and rollback use the same finite-use contract. That wiring
 is present, but its exact-head live acceptance and the inventory/rollback gates
 below remain required. Client and runtime source support alone is not a qualified
@@ -205,7 +219,7 @@ Production probe code is unchanged.
 The deploy job authorizes a 120-minute maximum window after receipt-validated
 ownership transfer and before its unchanged rollout/readiness gate. It exports
 the exact deployment/SHA and immutable expiry. All five qualifying jobs remain
-in that same push run; user-flow and certification reassert the window before
+in that same run; user-flow and certification reassert the window before
 consumption. Release needs every consumer and runs after failures too. A cleanup
 failure stays red; native expiry remains mandatory for cancelled or lost runners.
 
@@ -232,27 +246,39 @@ Retain start/assert and stop/refusal artifacts for the run and attempt. Verify
 on exact-head Actions that the existing staging control secret resolves in each
 called staging job; a missing token fails closed, never warrants a new credential.
 
-**Pending-slot replacement (residual recovery, 2026-11-07):** GitHub preserves a
-running holder with `cancel-in-progress: false`, but keeps only one pending item
-per group. The five-minute user-flow observer is outside that group and cannot
-replace a pending deploy or promotion soak. Actual holders (another deploy,
-drill or soak) can still replace one pending holder; there is no FIFO/fairness
-guarantee. A cancelled run is not qualification or staging history. Re-dispatch
-`deploy-staging` from `main` with `sha` set to that exact merged 40-hex SHA, wait
-for all five qualifying jobs plus release, and retain the new attempt's receipts
-before considering promotion. A cancelled production soak needs a new promotion
-run through its unchanged guard and fresh full-window measurement, never
-historical soak credit. The pin/history guard stays unchanged; an older pin
-still makes that deploy run intentionally red and cannot certify a different
-workflow head. No scheduler or automatic redispatch is added. The five-minute
-observer never grants a window; its cadence is not permission for
-near-continuous staging use.
+**Before any qualification dispatch:** subject to existing holds and
+authorization, check that `main` resolves to the intended merged 40-hex SHA
+immediately before dispatch. Use `main` as the workflow ref and that exact SHA
+as `sha` only if they match. If `main` has moved or the match cannot be verified,
+stop; do not dispatch the older SHA as a recovery pin. A drill pin can redeploy
+staging before the history guard fails it, and cannot produce B1 or a promotion
+certificate. Verify the run's recorded `headSha` against the target too: the
+pre-dispatch check does not lock `main`. A mismatch is not qualification.
 
-**Reruns:** use **Re-run all jobs**, never only failed jobs. A partial rerun has a
-new `run_attempt` but old grant outputs, so the inherited assert refuses with
-`staging_window_mismatch`. Do not copy another attempt's expiry, reset the grant
-or renew it to make the rerun pass. Missing inherited expiry fails closed via
-the nested-lock refusal/cancellation, not by bypassing the consumer.
+**Queued staging work:** Every holder uses `queue: max` and preserves the
+running holder. The queue is bounded; admission order is not a freshness check.
+After acquiring the lock, `deploy-staging` rechecks the fetched main tip before
+changing staging. A superseded workflow head fails red. A stale repeat can
+become the newest outcome for the still-serving SHA and block promotion even
+with an older green run. Do not skip that failure; qualify current `main`
+with a fresh dispatch only if the match above holds. To intentionally recover a
+prior main SHA, dispatch from current `main` with the full ancestor SHA and
+`recover_prior_sha: true` ([voice heat backout](database-roles.md#voice-heat-staging-backout)).
+This does not qualify as staging history. Do not rerun old workflow revisions
+with the old single-slot policy; let existing holders and waiters settle before
+using the measurement caller. Wait for all five qualifying jobs plus release
+and retain the new attempt's receipts. Cancelled runs are not evidence; a
+cancelled production soak still needs a fresh full-window measurement. No
+scheduler or automatic redispatch is added. The independent five-minute observer
+never grants a window.
+
+**Reruns:** do not use **Re-run all jobs** or **Re-run failed jobs** for
+qualification. Both create a new `run_attempt`; the deploy-called voice and help
+synthetics intentionally refuse every rerun, even with fresh grants. A partial
+rerun can also carry stale grant outputs. Do not copy another attempt's expiry,
+reset the grant or renew it to bypass refusal. For recovery, follow the same
+matching-head check above before a fresh dispatch. Wait for all five qualifying
+jobs and release, and retain the fresh run's receipts.
 
 Before activation, retain authorized live inventory for the staging and
 production Worker versions, namespaces, Container applications/instances,
@@ -276,9 +302,10 @@ compatibility is resolved by the roll-forward rule below, before the merge.
 
 ### First activation roll-forward bootstrap
 
-Activation is the ordinary `deploy-staging` push run for the change that ships
-`STAGING_RUNTIME_POLICY=bounded` in the staging vars. There is no wrapper or
-separate activation step and no baseline taken beforehand.
+Activation requires an authorized `deploy-staging` dispatch with
+`STAGING_RUNTIME_POLICY=bounded` in the staging vars. Apply the matching-head
+check above before dispatch; stop if the intended merged SHA no longer matches
+`main`. A merge alone does not activate the policy or establish a baseline.
 
 - **Predecessors are not restore targets.** The currently deployed staging
   versions (v875, v876 and v877) predate the policy and are unbounded. They are
@@ -312,13 +339,16 @@ separate activation step and no baseline taken beforehand.
   was red, since the policy bindings are what matter. The unchanged 18-pass stable
   restore gate still applies to it.
 
-Every gate in this document stays in force: exact-head Actions, Security then QA,
-separate per-PR exact-head Release Manager acceptance before merge, fresh inventory
-of the actual database, shared policy and applied migration ledger, exact-head
-qualification, and the `t0`, pre-7-day and post-7-day evidence below. The bootstrap
-sequence is a technical recovery decision, not approval to merge, deploy production
-or waive missing qualification. The merge-push qualification and rollback drill
-remain required live activation evidence.
+Keep exact-head Actions, applicable independent reviews, fresh inventory of the actual
+database, shared policy and applied migration ledger, exact-head qualification,
+and the `t0`, pre-7-day and post-7-day evidence below. A merge that would
+deploy production or whose deployment cannot be ruled out needs owner approval
+for the full PR head SHA. See
+[production merge evidence](../CONTRIBUTING.md#production-merge-evidence).
+The bootstrap sequence is a technical recovery decision, not approval to merge,
+deploy production or waive missing qualification. Exact-SHA staging qualification
+and the rollback drill remain required live activation evidence; a merge does not
+start them.
 
 At verified activation record UTC `t0`, actual resource/version/SHA identities,
 finite expiry, exact-head startup/qualification evidence, stop/idle convergence
@@ -360,17 +390,19 @@ merge or an unverified deployment is not `t0`.
    version. A restored deployment still leaves the job red on `main`: the rollback
    restores service, it never certifies the failed build. There is deliberately **no
    automatic permanent fence**: a successful restore ends with takeover (`active`), so
-   the next push can hand off again without a manual `release_fence` dispatch. When
+   the next authorized deploy can hand off without a `release_fence` dispatch. When
    the `deploy` or `snapshot` step did not succeed there is nothing to restore, so no
    rollback is attempted and staging stays owned by whatever version holds it. When the
    rollback step itself fails or its stable gate never verifies, treat staging as
    unverified — it may still serve the failed build or sit fenced. A red downstream
    `voice-synthetic` job is separate: it runs after the deploy job and never triggers
-   a rollback. Before re-running the deploy (or dispatching it), inspect the
+   a rollback. Before any fresh deploy dispatch, inspect the
    `auto-rollback-evidence.json` in the `staging-rollout-evidence` artifact plus the
    current Worker identity (`/health` version header), `/readyz` readiness and
-   ownership status, then fix the cause; production deploys are separate,
-   manual and cutover-owned.
+   ownership status, then fix the cause. For qualification, follow the fresh
+   exact-SHA dispatch recovery above, subject to existing holds and authorization;
+   do not rerun the failed workflow. Production deployment is governed separately
+   by the [production promotion gate](production-deploy.md).
 
 ## Provenance chain
 
@@ -404,7 +436,7 @@ merge or an unverified deployment is not `t0`.
    from the deployed checkout's lockfile after `npm ci`, so an older pinned drill
    uses that commit's CLI and receipt guard, not the workflow head's newer pin.
    Require at least one session, all pinned to that checkout's version (currently
-   4.156.0) with record version 1, exactly one `deploy` invocation and every other
+   4.161.0) with record version 1, exactly one `deploy` invocation and every other
    session exactly `--version` or `-v`, and exactly one staging deploy record
    with the expected Worker name, fresh timestamp and concrete Worker version.
    The `receipt` step runs this check **before** `deployment-takeover`, so
@@ -446,6 +478,15 @@ merge or an unverified deployment is not `t0`.
    rollout, and the exact Worker passes the runtime probes. On the active-lag counter
    shape, that listing-lag acceptance still requires two consecutive full passes.
    Successful stale-listing acceptance records `"application_listing_lag": true`.
+
+   After validating pinned rollout completion, require an authenticated stop receipt with
+   `running: false`, even at zero instances: an alarm may have started the prior build.
+   Only post-stop probes certify the exact Worker, revision, build and deploy ID; they can
+   cold-start the replacement. Zero or starting counters retry within the same deadline.
+   A busy status GET may retry within budget; send the stop POST once and fail if unconfirmed.
+   Stop preserves the grant and its expiry for automatic rollback and final release.
+   Historical recovery pins use their own checkout's verifier; pins predating this change
+   cannot supply fresh-stop evidence.
 
    A stale listing that is not verified as the rollout's previous image fails as
    `application_image_drift`. For a verified previous-image listing that has not
@@ -489,10 +530,20 @@ listing still shows the previous image. Replaced/reverted rollouts and identity
 or image drift still fail closed. Production retains its application-listing
 check.
 
+A valid stale Worker readback does not block the image POST while fenced; split
+traffic, unrelated versions and read errors do. Neither POST is retried. After
+image convergence, the target Worker must serve 100% within seven reads, ten
+seconds apart.
+
 Image completion is not rollback success: ownership takeover and the existing
 18 consecutive passing `/health` and `/readyz` polls still follow. Those polls
 require the restored Worker version, expected build revision (subject to the
 existing pre-stamp exception), and `gateway=ready`; any miss resets the streak.
+Before takeover and after the probes, verify the pinned rollout, application and
+history. Accept only the previous digest as listing lag, and only if the listing
+has never shown the restore digest and no newer rollout exists. Early drift keeps
+staging fenced; late drift prevents a success receipt. The drill requires a restore
+rollout ID distinct from both the snapshot and forward rollout IDs.
 
 If the image leg times out, the log and failure evidence name the unmet condition
 as `waiting_for=target_version|rollout_completion|counters_or_progress|application_image`.
@@ -510,7 +561,7 @@ gh workflow run deploy-staging.yml --ref main -f inject_gateway_failure=true
 ```
 
 `inject_gateway_failure` is a `workflow_dispatch`-only boolean (default
-false; a push cannot set it, and `deploy-production` never reads it). The
+false; `deploy-production` never reads it). The
 prepare step turns it into `--inject-gateway-failure` for
 `scripts/staging_rollout.py`, which writes
 `TWO_GATEWAY_READINESS_FAIL_INJECTION = "1"` into the **generated**
@@ -560,7 +611,7 @@ gh workflow run deploy-staging.yml --ref main -f inject_error_rate_spike=true
 ```
 
 `inject_error_rate_spike` is a `workflow_dispatch`-only boolean (default
-false; a push cannot set it, and `deploy-production` never reads it). It
+false; `deploy-production` never reads it). It
 reaches only the `error_rate_gate` step's `INJECT_ERROR_RATE_SPIKE` env
 through the pinned dispatch-only expression: the step passes
 `--rehearsal-firing '["rest_5xx_rate"]'` to
@@ -610,6 +661,28 @@ On success the job prints an allowlisted receipt: application/rollout/Worker
 version, target application version, immutable image digest, build revision/ID and
 HTTP statuses. Raw Cloudflare configurations can include env values and are never
 saved as artifacts. Temporary baseline/config/NDJSON files stay in runner scratch.
+
+## Read-only recovery inventory
+
+Freshly dispatch `staging-ownership-status.yml` on protected current `main`
+with `inventory=true` for each receipt. The staging job brackets an authenticated
+no-start ownership GET with two provider reads. Both samples must agree on the
+100% serving Worker version, bounded policy, Durable Object namespace, and
+newest completed rollout with a digest matching the application's configured
+image. The serving Worker must be the active owner. The receipt records
+its epoch and whether the container was running.
+
+Supply `plan_run_id` to authenticate the plan and both clean ledgers through
+cutover 0481 and store 0478 or later. The Worker fingerprints the host,
+database and exact branch pin of its direct `*.pg.psdb.cloud` binding
+without connecting. Only `sslmode` and `channel_binding` options are
+supported. A match yields `full_tuple`.
+
+`provider_only` attests provider and owner data when the Worker lacks
+fingerprint support or the plan is omitted. A supporting Worker refuses
+a mismatch. Recovery requires a fresh plan and a separate check of the
+predecessor against both ledgers. If none qualifies, use the separately
+authorized baseline transition.
 
 ## Verification boundaries
 

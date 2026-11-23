@@ -148,6 +148,7 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | In-scope prefix candidates refused by the automod verdict; the worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content, scope mismatches, bot/webhook messages and disabled text-command gates never increment it |
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert). Deliberately unconsumed: no production callsite records the family yet |
 | `two_bot_automod_decisions_total{outcome}` | Terminal automod inspection outcomes; `outcome` is `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out` or `sanction_refused`. Recorded once per committed `StoredOutcome` by the shared activation; replays and retained claims never count. Fixed eight series from process start; no message text, excerpts or user IDs become labels. `sanction_refused` is consumed by `automod_sanction_refused` (tickets on any increase); the other seven outcomes are policy working as designed |
+| `two_bot_automod_previews_total{result,filter,mode}` | Private preview outcomes counted before callback dispatch. See [the 24 fixed tuples](metrics.md#label-allowlists-stable). Successful audit replays and permission denials do not count; audit failures count only as `unavailable`. Not an alert input |
 
 ## Raid and join-risk observer drops
 
@@ -350,6 +351,7 @@ entry, so staleness tickets via `job_unknown_stale` instead of `job_stale`.
 | `member_unban_sweep` | `member_runtime.rs` (`sweep_job`) | Member unban sweep every 30 s with an attempt timeout that may outlive its cadence; a successful sweep need not complete any unban; failure-only alerting |
 | `automod_expiry` | `automod_gateway.rs` (`expiry_job`) | Automod repeat-history expiry tick every 60 s; a gateway without built activation is a no-op success, and real expiry work runs only with the automod gate on; failure-only alerting |
 | `lfg_sweep` | `lfg_jobs.rs` (`register`) | Bounded LFG lifecycle sweep every 60 s under announcement/identity gates; at most 20 candidates, row-local failures continue, and success does not prove every row or message refresh settled; 60 s `job_stale` cadence |
+| `voice_heat` | `voice_snapshot.rs` (`heat::job`) | Private five-minute sampler; shares the retention pool only with execute admission and gateway prerequisites. Gaps still flush completed hours. No new reader access; staleness uses `job_unknown_stale` |
 
 ## Alert rules
 

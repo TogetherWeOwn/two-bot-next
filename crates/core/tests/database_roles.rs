@@ -68,11 +68,18 @@ async fn execute(pool: &PgPool, sql: String) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+const ROLE_MATRIX: &str = include_str!("../../../sql/database_role_matrix.sql");
+
 async fn findings(pool: &PgPool, roles: &[String]) -> Result<Vec<String>, sqlx::Error> {
-    let sql = include_str!("../../../sql/verify_database_roles.sql").replace(
-        "-- @matrix",
-        include_str!("../../../sql/database_role_matrix.sql"),
-    );
+    findings_for_matrix(pool, roles, ROLE_MATRIX).await
+}
+
+async fn findings_for_matrix(
+    pool: &PgPool,
+    roles: &[String],
+    matrix: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let sql = include_str!("../../../sql/verify_database_roles.sql").replace("-- @matrix", matrix);
     let mut tx = pool.begin().await?;
     sqlx::raw_sql("SET TRANSACTION READ ONLY; SET LOCAL search_path = pg_catalog, pg_temp;")
         .execute(&mut *tx)
@@ -110,13 +117,9 @@ async fn denied(pool: &PgPool, role: &str, sql: &str) -> Result<(), sqlx::Error>
     }
 }
 
-async fn admission_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
-    use two_bot_core::send_admission::{
-        AdmissionError, PgSendAdmission, SendAdmission, SendCooldown,
-    };
-
+async fn runtime_role_pool(pool: &PgPool, role: &str) -> Result<PgPool, sqlx::Error> {
     let role = role.to_owned();
-    let runtime = PgPoolOptions::new()
+    PgPoolOptions::new()
         .max_connections(1)
         .after_connect(move |connection, _| {
             let role = role.clone();
@@ -128,7 +131,15 @@ async fn admission_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Err
             })
         })
         .connect_with((*pool.connect_options()).clone())
-        .await?;
+        .await
+}
+
+async fn admission_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
+    use two_bot_core::send_admission::{
+        AdmissionError, PgSendAdmission, SendAdmission, SendCooldown,
+    };
+
+    let runtime = runtime_role_pool(pool, role).await?;
     let result = async {
         let error = |error: AdmissionError| sqlx::Error::InvalidArgument(error.to_string());
         let gate = PgSendAdmission::new(runtime.clone(), "offline-database-role-admission")
@@ -151,6 +162,58 @@ async fn admission_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Err
         require(
             matches!(gate.admit().await, Err(AdmissionError::Blocked)),
             "runtime lost indefinite admission hold",
+        )
+    }
+    .await;
+    runtime.close().await;
+    result
+}
+
+// Use only the grants installed by the canonical plan on the migrated fixture.
+// The real adapter owns its transactions, so every pooled session is restricted.
+async fn preview_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
+    use std::time::Duration;
+    use tokio::time::Instant;
+    use two_bot_core::automod_preview_attempt::PreviewAttemptStore;
+    use two_bot_core::automod_preview_audit::{
+        preview_audit_id, preview_audit_record, PreviewAuditRow,
+    };
+    use two_bot_core::automod_preview_store::SqlPreviewStore;
+
+    let runtime = runtime_role_pool(pool, role).await?;
+    let result = async {
+        let effective_role: String = sqlx::query_scalar("SELECT current_user::text")
+            .fetch_one(&runtime)
+            .await?;
+        require(
+            effective_role == role,
+            "preview pool did not assume runtime role",
+        )?;
+
+        let id = preview_audit_id("roles-probe");
+        let new_store = || SqlPreviewStore::new(&runtime, Instant::now() + Duration::from_secs(5));
+        let mut writer = new_store();
+        require(
+            writer.claim_and_read(&id).await?.is_none(),
+            "preview id already exists",
+        )?;
+        let reason = "filter=bad_words;exemption=none;mode=dry_run;len=0_50";
+        let record = preview_audit_record("g", "a", "c", "matched", reason.to_owned());
+        let created_at = writer
+            .insert_and_commit(record, &id, "2026-01-01T00:00:00.123456Z")
+            .await?;
+        require(
+            created_at == "2026-01-01 00:00:00.123456+00",
+            "runtime preview insert did not return the receipt time",
+        )?;
+        require(
+            new_store().claim_and_read(&id).await?
+                == Some(PreviewAuditRow {
+                    outcome: "matched".to_owned(),
+                    reason: Some(reason.to_owned()),
+                    created_at,
+                }),
+            "runtime preview replay did not load the committed row",
         )
     }
     .await;
@@ -285,6 +348,10 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "clean plan drifted",
     )?;
 
+    exercise_voice_heat_grants(pool, roles).await?;
+    denied(pool, &roles[1], "SELECT * FROM web_v1.voice_heat").await?;
+    denied(pool, &roles[3], "SELECT * FROM web_v1.voice_heat").await?;
+
     exercise_member_grants(pool, roles).await?;
     exercise_member_store(pool, &roles[1]).await?;
 
@@ -392,6 +459,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // ticket foreign key. Delete the transcript before its parent ticket.
     as_role(pool, &roles[1], "INSERT INTO public.tickets (id, guild_id, channel_id, opener_id, status, created_at) VALUES ('ticket-probe', 'g', 'c', 'm', 'open', '2026-01-01T00:00:00Z'); SELECT * FROM public.tickets; UPDATE public.tickets SET claimed_by = 'staff' WHERE id = 'ticket-probe'; INSERT INTO public.ticket_transcripts (ticket_id, guild_id, channel_id, opener_id, claimed_by, content, message_count, created_at, purge_after) VALUES ('ticket-probe', 'g', 'c', 'm', 'staff', 'probe', 1, '2026-01-01T00:00:00Z', '2026-04-01T00:00:00Z'); SELECT * FROM public.ticket_transcripts; UPDATE public.ticket_transcripts SET content = 'updated probe' WHERE ticket_id = 'ticket-probe'; DELETE FROM public.ticket_transcripts WHERE ticket_id = 'ticket-probe'; DELETE FROM public.tickets WHERE id = 'ticket-probe'").await?;
     automod_runtime_role_regression(pool, roles).await?;
+    preview_as_runtime(pool, &roles[1]).await?;
     role_matrix_b2_regression(pool, roles).await?;
     for view in [
         "contract_meta",
@@ -404,6 +472,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "next_event",
         "funnel_daily",
         "funnel_by_source",
+        "voice_heat",
     ] {
         as_role(pool, &roles[2], &format!("SELECT * FROM web_v1.{view}")).await?;
     }
@@ -480,6 +549,14 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // PUBLIC/column access, attributes, inheritance and future grants all count.
     let (migrator, runtime, reader, ro) = (&roles[0], &roles[1], &roles[2], &roles[3]);
     for (change, restore) in [
+        (format!("REVOKE DELETE ON public.voice_heat_hours FROM {runtime}"),
+         format!("GRANT DELETE ON public.voice_heat_hours TO {runtime}")),
+        (format!("GRANT UPDATE ON public.voice_heat_hours TO {runtime}"),
+         format!("REVOKE UPDATE ON public.voice_heat_hours FROM {runtime}")),
+        (format!("GRANT SELECT ON public.voice_heat_hours TO {runtime} WITH GRANT OPTION"),
+         format!("REVOKE GRANT OPTION FOR SELECT ON public.voice_heat_hours FROM {runtime}")),
+        ("GRANT SELECT ON public.voice_heat_hours TO PUBLIC".to_owned(),
+         "REVOKE SELECT ON public.voice_heat_hours FROM PUBLIC".to_owned()),
         (format!("REVOKE SELECT ON public.discord_send_admission FROM {runtime}"),
          format!("GRANT SELECT ON public.discord_send_admission TO {runtime}")),
         (format!("REVOKE INSERT ON public.discord_send_admission FROM {runtime}"),
@@ -554,7 +631,107 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         findings(pool, roles).await?.is_empty(),
         "restored matrix drifted",
     )?;
-    Ok(())
+    exercise_voice_heat_backout(pool, roles).await
+}
+
+async fn exercise_voice_heat_backout(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
+    // The pre-heat verifier uses the same SQL without the new matrix entry.
+    let prior = ROLE_MATRIX.replace("    ('web_v1', 'voice_heat', 'view'),\n", "");
+    let drift = findings_for_matrix(pool, roles, &prior).await?;
+    let heat_select = |row: &String| row.ends_with("/web_v1.voice_heat/SELECT");
+    require(
+        drift.iter().any(heat_select),
+        "pre-heat verifier missed heat grant",
+    )?;
+    let readback = || {
+        sqlx::query_as::<_, (String, Vec<String>)>(
+            "SELECT contract_version, ARRAY(SELECT h::text FROM public.voice_heat_hours h
+             ORDER BY hour_start_utc) FROM web_v1.contract_meta",
+        )
+        .fetch_one(pool)
+    };
+    let (version, before) = readback().await?;
+    require(version == "1.1" && !before.is_empty(), "no 1.1 fixture")?;
+    let backout = include_str!("../../../sql/voice_heat_staging_backout.sql");
+    execute(pool, isolated(backout, roles)).await?;
+    let drift = findings_for_matrix(pool, roles, &prior).await?;
+    require(drift.is_empty(), &format!("pre-heat role drift: {drift:?}"))?;
+    let (version, after) = readback().await?;
+    require(version == "1.0", "backout did not restore 1.0")?;
+    require(before == after, "backout changed persisted heat rows")
+}
+
+async fn exercise_voice_heat_grants(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
+    use time::{Duration, OffsetDateTime};
+    use two_bot_core::{
+        voice_heat::{truncate_to_hour, Accumulator},
+        voice_heat_store::flush_hour_buckets,
+    };
+
+    as_role(pool, &roles[0], "TRUNCATE public.voice_heat_hours").await?;
+    for role in &roles[2..] {
+        denied(pool, role, "SELECT * FROM public.voice_heat_hours").await?;
+    }
+    denied(
+        pool,
+        &roles[1],
+        "UPDATE public.voice_heat_hours SET occupancy_sum = 1",
+    )
+    .await?;
+    denied(pool, &roles[1], "TRUNCATE public.voice_heat_hours").await?;
+
+    // Use the planned runtime role, not the scratch database owner, for the real
+    // writer and its explicit table lock, prune, insert and immutable replay.
+    let runtime = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            pool.connect_options()
+                .as_ref()
+                .clone()
+                .options([("role", roles[1].as_str())]),
+        )
+        .await?;
+    let result = async {
+        let active_role: String = sqlx::query_scalar("SELECT current_user::text")
+            .fetch_one(&runtime)
+            .await?;
+        require(active_role == roles[1], "voice heat writer used the wrong role")?;
+
+        let now = OffsetDateTime::now_utc();
+        let start = truncate_to_hour(now) - Duration::hours(1);
+        let expired = start - Duration::days(36);
+        sqlx::query("INSERT INTO public.voice_heat_hours (hour_start_utc) VALUES ($1)")
+            .bind(expired)
+            .execute(&runtime)
+            .await?;
+
+        let mut sampler = Accumulator::default();
+        sampler.record(start, 7);
+        sampler.record(expired, 9);
+        let flush_error = |error| sqlx::Error::InvalidArgument(format!("runtime flush: {error}"));
+        let written = flush_hour_buckets(&runtime, &sampler.completed(now))
+            .await
+            .map_err(flush_error)?;
+        require(written == 1, "runtime did not insert only the fresh bucket")?;
+
+        sampler.record(start + Duration::minutes(5), 11);
+        let replay = flush_hour_buckets(&runtime, &sampler.completed(now))
+            .await
+            .map_err(flush_error)?;
+        require(replay == 0, "runtime replay inserted the bucket again")?;
+        let rows = sqlx::query_as::<_, (OffsetDateTime, i32, i64, Option<OffsetDateTime>)>(
+            "SELECT hour_start_utc, samples, occupancy_sum, last_observed_at FROM public.voice_heat_hours",
+        )
+        .fetch_all(&runtime)
+        .await?;
+        require(
+            rows == [(start, 1, 7, Some(start))],
+            "runtime failed to expire old heat or changed the replayed row",
+        )
+    }
+    .await;
+    runtime.close().await;
+    result
 }
 
 async fn exercise_member_grants(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
@@ -1555,7 +1732,11 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         }
     }
     require(ledger == STAGING_LEDGER29.len(), "29-state incomplete").unwrap();
-    sqlx::raw_sql(include_str!("../../../sql/web_v1.sql"))
+    // This historical schema has the 1.0 views and helpers, but no heat table.
+    let (prior, _) = include_str!("../../../sql/web_v1.sql")
+        .split_once("-- Voice heat contract 1.1: trailing 28 complete UTC days; all 168 cells.")
+        .expect("heat publication suffix");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(prior))
         .execute(&provision_pool)
         .await
         .unwrap();
@@ -1567,6 +1748,14 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         .execute(&provision_pool)
         .await
         .unwrap();
+    let heat_absent: bool = sqlx::query_scalar(
+        "SELECT to_regclass('public.voice_heat_hours') IS NULL
+            AND to_regclass('web_v1.voice_heat') IS NULL",
+    )
+    .fetch_one(&provision_pool)
+    .await
+    .unwrap();
+    assert!(heat_absent);
     let ledger_rows = STAGING_LEDGER29
         .iter()
         .map(|version| format!("({version})"))
@@ -1649,6 +1838,9 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         }
     }
     require(!pending.is_empty(), "no pending migrations applied").unwrap();
+    two_bot_core::apply_web_contract(&migrator_pool)
+        .await
+        .unwrap();
     let pending_rows = pending
         .iter()
         .map(|version| format!("({version})"))
@@ -1686,6 +1878,16 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         "bootstrap flow drifted",
     )
     .unwrap();
+    let reader = runtime_role_pool(&scratch_admin, &roles[2]).await.unwrap();
+    let initial_cells: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM web_v1.voice_heat
+         WHERE source = 'insufficient' AND avg_in_voice IS NULL AND coverage = 0",
+    )
+    .fetch_one(&reader)
+    .await
+    .unwrap();
+    assert_eq!(initial_cells, 168);
+    reader.close().await;
     provision_pool.close().await;
     migrator_pool.close().await;
     scratch_admin.close().await;

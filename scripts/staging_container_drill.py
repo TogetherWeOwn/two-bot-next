@@ -70,6 +70,12 @@ import staging_rollout as rollout  # noqa: E402
 from staging_rollback_drill import ownership_control  # noqa: E402
 from staging_drill_use import StagingDrillUse
 
+from script_intake import (
+    decode_legacy_json,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 GateError = rollout.GateError
 require = rollout.require
 
@@ -79,18 +85,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 WORKER = rollout.WORKER
@@ -141,12 +136,12 @@ class ContainerDrillClient(rollout.Client):
                      "User-Agent": rollout.USER_AGENT})
         try:
             with self.opener.open(request, timeout=20) as response:
-                raw = response.read(rollout.MAX_BODY + 1)
+                raw = read_with_overflow(response, rollout.MAX_BODY)
                 status = response.status
         except HTTPError as error:
             codes = []
             try:
-                envelope = json.loads(error.read(rollout.MAX_BODY),
+                envelope = decode_legacy_json(error.read(rollout.MAX_BODY),
                                         object_pairs_hook=_reject_duplicate_keys)
                 codes = [str(item["code"]) for item in envelope.get("errors", [])
                          if isinstance(item, dict) and type(item.get("code")) is int][:4]
@@ -303,7 +298,7 @@ def validate_attestation(text):
     if text is None or text == "":
         return None
     try:
-        raw = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+        raw = decode_legacy_json(text, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         raise GateError("invalid_session_attestation") from None
     except ValueError:

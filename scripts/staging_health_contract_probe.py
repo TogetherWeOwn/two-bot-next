@@ -20,9 +20,8 @@ its root cause needs separate reviewed schema/ACL/connectivity evidence
 FAIL: observed unready components are never E2E approval. A starting or
 down gateway does not establish a lifecycle cause.
 
-No probe may apply a migration or test production. This probe never writes,
-follows no redirects, and sends no credentials. The only network calls
-are the two staging GETs above.
+This staging probe never writes or follows redirects. The opt-in sends the
+ownership bearer only on the readiness GET and requires an AutoMod receipt.
 
 Body-cap refusal contract: the transport reads at most BODY_CAP+1 bytes on
 both the normal and HTTPError paths so a hidden suffix is detected. Any body
@@ -55,10 +54,18 @@ from urllib.parse import urlsplit
 
 from build_identity import UNSTAMPED, is_build_id_shape, is_build_revision_shape
 
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
 BODY_CAP = 64 << 10
 TIMEOUT_SECONDS = 10
 USER_AGENT = "two-bot-next-staging-health-contract-probe/1.0 (read-only E2E)"
+PREVIEW_HEADER = "x-two-staging-preview"
 
 REQUIRED_COMPONENTS = ("process", "gateway", "database", "token_invalid")
 # Per-surface allowlist: exactly the four components the container serves
@@ -108,18 +115,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 @dataclass(frozen=True)
@@ -130,6 +126,7 @@ class Result:
     checkpoint_read_failed: bool = False
     failure_class: str | None = None
     http_status: int | None = None
+    preview_receipt: dict | None = None
 
     def line(self):
         return f"{'PASS' if self.ok else 'FAIL'} {self.name}: {self.reason}"
@@ -154,26 +151,21 @@ def staging_origin(url):
     return f"https://{parts.hostname}"
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None  # urllib then raises the 3xx as an HTTPError
-
-
-def fetch(url):
+def fetch(url, *, headers=None):
     """One GET without redirects; returns (status, headers, body bytes)."""
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = no_redirect_opener()
     request = urllib.request.Request(url, method="GET",
                                      headers={"User-Agent": USER_AGENT,
-                                              "Cache-Control": "no-cache"})
+                                              "Cache-Control": "no-cache", **(headers or {})})
     status = None
     try:
         try:
-            with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
+            with opener.open(request, timeout=16 if headers else TIMEOUT_SECONDS) as response:
                 status = response.status
-                return status, response.headers, response.read(BODY_CAP + 1)
+                return status, response.headers, read_with_overflow(response, BODY_CAP)
         except urllib.error.HTTPError as error:
             status = error.code
-            return status, error.headers or {}, error.read(BODY_CAP + 1)
+            return status, error.headers or {}, read_with_overflow(error, BODY_CAP)
     except (OSError, http.client.HTTPException):
         raise TransportError(status) from None
 
@@ -206,7 +198,7 @@ def get_json(fetch_fn, url, name):
     if len(body) > BODY_CAP:
         raise ProbeError(f"{name} probe answered over the body cap", http_status=status)
     try:
-        value = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+        value = decode_legacy_json(body, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         raise ProbeError(f"{name} probe carries duplicate JSON object keys",
                          http_status=status) from None
@@ -302,6 +294,20 @@ def check_build(report, expected_sha):
     return Result("build", True, detail)
 
 
+def preview_request(sha, authorization):
+    deployment, run, attempt, expiry = (os.environ.get(key, "") for key in (
+        "STAGING_USE_DEPLOYMENT", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "STAGING_USE_EXPIRES_AT"))
+    if (not re.fullmatch(r"Bearer [!-~]{32,4089}", authorization) or not sha or sha != os.environ.get("GITHUB_SHA")
+            or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", deployment)
+            or not re.fullmatch(r"[1-9][0-9]{0,19}", run)
+            or not re.fullmatch(r"[1-9][0-9]{0,15}", attempt)
+            or not re.fullmatch(r"[1-9][0-9]{0,15}", expiry) or int(expiry) <= time.time() * 1000):
+        raise ProbeError("AutoMod preview request is missing valid rollout authority")
+    receipt = dict(registry="pass", command="automod-preview", deploymentId=deployment,
+                   sha=sha, runId=run, runAttempt=int(attempt), expiresAt=int(expiry))
+    return {"Authorization": authorization, PREVIEW_HEADER: ":".join((deployment, sha, run, attempt, expiry))}, receipt
+
+
 def run(args, fetch_fn=fetch):
     try:
         origin = staging_origin(args.staging_url)
@@ -316,8 +322,13 @@ def run(args, fetch_fn=fetch):
         results.append(Result("health", False, str(error)))
     report = None
     status = None
+    preview = os.environ.get("STAGING_PREVIEW_AUTHORIZATION")
+    expected_receipt, headers, ready_fetch = None, None, fetch_fn
     try:
-        status, _, value = get_json(fetch_fn, origin + "/readyz", "readyz")
+        if preview and results[0].ok:
+            request_headers, expected_receipt = preview_request(args.expected_sha, preview)
+            ready_fetch = lambda url: fetch_fn(url, headers=request_headers)
+        status, headers, value = get_json(ready_fetch, origin + "/readyz", "readyz")
         state, report = parse_readyz(status, value)
         expected = 200 if all(text == "ready" for text in state.values()) else 503
         if status != expected:
@@ -348,6 +359,14 @@ def run(args, fetch_fn=fetch):
                               failure_class=error.failure_class,
                               http_status=status if status is not None else error.http_status))
     results.append(check_build(report, args.expected_sha))
+    if preview:
+        passed = (all(result.ok for result in results) and expected_receipt is not None
+                  and header(headers, PREVIEW_HEADER) == json.dumps(expected_receipt, separators=(",", ":"))
+                  and header(headers, "x-two-worker-version") == expected_receipt["deploymentId"]
+                  and report["build_id"] == f"{expected_receipt['runId']}-{expected_receipt['runAttempt']}"
+                  and time.time() * 1000 < expected_receipt["expiresAt"])
+        results.append(Result("automod-preview", passed, "registry receipt verified" if passed else "registry receipt refused",
+                              preview_receipt=expected_receipt if passed else None))
     return origin, results, report
 
 
@@ -404,6 +423,9 @@ def main(argv=None, fetch_fn=fetch):
                "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                **evidence_shape(results, report, args.expected_sha),
                "result": "pass" if not failed else "fail"}
+    preview_receipt = next((result.preview_receipt for result in results if result.preview_receipt), None)
+    if preview_receipt:
+        receipt["automod_preview"] = preview_receipt
     try:
         with open(args.evidence, "w", encoding="utf-8") as handle:
             json.dump(receipt, handle, indent=2)

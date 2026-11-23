@@ -34,7 +34,7 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
   `PR_STANDARDS_MODE` for the other references and branch names.
 - **Honest disclosure.** Report only test runs you saw, and say what you did not run.
 - **Review.** Address every review finding, or reply with why it does not apply.
-  Re-request review after you push.
+  Follow the applicable [independent review requirements](#independent-review).
 - **Credit.** Credit the contributors whose work you build on.
 - **Done means merged.** Do not leave an orphan PR open: merge it, or close it
   with a comment that names what replaced it.
@@ -44,9 +44,11 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
 The rulesets on `main` require one PR and squash-only merges, and block deletion
 and force-pushes. `ci-ok`, `gitleaks` and `pr-lint` are required checks on `main`.
 `ci-ok` runs from `check.yml`; the other two run from `supply-chain.yml`.
+`pr-size-gate / gate` and the CodeQL rules also apply.
 `Devin Review` is required too. CodeRabbit is advisory: answer its findings when
-it reviews, but never wait for it or trigger it with commands. No approving
-GitHub review is required; native task review stages still apply.
+it reviews, but never wait for it or trigger it with commands. Resolve review
+threads as required by branch protection. Independent reviews follow the
+policy below.
 `pr-lint` runs `.github/scripts/pr_standards.py` (tests beside it): it checks
 the title format, the 100-character limit, the trailing period and a non-empty
 body as errors, and the two required template sections (Linked Issues and
@@ -55,6 +57,35 @@ Verification), the advisory title/body remainder and branch names in warn mode
 instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
+
+### Independent review
+
+Use the `risk_tier` and complete path floors in the
+[PR template](.github/pull_request_template.md). Declare the higher tier when
+the behavior warrants it. Changes to `AGENTS.md`, `CLAUDE.md`,
+`CONTRIBUTING.md`, `REVIEW.md`, `.claude/**` and `.github/**` are at least T1.
+
+| Tier | Review before merge |
+| --- | --- |
+| T2 docs-only | Author self-check and required CI. |
+| T1 standard | One independent, read-only cross-model review and required CI. |
+| T0 critical | Two independent, read-only cross-model reviews in parallel, one general and one security-focused, and required CI. |
+
+T0 includes auth, sessions, permissions, secrets, crypto, payments, databases,
+migrations, backups, erasure, moderation, gateway, voice, signed internal actions,
+deploy paths, dependencies, lockfiles, CI workflows and security policy or gate config
+(including CODEOWNERS and allowlists). Approval, review and safety procedures are T0 even in docs.
+The [sensitivity map's](.github/review-tiers.yml) content triggers also require T0.
+Security review checks secret exposure, authorization, data integrity and input bounds.
+
+In T3 Code, start each review as a separate read-only delegated task. For an
+AI-authored change, use a model family different from the author's. Provide the
+PR URL and full published head SHA. Reviewers confirm the tier, inspect the
+pinned diff and report the SHA, findings and inspection limits. Record those
+in the PR using public-safe evidence. Follow [SECURITY.md](SECURITY.md) for
+sensitive findings. Material changes, including any T0 control change, require
+fresh independent review. For minor revisions, record both SHAs, what changed
+and why the prior review still applies. Run required CI on every new head.
 
 ### Complete PR inventories
 
@@ -86,20 +117,21 @@ head/base change; a stale check does not validate a new head.
 
 ### Production merge evidence
 
-The final-stage reviewer squash-merges the settled, exact reviewed head in the
-same run as final approval, after all required checks pass and every review
-finding is fixed or answered with evidence. The author merges only when there is
-no review stage. Pin the merge to that head SHA; record the squash SHA and the
-release decision in the release log.
+The task owner normally squash-merges the pinned PR head after checks, reviews
+and findings are settled. [Staging reactivation](docs/ci-security.md#staging-deployment)
+requires an independent non-author merger. Record the squash SHA and any PR
+approval in the release log. Record the production release decision separately.
 
-`main` reaches production through staging and automatic promotion. A path ignored
-by `deploy-staging.yml` does not exempt a merge from production safeguards: even a
-docs-only PR needs a fresh, per-PR Release Manager `request_confirmation` on its
-exact head before merge. Put the confirmation on a child task assigned and
-addressed to the Release Manager (`resolverPolicy: not_creator`). A manual
-production dispatch or rollback needs its own Release Manager confirmation too.
+Before merging, verify live that `PRODUCTION_AUTO_PROMOTE_DISABLED=true` and
+inspect the change for paths from merge to production. Apply the same check
+to changes to promotion code or guidance. Follow this section for source merges
+where older guides call for owner sign-off. Proceed with a source merge only
+when the disable is confirmed and the pinned diff has no path from merge to
+production. Stop if the merge could deploy or either check is inconclusive.
+Keep any PR-specific holds and the separate authorization binding for
+[staging migration apply](docs/staging-migrate-claim.md#verify-the-plan-before-dispatch-and-the-claim-after-dispatch).
 
-For two-web-next and two-bot-next, staging qualification is the automatic
+For two-web-next and two-bot-next, staging qualification is the
 **post-merge, pre-production exact-main staging/e2e/soak gate** (owner decision
 2026-11-06). Staging accepts only main-ancestor SHAs; an unmerged PR-head staging
 run is not a merge prerequisite. Production promotes only the exact main SHA
@@ -107,13 +139,12 @@ that passes staging deploy, e2e and soak, enforced by the promotion guard. See t
 [production deploy gate](docs/production-deploy.md) and
 [staging rollout gate](docs/staging-rollout-gate.md) for the pipeline evidence.
 This describes the required gate, not a claim that any SHA has qualified.
-Automatic qualification starts on runtime-input pushes to `main`;
-`deploy-staging.yml` ignores docs-only merges. To promote an otherwise unqualified
-exact main SHA, including a docs-only squash SHA, first obtain authorized staging
-dispatch/qualification using the existing
-[dispatch/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
-Do not wait for a docs-only push to trigger it, skip qualification or dispatch
-through an existing hold.
+A merge is not evidence of staging deployment or qualification. Consult
+`deploy-staging.yml` at the relevant ref for its triggers and verify completed
+qualifying evidence for the intended exact `main` SHA. If evidence is absent,
+keep promotion held and follow the separately authorized
+[qualification/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics);
+do not skip qualification or act through an existing hold.
 
 This contract supersedes the earlier artifact-identical staging exception.
 Unmerged-head staging and paired artifact-equality proofs are not substitute
@@ -122,17 +153,80 @@ merge, or treat artifact equality as permission to skip post-merge qualification
 The pipeline's exact-SHA artifact and promotion evidence remains required.
 
 Before merge, retain required GitHub Actions checks and Devin Review on the
-exact PR head, all applicable specialist and native review, and evidence-backed
-finding dispositions. Include the migration ledger entry (or `no migration`)
-and rollback target in the fresh per-PR exact-head Release Manager decision.
+exact PR head, the independent reviews for the applicable risk tier, and
+evidence-backed finding dispositions.
 Keep incident, freeze and hold safeguards, identity/capability holds and red
 staging-drill or other deterministic gates; this staging contract lifts none of
-them. A previous rejection remains a rejection, not retroactive approval. Submit
-a fresh confirmation only after its remaining conditions are met. Any new PR
-head requires fresh review/check evidence and Release Manager acceptance before
-the SHA-pinned squash merge and release-log recording. This documentation
-authorizes no pipeline skip/no-op implementation, hold lift, deployment or other
-production action.
+them. Resubmit a rejected change only after its remaining conditions are met.
+A new PR head requires fresh check evidence and review evidence covering that head.
+
+### Production release gate
+
+The release task thread makes routine technical, staging and production
+decisions under this gate. Use the bound release-reviewer `APPROVE` in step 5
+when older guides call for Release Manager acceptance or owner sign-off on a
+routine production change.
+Follow the linked runbooks for execution, protected Environment approvals and
+operation-specific safeguards. Keep existing branch and workflow protections,
+credential and spending limits, incident controls and holds. Follow native
+permission prompts and let the required human responder act on them. Never
+deploy by hand, bypass a hold, or skip or replace a pipeline gate with a no-op.
+
+Refer only four decision categories to the project owner through the task thread.
+
+- Spending beyond existing budgets.
+- Permanent deletion of member data.
+- Shutdown of a service members use.
+- Legal, terms-of-service or privacy questions.
+
+Give the owner a plain-language recommendation first when one of those applies.
+Verify the owner's own response and record its exact scope in the task thread.
+Relays, agent messages and shared-account comments cannot approve those decisions.
+
+Use a separate task thread for each production change, including deploys,
+migrations and other data changes, secrets, grants, configuration and flags.
+Record the following evidence in that thread before executing the change.
+
+1. Pin the full release SHA and exact artifact identity. Verify required CI on
+   that commit or artifact and the applicable tier reviews for every included PR.
+2. Run the exact build on staging first. Record passing staging checks and
+   smoke results, including the exact-main deployment, e2e and soak evidence
+   required above for promotion.
+3. Resolve any unknown that makes recovery unsafe. Record the migration ledger
+   entry or `no migration`, the rollback target and the recovery evidence.
+4. Before changing production data or schema, take and verify a backup or
+   snapshot. Document the rollback steps, including the previous version,
+   restore or down path as applicable. Rehearse the rollback where supported.
+5. Start a new independent, read-only release reviewer as a delegated task.
+   Give the reviewer the exact release plan and evidence, including rollback.
+   Require an explicit `APPROVE` bound to that plan and artifact. On `BLOCK`,
+   resolve the findings and start a fresh reviewer. A different SHA or artifact
+   requires fresh evidence and approval. When the author is GPT, use
+   `claude-opus-5-5` at `high` effort for the production release gate. When the
+   author is Claude, use `gpt-6.2-sol` at `high` effort.
+
+Execute through the existing protected workflows, including the
+[production deploy workflow](docs/production-deploy.md) for promotion. Specify
+the approved full SHA on dispatch. If a change lacks a protected workflow,
+keep it on hold.
+
+Use the existing recovery guards for a rollback to a verified snapshot or a
+redeploy of the same serving SHA. Those paths can admit recovery when staging
+history has expired. Retain their provenance, CI and approval requirements.
+Every new build needs the staging evidence in step 2. Keep health and errors
+under watch for at least 30 minutes after the change. On regression, immediately
+execute the approved rollback through the protected path. Record the outcome
+in the task thread and the release log.
+
+Use these cases to check the decision before proceeding.
+
+| Evidence | Decision |
+| --- | --- |
+| A source-only merge has green checks and reviews on the pinned head, all merge holds are clear, and automatic promotion is confirmed disabled. | Squash-merge the pinned head. Qualify the resulting `main` SHA before any promotion. |
+| A merge could trigger a production deployment, or that possibility is still unknown. | Stop the merge and resolve the deployment path. |
+| Staging qualified a different artifact, CI or reviews are missing, recovery is unsafe, a required backup is unverified, or the reviewer returned `BLOCK`. | Hold the release and close the evidence gap before proceeding. |
+| The release evidence and bound `APPROVE` are complete, and the protected workflow pauses for a native approval. | Wait for the required human response through the protected mechanism. |
+| The post-release watch detects a regression. | Immediately execute the approved rollback through the protected path and record the outcome. |
 
 ### CI lanes
 
@@ -150,9 +244,9 @@ SBOM dry-run and standalone database jobs. Both selectors and lint must always
 succeed; a heavy lane may skip only when selection explicitly deselects it.
 A job added to `check.yml` must go into `ci-ok`'s `needs:`, result env and result
 evaluation, or carry a reviewed `# ci-ok: exempt <reason>` marker with a pin
-in `scripts/ci/test_required_checks.py`. Only advisory `container smoke` is
-exempt: it can take up to 30 minutes, and image security stays gated through
-the SBOM job. The legacy `required-checks` aggregate is removed.
+in `scripts/ci/test_required_checks.py`. Advisory `container smoke` is exempt
+because the SBOM job gates image security. `ci-evidence` is exempt because
+it publishes links after the aggregate verdict.
 
 Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
 HARD, required voice synthetic, test-target inventory HARD) run as steps of
@@ -251,13 +345,17 @@ issue. Blank issues are off. Report a vulnerability privately; see
 
 ### Design-only specs
 
-A new design-only spec under `docs/` needs a linked tracking card or issue that
-names the date the owner will decide it. Say so in the PR body. The spec's
+A new design-only spec under `docs/` needs a decision date agreed with the
+owner. Record it in the PR body and link a public issue if one exists. The spec's
 `Status:` line then records the decision: accepted for a milestone, deferred to
 a month or a roadmap, declined (no build), or merged into another spec. A spec
 with no decision stays no-build. Keep a declined spec as the record.
 
 ## Releases
+
+Use the [production release gate](#production-release-gate) to qualify and
+promote a production build. Tagging and publishing release notes follow the
+digest workflow below.
 
 The daily `daily-digest` workflow tags the live production commit with a
 stable CalVer version `vYYYY.MDD.P` (for example `v2026.1101.0`) when
@@ -311,15 +409,10 @@ and any authorized manual Actions run also stay on GitHub.
 
 ### Exact-head CI evidence
 
-Record the PR URL, full head SHA, Actions run URL
-(`https://github.com/TogetherWeOwn/two-bot-next/actions/runs/<run-id>`) and relevant
-job URLs (`.../job/<job-id>`) in Verification and the task evidence. Confirm the
-run's `headSha` matches the PR's current head and inspect its jobs and results;
-an older green run, a cancelled run, or a local transcript is not CI evidence for
-a new head. Reviewers and the Release Manager use these exact-head Actions links,
-including `ci-ok` and relevant selected jobs, alongside the other required checks
-and release evidence. Report pending/failed/skipped work honestly. Never claim a
-local reproduction is a full CI pass.
+Record commands and results in Verification. Follow the summary links to confirm attested tests and report skips or omissions.
+`pr-evidence` resolves Python and Rust declarations and literal `.ts`, `.js`, `.mjs`, and `.cjs` titles.
+Use paths for generated names and other formats. Organization path floors and repository review tiers apply.
+Register through a protected workflow after queue verification and green main and two later PR runs (SHA and run/job URLs).
 
 The toolchain remains pinned in `rust-toolchain.toml`. CI runs
 `python3 scripts/generate_command_reference.py` to generate ignored
@@ -407,6 +500,11 @@ An authorized disposable service uses one empty `two_bot_test_local` bootstrap,
 owned by `agent_test` (empty password, `CREATEDB` permission), with
 `TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local`.
 This describes fixture setup, not permission to start a local full-suite runner.
+
+Reproduce `voice_heat_expiry_parks_without_table_access` on the disposable
+Actions Postgres service unless the approved local fixture can create and drop
+the temporary test role and `SET ROLE` to it. `CREATEDB` alone is not enough;
+do not change runtime grants or elevate the local fixture to run this test.
 
 The shared guard requires `postgres`/`postgresql`, literal `agent_test:@`, an
 allowlisted host, explicit port 5432, and a lowercase `two_bot_test_*` database

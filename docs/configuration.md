@@ -217,7 +217,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 138.
+Catalog entries: 139.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -306,6 +306,7 @@ Catalog entries: 138.
 | `TWO_INTERNAL_ALLOW_MEMBER_NOTIFY` | env_only | Not specified in Next | environment only | Reserved environment-only gate for member notifications; not wired and cannot enable delivery. |
 | `TWO_INTERNAL_ALLOW_MODERATION` | env_only | Not specified in Next | environment only | Capability gate for internal moderation actions. |
 | `TWO_INTERNAL_ALLOW_SETTINGS` | env_only | Not specified in Next | environment only | Capability gate for internal settings actions. |
+| `TWO_INTERNAL_ALLOW_VOICE_MOVE` | env_only | Not specified in Next | environment only | Default-off staging capability gate for self-only voice moves. |
 | `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | env_only | Not specified in Next | environment only | Capability gate for voice snapshot reads. |
 | `TWO_INTERNAL_BIND` | env_only | Not specified in Next | environment only | Canonical combined IP:port for receiver configuration; a wildcard bind requires the Worker-set container marker (TOG-16851). |
 | `TWO_INTERNAL_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy split internal-action listener interface; receiver configuration uses TWO_INTERNAL_BIND instead. |

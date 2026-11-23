@@ -22,6 +22,12 @@ import re
 import sys
 from pathlib import Path
 
+from script_intake import (
+    decode_legacy_json,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 
 METRICS = (
     ("peak_rss_mib",),
@@ -69,18 +75,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def _read_report(path):
@@ -94,7 +89,7 @@ def _read_report(path):
         raise IntakeRefused("unreadable_input")
     try:
         with path.open("rb") as handle:
-            data = handle.read(MAX_INPUT_BYTES + 1)
+            data = read_with_overflow(handle, MAX_INPUT_BYTES)
     except OSError:
         raise IntakeRefused("unreadable_input") from None
     if len(data) > MAX_INPUT_BYTES:
@@ -235,8 +230,8 @@ def main():
     except IntakeRefused as refused:
         return _invalid(refused.code)
     try:
-        baseline = json.loads(baseline_text, object_pairs_hook=_reject_duplicate_keys)
-        actual = json.loads(actual_text, object_pairs_hook=_reject_duplicate_keys)
+        baseline = decode_legacy_json(baseline_text, object_pairs_hook=_reject_duplicate_keys)
+        actual = decode_legacy_json(actual_text, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         return _invalid("duplicate_keys")
     except (ValueError, RecursionError):

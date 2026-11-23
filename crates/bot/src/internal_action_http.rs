@@ -43,9 +43,9 @@ use tokio::{
     net::TcpListener,
     sync::{OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinSet,
+    time::{timeout_at, Instant},
 };
 use tracing::Instrument;
-use twilight_cache_inmemory::DefaultInMemoryCache;
 use two_bot_core::{
     automation_transfer::{
         diff_import, export_document, max_import_entries, parse_import_document, ImportOutcome,
@@ -95,11 +95,14 @@ use two_bot_discord::{ActionExecutor, DiscordError, EventActionError, EventCall}
 
 use crate::voice_snapshot::{self, SnapshotRefusal, VoiceOccupancyClock};
 
+mod voice_move;
+
 const MAX_HEADER_BYTES: usize = 8192;
 const MAX_HEADERS: usize = 64;
 const MAX_REQUESTS: usize = 32;
 const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const VOICE_MOVE_BUDGET: Duration = Duration::from_secs(5);
 /// Headroom inside the supervisor's HTTP drain budget: the receiver's shared
 /// shutdown deadline sits this far inside it, so the receiver always runs its
 /// child-abort path and reports before the supervisor backstop — armed on the
@@ -125,7 +128,7 @@ fn internal_family(action: ActionLabel) -> &'static str {
             "event.read" | "event.upsert" | "event.cancel" => "event",
             "settings.get" | "settings.set" => "settings",
             "role.assign" | "guild.add_member" => "membership",
-            "voice.snapshot" => "voice",
+            "voice.snapshot" | "voice.move_member" => "voice",
             _ if name.starts_with("moderation.") => "moderation",
             _ => "other",
         },
@@ -917,7 +920,7 @@ struct ReceiverState {
     /// read. The gateway loop owns the writes through its pipeline; the
     /// receiver only projects. A cold cache reads as `discord_unavailable`,
     /// never as an empty guild.
-    voice_cache: Arc<DefaultInMemoryCache>,
+    voice_cache: Arc<two_bot_discord::SharedCache>,
     /// In-memory join clock feeding the keyless `voice.snapshot`
     /// `rooms[].occupied_since`. The gateway loop owns the writes through its
     /// pipeline observer; the receiver only stamps. An unwired clock reads
@@ -930,9 +933,13 @@ struct ReceiverState {
     /// reads as `discord_unavailable` with a fresh `observed_at` never
     /// stamped on stale occupancy.
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
+    voice_move: Option<ActionExecutor>,
+    voice_move_turn: tokio::sync::Mutex<()>,
     clock: Mutex<ClockGuard>,
     buckets: Mutex<TokenBuckets>,
     telemetry: Mutex<RejectionTelemetry>,
+    #[cfg(test)]
+    response_metrics: Box<metrics::Metrics>,
     capacity: Arc<Semaphore>,
     event_gate: tokio::sync::Mutex<()>,
     event_gate_wait: Duration,
@@ -980,9 +987,13 @@ impl ReceiverState {
             voice_cache: voice_snapshot::new_shared_cache(),
             voice_clock: VoiceOccupancyClock::new(),
             gateway_state: Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
+            voice_move: None,
+            voice_move_turn: tokio::sync::Mutex::new(()),
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
             telemetry: Mutex::new(RejectionTelemetry::default()),
+            #[cfg(test)]
+            response_metrics: Box::default(),
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
             event_gate: tokio::sync::Mutex::new(()),
             event_gate_wait: EVENT_GATE_WAIT,
@@ -996,7 +1007,7 @@ impl ReceiverState {
     /// the gateway pipeline writes through; tests that exercise the verb
     /// seed their own. Anything else keeps the cold default, which reads as
     /// `discord_unavailable`.
-    fn with_voice_cache(mut self, voice_cache: Arc<DefaultInMemoryCache>) -> Self {
+    fn with_voice_cache(mut self, voice_cache: Arc<two_bot_discord::SharedCache>) -> Self {
         self.voice_cache = voice_cache;
         self
     }
@@ -1023,13 +1034,28 @@ impl ReceiverState {
         self
     }
 
+    fn with_voice_move(mut self, flags: &InternalFlags, executor: ActionExecutor) -> Self {
+        self.voice_move = flags.is_enabled("voice.move_member").then_some(executor);
+        self
+    }
+
+    fn action_metrics(&self) -> &metrics::Metrics {
+        #[cfg(test)]
+        {
+            &self.response_metrics
+        }
+        #[cfg(not(test))]
+        metrics::global()
+    }
+
     fn reject(&self, failure: Failure, key: KeyLabel, action: ActionLabel, id: &str) -> Response {
         // Bounded receiver counter (TOG-20119): family from the bounded action
         // label, outcome from the refusal class. Labels are closed sets only;
         // the warn-summary below stays sampled as-is.
         let family = internal_family(action);
         let class = RejectionClass::classify(failure.class_code, &key, action);
-        metrics::global().internal_action(family, class.as_str());
+        self.action_metrics()
+            .internal_action(family, class.as_str());
         let records = self
             .telemetry
             .lock()
@@ -1238,7 +1264,7 @@ pub async fn bind(
     config: InternalActionConfig,
     pool: sqlx::PgPool,
     token: &str,
-    voice_cache: Arc<DefaultInMemoryCache>,
+    voice_cache: Arc<two_bot_discord::SharedCache>,
     voice_clock: Arc<VoiceOccupancyClock>,
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
 ) -> std::io::Result<BoundReceiver> {
@@ -1293,13 +1319,14 @@ pub async fn bind(
                 Arc::new(executor),
                 Arc::new(member),
                 Arc::new(EventReadExecutor::new(events.clone(), pool.clone())),
-                Arc::new(EventMutationExecutor::new(events, pool)),
+                Arc::new(EventMutationExecutor::new(events.clone(), pool)),
                 Arc::new(moderation),
                 Arc::new(channel),
             )
             .with_voice_cache(voice_cache)
             .with_voice_clock(voice_clock)
-            .with_gateway_state(gateway_state),
+            .with_gateway_state(gateway_state)
+            .with_voice_move(&InternalFlags::from_env(), events),
         ),
     })
 }
@@ -1487,6 +1514,9 @@ async fn receive(
     id: &str,
     permit: OwnedSemaphorePermit,
 ) -> Response {
+    // Start before reading the signed body or burning its nonce.
+    let (started, unknown) = (Instant::now(), ActionLabel::Unknown);
+    let wire_deadline = started + VOICE_MOVE_BUDGET;
     let reject_boundary =
         |failure| state.reject(failure, KeyLabel::Invalid, ActionLabel::Unknown, id);
     if request.uri().path_and_query().map(|path| path.as_str()) != Some(ACTIONS_PATH) {
@@ -1559,14 +1589,29 @@ async fn receive(
         Ok(verified) => verified,
         Err(error) => return reject(Failure::from_action(error), ActionLabel::Unknown),
     };
-    let burned = match verified.burn_durably(&state.store).await {
-        Ok(burned) => burned,
-        Err(error) => return reject(Failure::from_action(error), ActionLabel::Unknown),
+    // Bound the common nonce burn without parsing the action before commitment.
+    let burn = verified.burn_durably(&state.store);
+    let cutoff = if state.voice_move.is_some() {
+        wire_deadline
+    } else {
+        started + REQUEST_TIMEOUT
+    };
+    let nonce_result = timeout_at(cutoff, burn).await;
+    let burned = match (nonce_result, Instant::now() < cutoff) {
+        (Ok(Ok(burned)), true) => burned,
+        (Ok(Err(error)), true) => return reject(Failure::from_action(error), unknown),
+        _ => return reject(Failure::code(ErrorCode::UpstreamTimeout), unknown),
     };
     // The enabled set is the env-only flag gate, never the settings store: the
     // website must not be able to grant itself verbs. Verbs without a wired
     // effect adapter stay refused by the per-effect fences below.
-    let flags = InternalFlags::from_env();
+    let mut flags = InternalFlags::from_env();
+    // The move gate is fixed at bind time with its executor and deadline.
+    if state.voice_move.is_some() {
+        flags.enabled.insert("voice.move_member".to_owned());
+    } else {
+        flags.enabled.remove("voice.move_member");
+    }
     let decision = {
         let mut buckets = state.buckets.lock().expect("buckets lock");
         burned.authorize(&flags, true, true, &mut buckets)
@@ -1588,6 +1633,23 @@ async fn receive(
     // `event.read` above. The committed nonce is the replay guard.
     if decision.action == "voice.snapshot" {
         return read_voice_snapshot(state, id, key, action).await;
+    }
+    if decision.action == "voice.move_member" {
+        return match voice_move::execute(
+            state,
+            decision,
+            permit,
+            (id, headers.auth.nonce),
+            wire_deadline,
+        )
+        .await
+        {
+            Ok(result) => {
+                state.action_metrics().internal_action("voice", "executed");
+                event_read_response(result, id)
+            }
+            Err(error) => reject(error, action),
+        };
     }
     // Mutating event verbs take the same durable claim/audit path as
     // announcements below, with their own validation and key mapping.

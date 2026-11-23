@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import copy
 from datetime import datetime, timezone
+from email.message import Message
 import importlib.util
 import io
 import json
@@ -18,11 +19,15 @@ import tomllib
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 from urllib.error import HTTPError, URLError
+from urllib.request import HTTPSHandler
+from urllib.response import addinfourl
 
 
 # staging_rollout imports its sibling build_identity module; the spec import
 # below does not put the scripts directory on the path by itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from staging_cloudflare_fixture import CloudflareFake, LAG_COUNTERS
+
 spec = importlib.util.spec_from_file_location(
     "staging_rollout", Path(__file__).with_name("staging_rollout.py")
 )
@@ -91,7 +96,7 @@ def date(offset=0):
 def receipts():
     return [
         {
-            "type": "wrangler-session", "version": 1, "wrangler_version": "4.156.0",
+            "type": "wrangler-session", "version": 1, "wrangler_version": "4.161.0",
             "command_line_args": ["deploy", "--config", "staging-deploy.json", "--env", "staging"],
         },
         {
@@ -104,7 +109,7 @@ def receipts():
 
 
 def real_shape_receipts():
-    """Record shapes written by Wrangler 4.156.0 when `wrangler-action` drives a deploy.
+    """Record shapes written by Wrangler 4.161.0 when `wrangler-action` drives a deploy.
 
     Field names follow workers-sdk `packages/wrangler/src/index.ts` (the `wrangler-session`
     entry, written for EVERY invocation) and its deploy output entry; values are
@@ -112,9 +117,9 @@ def real_shape_receipts():
     """
     log = "/home/runner/.config/.wrangler/logs/wrangler-2026-10-03_01-22-59_123.log"
     return [
-        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.156.0",
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.161.0",
          "command_line_args": ["--version"], "log_file_path": log, "timestamp": date()},
-        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.156.0",
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.161.0",
          "command_line_args": ["deploy", "--config", "/tmp/staging-deploy.json", "--env", "staging"],
          "log_file_path": log, "timestamp": date()},
         {"version": 1, "type": "deploy", "worker_name": "two-bot-next-staging",
@@ -211,11 +216,14 @@ class FakeClient:
         self.zero_instance_first = None
         self.zero_instance_last = None
         self.calls = []
+        self.stop_staging = Mock()
 
     def respond(self, routes, key):
         if key not in routes or not routes[key]:
             raise AssertionError(f"unexpected offline fixture route: {key}")
         values = routes[key]
+        if callable(values):
+            return values()
         value = values.pop(0) if len(values) > 1 else values[0]
         if isinstance(value, Exception):
             raise value
@@ -249,7 +257,7 @@ class OfflineTestCase(unittest.TestCase):
         # Fail loudly if a new test accidentally tries real HTTP or Docker.
         opener = Mock()
         opener.open.side_effect = AssertionError("live HTTP forbidden in offline tests")
-        self.enterContext(patch.object(rollout, "build_opener", return_value=opener))
+        self.enterContext(patch.object(rollout, "no_redirect_opener", return_value=opener))
         self.enterContext(patch.object(rollout.subprocess, "run",
                                       side_effect=AssertionError("live Docker forbidden")))
 
@@ -258,6 +266,22 @@ class OfflineTestCase(unittest.TestCase):
             function(*args)
         self.assertEqual(str(caught.exception), code)
         self.assertNotIn(SENTINEL, str(caught.exception))
+
+
+class RedirectTests(unittest.TestCase):
+    def test_location_redirect_and_missing_target_keep_distinct_verdicts(self):
+        url = "https://api.cloudflare.com/client/v4/accounts/fixture/"
+        cases = (("https://other.example/", "unexpected_redirect"), (None, "api_http_failure"))
+        for location, verdict in cases:
+            headers = Message()
+            if location is not None:
+                headers["Location"] = location
+            response = addinfourl(io.BytesIO(b"fixture"), headers, url, 302)
+            response.msg = "redirect"
+            with self.subTest(location=location), patch.object(HTTPSHandler, "https_open", return_value=response) as send:
+                with self.assertRaisesRegex(rollout.GateError, f"^{verdict}$"):
+                    rollout.Client(ACCOUNT, SENTINEL).request(url, authenticated=True)
+                send.assert_called_once()
 
 
 class DeployReceiptTests(OfflineTestCase):
@@ -297,7 +321,7 @@ class DeployReceiptTests(OfflineTestCase):
         for flag in ("--version", "-v"):
             with self.subTest(flag=flag):
                 probe = {"type": "wrangler-session", "version": 1,
-                         "wrangler_version": "4.156.0", "command_line_args": [flag]}
+                         "wrangler_version": "4.161.0", "command_line_args": [flag]}
                 self.assertEqual(rollout.deploy_version([probe] + receipts(), STARTED), VERSION)
                 self.assertEqual(rollout.deploy_version(receipts() + [probe], STARTED), VERSION)
 
@@ -311,7 +335,7 @@ class DeployReceiptTests(OfflineTestCase):
         bad_args = receipts()
         bad_args[0]["command_line_args"] = ["deploy", 1]
         probe = {"type": "wrangler-session", "version": 1,
-                 "wrangler_version": "4.156.0", "command_line_args": ["--version"]}
+                 "wrangler_version": "4.161.0", "command_line_args": ["--version"]}
         wrong_probe = dict(probe, wrangler_version="4.142.0")
         schema_probe = dict(probe, version=2)
         other_command = dict(probe, command_line_args=["secret", "put", "X"])
@@ -779,6 +803,22 @@ class IdentityAndControlPlaneTests(OfflineTestCase):
 
 
 class ClientSanitizationTests(OfflineTestCase):
+    def test_stop_subprocess_passes_only_the_bound_staging_inputs_and_deadline(self):
+        parent_env = {"PATH": "/usr/bin", "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
+                      "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2",
+                      "STAGING_USE_EXPIRES_AT": "1700000000000", "STAGING_USE_RECEIPT": "test.jsonl"}
+        client = rollout.Client(ACCOUNT, SENTINEL, deadline=128)
+        with patch.dict(os.environ, {**parent_env, "CLOUDFLARE_API_TOKEN": SENTINEL}, clear=True), \
+                patch.object(rollout.time, "monotonic", return_value=100), \
+                patch.object(rollout.subprocess, "run", return_value=Mock(returncode=0)) as run:
+            client.stop_staging(URL, VERSION, REVISION)
+        script = Path(__file__).resolve().parents[1] / "wrangler/scripts/staging-use.mjs"
+        self.assertTrue(script.is_file())
+        run.assert_called_once_with(["node", str(script), "stop"], timeout=28,
+                                    env={**parent_env, "STAGING_WORKER_URL": URL,
+                                         "STAGING_USE_DEPLOYMENT": VERSION, "STAGING_USE_SHA": REVISION,
+                                         "STAGING_STOP_TIMEOUT_MS": "28000"})
+
     def test_authenticated_api_retries_transport_failures_with_bounded_backoff(self):
         client = rollout.Client(ACCOUNT, SENTINEL)
         response = Mock(status=200, headers={})
@@ -932,6 +972,10 @@ class DeploymentWiringTests(unittest.TestCase):
         self.assertLess(steps.index(deploy[0]), steps.index(receipt[0]))
         self.assertLess(steps.index(receipt[0]), steps.index(takeover[0]))
         self.assertLess(steps.index(takeover[0]), steps.index(verify[0]))
+        use = next(step for step in steps if "staging-use-pipeline.mjs begin" in step)
+        self.assertLess(steps.index(use), steps.index(verify[0]))
+        self.assertIn("STAGING_USE_EXPIRES_AT: ${{ steps.use.outputs.expires_at }}", verify[0])
+        self.assertIn("OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}", verify[0])
         self.assertNotRegex(receipt[0], r"(?m)^\s*(?:if|continue-on-error):")
         self.assertIn("set -euo pipefail", receipt[0])
         self.assertIn('--receipt "$ROLLOUT_DIR/baseline.json"', receipt[0])
@@ -1106,6 +1150,65 @@ class OrchestrationTests(OfflineTestCase):
 
     def assert_no_evidence(self):
         self.assertFalse(Path(self.args.evidence).exists())
+
+    def cloudflare_lag_client(self, counters, *, worker_reads=0, application_reads=0,
+                              rollout_list_reads=0):
+        cloudflare = CloudflareFake([OLD_VERSION, VERSION], app(OLD_IMAGE), [old_row()])
+        cloudflare.deploy_worker(VERSION, deployment_reads=worker_reads)
+        cloudflare.start_rollout(completed_row(), counters=counters,
+                                 application_reads=application_reads,
+                                 rollout_list_reads=rollout_list_reads, previous_probes=None)
+
+        def readyz():
+            status, headers, body = ready_response()
+            if cloudflare.ready_image() == OLD_IMAGE:
+                revision = "f" * 40
+                body = json.dumps(dict(json.loads(body), build_revision=revision,
+                                       build_id="123455-1", deploy_id=f"2026.10.20.1+{revision[:7]}")).encode()
+            return status, headers, body
+
+        client = verify_client()
+        client.deadline = self.clock.now + 60
+        client.api_routes.update({
+            APP_PATH: cloudflare.application_listing,
+            ROWS_PATH: cloudflare.rollout_listing,
+            DETAIL_PATH: lambda: cloudflare.rollout_detail(NEW_ROLLOUT),
+            DEPLOYMENTS_PATH: cloudflare.deployments,
+        })
+        client.request_routes[URL + "/readyz"] = readyz
+        client.stop_staging.side_effect = lambda *_: cloudflare.replace_container()
+        return client
+
+    def test_shared_cloudflare_rollout_lag_converges_after_replacing_previous_container(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for active, healthy in LAG_COUNTERS:
+            with self.subTest(active=active, healthy=healthy):
+                self.args.evidence = str(self.root / f"evidence-{active}-{healthy}.json")
+                client = self.cloudflare_lag_client(
+                    (active, healthy), application_reads=4, rollout_list_reads=1)
+                rollout.verify(self.args, client)
+                client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
+                self.assertEqual(client.calls.count(("request", URL + "/readyz")), 2)
+                self.assertEqual(client.calls.count(("api", ROWS_PATH)), 3)
+                evidence = json.loads(Path(self.args.evidence).read_text())
+                self.assertEqual(evidence["rollout_id"], NEW_ROLLOUT)
+                self.assertTrue(evidence["active_lag"])
+                self.assertNotIn("application_listing_lag", evidence)
+
+    def test_shared_cloudflare_rollout_refuses_stale_worker_or_previous_container(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for failure, worker_reads, probes in (("worker_version_not_active", None, 0),
+                                               ("serving_image_mismatch", 0, 1)):
+            with self.subTest(failure=failure):
+                client = self.cloudflare_lag_client(
+                    LAG_COUNTERS[0], worker_reads=worker_reads, application_reads=None)
+                client.stop_staging.side_effect = None
+                self.assert_gate(failure, rollout.verify, self.args, client)
+                self.assertEqual(client.stop_staging.call_count, probes)
+                self.assertEqual(client.calls.count(("request", URL + "/readyz")), probes)
+                self.assert_no_evidence()
 
     def test_prepare_records_only_exact_allowlisted_baseline(self):
         client = self.prepare_baseline()
@@ -1343,6 +1446,254 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(evidence["rollout_id"], NEW_ROLLOUT)
         self.assert_no_secret_saved_or_printed()
 
+    def test_forward_replaces_the_process_started_by_an_early_alarm(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        pending = {**completed_row(), "status": "progressing"}
+        done = completed_row()
+        done["health"]["instances"].update(active=0)
+        client.api_routes[DETAIL_PATH] = [pending, done]
+        client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+        # The grant saw a stopped singleton. A pending-rollout alarm can still
+        # start the prior build before any acceptance probe runs.
+        status, headers, body = ready_response()
+        old = {**json.loads(body), "build_revision": "f" * 40}
+        alarm_start = self.clock.sleep
+
+        def start_early(seconds):
+            alarm_start(seconds)
+            if not client.stop_staging.called:
+                client.request_routes[URL + "/readyz"] = [(status, headers, json.dumps(old).encode())]
+
+        def stop(url, version, revision):
+            self.assertEqual((url, version, revision), (URL, VERSION, REVISION))
+            self.assertEqual(client.calls.count(("api", DETAIL_PATH)), 2)
+            self.assertEqual(json.loads(client.request_routes[URL + "/readyz"][0][2]), old)
+            client.request_routes[URL + "/readyz"] = [ready_response()]
+
+        client.stop_staging.side_effect = stop
+        client.deadline = 130
+        with patch.object(rollout.time, "sleep", side_effect=start_early):
+            rollout.verify(self.args, client)
+        client.stop_staging.assert_called_once()
+        evidence = json.loads(Path(self.args.evidence).read_text())
+        self.assertTrue(evidence["active_lag"])
+        self.assertTrue(evidence["application_listing_lag"])
+
+    def test_completed_zero_instance_rollout_can_cold_start_after_stop(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        zero = completed_row()
+        zero["health"]["instances"].update(active=0, healthy=0)
+        client.api_routes[DETAIL_PATH] = [zero, completed_row()]
+
+        def stop(*_):
+            self.assertEqual(client.calls.count(("api", DETAIL_PATH)), 1)
+            self.assertFalse(any(kind == "request" for kind, _ in client.calls))
+
+        client.stop_staging.side_effect = stop
+        rollout.verify(self.args, client)
+        client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
+        self.assertEqual(json.loads(Path(self.args.evidence).read_text())["readyz"], 200)
+
+    def test_post_stop_counters_can_drop_before_the_exact_replacement_converges(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for counter in ("zero", "starting", "scheduling"):
+            with self.subTest(counter=counter):
+                self.args.evidence = str(self.root / f"evidence-{counter}.json")
+                client = verify_client()
+                transient = completed_row()
+                counts = transient["health"]["instances"]
+                counts.update(active=0, healthy=0)
+                if counter != "zero":
+                    counts[counter] = 1
+                # First opening read, first final recheck, then a healthy retry.
+                client.api_routes[DETAIL_PATH] = [completed_row(), transient, completed_row(), completed_row()]
+                client.deadline = self.clock.now + 20
+
+                def retry(seconds, client=client):
+                    self.assertEqual(seconds, 5)
+                    self.assertEqual(client.calls[-1], ("api", DETAIL_PATH))
+                    self.assertEqual(client.calls.count(("request", URL + "/readyz")), 1)
+                    self.assert_no_evidence()
+                    self.clock.sleep(seconds)
+
+                with patch.object(rollout.time, "sleep", side_effect=retry) as sleep:
+                    rollout.verify(self.args, client)
+                sleep.assert_called_once_with(5)
+                client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
+                self.assertEqual(client.calls.count(("api", DETAIL_PATH)), 4)
+                self.assertEqual(client.calls.count(("request", URL + "/readyz")), 2)
+                self.assertEqual(json.loads(Path(self.args.evidence).read_text())["readyz"], 200)
+
+    def test_stop_refusal_prevents_readiness_on_completed_rollout(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.stop_staging.side_effect = rollout.GateError("staging_stop_unconfirmed")
+        self.assert_gate("staging_stop_unconfirmed", rollout.verify, self.args, client)
+        self.assertFalse(any(kind == "request" for kind, _ in client.calls))
+        self.assert_no_evidence()
+
+    def test_forward_mismatch_records_only_the_rejected_sample(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        status, headers, body = ready_response()
+        request_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        headers.update({"x-request-id": request_id, "authorization": SENTINEL})
+        report = json.loads(body)
+        report.update(build_id="987654-1", build_revision="f" * 40, detail=SENTINEL)
+        client = verify_client()
+        client.request_routes[URL + "/readyz"] = [(status, headers, json.dumps(report).encode())]
+        with patch.object(rollout.time, "time", side_effect=[STARTED + 1, STARTED + 2]):
+            self.assert_gate("serving_image_mismatch", rollout.verify, self.args, client)
+        self.assertEqual(client.calls, [
+            ("api", NAMESPACE_PATH), ("api", APP_PATH), ("api", ROWS_PATH),
+            ("api", DETAIL_PATH), ("api", DEPLOYMENTS_PATH), ("request", URL + "/readyz"),
+        ])
+        self.assertEqual(self.clock.sleeps, [])
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+        raw = (self.root / "evidence.readyz-mismatch.json").read_bytes()
+        self.assertLess(len(raw), 1024)
+        self.assertEqual(json.loads(raw), {
+            "error": "serving_image_mismatch", "readyz_status": 200,
+            "sample_received_at_utc": "2027-01-15T08:00:02.000+00:00",
+            "run_id": "123456", "run_attempt": "2", "request_id": request_id,
+            "expected": {"worker_version": VERSION, "build_revision": REVISION,
+                         "build_id": BUILD_ID, "deploy_id": DEPLOY_ID},
+            "observed": {"worker_version": VERSION, "build_revision": "f" * 40,
+                         "build_id": "987654-1", "deploy_id": DEPLOY_ID},
+            "control_plane": {"rollout_id": NEW_ROLLOUT, "target_version": 8,
+                              "rollout_completed_observed_at_utc": "2027-01-15T08:00:01.000+00:00",
+                              "target_image_digest": IMAGE.split("@")[1]},
+        })
+
+    def test_forward_missing_or_invalid_identity_stays_red_and_bounded(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        status, headers, body = ready_response()
+        headers["x-request-id"] = SENTINEL
+        report = json.loads(body)
+        del report["build_revision"]
+        report.update(build_id="9" * 100_000 + "-1", deploy_id=None)
+        client.request_routes[URL + "/readyz"] = [(status, headers, json.dumps(report).encode())]
+        os.environ.pop("GITHUB_RUN_ID")
+        os.environ["GITHUB_RUN_ATTEMPT"] = "9" * 100_000
+        self.assert_gate("serving_image_mismatch", rollout.verify, self.args, client)
+        raw = (self.root / "evidence.readyz-mismatch.json").read_bytes()
+        self.assertLess(len(raw), 1024)
+        record = json.loads(raw)
+        self.assertEqual(record["observed"], {"worker_version": VERSION, "build_revision": "absent",
+                                               "build_id": "invalid", "deploy_id": "invalid"})
+        self.assertEqual((record["run_id"], record["run_attempt"], record["request_id"]),
+                         ("absent", "invalid", "invalid"))
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_forward_mismatch_write_failure_keeps_original_worker_error(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        status, _, body = ready_response()
+        client.request_routes[URL + "/readyz"] = [(status, {}, body)]
+        before = set(self.root.iterdir())
+
+        def partial_write(path, _record):
+            Path(path).write_text('{"error":')
+            raise OSError(SENTINEL)
+
+        with patch.object(rollout, "save", side_effect=partial_write):
+            self.assert_gate("serving_worker_mismatch", rollout.verify, self.args, client)
+        self.assertEqual(set(self.root.iterdir()), before)
+        self.assertIn("readiness mismatch evidence could not be written", self.stdout.getvalue())
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
+
+    def test_forward_mismatch_invalid_evidence_path_keeps_cli_verdict(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        status, _, body = ready_response()
+        client.request_routes[URL + "/readyz"] = [(status, {}, body)]
+        argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", "."]
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
+            self.assertEqual(rollout.main(), 1)
+        self.assertIn("staging rollout gate failed: serving_worker_mismatch", self.stdout.getvalue())
+        self.assertNotIn("invalid_local_receipt", self.stdout.getvalue())
+        self.assertEqual([call for call in client.calls if call[0] == "request"],
+                         [("request", URL + "/readyz")])
+
+    def test_forward_mismatch_preserves_both_verification_inputs(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        status, _, body = ready_response()
+        for arg in ("receipt", "output"):
+            original = Path(getattr(self.args, arg)).read_bytes()
+            for layout in ("same-path", "symlink", "hardlink"):
+                with self.subTest(arg=arg, layout=layout):
+                    evidence = self.root / f"{arg}-{layout}.json"
+                    sidecar = evidence.with_suffix(".readyz-mismatch.json")
+                    sidecar.write_bytes(original)
+                    input_path = sidecar if layout == "same-path" else sidecar.with_suffix(".input")
+                    if layout == "symlink":
+                        input_path.symlink_to(sidecar)
+                    elif layout == "hardlink":
+                        input_path.hardlink_to(sidecar)
+                    client = verify_client()
+                    client.request_routes[URL + "/readyz"] = [(status, {}, body)]
+                    args = argparse.Namespace(**(vars(self.args) | {arg: str(input_path), "evidence": str(evidence)}))
+                    inputs = {path: Path(path).read_bytes() for path in (args.receipt, args.output)}
+                    self.assert_gate("serving_worker_mismatch", rollout.verify, args, client)
+                    self.assertEqual({path: Path(path).read_bytes() for path in inputs}, inputs)
+                    self.assertEqual(sidecar.read_bytes(), original)
+                    self.assertFalse(evidence.exists())
+
+    def test_directory_alias_leaves_inputs_readable(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        evidence = Path(self.args.evidence)
+        sidecar = evidence.with_suffix(".readyz-mismatch.json")
+        sidecar.symlink_to(self.root, target_is_directory=True)
+        receipt = sidecar / Path(self.args.receipt).name
+        output = sidecar / Path(self.args.output).name
+        inputs = {path: path.read_bytes() for path in (receipt, output)}
+        self.args.receipt, self.args.output = str(receipt), str(output)
+        client = verify_client()
+        status, _, body = ready_response()
+        client.request_routes[URL + "/readyz"] = [(status, {}, body)]
+
+        self.assert_gate("serving_worker_mismatch", rollout.verify, self.args, client)
+        for path, original in inputs.items():
+            with self.subTest(input=path.name):
+                self.assertEqual(path.read_bytes(), original)
+        self.assertTrue(sidecar.is_symlink())
+        self.assert_no_evidence()
+
+    def test_forward_worker_mismatch_distinguishes_single_from_ambiguous_header(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        status, _, body = ready_response()
+        other_version = "87654321-1234-4234-8234-123456789abc"
+        for versions, observed in [([other_version], other_version), ([other_version, VERSION], "invalid")]:
+            with self.subTest(versions=versions):
+                headers = Message()
+                for version in versions:
+                    headers["X-Two-Worker-Version"] = version
+                client = verify_client()
+                client.request_routes[URL + "/readyz"] = [(status, headers, body)]
+                self.assert_gate("serving_worker_mismatch", rollout.verify, self.args, client)
+                record = json.loads((self.root / "evidence.readyz-mismatch.json").read_bytes())
+                self.assertEqual(record["error"], "serving_worker_mismatch")
+                self.assertEqual(record["expected"]["worker_version"], VERSION)
+                self.assertEqual(record["observed"]["worker_version"], observed)
+                self.assert_no_evidence()
+
     def test_success_exact_pinned_evidence_with_post_probe_rechecks(self):
         self.prepare_baseline()
         self.write_deploy_output()
@@ -1354,6 +1705,7 @@ class OrchestrationTests(OfflineTestCase):
             "revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
             "readyz": 200, "health": 200, "verification_elapsed_seconds": 0,
         })
+        self.assertFalse((self.root / "evidence.readyz-mismatch.json").exists())
         self.docker.assert_called_once_with(VERSION, REVISION, BUILD_ID, DEPLOY_ID)
         self.assertEqual(client.calls, [
             ("api", NAMESPACE_PATH), ("api", APP_PATH), ("api", ROWS_PATH),
@@ -1567,24 +1919,19 @@ class OrchestrationTests(OfflineTestCase):
         self.write_deploy_output()
 
     def test_final_reread_accepts_counters_that_wobble_between_completed_shapes(self):
-        # First read lag, final read converged (and the reverse): the exact
-        # build served ready both times, so a counter wobble must not fail.
-        for first, final, active_lag_expected in [
-            (lag_row(), completed_row(), True),
-            (completed_row(), lag_row(), False),
-        ]:
-            with self.subTest(first_is_lag=active_lag_expected):
+        # A pre-stop convergence sample cannot make a post-stop lagging row
+        # pass on its own. Both directions still accept two exact lag passes.
+        for first, final in [(lag_row(), completed_row()), (completed_row(), lag_row())]:
+            with self.subTest(first=first["health"]):
                 self.fresh_baseline()
                 client = verify_client()
                 client.api_routes[ROWS_PATH] = [[old_row(), first]]
-                client.api_routes[DETAIL_PATH] = [first, final]
-                if active_lag_expected:
-                    client.api_routes[DETAIL_PATH] = [first, first, first, final]
-                    client.request_routes[URL + "/readyz"] = [ready_response()]
-                    client.deadline = 130
+                client.api_routes[DETAIL_PATH] = [first, final, lag_row(), final]
+                client.deadline = 130
                 rollout.verify(self.args, client)
                 evidence = json.loads(Path(self.args.evidence).read_text())
-                self.assertEqual(evidence.get("active_lag", False), active_lag_expected)
+                self.assertTrue(evidence["active_lag"])
+                self.assertEqual(client.calls.count(("request", URL + "/readyz")), 2)
                 Path(self.args.evidence).unlink()
 
     def test_final_reread_still_rejects_failed_starting_or_idle_counters(self):
@@ -1602,7 +1949,7 @@ class OrchestrationTests(OfflineTestCase):
         self.fresh_baseline()
         client = verify_client()
         client.api_routes[DETAIL_PATH] = [completed_row(), idle]
-        self.assert_gate("rollout_not_converged", rollout.verify, self.args, client)
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
         self.assert_no_evidence()
 
     def test_lag_without_exact_runtime_never_succeeds(self):
@@ -2425,6 +2772,8 @@ class OrchestrationTests(OfflineTestCase):
 
         client = rollout.Client(ACCOUNT, SENTINEL, deadline=clock.now + 300)
         client.opener = Opener()
+        # Exercise real HTTP deadline clamping without invoking the stop subprocess.
+        client.stop_staging = Mock()
         return client, timeouts
 
     def gate_error_at_deadline_offset(self, offset):
@@ -2474,6 +2823,7 @@ class OrchestrationTests(OfflineTestCase):
         failure = {"phase": "durable_gateway", "class": "checkpoint_load_failed"}
         client, _ = self.client_with_real_deadline_reads(failure)
         self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
         self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
         self.assert_no_evidence()
         self.assert_no_secret_saved_or_printed()
@@ -2827,7 +3177,7 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(self.stdout.getvalue().splitlines()[1:], [
             "staging rollout gate failed: wrong_wrangler_receipt",
             "staging rollout diagnostic: records deploy=1,wrangler-session=2; "
-            "sessions deploy=1,probe=0,other=1; v1/wrangler-4.142.0 v1/wrangler-4.156.0",
+            "sessions deploy=1,probe=0,other=1; v1/wrangler-4.142.0 v1/wrangler-4.161.0",
         ])
         self.assert_no_evidence()
         # The caller-owned NDJSON input legitimately holds the sentinel; only

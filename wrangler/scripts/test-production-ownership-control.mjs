@@ -54,6 +54,17 @@ const timeout = () => ({ throws: new DOMException('The operation timed out', 'Ti
 const abort = () => ({ throws: new DOMException('The operation was aborted', 'AbortError') });
 const transport = (text = 'fetch failed') => ({ throws: new TypeError(text) });
 
+test('the standalone read makes one bounded GET and refuses denial or malformed bodies', async () => {
+  const valid = { ...ok(80).body, running: true };
+  const success = fixture([{ status: 200, body: valid }]);
+  assert.deepEqual(await success.invoke({ action: 'observe' }), valid);
+  for (const [status, body] of [[403, 'denied'], [302, 'redirect'], [200, '{'], [200, ' '.repeat(4097) + JSON.stringify(valid)]]) {
+    const f = fixture([{ status, body }]);
+    await assert.rejects(f.invoke({ action: 'observe' }));
+    assert.deepEqual(f.calls, ['GET']);
+  }
+});
+
 test('status succeeds first try without waiting', async () => {
   const f = fixture([ok(80)]);
   const result = await f.invoke({ action: 'status', expectedDeploymentId: 'new-deployment' });

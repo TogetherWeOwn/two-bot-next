@@ -1,9 +1,9 @@
 //! Rolling-window retention: raw roll-off, guild purge queue, deletion SLA.
 //!
 //! Thresholds come from the parent acceptance text (raw presence/voice rows
-//! roll off at 30 days, audit-log cache at 45 days, user deletions complete
-//! in under 72 hours). No threshold here is derived from any growth-analysis
-//! report.
+//! roll off at 30 days, raw attendance sessions at 90 days, audit-log cache
+//! at 45 days, and user deletions complete in under 72 hours). These windows
+//! are not derived from a growth-analysis report.
 //!
 //! ## Reuse boundary (adjacent consent-driven work, not re-implemented here)
 //!
@@ -90,6 +90,9 @@ use two_bot_core::stream_live_store::{
 pub const PRESENCE_RAW_RETENTION_DAYS: i32 = 30;
 /// Voice-session `events` rows older than this roll off.
 pub const VOICE_RAW_RETENTION_DAYS: i32 = 30;
+/// Raw attendance sessions roll off by join time, whether open or closed.
+/// Use elapsed hours in SQL so daylight-saving transitions cannot shorten it.
+const ATTENDANCE_SESSION_RETENTION_DAYS: i32 = 90;
 /// Audit-log cache rows older than this expire.
 pub const AUDIT_CACHE_RETENTION_DAYS: i32 = 45;
 /// User deletion requests complete well inside this many hours.
@@ -130,6 +133,8 @@ pub struct RetentionReport {
     /// Raw voice rows deleted (older than 30 days): voice-session `events`
     /// rows plus `event_store` voice captures by `event_time`.
     pub voice_raw_deleted: u64,
+    /// Raw attendance sessions older than 90 days by `joined_at`.
+    pub attendance_raw_deleted: u64,
     /// Audit-cache rows deleted (older than 45 days):
     /// `operational_audit_log` rows plus `event_store` cached Discord
     /// audit entries by `event_time`.
@@ -207,6 +212,7 @@ impl RetentionReport {
     pub fn total_deleted(&self) -> u64 {
         self.presence_raw_deleted
             + self.voice_raw_deleted
+            + self.attendance_raw_deleted
             + self.audit_cache_deleted
             + self.stream_live_delivered_expired
             + self.guild_rows_purged
@@ -383,6 +389,7 @@ async fn run_retention_inner(
                 failure = %failure,
                 presence_raw_deleted = report.presence_raw_deleted,
                 voice_raw_deleted = report.voice_raw_deleted,
+                attendance_raw_deleted = report.attendance_raw_deleted,
                 audit_cache_deleted = report.audit_cache_deleted,
                 stream_live_delivered_expired = report.stream_live_delivered_expired,
                 guild_rows_purged = report.guild_rows_purged,
@@ -494,6 +501,13 @@ async fn run_retention_core(
                 .await?;
             let presence = count_presence_raw(&mut tx).await?;
             let voice = count_voice_raw(&mut tx).await?;
+            let attendance: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM event_voice_sessions
+                 WHERE joined_at < now() - make_interval(hours => $1 * 24)",
+            )
+            .bind(ATTENDANCE_SESSION_RETENTION_DAYS)
+            .fetch_one(&mut *tx)
+            .await?;
             let audit = count_audit_cache(&mut tx).await?;
             let live_expired =
                 count_expired_delivered_live(&mut *tx, DELIVERED_DEDUP_RETENTION_DAYS).await?;
@@ -508,7 +522,7 @@ async fn run_retention_core(
             // of the guild purge, so those rows must not be counted again as
             // guild rows. Guard-deferred requests stay pending, and any
             // unresolved guard in the guild defers its purge too.
-            let gaps = crate::member_erasure::schema_gaps(&mut tx).await?;
+            let gaps = retention_coverage_gaps(&mut tx).await?;
             let schema_gap = !gaps.is_empty();
             let selected = select_pending(&mut tx, schema_gap).await?;
             let deferred = selected.deferred;
@@ -541,6 +555,7 @@ async fn run_retention_core(
             RetentionReport {
                 presence_raw_deleted: presence,
                 voice_raw_deleted: voice,
+                attendance_raw_deleted: attendance as u64,
                 audit_cache_deleted: audit,
                 stream_live_delivered_expired: live_expired,
                 guild_rows_purged: guild_rows,
@@ -602,6 +617,16 @@ async fn run_retention_core(
             .execute(&mut *tx)
             .await?
             .rows_affected();
+            // The member-erasure plan already includes the session table in
+            // the sorted lock list. Mapped windows have no age-based expiry.
+            let attendance = sqlx::query(
+                "DELETE FROM event_voice_sessions
+                 WHERE joined_at < now() - make_interval(hours => $1 * 24)",
+            )
+            .bind(ATTENDANCE_SESSION_RETENTION_DAYS)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
             let audit = sqlx::query(
             "DELETE FROM operational_audit_log WHERE occurred_at < now() - make_interval(days => $1)",
         )
@@ -621,7 +646,7 @@ async fn run_retention_core(
             // every pending request defers and every queued guild stays
             // queued; the exact gaps ride the warn logs for the code fix.
             *active_step = RetentionStep::DeletionIntake;
-            let schema_gaps = crate::member_erasure::schema_gaps(&mut tx).await?;
+            let schema_gaps = retention_coverage_gaps(&mut tx).await?;
             let schema_gapped = !schema_gaps.is_empty();
             // Pending deletions drain BEFORE guild purges so a departed
             // guild's pending receipts complete against pre-purge rows.
@@ -758,6 +783,7 @@ async fn run_retention_core(
             RetentionReport {
                 presence_raw_deleted: presence,
                 voice_raw_deleted: voice,
+                attendance_raw_deleted: attendance,
                 audit_cache_deleted: audit,
                 stream_live_delivered_expired: live_expired,
                 guild_rows_purged: guild_rows,
@@ -774,6 +800,24 @@ async fn run_retention_core(
         }
     };
     Ok(report)
+}
+
+async fn retention_coverage_gaps(
+    conn: &mut sqlx::PgConnection,
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut gaps = crate::member_erasure::schema_gaps(conn).await?;
+    // The role matrix deliberately withholds DELETE on this admission
+    // table. Keep both drains queued and let independent expiry proceed.
+    if gaps.is_empty()
+        && !sqlx::query_scalar::<_, bool>(
+            "SELECT pg_catalog.has_table_privilege('voice_create_reservations', 'DELETE')",
+        )
+        .fetch_one(conn)
+        .await?
+    {
+        gaps.push("privacy DELETE unavailable: voice_create_reservations".to_owned());
+    }
+    Ok(gaps)
 }
 
 /// Count the full bounded-policy backlog for the lifecycle's dry-run report.
@@ -810,9 +854,7 @@ async fn count_raw_expiry_candidates(
     // Mirror the dry-run core's preceding-stage settlement: a schema-coverage
     // gap defers every pending deletion and every queued guild purge, so with
     // gaps nothing precedes the raw batch and no row is excluded.
-    let schema_gapped = !crate::member_erasure::schema_gaps(&mut tx)
-        .await?
-        .is_empty();
+    let schema_gapped = !retention_coverage_gaps(&mut tx).await?.is_empty();
     let mut eligible_pairs: Vec<(String, String)> = Vec::new();
     let mut queued_unguarded: Vec<String> = Vec::new();
     if !schema_gapped {
@@ -884,6 +926,7 @@ async fn count_raw_expiry_candidates(
     Ok(RetentionReport {
         presence_raw_deleted: presence as u64,
         voice_raw_deleted: voice as u64,
+        attendance_raw_deleted: 0,
         audit_cache_deleted: audit as u64,
         stream_live_delivered_expired: 0,
         guild_rows_purged: 0,
@@ -1030,6 +1073,7 @@ pub async fn run_raw_expiry_batch(
     let mut report = RetentionReport {
         presence_raw_deleted: 0,
         voice_raw_deleted: 0,
+        attendance_raw_deleted: 0,
         audit_cache_deleted: 0,
         stream_live_delivered_expired: 0,
         guild_rows_purged: 0,
@@ -1266,6 +1310,9 @@ async fn complete_request(
 const EVENT_INSTANCE_GUILD_PURGE_TABLES: &[&str] = &[
     "event_voice_channels",
     "internal_event_keys",
+    // The plan purges sessions first; remove captured windows before the
+    // instance evidence they reference.
+    "event_attendance_windows",
     "event_instance_windows",
 ];
 
@@ -1336,6 +1383,10 @@ fn guild_projection_time_exclusions(table: &str, first_placeholder: usize) -> Ve
         "operational_audit_log" => vec![(
             format!("occurred_at < now() - make_interval(days => ${first_placeholder})"),
             AUDIT_CACHE_RETENTION_DAYS,
+        )],
+        "event_voice_sessions" => vec![(
+            format!("joined_at < now() - make_interval(hours => ${first_placeholder} * 24)"),
+            ATTENDANCE_SESSION_RETENTION_DAYS,
         )],
         _ => Vec::new(),
     }
@@ -1693,6 +1744,7 @@ mod retention_stage_order_tests {
         RetentionReport {
             presence_raw_deleted: 0,
             voice_raw_deleted: 0,
+            attendance_raw_deleted: 0,
             audit_cache_deleted: 0,
             stream_live_delivered_expired: 0,
             guild_rows_purged: 0,
@@ -1820,12 +1872,13 @@ mod ledger_tests {
         }
     }
 
-    fn report(values: [u64; 12]) -> RetentionReport {
-        let [presence, voice, audit, live_expired, guild_rows, failed, deferred_guilds, oldest_secs, completed, deferred, gap, overdue] =
+    fn report(values: [u64; 13]) -> RetentionReport {
+        let [presence, voice, attendance, audit, live_expired, guild_rows, failed, deferred_guilds, oldest_secs, completed, deferred, gap, overdue] =
             values;
         RetentionReport {
             presence_raw_deleted: presence,
             voice_raw_deleted: voice,
+            attendance_raw_deleted: attendance,
             audit_cache_deleted: audit,
             stream_live_delivered_expired: live_expired,
             guild_rows_purged: guild_rows,
@@ -1843,7 +1896,7 @@ mod ledger_tests {
 
     #[test]
     fn empty_run_deletes_nothing() {
-        let idle = report([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let idle = report([0; 13]);
         assert_eq!(idle.total_deleted(), 0);
     }
 
@@ -1853,7 +1906,8 @@ mod ledger_tests {
         // overdue signals vary freely: none of them may leak into the total.
         let mut rng = Ladder(0x1234_5678_9abc_def0);
         for _ in 0..256 {
-            let (presence, voice, audit, live_expired, guild_rows) = (
+            let (presence, voice, attendance, audit, live_expired, guild_rows) = (
+                rng.below(1_000_000),
                 rng.below(1_000_000),
                 rng.below(1_000_000),
                 rng.below(1_000_000),
@@ -1863,6 +1917,7 @@ mod ledger_tests {
             let raffle = report([
                 presence,
                 voice,
+                attendance,
                 audit,
                 live_expired,
                 guild_rows,
@@ -1876,8 +1931,8 @@ mod ledger_tests {
             ]);
             assert_eq!(
                 raffle.total_deleted(),
-                presence + voice + audit + live_expired + guild_rows,
-                "the total must sum exactly the five row classes, got {raffle:?}"
+                presence + voice + attendance + audit + live_expired + guild_rows,
+                "the total must sum exactly the six row classes, got {raffle:?}"
             );
         }
     }
@@ -1889,7 +1944,8 @@ mod ledger_tests {
         // The DB acceptance suite exercises the actual #960 projection logic.
         let mut rng = Ladder(0x0bad_f00d_dead_beef);
         for _ in 0..256 {
-            let (presence, voice, audit, live_expired, guild_rows) = (
+            let (presence, voice, attendance, audit, live_expired, guild_rows) = (
+                rng.below(1_000_000),
                 rng.below(1_000_000),
                 rng.below(1_000_000),
                 rng.below(1_000_000),
@@ -1899,6 +1955,7 @@ mod ledger_tests {
             let dry = report([
                 presence,
                 voice,
+                attendance,
                 audit,
                 live_expired,
                 guild_rows,
@@ -1913,6 +1970,7 @@ mod ledger_tests {
             let live = report([
                 presence,
                 voice,
+                attendance,
                 audit,
                 live_expired,
                 guild_rows,
@@ -2039,6 +2097,17 @@ mod ledger_tests {
         assert!(audit_condition.contains("$2"), "{audit_condition}");
         assert_eq!(audit_days, AUDIT_CACHE_RETENTION_DAYS);
 
+        let (attendance_condition, attendance_days) =
+            guild_projection_time_exclusions("event_voice_sessions", 2)
+                .into_iter()
+                .next()
+                .expect("event_voice_sessions needs a projection exclusion");
+        assert_eq!(
+            attendance_condition,
+            "joined_at < now() - make_interval(hours => $2 * 24)"
+        );
+        assert_eq!(attendance_days, ATTENDANCE_SESSION_RETENTION_DAYS);
+
         let mut without_exclusion: Vec<String> = crate::member_erasure::plan()
             .tables
             .iter()
@@ -2046,7 +2115,10 @@ mod ledger_tests {
             .collect();
         without_exclusion.push("presence_probe".to_owned());
         for table in without_exclusion {
-            if table == "events" || table == "operational_audit_log" {
+            if matches!(
+                table.as_str(),
+                "events" | "operational_audit_log" | "event_voice_sessions"
+            ) {
                 continue;
             }
             assert!(

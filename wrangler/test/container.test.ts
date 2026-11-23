@@ -10,10 +10,14 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
+import { Container } from "@cloudflare/containers";
+import detail from "./fixtures/staging-automod-preview.json" with { type: "json" };
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
+import { PREVIEW_HEADER } from "../src/staging-preview.ts";
 import { STAGING_USE_PATH, STAGING_USE_KEY, type StagingWindow } from "../src/staging-lifecycle.ts";
 import { EMPTY_STATE, LOG_QUERY_URL, type MetricsAlertState } from "../src/alert-rules.ts";
 import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
@@ -113,12 +117,13 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
   }
   const starts: StartConfig[] = [];
   const requests: { pathname: string; port: number }[] = [];
+  const alarms: (number | null)[] = [];
   const values = options instanceof Map ? options
     : flags.values ?? new Map<string, unknown>([[OWNER_KEY, "owner" in flags ? flags.owner : ACTIVE_OWNER]]);
   const gates: Promise<unknown>[] = [];
   let listenerPort = 8080;
   let probeStatus = 503;
-  let probeResponse: ((status: number) => Response) | undefined;
+  let probeResponse: ((status: number, pathname: string, redirect?: RequestRedirect) => Response) | undefined;
   const runtime = {
     running: flags.running ?? false,
     destroys: 0,
@@ -138,14 +143,18 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
     // A running container's monitor stays pending until it stops.
     monitor: () => new Promise<void>(() => {}),
     getTcpPort: (port: number) => ({
-      async fetch(input: string | Request) {
+      async fetch(input: string | Request, init?: RequestInit) {
         const pathname = new URL(typeof input === "string" ? input : input.url).pathname;
         requests.push({ pathname, port });
+        if (pathname === "/readyz") {
+          const headers = new Headers((input instanceof Request ? input : init)?.headers);
+          assert.equal(headers.has("authorization") || headers.has(PREVIEW_HEADER), false);
+        }
         if (port !== listenerPort) throw new Error("connection refused: wrong container port");
         // Liveness is not readiness, even with a configured token. Preserve
         // gateway-down; a synthetic env fixture is NOT proof of a READY event.
         const status = pathname === "/readyz" ? probeStatus : 200;
-        const response = probeResponse?.(status)
+        const response = probeResponse?.(status, pathname, input instanceof Request ? input.redirect : init?.redirect)
           ?? Response.json({ ready: status === 200, gateway_connected: status === 200 }, { status });
         Object.defineProperty(response, "webSocket", { value: null });
         return response;
@@ -179,8 +188,8 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
           return database.prepare(query).all(...bindings);
         },
       },
-      setAlarm: async () => {},
-      deleteAlarm: async () => {},
+      setAlarm: async (time: number) => { alarms.push(time); },
+      deleteAlarm: async () => { alarms.push(null); },
       sync: async () => {},
     },
     blockConcurrencyWhile<T>(callback: () => Promise<T>) {
@@ -195,9 +204,9 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
   );
   await Promise.all(gates);
   return {
-    bot, runtime, starts, requests, logs, values, ctx, database,
+    bot, runtime, starts, requests, logs, values, ctx, database, alarms,
     setProbeStatus: (status: number) => { probeStatus = status; },
-    setProbeResponse: (factory: (status: number) => Response) => { probeResponse = factory; },
+    setProbeResponse: (factory: NonNullable<typeof probeResponse>) => { probeResponse = factory; },
     pending: () => database.prepare("SELECT * FROM container_schedules WHERE callback = 'keepalive'").all(),
   };
 }
@@ -213,7 +222,50 @@ const BOUNDED_STAGING_ENV = {
   ...WORKER_ENV, TWO_DEPLOY_ENV: "staging", STAGING_RUNTIME_POLICY: "bounded", CONTAINER_RELEASE: "a".repeat(40),
 };
 
-function stagingUseRequest(action: "acquire" | "release", window: StagingWindow): Request {
+test("authenticated bounded staging ownership GET attests the forwarded target without container I/O", async (t) => {
+  const host = "fixture.pg.psdb.cloud";
+  const databaseUrl = `postgres://synthetic_role.fixture_branch:synthetic_password@${host}/postgres`;
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify({ branch_id: "fixture_branch", database: "postgres", host })).digest("hex");
+  const url = `https://worker.invalid${CONTROL_PATH}?runtime_db_fingerprint=${fingerprint}`;
+  const stage = await harness(t, { ...BOUNDED_STAGING_ENV, DATABASE_URL: databaseUrl });
+  const values = structuredClone(stage.values);
+  const alarms = [...stage.alarms];
+  const destroys = stage.runtime.destroys;
+  const request = probeRequest(url, { headers: { authorization: `Bearer ${CONTROL_TOKEN}` } });
+  const response = await stage.bot.fetch(request);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const state = await response.json();
+  assert.deepEqual(state, {
+    deploymentId: ID, owner: ACTIVE_OWNER, running: false, runtimeDatabaseFingerprint: fingerprint,
+  });
+  assert.equal(stage.bot.envVars.DATABASE_URL, databaseUrl);
+  assert.deepEqual(stage.values, values);
+  assert.deepEqual(stage.alarms, alarms);
+  assert.equal(stage.runtime.destroys, destroys);
+  assert.deepEqual(stage.starts, []);
+  assert.deepEqual(stage.requests, []);
+  assert.equal((await stage.bot.fetch(probeRequest(url))).status, 401);
+});
+
+test("ordinary and non-staging ownership control omit runtime DB evidence", async (t) => {
+  const host = "fixture.pg.psdb.cloud";
+  const databaseUrl = `postgres://synthetic_role.fixture_branch:synthetic_password@${host}/postgres`;
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify({ branch_id: "fixture_branch", database: "postgres", host })).digest("hex");
+  const normalPath = `https://worker.invalid${CONTROL_PATH}`;
+  const stage = await harness(t, { ...BOUNDED_STAGING_ENV, DATABASE_URL: databaseUrl });
+  const prod = await harness(t, { ...WORKER_ENV, TWO_DEPLOY_ENV: "production", DATABASE_URL: databaseUrl });
+  for (const [bot, url] of [[stage.bot, normalPath],
+    [prod.bot, normalPath + `?runtime_db_fingerprint=${fingerprint}`]] as const) {
+    const response = await bot.fetch(probeRequest(url, { headers: { authorization: `Bearer ${CONTROL_TOKEN}` } }));
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { deploymentId: ID, owner: ACTIVE_OWNER, running: false });
+  }
+});
+
+function stagingUseRequest(action: "acquire" | "release" | "stop", window: StagingWindow): Request {
   return probeRequest(`https://worker.invalid${STAGING_USE_PATH}`, {
     method: "POST", headers: { authorization: `Bearer ${CONTROL_TOKEN}` },
     body: JSON.stringify({ ...window, action, expectedEpoch: 1, deploymentId: ID, sha: BOUNDED_STAGING_ENV.CONTAINER_RELEASE }),
@@ -223,6 +275,110 @@ function stagingUseRequest(action: "acquire" | "release", window: StagingWindow)
 function stagingWindow(): StagingWindow {
   return { environment: "staging", runId: "123456", runAttempt: 1, expiresAt: Date.now() + 120_000 };
 }
+
+test("staging preview extends readiness without extra cold lifecycle activity", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"] });
+  const { application_id: app, guild_id: guild, name, id } = detail;
+  const env = { ...BOUNDED_STAGING_ENV, GUILD_ID: guild, DISCORD_APPLICATION_ID: app };
+  const window = stagingWindow(), sha = env.CONTAINER_RELEASE;
+  const grant = { ...window, deploymentId: ID, sha, epoch: 1, acquiredAt: Date.now(), phase: "active" };
+  const report = { components: ["process", "gateway", "database", "token_invalid"].map((name) => [name, "ready"]),
+    jobs: {}, build_revision: sha, build_id: `${window.runId}-${window.runAttempt}` };
+  const list = `https://discord.com/api/v10/applications/${app}/guilds/${guild}/commands`;
+  const urls = ["https://discord.com/api/v10/users/@me", list, `${list}/${id}`];
+  const replies = (end: unknown = detail) => [Response.json({ id: app, bot: true }), Response.json([detail]), Response.json(end)];
+  let queue = replies(), onDiscordRead: (() => void) | undefined;
+  const discord = t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+    assert.equal(url, urls[discord.mock.callCount() % 3]);
+    assert.equal(init.method, "GET");
+    assert.equal(init.redirect, "error");
+    assert.ok(init.signal);
+    assert.equal(new Headers(init.headers).get("authorization"), `Bot ${env.DISCORD_TOKEN}`);
+    onDiscordRead?.();
+    return queue.shift() ?? Response.error();
+  });
+  const binding = [ID, sha, window.runId, window.runAttempt, window.expiresAt].join(":");
+  const request = (headers = {}, method = "GET", query = "") =>
+    new Request(`https://worker.invalid/readyz${query}`, { method, headers: { ...headers, "cf-connecting-ip": "preview-fixture" } });
+  const opted = (patch = {}, method = "GET", query = "") =>
+    request({ authorization: `Bearer ${CONTROL_TOKEN}`, [PREVIEW_HEADER]: binding, ...patch }, method, query);
+  const renew = t.mock.method(Container.prototype, "renewActivityTimeout");
+  const cold = (use: unknown, running: boolean) =>
+    harness(t, env, { values: new Map<string, unknown>([[OWNER_KEY, ACTIVE_OWNER], [STAGING_USE_KEY, use]]), running });
+  const edge = (h: Awaited<ReturnType<typeof cold>>) => ({ ...env,
+    TWO_BOT: { getByName: () => h.bot } }) as unknown as Env;
+  const effects = (h: Awaited<ReturnType<typeof cold>>) => ({
+    alarms: h.alarms, starts: h.starts.length, stops: h.runtime.destroys, storage: h.values,
+    renewals: renew.mock.calls.filter((call) => call.this === h.bot).length,
+    schedules: h.database.prepare("SELECT callback, time, payload FROM container_schedules ORDER BY callback").all(),
+  });
+  for (const [use, running] of [[grant, false], [undefined, true]] as const) {
+    const ordinary = await cold(use, running), preview = await cold(use, running);
+    ordinary.setProbeResponse(() => Response.json(report));
+    preview.setProbeResponse(() => Response.json(report));
+    const normal = await worker.fetch(request(), edge(ordinary));
+    const withPreview = await worker.fetch(opted(), edge(preview));
+    const bodies = await Promise.all([withPreview.text(), normal.text()]);
+    await setImmediate();
+    assert.equal(withPreview.status, normal.status);
+    assert.ok(ordinary.alarms.some((time) => typeof time === "number"), "pinned SDK writes on cold construction");
+    assert.deepEqual(effects(preview), effects(ordinary));
+    if (use) {
+      assert.equal(ordinary.starts.length, 1);
+      assert.equal(discord.mock.callCount(), 3);
+      assert.equal(bodies[0], bodies[1]);
+      assert.deepEqual(JSON.parse(withPreview.headers.get(PREVIEW_HEADER)!), { registry: "pass", command: name,
+        deploymentId: ID, sha, runId: window.runId, runAttempt: window.runAttempt, expiresAt: window.expiresAt });
+    } else assert.equal(withPreview.headers.has(PREVIEW_HEADER), false);
+  }
+  const h = await cold(grant, true);
+  const send = (req = opted()) => worker.fetch(req, edge(h));
+  discord.mock.resetCalls();
+  for (const [req, status] of [[opted({ authorization: "Bearer incorrect" }), 401], [opted({}, "POST"), 405],
+    [opted({}, "GET", "?guild=other"), 400], [opted({ [PREVIEW_HEADER]: "wrong-attempt" }), 503]] as const) {
+    assert.equal((await send(req)).status, status);
+  }
+  assert.equal((await worker.fetch(opted(), { ...edge(h), CF_VERSION_METADATA: { id: "stale-edge" } } as Env)).status, 503);
+  h.values.set(STAGING_USE_KEY, { ...grant, acquiredAt: Date.now() - 2000, expiresAt: Date.now() - 1000 });
+  assert.equal((await send()).status, 503);
+  assert.equal(discord.mock.callCount(), 0);
+  const unready = { ...report, components: report.components.map(([key, state]) => [key, key === "gateway" ? "down" : state]),
+    gateway_failure: { phase: "durable_gateway", class: "checkpoint_load_failed" } };
+  for (const [change, read, status, calls] of [["redirect", 1, 500, 0], ["unready", 1, 503, 0], ["unready", 2, 503, 3],
+    ["drift", 1, 503, 0], ["drift", 2, 503, 3], ["release", 0, 503, 1], ["release", 1, 503, 0],
+    ["release", 2, 503, 3], ["expiry", 2, 503, 3]] as const) {
+    discord.mock.resetCalls();
+    queue = replies();
+    h.values.set(STAGING_USE_KEY, grant);
+    onDiscordRead = read === 0 ? () => h.values.set(STAGING_USE_KEY, { ...grant, phase: "released" }) : undefined;
+    let probes = 0;
+    h.setProbeResponse((_, path, redirect) => {
+      if (path !== "/readyz" || ++probes !== read) return Response.json(report);
+      if (change === "redirect" && redirect === "manual") return Response.redirect("https://redirect.invalid");
+      if (change === "unready") return Response.json(unready, { status: 503 });
+      if (change === "release") h.values.set(STAGING_USE_KEY, { ...grant, phase: "released" });
+      if (change === "expiry") t.mock.timers.setTime(grant.expiresAt);
+      return Response.json(change === "drift" ? { ...report, build_id: "9-9" } : report);
+    });
+    const result = await send();
+    assert.deepEqual([result.status, result.headers.has(PREVIEW_HEADER)],
+      [status, false], `${change} during readiness read ${read}`);
+    assert.equal(discord.mock.callCount(), calls);
+    if (change === "unready") assert.deepEqual(await result.json(), unready);
+  }
+  t.mock.timers.setTime(grant.acquiredAt);
+  h.setProbeResponse(() => Response.json(report));
+  for (const bad of [replies({ ...detail, default_member_permissions: "0" }), replies({ ...detail, options: [] }),
+    replies({ ...detail, version: "323456789012345678" }), [replies()[0]!, Response.json([])],
+    [replies()[0]!, new Response("x".repeat(256 * 1024 + 1))]]) {
+    discord.mock.resetCalls();
+    queue = [...bad];
+    const result = await send();
+    assert.deepEqual([result.status, result.headers.has(PREVIEW_HEADER)], [200, false]);
+    assert.deepEqual(await result.json(), report);
+    assert.equal(discord.mock.callCount(), bad.length);
+  }
+});
 
 for (const path of ["/health", "/readyz", "/version"]) {
   test(`bounded staging: idle ${path} cannot start or arm keepalive`, async (t) => {
@@ -239,6 +395,32 @@ for (const path of ["/health", "/readyz", "/version"]) {
     assert.equal(h.starts.length, 0, "all native SDK start paths are fenced");
   });
 }
+
+test("bounded staging: stop tears down the live process without spending its grant", async (t) => {
+  const h = await harness(t, BOUNDED_STAGING_ENV);
+  const window = stagingWindow();
+  const action = () => h.bot.fetch(stagingUseRequest("stop", window));
+  const acquired = await h.bot.fetch(stagingUseRequest("acquire", window));
+  assert.equal(acquired.status, 200);
+  const grant = await acquired.json() as { running: boolean; use: unknown };
+  await h.bot.fetch(probeRequest("https://worker.invalid/health")).then((r) => r.arrayBuffer());
+  assert.equal(h.runtime.running, true);
+  const failure = t.mock.method(h.runtime, "destroy", async () => { throw new Error("stop failed"); });
+  assert.equal((await action()).status, 503);
+  assert.equal(h.runtime.running, true);
+  assert.deepEqual(h.values.get(STAGING_USE_KEY), grant.use);
+  failure.mock.restore();
+  const stopped = await action();
+  assert.equal(stopped.status, 200);
+  assert.deepEqual(await stopped.json(), { ...grant, running: false });
+  assert.equal(h.runtime.running, false);
+  assert.equal(h.pending().length, 0);
+  assert.equal((await h.bot.listSchedules("stagingExpiry"))[0]?.time, Math.ceil(window.expiresAt / 1000));
+  await h.bot.fetch(probeRequest("https://worker.invalid/health")).then((r) => r.arrayBuffer());
+  assert.equal(h.starts.length, 2);
+  assert.equal((await h.bot.fetch(stagingUseRequest("release", window))).status, 200);
+  assert.equal(h.runtime.running, false);
+});
 
 test("bounded staging: authenticated acquire authorizes exact identity without starting; release is idempotent", async (t) => {
   const h = await harness(t, BOUNDED_STAGING_ENV);

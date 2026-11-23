@@ -106,7 +106,7 @@ def new_row(row_id=NEW_ROLLOUT):
 def deploy_records():
     return [
         {
-            "type": "wrangler-session", "version": 1, "wrangler_version": "4.156.0",
+            "type": "wrangler-session", "version": 1, "wrangler_version": "4.161.0",
             "command_line_args": ["deploy", "--config", "staging-deploy.json",
                                   "--env", "staging"],
         },
@@ -123,7 +123,7 @@ class OfflineTestCase(unittest.TestCase):
     def setUp(self):
         opener = Mock()
         opener.open.side_effect = AssertionError("live HTTP forbidden in offline tests")
-        self.enterContext(patch.object(rollout, "build_opener", return_value=opener))
+        self.enterContext(patch.object(rollout, "no_redirect_opener", return_value=opener))
         self.enterContext(patch.object(rollout.subprocess, "run",
                                       side_effect=AssertionError("live Docker forbidden")))
 

@@ -21,9 +21,14 @@ pub mod automation_quota;
 pub mod automation_transfer;
 pub mod automod;
 pub mod automod_preview;
+pub mod automod_preview_attempt;
+pub mod automod_preview_audit;
+pub mod automod_preview_flow;
 pub mod automod_preview_input;
 pub mod automod_preview_limiter;
 pub mod automod_preview_report;
+#[cfg(feature = "db")]
+pub mod automod_preview_store;
 pub mod automod_runtime;
 #[cfg(feature = "db")]
 pub mod automod_store;
@@ -133,6 +138,8 @@ pub mod presence_store;
 pub mod privacy;
 pub mod raid;
 pub mod raid_removal;
+pub mod realtime_signing;
+pub mod realtime_wire;
 pub mod referral_rewards;
 pub mod rejection_telemetry;
 pub mod router;
@@ -178,7 +185,12 @@ pub mod voice_create_admission;
 pub mod voice_custom_id;
 pub mod voice_ghost_cleanup;
 pub mod voice_heat;
+#[cfg(feature = "db")]
+pub mod voice_heat_store;
 pub mod voice_logging;
+pub mod voice_move_decision;
+pub mod voice_move_facts;
+pub mod voice_move_holds;
 pub mod voice_name_filter;
 pub mod voice_naming;
 pub mod voice_ownership;

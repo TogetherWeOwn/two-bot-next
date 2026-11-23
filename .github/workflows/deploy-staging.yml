@@ -4,14 +4,12 @@ name: deploy-staging
 run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'staging rollback proof' || github.workflow }}
 
 # Staging only. Accept the intended new rollout + serving image, never an old
-# healthy singleton. Production deploys remain manual and cutover-owned.
-# Active (TOG-12856): runs on a push to main that changes runtime inputs, and
-# on manual dispatch. The deploy job runs unconditionally in the `staging`
-# environment; `release_fence` only releases an uninitialized/parked singleton
-# after handoff authorization and defaults to false. `inject_gateway_failure`
-# is the rollback-drill switch (docs/staging-rollout-gate.md): dispatch-only,
-# defaults to false, and a push can never set it — the one expression that
-# reads it also requires `workflow_dispatch`. It reaches the deployed build
+# healthy singleton. Production promotion remains subject to its separate gates.
+# Runs only on workflow_dispatch; merging into main does not start staging.
+# The deploy job has no job-level condition and uses the `staging` environment.
+# `release_fence` only releases an uninitialized/parked singleton after handoff
+# authorization and defaults to false. `inject_gateway_failure` is the opt-in
+# rollback-drill switch (docs/staging-rollout-gate.md). It reaches the deployed build
 # only through the generated staging deploy config (staging_rollout.py
 # prepare), never a committed var, and deploy-production does not read it.
 # `inject_voice_stall` and `inject_unpaired_disconnect` are the remediation-
@@ -21,38 +19,12 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_ra
 # `sha` pins the deployed commit so arm and disarm run at one exact revision:
 # a dispatch-only string, empty by default (empty deploys the workflow head).
 # Every job checks out that ref and refuses anything that is not a full
-# 40-hex ancestor of origin/main, so a pin can only name a merged main commit
-# and rollback is a pin, not moving main.
+# 40-hex ancestor of origin/main. After the queue, the deploy job requires a
+# current workflow head; recover_prior_sha allows a deliberate older pin.
 #
-# Each deploy restarts the bot container and drops the gateway for 95-139 s, so
-# a push that only touches the paths below starts no run at all: the B2 soak
-# needs a stable gateway, and a docs merge changes nothing it serves. A
-# deny-list (`paths-ignore`), not an allow-list, so a path nobody classified
-# (a new top-level directory, a nested README under crates/) still deploys.
-# GitHub skips the run only when EVERY changed path matches, so a merge that
-# mixes docs with `crates/**`, `wrangler/**`, Cargo or workflow files deploys.
-# `deploy-staging` is not a required check, so a workflow-level filter cannot
-# strand a PR. scripts/ci/test_workflows.py pins this list against sample
-# runtime paths; the same non-runtime set is vetted in scripts/container-inputs.py.
-# Consequence: `deploy-production` needs a green run on its exact SHA. With an
-# empty `sha` it promotes the latest successful run's commit automatically; to
-# deploy a docs-only head, dispatch this workflow for it first.
+# A merge is not a deploy or qualification. Authorized dispatch and all
+# existing staging and production gates remain required.
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - '*.md' # root markdown only; `*` never crosses `/`, so nested READMEs still deploy
-      - LICENSE
-      - .editorconfig
-      - .gitignore
-      - .gitleaks.toml
-      - .gitleaksignore
-      - .github/ISSUE_TEMPLATE/**
-      - .github/pull_request_template.md
-      - .github/CODEOWNERS
-      - .github/dependabot.yml
-      - 'ops/**' # generated delivery evidence (weekly DORA files); never runtime
   workflow_dispatch:
     inputs:
       release_fence:
@@ -76,10 +48,18 @@ on:
         type: boolean
         default: false
       sha:
-        description: Deploy exactly this main commit (full 40-hex SHA, must be an ancestor of origin/main); empty deploys the workflow head
+        description: Deploy exactly this main commit (full 40-hex SHA); empty deploys the workflow head
         required: false
         type: string
         default: ""
+      recover_prior_sha:
+        description: Intentionally redeploy a prior main commit supplied in sha; never qualifies as staging history
+        type: boolean
+        default: false
+      verify_automod_preview:
+        description: Require a GET-only AutoMod preview receipt on a clean current-main rollout
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -88,21 +68,17 @@ permissions: {}
 concurrency:
   group: staging-lifecycle
   cancel-in-progress: false
+  queue: max
 
 jobs:
-  # Soak hold for remediation-drill windows: while the Operator holds staging
-  # armed, push deploys must not redeploy it. A held push fails fast here with
-  # a deferral message instead of reporting success without deploying (the
-  # production guard accepts a successful staging run as staging history, so a
-  # quiet skip would void that leg). Explicit arm/disarm dispatches proceed;
-  # error-rate rehearsals (including the daily automated proof) honor the hold.
-  # Reads only the Operator-owned repo variable STAGING_SOAK_HOLD_UNTIL (an
-  # ISO-8601 UTC deadline, at most 4h out): unset or empty means no hold, a
-  # past deadline fails open, and an unparsable or over-long value fails closed
-  # with a fix-it message. Merges stay unblocked (this workflow is not a
-  # required check); the next push after expiry deploys normally.
+  # Error-rate rehearsal dispatches honor the remediation-drill soak hold.
+  # Fail a held run rather than report success without deploying: a quiet
+  # skip could pollute staging history. Other dispatches bypass this hold.
+  # STAGING_SOAK_HOLD_UNTIL is an Operator-owned ISO-8601 UTC deadline, at
+  # most 4h out. An empty or expired hold allows the rehearsal to proceed;
+  # an unparsable or over-long deadline fails closed.
   soak-hold:
-    name: soak hold (defer push deploys while armed)
+    name: soak hold (defer error-rate rehearsals while armed)
     permissions:
       contents: read # the minimal-grants test requires an explicit grant; the job uses no token
     # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
@@ -110,7 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Defer the push while the soak hold is armed
+      - name: Check the rehearsal against the soak hold
         env:
           HOLD_UNTIL: ${{ vars.STAGING_SOAK_HOLD_UNTIL }}
           EVENT: ${{ github.event_name }}
@@ -136,7 +112,7 @@ jobs:
             echo "::error::Soak hold exceeds the 4h maximum: $HOLD_UNTIL. Shorten it or clear it."
             exit 1
           fi
-          echo "Staging deploy deferred by the soak hold until $HOLD_UNTIL. Merges are unaffected; the next push after expiry deploys normally." >> "$GITHUB_STEP_SUMMARY"
+          echo "Staging deploy deferred by the soak hold until $HOLD_UNTIL. A merge will not retry this run; dispatch a fresh authorized rehearsal with inject_error_rate_spike=true after expiry." >> "$GITHUB_STEP_SUMMARY"
           echo "::error::Staging deploy deferred by the soak hold until $HOLD_UNTIL"
           exit 1
   # Pre-deploy schema-drift gate: a drifted staging database fails this job
@@ -155,8 +131,7 @@ jobs:
       contents: read
     # No `if:`: every deploy must prove a drift-free staging DB first. A
     # skipped gate with a green deploy would re-create the silent-red staging.
-    # `needs: soak-hold`: while a drill hold is armed the hold fails first and
-    # this gate never runs; dispatches and unheld pushes proceed unchanged.
+    # `needs: soak-hold`: a deferred error-rate rehearsal fails before this gate.
     needs: soak-hold
     environment: staging-migrate-plan
     # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
@@ -224,8 +199,7 @@ jobs:
       contents: read
     # No `if:`: every deploy must prove drift-free grants first. A skipped
     # gate with a green deploy would re-create the 2026-10-16 crash-loop.
-    # `needs: soak-hold`: while a drill hold is armed the hold fails first and
-    # this gate never runs; dispatches and unheld pushes proceed unchanged.
+    # `needs: soak-hold`: a deferred error-rate rehearsal fails before this gate.
     needs: soak-hold
     environment: staging-migrate-plan
     # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
@@ -321,6 +295,7 @@ jobs:
         env:
           SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
           WORKFLOW_REF: ${{ github.ref }}
+          RECOVER_PRIOR_SHA: ${{ inputs.recover_prior_sha }}
         run: |
           [ "$WORKFLOW_REF" = "refs/heads/main" ] || { echo "::error::This job must run from main (workflow ref: $WORKFLOW_REF)" >&2; exit 1; }
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -331,6 +306,13 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA" || { echo "::error::Checkout did not land on $SOURCE_SHA" >&2; exit 1; }
           git fetch origin main
           git merge-base --is-ancestor "$SOURCE_SHA" origin/main || { echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 1; }
+          # Check the fetched tip after acquiring the lock; dispatch and queue
+          # admission are not freshness checks. Refuse before staging writes.
+          test "$GITHUB_SHA" = "$(git rev-parse FETCH_HEAD)" || { echo "::error::Staging dispatch superseded by main; start a fresh dispatch" >&2; exit 1; }
+          if [ "$SOURCE_SHA" != "$GITHUB_SHA" ] && [ "$RECOVER_PRIOR_SHA" != true ]; then
+            echo "::error::Prior-main pins require recover_prior_sha; do not set it for qualification" >&2
+            exit 1
+          fi
           # Export the validated dispatch-or-head SHA: every build-identity
           # and provenance consumer below stamps this, never the workflow
           # head, so a pinned drill labels the commit it actually serves
@@ -386,10 +368,8 @@ jobs:
           # the runner's workflow-head default, or a pinned drill would serve
           # the pin labeled as the head.
           GITHUB_SHA: ${{ env.DEPLOY_SHA }}
-          # Dispatch-only drill switches: a push run has no inputs and each
-          # expression requires workflow_dispatch besides, so every one is
-          # 'false' on every push. test_workflows.py pins these exact
-          # expressions.
+          # Opt-in drill switches. test_workflows.py pins the explicit
+          # workflow_dispatch guards as defense in depth.
           INJECT_GATEWAY_FAILURE: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_gateway_failure && 'true' || 'false' }}
           INJECT_VOICE_STALL: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_voice_stall && 'true' || 'false' }}
           INJECT_UNPAIRED_DISCONNECT: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_unpaired_disconnect && 'true' || 'false' }}
@@ -449,6 +429,14 @@ jobs:
             --variant staging \
             --out "$ROLLOUT_DIR/staging-rollback-snapshot.json"
           python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["ROLLOUT_DIR"] + "/staging-rollback-snapshot.json")), sort_keys=True))'
+      # A known fence would stop takeover before this run can own a recovery
+      # window. Leave both components alone unless the dispatch authorizes release.
+      - name: Check staging ownership before changing the deployment
+        if: ${{ !inputs.release_fence }}
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+        run: node ../tooling/wrangler/scripts/ownership-control.mjs deployment-preflight
       - name: Deploy to staging
         id: deploy
         uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
@@ -472,8 +460,8 @@ jobs:
       # or non-owner singleton refuses /readyz, so the rollout/readiness half
       # stays in `verify` after the transfer. A red `verify` therefore leaves
       # staging owned by a Worker whose identity was already checked but whose
-      # rollout was not confirmed; the owner stays `active`, so the next push
-      # can hand off again, and the red run is the alert.
+      # rollout was not confirmed; the owner stays `active`, so the next
+      # authorized dispatch can hand off again. The red run is the alert.
       - name: Validate Wrangler deploy receipt before ownership transfer
         run: |
           set -euo pipefail
@@ -517,7 +505,7 @@ jobs:
             fi
             case "$output" in
               *"Singleton is intentionally fenced or uninitialized"*)
-                echo "::error::Staging singleton fenced: re-run Actions > deploy-staging > Run workflow with release_fence checked after handoff authorization (or: gh workflow run deploy-staging.yml --ref main -f release_fence=true). A push/default never releases; do not change credentials." ;;
+                echo "::error::Staging singleton fenced: after handoff authorization, start a fresh deploy-staging dispatch from main with release_fence checked. The default never releases; do not change credentials." ;;
               *)
                 echo "::error::Staging ownership takeover failed (not a fence refusal); see the control-client output above. Do not change credentials." ;;
             esac
@@ -544,6 +532,9 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           STAGING_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_EXPIRES_AT: ${{ steps.use.outputs.expires_at }}
+          STAGING_USE_RECEIPT: ${{ env.ROLLOUT_DIR }}/staging-use.jsonl
         run: |
           set -euo pipefail
           python3 ../scripts/staging_rollout.py verify \
@@ -568,9 +559,7 @@ jobs:
           # Optional until the Operator provisions it: absent means the gate
           # records a skip, never a failure and never a silent pass.
           METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
-          # Dispatch-only drill switch: a push run has no inputs and this
-          # expression requires workflow_dispatch besides, so it is 'false'
-          # on every push. test_workflows.py pins this exact expression.
+          # Opt-in rehearsal switch; keep the explicit workflow_dispatch guard.
           INJECT_ERROR_RATE_SPIKE: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'true' || 'false' }}
           SHA: ${{ env.DEPLOY_SHA }}
         run: |
@@ -659,6 +648,7 @@ jobs:
       contents: read
     uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     with:
+      deploy_staging_call: true
       staging_use_expires_at: ${{ needs.deploy.outputs.staging_use_expires_at }}
       staging_use_sha: ${{ needs.deploy.outputs.staging_use_sha }}
       staging_use_deployment: ${{ needs.deploy.outputs.staging_use_deployment }}
@@ -679,6 +669,7 @@ jobs:
       contents: read
     uses: ./.github/workflows/help-embed-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     with:
+      deploy_staging_call: true
       staging_use_expires_at: ${{ needs.deploy.outputs.staging_use_expires_at }}
       staging_use_sha: ${{ needs.deploy.outputs.staging_use_sha }}
       staging_use_deployment: ${{ needs.deploy.outputs.staging_use_deployment }}
@@ -737,6 +728,12 @@ jobs:
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          STAGING_PREVIEW_AUTHORIZATION: >-
+            ${{ inputs.verify_automod_preview && !inputs.recover_prior_sha && !inputs.inject_error_rate_spike &&
+            needs.deploy.outputs.promotion_clean == 'true' && needs.deploy.outputs.staging_use_sha == github.sha &&
+            format('Bearer {0}', secrets.STAGING_OWNERSHIP_CONTROL_TOKEN) || '' }}
+          STAGING_USE_DEPLOYMENT: ${{ needs.deploy.outputs.staging_use_deployment }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.deploy.outputs.staging_use_expires_at }}
         run: |
           set -euo pipefail
           if [ -z "$STAGING_WORKER_URL" ]; then

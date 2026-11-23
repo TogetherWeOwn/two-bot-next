@@ -32,7 +32,17 @@ The adapter parses `TWO_RETENTION_MODE` with the following exact, case-sensitive
 
 Register the DB-only job through `website_jobs::serve`, even when the Discord gateway is unconfigured. Expose a `retention` status entry, including when parked. Use the existing `serve_jobs` supervisor and its shared shutdown: do not add a detached timer. The test permits a cadence from 60 seconds through one hour, startup jitter at most five seconds, and a positive timeout no greater than cadence. Retain the supervisor's existing cancellation-and-join semantics on shutdown; this contract does not demand that shutdown wait indefinitely for SQL.
 
-The real action must call the existing cutover retention operation. Every successful report has one structured `retention_run` event with `mode` and all `RetentionReport` counters, including `schema_gap_deferrals`. A partial `Ok(report)` with deferred/overdue deletions or failed guild purges must be visible at WARN, not silently reduced to scheduler success. Schema-coverage gaps defer as `Ok` (gap-deferred deletions in `schema_gap_deferrals` with the gap list in the warn log, queued guilds kept in `guild_purges_failed`) and retry after the plan is repaired; only SQL/connection failures return `ErrorClass::Database` to the supervisor. The tests accept the existing report field names; they do not invent a second erasure algorithm.
+The real action must call the existing cutover retention operation. Every successful report has one structured `retention_run` event with `mode` and all `RetentionReport` counters, including `schema_gap_deferrals`. A partial `Ok(report)` with deferred/overdue deletions or failed guild purges must be visible at WARN, not silently reduced to scheduler success. Schema-coverage gaps and the missing reservation DELETE grant defer as `Ok`, with deletions in `schema_gap_deferrals` and guild purges in `guild_purges_failed`. The warning carries the gap list. SQL/connection failures return `ErrorClass::Database` to the supervisor. The tests accept the existing report field names; they do not invent a second erasure algorithm.
+
+On each active tick, voice heat expiry follows the paged game-aggregate sweep,
+even if that sweep returned an error. For a pool with access to `voice_heat_hours`,
+dry run counts rows strictly older than 35 elapsed days and execute deletes them.
+`voice_heat_expiry` reports the count even when it is zero. The dormant role
+matrix grants runtime neither SELECT nor DELETE, so that pool reports
+`voice_heat_expiry_parked` instead of attempting heat SQL. An attempted sweep
+failure emits a classified diagnostic and fails the tick. If either sweep fails
+after core retention commits, one `retention_run` warning carries the committed
+counters and both failure flags. `off` still parks the entire job.
 
 ## Gateway contract
 

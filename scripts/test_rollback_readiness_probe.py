@@ -1,6 +1,7 @@
 """Rollback-readiness probe regressions: local fixtures only, no network or databases."""
 
 import contextlib
+from email.message import Message
 import gzip
 import io
 import json
@@ -11,6 +12,8 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from urllib.request import HTTPSHandler
+from urllib.response import addinfourl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rollback_readiness_probe as probe  # noqa: E402
@@ -348,6 +351,28 @@ class RollbackReadinessProbeTests(unittest.TestCase):
         self.assertEqual(code, 0, results)
         self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v16", results["PASS manifest"])
 
+    def test_v17_writer_sequence_marks_cover_only_the_matching_allocator(self):
+        head = manifest(version=17)
+        del head["sequences"]
+        table = "event_voice_sessions"
+        head["tables"].append({"name": table, "columns": ["id"], "count": 0})
+        session = {"table": table, "column": "id", "sequence": "public.event_voice_sessions_id_seq",
+                   "last_value": None, "readable": True}
+        marks = [dict(table=row["table"], column="id", lastValue=value, isCalled=called, increment=1)
+                 for row, value, called in zip([*LIVE, session], [42, 7, 1], [True, True, False])]
+        head["sequenceMarks"] = marks
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(head), mtime=2_160_000_000)
+        self.fx.write_live([*LIVE, session])
+        code, results, _ = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("v17", results["PASS manifest"])
+        self.assertIn("covers all 3 live sequences", results["PASS sequences"])
+        with self.assertRaisesRegex(probe.ProbeError, "event_voice_sessions.other .*no manifest high-water"):
+            probe.check_sequences(head, [dict(session, column="other")])
+        for live in (1, 2):
+            with self.assertRaisesRegex(probe.ProbeError, "event_voice_sessions.id .*would rewind"):
+                probe.check_sequences(head, [dict(session, last_value=live)])
+
     def assert_invalid_created_at(self, value):
         self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz",
                               archive_lines(manifest(createdAt=value)))
@@ -512,7 +537,7 @@ class RollbackReadinessProbeTests(unittest.TestCase):
             "empty archive": ([], None, "is empty"),
             "manifest not JSON": ([b"{manifest", *good[1:]], None, "manifest line is not JSON"),
             "row before manifest": (good[1:], None, "first line is not a manifest"),
-            "unknown version": (lines(version=17), None, "manifest version 17 is not one of (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)"),
+            "unknown version": (lines(version=18), None, "manifest version 18 is not one of (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)"),
             "boolean version": (lines(version=True), None, "manifest version True"),
             "no createdAt": (lines(createdAt=None), None, "no createdAt timestamp"),
             "negative eventsSequence": (lines(eventsSequence=-1), None, "invalid eventsSequence"),
@@ -583,10 +608,6 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                 self.assertIn("refusing: not the two-bot-next-staging workers.dev origin", readyz.reason)
                 self.assertEqual(self.requested, [])
 
-    def test_default_fetch_never_follows_redirects(self):
-        handler = probe._NoRedirect()
-        self.assertIsNone(handler.redirect_request(None, None, 302, "Found", {}, "https://elsewhere"))
-
     def test_rejects_non_two_require_key(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             probe.parse_args(["--require", "DATABASE_URL"])
@@ -642,6 +663,19 @@ class UserAgentTests(unittest.TestCase):
             probe.fetch("https://two-bot-next-staging.example-sub.workers.dev/readyz")
         self.assertEqual(seen, [probe.USER_AGENT])
         self.assertFalse(seen[0].startswith("Python-urllib"))
+
+
+class RedirectTransportTests(unittest.TestCase):
+    def test_default_fetch_never_follows_redirects(self):
+        url = STAGING + "/readyz"
+        headers = Message()
+        headers["Location"] = "https://other.example/"
+        response = addinfourl(io.BytesIO(b"fixture"), headers, url, 302)
+        response.msg = "redirect"
+        with (mock.patch("socket.create_connection", side_effect=AssertionError("unexpected socket")),
+              mock.patch.object(HTTPSHandler, "https_open", return_value=response) as send):
+            self.assertEqual(probe.fetch(url), (302, b"fixture"))
+            send.assert_called_once()
 
 
 class DeepNestingRefusalTests(unittest.TestCase):

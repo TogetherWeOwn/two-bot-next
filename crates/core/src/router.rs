@@ -55,9 +55,12 @@ pub mod replies;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+use super::automod_preview::automod_preview_definition;
+use super::automod_runtime::{AutomodRuntime, STAGING_GUILD_ID};
 use super::command_permissions::command_permission;
 use super::commands::{
     core_commands, merge_registry, CommandDefinition, CustomCommand, MergedRegistry, RegistryError,
+    GUILD_COMMAND_LIMIT,
 };
 use super::feature_commands::{
     announcement_commands, automation_commands, scorecard_attendance_command, FeatureGates,
@@ -123,7 +126,7 @@ pub const MODERATION_DISABLED_REPLY: &str = "Moderation is not enabled on this s
 /// Scorecard gate: env-gated, not a Discord role — say who enables it.
 pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
 
-/// Slash names routed while dark (unpublished until their slice lands).
+/// Slash names routed but absent from the default published set.
 /// Dispatch shadows each name (see `route_slash`), so a custom row under
 /// one could publish yet never execute. [`crate::custom_commands::reserved_command_names`]
 /// mirrors this set on the write path (`/command`, imports), so writes
@@ -185,6 +188,7 @@ pub enum ComponentHandler {
     /// the moderator gate runs in the channel slice, which re-runs the slash
     /// adjudication on the pressing member before any read.
     LockdownPreview,
+    HelpPage,
 }
 
 /// Contract feature slices implement so the router can hand a routed
@@ -456,6 +460,7 @@ pub enum ComponentOutcome {
 /// prefixes — legacy match order, exact first).
 pub struct InteractionRouter {
     gates: RouterGates,
+    staging_automod_preview: OnceLock<()>,
     handlers: HashMap<HandlerId, Box<dyn InteractionHandler>>,
 }
 
@@ -476,7 +481,24 @@ impl InteractionRouter {
     pub fn new(gates: RouterGates) -> Self {
         Self {
             gates,
+            staging_automod_preview: OnceLock::new(),
             handlers: HashMap::new(),
+        }
+    }
+
+    /// Open staging preview publication after attaching the gateway's AutoMod runtime.
+    /// The existing moderation gate must also allow the router to serve the command.
+    pub fn enable_staging_automod_preview(&self, automod: &AutomodRuntime) {
+        if self.gates.moderation
+            && self
+                .gates
+                .configured_guild
+                .map(|id| id.to_string())
+                .as_deref()
+                == Some(STAGING_GUILD_ID)
+            && automod.admits(Some(STAGING_GUILD_ID))
+        {
+            let _ = self.staging_automod_preview.set(());
         }
     }
 
@@ -717,8 +739,8 @@ impl InteractionRouter {
                 HandlerId::LockdownPreview,
                 RouterRefusal::LockdownPreviewPermission,
             )),
-            // Dark until the publication slice: routed and adjudicated like
-            // the other private reads, but with no published definition.
+            // Publication is staging-only; stale invocations still use the
+            // same guild and Manage Server checks as other moderation reads.
             "automod-preview" => Some((
                 HandlerId::AutomodPreview,
                 RouterRefusal::AutomodPreviewPermission,
@@ -1007,6 +1029,25 @@ impl InteractionRouter {
         ComponentOutcome::Handled { handler }
     }
 
+    /// Opt in to discovery navigation for message components. Only callers
+    /// that dispatch `HelpPage` and validate its source should use this route.
+    #[must_use]
+    pub fn route_component_with_help(
+        &self,
+        custom_id: &str,
+        guild_id: Option<u64>,
+    ) -> ComponentOutcome {
+        if !crate::help::cursor::Cursor::is_help_control(custom_id) {
+            return self.route_component(custom_id, guild_id);
+        }
+        if !self.guild_ok(guild_id) {
+            return ComponentOutcome::Ignore;
+        }
+        ComponentOutcome::Handled {
+            handler: ComponentHandler::HelpPage,
+        }
+    }
+
     /// Route one modal submit by `custom_id` through the same table as
     /// components. Unknown ids reply only inside the configured guild.
     #[must_use]
@@ -1198,7 +1239,15 @@ impl InteractionRouter {
         } else {
             Vec::new()
         };
-        merge_registry(&extra, &visible)
+        let mut merged = merge_registry(&extra, &visible)?;
+        // Preview may use a spare slot but must not evict persisted custom
+        // commands or change the existing /myroom deferral decision.
+        if self.staging_automod_preview.get().is_some()
+            && merged.commands.len() < GUILD_COMMAND_LIMIT
+        {
+            merged.commands.push(automod_preview_definition());
+        }
+        Ok(merged)
     }
 }
 
@@ -1970,6 +2019,41 @@ mod tests {
             );
             assert_eq!(r.route_slash(&ctx(name, None, None)), SlashOutcome::Ignore);
         }
+    }
+
+    #[test]
+    fn help_controls_use_only_the_reserved_component_namespace_in_the_home_guild() {
+        let r = router();
+        let id = "h1:malformed";
+        assert_eq!(
+            r.route_component(id, Some(GUILD)),
+            ComponentOutcome::Unknown
+        );
+        assert_eq!(r.route_modal(id, Some(GUILD)), ComponentOutcome::Unknown);
+        assert_eq!(
+            r.route_component_with_help(id, Some(GUILD)),
+            ComponentOutcome::Handled {
+                handler: ComponentHandler::HelpPage,
+            }
+        );
+        for guild in [Some(GUILD + 1), None] {
+            assert_eq!(r.route_component(id, guild), ComponentOutcome::Ignore);
+            assert_eq!(r.route_modal(id, guild), ComponentOutcome::Ignore);
+            assert_eq!(
+                r.route_component_with_help(id, guild),
+                ComponentOutcome::Ignore
+            );
+        }
+        for id in ["h1", "h12:malformed", "h2:malformed"] {
+            assert_eq!(
+                r.route_component_with_help(id, Some(GUILD)),
+                ComponentOutcome::Unknown
+            );
+        }
+        assert_eq!(
+            r.route_component_with_help(GAME_SELECT_ID, Some(GUILD)),
+            r.route_component(GAME_SELECT_ID, Some(GUILD))
+        );
     }
 
     #[test]

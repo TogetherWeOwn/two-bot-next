@@ -8,8 +8,11 @@ import unittest
 import urllib.parse
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+from email.message import Message
 from pathlib import Path
 from unittest import mock
+from urllib.request import HTTPRedirectHandler, HTTPSHandler
+from urllib.response import addinfourl
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -153,17 +156,20 @@ class ReaderContractTests(unittest.TestCase):
                 args, kwargs = build.return_value.open.call_args
                 self.assertEqual(args[0].get_method(), "GET")
                 self.assertEqual(kwargs["timeout"], 10)
-                self.assertTrue(any(isinstance(handler, incident_issue._NoRedirectHandler)
-                                    for handler in build.call_args.args))
+                [handler] = [h for h in build.call_args.args if isinstance(h, HTTPRedirectHandler)]
+                self.assertIsNone(handler.redirect_request(args[0], None, 302, "", {}, "https://other.example/"))
 
     def test_shared_transport_refuses_redirect(self):
         reader = hold.History(ENV)
-        error = incident_issue.urllib.error.HTTPError("https://example.invalid", 302, "", {}, None)
-        with mock.patch.object(incident_issue.urllib.request, "build_opener") as build:
-            build.return_value.open.side_effect = error
+        headers = Message()
+        headers["Location"] = "https://other.example/"
+        response = addinfourl(io.BytesIO(b"fixture"), headers, incident_issue.API, 302)
+        response.msg = "redirect"
+        with (mock.patch("socket.create_connection", side_effect=AssertionError("unexpected socket")),
+              mock.patch.object(HTTPSHandler, "https_open", return_value=response) as send):
             with self.assertRaisesRegex(incident_issue.IncidentError, "refused redirect"):
                 reader.get("x")
-        self.assertIsNone(incident_issue._NoRedirectHandler().redirect_request(None, None, 302, "", {}, "https://example.invalid"))
+            send.assert_called_once()
 
     def test_consumers_exhaust_reader_and_share_budget(self):
         reader = hold.History(ENV)

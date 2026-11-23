@@ -67,7 +67,7 @@ fn option(name: &str, value: &str) -> Value {
 fn interaction(id: u64, command: &str, options: Vec<Value>) -> Interaction {
     serde_json::from_value(json!({
         "id": id.to_string(), "application_id": "1111", "type": 2,
-        "token": TOKEN, "version": 1, "guild_id": "2222",
+        "token": TOKEN, "version": 1, "attachment_size_limit": 10485760, "guild_id": "2222",
         "channel": {"id": "4444", "type": 0, "name": "commands"},
         "authorizing_integration_owners": {"0": "2222"}, "entitlements": [],
         "member": {

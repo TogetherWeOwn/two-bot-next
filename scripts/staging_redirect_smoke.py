@@ -40,6 +40,8 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 
+from script_intake import no_redirect_opener, read_with_overflow
+
 STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
 INVITE_CODE = re.compile(r"[A-Za-z0-9-]{1,64}")
 VALID_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,38}[a-z0-9]")
@@ -109,11 +111,6 @@ def probe_slug(slug):
     return slug
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None  # urllib then raises the 3xx as an HTTPError
-
-
 # The edge refuses the default `Python-urllib/*` client outright (error 1010),
 # before the Worker is reached -- curl on the same probes passes. An explicit
 # client UA identifies read-only smoke traffic without impersonating a browser.
@@ -122,15 +119,15 @@ USER_AGENT = "two-bot-next-staging-redirect-smoke/1.0 (read-only E2E)"
 
 def fetch(url):
     """One GET without redirects; returns (status, headers, body bytes)."""
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = no_redirect_opener()
     request = urllib.request.Request(url, method="GET",
                                      headers={"User-Agent": USER_AGENT,
                                               "Cache-Control": "no-cache"})
     try:
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
-            return response.status, response.headers, response.read(BODY_CAP + 1)
+            return response.status, response.headers, read_with_overflow(response, BODY_CAP)
     except urllib.error.HTTPError as error:
-        return error.code, error.headers or {}, error.read(BODY_CAP + 1)
+        return error.code, error.headers or {}, read_with_overflow(error, BODY_CAP)
 
 
 def header(headers, name):

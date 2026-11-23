@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use two_bot_core::automod_preview_report::PreviewMetricLabels;
 use two_bot_core::metrics::{
     Metrics, AUTOMOD_DECISION_OUTCOMES, CHECKPOINT_FAILURE_STAGES, COMMUNITY_FACTS_DRAIN_REASONS,
     CONTAINMENT_STORE_OPS, DB_ERROR_OPS, DISPATCH_LANES, DROP_POISON_GUARDS, EVENTS,
@@ -29,6 +30,96 @@ fn repository_root() -> PathBuf {
 /// (`queue_full`, `queue_closed`); hardcoded because the production table is
 /// private and this conformance pin must fail closed on any drift.
 const JOIN_QUEUE_DROP_REASON_VALUES: &[&str] = &["queue_full", "queue_closed"];
+
+const PREVIEW_METRIC: &str = "two_bot_automod_previews_total";
+const PREVIEW_RESULTS: &[&str] = &[
+    "matched",
+    "no_match",
+    "exempt",
+    "partial",
+    "rate_limited",
+    "not_evaluated",
+    "unavailable",
+];
+const PREVIEW_FILTERS: &[&str] = &[
+    "bad_words",
+    "repeated_message",
+    "mention_spam",
+    "invite_link",
+    "external_link",
+    "attachment_type",
+    "none",
+];
+const PREVIEW_MODES: &[&str] = &["dry_run", "enforce", "not_evaluated"];
+
+#[test]
+fn automod_preview_metrics_accept_only_valid_tuples() {
+    fn samples(text: &str) -> BTreeSet<&str> {
+        text.lines()
+            .filter(|line| line.starts_with(PREVIEW_METRIC))
+            .collect()
+    }
+
+    let metrics = Metrics::default();
+    let mut expected = BTreeMap::new();
+    let first = PreviewMetricLabels {
+        result: "matched",
+        filter: "bad_words",
+        mode: "dry_run",
+    };
+    for &result in PREVIEW_RESULTS {
+        for &filter in PREVIEW_FILTERS {
+            for &mode in PREVIEW_MODES {
+                let labels = PreviewMetricLabels {
+                    result,
+                    filter,
+                    mode,
+                };
+                metrics.automod_preview(labels);
+                let valid = match result {
+                    "matched" => filter != "none" && mode != "not_evaluated",
+                    "not_evaluated" => filter == "none" && mode == "not_evaluated",
+                    "unavailable" => filter == "none",
+                    _ => filter == "none" && mode != "not_evaluated",
+                };
+                if valid {
+                    let key = format!(
+                        r#"{PREVIEW_METRIC}{{result="{result}",filter="{filter}",mode="{mode}"}}"#
+                    );
+                    expected.insert(key, if labels == first { 2 } else { 1 });
+                }
+            }
+        }
+    }
+
+    let forged = "sample\"} 999\nforged_series";
+    for labels in [
+        PreviewMetricLabels {
+            result: forged,
+            ..first
+        },
+        PreviewMetricLabels {
+            filter: forged,
+            ..first
+        },
+        PreviewMetricLabels {
+            mode: forged,
+            ..first
+        },
+    ] {
+        metrics.automod_preview(labels);
+    }
+    metrics.automod_preview(first);
+    let text = metrics.render(None);
+    assert!(!text.contains("forged_series"));
+    let baseline = Metrics::default().render(None);
+    let (zero, actual) = (samples(&baseline), samples(&text));
+    assert_eq!((zero.len(), actual.len()), (24, 24));
+    for (key, count) in expected {
+        assert!(zero.contains(format!("{key} 0").as_str()), "{key}");
+        assert!(actual.contains(format!("{key} {count}").as_str()), "{key}");
+    }
+}
 
 /// One `| Metric | Meaning |` row whose name ends in `_total`.
 #[derive(Debug, PartialEq, Eq)]
@@ -151,6 +242,7 @@ fn allowlisted_labels(name: &str) -> Vec<&'static str> {
         "two_bot_drop_poison_total" => vec!["guard"],
         "two_bot_presence_capture_total" => vec!["outcome"],
         "two_bot_automod_decisions_total" => vec!["outcome"],
+        PREVIEW_METRIC => vec!["result", "filter", "mode"],
         "two_bot_eventsub_classified_total" => vec!["kind"],
         "two_bot_eventsub_posts_total" => vec!["outcome"],
         "two_bot_eventsub_reconcile_passes_total" => vec!["outcome"],
@@ -237,6 +329,11 @@ fn expected_values(name: &str) -> Vec<(&'static str, Vec<&'static str>)> {
         "two_bot_automod_decisions_total" => {
             vec![("outcome", AUTOMOD_DECISION_OUTCOMES.to_vec())]
         }
+        PREVIEW_METRIC => vec![
+            ("result", PREVIEW_RESULTS.to_vec()),
+            ("filter", PREVIEW_FILTERS.to_vec()),
+            ("mode", PREVIEW_MODES.to_vec()),
+        ],
         "two_bot_eventsub_classified_total" => {
             vec![("kind", EVENTSUB_DELIVERY_KINDS.to_vec())]
         }
@@ -316,6 +413,7 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_drop_poison_total",
     "two_bot_presence_capture_total",
     "two_bot_automod_decisions_total",
+    PREVIEW_METRIC,
     "two_bot_eventsub_received_total",
     "two_bot_eventsub_classified_total",
     "two_bot_eventsub_posts_total",

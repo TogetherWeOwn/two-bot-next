@@ -20,6 +20,7 @@ fn attendance(id: u64, actor: &str, occurrence: &str) -> Interaction {
     let user = json!({"id":actor,"username":"synthetic-human","discriminator":"0"});
     serde_json::from_value(json!({
         "application_id":"1111","authorizing_integration_owners":{"0":GUILD.to_string()},
+        "attachment_size_limit":10485760,
         "id":id.to_string(),"token":"synthetic-checkin-token","type":2,"version":1,
         "guild_id":GUILD.to_string(),
         "member":{"permissions":(1_u64 << 33).to_string(),"roles":[],"deaf":false,"mute":false,"flags":0,"user":user},

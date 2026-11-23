@@ -4,11 +4,15 @@ Based on the earlier base_attestation_gate.py reader by Rick7C2. This reader
 provides neither freshness nor atomic consistency; callers must establish both.
 """
 
-import json
+from pathlib import Path
 import re
+import sys
 from urllib.error import HTTPError
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.request import Request
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from script_intake import decode_legacy_json, no_redirect_opener, read_with_overflow, unique_object
+sys.path.pop(0)
 
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 TIMEOUT_SECONDS = 30
@@ -17,20 +21,6 @@ _REPOSITORY = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_.-]{1,10
 
 class TransportError(ValueError):
     """A metadata read was refused without exposing request or response data."""
-
-
-class _NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def _object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError
-        result[key] = value
-    return result
 
 
 def _constant(_value):
@@ -48,7 +38,7 @@ class RestReader:
             raise TransportError("Metadata request refused")
         self._prefix = f"repos/{repository}/"
         self._token = token
-        self._opener = build_opener(ProxyHandler({}), _NoRedirect())
+        self._opener = no_redirect_opener(use_proxy=False)
 
     def __call__(self, route):
         try:
@@ -68,13 +58,13 @@ class RestReader:
             with self._opener.open(request, timeout=TIMEOUT_SECONDS) as response:
                 if response.status != 200:
                     raise ValueError
-                raw = response.read(MAX_RESPONSE_BYTES + 1)
+                raw = read_with_overflow(response, MAX_RESPONSE_BYTES)
                 if response.length not in (None, 0):
                     raise ValueError
             if len(raw) > MAX_RESPONSE_BYTES:
                 raise ValueError
-            value = json.loads(raw.decode("utf-8"), object_pairs_hook=_object,
-                               parse_constant=_constant)
+            value = decode_legacy_json(raw.decode("utf-8"), object_pairs_hook=unique_object,
+                                       parse_constant=_constant)
             expected_type = list if "/files?" in suffix else dict
             if not isinstance(value, expected_type):
                 raise ValueError

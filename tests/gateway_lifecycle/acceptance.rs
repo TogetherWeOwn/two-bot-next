@@ -334,7 +334,7 @@ mod cache_adapter {
         Box::new(
             serde_json::from_value(serde_json::json!({
                 "id": id.to_string(), "application_id": "1111", "type": 2,
-                "token": "synthetic-interaction-token", "version": 1,
+                "token": "synthetic-interaction-token", "version": 1, "attachment_size_limit": 10485760,
                 "guild_id": "22",
                 "channel": {"id": "4444", "type": 0, "name": "commands"},
                 "authorizing_integration_owners": {"0": "22"}, "entitlements": [],

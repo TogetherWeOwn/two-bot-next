@@ -1,0 +1,58 @@
+{
+  "name": "staging recovery inventory (read-only)",
+  "if": "github.repository_id == '1396224242' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && (inputs.inventory || inputs.plan_run_id != '')",
+  "permissions": {
+    "contents": "read",
+    "actions": "read"
+  },
+  "runs-on": "ubuntu-latest",
+  "environment": {
+    "name": "staging",
+    "deployment": "false"
+  },
+  "timeout-minutes": "5",
+  "steps": [
+    {
+      "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+      "with": {
+        "ref": "${{ github.sha }}",
+        "persist-credentials": "false",
+        "fetch-depth": "1"
+      }
+    },
+    {
+      "name": "Verify current main and authenticate the supplied plan",
+      "env": {
+        "GH_TOKEN": "${{ github.token }}",
+        "PLAN_RUN_ID": "${{ inputs.plan_run_id }}"
+      },
+      "run": "python3 scripts/staging_recovery_status.py plan > \"$RUNNER_TEMP/staging-status-plan.json\""
+    },
+    {
+      "name": "Bracket the no-start staging status read",
+      "env": {
+        "CLOUDFLARE_API_TOKEN": "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+        "CLOUDFLARE_ACCOUNT_ID": "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}",
+        "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+        "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"
+      },
+      "run": "python3 scripts/staging_recovery_status.py inventory > \"$RUNNER_TEMP/staging-recovery-status.json\""
+    },
+    {
+      "name": "Recheck current main before publishing",
+      "env": {
+        "GH_TOKEN": "${{ github.token }}"
+      },
+      "run": "python3 scripts/staging_recovery_status.py verify-main"
+    },
+    {
+      "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+      "with": {
+        "name": "staging-recovery-status-${{ github.run_id }}-${{ github.run_attempt }}",
+        "path": "${{ runner.temp }}/staging-recovery-status.json",
+        "if-no-files-found": "error",
+        "retention-days": "14"
+      }
+    }
+  ]
+}

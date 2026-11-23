@@ -48,6 +48,7 @@ class PolicyAdapter(unittest.TestCase):
 
     def test_transport_paths_require_t0_attestation(self):
         for path in (".github/scripts/attestation_transport.py",
+                     "scripts/script_intake.py",
                      "scripts/ci/test_attestation_transport.py"):
             with self.subTest(path=path):
                 self.assert_refused(metadata(), [path])

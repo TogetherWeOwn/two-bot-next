@@ -227,8 +227,19 @@ jobs:
         run: |
           python3 -m pip --isolated --disable-pip-version-check --no-cache-dir install --only-binary=:all: --no-deps --target "$RUNNER_TEMP/zizmor" 'zizmor==1.30.1' 'PyYAML==6.0.3'
 
+      - name: Set up Node for source-level CI regressions
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
       - name: Source-level CI gate regressions
         run: PYTHONPATH="$RUNNER_TEMP/zizmor" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+
+      - name: Ratchet Python script intake (HARD)
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
+        env:
+          INTAKE_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before }}
+        run: python3 scripts/ci/check-python-intake.py --hard "$INTAKE_BASE"
 
       - name: Reject hard-coded source snowflakes
         run: python3 scripts/ci/check-src-snowflakes.py
@@ -247,11 +258,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL -o "$RUNNER_TEMP/actionlint.tgz" \
-            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
-          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
-          "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes=
+          # Keep the pinned release and backport only native queue validation.
+          tools=$(mktemp -d "$RUNNER_TEMP/actionlint.XXXXXX")
+          trap 'rm -rf -- "$tools"' EXIT
+          curl -fsSL -o "$tools/go.tgz" https://go.dev/dl/go1.26.11.linux-amd64.tar.gz
+          printf '%s  %s\n' 9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec "$tools/go.tgz" | sha256sum -c -
+          tar -xzf "$tools/go.tgz" -C "$tools"
+          curl -fsSL -o "$tools/source.zip" https://proxy.golang.org/github.com/rhysd/actionlint/@v/v1.7.12.zip
+          printf '%s  %s\n' d954c3f877cc5b98a10852bbb642c49758948d9527f1b588a544b6309d336ec2 "$tools/source.zip" | sha256sum -c -
+          python3 -I -m zipfile -e "$tools/source.zip" "$tools/src"
+          src="$tools/src/github.com/rhysd/actionlint@v1.7.12"
+          git -C "$src" apply --unidiff-zero "$GITHUB_WORKSPACE/scripts/ci/actionlint-queue.patch"
+          (
+            cd "$src"
+            export GOENV=off GOTOOLCHAIN=local GOWORK=off CGO_ENABLED=0 GOFLAGS=-mod=readonly
+            export GOCACHE="$tools/cache" GOMODCACHE="$tools/modules"
+            export GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org GOPRIVATE= GONOPROXY= GONOSUMDB=
+            sha256sum go.mod go.sum > "$tools/dependencies.sha256"
+            "$tools/go/bin/go" test -v -run '^TestLinterLintOK$/^concurrency_queue\.yaml$' .
+            "$tools/go/bin/go" test -v -run '^TestLinterLintError$/^err$/^(concurrency_queue|case_sensitive_keys|unexpected_keys)$' .
+            "$tools/go/bin/go" build -trimpath -buildvcs=false -o "$tools/actionlint" ./cmd/actionlint
+            sha256sum -c "$tools/dependencies.sha256"
+          )
+          "$tools/actionlint" -shellcheck= -pyflakes=
 
       - name: offline build-cache safety regressions
         run: |
@@ -492,7 +521,21 @@ jobs:
 
       - name: cargo clippy -D warnings
         if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        shell: bash
+        env:
+          QUALITY_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && 'origin/main') || 'HEAD^' }}
+          QUALITY_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          export CLIPPY_CONF_DIR="$GITHUB_WORKSPACE/scripts/ci/sqlx-pool"
+          fixture=crates/store/tests/sqlx_pool_policy_fixture.rs
+          test ! -e "$fixture"
+          trap 'rm -- "$fixture"' EXIT
+          cp scripts/ci/fixtures/sqlx_pool_policy.rs "$fixture"
+          cargo clippy --workspace --all-targets --all-features --locked --message-format=json -- \
+            -D warnings --force-warn clippy::disallowed_methods \
+            | python3 scripts/ci/check_sqlx_pool.py --mode warn \
+                --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
 
       - name: channel moderation store clippy
         if: needs.job-inputs.outputs.rust != 'false'
@@ -505,6 +548,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps --locked
+      - name: Verify generated branded smoke payloads offline
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: >-
+          cargo run --locked -p two-bot-discord --example help_embed_smoke_payloads -- "${RUNNER_TEMP:?}/help-embed-payloads.json" &&
+          PYTHONPATH=scripts python3 -B -c 'import sys; from staging_help_embed_smoke import load_payloads; load_payloads(sys.argv[1])' "$RUNNER_TEMP/help-embed-payloads.json"
 
       # NOTE: cargo-deny runs before the toolchain install and every compile
       # step (disk hygiene); do not re-add it later in this job.
@@ -915,6 +963,19 @@ jobs:
       - name: prepare gateway lifecycle acceptance
         run: python3 tests/gateway_lifecycle/prepare.py --prepare
 
+      - name: Prepare synthetic RSVP reply capture
+        id: rsvp_reply_capture
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          # The PR job can test a synthetic merge; record the actual source tree.
+          checkout=$(git rev-parse HEAD)
+          tree=$(git rev-parse 'HEAD^{tree}')
+          printf 'RSVP capture source: %s (tree %s)\n' "$checkout" "$tree"
+          directory=$(mktemp -d "$RUNNER_TEMP/rsvp-replies.XXXXXX")
+          printf 'directory=%s\n' "$directory" >> "$GITHUB_OUTPUT"
+          # Keep CI-only artifact output out of the mirrored DB step environment.
+          printf 'RSVP_REPLY_CAPTURE_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
+
       # The standalone backup fixture has its own scratch-only URL guard.
       # Supplying it here executes the round trip rather than its local skip.
       - name: cargo test (integration, including website acceptance and backup round trip)
@@ -940,6 +1001,32 @@ jobs:
           --skip saturated_write_warns_with_identifiers_and_no_raw_counter
           --skip normal_uses_round_trip_byte_identical
           --skip exact_i32_max_writes_without_saturation_warn
+
+      - name: Verify synthetic RSVP reply capture
+        if: steps.rsvp_reply_capture.outputs.directory != ''
+        run: |
+          # Do not capture from any later test step in this job.
+          printf 'RSVP_REPLY_CAPTURE_DIR=\n' >> "$GITHUB_ENV"
+          for name in saved.json cancelled.json historical.json; do
+            file="${RSVP_REPLY_CAPTURE_DIR:?}/$name"
+            if [ -L "$file" ] || [ ! -f "$file" ] || [ ! -s "$file" ] ||
+              ! size=$(wc -c < "$file") || [ "$size" -gt 16384 ]; then
+              printf 'Missing or invalid synthetic RSVP capture: %s\n' "$name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload synthetic RSVP replies
+        if: steps.rsvp_reply_capture.outputs.directory != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: synthetic-rsvp-replies-${{ github.run_attempt }}
+          path: |
+            ${{ steps.rsvp_reply_capture.outputs.directory }}/saved.json
+            ${{ steps.rsvp_reply_capture.outputs.directory }}/cancelled.json
+            ${{ steps.rsvp_reply_capture.outputs.directory }}/historical.json
+          if-no-files-found: error
+          retention-days: 14
 
       # Invite saturation acceptance is DB-backed and racy under parallelism
       # (nanos+pid schema nonce; one head collided on CREATE SCHEMA with a
@@ -2283,7 +2370,7 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: |
           cargo test -p two-bot-core --features db --test send_admission --locked -- --ignored
-          cargo test -p two-bot-discord --features db-tests --lib --locked admission_ -- --ignored
+          cargo test -p two-bot-discord --features db-tests --lib --locked admission_ -- --include-ignored
           cargo test -p two-bot-cutover --test send_admission --locked -- --ignored
 
       # Post-suite storage evidence: max_wal_size is a soft target, so the
@@ -3618,6 +3705,16 @@ jobs:
         run: node --test scripts/test-production-ownership-control.mjs
       - name: Verify staging ownership status read (offline fixtures)
         run: node --test scripts/test-staging-ownership-status.mjs
+      - name: Verify voice REST receipt construction (offline fixtures)
+        run: node --test scripts/test-voice-rest-receipt.mjs
+      - name: Verify voice REST measurement adapter (offline fixtures)
+        run: node --test scripts/test-voice-rest-measurement.mjs
+      - name: Verify voice measurement grant metadata (offline fixtures)
+        run: node --test scripts/test-voice-measurement-metadata.mjs
+      - name: Verify voice measurement interval decisions (offline fixtures)
+        run: node --test scripts/test-voice-measurement-decision.mjs
+      - name: Verify voice measurement candidate (offline fixtures)
+        run: node --test scripts/test-voice-measurement-candidate.mjs
       - name: Verify promotion-gate intake cap (offline fixtures)
         run: node --test scripts/test-promotion-gate-intake-cap.mjs
       - name: Verify slow-burn decide intake cap (offline fixtures)
@@ -3835,3 +3932,20 @@ jobs:
               sys.exit(1)
           print("ci-ok passed")
           PY
+
+  ci-evidence:
+    # ci-ok: exempt Evidence publication depends on ci-ok and has its own verdict.
+    needs: ci-ok
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    permissions: {contents: read, actions: read}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: python3 -I .github/scripts/pr_evidence.py publish

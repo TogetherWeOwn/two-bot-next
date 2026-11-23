@@ -11,6 +11,7 @@ pub mod audit_mirror;
 mod automation_admission;
 pub mod automod;
 pub mod automod_activation;
+pub mod automod_preview_handler;
 pub mod brand;
 pub mod channel_access;
 #[cfg(feature = "db")]
@@ -35,6 +36,7 @@ pub use channel_moderation::{
     ChannelRuntimeError,
 };
 pub mod help_embed_smoke;
+pub mod help_navigation;
 pub mod intents;
 pub mod interactions;
 pub mod internal_actions;
@@ -57,10 +59,16 @@ pub mod onboarding_messages;
 pub mod onboarding_permissions;
 pub mod pipeline;
 pub mod ratelimit_guard;
+pub mod realtime_baseline_join;
+pub mod realtime_gateway;
+pub mod realtime_member_baseline;
+pub mod realtime_roster;
 #[cfg(feature = "db")]
 pub mod rsvp;
 #[cfg(any(test, feature = "test-support"))]
 pub mod staging_slash_smoke;
+#[cfg(test)]
+mod strict_transport_fixture;
 #[cfg(test)]
 mod test_clock;
 #[cfg(test)]
@@ -93,6 +101,6 @@ pub use internal_events::{event_status_name, scheduled_event_body, EventActionEr
 pub use pipeline::{
     build_cache, AuditEntryObserver, AuditLogObservation, ChannelClassifier, InviteSource,
     JoinObservation, JoinObserver, MemPipeline, MessageEligibility, NoClassification, NoInvites,
-    Pipeline, PipelineSnapshots, ScriptedInvites, SettingsChannelClassifier,
+    Pipeline, PipelineSnapshots, ScriptedInvites, SettingsChannelClassifier, SharedCache,
     VoiceTransitionObservation, VoiceTransitionObserver,
 };

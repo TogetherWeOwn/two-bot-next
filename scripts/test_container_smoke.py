@@ -362,7 +362,7 @@ def parked_readyz_body():
                 "community_scorecard", "inactivity", "audit_retry",
                 "self_role_recovery", "scheduled_messages", "feeds",
                 "member_unban_sweep", "retention", "lfg_sweep", "giveaway_countdown",
-                "giveaway_draw",
+                "giveaway_draw", "voice_heat",
             )}}
 
 
@@ -569,7 +569,7 @@ class ContainerSmokeTests(unittest.TestCase):
         self.fixture.image_size = 142437143
         self.fixture.binary_size = 10287160
         self.assertEqual(smoke.IMAGE_MAX_BYTES, 112 * smoke.MIB)
-        self.assertEqual(smoke.BINARY_MAX_BYTES, 18 * smoke.MIB)
+        self.assertEqual(smoke.BINARY_MAX_BYTES, 20 * smoke.MIB)
         self.assert_rejected("image exceeds size budget")
         self.assertFalse(any("--detach" in args for args, _ in self.fixture.calls))
 
@@ -588,8 +588,12 @@ class ContainerSmokeTests(unittest.TestCase):
         self.assert_rejected("image exceeds size budget")
 
     def test_default_binary_budget_is_enforced(self):
-        self.fixture.binary_size = smoke.BINARY_MAX_BYTES + 1
+        self.fixture.binary_size = 20 * smoke.MIB + 1
         self.assert_rejected("release binary exceeds size budget")
+
+    def test_exact_default_binary_budget_is_allowed(self):
+        self.fixture.binary_size = 20 * smoke.MIB
+        self.run_smoke()
 
     def test_exact_budget_is_allowed(self):
         self.run_smoke(image_max_bytes=self.fixture.image_size, binary_max_bytes=self.fixture.binary_size)
@@ -657,13 +661,13 @@ class ContainerSmokeTests(unittest.TestCase):
         body = parked_readyz_body()
         del body["jobs"]
         self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-        self.assert_rejected("all sixteen jobs parked")
+        self.assert_rejected("all seventeen jobs parked")
 
     def test_readyz_without_jobs_map_fails(self):
         body = parked_readyz_body()
         body["jobs"] = {}
         self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-        self.assert_rejected("all sixteen jobs parked")
+        self.assert_rejected("all seventeen jobs parked")
 
     def test_readyz_with_missing_job_fails(self):
         for name in parked_readyz_body()["jobs"]:
@@ -671,13 +675,13 @@ class ContainerSmokeTests(unittest.TestCase):
                 body = parked_readyz_body()
                 del body["jobs"][name]
                 self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-                self.assert_rejected("all sixteen jobs parked")
+                self.assert_rejected("all seventeen jobs parked")
 
     def test_readyz_with_unexpected_job_fails(self):
         body = parked_readyz_body()
         body["jobs"]["unexpected"] = dict(PARKED_JOB)
         self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-        self.assert_rejected("all sixteen jobs parked")
+        self.assert_rejected("all seventeen jobs parked")
 
     def test_readyz_with_running_job_fails(self):
         for name in parked_readyz_body()["jobs"]:
@@ -685,7 +689,7 @@ class ContainerSmokeTests(unittest.TestCase):
                 body = parked_readyz_body()
                 body["jobs"][name] = dict(PARKED_JOB, running=True)
                 self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-                self.assert_rejected("all sixteen jobs parked")
+                self.assert_rejected("all seventeen jobs parked")
 
     def test_readyz_with_started_job_fails(self):
         for name in parked_readyz_body()["jobs"]:
@@ -693,7 +697,7 @@ class ContainerSmokeTests(unittest.TestCase):
                 body = parked_readyz_body()
                 body["jobs"][name] = dict(PARKED_JOB, parked=False, last_start=100)
                 self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-                self.assert_rejected("all sixteen jobs parked")
+                self.assert_rejected("all seventeen jobs parked")
 
     def test_readyz_with_wrong_components_fails(self):
         body = parked_readyz_body()

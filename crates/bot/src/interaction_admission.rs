@@ -125,6 +125,7 @@ mod tests {
         Interaction {
             app_permissions: None,
             application_id: Id::<ApplicationMarker>::new(1),
+            attachment_size_limit: 10_485_760,
             authorizing_integration_owners: ApplicationIntegrationMap {
                 guild: Some(AnonymizableId::Id(Id::new(1))),
                 user: None,

@@ -48,7 +48,6 @@ from dataclasses import dataclass
 from datetime import date, time
 import gzip
 import http.client
-import json
 import os
 from pathlib import Path
 import re
@@ -59,11 +58,18 @@ import urllib.request
 from urllib.parse import urlsplit
 import zlib
 
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "wrangler/wrangler.toml"
 ARCHIVE_PREFIX = "two-funnel-"
 ARCHIVE_SUFFIX = ".ndjson.gz"
-DUMP_VERSIONS = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+DUMP_VERSIONS = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
 # Same budgets as the Rust reader (crates/core/src/backup/dump_file.rs),
 # whose decoded budget equals its compressed budget and counts newlines.
 COMPRESSED_CAP = 1 << 30
@@ -127,33 +133,12 @@ WHERE t.seq IS NOT NULL;
 """
 
 
-# Strings are skipped whole, so brackets inside them never count. An
-# unterminated string runs to the end, which keeps the scan linear.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 # CPython's old default recursion limit, which bounded the C JSON decoder.
 MAX_JSON_DEPTH = 1000
 
 
 def _loads_bounded(raw, **kwargs):
-    """json.loads with a lexical nesting bound that raises RecursionError.
-
-    Newer CPython sizes the decoder's recursion guard from the real C stack
-    and decodes 10,000 levels, so the bound no longer depends on the
-    interpreter: existing RecursionError refusals keep working unchanged.
-    """
-    # Decode bytes exactly as json.loads would, then scan and parse that text.
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
-    depth = 0
-    for match in JSON_TOKEN.finditer(raw):
-        token = match.group()
-        if token in "[{":
-            depth += 1
-            if depth > MAX_JSON_DEPTH:
-                raise RecursionError("JSON nesting exceeds the decoder bound")
-        elif token in "]}":
-            depth -= 1
-    return json.loads(raw, **kwargs)
+    return decode_legacy_json(raw, max_depth=MAX_JSON_DEPTH, **kwargs)
 
 
 class ProbeError(Exception):
@@ -175,18 +160,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def decode_strict(body):
@@ -290,6 +264,8 @@ def validate_manifest(obj):
             raise ProbeError(f"manifest table {name} has an invalid column list")
         if not is_int(table.get("count"), high=(1 << 64) - 1):
             raise ProbeError(f"manifest table {name} has an invalid row count")
+    if "sequenceMarks" in obj:
+        sequence_positions(obj["sequenceMarks"], names)
     return obj
 
 
@@ -344,7 +320,7 @@ def load_live_sequences(path):
         raise ProbeError("no live sequences query result given (--sequences FILE)")
     try:
         with open(path, "rb") as f:
-            data = f.read(SEQUENCES_FILE_CAP + 1)
+            data = read_with_overflow(f, SEQUENCES_FILE_CAP)
     except OSError as e:
         raise ProbeError(f"cannot read {path} ({e.__class__.__name__})")
     if len(data) > SEQUENCES_FILE_CAP:
@@ -369,24 +345,46 @@ def load_live_sequences(path):
     return rows
 
 
+def sequence_positions(marks, tables):
+    if not isinstance(marks, list):
+        raise ProbeError("manifest has invalid sequenceMarks")
+    positions = {}
+    for mark in marks:
+        if (not isinstance(mark, dict) or not isinstance(mark.get("table"), str)
+                or mark["table"] not in tables or not isinstance(mark.get("column"), str)
+                or not mark["column"] or not is_int(mark.get("lastValue"), low=-I64_MAX - 1)
+                or not isinstance(mark.get("isCalled"), bool)
+                or not is_int(mark.get("increment"), low=-I64_MAX - 1) or mark["increment"] == 0):
+            raise ProbeError("manifest has an invalid sequence mark")
+        key = (mark["table"], mark["column"])
+        if key in positions:
+            raise ProbeError(f"manifest sequence mark {key[0]}.{key[1]} is duplicated")
+        positions[key] = (mark["lastValue"], mark["isCalled"], mark["increment"])
+    return positions
+
+
 def check_sequences(manifest, rows):
     tables = {t["name"] for t in manifest["tables"]}
-    marks = manifest.get("sequences", {})
+    modern = "sequenceMarks" in manifest
+    marks = sequence_positions(manifest.get("sequenceMarks", []), tables)
+    legacy = manifest.get("sequences", {})
     problems = []
     for row in rows:
-        where = f"{row['table']}.{row['column']}"
-        mark = marks.get(row["table"])
-        if mark is None and (row["table"], row["column"]) == ("events", "id"):
-            # MAX(events.id) at dump time (crates/core/src/backup/dump.rs).
-            mark = manifest["eventsSequence"]
+        key = (row["table"], row["column"])
+        where = ".".join(key)
+        mark, called, increment = marks.get(key, (None, True, 1))
+        if not modern:
+            mark = legacy.get(key[0], manifest["eventsSequence"] if key == ("events", "id") else None)
         if row["table"] not in tables:
             problems.append(f"{where} (table not in the backup)")
         elif not row["readable"]:
             problems.append(f"{where} (no SELECT/USAGE on {row['sequence']})")
         elif mark is None:
             problems.append(f"{where} (no manifest high-water)")
-        elif row["last_value"] is not None and row["last_value"] > mark:
-            problems.append(f"{where} (live {row['last_value']} > manifest {mark}, would rewind)")
+        elif (live := row["last_value"]) is not None and (
+                (live - mark) * increment > 0 or (live == mark and not called)):
+            direction = "=" if live == mark else (">" if increment > 0 else "<")
+            problems.append(f"{where} (live {row['last_value']} {direction} manifest {mark}, would rewind)")
     if problems:
         shown = ", ".join(problems[:3]) + (f", +{len(problems) - 3} more" if len(problems) > 3 else "")
         raise ProbeError(f"{len(problems)} of {len(rows)} live sequences not covered: {shown}")
@@ -411,21 +409,16 @@ def staging_readyz_url(url):
     return f"https://{parts.hostname}/readyz"
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None  # urllib then raises the 3xx as an HTTPError
-
-
 def fetch(url):
     """One GET without redirects; returns (status, body bytes)."""
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = no_redirect_opener()
     try:
         with opener.open(urllib.request.Request(url, headers={"User-Agent": USER_AGENT},
                                                method="GET"),
                          timeout=READYZ_TIMEOUT_SECONDS) as response:
-            return response.status, response.read(READYZ_BODY_CAP + 1)
+            return response.status, read_with_overflow(response, READYZ_BODY_CAP)
     except urllib.error.HTTPError as e:
-        return e.code, e.read(READYZ_BODY_CAP + 1)
+        return e.code, read_with_overflow(e, READYZ_BODY_CAP)
 
 
 def readyz_state(status, body):
@@ -477,7 +470,7 @@ def check_readyz(url, fetch_fn):
 def check_deploy_config(config, envs, extra_keys):
     try:
         with open(config, "rb") as f:
-            data = f.read(CONFIG_FILE_CAP + 1)
+            data = read_with_overflow(f, CONFIG_FILE_CAP)
     except OSError as e:
         raise ProbeError(f"cannot read {config} ({e.__class__.__name__})")
     if len(data) > CONFIG_FILE_CAP:

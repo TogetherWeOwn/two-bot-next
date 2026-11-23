@@ -1,4 +1,4 @@
-"""Regressions for the lexical JSON nesting pre-scan copied into each parser.
+"""Regressions for the lexical JSON nesting pre-scan shared by the intake parsers.
 
 The scan must stay linear on hostile strings (an unterminated string used
 to rescan to the end from every later quote), and bytes must be scanned in
@@ -45,6 +45,16 @@ def load(relative):
 
 
 class DepthExceedsTests(unittest.TestCase):
+    def test_shared_scan_refuses_depth_and_handles_hostile_strings(self):
+        scan = load("script_intake.py").json_depth_exceeds
+        self.assertTrue(scan("[[[0]]]", 2))
+        self.assertFalse(scan('["[[[", {"x": "{"}]', 2))
+        for text in HOSTILE:
+            with self.subTest(size=len(text)):
+                started = time.monotonic()
+                self.assertFalse(scan(text, 100))
+                self.assertLess(time.monotonic() - started, SECONDS)
+
     def test_hostile_strings_scan_in_linear_time(self):
         for relative in DEPTH_EXCEEDS:
             module = load(relative)

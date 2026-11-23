@@ -4,7 +4,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use serde_json::Value;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use tokio::sync::{watch, Mutex, OnceCell};
 use two_bot_core::{
@@ -27,6 +26,7 @@ use crate::{
     scheduled_jobs,
     self_role_handlers::{SelfRoleService, RECOVERY_JOB_NAME},
     server,
+    voice_snapshot::heat,
 };
 
 /// Every supervised job name, in `/readyz` order. The settings poll needs
@@ -239,8 +239,8 @@ fn governed_executor(
 /// preflight `admission_transport` and the commands CLI `executor`
 /// (threat-model F6).
 pub(crate) const ADMISSION_POOL_MAX: u32 = 2;
-pub(crate) const ADMISSION_STATEMENT_TIMEOUT_MS: u64 = 15_000;
-pub(crate) const ADMISSION_ACQUIRE_TIMEOUT_SECS: u64 = 10;
+pub(crate) const ADMISSION_STATEMENT_TIMEOUT_MS: u64 = two_bot_store::STATEMENT_TIMEOUT_MS;
+pub(crate) const ADMISSION_ACQUIRE_TIMEOUT_SECS: u64 = two_bot_store::pool::ACQUIRE_TIMEOUT_SECS;
 
 /// Read the one TLS policy setting; an unset value is `Required`.
 pub(crate) fn admission_tls_policy_from_env() -> Result<TlsPolicy, &'static str> {
@@ -249,37 +249,16 @@ pub(crate) fn admission_tls_policy_from_env() -> Result<TlsPolicy, &'static str>
     TlsPolicy::from_setting(value.as_ref().map(|v| v.to_str().unwrap_or("")))
 }
 
-/// Shared fenced options builder: validate before SQLx can WARN-log query
-/// values, enforce the TLS policy, then apply the effective mode. The
-/// statement timeout rides the connection options. URL/parse failures read as
-/// the generic authority code; TLS refusals keep their fixed strings. Nothing
-/// echoes the URL, host or password.
-pub(crate) fn admission_connect_options(
-    url: &str,
-    tls: TlsPolicy,
-) -> Result<PgConnectOptions, &'static str> {
-    two_bot_core::database_url::validate(url).map_err(|_| "invalid admission authority")?;
-    // Threat-model F6: refuse plaintext/unverified modes and the wrong host
-    // class before SQLx parses the URL (see `docs/database-tls.md`).
-    database_tls::enforce(url, tls)?;
-    let options = two_bot_core::database_url::connect_options(url)
-        .map_err(|_| "invalid admission authority")?;
-    let options = database_tls::apply(options, tls);
-    Ok(options.options([(
-        "statement_timeout",
-        format!("{ADMISSION_STATEMENT_TIMEOUT_MS}ms"),
-    )]))
-}
-
 /// [`admission_pool`] with an explicit TLS policy (tests pass `LocalOnly`).
 /// Lazy, so refusal cases are hermetic (no socket) and the happy path asserts
 /// `pool.size() == 0`. The acquire timeout bounds the later wires.
 pub(crate) fn admission_pool_with_tls(url: &str, tls: TlsPolicy) -> Result<PgPool, &'static str> {
-    let options = admission_connect_options(url, tls)?;
-    Ok(PgPoolOptions::new()
-        .max_connections(ADMISSION_POOL_MAX)
-        .acquire_timeout(Duration::from_secs(ADMISSION_ACQUIRE_TIMEOUT_SECS))
-        .connect_lazy_with(options))
+    two_bot_store::pool::connect_lazy_pool_with_tls(url, tls, ADMISSION_POOL_MAX).map_err(|error| {
+        match error {
+            two_bot_store::ConnectError::Tls(message) => message,
+            _ => "invalid admission authority",
+        }
+    })
 }
 
 fn admission_pool(url: &str) -> Result<PgPool, String> {
@@ -288,7 +267,7 @@ fn admission_pool(url: &str) -> Result<PgPool, String> {
     admission_pool_with_tls(url, tls).map_err(|_| "invalid admission authority".to_owned())
 }
 
-/// Boot-composed single call: the eight parameters are the full supervised
+/// Boot-composed single call: the parameters are the full supervised
 /// surface (config, listener, gateway, shutdown plus one slot per consumer).
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
@@ -301,6 +280,7 @@ pub async fn serve(
     receiver: Option<crate::internal_action_http::BoundReceiver>,
     eventsub_receiver: Option<crate::eventsub_http::BoundEventsubReceiver>,
     member: Option<Arc<MemberRuntime>>,
+    voice_cache: Arc<two_bot_discord::SharedCache>,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
     let mut parked = Vec::new();
@@ -422,9 +402,11 @@ pub async fn serve(
     // Discord gateway is unconfigured. Missing/invalid/`off` mode or a
     // missing/unusable database parks the job without attempting destructive
     // work; the `/readyz` status entry exists either way.
-    match retention_registration(config) {
-        RetentionRegistration::Active(job) => registered.push(job),
-        RetentionRegistration::Parked => parked.push(crate::retention_jobs::NAME),
+    if let RetentionRegistration::Active(job, heat) = retention_registration(config) {
+        if let Some((pool, guild)) = heat {
+            registered.push(heat::job(pool, guild, voice_cache, gateway.gateway.clone()));
+        }
+        registered.push(job);
     }
 
     if let Some(service) = self_roles {
@@ -470,7 +452,7 @@ pub async fn serve(
 /// Retention registration outcome: an active supervised job, or a parked
 /// status entry with no job (safe mode, disabled, or no database).
 enum RetentionRegistration {
-    Active(Job),
+    Active(Job, Option<(PgPool, u64)>),
     Parked,
 }
 
@@ -501,7 +483,15 @@ fn retention_registration(config: &Config) -> RetentionRegistration {
         return RetentionRegistration::Parked;
     };
     match crate::retention_jobs::pool_from_url(&url) {
-        Ok(pool) => RetentionRegistration::Active(crate::retention_jobs::job(pool, mode)),
+        Ok(pool) => {
+            let heat = match (mode, crate::gateway_prerequisites(config)) {
+                (two_bot_cutover::retention::RetentionMode::Execute, Ok((_, _, guild))) => {
+                    Some((pool.clone(), guild))
+                }
+                _ => None,
+            };
+            RetentionRegistration::Active(crate::retention_jobs::job(pool, mode), heat)
+        }
         Err(_) => {
             tracing::warn!("retention parked: invalid database configuration");
             RetentionRegistration::Parked
@@ -530,7 +520,7 @@ async fn registered_statuses(
     parked: &[&str],
 ) -> Result<jobs::SharedStatus, jobs::UnregisteredJob> {
     // NAMES already carries the DB-only settings poll alongside the
-    // REST-backed domains, so the status map lists all sixteen jobs.
+    // REST-backed domains; maintenance jobs have their own entries.
     let mut names: Vec<&'static str> = NAMES
         .into_iter()
         .chain(community_jobs::NAMES)
@@ -542,7 +532,7 @@ async fn registered_statuses(
         .chain([crate::giveaway_runtime::REFRESH_JOB])
         .chain([crate::giveaway_runtime::DRAW_JOB])
         .chain([crate::lfg_jobs::NAME])
-        .chain([crate::retention_jobs::NAME])
+        .chain([crate::retention_jobs::NAME, heat::NAME])
         .collect();
     if crate::automod_gateway::enabled() {
         names.push(crate::automod_gateway::JOB_NAME);

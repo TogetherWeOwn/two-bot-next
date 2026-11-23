@@ -93,9 +93,16 @@ pub fn is_identity_column(column: &str) -> bool {
 /// Check the actual migrated schema, not migration-text grep. Also refuse a
 /// stale plan/exception (renamed or missing columns) before any deletion.
 pub async fn schema_gaps(conn: &mut PgConnection) -> Result<Vec<String>, sqlx::Error> {
+    // information_schema.columns hides ungranted columns from the gateway.
+    // A hidden identity table can still hold data that a receipt must cover.
     let columns: Vec<(String, String)> = sqlx::query_as(
-        "SELECT table_name, column_name FROM information_schema.columns
-         WHERE table_schema = current_schema() ORDER BY table_name, ordinal_position",
+        "SELECT c.relname::text, a.attname::text
+         FROM pg_catalog.pg_attribute a
+         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+           AND a.attnum > 0 AND NOT a.attisdropped
+         ORDER BY c.relname, a.attnum",
     )
     .fetch_all(conn)
     .await?;

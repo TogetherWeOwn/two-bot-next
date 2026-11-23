@@ -1506,14 +1506,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
     // Without the command runtime, keep the ordered builtins-only sync.
     match (interactions.as_ref(), runtime.as_ref()) {
         (Some(ordered), Some(commands)) => {
-            let application_id =
-                commands
-                    .executor()
-                    .current_application_id()
-                    .await
-                    .map_err(|_| {
-                        sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
-                    })?;
+            let application_id = commands.bootstrap_application_id().await.map_err(|_| {
+                sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
+            })?;
             ordered.set_application_id(application_id);
             commands
                 .publish_registry_checked(Some(application_id))
@@ -1581,8 +1576,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
             CHECKPOINT_IO_MAX,
             crate::gateway_metrics::Observer::default(),
             None::<tokio::sync::oneshot::Receiver<()>>,
+            two_bot::live_gateway::LiveGateway::default(),
         ),
-        move |(mut shard, mut received, mut deadline, mut observer, mut bootstrap)| {
+        move |(mut shard, mut received, mut deadline, mut observer, mut bootstrap, mut live)| {
             let state = Arc::clone(&receive_state);
             let generation = Arc::clone(&receive_generation);
             let generation_wake = Arc::clone(&receive_generation_wake);
@@ -1606,6 +1602,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         if committed.await.is_err() {
                             return Ok(None);
                         }
+                        live.disconnect();
                         transport_disconnected(&state, &generation, &generation_wake).await;
                         voice_disconnected(voice.as_ref());
                         // Twilight consumes the boot session from config on
@@ -1625,6 +1622,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         let message = match item {
                             Ok(message) => message,
                             Err(error) if matches!(error.kind(), twilight_gateway::error::ReceiveMessageErrorType::Reconnect) => {
+                                live.disconnect();
                                 transport_disconnected(&state, &generation, &generation_wake).await;
                                 voice_disconnected(voice.as_ref());
                                 // Twilight already backed off the failed connect.
@@ -1645,6 +1643,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         };
                         observer.observe(&message, &shard);
                         let Message::Text(text) = message else {
+                            live.disconnect();
                             crate::logging::shard_closed(&message);
                             transport_disconnected(&state, &generation, &generation_wake).await;
                             voice_disconnected(voice.as_ref());
@@ -1656,6 +1655,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         };
                         let observed_at = two_bot_core::now_iso();
                         let header: Header = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway header".into()))?;
+                        if matches!(header.op, 7 | 9) { live.disconnect(); }
                         if header.op == 10 {
                             let hello: HelloPacket = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway hello".into()))?;
                             if hello.d.heartbeat_interval == 0 { return Err(sqlx::Error::InvalidArgument("zero heartbeat interval".into())); }
@@ -1704,6 +1704,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         if missed > 0 {
                             two_bot_core::metrics::global().gateway_missed_events(missed);
                         }
+                        if missed > 0 || received.as_ref().is_none_or(|prev| prev.session_id != checkpoint.session_id) {
+                            live.disconnect();
+                        }
                         // A duplicate key in a MESSAGE_UPDATE refuses the
                         // automod edit below; selection is by decoded `t` so
                         // escaped spellings still match. The same bytes must
@@ -1732,6 +1735,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         } else {
                             None
                         };
+                        let live_raw = live.enabled().then(|| text.clone());
                         let parsed = if duplicate_refused {
                             None
                         } else {
@@ -1741,6 +1745,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                 Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
                             }
                         };
+                        if let Some(raw) = live_raw {
+                            let at = two_bot_core::realtime_wire::WireTime(time::OffsetDateTime::now_utc());
+                            live.receive(&raw, at, |request| shard.sender().command(request).is_ok());
+                        }
                         received = Some(checkpoint.clone());
                         let mut dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at, received: received_at, completion: None }));
                         // Detached command ingress must not wait behind the
@@ -1750,11 +1758,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         // disposition: rejected creates never reach automations.
                         if let (Some(runtime), Some(dispatch)) = (runtime.as_ref(), dispatch.as_ref()) {
                             if !(automod_enabled && matches!(dispatch.event, Event::MessageCreate(_))) {
-                                if interactions.is_some() {
-                                    runtime.dispatch_remaining(&dispatch.event);
-                                } else {
-                                    runtime.dispatch(&dispatch.event);
-                                }
+                                runtime.dispatch_received(&dispatch.event, interactions.is_some(), dispatch.received, &dispatch.observed_at);
                             }
                         }
                         // The ordered runtime is a separate instance from the
@@ -1887,14 +1891,17 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     }
                     Ok(None)
                 }.await;
+                if work.is_err() {
+                    live.disconnect();
+                }
                 match work {
                     Ok(Some(work)) => {
-                        Some((work, (shard, received, deadline, observer, bootstrap)))
+                        Some((work, (shard, received, deadline, observer, bootstrap, live)))
                     }
                     Ok(None) => None,
                     Err(error) => Some((
                         ReceivedWork::Failed(error),
-                        (shard, received, deadline, observer, bootstrap),
+                        (shard, received, deadline, observer, bootstrap, live),
                     )),
                 }
             }
@@ -2419,7 +2426,7 @@ pub async fn build_persistent_pipeline(
     guild_id: Snowflake,
     token: String,
     leveling: Option<LevelingRuntime>,
-    cache: Arc<twilight_cache_inmemory::DefaultInMemoryCache>,
+    cache: Arc<two_bot_discord::SharedCache>,
 ) -> Result<GatewayPipeline<HttpInvites>, sqlx::Error> {
     tokio::time::timeout(CHECKPOINT_IO_MAX, async {
         let buffer = GatewayFunnelBuffer::from_milestones(store.milestones().await?);
@@ -3349,7 +3356,7 @@ mod tests {
     fn live_entry() -> (LiveInteraction, tokio::sync::oneshot::Sender<bool>) {
         let interaction: twilight_model::application::interaction::Interaction =
             serde_json::from_value(serde_json::json!({
-                "id": "9", "application_id": "1111", "type": 2,
+                "id": "9", "application_id": "1111", "attachment_size_limit": 10485760, "type": 2,
                 "token": "synthetic-interaction-token", "version": 1,
                 "guild_id": "22",
                 "channel": {"id": "4444", "type": 0, "name": "commands"},
@@ -4723,6 +4730,7 @@ mod tests {
         let interaction: twilight_model::application::interaction::Interaction =
             serde_json::from_value(serde_json::json!({
                 "application_id": "111",
+                "attachment_size_limit": 10485760,
                 "authorizing_integration_owners": {"0": "22"},
                 "id": "333",
                 "token": "mock-callback",

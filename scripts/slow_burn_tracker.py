@@ -40,6 +40,13 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DRIVER = REPO_ROOT / "wrangler" / "scripts" / "slow-burn-decide.mjs"
 RUNBOOK_URL = (
@@ -75,40 +82,19 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_JSON_BYTES = 1024 * 1024
 
 
-# Strings are skipped whole, so brackets inside them never count. An
-# unterminated string runs to the end, which keeps the scan linear.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 # CPython's old default recursion limit, which bounded the C JSON decoder.
 MAX_JSON_DEPTH = 1000
 
 
 def _loads_bounded(raw, **kwargs):
-    """json.loads with a lexical nesting bound that raises RecursionError.
-
-    Newer CPython sizes the decoder's recursion guard from the real C stack
-    and decodes 10,000 levels, so the bound no longer depends on the
-    interpreter: existing RecursionError refusals keep working unchanged.
-    """
-    # Decode bytes exactly as json.loads would, then scan and parse that text.
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
-    depth = 0
-    for match in JSON_TOKEN.finditer(raw):
-        token = match.group()
-        if token in "[{":
-            depth += 1
-            if depth > MAX_JSON_DEPTH:
-                raise RecursionError("JSON nesting exceeds the decoder bound")
-        elif token in "]}":
-            depth -= 1
-    return json.loads(raw, **kwargs)
+    return decode_legacy_json(raw, max_depth=MAX_JSON_DEPTH, **kwargs)
 
 
 def _load_cache_json(path):
     """Read a bounded cache; missing, oversized or malformed data rebuilds."""
     try:
         with Path(path).open("rb") as stream:
-            raw = stream.read(MAX_JSON_BYTES + 1)
+            raw = read_with_overflow(stream, MAX_JSON_BYTES)
         if len(raw) > MAX_JSON_BYTES:
             return None
         return _loads_bounded(raw, object_pairs_hook=_reject_duplicate_keys)
@@ -135,25 +121,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    raised message is fixed vocabulary: it names no key, value or path.
-    """
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Turn every redirect into an HTTPError without contacting its target."""
-
-    def redirect_request(self, request, response, code, message, headers, new_url):
-        return None
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def _utc_now():
@@ -170,12 +138,12 @@ def scrape_metrics(origin, token):
         method="GET",
         headers={"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT},
     )
-    opener = urllib.request.build_opener(_NoRedirectHandler())
+    opener = no_redirect_opener()
     try:
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
             if response.status != 200:
                 raise TrackError(f"metrics scrape refused with status {response.status}")
-            body = response.read(MAX_BODY_BYTES + 1)
+            body = read_with_overflow(response, MAX_BODY_BYTES)
     except urllib.error.HTTPError as error:
         if error.code in (301, 302, 303, 307, 308):
             raise TrackError(

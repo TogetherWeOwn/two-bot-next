@@ -94,7 +94,7 @@ fn edit(id: u64, options: Vec<Value>) -> Interaction {
         "member": {"user": {"id": "3333", "username": "editor", "discriminator": "0", "avatar": null},
             "roles": [], "joined_at": null, "deaf": false, "mute": false, "flags": 0,
             "permissions": PERM_MANAGE_EVENTS.to_string()},
-        "token": format!("seat-boundary-{id}"), "version": 1, "entitlements": [],
+        "token": format!("seat-boundary-{id}"), "version": 1, "entitlements": [], "attachment_size_limit": 10485760,
         "authorizing_integration_owners": {},
         "data": {"id": "1", "name": "lfg-edit", "type": 1, "options": options}
     }))

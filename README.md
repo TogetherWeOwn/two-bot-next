@@ -192,35 +192,34 @@ configuration validation, then runs read-only tests.
 Squash-merge only; PR titles follow Conventional Commits and the body follows the
 [PR template](.github/pull_request_template.md). This repo is public, so keep
 internal tracker IDs out of titles, bodies, commits and branch names. The rulesets
-require `ci-ok`, `gitleaks`, `pr-lint` and `Devin Review` on the exact head commit;
-CodeRabbit is advisory, but its findings still need answers. Native task review
-stages remain required. Full suites and CI gates run on **GitHub Actions**, never
-as a local CI mirror. Push the PR branch and keep the PR a draft while incomplete.
-Record the full head SHA and matching Actions run/job links, not local transcripts,
-for reviewers and the Release Manager. The single `ci-ok` aggregate in
+enforce the [required checks](CONTRIBUTING.md#required-checks).
+Follow the [risk-tier review policy](CONTRIBUTING.md#independent-review).
+Run full suites and CI gates on **GitHub Actions**. Push the PR branch and keep
+the PR a draft while incomplete. Record the full head SHA and matching Actions
+run/job links in Verification. The single `ci-ok` aggregate in
 `.github/workflows/check.yml` gates both selectors, lint (`check`: fmt, clippy
 -D warnings, cargo-deny), every selected Rust/database lane and `worker check`
 (including the runbook command-drift test).
 
-The final-stage reviewer squash-merges the pinned settled head before final
-approval; the author merges only without a review stage. Every `main` merge,
-including docs-only, needs the Release Manager's exact-head authorization because
-it can reach production through the promotion path. For web/bot, staging
-qualification is the automatic **post-merge, pre-production exact-main
-staging/e2e/soak gate**, enforced by the promotion guard. Staging accepts only
-main-ancestor SHAs; unmerged-head staging and artifact-equality proofs are not
-substitute merge prerequisites. Runtime-input pushes to `main` start automatic
-qualification; docs-only merges do not trigger `deploy-staging`. Promoting an
-otherwise unqualified exact main SHA (including a docs-only squash SHA) requires
-authorized staging dispatch/qualification first; follow the existing
-[dispatch/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
+The task owner normally squash-merges the pinned head after required checks and reviews
+pass. When a merge would deploy production or deployment cannot be ruled out,
+get owner approval for the full PR head SHA. Production dispatch needs separate
+owner approval for the full release SHA it will deploy. For web/bot, staging
+qualification is the **post-merge, pre-production exact-main staging/e2e/soak
+gate**, enforced by the promotion guard. Staging accepts only main-ancestor
+SHAs; unmerged-head staging and artifact-equality proofs are not substitute
+merge prerequisites. A merge is not evidence of staging deployment or
+qualification. Consult `deploy-staging.yml` at the relevant ref for its triggers
+and verify completed qualifying evidence for the intended exact `main` SHA.
+If evidence is absent, keep promotion held and follow the separately authorized
+[qualification/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
 without bypassing holds. See
 [Production merge evidence](CONTRIBUTING.md#production-merge-evidence) for the
-superseding contract. Exact-PR-head Actions/Devin, specialist/native review,
-existing production holds, migration/no-migration and rollback evidence, fresh
-per-PR exact-head Release Manager acceptance and release-log recording remain
-required. Neither this policy nor CI evidence claims a staging pass or hold lift,
-or replaces post-merge qualification and exact-SHA artifact/promotion evidence. See
+full contract. Exact-head checks and reviews, existing holds, migration and rollback
+evidence, and release-log recording remain required. Production schema/data
+operations and rollback need separate authorization. Neither this policy nor CI
+evidence claims a staging pass or hold lift, or replaces post-merge
+qualification and exact-SHA artifact/promotion evidence. See
 [Contributing](CONTRIBUTING.md#verification-on-github-actions) and
 [AGENTS.md](AGENTS.md). The toolchain stays pinned in `rust-toolchain.toml`.
 

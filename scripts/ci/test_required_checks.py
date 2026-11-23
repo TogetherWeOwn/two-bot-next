@@ -22,7 +22,7 @@ REQUIRED = {"ci-ok", "gitleaks", "pr-lint"}
 TRIGGER_FILTERS = {"paths", "paths-ignore", "branches", "branches-ignore"}
 # Only the advisory image smoke and the aggregate itself sit outside ci-ok.
 # The smoke's source-level exemption carries the reason; both selectors gate.
-NOT_AGGREGATED = {"container", "ci-ok"}
+NOT_AGGREGATED = {"container", "ci-evidence", "ci-ok"}
 AGGREGATORS = ("ci-ok",)
 
 

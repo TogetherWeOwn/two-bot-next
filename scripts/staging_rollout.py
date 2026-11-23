@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
-"""Fail-closed staging gate for Wrangler 4.156.0's rolling Containers API.
+"""Fail-closed staging gate for Wrangler 4.161.0's rolling Containers API.
 
 Only allowlisted provenance is persisted/printed. API configurations and error
 bodies can contain secrets: never print them, including in exception messages.
 """
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import math
 import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import time
 import tomllib
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, HTTPRedirectHandler, build_opener
+from urllib.request import Request
 
-from build_identity import is_deploy_id_shape, parse_deploy_id
+from build_identity import (UNSTAMPED, is_build_id_shape, is_build_revision_shape,
+                            is_deploy_id_shape, parse_deploy_id)
+
+from script_intake import (
+    decode_legacy_json,
+    no_redirect_opener,
+    read_with_overflow,
+    unique_object as _unique_json_object,
+)
 
 WORKER = "two-bot-next-staging"
 APPLICATION = "two-bot-next-twobotcontainer-staging"
 CLASS = "TwoBotContainer"
-WRANGLER = "4.156.0"
+WRANGLER = "4.161.0"
 VERSION_PROBES = (["--version"], ["-v"])
 LIMIT = 100
 MAX_BODY = 2 * 1024 * 1024
@@ -72,33 +81,12 @@ UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 IMAGE = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}@sha256:[0-9a-f]{{64}}"
 
 
-# Strings are skipped whole, so brackets inside them never count. An
-# unterminated string runs to the end, which keeps the scan linear.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 # CPython's old default recursion limit, which bounded the C JSON decoder.
 MAX_JSON_DEPTH = 1000
 
 
 def _loads_bounded(raw, **kwargs):
-    """json.loads with a lexical nesting bound that raises RecursionError.
-
-    Newer CPython sizes the decoder's recursion guard from the real C stack
-    and decodes 10,000 levels, so the bound no longer depends on the
-    interpreter: existing RecursionError refusals keep working unchanged.
-    """
-    # Decode bytes exactly as json.loads would, then scan and parse that text.
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
-    depth = 0
-    for match in JSON_TOKEN.finditer(raw):
-        token = match.group()
-        if token in "[{":
-            depth += 1
-            if depth > MAX_JSON_DEPTH:
-                raise RecursionError("JSON nesting exceeds the decoder bound")
-        elif token in "]}":
-            depth -= 1
-    return json.loads(raw, **kwargs)
+    return decode_legacy_json(raw, max_depth=MAX_JSON_DEPTH, **kwargs)
 
 
 class GateError(Exception):
@@ -149,11 +137,6 @@ def number(value):
     return value
 
 
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        raise GateError("unexpected_redirect")
-
-
 class Client:
     def __init__(self, account, token, deadline=None):
         require(isinstance(account, str) and re.fullmatch(r"[0-9a-f]{32}", account), "invalid_account")
@@ -166,7 +149,23 @@ class Client:
         self.zero_instance_polls = 0
         self.zero_instance_first = None
         self.zero_instance_last = None
-        self.opener = build_opener(NoRedirect())
+        self.opener = no_redirect_opener()
+
+    def stop_staging(self, url, version, revision):
+        """Use the deploy checkout's redacting client; never probe or renew here."""
+        timeout = min(50, self.deadline - time.monotonic())
+        require(timeout > 0, "rollout_timeout")
+        keys = ("PATH", "OWNERSHIP_CONTROL_TOKEN", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
+                "STAGING_USE_EXPIRES_AT", "STAGING_USE_RECEIPT")
+        env = {key: os.environ[key] for key in keys if key in os.environ}
+        env.update(STAGING_WORKER_URL=url, STAGING_USE_DEPLOYMENT=version, STAGING_USE_SHA=revision,
+                   STAGING_STOP_TIMEOUT_MS=str(int(timeout * 1000)))
+        script = Path(__file__).resolve().parents[1] / "wrangler/scripts/staging-use.mjs"
+        try:
+            result = subprocess.run(["node", str(script), "stop"], env=env, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            raise GateError("staging_stop_unconfirmed") from None
+        require(result.returncode == 0, "staging_stop_unconfirmed")
 
     def request(self, url, authenticated=False):
         timeout = 10 if self.deadline is None else min(10, self.deadline - time.monotonic())
@@ -174,12 +173,20 @@ class Client:
         headers = {"Cache-Control": "no-cache", "User-Agent": USER_AGENT}
         if authenticated:
             headers["Authorization"] = f"Bearer {self.token}"
+        request = Request(url, headers=headers)
         try:
-            with self.opener.open(Request(url, headers=headers), timeout=timeout) as response:
-                body = response.read(MAX_BODY + 1)
+            with self.opener.open(request, timeout=timeout) as response:
+                body = read_with_overflow(response, MAX_BODY)
                 require(len(body) <= MAX_BODY, "response_too_large")
                 return response.status, response.headers, body
         except HTTPError as error:
+            # Preserve the distinct verdict for redirects that urllib could
+            # otherwise follow. Missing or unsupported targets remain HTTP errors.
+            if (error.code in (301, 302, 303, 307, 308)
+                    and error.url == request.full_url and error.headers is not None
+                    and ("location" in error.headers or "uri" in error.headers)):
+                error.close()
+                raise GateError("unexpected_redirect") from None
             # Even Cloudflare's error envelope may include configuration values.
             if authenticated:
                 raise GateError("api_http_failure") from None
@@ -189,7 +196,7 @@ class Client:
             media = (headers.get("content-type") or "").split(";")[0].strip().lower()
             if url.endswith("/readyz") and error.code in (500, 503) and media == "application/json":
                 try:
-                    body = error.read(MAX_BODY + 1)
+                    body = read_with_overflow(error, MAX_BODY)
                 except (OSError, ValueError):
                     return error.code, {}, b""
                 if len(body) <= MAX_BODY:
@@ -226,13 +233,7 @@ class DuplicateKeyError(ValueError):
 
 
 def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins, at any depth."""
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, error=DuplicateKeyError)
 
 
 def decode(body):
@@ -548,6 +549,69 @@ def runtime_ready(status, headers, body, version, revision, build_id, deploy_id)
     components = sequence(report.get("components"))
     return bool(components) and all(isinstance(part, list) and len(part) == 2 and part[1] == "ready"
                                    for part in components)
+
+
+def save_forward_mismatch(args, code, headers, body, version, baseline, pinned, image,
+                          rollout_observed_at, sample_received_at):
+    """Retain only bounded identities, never probe text or configurations."""
+    sidecar = Path(args.evidence).with_suffix(".readyz-mismatch.json")
+    # Replacing a directory symlink could break paths to both inputs.
+    if sidecar.is_symlink():
+        raise ValueError("mismatch evidence destination is a symlink")
+    if sidecar.exists() and any(sidecar.samefile(path) for path in (args.receipt, args.output)):
+        raise ValueError("mismatch evidence aliases a verification input")
+    missing = object()
+
+    def field(value, valid):
+        if value is missing:
+            return "absent"
+        return value if isinstance(value, str) and valid(value) else "invalid"
+
+    def singleton_header(name, valid):
+        if hasattr(headers, "get_all") and len(headers.get_all(name, [])) > 1:
+            return "invalid"
+        return field(headers.get(name, missing), valid)
+
+    def utc(seconds):
+        return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="milliseconds")
+
+    try:
+        report = mapping(decode(body))
+    except GateError:
+        # The Worker identity check can fail before the gate reads the body.
+        report = dict.fromkeys(("build_revision", "build_id", "deploy_id"), None)
+    compiled_fields = {
+        "build_revision": ("revision", is_build_revision_shape),
+        "build_id": ("build_id", is_build_id_shape),
+        "deploy_id": ("deploy_id", is_deploy_id_shape),
+    }
+    expected = {"worker_version": version}
+    observed = {"worker_version": singleton_header("x-two-worker-version", re.compile(UUID).fullmatch)}
+    for key, (baseline_key, valid) in compiled_fields.items():
+        expected[key] = field(baseline[baseline_key], valid)
+        observed[key] = field(report.get(key, missing), lambda value: value == UNSTAMPED or valid(value))
+
+    target_version = pinned["target_version"]  # already checked as a nonnegative int
+    record = {
+        "error": code, "readyz_status": 200, "sample_received_at_utc": utc(sample_received_at),
+        "run_id": field(os.environ.get("GITHUB_RUN_ID", missing), re.compile(r"[1-9][0-9]{0,19}").fullmatch),
+        "run_attempt": field(os.environ.get("GITHUB_RUN_ATTEMPT", missing),
+                             re.compile(r"[1-9][0-9]{0,19}").fullmatch),
+        # Match the existing Worker/Rust correlation ID contract; do not mint one.
+        "request_id": singleton_header("x-request-id", re.compile(r"[0-9A-HJKMNP-TV-Z]{26}").fullmatch),
+        "expected": expected, "observed": observed,
+        "control_plane": {
+            "rollout_id": pinned["id"],  # already shape- and length-checked
+            "rollout_completed_observed_at_utc": utc(rollout_observed_at),
+            "target_version": target_version if target_version < 2**64 else "invalid",
+            "target_image_digest": image.rsplit("@", 1)[1],  # checked by docker_image and the rollout gate
+        },
+    }
+    # Stage privately on the same filesystem; publish only a complete record.
+    with tempfile.TemporaryDirectory(dir=sidecar.parent, prefix=".readyz-mismatch-") as temporary:
+        staged = Path(temporary) / "record.json"
+        save(staged, record)
+        os.replace(staged, sidecar)
 
 
 def rollout_observation(row):
@@ -941,6 +1005,7 @@ def verify(args, client):
     image_stale = 0
     listing_seen_target = False
     drift_candidate = False
+    stopped_after_completion = False
     app = row = None
     while time.monotonic() < client.deadline:
         probed = False
@@ -983,8 +1048,18 @@ def verify(args, client):
             # The pinned rollout plus exact-build /readyz and /health probes are
             # the acceptance evidence; keep polling those while the listing lags.
             if complete or lag:
+                rollout_observed_at = time.time()
                 active_worker(client, version)
+            # Shape/identity were validated above. Stop even with zero instances:
+            # counters can lag, and an alarm can start the old process after grant.
+            # Keep the finite grant, so rollback can still run if the stop fails.
+            stopped_this_poll = row["status"] == "completed" and not stopped_after_completion
+            if stopped_this_poll:
+                client.stop_staging(url, version, baseline["revision"])
+                stopped_after_completion = True
+            if complete or lag:
                 status, headers, body = client.request(url + "/readyz")
+                sample_received_at = time.time()
                 probed = True
                 observed = "rollout=active_lag " if lag else "rollout=converged "
                 client.observation = observed + runtime_observation(
@@ -992,8 +1067,19 @@ def verify(args, client):
                     baseline["deploy_id"])
                 if stale:
                     client.observation += f" application_image=stale polls={image_stale}"
-                if runtime_ready(status, headers, body, version, baseline["revision"], baseline["build_id"],
-                                   baseline["deploy_id"]):
+                try:
+                    ready = runtime_ready(status, headers, body, version, baseline["revision"],
+                                          baseline["build_id"], baseline["deploy_id"])
+                except GateError as error:
+                    if str(error) in ("serving_worker_mismatch", "serving_image_mismatch"):
+                        try:
+                            save_forward_mismatch(args, str(error), headers, body, version, baseline,
+                                                  pinned, image, rollout_observed_at, sample_received_at)
+                        except Exception:
+                            # The optional sidecar must not replace the gate's verdict.
+                            print("staging rollout readiness mismatch evidence could not be written")
+                    raise
+                if ready:
                     health, health_headers, _ = client.request(url + "/health")
                     client.observation = f"{observed}readyz=200 health={health}"
                     if stale:
@@ -1012,9 +1098,28 @@ def verify(args, client):
                         # and lag shapes while the exact build keeps serving, so
                         # either completed shape passes the re-read; identity,
                         # steps and failed/starting/scheduling stay exact.
-                        require(converged(final, image, pinned["target_version"])
-                                or active_lag(final, image, pinned["target_version"]),
-                                "rollout_not_converged")
+                        final_complete = converged(final, image, pinned["target_version"])
+                        if not final_complete and not active_lag(final, image, pinned["target_version"]):
+                            shape = _rollout_shape(final, image, pinned["target_version"])
+                            counts, progress_ok = shape if shape else ({}, False)
+                            # A stop deliberately drops the singleton. Retry only
+                            # its zero/starting shapes; never accept them as ready.
+                            require(progress_ok and counts["healthy"] == counts["failed"] == 0
+                                    and counts["active"] <= 1
+                                    and counts["starting"] + counts["scheduling"] <= 1,
+                                    "rollout_not_converged")
+                            row = final
+                            client.observation = rollout_observation(row)
+                            if stale:
+                                client.observation += f" application_image=stale polls={image_stale}"
+                                if image_stale > APPLICATION_IMAGE_STALE_POLLS:
+                                    raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
+                            lag_streak = 0
+                            time.sleep(max(0, min(5, client.deadline - time.monotonic())))
+                            continue
+                        if stopped_this_poll and not final_complete:
+                            # The pre-stop counters cannot skip lag confirmation.
+                            complete, lag = False, True
                         final_app = deadline_aware_read(
                             client, lambda: application(client), app, final, image,
                             drift_candidate, verification_started)

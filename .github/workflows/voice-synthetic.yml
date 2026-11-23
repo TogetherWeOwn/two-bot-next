@@ -26,6 +26,14 @@ on:
     # The test token crosses the boundary by name. The control token stays in
     # the separate staging-environment job and never enters the consumer.
     inputs:
+      artifact_invocation:
+        type: string
+        required: false
+        default: ''
+      deploy_staging_call:
+        type: boolean
+        required: false
+        default: false
       staging_use_expires_at:
         type: string
         required: true
@@ -35,6 +43,7 @@ on:
       staging_use_deployment:
         type: string
         required: true
+    outputs: {exercised: {value: "${{ jobs.synthetic.outputs.exercised }}"}}
     secrets:
       TWO_VOICE_SYNTHETIC_BOT_TOKEN:
         required: false
@@ -51,13 +60,23 @@ permissions: {}
 # Standalone owns the global window; a called run must never wait on its
 # parent's lock. Inputs are workflow_call-only and come from deploy outputs.
 concurrency:
-  group: ${{ inputs.staging_use_expires_at != '' && format('staging-voice-consumer-{0}', github.run_id) || 'staging-lifecycle' }}
+  group: ${{ (inputs.deploy_staging_call || inputs.staging_use_expires_at != '') && format('staging-voice-consumer-{0}', github.run_id) || 'staging-lifecycle' }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
+  rerun-refusal:
+    needs: [staging-window, synthetic, staging-use-release]
+    if: always() && inputs.deploy_staging_call && (github.run_attempt > 1 || inputs.staging_use_expires_at == '' || inputs.staging_use_sha == '' || inputs.staging_use_deployment == '')
+    permissions: {}
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - run: exit 1
+
   staging-window:
     name: authorize staging use before the consumer
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (!inputs.deploy_staging_call || (github.run_attempt == 1 && inputs.staging_use_expires_at != '' && inputs.staging_use_sha != '' && inputs.staging_use_deployment != ''))
     permissions:
       contents: read
     environment: staging
@@ -65,6 +84,7 @@ jobs:
     timeout-minutes: 8
     outputs:
       expires_at: ${{ steps.begin.outputs.expires_at }}
+      checked_at: ${{ steps.clock.outputs.checked_at }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -76,7 +96,7 @@ jobs:
           package-manager-cache: false
       - name: Acquire a finite standalone window and prove readiness
         id: begin
-        if: inputs.staging_use_expires_at == ''
+        if: inputs.staging_use_expires_at == '' && !inputs.deploy_staging_call
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
@@ -84,7 +104,7 @@ jobs:
           STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use.jsonl
         run: node wrangler/scripts/staging-use-pipeline.mjs begin
       - name: Assert the caller's exact window and readiness
-        if: inputs.staging_use_expires_at != ''
+        if: (inputs.deploy_staging_call || inputs.staging_use_expires_at != '')
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
@@ -97,16 +117,19 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: staging-use-voice-start-${{ github.run_id }}-${{ github.run_attempt }}
+          name: staging-use-voice-start-${{ github.run_id }}-${{ github.run_attempt }}${{ inputs.artifact_invocation != '' && format('-{0}', inputs.artifact_invocation) || '' }}
           path: ${{ runner.temp }}/staging-use.jsonl
           if-no-files-found: error
           retention-days: 14
+
+      - id: clock
+        run: printf 'checked_at=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
 
   # Called runs never release the parent's grant. The workflow lock covers
   # standalone begin, consumer and cleanup; native expiry covers runner loss.
   staging-use-release:
     needs: [staging-window, synthetic]
-    if: inputs.staging_use_expires_at == '' && always() && github.ref == 'refs/heads/main' && needs.staging-window.outputs.expires_at != ''
+    if: inputs.staging_use_expires_at == '' && !inputs.deploy_staging_call && always() && github.ref == 'refs/heads/main' && needs.staging-window.outputs.expires_at != ''
     permissions:
       contents: read
     environment: staging
@@ -122,7 +145,7 @@ jobs:
           node-version: 22
           package-manager-cache: false
       - name: Release only this standalone run's window
-        if: inputs.staging_use_expires_at == ''
+        if: inputs.staging_use_expires_at == '' && !inputs.deploy_staging_call
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
@@ -143,22 +166,27 @@ jobs:
     needs: staging-window
     permissions:
       contents: read
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (!inputs.deploy_staging_call || github.run_attempt == 1)
     environment: voice-synthetic
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs: {exercised: "${{ steps.voice.outputs.exercised }}"}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: Run the staging voice synthetic
+        id: voice
         env:
           TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
           VOICE_SYNTHETIC_REQUIRED: ${{ vars.VOICE_SYNTHETIC_REQUIRED }}
           TWO_STAGING_EMPTY_GRACE_SECONDS: ${{ vars.STAGING_EMPTY_GRACE_SECONDS || '60' }}
           RUN_ID: ${{ github.run_id }}
+          GRANT_EXPIRES_AT: ${{ inputs.staging_use_expires_at || needs.staging-window.outputs.expires_at }}
+          VOICE_JOB_ANCHOR: ${{ needs.staging-window.outputs.checked_at }}
+          VOICE_WORK_SECONDS: "300"
         run: |
           set -euo pipefail
           if [ -z "${TWO_VOICE_SYNTHETIC_BOT_TOKEN:-}" ]; then
@@ -169,21 +197,36 @@ jobs:
             echo "::error::TWO_VOICE_SYNTHETIC_BOT_TOKEN missing and the voice gate is required (set VOICE_SYNTHETIC_REQUIRED=false to opt out)"
             exit 1
           fi
-          # Two retries absorb a transient gateway/REST hiccup and the documented
-          # 95-139 s per-deploy gateway drop; three failures fail the run.
+          # The predecessor's clock counts queues and all runner setup, with a 60 s margin.
+          budget=$((VOICE_WORK_SECONDS + 150)) # Hard ceiling; includes Discord restoration.
+          reserve_attempt() {
+            local now finish
+            now=$(date +%s)
+            finish=$((now + budget + 2 + $1))
+            if [[ ! "$VOICE_JOB_ANCHOR" =~ ^[1-9][0-9]{0,9}$ || ! "$GRANT_EXPIRES_AT" =~ ^[1-9][0-9]{0,12}$ ]] || (( VOICE_JOB_ANCHOR > now || finish >= VOICE_JOB_ANCHOR + 540 || finish * 1000 >= GRANT_EXPIRES_AT )); then
+              echo '::error::not enough runner or staging grant time for voice work and cleanup'; exit 1
+            fi
+          }
           for attempt in 1 2 3; do
-            if python3 scripts/staging_voice_synthetic.py --evidence "voice-synthetic-$RUN_ID-$attempt.json"; then
+            reserve_attempt 0
+            if timeout -s KILL "${budget}s" python3 scripts/staging_voice_synthetic.py --evidence "voice-synthetic-$RUN_ID-$attempt.json"; then
+              printf 'exercised=true\n' >> "$GITHUB_OUTPUT"
               exit 0
+            else
+              case $? in 124|137) exit 1 ;; esac
             fi
             echo "::warning::voice synthetic attempt $attempt failed"
-            [ "$attempt" = 3 ] || sleep 60
+            if [ "$attempt" != 3 ]; then
+              reserve_attempt 60
+              sleep 60
+            fi
           done
           exit 1
       - name: Upload the evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: voice-synthetic-${{ github.run_id }}
+          name: voice-synthetic-${{ github.run_id }}${{ inputs.artifact_invocation != '' && format('-{0}', inputs.artifact_invocation) || '' }}
           path: voice-synthetic-${{ github.run_id }}-*.json
           if-no-files-found: ignore
           retention-days: 14

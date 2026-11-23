@@ -19,6 +19,8 @@ import time
 from urllib.parse import urlsplit
 import uuid
 
+from script_intake import decode_legacy_json, read_with_overflow
+
 MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
 # Recalibrated for the linked S4 self-role runtime: PR head measured
@@ -87,12 +89,18 @@ IMAGE_MAX_BYTES = 112 * MIB
 # lto, strip). The binary ceiling moves to 18 MiB, leaving about 1 MiB of
 # headroom above the measured heads; revisit if the binary approaches it.
 # The 112 MiB image ceiling is unchanged (43.46 MiB measured on this head).
-BINARY_MAX_BYTES = 18 * MIB
+# 2026-11-18 recalibration: main measured 18,806,512 bytes (17.94 MiB),
+# leaving 67,856 bytes under 18 MiB. The Twilight head measured 19,199,352
+# bytes (18.31 MiB), 324,984 bytes over. 20 MiB leaves 1,772,168 bytes
+# (about 1.7 MiB) above the Twilight measurement; revisit if the binary
+# approaches it. The release profile (opt-level=z, LTO, strip, panic=unwind)
+# and the 112 MiB image ceiling are unchanged.
+BINARY_MAX_BYTES = 20 * MIB
 # CLI refusal bounds (not budget policy): --image-max-bytes/--binary-max-bytes
 # outside 1..cap are unusable — a non-positive budget can never pass and a
 # gigantic one silently disables the budget — so main() refuses them with a
 # fixed message before any Docker call. The caps sit far above any sane
-# override (defaults are 112 MiB/18 MiB) and far below budget-disabling
+# override (defaults are 112 MiB/20 MiB) and far below budget-disabling
 # magnitudes; sane values pass through byte-identically.
 IMAGE_BUDGET_CAP_BYTES = 1024 * MIB
 BINARY_BUDGET_CAP_BYTES = 256 * MIB
@@ -149,7 +157,7 @@ def inspect_state(name):
     is never echoed into the failure.
     """
     try:
-        entries = json.loads(docker("inspect", name).stdout)
+        entries = decode_legacy_json(docker("inspect", name).stdout)
     except ValueError:
         raise RuntimeError("docker inspect output is not valid JSON") from None
     require(isinstance(entries, list) and entries, "docker inspect returned no entries")
@@ -237,7 +245,7 @@ def http_response(url):
         response = connection.getresponse()
         # Bounded read: a status line alone is an answer, a body past the cap
         # is a refusal raised before any decoding (not caught below).
-        raw = response.read(MAX_BODY_BYTES + 1)
+        raw = read_with_overflow(response, MAX_BODY_BYTES)
         if len(raw) > MAX_BODY_BYTES:
             raise BodyTooLarge("loopback response body exceeds the 64 KiB cap")
         if response.length:
@@ -246,7 +254,7 @@ def http_response(url):
             # still a transport miss for the caller to retry.
             raise http.client.IncompleteRead(raw, response.length)
         try:
-            return response.status, json.loads(raw)
+            return response.status, decode_legacy_json(raw)
         except ValueError:
             # A status with no JSON body (e.g. a bare 3xx) is still an
             # answer; the caller's exact status/body assertions reject it.
@@ -261,7 +269,7 @@ def http_response(url):
 
 
 def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BYTES):
-    image_entries = json.loads(docker("image", "inspect", image).stdout)
+    image_entries = decode_legacy_json(docker("image", "inspect", image).stdout)
     require(isinstance(image_entries, list) and image_entries,
             "docker image inspect returned no entries")
     require(isinstance(image_entries[0], dict),
@@ -360,7 +368,7 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                 ["token_invalid", "ready"],
             ], f"/readyz body must report a ready process, parked gateway, database down and valid token state; got status={code} body={json.dumps(body)[:2000]}")
             # The runtime always reports informational job status alongside
-            # readiness; with no credentials all sixteen jobs must be parked,
+            # readiness; with no credentials all seventeen jobs must be parked,
             # non-running and never started. Jobs never flip the 503 above. The
             # audit-retry, scheduled-messages, self-role recovery, feeds,
             # settings-poll, member-unban-sweep, LFG sweep, retention and
@@ -375,9 +383,9 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                     "community_scorecard", "inactivity", "audit_retry",
                     "self_role_recovery", "scheduled_messages", "feeds",
                     "member_unban_sweep", "retention", "lfg_sweep", "giveaway_countdown",
-                    "giveaway_draw",
+                    "giveaway_draw", "voice_heat",
                 )
-            }, "/readyz body must report all sixteen jobs parked, non-running, never started")
+            }, "/readyz body must report all seventeen jobs parked, non-running, never started")
             # Check PID 1, not merely Docker's configured user or an exec helper.
             uid = pid1_uids(name)
             require(len(uid) == 4 and all(value != 0 for value in uid), "runtime PID 1 is root")

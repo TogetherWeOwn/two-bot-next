@@ -129,7 +129,11 @@ impl VoiceEventSink for RecordingVoice {
     }
 }
 
-struct GatewayVoiceReplies(two_bot_discord::ActionExecutor);
+struct GatewayVoiceReplies {
+    executor: two_bot_discord::ActionExecutor,
+    completion:
+        Arc<std::sync::Mutex<Option<twilight_model::http::interaction::InteractionResponse>>>,
+}
 
 impl two_bot::voice_rooms::InteractionReplies for GatewayVoiceReplies {
     async fn defer(
@@ -157,7 +161,8 @@ impl two_bot::voice_rooms::InteractionReplies for GatewayVoiceReplies {
         interaction: &twilight_model::application::interaction::Interaction,
         response: twilight_model::http::interaction::InteractionResponse,
     ) -> Result<(), RoomHttpError> {
-        self.0
+        *self.completion.lock().unwrap() = Some(response.clone());
+        self.executor
             .edit_interaction_response(
                 interaction.application_id.get(),
                 &interaction.token,
@@ -176,7 +181,7 @@ impl two_bot::voice_rooms::InteractionReplies for GatewayVoiceReplies {
         interaction: &twilight_model::application::interaction::Interaction,
         response: twilight_model::http::interaction::InteractionResponse,
     ) -> Result<(), RoomHttpError> {
-        self.0
+        self.executor
             .answer_interaction(interaction.id.get(), &interaction.token, &response)
             .await
             .map_err(|_| RoomHttpError::InvalidRequest)
@@ -251,13 +256,17 @@ async fn registered_voice_id_with_rsvp_payload_has_one_voice_callback() {
         false,
     );
     let rooms = PgRoomStore::new(db.pool.clone());
+    let completion = Arc::new(std::sync::Mutex::new(None));
     let voice = Arc::new(two_bot::voice_rooms::VoiceResponder::new(
         Arc::new(VoiceRuntime::new(
             move || (rooms.clone(), DeleteOnly::default()),
             Duration::from_secs(60),
             true,
         )),
-        Arc::new(GatewayVoiceReplies(executor)),
+        Arc::new(GatewayVoiceReplies {
+            executor,
+            completion: Arc::clone(&completion),
+        }),
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -306,7 +315,7 @@ async fn registered_voice_id_with_rsvp_payload_has_one_voice_callback() {
     wait_sequence(&db.store, 1).await;
     ws.send(Message::text(
         json!({"op":0,"s":2,"t":"INTERACTION_CREATE","d":{
-            "application_id":"1111", "authorizing_integration_owners":{"0":GUILD},
+            "application_id":"1111", "attachment_size_limit":10485760, "authorizing_integration_owners":{"0":GUILD},
             "id":"7000", "token":"voice-identity-fixture", "type":2, "version":1,
             "guild_id":GUILD, "entitlements":[],
             "member":{"permissions":"0","roles":[],"deaf":false,"mute":false,"flags":0,
@@ -347,21 +356,25 @@ async fn registered_voice_id_with_rsvp_payload_has_one_voice_callback() {
     );
     let callback: Value = serde_json::from_slice(&callbacks[0].body).unwrap();
     assert_eq!(callback["type"], 5, "the voice responder owns the defer");
-    let edit = requests
-        .iter()
-        .find(|request| request.method == "PATCH")
-        .unwrap();
-    let edit: Value = serde_json::from_slice(&edit.body).unwrap();
-    assert!(edit["content"]
-        .as_str()
+    let response = completion.lock().unwrap().take().expect("voice completion");
+    let data = response.data.expect("voice reply data");
+    assert!(data.content.as_deref().is_none_or(str::is_empty));
+    let embeds = data.embeds.expect("voice reply embeds");
+    assert_eq!(embeds.len(), 1);
+    assert!(embeds[0]
+        .description
+        .as_deref()
         .unwrap()
-        .to_lowercase()
-        .contains("pong"));
+        .starts_with("Pong! "));
+    assert_eq!(
+        embeds[0].footer.as_ref().unwrap().text,
+        "Together We Own · Voice"
+    );
     rest.shutdown().await;
     db.close().await;
 }
 
-async fn cold_voice_gateway(release_ready: Arc<Notify>) -> MockGateway {
+async fn cold_voice_gateway(release_ready: Arc<Notify>, rooms_enabled: bool) -> MockGateway {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let gateway_url = url.clone();
@@ -396,6 +409,14 @@ async fn cold_voice_gateway(release_ready: Arc<Notify>) -> MockGateway {
                                 json!({"op":0,"s":4,"t":"RESUMED","d":{}}),
                             ] {
                                 ws.send(Message::text(packet.to_string())).await.unwrap();
+                            }
+                            if !rooms_enabled {
+                                let mut live_leave = leave(5);
+                                // A distinct member keeps same-millisecond leave keys distinct.
+                                live_leave["d"]["user"]["id"] = json!("78");
+                                ws.send(Message::text(live_leave.to_string()))
+                                    .await
+                                    .unwrap();
                             }
                         } else {
                             release_ready.notified().await;
@@ -434,9 +455,15 @@ async fn cold_voice_gateway(release_ready: Arc<Notify>) -> MockGateway {
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_rooms() {
+    cold_voice_resume(true).await;
+    cold_voice_resume(false).await;
+}
+
+async fn cold_voice_resume(rooms_enabled: bool) {
+    use crate::voice_snapshot::{new_shared_cache, read_voice_total};
     let db = TestDb::new().await;
     let release = Arc::new(Notify::new());
-    let mut mock = cold_voice_gateway(release.clone()).await;
+    let mut mock = cold_voice_gateway(release.clone(), rooms_enabled).await;
     db.store
         .commit_dispatch(
             &checkpoint("saved-session", 2, &mock.url),
@@ -488,8 +515,17 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
         saved.as_ref(),
         Some(&mock.url),
     );
-    let pipeline = Arc::new(build_pipeline(db.store.milestones().await.unwrap(), None));
+    let cache = new_shared_cache();
+    let buffer = GatewayFunnelBuffer::from_milestones(db.store.milestones().await.unwrap());
+    let pipeline = Arc::new(two_bot_discord::OrderedLevelingPipeline::with_shared_cache(
+        buffer.clone(),
+        None,
+        two_bot_discord::NoInvites,
+        buffer,
+        cache.clone(),
+    ));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
+    let sink = rooms_enabled.then(|| voice.clone() as Arc<dyn VoiceEventSink>);
     let runner = tokio::spawn(run_shard(
         shard,
         pipeline.clone(),
@@ -499,12 +535,30 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
         None,
         None,
         None,
-        Some(voice.clone()),
+        sink,
         std::future::pending(),
     ));
     let resume = mock.authentication().await;
     assert_eq!(resume["op"], 6);
     assert_eq!(resume["d"]["seq"], 2);
+    if !rooms_enabled {
+        // Keep processing the old session after RESUMED instead of forcing a
+        // fresh IDENTIFY for heat. A cold partial cache is still a gap.
+        wait_sequence(&db.store, 5).await;
+        wait_connected(&state).await;
+        let saved = db.store.load().await.unwrap().unwrap();
+        assert_eq!(
+            (saved.session_id.as_str(), saved.sequence),
+            ("saved-session", 5)
+        );
+        assert_eq!(db.count().await, 3);
+        assert!(read_voice_total(&cache, VOICE_GUILD_ID).is_err());
+        runner.abort();
+        let _ = runner.await;
+        mock.task.abort();
+        db.close().await;
+        return;
+    }
     assert_eq!(mock.authentication().await["op"], 2);
     let saved = db.store.load().await.unwrap().unwrap();
     assert_eq!(
@@ -546,7 +600,7 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
         db.store.load().await.unwrap().unwrap().session_id,
         "voice-session"
     );
-    assert_eq!(*state.read().await, GatewayState::Connected);
+    wait_connected(&state).await;
     let disconnects = voice.disconnects.load(Ordering::Relaxed);
     runner.abort();
     let _ = runner.await;

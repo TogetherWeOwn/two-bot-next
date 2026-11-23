@@ -1,0 +1,6 @@
+{
+  "op": 0,
+  "t": "VOICE_STATE_UPDATE",
+  "d": {"guild_id":"10", "user_id":"31", "channel_id":"20", "session_id":"fixture-session",
+        "deaf":false, "mute":false, "self_deaf":false, "self_mute":false, "self_video":false, "suppress":false}
+}

@@ -16,20 +16,16 @@ import test_worker_container_rollback as fixtures
 
 class ImageRestoreListingTests(unittest.TestCase):
     def routes(self, row=None):
-        routes, _ = fixtures.RollbackRunTests().routes()
-        # The application list never catches up to the restored digest.
-        routes[("GET", "/containers/applications")] = lambda: {
-            "success": True, "result": [{
-                "id": fixtures.APP_ID, "name": fixtures.APPLICATION,
-                "durable_objects": {"namespace_id": fixtures.NAMESPACE},
-                "configuration": {"image": fixtures.bad_image()}}]}
+        routes, _ = fixtures.RollbackRunTests().routes(listing_lag=True)
         if row is not None:
             routes[("GET", f"/containers/applications/{fixtures.APP_ID}/rollouts/r-new")] = \
                 lambda: {"success": True, "result": row}
         return routes
 
     def row(self):
-        return fixtures.rollout_row("r-new", fixtures.good_image(), target_version=9)
+        row = fixtures.rollout_row("r-new", fixtures.good_image(), target_version=9)
+        row["current_configuration"]["image"] = fixtures.bad_image()
+        return row
 
     def test_stale_listing_accepts_completed_rollout_then_requires_18_ready_polls(self):
         for active, healthy in ((1, 1), (0, 1), (1, 0)):
@@ -84,8 +80,9 @@ class ImageRestoreListingTests(unittest.TestCase):
 
     def test_target_version_can_be_pinned_by_a_later_poll(self):
         routes = self.routes(self.row())
-        routes[("POST", f"/containers/applications/{fixtures.APP_ID}/rollouts")] = \
-            lambda _body: {"id": "r-new"}
+        route = ("POST", f"/containers/applications/{fixtures.APP_ID}/rollouts")
+        post = routes[route]
+        routes[route] = lambda body: {"id": post(body)["id"]}
         rb, _, _ = fixtures.make_rollback(routes)
         result = rb.run(fixtures.GOOD_VERSION, fixtures.good_image())
         self.assertEqual(result["restored_rollout_id"], "r-new")

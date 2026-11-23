@@ -14,18 +14,13 @@ import sys
 from attestation_inventory import evaluate_bracketed
 from attestation_transport import RestReader
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from script_intake import decode_legacy_json, read_with_overflow, unique_object
+sys.path.pop(0)
+
 
 MAX_EVENT_BYTES = 8 * 1024 * 1024
 REFUSAL = "Attestation validation refused."
-
-
-def _object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError
-        result[key] = value
-    return result
 
 
 def _constant(_value):
@@ -54,11 +49,11 @@ def main(argv=None):
         if os.environ.get("GITHUB_EVENT_NAME") != "pull_request_target":
             raise ValueError
         with args.event.open("rb") as source:
-            raw = source.read(MAX_EVENT_BYTES + 1)
+            raw = read_with_overflow(source, MAX_EVENT_BYTES)
         if len(raw) > MAX_EVENT_BYTES:
             raise ValueError
-        event = json.loads(raw.decode("utf-8"), object_pairs_hook=_object,
-                           parse_constant=_constant)
+        event = decode_legacy_json(raw.decode("utf-8"), object_pairs_hook=unique_object,
+                                   parse_constant=_constant)
         repository = os.environ.get("GITHUB_REPOSITORY", "")
         reader = RestReader(repository, os.environ.get("GH_TOKEN", ""))
         result = evaluate_bracketed(event, repository, os.environ.get("GITHUB_SHA", ""),

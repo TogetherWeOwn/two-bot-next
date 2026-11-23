@@ -1,0 +1,15 @@
+{
+  "name": "automod-preview",
+  "id": "123456789012345678",
+  "version": "223456789012345678",
+  "application_id": "1469137636663758888",
+  "guild_id": "1545644954272137297",
+  "type": 1,
+  "default_member_permissions": "32",
+  "description": "Synthetic registry data that must stay out of the receipt",
+  "options": [
+    { "name": "text", "type": 3, "required": true, "min_length": 1, "max_length": 2000 },
+    { "name": "mentions", "type": 4, "min_value": 0, "max_value": 100 },
+    { "name": "attachments", "type": 3, "max_length": 1000 }
+  ]
+}

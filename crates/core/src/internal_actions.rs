@@ -115,17 +115,32 @@ pub fn body_hash(raw: &[u8]) -> String {
 /// `POST\n/internal/actions\n{timestamp}\n{nonce}\n{sha256_hex(body)}`.
 #[must_use]
 pub fn canonical_string(timestamp: &str, nonce: &str, raw: &[u8]) -> String {
-    format!(
-        "POST\n{ACTIONS_PATH}\n{timestamp}\n{nonce}\n{}",
-        body_hash(raw)
-    )
+    canonical_post(ACTIONS_PATH, timestamp, nonce, raw)
+}
+
+fn canonical_post(path: &'static str, timestamp: &str, nonce: &str, raw: &[u8]) -> String {
+    format!("POST\n{path}\n{timestamp}\n{nonce}\n{}", body_hash(raw))
 }
 
 /// `sha256=` + hex(HMAC-SHA256(secret, canonical)).
 #[must_use]
 pub fn sign(secret: &[u8], timestamp: &str, nonce: &str, raw: &[u8]) -> String {
+    sign_post(ACTIONS_PATH, secret, timestamp, nonce, raw)
+}
+
+/// Sign the exact bytes of a POST to the caller's fixed protocol route.
+/// The caller must select the path as a literal (never from request metadata),
+/// use a key scoped to the protocol, and validate timestamp and nonce grammar.
+#[must_use]
+pub(crate) fn sign_post(
+    path: &'static str,
+    secret: &[u8],
+    timestamp: &str,
+    nonce: &str,
+    raw: &[u8],
+) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts keys of any length");
-    mac.update(canonical_string(timestamp, nonce, raw).as_bytes());
+    mac.update(canonical_post(path, timestamp, nonce, raw).as_bytes());
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
@@ -471,6 +486,10 @@ pub struct BucketDecision {
 #[derive(Debug, Clone, Default)]
 pub struct TokenBuckets {
     buckets: HashMap<String, BucketState>,
+    // Refill deadlines persist only for active buckets; the clock floor
+    // survives eviction so a reinserted member cannot replay elapsed time.
+    voice_members: HashMap<String, u128>,
+    voice_clock_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -483,6 +502,50 @@ impl TokenBuckets {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    const VOICE_MEMBER_LIMIT: usize = 1024;
+    const VOICE_REFILL_MS: u128 = 50_000;
+    const VOICE_BURST_MS: u128 = 6 * Self::VOICE_REFILL_MS;
+
+    /// Charge a validated voice-move subject. Unseen subjects fail closed at
+    /// capacity unless a fully replenished entry can be discarded.
+    pub fn take_voice_member(&mut self, key: &str, now_ms: u64) -> BucketDecision {
+        self.voice_clock_ms = self.voice_clock_ms.max(now_ms);
+        let clock = u128::from(self.voice_clock_ms);
+        let wall = u128::from(now_ms);
+        let denied_until = |deadline: u128| BucketDecision {
+            allowed: false,
+            // Divide before narrowing; deadlines are at most u64::MAX + one burst.
+            retry_after_secs: (deadline.saturating_sub(wall).div_ceil(1_000) as u64).max(1),
+        };
+
+        let members = &mut self.voice_members;
+        if let Some(full_at) = members.get_mut(key) {
+            // A charge extends the full-refill deadline by one token's worth
+            // of time. This keeps partial credit exact without touching denied buckets.
+            let next_full = (*full_at).max(clock) + Self::VOICE_REFILL_MS;
+            if next_full > clock + Self::VOICE_BURST_MS {
+                return denied_until(next_full - Self::VOICE_BURST_MS);
+            }
+            *full_at = next_full;
+        } else {
+            if members.len() >= Self::VOICE_MEMBER_LIMIT {
+                let mut earliest_full = clock + Self::VOICE_BURST_MS;
+                members.retain(|_, &mut full_at| {
+                    earliest_full = earliest_full.min(full_at);
+                    full_at > clock
+                });
+                if members.len() >= Self::VOICE_MEMBER_LIMIT {
+                    return denied_until(earliest_full);
+                }
+            }
+            members.insert(key.to_owned(), clock + Self::VOICE_REFILL_MS);
+        }
+        BucketDecision {
+            allowed: true,
+            retry_after_secs: 0,
+        }
     }
 
     /// Take one token from `key`'s bucket, creating it full on first use.
@@ -672,7 +735,7 @@ pub fn auth_failure(log_reason: impl Into<String>) -> ActionError {
 /// (TOG-5510), plus `voice.snapshot`, the keyless gateway-cache read. Adding
 /// a verb here without deciding which side of [`NEEDS_IDEMPOTENCY_KEY`] it
 /// falls on is the mistake that set exists to prevent.
-pub const IMPLEMENTED_ACTIONS: [&str; 20] = [
+pub const IMPLEMENTED_ACTIONS: [&str; 21] = [
     "role.assign",
     "guild.add_member",
     "announcement.post",
@@ -693,6 +756,7 @@ pub const IMPLEMENTED_ACTIONS: [&str; 20] = [
     "moderation.lockdown",
     "moderation.unlock",
     "voice.snapshot",
+    "voice.move_member",
 ];
 
 /// Actions where a repeat is not harmless, so the caller must send an
@@ -813,6 +877,8 @@ pub struct InternalFlags {
     /// Destructive automations imports need this stronger, separately
     /// configured capability on top of the base automations flag.
     pub allow_automation_overwrite: bool,
+    // Kept out of the live verb registry until the receiver is wired.
+    allow_attendance_read: bool,
 }
 
 impl InternalFlags {
@@ -845,6 +911,11 @@ impl InternalFlags {
         if flag("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT") {
             enabled.insert("voice.snapshot".to_owned());
         }
+        if flag("TWO_INTERNAL_ALLOW_VOICE_MOVE")
+            && vars.get("TWO_DEPLOY_ENV").is_some_and(|v| v == "staging")
+        {
+            enabled.insert("voice.move_member".to_owned());
+        }
         // Merely shipping the implementation must not widen the allowlist.
         if flag("TWO_INTERNAL_ALLOW_AUTOMATIONS") {
             enabled.insert("automations.import".to_owned());
@@ -861,6 +932,7 @@ impl InternalFlags {
             enabled,
             allow_automation_overwrite: flag("TWO_INTERNAL_ALLOW_AUTOMATIONS")
                 && flag("TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE"),
+            allow_attendance_read: flag("TWO_INTERNAL_ALLOW_ATTENDANCE_READ"),
         }
     }
 
@@ -1414,9 +1486,20 @@ pub struct VoiceMoveRequest<'a> {
 
 impl<'a> VoiceMoveRequest<'a> {
     pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        let canonical_id = |field| {
+            let value = require_snowflake(body, field)?;
+            if value.starts_with('0') || value.parse::<u64>().is_err() {
+                return Err(ActionError::new(
+                    ErrorCode::Malformed,
+                    "Invalid Discord id",
+                    format!("bad_{field}"),
+                ));
+            }
+            Ok(value)
+        };
         Ok(Self {
-            discord_id: require_snowflake(body, "discord_id")?,
-            channel_id: require_snowflake(body, "channel_id")?,
+            discord_id: canonical_id("discord_id")?,
+            channel_id: canonical_id("channel_id")?,
         })
     }
 
@@ -1431,7 +1514,7 @@ impl<'a> VoiceMoveRequest<'a> {
     }
 }
 
-/// Closed result words for a future self-only voice move.
+/// Closed result words for a self-only voice move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceMoveOutcome {
     Moved,
@@ -1909,6 +1992,16 @@ pub struct AuthenticatedRequest<'a> {
 /// ```
 pub struct NonceBurnedRequest<'a>(AuthenticatedRequest<'a>);
 
+/// One validated, signed and replay-guarded request for the dormant adapter.
+/// No public constructor: arbitrary JSON or an `AuthDecision` cannot mint it.
+pub struct AttendanceReadRequest(String);
+
+impl AttendanceReadRequest {
+    pub fn event_key(&self) -> &str {
+        &self.0
+    }
+}
+
 impl<'a> AuthenticatedRequest<'a> {
     /// Authenticate headers and exact bytes without parsing JSON or touching
     /// replay/rate-limit state. Malformed authenticated bodies must reach the
@@ -2021,6 +2114,25 @@ impl NonceBurnedRequest<'_> {
     ) -> Result<AuthDecision, ActionError> {
         authorize_burned(self.0, flags, has_store, has_settings, buckets)
     }
+
+    /// Authorize the dormant read without widening the serving registry.
+    pub fn authorize_attendance_read(
+        self,
+        flags: &InternalFlags,
+        buckets: &mut TokenBuckets,
+    ) -> Result<AttendanceReadRequest, ActionError> {
+        let body = rate_limited_body(&self.0, buckets)?;
+        if !flags.allow_attendance_read
+            || body.get("action").and_then(Value::as_str) != Some("event.attendance.read")
+        {
+            return Err(ActionError::new(
+                ErrorCode::ActionNotAllowed,
+                "Attendance read is not allowed",
+                "attendance_not_allowed",
+            ));
+        }
+        Ok(AttendanceReadRequest(validate_event_key(&body)?.to_owned()))
+    }
 }
 
 fn replayed_nonce() -> ActionError {
@@ -2087,13 +2199,10 @@ pub fn authorize(
     NonceBurnedRequest(verified).authorize(flags, has_store, has_settings, buckets)
 }
 
-fn authorize_burned(
-    verified: AuthenticatedRequest<'_>,
-    flags: &InternalFlags,
-    has_store: bool,
-    has_settings: bool,
+fn rate_limited_body(
+    verified: &AuthenticatedRequest<'_>,
     buckets: &mut TokenBuckets,
-) -> Result<AuthDecision, ActionError> {
+) -> Result<Map<String, Value>, ActionError> {
     let per_key = buckets.take(
         &format!("key:{}", verified.key_id),
         DEFAULT_BUCKET,
@@ -2108,7 +2217,17 @@ fn authorize_burned(
         .with_retry_after(per_key.retry_after_secs));
     }
 
-    let body = parse_body_object(verified.raw)?;
+    parse_body_object(verified.raw)
+}
+
+fn authorize_burned(
+    verified: AuthenticatedRequest<'_>,
+    flags: &InternalFlags,
+    has_store: bool,
+    has_settings: bool,
+    buckets: &mut TokenBuckets,
+) -> Result<AuthDecision, ActionError> {
+    let body = rate_limited_body(&verified, buckets)?;
     let action = match body.get("action").and_then(Value::as_str) {
         Some(a) if !a.is_empty() => a.to_owned(),
         _ => {
@@ -2134,6 +2253,15 @@ fn authorize_burned(
                 "rate_limited_add_member",
             )
             .with_retry_after(per_action.retry_after_secs));
+        }
+    }
+
+    if action == "voice.move_member" {
+        let member = VoiceMoveRequest::validate(&body)?.discord_id();
+        let limit = buckets.take_voice_member(member, verified.guarded_ms);
+        if !limit.allowed {
+            let failure = ActionError::new(ErrorCode::RateLimited, "Slow down", "voice_move");
+            return Err(failure.with_retry_after(limit.retry_after_secs));
         }
     }
 
@@ -2620,6 +2748,86 @@ mod tests {
     }
 
     #[test]
+    fn voice_member_buckets_reclaim_only_full_entries() {
+        let mut buckets = TokenBuckets::new();
+        const ACTIVE: &str = "123456789012345678";
+        const NEW: &str = "123456789012349999";
+        for offset in 0..TokenBuckets::VOICE_MEMBER_LIMIT {
+            let member = (123456789012345678u64 + offset as u64).to_string();
+            assert!(buckets.take_voice_member(&member, 0).allowed);
+        }
+        for _ in 1..6 {
+            assert!(buckets.take_voice_member(ACTIVE, 0).allowed);
+        }
+        let denied = buckets.take_voice_member(NEW, 49_999);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 1);
+        assert_eq!(
+            buckets.voice_members.len(),
+            TokenBuckets::VOICE_MEMBER_LIMIT
+        );
+        assert!(buckets.take_voice_member(NEW, 50_000).allowed);
+        assert_eq!(buckets.voice_members.len(), 2);
+        assert!(buckets.take_voice_member(ACTIVE, 50_000).allowed);
+        assert!(!buckets.take_voice_member(ACTIVE, 50_000).allowed);
+    }
+
+    #[test]
+    fn voice_member_capacity_retry_waits_for_a_full_bucket() {
+        let mut buckets = TokenBuckets::new();
+        for offset in 0..TokenBuckets::VOICE_MEMBER_LIMIT {
+            let member = (123456789012345678u64 + offset as u64).to_string();
+            for _ in 0..6 {
+                assert!(buckets.take_voice_member(&member, 0).allowed);
+            }
+        }
+        let denied = buckets.take_voice_member("123456789012349999", 0);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 300);
+    }
+
+    #[test]
+    fn voice_member_refills_at_the_same_boundary_with_or_without_denials() {
+        let mut buckets = TokenBuckets::new();
+        let polled = "123456789012345678";
+        let idle = "123456789012345679";
+        for member in [polled, idle] {
+            for _ in 0..6 {
+                assert!(buckets.take_voice_member(member, 0).allowed);
+            }
+        }
+        for step in 1..10 {
+            assert!(!buckets.take_voice_member(polled, step * 5_000).allowed);
+        }
+        assert!(buckets.take_voice_member(polled, 50_000).allowed);
+        assert!(buckets.take_voice_member(idle, 50_000).allowed);
+    }
+
+    #[test]
+    fn voice_member_reinsertion_does_not_credit_clock_recovery() {
+        let mut buckets = TokenBuckets::new();
+        const FIRST: &str = "123456789012345678";
+        for offset in 0..TokenBuckets::VOICE_MEMBER_LIMIT {
+            let member = (123456789012345678u64 + offset as u64).to_string();
+            assert!(buckets.take_voice_member(&member, 100_000).allowed);
+        }
+        assert!(
+            buckets
+                .take_voice_member("123456789012349999", 150_000)
+                .allowed
+        );
+        assert!(!buckets.voice_members.contains_key(FIRST));
+        for _ in 0..6 {
+            assert!(buckets.take_voice_member(FIRST, 100_000).allowed);
+        }
+        let denied = buckets.take_voice_member(FIRST, 100_000);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 100);
+        assert!(!buckets.take_voice_member(FIRST, 150_000).allowed);
+        assert!(buckets.take_voice_member(FIRST, 200_000).allowed);
+    }
+
+    #[test]
     fn voice_move_request_names_one_member_and_one_room() {
         let body = map(json!({
             "discord_id": "123456789012345678",
@@ -2638,6 +2846,26 @@ mod tests {
                 VoiceMoveRequest::validate(&body).unwrap_err().code,
                 ErrorCode::Malformed
             );
+        }
+    }
+
+    #[test]
+    fn voice_move_request_rejects_noncanonical_snowflakes() {
+        for invalid in [
+            "00000000000000000",
+            "012345678901234567",
+            "18446744073709551616",
+        ] {
+            for (member, channel) in [
+                (invalid, "123456789012345679"),
+                ("123456789012345678", invalid),
+            ] {
+                let body = map(json!({"discord_id": member, "channel_id": channel}));
+                assert_eq!(
+                    VoiceMoveRequest::validate(&body).unwrap_err().code,
+                    ErrorCode::Malformed
+                );
+            }
         }
     }
 
@@ -3194,6 +3422,7 @@ mod tests {
         for key in [
             "TWO_INTERNAL_KEYS",
             "TWO_INTERNAL_ALLOW_MODERATION",
+            "TWO_INTERNAL_ALLOW_VOICE_MOVE",
             "TWO_MODERATION",
             "DISCORD_TOKEN",
             "TWO_OWEN_USER_ID",
@@ -3249,10 +3478,11 @@ mod tests {
         // voice.snapshot read adds one env-only key
         // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT). The reserved member notification
         // gate adds one env-only key without wiring notification delivery.
+        // The staging self-move gate adds one env-only key.
         for (class, expected) in [
             (SettingClass::Hot, 52),
             (SettingClass::Cold, 18),
-            (SettingClass::EnvOnly, 68),
+            (SettingClass::EnvOnly, 69),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
@@ -3949,6 +4179,72 @@ mod tests {
             nonce,
             signature: sig,
         }
+    }
+
+    #[test]
+    fn attendance_authorization_is_opt_in_and_cannot_enable_the_serving_registry() {
+        let vector = vec1();
+        let now = vector.timestamp.parse::<u64>().unwrap() * 1000;
+        let signed = |raw: &[u8], signed_body: &[u8], setting: Option<&str>| {
+            let nonce = test_nonce();
+            let sig = sign(
+                vector.secret.as_bytes(),
+                &vector.timestamp,
+                &nonce,
+                signed_body,
+            );
+            let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
+            let verified = AuthenticatedRequest::verify(
+                &headers,
+                raw,
+                &ring(),
+                SKEW_SECONDS,
+                now,
+                &mut ClockGuard::new(),
+            )?;
+            let flags = InternalFlags::from_map(
+                &setting
+                    .into_iter()
+                    .map(|v| {
+                        (
+                            "TWO_INTERNAL_ALLOW_ATTENDANCE_READ".to_owned(),
+                            v.to_owned(),
+                        )
+                    })
+                    .collect(),
+            );
+            assert!(!flags.is_enabled("event.attendance.read"));
+            assert!(!is_implemented("event.attendance.read"));
+            // Model a successful nonce burn; the live receiver still has no dispatch.
+            assert!(NonceCache::new(NONCE_TTL_SECONDS).offer(&nonce, now));
+            NonceBurnedRequest(verified).authorize_attendance_read(&flags, &mut TokenBuckets::new())
+        };
+        let valid = br#"{"action":"event.attendance.read","event_key":"fixture:1"}"#;
+        let tampered = br#"{"action":"event.attendance.read","event_key":"fixture:2"}"#;
+        assert_eq!(
+            signed(tampered, valid, Some("1")).err().unwrap().code,
+            ErrorCode::Unauthorized
+        );
+        for setting in [None, Some("0"), Some("true")] {
+            assert_eq!(
+                signed(valid, valid, setting).err().unwrap().code,
+                ErrorCode::ActionNotAllowed
+            );
+        }
+        let wrong = br#"{"action":"event.read","event_key":"fixture:1"}"#;
+        assert_eq!(
+            signed(wrong, wrong, Some("1")).err().unwrap().code,
+            ErrorCode::ActionNotAllowed
+        );
+        let malformed = br#"{"action":"event.attendance.read","event_key":"fixture/path"}"#;
+        assert_eq!(
+            signed(malformed, malformed, Some("1")).err().unwrap().code,
+            ErrorCode::Malformed
+        );
+        assert_eq!(
+            signed(valid, valid, Some("1")).unwrap().event_key(),
+            "fixture:1"
+        );
     }
 
     fn authorize_for_test(

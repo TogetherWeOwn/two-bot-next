@@ -60,9 +60,14 @@ Usage:
 import argparse
 import json
 import os
-import re
 import sys
 from datetime import datetime, timezone
+
+from script_intake import (
+    decode_legacy_json,
+    json_depth_exceeds as _json_depth_exceeds,
+    unique_object as _unique_json_object,
+)
 
 SCHEMA_VERSION = 1
 
@@ -146,42 +151,13 @@ def _read_log_lines(path):
 
 
 def _unique_object(pairs):
-    """object_pairs_hook refusing duplicate keys instead of last-wins."""
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise ValueError("duplicate field")
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, message='duplicate field')
 
 
 # Well below CPython's default recursion limit (1000): any record deeper
 # than this would raise RecursionError under recursive traversal/repr, so
 # it is refused up front with an explicit stack instead of recursing.
 MAX_RECORD_DEPTH = 100
-
-# Strings are skipped whole, so brackets inside them never count. An
-# unterminated string runs to the end, which keeps the scan linear.
-JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
-
-
-def _json_depth_exceeds(text, limit):
-    """Lexical nesting pre-scan, run before json.loads.
-
-    The decoder's own RecursionError is no longer a reliable bound: newer
-    CPython sizes it from the real C stack and decodes 10,000 levels.
-    """
-    depth = 0
-    for match in JSON_TOKEN.finditer(text):
-        token = match.group()
-        if token in "[{":
-            depth += 1
-            if depth > limit:
-                return True
-        elif token in "]}":
-            depth -= 1
-    return False
-
 
 def _too_deeply_nested(record, limit=MAX_RECORD_DEPTH):
     """Iterative depth check; True when nesting exceeds limit."""
@@ -265,7 +241,7 @@ def summarize(lines):
                          f"malformed line {lineno}: too deeply nested")
             continue
         try:
-            record = json.loads(line, object_pairs_hook=_unique_object)
+            record = decode_legacy_json(line, object_pairs_hook=_unique_object)
         except RecursionError:
             # Decoder-level backstop behind the lexical pre-scan above, for
             # any decoder whose stack is smaller than MAX_RECORD_DEPTH.

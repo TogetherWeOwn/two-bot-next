@@ -125,10 +125,22 @@ function validDeploymentId(value) {
   return typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
 }
 
+async function observationJson(response) {
+  const chunks = [];
+  let bytes = 0;
+  if (response.status !== 200) throw new ControlError("Unexpected ownership status");
+  for await (const chunk of response.body) {
+    bytes += chunk.byteLength;
+    if (bytes > 4096) throw new ControlError("Ownership status body too large");
+    chunks.push(chunk);
+  }
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
+}
+
 export async function control({ action, url, productionUrl = process.env.PRODUCTION_WORKER_URL ?? "", stagingUrl = process.env.STAGING_WORKER_URL ?? "", token, actor, expectedEpoch, expectedDeploymentId, releaseFence = false, takeoverAttempts = 34, takeoverRetryDelayMs = 10000, takeoverWindowMs = 330000, statusAttempts = 34, statusRetryDelayMs = 10000, statusWindowMs = 330000 }, send = fetch, wait = sleep, now = Date.now) {
   const origin = checkOrigin(url, productionUrl, stagingUrl);
   if (!token || token.length < 32) throw new ControlError("OWNERSHIP_CONTROL_TOKEN is missing or invalid; stop before deployment");
-  if (!["preflight", "status", "takeover", "fence"].includes(action)) throw new ControlError("Unknown action");
+  if (!["preflight", "status", "observe", "takeover", "fence"].includes(action)) throw new ControlError("Unknown action");
   if (action === "preflight") return { configured: true };
   if (expectedDeploymentId !== undefined && !validDeploymentId(expectedDeploymentId)) {
     throw new ControlError("Expected deployment id is invalid; stop before posting");
@@ -157,7 +169,7 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
     }
     let raw;
     try {
-      raw = await response.json();
+      raw = action === "observe" ? await observationJson(response) : await response.json();
     } catch {
       throw new TransientFailure(`Ownership control invalid response attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`);
     }
@@ -230,6 +242,8 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
     }
     return result;
   };
+  // The protected status workflow binds the returned version after a single GET.
+  if (action === "observe") return read({ method: "GET" });
   if (action === "status") {
     // After a version change the ownership Durable Object keeps running the
     // previous code until Cloudflare's deferred update reaches it (up to

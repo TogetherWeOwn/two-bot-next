@@ -1,12 +1,13 @@
 """Fail closed on empty CycloneDX inventories or missing Cargo.lock packages."""
 
 import argparse
-import json
 import math
 from pathlib import Path
 import re
 import sys
 import tomllib
+
+from script_intake import decode_legacy_json, unique_object as _unique_json_object
 
 
 OVER_CAP = "SBOM input exceeds the byte cap"
@@ -24,12 +25,7 @@ MAX_DEPTH = 100
 
 
 def _reject_duplicate_keys(pairs):
-    seen = set()
-    for key, _ in pairs:
-        if key in seen:
-            raise ValueError(DUP_KEYS)
-        seen.add(key)
-    return dict(pairs)
+    return _unique_json_object(pairs, message=DUP_KEYS)
 
 
 def _reject_constant(value):
@@ -54,7 +50,7 @@ def read_capped_text(path, cap):
 
 def parse_bom_text(text):
     try:
-        return json.loads(
+        return decode_legacy_json(
             text,
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_constant,

@@ -151,6 +151,7 @@ pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
                     color: None,
                     description: Some(text),
                     fields: Vec::new(),
+                    flags: None,
                     footer: None,
                     image: None,
                     kind: "rich".to_owned(),
@@ -168,53 +169,41 @@ pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
     }
 }
 
-/// One immediate ephemeral detail reply for `/help command:name` (or its
-/// unknown-name correction). Short detail stays in content; longer detail
-/// moves to one embed description, truncated with an explicit notice past
-/// Discord's description ceiling. The executor sanitizer stays the final
-/// mention/length backstop.
+/// One immediate branded ephemeral reply for `/help command:name` or its correction.
 #[must_use]
 pub fn help_detail_response(detail: String) -> InteractionResponse {
-    if two_bot_core::message_safety::text_len(&detail)
-        <= two_bot_core::message_safety::CONTENT_LIMIT
-    {
-        return text_response(InteractionReply::new(detail, true));
+    branded_help_detail_response(detail)
+}
+
+/// One immediate branded ephemeral detail or correction reply. Neutralize
+/// mentions before sizing so expansion cannot cut off the truncation notice.
+#[must_use]
+pub(crate) fn branded_help_detail_response(detail: String) -> InteractionResponse {
+    use crate::help_navigation::{help_callback, HELP_SURFACE, HELP_TITLE};
+    use two_bot_core::message_safety::{
+        neutralize_mentions, text_len, truncate, EMBED_DESCRIPTION_LIMIT,
+    };
+
+    let mut description = neutralize_mentions(&detail);
+    if text_len(&description) > EMBED_DESCRIPTION_LIMIT {
+        // Keep the notice from the core Help renderer intact when present.
+        const CORE_NOTICE: &str = "\n…(detail truncated; /help lists every confirmed command.)\n";
+        const DISPLAY_NOTICE: &str = "…(detail truncated for display.)";
+        let (body, notice) = description
+            .strip_suffix(CORE_NOTICE)
+            .map_or((description.as_str(), DISPLAY_NOTICE), |body| {
+                (body, CORE_NOTICE)
+            });
+        description = truncate(body, EMBED_DESCRIPTION_LIMIT - text_len(notice)) + notice;
     }
-    let mut description = detail;
-    if two_bot_core::message_safety::text_len(&description)
-        > two_bot_core::message_safety::EMBED_DESCRIPTION_LIMIT
-    {
-        description = two_bot_core::message_safety::truncate(
-            &description,
-            two_bot_core::message_safety::EMBED_DESCRIPTION_LIMIT - 64,
-        ) + "…(detail truncated for display.)";
-    }
-    InteractionResponse {
-        kind: InteractionResponseType::ChannelMessageWithSource,
-        data: Some(InteractionResponseData {
-            allowed_mentions: Some(Default::default()),
-            embeds: Some(vec![brand_embed(
-                EmbedKind::Default,
-                Embed {
-                    author: None,
-                    color: None,
-                    description: Some(description),
-                    fields: Vec::new(),
-                    footer: None,
-                    image: None,
-                    kind: "rich".to_owned(),
-                    provider: None,
-                    thumbnail: None,
-                    timestamp: None,
-                    title: None,
-                    url: None,
-                    video: None,
-                },
-            )]),
-            flags: Some(MessageFlags::EPHEMERAL),
-            ..Default::default()
-        }),
-    }
+    help_callback(
+        EmbedKind::Default,
+        HELP_TITLE,
+        &description,
+        Vec::new(),
+        crate::brand::brand_footer_for(HELP_SURFACE),
+        None,
+    )
 }
 
 #[must_use]
@@ -679,6 +668,11 @@ impl InteractionRuntime {
     pub fn set_bot_user_id(&self, id: u64) {
         self.bot_user_id
             .store(id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The identity already armed by trusted bootstrap or READY.
+    pub fn known_bot_user_id(&self) -> u64 {
+        self.bot_user_id.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// RESUMED boots without tickets never learn the bot user: resolve it once
@@ -1203,6 +1197,7 @@ fn option_to_twilight(opt: &two_bot_core::commands::CommandOption) -> CommandOpt
         },
         description: opt.description.clone(),
         description_localizations: None,
+        file_types: None,
         kind,
         max_length: opt.max_length.and_then(|m| u16::try_from(m).ok()),
         max_value: opt.max_value.map(CommandOptionValue::Integer),
@@ -1340,7 +1335,7 @@ mod help_response_tests {
     }
 
     #[test]
-    fn short_detail_stays_in_ephemeral_content() {
+    fn short_detail_uses_the_branded_ephemeral_embed() {
         let detail = "/rank — Show your XP, level and server rank.\nUsage: /rank [member]\n";
         let wire =
             serde_json::to_value(help_detail_response(detail.to_owned())).expect("serializes");
@@ -1350,8 +1345,26 @@ mod help_response_tests {
             wire["data"]["allowed_mentions"]["parse"],
             serde_json::json!([])
         );
-        assert_eq!(wire["data"]["content"], detail);
-        assert!(wire["data"]["embeds"].is_null());
+        assert!(wire["data"]["content"].is_null());
+        let embed = &wire["data"]["embeds"][0];
+        assert_eq!(embed["description"], detail);
+        assert_eq!(embed["title"], "Together We Own help");
+        assert_eq!(
+            embed["color"].as_u64(),
+            Some(u64::from(EmbedKind::Default.color()))
+        );
+        assert_eq!(
+            embed["footer"]["text"],
+            crate::brand::brand_footer_for("Help").text
+        );
+        assert_eq!(embed["footer"]["icon_url"], crate::brand::BRAND_ICON_URL);
+        assert!(wire["data"]["components"].is_null());
+        assert_eq!(
+            wire,
+            serde_json::to_value(branded_help_detail_response(detail.to_owned()))
+                .expect("preview serializes"),
+            "the topic callback uses the exact renderer exercised by the preview"
+        );
     }
 
     #[test]
@@ -1408,6 +1421,50 @@ mod help_response_tests {
                 crate::brand::BRAND_ICON_URL
             );
         }
+    }
+
+    #[test]
+    fn detail_notice_survives_mention_neutralization_at_the_limit() {
+        let detail = "@everyone".repeat(EMBED_DESCRIPTION_LIMIT / 9);
+        assert!(text_len(&detail) <= EMBED_DESCRIPTION_LIMIT);
+        let safe =
+            crate::message_safety::interaction_response(&branded_help_detail_response(detail))
+                .expect("sanitized detail");
+        let wire = serde_json::to_value(safe).expect("serializes");
+        let description = wire["data"]["embeds"][0]["description"]
+            .as_str()
+            .expect("description");
+        assert!(text_len(description) <= EMBED_DESCRIPTION_LIMIT);
+        assert!(description.ends_with("…(detail truncated for display.)"));
+        assert!(!description.contains("@everyone"));
+    }
+
+    #[test]
+    fn branded_detail_preserves_the_core_notice_after_mention_expansion() {
+        use two_bot_core::message_safety::neutralize_mentions;
+
+        let notice = "\n…(detail truncated; /help lists every confirmed command.)\n";
+        let detail = CommandDefinition::new("maximum", "Valid wide definition")
+            .examples(vec![
+                "@here ".repeat(50) + &"x".repeat(3640),
+                "y".repeat(200),
+            ])
+            .help_detail_text();
+        assert!(detail.ends_with(notice));
+        assert!(text_len(&detail) <= EMBED_DESCRIPTION_LIMIT);
+        assert!(text_len(&neutralize_mentions(&detail)) > EMBED_DESCRIPTION_LIMIT);
+
+        let safe =
+            crate::message_safety::interaction_response(&branded_help_detail_response(detail))
+                .expect("sanitized detail");
+        let wire = serde_json::to_value(safe).expect("serializes");
+        let description = wire["data"]["embeds"][0]["description"]
+            .as_str()
+            .expect("description");
+        assert!(text_len(description) <= EMBED_DESCRIPTION_LIMIT);
+        assert!(description.ends_with(notice));
+        assert_eq!(description.matches("…(detail trunc").count(), 1);
+        assert!(!description.contains("@here"));
     }
 
     #[test]

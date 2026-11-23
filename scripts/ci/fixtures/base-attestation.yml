@@ -22,7 +22,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            scripts/script_intake.py
           sparse-checkout-cone-mode: false
       - name: Verify checkout and evaluate metadata
         env:

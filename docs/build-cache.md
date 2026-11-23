@@ -72,7 +72,7 @@ foreign, mixed, symlinked or unreadable contents refuse that slot unchanged
 (the next slot is tried). Re-running in the same worktree keeps its warm
 artifacts. A third concurrent invocation exits 75 immediately;
 it does not queue indefinitely, create another target, or fall back to a local
-`target/`. Retain/continue the card rather than evading the limit. A missing pool,
+`target/`. Record the refusal and continue when the prerequisite is met. A missing pool,
 quota receipt, scratch-coverage receipt, low filesystem headroom, bad policy,
 over-budget target/scratch, missing scratch directory, or crash sentinel also
 refuses admission. Do not run direct compiling Cargo commands on the
@@ -155,9 +155,9 @@ external targets. Its success must not clear this gate.** Do not extend candidat
 selection by globbing `/tmp/*target*`, a directory name, or issue terminal status.
 Scratch can contain source/evidence, active runs, shared data or mixed outputs.
 
-Keep the TWO rollout admission restriction until the Operator retains both the
+Keep the TWO rollout admission restriction until the operator retains both the
 pre-policy scratch-coverage receipt and post-policy adoption evidence on the
-**same rollout card**. Collect them in this order:
+**same rollout record**. Collect them in this order:
 
 1. Canonical container-to-host mount/writable-layer mapping, measured backing
    filesystem and allocated-byte accounting for these paths and all discovered
@@ -190,7 +190,7 @@ pre-policy scratch-coverage receipt and post-policy adoption evidence on the
 Only after items 1–3 are verified and retained may the Operator set
 `scratch_coverage_receipt` in the step-3 `policy.json`. The receipt attests that
 pre-policy coverage, not completed adoption; record item 4 as pending, then append
-its actual results on the same card. This permits only the narrow new-pool wrapper
+its actual results on the same record. This permits only the narrow new-pool wrapper
 allowance, not release of the rollout restriction. Item 4 and every step-5 gate
 must pass before release. The wrapper **refuses launch** when the receipt is
 absent/blank, even with a quota receipt. Like `quota_receipt`, this is an attestation
@@ -631,12 +631,11 @@ this mismatch is a finding, not evidence that the host has recovered.
 ### Evidence-first removal handoff
 
 This is a documentation/checklist contract, **not authorization for a live host
-rehearsal or removal**. Code merge is not host deployment. Use the existing
-Paperclip issue documents, native review stages and interactions; no new service,
-cleanup tool, unattended deletion or waiver. DevOps owns future handoff
-preparation, Engineering Lead independently reviews the evidence, and the
-operator alone performs separately authorized host actions. Keep host details
-and readiness packets in the restricted remediation card, not the public PR.
+rehearsal or removal**. A designated maintainer prepares the handoff, an
+independent reviewer checks the evidence, and the operator alone performs
+separately authorized host actions. Keep host details and readiness packets
+in the restricted remediation record outside public PRs and issues. This procedure authorizes no new service,
+cleanup tool, unattended deletion or waiver.
 
 ### Applicability before preparation
 
@@ -655,7 +654,7 @@ and readiness packets in the restricted remediation card, not the public PR.
   A slot holder is not a general hold for legacy or external writers.
 - Primary shared-workspace targets, old shared caches and arbitrary external
   targets are **unsupported by the legacy audit**. An empty audit, terminal
-  cleanup card or absence of Cargo PIDs does not make them eligible. Preserve
+  cleanup task or absence of Cargo PIDs does not make them eligible. Preserve
   them pending a separately reviewed, separately authorized exact-path procedure.
   Never repoint `--worktrees`, fabricate eligibility booleans, widen tool scope
   or use `retain` on a path outside its supported slots.
@@ -667,7 +666,7 @@ bundle missing preparation with removal in an execution confirmation. Preparatio
 is not deletion authority. Missing capability or evidence means **STOP**: retain
 the gap and no executable removal handoff.
 
-Save a revisioned readiness packet as an issue document with retained attachments
+Save a revisioned readiness packet in the restricted record with retained attachments
 where needed. All fields below are required; placeholders are not evidence:
 
 | Packet field | Evidence to retain |
@@ -675,7 +674,7 @@ where needed. All fields below are required; placeholders are not evidence:
 | Binding | Packet revision, handoff owner, preparation time, canonical exact target path and filesystem device/inode identity; container identity, aliases and canonical host/container mount or writable-layer mapping. |
 | Executable and procedure | Reviewed **merged** executable and guard SHA, checkout/identity verification, exact applicable procedure/version and scope; explicit supported-candidate determination, not an empty-audit inference. |
 | Independent provenance | Operator's independently established exact-target `build_output_only` classification and its source evidence; tool filename heuristics cannot mint it. Preserve mixed, unknown or unclassified material. |
-| Control-plane references | Authoritative complete export and capture time covering running, queued and retry runs on all related issues, and every execution/project/shared workspace reference, including terminal cards; attribution source and results. |
+| Control-plane references | Authoritative complete export and capture time covering running, queued and retry runs on all related tasks, and every execution/project/shared workspace reference, including completed tasks; attribution source and results. |
 | Host visibility | Host PID namespace and complete host/container cwd, exe, fd, mmap and cmdline visibility/results, alias/device/inode checks and denied/incomplete scan results. A container-only PID view is insufficient. |
 | Bounded hold | Existing supported hold method, affected writers/admission scope, quiescence proof, owner, maximum duration, start/expiry, release/undo and verification. Prove it covers the exact procedure; no service stop, cancellation or environment/roster edit is implied. |
 | Preflight output | Complete host inventory and applicable audit output, command/procedure identity, start/end times and exit status, plus allocated-byte baseline and protected-path list. Inventory must be at most 60 seconds old both before and after scanning. |
@@ -690,24 +689,21 @@ legacy-removal hold, and this checklist does not authorize changing them.
 
 ### 2. REVIEW — independent evidence gate, then one confirmation
 
-Keep the executor assigned. Request Engineering Lead review of the exact packet
-revision through a native `executionPolicy.stages` review stage; the executor
-must never be its own reviewer. Preserve existing stage IDs when updating a
-policy. Missing, unsupported or ambiguous evidence returns to preparation.
+Keep the executor assigned. A reviewer independent of the executor reviews the
+exact packet revision. Missing, unsupported or ambiguous evidence returns to
+preparation.
 
 Only after that review passes may the handoff owner create **one**
-operator-addressed `Operator step:` execution `request_confirmation` on the
-existing handoff card. Bind its `payload.target` to the issue document's exact
-revision and name the canonical exact target, procedure and merged guard SHA.
-Use the operator's configured user identity, `resolverPolicy: human_only` and
-`continuationPolicy: wake_assignee`; do not substitute a general board response.
-No separate card is needed for each preflight substep.
+confirmation request to the designated human operator in the restricted handoff
+record. Bind it to the exact packet revision, canonical target, procedure and
+merged guard SHA. Verify the response came directly from the designated human
+operator and retain it for the assigned executor.
 
 Acceptance is **neither execution evidence nor a waiver**, and does not supply
 missing normal authorization for host action. Never backfill a packet to imply
 an unobserved preflight occurred. A changed target, procedure or packet revision
-requires renewed independent review and a new exact-target confirmation; withdraw
-or supersede the old request through the existing interaction flow.
+requires renewed independent review and a new exact-target confirmation.
+Withdraw or supersede the old request in the handoff record.
 
 ### 3. EXECUTE — separate authorization and fresh final evidence
 
@@ -769,11 +765,11 @@ Fully supported fictional case: `/HOST/EXAMPLE/worktrees/closed-fixture/target`
 is an immediate ignored, untracked, nonsymlink worktree target with independently
 attested build-output-only provenance. Complete authoritative rows show terminal
 attribution, no live/queued/retry runs and no execution/project/shared references;
-complete host/container process checks are negative. DevOps retains packet R1,
+complete host/container process checks are negative. The maintainer retains packet R1,
 including mapped identity, merged guard SHA, applicable approved procedure,
 allocated-byte baseline, bounded hold plan and a fresh preparation audit. The
-sample hold is released before Engineering Lead independently reviews R1 through
-the native stage. Only then is one operator-addressed confirmation for R1 and
+sample hold is released before independent review of R1 begins.
+Only then is one operator-addressed confirmation for R1 and
 that exact target accepted; separate normal execution authorization is recorded.
 
 Review finishes minutes later: **R1's sample is now stale and its hold released**.
@@ -793,7 +789,7 @@ example; it is not evidence of a real removal.
 
 The evidence gates above precede any separately authorized removal in this
 rollout; they do not expand provisioning, generator-guard or slot-recovery scope.
-Keep the existing rollout receipts on the same remediation/handoff card.
+Keep the existing rollout receipts in the same remediation record.
 
 1. Record `findmnt -T /home`, `findmnt -T <host TWO worktrees>`, `df -B1` and
    `statvfs` user-available bytes and the explicit container-to-host mapping.
@@ -856,7 +852,7 @@ Keep the existing rollout receipts on the same remediation/handoff card.
    observation stops further invocations and leaves the release gate unresolved.
 5. Release the rollout admission restriction only after the guard, quota, monitor **and scratch
    coverage** are verified. Attach quota/audit/monitor/adoption/scratch receipts to
-   the same Operator card. Admission tests before final policy use disposable
+   the same operator rollout record. Admission tests before final policy use disposable
    offline fixture pools; never put a synthetic receipt in the real pool.
 
 Rollback: hold new TWO compilation, let active invocations finish (do not kill

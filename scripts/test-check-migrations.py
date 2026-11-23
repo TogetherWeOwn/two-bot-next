@@ -200,6 +200,11 @@ class MigrationTests(unittest.TestCase):
             with self.subTest(contents=contents), self.assertRaisesRegex(checker.MigrationError, "duplicate JSON key"):
                 checker.read_lock(contents)
 
+    def test_duplicate_lock_keeps_the_decoded_member_diagnostic(self):
+        contents = r'{"version":1,"migrations":{},"\u0076ersion":1}'
+        with self.assertRaisesRegex(checker.MigrationError, "^migrations.lock: duplicate JSON key 'version'$"):
+            checker.read_lock(contents)
+
     def test_symlink_migration_fails(self):
         (self.root / FIRST).unlink()
         (self.root / FIRST).symlink_to(self.root / "migrations.lock")

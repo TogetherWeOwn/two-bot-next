@@ -7,7 +7,6 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tower::ServiceExt;
-use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
 use twilight_model::gateway::payload::incoming::{GuildCreate, VoiceStateUpdate};
 use twilight_model::guild::Guild;
@@ -1969,7 +1968,7 @@ fn voice_state(user_id: &str, channel_id: Option<&str>) -> VoiceStateUpdate {
 /// Gateway cache holding a small guild: five voice rooms (one AFK, one
 /// empty), one stage channel and one text channel, with a bot, an unknown
 /// user and a stage speaker among the occupants.
-fn seeded_voice_cache() -> Arc<DefaultInMemoryCache> {
+fn seeded_voice_cache() -> Arc<two_bot_discord::SharedCache> {
     let cache = voice_snapshot::new_shared_cache();
     cache.update(&seeded_guild_event());
     cache
@@ -2028,7 +2027,7 @@ fn connected_gateway() -> Arc<tokio::sync::RwLock<crate::gateway::GatewayState>>
     ))
 }
 
-fn voice_app(pool: sqlx::PgPool, cache: Arc<DefaultInMemoryCache>) -> Router {
+fn voice_app(pool: sqlx::PgPool, cache: Arc<two_bot_discord::SharedCache>) -> Router {
     let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
     router(Arc::new(
         ReceiverState::new(
@@ -2048,7 +2047,7 @@ fn voice_app(pool: sqlx::PgPool, cache: Arc<DefaultInMemoryCache>) -> Router {
 
 /// Same shared cache but the gateway mid-reconnect: `Armed`, never
 /// `Connected`. Stale occupancy must refuse, never serve.
-fn voice_app_not_ready(pool: sqlx::PgPool, cache: Arc<DefaultInMemoryCache>) -> Router {
+fn voice_app_not_ready(pool: sqlx::PgPool, cache: Arc<two_bot_discord::SharedCache>) -> Router {
     let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
     router(Arc::new(
         ReceiverState::new(
@@ -2223,6 +2222,68 @@ async fn voice_snapshot_serves_pipeline_fed_shared_cache() {
 }
 
 #[tokio::test]
+async fn voice_snapshot_refuses_guild_omitted_by_ready_until_full_reseed() {
+    use two_bot_discord::{NoInvites, OrderedLevelingPipeline, PipelineSnapshots};
+
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    let cache = seeded_voice_cache();
+    let pipeline = OrderedLevelingPipeline::with_shared_cache(
+        two_bot_core::MemStore::new(),
+        None,
+        NoInvites,
+        PipelineSnapshots::new(),
+        Arc::clone(&cache),
+    );
+    let app = voice_app(db.pool().clone(), Arc::clone(&cache));
+    let read = || answer(app.clone(), signed_read(&voice_snapshot_payload(), "old"));
+    let guild_id = staging_guild().parse().unwrap();
+    let scalar = || voice_snapshot::read_voice_total(&cache, guild_id);
+    let (status, _, body) = read().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["total_in_voice"], 2);
+    assert_eq!(scalar(), Ok(2));
+
+    let ready = Event::Ready(serde_json::from_value(serde_json::json!({
+        "v": 10, "session_id": "new-session", "resume_gateway_url": "ws://fixture.invalid",
+        "application": {"id": "999", "flags": 0},
+        "user": {"id": "999", "username": "fixture", "discriminator": "0", "mfa_enabled": false},
+        "guilds": []
+    })).unwrap());
+    for event in [
+        ready,
+        Event::VoiceStateUpdate(Box::new(voice_state("41", Some("33")))),
+    ] {
+        pipeline.handle(&event).await.unwrap();
+        let (status, _, body) = read().await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "discord_unavailable");
+        assert_eq!(body["error"]["retryable"], true);
+        assert_eq!(scalar(), Err(SnapshotRefusal::CacheIncomplete));
+    }
+
+    let Event::GuildCreate(mut create) = seeded_guild_event() else {
+        unreachable!()
+    };
+    let GuildCreate::Available(guild) = create.as_mut() else {
+        unreachable!()
+    };
+    // Keep a text channel so this is a complete guild with no voice rooms.
+    guild.channels.retain(|channel| channel.id.get() == 37);
+    guild.afk_channel_id = None;
+    guild.voice_states.clear();
+    pipeline.handle(&Event::GuildCreate(create)).await.unwrap();
+    let (status, _, body) = read().await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["total_in_voice"], 0);
+    assert_eq!(body["result"]["rooms"], serde_json::json!([]));
+    assert_eq!(scalar(), Ok(0));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn voice_snapshot_projects_the_live_cache_shape() {
     let Some(db) = database().await else { return };
     let _flag = INTERNAL_FLAG_LOCK.lock().await;
@@ -2278,7 +2339,7 @@ async fn voice_snapshot_projects_the_live_cache_shape() {
 /// `voice_app` keeps the empty default, which reads every room as `null`.
 fn voice_app_with_clock(
     pool: sqlx::PgPool,
-    cache: Arc<DefaultInMemoryCache>,
+    cache: Arc<two_bot_discord::SharedCache>,
     clock: Arc<voice_snapshot::VoiceOccupancyClock>,
 ) -> Router {
     let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
@@ -4264,6 +4325,31 @@ async fn website_channel_executor_disabled_records_one_refused_sample() {
         "a disabled executor touches neither Discord nor the store: {:?}",
         mock.paths()
     );
+}
+
+#[tokio::test]
+async fn attendance_read_is_not_dispatched_even_with_the_flag_set() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    let api = MockEventApi::start().await;
+    let app = read_app(db.pool().clone(), &api);
+    let raw = r#"{"action":"event.attendance.read","event_key":"fixture:1"}"#;
+    let nonce = nonce();
+    let flag = "TWO_INTERNAL_ALLOW_ATTENDANCE_READ";
+    let previous = std::env::var_os(flag);
+    std::env::set_var(flag, "1");
+    let (status, _, body) = answer(app.clone(), signed_read_with_nonce(raw, "old", &nonce)).await;
+    let (replay, _, replay_body) = answer(app, signed_read_with_nonce(raw, "old", &nonce)).await;
+    match previous {
+        Some(value) => std::env::set_var(flag, value),
+        None => std::env::remove_var(flag),
+    }
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(replay, StatusCode::CONFLICT);
+    assert_eq!(replay_body["error"]["code"], "replayed");
+    assert_eq!(api.count(), 0);
+    db.close().await.unwrap();
 }
 
 #[tokio::test]

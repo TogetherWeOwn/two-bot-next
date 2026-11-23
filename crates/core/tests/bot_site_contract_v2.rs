@@ -3,19 +3,18 @@
 //! Hermetic: `tests/fixtures/bot-site-contract-v2.json` holds golden
 //! request/result pairs per verb; this file only drives the production
 //! validators in `two_bot_core::internal_actions` and checks shapes.
-//! `voice.snapshot` validates against the allowlist, the flag gate and the
-//! field validators. The other five verbs have no implementation yet, so the
-//! test pins `is_implemented == false` and checks shapes only — landing an
-//! implementation must flip the pin and tighten these checks.
+//! The voice verbs exercise the allowlist and flag gates. The remaining verbs
+//! have shape checks until their implementations land.
 
 use std::collections::HashMap;
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use two_bot_core::community_snapshots::RankKey;
 use two_bot_core::internal_actions::{
     assert_allowed, is_implemented, is_request_id, is_snowflake, needs_idempotency_key,
     require_snowflake, require_timestamp, utf16_len, valid_event_key, valid_idempotency_key,
-    validate_idempotency_key, ErrorCode, InternalFlags, MAX_EVENT_NAME_CHARS,
+    validate_idempotency_key, ErrorCode, InternalFlags, VoiceMoveOutcome, VoiceMoveRequest,
+    MAX_EVENT_NAME_CHARS,
 };
 
 const IDEMPOTENCY_REQUIREMENTS: [(&str, bool); 6] = [
@@ -187,7 +186,6 @@ fn snapshot_refusals_require_matching_valid_correlation_ids() {
 fn unimplemented_verbs_stay_closed_until_they_land() {
     let fx = fixture();
     for name in [
-        "voice.move_member",
         "reminder.send",
         "place_offer.send",
         "event.attendance.read",
@@ -215,27 +213,87 @@ fn unimplemented_verbs_stay_closed_until_they_land() {
 fn move_member_request_and_outcomes_match_the_closed_vocab() {
     let fx = fixture();
     let v = verb(&fx, "voice.move_member");
+    use VoiceMoveOutcome::*;
     let request = body(&v["request"]);
-    assert_eq!(request["action"], "voice.move_member");
-    require_snowflake(&request, "discord_id").expect("discord_id snowflake");
-    require_snowflake(&request, "channel_id").expect("channel_id snowflake");
+    let action = "voice.move_member";
+    assert_eq!(request["action"], action);
+    assert_eq!(v["implemented"], true);
+    assert!(is_implemented(action));
+    let gate_flag = v["gate_flag"].as_str().expect("voice move gate flag");
+    assert_eq!(gate_flag, "TWO_INTERNAL_ALLOW_VOICE_MOVE");
+    let stage_flags = |env: &str, value: &str| {
+        InternalFlags::from_map(&HashMap::from([
+            ("TWO_DEPLOY_ENV".to_owned(), env.to_owned()),
+            (gate_flag.to_owned(), value.to_owned()),
+        ]))
+    };
+    for flags in [
+        flags_empty(),
+        flags_with(gate_flag),
+        stage_flags("staging", "01"),
+        stage_flags("production", "1"),
+    ] {
+        assert_eq!(
+            assert_allowed(action, &flags, true, true).unwrap_err().code,
+            ErrorCode::ActionNotAllowed
+        );
+    }
+    assert_allowed(action, &stage_flags("staging", "1"), true, true)
+        .expect("explicit staging gate allows the verb");
+    assert!(!needs_idempotency_key(action));
+    let validated = VoiceMoveRequest::validate(&request).expect("valid self-move payload");
+    assert_eq!(request["discord_id"], validated.discord_id());
+    assert_eq!(request["channel_id"], validated.channel_id());
     let outcomes: Vec<&str> = v["outcomes"]
         .as_array()
         .expect("outcomes array")
         .iter()
         .map(|o| o.as_str().expect("outcome str"))
         .collect();
-    for (name, result) in v["results"].as_object().expect("results object") {
-        let outcome = result["outcome"].as_str().expect("outcome str");
-        assert_eq!(outcome, name, "golden key names its outcome");
-        assert!(outcomes.contains(&outcome), "{outcome} is a closed outcome");
-        if outcome == "moved" {
-            assert!(is_snowflake(
-                result["from_channel_id"]
-                    .as_str()
-                    .expect("moved carries from_channel_id")
-            ));
-        }
+    assert_eq!(
+        outcomes,
+        [
+            Moved,
+            AlreadyInRoom,
+            NotConnected,
+            NotPermitted,
+            RoomFull,
+            RoomGone,
+            BotNotPermitted,
+            DiscordUnavailable,
+            RateLimited
+        ]
+        .map(VoiceMoveOutcome::as_str)
+    );
+    let moved_result = &v["results"][Moved.as_str()];
+    assert_eq!(moved_result["outcome"], Moved.as_str());
+    assert!(is_snowflake(
+        moved_result["from_channel_id"].as_str().unwrap()
+    ));
+    let results = v["results"].as_object().expect("results object");
+    assert_eq!(results.len(), 7);
+    for outcome in [
+        AlreadyInRoom,
+        NotConnected,
+        NotPermitted,
+        RoomFull,
+        RoomGone,
+        BotNotPermitted,
+    ] {
+        let name = outcome.as_str();
+        assert_eq!(results[name], json!({"outcome": name}));
+    }
+    let refusals = v["refusals"].as_object().expect("refusals object");
+    assert_eq!(refusals.len(), 2);
+    for outcome in [DiscordUnavailable, RateLimited] {
+        let name = outcome.as_str();
+        assert_eq!(
+            refusals[name],
+            json!({"status": outcome.status(), "body": {
+                "ok": false, "request_id": "00000000000000000000000001",
+                "error": {"code": name, "message": "request refused", "retryable": true}
+            }})
+        );
     }
 }
 

@@ -1,5 +1,5 @@
 {
-  "comment": "Golden request/result pairs for the bot-site contract v2 (docs/bot-site-contract.md section 2). Test-only values: snowflakes, timestamps, cursors and keys are invented and carry no real member data. Validators exercised here are the ones that exist in crates/core/src/internal_actions.rs today: voice.snapshot is allowlisted and flag-gated; the other five verbs are shape-only JSON until their implementations land, and the test pins is_implemented == false so each landing forces this fixture and its test to tighten.",
+  "comment": "Golden request/result pairs for the bot-site contract v2 (docs/bot-site-contract.md section 2). Snowflakes, timestamps, cursors and keys are synthetic. Voice snapshot and self-move use real validators. The remaining verbs are shape-only until their implementations land.",
   "verbs": {
     "voice.snapshot": {
       "request": {"action": "voice.snapshot"},
@@ -21,7 +21,7 @@
     },
     "voice.move_member": {
       "request": {"action": "voice.move_member", "discord_id": "100000000000000001", "channel_id": "100000000000000011"},
-      "implemented": false,
+      "implemented": true,
       "needs_idempotency_key": false,
       "gate_flag": "TWO_INTERNAL_ALLOW_VOICE_MOVE",
       "outcomes": ["moved", "already_in_room", "not_connected", "not_permitted", "room_full", "room_gone", "bot_not_permitted", "discord_unavailable", "rate_limited"],
@@ -32,9 +32,11 @@
         "not_permitted": {"outcome": "not_permitted"},
         "room_full": {"outcome": "room_full"},
         "room_gone": {"outcome": "room_gone"},
-        "bot_not_permitted": {"outcome": "bot_not_permitted"},
-        "discord_unavailable": {"outcome": "discord_unavailable"},
-        "rate_limited": {"outcome": "rate_limited"}
+        "bot_not_permitted": {"outcome": "bot_not_permitted"}
+      },
+      "refusals": {
+        "discord_unavailable": {"status": 502, "body": {"ok": false, "request_id": "00000000000000000000000001", "error": {"code": "discord_unavailable", "message": "request refused", "retryable": true}}},
+        "rate_limited": {"status": 429, "body": {"ok": false, "request_id": "00000000000000000000000001", "error": {"code": "rate_limited", "message": "request refused", "retryable": true}}}
       }
     },
     "reminder.send": {

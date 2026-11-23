@@ -119,7 +119,7 @@ fn runtime(pool: PgPool, mock: &MockRest) -> Arc<TicketRuntime> {
 
 fn open_button() -> Interaction {
     serde_json::from_value(json!({
-        "application_id":"400", "authorizing_integration_owners":{"0":"100"},
+        "application_id":"400", "attachment_size_limit":10485760, "authorizing_integration_owners":{"0":"100"},
         "id":"800", "token":"receipt-interaction-token-sentinel", "type":3, "version":1,
         "guild_id":"100", "channel":{"id":"700","type":0,"name":"tickets","permissions":"0"},
         "data":{"custom_id":"two:tickets:open","component_type":2},

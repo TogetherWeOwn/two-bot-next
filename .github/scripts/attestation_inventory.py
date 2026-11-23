@@ -17,6 +17,7 @@ SELF_GATE_PATHS = frozenset({
     "scripts/ci/test_base_attestation_gate.py",
     ".github/scripts/attestation_inventory.py",
     ".github/scripts/attestation_transport.py",
+    "scripts/script_intake.py",
     "scripts/ci/test_attestation_transport.py",
     "scripts/ci/test_attestation_inventory.py",
     "scripts/ci/test_attestation_snapshot.py",

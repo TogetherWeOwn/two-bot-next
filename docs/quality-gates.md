@@ -7,6 +7,14 @@ legs, the `coverage-shard` matrix runs them alongside per-shard disposable
 Postgres services, and `patch-coverage` merges and gates — rather than the
 lint-only `check` lane.
 
+- Python intake (HARD) runs in `check` on PRs, merge-queue runs and pushes.
+  It compares stdlib intake calls in `scripts/` and `.github/scripts/`
+  against the checked-out base. Test files are exempt. It caps direct calls,
+  imports and other references separately for each API and file, carrying
+  allowances across file renames. Refactors and argument edits keep existing
+  allowances. New uses must call `scripts/script_intake.py`. An uninspectable
+  changed script fails the gate.
+
 - Patch coverage (HARD): `cargo llvm-cov --workspace --lib --bins --tests
   --features two-bot-core/db -- --include-ignored` plus
   `scripts/ci/check-patch-coverage.py` requires 80% line coverage over the
@@ -105,6 +113,48 @@ lint-only `check` lane.
   and a row in the `CONSTRAINTS.md` Exceptions table. `#[expect(...)]` and
   `cfg_attr(..., allow/expect/ignore)` count as waivers. The
   guard reads that table from the base branch, so a PR cannot exempt itself.
+
+## Changed-line mutation testing
+
+The Rust lane runs in WARN on GitHub Actions pull-request heads. It checks
+the existing job selector and uses the merge-base diff. Pure deletions and
+renames add no candidates. Pinned `cargo mutants --in-diff` discovers edits
+in `src/` and `crates/*/src/`. The lane runs edits contained in added lines.
+It first verifies the unmutated baseline. Then it runs the affected package's
+non-ignored Cargo tests serially with all features and disposable Postgres.
+Unviable edits are unsupported. Timeouts, excess work and incomplete reports
+are infrastructure errors. Receipts distinguish outcomes without publishing
+mutant source or test output. The small fixture covers killed and surviving
+mutants, a failing baseline, and scope. Review exact-head fixture and
+representative PR receipts before making the check required.
+
+The Python lane also runs in WARN. It uses the same merge-base diff for
+`scripts/` source, and a pinned Python runtime to mutate comparisons,
+boolean expressions and arithmetic on added lines. For each source file
+with an explicit offline unittest binding, it runs that suite against a
+disposable checkout and then reruns it for each candidate. Files without
+an offline binding, edits without a supported operator and suites that
+execute zero tests are reported as unsupported. The Actions fixture also
+checks that an unchanged operator stays outside the sample.
+
+The Worker lane also runs in WARN for added TypeScript lines under
+`wrangler/src/`. The locked Babel TypeScript parser locates comparison,
+standalone logical, arithmetic and boolean edits. It excludes chained
+logical operators to preserve grouping. The lane uses the Worker Node test
+entry point with a counts-only reporter in a disposable snapshot. The
+reporter excludes file-only passes, and cancelled tests give an infrastructure
+verdict. The fixture covers an empty test
+file along with strong, weak and failing assertions. Unsupported edits and
+failed measurements have their own verdicts.
+The Worker suite has four minutes per execution and the lane records partial
+results with an infrastructure error if it reaches its 22-minute budget.
+
+Before making the lane required, collect exact-head WARN receipts for
+representative PRs in all three languages. Check that real suites run,
+database-backed Rust coverage is accounted for, and the engine jobs complete
+within their budgets. The required check must use reviewed gate policy and
+fail closed on missing or incomplete measurements. Fixture coverage of the
+HARD exit codes is one part of that evidence.
 
 ## Scanner dependency triage (review by 2026-11-16)
 
