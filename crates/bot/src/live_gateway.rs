@@ -1,6 +1,6 @@
-//! Ordered, dormant gateway intake for realtime voice and scheduled-event deltas.
+//! Ordered, dormant gateway intake for realtime deltas.
 
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -11,7 +11,7 @@ use twilight_model::{
 };
 use two_bot_core::{duplicate_keys::reject_duplicate_keys, realtime_wire as wire};
 use two_bot_discord::{realtime_baseline_join::BaselineJoin, realtime_gateway, realtime_roster};
-use wire::{Change, ChannelKind, Operation, WireTime};
+use wire::{Change, ChannelKind, Operation, OverwriteKind, WireTime};
 
 use crate::live_delivery::{self, Delivery};
 
@@ -39,12 +39,18 @@ struct Intake {
     sender: live_delivery::Sender<QueuedDelta>,
 }
 
+/// Keep the references the hub will validate after each delta. The hub also
+/// applies the channel, member and role removal cascades below.
 struct BaselineFence {
-    members: HashSet<wire::Id>,
-    rooms: HashSet<wire::Id>,
-    events: HashSet<wire::Id>,
+    guild: wire::Guild,
+    channels: Rows<wire::Channel>,
+    roles: Rows<wire::Role>,
+    members: Rows<wire::Member>,
+    events: Rows<Option<wire::Id>>,
     lifetime: watch::Sender<()>,
 }
+
+type Rows<T> = HashMap<wire::Id, T>;
 
 #[derive(Deserialize)]
 struct Dispatch<'a> {
@@ -172,16 +178,15 @@ impl Intake {
             _ if self.pending_until.is_some() => {
                 if let Some(topics) = self.join.observe(raw, at).map_err(|_| ())? {
                     self.active = Some(BaselineFence {
-                        members: topics.members.into_iter().map(|row| row.user_id).collect(),
-                        rooms: topics
-                            .channels
+                        guild: topics.guild,
+                        channels: index(topics.channels, |row| row.id),
+                        roles: index(topics.roles, |row| row.id),
+                        members: index(topics.members, |row| row.user_id),
+                        events: topics
+                            .events
                             .into_iter()
-                            .filter(|row| {
-                                matches!(row.kind, ChannelKind::Voice | ChannelKind::Stage)
-                            })
-                            .map(|row| row.id)
+                            .map(|row| (row.id, row.channel_id))
                             .collect(),
-                        events: topics.events.into_iter().map(|row| row.id).collect(),
                         lifetime: watch::channel(()).0,
                     });
                     self.pending_until = None;
@@ -215,54 +220,158 @@ impl Intake {
         let payload = body.ok_or(())?.get();
         reject_duplicate_keys(payload.as_bytes()).map_err(|_| ())?;
         let operation = match kind {
-            "VOICE_STATE_UPDATE" => {
-                realtime_gateway::project(self.guild, kind, &object(payload)?).map_err(|_| ())?
+            "CHANNEL_CREATE" | "CHANNEL_UPDATE" | "CHANNEL_DELETE" => {
+                realtime_gateway::project_live_channel(
+                    kind,
+                    &object(payload)?,
+                    Some(&active.channels),
+                )
+                .map_err(|_| ())?
+            }
+            "GUILD_MEMBER_UPDATE" => Some(
+                realtime_roster::project_member_update(&object(payload)?, |id| {
+                    active.members.get(&id)
+                })
+                .map_err(|_| ())?,
+            ),
+            "GUILD_MEMBER_ADD" | "GUILD_MEMBER_REMOVE" => {
+                realtime_roster::project(self.guild, raw).map_err(|_| ())?
             }
             "GUILD_SCHEDULED_EVENT_CREATE"
             | "GUILD_SCHEDULED_EVENT_UPDATE"
             | "GUILD_SCHEDULED_EVENT_DELETE" => {
                 realtime_roster::project_scheduled_event(self.guild, raw).map_err(|_| ())?
             }
-            _ => return Err(()),
+            _ => realtime_gateway::project(self.guild, kind, &object(payload)?).map_err(|_| ())?,
         };
-        let operation = operation.ok_or(())?;
-        // Any later encoding error retires the entire generation.
-        active.apply(&operation)?;
+        let Some(operation) = operation else {
+            return Ok(());
+        };
+        let guild = wire::Id(self.guild.into_nonzero());
+        let seq = self.seq.checked_add(1).ok_or(())?;
+        let body = wire::encode_delta(guild, seq, at, std::slice::from_ref(&operation)).ok_or(())?;
+        active.apply(guild, operation)?;
+        self.seq = seq;
         let generation = active.lifetime.subscribe();
-        self.seq = self.seq.checked_add(1).ok_or(())?;
-        let body = wire::encode_delta(
-            wire::Id(self.guild.into_nonzero()),
-            self.seq,
-            at,
-            &[operation],
-        )
-        .ok_or(())?;
         self.sender.offer(QueuedDelta { body, generation });
         Ok(())
     }
 }
 
 impl BaselineFence {
-    fn apply(&mut self, operation: &Operation) -> Result<(), ()> {
+    fn apply(&mut self, guild: wire::Id, operation: Operation) -> Result<(), ()> {
         match operation {
-            Operation::Voice(Change::Upsert { id, value })
-                if self.members.contains(id) && self.rooms.contains(&value.channel_id) => {}
-            Operation::Voice(Change::Remove { id }) if self.members.contains(id) => {}
-            Operation::Events(Change::Upsert { id, value }) => {
-                if value.channel_id.is_some_and(|id| !self.rooms.contains(&id))
-                    || (self.events.len() == wire::MAX_SNAPSHOT_EVENTS && !self.events.contains(id))
+            Operation::Guild(Change::Upsert { value, .. })
+                if self.members.contains_key(&value.owner_id)
+                    && value
+                        .afk_channel_id
+                        .is_none_or(|id| self.kind(id) == Some(ChannelKind::Voice)) =>
+            {
+                self.guild = value;
+            }
+            Operation::Channels(Change::Upsert { id, value }) => self.upsert_channel(id, value)?,
+            Operation::Channels(Change::Remove { id }) => {
+                if self.guild.afk_channel_id == Some(id)
+                    || self.channels.values().any(|row| row.parent_id == Some(id))
                 {
                     return Err(());
                 }
-                self.events.insert(*id);
+                self.channels.remove(&id);
+                self.events.retain(|_, room| *room != Some(id));
+            }
+            Operation::Roles(Change::Upsert { id, value }) => {
+                insert(&mut self.roles, id, value, wire::MAX_SNAPSHOT_ROLES)?;
+            }
+            Operation::Roles(Change::Remove { id }) => self.remove_role(guild, id)?,
+            Operation::Members(Change::Upsert { id, value }) => {
+                if !value.role_ids.iter().all(|id| self.roles.contains_key(id)) {
+                    return Err(());
+                }
+                insert(&mut self.members, id, value, wire::MAX_SNAPSHOT_MEMBERS)?;
+            }
+            Operation::Members(Change::Remove { id }) if id != self.guild.owner_id => {
+                self.members.remove(&id);
+            }
+            Operation::Voice(Change::Upsert { id, value })
+                if self.members.contains_key(&id) && is_voice_room(self.kind(value.channel_id)) => {
+            }
+            Operation::Voice(Change::Remove { id }) if self.members.contains_key(&id) => {}
+            Operation::Events(Change::Upsert { id, value }) => {
+                if value
+                    .channel_id
+                    .is_some_and(|id| !is_voice_room(self.kind(id)))
+                {
+                    return Err(());
+                }
+                insert(
+                    &mut self.events,
+                    id,
+                    value.channel_id,
+                    wire::MAX_SNAPSHOT_EVENTS,
+                )?;
             }
             Operation::Events(Change::Remove { id }) => {
-                self.events.remove(id);
+                self.events.remove(&id);
             }
             _ => return Err(()),
         }
         Ok(())
     }
+
+    fn kind(&self, id: wire::Id) -> Option<ChannelKind> {
+        self.channels.get(&id).map(|row| row.kind)
+    }
+
+    fn upsert_channel(&mut self, id: wire::Id, row: wire::Channel) -> Result<(), ()> {
+        // A change between tracked kinds can invalidate existing references.
+        if self.kind(id).is_some_and(|previous| previous != row.kind)
+            || row.parent_id.is_some_and(|parent| {
+                matches!(row.kind, ChannelKind::Category)
+                    || !matches!(self.kind(parent), Some(ChannelKind::Category))
+            })
+            || row.overwrites.iter().any(|entry| {
+                entry.kind == OverwriteKind::Role && !self.roles.contains_key(&entry.id)
+            })
+        {
+            return Err(());
+        }
+        insert(&mut self.channels, id, row, wire::MAX_SNAPSHOT_CHANNELS)
+    }
+
+    fn remove_role(&mut self, guild: wire::Id, id: wire::Id) -> Result<(), ()> {
+        // Guessing how to remove a role overwrite can widen access.
+        if id == guild
+            || self.channels.values().any(|row| {
+                row.overwrites
+                    .iter()
+                    .any(|entry| entry.kind == OverwriteKind::Role && entry.id == id)
+            })
+        {
+            return Err(());
+        }
+        if self.roles.remove(&id).is_some() {
+            for member in self.members.values_mut() {
+                member.role_ids.retain(|role| *role != id);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_voice_room(kind: Option<ChannelKind>) -> bool {
+    matches!(kind, Some(ChannelKind::Voice | ChannelKind::Stage))
+}
+
+fn index<T>(rows: Vec<T>, key: impl Fn(&T) -> wire::Id) -> Rows<T> {
+    rows.into_iter().map(|row| (key(&row), row)).collect()
+}
+
+fn insert<T>(rows: &mut Rows<T>, id: wire::Id, row: T, limit: usize) -> Result<(), ()> {
+    if rows.len() == limit && !rows.contains_key(&id) {
+        return Err(());
+    }
+    rows.insert(id, row);
+    Ok(())
 }
 
 fn object<'a, T: Deserialize<'a>>(raw: &'a str) -> Result<T, ()> {

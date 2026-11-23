@@ -1,5 +1,7 @@
 //! Project allowlisted gateway events into realtime v1 operations. No I/O.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use twilight_model::{
@@ -12,6 +14,8 @@ use twilight_model::{
 };
 use two_bot_core::realtime_wire as wire;
 use wire::{Change, Operation};
+
+use crate::realtime_member_baseline::Object;
 
 pub mod baseline;
 
@@ -47,7 +51,7 @@ pub fn project(
     // Twilight also maps omitted nullable fields to None; only explicit null clears state.
     let operation = match event_type {
         "CHANNEL_CREATE" | "CHANNEL_UPDATE" | "CHANNEL_DELETE" => {
-            return channel_change(payload, event_type == "CHANNEL_DELETE");
+            return project_live_channel(event_type, payload, None);
         }
         "GUILD_UPDATE" if payload.get("afk_channel_id").is_some() => {
             let guild: GuildUpdate = decode(payload)?;
@@ -101,6 +105,9 @@ fn wire_id<M>(id: Id<M>) -> wire::Id {
 }
 
 fn decode<'a, T: Deserialize<'a>>(payload: &'a Value) -> Result<T, ProjectionError> {
+    if !payload.is_object() {
+        return Err(ProjectionError::InvalidPayload);
+    }
     T::deserialize(payload).map_err(|_| ProjectionError::InvalidPayload)
 }
 
@@ -133,7 +140,7 @@ struct ChannelRow {
     name: Option<String>,
     parent_id: Option<Id<ChannelMarker>>,
     position: Option<i32>,
-    permission_overwrites: Option<Vec<OverwriteRow>>,
+    permission_overwrites: Option<Vec<Object<OverwriteRow>>>,
 }
 
 #[derive(Deserialize)]
@@ -147,20 +154,62 @@ struct OverwriteRow {
     deny: wire::Permissions,
 }
 
-fn channel_change(payload: &Value, delete: bool) -> Result<Option<Operation>, ProjectionError> {
+/// Project a guild-scoped channel dispatch. When a live baseline is supplied,
+/// an update must identify an existing row before it can carry fields forward.
+pub fn project_live_channel(
+    event_type: &str,
+    payload: &Value,
+    channels: Option<&HashMap<wire::Id, wire::Channel>>,
+) -> Result<Option<Operation>, ProjectionError> {
     let channel: ChannelKey = decode(payload)?;
-    let Some(kind) = channel_kind(channel.kind)? else {
-        return Ok(None);
-    };
     let id = wire_id(channel.id);
-    if delete {
+    let previous = channels.and_then(|rows| rows.get(&id));
+    let Some(kind) = channel_kind(channel.kind)? else {
+        return if previous.is_some() {
+            Err(ProjectionError::UnknownChannelKind)
+        } else {
+            Ok(None)
+        };
+    };
+    if event_type == "CHANNEL_DELETE" {
         return Ok(Some(Operation::Channels(Change::Remove { id })));
     }
+    let input = decode(payload)?;
+    let value = if event_type == "CHANNEL_UPDATE" && channels.is_some() {
+        let row = previous
+            .cloned()
+            .ok_or(ProjectionError::IncompleteChannel)?;
+        patch_channel(row, kind, payload, input)?
+    } else {
+        channel_row(id, kind, input)?
+    };
+    Ok(Some(Operation::Channels(Change::Upsert { id, value })))
+}
 
-    Ok(Some(Operation::Channels(Change::Upsert {
-        id,
-        value: channel_row(id, kind, decode(payload)?)?,
-    })))
+fn patch_channel(
+    mut row: wire::Channel,
+    kind: wire::ChannelKind,
+    payload: &Value,
+    input: ChannelRow,
+) -> Result<wire::Channel, ProjectionError> {
+    row.kind = kind;
+    if payload.get("name").is_some() {
+        row.name = input.name.ok_or(ProjectionError::IncompleteChannel)?;
+    }
+    if payload.get("permission_overwrites").is_some() {
+        row.overwrites = channel_overwrites(input.permission_overwrites)?;
+    }
+    if payload.get("parent_id").is_some() {
+        row.parent_id = input.parent_id.map(wire_id);
+    }
+    if payload.get("position").is_some() {
+        row.position = input
+            .position
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| ProjectionError::InvalidPosition)?;
+    }
+    Ok(row)
 }
 
 fn channel_kind(kind: ChannelType) -> Result<Option<wire::ChannelKind>, ProjectionError> {
@@ -182,17 +231,13 @@ fn channel_kind(kind: ChannelType) -> Result<Option<wire::ChannelKind>, Projecti
     }))
 }
 
-fn channel_row(
-    id: wire::Id,
-    kind: wire::ChannelKind,
-    channel: ChannelRow,
-) -> Result<wire::Channel, ProjectionError> {
-    let name = channel.name.ok_or(ProjectionError::IncompleteChannel)?;
-    let overwrites = channel
-        .permission_overwrites
+fn channel_overwrites(
+    overwrites: Option<Vec<Object<OverwriteRow>>>,
+) -> Result<Vec<wire::Overwrite>, ProjectionError> {
+    overwrites
         .ok_or(ProjectionError::IncompleteChannel)?
         .into_iter()
-        .map(|entry| {
+        .map(|Object(entry)| {
             let kind = match entry.kind {
                 PermissionOverwriteType::Role => wire::OverwriteKind::Role,
                 PermissionOverwriteType::Member => wire::OverwriteKind::Member,
@@ -205,7 +250,16 @@ fn channel_row(
                 deny: entry.deny,
             })
         })
-        .collect::<Result<_, _>>()?;
+        .collect()
+}
+
+fn channel_row(
+    id: wire::Id,
+    kind: wire::ChannelKind,
+    channel: ChannelRow,
+) -> Result<wire::Channel, ProjectionError> {
+    let name = channel.name.ok_or(ProjectionError::IncompleteChannel)?;
+    let overwrites = channel_overwrites(channel.permission_overwrites)?;
     let position = channel
         .position
         .map(u32::try_from)

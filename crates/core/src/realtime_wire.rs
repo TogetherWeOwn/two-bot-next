@@ -9,7 +9,10 @@ pub mod recovery;
 mod snapshot;
 mod validation;
 
-pub use snapshot::{encode_snapshot, Topics, MAX_SNAPSHOT_EVENTS};
+pub use snapshot::{
+    encode_snapshot, Topics, MAX_SNAPSHOT_CHANNELS, MAX_SNAPSHOT_EVENTS, MAX_SNAPSHOT_MEMBERS,
+    MAX_SNAPSHOT_ROLES,
+};
 pub use validation::event_text_is_valid;
 
 const DELTA_BYTES: usize = 64 * 1024;
@@ -54,7 +57,7 @@ pub struct Guild {
     pub afk_channel_id: Option<Id>,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelKind {
     Voice,
