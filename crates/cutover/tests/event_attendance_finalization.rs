@@ -70,6 +70,7 @@ async fn unsupported_tags_finalize_by_id_and_preserve_metadata() {
         "ARRAY['a', NULL]::text[]",
         "'{{a,b},{c,d}}'::text[]",
         "'[0:1]={a,b}'::text[]",
+        "'[2:3]={a,b}'::text[]",
         "array_fill('a'::text, ARRAY[129])",
         "ARRAY[repeat('é', 8193)]",
     ] {
@@ -88,6 +89,8 @@ async fn unsupported_tags_finalize_by_id_and_preserve_metadata() {
     assert_eq!(open.len(), cases.len());
     for (row, (id, mut before)) in open.into_iter().zip(cases) {
         assert_eq!(row.id, id);
+        assert_eq!(row.joined_at, Some(JOIN));
+        assert_eq!(row.channel_id.as_deref(), Some("400000000000000001"));
         assert_eq!(row.event_keys, None);
         assert_eq!(
             close_observed(pool, GUILD, LOST, id, left).await.unwrap(),
@@ -126,15 +129,14 @@ async fn locked_close_checks_shape_after_an_earlier_healthy_read() {
     assert_eq!(page[0].joined_at, Some(JOIN));
     assert_eq!(page[0].channel_id.as_deref(), Some("400000000000000001"));
     let mut writer = pool.begin().await.unwrap();
-    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *writer)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE event_voice_sessions SET event_keys = '[0:1]={a,b}'::text[] WHERE id = $1")
-        .bind(id)
-        .execute(&mut *writer)
-        .await
-        .unwrap();
+    let pid: i32 = sqlx::query_scalar(
+        "UPDATE event_voice_sessions SET event_keys = '[0:1]={a,b}'::text[]
+         WHERE id = $1 RETURNING pg_backend_pid()",
+    )
+    .bind(id)
+    .fetch_one(&mut *writer)
+    .await
+    .unwrap();
 
     let left = JOIN + Duration::minutes(20);
     let close_pool = pool.clone();
@@ -160,7 +162,9 @@ async fn locked_close_checks_shape_after_an_earlier_healthy_read() {
         close.await.unwrap().unwrap(),
         CloseOutcome::ClosedWithUnsupportedTags
     );
-    assert_eq!(state(pool, id).await.1.as_deref(), Some("[0:1]={a,b}"));
+    let (closed_at, tags, ..) = state(pool, id).await;
+    assert_eq!(closed_at, Some(left));
+    assert_eq!(tags.as_deref(), Some("[0:1]={a,b}"));
     db.close().await.unwrap();
 }
 
@@ -183,32 +187,30 @@ async fn member_loss_pages_preserve_original_close_and_healthy_neighbor_credit()
     for id in [original, neighbor, foreign] {
         before.push((id, state(pool, id).await));
     }
-    assert_eq!(
-        member_loss_page(pool, GUILD, LOST, 0).await.unwrap(),
-        lost[..32]
-    );
+    let page = member_loss_page(pool, GUILD, LOST, 0).await.unwrap();
+    assert_eq!(page, lost[..32]);
     assert_eq!(open_page(pool, GUILD, LOST, 0).await.unwrap().len(), 32);
-    assert_eq!(
-        member_loss_page(pool, GUILD, LOST, lost[31]).await.unwrap(),
-        lost[32..]
-    );
+    let next = member_loss_page(pool, GUILD, LOST, lost[31]).await.unwrap();
+    assert_eq!(next, lost[32..]);
     assert!(close_after_member_loss(pool, GUILD, LOST, &lost[..9])
         .await
         .is_err());
-    assert_eq!(
-        close_after_member_loss(pool, GUILD, LOST, &[original, neighbor, foreign])
-            .await
-            .unwrap(),
-        0
-    );
+    let skipped = close_after_member_loss(pool, GUILD, LOST, &[original, neighbor, foreign])
+        .await
+        .unwrap();
+    assert_eq!(skipped, 0);
     for batch in lost.chunks(CLOSES_PER_TURN) {
-        assert_eq!(
-            close_after_member_loss(pool, GUILD, LOST, batch)
-                .await
-                .unwrap(),
-            batch.len() as u64
-        );
+        let affected = close_after_member_loss(pool, GUILD, LOST, batch)
+            .await
+            .unwrap();
+        assert_eq!(affected, batch.len() as u64);
     }
+    let remaining = member_loss_page(pool, GUILD, LOST, 0).await.unwrap();
+    assert!(remaining.is_empty());
+    let empty = close_after_member_loss(pool, GUILD, LOST, &[])
+        .await
+        .unwrap();
+    assert_eq!(empty, 0);
     assert_eq!(state(pool, lost[0]).await.0, Some(JOIN));
     for (id, before) in before {
         assert_eq!(state(pool, id).await, before);
