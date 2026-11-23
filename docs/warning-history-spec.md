@@ -1,31 +1,11 @@
 # Private, bounded warning history for staff
 
-## Dormant storage slice
-
-The [guild-bound member moderation store](../crates/core/src/member_moderation_store/warning_history.rs)
-provides five-row metadata pages with
-stable references, UTC timestamps and recorder IDs. Its continuation keys
-stay server-side and are bound to the guild and target. The additive cutover
-migration extends the order from 0110 with a concurrent C-collated tie-breaker
-index. The command has no registry or runtime caller. Migration verification
-uses disposable fixtures.
-
-The next source slice must reuse the [moderation runtime's](../crates/bot/src/member_runtime.rs)
-fresh guild facts
-and actor permission resolver, add the channel checks below, and deny
-self-target reads even for staff. A separate private interaction slice owns
-ephemeral admission and replies, cursor lifetime, session limits and the
-second authority check. Complete WH-G1–WH-G4 before any activation, including
-the AutoMod preview delivery prerequisite and a valid applied history index.
-Before any non-fixture index apply, check compatibility with imported key
-sizes. If a concurrent build is interrupted, inspect the index and ledger
-before retrying through the existing migration procedure.
-
 Status: **Accepted for M2** (owner decision 2026-11-01). Build is tracked on
 linked cards; each build re-checks this spec's `file:line` seams on current
-`main` first. The owner accepted the feature intent. The dormant source slice
-uses the repository's normal review and CI gates. The independent history-read
-gates `WH-G1`–`WH-G4` below remain open for activation, and no
+`main` first. This acceptance is the owner intent review the original proposal
+waits for; its own technical gates, test matrix and kill rule still apply before
+any build PR merges. This acceptance is the recorded intent acceptance; the
+independent history-read gates `WH-G1`–`WH-G4` below remain open, and no
 historical-data grant, command publication or production activation follows
 from it. Where the original proposal text that follows conflicts with this
 decision, this Status wins and the original text is kept as the record.
@@ -34,6 +14,24 @@ editable repository spec; the task document mirrors it. Merge publishes a
 proposal, **not** intent acceptance, a historical-data grant, command
 publication or production activation. No runtime code, schema, retention policy,
 credential, permission, data collection or live operation changes.
+
+## Dormant storage slice
+
+The 2026-11-23 source authorization covers an unwired metadata reader, synthetic
+fixtures and an unregistered index candidate. WH-G1–WH-G4 remain open.
+
+The store returns five entries with guild- and target-bound continuation keys.
+The command has no registry or runtime caller.
+[Warning history store](../crates/core/src/member_moderation_store/warning_history.rs)
+
+The index extends the 0110 order. Fix shared-schema fixture deadlocks before
+registering it. Check combined guild, target and warning key sizes before release.
+[Cutover index candidate](../crates/cutover/migration-candidates/moderation_warning_history_order.sql)
+
+Reuse the existing moderation resolver for fresh guild permissions, add channel
+checks, and deny staff self-targets. A separate slice owns private interactions,
+cursor limits and the final authority check. AutoMod preview delivery gates
+activation. [Moderation runtime](../crates/bot/src/member_runtime.rs)
 
 ## Decision and alternatives
 
@@ -196,8 +194,7 @@ empty, replied-user ping off; no active mention, markdown, URL or code syntax.
   rows between pages. Never claim an exact lifetime total or complete history.
   The missing full-order index is a prerequisite, not repaired by LIMIT: WH-G2
   needs a tie-heavy disposable fixture and EXPLAIN evidence of an ordered bounded
-  plan. Applying the index outside disposable fixtures requires the existing
-  migration and release procedures.
+  plan. No index migration or production query is authorized by this proposal.
 - Only **Next older / Stop**. Cursor is an opaque random component handle with
   server-side binding to version, guild, actor, channel, target, high-water, last
   tuple, page count and expiry. No response bodies/reasons/profiles cached. Handle
@@ -288,7 +285,7 @@ DB acceptance for WH-S01–S16. Reasons remain withheld. No schema migration,
 web service, new role/key/policy, runtime implementation or build/acceptance cards
 are created in this design task.
 
-Before activation, bind recorded host/CEO intent alignment and independent
+Before **any** future build, bind recorded host/CEO intent alignment and independent
 security/frozen-copy disposition to the exact task spec revision, repository commit
 and file SHA-256. Explicitly resolve:
 

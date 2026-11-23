@@ -21,6 +21,12 @@ async fn tie_heavy_history_uses_bounded_index_ranges() {
     .execute(db.pool())
     .await
     .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../cutover/migration-candidates/moderation_warning_history_order.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
     let created_at = OffsetDateTime::parse("2026-10-01T00:00:00Z", &Rfc3339).unwrap();
     let cursor = WarningHistoryCursor {
         guild: "1".into(),
@@ -54,7 +60,7 @@ async fn tie_heavy_history_uses_bounded_index_ranges() {
             scan["Index Name"], "idx_moderation_warnings_history_order",
             "{plan}"
         );
-        assert_eq!(scan["Actual Rows"], 6, "{plan}");
+        assert_eq!(scan["Actual Rows"].as_f64(), Some(6.0), "{plan}");
         assert!(scan.get("Filter").is_none(), "{plan}");
         if cursor.is_some() {
             assert!(
