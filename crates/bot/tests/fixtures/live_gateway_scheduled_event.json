@@ -8,6 +8,7 @@
   "name": "Fixture event",
   "description": null,
   "entity_metadata": null,
+  "recurrence_rule": null,
   "scheduled_start_time": "2026-11-21T15:00:00+02:00",
   "scheduled_end_time": null,
   "creator_id": "31",

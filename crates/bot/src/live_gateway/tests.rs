@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
+use twilight_model::id::marker::ScheduledEventMarker;
 
 const GUILD: GuildId = Id::new(10);
 const AT: WireTime = WireTime(time::OffsetDateTime::UNIX_EPOCH);
@@ -18,7 +19,13 @@ fn event_row(id: u64) -> Value {
 }
 
 fn event(live: &mut LiveGateway, kind: &str, row: Value) {
-    receive(live, &json!({"op": 0, "t": kind, "d": row}).to_string());
+    let frame = json!({"op": 0, "s": 1, "t": kind, "d": row}).to_string();
+    assert!(
+        twilight_gateway::parse(frame.clone(), twilight_gateway::EventTypeFlags::all())
+            .is_ok_and(|parsed| parsed.is_some()),
+        "{kind} fixture must pass the shard parser"
+    );
+    receive(live, &frame);
 }
 
 fn receive(live: &mut LiveGateway, raw: &str) {
@@ -70,12 +77,18 @@ async fn scheduled_events_share_voice_order_and_emit_only_allowlisted_fields() {
     let nonce = begin(&mut live);
     event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(90));
     complete(&mut live, &nonce);
+    let baseline = live
+        .0
+        .as_ref()
+        .and_then(|intake| intake.active.as_ref())
+        .expect("completed baseline");
+    assert_eq!(baseline.events.len(), 1);
+    let joined_event = wire::Id(Id::<ScheduledEventMarker>::new(90).into_nonzero());
+    assert!(baseline.events.contains(&joined_event));
 
-    event(
-        &mut live,
-        "GUILD_SCHEDULED_EVENT_CREATE",
-        json!({"guild_id": "11", "unprojected": "foreign"}),
-    );
+    let mut foreign = event_row(92);
+    foreign["guild_id"] = json!("11");
+    event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", foreign);
     event(
         &mut live,
         "GUILD_SCHEDULED_EVENT_USER_ADD",
@@ -90,11 +103,7 @@ async fn scheduled_events_share_voice_order_and_emit_only_allowlisted_fields() {
     event(&mut live, "GUILD_SCHEDULED_EVENT_UPDATE", active.clone());
     active["status"] = json!(3);
     event(&mut live, "GUILD_SCHEDULED_EVENT_UPDATE", active);
-    event(
-        &mut live,
-        "GUILD_SCHEDULED_EVENT_DELETE",
-        json!({"guild_id": "10", "id": "90"}),
-    );
+    event(&mut live, "GUILD_SCHEDULED_EVENT_DELETE", event_row(90));
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let worker = receiver.run(async move |body| {
@@ -144,11 +153,7 @@ fn scheduled_event_limit_counts_baseline_rows_and_releases_removed_rows() {
     complete(&mut live, &nonce);
 
     event(&mut live, "GUILD_SCHEDULED_EVENT_UPDATE", event_row(1000));
-    event(
-        &mut live,
-        "GUILD_SCHEDULED_EVENT_DELETE",
-        json!({"guild_id": "10", "id": "1000"}),
-    );
+    event(&mut live, "GUILD_SCHEDULED_EVENT_DELETE", event_row(1000));
     event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(1100));
     assert!(live.0.as_ref().expect("intake").active.is_some());
     event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(1101));

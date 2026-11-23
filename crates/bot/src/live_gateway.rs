@@ -226,6 +226,7 @@ impl Intake {
             _ => return Err(()),
         };
         let operation = operation.ok_or(())?;
+        // Any later encoding error retires the entire generation.
         active.apply(&operation)?;
         let generation = active.lifetime.subscribe();
         self.seq = self.seq.checked_add(1).ok_or(())?;
