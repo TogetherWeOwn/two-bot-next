@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{PgPool, Row};
 use two_bot_core::backup::dump::{dump, restore, DbDumpError};
@@ -133,7 +134,13 @@ const FROZEN_V13_TABLES: [&str; 101] = [
     "event_store",
 ];
 
+static CUTOVER_MIGRATIONS: Migrator = sqlx::migrate!("../cutover/migrations");
+
 async fn database() -> Option<TestDatabase> {
+    database_with_migrations(&CUTOVER_MIGRATIONS).await
+}
+
+async fn database_with_migrations(migrations: &Migrator) -> Option<TestDatabase> {
     let url = match std::env::var("TWO_TEST_DATABASE_URL") {
         Ok(url) => url,
         Err(std::env::VarError::NotPresent) => {
@@ -143,7 +150,7 @@ async fn database() -> Option<TestDatabase> {
         Err(error) => panic!("invalid test bootstrap configuration: {error}"),
     };
     Some(
-        TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        TestDatabase::create(&url, migrations)
             .await
             .expect("create and migrate isolated test database"),
     )
@@ -3197,11 +3204,12 @@ async fn v16_archive_restores_instance_windows_and_clears_attendance() {
         .await
         .unwrap();
     let names = vec!["event_instance_windows".to_owned()];
-    let archived = snapshot(pool, &names).await;
+    let mut archived = snapshot(pool, &names).await;
     assert_eq!(archived[&names[0]].rows.len(), 2);
+    remove_recovery_boundary(&mut archived);
 
     // Freeze the released table names independently of the current inventory.
-    // Rows and column metadata still come from the migrated database.
+    // Shape the seeded rows and metadata to match the pre-0475 release.
     let released: BTreeSet<&str> = FROZEN_V13_TABLES
         .iter()
         .copied()
@@ -3224,13 +3232,33 @@ async fn v16_archive_restores_instance_windows_and_clears_attendance() {
     old.buffers
         .retain(|name, _| released.contains(name.as_str()));
     assert_eq!(old.manifest.tables.len(), released.len());
+    let windows = old
+        .manifest
+        .tables
+        .iter_mut()
+        .find(|table| table.name == names[0])
+        .unwrap();
+    let boundary = windows
+        .columns
+        .iter()
+        .position(|name| name == "attendance_recovered_at")
+        .unwrap();
+    windows.columns.remove(boundary);
+    windows.column_types.remove(boundary);
+    for row in old.buffers.get_mut(&names[0]).unwrap() {
+        assert!(row.remove("attendance_recovered_at").is_some());
+    }
     old.manifest.version = 16;
+    old.manifest
+        .cutover_migrations
+        .retain(|version| *version < 480 && *version != 475);
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let path = directory.path("released-v16-populated.ndjson.gz");
     write_archive(&path, &old);
     let inspected = inspect(&path).unwrap();
     assert_eq!(inspected.manifest.version, 16);
     assert_eq!(inspected.manifest.missing_tables(), attendance);
+    assert_archive_omits_recovery_boundary(&inspected);
 
     sqlx::query("DELETE FROM event_instance_windows")
         .execute(pool)
@@ -3238,8 +3266,12 @@ async fn v16_archive_restores_instance_windows_and_clears_attendance() {
         .unwrap();
     assert!(snapshot(pool, &names).await[&names[0]].rows.is_empty());
     forget_moderation_history(pool).await;
+    let started = database_clock(pool).await;
     assert!(restore(pool, &path).await.unwrap().ok);
-    assert_eq!(snapshot(pool, &names).await, archived);
+    assert_recovery_fences(pool, &started).await;
+    let mut restored = snapshot(pool, &names).await;
+    remove_recovery_boundary(&mut restored);
+    assert_eq!(restored, archived);
     assert_newer_tables_cleared(pool, &attendance, 16).await;
     let safe_defaults: bool = sqlx::query_scalar(
         "INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, joined_at)
@@ -3254,6 +3286,135 @@ async fn v16_archive_restores_instance_windows_and_clears_attendance() {
     assert!(
         safe_defaults,
         "restore preserves defaults and the allocator floor"
+    );
+    db.close().await.unwrap();
+}
+
+fn assert_archive_omits_recovery_boundary(archive: &DumpContents) {
+    // Later migrations may be recorded while 0475 is still missing.
+    assert!(!archive.manifest.cutover_migrations.contains(&475));
+    let windows = archive
+        .manifest
+        .tables
+        .iter()
+        .find(|table| table.name == "event_instance_windows")
+        .unwrap();
+    assert!(!windows
+        .columns
+        .iter()
+        .any(|name| name == "attendance_recovered_at"));
+    assert_eq!(windows.columns.len(), windows.column_types.len());
+    let rows = &archive.buffers["event_instance_windows"];
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|row| !row.contains_key("attendance_recovered_at")));
+}
+
+async fn database_clock(pool: &PgPool) -> String {
+    sqlx::query_scalar("SELECT clock_timestamp()::text")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn assert_recovery_fences(pool: &PgPool, started: &str) {
+    let fenced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_instance_windows WHERE attendance_recovered_at >= $1::timestamptz AND attendance_recovered_at <= clock_timestamp()")
+        .bind(started)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        fenced, 2,
+        "both windows receive a fence during the operation"
+    );
+}
+
+fn remove_recovery_boundary(snapshot: &mut Snapshot) {
+    let windows = snapshot.get_mut("event_instance_windows").unwrap();
+    let index = windows
+        .columns
+        .iter()
+        .position(|(name, _)| name == "attendance_recovered_at")
+        .unwrap();
+    windows.columns.remove(index);
+    for row in &mut windows.rows {
+        row.remove(index);
+    }
+}
+
+#[tokio::test]
+async fn pre_0475_v17_archive_and_migration_fence_event_instance_windows() {
+    // Build the pre-0475 schema and ledger so the real v17 writer reads both
+    // from PostgreSQL.
+    let migrations = Migrator::with_migrations(
+        CUTOVER_MIGRATIONS
+            .iter()
+            .filter(|m| m.version != 475)
+            .cloned()
+            .collect(),
+    );
+    let Some(db) = database_with_migrations(&migrations).await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let names: Vec<_> = ["event_instance_windows"]
+        .into_iter()
+        .chain(ATTENDANCE_TABLES)
+        .map(str::to_owned)
+        .collect();
+    let before = snapshot(pool, &names).await;
+    let directory = ArchiveDirectory::new();
+    let path = directory.path("released-v17-before-0475.ndjson.gz");
+    dump(pool, &path).await.unwrap();
+    let old = inspect(&path).unwrap();
+    assert_eq!(old.manifest.version, 17);
+    assert!(old.manifest.cutover_migrations.contains(&480));
+    assert!(old.manifest.missing_tables().is_empty());
+    assert_archive_omits_recovery_boundary(&old);
+    for name in ATTENDANCE_TABLES {
+        assert!(
+            !old.buffers[name].is_empty(),
+            "v17 fixture must populate {name}"
+        );
+    }
+
+    let started = database_clock(pool).await;
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0475_attendance_recovery_boundary.sql"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_recovery_fences(pool, &started).await;
+    let mut after = snapshot(pool, &names).await;
+    remove_recovery_boundary(&mut after);
+    assert_eq!(after, before, "migration preserves all existing evidence");
+    sqlx::query("UPDATE event_instance_windows SET attendance_recovered_at = NULL")
+        .execute(pool)
+        .await
+        .unwrap();
+    let nulls: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_instance_windows WHERE attendance_recovered_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        nulls, 2,
+        "explicit NULL remains available for new instances"
+    );
+
+    forget_moderation_history(pool).await;
+    let started = database_clock(pool).await;
+    assert!(restore(pool, &path).await.unwrap().ok);
+    assert_recovery_fences(pool, &started).await;
+    let mut restored = snapshot(pool, &names).await;
+    remove_recovery_boundary(&mut restored);
+    assert_eq!(
+        restored, before,
+        "restore preserves instance and attendance evidence"
     );
     db.close().await.unwrap();
 }
