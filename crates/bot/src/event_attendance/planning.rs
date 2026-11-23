@@ -1,8 +1,11 @@
 //! Mapped event attendance planning and dormant open admission. No runtime caller.
 
-use std::ops::{AsyncFnOnce, Range};
+use std::{ops::Range, time::Duration};
 
+use sqlx::PgPool;
+use time::OffsetDateTime;
 use two_bot_core::Snowflake;
+use two_bot_cutover::event_attendance::writer::{open_mapped_session, NewAttendanceSession};
 
 const ATTENDANCE_GRACE_MS: i64 = 15 * 60 * 1_000;
 
@@ -116,7 +119,7 @@ pub fn plan_transition(
     TransitionPlan { closes, open }
 }
 
-/// A caller must explicitly request open planning. No runtime flag is read here.
+/// The guild actor must opt in and settle recovery before requesting an open.
 #[derive(Clone, Copy, Default)]
 pub enum OpenCapture {
     #[default]
@@ -124,47 +127,51 @@ pub enum OpenCapture {
     Enabled,
 }
 
-/// Both privacy decisions for the guild and member that own the observation.
-pub struct OpenPrivacy {
-    pub guild_voice_enabled: bool,
-    pub member_opted_out: bool,
+#[derive(Clone, Copy)]
+pub struct VoiceObservation<'a> {
+    pub guild_id: Snowflake,
+    pub member_id: Snowflake,
+    pub previous: Option<Snowflake>,
+    pub current: Option<Snowflake>,
+    pub channel_name: &'a str,
+    pub is_bot: bool,
+    pub afk_channel: Option<Snowflake>,
+    /// Original gateway observation time.
+    pub observed_at: OffsetDateTime,
 }
 
-/// A candidate for the eventual write boundary, not authorization to persist.
-pub struct AdmittedOpen {
-    pub channel_id: Snowflake,
-    pub joined_ms: i64,
-    pub tags: Vec<String>,
-}
+#[derive(Debug, thiserror::Error)]
+#[error("attendance open storage unavailable")]
+pub struct OpenWriteError;
 
 impl OpenCapture {
-    /// Plan only the open side of a transition, using trusted mapped windows.
-    /// Consult privacy only for an eligible join or move. If either check is
-    /// unavailable or fails, the callback must return `None`. The eventual
-    /// writer must still enforce current privacy and lifecycle at persistence.
-    /// This decision does not govern the finalization of existing rows.
-    pub async fn plan_open(
+    /// Admit a fresh guild voice join or move. The caller must have settled
+    /// continuity and any prior closes. Never retry an uncertain write from
+    /// this frame. Storage resolves mappings and privacy for the same scope.
+    pub async fn write_observation(
         self,
-        windows: &[AttendanceWindowMs],
-        previous: Option<Snowflake>,
-        current: Option<Snowflake>,
-        observed_ms: i64,
-        check_privacy: impl AsyncFnOnce() -> Option<OpenPrivacy>,
-    ) -> Option<AdmittedOpen> {
-        if matches!(self, Self::Off) {
-            return None;
+        pool: &PgPool,
+        observation: &VoiceObservation<'_>,
+    ) -> Result<bool, OpenWriteError> {
+        if matches!(self, Self::Off) || observation.previous == observation.current {
+            return Ok(false);
         }
-        let channel_id = current?;
-        let open = plan_transition(windows, &[], previous, current, observed_ms).open?;
-        let privacy = check_privacy().await?;
-        if !privacy.guild_voice_enabled || privacy.member_opted_out {
-            return None;
-        }
-        Some(AdmittedOpen {
+        let Some(channel_id) = observation.current else {
+            return Ok(false);
+        };
+        let new = NewAttendanceSession {
+            guild_id: observation.guild_id,
+            member_id: observation.member_id,
             channel_id,
-            joined_ms: observed_ms,
-            tags: open.tags,
-        })
+            channel_name: observation.channel_name,
+            is_bot: observation.is_bot,
+            afk: observation.afk_channel == Some(channel_id),
+            joined_at: observation.observed_at,
+        };
+        match tokio::time::timeout(Duration::from_secs(1), open_mapped_session(pool, &new)).await {
+            Ok(Ok(opened)) => Ok(opened),
+            Ok(Err(_)) | Err(_) => Err(OpenWriteError),
+        }
     }
 }
 
@@ -188,92 +195,6 @@ mod tests {
             channel_id,
             joined_ms,
             event_keys: vec![key.to_owned()],
-        }
-    }
-
-    #[derive(Default)]
-    struct PrivacyProbe {
-        calls: usize,
-        verdict: Option<OpenPrivacy>,
-    }
-
-    impl PrivacyProbe {
-        fn check(&mut self) -> Option<OpenPrivacy> {
-            self.calls += 1;
-            self.verdict.take()
-        }
-    }
-
-    #[tokio::test]
-    async fn ineligible_opens_skip_privacy_lookup() {
-        let windows = [window("show", 0, 60 * MIN)];
-        let mut probe = PrivacyProbe::default();
-        for (mode, mapped, previous, current, observed_ms) in [
-            (OpenCapture::default(), &windows[..], None, Some(7), 0),
-            (OpenCapture::Enabled, &windows[..], Some(7), Some(7), 0),
-            (OpenCapture::Enabled, &windows[..], Some(7), None, 0),
-            (OpenCapture::Enabled, &[][..], None, Some(7), 0),
-            (OpenCapture::Enabled, &windows[..], None, Some(7), 75 * MIN),
-        ] {
-            let open = mode
-                .plan_open(mapped, previous, current, observed_ms, async || {
-                    probe.check()
-                })
-                .await;
-            assert!(open.is_none());
-            assert_eq!(probe.calls, 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn admitted_open_uses_mapped_tags_and_original_observation() {
-        let observed_ms = 45 * MIN + 123;
-        let windows = [
-            window("late", 30 * MIN, 120 * MIN),
-            window("early", 0, 60 * MIN),
-            window("late", 30 * MIN, 120 * MIN),
-            window("future", 120 * MIN, 180 * MIN),
-        ];
-        let mut probe = PrivacyProbe {
-            verdict: Some(OpenPrivacy {
-                guild_voice_enabled: true,
-                member_opted_out: false,
-            }),
-            ..PrivacyProbe::default()
-        };
-        let open = OpenCapture::Enabled
-            .plan_open(&windows, None, Some(7), observed_ms, async || probe.check())
-            .await
-            .expect("mapped join with confirmed privacy should be admitted");
-        assert_eq!(probe.calls, 1);
-        assert_eq!(open.channel_id, 7);
-        assert_eq!(open.joined_ms, observed_ms);
-        assert_eq!(open.tags, ["early", "late"]);
-    }
-
-    #[tokio::test]
-    async fn privacy_denial_or_unavailability_refuses_new_open() {
-        let windows = [window("show", 0, 60 * MIN)];
-        for verdict in [
-            Some(OpenPrivacy {
-                guild_voice_enabled: false,
-                member_opted_out: false,
-            }),
-            Some(OpenPrivacy {
-                guild_voice_enabled: true,
-                member_opted_out: true,
-            }),
-            None,
-        ] {
-            let mut probe = PrivacyProbe {
-                verdict,
-                ..PrivacyProbe::default()
-            };
-            let open = OpenCapture::Enabled
-                .plan_open(&windows, Some(7), Some(9), 0, async || probe.check())
-                .await;
-            assert_eq!(probe.calls, 1);
-            assert!(open.is_none());
         }
     }
 
