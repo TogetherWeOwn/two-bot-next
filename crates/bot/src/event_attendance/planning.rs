@@ -1,6 +1,6 @@
 //! Mapped event attendance planning and dormant open admission. No runtime caller.
 
-use std::{ops::Range, time::Duration};
+use std::{io, ops::Range, time::Duration};
 
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -140,10 +140,6 @@ pub struct VoiceObservation<'a> {
     pub observed_at: OffsetDateTime,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("attendance open storage unavailable")]
-pub struct OpenWriteError;
-
 impl OpenCapture {
     /// Admit a fresh guild voice join or move. The caller must have settled
     /// continuity and any prior closes. Never retry an uncertain write from
@@ -152,7 +148,7 @@ impl OpenCapture {
         self,
         pool: &PgPool,
         observation: &VoiceObservation<'_>,
-    ) -> Result<bool, OpenWriteError> {
+    ) -> io::Result<bool> {
         if matches!(self, Self::Off) || observation.previous == observation.current {
             return Ok(false);
         }
@@ -170,7 +166,7 @@ impl OpenCapture {
         };
         match tokio::time::timeout(Duration::from_secs(1), open_mapped_session(pool, &new)).await {
             Ok(Ok(opened)) => Ok(opened),
-            Ok(Err(_)) | Err(_) => Err(OpenWriteError),
+            Ok(Err(_)) | Err(_) => Err(io::Error::other("attendance open storage unavailable")),
         }
     }
 }

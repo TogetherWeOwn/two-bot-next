@@ -69,7 +69,7 @@ WITH eligible AS MATERIALIZED (
       AND NOT EXISTS (
           SELECT 1 FROM event_voice_sessions s
           WHERE s.guild_id = $1 AND s.member_id = $2
-            AND (s.left_at IS NULL OR s.joined_at >= $4)
+            AND (s.left_at IS NULL OR s.left_at > $4 OR s.joined_at >= $4)
       )
     ORDER BY k.event_key LIMIT 129 FOR SHARE OF k
 ), captured AS (

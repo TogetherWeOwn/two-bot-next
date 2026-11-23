@@ -2,7 +2,7 @@
 
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
-use two_bot::event_attendance::planning::{OpenCapture, OpenWriteError, VoiceObservation};
+use two_bot::event_attendance::planning::{OpenCapture, VoiceObservation};
 use two_bot_core::internal_action_store::InternalActionStore;
 use two_bot_cutover::{
     db::CutoverDb,
@@ -38,8 +38,8 @@ async fn mapped_gateway_opens_respect_privacy_and_replay() {
     let guild = GUILD.to_string();
     let member = MEMBER.to_string();
     let starts: OffsetDateTime =
-        sqlx::query_scalar("SELECT starts_at FROM event_instance_windows WHERE guild_id = $1")
-            .bind(&guild)
+        sqlx::query_scalar("SELECT starts_at FROM event_instance_windows WHERE event_id = $1")
+            .bind(EVENT)
             .fetch_one(pool)
             .await
             .unwrap();
@@ -54,15 +54,12 @@ async fn mapped_gateway_opens_respect_privacy_and_replay() {
         afk_channel: Some(CHANNEL),
         observed_at: at,
     };
-    assert!(!write(pool, frame).await, "only the other guild is mapped");
+    assert!(!write(pool, frame).await);
     let mappings = InternalActionStore::new(pool.clone());
     for key in ["show", "alias"] {
         mappings.put_event_key(&guild, key, EVENT).await.unwrap();
     }
-    for observed_at in [
-        at - Duration::microseconds(1),
-        starts + Duration::minutes(75),
-    ] {
+    for observed_at in [at - Duration::microseconds(1), at + Duration::seconds(30)] {
         let outside = VoiceObservation {
             observed_at,
             ..frame
@@ -82,11 +79,11 @@ async fn mapped_gateway_opens_respect_privacy_and_replay() {
         .await
         .unwrap();
     assert!(!write(pool, frame).await);
-    let unused: bool =
-        sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM event_attendance_windows)")
-            .fetch_one(pool)
-            .await
-            .unwrap();
+    let history_empty = "SELECT NOT EXISTS (SELECT 1 FROM event_attendance_windows)";
+    let unused: bool = sqlx::query_scalar(history_empty)
+        .fetch_one(pool)
+        .await
+        .unwrap();
     assert!(unused, "refusals must not write historical windows");
     let foreign = VoiceObservation {
         guild_id: OTHER_GUILD,
@@ -125,16 +122,22 @@ async fn mapped_gateway_opens_respect_privacy_and_replay() {
             .unwrap(),
         CloseOutcome::Closed
     );
-    assert!(!write(pool, frame).await, "a closed frame cannot reopen");
+    let mut replay = frame;
+    for observed_at in [at, at + Duration::milliseconds(500)] {
+        replay.observed_at = observed_at;
+        assert!(!write(pool, replay).await, "a closed span cannot reopen");
+    }
     assert!(write(pool, next).await, "a later move can open");
     sqlx::query("ALTER TABLE privacy_opt_outs RENAME TO fixture_privacy_unavailable")
         .execute(pool)
         .await
         .unwrap();
-    assert!(matches!(
-        OpenCapture::Enabled.write_observation(pool, &next).await,
-        Err(OpenWriteError)
-    ));
+    let unavailable = OpenCapture::Enabled
+        .write_observation(pool, &next)
+        .await
+        .unwrap_err();
+    let message = unavailable.to_string();
+    assert_eq!(message, "attendance open storage unavailable");
     let closed_pool = pool.clone();
     db.close().await.unwrap();
     for (mode, previous, current) in [
