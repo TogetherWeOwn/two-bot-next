@@ -484,8 +484,6 @@ async fn seed_staging_state(fx: &Fixture) -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-#[ignore = "requires agent-testdb or the CI service"]
 async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestResult {
     use two_bot_cutover::staging_migrate::MIGRATOR;
 
@@ -1294,7 +1292,10 @@ async fn real_sqlx_runner_cases() -> TestResult {
     assert!(err.contains("incomplete"));
 
     c.close().await?;
-    fx.finish().await
+    fx.finish().await?;
+    // Use a fresh fixture on the same guarded CI route to verify a single
+    // missing migration below the ledger maximum.
+    applies_missing_0475_after_0481_and_reads_back_both_ledgers().await
 }
 
 /// Marker the runner records when the ledger cannot be read after a run.
