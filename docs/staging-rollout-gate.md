@@ -704,8 +704,9 @@ restore mutation. The workflow also owns binding, artifact and runtime acceptanc
 4. After rollout, readiness, error-rate and release checks pass, authenticate
    the protected artifact and set `recovery_pair` to its `UUID@sha256:digest`.
    Dispatch `verified` to check both migration trees and the pinned stopped pair
-   before replacement. Roll forward on a failure before acquisition. Once a
-   window is acquired, rollback can restore the pinned pair within that expiry.
+   before replacement. Unconfirmed acquisition skips rollback. Confirm release
+   or expiry and stopped state before rolling forward. A confirmed grant
+   permits rollback to the pinned pair within its original expiry.
 
 ## Verification boundaries
 
