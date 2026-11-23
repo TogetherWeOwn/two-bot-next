@@ -1009,6 +1009,65 @@ async fn voice_snapshot_delayed_completion_keeps_conservative_attendance_floor()
 }
 
 #[tokio::test]
+async fn first_close_time_tag_respects_persisted_recovery_floor() {
+    use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
+    use two_bot_core::{
+        event_instance_store::{attendance_close_follows_recovery_in, lock_guild},
+        scheduled_events::EventStatus,
+        website_store::{replace_events, upsert_event},
+    };
+
+    let db = TestDb::new().await;
+    let mut event = snapshot_event_fixture(&db, EventStatus::Active).await;
+    let instance = OffsetDateTime::parse(&event.starts_at, &Rfc3339).unwrap();
+    let recovered = "2026-11-03T10:02:00.000Z";
+    let floor = OffsetDateTime::parse(recovered, &Rfc3339).unwrap();
+    let before_floor = floor - Duration::seconds(1);
+    let allows = |occurrence, joined| {
+        let pool = &db.pool;
+        async move {
+            let mut tx = pool.begin().await.unwrap();
+            lock_guild(&mut tx, SNAPSHOT_GUILD).await.unwrap();
+            let eligible = attendance_close_follows_recovery_in(
+                &mut tx,
+                SNAPSHOT_GUILD,
+                SNAPSHOT_EVENT,
+                occurrence,
+                joined,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            eligible
+        }
+    };
+
+    assert!(allows(instance, before_floor).await);
+    replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &[])
+        .await
+        .unwrap();
+    assert!(!allows(instance, floor).await);
+    upsert_event(&db.pool, SNAPSHOT_GUILD, recovered, &event)
+        .await
+        .unwrap();
+    assert!(!allows(instance, before_floor).await);
+    assert!(allows(instance, floor).await);
+    assert!(!allows(instance + Duration::seconds(1), floor).await);
+
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:03:00.000Z", &event)
+        .await
+        .unwrap();
+    assert!(!allows(instance, before_floor).await);
+    assert!(allows(instance, floor).await);
+    event.status = EventStatus::Cancelled;
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:04:00.000Z", &event)
+        .await
+        .unwrap();
+    assert!(!allows(instance, floor).await);
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn voice_snapshot_event_evidence_failure_rolls_back_each_mirror_writer() {
     use two_bot_core::{
         scheduled_events::EventStatus,
