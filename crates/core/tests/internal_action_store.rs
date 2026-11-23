@@ -912,12 +912,24 @@ async fn voice_snapshot_attendance_boundary_moves_only_on_accepted_recovery() {
     replace_events(&db.pool, SNAPSHOT_GUILD, omitted, &[])
         .await
         .unwrap();
-    upsert_event(&db.pool, SNAPSHOT_GUILD, omitted, &event)
+    let stale = "2026-11-03T10:00:30.000Z";
+    for stamp in [stale, omitted] {
+        replace_events(
+            &db.pool,
+            SNAPSHOT_GUILD,
+            stamp,
+            std::slice::from_ref(&event),
+        )
         .await
         .unwrap();
-    assert_attendance_recovery_boundary(&db, "missing", None).await;
+        upsert_event(&db.pool, SNAPSHOT_GUILD, stamp, &event)
+            .await
+            .unwrap();
+        assert_attendance_recovery_boundary(&db, "missing", None).await;
+    }
 
     let recovered = "2026-11-03T10:02:00.000Z";
+    event.status = EventStatus::Scheduled;
     replace_events(
         &db.pool,
         SNAPSHOT_GUILD,
@@ -926,7 +938,8 @@ async fn voice_snapshot_attendance_boundary_moves_only_on_accepted_recovery() {
     )
     .await
     .unwrap();
-    assert_attendance_recovery_boundary(&db, "active", Some(recovered)).await;
+    assert_attendance_recovery_boundary(&db, "scheduled", Some(recovered)).await;
+    event.status = EventStatus::Active;
     upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:03:00.000Z", &event)
         .await
         .unwrap();
@@ -978,10 +991,12 @@ async fn voice_snapshot_delayed_completion_keeps_conservative_attendance_floor()
             .await
             .unwrap();
         }
-        replace_events(&db.pool, SNAPSHOT_GUILD, omitted, &[])
-            .await
-            .unwrap();
-        assert_attendance_recovery_boundary(&db, "missing", prior).await;
+        for stamp in ["2026-11-03T10:01:30.000Z", omitted, omitted] {
+            replace_events(&db.pool, SNAPSHOT_GUILD, stamp, &[])
+                .await
+                .unwrap();
+            assert_attendance_recovery_boundary(&db, "missing", prior).await;
+        }
 
         event.status = EventStatus::Completed;
         event.ends_at = Some(snapshot_time(&db.pool, "-5 minutes").await);
