@@ -684,26 +684,23 @@ a mismatch. Recovery requires a fresh plan and a separate check of the
 predecessor against both ledgers. If none qualifies, use the separately
 authorized baseline transition.
 
-Use `scripts/ci/staging_rollback_compatibility.py` to compare both migration
-trees of each recovery candidate against the verified plan. The protected
-`verified` mode requires this comparison before replacing the predecessor.
+With a verified clean plan, run `scripts/ci/staging_rollback_compatibility.py`
+against the plan, forward and recovery source SHAs to check both migration
+trees byte for byte. This is an operator-run preflight. Automatic rollback
+enforcement requires wiring it into the protected workflow before the first
+restore mutation. The workflow also owns binding, artifact and runtime acceptance.
 
 ### Recover a baseline when the serving pair is incompatible
 
-1. Confirm the approved fingerprint in a protected read-only plan for the
-   intended source. Require successful cutover entries for 0475 and 0481 and
-   store entry 0478. If 0475 is pending, use the separate migration decision
-   and require a fresh clean plan after any authorized apply.
-2. Confirm the predecessor is stopped and its window is released or expired.
-   Dispatch `bootstrap` on current `main`. The plan supplies the fingerprint.
-   After publication, an authenticated GET must prove the exact serving Worker
-   would forward the approved target and enforce it at startup. The gate must
-   pass before takeover or acquisition. Missing proof or a mismatch refuses.
-3. Bootstrap excludes the previous snapshot and deliberately stays red to
-   exclude downstream qualification. After a failure or ambiguous publication,
-   reconcile the actual pair with protected read-only inventory and roll forward.
-   If a window was acquired, confirm release or native expiry and stopped state.
-   Resolve a binding failure through the scoped staging credential path.
+1. Confirm the approved fingerprint and successful cutover 0475/0481 and
+   store 0478 in the protected exact-source plan. If 0475 is pending, require
+   a fresh clean plan after any separately authorized apply.
+2. Confirm the stopped predecessor's window is released or expired. Dispatch
+   `bootstrap` on current `main`. The authenticated GET must prove the exact
+   serving Worker's binding and startup guard before takeover or acquisition.
+3. Bootstrap stays red and excludes the predecessor from rollback. Reconcile
+   ambiguous publication with protected read-only inventory and roll forward.
+   Confirm release or expiry and stopped state after any acquired window.
 4. After rollout, readiness, error-rate and release checks pass, authenticate
    the protected artifact and set `recovery_pair` to its `UUID@sha256:digest`.
    Dispatch `verified` to check both migration trees and the pinned stopped pair

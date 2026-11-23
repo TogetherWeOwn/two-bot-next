@@ -229,7 +229,8 @@ test("authenticated bounded staging ownership GET attests the forwarded target w
   const fingerprint = createHash("sha256")
     .update(JSON.stringify({ branch_id: "fixture_branch", database: "postgres", host })).digest("hex");
   const url = `https://worker.invalid${CONTROL_PATH}?runtime_db_fingerprint=${fingerprint}`;
-  const stage = await harness(t, { ...BOUNDED_STAGING_ENV, DATABASE_URL: databaseUrl });
+  const stage = await harness(t, { ...BOUNDED_STAGING_ENV, DATABASE_URL: databaseUrl,
+    STAGING_RECOVERY_DB_FINGERPRINT: fingerprint });
   const values = structuredClone(stage.values);
   const alarms = [...stage.alarms];
   const destroys = stage.runtime.destroys;
@@ -240,6 +241,7 @@ test("authenticated bounded staging ownership GET attests the forwarded target w
   const state = await response.json();
   assert.deepEqual(state, {
     deploymentId: ID, owner: ACTIVE_OWNER, running: false, runtimeDatabaseFingerprint: fingerprint,
+    runtimeDatabaseStartupGuard: true,
   });
   assert.equal(stage.bot.envVars.DATABASE_URL, databaseUrl);
   assert.deepEqual(stage.values, values);
@@ -293,17 +295,10 @@ test("protected staging refuses missing or different database bindings before gr
   }
 });
 
-test("protected staging attests its effective binding and admits only the checked startup environment", async (t) => {
+test("protected staging admits only the checked startup environment", async (t) => {
   const database = "postgres://fixture.fixture_branch:synthetic@fixture.pg.psdb.cloud/postgres";
   const stage = await harness(t, { ...BOUNDED_STAGING_ENV, DATABASE_URL: database,
     STAGING_RECOVERY_DB_FINGERPRINT: databaseTargets.fingerprint });
-  const response = await stage.bot.fetch(probeRequest(
-    `https://worker.invalid${CONTROL_PATH}?runtime_db_fingerprint=${databaseTargets.fingerprint}`,
-    { headers: { authorization: `Bearer ${CONTROL_TOKEN}` } },
-  ));
-  assert.deepEqual(await response.json(), { deploymentId: ID, owner: ACTIVE_OWNER, running: false,
-    runtimeDatabaseFingerprint: databaseTargets.fingerprint, runtimeDatabaseStartupGuard: true });
-  assert.deepEqual(stage.starts, []);
   assert.equal((await stage.bot.fetch(stagingUseRequest("acquire", stagingWindow()))).status, 200);
   const override = { envVars: { DATABASE_URL: "different" } };
   await assert.rejects(stage.bot.start(override), /staging_start_options_refused/);

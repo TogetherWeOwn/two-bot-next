@@ -196,8 +196,6 @@ jobs:
       - name: Verify the recovery plan and both ledgers
         id: recovery-plan
         if: ${{ inputs.recovery_mode != 'standard' }}
-        env:
-          DEPLOY_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
         run: python3 scripts/staging_bootstrap.py plan
   # Pre-deploy role-drift gate: a database whose grants lag the migrations
   # fails this job (and, through `needs`, the deploy below) instead of
@@ -338,11 +336,6 @@ jobs:
           # head, so a pinned drill labels the commit it actually serves
           # (as deploy-production's guard SHA does for the same reason).
           echo "DEPLOY_SHA=$SOURCE_SHA" >> "$GITHUB_ENV"
-      - name: Require a clean current-main recovery dispatch
-        if: ${{ inputs.recovery_mode != 'standard' }}
-        env:
-          RECOVERY_DRILL: ${{ inputs.inject_gateway_failure || inputs.inject_error_rate_spike || inputs.inject_voice_stall || inputs.inject_unpaired_disconnect }}
-        run: test "$DEPLOY_SHA" = "$GITHUB_SHA" && test "$RECOVERY_DRILL" = false
       # The runner context is not available in job-level env, so derive the
       # per-attempt paths here and export them to every later step.
       - name: Set per-attempt rollout paths

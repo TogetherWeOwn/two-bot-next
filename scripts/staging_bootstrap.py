@@ -1,10 +1,9 @@
 """Prepare and attest protected, no-start staging recovery deployments."""
 
-import json
 import os
 from pathlib import Path
 import sys
-from time import monotonic
+from time import monotonic, sleep
 
 from ci.staging_rollback_compatibility import Refused as IncompatibleSource, verify as verify_migration_sources
 from script_intake import read_with_overflow
@@ -16,6 +15,7 @@ from staging_rollout import Client, GateError, decode, mapping, require, save
 from worker_container_rollback import SHA, VERSION_ID, deployments, version_sha
 
 PIN = "STAGING_RECOVERY_DB_FINGERPRINT"
+DRILLS = ("inject_gateway_failure", "inject_error_rate_spike", "inject_voice_stall", "inject_unpaired_disconnect")
 
 
 def read_json(path, limit=MAX_OWNER):
@@ -29,18 +29,31 @@ def verified_plan(plan, source):
     proof = plan_projection(plan)
     require(proof["source_sha"] == source, "recovery_plan_source_mismatch")
     require(any(row["version"] == 475 for row in plan["ledger_before"]), "recovery_plan_missing_0475")
-    return {**proof, "cutover_0475_applied": True}
+    return proof
 
 
 def pin_config(config, fingerprint):
-    tables = [mapping(config.get("vars", {}))]
-    environments = mapping(config.get("env"))
-    tables.extend(mapping(mapping(env).get("vars", {})) for env in environments.values())
-    require(all(PIN not in variables for variables in tables), "recovery_pin_already_configured")
-    staging = mapping(mapping(environments.get("staging")).get("vars"))
+    staging = mapping(mapping(mapping(config.get("env")).get("staging")).get("vars"))
+    require(PIN not in staging, "recovery_pin_already_configured")
     require(staging.get("TWO_DEPLOY_ENV") == "staging" and staging.get("STAGING_RUNTIME_POLICY") == "bounded",
             "recovery_requires_bounded_staging")
     staging[PIN] = fingerprint
+
+
+def read_after_update(read, version, fingerprint, wait=sleep):
+    # Wrangler may retain the previous Durable Object code for 300 seconds.
+    deadline = monotonic() + 330
+    while True:
+        try:
+            state = mapping(read(fingerprint))
+            observed = state.get("deploymentId")
+            if observed == version or not matches(VERSION_ID, observed) or state.get("running") is not False:
+                return state
+        except GateError as error:
+            if str(error) != "ownership_deployment_mismatch":
+                raise
+        require(monotonic() + 10 < deadline, "ownership_propagation_timeout")
+        wait(10)
 
 
 def attest(client, read, version, source, fingerprint=None, *, active_owner=False):
@@ -87,28 +100,31 @@ def prepare(mode, root, repo, client, account, read, source, fingerprint, expect
 
 def main(argv, env):
     try:
-        source = env.get("DEPLOY_SHA")
-        require(matches(SHA, source) and source == env.get("GITHUB_SHA"), "recovery_requires_current_main")
         if argv == ["plan"]:
-            proof = verified_plan(read_json(Path("staging-schema-gate-manifest.json"), MAX_PLAN), source)
+            inputs = mapping(read_json(Path(env["GITHUB_EVENT_PATH"]), MAX_PLAN).get("inputs"))
+            require(all(inputs.get(name, "false") == "false" for name in DRILLS), "recovery_drill_refused")
+            proof = verified_plan(read_json(Path("staging-schema-gate-manifest.json"), MAX_PLAN), env["GITHUB_SHA"])
             with Path(env["GITHUB_OUTPUT"]).open("a") as out:
                 out.write(f"fingerprint={proof['target_fingerprint']}\n")
-            print(json.dumps(proof, sort_keys=True))
             return 0
+        source = env.get("DEPLOY_SHA")
+        require(matches(SHA, source) and source == env.get("GITHUB_SHA"), "recovery_requires_current_main")
         mode, fingerprint = env.get("RECOVERY_MODE"), env.get("RECOVERY_FINGERPRINT")
         require(mode in ("bootstrap", "verified") and matches(HEX64, fingerprint), "recovery_plan_unavailable")
         token, account = env.get("OWNERSHIP_CONTROL_TOKEN", ""), env.get("CLOUDFLARE_ACCOUNT_ID")
         require(env.get("STAGING_WORKER_URL") in (ORIGIN, ORIGIN + "/") and 32 <= len(token) <= 4096,
                 "recovery_control_unavailable")
-        client = Client(account, env.get("CLOUDFLARE_API_TOKEN"), deadline=monotonic() + 95)
+        client = Client(account, env.get("CLOUDFLARE_API_TOKEN"), deadline=monotonic() + 370)
         root = Path(env["ROLLOUT_DIR"])
         if argv == ["prepare"]:
-            prepare(mode, root, ".", client, account, lambda expected: read_ownership(token, expected),
+            prepare(mode, root, "..", client, account, lambda expected: read_ownership(token, expected),
                     source, fingerprint, env.get("RECOVERY_PAIR", ""))
         else:
             require(argv == ["verify"], "recovery_operation_invalid")
             version = read_json(root / "receipt.json").get("worker_version")
-            attest(client, lambda expected: read_ownership(token, expected), version, source, fingerprint)
+            def read(expected):
+                return read_after_update(lambda pin: read_ownership(token, pin, deferred=True), version, expected)
+            attest(client, read, version, source, fingerprint)
             proof = {"worker_version": version, "source_sha": source, "target_fingerprint": fingerprint,
                      "running": False, "startup_guard": True}
             save(root / "staging-runtime-binding.json", proof)
