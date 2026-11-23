@@ -684,6 +684,11 @@ a mismatch. Recovery requires a fresh plan and a separate check of the
 predecessor against both ledgers. If none qualifies, use the separately
 authorized baseline transition.
 
+With a verified clean plan, run `scripts/ci/staging_rollback_compatibility.py`
+against the plan, forward and recovery source SHAs to check both migration
+trees byte for byte. Keep binding, artifact and runtime acceptance in the
+protected staging workflow.
+
 ## Verification boundaries
 
 Offline standard-library fixtures exercise selection, schema/error handling,
