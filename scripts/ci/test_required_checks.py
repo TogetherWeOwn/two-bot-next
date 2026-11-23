@@ -207,6 +207,19 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertIn("nextest", agg["needs"])
         self.assertIn("NEXTEST_RESULT", "\n".join(step.get("run", "") for step in agg["steps"]))
 
+    def test_db_compatibility_is_a_read_only_pr_gate(self):
+        jobs = self.workflows["check.yml"]["jobs"]
+        job = jobs["db-compatibility"]
+        self.assertEqual(job["if"], "github.event_name == 'pull_request' && needs.job-inputs.outputs.db-compat != 'false'")
+        self.assertEqual(job["permissions"], {"contents": "read"})
+        self.assertNotIn("environment", job)
+        self.assertNotIn("ports", job["services"]["agent-testdb"])
+        self.assertNotIn("secrets.", str(job))
+        checkout = job["steps"][0]["with"]
+        self.assertEqual(checkout["ref"], "${{ github.event.pull_request.head.sha }}")
+        self.assertEqual(checkout["persist-credentials"], "false")
+        self.assertEqual(self.run_aggregator("ci-ok", {"db-compatibility": "skipped"}, selected=""), 1)
+
     def aggregator(self, name):
         job = self.workflows["check.yml"]["jobs"][name]
         step = next(step for step in job["steps"] if "python3 -" in step.get("run", ""))
@@ -269,7 +282,7 @@ class RequiredChecksReportTests(unittest.TestCase):
         gated = {"rust-tests", "coverage-plan", "coverage-shard", "patch-coverage",
                  "ignored-db-stores", "ignored-db-runtime", "self-role-store",
                  "community-db", "feeds-db", "tickets-postgres", "moderation-db",
-                 "parity-docs", "supply-chain", "fuzz-compile", "nextest"}
+                 "parity-docs", "supply-chain", "fuzz-compile", "nextest", "db-compatibility"}
         for name in AGGREGATORS:
             with self.subTest(aggregator=name):
                 skipped = {job: "skipped" for job in gated}

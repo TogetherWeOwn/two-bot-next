@@ -77,6 +77,7 @@ SUPPLY = "supply"
 DOCS = "docs"
 # Live voice synthetic offline suite (not a CI job; never part of ALL_JOBS).
 VOICE = "voice"
+DB_COMPAT = "db-compat"
 ALL_JOBS = frozenset({RUST, WORKER, PARITY, SUPPLY})
 NO_JOBS = frozenset()
 
@@ -400,6 +401,24 @@ def voice_selected(changed, deleted=()):
     return False
 
 
+def db_compat_selected(paths):
+    """Select schema inputs and changes to the compatibility proof itself."""
+    for path in paths:
+        parts = Path(path).parts
+        if (path.startswith(("sql/", "scripts/ci/db_compatibility", "scripts/ci/fixtures/db_compatibility_"))
+                or {"migrations", "sql"}.intersection(parts[:-1])
+                or path in {"migrations.lock", ".github/workflows/check.yml",
+                            "scripts/job-inputs.py", "crates/core/src/database_roles.rs",
+                            "crates/core/src/database_tls.rs", "crates/core/src/database_url.rs",
+                            "crates/core/src/scheduled_store.rs", "crates/core/src/website_store.rs",
+                            "crates/cutover/src/raid_tools.rs",
+                            "crates/cutover/src/db.rs", "crates/cutover/src/staging_migrate.rs",
+                            "crates/store/src/migrations.rs", "crates/store/src/pool.rs",
+                            "crates/bot/src/database_roles_cli.rs", "crates/store/src/web.rs"}):
+            return True
+    return False
+
+
 def selection(changed, deleted=()):
     """Map of job -> bool for changed repo-relative paths.
 
@@ -430,13 +449,13 @@ def git_diff_names(base_ref, head_ref, root=ROOT, diff_filter=None):
     rename like ``src/x.rs`` -> ``docs/y.md`` would classify as a docs-only
     change while Rust code was deleted.
     """
-    command = ["git", "-C", str(root), "diff", "--name-only", "--no-renames"]
+    command = ["git", "-C", str(root), "diff", "--name-only", "--no-renames", "-z"]
     if diff_filter is not None:
         command.append(f"--diff-filter={diff_filter}")
     command.append(f"{base_ref}..{head_ref}")
     try:
         output = subprocess.run(
-            command, capture_output=True, text=True, check=True,
+            command, capture_output=True, text=True, errors="surrogateescape", check=True,
             timeout=GIT_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as error:
         raise JobInputsError(
@@ -448,7 +467,7 @@ def git_diff_names(base_ref, head_ref, root=ROOT, diff_filter=None):
             f"job-inputs: git diff spawn failed ({error}); "
             "next: re-run the selector on a runner with git "
             "installed") from error
-    return [line for line in output.stdout.splitlines() if line.strip()]
+    return [path for path in output.stdout.split("\0") if path]
 
 
 def changed_files(base_ref, head_ref, root=ROOT):
@@ -460,11 +479,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-ref", required=True)
     parser.add_argument("--head-ref", required=True)
-    parser.add_argument("--job", choices=(RUST, WORKER, PARITY, SUPPLY, DOCS, VOICE),
+    parser.add_argument("--job", choices=(RUST, WORKER, PARITY, SUPPLY, DOCS, VOICE, DB_COMPAT),
                         default=None,
                         help="print only this job's selection (default: all)")
     args = parser.parse_args(argv)
     try:
+        if args.job == DB_COMPAT:
+            print("true" if db_compat_selected(git_diff_names(args.base_ref, args.head_ref)) else "false")
+            return 0
         changed = git_diff_names(args.base_ref, args.head_ref,
                                  diff_filter="ACMRTUXB")
         deleted = git_diff_names(args.base_ref, args.head_ref,
