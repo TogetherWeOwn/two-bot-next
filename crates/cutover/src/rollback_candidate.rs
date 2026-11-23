@@ -21,7 +21,9 @@ pub enum PrivacyAccess {
 
 /// Pins established together from the exact candidate, independently of the
 /// supplied evidence. Ledger hashes use the existing migration manifest
-/// format with an empty pending list.
+/// format with an empty pending list. The candidate must share the grant
+/// contract compiled into this verifier. A different historical grant
+/// contract requires a verifier built with that contract.
 pub struct CandidatePin<'a> {
     pub source_sha: &'a str,
     pub image_digest: &'a str,

@@ -352,6 +352,7 @@ impl CandidateReadout {
             image_digest: pin.image_digest,
             cutover: &self.cutover,
             store: &self.store,
+            // The fixture substitutes only role identifiers in the canonical SQL.
             roles: Some((roles, self.roles_match)),
             history_rows_present: Some(self.history_rows_present),
         }
@@ -361,10 +362,14 @@ impl CandidateReadout {
 async fn candidate_readout(audit: &PgPool, name: &str) -> CandidateReadout {
     let mut conn = audit.acquire().await.unwrap();
     let mut tx = read_only_transaction(&mut conn).await.unwrap();
-    sqlx::raw_sql("SET LOCAL search_path = pg_catalog, pg_temp; SET LOCAL row_security = off;")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
+    sqlx::raw_sql(
+        "SET LOCAL statement_timeout = '5s';
+         SET LOCAL search_path = pg_catalog, pg_temp;
+         SET LOCAL row_security = off;",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
     let role: String = sqlx::query_scalar("SELECT current_user::text")
         .fetch_one(&mut *tx)
         .await
@@ -491,12 +496,15 @@ async fn verify_rollback_candidate(
         .unwrap();
     for observations in [
         &[][..],
-        &[("101", "30", "match")][..],
-        &[("102", "31", "conflict")][..],
-        &[("102", "30", "ambiguous")][..],
+        &[("101", "30", "rollback-fixture-a")][..],
+        &[("102", "31", "rollback-fixture-a")][..],
+        &[
+            ("101", "30", "rollback-fixture-a"),
+            ("102", "30", "rollback-fixture-b"),
+        ][..],
     ] {
         for &(guild, author, key) in observations {
-            sqlx::query(
+            let inserted = sqlx::query(
                 "INSERT INTO event_store
                     (event_type, guild_id, channel_id, message_id, user_id, event_time, dedup_key)
                  SELECT 'MESSAGE_CREATE', $1, channel_id, message_id, $2, sent_at, $3
@@ -508,12 +516,20 @@ async fn verify_rollback_candidate(
             .execute(migrator)
             .await
             .unwrap();
+            assert_eq!(inserted.rows_affected(), 1);
         }
         let readout = candidate_readout(audit, name).await;
         assert_eq!(
             verify(&pin, &artifact, &readout.evidence(&pin, &roles)),
             Err(Refusal::History)
         );
+        let removed = sqlx::query(
+            "DELETE FROM event_store WHERE dedup_key IN ('rollback-fixture-a', 'rollback-fixture-b')",
+        )
+        .execute(migrator)
+        .await
+        .unwrap();
+        assert_eq!(removed.rows_affected(), observations.len() as u64);
     }
     assert_counts(
         migrator,
