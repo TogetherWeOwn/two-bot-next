@@ -60,12 +60,12 @@
     {"op": 0, "t": "GUILD_ROLE_UPDATE", "d": {"guild_id": "10", "role": ["50", "0"]}},
     {"op": 0, "t": "GUILD_UPDATE", "d": {"id": "10", "owner_id": "99", "afk_channel_id": "20", "name": "Synthetic guild", "afk_timeout": 60, "default_message_notifications": 0, "emojis": [], "features": [], "explicit_content_filter": 0, "mfa_level": 0, "nsfw_level": 0, "preferred_locale": "en-US", "premium_progress_bar_enabled": false, "premium_tier": 0, "roles": [], "system_channel_flags": 0, "verification_level": 0}},
     {"op": 0, "t": "GUILD_UPDATE", "d": {"id": "10", "owner_id": "31", "afk_channel_id": "21", "name": "Synthetic guild", "afk_timeout": 60, "default_message_notifications": 0, "emojis": [], "features": [], "explicit_content_filter": 0, "mfa_level": 0, "nsfw_level": 0, "preferred_locale": "en-US", "premium_progress_bar_enabled": false, "premium_tier": 0, "roles": [], "system_channel_flags": 0, "verification_level": 0}},
-    {"op": 0, "t": "GUILD_MEMBER_ADD", "d": {"guild_id": "10", "user": {"id": "32", "username": "synthetic-user", "discriminator": "0", "global_name": "Excluded display name"}, "roles": []}},
     {"op": 0, "t": "GUILD_MEMBER_UPDATE", "d": {"guild_id": "10", "user": {"id": "32", "username": "synthetic-user", "discriminator": "0", "global_name": "Excluded display name"}, "roles": []}},
     {"op": 0, "t": "GUILD_MEMBER_UPDATE", "d": {"guild_id": "10", "user": {"id": "31"}, "roles": ["99"]}},
     {"op": 0, "t": "GUILD_MEMBER_UPDATE", "d": {"guild_id": "10", "user": {"id": "31"}, "roles": [], "pending": null}},
     {"op": 0, "t": "GUILD_MEMBER_UPDATE", "d": {"guild_id": "10", "user": {"id": "31"}, "nick": "Incomplete"}},
     {"op": 0, "t": "GUILD_MEMBER_REMOVE", "d": {"guild_id": "10", "user": ["31"]}}
   ],
+  "missing_screening": {"guild_id": "10", "user": {"id": "32", "username": "synthetic-user", "discriminator": "0", "global_name": "Excluded display name"}, "roles": [], "deaf": false, "mute": false, "flags": 0},
   "rejection_baseline": {"op": 0, "t": "GUILD_CREATE", "d": {"id": "10", "owner_id": "31", "afk_channel_id": "20", "member_count": 1, "channels": [{"id": "20", "name": "Voice", "type": 2, "permission_overwrites": []}, {"id": "21", "name": "Stage", "type": 13, "permission_overwrites": []}, {"id": "22", "name": "Text", "type": 0, "permission_overwrites": [{"id": "50", "type": 0, "allow": "9223372036854776832", "deny": "0"}], "parent_id": "23"}, {"id": "23", "name": "Category", "type": 4, "permission_overwrites": []}], "roles": [{"id": "10", "permissions": "0"}, {"id": "50", "permissions": "0"}], "voice_states": [], "guild_scheduled_events": []}}
 }

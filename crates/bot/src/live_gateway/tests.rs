@@ -161,13 +161,15 @@ fn scheduled_event_limit_counts_baseline_rows_and_releases_removed_rows() {
         "CHANNEL_DELETE",
         json!({"guild_id":"10","id":"21","type":13}),
     );
+    event(&mut live, "GUILD_SCHEDULED_EVENT_DELETE", event_row(1001));
     event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(1100));
-    assert!(live.0.as_ref().expect("intake").active.is_some());
     event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(1101));
+    assert!(live.0.as_ref().expect("intake").active.is_some());
+    event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(1102));
     receive(&mut live, VOICE);
     let intake = live.0.as_ref().expect("intake");
     assert!(intake.active.is_none());
-    assert_eq!(intake.seq, 3);
+    assert_eq!(intake.seq, 5);
 }
 
 #[tokio::test(start_paused = true)]
@@ -264,7 +266,7 @@ async fn rejected_or_superseded_baselines_cannot_send() {
         "../../tests/fixtures/live_gateway_topology.json"
     ));
     let extra = fixture["invalid"].as_array().expect("invalid dispatches");
-    let current_seq = invalidations.len() + extra.len() + 1;
+    let current_seq = invalidations.len() + extra.len() + 2;
     let invalidations = invalidations
         .into_iter()
         .chain(extra.iter().map(Value::to_string));
@@ -276,6 +278,12 @@ async fn rejected_or_superseded_baselines_cannot_send() {
         receive(&mut live, &invalid);
         receive(&mut live, VOICE);
     }
+    let stale = begin(&mut live);
+    complete(&mut live, &stale);
+    receive(&mut live, VOICE);
+    let member = fixture["missing_screening"].clone();
+    event(&mut live, "GUILD_MEMBER_ADD", member);
+    receive(&mut live, VOICE);
     let stale = begin(&mut live);
     let current = begin(&mut live);
     complete(&mut live, &stale);
