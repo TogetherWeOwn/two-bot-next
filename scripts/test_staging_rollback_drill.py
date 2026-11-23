@@ -21,6 +21,7 @@ spec.loader.exec_module(drill)
 GateError = drill.GateError
 # The drill module put scripts/ on sys.path; the finite-window adapter and its fake runtime live beside it.
 import staging_drill_use as use_module
+from staging_cloudflare_fixture import CloudflareFake
 from test_staging_drill_use import (
     CF_TOKEN, RECEIPT, SHA_A, SHA_B, WINDOW_MS, FakeRuntime, policy_bindings, version_payload)
 
@@ -35,11 +36,11 @@ DEPLOYMENTS_PATH = "/workers/scripts/two-bot-next-staging/deployments"
 VERSIONS_PATH = "/workers/scripts/two-bot-next-staging/versions/"
 
 
-class World:
+class World(CloudflareFake):
     """One staging singleton: Worker deployments, ownership record, readiness."""
 
     def __init__(self, history=(PRE, TARGET, OLDER), phase="active", epoch=7, ready_polls=2):
-        self.history = list(history)  # newest first
+        super().__init__(history, split_versions=(PRE, TARGET))
         self.phase, self.epoch, self.running = phase, epoch, phase == "active"
         self.ready_polls = ready_polls
         self.polls_left = 0
@@ -47,6 +48,7 @@ class World:
         self.calls = []
         self.posts = []
         self.reject_post = None
+        self.target_deployment_reads = 0
         self.fail_control = {}  # (action, nth call) -> error to raise
         self.never_ready = set()  # versions whose Worker never reports ready
         self.events = []  # ordered API and ownership calls for the transport fixtures
@@ -73,12 +75,7 @@ class FakeClient:
 
     def api(self, path):
         if path == DEPLOYMENTS_PATH:
-            rows = []
-            for version in self.world.history:
-                versions = [{"version_id": version, "percentage": 100}] if version else \
-                    [{"version_id": PRE, "percentage": 50}, {"version_id": TARGET, "percentage": 50}]
-                rows.append({"id": "d", "versions": versions})
-            return {"deployments": rows}
+            return self.world.deployments()
         if path.startswith(VERSIONS_PATH):
             version = path.removeprefix(VERSIONS_PATH)
             if version not in self.world.history:
@@ -96,7 +93,7 @@ class FakeClient:
         if world.reject_post:
             raise world.reject_post
         version = body["versions"][0]["version_id"]
-        world.history.insert(0, version)
+        world.deploy_worker(version, deployment_reads=world.target_deployment_reads if version != PRE else 0)
         return {"id": "new"}
 
     def request(self, url):
@@ -288,6 +285,19 @@ class RefusalTests(unittest.TestCase):
 
 
 class FailureRecoveryTests(unittest.TestCase):
+    def test_stale_target_readback_refuses_takeover_and_restores_original_version(self):
+        world = World()
+        world.target_deployment_reads = 1
+        instance, failures, _ = run_drill(world)
+        self.assertEqual(failures, ["drill:rollback_not_active"])
+        self.assertEqual([body["versions"][0]["version_id"] for _, body in world.posts],
+                         [TARGET, PRE])
+        self.assertEqual([call[3] for call in world.calls if call[0] == "deployment-takeover"],
+                         [PRE])
+        self.assertNotIn("first_ready", instance.evidence["drill"])
+        self.assertIn("first_ready", instance.evidence["restore"])
+        self.assertEqual(world.history[0], PRE)
+
     def test_refused_rollback_still_releases_the_fence_on_the_original_version(self):
         world = World()
         world.reject_post = GateError("api_http_failure", "status=409 codes=10220")

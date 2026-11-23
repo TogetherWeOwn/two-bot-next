@@ -26,6 +26,8 @@ from urllib.response import addinfourl
 # staging_rollout imports its sibling build_identity module; the spec import
 # below does not put the scripts directory on the path by itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from staging_cloudflare_fixture import CloudflareFake, LAG_COUNTERS
+
 spec = importlib.util.spec_from_file_location(
     "staging_rollout", Path(__file__).with_name("staging_rollout.py")
 )
@@ -220,6 +222,8 @@ class FakeClient:
         if key not in routes or not routes[key]:
             raise AssertionError(f"unexpected offline fixture route: {key}")
         values = routes[key]
+        if callable(values):
+            return values()
         value = values.pop(0) if len(values) > 1 else values[0]
         if isinstance(value, Exception):
             raise value
@@ -1146,6 +1150,65 @@ class OrchestrationTests(OfflineTestCase):
 
     def assert_no_evidence(self):
         self.assertFalse(Path(self.args.evidence).exists())
+
+    def cloudflare_lag_client(self, counters, *, worker_reads=0, application_reads=0,
+                              rollout_list_reads=0):
+        cloudflare = CloudflareFake([OLD_VERSION, VERSION], app(OLD_IMAGE), [old_row()])
+        cloudflare.deploy_worker(VERSION, deployment_reads=worker_reads)
+        cloudflare.start_rollout(completed_row(), counters=counters,
+                                 application_reads=application_reads,
+                                 rollout_list_reads=rollout_list_reads, previous_probes=None)
+
+        def readyz():
+            status, headers, body = ready_response()
+            if cloudflare.ready_image() == OLD_IMAGE:
+                revision = "f" * 40
+                body = json.dumps(dict(json.loads(body), build_revision=revision,
+                                       build_id="123455-1", deploy_id=f"2026.10.20.1+{revision[:7]}")).encode()
+            return status, headers, body
+
+        client = verify_client()
+        client.deadline = self.clock.now + 60
+        client.api_routes.update({
+            APP_PATH: cloudflare.application_listing,
+            ROWS_PATH: cloudflare.rollout_listing,
+            DETAIL_PATH: lambda: cloudflare.rollout_detail(NEW_ROLLOUT),
+            DEPLOYMENTS_PATH: cloudflare.deployments,
+        })
+        client.request_routes[URL + "/readyz"] = readyz
+        client.stop_staging.side_effect = lambda *_: cloudflare.replace_container()
+        return client
+
+    def test_shared_cloudflare_rollout_lag_converges_after_replacing_previous_container(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for active, healthy in LAG_COUNTERS:
+            with self.subTest(active=active, healthy=healthy):
+                self.args.evidence = str(self.root / f"evidence-{active}-{healthy}.json")
+                client = self.cloudflare_lag_client(
+                    (active, healthy), application_reads=4, rollout_list_reads=1)
+                rollout.verify(self.args, client)
+                client.stop_staging.assert_called_once_with(URL, VERSION, REVISION)
+                self.assertEqual(client.calls.count(("request", URL + "/readyz")), 2)
+                self.assertEqual(client.calls.count(("api", ROWS_PATH)), 3)
+                evidence = json.loads(Path(self.args.evidence).read_text())
+                self.assertEqual(evidence["rollout_id"], NEW_ROLLOUT)
+                self.assertTrue(evidence["active_lag"])
+                self.assertNotIn("application_listing_lag", evidence)
+
+    def test_shared_cloudflare_rollout_refuses_stale_worker_or_previous_container(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for failure, worker_reads, probes in (("worker_version_not_active", None, 0),
+                                               ("serving_image_mismatch", 0, 1)):
+            with self.subTest(failure=failure):
+                client = self.cloudflare_lag_client(
+                    LAG_COUNTERS[0], worker_reads=worker_reads, application_reads=None)
+                client.stop_staging.side_effect = None
+                self.assert_gate(failure, rollout.verify, self.args, client)
+                self.assertEqual(client.stop_staging.call_count, probes)
+                self.assertEqual(client.calls.count(("request", URL + "/readyz")), probes)
+                self.assert_no_evidence()
 
     def test_prepare_records_only_exact_allowlisted_baseline(self):
         client = self.prepare_baseline()
