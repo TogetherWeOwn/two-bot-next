@@ -692,15 +692,13 @@ restore mutation. The workflow also owns binding, artifact and runtime acceptanc
 
 ### Recover a baseline when the serving pair is incompatible
 
-1. Confirm the approved fingerprint and successful cutover 0475/0481 and
-   store 0478 in the protected exact-source plan. If 0475 is pending, require
-   a fresh clean plan after any separately authorized apply.
+1. Confirm the approved fingerprint and successful cutover 0475/0481 and store
+   0478 in the exact-source plan. Require a fresh clean plan after any authorized apply.
 2. Confirm the stopped predecessor's window is released or expired. Dispatch
    `bootstrap` on current `main`. The authenticated GET must prove the exact
    serving Worker's binding and startup guard before takeover or acquisition.
 3. Bootstrap stays red and excludes the predecessor from rollback. Reconcile
-   ambiguous publication with protected read-only inventory and roll forward.
-   Confirm release or expiry and stopped state after any acquired window.
+   publication with read-only inventory. Confirm the window ended and staging stopped.
 4. After rollout, readiness, error-rate and release checks pass, authenticate
    the protected artifact and set `recovery_pair` to its `UUID@sha256:digest`.
    Dispatch `verified` to check both migration trees and the pinned stopped pair

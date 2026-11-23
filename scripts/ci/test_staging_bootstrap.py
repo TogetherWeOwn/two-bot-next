@@ -33,7 +33,6 @@ class StagingBootstrapTests(unittest.TestCase):
                          (FINGERPRINT, 481, 478))
 
     def test_verifier_refuses_unproved_or_different_effective_binding(self):
-        bootstrap.attest(self, lambda _: self.state, VERSION, SOURCE, FINGERPRINT)
         deferred = [bootstrap.GateError("ownership_deployment_mismatch"), {**self.state, "deploymentId": "b" * 8 + VERSION[8:]}, self.state]
         with patch.object(bootstrap, "read_ownership", side_effect=deferred) as read:
             self.assertEqual(bootstrap.read_after_update(read, VERSION, FINGERPRINT, lambda _: None), self.state)

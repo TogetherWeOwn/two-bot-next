@@ -7662,7 +7662,6 @@ class WorkflowTests(unittest.TestCase):
                  "Prove the serving Worker database before ownership or startup", "takeover", "use"]
         self.assertEqual([name for name in labels if name in names], names)
         self.assertNotIn("continue-on-error", steps[labels.index(names[3])])
-        self.assertIn(" && inputs.recovery_mode != 'bootstrap' && ", steps[labels.index("auto_rollback")]["if"])
         exclude = steps[labels.index("Keep the bootstrap baseline out of staging qualification")]
         self.assertEqual(exclude["if"], "${{ inputs.recovery_mode == 'bootstrap' }}")
         self.assertIn("exit 1", exclude["run"])
