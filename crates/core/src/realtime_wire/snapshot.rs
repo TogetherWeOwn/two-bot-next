@@ -10,6 +10,9 @@ use super::{
 };
 
 const SNAPSHOT_BYTES: usize = 1024 * 1024;
+pub const MAX_SNAPSHOT_CHANNELS: usize = 500;
+pub const MAX_SNAPSHOT_ROLES: usize = 250;
+pub const MAX_SNAPSHOT_MEMBERS: usize = 10_000;
 /// Maximum number of current scheduled events in a v1 snapshot.
 pub const MAX_SNAPSHOT_EVENTS: usize = 100;
 
@@ -57,10 +60,10 @@ pub fn encode_snapshot(
 }
 
 fn valid_topics(guild_id: Id, state: &Topics) -> bool {
-    if state.channels.len() > 500
-        || state.roles.len() > 250
-        || state.members.len() > 10_000
-        || state.voice.len() > 10_000
+    if state.channels.len() > MAX_SNAPSHOT_CHANNELS
+        || state.roles.len() > MAX_SNAPSHOT_ROLES
+        || state.members.len() > MAX_SNAPSHOT_MEMBERS
+        || state.voice.len() > MAX_SNAPSHOT_MEMBERS
         || state.events.len() > MAX_SNAPSHOT_EVENTS
     {
         return false;

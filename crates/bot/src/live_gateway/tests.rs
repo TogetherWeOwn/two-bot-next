@@ -84,7 +84,7 @@ async fn scheduled_events_share_voice_order_and_emit_only_allowlisted_fields() {
         .expect("completed baseline");
     assert_eq!(baseline.events.len(), 1);
     let joined_event = wire::Id(Id::<ScheduledEventMarker>::new(90).into_nonzero());
-    assert!(baseline.events.contains(&joined_event));
+    assert!(baseline.events.contains_key(&joined_event));
 
     let mut foreign = event_row(92);
     foreign["guild_id"] = json!("11");
@@ -148,12 +148,19 @@ fn scheduled_event_limit_counts_baseline_rows_and_releases_removed_rows() {
     let (mut live, _receiver) = LiveGateway::for_guild(GUILD, 0);
     receive(&mut live, READY);
     let mut create = decoded(CREATE.as_bytes());
-    create["d"]["guild_scheduled_events"] = json!((1000..1100).map(event_row).collect::<Vec<_>>());
+    let mut events = (1000..1100).map(event_row).collect::<Vec<_>>();
+    events[0]["channel_id"] = json!("21");
+    events[0]["entity_type"] = json!(1);
+    create["d"]["guild_scheduled_events"] = json!(events);
     let nonce = begin_with(&mut live, &create.to_string());
     complete(&mut live, &nonce);
 
-    event(&mut live, "GUILD_SCHEDULED_EVENT_UPDATE", event_row(1000));
-    event(&mut live, "GUILD_SCHEDULED_EVENT_DELETE", event_row(1000));
+    event(&mut live, "GUILD_SCHEDULED_EVENT_UPDATE", event_row(1001));
+    event(
+        &mut live,
+        "CHANNEL_DELETE",
+        json!({"guild_id":"10","id":"21","type":13}),
+    );
     event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(1100));
     assert!(live.0.as_ref().expect("intake").active.is_some());
     event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(1101));
@@ -161,6 +168,34 @@ fn scheduled_event_limit_counts_baseline_rows_and_releases_removed_rows() {
     let intake = live.0.as_ref().expect("intake");
     assert!(intake.active.is_none());
     assert_eq!(intake.seq, 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn topology_and_roster_share_receive_order_with_voice_and_events() {
+    let fixture = decoded(include_bytes!(
+        "../../tests/fixtures/live_gateway_topology.json"
+    ));
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, 40);
+    receive(&mut live, READY);
+    let nonce = begin(&mut live);
+    complete(&mut live, &nonce);
+    let mut disabled = LiveGateway::default();
+    for row in fixture["dispatches"].as_array().expect("dispatches") {
+        let kind = row[0].as_str().expect("dispatch type");
+        event(&mut disabled, kind, row[1].clone());
+        event(&mut live, kind, row[1].clone());
+    }
+    assert!(!disabled.enabled());
+
+    let mut deltas = Vec::new();
+    let worker = receiver.run(async |body| {
+        deltas.push(decoded(body));
+        Delivery::Accepted
+    });
+    assert!(tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .is_err());
+    assert_eq!(&deltas, fixture["deltas"].as_array().expect("deltas"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -225,10 +260,17 @@ async fn rejected_or_superseded_baselines_cannot_send() {
         r#"{"op":0,"t":"GUILD_SCHEDULED_EVENT_DELETE","d":{"guild_id":"10","id":"91","id":"90"}}"#
             .into(),
     ];
-    let current_seq = invalidations.len() + 1;
+    let fixture = decoded(include_bytes!(
+        "../../tests/fixtures/live_gateway_topology.json"
+    ));
+    let extra = fixture["invalid"].as_array().expect("invalid dispatches");
+    let current_seq = invalidations.len() + extra.len() + 1;
+    let invalidations = invalidations
+        .into_iter()
+        .chain(extra.iter().map(Value::to_string));
     for invalid in invalidations {
         receive(&mut live, READY);
-        let nonce = begin(&mut live);
+        let nonce = begin_with(&mut live, &fixture["rejection_baseline"].to_string());
         complete(&mut live, &nonce);
         receive(&mut live, VOICE);
         receive(&mut live, &invalid);
