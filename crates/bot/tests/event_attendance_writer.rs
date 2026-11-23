@@ -30,19 +30,28 @@ async fn mapped_gateway_opens_respect_privacy_and_replay() {
     let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
         .await
         .unwrap();
-    let pool = db.pool();
+    // Await teardown before propagating an assertion failure from the fixture.
+    let result = tokio::spawn(exercise_writer(db.pool().clone())).await;
+    db.close().await.unwrap();
+    result.unwrap();
+}
+
+async fn exercise_writer(pool: PgPool) {
+    let pool = &pool;
     sqlx::raw_sql(include_str!("fixtures/event_attendance_writer.sql"))
         .execute(pool)
         .await
         .unwrap();
     let guild = GUILD.to_string();
     let member = MEMBER.to_string();
-    let starts: OffsetDateTime =
-        sqlx::query_scalar("SELECT starts_at FROM event_instance_windows WHERE event_id = $1")
-            .bind(EVENT)
-            .fetch_one(pool)
-            .await
-            .unwrap();
+    let (instance, starts): (OffsetDateTime, OffsetDateTime) = sqlx::query_as(
+        "SELECT instance_starts_at, starts_at FROM event_instance_windows WHERE event_id = $1",
+    )
+    .bind(EVENT)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_ne!(instance, starts);
     let at = starts - Duration::minutes(15);
     let frame = VoiceObservation {
         guild_id: GUILD,
@@ -59,11 +68,9 @@ async fn mapped_gateway_opens_respect_privacy_and_replay() {
     for key in ["show", "alias"] {
         mappings.put_event_key(&guild, key, EVENT).await.unwrap();
     }
+    let mut outside = frame;
     for observed_at in [at - Duration::microseconds(1), at + Duration::seconds(30)] {
-        let outside = VoiceObservation {
-            observed_at,
-            ..frame
-        };
+        outside.observed_at = observed_at;
         assert!(!write(pool, outside).await);
     }
 
@@ -94,7 +101,7 @@ async fn mapped_gateway_opens_respect_privacy_and_replay() {
 
     let (a, b) = tokio::join!(write(pool, frame), write(pool, frame));
     assert_ne!(a, b, "concurrent frames admit one span");
-    let micros = starts.unix_timestamp_nanos() / 1_000;
+    let micros = instance.unix_timestamp_nanos() / 1_000;
     let tags = ["alias", "show"].map(|key| format!("{key}/{EVENT}/{micros}"));
     let id = sqlx::query_scalar(
         "SELECT id FROM event_voice_sessions
@@ -116,12 +123,10 @@ async fn mapped_gateway_opens_respect_privacy_and_replay() {
         ..frame
     };
     assert!(!write(pool, next).await);
-    assert_eq!(
-        close_observed(pool, &guild, &member, id, next.observed_at)
-            .await
-            .unwrap(),
-        CloseOutcome::Closed
-    );
+    let closed = close_observed(pool, &guild, &member, id, next.observed_at)
+        .await
+        .unwrap();
+    assert_eq!(closed, CloseOutcome::Closed);
     let mut replay = frame;
     for observed_at in [at, at + Duration::milliseconds(500)] {
         replay.observed_at = observed_at;
@@ -138,21 +143,16 @@ async fn mapped_gateway_opens_respect_privacy_and_replay() {
         .unwrap_err();
     let message = unavailable.to_string();
     assert_eq!(message, "attendance open storage unavailable");
-    let closed_pool = pool.clone();
-    db.close().await.unwrap();
+    pool.close().await;
+    let mut skipped = frame;
     for (mode, previous, current) in [
         (OpenCapture::default(), None, Some(CHANNEL)),
         (OpenCapture::Enabled, Some(CHANNEL), Some(CHANNEL)),
         (OpenCapture::Enabled, Some(CHANNEL), None),
     ] {
-        let skipped = VoiceObservation {
-            previous,
-            current,
-            ..frame
-        };
-        assert!(!mode
-            .write_observation(&closed_pool, &skipped)
-            .await
-            .unwrap());
+        skipped.previous = previous;
+        skipped.current = current;
+        let opened = mode.write_observation(pool, &skipped).await.unwrap();
+        assert!(!opened);
     }
 }
