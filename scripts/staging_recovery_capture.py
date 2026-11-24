@@ -41,6 +41,13 @@ def encrypt(payload, certificate):
         ).stdout
 
 
+def expected_objects_covered(report):
+    missing = report["missing_expected"]
+    return missing == [] or (
+        missing == ["public.live_sequence_watermarks"] and report["missing_before_0482"] is True
+    )
+
+
 def main():
     try:
         public_certificate = os.environ.get("RECOVERY_RECIPIENT", "")
@@ -56,7 +63,7 @@ def main():
                           query.replace("-- @matrix", matrix))
         report = decode_inventory(output)
         if (report["database"]["name"] != database or report["role"] != DB_ROLE
-                or report["missing_expected"] or report["unsupported"]
+                or not expected_objects_covered(report) or report["unsupported"]
                 or not (report["cutover_ledger"] and report["store_ledger"])):
             raise ReadFailed("catalog inventory could not cover the reviewed scope")
         report["target"] = {"host": host, "database": database,

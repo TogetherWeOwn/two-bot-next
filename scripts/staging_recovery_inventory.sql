@@ -91,6 +91,8 @@ SELECT jsonb_build_object(
               AND p.kind = CASE WHEN e.kind IN ('sequence', 'view', 'function')
                                 THEN e.kind ELSE 'table' END)
         ORDER BY e.schema_name, e.name),
+    'missing_before_0482', to_regclass('public.live_sequence_watermarks') IS NULL
+        AND NOT EXISTS (SELECT 1 FROM public._sqlx_migrations WHERE version = 482),
     'unsupported', EXISTS (SELECT 1 FROM relations WHERE relkind IN ('f', 'c'))
         OR EXISTS (SELECT 1 FROM routines WHERE prokind = 'a')
         OR EXISTS (SELECT 1 FROM pg_shdepend d JOIN pg_database b ON b.oid = d.dbid
