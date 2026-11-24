@@ -26,7 +26,8 @@ still fits the candidate's schema before the deploy:
    default, truncates, deletes all rows or revokes refuses, unless the file
    carries a reviewed
    `-- rollback-compatible: <reason>` line. A rewritten or deleted migration
-   always refuses. The serving SHA must be an ancestor of the candidate.
+   always refuses. Known binary compatibility boundaries also refuse even
+   when the SQL is additive. The serving SHA must be an ancestor.
 
 Evidence carries allowlisted IDs, file names and fixed-vocabulary codes only:
 never SQL text, API bodies or credentials. Exit 0 passes, 1 refuses.
@@ -65,6 +66,7 @@ GIT_TIMEOUT_SECONDS = 30
 COMMAND_TIMEOUT_SECONDS = 120
 COMMAND_OUTPUT_CAP = 1024 * 1024
 MIGRATION = re.compile(r"crates/[a-z0-9_-]+/migrations/[0-9]{4}_[a-z][a-z0-9_]*\.sql")
+ATTENDANCE_MIGRATION = "crates/cutover/migrations/0480_event_attendance.sql"
 # A reviewed exception: the author states why the serving build still runs
 # against this schema. At least a short sentence, never an empty marker.
 # The reason must stay on the marker's own line: \s would also span the
@@ -311,6 +313,11 @@ def migration_findings(repo, serving_sha, sha, git_fn=git):
             continue
         sql = git_fn(repo, "show", f"{sha}:{path}").decode("utf-8", "replace")
         checked.append(name)
+        # Older builds cannot handle the v17 archive and privacy inventory
+        # introduced at this boundary. The SQL-only marker cannot certify them.
+        if path == ATTENDANCE_MIGRATION:
+            refusals.append({"migration": name, "code": "attendance_rollback_requires_compatible_build"})
+            continue
         code = incompatible_code(sql)
         # A marker vouches only for statements the lexer could read. An
         # unreadable migration never passes (docs/migrations.md), so the

@@ -222,6 +222,21 @@ class MigrationFindingTests(unittest.TestCase):
         self.assertEqual(checked, ["0002_add.sql"])
         self.assertEqual(refusals, [])
 
+    def test_attendance_boundary_requires_compatible_rollback_build(self):
+        self.repo.write(
+            "crates/cutover/migrations/0480_event_attendance.sql",
+            "-- rollback-compatible: additive SQL alone says nothing about older binaries\n"
+            "CREATE TABLE event_attendance_windows (id bigint);\n",
+        )
+        expanded = self.repo.commit("attendance expansion")
+        self.assertEqual(
+            self.findings(expanded),
+            (["0480_event_attendance.sql"], [{
+                "migration": "0480_event_attendance.sql", "code": "attendance_rollback_requires_compatible_build",
+            }]),
+        )
+        self.assertEqual(self.findings(self.repo.commit("later build"), serving=expanded), ([], []))
+
     def test_incompatible_migration_refuses_unless_reviewed(self):
         self.repo.write("crates/cutover/migrations/0002_drop.sql", "ALTER TABLE t DROP COLUMN c;\n")
         candidate = self.repo.commit("drop")

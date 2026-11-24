@@ -125,6 +125,13 @@ in a trigger event clause (it names the event, not a `DELETE FROM`). Dynamic SQL
 `EXECUTE '...'` string is not visible to the scan: keep it out of migrations,
 or annotate the file. A rewritten or deleted migration always refuses.
 
+The attendance schema in Cutover 0480 is also a binary compatibility
+boundary. A previous build from before 0480 cannot handle the expanded
+privacy inventory or v17 backup format. A promotion across this boundary
+refuses even when the migration SQL is additive or has a SQL compatibility
+marker. Use the separately qualified recovery path before promoting this
+schema change.
+
 Ship expand first, contract later: the contract migration lands only after
 every build that still reads the old shape has left production. When a
 flagged statement is safe anyway (for example it drops a table no shipped
