@@ -68,14 +68,26 @@ class ReviewedMigrationTests(unittest.TestCase):
         with self.assertRaisesRegex(GateError, "staging_plan_changed"):
             compare_plans(self.plan, {**self.plan, "ledger_before": [475, 481]})
 
-    def test_refuses_replayed_expired_or_unmerged_requests(self):
+    def test_refuses_mismatched_merge_event(self):
+        for field, value in {"commit_id": "e" * 40, "actor": {"id": 12}, "created_at": "2026-11-24T02:59:00Z"}.items():
+            with self.subTest(field=field):
+                self.setUp()
+                self.merge[field] = value
+                with self.assertRaisesRegex(GateError, "request_merge_unproved"):
+                    self.authorize()
+
+    def test_refuses_expired_request_after_matching_merge(self):
+        expired = "2026-11-23T01:00:00Z"
+        self.pull["merged_at"] = self.merge["created_at"] = self.approval["completed_at"] = expired
+        with self.assertRaisesRegex(GateError, "reviewed_request_expired"):
+            self.authorize()
+
+    def test_refuses_replayed_or_unmerged_requests(self):
         for mutation in (
             lambda: self.env.update(GITHUB_RUN_ATTEMPT="2"), lambda: self.runs.update(total_count=2),
             lambda: self.git.update(log=b"already-committed"), lambda: self.pull.update(state="open"),
-            lambda: self.merge.update(commit_id="e" * 40),
             lambda: self.git.update(diff=self.git["diff"] + b"\nM\tDockerfile"),
             lambda: self.approval["app"].update(id=15368), lambda: self.approval.update(external_id="staging-apply:9"),
-            lambda: self.pull.update(merged_at="2026-11-23T01:00:00Z"),
             lambda: self.routes["actions/artifacts/32"].update(digest="sha256:" + "f" * 64),
         ):
             with self.subTest(mutation=mutation):
