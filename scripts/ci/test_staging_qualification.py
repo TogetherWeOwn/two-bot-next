@@ -125,11 +125,12 @@ class ReviewedStagingTests(unittest.TestCase):
         self.assertEqual(proof["checks"]["check.yml"], {"run_id": 51, "attempt": 1})
 
     def test_refuses_changed_workflow_off_main_source_or_newer_staging(self):
-        self.git("switch", "-q", "main")
-        changed = self.commit(".github/workflows/deploy-staging.yml")
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.env["FETCHED_MAIN_SHA"] = changed
-            self.authorize()
+        for number, path in enumerate(("wrangler/src/alert-rules.ts", ".github/workflows/deploy-staging.yml")):
+            self.git("switch", "-qc", f"gate-change-{number}", self.tip)
+            self.env["FETCHED_MAIN_SHA"] = self.commit(path)
+            self.workdir.mkdir(exist_ok=True)
+            with self.subTest(changed_path=path), self.assertRaises(subprocess.CalledProcessError):
+                self.authorize()
         self.env["FETCHED_MAIN_SHA"] = self.tip
         with self.assertRaises(subprocess.CalledProcessError):
             self.inputs["sha"] = self.env["SOURCE_SHA"] = self.off_main

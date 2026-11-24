@@ -3419,6 +3419,20 @@ def staging_active_errors(workflow):
         errors.append(f"{name}:deploy: must stay scoped to the staging environment")
     if not runner_allowed("deploy", job.get("runs-on")):
         errors.append(f"{name}:deploy: must use the explicit ubuntu-latest runner for job 'deploy'")
+    gate_root = "${{ inputs.reviewed_plan != '' && '../tooling' || '..' }}"
+    gate_commands = (
+        "wrangler/scripts/ownership-control.mjs preflight",
+        "scripts/staging_rollout.py prepare",
+        "scripts/worker_container_rollback.py snapshot",
+        "scripts/staging_rollout.py receipt",
+        "wrangler/scripts/ownership-control.mjs deployment-takeover",
+        "scripts/staging_rollout.py verify",
+        "wrangler/scripts/promotion-error-gate.mjs",
+    )
+    scripts = "\n".join(str(step.get("run") or "") for step in job.get("steps", []))
+    if (job.get("env", {}).get("STAGING_GATE_ROOT") != gate_root
+            or any(f'"${{STAGING_GATE_ROOT:-..}}"/{command}' not in scripts for command in gate_commands)):
+        errors.append(f"{name}:deploy: reviewed-source deploy gates must use workflow-head tooling")
     for step in job.get("steps", []):
         if step.get("if") == STATIC_FALSE:
             errors.append(f"{name}:deploy: a statically-disabled step would report success without deploying")

@@ -17,8 +17,9 @@ WORKFLOW = ".github/workflows/deploy-staging.yml"
 PLAN = re.compile(r"([1-9][0-9]{0,19})@(sha256:[a-f0-9]{64})")
 PAIR = re.compile(VERSION_ID.pattern + r"@sha256:[0-9a-f]{64}")
 CHECKS = {"check.yml": ("ci-ok", "worker check"), "supply-chain.yml": ("pr-lint", "gitleaks")}
-# Include reusable workflows and both checkout trees' operational tooling.
-TRUSTED_PATHS = (".github/workflows", ".github/scripts", "scripts", "wrangler/scripts")
+# The error-rate gate imports these Worker modules directly.
+TRUSTED_PATHS = (".github/workflows", ".github/scripts", "scripts", "wrangler/scripts",
+                 "wrangler/src/alert-rules.ts", "wrangler/src/metrics-scrape.ts")
 INCOMPATIBLE_INPUTS = ("recover_prior_sha", "release_fence", "inject_gateway_failure",
                        "inject_error_rate_spike", "inject_voice_stall",
                        "inject_unpaired_disconnect", "verify_automod_preview")

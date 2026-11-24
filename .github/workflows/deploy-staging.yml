@@ -310,6 +310,7 @@ jobs:
     env:
       RECOVERY_MODE: ${{ inputs.recovery_mode }}
       RECOVERY_FINGERPRINT: ${{ needs.schema-gate.outputs.recovery_fingerprint }}
+      STAGING_GATE_ROOT: ${{ inputs.reviewed_plan != '' && '../tooling' || '..' }}
     # Sized for the worst case: the deploy, a failing verify and the
     # auto-rollback budget (600 s image + 900 s gate). A 30 min cap can
     # cancel the run mid-rollback and leave staging fenced.
@@ -325,11 +326,9 @@ jobs:
           fetch-depth: 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Reviewed tooling runs from the workflow's own commit: a pinned
-          # drill deploys an older SHA whose checkout predates deploy_id.py,
-          # so the compute and record steps below run from here, never from
-          # the deployed commit. The prepare/verify gate scripts stay on the
-          # deployed checkout: they judge that commit's own identity.
+          # Reviewed qualifications run the deployment gates from this
+          # checkout. Default deploys and recovery drills retain their gate
+          # source. Shared recovery and deploy-ID tooling always runs here.
           ref: ${{ github.sha }}
           path: tooling
           persist-credentials: false
@@ -416,7 +415,7 @@ jobs:
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
-        run: node scripts/ownership-control.mjs preflight
+        run: node "${STAGING_GATE_ROOT:-..}"/wrangler/scripts/ownership-control.mjs preflight
       - name: Snapshot staging identity and generate per-deploy image provenance
         id: prepare
         env:
@@ -447,7 +446,7 @@ jobs:
           if [ "$INJECT_UNPAIRED_DISCONNECT" = "true" ]; then
             inject+=(--inject-unpaired-disconnect)
           fi
-          python3 ../scripts/staging_rollout.py prepare \
+          python3 "${STAGING_GATE_ROOT:-..}"/scripts/staging_rollout.py prepare \
             --receipt "$ROLLOUT_DIR/baseline.json" \
             --output "$WRANGLER_OUTPUT_FILE_PATH" \
             --deploy-config "$ROLLOUT_DIR/staging-deploy.json" "${inject[@]}"
@@ -486,7 +485,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          python3 ../scripts/worker_container_rollback.py snapshot \
+          python3 "${STAGING_GATE_ROOT:-..}"/scripts/worker_container_rollback.py snapshot \
             --variant staging \
             --out "$ROLLOUT_DIR/staging-rollback-snapshot.json"
           python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["ROLLOUT_DIR"] + "/staging-rollback-snapshot.json")), sort_keys=True))'
@@ -536,7 +535,7 @@ jobs:
       - name: Validate Wrangler deploy receipt before ownership transfer
         run: |
           set -euo pipefail
-          python3 ../scripts/staging_rollout.py receipt \
+          python3 "${STAGING_GATE_ROOT:-..}"/scripts/staging_rollout.py receipt \
             --receipt "$ROLLOUT_DIR/baseline.json" \
             --output "$WRANGLER_OUTPUT_FILE_PATH" \
             --evidence "$ROLLOUT_DIR/receipt.json"
@@ -573,7 +572,7 @@ jobs:
           if output="$(
             timeout --signal=TERM --kill-after=10s 390s \
               env OWNERSHIP_EXPECTED_DEPLOYMENT="$(python3 -c 'import json,os;print(json.load(open(os.environ["ROLLOUT_DIR"]+"/receipt.json"))["worker_version"])')" \
-              node scripts/ownership-control.mjs deployment-takeover 2>&1
+              node "${STAGING_GATE_ROOT:-..}"/wrangler/scripts/ownership-control.mjs deployment-takeover 2>&1
           )"; then
             printf '%s\n' "$output"
           else
@@ -617,7 +616,7 @@ jobs:
           STAGING_USE_RECEIPT: ${{ env.ROLLOUT_DIR }}/staging-use.jsonl
         run: |
           set -euo pipefail
-          python3 ../scripts/staging_rollout.py verify \
+          python3 "${STAGING_GATE_ROOT:-..}"/scripts/staging_rollout.py verify \
             --receipt "$ROLLOUT_DIR/baseline.json" \
             --output "$WRANGLER_OUTPUT_FILE_PATH" \
             --evidence "$ROLLOUT_DIR/evidence.json"
@@ -648,7 +647,7 @@ jobs:
           if [ "$INJECT_ERROR_RATE_SPIKE" = "true" ]; then
             rehearsal=(--rehearsal-firing '["rest_5xx_rate"]')
           fi
-          node scripts/promotion-error-gate.mjs \
+          node "${STAGING_GATE_ROOT:-..}"/wrangler/scripts/promotion-error-gate.mjs \
             --metrics-url "$STAGING_URL" \
             --evidence "$ROLLOUT_DIR/error-rate-gate.json" \
             --sha "$SHA" "${rehearsal[@]}"

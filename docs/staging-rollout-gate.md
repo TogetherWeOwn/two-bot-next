@@ -266,8 +266,10 @@ fence release and AutoMod preview switches off. Use a fresh attempt.
 The serialized deployment job verifies the exact source's successful push CI
 and supply-chain checks, authenticates the plan artifact, compares it to the
 fresh schema gate and checks that the stopped rollback pair still matches
-before replacing it. It checks both SHAs against protected main. Changes to
-workflow or deployment tooling after dispatch require a fresh dispatch.
+before replacing it. The deployment gates use the protected workflow checkout
+and package the reviewed source's build and configuration. The job checks both
+SHAs against protected main. Changes to workflow or deployment tooling after
+dispatch require a fresh dispatch.
 The source must contain the most recent successful staging revision. A newer
 successful run also supersedes an older queued dispatch of the same source.
 
