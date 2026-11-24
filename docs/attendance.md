@@ -25,9 +25,9 @@ JSON. The harness probes `/readyz` around each signed read.
 | `attendance_read` | Effective `TWO_INTERNAL_ALLOW_ATTENDANCE_READ`. JSON `true` for pending and finalized, `false` for OFF and cleanup |
 | `attendance_capture`, `signed_ingress` | Capture `false` throughout. Signed ingress `true` during the three wire phases |
 | `primary_fixture`, `foreign_fixture` | Primary `pending` or `finalized` per phase. For finalized, `foreign-only` after checking the key exists only in the foreign tenant |
-| `lifecycle`, `fixture_rows` | Successful `staging-use.mjs` JSONL `ready` record for wire phases. Stopped `release` or `stop` record and `0` fixture rows across both tenants for cleanup |
+| `lifecycle`, `fixture_rows` | Successful `staging-use.mjs` JSONL `ready` record for wire phases. Stopped `release` record with lease `released` and `0` fixture rows across both tenants for cleanup |
 
-Use the same fixture start (`YYYY-MM-DDTHH:MM:00Z`) and each phase's readback.
+Use Python 3.11+, the same fixture start (`YYYY-MM-DDTHH:MM:00Z`) and each phase's readback.
 Inject `STAGING_ATTENDANCE_KEY_ID` and `STAGING_ATTENDANCE_SIGNING_SECRET` for
 the dedicated staging caller. Pass the 64-character lowercase hex secret as ASCII.
 

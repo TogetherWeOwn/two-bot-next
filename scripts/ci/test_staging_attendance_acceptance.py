@@ -1,21 +1,24 @@
 """Offline signed attendance acceptance with synthetic response envelopes."""
 
+from copy import deepcopy
+from email.message import Message
+from io import BytesIO
+import json
 from pathlib import Path
 import sys
 import time
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import staging_attendance_acceptance as acceptance
 from script_intake import decode_json
-from staging_automation_read_smoke import STAGING_GUILD_ID
 
 
 FIXTURE = decode_json(Path(__file__).with_name("fixtures").joinpath("staging_attendance_acceptance.json").read_bytes())
 ROLLOUT, READY, RESULT = (FIXTURE[key] for key in ("rollout", "ready", "result"))
 IDENTITY = tuple(ROLLOUT[key] for key in ("worker_version", "revision", "build_id", "deploy_id"))
-VERSION, SHA, _, _ = IDENTITY
 ORIGIN = acceptance.STAGING_ORIGIN
 EVENT = RESULT["event_key"]
 START = acceptance.fixture_start("2026-11-24T16:00:00Z")
@@ -23,14 +26,9 @@ START = acceptance.fixture_start("2026-11-24T16:00:00Z")
 
 class AcceptanceTests(unittest.TestCase):
     def test_effective_configuration_and_cleanup(self):
-        lease = {"phase": "active", "deploymentId": VERSION, "sha": SHA, "epoch": 8,
-                 "expiresAt": int((time.time() + 60) * 1000)}
-        lifecycle = {"schema": "two-bot-staging-use.v1", "environment": "staging", "deploymentId": VERSION,
-                     "sha": SHA, "epoch": 8, "action": "ready", "running": True, "use": lease}
-        observed = {**ROLLOUT, "build_revision": SHA, "environment": "staging", "origin": ORIGIN,
-                    "guild_id": STAGING_GUILD_ID, "attendance_read": True, "attendance_capture": False,
-                    "signed_ingress": True, "primary_fixture": "finalized", "foreign_fixture": "foreign-only",
-                    "lifecycle": lifecycle}
+        observed = deepcopy(FIXTURE["observed"])
+        lifecycle, lease = observed["lifecycle"], observed["lifecycle"]["use"]
+        lease["expiresAt"] = int((time.time() + 60) * 1000)
         check = acceptance.validate_configuration
         self.assertEqual(check("finalized", ORIGIN, ROLLOUT, observed), IDENTITY)
         mismatches = {"guild_id": "2", "origin": "https://other.example.test", "build_id": "1234-2",
@@ -41,8 +39,11 @@ class AcceptanceTests(unittest.TestCase):
         lease["expiresAt"] = 1
         with self.assertRaises(acceptance.Refused):
             check("finalized", ORIGIN, ROLLOUT, observed)
-        lifecycle.update(action="release", running=False, use=None)
         observed.update(attendance_read=False, fixture_rows=0)
+        lifecycle.update(action="stop", running=False)
+        with self.assertRaises(acceptance.Refused):
+            check("cleanup", ORIGIN, ROLLOUT, observed)
+        lifecycle["action"], lease["phase"] = "release", "released"
         self.assertEqual(check("cleanup", ORIGIN, ROLLOUT, observed), IDENTITY)
         with self.assertRaises(acceptance.Refused):
             check("cleanup", ORIGIN, ROLLOUT, {**observed, "fixture_rows": 1})
@@ -56,7 +57,7 @@ class AcceptanceTests(unittest.TestCase):
                 self.assertIsNone(request.get_header("X-two-signature"))
                 readies.append(request)
                 report = {**READY, "build_id": "1234-2"} if drift and requests else READY
-                return 200, {"x-two-worker-version": VERSION}, report
+                return 200, {"x-two-worker-version": ROLLOUT["worker_version"]}, report
             self.assertEqual(request.full_url, ORIGIN + "/internal/actions")
             key = decode_json(request.data)["event_key"]
             self.assertEqual(decode_json(request.data), {"action": "event.attendance.read", "event_key": key})
@@ -70,8 +71,13 @@ class AcceptanceTests(unittest.TestCase):
                 result = {**RESULT, "final": 1} if wrong_result else RESULT
                 return 200, headers, dict(envelope, ok=True, result=result)
             status, code = (403, "action_not_allowed") if phase == "off" else (404, "not_found")
-            return status, headers, dict(envelope, ok=False, error={
-                "code": code, "message": "request refused", "retryable": False})
+            envelope.update(ok=False, error={"code": code, "message": "request refused", "retryable": False})
+            media = Message()
+            media["content-type"], media["cache-control"] = "application/json", "no-store"
+            raw = BytesIO(json.dumps(envelope).encode("ascii"))
+            with patch.object(acceptance, "no_redirect_opener") as opener:
+                opener.return_value.open.side_effect = HTTPError(request.full_url, status, code, media, raw)
+                return acceptance.send(request)
 
         return check, requests, readies
 

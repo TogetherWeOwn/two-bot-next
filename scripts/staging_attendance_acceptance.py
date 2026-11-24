@@ -26,6 +26,7 @@ from staging_rollout import UUID, readiness_identity
 ACTION_PATH = "/internal/actions"
 ACTION = "event.attendance.read"
 STAGING_ORIGIN = "https://two-bot-next-staging.5150.workers.dev"
+HTTP_HEADERS = {"User-Agent": "two-bot-staging-attendance-acceptance/1.0", "Cache-Control": "no-cache"}
 MEMBER = "300000000000000001"
 ROOM = "400000000000000001"
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -77,17 +78,17 @@ def validate_configuration(phase, origin, rollout, observed):
     require(isinstance(lifecycle, dict) and lifecycle.get("schema") == "two-bot-staging-use.v1"
             and lifecycle.get("environment") == "staging" and lifecycle.get("deploymentId") == version
             and lifecycle.get("sha") == sha, "staging lifecycle identity did not match")
+    use = lifecycle.get("use")
+    require(isinstance(use, dict) and use.get("sha") == sha and use.get("deploymentId") == version
+            and type(use.get("epoch")) is int and use["epoch"] > 0
+            and use["epoch"] == lifecycle.get("epoch"), "staging lease identity did not match")
     if phase == "cleanup":
-        require(lifecycle.get("action") in ("release", "stop") and lifecycle.get("running") is False
+        require(lifecycle.get("action") == "release" and use.get("phase") == "released" and lifecycle.get("running") is False
                 and type(observed.get("fixture_rows")) is int
                 and observed["fixture_rows"] == 0, "cleanup readback is incomplete")
     else:
-        use = lifecycle.get("use")
         require(lifecycle.get("action") == "ready" and lifecycle.get("running") is True
-                and isinstance(use, dict) and use.get("phase") == "active"
-                and use.get("sha") == sha and use.get("deploymentId") == version
-                and type(use.get("epoch")) is int and use["epoch"] > 0
-                and use["epoch"] == lifecycle.get("epoch")
+                and use.get("phase") == "active"
                 and type(use.get("expiresAt")) is int and use["expiresAt"] > (time.time() + RUN_BUDGET) * 1000,
                 "staging lease did not cover the probe")
         expected_fixture = "pending" if phase == "pending" else "finalized"
@@ -151,13 +152,8 @@ def send(request):
         return response.code, headers, json_object(read_with_overflow(response, BODY_CAP))
 
 
-def request(url, *, body=None, headers=None):
-    return Request(url, data=body, headers={"User-Agent": "two-bot-staging-attendance-acceptance/1.0",
-                                            "Cache-Control": "no-cache", **(headers or {})})
-
-
 def ready(check, origin, identity):
-    status, headers, result = check(request(origin + "/readyz"))
+    status, headers, result = check(Request(origin + "/readyz", headers=HTTP_HEADERS))
     require(status == 200 and readiness_identity(headers, result, *identity) == "match",
             "serving build did not match the staging rollout")
     state, report = parse_readyz(status, result)
@@ -171,7 +167,7 @@ def signed_read(check, origin, signer, event_key, expected_status, expected):
     headers = signing_headers(*signer, str(int(time.time())), secrets.token_hex(16), body)
     headers.update({"Content-Type": "application/json", "x-request-id": request_id})
     started = time.monotonic()
-    status, response_headers, result = check(request(origin + ACTION_PATH, body=body, headers=headers))
+    status, response_headers, result = check(Request(origin + ACTION_PATH, data=body, headers={**HTTP_HEADERS, **headers}))
     require(time.monotonic() - started < WEB_TIMEOUT, "signed read exceeded the Web deadline")
     envelope = {"ok": expected_status == 200, "request_id": request_id, **expected}
     # Canonical JSON equality preserves JSON types (Python bool/int equality does not).
@@ -226,11 +222,9 @@ def main(argv=None, *, env=None, check=send):
             finally:
                 signal.alarm(0)
                 signal.signal(signal.SIGALRM, old_handler)
-    except Refused as error:
-        print(f"FAIL: {error}", file=sys.stderr)
-        return 1
-    except (OSError, ValueError, RecursionError, http.client.HTTPException, ProbeError, SmokeError):
-        print("FAIL: attendance acceptance input or transport refused", file=sys.stderr)
+    except (Refused, OSError, ValueError, RecursionError, http.client.HTTPException, ProbeError, SmokeError) as error:
+        reason = str(error) if isinstance(error, Refused) else "attendance acceptance input or transport refused"
+        print(f"FAIL: {reason}", file=sys.stderr)
         return 1
     print(f"PASS: attendance {args.phase}")
     return 0
