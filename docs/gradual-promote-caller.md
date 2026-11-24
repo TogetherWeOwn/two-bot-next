@@ -80,7 +80,7 @@ npm run test:smoke
 `.github/workflows/gradual-promote-proof.yml` (dispatch-only, main-only,
 `staging` environment) holds the pinned invocation:
 
-- Action: `TogetherWeOwn/.github/actions/gradual-promote@2ef8ad6447e11d019ac3098bcfd011193b75266a`
+- Action: `TogetherWeOwn/.github/actions/gradual-promote@8059ac2b121b63443db656b1e10e927b8af8133c`
 - Worker: `two-bot-next-gradual-proof` (isolated synthetic target, not yet
   provisioned)
 - `allow-indexable: "false"` (no indexable surface on this Worker)

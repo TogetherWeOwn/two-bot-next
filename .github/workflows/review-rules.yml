@@ -1,6 +1,6 @@
 name: review-rules (shadow)
 # ci-policy: non-required -- advisory signals; existing required gates stay unchanged.
-# Pinned to the published TogetherWeOwn/.github central PR #26 squash-merge commit.
+# Pinned to the published TogetherWeOwn/.github release commit.
 on:
   pull_request:
   merge_group:
