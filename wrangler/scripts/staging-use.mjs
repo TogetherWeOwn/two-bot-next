@@ -128,7 +128,8 @@ function window(state, args, now, phase = "active") {
 export async function stagingUse(args, send = fetch, pause = wait, now = Date.now) {
   const base = origin(args.url);
   require(typeof args.token === "string" && args.token.length >= 32, "staging_token_missing");
-  require(["status", "observe", "acquire", "assert", "ready", "release", "stop"].includes(args.action), "staging_action_invalid");
+  require(["status", "observe", "acquire", "assert", "ready", "release", "stop", "automod-absent"].includes(args.action),
+    "staging_action_invalid");
   require(args.voiceMove === undefined || (args.action === "acquire" && args.voiceMove === true),
     "staging_voice_move_invalid");
   // A release may be retried after expiry, but never extends that expiry.
@@ -145,6 +146,19 @@ export async function stagingUse(args, send = fetch, pause = wait, now = Date.no
     statusRetryDeadline = Math.min(start + 30000, stopDeadline - MAX_REQUEST_MS);
   }
   const headers = { authorization: `Bearer ${args.token}`, "cache-control": "no-cache" };
+  if (args.action === "automod-absent") {
+    headers["x-two-staging-preview"] = [args.deploymentId, args.sha, args.runId, args.runAttempt, args.expiresAt].join(":");
+    const deadline = performance.now() + Math.min(MAX_REQUEST_MS, args.expiresAt - now());
+    const response = await request(send, new URL(PATH, base), { method: "GET", headers }, deadline);
+    require(response.status === 200 && response.body?.registry === "absent", "staging_preview_absence_unconfirmed");
+    const state = parseStagingState(response.body);
+    require(state, "staging_response_invalid");
+    identity(state, args);
+    const at = now();
+    window(state, args, at);
+    require(!state.running, "staging_stop_unconfirmed");
+    return { ...receipt(args.action, state, at), registry: "absent", command: "automod-preview" };
+  }
   const control = async (init) => {
     const retryDeadline = init.method === "GET" ? statusRetryDeadline : undefined;
     let deadline = stopDeadline ?? retryDeadline ?? performance.now() + MAX_REQUEST_MS;
