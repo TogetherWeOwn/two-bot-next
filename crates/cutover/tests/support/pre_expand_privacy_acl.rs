@@ -475,10 +475,12 @@ async fn exercise_schema_undo(migrator: &PgPool) {
         "DELETE FROM _sqlx_migrations WHERE version = 482",
         "UPDATE _sqlx_migrations SET version = 499 WHERE version = 482",
         "UPDATE _sqlx_migrations SET success = false WHERE version = 473",
+        "UPDATE _sqlx_migrations SET description = 'fixture drift' WHERE version = 481",
         "UPDATE _sqlx_migrations SET checksum = decode(repeat('00', 48), 'hex') WHERE version = 481",
         "DELETE FROM _two_bot_migrations WHERE version = 478",
         "UPDATE _two_bot_migrations SET version = 499 WHERE version = 478",
         "UPDATE _two_bot_migrations SET success = false WHERE version = 465",
+        "UPDATE _two_bot_migrations SET description = 'fixture drift' WHERE version = 478",
         "UPDATE _two_bot_migrations SET checksum = decode(repeat('00', 48), 'hex') WHERE version = 478",
         "UPDATE web_contract_meta SET contract_version = '1.0' WHERE singleton",
     ] {
