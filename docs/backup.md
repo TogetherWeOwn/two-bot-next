@@ -357,6 +357,10 @@ during the watch window), and restoring pre-backup watermarks could mark
 post-backup writes as already journaled, silently breaking rollback coverage.
 Migration ledgers (`_sqlx_migrations`, `schema_migrations` and the store
 chain's `_two_bot_migrations`) describe target DDL and are never restored.
+The dormant `live_sequence_watermarks` table is also excluded. Restore
+preserves the target's watermark because an archive can predate deltas the
+hub already accepted. Before enabling a producer after database replacement
+or point-in-time recovery, reconcile the durable watermark with the hub.
 Replay guards, idempotency records, gateway sessions, lease-bearing durable
 tables and audit history are **not** ephemeral exclusions. Derived `web_v1`
 views contain no independent table data; the website service's own separate

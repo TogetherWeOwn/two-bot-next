@@ -345,6 +345,9 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     // replay a pre-restore lane hold into a recovered process; a restored
     // database re-admits from generation zero and re-learns cooldowns.
     "discord_send_admission",
+    // Keep the destination's live-hub watermark. An archive could rewind it
+    // below sequences the hub already observed.
+    "live_sequence_watermarks",
     // Onboarding restart-recovery queue: captured member state and delivery
     // receipts bound to a gateway session. Never replay a pre-restore job
     // into a recovered process; welcome/goodbye state of record lives in the
