@@ -69,14 +69,15 @@ class Rehearsal:
         print(f"policy={value}", flush=True)
 
     def docker_run(self, name, *args, namespace=None, entrypoint=None, env=None):
-        argv = ["docker", "run", "-d", "--pull=never", "--name", name,
+        argv = ["docker", "create", "--pull=never", "--name", name,
                 "--network", f"container:{namespace}" if namespace else "none"]
         if entrypoint:
             argv.extend(["--entrypoint", entrypoint])
         for key, value in (env or {}).items():
             argv.extend(["-e", f"{key}={value}"])
-        run(*argv, *args)
-        self.cleanup.callback(run, "docker", "container", "rm", "--force", "--volumes", name)
+        container_id = run(*argv, *args).decode().strip()
+        self.cleanup.callback(run, "docker", "container", "rm", "--force", "--volumes", container_id)
+        run("docker", "start", container_id)
 
     def sql(self, sql, db=None):
         return run("docker", "exec", "-i", self.pg, "psql", "-XAtq", "-v", "ON_ERROR_STOP=1", "-U",
