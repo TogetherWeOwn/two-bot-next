@@ -54,8 +54,11 @@ export const snapshot = {
   v: 1, guild_id: scope.guildId, seq: 9, observed_at: "2026-11-24T20:00:00.123456789Z",
   topics: {
     guild: { ownerId: "2", afkChannelId: "3" },
-    channels: [{ id: "3", name: "応接室", kind: "voice", parentId: null, position: 0xffff_ffff, overwrites: [] }],
-    roles: [{ id: scope.guildId, permissions: "18446744073709551615" }],
+    channels: [
+      { id: "3", name: "応接室", kind: "voice", parentId: null, position: 0xffff_ffff, overwrites: [] },
+      { id: "4", name: "Lobby", kind: "other", parentId: null, position: 0, overwrites: [] },
+    ],
+    roles: [{ id: scope.guildId, permissions: "18446744073709551615" }, { id: "5", permissions: "0" }],
     members: [{ userId: "2", roleIds: [scope.guildId], nick: null, bot: false, pending: false }],
     voice: [{ userId: "2", channelId: "3" }],
     events: [],
