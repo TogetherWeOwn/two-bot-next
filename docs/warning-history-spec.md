@@ -15,6 +15,24 @@ proposal, **not** intent acceptance, a historical-data grant, command
 publication or production activation. No runtime code, schema, retention policy,
 credential, permission, data collection or live operation changes.
 
+## Dormant storage slice
+
+The 2026-11-23 source authorization covers an unwired metadata reader, synthetic
+fixtures and an unregistered index candidate. WH-G1–WH-G4 remain open.
+
+The store returns five entries with guild- and target-bound continuation keys.
+The command has no registry or runtime caller.
+[Warning history store](../crates/core/src/member_moderation_store/warning_history.rs)
+
+The index extends the 0110 order. Fix shared-schema fixture deadlocks before
+registering it. Check combined guild, target and warning key sizes before release.
+[Cutover index candidate](../crates/cutover/migration-candidates/moderation_warning_history_order.sql)
+
+Reuse the existing moderation resolver for fresh guild permissions, add channel
+checks, and deny staff self-targets. A separate slice owns private interactions,
+cursor limits and the final authority check. AutoMod preview delivery gates
+activation. [Moderation runtime](../crates/bot/src/member_runtime.rs)
+
 ## Decision and alternatives
 
 Consumer: current staff checking recorded prior warnings before deciding what to

@@ -1,6 +1,7 @@
 //! Full-schema erasure acceptance, only on the guarded disposable test service.
 
 use sqlx::PgPool;
+use two_bot_core::member_moderation_store::{PgMemberModerationStore, WarningHistoryEntry};
 use two_bot_core::{ChannelAuditRow, ChannelClaim, ChannelModerationStore};
 use two_bot_cutover::member_erasure::{erase_member, plan, schema_gaps, ErasureMode};
 use two_bot_testsupport::TestDatabase;
@@ -51,6 +52,111 @@ async fn audit_count(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn warning_history_projects_bounded_metadata_and_respects_erasure() {
+    let Some(db) = database().await else { return };
+    sqlx::raw_sql(include_str!("fixtures/warning_history.sql"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let guild = "100000000000000011";
+    let foreign = "100000000000000012";
+    let target = "100000000000000021";
+    let other_target = "100000000000000022";
+    let recorder = "100000000000000031";
+    let store = PgMemberModerationStore::new(db.pool().clone(), guild);
+    let foreign_store = PgMemberModerationStore::new(db.pool().clone(), foreign);
+    let before = snapshot(db.pool(), "moderation_warnings").await;
+
+    let first = store.warning_history(guild, target, None).await.unwrap();
+    let newest = WarningHistoryEntry {
+        reference: "W-55027ec5889226ab1d57ecf2ee95ce7b1f925f493d3a0e48710a457f2c6459a0".into(),
+        recorded_at_utc: "2026-10-01T00:00:00.123456Z".into(),
+        recorder_id: Some(100000000000000031),
+    };
+    assert_eq!(first.entries.len(), 5);
+    assert_eq!(first.entries[0], newest);
+    assert_eq!(
+        first
+            .entries
+            .iter()
+            .map(|row| row.recorder_id)
+            .collect::<Vec<_>>(),
+        [Some(100000000000000031), None, None, Some(u64::MAX), None]
+    );
+    let cursor = first.next.as_ref().unwrap();
+    let second = store
+        .warning_history(guild, target, Some(cursor))
+        .await
+        .unwrap();
+    assert_eq!(second.entries.len(), 2);
+    assert_eq!(
+        second.entries[0].reference,
+        "W-65841c30bab70f434a5cbd29d4fa1f9ed5666f71b6721463b9a2eeba4c224455"
+    );
+    assert_eq!(
+        second.entries[1].reference,
+        "W-85563c1d7f13569ecad0ea6a3a31e0beb572fe6f8c0001571bcb38172034c867"
+    );
+    assert!(second.next.is_none());
+    assert!(store.warning_history(foreign, target, None).await.is_err());
+    assert!(foreign_store
+        .warning_history(foreign, target, Some(cursor))
+        .await
+        .is_err());
+    assert!(store
+        .warning_history(guild, other_target, Some(cursor))
+        .await
+        .is_err());
+    assert!(store.warning_history(guild, "021", None).await.is_err());
+    assert!(store
+        .warning_history(guild, "100000000000000023", None)
+        .await
+        .unwrap()
+        .entries
+        .is_empty());
+    for malformed_target in ["100000000000000024", "100000000000000025"] {
+        assert!(store
+            .warning_history(guild, malformed_target, None)
+            .await
+            .is_err());
+    }
+    assert_eq!(snapshot(db.pool(), "moderation_warnings").await, before);
+    assert_eq!(audit_count(db.pool()).await, 0);
+
+    let mode = ErasureMode::Execute { actor: ACTOR };
+    erase_member(db.pool(), guild, recorder, mode)
+        .await
+        .unwrap();
+    let after_actor = store.warning_history(guild, target, None).await.unwrap();
+    assert_eq!(&after_actor.entries[..4], &first.entries[1..]);
+    assert_eq!(after_actor.entries[4], second.entries[0]);
+
+    erase_member(db.pool(), guild, target, mode).await.unwrap();
+    for subject in [target, other_target] {
+        assert!(store
+            .warning_history(guild, subject, None)
+            .await
+            .unwrap()
+            .entries
+            .is_empty());
+    }
+    assert!(store
+        .warning_history(guild, target, Some(cursor))
+        .await
+        .unwrap()
+        .entries
+        .is_empty());
+    let surviving = foreign_store
+        .warning_history(foreign, target, None)
+        .await
+        .unwrap();
+    assert_eq!(surviving.entries.len(), 1);
+    assert_eq!(surviving.entries[0].recorder_id, newest.recorder_id);
+    assert_eq!(audit_count(db.pool()).await, 2);
+    db.close().await.unwrap();
 }
 
 #[tokio::test]
