@@ -108,7 +108,8 @@ def main(argv, env):
                                   env.get("RECOVERY_PLAN_SOURCE") or env["GITHUB_SHA"])
             with Path(env["GITHUB_OUTPUT"]).open("a") as out:
                 out.write(f"fingerprint={proof['target_fingerprint']}\n")
-                out.write(f"plan={json.dumps(proof, separators=(',', ':'))}\n")
+                if env.get("REVIEWED_PLAN"):
+                    out.write(f"plan={json.dumps(proof, separators=(',', ':'))}\n")
             return 0
         source = env.get("DEPLOY_SHA")
         reviewed = env.get("REVIEWED_SOURCE")
