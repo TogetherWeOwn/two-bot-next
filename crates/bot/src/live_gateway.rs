@@ -4,23 +4,62 @@ use std::{collections::HashMap, future::Future, time::Duration};
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use tokio::{sync::watch, time::Instant};
+use sqlx::PgPool;
+use tokio::{
+    sync::watch,
+    time::{timeout, timeout_at, Instant},
+};
 use twilight_model::{
     gateway::payload::outgoing::RequestGuildMembers,
     id::{marker::GuildMarker, Id},
 };
 use two_bot_core::{duplicate_keys::reject_duplicate_keys, realtime_wire as wire};
 use two_bot_discord::{realtime_baseline_join::BaselineJoin, realtime_gateway, realtime_roster};
+use wire::recovery::{Generation, Recovery};
+use wire::watermark::{self, ReservationError};
 use wire::{Change, ChannelKind, Operation, OverwriteKind, WireTime};
 
 use crate::live_delivery::{self, Delivery};
 
 const BASELINE_TIMEOUT: Duration = Duration::from_secs(30);
+const RESERVATION_TIMEOUT: Duration = Duration::from_secs(1);
 type GuildId = Id<GuildMarker>;
 
 /// The default receive path has no collector, queue or member requests.
-#[derive(Default)]
-pub struct LiveGateway(Option<Intake>);
+pub struct LiveGateway<W = PgPool>(Option<Intake<W>>);
+
+impl Default for LiveGateway {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+/// Storage for a single ordered owner. `reserve` must report success only for
+/// a fresh, committed compare-and-advance in the same store as `read`.
+pub trait SequenceWatermark: Send + Sync {
+    fn read(&self, guild: wire::Id) -> impl Future<Output = Result<u64, ReservationError>> + Send;
+    fn reserve(
+        &self,
+        guild: wire::Id,
+        expected: u64,
+        next: u64,
+    ) -> impl Future<Output = Result<(), ReservationError>> + Send;
+}
+
+impl SequenceWatermark for PgPool {
+    async fn read(&self, guild: wire::Id) -> Result<u64, ReservationError> {
+        watermark::read(self, guild).await
+    }
+
+    async fn reserve(
+        &self,
+        guild: wire::Id,
+        expected: u64,
+        next: u64,
+    ) -> Result<(), ReservationError> {
+        watermark::reserve(self, guild, expected, next).await
+    }
+}
 
 pub struct LiveReceiver(live_delivery::Receiver<QueuedDelta>);
 
@@ -29,19 +68,22 @@ struct QueuedDelta {
     generation: watch::Receiver<()>,
 }
 
-struct Intake {
+struct Intake<W> {
     guild: GuildId,
     identified: bool,
     join: BaselineJoin,
     pending_until: Option<Instant>,
     active: Option<BaselineFence>,
-    seq: u64,
+    watermark: W,
     sender: live_delivery::Sender<QueuedDelta>,
 }
 
 /// Keep the references the hub will validate after each delta. The hub also
 /// applies the channel, member and role removal cascades below.
 struct BaselineFence {
+    seq: u64,
+    recovery: Recovery,
+    generation: Generation,
     guild: wire::Guild,
     channels: Rows<wire::Channel>,
     roles: Rows<wire::Role>,
@@ -70,10 +112,10 @@ struct GuildScope {
     guild_id: GuildId,
 }
 
-impl LiveGateway {
-    /// Construct an isolated handoff. The cursor is in memory until durable
-    /// reservation and snapshot publication are wired at the runtime boundary.
-    pub fn for_guild(guild: GuildId, seq: u64) -> (Self, LiveReceiver) {
+impl<W: SequenceWatermark> LiveGateway<W> {
+    /// Construct a dormant handoff for the sole ordered owner of this guild.
+    /// The first complete baseline and every rebuild read the durable cursor.
+    pub fn for_guild(guild: GuildId, watermark: W) -> (Self, LiveReceiver) {
         let (sender, receiver) = live_delivery::channel();
         let intake = Intake {
             guild,
@@ -81,7 +123,7 @@ impl LiveGateway {
             join: BaselineJoin::new(guild),
             pending_until: None,
             active: None,
-            seq,
+            watermark,
             sender,
         };
         (Self(Some(intake)), LiveReceiver(receiver))
@@ -89,6 +131,14 @@ impl LiveGateway {
 
     pub fn enabled(&self) -> bool {
         self.0.is_some()
+    }
+
+    /// The published recovery view while it covers the active cursor.
+    /// Serving later deltas requires a snapshot source that advances with them.
+    pub fn recovery(&self) -> Option<(&Recovery, &Generation)> {
+        let active = self.0.as_ref()?.active.as_ref()?;
+        (active.recovery.baseline()?.seq == active.seq)
+            .then_some((&active.recovery, &active.generation))
     }
 
     /// Retire before processing any further dispatch after a transport loss,
@@ -100,14 +150,14 @@ impl LiveGateway {
     }
 
     /// Called by the shard owner for each accepted dispatch in receive order.
-    pub fn receive(
+    pub async fn receive(
         &mut self,
         raw: &str,
         at: WireTime,
         request_members: impl FnOnce(&RequestGuildMembers) -> bool,
     ) {
         let Some(intake) = &mut self.0 else { return };
-        match intake.receive(raw, at) {
+        match intake.receive(raw, at).await {
             Ok(Some(request)) if !request_members(&request) => {
                 intake.retire("member_request_refused")
             }
@@ -148,7 +198,7 @@ impl LiveReceiver {
     }
 }
 
-impl Intake {
+impl<W: SequenceWatermark> Intake<W> {
     fn disconnect(&mut self) {
         self.identified = false;
         self.retire("disconnect");
@@ -163,7 +213,11 @@ impl Intake {
         }
     }
 
-    fn receive(&mut self, raw: &str, at: WireTime) -> Result<Option<RequestGuildMembers>, ()> {
+    async fn receive(
+        &mut self,
+        raw: &str,
+        at: WireTime,
+    ) -> Result<Option<RequestGuildMembers>, ()> {
         let Ok(dispatch @ Dispatch { op: 0, .. }) = object::<Dispatch<'_>>(raw) else {
             self.identified = false;
             return Err(());
@@ -194,29 +248,66 @@ impl Intake {
                     return Ok(request);
                 }
             }
-            _ if self.pending_until.is_some() => {
-                if let Some(topics) = self.join.observe(raw, at).map_err(|_| ())? {
-                    self.active = Some(BaselineFence {
-                        guild: topics.guild,
-                        channels: index(topics.channels, |row| row.id),
-                        roles: index(topics.roles, |row| row.id),
-                        members: index(topics.members, |row| row.user_id),
-                        events: topics
-                            .events
-                            .into_iter()
-                            .map(|row| (row.id, row.channel_id))
-                            .collect(),
-                        lifetime: watch::channel(()).0,
-                    });
-                    self.pending_until = None;
+            _ => {
+                if let Some(until) = self.pending_until {
+                    if let Some(topics) = self.join.observe(raw, at).map_err(|_| ())? {
+                        let deadline = until.min(Instant::now() + RESERVATION_TIMEOUT);
+                        timeout_at(deadline, self.publish_baseline(at, topics))
+                            .await
+                            .map_err(|_| ())??;
+                    }
+                } else {
+                    self.forward(raw, &dispatch, at).await?;
                 }
             }
-            _ => self.forward(raw, &dispatch, at)?,
         }
         Ok(None)
     }
 
-    fn forward(&mut self, raw: &str, dispatch: &Dispatch<'_>, at: WireTime) -> Result<(), ()> {
+    async fn publish_baseline(&mut self, at: WireTime, topics: wire::Topics) -> Result<(), ()> {
+        let guild = wire::Id(self.guild.into_nonzero());
+        let mut recovery = Recovery::new(guild);
+        let generation = recovery.begin();
+        let watermark = &self.watermark;
+        let expected = watermark.read(guild).await.map_err(|_| ())?;
+        let body = recovery
+            .publish(
+                &generation,
+                expected,
+                at,
+                topics,
+                async |guild, from, to| watermark.reserve(guild, from, to).await,
+            )
+            .await
+            .map_err(|_| ())?;
+        let baseline = recovery.baseline().ok_or(())?;
+        let topics = &baseline.topics;
+        let active = BaselineFence {
+            seq: baseline.seq,
+            guild: topics.guild.clone(),
+            channels: index(&topics.channels, |row| row.id),
+            roles: index(&topics.roles, |row| row.id),
+            members: index(&topics.members, |row| row.user_id),
+            events: topics
+                .events
+                .iter()
+                .map(|row| (row.id, row.channel_id))
+                .collect(),
+            recovery,
+            generation,
+            lifetime: watch::channel(()).0,
+        };
+        self.pending_until = None;
+        self.offer(active, body);
+        Ok(())
+    }
+
+    async fn forward(
+        &mut self,
+        raw: &str,
+        dispatch: &Dispatch<'_>,
+        at: WireTime,
+    ) -> Result<(), ()> {
         let Some(active) = &mut self.active else {
             return Ok(());
         };
@@ -267,13 +358,31 @@ impl Intake {
             return Ok(());
         };
         let guild = wire::Id(self.guild.into_nonzero());
-        let seq = self.seq.checked_add(1).ok_or(())?;
+        let expected = active.seq;
+        let seq = expected + 1; // Active cursors are bounded by the wire codec.
         let body = wire::encode_delta(guild, seq, at, std::slice::from_ref(&operation)).ok_or(())?;
         active.apply(guild, operation)?;
-        self.seq = seq;
-        let generation = active.lifetime.subscribe();
-        self.sender.offer(QueuedDelta { body, generation });
+        // Own the delivery fence across the await so dropping a possibly
+        // committed reservation also drops the generation and snapshot.
+        let mut active = self.active.take().ok_or(())?;
+        let result = timeout(
+            RESERVATION_TIMEOUT,
+            self.watermark.reserve(guild, expected, seq),
+        )
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            self.active = Some(active);
+            return Err(());
+        }
+        active.seq = seq;
+        self.offer(active, body);
         Ok(())
+    }
+
+    fn offer(&mut self, active: BaselineFence, body: Vec<u8>) {
+        let generation = active.lifetime.subscribe();
+        self.active = Some(active);
+        self.sender.offer(QueuedDelta { body, generation });
     }
 }
 
@@ -381,8 +490,8 @@ fn is_voice_room(kind: Option<ChannelKind>) -> bool {
     matches!(kind, Some(ChannelKind::Voice | ChannelKind::Stage))
 }
 
-fn index<T>(rows: Vec<T>, key: impl Fn(&T) -> wire::Id) -> Rows<T> {
-    rows.into_iter().map(|row| (key(&row), row)).collect()
+fn index<T: Clone>(rows: &[T], key: impl Fn(&T) -> wire::Id) -> Rows<T> {
+    rows.iter().map(|row| (key(row), row.clone())).collect()
 }
 
 fn insert<T>(rows: &mut Rows<T>, id: wire::Id, row: T, limit: usize) -> Result<(), ()> {

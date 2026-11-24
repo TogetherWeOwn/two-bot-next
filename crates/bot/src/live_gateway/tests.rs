@@ -1,6 +1,8 @@
 use super::*;
 use crate::tuning_test_support::Capture;
+use futures_util::FutureExt;
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tracing::instrument::WithSubscriber;
 use twilight_model::id::marker::ScheduledEventMarker;
@@ -12,6 +14,55 @@ const CREATE: &str = include_str!("../../tests/fixtures/live_gateway_guild_creat
 const VOICE: &str = include_str!("../../tests/fixtures/live_gateway_voice_state_update.json");
 const TOPOLOGY: &[u8] = include_bytes!("../../tests/fixtures/live_gateway_topology.json");
 
+#[derive(Clone)]
+struct FakeWatermark(Arc<Mutex<WatermarkState>>);
+
+struct WatermarkState {
+    seq: u64,
+    ack: Option<Ack>,
+}
+
+enum Ack {
+    Lost,
+    Pending,
+}
+
+impl FakeWatermark {
+    fn new(seq: u64) -> Self {
+        Self(Arc::new(Mutex::new(WatermarkState { seq, ack: None })))
+    }
+}
+
+impl SequenceWatermark for FakeWatermark {
+    async fn read(&self, guild: wire::Id) -> Result<u64, ReservationError> {
+        assert_eq!(guild.0, GUILD.into_nonzero());
+        Ok(self.0.lock().expect("fake watermark").seq)
+    }
+
+    async fn reserve(
+        &self,
+        guild: wire::Id,
+        expected: u64,
+        next: u64,
+    ) -> Result<(), ReservationError> {
+        assert_eq!(guild.0, GUILD.into_nonzero());
+        assert!(next <= wire::MAX_SEQ && matches!(next.checked_sub(expected), Some(1 | 2)));
+        let ack = {
+            let mut state = self.0.lock().expect("fake watermark");
+            if state.seq != expected {
+                return Err(ReservationError::Conflict);
+            }
+            state.seq = next;
+            state.ack.take()
+        };
+        match ack {
+            Some(Ack::Pending) => std::future::pending().await,
+            Some(Ack::Lost) => Err(ReservationError::Storage),
+            None => Ok(()),
+        }
+    }
+}
+
 fn event_row(id: u64) -> Value {
     let mut row: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/live_gateway_scheduled_event.json"
@@ -21,7 +72,7 @@ fn event_row(id: u64) -> Value {
     row
 }
 
-fn event(live: &mut LiveGateway, kind: &str, row: Value) {
+fn event(live: &mut LiveGateway<impl SequenceWatermark>, kind: &str, row: Value) {
     let frame = json!({"op": 0, "s": 1, "t": kind, "d": row}).to_string();
     assert!(
         twilight_gateway::parse(frame.clone(), twilight_gateway::EventTypeFlags::all())
@@ -31,31 +82,126 @@ fn event(live: &mut LiveGateway, kind: &str, row: Value) {
     receive(live, &frame);
 }
 
-fn receive(live: &mut LiveGateway, raw: &str) {
-    live.receive(raw, AT, |_| panic!("unexpected member request"));
+fn receive(live: &mut LiveGateway<impl SequenceWatermark>, raw: &str) {
+    live.receive(raw, AT, |_| panic!("unexpected member request"))
+        .now_or_never()
+        .expect("immediate fixture storage");
 }
 
-fn begin(live: &mut LiveGateway) -> String {
+fn begin(live: &mut LiveGateway<FakeWatermark>) -> String {
     begin_with(live, CREATE)
 }
 
-fn begin_with(live: &mut LiveGateway, create: &str) -> String {
+fn begin_with(live: &mut LiveGateway<FakeWatermark>, create: &str) -> String {
     let mut nonce = None;
     live.receive(create, AT, |request| {
         assert_eq!(request.d.guild_id, GUILD);
         nonce.clone_from(&request.d.nonce);
         true
-    });
+    })
+    .now_or_never()
+    .expect("baseline collection starts immediately");
     nonce.expect("fresh member request")
 }
 
-fn complete(live: &mut LiveGateway, nonce: &str) {
-    receive(live, &json!({"op":0,"t":"GUILD_MEMBERS_CHUNK","d":{"guild_id":"10","nonce":nonce,
-        "chunk_index":0,"chunk_count":1,"members":[{"user":{"id":"31"},"roles":[],"pending":false}]}}).to_string());
+fn complete(live: &mut LiveGateway<FakeWatermark>, nonce: &str) {
+    receive(live, &chunk(nonce));
+}
+
+fn chunk(nonce: &str) -> String {
+    json!({"op":0,"t":"GUILD_MEMBERS_CHUNK","d":{"guild_id":"10","nonce":nonce,
+        "chunk_index":0,"chunk_count":1,"members":[{"user":{"id":"31"},"roles":[],"pending":false}]}}).to_string()
 }
 
 fn decoded(body: &[u8]) -> Value {
     serde_json::from_slice(body).expect("wire delta")
+}
+
+#[tokio::test(start_paused = true)]
+async fn conflict_or_lost_ack_requires_a_new_covering_baseline() {
+    for lose_ack in [false, true] {
+        let watermark = FakeWatermark::new(0);
+        let (mut live, receiver) = LiveGateway::for_guild(GUILD, watermark.clone());
+        receive(&mut live, READY);
+        let old = begin(&mut live);
+        complete(&mut live, &old);
+        assert!(live.recovery().is_some());
+        receive(&mut live, VOICE); // Queue a confirmed delta at 3.
+        {
+            let mut store = watermark.0.lock().expect("fake watermark");
+            assert_eq!(store.seq, 3);
+            if lose_ack {
+                store.ack = Some(Ack::Lost);
+            } else {
+                store.seq = 4; // A competing reservation won the same target.
+            }
+        }
+        receive(&mut live, VOICE);
+        receive(&mut live, VOICE);
+        complete(&mut live, &old);
+        assert!(live.0.as_ref().expect("intake").active.is_none());
+        assert_eq!(watermark.0.lock().expect("fake watermark").seq, 4);
+
+        let fresh = begin(&mut live);
+        complete(&mut live, &old);
+        assert!(live.recovery().is_none());
+        complete(&mut live, &fresh);
+        let (recovery, generation) = live.recovery().expect("replacement published baseline");
+        assert!(recovery.is_current(generation));
+        let baseline = recovery.baseline().expect("replacement snapshot");
+        let snapshot = decoded(&baseline.snapshot);
+        assert_eq!(snapshot["seq"], 6);
+        assert_eq!(snapshot["topics"]["members"][0]["userId"], "31");
+        receive(&mut live, VOICE);
+        assert!(live.recovery().is_none());
+        assert_eq!(watermark.0.lock().expect("fake watermark").seq, 7);
+
+        let mut received = Vec::new();
+        let worker = receiver.run(async |body| {
+            received.push(decoded(body));
+            Delivery::Accepted
+        });
+        assert!(timeout(Duration::from_secs(1), worker).await.is_err());
+        let [marker, delta] = received.as_slice() else {
+            panic!("only the rebuilt generation should reach the sink: {received:?}");
+        };
+        assert_eq!(marker["seq"], snapshot["seq"]);
+        assert_eq!(marker["ops"][0]["topic"], "guild");
+        assert_eq!(delta["seq"], 7);
+        assert_eq!(delta["ops"][0]["topic"], "voice");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_or_timing_out_a_committed_reservation_withdraws_delivery() {
+    let watermark = FakeWatermark::new(0);
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, watermark.clone());
+    receive(&mut live, READY);
+    let first = begin(&mut live);
+    watermark.0.lock().expect("fake watermark").ack = Some(Ack::Pending);
+    live.receive(&chunk(&first), AT, |_| false).await;
+    assert!(live.recovery().is_none());
+    assert_eq!(watermark.0.lock().expect("fake watermark").seq, 2);
+
+    let second = begin(&mut live);
+    complete(&mut live, &second);
+    assert!(live.recovery().is_some());
+    watermark.0.lock().expect("fake watermark").ack = Some(Ack::Pending);
+    assert!(live.receive(VOICE, AT, |_| false).now_or_never().is_none());
+    assert!(live.0.as_ref().expect("intake").active.is_none());
+    receive(&mut live, VOICE);
+    assert!(live.recovery().is_none());
+    assert_eq!(watermark.0.lock().expect("fake watermark").seq, 5);
+
+    let fresh = begin(&mut live);
+    complete(&mut live, &fresh);
+    let mut received = Vec::new();
+    let worker = receiver.run(async |body| {
+        received.push(decoded(body)["seq"].as_u64().expect("wire sequence"));
+        Delivery::Accepted
+    });
+    assert!(timeout(Duration::from_secs(1), worker).await.is_err());
+    assert_eq!(received, [7]);
 }
 
 #[test]
@@ -67,14 +213,14 @@ fn default_dispatches_and_cold_resume_make_no_requests() {
     }
     event(&mut disabled, "GUILD_SCHEDULED_EVENT_CREATE", event_row(90));
     assert!(!disabled.enabled());
-    let (mut live, _) = LiveGateway::for_guild(GUILD, 0);
+    let (mut live, _) = LiveGateway::for_guild(GUILD, FakeWatermark::new(0));
     receive(&mut live, r#"{"op":0,"t":"RESUMED","d":{}}"#);
     receive(&mut live, CREATE);
 }
 
 #[tokio::test(start_paused = true)]
 async fn scheduled_events_share_voice_order_and_emit_only_allowlisted_fields() {
-    let (mut live, receiver) = LiveGateway::for_guild(GUILD, 40);
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, FakeWatermark::new(38));
     receive(&mut live, READY);
     event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(90));
     let nonce = begin(&mut live);
@@ -114,6 +260,7 @@ async fn scheduled_events_share_voice_order_and_emit_only_allowlisted_fields() {
         Delivery::Accepted
     });
     tokio::join!(worker, async {
+        assert_eq!(rx.recv().await.expect("recovery marker")["seq"], 40);
         let mut value = json!({
             "id": "91", "channelId": "20", "status": "scheduled", "title": "Fixture event",
             "description": null, "location": null, "startsAt": "2026-11-21T13:00:00Z", "endsAt": null
@@ -146,9 +293,10 @@ async fn scheduled_events_share_voice_order_and_emit_only_allowlisted_fields() {
     });
 }
 
-#[test]
-fn scheduled_event_limit_counts_baseline_rows_and_releases_removed_rows() {
-    let (mut live, _receiver) = LiveGateway::for_guild(GUILD, 0);
+#[tokio::test]
+async fn scheduled_event_limit_counts_baseline_rows_and_releases_removed_rows() {
+    let watermark = FakeWatermark::new(0);
+    let (mut live, _receiver) = LiveGateway::for_guild(GUILD, watermark.clone());
     receive(&mut live, READY);
     let mut create = decoded(CREATE.as_bytes());
     let mut events = (1000..1100).map(event_row).collect::<Vec<_>>();
@@ -172,13 +320,13 @@ fn scheduled_event_limit_counts_baseline_rows_and_releases_removed_rows() {
     receive(&mut live, VOICE);
     let intake = live.0.as_ref().expect("intake");
     assert!(intake.active.is_none());
-    assert_eq!(intake.seq, 5);
+    assert_eq!(watermark.0.lock().expect("fake watermark").seq, 7);
 }
 
 #[tokio::test(start_paused = true)]
 async fn topology_and_roster_share_receive_order_with_voice_and_events() {
     let fixture = decoded(TOPOLOGY);
-    let (mut live, receiver) = LiveGateway::for_guild(GUILD, 40);
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, FakeWatermark::new(38));
     receive(&mut live, READY);
     let nonce = begin(&mut live);
     complete(&mut live, &nonce);
@@ -198,12 +346,13 @@ async fn topology_and_roster_share_receive_order_with_voice_and_events() {
     assert!(tokio::time::timeout(Duration::from_secs(1), worker)
         .await
         .is_err());
-    assert_eq!(&deltas, fixture["deltas"].as_array().expect("deltas"));
+    assert_eq!(deltas[0]["seq"], 40);
+    assert_eq!(&deltas[1..], fixture["deltas"].as_array().expect("deltas"));
 }
 
 #[tokio::test(start_paused = true)]
 async fn voice_only_is_encoded_once_in_receive_order_and_retried_unchanged() {
-    let (mut live, receiver) = LiveGateway::for_guild(GUILD, 40);
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, FakeWatermark::new(38));
     receive(&mut live, VOICE);
     receive(&mut live, READY);
     let nonce = begin(&mut live);
@@ -222,13 +371,17 @@ async fn voice_only_is_encoded_once_in_receive_order_and_retried_unchanged() {
     let mut retry = true;
     let worker = receiver.run(async move |body| {
         tx.send(body.to_vec()).expect("fixture receiver");
-        if std::mem::take(&mut retry) {
+        if decoded(body)["seq"] == 41 && std::mem::take(&mut retry) {
             Delivery::Retry
         } else {
             Delivery::Accepted
         }
     });
     tokio::join!(worker, async {
+        assert_eq!(
+            decoded(&rx.recv().await.expect("recovery marker"))["seq"],
+            40
+        );
         let first = rx.recv().await.expect("join");
         assert_eq!(rx.recv().await.expect("retry"), first);
         let expected = include_str!("../../tests/fixtures/live_gateway_deltas.json");
@@ -245,7 +398,7 @@ async fn voice_only_is_encoded_once_in_receive_order_and_retried_unchanged() {
 
 #[tokio::test(start_paused = true)]
 async fn rejected_or_superseded_baselines_cannot_send() {
-    let (mut live, receiver) = LiveGateway::for_guild(GUILD, 0);
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, FakeWatermark::new(0));
     let scheduled_event = |field: &str, value: Value| {
         let mut row = event_row(91);
         row[field] = value;
@@ -265,7 +418,8 @@ async fn rejected_or_superseded_baselines_cannot_send() {
     ];
     let fixture = decoded(TOPOLOGY);
     let extra = fixture["invalid"].as_array().expect("invalid dispatches");
-    let current_seq = invalidations.len() + extra.len() + 2;
+    // Each completed old generation reserves a marker (+2) and a voice delta (+1).
+    let current_seq = (invalidations.len() + extra.len() + 1) * 3 + 2;
     let invalidations = invalidations
         .into_iter()
         .chain(extra.iter().map(Value::to_string));
@@ -314,7 +468,7 @@ async fn rejected_or_superseded_baselines_cannot_send() {
 
 #[tokio::test(start_paused = true)]
 async fn disconnect_discards_retry_and_backlog_before_a_fresh_baseline_delivers() {
-    let (mut live, receiver) = LiveGateway::for_guild(GUILD, 0);
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, FakeWatermark::new(0));
     receive(&mut live, READY);
     let nonce = begin(&mut live);
     complete(&mut live, &nonce);
@@ -322,18 +476,19 @@ async fn disconnect_discards_retry_and_backlog_before_a_fresh_baseline_delivers(
     receive(&mut live, VOICE);
 
     let capture = Capture::default();
-    let (tx, mut rx) = mpsc::channel(3);
+    let (tx, mut rx) = mpsc::channel(4);
     let worker = receiver.run(async move |body| {
         let seq = decoded(body)["seq"].as_u64().expect("wire sequence");
         tx.try_send(seq).expect("bounded fixture attempts");
-        if seq == 1 {
+        if seq == 3 {
             Delivery::Retry
         } else {
             Delivery::Accepted
         }
     });
     let rebuild = async {
-        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(rx.recv().await, Some(2));
+        assert_eq!(rx.recv().await, Some(3));
         let retired_at = Instant::now();
         live.disconnect();
         live.disconnect();
@@ -344,7 +499,8 @@ async fn disconnect_discards_retry_and_backlog_before_a_fresh_baseline_delivers(
         let nonce = begin(&mut live);
         complete(&mut live, &nonce);
         receive(&mut live, VOICE);
-        assert_eq!(rx.recv().await, Some(3));
+        assert_eq!(rx.recv().await, Some(6));
+        assert_eq!(rx.recv().await, Some(7));
         assert_eq!(retired_at.elapsed(), Duration::ZERO);
         drop(live);
         assert_eq!(rx.recv().await, None);
@@ -369,7 +525,7 @@ async fn disconnect_discards_retry_and_backlog_before_a_fresh_baseline_delivers(
 
 #[tokio::test(start_paused = true)]
 async fn shutdown_drops_in_flight_and_buffered_work_with_intake_still_alive() {
-    let (mut live, receiver) = LiveGateway::for_guild(GUILD, 0);
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, FakeWatermark::new(0));
     receive(&mut live, READY);
     let nonce = begin(&mut live);
     complete(&mut live, &nonce);
@@ -391,7 +547,7 @@ async fn shutdown_drops_in_flight_and_buffered_work_with_intake_still_alive() {
     );
     let stop_worker = async {
         let body = rx.recv().await.expect("first attempt");
-        assert_eq!(decoded(&body)["seq"], 1);
+        assert_eq!(decoded(&body)["seq"], 2);
         let stopped_at = Instant::now();
         shutdown.send(()).expect("worker waiting for shutdown");
         assert!(cancelled.await.is_err());

@@ -1747,7 +1747,8 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         };
                         if let Some(raw) = live_raw {
                             let at = two_bot_core::realtime_wire::WireTime(time::OffsetDateTime::now_utc());
-                            live.receive(&raw, at, |request| shard.sender().command(request).is_ok());
+                            let sender = shard.sender();
+                            live.receive(&raw, at, |request| sender.command(request).is_ok()).await;
                         }
                         received = Some(checkpoint.clone());
                         let mut dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at, received: received_at, completion: None }));
