@@ -447,7 +447,7 @@ class CertifyGraphTests(WorkflowFilesTests):
         synthetic = self.staging["jobs"]["user-flow-synthetic"]
         self.assertEqual(synthetic["needs"], "deploy")
         guard = self.staging["jobs"]["pinned-history-guard"]
-        self.assertEqual(guard["needs"], "voice-synthetic")
+        self.assertEqual(guard["needs"], ["deploy", "voice-synthetic"])
 
     def test_certify_requires_clean_promotion_and_voice_gate(self):
         job = self.staging["jobs"]["certify-promotion"]

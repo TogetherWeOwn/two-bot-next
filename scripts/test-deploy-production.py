@@ -185,6 +185,7 @@ def green():
         "worker check": {"check_runs": [check_run("worker check")]},
         "staging": {"total_count": 1, "workflow_runs": [{"conclusion": "success"}]},
         "staging-all": {"total_count": 1, "workflow_runs": [staging_run()]},
+        "staging-reviewed": {"total_count": 0, "workflow_runs": []},
         "staging-jobs": {"total_count": 1, "jobs": [staging_synthetic_job()]},
         "environment": {
             "name": "production",
@@ -869,7 +870,7 @@ class StaticGuardTests(unittest.TestCase):
         for needle in ("set -euo pipefail", '--expected-sha "$SHA"', 'if [ "$probe" -gt 1 ]',
                        "wrangler/scripts/rest-5xx-counters.mjs",
                        "deploy-staging.yml/runs", "--method GET", "-f branch=main",
-                       "-q '[.workflow_runs[] | {head_sha, head_branch, status, conclusion}]'",
+                       "-q '[.workflow_runs[] | {head_sha, head_branch, display_title, event, status, conclusion}]'",
                        'promotion_regression_gate.py staging', '--auto "$AUTO"',
                        '--run-id "$RUN_ID"', '--attempt "$RUN_ATTEMPT"',
                        '--staging-runs "$RUNNER_TEMP/staging-runs.json"',
@@ -1054,11 +1055,17 @@ class GuardBehaviourTests(unittest.TestCase):
                 key = "snapshot-run"
             elif re.fullmatch(rf"repos/{REPO}/actions/runs/[0-9]+", path):
                 key = "ci-run"
-            elif path == f"repos/{REPO}/actions/runs/501/attempts/2/jobs":
+            elif path in (f"repos/{REPO}/actions/runs/501/attempts/2/jobs",
+                          f"repos/{REPO}/actions/runs/501/attempts/1/jobs"):
                 # The forwarded staging run (501, attempt 2): its user-flow synthetic job.
                 key = "staging-jobs"
             elif re.fullmatch(rf"repos/{REPO}/actions/runs/[0-9]+/attempts/[0-9]+/jobs", path):
                 key = "ci-jobs"
+            elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs" and "created" in query:
+                self.assertEqual(query["event"], "workflow_dispatch")
+                self.assertEqual(query["branch"], "main")
+                self.assertNotIn("status", query)
+                key = "staging-reviewed"
             elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs" and "head_sha" not in query:
                 # Promotion: the latest successful staging deploy on main.
                 self.assertEqual(
@@ -1209,6 +1216,39 @@ class GuardBehaviourTests(unittest.TestCase):
             [query.get("check_name") for path, query in calls if path.endswith("/check-runs")],
             ["ci-ok", "worker check"],
         )
+
+    def test_reviewed_stage_selects_exact_serving_sha_and_latest_outcome(self):
+        workflow_sha = "e" * 40
+        reviewed = {
+            **staging_run(attempt=1, sha=workflow_sha), "event": "workflow_dispatch", "head_branch": "main",
+            "display_title": f"reviewed staging source {SHA}", "path": ".github/workflows/deploy-staging.yml",
+            "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+        }
+        fixtures = {
+            "staging-latest": {"total_count": 1, "workflow_runs": [reviewed]},
+            "staging": {"total_count": 0, "workflow_runs": []},
+            "staging-all": {"total_count": 0, "workflow_runs": []},
+            "staging-reviewed": {"total_count": 1, "workflow_runs": [reviewed]},
+            "staging-jobs": {"total_count": 1, "jobs": [staging_synthetic_job(attempt=1, sha=workflow_sha)]},
+        }
+        for requested in ("", SHA):
+            with self.subTest(requested=requested):
+                code, outputs, _, _, stdout = self.guard(sha=requested, **fixtures)
+                self.assertEqual(code, 0, stdout)
+                self.assertEqual((outputs["sha"], outputs["staging_run_id"], outputs["staging_attempt"]),
+                                 (SHA, "501", "1"))
+        newer = {**reviewed, "id": 502, "run_number": 6, "conclusion": "failure"}
+        self.assertRefused(self.guard(**{
+            **fixtures, "staging-reviewed": {"total_count": 2, "workflow_runs": [reviewed, newer]},
+        }), "latest deploy-staging run")
+        self.assertRefused(self.guard(**{
+            **fixtures, "staging-jobs": {"total_count": 1, "jobs": [staging_synthetic_job(attempt=1)]},
+        }), "user-flow synthetic has no successful run")
+        self.assertRefused(self.guard(sha="", **{
+            **fixtures, "staging-latest": {"total_count": 1, "workflow_runs": [
+                {**reviewed, "head_repository": {"full_name": "foreign/repo"}},
+            ]},
+        }), "no successful deploy-staging run on main")
 
     def test_main_head_itself_passes_and_sha_is_normalised(self):
         code, outputs, _, _, _ = self.guard(sha=f" {SHA.upper()}\n", compare={"status": "identical"})
@@ -2000,8 +2040,7 @@ class GuardBehaviourTests(unittest.TestCase):
         code, outputs, summary, calls, _ = self.guard(
             event="workflow_run", sha="", run_sha=old_run_sha, run_conclusion="success",
             **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
-               "staging": {"total_count": 1, "workflow_runs": [
-                   {"conclusion": "success", "updated_at": green_at}]}})
+               "staging-all": {"total_count": 1, "workflow_runs": [{**staging_run(), "updated_at": green_at}]}})
         self.assertEqual(code, 0)
         self.assertEqual(outputs["sha"], SHA)
         self.assertNotEqual(outputs["sha"], old_run_sha)
@@ -2202,8 +2241,7 @@ class GuardBehaviourTests(unittest.TestCase):
         _, outputs, _, _, _ = self.guard(
             event="schedule", sha="",
             **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
-               "staging": {"total_count": 1, "workflow_runs": [
-                   {"conclusion": "success", "updated_at": green_at}]}})
+               "staging-all": {"total_count": 1, "workflow_runs": [{**staging_run(), "updated_at": green_at}]}})
         self.assertEqual(outputs["skip"], "")
         self.assertEqual(outputs["soak_seconds"], "0")
 
@@ -2382,7 +2420,8 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("tooling/scripts/ci/roles_gate.py", roles_gate)
 
     def test_api_failures_fail_closed(self):
-        for key in ("compare", "ci-runs", "ci-run", "ci-jobs", "ci-ok", "worker check", "staging", "branches"):
+        for key in ("compare", "ci-runs", "ci-run", "ci-jobs", "ci-ok", "worker check", "staging",
+                    "staging-reviewed", "branches"):
             for broken in (failed_call(), "not json"):
                 with self.subTest(key=key, broken=broken):
                     self.assertRefused(self.guard(**{key: broken}), "failing closed")

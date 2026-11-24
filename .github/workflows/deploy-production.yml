@@ -546,7 +546,7 @@ jobs:
               # Reviewed-source runs have a different GitHub head SHA. Scan the
               # certificate retention window, including queued and red runs,
               # so an older green attempt cannot conceal a newer failed one.
-              since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=14)).isoformat(timespec="seconds")
+              since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
               recent = collection(staging_path, "recent deploy-staging dispatches", "workflow_runs",
                                   branch="main", event="workflow_dispatch", created=f">={since}")
               reviewed_runs = [
@@ -561,6 +561,8 @@ jobs:
               staging_runs.update({run["id"]: run for run in reviewed_runs})
               if not staged.get("total_count") and not any(run.get("conclusion") == "success" for run in reviewed_runs):
                   refuse(f"deploy-staging has no successful run on {sha}")
+              if not staging_runs:
+                  refuse(f"deploy-staging has no verifiable latest run on {sha}")
               def verified_proof(row):
                   # A name alone cannot excuse red history. Only this workflow's
                   # dispatch-only proof identity, exact attempt, and complete
@@ -618,7 +620,8 @@ jobs:
               # not only a scheduled check: a green run whose synthetic job
               # was skipped, renamed or ran in another attempt certifies nothing.
               staging_attempt = staging_run.get("run_attempt")
-              if type(staging_attempt) is not int or staging_attempt <= 0:
+              reviewed = str(staging_run.get("display_title") or "").startswith("reviewed staging source ")
+              if type(staging_attempt) is not int or staging_attempt <= 0 or (reviewed and staging_attempt != 1):
                   refuse(f"the latest deploy-staging run on {sha} carries no verifiable attempt")
               staging_jobs = collection(
                   f"repos/{repo}/actions/runs/{staging_run['id']}/attempts/{staging_attempt}/jobs",

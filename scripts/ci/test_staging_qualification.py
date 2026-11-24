@@ -159,12 +159,11 @@ class ReviewedStagingTests(unittest.TestCase):
             del self.inputs[key]
 
     def test_refuses_mismatched_plan_and_unbound_or_failed_latest_checks(self):
+        fresh = self.fresh.copy()
         with self.assertRaisesRegex(GateError, "reviewed_plan_mismatch"):
             self.fresh["target_fingerprint"] = "0" * 64
             self.authorize()
-        self.fresh = plan_projection(plan_fixture() | {"source_sha": self.source,
-            "plan_manifest_sha256": self.fresh["cutover_projection_sha256"],
-            "store_plan_manifest_sha256": self.fresh["store_projection_sha256"]})
+        self.fresh = fresh
         self.checks["ci-ok"]["app"]["id"] = 99
         with self.assertRaisesRegex(GateError, "candidate_check_unproved"):
             self.authorize()
