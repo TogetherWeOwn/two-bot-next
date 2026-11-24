@@ -931,9 +931,9 @@ test("staging self-move stamps only its selected lease and reads OFF after relea
   assert.equal((await h.bot.fetch(stagingUseRequest("acquire", interrupted))).status, 200);
   h.runtime.running = true;
   t.mock.timers.setTime(interrupted.expiresAt);
+  assert.partialDeepStrictEqual(await off(), { voiceMoveEnabled: false, running: true });
   await h.bot.stagingExpiry();
-  const expired = await off();
-  assert.deepEqual([expired.voiceMoveEnabled, expired.running], [false, false]);
+  assert.partialDeepStrictEqual(await off(), { voiceMoveEnabled: false, running: false });
   assert.ok(h.logs.some((line) => line.includes('"action":"expiry","outcome":"stopped"')
     && line.includes('"voice_move_enabled":false') && line.includes('"run_id":"123458"')));
 });

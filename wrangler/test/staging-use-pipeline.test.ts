@@ -133,9 +133,9 @@ test("self-move selection and cleanup require affirmative, exact lease readback"
     return { ...value, voiceMoveEnabled: value.use?.phase === "active" };
   };
   await assert.rejects(pipelineUse(begin, f.invoke, clock), code("staging_voice_move_unconfirmed"));
+  assert.deepEqual(f.called(), ["status"]);
   const ready = await pipelineUse(begin, invoke, clock);
-  assert.equal(ready.voiceMoveEnabled, true);
-  assert.equal(f.calls.find((call) => call.action === "acquire")?.voiceMove, true);
+  assert.deepEqual([ready.voiceMoveEnabled, f.calls.find((call) => call.action === "acquire")?.voiceMove], [true, true]);
   const finish = { ...base, action: "finish", voiceMove: true, expiresAt: ready.use.expiresAt };
   const lostReply = async (args: any) => {
     const value = await invoke(args);
