@@ -76,6 +76,21 @@ class StagingBootstrapTests(unittest.TestCase):
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(output.read_text(), f"fingerprint={FINGERPRINT}\n")
 
+    def test_reviewed_plan_emits_source_projection_with_a_later_workflow_sha(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="staging-reviewed-plan-")))
+        plan = recovery_plan_fixture()
+        (root / "staging-schema-gate-manifest.json").write_text(json.dumps(plan))
+        event, output = root / "event.json", root / "output"
+        event.write_text(json.dumps({"inputs": {"recovery_mode": "verified"}}))
+        env = {"GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(output), "GITHUB_SHA": "f" * 40,
+               "RECOVERY_PLAN_SOURCE": SOURCE, "REVIEWED_PLAN": "fixture", "PYTHONDONTWRITEBYTECODE": "1"}
+        run = subprocess.run([sys.executable, bootstrap.__file__, "plan"], cwd=root, env=env,
+                             capture_output=True, text=True, timeout=5)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        fields = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        self.assertEqual(fields["fingerprint"], FINGERPRINT)
+        self.assertEqual(json.loads(fields["plan"]), bootstrap.verified_plan(plan, SOURCE))
+
     def test_authenticated_get_retries_only_deferred_deployment_mismatch(self):
         token = ENV["OWNERSHIP_CONTROL_TOKEN"]
         url = f"{status.ORIGIN}/internal/ownership?runtime_db_fingerprint={FINGERPRINT}"
