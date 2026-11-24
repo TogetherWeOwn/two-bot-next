@@ -531,8 +531,6 @@ jobs:
               # Immutable promotion needs the LATEST staging deploy of this SHA to be
               # green: an older success cannot hide a newer failed or running deploy.
               staging_path = f"repos/{repo}/actions/workflows/deploy-staging.yml/runs"
-              staged = api(staging_path, "deploy-staging runs",
-                           head_sha=sha, branch="main", status="success", per_page="1")
               head_runs = collection(
                   staging_path, "deploy-staging runs on the SHA",
                   "workflow_runs", head_sha=sha, branch="main",
@@ -543,10 +541,10 @@ jobs:
                   ) for run in head_runs
               ):
                   refuse(f"deploy-staging has no verifiable latest run on {sha}")
-              # Reviewed-source runs have a different GitHub head SHA. Scan the
-              # certificate retention window, including queued and red runs,
-              # so an older green attempt cannot conceal a newer failed one.
-              since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
+              # Reviewed-source runs carry a different GitHub head SHA. Search
+              # past the 14-day artifact retention and GitHub's 35-day run
+              # limit (including wait/approval), since created_at precedes upload.
+              since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=50)).strftime("%Y-%m-%dT%H:%M:%SZ")
               recent = collection(staging_path, "recent deploy-staging dispatches", "workflow_runs",
                                   branch="main", event="workflow_dispatch", created=f">={since}")
               reviewed_runs = [
@@ -559,10 +557,8 @@ jobs:
                   refuse(f"deploy-staging has no verifiable latest run on {sha}")
               staging_runs = {run["id"]: run for run in head_runs if staged_source(run) == sha}
               staging_runs.update({run["id"]: run for run in reviewed_runs})
-              if not staged.get("total_count") and not any(run.get("conclusion") == "success" for run in reviewed_runs):
-                  refuse(f"deploy-staging has no successful run on {sha}")
               if not staging_runs:
-                  refuse(f"deploy-staging has no verifiable latest run on {sha}")
+                  refuse(f"deploy-staging has no successful run on {sha}")
               def verified_proof(row):
                   # A name alone cannot excuse red history. Only this workflow's
                   # dispatch-only proof identity, exact attempt, and complete
