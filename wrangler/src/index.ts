@@ -1562,7 +1562,7 @@ export class TwoBotContainer extends Container<Env> {
         if (change) {
           if (change.action === "acquire") {
             if (change.voiceMove && !this.voiceMoveConfigured()) {
-              throw new OwnershipRefused("voice_move_unavailable");
+              throw new OwnershipRefused("staging_use_required");
             }
             await this.requireRecoveryDatabase();
             use = await this.stagingUse.acquire(change, identity,
