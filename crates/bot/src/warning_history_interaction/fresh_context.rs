@@ -6,7 +6,7 @@ use super::*;
 use crate::{
     discord_test_common::{MockRest, ScriptedResponse},
     member_runtime::warning_history_authorizer::tests::{
-        assert_reads, evidence, executor, overwrite,
+        assert_reads, assert_scope_reads, evidence, executor, overwrite,
     },
 };
 
@@ -18,9 +18,10 @@ fn script(refreshes: impl IntoIterator<Item = [Value; 5]>) -> Vec<ScriptedRespon
         .collect()
 }
 
-fn authorized(executor: &ActionExecutor) -> Fake<'_> {
+fn with_authorizer(executor: &ActionExecutor, caller: Invocation) -> Fake<'_> {
     Fake {
         executor: Some(executor),
+        caller,
         ..Fake::new([Pass; 5])
     }
 }
@@ -32,8 +33,8 @@ async fn after_cooldown() {
     resume();
 }
 
-async fn open(state: &HistoryState, executor: &ActionExecutor) -> String {
-    let initial = authorized(executor);
+async fn open(state: &HistoryState, executor: &ActionExecutor, caller: Invocation) -> String {
+    let initial = with_authorizer(executor, caller);
     run(state, &initial, INITIAL).await;
     ordered(&initial, "read");
     assert!(initial.delivered.get());
@@ -49,41 +50,51 @@ async fn assert_closed(state: &HistoryState, handle: &str) {
 
 #[tokio::test]
 async fn foreign_next_scope_leaves_the_bound_page_usable() {
+    let bound = Invocation {
+        principal: (CALLER.principal.0, id(45)),
+        channel: id(78),
+    };
+    let (actor, channel) = (bound.principal.1.get(), bound.channel.get());
+    let bound_evidence = || {
+        let mut docs = evidence();
+        docs[1]["user"]["id"] = json!(actor.to_string());
+        docs[4]["id"] = json!(channel.to_string());
+        docs
+    };
     let rest = MockRest::start(
-        script([evidence(), evidence(), evidence(), evidence()]),
+        script(std::array::from_fn::<_, 4, _>(|_| bound_evidence())),
         ScriptedResponse::status(500),
     )
     .await;
     let executor = executor(&rest);
     let state = HistoryState::default();
-    let handle = open(&state, &executor).await;
+    let handle = open(&state, &executor, bound).await;
     for caller in [
         Invocation {
-            principal: (id(23), CALLER.principal.1),
-            ..CALLER
+            principal: (id(23), bound.principal.1),
+            ..bound
         },
         Invocation {
-            principal: (CALLER.principal.0, id(45)),
-            ..CALLER
+            principal: CALLER.principal,
+            ..bound
         },
         Invocation {
-            channel: id(78),
-            ..CALLER
+            channel: CALLER.channel,
+            ..bound
         },
     ] {
-        let mut foreign = authorized(&executor);
-        foreign.caller = caller;
+        let foreign = with_authorizer(&executor, caller);
         run(&state, &foreign, Input::Next(&handle)).await;
         foreign.control_status(EXPIRED);
     }
-    assert_reads(&rest, &[5, 5]);
+    assert_scope_reads(&rest, &[5, 5], actor, channel);
 
-    let next = authorized(&executor);
+    let next = with_authorizer(&executor, bound);
     run(&state, &next, Input::Next(&handle)).await;
     ordered(&next, "next");
     assert!(next.delivered.get());
     assert_ne!(next.next(5), handle);
-    assert_reads(&rest, &[5, 5, 5, 5]);
+    assert_scope_reads(&rest, &[5, 5, 5, 5], actor, channel);
 }
 
 #[tokio::test]
@@ -103,8 +114,8 @@ async fn next_refuses_stale_or_inconsistent_scope_before_the_read() {
         .await;
         let executor = executor(&rest);
         let state = HistoryState::default();
-        let handle = open(&state, &executor).await;
-        let next = authorized(&executor);
+        let handle = open(&state, &executor, CALLER).await;
+        let next = with_authorizer(&executor, CALLER);
         run(&state, &next, Input::Next(&handle)).await;
         assert_eq!(*next.trace.borrow(), ["ack", "fresh", "edit"]);
         next.status(expected);
@@ -126,8 +137,8 @@ async fn next_discards_the_projection_when_channel_access_is_revoked_after_read(
     .await;
     let executor = executor(&rest);
     let state = HistoryState::default();
-    let handle = open(&state, &executor).await;
-    let next = authorized(&executor);
+    let handle = open(&state, &executor, CALLER).await;
+    let next = with_authorizer(&executor, CALLER);
     run(&state, &next, Input::Next(&handle)).await;
     ordered(&next, "next");
     next.status(DENIED);
@@ -146,8 +157,8 @@ async fn stop_while_next_refreshes_authority_prevents_the_read() {
     .await;
     let executor = executor(&rest);
     let state = HistoryState::default();
-    let handle = open(&state, &executor).await;
-    let next = authorized(&executor);
+    let handle = open(&state, &executor, CALLER).await;
+    let next = with_authorizer(&executor, CALLER);
     let mut pending = std::pin::pin!(run(&state, &next, Input::Next(&handle)));
     tokio::select! {
         () = gate.wait_for_request() => {},
@@ -156,7 +167,7 @@ async fn stop_while_next_refreshes_authority_prevents_the_read() {
     assert_eq!(*next.trace.borrow(), ["ack", "fresh"]);
     assert!(next.reply.borrow().is_none());
 
-    let stop = authorized(&executor);
+    let stop = with_authorizer(&executor, CALLER);
     run(&state, &stop, Input::Stop(&handle)).await;
     stop.control_status(Outcome::Stopped);
     assert!(stop.delivered.get());

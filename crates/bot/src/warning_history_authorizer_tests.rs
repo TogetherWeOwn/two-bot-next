@@ -4,13 +4,6 @@ use serde_json::json;
 use std::sync::Arc;
 use two_bot_discord::ratelimit_guard::{GuardConfig, RateLimitGuard};
 
-const PATHS: [&str; 5] = [
-    "/api/v10/guilds/22",
-    "/api/v10/guilds/22/members/44",
-    "/api/v10/users/@me",
-    "/api/v10/guilds/22/members/99",
-    "/api/v10/channels/77",
-];
 const VIEW: u64 = Permissions::VIEW_CHANNEL.bits();
 const COMMANDS: u64 = Permissions::USE_SLASH_COMMANDS.bits();
 
@@ -56,11 +49,29 @@ async fn refresh(
 }
 
 pub(in crate::member_runtime) fn assert_reads(rest: &MockRest, batches: &[usize]) {
+    assert_scope_reads(rest, batches, 44, 77);
+}
+
+pub(in crate::member_runtime) fn assert_scope_reads(
+    rest: &MockRest,
+    batches: &[usize],
+    actor: u64,
+    channel: u64,
+) {
+    let actor_path = format!("/api/v10/guilds/22/members/{actor}");
+    let channel_path = format!("/api/v10/channels/{channel}");
+    let paths = [
+        "/api/v10/guilds/22",
+        actor_path.as_str(),
+        "/api/v10/users/@me",
+        "/api/v10/guilds/22/members/99",
+        channel_path.as_str(),
+    ];
     let requests = rest.requests();
     assert_eq!(requests.len(), batches.iter().sum::<usize>());
     let paths = batches
         .iter()
-        .flat_map(|&count| PATHS[..count].iter().copied());
+        .flat_map(|&count| paths[..count].iter().copied());
     for (request, path) in requests.iter().zip(paths) {
         assert_eq!(request.method, "GET");
         assert_eq!(request.path, path);
