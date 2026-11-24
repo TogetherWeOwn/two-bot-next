@@ -95,6 +95,7 @@ use two_bot_discord::{ActionExecutor, DiscordError, EventActionError, EventCall}
 
 use crate::voice_snapshot::{self, SnapshotRefusal, VoiceOccupancyClock};
 
+pub mod live_snapshot;
 mod voice_move;
 
 const MAX_HEADER_BYTES: usize = 8192;
