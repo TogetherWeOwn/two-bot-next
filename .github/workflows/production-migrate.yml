@@ -148,6 +148,10 @@ jobs:
       checks: read
     if: github.ref == 'refs/heads/main' && inputs.mode == 'apply'
     needs: plan
+    outputs:
+      external_id: ${{ steps.request.outputs.external_id }}
+      check_id: ${{ steps.request.outputs.check_id }}
+      plan_sha256: ${{ steps.request.outputs.plan_sha256 }}
     # No Environment or DB secrets. Verify the independent approval of the
     # producing artifact and unchanged fresh plan before apply can start.
     runs-on: ubuntu-latest
@@ -165,6 +169,7 @@ jobs:
           name: production-migrate-manifest
           path: current-plan
       - name: Publish apply claim
+        id: request
         env:
           GH_TOKEN: ${{ github.token }}
           MODE: ${{ inputs.mode }}
@@ -185,7 +190,7 @@ jobs:
           python3 scripts/ci/production_migrate_claim.py \
             --manifest current-plan/production-migrate-manifest.json \
             --output production-migrate-apply-claim.json
-          python3 scripts/production_migrate_approval.py current-plan/production-migrate-manifest.json production-migrate-apply-claim.json
+          python3 scripts/production_migrate_approval.py authorize current-plan/production-migrate-manifest.json production-migrate-apply-claim.json
       - name: Upload apply claim
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -203,6 +208,7 @@ jobs:
       # grant the deploy-production guard already carries for run gating; the
       # plan job keeps contents:read only because it produces the manifest.
       actions: read # Provenance gate downloads the producing plan run manifest artifact.
+      checks: read # Revalidate the independent approval immediately before DDL.
     # Dispatch from main only, mode=apply only, and only after a green plan.
     # The binding must be scoped to the production-migrate-apply environment
     # (main-only deployment branches) so a workflow edited
@@ -251,6 +257,21 @@ jobs:
           path: producing-plan
           run-id: ${{ inputs.plan_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check out trusted production approval verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: approval-tools
+      - name: Install Python for the production approval verifier
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 >/dev/null
+      - name: Recheck the exact production approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVAL_EXTERNAL_ID: ${{ needs.claim.outputs.external_id }}
+          APPROVAL_CHECK_ID: ${{ needs.claim.outputs.check_id }}
+          APPROVAL_PLAN_SHA256: ${{ needs.claim.outputs.plan_sha256 }}
+        run: python3 approval-tools/scripts/production_migrate_approval.py recheck producing-plan/production-migrate-manifest.json
       - name: Run
         env:
           # Must already exist as a production-migrate-apply environment secret; absent means refusal.

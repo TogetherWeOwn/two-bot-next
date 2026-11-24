@@ -1,6 +1,6 @@
 """Offline production-claim contract tests; no Actions dispatch, database or approval."""
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from io import BytesIO
 import json
@@ -170,6 +170,7 @@ class ProductionApprovalTests(unittest.TestCase):
                     "GITHUB_WORKFLOW_SHA": ENV["GITHUB_SHA"], "GITHUB_RUN_ATTEMPT": "1",
                     "GITHUB_REF_PROTECTED": "true", "GITHUB_ACTOR_ID": "42"}
         self.claim = build_claim(self.plan, self.env)
+        self.env["GITHUB_REPOSITORY_ID"] = "1396224242"
         archive = BytesIO()
         with ZipFile(archive, "w") as writer:
             writer.writestr(f"{approval.ARTIFACT}.json", json.dumps(self.plan))
@@ -182,15 +183,26 @@ class ProductionApprovalTests(unittest.TestCase):
                "repository": {"full_name": ENV["GITHUB_REPOSITORY"]},
                "head_repository": {"full_name": ENV["GITHUB_REPOSITORY"]}}
         self.check = {
-            "name": approval.CHECK_NAME, "head_sha": ENV["GITHUB_SHA"], "app": {"id": approval.APP_ID},
+            "name": approval.CHECK_NAME, "head_sha": ENV["GITHUB_SHA"], "app": {"id": approval.APP_ID}, "id": 1234,
             "status": "completed", "conclusion": "success", "completed_at": "2026-11-24T10:00:00Z",
             "external_id": f"production-apply:{ENV['PLAN_RUN_ID']}:{digest}",
         }
         self.checks = {"total_count": 1, "check_runs": [self.check]}
+        self.settings = {"name": approval.ENVIRONMENT, "can_admins_bypass": False,
+                         "deployment_branch_policy": {"custom_branch_policies": True, "protected_branches": False},
+                         "protection_rules": [{"type": "branch_policy"}]}
+        self.history = {"total_count": 2, "workflow_runs": [
+            {"id": int(ENV["PLAN_RUN_ID"])}, {"id": int(ENV["GITHUB_RUN_ID"])}]}
         self.responses = {
+            approval.POLICY: self.settings,
+            f"{approval.POLICY}/deployment-branch-policies?per_page=2": {
+                "total_count": 1, "branch_policies": [{"type": "branch", "name": "main"}]},
             applying: {**run, "id": int(ENV["GITHUB_RUN_ID"]), "actor": {"id": 42},
                        "triggering_actor": {"id": 42}, "created_at": "2026-11-24T10:01:00Z"},
-            producing: {**run, "id": int(ENV["PLAN_RUN_ID"]), "status": "completed", "conclusion": "success"},
+            producing: {**run, "id": int(ENV["PLAN_RUN_ID"]), "status": "completed", "conclusion": "success",
+                        "created_at": "2026-11-24T09:00:00Z"},
+            ("actions/workflows/production-migrate.yml/runs?event=workflow_dispatch&branch=main"
+             "&created=%3E%3D2026-11-24T09%3A00%3A00Z&per_page=30"): self.history,
             f"{producing}/attempts/1/jobs?per_page=4": {"total_count": 3, "jobs": [
                 {"name": f"production-migrate ({job})", "conclusion": conclusion}
                 for job, conclusion in (("plan", "success"), ("claim", "skipped"), ("apply", "skipped"))
@@ -200,7 +212,7 @@ class ProductionApprovalTests(unittest.TestCase):
                  "size_in_bytes": len(raw), "digest": f"sha256:{digest}"},
             ]},
             "actions/artifacts/99/zip": raw,
-            f"commits/{ENV['GITHUB_SHA']}/check-runs?check_name={approval.CHECK_NAME}&filter=all&per_page=100": self.checks,
+            f"commits/{ENV['GITHUB_SHA']}/check-runs?check_name={approval.CHECK_NAME}&filter=all&per_page=30": self.checks,
         }
         self.now = datetime(2026, 11, 24, 11, tzinfo=timezone.utc)
 
@@ -217,7 +229,9 @@ class ProductionApprovalTests(unittest.TestCase):
         fresh["audit"]["connection_usage"]["used"] = 11
         fresh["expected_pending"] = []
         fresh["role_verified_connections"] = 2
-        self.assertEqual(self.authorize(fresh), 99)
+        evidence = self.authorize(fresh)
+        self.assertEqual(evidence["check_id"], self.check["id"])
+        self.assertEqual(evidence["plan_sha256"], approval.digest_json(self.plan))
 
     def test_refuses_fresh_ledger_or_role_audit_drift(self):
         for field in ("ledger_before", "ledger_store_before", "audit"):
@@ -226,7 +240,7 @@ class ProductionApprovalTests(unittest.TestCase):
                 if field == "audit":
                     fresh["audit"]["verify_findings"] = ["drift"]
                 else:
-                    fresh[field] = fresh[field.replace("before", "after")] = []
+                    fresh[field] = fresh[field.replace("before", "after")] = [{"version": 2, "success": True}]
                 with self.assertRaisesRegex(GateError, "production_migration_plan_changed"):
                     self.authorize(fresh)
 
@@ -250,6 +264,39 @@ class ProductionApprovalTests(unittest.TestCase):
         self.responses["actions/artifacts/99/zip"] += b"x"
         with self.assertRaises((GateError, ProofError)):
             self.authorize()
+
+    def test_refuses_unprotected_environment(self):
+        self.settings["can_admins_bypass"] = True
+        with self.assertRaisesRegex(GateError, "production_migration_environment_unprotected"):
+            self.authorize()
+        self.settings["can_admins_bypass"] = False
+        self.responses[f"{approval.POLICY}/deployment-branch-policies?per_page=2"]["branch_policies"][0]["name"] = "*"
+        with self.assertRaisesRegex(GateError, "production_migration_environment_unprotected"):
+            self.authorize()
+
+    def test_refuses_reuse_after_an_apply_attempt(self):
+        self.history["workflow_runs"].append({"id": 456})
+        self.history["total_count"] += 1
+        attempted = {"name": "production-migrate (apply)", "started_at": "2026-11-24T10:00:55Z",
+                     "conclusion": "failure"}
+        self.responses["actions/runs/456/attempts/1/jobs?per_page=4"] = {"total_count": 1, "jobs": [attempted]}
+        with self.assertRaisesRegex(GateError, "production_plan_superseded_by_apply_attempt"):
+            self.authorize()
+        attempted.update(started_at=None, conclusion="skipped")
+        self.assertEqual(self.authorize()["check_id"], 1234)
+
+    def test_recheck_refuses_a_revoked_or_expired_approval(self):
+        evidence = self.authorize()
+        env = {**self.env, **{f"APPROVAL_{key.upper()}": str(value) for key, value in evidence.items()}}
+        approval.recheck(self.plan, env, self.now, self.responses.__getitem__)
+        with self.assertRaisesRegex(GateError, "independent_production_approval_stale"):
+            approval.recheck(self.plan, env, self.now + timedelta(days=1), self.responses.__getitem__)
+        self.check["id"] = 2345
+        with self.assertRaisesRegex(GateError, "independent_production_approval_changed"):
+            approval.recheck(self.plan, env, self.now, self.responses.__getitem__)
+        self.check["conclusion"] = "failure"
+        with self.assertRaisesRegex(GateError, "independent_production_approval_invalid"):
+            approval.recheck(self.plan, env, self.now, self.responses.__getitem__)
 
 
 if __name__ == "__main__":

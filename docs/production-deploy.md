@@ -99,7 +99,7 @@ the guarded SHA through the no-reviewer `production-migrate-plan` environment
 and refuses a new build when either the cutover or store migration chain is
 ahead of its production ledger (`pending_before` or `pending_store_before`).
 Apply the named pending versions through the manual `production-migrate`
-apply dispatch (reviewed plan required), then re-dispatch. A rollback and a
+apply dispatch with independent approval of the exact plan, then re-dispatch. A rollback and a
 live-SHA takeover redeploy serve no new schema and skip this gate job
 (guard-validated modes only; the production job accepts exactly those),
 so recovery never waits on it.

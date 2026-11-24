@@ -1481,9 +1481,12 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
         } or "python3 scripts/staging_migrate_approval.py prepare" not in str(publish.get("run", ""))):
             errors.append(f"{prefix} must authenticate the producing plan and export the approval binding")
     else:
-        approval = ("python3 scripts/production_migrate_approval.py "
+        approval = ("python3 scripts/production_migrate_approval.py authorize "
                     f"current-plan/{manifest}.json {claim_artifact}.json")
-        if str(publish.get("run", "")).strip().splitlines()[-1:] != [approval]:
+        outputs = {key: "${{ steps.request.outputs." + key + " }}"
+                   for key in ("external_id", "check_id", "plan_sha256")}
+        if (str(publish.get("run", "")).strip().splitlines()[-1:] != [approval]
+                or publish.get("id") != "request" or claim.get("outputs") != outputs):
             errors.append(f"{prefix} must verify independent approval of the exact producing plan")
     if publish.get("env") != expected_env or publish.get("shell") != "bash":
         errors.append(f"{prefix} must pass exactly the dispatch fields via env, in bash")
@@ -1636,9 +1639,11 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         errors.append(f"{name}:apply: must read the {apply_env} Environment binding")
     if plan.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:plan: must keep contents:read only (it produces the manifest)")
-    if apply.get("permissions") != {"contents": "read", "actions": "read"}:
-        errors.append(f"{name}:apply: must carry exactly contents:read plus actions:read "
-                      "(provenance artifact fetch, nothing more)")
+    apply_permissions = {"contents": "read", "actions": "read"}
+    if name == "production-migrate.yml":
+        apply_permissions["checks"] = "read"
+    if apply.get("permissions") != apply_permissions:
+        errors.append(f"{name}:apply: must keep the exact read-only permissions")
     if plan.get("if") != "github.ref == 'refs/heads/main'":
         errors.append(f"{name}:plan: must run only from main")
     apply_condition = "github.ref == 'refs/heads/main' && inputs.mode == 'apply'"
@@ -1662,6 +1667,30 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                 or "continue-on-error" in apply or apply.get("timeout-minutes") != "30"
                 or "if" in steps[ddl[0]] or "continue-on-error" in steps[ddl[0]]):
             errors.append(f"{name}:apply: must verify the exact native approval before building and running DDL")
+        checkouts = [step for step in steps if (step.get("with") or {}).get("path") == "approval-tools"]
+        if (len(checkouts) != 1 or not str(checkouts[0].get("uses", "")).startswith("actions/checkout@")
+                or checkouts[0].get("with") != {"path": "approval-tools", "persist-credentials": "false",
+                                               "ref": "${{ github.sha }}"}
+                or "if" in checkouts[0] or "continue-on-error" in checkouts[0]):
+            errors.append(f"{name}:apply: must load the verifier at the trusted workflow SHA")
+    else:
+        steps = apply.get("steps", [])
+        ddl = [i for i, step in enumerate(steps) if "--apply " in str(step.get("run", ""))]
+        recheck = {
+            "name": "Recheck the exact production approval",
+            "env": {
+                "GH_TOKEN": "${{ github.token }}",
+                "APPROVAL_EXTERNAL_ID": "${{ needs.claim.outputs.external_id }}",
+                "APPROVAL_CHECK_ID": "${{ needs.claim.outputs.check_id }}",
+                "APPROVAL_PLAN_SHA256": "${{ needs.claim.outputs.plan_sha256 }}",
+            },
+            "run": "python3 approval-tools/scripts/production_migrate_approval.py recheck "
+                   "producing-plan/production-migrate-manifest.json",
+        }
+        if (len(ddl) != 1 or ddl[0] < 3 or steps[ddl[0] - 1] != recheck
+                or "continue-on-error" in apply or "if" in steps[ddl[0]]
+                or "continue-on-error" in steps[ddl[0]]):
+            errors.append(f"{name}:apply: must recheck approval immediately before DDL")
         checkouts = [step for step in steps if (step.get("with") or {}).get("path") == "approval-tools"]
         if (len(checkouts) != 1 or not str(checkouts[0].get("uses", "")).startswith("actions/checkout@")
                 or checkouts[0].get("with") != {"path": "approval-tools", "persist-credentials": "false",
@@ -9294,7 +9323,10 @@ class WorkflowTests(unittest.TestCase):
         for job_id in ("plan", "claim", "apply"):
             with self.subTest(mirror=job_id):
                 prod_job, stag_job = migrate["jobs"][job_id], staging["jobs"][job_id]
-                self.assertEqual(prod_job.get("if"), stag_job.get("if"))
+                expected_condition = stag_job["if"]
+                if job_id == "apply":
+                    expected_condition += " && github.run_attempt == 1"
+                self.assertEqual(prod_job["if"], expected_condition)
                 self.assertEqual(prod_job.get("runs-on"), stag_job.get("runs-on"))
 
     def test_staging_rollback_drill_shape_is_pinned(self):
@@ -11041,11 +11073,12 @@ class WorkflowTests(unittest.TestCase):
                         # Marker-label actor audit via the issue-events API.
                         expected["pull-requests"] = "read"
                     elif (name, job_id) in (("staging-migrate.yml", "claim"),
-                                                 ("staging-migrate.yml", "apply"),
-                                                 ("production-migrate.yml", "apply")):
+                                            ("staging-migrate.yml", "apply")):
                         # Read-only fetch of the producing plan
                         # run's manifest artifact for the provenance gate.
                         expected = {"contents": "read", "actions": "read"}
+                    elif name == "production-migrate.yml" and job_id in ("claim", "apply"):
+                        expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-staging.yml", "deploy"):
                         # Derives the deploy ID from today's staging
                         # Deployments, then records this one.

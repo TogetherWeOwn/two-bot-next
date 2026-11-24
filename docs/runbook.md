@@ -2790,7 +2790,8 @@ gates. The manifest carries `migration_target`
 
 The workflow has three jobs (`plan`, `claim`, `apply`). It uses
 `production-migrate-plan` for read-only planning and the main-only
-`production-migrate-apply` Environment for apply. It uses pinned actions,
+`production-migrate-apply` Environment for apply. Restrict apply to the
+single `main` branch and disable administrator bypass. It uses pinned actions,
 an explicit `ubuntu-latest` runner, a pipefail shell, and artifact names
 (`production-migrate-manifest`, `production-migrate-apply-claim`, 14-day
 retention, stored ZIP entries). The `claim` job runs
@@ -2803,20 +2804,23 @@ and both secrets must exist before dispatch; the host provisions them after
 this change merges. The cutover itself does not need this path: the fresh
 `two_bot` bootstrap uses the tested provisioner flow.
 
-After the production release gate is satisfied, give the independent approval
-App operator the producing plan run, its artifact SHA-256 and the protected
+After the independent release reviewer approves the production change, give
+the independent approval App operator the producing plan run, its artifact SHA-256 and the protected
 workflow SHA that will receive the apply dispatch. The operator records a
 successful `production-migration-approval` check on that workflow SHA with
 external ID `production-apply:<plan run ID>:<archive SHA-256 without prefix>`
 before dispatch. Use an attempt-one plan-only run. The approval expires after
-23 hours and 30 minutes. An approval on a different workflow SHA or artifact
-requires a new decision.
+23 hours and 30 minutes. A revised decision or a renewal needs a fresh
+plan run. Keep the approval App credential under the independent operator's
+control.
 
 The `claim` job authenticates the producing run and archive and compares
 the fresh production plan, including both ledgers and role findings. It
 requires the matching check from the designated App before the apply job can
-receive its migrator binding. Environment protections still apply. After a
-refusal or uncertain outcome, reconcile both ledgers before another dispatch.
+receive its migrator binding. The apply job rechecks approval and Environment
+policy immediately before DDL. Any intervening apply attempt consumes older
+plans. After a refusal or uncertain outcome, reconcile both ledgers and use
+a fresh plan and approval before another dispatch.
 
 ### Redeploy the approved revision
 
