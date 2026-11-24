@@ -431,7 +431,9 @@ test("staging registry absence is a stopped, authenticated GET under the exact l
       headers: { authorization: `Bearer ${CONTROL_TOKEN}`, [PREVIEW_HEADER]: binding, ...headers } });
   const send = (req = request()) => worker.fetch(req, edge);
   const sibling = { ...detail, name: "help" };
-  let list = Response.json([sibling]);
+  const defaultSlash = { id: "18446744073709551615", version: "18446744073709551615",
+    application_id: app, guild_id: guild, name: "rank" };
+  let list = Response.json([sibling, defaultSlash]);
   let botId = app;
   let afterList = () => {};
   const calls: string[] = [];
@@ -466,6 +468,9 @@ test("staging registry absence is a stopped, authenticated GET under the exact l
   assert.equal(calls.length, 3);
   botId = app;
   for (const bad of [Response.json([detail]), Response.json([sibling, sibling]),
+    Response.json([{ ...defaultSlash, id: "18446744073709551616" }]),
+    Response.json([{ ...defaultSlash, version: "18446744073709551616" }]),
+    Response.json([defaultSlash, { ...sibling, name: defaultSlash.name }]),
     Response.json([null]), Response.json({ commands: [] }), Response.json([{ ...sibling, guild_id: "wrong" }]),
     new Response(`[{${JSON.stringify(sibling).slice(1, -1)},"na\\u006de":"other"}]`),
     new Response(new Uint8Array([91, 34, 255, 34, 93])),

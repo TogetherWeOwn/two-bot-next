@@ -1,5 +1,6 @@
 import { authenticated } from "./ownership.ts";
 import { withSecurityHeaders } from "./security-headers.ts";
+import { isSnowflake } from "./container-env.ts";
 
 export const PREVIEW_HEADER = "x-two-staging-preview";
 // Match the pinned staging application and guild in the bot command registry.
@@ -72,11 +73,12 @@ export async function readPreviewAbsent(env: PreviewEnv, get: DiscordGet): Promi
   const ids = new Set<string>(), commands = new Set<string>();
   for (const raw of list) {
     const row = record(raw);
-    if (!row || !snowflake(row.id) || !snowflake(row.version)
+    const type = row && !Object.hasOwn(row, "type") ? 1 : row?.type;
+    if (!row || !snowflake(row.id) || !isSnowflake(row.id) || !snowflake(row.version) || !isSnowflake(row.version)
       || row.application_id !== APP || (Object.hasOwn(row, "guild_id") && row.guild_id !== GUILD)
-      || (row.type !== 1 && row.type !== 2 && row.type !== 3)
+      || (type !== 1 && type !== 2 && type !== 3)
       || typeof row.name !== "string" || !row.name.trim() || row.name === NAME) throw refuse();
-    const command = `${row.type}:${row.name}`;
+    const command = `${type}:${row.name}`;
     if (ids.has(row.id) || commands.has(command)) throw refuse();
     ids.add(row.id);
     commands.add(command);
