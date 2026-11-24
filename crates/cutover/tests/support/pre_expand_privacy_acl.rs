@@ -9,7 +9,8 @@ use two_bot_core::database_roles::{plan_for_phase, verification_sql, Phase};
 use two_bot_cutover::legacy_verify::read_only_transaction;
 use two_bot_cutover::member_erasure::{erase_member, ErasureMode};
 use two_bot_cutover::retention::{
-    fulfill_user_deletion, handle_guild_delete, request_user_deletion, run_retention, RetentionMode,
+    fulfill_user_deletion, handle_guild_delete, request_user_deletion, run_retention,
+    RetentionMode, RetentionReport,
 };
 use two_bot_cutover::rollback_candidate::{
     roles_sha256, verify, ArtifactEvidence, CandidatePin, DatabaseEvidence, PrivacyAccess, Refusal,
@@ -183,6 +184,9 @@ const SESSIONS: &str = "SELECT count(*) FROM event_voice_sessions";
 const WINDOWS: &str = "SELECT count(*) FROM event_attendance_windows";
 const AUDITS: &str = "SELECT count(*) FROM member_erasure_audit";
 const CAPTURE: &str = "SELECT count(*) FROM event_store WHERE dedup_key = 'fixture'";
+const HISTORY: &str = "SELECT count(*) FROM public.backfill_history_messages";
+const WRITE_HISTORY: &str =
+    "INSERT INTO public.backfill_history_messages VALUES ('10','20','30','2026-01-01T00:00:00Z')";
 const RECEIPTS: &str =
     "SELECT count(*) FROM retention_deletion_requests WHERE receipt_id IS NOT NULL";
 
@@ -358,11 +362,39 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     .await
     .unwrap();
     restore_v17(&migrator, name).await;
+    assert_eq!(count(&migrator, HISTORY).await, 0);
+    assert!(!erase_member(&migrator, GUILD, MEMBER, ErasureMode::DryRun)
+        .await
+        .unwrap()
+        .is_empty());
+    let preview = run_retention(&migrator, RetentionMode::DryRun)
+        .await
+        .unwrap();
+    assert_eq!(preview.deletions_completed, 1);
+    assert!(preview.guild_rows_purged > 0);
+    assert_preserved(&migrator).await;
+    assert_eq!(count(&migrator, AUDITS).await, 0);
+    assert_unverifiable_history(pool, &migrator, name, &request).await;
     verify_rollback_candidate(&audit, &migrator, name, &before_grants).await;
+    restore_v17(&migrator, name).await;
+    assert_counts(&migrator, &[(HISTORY, 1), (AUDITS, 0)]).await;
+    assert_history_defers(&migrator, &request).await;
+    for mode in [
+        ErasureMode::DryRun,
+        ErasureMode::Execute { actor: "fixture" },
+    ] {
+        assert_coverage_refusal(
+            erase_member(&migrator, GUILD, MEMBER, mode)
+                .await
+                .unwrap_err(),
+        );
+    }
+    sqlx::query("DELETE FROM public.backfill_history_messages")
+        .execute(&migrator)
+        .await
+        .unwrap();
     assert_counts(&runtime, &[(SESSIONS, 3), (WINDOWS, 2)]).await;
     assert_eq!(count(&migrator, AUDITS).await, 0);
-    let denied = fulfill_user_deletion(&runtime, &request).await.unwrap_err();
-    assert_eq!(denied.to_string(), "erasure schema coverage incomplete");
     assert_hidden_schema_and_replay_refusals(&runtime, &migrator, &request).await;
     assert_runtime_refusal(&runtime, &request, "42501").await;
     for mode in [RetentionMode::DryRun, RetentionMode::Execute] {
@@ -373,13 +405,22 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
         assert_eq!(expiry, (1, i64::from(mode == RetentionMode::DryRun)));
     }
     assert_preserved(&runtime).await;
+    sqlx::raw_sql(include_str!("../fixtures/history_lock.sql"))
+        .execute(&migrator)
+        .await
+        .unwrap();
     let receipt = fulfill_user_deletion(&migrator, &request).await.unwrap();
     assert_eq!(receipt.receipt_id, format!("rcpt-{request}"));
     assert!(fulfill_user_deletion(&migrator, &request).await.is_err());
     assert_counts(&runtime, &[(RECEIPTS, 1), (SESSIONS, 2), (RESERVATIONS, 2)]).await;
+    assert_eq!(count(&runtime, "SELECT count(*) FROM members WHERE guild_id = '100000000000000002' AND member_id = '200000000000000001'").await, 1);
+    request_user_deletion(&runtime, GUILD, "200000000000000003")
+        .await
+        .unwrap();
     let drained = run_retention(&migrator, RetentionMode::Execute)
         .await
         .unwrap();
+    assert_eq!(drained.deletions_completed, 1);
     assert!(drained.guild_rows_purged > 0);
     let survivors: Vec<(String, String)> =
         sqlx::query_as("SELECT guild_id, member_id FROM event_voice_sessions")
@@ -391,7 +432,154 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
         [(GUILD.to_owned(), "200000000000000002".to_owned())]
     );
     assert_counts(&runtime, &[(WINDOWS, 1), (RESERVATIONS, 1), (QUEUE, 0)]).await;
+    assert_eq!(count(&runtime, MEMBERS).await, 1);
     assert_eq!(count(&runtime, "SELECT count(*) FROM moderation_idempotency WHERE state = 'done' AND outcome = 'operator_released'").await, 2);
+    let repeat = run_retention(&migrator, RetentionMode::Execute)
+        .await
+        .unwrap();
+    assert_eq!(
+        (repeat.deletions_completed, repeat.guild_rows_purged),
+        (0, 0)
+    );
+    assert_eq!(count(&runtime, RECEIPTS).await, 2);
+    erase_member(
+        &migrator,
+        GUILD,
+        "200000000000000002",
+        ErasureMode::Execute { actor: "fixture" },
+    )
+    .await
+    .unwrap();
+    assert_counts(&migrator, &[(MEMBERS, 0), (AUDITS, 1), (HISTORY, 0)]).await;
+    assert!(candidate_readout(&audit, name).await.roles_match);
+}
+
+fn assert_drain_defers(report: &RetentionReport) {
+    assert_eq!(
+        (report.schema_gap_deferrals, report.guild_purges_failed),
+        (1, 1)
+    );
+    assert_eq!(
+        (report.deletions_completed, report.guild_rows_purged),
+        (0, 0)
+    );
+}
+
+fn assert_coverage_refusal(error: sqlx::Error) {
+    assert_eq!(error.to_string(), "erasure schema coverage incomplete");
+}
+
+async fn assert_history_defers(operator: &PgPool, request: &str) {
+    assert_coverage_refusal(fulfill_user_deletion(operator, request).await.unwrap_err());
+    for mode in [RetentionMode::DryRun, RetentionMode::Execute] {
+        assert_drain_defers(&run_retention(operator, mode).await.unwrap());
+    }
+    assert_preserved(operator).await;
+}
+
+async fn assert_unverifiable_history(admin: &PgPool, operator: &PgPool, name: &str, request: &str) {
+    validate_name(name);
+    for (change, undo) in [
+        (
+            "ALTER TABLE public.backfill_history_messages ENABLE ROW LEVEL SECURITY".to_owned(),
+            "ALTER TABLE public.backfill_history_messages DISABLE ROW LEVEL SECURITY".to_owned(),
+        ),
+        (
+            "ALTER TABLE public.backfill_history_messages ALTER COLUMN author_id DROP NOT NULL"
+                .to_owned(),
+            "ALTER TABLE public.backfill_history_messages ALTER COLUMN author_id SET NOT NULL"
+                .to_owned(),
+        ),
+        (
+            "ALTER TABLE public.backfill_history_messages RENAME TO history_fixture".to_owned(),
+            "ALTER TABLE public.history_fixture RENAME TO backfill_history_messages".to_owned(),
+        ),
+        (
+            format!("REVOKE SELECT ON public.backfill_history_messages FROM {name}_m"),
+            format!("GRANT SELECT ON public.backfill_history_messages TO {name}_m"),
+        ),
+        (
+            format!("ALTER TABLE public.backfill_history_messages OWNER TO {name}_w"),
+            format!("ALTER TABLE public.backfill_history_messages OWNER TO {name}_m"),
+        ),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(change))
+            .execute(admin)
+            .await
+            .unwrap();
+        assert_history_defers(operator, request).await;
+        sqlx::query(sqlx::AssertSqlSafe(undo))
+            .execute(admin)
+            .await
+            .unwrap();
+    }
+    sqlx::query("SET default_transaction_isolation = 'repeatable read'")
+        .execute(operator)
+        .await
+        .unwrap();
+    assert_coverage_refusal(fulfill_user_deletion(operator, request).await.unwrap_err());
+    let report = run_retention(operator, RetentionMode::Execute)
+        .await
+        .unwrap();
+    assert_drain_defers(&report);
+    assert_preserved(operator).await;
+    sqlx::query("RESET default_transaction_isolation")
+        .execute(operator)
+        .await
+        .unwrap();
+
+    let mut writer = admin.begin().await.unwrap();
+    sqlx::query(WRITE_HISTORY)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key)
+         VALUES ('PRESENCE_UPDATE', $1, $2, now() - interval '40 days', 'fixture')",
+    )
+    .bind(GUILD)
+    .bind(MEMBER)
+    .execute(operator)
+    .await
+    .unwrap();
+    let report = run_retention(operator, RetentionMode::Execute)
+        .await
+        .unwrap();
+    assert_drain_defers(&report);
+    assert_eq!(
+        (report.presence_raw_deleted, count(operator, CAPTURE).await),
+        (1, 0)
+    );
+    assert_preserved(operator).await;
+
+    // The next run has scanned coverage and is waiting for SHARE while the
+    // writer is still invisible. Commit before SHARE is granted.
+    let drain = operator.clone();
+    let pending = tokio::spawn(async move { run_retention(&drain, RetentionMode::Execute).await });
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        while count(
+            admin,
+            "SELECT count(*) FROM pg_catalog.pg_locks
+            WHERE relation = 'public.backfill_history_messages'::regclass
+              AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+              AND mode = 'ShareLock' AND NOT granted",
+        )
+        .await
+            == 0
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("privacy drain did not wait on the synthetic history writer");
+    writer.commit().await.unwrap();
+    assert_drain_defers(&pending.await.unwrap().unwrap());
+    assert_counts(operator, &[(HISTORY, 1), (AUDITS, 0)]).await;
+    assert_preserved(operator).await;
+    sqlx::query("DELETE FROM public.backfill_history_messages")
+        .execute(operator)
+        .await
+        .unwrap();
 }
 
 async fn rollback_catalog(pool: &PgPool) -> String {
@@ -668,10 +856,7 @@ async fn verify_rollback_candidate(
 
     // These observations exercise the no-link, apparent exact match,
     // conflicting and ambiguous cases. None supplies a guild for 0409.
-    sqlx::query("INSERT INTO backfill_history_messages VALUES ('10','20','30',now())")
-        .execute(migrator)
-        .await
-        .unwrap();
+    sqlx::query(WRITE_HISTORY).execute(migrator).await.unwrap();
     for observations in [
         &[][..],
         &[("101", "30", "rollback-fixture-a")][..],
@@ -701,6 +886,12 @@ async fn verify_rollback_candidate(
             verify(&pin, &artifact, &readout.evidence(&pin, &roles)),
             Err(Refusal::History)
         );
+        assert_drain_defers(
+            &run_retention(migrator, RetentionMode::Execute)
+                .await
+                .unwrap(),
+        );
+        assert_preserved(migrator).await;
         let removed = sqlx::query(
             "DELETE FROM event_store WHERE dedup_key IN ('rollback-fixture-a', 'rollback-fixture-b')",
         )
@@ -725,7 +916,14 @@ async fn assert_runtime_refusal(runtime: &PgPool, request: &str, state: &str) {
 }
 
 async fn assert_preserved(runtime: &PgPool) {
-    let expected = [(MEMBERS, 3), (RESERVATIONS, 3), (QUEUE, 1), (RECEIPTS, 0)];
+    let pending = "SELECT count(*) FROM retention_deletion_requests WHERE status = 'pending'";
+    let expected = [
+        (MEMBERS, 3),
+        (RESERVATIONS, 3),
+        (QUEUE, 1),
+        (RECEIPTS, 0),
+        (pending, 1),
+    ];
     assert_counts(runtime, &expected).await;
 }
 
@@ -797,7 +995,7 @@ async fn assert_hidden_schema_and_replay_refusals(
     assert_preserved(runtime).await;
     // Isolate the role and replay controls after proving full-schema refusal.
     sqlx::raw_sql(
-        "DROP TABLE privacy_hidden_fixture, backfill_history_messages;
+        "DROP TABLE privacy_hidden_fixture;
          INSERT INTO moderation_idempotency
             (guild_id, idempotency_key, action, request_hash, state, claimed_at)
          SELECT DISTINCT guild_id, 'guard-200000000000000001', 'warn', 'fixture', 'claimed', now()

@@ -499,6 +499,9 @@ async fn run_retention_core(
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .execute(&mut *tx)
                 .await?;
+            sqlx::query("SET LOCAL statement_timeout = '15s'")
+                .execute(&mut *tx)
+                .await?;
             let presence = count_presence_raw(&mut tx).await?;
             let voice = count_voice_raw(&mut tx).await?;
             let attendance: i64 = sqlx::query_scalar(
@@ -522,7 +525,7 @@ async fn run_retention_core(
             // of the guild purge, so those rows must not be counted again as
             // guild rows. Guard-deferred requests stay pending, and any
             // unresolved guard in the guild defers its purge too.
-            let gaps = retention_coverage_gaps(&mut tx).await?;
+            let gaps = retention_coverage_gaps(&mut tx, mode).await?;
             let schema_gap = !gaps.is_empty();
             let selected = select_pending(&mut tx, schema_gap).await?;
             let deferred = selected.deferred;
@@ -646,7 +649,7 @@ async fn run_retention_core(
             // every pending request defers and every queued guild stays
             // queued; the exact gaps ride the warn logs for the code fix.
             *active_step = RetentionStep::DeletionIntake;
-            let schema_gaps = retention_coverage_gaps(&mut tx).await?;
+            let schema_gaps = retention_coverage_gaps(&mut tx, mode).await?;
             let schema_gapped = !schema_gaps.is_empty();
             // Pending deletions drain BEFORE guild purges so a departed
             // guild's pending receipts complete against pre-purge rows.
@@ -803,16 +806,19 @@ async fn run_retention_core(
 }
 
 async fn retention_coverage_gaps(
-    conn: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mode: RetentionMode,
 ) -> Result<Vec<String>, sqlx::Error> {
-    let mut gaps = crate::member_erasure::schema_gaps(conn).await?;
+    let mut gaps =
+        crate::member_erasure::privacy_coverage_gaps(tx, matches!(mode, RetentionMode::DryRun))
+            .await?;
     // The role matrix deliberately withholds DELETE on this admission
     // table. Keep both drains queued and let independent expiry proceed.
     if gaps.is_empty()
         && !sqlx::query_scalar::<_, bool>(
             "SELECT pg_catalog.has_table_privilege('voice_create_reservations', 'DELETE')",
         )
-        .fetch_one(conn)
+        .fetch_one(&mut **tx)
         .await?
     {
         gaps.push("privacy DELETE unavailable: voice_create_reservations".to_owned());
@@ -854,7 +860,9 @@ async fn count_raw_expiry_candidates(
     // Mirror the dry-run core's preceding-stage settlement: a schema-coverage
     // gap defers every pending deletion and every queued guild purge, so with
     // gaps nothing precedes the raw batch and no row is excluded.
-    let schema_gapped = !retention_coverage_gaps(&mut tx).await?.is_empty();
+    let schema_gapped = !retention_coverage_gaps(&mut tx, RetentionMode::DryRun)
+        .await?
+        .is_empty();
     let mut eligible_pairs: Vec<(String, String)> = Vec::new();
     let mut queued_unguarded: Vec<String> = Vec::new();
     if !schema_gapped {
@@ -1209,6 +1217,14 @@ pub async fn fulfill_user_deletion(
             "unknown or settled deletion request".into(),
         ));
     };
+    if !crate::member_erasure::privacy_coverage_gaps(&mut tx, false)
+        .await?
+        .is_empty()
+    {
+        return Err(sqlx::Error::InvalidArgument(
+            crate::member_erasure::SCHEMA_GAP_REFUSAL.into(),
+        ));
+    }
     let (receipt_id, requested_at_unix, completed_at_unix) =
         complete_request(&mut tx, request_id, &guild_id, &user_id).await?;
     tx.commit().await?;
@@ -1245,22 +1261,15 @@ fn is_schema_gap_refusal(err: &sqlx::Error) -> bool {
 /// Delete the requesting member's full footprint and settle the request,
 /// returning the receipt fields. Shared by [`fulfill_user_deletion`] and the
 /// [`run_retention`] pending drain so both paths honor the same receipt and
-/// the same safety gates as `erase_member`.
+/// the same safety gates as `erase_member`. The enclosing transaction must
+/// establish privacy coverage before calling this function.
 async fn complete_request(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request_id: &str,
     guild_id: &str,
     user_id: &str,
 ) -> Result<(String, i64, i64), sqlx::Error> {
-    // Share erase_member's safety gates: refuse on schema drift or unresolved
-    // replay fences, leaving the request pending with no receipt. The caller
-    // (single fulfilment or per-request savepoint) decides whether a refusal
-    // is swallowed or fatal.
-    if !crate::member_erasure::schema_gaps(tx).await?.is_empty() {
-        return Err(sqlx::Error::InvalidArgument(
-            crate::member_erasure::SCHEMA_GAP_REFUSAL.into(),
-        ));
-    }
+    // Unresolved replay fences leave the request pending with no receipt.
     if crate::member_erasure::has_unresolved_guards(tx, guild_id, user_id).await? {
         return Err(sqlx::Error::InvalidArgument(
             crate::member_erasure::REPLAY_GUARD_REFUSAL.into(),
