@@ -152,6 +152,7 @@ jobs:
       external_id: ${{ steps.request.outputs.external_id }}
       check_id: ${{ steps.request.outputs.check_id }}
       plan_sha256: ${{ steps.request.outputs.plan_sha256 }}
+      atomic_release: ${{ steps.request.outputs.atomic_release }}
     # No Environment or DB secrets. Verify the independent approval of the
     # producing artifact and unchanged fresh plan before apply can start.
     runs-on: ubuntu-latest
@@ -218,6 +219,8 @@ jobs:
     # plan (`two-bot db roles plan`) and `two-bot db roles verify` must read
     # 0; deploy-production refuses any new build while findings remain (the
     # 2026-10-16 crash-loop: migrations 0424-0441 without the role reapply).
+    # The exact 0475/0479–0482 and Store 0478 bundle instead commits its new
+    # grant and contract delta together with the migrations after role readback.
     if: github.ref == 'refs/heads/main' && inputs.mode == 'apply'
     needs: [plan, claim]
     environment: production-migrate-apply
@@ -244,6 +247,7 @@ jobs:
           git fetch origin main
           git merge-base --is-ancestor "$SOURCE_SHA" origin/main
       - name: Build runner
+        if: needs.claim.outputs.atomic_release == 'false'
         run: cargo build -p two-bot-cutover --bin staging-migrate --locked
       - name: Fetch producing plan manifest
         # Provenance gate: the apply runner proves the bound
@@ -267,6 +271,15 @@ jobs:
           path: approval-tools
       - name: Install Python for the production approval verifier
         run: apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 >/dev/null
+      - name: Build the protected release transaction runner
+        if: needs.claim.outputs.atomic_release == 'true'
+        working-directory: approval-tools
+        run: |
+          set -eu
+          for path in database_role_matrix.sql verify_database_roles.sql web_v1.sql; do
+            cmp "sql/$path" "../sql/$path"
+          done
+          cargo build -p two-bot-cutover --bin staging-migrate --locked
       - name: Recheck the exact production approval
         env:
           GH_TOKEN: ${{ github.token }}
@@ -289,6 +302,7 @@ jobs:
           PLAN_MANIFEST_SHA256: ${{ inputs.plan_manifest_sha256 }}
           STORE_PLAN_MANIFEST_SHA256: ${{ inputs.store_plan_manifest_sha256 }}
           PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+          ATOMIC_RELEASE: ${{ needs.claim.outputs.atomic_release }}
         # `shell: bash` runs with `-eo pipefail`. The container's default `sh`
         # has no pipefail, so a refusal (exit 2) or failure (exit 1) piped into
         # `tee` left the job green with nothing migrated. `set -o pipefail`
@@ -297,7 +311,12 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ./target/debug/staging-migrate --target production --apply --source-sha "$SOURCE_SHA" \
+          case "$ATOMIC_RELEASE" in
+            true) runner=./approval-tools/target/debug/staging-migrate ;;
+            false) runner=./target/debug/staging-migrate ;;
+            *) exit 2 ;;
+          esac
+          "$runner" --target production --apply --source-sha "$SOURCE_SHA" \
             --production-host "$PRODUCTION_HOST" --production-database "$PRODUCTION_DATABASE" \
             --production-branch-id "$PRODUCTION_BRANCH_ID" \
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
