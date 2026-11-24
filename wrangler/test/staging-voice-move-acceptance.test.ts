@@ -33,6 +33,14 @@ test("voice acceptance records the three session-bound outcomes and OFF", async 
   assert.deepEqual(receipt.cleanup, { memberDisconnected: true, off: true, stopped: true });
 });
 
+test("voice fixture recognizes the occupied source before the Connect denial", async () => {
+  const { args, moves } = mockVoiceMoveWindow();
+  const [channelId] = args.fixture.channelIds;
+  const reply = await args.caller.move({ channelId, signal: new AbortController().signal });
+  assert.deepEqual(reply.body.result, { outcome: "already_in_room" });
+  assert.deepEqual(moves, []);
+});
+
 test("voice acceptance refuses mismatched fixture, caller or ready proof before dispatch", async () => {
   const changes = [
     (args) => ({ fixture: { ...args.fixture, channelIds: ["300", "300"] } }),

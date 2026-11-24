@@ -74,10 +74,10 @@ export function mockVoiceMoveWindow() {
           let outcome;
           if (connectedChannelId === null) {
             outcome = "not_connected";
-          } else if (!canConnect(channelId)) {
-            outcome = "not_permitted";
           } else if (connectedChannelId === channelId) {
             outcome = "already_in_room";
+          } else if (!canConnect(channelId)) {
+            outcome = "not_permitted";
           } else {
             outcome = "moved";
             connectedChannelId = channelId;
