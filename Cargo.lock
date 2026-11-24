@@ -2241,6 +2241,10 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "rand",
  "rustls",
  "serde",
@@ -2264,6 +2268,7 @@ dependencies = [
  "two-bot-discord",
  "two-bot-store",
  "two-bot-testsupport",
+ "url",
 ]
 
 [[package]]

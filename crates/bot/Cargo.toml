@@ -32,6 +32,10 @@ serde = { workspace = true }
 time = { workspace = true }
 axum = { workspace = true }
 futures-util = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-rustls = { workspace = true }
+hyper-util = { workspace = true }
 # Sole rustls crypto provider (ring): twilight's Shard build panics without
 # exactly one provider feature enabled. Declared here (not on a lib) so the
 # release binary and `cargo test` share the same provider.
@@ -48,6 +52,7 @@ twilight-cache-inmemory = { workspace = true }
 twilight-gateway = { workspace = true }
 twilight-http = { workspace = true }
 twilight-model = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 two-bot-discord = { version = "0.4.0", path = "../discord", features = ["test-support"] }

@@ -26,6 +26,7 @@ pub mod join_risk_runtime;
 pub mod lane_jitter;
 pub mod live_delivery;
 pub mod live_gateway;
+pub mod live_transport;
 pub mod raid_runtime;
 
 // Shared query observer and settings fixture; one module per test crate.
