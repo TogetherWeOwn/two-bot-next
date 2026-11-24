@@ -42,6 +42,14 @@ a gap. A cut expires 30 seconds after its observation and remains unavailable
 while it exceeds the snapshot size limit. The serving action registry and
 ingress have no `live.snapshot` entry.
 
+The unmounted Bot handler accepts the Web hub's signed `POST /internal/actions`
+and reads from that ordered owner under the same guild scope. Web recovery
+still needs a separately reviewed HTTPS path from the hub's `BOT_ENDPOINT_URL`
+to this handler. It must forward the request signed with the dedicated
+`DISCORD_LIVE_SNAPSHOT_KEY_ID` and `DISCORD_LIVE_SNAPSHOT_SECRET` for the same
+`DISCORD_GUILD_ID` and pass through up to 1 MiB of direct v1 JSON with
+`Cache-Control: no-store`. The current staging relay expects a correlated action envelope.
+
 No signing key, secret custodian or export authority is supplied by this code.
 Key creation and transfer into the website's staging secret store stay on HOLD
 until separately approved and recorded. Never use the signing test fixture as a

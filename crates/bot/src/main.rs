@@ -79,6 +79,7 @@ mod interaction_admission;
 #[cfg(test)]
 mod interaction_composition_tests;
 mod internal_action_http;
+pub use internal_action_http::live_snapshot::LiveSnapshotEndpoint;
 #[cfg(test)]
 mod job_emission_conformance_tests;
 mod jobs;
