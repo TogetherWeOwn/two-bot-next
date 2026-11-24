@@ -175,7 +175,7 @@ fn push_bound(query: &mut QueryBuilder<Postgres>, operator: &'static str, key: &
         .push(r#"::text COLLATE "C")"#);
 }
 
-#[cfg(test)]
-mod continuation;
+#[cfg(any(test, feature = "test-support"))]
+pub mod continuation;
 #[cfg(test)]
 mod tests;

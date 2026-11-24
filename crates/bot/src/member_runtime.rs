@@ -54,6 +54,9 @@ use crate::{
 #[cfg(test)]
 #[path = "warning_history_authorizer.rs"]
 mod warning_history_authorizer;
+#[cfg(test)]
+#[path = "warning_history_interaction.rs"]
+mod warning_history_interaction;
 
 /// Supervised unban-sweep job name (status surface + registration).
 pub const SWEEP_JOB_NAME: &str = "member_unban_sweep";

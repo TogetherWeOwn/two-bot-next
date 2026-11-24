@@ -22,20 +22,20 @@ type Sessions = HashMap<Principal, Session>;
 type Cooldowns = HashMap<Principal, Instant>;
 
 #[derive(Clone, Copy)]
-struct Invocation {
-    principal: Principal,
-    channel: NonZeroU64,
+pub struct Invocation {
+    pub principal: Principal,
+    pub channel: NonZeroU64,
 }
 
 // WH_EXPIRED, WH_BUSY and WH_UNAVAILABLE.
 #[derive(Debug, PartialEq, Eq)]
-enum Status {
+pub enum Status {
     Expired,
     Busy,
     Unavailable,
 }
 
-enum Controls {
+pub enum Controls {
     Next(String),
     Done,
     Limit, // WH_LIMIT
@@ -58,7 +58,7 @@ struct State {
 }
 
 #[derive(Default)]
-struct HistoryState(Mutex<State>);
+pub struct HistoryState(Mutex<State>);
 
 fn random_handle() -> Result<Arc<str>, Status> {
     let mut bytes = [0; 16];
@@ -90,7 +90,7 @@ impl HistoryState {
         self.0.lock().map_err(|_| Status::Unavailable)
     }
 
-    fn start(&self, scope: Invocation, target: NonZeroU64) -> Result<Attempt<'_>, Status> {
+    pub fn start(&self, scope: Invocation, target: NonZeroU64) -> Result<Attempt<'_>, Status> {
         let mut state = self.lock()?;
         let now = Instant::now();
         admit(&mut state.cooldowns, scope.principal, now)?;
@@ -112,7 +112,7 @@ impl HistoryState {
         Ok(attempt)
     }
 
-    fn next(&self, scope: Invocation, handle: &str) -> Result<Attempt<'_>, Status> {
+    pub fn next(&self, scope: Invocation, handle: &str) -> Result<Attempt<'_>, Status> {
         validate(handle)?;
         let mut state = self.lock()?;
         let now = Instant::now();
@@ -134,7 +134,7 @@ impl HistoryState {
         Ok(session.attempt(self, scope.principal))
     }
 
-    fn stop(&self, scope: Invocation, handle: &str) -> Result<(), Status> {
+    pub fn stop(&self, scope: Invocation, handle: &str) -> Result<(), Status> {
         validate(handle)?;
         let mut state = self.lock()?;
         let session = find(&mut state.sessions, scope, Instant::now())?;
@@ -166,7 +166,7 @@ impl Session {
 }
 
 // Dropping a failed or canceled attempt closes its session and preserves admission.
-struct Attempt<'a> {
+pub struct Attempt<'a> {
     state: &'a HistoryState,
     who: Principal,
     handle: Arc<str>,
@@ -186,13 +186,13 @@ impl<'a> Attempt<'a> {
             .ok_or(Status::Expired)
     }
 
-    fn request(&self) -> Result<(NonZeroU64, Option<&WarningHistoryCursor>), Status> {
+    pub fn request(&self) -> Result<(NonZeroU64, Option<&WarningHistoryCursor>), Status> {
         let target = self.active(&mut *self.state.lock()?)?.target;
         Ok((target, self.cursor.as_ref()))
     }
 
     // Prepare at the delivery boundary after the final fresh authorization.
-    fn prepare(
+    pub fn prepare(
         mut self,
         mut next: Option<WarningHistoryCursor>,
     ) -> Result<(Prepared<'a>, Controls), Status> {
@@ -226,10 +226,10 @@ impl Drop for Attempt<'_> {
     }
 }
 
-struct Prepared<'a>(Attempt<'a>, Option<WarningHistoryCursor>);
+pub struct Prepared<'a>(Attempt<'a>, Option<WarningHistoryCursor>);
 
 impl Prepared<'_> {
-    fn confirm(self) -> Result<(), Status> {
+    pub fn confirm(self) -> Result<(), Status> {
         let mut state = self.0.state.lock()?;
         let session = self.0.active(&mut state)?;
         if let Some(cursor) = self.1 {
@@ -240,6 +240,20 @@ impl Prepared<'_> {
             state.sessions.remove(&self.0.who);
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub fn synthetic_cursor(guild: NonZeroU64, target: NonZeroU64) -> WarningHistoryCursor {
+    let key = |id: &str| super::Key {
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+        id: id.into(),
+    };
+    WarningHistoryCursor {
+        guild: guild.to_string(),
+        target: target.to_string(),
+        high_water: key("synthetic-high"),
+        last_shown: key("synthetic-last"),
     }
 }
 
