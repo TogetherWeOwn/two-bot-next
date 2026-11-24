@@ -618,7 +618,7 @@ async function readBoundedText(response: Response, limit: number, signal?: Abort
     const bytes = new Uint8Array(size);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    return new TextDecoder("utf-8", { fatal }).decode(bytes);
+    return new TextDecoder("utf-8", { fatal, ignoreBOM: false }).decode(bytes);
   } finally {
     // A hostile cancel hook can itself stall or reject. Do not await it.
     if (!complete) void reader.cancel().catch(() => {});
@@ -1200,6 +1200,8 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   private async previewAbsent(request: Request): Promise<void> {
+    // Keep the stopped check and Discord read in the caller's ownership gate
+    // so no startup can race the absence receipt.
     const use = await this.previewUse(request);
     if (this.ctx.container?.running !== false) throw new OwnershipRefused("shutdown_unconfirmed");
     const signal = AbortSignal.timeout(Math.max(0, Math.min(8_000, use.expiresAt - Date.now())));
