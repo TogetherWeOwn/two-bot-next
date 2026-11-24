@@ -42,13 +42,16 @@ a gap. A cut expires 30 seconds after its observation and remains unavailable
 while it exceeds the snapshot size limit. The serving action registry and
 ingress have no `live.snapshot` entry.
 
-The unmounted Bot handler accepts the Web hub's signed `POST /internal/actions`
-and reads from that ordered owner under the same guild scope. Web recovery
-still needs a separately reviewed HTTPS path from the hub's `BOT_ENDPOINT_URL`
-to this handler. It must forward the request signed with the dedicated
-`DISCORD_LIVE_SNAPSHOT_KEY_ID` and `DISCORD_LIVE_SNAPSHOT_SECRET` for the same
-`DISCORD_GUILD_ID` and pass through up to 1 MiB of direct v1 JSON with
-`Cache-Control: no-store`. The current staging relay expects a correlated action envelope.
+An unregistered Worker seam forwards the Web hub's signed `POST /internal/actions`
+under a dedicated `DISCORD_LIVE_SNAPSHOT_KEY_ID` and `DISCORD_GUILD_ID` scope.
+It requires an owned, running receiver and serves validated direct v1 JSON up
+to 1 MiB with `Cache-Control: no-store`. With no scope it refuses the request.
+Before activation, choose whether `BOT_ENDPOINT_URL` will use a separate
+snapshot HTTPS origin at the same signed path or whether the existing Bot
+origin will dispatch separately to the snapshot and action-envelope handlers.
+That change must register the Worker and Bot handlers, connect the DO ownership
+and staging-use gate, and provision the dedicated snapshot credential and
+guild scope under the existing holds. Web still checks freshness and cursor coverage.
 
 No signing key, secret custodian or export authority is supplied by this code.
 Key creation and transfer into the website's staging secret store stay on HOLD
