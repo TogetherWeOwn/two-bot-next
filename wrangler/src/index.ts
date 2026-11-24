@@ -30,7 +30,7 @@ import {
 } from "./ownership.ts";
 import { StagingLifecycle, STAGING_USE_PATH, parseStagingUseChange, type StagingUse } from "./staging-lifecycle.ts";
 import { stagingDatabaseEvidence } from "./staging-database-fingerprint.ts";
-import { PREVIEW_HEADER, previewRefusal, readPreview } from "./staging-preview.ts";
+import { PREVIEW_HEADER, parseRegistryJson, previewRefusal, readPreview, readPreviewAbsent } from "./staging-preview.ts";
 import {
   TokenBuckets,
   RedirectMissCache,
@@ -599,7 +599,8 @@ async function deadlineFetch(work: Promise<Response>, signal: AbortSignal): Prom
 }
 
 /** Read at most `limit` bytes; cancel oversize/failed bodies without buffering. */
-async function readBoundedText(response: Response, limit: number, signal?: AbortSignal): Promise<string | null> {
+async function readBoundedText(response: Response, limit: number, signal?: AbortSignal,
+  fatal = false): Promise<string | null> {
   const reader = response.body?.getReader();
   if (!reader) return "";
   const chunks: Uint8Array[] = [];
@@ -617,7 +618,7 @@ async function readBoundedText(response: Response, limit: number, signal?: Abort
     const bytes = new Uint8Array(size);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    return new TextDecoder().decode(bytes);
+    return new TextDecoder("utf-8", { fatal }).decode(bytes);
   } finally {
     // A hostile cancel hook can itself stall or reject. Do not await it.
     if (!complete) void reader.cancel().catch(() => {});
@@ -1198,6 +1199,32 @@ export class TwoBotContainer extends Container<Env> {
     return use;
   }
 
+  private async previewAbsent(request: Request): Promise<void> {
+    const use = await this.previewUse(request);
+    if (this.ctx.container?.running !== false) throw new OwnershipRefused("shutdown_unconfirmed");
+    const signal = AbortSignal.timeout(Math.max(0, Math.min(8_000, use.expiresAt - Date.now())));
+    try {
+      await readPreviewAbsent(this.env, async (url, token) => {
+        signal.throwIfAborted();
+        const response = await deadlineFetch(fetch(url, { method: "GET", redirect: "error", cache: "no-store",
+          signal, headers: { authorization: `Bot ${token}` } }), signal);
+        if (response.status !== 200 || response.redirected || response.headers.has("location")) {
+          releaseBody(response);
+          throw new Error("staging_preview_unavailable");
+        }
+        const body = await readBoundedText(response, 256 * 1024, signal, true);
+        return parseRegistryJson(body ?? "");
+      });
+    } catch {
+      throw new OwnershipRefused("staging_preview_absence_unconfirmed");
+    }
+    const after = await this.previewUse(request);
+    if (signal.aborted || after.epoch !== use.epoch || after.acquiredAt !== use.acquiredAt
+      || this.ctx.container?.running !== false) {
+      throw new OwnershipRefused("staging_preview_absence_unconfirmed");
+    }
+  }
+
   private async stagingPreview(request: Request, admitted: StagingUse, response: Response): Promise<Response> {
     const { deploymentId, sha, runId, runAttempt, expiresAt } = admitted;
     const signal = AbortSignal.timeout(Math.max(0, Math.min(8_000, expiresAt - Date.now())));
@@ -1465,7 +1492,11 @@ export class TwoBotContainer extends Container<Env> {
 
   private async stagingControl(request: Request): Promise<Response> {
     if (!this.boundedStaging()) return notFound();
-    if (!await authenticated(request, this.env.OWNERSHIP_CONTROL_TOKEN)) {
+    const checkAbsence = request.headers.has(PREVIEW_HEADER);
+    if (checkAbsence) {
+      const refusal = await previewRefusal(request, new URL(request.url), this.env.OWNERSHIP_CONTROL_TOKEN);
+      if (refusal) return refusal;
+    } else if (!await authenticated(request, this.env.OWNERSHIP_CONTROL_TOKEN)) {
       return new Response("unauthorized", { status: 401, headers: withSecurityHeaders() });
     }
     if (request.method !== "GET" && request.method !== "POST") {
@@ -1482,6 +1513,7 @@ export class TwoBotContainer extends Container<Env> {
         const owner = await this.ownership.require(id);
         const identity = { deploymentId: id, sha: this.env.CONTAINER_RELEASE ?? "", owner };
         let use = await this.stagingUse.read();
+        if (checkAbsence) await this.previewAbsent(request);
         if (change) {
           if (change.action === "acquire") {
             await this.requireRecoveryDatabase();
@@ -1502,7 +1534,7 @@ export class TwoBotContainer extends Container<Env> {
         // Acquisition authorizes, but does not itself start or certify the
         // container. The pipeline must probe and verify the exact build next.
         return Response.json({ deploymentId: id, sha: identity.sha, owner, use: use ?? null,
-          running: this.ctx.container?.running ?? false }, {
+          running: this.ctx.container?.running ?? false, ...(checkAbsence ? { registry: "absent" } : {}) }, {
           headers: withSecurityHeaders({ "cache-control": "no-store" }),
         });
       });

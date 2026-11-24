@@ -94,6 +94,17 @@ production performance measurements.
 
 On clean current-main rollouts, `verify_automod_preview` adds a readback receipt to the user-flow artifact.
 
+For an affirmative absence check, the protected staging control client
+supports `node wrangler/scripts/staging-use.mjs automod-absent`. Supply the
+existing staging ownership binding and the exact active run, attempt, Worker,
+source SHA and expiry, using the same environment fields as `staging-use.mjs
+stop`. The container must already be stopped. The client uses a GET to the
+ownership control route, which authenticates the existing staging bot to
+Discord and checks its staging guild registry. A valid list with no
+`automod-preview` yields an allowlisted absence receipt. An invalid list,
+duplicate entry, failed read, or expired window refuses. The absence check
+changes neither the runtime nor Discord and has no role in release certification.
+
 ## Live read-mostly smoke run
 
 `scripts/staging_smoke_run.py` is the live counterpart: one fenced, GET-only

@@ -15,6 +15,9 @@ const OPTIONS = [
 ] satisfies Record<string, unknown>[];
 const BOUNDS = ["min_length", "max_length", "min_value", "max_value"];
 const EMPTY = ["choices", "options", "channel_types"];
+const refuse = () => new Error("staging_preview_registry_mismatch");
+type PreviewEnv = { GUILD_ID?: string; DISCORD_APPLICATION_ID?: string; DISCORD_TOKEN?: string };
+type DiscordGet = (url: string, token: string) => Promise<unknown>;
 export async function previewRefusal(request: Request, url: URL, token?: string): Promise<Response | null> {
   const reply = (status: number, extra = {}) =>
     new Response(null, { status, headers: withSecurityHeaders({ "cache-control": "no-store", ...extra }) });
@@ -33,15 +36,55 @@ function identity(row: Record<string, unknown> | undefined): boolean {
   return !!row && row.name === NAME && row.type === 1 && row.application_id === APP
     && (!Object.hasOwn(row, "guild_id") || row.guild_id === GUILD) && snowflake(row.version);
 }
-export async function readPreview(env: { GUILD_ID?: string; DISCORD_APPLICATION_ID?: string; DISCORD_TOKEN?: string },
-  get: (url: string, token: string) => Promise<unknown>): Promise<void> {
+
+async function registry(env: PreviewEnv, get: DiscordGet) {
   const token = env.DISCORD_TOKEN;
-  const refuse = () => new Error("staging_preview_registry_mismatch");
   if (env.GUILD_ID !== GUILD || env.DISCORD_APPLICATION_ID !== APP || !token?.trim()) throw refuse();
   const bot = record(await get(`${API}/users/@me`, token));
   if (bot?.id !== APP || bot.bot !== true) throw refuse();
   const list = await get(COMMANDS, token);
   if (!Array.isArray(list)) throw refuse();
+  return { token, list };
+}
+
+/** JSON.parse validates the grammar first. Reject ambiguous object members
+ * before an overwritten name or principal can be mistaken for absence. */
+export function parseRegistryJson(text: string): unknown {
+  const value: unknown = JSON.parse(text);
+  const scopes: (Set<string> | null)[] = [];
+  for (const match of text.matchAll(/"(?:[^"\\]|\\.)*"\s*:?|[{}\[\]]/g)) {
+    const token = match[0];
+    if (token === "{") scopes.push(new Set());
+    else if (token === "[") scopes.push(null);
+    else if (token === "}" || token === "]") scopes.pop();
+    else if (token.endsWith(":")) {
+      const keys = scopes.at(-1);
+      const key: string = JSON.parse(token.slice(0, -1));
+      if (!keys || keys.has(key)) throw refuse();
+      keys.add(key);
+    }
+  }
+  return value;
+}
+
+export async function readPreviewAbsent(env: PreviewEnv, get: DiscordGet): Promise<void> {
+  const { list } = await registry(env, get);
+  const ids = new Set<string>(), commands = new Set<string>();
+  for (const raw of list) {
+    const row = record(raw);
+    if (!row || !snowflake(row.id) || !snowflake(row.version)
+      || row.application_id !== APP || (Object.hasOwn(row, "guild_id") && row.guild_id !== GUILD)
+      || (row.type !== 1 && row.type !== 2 && row.type !== 3)
+      || typeof row.name !== "string" || !row.name.trim() || row.name === NAME) throw refuse();
+    const command = `${row.type}:${row.name}`;
+    if (ids.has(row.id) || commands.has(command)) throw refuse();
+    ids.add(row.id);
+    commands.add(command);
+  }
+}
+
+export async function readPreview(env: PreviewEnv, get: DiscordGet): Promise<void> {
+  const { token, list } = await registry(env, get);
   const matches = list.map(record).filter((entry) => entry?.name === NAME);
   const entry = matches[0];
   if (matches.length !== 1 || !entry || !identity(entry) || !snowflake(entry.id)
