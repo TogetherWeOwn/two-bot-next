@@ -176,4 +176,6 @@ fn push_bound(query: &mut QueryBuilder<Postgres>, operator: &'static str, key: &
 }
 
 #[cfg(test)]
+mod continuation;
+#[cfg(test)]
 mod tests;
