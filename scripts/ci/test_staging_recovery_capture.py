@@ -16,6 +16,11 @@ import staging_recovery_capture as capture
 
 
 class StagingRecoveryCaptureTests(unittest.TestCase):
+    def test_shipped_pin_matches_staging_recipient_certificate(self):
+        cert = Path(__file__).with_name("fixtures") / "staging_recovery_recipient.pem"
+        der = ssl.PEM_cert_to_DER_cert(cert.read_text(encoding="ascii"))
+        self.assertEqual(hashlib.sha256(der).hexdigest(), capture.RECIPIENT_SHA256)
+
     def test_unreviewed_certificate_refuses_before_database_access(self):
         with patch.dict(capture.os.environ, {"RECOVERY_RECIPIENT": "YQ=="}, clear=True), \
                 patch.object(capture, "database_target") as database_target:
