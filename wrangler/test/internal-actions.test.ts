@@ -125,13 +125,14 @@ async function harness(t: TestContext, env: Record<string, unknown>,
     getTcpPort: (port: number) => ({
       async fetch(input: string | Request, init?: RequestInit | Request) {
         const url = new URL(typeof input === "string" ? input : input.url);
+        const request = input instanceof Request ? input : init;
         if (!listening.has(port)) throw new Error(`connection refused: nothing listens on ${port}`);
         const record: Seen = {
           port,
           pathname: url.pathname,
-          method: init?.method ?? "GET",
-          headers: Object.fromEntries(new Headers(init?.headers)),
-          body: init instanceof Request && init.body ? new Uint8Array(await init.arrayBuffer()) : null,
+          method: request?.method ?? "GET",
+          headers: Object.fromEntries(new Headers(request?.headers)),
+          body: request instanceof Request && request.body ? new Uint8Array(await request.arrayBuffer()) : null,
         };
         seen.push(record);
         const response = port === RECEIVER_PORT && url.pathname === ACTIONS_PATH
@@ -586,6 +587,7 @@ test("unmounted snapshot composition returns direct v1 while ordinary ingress ke
   await h.warm();
   const fresh = { ...snapshot, observed_at: new Date().toISOString() };
   let authenticated = 0;
+  let refusalCancelled = false;
   h.setReceiver(({ headers, body, method, pathname }) => {
     if (headers["x-two-key-id"] === SIGNED_HEADERS["x-two-key-id"]) {
       return Response.json({ ok: true, request_id: headers["x-request-id"], result: { message_id: "1" } });
@@ -595,7 +597,13 @@ test("unmounted snapshot composition returns direct v1 while ordinary ingress ke
     if (method !== "POST" || !body || headers["x-two-key-id"] !== scope.keyId ||
       !headers["x-two-timestamp"] || !headers["x-two-nonce"] ||
       headers["x-two-signature"] !== signature(body, pathname, headers["x-two-timestamp"], headers["x-two-nonce"])) {
-      return Response.json({ ok: false, error: { code: "unauthorized" } }, { status: 401 });
+      const refusal = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"ok":false,"error":{"code":"unauthorized"}}'));
+        },
+        cancel() { refusalCancelled = true; },
+      });
+      return new Response(refusal, { status: 401, headers: { "content-type": "application/json" } });
     }
     authenticated++;
     return Response.json(fresh);
@@ -620,6 +628,7 @@ test("unmounted snapshot composition returns direct v1 while ordinary ingress ke
   await snapshotRefused(await pull(wrongMac), 503, "unavailable");
   assert.equal(h.receiverCalls().length, 2, "the private receiver decides whether the MAC matches");
   assert.equal(authenticated, 1);
+  assert.equal(refusalCancelled, true);
 
   await snapshotRefused(await h.call(webSnapshotRequest()), 503, "unavailable");
   assert.equal(authenticated, 2, "routed ordinary ingress still refuses a direct v1 reply");
@@ -658,12 +667,22 @@ test("unmounted snapshot composition requires the configured guild, key, owner a
 
   h.values.delete(OWNER_KEY);
   await snapshotRefused(await pull(webSnapshotRequest()), 503, "unavailable");
-  h.values.set(OWNER_KEY, OWNER);
-  h.values.set(STAGING_USE_KEY, { ...stagingUse, phase: "released" });
-  assert.equal(h.runtime.running, true);
-  await snapshotRefused(await pull(webSnapshotRequest()), 503, "unavailable");
-  assert.equal(h.runtime.running, false, "the existing staging-use gate tears down the unauthorized runtime");
   assert.deepEqual(h.receiverCalls(), []);
+
+  h.values.set(OWNER_KEY, OWNER);
+  assert.equal(h.runtime.running, true);
+  const fresh = { ...snapshot, observed_at: new Date().toISOString() };
+  h.setReceiver(() => new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      // No eager pull. Release authority when the relay reads the response body.
+      h.values.set(STAGING_USE_KEY, { ...stagingUse, phase: "released" });
+      controller.enqueue(new TextEncoder().encode(JSON.stringify(fresh)));
+      controller.close();
+    },
+  }, { highWaterMark: 0 }), { headers: { "content-type": "application/json" } }));
+  await snapshotRefused(await pull(webSnapshotRequest()), 503, "unavailable");
+  assert.equal(h.receiverCalls().length, 1);
+  assert.equal(h.runtime.running, false, "the owned body read rechecks staging use before releasing the response");
 });
 
 test("logs carry only scalar event, status, error class, request id, release and log url", async (t) => {
