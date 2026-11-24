@@ -1,6 +1,10 @@
 {
   "version": 1,
   "migrations": {
+    "crates/cutover/migrations/0482_live_sequence_watermarks.sql": {
+      "sha256": "50d83ac3393e4e524f0394dbda8a71af89f13d3326759866573860f38b0168d7",
+      "justification": "Create the dormant live-hub reservation watermark for each guild."
+    },
     "crates/cutover/migrations/0481_internal_voice_move_audit.sql": {
       "sha256": "63e729a45a7af53e629c86bff0014b9ae8387dbe6c3a77ec39a60b390b3008e3",
       "justification": "Record closed terminal voice move outcomes and scalar witnesses in the private ledger."

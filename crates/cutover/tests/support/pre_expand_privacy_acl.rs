@@ -365,7 +365,8 @@ async fn restore_v17(migrator: &PgPool, name: &str) {
     .await;
     std::fs::remove_dir_all(dir).unwrap();
     assert_eq!(result.unwrap(), (17, true));
-    assert_ledgers(migrator, 481, 478).await;
+    let tail = |chain: &Migrator| chain.iter().next_back().unwrap().version;
+    assert_ledgers(migrator, tail(&CUTOVER), tail(&two_bot_store::MIGRATOR)).await;
 }
 
 async fn assert_ledgers(migrator: &PgPool, cutover: i64, store: i64) {

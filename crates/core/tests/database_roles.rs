@@ -487,11 +487,21 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
          WHERE id = 'role-probe'",
     )
     .await?;
+    as_role(
+        pool,
+        &roles[1],
+        "INSERT INTO public.live_sequence_watermarks (guild_id, seq) VALUES ('42', 1); \
+         SELECT seq FROM public.live_sequence_watermarks WHERE guild_id = '42'; \
+         UPDATE public.live_sequence_watermarks SET seq = 2 WHERE guild_id = '42'",
+    )
+    .await?;
     for sql in [
         "DELETE FROM public.discord_send_admission",
         "TRUNCATE public.discord_send_admission",
         "DELETE FROM public.voice_create_reservations",
         "TRUNCATE public.voice_create_reservations",
+        "DELETE FROM public.live_sequence_watermarks",
+        "TRUNCATE public.live_sequence_watermarks",
         "CREATE TABLE public.runtime_probe (id int)",
         "CREATE SCHEMA runtime_probe",
         "CREATE TEMP TABLE runtime_probe (id int)",
@@ -512,6 +522,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "INSERT INTO public.discord_send_admission (token_key) VALUES ('offline')",
         "UPDATE public.discord_send_admission SET in_flight = FALSE",
         "DELETE FROM public.discord_send_admission",
+        "SELECT * FROM public.live_sequence_watermarks",
         "SELECT * FROM public.voice_create_reservations",
         "INSERT INTO public.voice_create_reservations (id, guild_id, user_id, created_at) VALUES ('reader', '1', '2', now())",
         "SELECT * FROM public.members",

@@ -23,6 +23,7 @@ use two_bot_core::backup::dump_file::{
     DumpTableInfo, SequenceMark, DESTINATION_OWNED_COLUMNS, DUMP_TABLES, DUMP_VERSION,
     EXCLUDED_TABLES, OPTIONAL_LEGACY_TABLES,
 };
+use two_bot_core::realtime_wire::{watermark, Id};
 use two_bot_core::voice_access::{
     may_create_room, may_use_command, AccessControls, AccessDecision, AccessDenyReason,
     AccessMember,
@@ -1118,6 +1119,8 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     assert_guards_work(pool).await;
     let directory = ArchiveDirectory::new();
     let original = directory.path("complete.ndjson.gz");
+    let live_guild = Id(42_u64.try_into().unwrap());
+    watermark::reserve(pool, live_guild, 0, 1).await.unwrap();
     let manifest = dump(pool, &original).await.unwrap();
     assert_eq!(manifest.events_sequence, 107);
     assert_eq!(
@@ -1139,6 +1142,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     // Independent, freshly migrated destination, not a wipe of the source DB.
     let target = database().await.expect("test bootstrap already configured");
     let pool = target.pool();
+    watermark::reserve(pool, live_guild, 0, 2).await.unwrap();
     sqlx::raw_sql(
         "CREATE TABLE schema_migrations (id TEXT PRIMARY KEY); \
          INSERT INTO schema_migrations VALUES ('destination-ledger-only'); \
@@ -1173,6 +1177,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         .unwrap();
     let cas_before = next_cas_token(pool).await;
     let report = restore(pool, &original).await.unwrap();
+    assert_eq!(watermark::read(pool, live_guild).await.unwrap(), 2);
     assert!(report.ok);
     assert!(report.dropped_columns.is_empty());
     assert!(

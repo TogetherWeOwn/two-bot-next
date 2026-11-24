@@ -29,13 +29,15 @@ ledger through SELECT only, with no DML, DDL, sequence, function or default
 privileges, so a plan run can never change data or schema. Migrator-only tables
 stay unreadable to it, exactly as for runtime and reader.
 
-Existing append-only audit triggers continue to constrain
-DML; a grant does not disable those controls. Both `discord_send_admission` and
-`voice_create_reservations` are restricted admission lanes: runtime has SELECT,
-INSERT and UPDATE only, never DELETE/TRUNCATE. The reservation rows preserve
-accepted room-create history across rollback, deletion and restart; runtime can
-settle a hold but cannot erase that durable history. Reader and PUBLIC receive
-no admission-lane access. The verifier requires these three runtime privileges,
+Existing append-only audit triggers continue to constrain DML after a grant.
+Restricted admission tables
+(`discord_send_admission`, `voice_create_reservations` and
+`live_sequence_watermarks`) grant runtime SELECT, INSERT and UPDATE only,
+with DELETE and TRUNCATE denied.
+Room reservation rows preserve accepted room-create history across rollback,
+deletion and restart. Runtime can settle a hold but cannot erase the history.
+Reader and PUBLIC receive no admission-lane access.
+The verifier requires these three runtime privileges,
 read-only SELECT for the migrator-plan role, and rejects extra erase or public access.
 Member erasure is the operator-only path that writes the migrator-only audit
 table, so it deletes reservation rows as the migrator, never as runtime.
@@ -318,6 +320,11 @@ also require a separately reviewed operator correction.
 Rollback is an operator-reviewed restoration of the prior ownership/ACL inventory
 and login configuration, not dropping groups or deleting data. Save that inventory
 before changing permissions. Never rotate/delete a credential as a side effect.
+
+For a separately authorized staging recovery to a pre-0482 build, restore
+the prior ACL by revoking the runtime and read-only migrator grants on
+`public.live_sequence_watermarks`. Preserve the table and verify roles with
+the recovery SHA before dispatching. The forward role plan restores the grants.
 
 ### Voice heat staging backout
 

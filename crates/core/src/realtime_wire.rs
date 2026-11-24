@@ -8,6 +8,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 pub mod recovery;
 mod snapshot;
 mod validation;
+#[cfg(feature = "db")]
+pub mod watermark;
 
 pub use snapshot::{
     encode_snapshot, Topics, MAX_SNAPSHOT_CHANNELS, MAX_SNAPSHOT_EVENTS, MAX_SNAPSHOT_MEMBERS,
