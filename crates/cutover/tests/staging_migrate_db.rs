@@ -15,7 +15,6 @@
 
 use std::{
     collections::HashSet,
-    process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -24,9 +23,8 @@ use serde_json::Value;
 use sqlx::{
     migrate::Migrator,
     postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
-    Connection, Executor, PgConnection,
+    Connection, Executor, PgConnection, Row,
 };
-use tokio::io::AsyncWriteExt;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -486,7 +484,7 @@ async fn seed_staging_state(fx: &Fixture) -> TestResult {
     Ok(())
 }
 
-fn fixture_psql(fx: &Fixture, login: &str) -> tokio::process::Command {
+fn attendance_psql(fx: &Fixture, login: &str) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("psql");
     command.env_clear().kill_on_drop(true).args([
         "-XqAtw",
@@ -505,7 +503,7 @@ async fn attendance_readback(
     legacy: &str,
     fence: &str,
 ) -> (bool, String) {
-    let out = fixture_psql(fx, login)
+    let out = attendance_psql(fx, login)
         .args([
             "--file",
             concat!(
@@ -532,7 +530,7 @@ async fn attendance_readback(
 async fn previous_attendance_reader(fx: &Fixture) -> Vec<u8> {
     // The event-voice window SELECT from the parent of #2158. Only the
     // bound event parameter is replaced with a synthetic literal.
-    let out = fixture_psql(fx, &fx.outsider)
+    let out = attendance_psql(fx, &fx.outsider)
         .args([
             "--command",
             "SELECT instance_starts_at, starts_at, ends_at,
@@ -634,7 +632,7 @@ async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestRe
     let (ok, no_grant) =
         attendance_readback(&fx, &fx.rologin, db, &fx.rologin, "capture", "", "").await;
     assert!(!ok && no_grant.is_empty());
-    let denied = fixture_psql(&fx, reader)
+    let denied = attendance_psql(&fx, reader)
         .args(["--command", "SELECT count(*) FROM public._sqlx_migrations"])
         .output()
         .await?;
@@ -800,31 +798,16 @@ async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestRe
 }
 
 async fn recovery_inventory(
-    fx: &Fixture,
+    reader: &mut PgConnection,
+    query: &str,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    let query = include_str!("../../../scripts/staging_recovery_inventory.sql").replace(
-        "-- @matrix",
-        include_str!("../../../sql/database_role_matrix.sql"),
-    );
-    let mut child = fixture_psql(fx, &fx.rologin)
-        .args(["--set=ON_ERROR_STOP=1", "--file=-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or("recovery inventory psql stdin was not piped")?
-        .write_all(query.as_bytes())
+    let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(query.to_owned()))
+        .fetch_all(reader)
         .await?;
-    let output = child.wait_with_output().await?;
-    assert!(
-        output.status.success(),
-        "fixture inventory failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(serde_json::from_slice(&output.stdout)?)
+    let [report] = rows.as_slice() else {
+        return Err("fixture inventory must return one report".into());
+    };
+    Ok(report.try_get(0)?)
 }
 
 async fn recovery_inventory_proves_pre_0482_absence() -> TestResult {
@@ -841,25 +824,45 @@ async fn recovery_inventory_proves_pre_0482_absence() -> TestResult {
     )
     .execute(&mut conn)
     .await?;
-    let report = recovery_inventory(&fx).await?;
+    // psql's gset only consumes the guard row. Execute the same guard and
+    // inventory on either side of a committed DDL change in a second session.
+    let (begin, query) = include_str!("../../../scripts/staging_recovery_inventory.sql")
+        .split_once("\n\\gset\n")
+        .ok_or("fixture inventory is missing the psql guard boundary")?;
+    let query = query.replace(
+        "-- @matrix",
+        include_str!("../../../sql/database_role_matrix.sql"),
+    );
+    let mut reader = fx.ro_session().await?;
+    sqlx::raw_sql(begin).execute(&mut reader).await?;
+    conn.execute("CREATE INDEX live_sequence_watermarks ON public._sqlx_migrations (success)")
+        .await?;
+    let report = recovery_inventory(&mut reader, &query).await?;
     assert_eq!(report["missing_before_0482"], true);
     assert!(report["missing_expected"]
         .as_array()
         .expect("missing-object list")
         .contains(&Value::from("public.live_sequence_watermarks")));
 
-    conn.execute(
-        "INSERT INTO public._sqlx_migrations (version, description, success) VALUES (482, 'fixture', false)",
+    sqlx::raw_sql(begin).execute(&mut reader).await?;
+    assert_eq!(
+        recovery_inventory(&mut reader, &query).await?["missing_before_0482"],
+        false
+    );
+
+    sqlx::raw_sql(
+        "DROP INDEX public.live_sequence_watermarks;
+         INSERT INTO public._sqlx_migrations (version, description, success) VALUES (482, 'fixture', false);",
     )
+    .execute(&mut conn)
     .await?;
-    assert_eq!(recovery_inventory(&fx).await?["missing_before_0482"], false);
+    sqlx::raw_sql(begin).execute(&mut reader).await?;
+    assert_eq!(
+        recovery_inventory(&mut reader, &query).await?["missing_before_0482"],
+        false
+    );
 
-    conn.execute("DELETE FROM public._sqlx_migrations WHERE version = 482")
-        .await?;
-    conn.execute("CREATE INDEX live_sequence_watermarks ON public._sqlx_migrations (success)")
-        .await?;
-    assert_eq!(recovery_inventory(&fx).await?["missing_before_0482"], false);
-
+    reader.close().await?;
     conn.close().await?;
     fx.finish().await
 }
