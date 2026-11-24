@@ -949,10 +949,11 @@ async fn run(cli_args: &[String]) {
                     // unless TWO_MUSIC=1; the tap refuses non-staging guilds.
                     let voice = music_capture::MusicVoiceTap::wrap(voice, Some(guild_id));
 
-                    let mut intents = intents_from_env(&activation);
-                    if live_snapshot_owner.is_some() {
-                        intents |= twilight_gateway::Intents::GUILD_SCHEDULED_EVENTS;
-                    }
+                    let shard_state = ShardState {
+                        readiness: Arc::clone(&state),
+                        snapshot_owner: live_snapshot_owner,
+                    };
+                    let intents = shard_state.intents(intents_from_env(&activation));
                     // Voice-room game names need GUILD_PRESENCES; record
                     // whether this boot requested it so a missing game
                     // rename is diagnosable from logs alone (the flag may
@@ -979,10 +980,7 @@ async fn run(cli_args: &[String]) {
                     run_shard(
                         shard,
                         pipeline,
-                        ShardState {
-                            readiness: Arc::clone(&state),
-                            snapshot_owner: live_snapshot_owner,
-                        },
+                        shard_state,
                         store,
                         interactions,
                         onboarding,

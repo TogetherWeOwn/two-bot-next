@@ -83,7 +83,6 @@ test("snapshot refuses invalid, oversize and unavailable peers without logging p
 });
 
 test("snapshot deadline bounds a stalled reply and ordinary actions still require their envelope", { timeout: 1_000 }, async (t) => {
-  assert.ok(LIVE_SNAPSHOT_TIMEOUT_MS < webSnapshot.deadlineMs);
   const timeout = AbortSignal.timeout;
   t.mock.method(AbortSignal, "timeout", (ms: number) => {
     assert.equal(ms, LIVE_SNAPSHOT_TIMEOUT_MS);

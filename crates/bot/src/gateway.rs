@@ -1445,6 +1445,15 @@ pub struct ShardState {
     pub snapshot_owner: Option<Arc<RwLock<LiveGateway>>>,
 }
 
+impl ShardState {
+    pub fn intents(&self, mut base: Intents) -> Intents {
+        if self.snapshot_owner.is_some() {
+            base.insert(Intents::GUILD_SCHEDULED_EVENTS);
+        }
+        base
+    }
+}
+
 impl From<Arc<RwLock<GatewayState>>> for ShardState {
     fn from(readiness: Arc<RwLock<GatewayState>>) -> Self {
         Self {
@@ -1624,7 +1633,6 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         // A cold RESUME replayed missed dispatches but cannot
                         // populate a fresh cache. IDENTIFY only once RESUMED has
                         // committed; READY + GuildCreate then rebuild voice state.
-                        // The realtime snapshot uses the same bootstrap.
                         if committed.await.is_err() {
                             return Ok(None);
                         }
@@ -2583,6 +2591,15 @@ mod deferred_poison_acceptance;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_owner_subscribes_to_scheduled_events() {
+        let mut state = ShardState::from(Arc::new(RwLock::new(GatewayState::Armed)));
+        let base = Intents::GUILDS;
+        assert_eq!(state.intents(base), base);
+        state.snapshot_owner = Some(Arc::new(RwLock::new(LiveGateway::default())));
+        assert_eq!(state.intents(base), base | Intents::GUILD_SCHEDULED_EVENTS);
+    }
 
     #[test]
     fn activation_intents_refuse_uncleared_automod_and_tickets() {

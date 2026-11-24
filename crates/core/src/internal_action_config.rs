@@ -394,6 +394,7 @@ mod tests {
         assert!(!format!("{config:?}").contains(&read_secret));
         assert!(!config.keys().contains("web:snapshot"));
         assert_eq!(config.take_live_snapshot_key().unwrap().id, "web:snapshot");
+        assert!(config.take_live_snapshot_key().is_none());
     }
 
     #[test]

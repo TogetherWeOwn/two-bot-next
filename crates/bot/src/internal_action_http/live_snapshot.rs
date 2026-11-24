@@ -144,10 +144,9 @@ impl<W: SequenceWatermark> LiveSnapshotEndpoint<W> {
             )
             .map_err(Failure::from_action)?;
 
-        let owner = self
-            .owner
-            .upgrade()
-            .ok_or_else(|| Failure::code(ErrorCode::DiscordUnavailable))?;
+        let Some(owner) = self.owner.upgrade() else {
+            return Err(Failure::code(ErrorCode::DiscordUnavailable));
+        };
         let owner = owner.read().await;
         owner
             .read_snapshot(grant, || WireTime(time::OffsetDateTime::now_utc()))
