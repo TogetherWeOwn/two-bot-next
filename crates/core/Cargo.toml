@@ -45,6 +45,7 @@ sqlx = { workspace = true, optional = true }
 [features]
 default = []
 db = ["dep:sqlx"]
+test-support = []
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

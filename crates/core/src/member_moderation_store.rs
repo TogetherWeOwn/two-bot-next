@@ -15,6 +15,9 @@ use crate::member_moderation::{
 };
 
 mod warning_history;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use warning_history::continuation;
 pub use warning_history::{WarningHistoryCursor, WarningHistoryEntry, WarningHistoryPage};
 
 #[derive(Clone)]
