@@ -140,6 +140,8 @@ EXEMPT = {
     ("staging-fixture-census.yml", "fixture-census"): "database read only",
     ("staging-migrate.yml", "plan"): "database plan only",
     ("staging-migrate.yml", "apply"): "database migration; staging-migrate lane",
+    ("staging-migrate-reviewed.yml", "plan"): "database plan only",
+    ("staging-migrate-reviewed.yml", "apply"): "reviewed database migration; staging-migrate lane",
     ("staging-privacy-verify-read.yml", "read"): "database read only",
     ("staging-recovery-capture.yml", "capture"): "read-only database recovery inventory",
     ("staging-retention-census.yml", "census"): "database read only",

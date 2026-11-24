@@ -149,13 +149,11 @@ Reuse a plan only when the apply dispatch's fresh read-only plan matches both le
 
 ## Authorize one apply through a protected merge
 
-When the Environment has no required reviewers, use a separate T0 PR
-that adds one `.github/staging-apply/<32-lowercase-hex>.json` request. Use a new
-name for every request. The JSON contains `plan_run_id` as a decimal string,
-`plan_archive_digest` and `recovery_archive_digest` as `sha256:` digests. Use an
-authenticated plan whose recovery reference names a verified staging capture.
-The plan archive binds the full source, target, both ledgers and pending sets,
-and the recovery and ACL references. The request fixture is checked in CI.
+In a reviewer-free Environment, use a T0 PR to add one new
+`.github/staging-apply/<32-lowercase-hex>.json` request with decimal string `plan_run_id`
+and `sha256:` digests `plan_archive_digest` and `recovery_archive_digest`.
+The authenticated plan binds the source, target, both ledgers and pending sets,
+verified staging capture and ACL reference. CI validates the request fixture.
 
 Obtain independent general and security T0 approvals on the exact request PR
 head, including explicit approval of staging apply and its private recovery proof.
