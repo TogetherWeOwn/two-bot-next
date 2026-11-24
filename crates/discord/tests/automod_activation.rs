@@ -1501,7 +1501,29 @@ mod preview_attempt_acceptance {
             activation.preview(AutomodRuntime::effective_config),
             runtime(true).effective_config()
         );
-        assert_eq!(count().await?, 3);
+        let mut overlay = runtime(true).effective_config();
+        let protected = AutomodRuntime::new_staging_preview(
+            overlay.clone(),
+            two_bot_core::backup::guild_config::STAGING_BOT_APPLICATION_ID,
+            STAGING_GUILD_ID,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(1),
+        )
+        .expect("staging runtime");
+        let protected =
+            AutomodActivation::new(protected, ledger.clone(), facts.clone(), executor(&mock));
+        overlay.policy.bad_words = vec!["synthetic".to_owned()];
+        let result = handle_automod_preview(
+            Some(&protected),
+            &pool,
+            &Mutex::default(),
+            &sample("4245"),
+            RECEIPT_MS,
+            Instant::now() + Duration::from_secs(5),
+            |_| Some(overlay),
+        )
+        .await;
+        assert_eq!(result.metric, fresh.metric);
+        assert_eq!(count().await?, 4);
         assert_eq!(ledger.claims(), 3, "only the three gateway creates claim");
         assert_eq!(ledger.violations(), 0);
         assert_eq!(facts.target_calls(), 0);

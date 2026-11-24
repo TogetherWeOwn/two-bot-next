@@ -667,6 +667,25 @@ preview-by-message-id, dashboard parity, live-guild scope, and any change
 to matcher semantics (corpus rows are added only as preview-parity
 expectations, never as behavior changes).
 
+### Protected staging readback
+
+Admission requires the exact stopped staging lease, verified recovery, database
+and gateway proofs, moderation eligibility, cleanup reserve and affirmative
+absence with spare registry capacity. Voice flags or selection disqualify it.
+
+Before wiring the protected caller, persist the sole AutoMod purpose on the
+lease, excluding Help, voice, ordinary certification and promotion. Boot a
+fresh shard with dedicated intents. Skip session resume, ordinary registry
+sync and interaction dispatch. Keep member intake and enforcement off.
+
+Before any write, persist the stopped/absent baseline, registry comparison
+evidence and targeted intent under the exact lease. Recheck the lease and
+reserve at the write. Verify the full registry delta and positive GET.
+On expiry, cancellation or uncertain writes, fence and drain publication.
+Hold across restart and remove only the command attributable to that intent.
+Ambiguity keeps the hold in place. Clear intent and admit later uses only
+after affirmative absence and confirmed stop. Activation awaits those controls.
+
 ## 10. Spec self-check (doctest)
 
 The numbers asserted above, verified against themselves. This checks the

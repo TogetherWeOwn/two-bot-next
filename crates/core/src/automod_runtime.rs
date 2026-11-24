@@ -7,11 +7,14 @@
 
 use std::future::Future;
 
+use time::OffsetDateTime;
+
 use crate::automod::{
     match_automod_with_clock, sanction_for, AutomodConfig, AutomodFilter, AutomodMessage,
     AutomodSanction, RepeatObservation, RepeatTracker, SanctionAction,
 };
 use crate::automod_preview::{preview_automod, PreviewVerdict};
+use crate::backup::guild_config::STAGING_BOT_APPLICATION_ID;
 use crate::commands::PERM_MODERATE_MEMBERS;
 use crate::moderation::{
     moderation_target_protection, ModerationPolicy, ModerationTarget, TargetProtection,
@@ -180,6 +183,7 @@ pub enum Inspection {
 pub struct AutomodRuntime {
     config: AutomodConfig,
     scope: AutomodScope,
+    staging_preview_until: Option<OffsetDateTime>,
     repeats: RepeatTracker,
     /// Newest message-clock observation. The maintenance tick never expires
     /// repeat history against a wall clock ahead of it, so a resumed batch
@@ -193,9 +197,44 @@ impl AutomodRuntime {
         Self {
             config,
             scope,
+            staging_preview_until: None,
             repeats: RepeatTracker::default(),
             newest_observation_ms: None,
         }
+    }
+
+    /// Construct the isolated runtime after protected staging admission.
+    /// The caller must bind the supplied deadline to the authenticated lease.
+    #[must_use]
+    pub fn new_staging_preview(
+        mut config: AutomodConfig,
+        application_id: &str,
+        guild_id: &str,
+        expires_at: OffsetDateTime,
+    ) -> Option<Self> {
+        if application_id != STAGING_BOT_APPLICATION_ID
+            || guild_id != STAGING_GUILD_ID
+            || !config.enabled
+            || expires_at <= OffsetDateTime::now_utc()
+        {
+            return None;
+        }
+        config.dry_run = true;
+        let mut runtime = Self::new(
+            config,
+            AutomodScope {
+                guild_id: guild_id.to_owned(),
+                live_approved: false,
+            },
+        );
+        runtime.staging_preview_until = Some(expires_at);
+        Some(runtime)
+    }
+
+    /// The protected preview mode remains in force after expiry.
+    #[must_use]
+    pub fn is_staging_preview(&self) -> bool {
+        self.staging_preview_until.is_some()
     }
 
     #[must_use]
@@ -208,11 +247,12 @@ impl AutomodRuntime {
     /// boot-time `enabled` gate, guild scope and repeat history are preserved.
     /// Returns true when anything observable changed.
     pub fn apply_live_config(&mut self, config: &AutomodConfig) -> bool {
-        if self.config.policy == config.policy && self.config.dry_run == config.dry_run {
+        let dry_run = self.is_staging_preview() || config.dry_run;
+        if self.config.policy == config.policy && self.config.dry_run == dry_run {
             return false;
         }
         self.config.policy = config.policy.clone();
-        self.config.dry_run = config.dry_run;
+        self.config.dry_run = dry_run;
         true
     }
 
@@ -227,7 +267,11 @@ impl AutomodRuntime {
     /// other guilds and a disabled config take the ordinary funnel path.
     #[must_use]
     pub fn admits(&self, guild_id: Option<&str>) -> bool {
-        self.config.enabled && guild_id.is_some_and(|guild_id| self.scope.permits(guild_id))
+        self.config.enabled
+            && guild_id.is_some_and(|guild_id| self.scope.permits(guild_id))
+            && self
+                .staging_preview_until
+                .is_none_or(|end| OffsetDateTime::now_utc() < end)
     }
 
     /// Clone the live effective config for one preview evaluation (automod
@@ -289,7 +333,7 @@ impl AutomodRuntime {
         let Some(guild_id) = delivery.guild_id.as_deref() else {
             return Inspection::Ignore;
         };
-        if !self.scope.permits(guild_id) {
+        if self.is_staging_preview() || !self.scope.permits(guild_id) {
             return Inspection::Ignore;
         }
         if !self.config.enabled {

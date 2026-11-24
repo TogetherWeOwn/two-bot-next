@@ -17,7 +17,7 @@ const OPTIONS = [
 const BOUNDS = ["min_length", "max_length", "min_value", "max_value"];
 const EMPTY = ["choices", "options", "channel_types"];
 const refuse = () => new Error("staging_preview_registry_mismatch");
-type PreviewEnv = { GUILD_ID?: string; DISCORD_APPLICATION_ID?: string; DISCORD_TOKEN?: string };
+export type PreviewEnv = { GUILD_ID?: string; DISCORD_APPLICATION_ID?: string; DISCORD_TOKEN?: string };
 type DiscordGet = (url: string, token: string) => Promise<unknown>;
 export async function previewRefusal(request: Request, url: URL, token?: string): Promise<Response | null> {
   const reply = (status: number, extra = {}) =>
@@ -68,9 +68,10 @@ export function parseRegistryJson(text: string): unknown {
   return value;
 }
 
-export async function readPreviewAbsent(env: PreviewEnv, get: DiscordGet): Promise<void> {
+export async function readPreviewAbsent(env: PreviewEnv, get: DiscordGet): Promise<number> {
   const { list } = await registry(env, get);
   const ids = new Set<string>(), commands = new Set<string>();
+  let slashCount = 0;
   for (const raw of list) {
     const row = record(raw);
     const type = row && !Object.hasOwn(row, "type") ? 1 : row?.type;
@@ -82,7 +83,9 @@ export async function readPreviewAbsent(env: PreviewEnv, get: DiscordGet): Promi
     if (ids.has(row.id) || commands.has(command)) throw refuse();
     ids.add(row.id);
     commands.add(command);
+    if (type === 1) slashCount++;
   }
+  return slashCount;
 }
 
 export async function readPreview(env: PreviewEnv, get: DiscordGet): Promise<void> {

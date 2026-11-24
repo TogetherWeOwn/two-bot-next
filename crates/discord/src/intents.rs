@@ -41,6 +41,12 @@ pub fn gateway_intents(message_content: bool) -> Intents {
     }
 }
 
+/// Start the protected preview shard without subscriptions to member messages.
+#[must_use]
+pub const fn staging_automod_preview_intents() -> Intents {
+    Intents::GUILDS
+}
+
 /// Privileged `GUILD_PRESENCES` for voice-room names: requested only when
 /// voice rooms are on (`TWO_VOICE=1`) and the deployment opts in with
 /// `TWO_VOICE_PRESENCE=1` (both exact). The Developer Portal "Presence Intent"
