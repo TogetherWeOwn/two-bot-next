@@ -247,13 +247,24 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     setup.commit().await.unwrap();
     let runtime = role_pool(pool, format!("{name}_b")).await;
     let migrator = role_pool(pool, format!("{name}_m")).await;
+    let audit = role_pool(pool, format!("{name}_r")).await;
     sqlx::raw_sql(
         "INSERT INTO members (guild_id, member_id) VALUES
              ('100000000000000001','200000000000000001'),
              ('100000000000000001','200000000000000002'),
              ('100000000000000002','200000000000000001');
          INSERT INTO voice_create_reservations (guild_id, user_id, created_at)
-             SELECT guild_id, member_id, clock_timestamp() FROM members;",
+             SELECT guild_id, member_id, clock_timestamp() FROM members;
+         INSERT INTO event_instance_windows
+             (guild_id, event_id, instance_starts_at, starts_at, status, observed_at)
+         VALUES ('100000000000000001', '300000000000000001', now(), now(), 'active', now());
+         WITH intent AS (
+             INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state)
+             VALUES (repeat('a', 64), repeat('b', 64), 'event.upsert', repeat('c', 64), 'in_flight')
+             RETURNING intent_id, caller_hash, action
+         )
+         INSERT INTO internal_action_log (intent_id, caller_hash, action, phase)
+             SELECT intent_id, caller_hash, action, 'intent' FROM intent;",
     )
     .execute(&runtime)
     .await
@@ -264,6 +275,9 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     let request = request_user_deletion(&runtime, GUILD, MEMBER)
         .await
         .unwrap();
+    let legacy_ledger = candidate_readout(&audit, name).await;
+    let legacy_objects = rollback_catalog(&migrator).await;
+    let legacy_rows = rollback_rows(&runtime).await;
     assert_runtime_refusal(&runtime, &request, "42P01").await;
     let result = run_retention(&runtime, RetentionMode::Execute).await;
     let err = result.unwrap_err();
@@ -285,11 +299,43 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     CUTOVER.run(&migrator).await.unwrap();
     two_bot_store::migrate(&migrator).await.unwrap();
     two_bot_core::apply_web_contract(&migrator).await.unwrap();
-    let audit = role_pool(pool, format!("{name}_r")).await;
     let before_grants = candidate_readout(&audit, name).await;
     let mut grants = pool.begin().await.unwrap();
     install_roles(&mut grants, name, Phase::Full).await.unwrap();
     grants.commit().await.unwrap();
+    let applied = candidate_readout(&audit, name).await;
+    assert!(applied.roles_match);
+    let fence = recovery_fence(&runtime).await;
+    let migration_fence: String = sqlx::query_scalar(
+        "SELECT encode(sha256(timestamptz_send(installed_on)), 'hex')
+         FROM public._sqlx_migrations WHERE version = 475 AND success",
+    )
+    .fetch_one(&audit)
+    .await
+    .unwrap();
+    assert_eq!(fence, migration_fence);
+    assert_eq!(rollback_rows(&runtime).await, legacy_rows);
+    exercise_schema_undo(&migrator).await;
+    let restored = candidate_readout(&audit, name).await;
+    let boundary = applied
+        .cutover
+        .iter()
+        .find(|row| row.version == 475)
+        .unwrap();
+    let mut expected = legacy_ledger.cutover;
+    expected.push(boundary.clone());
+    assert_eq!(restored.cutover, expected);
+    assert_eq!(restored.store, legacy_ledger.store);
+    assert_eq!(rollback_catalog(&migrator).await, legacy_objects);
+    assert_eq!(rollback_rows(&runtime).await, legacy_rows);
+    assert_eq!(recovery_fence(&runtime).await, fence);
+    CUTOVER.run(&migrator).await.unwrap();
+    two_bot_store::migrate(&migrator).await.unwrap();
+    two_bot_core::apply_web_contract(&migrator).await.unwrap();
+    let mut grants = pool.begin().await.unwrap();
+    install_roles(&mut grants, name, Phase::Full).await.unwrap();
+    grants.commit().await.unwrap();
+    assert_eq!(recovery_fence(&runtime).await, fence);
     sqlx::raw_sql(
         "INSERT INTO event_attendance_windows
              (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at)
@@ -338,6 +384,70 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     assert_eq!(count(&runtime, "SELECT count(*) FROM moderation_idempotency WHERE state = 'done' AND outcome = 'operator_released'").await, 2);
 }
 
+async fn rollback_catalog(pool: &PgPool) -> String {
+    sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+          'relations', (SELECT jsonb_agg(jsonb_build_array(n.nspname, c.relname, c.relkind,
+                                                          c.relowner, c.relacl)
+                                         ORDER BY n.nspname, c.relname)
+                        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname IN ('public', 'web_v1')),
+          'schemas', (SELECT jsonb_agg(jsonb_build_array(nspname, nspowner, nspacl) ORDER BY nspname)
+                      FROM pg_namespace WHERE nspname IN ('public', 'web_v1')),
+          'audit_constraints', (SELECT jsonb_agg(jsonb_build_array(conname, pg_get_constraintdef(oid), convalidated)
+                                                 ORDER BY conname)
+                                FROM pg_constraint WHERE conrelid = 'public.internal_action_log'::regclass),
+          'web_version', (SELECT contract_version FROM public.web_contract_meta WHERE singleton)
+        )::text",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn rollback_rows(pool: &PgPool) -> (String, String) {
+    sqlx::query_as(
+        "SELECT
+           (SELECT (to_jsonb(w) - 'attendance_recovered_at')::text
+            FROM public.event_instance_windows w WHERE w.event_id = '300000000000000001'),
+           (SELECT (to_jsonb(a) - ARRAY['delivery_hash', 'from_channel_id', 'request_id'])::text
+            FROM public.internal_action_log a WHERE a.caller_hash = repeat('a', 64))",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn recovery_fence(pool: &PgPool) -> String {
+    sqlx::query_scalar(
+        "SELECT encode(sha256(timestamptz_send(attendance_recovered_at)), 'hex')
+         FROM public.event_instance_windows WHERE event_id = '300000000000000001'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn exercise_schema_undo(migrator: &PgPool) {
+    let undo = include_str!("../fixtures/production_schema_undo.sql");
+    let mut refusal = migrator.begin().await.unwrap();
+    sqlx::query("INSERT INTO live_sequence_watermarks (guild_id, seq) VALUES ('1', 1)")
+        .execute(&mut *refusal)
+        .await
+        .unwrap();
+    assert_sqlstate(
+        &sqlx::raw_sql(undo)
+            .execute(&mut *refusal)
+            .await
+            .unwrap_err(),
+        "23514",
+    );
+    refusal.rollback().await.unwrap();
+    let mut undo_tx = migrator.begin().await.unwrap();
+    sqlx::raw_sql(undo).execute(&mut *undo_tx).await.unwrap();
+    undo_tx.commit().await.unwrap();
+}
+
 struct CandidateReadout {
     cutover: Vec<LedgerRow>,
     store: Vec<LedgerRow>,
@@ -384,10 +494,10 @@ async fn candidate_readout(audit: &PgPool, name: &str) -> CandidateReadout {
     .unwrap()
     .is_none();
     let cutover = candidate_ledger(&mut tx,
-        "SELECT version, description, success, encode(checksum, 'hex') FROM public._sqlx_migrations"
+        "SELECT version, description, success, encode(checksum, 'hex') FROM public._sqlx_migrations ORDER BY version"
     ).await;
     let store = candidate_ledger(&mut tx,
-        "SELECT version, description, success, encode(checksum, 'hex') FROM public._two_bot_migrations"
+        "SELECT version, description, success, encode(checksum, 'hex') FROM public._two_bot_migrations ORDER BY version"
     ).await;
     let history_rows_present =
         sqlx::query_scalar("SELECT EXISTS (SELECT FROM public.backfill_history_messages)")
