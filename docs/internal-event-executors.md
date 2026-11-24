@@ -215,5 +215,9 @@ counts, immutable Bot image references and the recorder source hash. A
 successful run proves the installed binaries exercise the modeled boundary.
 It does not establish that the live guild policy has been configured or read
 back. The same image may back both positions when the serving and retained
-receipts agree. Such a run covers two processes and the recorded rollback pair,
-with no claim about a different release.
+receipts agree. Such a run covers two processes and the recorded rollback pair.
+The full verdict requires both positive controls. A retained announcement
+transport using compiled WebPKI roots rejects the synthetic CA before the
+request reaches the recorder. Its announcement control remains incomplete
+until both admitted images can use the disposable trust root at the same
+Discord origin.
