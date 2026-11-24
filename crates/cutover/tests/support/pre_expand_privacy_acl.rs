@@ -257,7 +257,8 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
              SELECT guild_id, member_id, clock_timestamp() FROM members;
          INSERT INTO event_instance_windows
              (guild_id, event_id, instance_starts_at, starts_at, status, observed_at)
-         VALUES ('100000000000000001', '300000000000000001', now(), now(), 'active', now());
+         VALUES ('100000000000000001', '300000000000000001',
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'active', '2026-01-01T00:00:00.000Z');
          WITH intent AS (
              INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state)
              VALUES (repeat('a', 64), repeat('b', 64), 'event.upsert', repeat('c', 64), 'in_flight')
