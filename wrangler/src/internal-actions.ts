@@ -198,6 +198,7 @@ export async function readBody(
   request: Request,
   requestId: string = ensureRequestId(request.headers.get(REQUEST_ID_HEADER)),
   release: unknown = UNKNOWN_RELEASE,
+  signal?: AbortSignal,
 ): Promise<BodyRead> {
   const declared = request.headers.get("content-length");
   if (declared !== null) {
@@ -214,7 +215,8 @@ export async function readBody(
   });
   try {
     for (;;) {
-      const step = await Promise.race([reader.read(), timeout]);
+      signal?.throwIfAborted();
+      const step = await boundRead(Promise.race([reader.read(), timeout]), signal);
       if (step === "timeout") {
         void reader.cancel().catch(() => {});
         return { refusal: refuse(408, "request_timeout", true, undefined, requestId, release) };
@@ -228,6 +230,10 @@ export async function readBody(
       chunks.push(step.value);
     }
   } catch {
+    if (signal?.aborted) {
+      releaseReader(reader);
+      return { refusal: refuse(408, "request_timeout", true, undefined, requestId, release) };
+    }
     return { refusal: refuse(400, "malformed", false, undefined, requestId, release) };
   } finally {
     clearTimeout(timer);
@@ -343,13 +349,13 @@ const RELAYED_RESPONSE_HEADERS = ["content-type", "idempotent-replay", "retry-af
  * read cannot hold the caller past the deadline. Cleanup stays with the
  * caller (best-effort release, never awaited).
  */
-function boundRead<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+export function boundRead<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return work;
-  if (signal.aborted) return Promise.reject(new Error("receiver deadline exceeded"));
   let onAbort = () => {};
   const aborted = new Promise<never>((_, reject) => {
     onAbort = () => reject(new Error("receiver deadline exceeded"));
     signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
   });
   return Promise.race([work, aborted]).finally(() => {
     signal.removeEventListener("abort", onAbort);
@@ -357,7 +363,7 @@ function boundRead<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
 }
 
 /** Best-effort body release: a stalling cancel hook must not hold the caller. */
-function releaseUpstream(upstream: Response): void {
+export function releaseUpstream(upstream: Response): void {
   if (!upstream.body) return;
   try {
     void upstream.body.cancel().catch(() => {});
@@ -417,7 +423,7 @@ const RECEIVER_REFUSALS: ReadonlyMap<string, { status: number; retryable: boolea
 ]);
 
 /** True for a JSON object: objects only, never null or an array. */
-function isJsonObject(value: unknown): value is Record<string, unknown> {
+export function isJsonObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -521,51 +527,50 @@ export async function relayReceiverResponse(
     releaseUpstream(upstream);
     return refuse(503, "unavailable", true, undefined, requestId, release);
   }
-  const reader = upstream.body?.getReader();
-  if (!reader) {
-    // The receiver always answers with a body: a bodiless JSON response is
-    // not an envelope, so it fails closed.
-    releaseUpstream(upstream);
+  const body = await readReceiverBytes(upstream, MAX_RESPONSE_BYTES, signal);
+  const projected = body === null ? null : projectReceiverJson(upstream.status, body, requestId);
+  if (projected === null) {
     return refuse(503, "unavailable", true, undefined, requestId, release);
   }
+  const headers = relayHeaders(upstream.headers);
+  return Response.json(projected, { status: upstream.status, headers });
+}
+
+/** Collect receiver bytes within the caller's cap and existing deadline. */
+export async function readReceiverBytes(
+  upstream: Response,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<Uint8Array | null> {
+  const reader = upstream.body?.getReader();
+  if (!reader) return null;
   const chunks: Uint8Array[] = [];
   let total = 0;
   try {
     for (;;) {
-      if (signal?.aborted) {
-        releaseReader(reader);
-        return refuse(503, "unavailable", true, undefined, requestId, release);
-      }
-      let step: ReadableStreamReadResult<Uint8Array>;
-      try {
-        step = await boundRead(reader.read(), signal);
-      } catch {
-        releaseReader(reader);
-        return refuse(503, "unavailable", true, undefined, requestId, release);
-      }
+      signal?.throwIfAborted();
+      const step = await boundRead(reader.read(), signal);
+      signal?.throwIfAborted();
       if (step.done) break;
       total += step.value.byteLength;
-      if (total > MAX_RESPONSE_BYTES) {
+      if (total > limit) {
         releaseReader(reader);
-        return refuse(503, "unavailable", true, undefined, requestId, release);
+        return null;
       }
       chunks.push(step.value);
     }
   } catch {
-    return refuse(503, "unavailable", true, undefined, requestId, release);
+    releaseReader(reader);
+    return null;
   }
+  reader.releaseLock();
   const body = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
     body.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  const projected = projectReceiverJson(upstream.status, body, requestId);
-  if (projected === null) {
-    return refuse(503, "unavailable", true, undefined, requestId, release);
-  }
-  const headers = relayHeaders(upstream.headers);
-  return Response.json(projected, { status: upstream.status, headers });
+  return body;
 }
 
 function relayHeaders(source: Headers): Headers {
