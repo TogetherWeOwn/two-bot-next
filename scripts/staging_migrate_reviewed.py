@@ -82,16 +82,23 @@ def authorize(env, event, api, now, run_git=git, fetch_plan=authenticated_plan):
 
     pulls = api(f"commits/{sha}/pulls?per_page=2")
     require(isinstance(pulls, list) and len(pulls) == 1, "request_merge_unproved")
-    pull = pulls[0]
+    # The association only identifies the PR. The merge event carries the commit ID.
+    number = mapping(pulls[0]).get("number")
+    require(type(number) is int and number > 0, "request_merge_unproved")
+    pull = mapping(api(f"pulls/{number}"))
     head = pull["head"]["sha"]
-    number = pull["number"]
-    require(pull["merge_commit_sha"] == sha and pull["state"] == "closed" and pull["base"]["ref"] == "main"
+    require(pull["number"] == number and pull["merged"] is True
+            and pull["state"] == "closed" and pull["base"]["ref"] == "main"
             and all(pull[key]["repo"]["full_name"] == REPO for key in ("base", "head"))
-            and SHA40.fullmatch(head) and type(number) is int and number > 0, "request_merge_unproved")
+            and SHA40.fullmatch(head), "request_merge_unproved")
+    events = api(f"issues/{number}/events?per_page=100")
+    require(isinstance(events, list) and len(events) < 100, "request_merge_history_unproved")
+    merges = [event for event in events if mapping(event).get("event") == "merged"]
+    require(len(merges) == 1 and merges[0]["commit_id"] == sha
+            and merges[0]["created_at"] == pull["merged_at"]
+            and merges[0]["actor"]["id"] == pull["merged_by"]["id"], "request_merge_unproved")
     still_fresh(pull["merged_at"], now)
-    merged = api(f"pulls/{number}")
-    require(merged["merged"] is True and merged["merge_commit_sha"] == sha and merged["head"]["sha"] == head
-            and APP_BOT_ID not in (pull["user"]["id"], merged["merged_by"]["id"]), "request_merge_actor_unproved")
+    require(APP_BOT_ID not in (pull["user"]["id"], pull["merged_by"]["id"]), "request_merge_actor_unproved")
     verify_approval(api, head, number, pull["merged_at"])
     checks = api(f"commits/{head}/check-runs?check_name=ci-ok&per_page=10")["check_runs"]
     require(any(check["app"]["id"] == 15368 and check["name"] == "ci-ok" and check["head_sha"] == head

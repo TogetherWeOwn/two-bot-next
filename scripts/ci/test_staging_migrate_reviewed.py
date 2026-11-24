@@ -24,9 +24,10 @@ class ReviewedMigrationTests(unittest.TestCase):
         self.event = {"before": parent, "after": sha, "ref": "refs/heads/main", "forced": False,
                       "created": False, "deleted": False}
         self.merged_at = "2026-11-24T03:00:00Z"
-        self.pull = {"number": 10, "state": "closed", "merge_commit_sha": sha, "merged_at": self.merged_at,
-                     "user": {"id": 11},
+        self.pull = {"number": 10, "state": "closed", "merged": True,
+                     "merged_at": self.merged_at, "user": {"id": 11}, "merged_by": {"id": 11},
                      "base": {"ref": "main", "repo": repo}, "head": {"sha": head, "repo": repo}}
+        self.merge = {"event": "merged", "commit_id": sha, "created_at": self.merged_at, "actor": {"id": 11}}
         self.plan = {"mode": "plan", "migration_target": "staging", "role": "two_bot_migrator_ro",
                      "source_sha": parent, "pending_before": [475], "pending_store_before": [],
                      "recovery_evidence_ref": "staging-recovery-capture/31/artifacts/32", "ledger_before": [481],
@@ -38,8 +39,9 @@ class ReviewedMigrationTests(unittest.TestCase):
                          "external_id": "staging-apply:10", "conclusion": "success", "completed_at": self.merged_at}
         self.routes = {
             f"actions/workflows/staging-migrate-reviewed.yml/runs?event=push&head_sha={sha}&branch=main&per_page=2": self.runs,
-            f"commits/{sha}/pulls?per_page=2": [self.pull],
-            "pulls/10": {**self.pull, "merged": True, "merged_by": self.pull["user"]},
+            f"commits/{sha}/pulls?per_page=2": [{"number": 10}],
+            "pulls/10": self.pull,
+            "issues/10/events?per_page=100": [self.merge],
             f"commits/{head}/check-runs?check_name=staging-migration-approval&filter=all&per_page=10": {
                 "total_count": 1, "check_runs": [self.approval]},
             f"commits/{head}/check-runs?check_name=ci-ok&per_page=10": {"check_runs": [
@@ -70,6 +72,7 @@ class ReviewedMigrationTests(unittest.TestCase):
         for mutation in (
             lambda: self.env.update(GITHUB_RUN_ATTEMPT="2"), lambda: self.runs.update(total_count=2),
             lambda: self.git.update(log=b"already-committed"), lambda: self.pull.update(state="open"),
+            lambda: self.merge.update(commit_id="e" * 40),
             lambda: self.git.update(diff=self.git["diff"] + b"\nM\tDockerfile"),
             lambda: self.approval["app"].update(id=15368), lambda: self.approval.update(external_id="staging-apply:9"),
             lambda: self.pull.update(merged_at="2026-11-23T01:00:00Z"),
