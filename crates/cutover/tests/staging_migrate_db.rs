@@ -26,6 +26,9 @@ use sqlx::{
     Connection, Executor, PgConnection, Row,
 };
 
+#[path = "support/warning_history_recovery.rs"]
+mod warning_history_recovery;
+
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
