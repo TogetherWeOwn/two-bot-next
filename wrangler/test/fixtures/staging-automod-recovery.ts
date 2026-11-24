@@ -19,6 +19,7 @@ export class Storage {
   staged: unknown;
   beforeSync?: () => void;
   afterWrite?: () => void;
+  afterCommit?: () => void;
 
   async get<T>(_key: string): Promise<T | undefined> {
     return structuredClone(this.value) as T | undefined;
@@ -34,6 +35,7 @@ export class Storage {
     if (this.staged !== undefined) {
       this.value = this.staged;
       this.staged = undefined;
+      this.afterCommit?.();
     }
   }
 }

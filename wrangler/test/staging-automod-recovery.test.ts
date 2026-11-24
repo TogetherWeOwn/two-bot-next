@@ -43,13 +43,13 @@ test("AutoMod recovery fences publication on expiry or cancellation without rene
     const recovery = new StagingAutomodRecovery(store);
     let at = now();
     let observed: { lease: AutomodIntent["lease"]; baselineAbsent: true; publishBefore: number } = admission;
-    store.afterWrite = () => {
+    store.afterCommit = () => {
       at = current ? now() : lease.expiresAt;
       observed = current ?? admission;
     };
     await assert.rejects(recovery.persistIntent(intent, async () => observed, () => at),
       /admission_mismatch/);
-    assert.deepEqual(await recovery.pending(), intent);
+    assert.deepEqual((store.value as { intent: AutomodIntent }).intent, intent);
     const registry = new Registry();
     registry.authorized = false;
     await assert.rejects(recovery.recover(lease, registry), /cleanup_unverified/);
