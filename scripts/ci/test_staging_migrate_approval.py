@@ -3,13 +3,12 @@
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
-from pathlib import Path
 import sys
 import unittest
 
-from test_staging_migrate_claim import ENV, PLAN
+from test_staging_migrate_claim import ENV, PLAN, ROOT
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(ROOT / "scripts"))
 import staging_migrate_approval as approval
 
 

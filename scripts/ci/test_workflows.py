@@ -9261,16 +9261,12 @@ class WorkflowTests(unittest.TestCase):
                         step["run"] = step["run"].replace(
                             " --plan-manifest-path producing-plan/production-migrate-manifest.json", "")
             self.assertTrue(mutated(drop_path))
-        # Production and staging stay mirrors: same job ids, same step counts,
-        # same pinned actions and container, differing only by the documented
-        # production prefix (names, envs, secrets, artifacts, flags).
+        # Compare shared routing. Each workflow pins its own grants and approval steps.
         staging = self.workflows["staging-migrate.yml"]
         self.assertEqual(set(migrate["jobs"]), set(staging["jobs"]))
         for job_id in ("plan", "claim", "apply"):
             with self.subTest(mirror=job_id):
                 prod_job, stag_job = migrate["jobs"][job_id], staging["jobs"][job_id]
-                self.assertEqual(len(prod_job.get("steps", [])), len(stag_job.get("steps", [])))
-                self.assertEqual(prod_job.get("permissions"), stag_job.get("permissions"))
                 self.assertEqual(prod_job.get("if"), stag_job.get("if"))
                 self.assertEqual(prod_job.get("runs-on"), stag_job.get("runs-on"))
 

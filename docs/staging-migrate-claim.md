@@ -27,19 +27,16 @@ directions.
 
 `staging-migrate.yml` has a `claim` job named `staging-migrate (claim)`. It runs
 only for an apply dispatch on `main`, after the read-only `plan` job succeeds.
-It has no environment or database binding. It uses `contents: read` for
-checkout and `actions: read` to authenticate the producing plan.
+It has no environment or database binding. It uses `actions: read` for plan provenance.
 It checks out `github.sha` (the workflow revision), downloads this dispatch's plan
 artifact and runs `scripts/ci/staging_migrate_claim.py`. Inputs enter through
 step environment variables, not shell interpolation. Refusal fails the job;
 there is no continue-on-error or upload-on-failure path.
 
-The `apply` job needs **both** `plan` and `claim`. Configure `staging-migrate-apply`
-for `main` only, name designated staging maintainers with repository read
-access as **Required reviewers**, enable **Prevent self-review** and disable
-administrator bypass. The claim refuses missing protections or a roster with
-no independent reviewer. The prior direct-owner requirement applies until
-the reviewed workflow and Environment protections are active.
+The `apply` job needs **both** `plan` and `claim`. In `staging-migrate-apply`,
+allow `main` only, name independent maintainers with read access as **Required
+reviewers**, enable **Prevent self-review** and disable administrator bypass.
+Keep direct owner approval until the reviewed workflow and protections are active.
 
 ## Exact artifact names and v1 document
 
@@ -142,14 +139,12 @@ both pending lists, both digests, the pinned target (`staging_host`,
 (`recovery_evidence_ref`, `acl_plan_ref`). The digests do not cover the target or
 either reference. Do not dispatch if any value differs or a hold applies.
 
-The designated maintainer checks the exact plan, recovery and ACL evidence
-against the claim. Use **Review deployments** on the apply run, select
-`staging-migrate-apply` and enter `approve-staging-migration sha256:<digest>`
-from the claim summary. It binds the full claim and producing artifact ID and
-archive digest to the apply run and attempt.
+The designated maintainer checks the plan, recovery and ACL evidence against
+the claim. In **Review deployments**, select `staging-migrate-apply` and enter
+`approve-staging-migration sha256:<digest>` from the claim summary. The digest
+binds the full claim and producing artifact ID and archive digest.
 
-Before building the runner, apply checks the Environment policy, reviewer,
-approval comment and producing plan. Attempt 1 must leave 30 minutes within
-the 24-hour window. Retry or change the tuple with a new dispatch and approval. Reuse
-an available producing plan if the fresh read-only plan still matches it.
+Before building, apply checks the Environment, reviewer, comment and plan.
+Attempt 1 must leave 30 minutes within the 24-hour window. Retry or change the
+tuple with fresh approval. Reuse an available plan if the fresh plan matches.
 Review unchanged audit findings, including objects the migration will create.
