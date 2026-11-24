@@ -11,9 +11,9 @@ WORKFLOWS = Path(__file__).resolve().parents[2] / ".github/workflows"
 class SharedReferenceAnnotationTests(unittest.TestCase):
     def test_verified_annotations_match_pinned_references(self):
         references = (
-            ("daily-digest.yml", "actions/calver", "2ef8ad6447e11d019ac3098bcfd011193b75266a", "v0.10.0", 2),
-            ("review-rules.yml", ".github/workflows/review-rules.yml", "2ef8ad6447e11d019ac3098bcfd011193b75266a", "v0.10.0", 1),
-            ("test-guard.yml", ".github/workflows/test-guard.yml", "2ef8ad6447e11d019ac3098bcfd011193b75266a", "v0.10.0", 1),
+            ("daily-digest.yml", "actions/calver", "8059ac2b121b63443db656b1e10e927b8af8133c", "v0.12.1", 2),
+            ("review-rules.yml", ".github/workflows/review-rules.yml", "8059ac2b121b63443db656b1e10e927b8af8133c", "v0.12.1", 1),
+            ("test-guard.yml", ".github/workflows/test-guard.yml", "8059ac2b121b63443db656b1e10e927b8af8133c", "v0.12.1", 1),
         )
         for filename, path, sha, version, count in references:
             with self.subTest(workflow=filename):

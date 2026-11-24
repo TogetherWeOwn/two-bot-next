@@ -16,6 +16,8 @@ targets = [{ triple = "x86_64-unknown-linux-gnu" }]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
+# Preserve transitive advisory coverage after cargo-deny 0.22 changed its default.
+unmaintained = "all"
 
 [licenses]
 allow = [

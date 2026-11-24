@@ -1,6 +1,6 @@
 name: review-rules (shadow)
 # ci-policy: non-required -- advisory signals; existing required gates stay unchanged.
-# Pinned to the published TogetherWeOwn/.github central PR #26 squash-merge commit.
+# Pinned to the published TogetherWeOwn/.github release commit.
 on:
   pull_request:
   merge_group:
@@ -12,7 +12,7 @@ jobs:
   review-rules:
     permissions:
       contents: read
-    uses: TogetherWeOwn/.github/.github/workflows/review-rules.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
+    uses: TogetherWeOwn/.github/.github/workflows/review-rules.yml@8059ac2b121b63443db656b1e10e927b8af8133c # v0.12.1
     with:
       packs: rust,security,python-shell-ci
       mode: warn
