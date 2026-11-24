@@ -96,7 +96,7 @@ def date(offset=0):
 def receipts():
     return [
         {
-            "type": "wrangler-session", "version": 1, "wrangler_version": "4.161.0",
+            "type": "wrangler-session", "version": 1, "wrangler_version": "4.165.0",
             "command_line_args": ["deploy", "--config", "staging-deploy.json", "--env", "staging"],
         },
         {
@@ -109,7 +109,7 @@ def receipts():
 
 
 def real_shape_receipts():
-    """Record shapes written by Wrangler 4.161.0 when `wrangler-action` drives a deploy.
+    """Record shapes written by Wrangler 4.165.0 when `wrangler-action` drives a deploy.
 
     Field names follow workers-sdk `packages/wrangler/src/index.ts` (the `wrangler-session`
     entry, written for EVERY invocation) and its deploy output entry; values are
@@ -117,9 +117,9 @@ def real_shape_receipts():
     """
     log = "/home/runner/.config/.wrangler/logs/wrangler-2026-10-03_01-22-59_123.log"
     return [
-        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.161.0",
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.165.0",
          "command_line_args": ["--version"], "log_file_path": log, "timestamp": date()},
-        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.161.0",
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.165.0",
          "command_line_args": ["deploy", "--config", "/tmp/staging-deploy.json", "--env", "staging"],
          "log_file_path": log, "timestamp": date()},
         {"version": 1, "type": "deploy", "worker_name": "two-bot-next-staging",
@@ -321,13 +321,13 @@ class DeployReceiptTests(OfflineTestCase):
         for flag in ("--version", "-v"):
             with self.subTest(flag=flag):
                 probe = {"type": "wrangler-session", "version": 1,
-                         "wrangler_version": "4.161.0", "command_line_args": [flag]}
+                         "wrangler_version": "4.165.0", "command_line_args": [flag]}
                 self.assertEqual(rollout.deploy_version([probe] + receipts(), STARTED), VERSION)
                 self.assertEqual(rollout.deploy_version(receipts() + [probe], STARTED), VERSION)
 
     def test_missing_ambiguous_or_wrong_wrangler_session(self):
         wrong = receipts()
-        wrong[0]["wrangler_version"] = "4.142.0"
+        wrong[0]["wrangler_version"] = "4.161.0"
         schema = receipts()
         schema[0]["version"] = 2
         no_args = receipts()
@@ -335,8 +335,8 @@ class DeployReceiptTests(OfflineTestCase):
         bad_args = receipts()
         bad_args[0]["command_line_args"] = ["deploy", 1]
         probe = {"type": "wrangler-session", "version": 1,
-                 "wrangler_version": "4.161.0", "command_line_args": ["--version"]}
-        wrong_probe = dict(probe, wrangler_version="4.142.0")
+                 "wrangler_version": "4.165.0", "command_line_args": ["--version"]}
+        wrong_probe = dict(probe, wrangler_version="4.161.0")
         schema_probe = dict(probe, version=2)
         other_command = dict(probe, command_line_args=["secret", "put", "X"])
         no_args_probe = {key: value for key, value in probe.items() if key != "command_line_args"}
@@ -3177,7 +3177,7 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(self.stdout.getvalue().splitlines()[1:], [
             "staging rollout gate failed: wrong_wrangler_receipt",
             "staging rollout diagnostic: records deploy=1,wrangler-session=2; "
-            "sessions deploy=1,probe=0,other=1; v1/wrangler-4.142.0 v1/wrangler-4.161.0",
+            "sessions deploy=1,probe=0,other=1; v1/wrangler-4.142.0 v1/wrangler-4.165.0",
         ])
         self.assert_no_evidence()
         # The caller-owned NDJSON input legitimately holds the sentinel; only
