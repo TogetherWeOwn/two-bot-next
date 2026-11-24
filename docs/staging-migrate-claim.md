@@ -1,9 +1,8 @@
 # Staging migration apply-claim contract
 
-The claim is non-secret evidence of the staging apply request, not an approval
-or permission to apply migrations. The staging gate combines the `main`-only
-GitHub environment branch rule, a successful claim job and explicit owner
-approval recorded **before** dispatch. See the
+The claim describes one staging apply request. Before DDL, the workflow
+requires an exact approval from a designated staging maintainer through the
+GitHub `staging-migrate-apply` Environment. See the
 [staging migration runbook](runbook.md#staging-only-migration-runner) for recovery
 and ACL prerequisites. Production has its own approval and protection rules:
 `production-migrate.yml` with `scripts/ci/production_migrate_claim.py`, which
@@ -28,16 +27,21 @@ directions.
 
 `staging-migrate.yml` has a `claim` job named `staging-migrate (claim)`. It runs
 only for an apply dispatch on `main`, after the read-only `plan` job succeeds.
-It has no environment, no database binding and only `contents: read` permission.
+It has no environment or database binding. It uses `contents: read` for
+checkout and `actions: read` to authenticate the producing plan.
 It checks out `github.sha` (the workflow revision), downloads this dispatch's plan
 artifact and runs `scripts/ci/staging_migrate_claim.py`. Inputs enter through
 step environment variables, not shell interpolation. Refusal fails the job;
 there is no continue-on-error or upload-on-failure path.
 
-The `apply` job needs **both** `plan` and `claim`. Owner approval precedes
-workflow dispatch, so it reviews the producing plan, not this later claim.
-The `staging-migrate-apply` environment restricts deployment to `main`; do not
-expect a GitHub reviewer or custom protection rule to pause the job.
+The `apply` job requires a successful `plan` and `claim`, then waits for native
+Environment review. The Environment administrator designates individual staging
+maintainers with repository read access under **Required reviewers**. Keep its
+only deployment branch `main`, enable **Prevent self-review**, and disable
+administrator bypass. The claim refuses missing protections or a roster with
+no reviewer independent of the requester. Until the replacement workflow is
+merged and those controls are active, the prior direct-owner requirement
+still applies. A new workflow run with missing controls refuses apply.
 
 ## Exact artifact names and v1 document
 
@@ -123,7 +127,7 @@ A JavaScript consumer must parse numeric i64 tokens losslessly before comparing
 or hashing; `JSON.parse` into ordinary numbers silently rounds the vector's
 `9007199254740993`. Do not repair a rounded number after parsing it.
 
-## Verify the plan before dispatch and the claim after dispatch
+## Verify and approve one staging apply
 
 Before dispatching apply, use fresh, attempt-scoped GitHub reads to verify a
 successful plan-only `staging-migrate.yml` dispatch on `main`: the plan job
@@ -133,23 +137,26 @@ recovery/ACL references. Recompute both projection digests losslessly and
 compare them with the embedded digests. Do not dispatch if the artifact is
 missing, expired, ambiguous or cannot be authenticated.
 
-Before dispatch, verify and retain [direct owner approval](../CONTRIBUTING.md#production-merge-evidence)
-for the full source SHA, producing plan run ID, both pending lists, both manifest
-digests and the recovery reference. Keep restricted evidence in the private task
-thread. Require fresh approval for any changed input, even when hashes match.
-
-Before submitting `mode: apply` on `main`, compare the actual dispatch inputs
+The requester compares the `mode: apply` dispatch inputs on `main`
 with the authenticated producing manifest and its run ID. Match the source SHA,
 both pending lists, both digests, the pinned target (`staging_host`,
 `staging_database`, `staging_branch_id`) and both evidence references
 (`recovery_evidence_ref`, `acl_plan_ref`). The digests do not cover the target or
-either reference. Do not dispatch if any value differs, the exact binding lacks approval or a hold applies.
+either reference. Keep restricted recovery evidence in the private task thread.
 
-After dispatch, verify that the claim came from the successful
-`staging-migrate (claim)` job on that run and attempt, agrees with the
-workflow-head SHA and matches the pre-dispatch inputs. This operator comparison
-is audit evidence, not an approval gate; apply does not wait for it. The apply
-job downloads the separate producing run's manifest, and the runner checks its
-pending sets, hashes and provenance **before DDL**. The claim neither replaces
-those checks nor weakens read-only/apply credential separation, main-only
-protections or shell failure propagation.
+The designated maintainer reviews the authenticated producing plan, recovery
+and ACL references, and the completed claim artifact on the waiting apply run.
+Compare the exact source, plan run, target, both migration lists and digests,
+and both references. If they match and recovery is verified, use **Review
+deployments** on that run, select `staging-migrate-apply`, and enter the exact
+`approve-staging-migration sha256:<digest>` comment from the claim job summary.
+The digest covers the claim, including the apply run and attempt, and the
+producing plan artifact ID and archive digest. Reject a mismatched request.
+
+Before passing the migrator credential to the runner, the apply job checks the
+current Environment rules, the requester and reviewer GitHub IDs, the approval
+comment and the downloaded plan. Apply is limited to the first attempt within
+24 hours of dispatch. Use a new dispatch and approval for a retry or changed
+tuple. An eligible producing plan can be reused while its artifact is available
+and the fresh read-only plan still matches it. The runner independently checks
+pending sets, hashes and producing-plan provenance before DDL.

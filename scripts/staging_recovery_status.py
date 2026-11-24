@@ -108,7 +108,7 @@ def plan_projection(plan):
             "cutover_projection_sha256": cutover_digest, "store_projection_sha256": store_digest}
 
 
-def verified_plan(run_id, api=github):
+def authenticated_plan(run_id, api=github):
     require(matches(RUN_ID, run_id), "invalid_plan_run_id")
     route = f"actions/runs/{run_id}"
     run = mapping(api(route))
@@ -130,7 +130,12 @@ def verified_plan(run_id, api=github):
             and 0 < number(artifact.get("size_in_bytes")) <= MAX_PLAN, "invalid_plan_artifact")
     digest = artifact.get("digest")
     plan = plan_manifest(api(f"actions/artifacts/{artifact_id}/zip", binary=True), digest)
-    return {"run_id": int(run_id), "artifact_id": artifact_id, "archive_digest": digest, **plan_projection(plan)}
+    return plan, {"run_id": int(run_id), "artifact_id": artifact_id, "archive_digest": digest}
+
+
+def verified_plan(run_id, api=github):
+    plan, artifact = authenticated_plan(run_id, api)
+    return {**artifact, **plan_projection(plan)}
 
 
 def checked_plan_summary(value):

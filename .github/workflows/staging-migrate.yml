@@ -10,8 +10,8 @@ name: staging-migrate
 # no-reviewer `staging-migrate-plan` environment and always runs; `apply`
 # reads only TWO_BOT_STAGING_MIGRATOR_DATABASE_URL from the reviewed
 # `staging-migrate-apply` environment and runs only for mode=apply, after a
-# green plan. Both environments must exist before dispatch; a missing
-# environment fails the job instead of leaking a binding.
+# green plan and verified native Environment approval. Both environments
+# must exist before dispatch.
 on:
   workflow_dispatch:
     inputs:
@@ -144,8 +144,12 @@ jobs:
     name: staging-migrate (claim)
     permissions:
       contents: read
+      actions: read # Authenticate the producing read-only plan for review.
     if: github.ref == 'refs/heads/main' && inputs.mode == 'apply'
     needs: plan
+    outputs:
+      approval_digest: ${{ steps.request.outputs.digest }}
+      approval_plan_sha256: ${{ steps.request.outputs.plan_sha256 }}
     # No Environment and no DB secrets: this artifact must exist BEFORE the
     # protected apply job can be approved. A step inside apply is too late.
     # https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments
@@ -164,7 +168,9 @@ jobs:
           name: staging-migrate-manifest
           path: current-plan
       - name: Publish apply claim
+        id: request
         env:
+          GH_TOKEN: ${{ github.token }}
           MODE: ${{ inputs.mode }}
           SOURCE_SHA: ${{ inputs.source_sha }}
           STAGING_HOST: ${{ inputs.staging_host }}
@@ -183,6 +189,8 @@ jobs:
           python3 scripts/ci/staging_migrate_claim.py \
             --manifest current-plan/staging-migrate-manifest.json \
             --output staging-migrate-apply-claim.json
+          python3 scripts/staging_migrate_approval.py prepare \
+            current-plan/staging-migrate-manifest.json staging-migrate-apply-claim.json
       - name: Upload apply claim
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -247,6 +255,22 @@ jobs:
           path: producing-plan
           run-id: ${{ inputs.plan_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check out trusted staging approval verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: approval-tools
+      - name: Install Python for the staging approval verifier
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 >/dev/null
+      - name: Verify the native staging approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVAL_DIGEST: ${{ needs.claim.outputs.approval_digest }}
+          APPROVAL_PLAN_SHA256: ${{ needs.claim.outputs.approval_plan_sha256 }}
+        run: python3 approval-tools/scripts/staging_migrate_approval.py verify producing-plan/staging-migrate-manifest.json
       - name: Run
         env:
           # Must already exist as a staging-migrate-apply environment secret; absent means refusal.

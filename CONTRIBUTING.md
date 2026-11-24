@@ -129,7 +129,7 @@ where older guides call for owner sign-off. Proceed with a source merge only
 when the disable is confirmed and the pinned diff has no path from merge to
 production. Stop if the merge could deploy or either check is inconclusive.
 Keep any PR-specific holds and the separate authorization binding for
-[staging migration apply](docs/staging-migrate-claim.md#verify-the-plan-before-dispatch-and-the-claim-after-dispatch).
+[staging migration apply](docs/staging-migrate-claim.md#verify-and-approve-one-staging-apply).
 
 For two-web-next and two-bot-next, staging qualification is the
 **post-merge, pre-production exact-main staging/e2e/soak gate** (owner decision

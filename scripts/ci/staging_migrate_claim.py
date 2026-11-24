@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Publish a non-secret apply request before its Environment can be approved.
 
-The protection-rule consumer must still authenticate both runs/artifacts and
-require independent CEO GO. This publisher is request transport, not approval.
+The staging approval gate authenticates the producing plan and verifies the
+independent Environment decision before apply. This module publishes the claim.
 """
 import argparse
 import hashlib
