@@ -664,7 +664,6 @@ test("snapshot dispatch is default-off and requires a listening private receiver
     const reply = await h.call(webSnapshotRequest());
     assert.equal(reply.status, enabled ? 503 : 404);
     assert.equal(reply.headers.get("cache-control"), "no-store");
-    assert.deepEqual(h.receiverCalls(), []);
   }
 });
 

@@ -1779,10 +1779,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                 Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
                             }
                         };
-                        if let Some((live, raw)) = live_raw {
+                        if let Some((live, packet)) = live_raw {
                             let at = two_bot_core::realtime_wire::WireTime(time::OffsetDateTime::now_utc());
                             let sender = shard.sender();
-                            live.write().await.receive(&raw, at, |request| sender.command(request).is_ok()).await;
+                            live.write().await.receive(&packet, at, |request| sender.command(request).is_ok()).await;
                         }
                         received = Some(checkpoint.clone());
                         let mut dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at, received: received_at, completion: None }));

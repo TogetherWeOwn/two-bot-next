@@ -32,30 +32,28 @@ Adding secrets cannot enable unforwarded role/capability gates. Do not stage
 those inputs to try to enable them. Widening forwarding requires a separate
 reviewed change; direct-container configuration support is not rollout authority.
 
-The dormant `live.snapshot` boundary takes a committed nonce and a dedicated
+The `live.snapshot` boundary takes a committed nonce and a dedicated
 signing-key scope for one guild before it looks up recovery state. A current,
 fresh generation can return the complete v1 snapshot directly as JSON. The
-dormant guild owner advances the snapshot cut with each committed reservation.
+guild owner advances the snapshot cut with each committed reservation.
 After a failed reservation, reads stay unavailable until the owner rebuilds.
 The Web hub requires a snapshot covering its highest observed sequence after
 a gap. A cut expires 30 seconds after its observation and remains unavailable
 while it exceeds the snapshot size limit.
 
-The Worker relay accepts the Web hub's signed `POST /internal/actions`
-under a dedicated `DISCORD_LIVE_SNAPSHOT_KEY_ID` and `DISCORD_GUILD_ID` scope.
+The Worker relays the Web hub's signed `POST /internal/actions` for the Bot's `GUILD_ID`. Rust verifies it using `TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID` and `TWO_INTERNAL_LIVE_SNAPSHOT_SECRET`.
 The `TwoBotContainer` adapter uses the existing ownership and staging-use
 gate and reads from the running receiver's private port. The relay serves
 validated direct v1 JSON up to 1 MiB with `Cache-Control: no-store`. With no
 scope it refuses the request.
-Offline tests call the route with a signed Web-shaped request and
+Offline tests call the adapter directly with a signed Web-shaped request and
 an in-memory receiver peer. The Rust receiver tests exercise the mounted
 handler's signature checks, durable replay prevention and guild recovery state.
 
 Web currently uses `BOT_ENDPOINT_URL` for both snapshots and ordinary actions
 at the same signed path. Ordinary actions keep their envelope. Snapshots require
 bounded staging, both receiver switches and `TWO_INTERNAL_LIVE_SNAPSHOT_ENABLED=1`.
-Rust authorizes the Bot's `GUILD_ID` with `TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID` and `TWO_INTERNAL_LIVE_SNAPSHOT_SECRET`.
-[Web live qualification](https://github.com/TogetherWeOwn/two-web-next/issues/2705) covers outbound delivery and the Web-first rollout.
+The relay's 2.25-second budget fits Web's 2.5-second deadline. [Web live qualification](https://github.com/TogetherWeOwn/two-web-next/issues/2705) covers outbound delivery and the Web-first rollout.
 
 No signing key, secret custodian or export authority is supplied by this code.
 Key creation and transfer into the website's staging secret store stay on HOLD

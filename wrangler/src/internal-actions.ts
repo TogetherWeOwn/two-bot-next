@@ -52,7 +52,6 @@ export const CONTAINER_MARKER_VALUE = "1";
 export const MAX_BODY_BYTES = 2 * 1024 * 1024;
 export const BODY_TIMEOUT_MS = 5_000;
 export const REQUEST_TIMEOUT_MS = 20_000;
-// Leave room in the Web caller's 2.5-second pull deadline.
 export const LIVE_SNAPSHOT_TIMEOUT_MS = 2_250;
 export const LIVE_SNAPSHOT_DISPATCH_HEADER = "x-two-live-snapshot";
 /** Concurrent ingress requests per isolate; the receiver itself admits 32. */
