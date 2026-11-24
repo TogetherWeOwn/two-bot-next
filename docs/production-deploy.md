@@ -704,6 +704,8 @@ and `sha` set to the full 40-character lowercase candidate commit.
    child run ID/SHA and restored members. A failed receipt records a fixed
    error code and the child run ID when dispatch returned one. The wrapper
    remains red, and a failed receipt does not confirm recovery or shutdown.
+   A refused rerun uploads `staging-rollback-proof-attempt-<attempt>` so the
+   first attempt's artifact stays available under its original name.
 
 The child is named `staging rollback proof`, not a staging certification run.
 Production excludes it from latest-certification history only after re-reading
