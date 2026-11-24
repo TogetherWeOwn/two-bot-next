@@ -1,0 +1,27 @@
+{
+  "rollout": {
+    "worker_version": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "build_id": "1234-1",
+    "deploy_id": "2026.11.24.1+aaaaaaa",
+    "readyz": 200,
+    "health": 200
+  },
+  "ready": {
+    "build_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "build_id": "1234-1",
+    "deploy_id": "2026.11.24.1+aaaaaaa",
+    "jobs": {},
+    "components": [["process", "ready"], ["gateway", "ready"], ["database", "ready"], ["token_invalid", "ready"]]
+  },
+  "result": {
+    "v": 1,
+    "event_key": "attendance-acceptance:1234-1",
+    "threshold_minutes": 10,
+    "peak_concurrent": 1,
+    "final": true,
+    "window": { "starts_at": "2026-11-24T16:00:00.000Z", "ends_at": "2026-11-24T16:30:00.000Z" },
+    "rooms": [{ "channel_id": "400000000000000001", "name_at_close": "Synthetic attendance room" }],
+    "members": [{ "discord_id": "300000000000000001", "minutes": 12, "sessions": 1, "first_joined_at": "2026-11-24T16:01:00.000Z" }]
+  }
+}
