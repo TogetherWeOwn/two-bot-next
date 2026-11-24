@@ -29,15 +29,10 @@ registering it. Check combined guild, target and warning key sizes before releas
 [Cutover index candidate](../crates/cutover/migration-candidates/moderation_warning_history_order.sql)
 
 The dormant authorizer reuses the moderation resolver and checks current channel
-overwrites with at most five Discord GETs per refresh.
-[Read authorizer](../crates/bot/src/warning_history_authorizer.rs)
-
-The process-local continuation state reserves read attempts, binds component
-handles and enforces the cursor and cooldown limits below. Both seams compile
-only in tests. The interaction slice owns private acknowledgement, fresh
-authorization and private delivery. WH-G1–WH-G4 and AutoMod preview delivery
-gate activation.
-[Continuation state](../crates/core/src/member_moderation_store/warning_history/continuation.rs)
+overwrites with at most five Discord GETs per refresh. Synthetic tests compile
+the seam alongside the dormant [continuation state](../crates/core/src/member_moderation_store/warning_history/continuation.rs).
+Private interactions and the final authority check belong to the interaction slice. AutoMod preview
+delivery gates activation. [Read authorizer](../crates/bot/src/warning_history_authorizer.rs)
 
 ## Decision and alternatives
 
