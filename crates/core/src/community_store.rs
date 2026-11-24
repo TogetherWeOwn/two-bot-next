@@ -667,43 +667,45 @@ mod tests {
 
     static MIGRATIONS: Migrator = sqlx::migrate!("../cutover/migrations");
 
-    /// Only an absent URL skips the test. Configured setup failures are errors.
-    async fn test_db() -> Option<TestDatabase> {
-        let url = match std::env::var("TWO_TEST_DATABASE_URL") {
-            Ok(url) => url,
-            Err(std::env::VarError::NotPresent) => return None,
+    fn test_database_url() -> Option<String> {
+        match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(url) => Some(url),
+            Err(std::env::VarError::NotPresent) => None,
             Err(_) => panic!("TWO_TEST_DATABASE_URL must be Unicode"),
-        };
-        // SQLx's migration lock and concurrent index snapshot waits are both
-        // database-wide. Give each parallel fixture its own database.
-        Some(
-            TestDatabase::create(&url, &MIGRATIONS)
-                .await
-                .expect("test database setup"),
-        )
+        }
     }
 
-    #[tokio::test]
-    async fn warning_index_build_overlaps_a_peer_migrator() {
-        let (Some(builder), Some(peer)) = tokio::join!(test_db(), test_db()) else {
-            assert_ne!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
-            return;
-        };
-        let mut build_conn = builder.pool().acquire().await.unwrap();
-        build_conn.lock().await.unwrap();
+    async fn create_test_db(url: &str) -> Result<TestDatabase, String> {
+        // SQLx's migration lock and concurrent index snapshot waits are both
+        // database-wide. Give each parallel fixture its own database.
+        TestDatabase::create(url, &MIGRATIONS)
+            .await
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    /// Only an absent URL skips the test. Configured setup failures are errors.
+    async fn test_db() -> Option<TestDatabase> {
+        let url = test_database_url()?;
+        Some(create_test_db(&url).await.expect("test database setup"))
+    }
+
+    async fn build_warning_index_with_peer_migrator(
+        builder: &TestDatabase,
+        peer: &TestDatabase,
+    ) -> Result<bool, sqlx::Error> {
+        let mut build_conn = builder.pool().acquire().await?;
+        build_conn.lock().await?;
 
         // Keep the peer's snapshot alive for the entire build. In a shared
         // database it would hold up the build while the peer waited for the
         // builder's SQLx advisory lock, even with distinct search paths.
-        let mut snapshot = peer.pool().begin().await.unwrap();
+        let mut snapshot = peer.pool().begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .execute(&mut *snapshot)
-            .await
-            .unwrap();
+            .await?;
         sqlx::query("SELECT pg_current_snapshot()")
             .execute(&mut *snapshot)
-            .await
-            .unwrap();
+            .await?;
         let (built, migrated) = tokio::join!(
             sqlx::raw_sql(include_str!(
                 "../../cutover/migration-candidates/moderation_warning_history_order.sql"
@@ -713,15 +715,37 @@ mod tests {
         );
         let rolled_back = snapshot.rollback().await;
         let unlocked = build_conn.unlock().await;
-        let valid: Result<bool, _> = sqlx::query_scalar(
+        built?;
+        migrated?;
+        rolled_back?;
+        unlocked?;
+        sqlx::query_scalar(
             "SELECT indisvalid AND indisready FROM pg_index
              WHERE indexrelid = to_regclass('idx_moderation_warnings_history_order')
                AND indrelid = 'moderation_warnings'::regclass",
         )
         .fetch_one(&mut *build_conn)
-        .await;
-        drop(build_conn);
+        .await
+    }
 
+    #[tokio::test]
+    async fn warning_index_build_overlaps_a_peer_migrator() {
+        let Some(url) = test_database_url() else {
+            assert_ne!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+            return;
+        };
+        let (builder, peer) = tokio::join!(create_test_db(&url), create_test_db(&url));
+        let (builder, peer) = match (builder, peer) {
+            (Ok(builder), Ok(peer)) => (builder, peer),
+            (Ok(db), Err(error)) | (Err(error), Ok(db)) => {
+                let cleanup = db.close().await;
+                panic!("paired fixture setup failed: {error}. Sibling cleanup: {cleanup:?}");
+            }
+            (Err(builder), Err(peer)) => panic!("builder setup failed: {builder}. Peer: {peer}"),
+        };
+
+        // Await explicit teardown before reporting failures from either session.
+        let valid = build_warning_index_with_peer_migrator(&builder, &peer).await;
         let builder_name = builder.name().to_owned();
         let builder_closed = builder.close().await;
         let builder_gone: Result<bool, _> =
@@ -733,11 +757,7 @@ mod tests {
 
         builder_closed.expect("drop builder database");
         peer_closed.expect("drop peer database");
-        built.expect("build warning-history candidate while peer snapshot is open");
-        migrated.expect("run peer SQLx migrator while builder holds its lock");
-        rolled_back.expect("release peer snapshot");
-        unlocked.expect("release builder migration lock");
-        assert!(valid.expect("find the built index"));
+        assert!(valid.expect("build warning-history candidate with a peer SQLx migrator"));
         assert!(builder_gone.expect("check builder database teardown from peer"));
     }
 
