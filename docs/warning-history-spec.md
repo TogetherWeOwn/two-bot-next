@@ -28,10 +28,11 @@ The index extends the 0110 order. Fix shared-schema fixture deadlocks before
 registering it. Check combined guild, target and warning key sizes before release.
 [Cutover index candidate](../crates/cutover/migration-candidates/moderation_warning_history_order.sql)
 
-Reuse the existing moderation resolver for fresh guild permissions, add channel
-checks, and deny staff self-targets. A separate slice owns private interactions,
-cursor limits and the final authority check. AutoMod preview delivery gates
-activation. [Moderation runtime](../crates/bot/src/member_runtime.rs)
+The dormant authorizer reuses the moderation resolver and checks current channel
+overwrites with at most five Discord GETs per refresh. Synthetic tests compile
+the seam until the interaction slice supplies a caller. Private interactions,
+cursor limits and the final authority check belong to that slice. AutoMod preview
+delivery gates activation. [Read authorizer](../crates/bot/src/warning_history_authorizer.rs)
 
 ## Decision and alternatives
 

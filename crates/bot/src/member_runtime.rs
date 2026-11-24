@@ -50,6 +50,11 @@ use crate::{
     jobs::{self, ErrorClass, Job},
 };
 
+// The interaction slice will compile this seam into the runtime when it has a caller.
+#[cfg(test)]
+#[path = "warning_history_authorizer.rs"]
+mod warning_history_authorizer;
+
 /// Supervised unban-sweep job name (status surface + registration).
 pub const SWEEP_JOB_NAME: &str = "member_unban_sweep";
 /// Job names owned by this slice.
@@ -466,10 +471,14 @@ pub(crate) async fn guild_facts(
         .await
         .map_err(|error| AuthorityCause::from_read(&error))?
         .ok_or(AuthorityCause::MalformedRoles)?;
-    if text(&guild, "id").as_deref() != Some(guild_id) {
+    parse_guild(&guild, guild_id)
+}
+
+fn parse_guild(guild: &serde_json::Value, guild_id: &str) -> Result<GuildFacts, AuthorityCause> {
+    if text(guild, "id").as_deref() != Some(guild_id) {
         return Err(AuthorityCause::GuildMismatch);
     }
-    let owner_id = text(&guild, "owner_id")
+    let owner_id = text(guild, "owner_id")
         .filter(|id| valid_id(id))
         .ok_or(AuthorityCause::MalformedRoles)?;
     let mut positions = HashMap::new();
