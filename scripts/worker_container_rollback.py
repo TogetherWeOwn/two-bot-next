@@ -423,7 +423,7 @@ def control_client(variant, token, worker_url, staging_url, actor, root=None):
             "OWNERSHIP_CONTROL_TOKEN": token,
             "OWNERSHIP_ACTOR": actor,
             "OWNERSHIP_RELEASE_FENCE": "true" if action in (
-                "takeover", "deployment-takeover") else "false",
+                "takeover", "takeover-fenced", "deployment-takeover") else "false",
         }
         if variant == "production":
             env["PRODUCTION_WORKER_URL"] = worker_url

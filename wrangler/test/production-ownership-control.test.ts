@@ -79,6 +79,43 @@ test("takeover posts exactly the read epoch and confirms the transition", async 
   assert.deepEqual(JSON.parse(String(s.calls[1]!.body)), { action: "takeover", actor: args.actor, expectedEpoch: 3 });
 });
 
+test("fenced recovery requires a stopped matching epoch before takeover", async () => {
+  const recovery = { ...args, action: "takeover-fenced", releaseFence: true, expectedEpoch: 3 };
+  for (const s of [
+    sender({ epoch: 4, deploymentId: null, phase: "fenced" }),
+    sender({ epoch: 3, deploymentId: "B", phase: "active" }),
+    sender({ epoch: 3, deploymentId: null, phase: "fenced" }, "B", true),
+    sender({ epoch: 3, deploymentId: null, phase: "fenced" }, "C"),
+  ]) {
+    await assert.rejects(control(recovery, s.send));
+    assert.deepEqual(s.calls.map((call) => call.method), ["GET"]);
+  }
+});
+
+test("fenced recovery never retries an interrupted takeover at a new epoch", async () => {
+  const recovery = { ...args, action: "takeover-fenced", releaseFence: true, expectedEpoch: 3 };
+  for (const interrupt of [true, false]) {
+    const calls: string[] = [];
+    const operation = control(recovery, async (_url: URL, init: RequestInit) => {
+      calls.push(String(init.method));
+      if (init.method === "GET") {
+        return Response.json({ deploymentId: "B", running: false,
+          owner: { epoch: 3, deploymentId: null, phase: "fenced" } });
+      }
+      assert.deepEqual(JSON.parse(String(init.body)), { action: "takeover", actor: args.actor, expectedEpoch: 3 });
+      if (interrupt) throw new Error("fixture lost the acknowledgement");
+      return Response.json({ deploymentId: "B", running: false,
+        owner: { epoch: 4, deploymentId: "B", phase: "active", actor: args.actor } });
+    }, async () => { assert.fail("fenced takeover must never retry"); });
+    if (interrupt) {
+      await assert.rejects(operation, /Ownership control request failed/);
+    } else {
+      assert.equal((await operation).owner.epoch, 4);
+    }
+    assert.deepEqual(calls, ["GET", "POST"]);
+  }
+});
+
 test("routine takeover refuses to unpark a fenced/pristine singleton", async () => {
   for (const owner of [null, { epoch: 2, deploymentId: null, phase: "fenced" }]) {
     const s = sender(owner);
