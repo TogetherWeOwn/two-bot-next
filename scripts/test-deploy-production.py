@@ -183,8 +183,9 @@ def green():
         "ci-ok": {"check_runs": [check_run("ci-ok")]},
         "check": {"check_runs": [check_run("check")]},
         "worker check": {"check_runs": [check_run("worker check")]},
-        "staging": {"total_count": 1, "workflow_runs": [{"conclusion": "success"}]},
+        "staging": {"total_count": 1, "workflow_runs": [staging_run()]},
         "staging-all": {"total_count": 1, "workflow_runs": [staging_run()]},
+        "staging-reviewed": {"total_count": 0, "workflow_runs": []},
         "staging-jobs": {"total_count": 1, "jobs": [staging_synthetic_job()]},
         "environment": {
             "name": "production",
@@ -997,7 +998,7 @@ class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
               ref="refs/heads/main", auto="", resolved_sha=None, event="workflow_dispatch",
               run_sha="", run_conclusion="", run_updated="", hold="", auto_disabled="", spike="",
-              run_path="", run_event="", cutover_hold="", **responses):
+              run_path="", run_event="", cutover_hold="", reviewed_history="true", **responses):
         if image is None:
             image = IMAGE if rollback else ""
         api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]},
@@ -1054,11 +1055,19 @@ class GuardBehaviourTests(unittest.TestCase):
                 key = "snapshot-run"
             elif re.fullmatch(rf"repos/{REPO}/actions/runs/[0-9]+", path):
                 key = "ci-run"
-            elif path == f"repos/{REPO}/actions/runs/501/attempts/2/jobs":
+            elif path in (f"repos/{REPO}/actions/runs/501/attempts/2/jobs",
+                          f"repos/{REPO}/actions/runs/501/attempts/1/jobs"):
                 # The forwarded staging run (501, attempt 2): its user-flow synthetic job.
                 key = "staging-jobs"
             elif re.fullmatch(rf"repos/{REPO}/actions/runs/[0-9]+/attempts/[0-9]+/jobs", path):
                 key = "ci-jobs"
+            elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs" and "created" in query:
+                self.assertEqual(query["event"], "workflow_dispatch")
+                self.assertEqual(query["branch"], "main")
+                self.assertNotIn("status", query)
+                oldest = datetime.datetime.fromisoformat(query["created"].removeprefix(">="))
+                self.assertGreaterEqual((datetime.datetime.now(datetime.timezone.utc) - oldest).days, 49)
+                key = "staging-reviewed"
             elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs" and "head_sha" not in query:
                 # Promotion: the latest successful staging deploy on main.
                 self.assertEqual(
@@ -1074,10 +1083,8 @@ class GuardBehaviourTests(unittest.TestCase):
                 )
                 key = "staging-all"
             elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs":
-                self.assertEqual(
-                    {k: query[k] for k in ("head_sha", "branch", "status")},
-                    {"head_sha": downstream, "branch": "main", "status": "success"},
-                )
+                self.assertEqual(query, {"head_sha": downstream, "branch": "main",
+                                         "status": "success", "per_page": "1"})
                 key = "staging"
             elif path == f"repos/{REPO}/environments/production":
                 key = "environment"
@@ -1125,6 +1132,7 @@ class GuardBehaviourTests(unittest.TestCase):
                 "INJECT_ERROR_RATE_SPIKE": spike, "CUTOVER_HOLD": cutover_hold,
                 "PRODUCTION_WORKER_URL": "https://production.example.test",
                 "AUTO_APPROVE": auto,
+                "REVIEWED_STAGING_HISTORY": reviewed_history,
                 "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
             }
             stdout, code = io.StringIO(), 0
@@ -1209,6 +1217,54 @@ class GuardBehaviourTests(unittest.TestCase):
             [query.get("check_name") for path, query in calls if path.endswith("/check-runs")],
             ["ci-ok", "worker check"],
         )
+
+    def test_reviewed_stage_selects_exact_serving_sha_and_latest_outcome(self):
+        workflow_sha = "e" * 40
+        reviewed = {
+            **staging_run(attempt=1, sha=workflow_sha), "event": "workflow_dispatch", "head_branch": "main",
+            "display_title": f"reviewed staging source {SHA}", "path": ".github/workflows/deploy-staging.yml",
+            "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+        }
+        fixtures = {
+            "staging-latest": {"total_count": 1, "workflow_runs": [reviewed]},
+            "staging-all": {"total_count": 0, "workflow_runs": []},
+            "staging-reviewed": {"total_count": 1, "workflow_runs": [reviewed]},
+            "staging-jobs": {"total_count": 1, "jobs": [staging_synthetic_job(attempt=1, sha=workflow_sha)]},
+        }
+        for requested in ("", SHA):
+            with self.subTest(requested=requested):
+                code, outputs, _, _, stdout = self.guard(sha=requested, **fixtures)
+                self.assertEqual(code, 0, stdout)
+                self.assertEqual((outputs["sha"], outputs["staging_run_id"], outputs["staging_attempt"]),
+                                 (SHA, "501", "1"))
+        newer = {**reviewed, "id": 502, "run_number": 6, "conclusion": "failure"}
+        self.assertRefused(self.guard(**{
+            **fixtures, "staging-reviewed": {"total_count": 2, "workflow_runs": [reviewed, newer]},
+        }), "latest deploy-staging run")
+        self.assertRefused(self.guard(**{
+            **fixtures, "staging-jobs": {"total_count": 1, "jobs": [staging_synthetic_job(attempt=1)]},
+        }), "user-flow synthetic has no successful run")
+        self.assertRefused(self.guard(sha="", **{
+            **fixtures, "staging-latest": {"total_count": 1, "workflow_runs": [
+                {**reviewed, "head_repository": {"full_name": "foreign/repo"}},
+            ]},
+        }), "no successful deploy-staging run on main")
+        other_source = {**reviewed, "head_sha": SHA, "display_title": f"reviewed staging source {workflow_sha}"}
+        self.assertRefused(self.guard(**{
+            **fixtures, "staging-all": {"total_count": 1, "workflow_runs": [other_source]},
+            "staging-reviewed": {"total_count": 1, "workflow_runs": [other_source]},
+        }), "deploy-staging has no successful run")
+
+    def test_dormant_reviewed_history_leaves_default_and_stale_refusal_in_place(self):
+        responses = {"staging-reviewed": failed_call()}
+        code, outputs, _, calls, _ = self.guard(reviewed_history="false", **responses)
+        self.assertEqual(code, 0)
+        self.assertEqual((outputs["sha"], outputs["staging_run_id"]), (SHA, "501"))
+        self.assertFalse(any(query.get("created") for _, query in calls))
+        red = staging_run(run_id=502, number=6, conclusion="failure")
+        self.assertRefused(self.guard(reviewed_history="false", **responses, **{
+            "staging-all": {"total_count": 2, "workflow_runs": [staging_run(), red]},
+        }), "not a completed success")
 
     def test_main_head_itself_passes_and_sha_is_normalised(self):
         code, outputs, _, _, _ = self.guard(sha=f" {SHA.upper()}\n", compare={"status": "identical"})
@@ -1617,7 +1673,8 @@ class GuardBehaviourTests(unittest.TestCase):
                 )
 
     def test_sha_without_a_successful_staging_deploy_is_refused(self):
-        self.assertRefused(self.guard(staging={"total_count": 0, "workflow_runs": []}), "deploy-staging has no successful run")
+        self.assertRefused(self.guard(**{"staging-all": {"total_count": 0, "workflow_runs": []}}),
+                           "deploy-staging has no successful run")
 
     def test_missing_production_environment_is_refused(self):
         # A missing Environment would be auto-created with no reviewers.
@@ -1657,7 +1714,7 @@ class GuardBehaviourTests(unittest.TestCase):
     def test_auto_approve_refuses_unless_the_latest_staging_deploy_succeeded(self):
         environment = {**green()["environment"], "protection_rules": []}
         for runs, reason in (
-            ([], "no verifiable latest run"),
+            ([], "no successful run"),
             ([staging_run(conclusion="failure")], "not a completed success"),
             ([staging_run(), staging_run(run_id=502, number=6, conclusion="failure")], "not a completed success"),
             ([staging_run(), staging_run(run_id=502, number=6, status="in_progress", conclusion=None)],
@@ -1672,7 +1729,7 @@ class GuardBehaviourTests(unittest.TestCase):
     def test_auto_approve_keeps_every_other_guard(self):
         environment = {**green()["environment"], "protection_rules": []}
         self.assertRefused(self.guard(auto="true", environment=environment,
-                                      staging={"total_count": 0, "workflow_runs": []}),
+                                      **{"staging-all": {"total_count": 0, "workflow_runs": []}}),
                            "deploy-staging has no successful run")
         self.assertRefused(self.guard(auto="true", environment=environment, compare={"status": "behind"}),
                            "not an ancestor of origin/main")
@@ -2000,8 +2057,7 @@ class GuardBehaviourTests(unittest.TestCase):
         code, outputs, summary, calls, _ = self.guard(
             event="workflow_run", sha="", run_sha=old_run_sha, run_conclusion="success",
             **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
-               "staging": {"total_count": 1, "workflow_runs": [
-                   {"conclusion": "success", "updated_at": green_at}]}})
+               "staging-all": {"total_count": 1, "workflow_runs": [{**staging_run(), "updated_at": green_at}]}})
         self.assertEqual(code, 0)
         self.assertEqual(outputs["sha"], SHA)
         self.assertNotEqual(outputs["sha"], old_run_sha)
@@ -2108,15 +2164,13 @@ class GuardBehaviourTests(unittest.TestCase):
         code, outputs, _, _, _ = self.guard(
             event="schedule", sha="",
             **{"production-readyz": {"status": 500, "build_revision": SHA},
-               "compare-live": failed_call(),
-               "staging": {"total_count": 1, "workflow_runs": [{"conclusion": "success"}]}})
+               "compare-live": failed_call()})
         self.assertEqual(code, 0)
         self.assertEqual(outputs["skip"], "")
         code, outputs, _, calls, _ = self.guard(
             event="schedule", sha="",
             **{"production-readyz": {"status": 200, "build_revision": "c" * 40},
-               "compare-live": failed_call(),
-               "staging": {"total_count": 1, "workflow_runs": [{"conclusion": "success"}]}})
+               "compare-live": failed_call()})
         self.assertEqual(code, 0)
         self.assertEqual(outputs["skip"], "")
         self.assertTrue(any(path.startswith(f"repos/{REPO}/compare/") for path, _ in calls))
@@ -2202,8 +2256,7 @@ class GuardBehaviourTests(unittest.TestCase):
         _, outputs, _, _, _ = self.guard(
             event="schedule", sha="",
             **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
-               "staging": {"total_count": 1, "workflow_runs": [
-                   {"conclusion": "success", "updated_at": green_at}]}})
+               "staging-all": {"total_count": 1, "workflow_runs": [{**staging_run(), "updated_at": green_at}]}})
         self.assertEqual(outputs["skip"], "")
         self.assertEqual(outputs["soak_seconds"], "0")
 
@@ -2230,8 +2283,7 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("nothing is deployed", summary)
         code, outputs, _, _, _ = self.guard(
             event="schedule", sha="", hold="2020-01-01T00:00:00Z",
-            **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
-               "staging": {"total_count": 1, "workflow_runs": [{"conclusion": "success"}]}})
+            **{"production-readyz": {"status": 200, "build_revision": "f" * 40}})
         self.assertEqual(code, 0)
         self.assertEqual(outputs["skip"], "")
 
@@ -2249,9 +2301,7 @@ class GuardBehaviourTests(unittest.TestCase):
             with self.subTest(auto_disabled=disabled):
                 code, outputs, _, _, _ = self.guard(
                     event="schedule", sha="", auto_disabled=disabled,
-                    **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
-                       "staging": {"total_count": 1, "workflow_runs": [
-                           {"conclusion": "success"}]}})
+                    **{"production-readyz": {"status": 200, "build_revision": "f" * 40}})
                 self.assertEqual(code, 0)
                 self.assertEqual(outputs["skip"], "")
 
@@ -2382,7 +2432,8 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("tooling/scripts/ci/roles_gate.py", roles_gate)
 
     def test_api_failures_fail_closed(self):
-        for key in ("compare", "ci-runs", "ci-run", "ci-jobs", "ci-ok", "worker check", "staging", "branches"):
+        for key in ("compare", "ci-runs", "ci-run", "ci-jobs", "ci-ok", "worker check", "staging-all",
+                    "staging-reviewed", "branches"):
             for broken in (failed_call(), "not json"):
                 with self.subTest(key=key, broken=broken):
                     self.assertRefused(self.guard(**{key: broken}), "failing closed")
