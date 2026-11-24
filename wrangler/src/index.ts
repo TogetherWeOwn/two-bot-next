@@ -73,6 +73,7 @@ import {
   receiverEnabled,
   relayReceiverResponse,
 } from "./internal-actions.ts";
+import { handleLiveSnapshotRelay, type SnapshotScope } from "./live-snapshot-relay.ts";
 import {
   EVENTSUB_PATH,
   EVENTSUB_RECEIVER_BIND,
@@ -912,6 +913,30 @@ export class TwoBotContainer extends Container<Env> {
       await this.requireStagingUse();
       try { return await operation(); }
       finally { await this.requireStagingUse(); }
+    });
+  }
+
+  /** Unmounted composition. Static so the DO instance exposes no snapshot RPC. */
+  static relayLiveSnapshot(
+    bot: TwoBotContainer,
+    request: Request,
+    clientKey: string,
+    stampedDeploymentId: string,
+    scope?: SnapshotScope,
+  ): Promise<Response> {
+    const container = bot.ctx.container;
+    return handleLiveSnapshotRelay(request, clientKey, scope, {
+      whileOwned: (operation) => bot.owned(operation),
+      fence: bot.ownership,
+      deploymentId: bot.id(),
+      stampedDeploymentId,
+      running: () => container?.running === true,
+      fetch: async (forward, port) => {
+        // Use only the running process. The SDK proxy can start it and wraps
+        // the body in a pipe whose rejection escapes on consumer cancellation.
+        if (!container?.running) return new Response(null, { status: 503 });
+        return container.getTcpPort(port).fetch(forward);
+      },
     });
   }
 

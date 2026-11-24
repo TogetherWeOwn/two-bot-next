@@ -10,18 +10,18 @@ const secret = randomBytes(32);
 const timestamp = "1790000000";
 const nonce = "0123456789abcdef0123456789abcdef";
 
-export function signature(bytes: string | Uint8Array, target = path): string {
+export function signature(bytes: string | Uint8Array, target = path, signedAt = timestamp, requestNonce = nonce): string {
   const digest = createHash("sha256").update(bytes).digest("hex");
-  return `sha256=${createHmac("sha256", secret).update(`POST\n${target}\n${timestamp}\n${nonce}\n${digest}`).digest("hex")}`;
+  return `sha256=${createHmac("sha256", secret).update(`POST\n${target}\n${signedAt}\n${requestNonce}\n${digest}`).digest("hex")}`;
 }
 
-export function request(payload = body, url = origin + path): Request {
-  return new Request(url, { method: "POST", body: payload, headers: {
+export function request(payload = body, url = origin + path, signedAt = timestamp, requestNonce = nonce): Request {
+  return new Request(url, { method: "POST", body: payload, redirect: "manual", headers: {
     "content-type": "application/json",
     "x-two-key-id": scope.keyId,
-    "x-two-timestamp": timestamp,
-    "x-two-nonce": nonce,
-    "x-two-signature": signature(payload),
+    "x-two-timestamp": signedAt,
+    "x-two-nonce": requestNonce,
+    "x-two-signature": signature(payload, path, signedAt, requestNonce),
   } });
 }
 

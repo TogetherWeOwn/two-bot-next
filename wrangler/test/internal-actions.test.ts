@@ -12,6 +12,7 @@ import { randomBytes } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import { OWNER_KEY, DEPLOYMENT_HEADER } from "../src/ownership.ts";
+import { STAGING_USE_KEY, type StagingUse } from "../src/staging-lifecycle.ts";
 import { LOG_QUERY_URL } from "../src/alert-rules.ts";
 import { isRequestId } from "../src/request-id.ts";
 import {
@@ -27,6 +28,7 @@ import {
   relayReceiverResponse,
   resetIngressLimits,
 } from "../src/internal-actions.ts";
+import { request as signedSnapshot, scope, signature, snapshot } from "./fixtures/live-snapshot-peer.ts";
 
 const ID = "deployment-A";
 const OWNER = {
@@ -91,7 +93,8 @@ interface Seen {
   body: Uint8Array | null;
 }
 
-async function harness(t: TestContext, env: Record<string, unknown>, options: { owner?: unknown } = {}) {
+async function harness(t: TestContext, env: Record<string, unknown>,
+  options: { owner?: unknown; stagingUse?: StagingUse } = {}) {
   const database = new DatabaseSync(":memory:");
   t.after(() => database.close());
   t.after(() => resetIngressLimits());
@@ -103,6 +106,7 @@ async function harness(t: TestContext, env: Record<string, unknown>, options: { 
   const starts: { env?: Record<string, string> }[] = [];
   const seen: Seen[] = [];
   const values = new Map<string, unknown>([[OWNER_KEY, "owner" in options ? options.owner : OWNER]]);
+  if (options.stagingUse) values.set(STAGING_USE_KEY, options.stagingUse);
   const listening = new Set<number>();
   let receiver: (request: Seen) => Response | Promise<Response> = (request) =>
     Response.json({ ok: true, request_id: request.headers["x-request-id"], result: { message_id: "1" } });
@@ -121,13 +125,14 @@ async function harness(t: TestContext, env: Record<string, unknown>, options: { 
     getTcpPort: (port: number) => ({
       async fetch(input: string | Request, init?: RequestInit | Request) {
         const url = new URL(typeof input === "string" ? input : input.url);
+        const request = input instanceof Request ? input : init;
         if (!listening.has(port)) throw new Error(`connection refused: nothing listens on ${port}`);
         const record: Seen = {
           port,
           pathname: url.pathname,
-          method: init?.method ?? "GET",
-          headers: Object.fromEntries(new Headers(init?.headers)),
-          body: init instanceof Request && init.body ? new Uint8Array(await init.arrayBuffer()) : null,
+          method: request?.method ?? "GET",
+          headers: Object.fromEntries(new Headers(request?.headers)),
+          body: request instanceof Request && request.body ? new Uint8Array(await request.arrayBuffer()) : null,
         };
         seen.push(record);
         const response = port === RECEIVER_PORT && url.pathname === ACTIONS_PATH
@@ -560,6 +565,143 @@ test("the ownership fence refuses ingress; a stale or spoofed deployment never f
   }));
   assert.equal(missing.status, 503);
   assert.equal(h.seen.length, before);
+});
+
+const webSnapshotUrl = `https://worker.invalid${ACTIONS_PATH}`;
+const webSnapshotBody = (guildId = scope.guildId) => JSON.stringify({ action: "live.snapshot", guild_id: guildId });
+const webSnapshotRequest = (payload = webSnapshotBody()) =>
+  signedSnapshot(payload, webSnapshotUrl, String(Math.floor(Date.now() / 1000)), randomBytes(16).toString("hex"));
+
+async function snapshotRefused(reply: Response, status: number, code: string) {
+  assert.equal(reply.status, status);
+  assert.equal(reply.headers.get("cache-control"), "no-store");
+  const body = await reply.json() as { request_id: string };
+  assert.ok(isRequestId(body.request_id));
+  assert.deepEqual(body, {
+    ok: false, request_id: body.request_id, error: { code, message: "request refused", retryable: status === 503 },
+  });
+}
+
+test("unmounted snapshot composition returns direct v1 while ordinary ingress keeps its envelope", async (t) => {
+  const h = await harness(t, ENABLED_ENV);
+  await h.warm();
+  const fresh = { ...snapshot, observed_at: new Date().toISOString() };
+  let authenticated = 0;
+  let refusalCancelled = false;
+  h.setReceiver(({ headers, body, method, pathname }) => {
+    if (headers["x-two-key-id"] === SIGNED_HEADERS["x-two-key-id"]) {
+      return Response.json({ ok: true, request_id: headers["x-request-id"], result: { message_id: "1" } });
+    }
+    // In-memory peer for the Rust snapshot HTTP contract. Verify the MAC on
+    // received bytes so a syntactically valid but mismatched MAC is refused.
+    if (method !== "POST" || !body || headers["x-two-key-id"] !== scope.keyId ||
+      !headers["x-two-timestamp"] || !headers["x-two-nonce"] ||
+      headers["x-two-signature"] !== signature(body, pathname, headers["x-two-timestamp"], headers["x-two-nonce"])) {
+      const refusal = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"ok":false,"error":{"code":"unauthorized"}}'));
+        },
+        cancel() { refusalCancelled = true; },
+      });
+      return new Response(refusal, { status: 401, headers: { "content-type": "application/json" } });
+    }
+    authenticated++;
+    return Response.json(fresh);
+  });
+
+  const inbound = webSnapshotRequest();
+  const pull = (request: Request) => TwoBotContainer.relayLiveSnapshot(h.bot, request, "fixture", ID, scope);
+  const reply = await pull(inbound);
+  assert.equal(reply.status, 200);
+  assert.equal(reply.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await reply.json(), fresh);
+  const [forward] = h.receiverCalls();
+  assert.deepEqual(forward?.body, new TextEncoder().encode(webSnapshotBody()));
+  for (const name of ["x-two-key-id", "x-two-timestamp", "x-two-nonce", "x-two-signature"]) {
+    assert.equal(forward?.headers[name], inbound.headers.get(name));
+  }
+
+  const wrongMac = new Request(webSnapshotUrl, {
+    method: "POST", body: webSnapshotBody(), redirect: "manual",
+    headers: webSnapshotRequest(webSnapshotBody("4")).headers,
+  });
+  await snapshotRefused(await pull(wrongMac), 503, "unavailable");
+  assert.equal(h.receiverCalls().length, 2, "the private receiver decides whether the MAC matches");
+  assert.equal(authenticated, 1);
+  assert.equal(refusalCancelled, true);
+
+  await snapshotRefused(await h.call(webSnapshotRequest()), 503, "unavailable");
+  assert.equal(authenticated, 2, "routed ordinary ingress still refuses a direct v1 reply");
+  const ordinary = await h.call(post());
+  assert.equal(ordinary.status, 200);
+  assert.equal(ordinary.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await ordinary.json(), {
+    ok: true, request_id: h.receiverCalls().at(-1)?.headers["x-request-id"], result: { message_id: "1" },
+  });
+});
+
+test("unmounted snapshot composition requires the configured guild, key, owner and staging use", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"] });
+  const sha = "a".repeat(40);
+  const stagingUse: StagingUse = {
+    environment: "staging", phase: "active", deploymentId: ID, epoch: OWNER.epoch, sha,
+    runId: "100", runAttempt: 1, acquiredAt: Date.now(), expiresAt: Date.now() + 120_000,
+  };
+  const stage = () => harness(t, {
+    ...ENABLED_ENV, TWO_DEPLOY_ENV: "staging", STAGING_RUNTIME_POLICY: "bounded", CONTAINER_RELEASE: sha,
+  }, { stagingUse });
+  const released = await stage();
+  await released.warm();
+  released.values.set(STAGING_USE_KEY, { ...stagingUse, phase: "released" });
+  assert.equal(released.runtime.running, true);
+  await snapshotRefused(
+    await TwoBotContainer.relayLiveSnapshot(released.bot, webSnapshotRequest(), "fixture", ID, scope),
+    503, "unavailable",
+  );
+  assert.deepEqual(released.receiverCalls(), []);
+  assert.equal(released.runtime.running, false);
+
+  const h = await stage();
+  const pull = (request: Request, stamp = ID) => TwoBotContainer.relayLiveSnapshot(h.bot, request, "fixture", stamp, scope);
+  await snapshotRefused(await pull(webSnapshotRequest()), 503, "unavailable");
+  assert.deepEqual(h.starts, [], "snapshot cannot start a cold container");
+  await h.warm();
+
+  const disabled = await TwoBotContainer.relayLiveSnapshot(h.bot, webSnapshotRequest(), "fixture", ID);
+  assert.equal(disabled.status, 404);
+  assert.equal(disabled.headers.get("cache-control"), "no-store");
+  await snapshotRefused(await pull(webSnapshotRequest(webSnapshotBody("4"))), 403, "action_not_allowed");
+  const wrongKey = webSnapshotRequest();
+  wrongKey.headers.set("x-two-key-id", SIGNED_HEADERS["x-two-key-id"]);
+  await snapshotRefused(await pull(wrongKey), 401, "unauthorized");
+  const spoof = webSnapshotRequest();
+  spoof.headers.set(DEPLOYMENT_HEADER, ID);
+  await snapshotRefused(await pull(spoof, "stale-deployment"), 503, "unavailable");
+
+  h.values.delete(OWNER_KEY);
+  await snapshotRefused(await pull(webSnapshotRequest()), 503, "unavailable");
+  assert.deepEqual(h.receiverCalls(), []);
+
+  h.values.set(OWNER_KEY, OWNER);
+  t.mock.timers.setTime(stagingUse.expiresAt - 1);
+  const fresh = { ...snapshot, observed_at: new Date().toISOString() };
+  h.setReceiver(() => Response.json(fresh));
+  const active = await pull(webSnapshotRequest());
+  assert.equal(active.status, 200);
+  assert.equal(active.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await active.json(), fresh);
+
+  h.setReceiver(() => new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      // No eager pull. The grant expires when the relay reads the body.
+      t.mock.timers.setTime(stagingUse.expiresAt);
+      controller.enqueue(new TextEncoder().encode(JSON.stringify(fresh)));
+      controller.close();
+    },
+  }, { highWaterMark: 0 }), { headers: { "content-type": "application/json" } }));
+  await snapshotRefused(await pull(webSnapshotRequest()), 503, "unavailable");
+  assert.equal(h.receiverCalls().length, 2);
+  assert.equal(h.runtime.running, false, "the owned body read rechecks staging use before releasing the response");
 });
 
 test("logs carry only scalar event, status, error class, request id, release and log url", async (t) => {
