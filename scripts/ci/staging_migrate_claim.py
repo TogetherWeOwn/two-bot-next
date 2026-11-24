@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Publish a non-secret apply request before its Environment can be approved.
 
-The staging approval gate authenticates the producing plan and verifies the
-independent Environment decision before apply. This module publishes the claim.
+The staging approval gate authenticates the plan and verifies the native decision.
 """
 import argparse
 import hashlib

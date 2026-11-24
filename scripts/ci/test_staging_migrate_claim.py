@@ -298,6 +298,7 @@ class ClaimWorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["claim"]["steps"][2].update({"continue-on-error": "true"}),
             lambda w: w["jobs"]["claim"]["steps"][3].update({"if": "always()"}),
             lambda w: w["jobs"]["claim"]["steps"][3]["with"].update({"compression-level": "6"}),
+            lambda w: w["jobs"]["apply"]["steps"][-2].update({"continue-on-error": True}),
             lambda w: w["jobs"]["plan"]["steps"][-1]["with"].pop("compression-level"),
         ]
         for index, change in enumerate(changes):

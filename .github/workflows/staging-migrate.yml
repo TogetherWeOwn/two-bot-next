@@ -262,9 +262,7 @@ jobs:
           ref: ${{ github.sha }}
           path: approval-tools
       - name: Install Python for the staging approval verifier
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends python3 >/dev/null
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 >/dev/null
       - name: Verify the native staging approval
         env:
           GH_TOKEN: ${{ github.token }}

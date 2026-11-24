@@ -2623,17 +2623,14 @@ producing read-only plan. Before submitting `mode: apply`, compare its inputs wi
 the authenticated manifest and run ID, including
 the pinned staging host, database and branch ID, `recovery_evidence_ref` and
 `acl_plan_ref`. Stop for mismatched inputs or a hold. Follow the
-[staging apply approval procedure](staging-migrate-claim.md#verify-and-approve-one-staging-apply).
-The prior direct-owner requirement applies until the reviewed workflow and
-native Environment protection are active.
+[staging approval procedure](staging-migrate-claim.md#verify-the-plan-before-dispatch-and-the-claim-after-dispatch).
 
 For `mode: apply`, the `claim` job validates the dispatch against its fresh
 read-only plan and uploads `staging-migrate-apply-claim.json` as the
 `staging-migrate-apply-claim` artifact. It has no environment or database binding.
 The `apply` job runs only after a green plan **and claim** and reads its binding
-from `staging-migrate-apply` after an independent designated maintainer approves
-the exact claim through GitHub. Before DDL, the job checks the approval record
-and producing plan. The [claim contract](staging-migrate-claim.md)
+from `staging-migrate-apply` after a designated maintainer approves the exact
+claim. The [claim contract](staging-migrate-claim.md)
 defines the exact fields and proof checks. This gate applies
 only to staging; it does not change production approval or protection.
 After apply, follow the reviewed ACL sequence so other shared-database services

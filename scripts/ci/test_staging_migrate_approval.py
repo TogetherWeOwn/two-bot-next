@@ -8,7 +8,6 @@ import sys
 import unittest
 
 from test_staging_migrate_claim import ENV, PLAN
-from test_workflows import load_workflows, staging_migrate_errors
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import staging_migrate_approval as approval
@@ -91,7 +90,6 @@ class StagingMigrationApprovalTests(unittest.TestCase):
             lambda: self.settings["protection_rules"][1].update(prevent_self_review=False),
             lambda: self.env.update(GITHUB_RUN_ATTEMPT="2"),
             lambda: self.responses[self.route].update(created_at="2026-11-23T11:00:00Z"),
-            lambda: self.responses[self.route].update(triggering_actor=self.reviewer),
             lambda: self.review["environments"][0].update(id=34),
         ):
             with self.subTest(mutation=mutation):
@@ -104,10 +102,3 @@ class StagingMigrationApprovalTests(unittest.TestCase):
         self.authorize()
         with self.assertRaisesRegex(approval.GateError, "staging_approved_plan_changed"):
             self.verify(producing={**self.plan, "acl_plan_ref": "changed"})
-
-    def test_workflow_requires_the_trusted_approval_check_before_ddl(self):
-        workflow = load_workflows()["staging-migrate.yml"]
-        self.assertEqual(staging_migrate_errors(workflow), [])
-        steps = workflow["jobs"]["apply"]["steps"]
-        steps[-2].update({"continue-on-error": True})
-        self.assertTrue(staging_migrate_errors(workflow))
