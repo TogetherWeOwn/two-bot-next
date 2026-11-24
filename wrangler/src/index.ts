@@ -73,6 +73,7 @@ import {
   receiverEnabled,
   relayReceiverResponse,
 } from "./internal-actions.ts";
+import { handleLiveSnapshotRelay, type SnapshotScope } from "./live-snapshot-relay.ts";
 import {
   EVENTSUB_PATH,
   EVENTSUB_RECEIVER_BIND,
@@ -912,6 +913,24 @@ export class TwoBotContainer extends Container<Env> {
       await this.requireStagingUse();
       try { return await operation(); }
       finally { await this.requireStagingUse(); }
+    });
+  }
+
+  /** Unmounted composition. Static so the DO instance exposes no snapshot RPC. */
+  static relayLiveSnapshot(
+    bot: TwoBotContainer,
+    request: Request,
+    clientKey: string,
+    stampedDeploymentId: string,
+    scope?: SnapshotScope,
+  ): Promise<Response> {
+    return handleLiveSnapshotRelay(request, clientKey, scope, {
+      whileOwned: (operation) => bot.owned(operation),
+      fence: bot.ownership,
+      deploymentId: bot.id(),
+      stampedDeploymentId,
+      running: () => bot.ctx.container?.running === true,
+      fetch: (forward, port) => bot.containerFetch(forward, port),
     });
   }
 

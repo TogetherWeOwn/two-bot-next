@@ -14,10 +14,10 @@ export const LIVE_SNAPSHOT_TIMEOUT_MS = 2_250; // Inside the Web loader's 2.5-se
 const buckets = new TokenBuckets({ capacity: 20, refillPerSecond: 1 });
 let inFlight = 0;
 
-type SnapshotScope = { keyId: string; guildId: string };
+export type SnapshotScope = { keyId: string; guildId: string };
 
 interface OwnedReceiver {
-  // A future DO adapter must supply TwoBotContainer.owned, which also checks staging use.
+  // TwoBotContainer.owned also checks staging use.
   whileOwned<T>(operation: () => Promise<T>): Promise<T>;
   fence: Pick<OwnershipFence, "require">;
   deploymentId: string;

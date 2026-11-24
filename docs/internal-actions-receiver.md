@@ -42,16 +42,23 @@ a gap. A cut expires 30 seconds after its observation and remains unavailable
 while it exceeds the snapshot size limit. The serving action registry and
 ingress have no `live.snapshot` entry.
 
-An unregistered Worker seam forwards the Web hub's signed `POST /internal/actions`
+The unregistered Worker relay accepts the Web hub's signed `POST /internal/actions`
 under a dedicated `DISCORD_LIVE_SNAPSHOT_KEY_ID` and `DISCORD_GUILD_ID` scope.
-It requires an owned, running receiver and serves validated direct v1 JSON up
-to 1 MiB with `Cache-Control: no-store`. With no scope it refuses the request.
-Before activation, choose whether `BOT_ENDPOINT_URL` will use a separate
-snapshot HTTPS origin at the same signed path or whether the existing Bot
-origin will dispatch separately to the snapshot and action-envelope handlers.
-That change must register the Worker and Bot handlers, connect the DO ownership
-and staging-use gate, and provision the dedicated snapshot credential and
-guild scope under the existing holds. Web still checks freshness and cursor coverage.
+The unmounted `TwoBotContainer` adapter uses the existing ownership and staging-use
+gate and a running receiver. The relay serves validated direct v1 JSON up to
+1 MiB with `Cache-Control: no-store`. With no scope it refuses the request.
+Offline tests call the adapter directly with a signed Web-shaped request and
+an in-memory receiver peer. The Rust receiver tests exercise the unmounted
+handler's signature checks, durable replay prevention and guild recovery state.
+
+Web currently uses `BOT_ENDPOINT_URL` for both snapshots and ordinary actions
+at the same signed path. Activation needs agreement with Web on dispatch. A
+shared origin must dispatch snapshots to the dedicated relay and private Rust
+handler while preserving the ordinary action envelope. A dedicated origin
+requires a separate snapshot origin setting in Web so ordinary callers keep
+their endpoint. Either choice requires mounting the Worker and Rust boundaries
+and provisioning the dedicated snapshot credential and guild scope under the
+existing holds. Web still checks freshness and cursor coverage.
 
 No signing key, secret custodian or export authority is supplied by this code.
 Key creation and transfer into the website's staging secret store stay on HOLD
