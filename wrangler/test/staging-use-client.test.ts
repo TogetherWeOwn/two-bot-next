@@ -70,6 +70,33 @@ test("staging client: stop requires a confirmed stop on the same epoch and activ
   assert.equal(wrongRun.calls.length, 1);
 });
 
+test("staging client: registry absence requires an explicit stopped receipt for this attempt", async () => {
+  const absent = { ...args, action: "automod-absent" };
+  const sampled = { ...state, registry: "absent", unexpected: "raw registry sentinel" };
+  const h = responses([Response.json(sampled)]);
+  const proof = await stagingUse(absent, h.send, async () => {}, clock);
+  assert.equal(proof.action, "automod-absent");
+  assert.equal(proof.registry, "absent");
+  assert.equal(proof.command, "automod-preview");
+  assert.equal(proof.running, false);
+  assert.equal(JSON.stringify(proof).includes(sampled.unexpected), false);
+  assert.deepEqual(h.calls.map(({ url, init }) => [url.pathname, init.method, init.body]),
+    [["/internal/staging-use", "GET", undefined]]);
+  assert.equal(new Headers(h.calls[0].init.headers).get("x-two-staging-preview"),
+    [args.deploymentId, args.sha, args.runId, args.runAttempt, args.expiresAt].join(":"));
+  for (const [reply, error] of [
+    [Response.json(state), /staging_preview_absence_unconfirmed/],
+    [Response.json(sampled, { status: 503 }), /staging_preview_absence_unconfirmed/],
+    [Response.json({ ...sampled, running: true }), /staging_stop_unconfirmed/],
+    [Response.json({ ...sampled, use: { ...use, phase: "released" } }), /staging_window_mismatch/],
+    [Response.json({ ...sampled, use: { ...use, runAttempt: 1 } }), /staging_window_mismatch/],
+  ] as const) {
+    const refused = responses([reply]);
+    await assert.rejects(stagingUse(absent, refused.send, async () => {}, clock), error);
+    assert.equal(refused.calls.length, 1);
+  }
+});
+
 test("staging client CLI: stop defaults its timeout when the override is unset", () => {
   const dir = mkdtempSync(join(tmpdir(), "staging-use-cli-test-"));
   try {

@@ -418,6 +418,83 @@ test("staging preview extends readiness without extra cold lifecycle activity", 
   }
 });
 
+test("staging registry absence is a stopped, authenticated GET under the exact lease", async (t) => {
+  const { application_id: app, guild_id: guild } = detail;
+  const env = { ...BOUNDED_STAGING_ENV, GUILD_ID: guild, DISCORD_APPLICATION_ID: app };
+  const window = stagingWindow(), sha = env.CONTAINER_RELEASE;
+  const grant = { ...window, deploymentId: ID, sha, epoch: 1, acquiredAt: Date.now(), phase: "active" };
+  const h = await harness(t, env, { values: new Map<string, unknown>([[OWNER_KEY, ACTIVE_OWNER], [STAGING_USE_KEY, grant]]) });
+  const edge = { ...env, TWO_BOT: { getByName: () => h.bot } } as unknown as Env;
+  const binding = [ID, sha, window.runId, window.runAttempt, window.expiresAt].join(":");
+  const request = (headers = {}, method = "GET", query = "") => probeRequest(
+    `https://worker.invalid${STAGING_USE_PATH}${query}`, { method,
+      headers: { authorization: `Bearer ${CONTROL_TOKEN}`, [PREVIEW_HEADER]: binding, ...headers } });
+  const send = (req = request()) => worker.fetch(req, edge);
+  const sibling = { ...detail, name: "help" };
+  const defaultSlash = { id: "18446744073709551615", version: "18446744073709551615",
+    application_id: app, guild_id: guild, name: "rank" };
+  let list = Response.json([sibling, defaultSlash]);
+  let botId = app;
+  let afterList = () => {};
+  const calls: string[] = [];
+  const mock = t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+    calls.push(url);
+    assert.equal(init.method, "GET");
+    assert.equal(init.redirect, "error");
+    assert.ok(init.signal);
+    assert.equal(new Headers(init.headers).get("authorization"), `Bot ${env.DISCORD_TOKEN}`);
+    if (url === "https://discord.com/api/v10/users/@me") return Response.json({ id: botId, bot: true });
+    assert.equal(url, `https://discord.com/api/v10/applications/${app}/guilds/${guild}/commands`);
+    afterList();
+    return list;
+  });
+  for (const [req, status] of [[request({ authorization: "Bearer wrong" }), 401],
+    [request({}, "POST"), 405], [request({}, "GET", "?ignored"), 400],
+    [request({ [PREVIEW_HEADER]: "other-window" }), 503]] as const) {
+    assert.equal((await send(req)).status, status);
+  }
+  h.runtime.running = true;
+  assert.equal((await send()).status, 503);
+  h.runtime.running = false;
+  assert.equal(mock.mock.callCount(), 0);
+  const ok = await send();
+  assert.equal(ok.status, 200);
+  assert.match(ok.headers.get("cache-control") ?? "", /no-store/);
+  assert.deepEqual(await ok.json(), { deploymentId: ID, sha, owner: ACTIVE_OWNER,
+    use: grant, running: false, registry: "absent" });
+  assert.equal(calls.length, 2);
+  botId = "wrong-app";
+  assert.equal((await send()).status, 503);
+  assert.equal(calls.length, 3);
+  botId = app;
+  for (const bad of [Response.json([detail]), Response.json([sibling, sibling]),
+    Response.json([{ ...defaultSlash, id: "18446744073709551616" }]),
+    Response.json([{ ...defaultSlash, version: "18446744073709551616" }]),
+    Response.json([defaultSlash, { ...sibling, name: defaultSlash.name }]),
+    Response.json([null]), Response.json({ commands: [] }), Response.json([{ ...sibling, guild_id: "wrong" }]),
+    new Response(`[{${JSON.stringify(sibling).slice(1, -1)},"na\\u006de":"other"}]`),
+    new Response(new Uint8Array([91, 34, 255, 34, 93])),
+    new Response("[]", { status: 403 }), Response.redirect("https://redirect.invalid/"),
+    new Response(" ".repeat(256 * 1024 + 1))]) {
+    list = bad;
+    const rejected = await send();
+    assert.equal(rejected.status, 503);
+    assert.deepEqual(await rejected.json(), { error: "ownership_fenced", reason: "operation_failed" });
+  }
+  list = Response.json([]);
+  afterList = () => { h.runtime.running = true; };
+  const resumed = await send();
+  assert.equal(resumed.status, 503);
+  assert.deepEqual(await resumed.json(), { error: "ownership_fenced", reason: "operation_failed" });
+  assert.deepEqual(h.values.get(STAGING_USE_KEY), grant);
+  h.runtime.running = false;
+  list = Response.json([]);
+  afterList = () => { h.values.set(STAGING_USE_KEY, { ...grant, phase: "released" }); };
+  assert.equal((await send()).status, 503);
+  assert.deepEqual(h.starts, []);
+  assert.deepEqual(h.requests, []);
+});
+
 for (const path of ["/health", "/readyz", "/version"]) {
   test(`bounded staging: idle ${path} cannot start or arm keepalive`, async (t) => {
     const h = await harness(t, BOUNDED_STAGING_ENV);
