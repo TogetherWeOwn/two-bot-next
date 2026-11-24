@@ -223,6 +223,13 @@ class ProductionApprovalTests(unittest.TestCase):
                                                 self.responses.__getitem__)
                 self.assertEqual(result["atomic_release"], selected)
 
+    def test_attendance_apply_refuses_without_protected_recovery(self):
+        for pending in (["480"], ["475", "479", "480", "481", "482"]):
+            with self.subTest(pending=pending), self.assertRaisesRegex(
+                    GateError, "^production_attendance_recovery_unavailable$"):
+                approval.require_supported_recovery({"expected_pending": pending})
+        approval.require_supported_recovery({"expected_pending": ["475", "479"]})
+
     def test_refuses_fresh_ledger_or_role_audit_drift(self):
         for field in ("ledger_before", "ledger_store_before", "audit"):
             with self.subTest(field=field):

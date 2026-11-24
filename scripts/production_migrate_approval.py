@@ -133,12 +133,19 @@ def recheck(producing, env, now, api=api_get):
     require(str(check_id) == env.get("APPROVAL_CHECK_ID"), "independent_production_approval_changed")
 
 
+def require_supported_recovery(claim):
+    # The ordinary migration workflow cannot couple this expansion to a
+    # compatible Worker/image recovery. Keep the refusal before DDL.
+    require("480" not in claim["expected_pending"], "production_attendance_recovery_unavailable")
+
+
 def main(args, env):
     try:
         now = datetime.now(timezone.utc)
         if len(args) == 3 and args[0] == "authorize":
             fresh, claim = (load_document(path) for path in args[1:])
             approval = authorize(fresh, claim, env, now)
+            require_supported_recovery(claim)
             with Path(env["GITHUB_OUTPUT"]).open("a") as output:
                 for key, value in approval.items():
                     print(f"{key}={value}", file=output)

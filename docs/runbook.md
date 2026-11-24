@@ -2822,6 +2822,13 @@ timeouts. For an uncertain commit, classify both
 ledgers and role state before retrying. A committed change still requires
 an independently qualified recovery route before rollout.
 
+The ordinary production migration workflow refuses plans that apply
+Cutover 0480. The database inverse verifies both ledgers and role
+states, and retains 0475, but still needs a protected release path
+that authenticates a stopped writer and ties the verified inverse
+to the prior Worker and image takeover. The disposable rehearsal
+does not authorize a live inverse.
+
 ### Redeploy the approved revision
 
 With the correct revision already selected in a separate clean operator checkout,

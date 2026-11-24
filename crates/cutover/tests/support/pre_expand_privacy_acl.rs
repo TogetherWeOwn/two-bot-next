@@ -346,6 +346,12 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     // positive undo, before the existing fixture inserts attendance rows.
     assert_undo_refused(
         &migrator,
+        "SELECT setval('public.event_voice_sessions_id_seq', 2, false)",
+        "new schema contains evidence",
+    )
+    .await;
+    assert_undo_refused(
+        &migrator,
         "SELECT nextval('public.event_voice_sessions_id_seq')",
         "new schema contains evidence",
     )
@@ -683,7 +689,10 @@ async fn exercise_schema_undo(migrator: &PgPool) {
     undo_tx.commit().await.unwrap();
 }
 
-const SCHEMA_UNDO: &str = include_str!("../fixtures/production_schema_undo.sql");
+const SCHEMA_UNDO: &str = concat!(
+    include_str!("../fixtures/production_schema_undo.sql"),
+    include_str!("../../../../sql/release_schema_inverse.sql"),
+);
 
 async fn assert_undo_refused(migrator: &PgPool, seed: &str, message: &str) {
     let mut refusal = migrator.begin().await.unwrap();
