@@ -145,4 +145,4 @@ the claim. In **Review deployments**, select `staging-migrate-apply` and enter
 binds the full claim and producing artifact ID and archive digest.
 
 Apply checks approval within 23h30m of dispatch. Retry or change inputs with a new dispatch and approval.
-Reuse a matching plan and review its audit findings, including expected missing objects.
+Reuse a plan only when the apply dispatch's fresh read-only plan matches both ledgers and audit findings.
