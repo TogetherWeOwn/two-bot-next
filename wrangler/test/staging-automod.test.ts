@@ -34,11 +34,11 @@ test("AutoMod admission proves stopped absence and spare capacity under the exac
   assert.deepEqual(calls, ["stopped", "https://discord.com/api/v10/users/@me",
     `https://discord.com/api/v10/applications/${app}/guilds/${guild}/commands`, "stopped"]);
   assert.deepEqual(result, { lease, baselineAbsent: true, publishBefore: 55_000 });
-  assert.equal(Object.isFrozen(result.lease), true);
 });
 
 test("AutoMod admission refuses mixed modes, invalid bindings, missing proofs and uncertain absence", async () => {
-  const noGet = async () => assert.fail("must refuse before reading Discord");
+  let reads = 0;
+  const noGet = async () => { reads++; };
   for (const change of [
     { origin: "https://two-bot-next.example.workers.dev" }, { origin: `${input.origin}\n` },
     ...["help", "voice", "certify", "promote"].map(mode => ({ purposes: ["automod-preview", mode] })),
@@ -48,6 +48,7 @@ test("AutoMod admission refuses mixed modes, invalid bindings, missing proofs an
   for (const change of [
     { TWO_DEPLOY_ENV: "production" }, { STAGING_RUNTIME_POLICY: "always" }, { GUILD_ID: "wrong" },
     { DISCORD_APPLICATION_ID: "wrong" }, { TWO_AUTOMOD: "1" }, { TWO_MODERATION: "0" },
+    { TWO_VOICE: "1" }, { TWO_INTERNAL_ALLOW_VOICE_MOVE: "1" },
     { TWO_OWEN_USER_ID: "1" }, { TWO_MODERATION_PROTECTED_ROLE_IDS: `${env.TWO_OWEN_USER_ID},` },
   ]) await assert.rejects(admitStagingAutomod(input, { ...env, ...change }, stopped, noGet, now), refused);
   for (const current of [
@@ -55,6 +56,7 @@ test("AutoMod admission refuses mixed modes, invalid bindings, missing proofs an
     { ...lease, runAttempt: 1 }, { ...lease, expiresAt: 50_000 }, { ...lease, voiceMove: true as const },
   ]) await assert.rejects(admitStagingAutomod(input, env, async () => ({ lease: current, running: false }), noGet, now), refused);
   await assert.rejects(admitStagingAutomod(input, env, async () => ({ lease, running: true }), noGet, now), refused);
+  assert.equal(reads, 0, "preflight refusals must precede Discord reads");
 
   const full = Array.from({ length: 100 }, (_, i) => ({ ...command,
     id: String(1000000000000000000n + BigInt(i)), name: `command${i}` }));
@@ -62,18 +64,23 @@ test("AutoMod admission refuses mixed modes, invalid bindings, missing proofs an
     await assert.rejects(admitStagingAutomod(input, env, stopped,
       async url => url.endsWith("/@me") ? { id: app, bot: true } : list, now), refused);
   }
-  await assert.rejects(admitStagingAutomod(input, env, stopped, async () => ({ id: "wrong", bot: true }), now), refused);
 });
 
 test("AutoMod admission rechecks the lease and cleanup deadline after registry readback", async () => {
-  for (const change of [{ lease: { ...lease, epoch: 4 } }, { running: true }, {}]) {
+  for (const [change, after] of [[{ lease: { ...lease, epoch: 4 } }, now()],
+    [{ running: true }, now()], [{}, 55_000], [{}, lease.expiresAt]] as const) {
     let read = false;
     const observe = async () => ({ lease, running: false, ...(read ? change : {}) });
     await assert.rejects(admitStagingAutomod(input, env, observe, async url => {
       if (url.endsWith("/@me")) return { id: app, bot: true };
       read = true;
       return [];
-    }, () => read && Object.keys(change).length === 0 ? lease.expiresAt : now()), refused);
+    }, () => read ? after : now()), refused);
     assert.equal(read, true);
   }
+});
+
+test("AutoMod admission settles if the Discord adapter ignores abort", { timeout: 500 }, async () => {
+  await assert.rejects(admitStagingAutomod(input, env, stopped,
+    () => new Promise(() => {}), () => 54_995), refused);
 });

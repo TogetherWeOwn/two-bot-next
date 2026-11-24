@@ -1391,13 +1391,14 @@ mod preview_attempt_acceptance {
         let mut missing = request.clone();
         missing.data = None;
         let refreshes = AtomicUsize::new(0);
-        let use_resolved_policy = AtomicBool::new(false);
+        let resolved_mode = AtomicUsize::new(0);
         let run_until = |active, limit, request, receipt, deadline| {
             handle_automod_preview(active, &pool, limit, request, receipt, deadline, |guild| {
                 assert_eq!(guild, STAGING_GUILD_ID);
                 refreshes.fetch_add(1, Ordering::Relaxed);
-                use_resolved_policy.load(Ordering::Relaxed).then(|| {
-                    let mut config = runtime(false).effective_config();
+                let mode = resolved_mode.load(Ordering::Relaxed);
+                (mode != 0).then(|| {
+                    let mut config = runtime(mode == 2).effective_config();
                     config.policy.bad_words = vec!["synthetic".to_owned()];
                     config
                 })
@@ -1488,7 +1489,7 @@ mod preview_attempt_acceptance {
             ["automod-preview:4243", "rate_limited", rate_reason],
         ];
         assert_eq!(rows.fetch_all(&pool).await?, expected);
-        use_resolved_policy.store(true, Ordering::Relaxed);
+        resolved_mode.store(1, Ordering::Relaxed);
         let fresh = sample("4244");
         let fresh = run(active, &Mutex::default(), &fresh, RECEIPT_MS).await;
         assert_eq!(
@@ -1501,7 +1502,20 @@ mod preview_attempt_acceptance {
             activation.preview(AutomodRuntime::effective_config),
             runtime(true).effective_config()
         );
-        assert_eq!(count().await?, 3);
+        let protected = AutomodRuntime::new_staging_preview(
+            runtime(true).effective_config(),
+            two_bot_core::backup::guild_config::STAGING_BOT_APPLICATION_ID,
+            STAGING_GUILD_ID,
+            time::OffsetDateTime::now_utc() + time::Duration::minutes(1),
+        )
+        .expect("staging runtime");
+        let protected =
+            AutomodActivation::new(protected, ledger.clone(), facts.clone(), executor(&mock));
+        resolved_mode.store(2, Ordering::Relaxed);
+        let request = sample("4245");
+        let result = run(Some(&protected), &Mutex::default(), &request, RECEIPT_MS).await;
+        assert_eq!(result.metric, fresh.metric);
+        assert_eq!(count().await?, 4);
         assert_eq!(ledger.claims(), 3, "only the three gateway creates claim");
         assert_eq!(ledger.violations(), 0);
         assert_eq!(facts.target_calls(), 0);

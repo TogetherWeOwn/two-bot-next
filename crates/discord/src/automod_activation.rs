@@ -158,7 +158,7 @@ impl<L: AutomodClaimLedger, F: AutomodFacts> AutomodActivation<L, F> {
         let kind = delivery.kind;
         let (admitted, dry_run) = {
             let runtime = self.runtime();
-            if !runtime.accepts_member_messages() {
+            if runtime.is_staging_preview() {
                 return activation(FunnelDisposition::None, ActivationOutcome::Bypassed);
             }
             (

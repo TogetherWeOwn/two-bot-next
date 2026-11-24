@@ -1,12 +1,14 @@
 import { isSnowflake } from "./container-env.ts";
 import { MAX_STAGING_USE_MS, type StagingUse } from "./staging-lifecycle.ts";
-import { readPreviewAbsent, stagingPreviewScope, type PreviewEnv } from "./staging-preview.ts";
+import { readPreviewAbsent, type PreviewEnv } from "./staging-preview.ts";
 
-type Window = Readonly<StagingUse & { voiceMove?: true }>;
+type Window = Readonly<StagingUse>;
 type BootEnv = PreviewEnv & {
   TWO_DEPLOY_ENV?: string;
   STAGING_RUNTIME_POLICY?: string;
   TWO_AUTOMOD?: string;
+  TWO_VOICE?: string;
+  TWO_INTERNAL_ALLOW_VOICE_MOVE?: string;
   TWO_MODERATION?: string;
   TWO_OWEN_USER_ID?: string;
   TWO_MODERATION_PROTECTED_ROLE_IDS?: string;
@@ -23,6 +25,7 @@ type Admission = {
 };
 
 type Observation = { lease: Window; running: boolean };
+// Reuse the protected absence adapter's 256 KiB cap and strict JSON decoding.
 type DiscordGet = (url: string, token: string, signal: AbortSignal) => Promise<unknown>;
 
 function moderationId(value: string): boolean {
@@ -31,7 +34,7 @@ function moderationId(value: string): boolean {
 
 function sameLease(a: Window, b: Window, now: number): boolean {
   return a.environment === "staging" && b.environment === a.environment
-    && a.phase === "active" && b.phase === a.phase && a.voiceMove === undefined && b.voiceMove === undefined
+    && a.phase === "active" && b.phase === a.phase && !("voiceMove" in a) && !("voiceMove" in b)
     && a.deploymentId === b.deploymentId && a.sha === b.sha && a.epoch === b.epoch
     && a.runId === b.runId && a.runAttempt === b.runAttempt
     && a.acquiredAt === b.acquiredAt && a.expiresAt === b.expiresAt
@@ -54,9 +57,9 @@ export async function admitStagingAutomod(
   const roles = env.TWO_MODERATION_PROTECTED_ROLE_IDS ?? "";
   if (input.origin !== input.origin.trim() || !/^https:\/\/two-bot-next-staging\.[a-z0-9-]+\.workers\.dev$/.test(input.origin)
     || env.TWO_DEPLOY_ENV !== "staging" || env.STAGING_RUNTIME_POLICY !== "bounded"
-    || !stagingPreviewScope(env)
     || input.purposes.length !== 1 || input.purposes[0] !== "automod-preview"
-    || env.TWO_AUTOMOD === "1" || env.TWO_MODERATION !== "1" || !moderationId(env.TWO_OWEN_USER_ID ?? "")
+    || env.TWO_AUTOMOD === "1" || env.TWO_VOICE === "1" || env.TWO_INTERNAL_ALLOW_VOICE_MOVE === "1"
+    || env.TWO_MODERATION !== "1" || !moderationId(env.TWO_OWEN_USER_ID ?? "")
     || (roles !== "" && !roles.split(",").every(moderationId))
     || input.verifiedRecoveryPair !== true || input.verifiedRuntimeDatabase !== true
     || input.verifiedGatewayIntents !== true || !Number.isSafeInteger(cleanupReserveMs)
@@ -70,13 +73,21 @@ export async function admitStagingAutomod(
   };
   const at = await requireStopped();
   const signal = AbortSignal.timeout(Math.min(publishBefore - at, 8_000));
+  let expire = () => {};
+  const timedOut = new Promise<never>((_, reject) => {
+    expire = () => reject(refuse());
+    signal.addEventListener("abort", expire, { once: true });
+  });
   try {
-    if (await readPreviewAbsent(env, (url, token) => {
+    const read = readPreviewAbsent(env, (url, token) => {
       signal.throwIfAborted();
       return get(url, token, signal);
-    }) >= 100 || signal.aborted) throw refuse();
+    });
+    if (await Promise.race([read, timedOut]) >= 100 || signal.aborted) throw refuse();
   } catch {
     throw refuse();
+  } finally {
+    signal.removeEventListener("abort", expire);
   }
   await requireStopped();
   return { lease, baselineAbsent: true, publishBefore };

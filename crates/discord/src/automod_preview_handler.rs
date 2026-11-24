@@ -127,7 +127,11 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
             Instant::now,
             || {
                 let live = resolve_live(guild);
-                active.preview(|runtime| runtime.effective_preview_config(live))
+                active.preview(|runtime| {
+                    let mut config = live.unwrap_or_else(|| runtime.effective_config());
+                    config.dry_run |= runtime.is_staging_preview();
+                    config
+                })
             },
         ) {
             Ok(config) => config.map(|config| (guild, input, config)),

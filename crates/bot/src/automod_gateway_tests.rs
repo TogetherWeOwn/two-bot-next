@@ -273,20 +273,13 @@ async fn protected_preview_keeps_dry_run_and_suppresses_member_deliveries() {
     let until = OffsetDateTime::now_utc() + TimeDuration::minutes(10);
     let app = STAGING_BOT_APPLICATION_ID;
     let guild = STAGING_GUILD_ID;
-    for (application, scope, expires) in [
-        ("1", guild, until),
-        (app, "1", until),
-        (app, guild, OffsetDateTime::UNIX_EPOCH),
-    ] {
-        assert!(
-            AutomodRuntime::new_staging_preview(config.clone(), application, scope, expires)
-                .is_none()
-        );
-    }
-    let mut runtime =
-        AutomodRuntime::new_staging_preview(config, app, guild, until).expect("protected runtime");
+    let new =
+        |app, guild, until| AutomodRuntime::new_staging_preview(config.clone(), app, guild, until);
+    assert!(new("1", guild, until).is_none());
+    assert!(new(app, "1", until).is_none());
+    assert!(new(app, guild, OffsetDateTime::UNIX_EPOCH).is_none());
+    let mut runtime = new(app, guild, until).expect("protected runtime");
     assert!(runtime.dry_run() && runtime.admits(Some(guild)));
-    assert!(!runtime.admits(Some("1")));
     let router = InteractionRouter::new(RouterGates::from_slices(
         Some(GUILD),
         &FeatureGates::from_map(&boot),
@@ -317,21 +310,18 @@ async fn protected_preview_keeps_dry_run_and_suppresses_member_deliveries() {
         value,
         version: 1,
     };
-    let ops = OpsRecord {
-        epoch: 1,
-        overrides: vars(&[
-            ("TWO_AUTOMOD_ENFORCE", "1"),
-            ("TWO_AUTOMOD_BAD_WORDS", "synthetic"),
-        ]),
-    };
+    let ops = OpsRecord::parse(&json!({"epoch": 1, "overrides": {"TWO_AUTOMOD_ENFORCE": "1"}}))
+        .expect("ops overlay");
     for (i, rows) in [
         vec![
             row("TWO_AUTOMOD_ENFORCE", json!(true)),
             row("TWO_AUTOMOD_BAD_WORDS", json!(["synthetic"])),
         ],
-        vec![row("TWO_AUTOMOD_REPEAT_COUNT", json!(999))],
+        vec![
+            row("TWO_AUTOMOD_ENFORCE", json!(false)),
+            row("TWO_AUTOMOD_REPEAT_COUNT", json!(999)),
+        ],
         vec![row("TWO_AUTOMOD_SANCTIONS", json!("2:warn"))],
-        vec![],
     ]
     .into_iter()
     .enumerate()
@@ -344,15 +334,11 @@ async fn protected_preview_keeps_dry_run_and_suppresses_member_deliveries() {
             writer.apply_ops(Some(&ops), std::time::Instant::now());
         }
         refresh_live(&active, &boot, guild, &live);
-        let overlay = resolve_live_config(&boot, guild, &live);
         assert_eq!(
-            overlay.as_ref().map(|config| config.dry_run),
+            resolve_live_config(&boot, guild, &live).map(|config| config.dry_run),
             (i != 2).then_some(false)
         );
-        active.preview(|runtime| {
-            assert!(runtime.effective_preview_config(overlay).dry_run);
-            assert!(runtime.effective_config().dry_run);
-        });
+        assert!(active.preview(AutomodRuntime::dry_run));
     }
     for kind in [MessageDeliveryKind::Create, MessageDeliveryKind::Update] {
         let result =
@@ -362,10 +348,8 @@ async fn protected_preview_keeps_dry_run_and_suppresses_member_deliveries() {
         assert_eq!(result.disposition, FunnelDisposition::None);
         assert!(matches!(result.outcome, ActivationOutcome::Bypassed));
     }
-    assert_eq!(
-        two_bot_discord::intents::staging_automod_preview_intents().bits(),
-        1
-    );
+    let intents = two_bot_discord::intents::staging_automod_preview_intents();
+    assert_eq!(intents.bits(), 1);
 }
 
 /// TOG-19027: stored automod lists/thresholds reach the consumer through

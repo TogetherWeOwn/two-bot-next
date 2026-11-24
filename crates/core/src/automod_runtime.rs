@@ -231,10 +231,10 @@ impl AutomodRuntime {
         Some(runtime)
     }
 
-    /// The protected preview runtime consumes no member deliveries, even after expiry.
+    /// The protected preview mode remains in force after expiry.
     #[must_use]
-    pub fn accepts_member_messages(&self) -> bool {
-        self.staging_preview_until.is_none()
+    pub fn is_staging_preview(&self) -> bool {
+        self.staging_preview_until.is_some()
     }
 
     #[must_use]
@@ -247,7 +247,7 @@ impl AutomodRuntime {
     /// boot-time `enabled` gate, guild scope and repeat history are preserved.
     /// Returns true when anything observable changed.
     pub fn apply_live_config(&mut self, config: &AutomodConfig) -> bool {
-        let dry_run = self.staging_preview_until.is_some() || config.dry_run;
+        let dry_run = self.is_staging_preview() || config.dry_run;
         if self.config.policy == config.policy && self.config.dry_run == dry_run {
             return false;
         }
@@ -283,14 +283,6 @@ impl AutomodRuntime {
     #[must_use]
     pub fn effective_config(&self) -> AutomodConfig {
         self.config.clone()
-    }
-
-    /// Apply the same dry-run interlock to the detached preview settings read.
-    #[must_use]
-    pub fn effective_preview_config(&self, live: Option<AutomodConfig>) -> AutomodConfig {
-        let mut config = live.unwrap_or_else(|| self.effective_config());
-        config.dry_run |= self.staging_preview_until.is_some();
-        config
     }
 
     /// Evaluate one synthetic preview message read-only (automod preview
@@ -338,13 +330,10 @@ impl AutomodRuntime {
     /// Call only after winning the durable delivery claim. Retries must replay
     /// the stored outcome, not observe the repeat tracker or award the funnel.
     pub fn inspect(&mut self, delivery: &MessageDelivery) -> Inspection {
-        if !self.accepts_member_messages() {
-            return Inspection::Ignore;
-        }
         let Some(guild_id) = delivery.guild_id.as_deref() else {
             return Inspection::Ignore;
         };
-        if !self.scope.permits(guild_id) {
+        if self.is_staging_preview() || !self.scope.permits(guild_id) {
             return Inspection::Ignore;
         }
         if !self.config.enabled {

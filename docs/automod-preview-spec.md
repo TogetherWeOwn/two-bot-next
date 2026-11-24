@@ -669,36 +669,22 @@ expectations, never as behavior changes).
 
 ### Protected staging readback
 
-The dormant AutoMod-only admission consumes the protected lifecycle's
-authoritative lease and stopped state under its ownership gate. It requires
-the exact run, attempt, build, deployment, owner epoch and deadline, the
-existing staging app and guild, a verified recovery pair and database binding,
-gateway-intent evidence, valid existing moderation configuration and a finite
-cleanup reserve. The baseline needs an affirmative GET absence result and a
-spare slash-command slot. Admission checks the same stopped lease again after
-the read. Help, voice, ordinary staging certification and promotion cannot
-share this mode. A durable voice selection also disqualifies the lease.
+Admission requires the exact stopped staging lease, verified recovery, database
+and gateway proofs, moderation eligibility, cleanup reserve and affirmative
+absence with spare registry capacity. Voice flags or selection disqualify it.
 
-A later boot must use a fresh isolated shard with the dedicated intents, with
-no saved gateway session or ordinary registry/publisher path. The isolated
-runtime suppresses member deliveries and keeps enforcement off at boot and
-through every settings overlay or fallback. The readback lane consumes no
-interactions. This source slice has no workflow or boot caller.
+Before wiring the protected caller, persist the sole AutoMod purpose on the
+lease, excluding Help, voice, ordinary certification and promotion. Boot a
+fresh shard with dedicated intents. Skip session resume, ordinary registry
+sync and interaction dispatch. Keep member intake and enforcement off.
 
-Before a later slice enables that caller, the lifecycle owner must persist the
-exact admitted lease, stopped and absent baseline, registry comparison evidence
-and single-command write intent before authorizing any Discord write. Recheck
-authority and reserve at the write boundary. Keep automatic guild registry
-publication disconnected and compare the full registry before and after the
-targeted change. Use the protected positive GET to verify the staged command.
-
-On expiry, cancellation or a lost write response, fence new work and drain
-in-flight publication before reconciling under the original durable intent.
-Keep the lifecycle held across restart until idempotent recovery confirms the
-staged command's exact identity or affirmative absence. Delete only the command
-attributable to that intent. An ambiguous match leaves the hold in place. Clear
-the intent and admit later uses only after affirmative absence and a confirmed
-runtime stop. Activation remains pending that publication and cleanup slice.
+Before any write, persist the stopped/absent baseline, registry comparison
+evidence and targeted intent under the exact lease. Recheck the lease and
+reserve at the write. Verify the full registry delta and positive GET.
+On expiry, cancellation or uncertain writes, fence and drain publication.
+Hold across restart and remove only the command attributable to that intent.
+Ambiguity keeps the hold in place. Clear intent and admit later uses only
+after affirmative absence and confirmed stop. Activation awaits those controls.
 
 ## 10. Spec self-check (doctest)
 

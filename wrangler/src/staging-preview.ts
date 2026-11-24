@@ -19,9 +19,6 @@ const EMPTY = ["choices", "options", "channel_types"];
 const refuse = () => new Error("staging_preview_registry_mismatch");
 export type PreviewEnv = { GUILD_ID?: string; DISCORD_APPLICATION_ID?: string; DISCORD_TOKEN?: string };
 type DiscordGet = (url: string, token: string) => Promise<unknown>;
-export function stagingPreviewScope(env: PreviewEnv): boolean {
-  return env.GUILD_ID === GUILD && env.DISCORD_APPLICATION_ID === APP;
-}
 export async function previewRefusal(request: Request, url: URL, token?: string): Promise<Response | null> {
   const reply = (status: number, extra = {}) =>
     new Response(null, { status, headers: withSecurityHeaders({ "cache-control": "no-store", ...extra }) });
@@ -43,7 +40,7 @@ function identity(row: Record<string, unknown> | undefined): boolean {
 
 async function registry(env: PreviewEnv, get: DiscordGet) {
   const token = env.DISCORD_TOKEN;
-  if (!stagingPreviewScope(env) || !token?.trim()) throw refuse();
+  if (env.GUILD_ID !== GUILD || env.DISCORD_APPLICATION_ID !== APP || !token?.trim()) throw refuse();
   const bot = record(await get(`${API}/users/@me`, token));
   if (bot?.id !== APP || bot.bot !== true) throw refuse();
   const list = await get(COMMANDS, token);
