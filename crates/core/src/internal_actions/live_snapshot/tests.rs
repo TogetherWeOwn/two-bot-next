@@ -36,18 +36,18 @@ struct Client {
     buckets: TokenBuckets,
     authority: Option<&'static LiveSnapshotReadAuthority<'static>>,
     now: WireTime,
-    nonce: u128,
+    nonce: String,
 }
 
 impl Client {
     fn new() -> Self {
         Self {
             keys: KeyRing::new(
-                [(READ_KEY, [1; 32]), (ACTION_KEY, [2; 32])]
+                [READ_KEY, ACTION_KEY]
                     .into_iter()
-                    .map(|(id, bytes)| SigningKey {
+                    .map(|id| SigningKey {
                         id: id.into(),
-                        secret: Secret::new(bytes.to_vec()),
+                        secret: Secret::new(rand::random::<[u8; 32]>().to_vec()),
                     })
                     .collect(),
             ),
@@ -56,7 +56,7 @@ impl Client {
             buckets: TokenBuckets::new(),
             authority: Some(&AUTHORITY),
             now: observed(),
-            nonce: 1,
+            nonce: hex::encode(rand::random::<[u8; 16]>()),
         }
     }
 
@@ -69,14 +69,8 @@ impl Client {
         // Freeze authentication time independently of the baseline lease tests.
         let seconds = observed().0.unix_timestamp();
         let timestamp = seconds.to_string();
-        let nonce = format!("{:032x}", self.nonce);
-        self.nonce += 1;
-        let signature = sign(
-            &[if key_id == READ_KEY { 1 } else { 2 }; 32],
-            &timestamp,
-            &nonce,
-            raw,
-        );
+        let nonce = std::mem::replace(&mut self.nonce, hex::encode(rand::random::<[u8; 16]>()));
+        let signature = sign(self.keys.keys[key_id].expose(), &timestamp, &nonce, raw);
         let headers = AuthHeaders {
             key_id,
             timestamp: &timestamp,
@@ -155,8 +149,9 @@ fn a_replayed_nonce_cannot_load_state_and_the_verb_stays_unregistered() {
     let mut client = Client::new();
     assert!(!is_implemented("live.snapshot"));
     let raw = b"{";
+    let nonce = client.nonce.clone();
     assert_eq!(client.refusal(raw, READ_KEY), ErrorCode::Malformed);
-    client.nonce -= 1;
+    client.nonce = nonce;
     assert_eq!(client.refusal(raw, READ_KEY), ErrorCode::Replayed);
 }
 
