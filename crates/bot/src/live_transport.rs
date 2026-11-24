@@ -109,4 +109,4 @@ fn build_client(connector: HttpsConnector<HttpConnector>) -> HttpClient {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

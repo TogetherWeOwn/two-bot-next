@@ -73,15 +73,21 @@ impl Recovery {
         generation: &Generation,
         now: WireTime,
     ) -> Option<&[u8]> {
-        if self.guild_id != guild_id || !self.is_current(generation) {
-            return None;
-        }
         let baseline = self.baseline.as_ref()?;
-        // Match the Web client's observation window and millisecond precision.
-        let age = now.unix_millis() - baseline.observed_at.unix_millis();
-        (-2_000..30_000)
-            .contains(&age)
+        self.allows_snapshot(guild_id, generation, baseline.observed_at, now)
             .then_some(baseline.snapshot.as_slice())
+    }
+
+    pub(crate) fn allows_snapshot(
+        &self,
+        guild_id: Id,
+        generation: &Generation,
+        observed_at: WireTime,
+        now: WireTime,
+    ) -> bool {
+        // Match the Web client's observation window and millisecond precision.
+        let age = now.unix_millis() - observed_at.unix_millis();
+        self.guild_id == guild_id && self.is_current(generation) && (-2_000..30_000).contains(&age)
     }
 
     /// The caller must establish completeness in this gateway generation before

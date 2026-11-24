@@ -3,8 +3,9 @@
 use std::num::NonZeroU64;
 
 use crate::realtime_wire::{
+    encode_snapshot,
     recovery::{Generation, Recovery},
-    Id, WireTime,
+    Id, Topics, WireTime,
 };
 
 use super::{
@@ -67,6 +68,24 @@ impl AuthorizedLiveSnapshotRead {
     ) -> Option<&'state [u8]> {
         let (recovery, generation) = load(self.0)?;
         recovery.read_snapshot(self.0, generation, now())
+    }
+
+    /// Encode an advancing cut. The owner must hold one ordered view across
+    /// the cursor, clock sample, and materialization of its complete topics.
+    pub fn read_current(
+        self,
+        recovery: &Recovery,
+        generation: &Generation,
+        (seq, observed_at): (u64, WireTime),
+        now: WireTime,
+        topics: impl FnOnce() -> Topics,
+    ) -> Option<Vec<u8>> {
+        if seq < recovery.baseline()?.seq
+            || !recovery.allows_snapshot(self.0, generation, observed_at, now)
+        {
+            return None;
+        }
+        encode_snapshot(self.0, seq, observed_at, &topics())
     }
 }
 
