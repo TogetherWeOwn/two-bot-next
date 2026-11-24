@@ -1,5 +1,6 @@
 """Prepare and attest protected, no-start staging recovery deployments."""
 
+import json
 import os
 from pathlib import Path
 import sys
@@ -103,14 +104,19 @@ def main(argv, env):
         if argv == ["plan"]:
             inputs = mapping(read_json(Path(env["GITHUB_EVENT_PATH"]), MAX_PLAN).get("inputs"))
             require(all(inputs.get(name, "false") == "false" for name in DRILLS), "recovery_drill_refused")
-            proof = verified_plan(read_json(Path("staging-schema-gate-manifest.json"), MAX_PLAN), env["GITHUB_SHA"])
+            proof = verified_plan(read_json(Path("staging-schema-gate-manifest.json"), MAX_PLAN),
+                                  env.get("RECOVERY_PLAN_SOURCE") or env["GITHUB_SHA"])
             with Path(env["GITHUB_OUTPUT"]).open("a") as out:
                 out.write(f"fingerprint={proof['target_fingerprint']}\n")
+                out.write(f"plan={json.dumps(proof, separators=(',', ':'))}\n")
             return 0
         source = env.get("DEPLOY_SHA")
-        require(matches(SHA, source) and source == env.get("GITHUB_SHA"), "recovery_requires_current_main")
+        reviewed = env.get("REVIEWED_SOURCE")
+        require(matches(SHA, source) and source == (reviewed or env.get("GITHUB_SHA")),
+                "recovery_requires_current_main_or_reviewed_source")
         mode, fingerprint = env.get("RECOVERY_MODE"), env.get("RECOVERY_FINGERPRINT")
         require(mode in ("bootstrap", "verified") and matches(HEX64, fingerprint), "recovery_plan_unavailable")
+        require(not reviewed or mode == "verified", "reviewed_source_requires_verified_recovery")
         token, account = env.get("OWNERSHIP_CONTROL_TOKEN", ""), env.get("CLOUDFLARE_ACCOUNT_ID")
         require(env.get("STAGING_WORKER_URL") in (ORIGIN, ORIGIN + "/") and 32 <= len(token) <= 4096,
                 "recovery_control_unavailable")
