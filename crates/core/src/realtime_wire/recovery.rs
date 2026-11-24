@@ -14,6 +14,7 @@ pub struct Baseline {
     pub seq: u64,
     pub topics: Topics,
     pub snapshot: Vec<u8>,
+    observed_at: WireTime,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -44,10 +45,16 @@ impl Recovery {
     /// Withdraw the old baseline before rebuilding. Old generation tokens no
     /// longer match; the delivery owner must also retire their queued attempts.
     pub fn begin(&mut self) -> Generation {
-        self.baseline = None;
+        self.retire();
         let generation = Generation(Arc::new(()));
         self.generation = Some(generation.clone());
         generation
+    }
+
+    /// Withdraw a published baseline and invalidate its generation immediately.
+    pub fn retire(&mut self) {
+        self.generation = None;
+        self.baseline = None;
     }
 
     pub fn is_current(&self, generation: &Generation) -> bool {
@@ -58,6 +65,23 @@ impl Recovery {
 
     pub fn baseline(&self) -> Option<&Baseline> {
         self.baseline.as_ref()
+    }
+
+    pub(crate) fn read_snapshot(
+        &self,
+        guild_id: Id,
+        generation: &Generation,
+        now: WireTime,
+    ) -> Option<&[u8]> {
+        if self.guild_id != guild_id || !self.is_current(generation) {
+            return None;
+        }
+        let baseline = self.baseline.as_ref()?;
+        // Match the Web client's observation window and millisecond precision.
+        let age = now.unix_millis() - baseline.observed_at.unix_millis();
+        (-2_000..30_000)
+            .contains(&age)
+            .then_some(baseline.snapshot.as_slice())
     }
 
     /// The caller must establish completeness in this gateway generation before
@@ -110,6 +134,7 @@ impl Recovery {
             seq,
             topics,
             snapshot,
+            observed_at,
         });
         Ok(marker)
     }
