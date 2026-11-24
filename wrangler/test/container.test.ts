@@ -19,7 +19,7 @@ import detail from "./fixtures/staging-automod-preview.json" with { type: "json"
 import databaseTargets from "./fixtures/staging-database-fingerprint.json" with { type: "json" };
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
 import { PREVIEW_HEADER } from "../src/staging-preview.ts";
-import { STAGING_USE_PATH, STAGING_USE_KEY, type StagingWindow } from "../src/staging-lifecycle.ts";
+import { STAGING_USE_PATH, STAGING_USE_KEY, VOICE_MOVE_LEASE_HEADER, type StagingWindow } from "../src/staging-lifecycle.ts";
 import { EMPTY_STATE, LOG_QUERY_URL, type MetricsAlertState } from "../src/alert-rules.ts";
 import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
 
@@ -877,6 +877,65 @@ test("bounded staging: unconfirmed expiry teardown persists a stop-only successo
   assert.equal(h.runtime.running, false);
   assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 0);
   assert.equal(h.starts.length, 1);
+});
+
+test("staging self-move stamps only its selected lease and reads OFF after release or interruption", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  const env = { ...BOUNDED_STAGING_ENV, INTERNAL_ACTIONS_INGRESS: "1",
+    TWO_INTERNAL_ACTIONS: "1", TWO_INTERNAL_ALLOW_VOICE_MOVE: "1" };
+  const inert = await harness(t, { ...env, TWO_INTERNAL_ALLOW_VOICE_MOVE: "0" });
+  const h = await harness(t, env);
+  const window = stagingWindow();
+  const off = () => h.bot.fetch(probeRequest(`https://worker.invalid${STAGING_USE_PATH}`,
+    { headers: { authorization: `Bearer ${CONTROL_TOKEN}` } })).then((r) => r.json());
+  const selected = { ...window, voiceMove: true as const };
+  const body = '{"action":"voice.move_member","discord_id":"111","channel_id":"222"}';
+  const delivered: (string | null)[] = [];
+  t.mock.method(h.bot, "containerFetch", async (request: Request) => {
+    assert.equal(await request.text(), body);
+    delivered.push(request.headers.get(VOICE_MOVE_LEASE_HEADER));
+    return Response.json({ ok: true, request_id: request.headers.get("x-request-id"), result: {} });
+  });
+  const send = () => h.bot.fetch(probeRequest("https://worker.invalid/internal/actions", { method: "POST", body,
+    headers: { "content-type": "application/json", "x-two-key-id": "fixture",
+      "x-two-timestamp": "1800000000", "x-two-nonce": "fixture",
+      "x-two-signature": "fixture", [VOICE_MOVE_LEASE_HEADER]: String(window.expiresAt) } }));
+  const refusal = await inert.bot.fetch(stagingUseRequest("acquire", selected));
+  assert.deepEqual([refusal.status, (await refusal.json()).reason, inert.values.has(STAGING_USE_KEY)], [503, "staging_use_required", false]);
+  assert.equal((await h.bot.fetch(stagingUseRequest("acquire", window))).status, 200);
+  assert.equal((await off()).voiceMoveEnabled, false);
+  const conflict = await h.bot.fetch(stagingUseRequest("acquire", selected));
+  assert.equal((await conflict.json()).reason, "staging_use_conflict");
+  h.runtime.running = true;
+  assert.equal((await send()).status, 200);
+  assert.equal((await h.bot.fetch(stagingUseRequest("release", window))).status, 200);
+  const opted = { ...selected, runId: "123457" };
+  assert.equal((await h.bot.fetch(stagingUseRequest("acquire", opted))).status, 200);
+  assert.equal((await off()).voiceMoveEnabled, true);
+  h.runtime.running = true;
+  t.mock.timers.setTime(window.expiresAt - 1_100);
+  assert.equal((await send()).status, 200);
+  t.mock.timers.setTime(window.expiresAt - 999);
+  assert.equal((await send()).status, 200);
+  assert.deepEqual(delivered, [null, String(window.expiresAt - 1_000), null]);
+  const failure = t.mock.method(h.runtime, "destroy", async () => { throw new Error("stop failed"); });
+  assert.equal((await h.bot.fetch(stagingUseRequest("release", { ...window, runId: opted.runId }))).status, 503);
+  const afterFailure = await off();
+  assert.deepEqual([afterFailure.use.phase, afterFailure.voiceMoveEnabled, afterFailure.running], ["released", false, true]);
+  assert.equal((await send()).status, 503);
+  failure.mock.restore();
+  await h.bot.stagingExpiry();
+  assert.equal((await off()).running, false);
+
+  const interrupted = { ...stagingWindow(), voiceMove: true as const, runId: "123458" };
+  assert.equal((await h.bot.fetch(stagingUseRequest("acquire", interrupted))).status, 200);
+  h.runtime.running = true;
+  t.mock.timers.setTime(interrupted.expiresAt);
+  assert.partialDeepStrictEqual(await off(), { voiceMoveEnabled: false, running: true });
+  await h.bot.stagingExpiry();
+  assert.partialDeepStrictEqual(await off(), { voiceMoveEnabled: false, running: false });
+  assert.ok(h.logs.some((line) => line.includes('"action":"expiry","outcome":"stopped"')
+    && line.includes('"voice_move_enabled":false') && line.includes('"run_id":"123458"')));
 });
 
 for (const env of [WORKER_ENV, { ...WORKER_ENV, TWO_DEPLOY_ENV: "production", STAGING_RUNTIME_POLICY: "bounded" }]) {

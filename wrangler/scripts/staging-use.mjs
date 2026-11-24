@@ -33,7 +33,8 @@ export function parseStagingState(value) {
   const ownership = parseOwnershipResponse(value);
   if (!ownership || !record(value) || typeof value.sha !== "string" || !SHA.test(value.sha)
     || !Object.hasOwn(value, "use") || !positive(ownership.owner?.epoch)
-    || ownership.owner.phase !== "active" || ownership.owner.deploymentId !== ownership.deploymentId) return null;
+    || ownership.owner.phase !== "active" || ownership.owner.deploymentId !== ownership.deploymentId
+    || (Object.hasOwn(value, "voiceMoveEnabled") && typeof value.voiceMoveEnabled !== "boolean")) return null;
   let use = null;
   if (value.use !== null) {
     const u = value.use;
@@ -47,7 +48,8 @@ export function parseStagingState(value) {
   }
   // Never project the audit actor or arbitrary success-body/debug fields.
   return { deploymentId: ownership.deploymentId, sha: value.sha, epoch: ownership.owner.epoch,
-    running: ownership.running, use };
+    running: ownership.running, use,
+    ...(Object.hasOwn(value, "voiceMoveEnabled") ? { voiceMoveEnabled: value.voiceMoveEnabled } : {}) };
 }
 
 // One deadline spans fetch, headers and the bounded body. Even an uncooperative
@@ -128,6 +130,8 @@ export async function stagingUse(args, send = fetch, pause = wait, now = Date.no
   require(typeof args.token === "string" && args.token.length >= 32, "staging_token_missing");
   require(["status", "observe", "acquire", "assert", "ready", "release", "stop", "automod-absent"].includes(args.action),
     "staging_action_invalid");
+  require(args.voiceMove === undefined || (args.action === "acquire" && args.voiceMove === true),
+    "staging_voice_move_invalid");
   // A release may be retried after expiry, but never extends that expiry.
   if (!["status", "observe"].includes(args.action)) binding(args, args.action === "release" ? Math.min(now(), args.expiresAt - 1) : now());
   let statusRetryDeadline = args.statusRetryDeadline;
@@ -192,12 +196,14 @@ export async function stagingUse(args, send = fetch, pause = wait, now = Date.no
     if (args.action === "stop") window(state, args, now());
     if (args.action === "release") require(sameRunWindow(state.use, args), "staging_window_mismatch");
     const change = { action: args.action, environment: "staging", deploymentId: args.deploymentId,
-      sha: args.sha, expectedEpoch: state.epoch, runId: args.runId, runAttempt: args.runAttempt, expiresAt: args.expiresAt };
+      sha: args.sha, expectedEpoch: state.epoch, runId: args.runId, runAttempt: args.runAttempt, expiresAt: args.expiresAt,
+      ...(args.voiceMove === true ? { voiceMove: true } : {}) };
     state = await control({ method: "POST", body: JSON.stringify(change) });
     identity(state, args);
     require(state.epoch === epoch, "staging_epoch_mismatch");
   }
   window(state, args, now(), args.action === "release" ? "released" : "active");
+  if (args.voiceMove) require(state.voiceMoveEnabled === true, "staging_voice_move_unconfirmed");
   if (args.action === "release" || args.action === "stop") require(!state.running, "staging_stop_unconfirmed");
   if (args.action === "ready") {
     // Never grant readiness beyond expiry. The existing rollout gate still

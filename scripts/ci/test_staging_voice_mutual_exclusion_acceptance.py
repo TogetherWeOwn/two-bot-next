@@ -74,6 +74,7 @@ USER_FLOW = "synthetic-user-flow.yml"
 CONTAINER = "staging-container-drill.yml"
 ROLLBACK = "staging-rollback-drill.yml"
 MCP = "staging-mcp-proveout.yml"
+VOICE_MOVE = "staging-voice-move.yml"
 PRODUCTION = "deploy-production.yml"
 SOAK = "soak"
 PUBLISHER = "staging-soak-evidence"
@@ -102,6 +103,7 @@ INHERITED_GUARD = "inputs.staging_use_expires_at != ''"
 EXPLICIT_STANDALONE_GUARD = STANDALONE_GUARD + " && !inputs.deploy_staging_call"
 EXPLICIT_INHERITED_GUARD = "(inputs.deploy_staging_call || " + INHERITED_GUARD + ")"
 MAIN_ONLY = "github.ref == 'refs/heads/main'"
+VOICE_MOVE_GUARD = f"inputs.verify_lease && {MAIN_ONLY} && github.ref_protected && github.run_attempt == 1"
 # (workflow, job) that must hold the canonical group when run standalone,
 # and whether the hold must be job-level (to keep sibling prod probes free).
 STANDALONE_HOLDERS = {(VOICE, "synthetic"): False,
@@ -611,6 +613,11 @@ def repository_errors(wfs, canonical):
         measurement = file == MEASUREMENT and is_measurement_caller(workflow, canonical)
         if file == MEASUREMENT and not measurement:
             errors.append(f"{file}: dispatch, canonical lock, guards or staging authority changed")
+        if file == VOICE_MOVE:
+            job = (workflow.get("jobs") or {}).get("verify-lease") or {}
+            if (events(workflow) != ("workflow_dispatch",) or job.get("if") != VOICE_MOVE_GUARD
+                    or "concurrency" in job or workflow.get("concurrency") != voice_move_queue(canonical)):
+                errors.append(f"{file}: dispatch must hold the guarded canonical lifecycle lock")
         triggers = tuple(t for t in events(workflow) if t != "workflow_call")
         nodes = [("workflow", workflow)] + list((workflow.get("jobs") or {}).items())
         for name, node in nodes:
@@ -627,6 +634,7 @@ def repository_errors(wfs, canonical):
             touches = STAGING_TOUCH.search(str(node)) or "staging" in env
             classified = (file in (DEPLOY, *CONSUMERS) or (file, name) in holders
                           or (file == STAGING_SOAK and admitted_soak(wfs))
+                          or (file == VOICE_MOVE and name == "verify-lease")
                           or (measurement and (name in MEASUREMENT_STAGING_JOBS or name in MEASUREMENT_CALLS))
                           or (file, name) in EXEMPT)
             if touches and not classified:
@@ -649,6 +657,11 @@ def squash(value):
 def expr(text):
     return f"${{{{ {text} }}}}"
 
+
+def voice_move_queue(canonical):
+    return {"group": expr(f"{VOICE_MOVE_GUARD} && '{canonical}' || "
+                          "format('staging-voice-move-refused-{0}-{1}', github.run_id, github.run_attempt)"),
+            "cancel-in-progress": "false", "queue": "max"}
 
 GUARD_SHA = expr("needs.guard.outputs.sha")
 # Ordinary guarded deploy only: rollback and the live-SHA cure never queue on
@@ -883,6 +896,7 @@ def target_fixture(group=FIXTURE_GROUP):
     deploy = wfs[DEPLOY]
     deploy["concurrency"] = dict(lock)
     wfs[MEASUREMENT]["concurrency"] = measurement_queue(group)
+    wfs[VOICE_MOVE]["concurrency"] = voice_move_queue(group)
     jobs = deploy["jobs"]
     for workflow in (deploy, wfs[VOICE], wfs[HELP]):
         strip_staging_use(workflow)

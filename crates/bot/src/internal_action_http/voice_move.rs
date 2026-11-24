@@ -1,6 +1,7 @@
 //! Signed, keyless terminal receipt for a staged move.
-use super::{json, AuthDecision, ErrorCode, Failure, ReceiverState, Value};
+use super::{json, one_header, AuthDecision, ErrorCode, Failure, ReceiverState, Value};
 use crate::gateway::GatewayState;
+use axum::http::HeaderMap;
 use std::{
     sync::{atomic::Ordering, Arc},
     time::Duration,
@@ -12,11 +13,36 @@ use tokio::{
 use tracing::Instrument;
 use two_bot_core::{
     backup::guild_config::TWO_STAGING_GUILD_ID as GUILD,
+    internal_action_config::InternalActionConfig,
     internal_actions::{body_hash, VoiceMoveOutcome as Outcome, VoiceMoveRequest},
 };
 use two_bot_discord::executor::member::VoiceMoveRoster;
 
 const AUDIT_GRACE: Duration = Duration::from_secs(5);
+
+/// The wildcard listener uses the DO's private relay. Both public and DO
+/// intake rebuild the header set, so caller headers cannot supply this proof.
+/// Direct private binds still use their existing explicit startup gate.
+pub(super) fn lease_deadline(
+    config: &InternalActionConfig,
+    headers: &HeaderMap,
+    wire_deadline: Instant,
+    (instant, now_ms): (Instant, u64),
+) -> Option<Instant> {
+    if !config.listen_addr().ip().is_unspecified() {
+        return Some(wire_deadline);
+    }
+    let raw = one_header(headers, "x-two-voice-move-until", 16).ok()??;
+    if raw.starts_with('0') || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let remaining = raw.parse::<u64>().ok()?.checked_sub(now_ms)?;
+    // Bound late delivery as well as a timely request.
+    if remaining == 0 || remaining > 20_000 {
+        return None;
+    }
+    Some(wire_deadline.min(instant + Duration::from_millis(remaining)))
+}
 
 pub(super) async fn execute(
     state: &Arc<ReceiverState>,

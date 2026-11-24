@@ -754,18 +754,27 @@ async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_mem
             ("TWO_DEPLOY_ENV".to_owned(), deploy_env.to_owned()),
             ("TWO_INTERNAL_ALLOW_VOICE_MOVE".to_owned(), "1".to_owned()),
         ]));
-        let receiver = Arc::into_inner(state(
+        let mut receiver = Arc::into_inner(state(
             db.pool().clone(),
             Arc::new(MockEffect::new(MockOutcome::Success)),
         ))
         .unwrap();
+        receiver.config = config_with_bind("0.0.0.0:8091");
         Arc::new(receiver.with_voice_move(&flags, executor.clone()))
     };
     let payload =
         json!({"action":"voice.move_member","discord_id":MEMBER,"channel_id":TARGET}).to_string();
+    let with_lease = |mut request: Request, expires: u64| {
+        request.headers_mut().insert(
+            "x-two-voice-move-until",
+            expires.to_string().parse().unwrap(),
+        );
+        request
+    };
+    let lease = |request| with_lease(request, now_ms() + 15_000);
     let (status, _, body) = answer(
         router(state_for("production")),
-        signed_read(&payload, "old"),
+        lease(signed_read(&payload, "old")),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -777,12 +786,20 @@ async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_mem
     let pipeline = seed_move_pipeline(inner.voice_cache.clone(), clock.clone()).await;
     inner.gateway_state = connected_gateway();
     let app = router(receiver);
-    let (parts, _) = signed_read(&payload, "old").into_parts();
+    let (parts, _) = lease(signed_read(&payload, "old")).into_parts();
     let tampered = Request::from_parts(parts, Body::from(payload.replace(MEMBER, OTHER)));
     assert_eq!(
         answer(app.clone(), tampered).await.0,
         StatusCode::UNAUTHORIZED
     );
+    for request in [
+        signed_read(&payload, "old"),
+        with_lease(signed_read(&payload, "old"), now_ms()),
+    ] {
+        let (status, _, body) = answer(app.clone(), request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "action_not_allowed");
+    }
     mock.assert_wires(0);
 
     for (room, outcome, wires) in [
@@ -793,7 +810,7 @@ async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_mem
         let delivery = nonce();
         let (status, _, body) = answer(
             app.clone(),
-            signed_read_with_nonce(&payload, "old", &delivery),
+            lease(signed_read_with_nonce(&payload, "old", &delivery)),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -823,7 +840,7 @@ async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_mem
     }
 
     publish_move_room(&pipeline, MEMBER, Some(SOURCE)).await;
-    let (status, _, body) = answer(app.clone(), signed_read(&payload, "old")).await;
+    let (status, _, body) = answer(app.clone(), lease(signed_read(&payload, "old"))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["result"],
@@ -847,7 +864,7 @@ async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_mem
     .execute(db.pool())
     .await
     .unwrap();
-    let (status, _, body) = answer(app, signed_read(&payload, "old")).await;
+    let (status, _, body) = answer(app, lease(signed_read(&payload, "old"))).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(body["error"]["code"], "discord_unavailable");
     assert_eq!(body["error"]["retryable"], true);
@@ -868,6 +885,25 @@ async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_mem
         .occupancy(MEMBER.parse().unwrap(), TARGET.parse().unwrap(), 0)
         .is_err());
     db.close().await.unwrap();
+}
+
+#[test]
+fn voice_move_lease_clamps_wire_deadline_and_refuses_ambiguous_headers() {
+    let now = Instant::now();
+    let wire = now + Duration::from_secs(5);
+    let config = config_with_bind("0.0.0.0:8091");
+    let check = |map: &HeaderMap| voice_move::lease_deadline(&config, map, wire, (now, 10_000));
+    let mut headers = HeaderMap::new();
+    for raw in ["010001", "10001x", "10000", "30001"] {
+        headers.insert("x-two-voice-move-until", HeaderValue::from_static(raw));
+        assert_eq!(check(&headers), None);
+    }
+    headers.insert("x-two-voice-move-until", HeaderValue::from_static("30000"));
+    assert_eq!(check(&headers), Some(wire));
+    headers.insert("x-two-voice-move-until", HeaderValue::from_static("10001"));
+    assert_eq!(check(&headers), Some(now + Duration::from_millis(1)));
+    headers.append("x-two-voice-move-until", HeaderValue::from_static("10002"));
+    assert_eq!(check(&headers), None);
 }
 
 async fn signed_voice_move(uncertain: bool, with_retry_after: bool) {

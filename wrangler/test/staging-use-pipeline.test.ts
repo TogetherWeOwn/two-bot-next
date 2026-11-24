@@ -125,6 +125,35 @@ test("begin persists attempt and chosen expiry before acquire, then acquires and
   assert.equal(result.use.phase, "active");
 });
 
+test("self-move selection and cleanup require affirmative, exact lease readback", async () => {
+  const begin = { ...base, action: "begin", voiceMove: true, expectedSha: SHA, minutes: 10 };
+  const f = fixture();
+  const invoke = async (args: any) => {
+    const value = await f.invoke(args);
+    return { ...value, voiceMoveEnabled: value.use?.phase === "active" };
+  };
+  await assert.rejects(pipelineUse(begin, f.invoke, clock), code("staging_voice_move_unconfirmed"));
+  assert.deepEqual(f.called(), ["status"]);
+  const ready = await pipelineUse(begin, invoke, clock);
+  assert.deepEqual([ready.voiceMoveEnabled, f.calls.find((call) => call.action === "acquire")?.voiceMove], [true, true]);
+  const finish = { ...base, action: "finish", voiceMove: true, expiresAt: ready.use.expiresAt };
+  const lostReply = async (args: any) => {
+    const value = await invoke(args);
+    if (args.action === "release") throw new StagingUseError("staging_transport_failed");
+    return value;
+  };
+  const off = await pipelineUse(finish, lostReply, clock);
+  assert.deepEqual([off.use.phase, off.running, off.voiceMoveEnabled], ["released", false, false]);
+  assert.deepEqual(f.called().slice(-3), ["status", "release", "status"]);
+  for (const invalid of [{ voiceMoveEnabled: undefined }, { voiceMoveEnabled: true }, { running: true }, { epoch: 8 }]) {
+    let statusReads = 0;
+    const withoutProof = async (args: any) => ({
+      ...await invoke(args), ...(args.action === "status" && ++statusReads === 2 ? invalid : {}),
+    });
+    await assert.rejects(pipelineUse(finish, withoutProof, clock), code("staging_voice_move_cleanup_unconfirmed"));
+  }
+});
+
 test("deploy begin pins the independent receipt before any mutation", async () => {
   for (const over of [{ sha: SHA2 }, { deploymentId: "dep-2" }]) {
     const f = fixture();

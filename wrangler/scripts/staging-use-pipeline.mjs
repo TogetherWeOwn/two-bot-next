@@ -18,10 +18,13 @@ export async function pipelineUse(args, invoke = stagingUse, now = Date.now, emi
   require(["begin", "consume", "restore-check", "rebind", "finish"].includes(args.action), "staging_pipeline_action_invalid");
   require(typeof args.runId === "string" && /^[1-9][0-9]{0,19}$/.test(args.runId)
     && positive(args.runAttempt), "staging_run_invalid");
+  require(args.voiceMove === undefined || (args.voiceMove === true && ["begin", "finish"].includes(args.action)),
+    "staging_voice_move_invalid");
   if (args.action === "begin") {
     require(positive(args.minutes) && args.minutes <= MAX_WINDOW_MINUTES, "staging_window_invalid");
     require(args.expiresAt === undefined, "staging_pipeline_begin_inherited");
     require(args.acquireOnly === undefined || typeof args.acquireOnly === "boolean", "staging_pipeline_mode_invalid");
+    require(!args.voiceMove || !args.acquireOnly, "staging_voice_move_invalid");
     require(args.expectedSha === undefined || (typeof args.expectedSha === "string"
       && /^[0-9a-f]{40}$/.test(args.expectedSha)), "staging_identity_invalid");
   } else require(positive(args.expiresAt), "staging_window_invalid");
@@ -67,10 +70,23 @@ export async function pipelineUse(args, invoke = stagingUse, now = Date.now, emi
       const result = { schema: "two-bot-staging-pipeline.v1", action: "not-owned", environment: "staging",
         runId: args.runId, runAttempt: args.runAttempt, observedAt: new Date(now()).toISOString() };
       emit(result);
+      require(!args.voiceMove, "staging_voice_move_cleanup_unconfirmed");
       return result;
     }
     require(sameWindow(state.use, args), "staging_window_mismatch");
-    return call("release", { sha: state.sha, deploymentId: state.deploymentId, expiresAt: args.expiresAt });
+    const release = { sha: state.sha, deploymentId: state.deploymentId, expiresAt: args.expiresAt };
+    if (!args.voiceMove) return call("release", release);
+    try { await call("release", release); }
+    catch (error) {
+      // A lost reply is ambiguous. Read back before judging and never resend.
+      if (!(error instanceof StagingUseError)) throw error;
+    }
+    const off = await call("status");
+    require(sameWindow(off.use, args) && (off.use.phase === "released" || now() >= off.use.expiresAt)
+      && off.running === false && off.voiceMoveEnabled === false && off.epoch === state.epoch
+      && off.sha === state.sha && off.deploymentId === state.deploymentId,
+    "staging_voice_move_cleanup_unconfirmed");
+    return off;
   }
   let expiresAt;
   if (args.action === "begin") {
@@ -81,6 +97,8 @@ export async function pipelineUse(args, invoke = stagingUse, now = Date.now, emi
     // standalone consumers may discover the currently serving build instead.
     if (args.sha !== undefined) require(state.sha === args.sha && state.deploymentId === args.deploymentId,
       "staging_identity_mismatch");
+    if (args.voiceMove) require(state.voiceMoveEnabled === false
+      || (state.voiceMoveEnabled === true && sameAttempt(state.use, args)), "staging_voice_move_unconfirmed");
     // A retry cannot mint a longer window, even when its first acquire/ready
     // response was lost. A released or expired attempt can never begin again.
     if (sameAttempt(state.use, args)) {
@@ -103,11 +121,13 @@ export async function pipelineUse(args, invoke = stagingUse, now = Date.now, emi
   // can still be released by the parent; the native alarm is the last resort.
   emit({ schema: "two-bot-staging-pipeline.v1", action: "window", environment: "staging",
     ...binding, runId: args.runId, runAttempt: args.runAttempt, observedAt: new Date(now()).toISOString() });
-  const acquired = await call("acquire", binding);
+  const acquired = await call("acquire", args.voiceMove ? { ...binding, voiceMove: true } : binding);
   // Deploy uses its existing rollout/readiness gate (including intentional
   // failure drills). Do not hide that verdict behind a second readiness loop.
   if (args.action === "begin" && args.acquireOnly) return acquired;
-  return call("ready", binding);
+  const ready = await call("ready", binding);
+  if (args.voiceMove) require(ready.voiceMoveEnabled === true, "staging_voice_move_unconfirmed");
+  return ready;
 }
 
 if (isDirectInvocation(process.argv[1], import.meta.url)) {
@@ -133,12 +153,15 @@ if (isDirectInvocation(process.argv[1], import.meta.url)) {
     require(path, "staging_receipt_required");
     require(process.env.STAGING_USE_ACQUIRE_ONLY === undefined || process.env.STAGING_USE_ACQUIRE_ONLY === "1",
       "staging_pipeline_mode_invalid");
+    require(process.env.STAGING_USE_VOICE_MOVE === undefined || process.env.STAGING_USE_VOICE_MOVE === "1",
+      "staging_voice_move_invalid");
     await pipelineUse({ action: process.argv[2], url: process.env.STAGING_WORKER_URL,
       token: process.env.OWNERSHIP_CONTROL_TOKEN, runId: process.env.GITHUB_RUN_ID,
       runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT), minutes: Number(process.env.STAGING_USE_MINUTES),
       expiresAt: process.env.STAGING_USE_EXPIRES_AT === undefined ? undefined : Number(process.env.STAGING_USE_EXPIRES_AT),
       sha: process.env.STAGING_USE_SHA, deploymentId: process.env.STAGING_USE_DEPLOYMENT,
       expectedSha: process.env.STAGING_USE_EXPECTED_SHA,
+      voiceMove: process.env.STAGING_USE_VOICE_MOVE === "1" ? true : undefined,
       acquireOnly: process.env.STAGING_USE_ACQUIRE_ONLY === "1" }, stagingUse, Date.now, emit);
   } catch (error) {
     const code = error instanceof StagingUseError ? error.code : "staging_pipeline_failed";

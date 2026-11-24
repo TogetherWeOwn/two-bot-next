@@ -61,9 +61,14 @@ fn secret(index: usize) -> String {
 }
 
 fn config() -> InternalActionConfig {
+    config_with_bind("127.0.0.1:8091")
+}
+
+fn config_with_bind(bind: &str) -> InternalActionConfig {
     InternalActionConfig::from_map(&HashMap::from([
         ("TWO_INTERNAL_ACTIONS".to_owned(), "1".to_owned()),
-        ("TWO_INTERNAL_BIND".to_owned(), "127.0.0.1:8091".to_owned()),
+        ("TWO_INTERNAL_BIND".to_owned(), bind.to_owned()),
+        ("TWO_INTERNAL_CONTAINER".to_owned(), "1".to_owned()),
         (
             "TWO_INTERNAL_KEYS".to_owned(),
             format!("old:{},new:{}", secret(0), secret(1)),
