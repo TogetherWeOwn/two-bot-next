@@ -339,6 +339,11 @@ async fn topology_and_roster_share_receive_order_with_voice_and_events() {
         if kind == "GUILD_ROLE_DELETE" {
             assert!(cut.members.values().all(|row| row.role_ids.is_empty()));
         }
+        if row[1]["guild_id"] == "10"
+            && (kind == "GUILD_MEMBER_REMOVE" || (kind == "CHANNEL_DELETE" && row[1]["id"] == "20"))
+        {
+            assert!(cut.voice.is_empty(), "{kind} must clear its voice rows");
+        }
     }
     assert!(!disabled.enabled());
     let cut = active(&live).expect("ordered cut");
@@ -374,6 +379,7 @@ async fn voice_only_is_encoded_once_in_receive_order_and_retried_unchanged() {
     receive(&mut live, VOICE);
     receive(&mut live, &VOICE.replace(r#""20""#, r#""21""#));
     receive(&mut live, &VOICE.replace(r#""20""#, "null"));
+    assert!(active(&live).unwrap().voice.is_empty());
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut retry = true;
@@ -579,10 +585,10 @@ async fn shutdown_drops_in_flight_and_buffered_work_with_intake_still_alive() {
 
 #[tokio::test]
 async fn signed_worker_requires_a_covering_snapshot_after_a_gap() {
-    use crate::live_transport::tests::{web_signature, KEY_ID};
-    use http_body_util::BodyExt as _;
-    use hyper::{Method, StatusCode};
-    use std::cell::{Cell, RefCell};
+    use crate::live_transport::tests::{loopback_transport, web_signature, KEY_ID};
+    use axum::{routing::post, Router};
+    use hyper::{body::Bytes, HeaderMap, StatusCode};
+    use tokio::net::TcpListener;
     use two_bot_core::{
         clock_guard::ClockGuard,
         internal_action_store::InternalActionStore,
@@ -612,7 +618,7 @@ async fn signed_worker_requires_a_covering_snapshot_after_a_gap() {
         id: authority.key_id.into(),
         secret: secret.clone(),
     }]);
-    let pull = async |source: &LiveGateway<FakeWatermark>, now| {
+    let grant = async || {
         let body = br#"{"action":"live.snapshot","guild_id":"10"}"#;
         let now_ms = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as u64;
         let timestamp = (now_ms / 1000).to_string();
@@ -624,7 +630,7 @@ async fn signed_worker_requires_a_covering_snapshot_after_a_gap() {
             nonce: &nonce,
             signature: &signature,
         };
-        let grant = AuthenticatedRequest::verify(
+        AuthenticatedRequest::verify(
             &headers,
             body,
             &keys,
@@ -637,108 +643,124 @@ async fn signed_worker_requires_a_covering_snapshot_after_a_gap() {
         .await
         .unwrap()
         .authorize_live_snapshot(Some(&authority), &mut TokenBuckets::new())
-        .unwrap();
+        .unwrap()
+    };
+    let grants = [
+        grant().await,
+        grant().await,
+        grant().await,
+        grant().await,
+        grant().await,
+    ];
+    let mut grants = grants.into_iter();
+    let mut pull = |source: &LiveGateway<FakeWatermark>, now| {
         source
-            .read_snapshot(grant, || now)
+            .read_snapshot(grants.next().unwrap(), || now)
             .map(|body| decoded(&body))
     };
 
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let key = Secret::new(hex::encode(rand::random::<[u8; 32]>()));
-    let transport = LiveTransport::new("https://site.example", KEY_ID, key.clone()).unwrap();
-    let watermark = FakeWatermark::new(0);
-    let (mut live, receiver) = LiveGateway::for_guild(GUILD, watermark.clone());
-    let snapshot = RefCell::new(None::<Value>);
-    let cursor = Cell::new(0);
-    let minimum = Cell::new(0);
-    let attempts = RefCell::new(Vec::new());
-    let mut worker = std::pin::pin!(receiver.run(async |body| {
-        transport
-            .attempt_with(body, async |request| {
-                let (parts, raw) = request.into_parts();
-                let raw = raw.collect().await.unwrap().to_bytes();
-                assert_eq!(parts.method, Method::POST);
-                assert_eq!(parts.uri.path(), INGEST_PATH);
-                let headers = parts.headers;
+    let transport = loopback_transport(&listener, key.clone());
+    let (tx, mut attempts) = mpsc::channel(1);
+    let web = Router::new().route(
+        INGEST_PATH,
+        post(move |headers: HeaderMap, raw: Bytes| {
+            let tx = tx.clone();
+            let key = key.clone();
+            async move {
                 assert_eq!(headers["x-two-key-id"], KEY_ID);
                 let timestamp = headers["x-two-timestamp"].to_str().unwrap();
                 let nonce = headers["x-two-nonce"].to_str().unwrap();
                 let expected = web_signature(&key, timestamp, nonce, &raw);
                 assert_eq!(headers["x-two-signature"], expected.as_str());
-                let delta = decoded(&raw);
-                assert_eq!(delta["guild_id"], "10");
-                let seq = delta["seq"].as_u64().unwrap();
-                // Mirror the Web hub's cursor gate with a synthetic signed pull result.
-                let current = cursor.get();
-                let was_ready = minimum.get() == current;
-                minimum.set(minimum.get().max(seq));
-                let covered = snapshot.borrow().as_ref().and_then(|reply| {
-                    assert_eq!(reply["guild_id"], delta["guild_id"]);
-                    reply["seq"].as_u64().filter(|&cut| cut >= minimum.get())
-                });
-                let status = match covered {
-                    _ if seq <= current || (was_ready && current > 0 && seq == current + 1) => {
-                        cursor.set(current.max(seq));
-                        StatusCode::NO_CONTENT
-                    }
-                    Some(cut) => {
-                        cursor.set(cut);
-                        minimum.set(cut);
-                        StatusCode::NO_CONTENT
-                    }
-                    None => StatusCode::CONFLICT,
-                };
-                attempts.borrow_mut().push((seq, status));
-                Some(status)
-            })
-            .await
-    }));
-
-    receive(&mut live, READY);
-    let nonce = begin(&mut live);
-    complete(&mut live, &nonce);
-    receive(&mut live, VOICE);
-    let first = pull(&live, AT).await.unwrap();
-    assert_eq!(first["seq"], 3);
-    assert_eq!(
-        first["topics"]["voice"],
-        json!([{"userId":"31","channelId":"20"}])
+                let (reply, status) = oneshot::channel();
+                tx.send((decoded(&raw), reply)).await.unwrap();
+                status.await.unwrap()
+            }
+        }),
     );
-    snapshot.replace(Some(first));
-    assert!(worker.as_mut().now_or_never().is_none());
+    let server = tokio::spawn(async move { axum::serve(listener, web).await });
+    let mut applied = 0;
+    let mut minimum = 0;
+    let mut ingest = async |expected, snapshot: Option<&Value>| {
+        let (delta, reply) = attempts.recv().await.unwrap();
+        assert_eq!(delta["guild_id"], "10");
+        let seq = delta["seq"].as_u64().unwrap();
+        assert_eq!(seq, expected);
+        if seq <= applied {
+            reply.send(StatusCode::NO_CONTENT).unwrap();
+            return StatusCode::NO_CONTENT;
+        }
+        // Mirror the Web hub's cursor gate using the signed pull response.
+        let ready = applied > 0 && applied == minimum;
+        minimum = minimum.max(seq);
+        let cut = if ready && seq == applied + 1 {
+            Some(seq)
+        } else {
+            snapshot
+                .filter(|cut| cut["guild_id"] == delta["guild_id"])
+                .and_then(|cut| cut["seq"].as_u64())
+                .filter(|&cut| cut >= minimum)
+        };
+        let status = cut.map_or(StatusCode::CONFLICT, |cut| {
+            applied = cut;
+            minimum = cut;
+            StatusCode::NO_CONTENT
+        });
+        reply.send(status).unwrap();
+        status
+    };
 
-    receive(&mut live, VOICE); // Queued at 4, then retired before the worker can send it.
-    watermark.0.lock().unwrap().ack = Some(Ack::Lost);
-    receive(&mut live, VOICE); // May have committed 5.
-    assert!(pull(&live, AT).await.is_none());
-    let nonce = begin(&mut live);
-    complete(&mut live, &nonce);
-    let now = WireTime(AT.0 + time::Duration::seconds(30));
-    assert!(pull(&live, now).await.is_none());
-    assert!(worker.as_mut().now_or_never().is_none());
-    assert_eq!(cursor.get(), 3);
+    let watermark = FakeWatermark::new(0);
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, watermark.clone());
+    let (stop, shutdown) = oneshot::channel();
+    let scenario = async {
+        receive(&mut live, READY);
+        let nonce = begin(&mut live);
+        complete(&mut live, &nonce);
+        receive(&mut live, VOICE);
+        let first = pull(&live, AT).unwrap();
+        assert_eq!(first["seq"], 3);
+        assert_eq!(
+            first["topics"]["voice"],
+            json!([{"userId":"31","channelId":"20"}])
+        );
+        assert_eq!(ingest(2, Some(&first)).await, StatusCode::NO_CONTENT);
+        assert_eq!(ingest(3, None).await, StatusCode::NO_CONTENT);
 
-    live.receive(&VOICE.replace(r#""20""#, r#""21""#), now, |_| false)
-        .await;
-    let covering = pull(&live, now).await.unwrap();
-    assert_eq!(covering["seq"], 8);
-    assert_eq!(covering["observed_at"], "1970-01-01T00:00:30Z");
-    assert_eq!(
-        covering["topics"]["voice"],
-        json!([{"userId":"31","channelId":"21"}])
-    );
-    snapshot.replace(Some(covering));
-    assert!(worker.as_mut().now_or_never().is_none());
-    assert_eq!(cursor.get(), 8);
-    assert_eq!(
-        *attempts.borrow(),
-        [
-            (2, StatusCode::NO_CONTENT),
-            (3, StatusCode::NO_CONTENT),
-            (7, StatusCode::CONFLICT),
-            (8, StatusCode::NO_CONTENT),
-        ]
-    );
+        receive(&mut live, VOICE); // Queued at 4, then retired.
+        watermark.0.lock().unwrap().ack = Some(Ack::Lost);
+        receive(&mut live, VOICE); // May have committed 5.
+        assert!(pull(&live, AT).is_none());
+        let nonce = begin(&mut live);
+        complete(&mut live, &nonce);
+        let now = WireTime(AT.0 + time::Duration::seconds(30));
+        assert!(pull(&live, now).is_none());
+        assert_eq!(ingest(7, Some(&first)).await, StatusCode::CONFLICT);
+
+        live.receive(&VOICE.replace(r#""20""#, r#""21""#), now, |_| false)
+            .await;
+        let covering = pull(&live, now).unwrap();
+        assert_eq!(covering["seq"], 8);
+        assert_eq!(covering["observed_at"], "1970-01-01T00:00:30Z");
+        assert_eq!(
+            covering["topics"]["voice"],
+            json!([{"userId":"31","channelId":"21"}])
+        );
+        assert_eq!(ingest(8, Some(&covering)).await, StatusCode::NO_CONTENT);
+        stop.send(()).unwrap();
+    };
+    let worker = receiver.run_signed_until(async { shutdown.await.unwrap() }, &transport);
+    timeout(Duration::from_secs(10), async {
+        tokio::join!(worker, scenario)
+    })
+    .await
+    .unwrap();
+    assert_eq!(applied, 8);
     live.disconnect();
-    assert!(pull(&live, now).await.is_none());
+    assert!(pull(&live, AT).is_none());
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
     db.close().await.unwrap();
 }

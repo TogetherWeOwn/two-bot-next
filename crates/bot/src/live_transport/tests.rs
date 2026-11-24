@@ -123,7 +123,7 @@ async fn request_matches_web_verified_wire_fixture() {
     );
 }
 
-fn loopback_transport(listener: &TcpListener, key: Secret<String>) -> LiveTransport {
+pub(crate) fn loopback_transport(listener: &TcpListener, key: Secret<String>) -> LiveTransport {
     let mut transport = LiveTransport::new(ORIGIN, KEY_ID, key).unwrap();
     transport.endpoint = Secret::new(
         format!("http://{}{INGEST_PATH}", listener.local_addr().unwrap())
