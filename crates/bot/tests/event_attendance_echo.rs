@@ -1,6 +1,8 @@
 //! Round trip through the dormant Bot attendance path with synthetic event evidence.
 
-use serde_json::json;
+use std::future::Future;
+
+use serde_json::{json, Value};
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
 use two_bot::event_attendance::{
@@ -33,6 +35,8 @@ const EVENT_KEY: &str = "echo-fixture";
 const MEMBER: u64 = 300000000000000001;
 const CHANNEL: u64 = 400000000000000001;
 const ROOM: &str = "Fixture room";
+// Canonical Web signer body, without an idempotency key or guild selector.
+const READ_BODY: &[u8] = br#"{"action":"event.attendance.read","event_key":"echo-fixture"}"#;
 
 fn iso(at: OffsetDateTime) -> String {
     format_iso_millis(i64::try_from(at.unix_timestamp_nanos().div_euclid(1_000_000)).unwrap())
@@ -42,42 +46,46 @@ fn random_nonce() -> String {
     format!("{:032x}", rand::random::<u128>())
 }
 
-async fn signed_request(
-    store: &InternalActionStore,
-    key: &SigningKey,
-    keys: &KeyRing,
+struct SignedEcho<'a> {
+    store: &'a InternalActionStore,
+    key: SigningKey,
+    keys: KeyRing,
     now: u64,
-    nonce: &str,
-) -> Result<AttendanceReadRequest, ErrorCode> {
-    // The Web signer sends a canonical body with no idempotency key or guild selector.
-    let body = br#"{"action":"event.attendance.read","event_key":"echo-fixture"}"#;
-    let timestamp = now.to_string();
-    let signature = sign(key.secret.expose(), &timestamp, nonce, body);
-    let headers = AuthHeaders {
-        key_id: &key.id,
-        timestamp: &timestamp,
-        nonce,
-        signature: &signature,
-    };
-    let verified = AuthenticatedRequest::verify(
-        &headers,
-        body,
-        keys,
-        SKEW_SECONDS,
-        now * 1_000,
-        &mut ClockGuard::new(),
-    )
-    .map_err(|error| error.code)?;
-    let burned = verified
-        .burn_durably(store)
-        .await
+}
+
+impl SignedEcho<'_> {
+    async fn request(
+        &self,
+        flags: &InternalFlags,
+        body: &[u8],
+        sent_at: u64,
+        nonce: &str,
+    ) -> Result<AttendanceReadRequest, ErrorCode> {
+        let timestamp = sent_at.to_string();
+        let signature = sign(self.key.secret.expose(), &timestamp, nonce, body);
+        let headers = AuthHeaders {
+            key_id: &self.key.id,
+            timestamp: &timestamp,
+            nonce,
+            signature: &signature,
+        };
+        let verified = AuthenticatedRequest::verify(
+            &headers,
+            body,
+            &self.keys,
+            SKEW_SECONDS,
+            self.now * 1_000,
+            &mut ClockGuard::new(),
+        )
         .map_err(|error| error.code)?;
-    let flags = InternalFlags::from_map(
-        &[("TWO_INTERNAL_ALLOW_ATTENDANCE_READ".into(), "1".into())].into(),
-    );
-    burned
-        .authorize_attendance_read(&flags, &mut TokenBuckets::new())
-        .map_err(|error| error.code)
+        let burned = verified
+            .burn_durably(self.store)
+            .await
+            .map_err(|error| error.code)?;
+        burned
+            .authorize_attendance_read(flags, &mut TokenBuckets::new())
+            .map_err(|error| error.code)
+    }
 }
 
 #[tokio::test]
@@ -150,15 +158,31 @@ async fn exercise_echo(pool: PgPool) {
         observed_at: joined_at + Duration::seconds(1),
         ..observation
     };
+    assert!(
+        !OpenCapture::default()
+            .write_observation(pool, &observation)
+            .await
+            .unwrap(),
+        "default-off capture refuses an otherwise admissible join"
+    );
     assert!(capture.write_observation(pool, &observation).await.unwrap());
 
     let key = SigningKey {
         id: "echo-fixture".into(),
         secret: Secret::new(rand::random::<[u8; 32]>().to_vec()),
     };
-    let keys = KeyRing::new(vec![key.clone()]);
+    let signed = SignedEcho {
+        store: &store,
+        keys: KeyRing::new(vec![key.clone()]),
+        key,
+        now: now_secs,
+    };
+    let enabled = InternalFlags::from_map(
+        &[("TWO_INTERNAL_ALLOW_ATTENDANCE_READ".into(), "1".into())].into(),
+    );
     let echo = async |nonce: &str| {
-        let request = signed_request(&store, &key, &keys, now_secs, nonce)
+        let request = signed
+            .request(&enabled, READ_BODY, now_secs, nonce)
             .await
             .unwrap();
         read(request, pool, |scope| {
@@ -208,8 +232,9 @@ async fn exercise_echo(pool: PgPool) {
     upsert_event(pool, guild, &iso(now), &event).await.unwrap();
     let final_nonce = random_nonce();
     // Web Echo can freeze this v1 result. A real but short visit has zero whole minutes.
+    let finalized = echo(&final_nonce).await.unwrap();
     assert_eq!(
-        echo(&final_nonce).await.unwrap(),
+        finalized,
         json!({
             "v": 1,
             "event_key": EVENT_KEY,
@@ -227,12 +252,14 @@ async fn exercise_echo(pool: PgPool) {
         })
     );
     assert_eq!(
-        signed_request(&store, &key, &keys, now_secs, &final_nonce)
+        signed
+            .request(&enabled, READ_BODY, now_secs, &final_nonce)
             .await
             .err(),
         Some(ErrorCode::Replayed),
         "the same signed request cannot reach the finalized reader again"
     );
+    staged_echo_enablement_and_rollback(pool, &signed, &enabled, &finalized).await;
 
     let mark_ambiguous = async |ambiguous| {
         sqlx::query(
@@ -279,4 +306,115 @@ async fn exercise_echo(pool: PgPool) {
         Err(ReadRefusal::NotFound),
         "erased span"
     );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PullRefusal {
+    Request(ErrorCode),
+    Read(ReadRefusal),
+}
+
+// Web owns whether to pull and freeze. The fixture records those effects in
+// memory. The real Web parser and public projection are covered in two-web-next.
+#[derive(Default)]
+struct WebPeer {
+    pulls: usize,
+    frozen: Vec<Value>,
+}
+
+impl WebPeer {
+    async fn poll(
+        &mut self,
+        enabled: bool,
+        pull: impl Future<Output = Result<Value, PullRefusal>>,
+    ) -> Result<(), PullRefusal> {
+        if enabled {
+            self.pulls += 1;
+            self.frozen.push(pull.await?);
+        }
+        Ok(())
+    }
+}
+
+async fn staged_echo_enablement_and_rollback(
+    pool: &PgPool,
+    signed: &SignedEcho<'_>,
+    enabled: &InternalFlags,
+    finalized: &Value,
+) {
+    let disabled = InternalFlags::from_map(&Default::default());
+    let pull = async |flags: &InternalFlags, body: &[u8], sent_at, ticket: fn() -> bool| {
+        let request = signed
+            .request(flags, body, sent_at, &random_nonce())
+            .await
+            .map_err(PullRefusal::Request)?;
+        read(request, pool, |_| Some(ticket))
+            .await
+            .map_err(PullRefusal::Read)
+    };
+    let steady = async |flags: &InternalFlags| pull(flags, READ_BODY, signed.now, || true).await;
+
+    let stored_spans = async || {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT to_jsonb(span) FROM event_voice_sessions AS span WHERE guild_id = $1 ORDER BY id",
+        )
+        .bind(TWO_STAGING_GUILD_ID)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    };
+    let before = stored_spans().await;
+    assert_eq!(before.len(), 1);
+    let denied = Err(PullRefusal::Request(ErrorCode::ActionNotAllowed));
+
+    let mut web_first = WebPeer::default();
+    assert_eq!(web_first.poll(true, steady(&disabled)).await, denied);
+    assert_eq!(web_first.pulls, 1);
+    assert!(web_first.frozen.is_empty());
+    web_first.poll(true, steady(enabled)).await.unwrap();
+    assert_eq!(web_first.frozen.as_slice(), std::slice::from_ref(finalized));
+
+    let mut bot_first = WebPeer::default();
+    // A disabled peer issues no request, even with Bot able to serve this record.
+    bot_first.poll(false, steady(enabled)).await.unwrap();
+    assert_eq!(bot_first.pulls, 0);
+    assert!(bot_first.frozen.is_empty());
+    assert_eq!(
+        bot_first
+            .poll(
+                true,
+                pull(enabled, READ_BODY, signed.now - SKEW_SECONDS - 1, || true)
+            )
+            .await,
+        Err(PullRefusal::Request(ErrorCode::StaleRequest))
+    );
+    assert_eq!(
+        bot_first
+            .poll(true, pull(enabled, READ_BODY, signed.now, || false))
+            .await,
+        Err(PullRefusal::Read(ReadRefusal::Unavailable))
+    );
+    // A different verb is how the contract can introduce a breaking request.
+    let unsupported = br#"{"action":"event.attendance.read.v2","event_key":"echo-fixture"}"#;
+    assert_eq!(
+        bot_first
+            .poll(true, pull(enabled, unsupported, signed.now, || true))
+            .await,
+        denied
+    );
+    assert!(bot_first.frozen.is_empty());
+    bot_first.poll(true, steady(enabled)).await.unwrap();
+    assert_eq!(bot_first.frozen.as_slice(), std::slice::from_ref(finalized));
+
+    // Roll back Web first and then Bot. Also exercise Bot rollback while Web
+    // still pulls. Neither rollback purges the existing records.
+    let pulls = bot_first.pulls;
+    bot_first.poll(false, steady(enabled)).await.unwrap();
+    bot_first.poll(false, steady(&disabled)).await.unwrap();
+    assert_eq!(bot_first.pulls, pulls);
+    assert_eq!(web_first.poll(true, steady(&disabled)).await, denied);
+    web_first.poll(false, steady(&disabled)).await.unwrap();
+    assert_eq!(web_first.frozen, bot_first.frozen);
+    assert_eq!(bot_first.frozen.as_slice(), std::slice::from_ref(finalized));
+    assert_eq!(stored_spans().await, before);
 }
