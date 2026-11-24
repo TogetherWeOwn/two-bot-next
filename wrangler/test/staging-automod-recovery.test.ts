@@ -37,16 +37,17 @@ test("AutoMod recovery reloads the exact intent and receipt after restart", asyn
 });
 
 test("AutoMod recovery fences publication on expiry or cancellation without renewing authority", async () => {
-  for (const current of [lease, { ...lease, phase: "released" as const }]) {
+  for (const current of [undefined, { ...admission, lease: { ...lease, phase: "released" as const } },
+    { ...admission, publishBefore: intent.publishBefore - 1 }]) {
     const store = new Storage();
     const recovery = new StagingAutomodRecovery(store);
     let at = now();
-    let observed = lease as AutomodIntent["lease"];
+    let observed: { lease: AutomodIntent["lease"]; baselineAbsent: true; publishBefore: number } = admission;
     store.afterWrite = () => {
-      at = current === lease ? lease.expiresAt : now();
-      observed = current;
+      at = current ? now() : lease.expiresAt;
+      observed = current ?? admission;
     };
-    await assert.rejects(recovery.persistIntent(intent, async () => ({ ...admission, lease: observed }), () => at),
+    await assert.rejects(recovery.persistIntent(intent, async () => observed, () => at),
       /admission_mismatch/);
     assert.deepEqual(await recovery.pending(), intent);
     const registry = new Registry();
@@ -100,6 +101,7 @@ test("AutoMod recovery refuses a wrong scope, lease or command revision", async 
   await recovery.persistIntent(intent, observe, now);
   await assert.rejects(recovery.recordCreated({ ...created, intent: { ...intent, lease: wrongLease } }), /receipt_mismatch/);
   await assert.rejects(recovery.recordCreated({ ...created, intent: { ...intent, baseline: "c".repeat(64) } }), /receipt_mismatch/);
+  await assert.rejects(recovery.recordCreated({ ...created, intent: { ...intent, publishBefore: intent.publishBefore - 1 } }), /receipt_mismatch/);
   await assert.rejects(recovery.recordCreated({ intent, ...created, id: "18446744073709551616" }), /receipt_mismatch/);
   await recovery.recordCreated({ intent, ...created });
   await assert.rejects(recovery.recordCreated({ intent, ...other }), /receipt_mismatch/);
