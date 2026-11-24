@@ -218,7 +218,7 @@ jobs:
     # plan (`two-bot db roles plan`) and `two-bot db roles verify` must read
     # 0; deploy-production refuses any new build while findings remain (the
     # 2026-10-16 crash-loop: migrations 0424-0441 without the role reapply).
-    if: github.ref == 'refs/heads/main' && inputs.mode == 'apply' && github.run_attempt == 1
+    if: github.ref == 'refs/heads/main' && inputs.mode == 'apply'
     needs: [plan, claim]
     environment: production-migrate-apply
     # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
@@ -228,6 +228,12 @@ jobs:
     container:
       image: rust:1.100-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8
     steps:
+      - name: Refuse reruns of production migration apply
+        run: |
+          if [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then
+            echo "::error::Production migration apply requires a fresh plan and dispatch." >&2
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

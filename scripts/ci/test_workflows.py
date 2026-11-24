@@ -1647,8 +1647,6 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
     if plan.get("if") != "github.ref == 'refs/heads/main'":
         errors.append(f"{name}:plan: must run only from main")
     apply_condition = "github.ref == 'refs/heads/main' && inputs.mode == 'apply'"
-    if name == "production-migrate.yml":
-        apply_condition += " && github.run_attempt == 1"
     if apply.get("if") != apply_condition:
         errors.append(f"{name}:apply: must preserve dispatch and attempt restrictions")
     if apply.get("needs") != ["plan", "claim"]:
@@ -1675,6 +1673,12 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
             errors.append(f"{name}:apply: must load the verifier at the trusted workflow SHA")
     else:
         steps = apply.get("steps", [])
+        refusal = {"name": "Refuse reruns of production migration apply", "run": (
+            'if [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then\n'
+            '  echo "::error::Production migration apply requires a fresh plan and dispatch." >&2\n'
+            '  exit 1\nfi\n')}
+        if steps[:1] != [refusal]:
+            errors.append(f"{name}:apply: must fail on reruns before checkout")
         ddl = [i for i, step in enumerate(steps) if "--apply " in str(step.get("run", ""))]
         recheck = {
             "name": "Recheck the exact production approval",
@@ -9323,10 +9327,7 @@ class WorkflowTests(unittest.TestCase):
         for job_id in ("plan", "claim", "apply"):
             with self.subTest(mirror=job_id):
                 prod_job, stag_job = migrate["jobs"][job_id], staging["jobs"][job_id]
-                expected_condition = stag_job["if"]
-                if job_id == "apply":
-                    expected_condition += " && github.run_attempt == 1"
-                self.assertEqual(prod_job["if"], expected_condition)
+                self.assertEqual(prod_job["if"], stag_job["if"])
                 self.assertEqual(prod_job.get("runs-on"), stag_job.get("runs-on"))
 
     def test_staging_rollback_drill_shape_is_pinned(self):

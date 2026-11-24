@@ -154,7 +154,7 @@ class ProductionClaimTests(unittest.TestCase):
         self.assertNotIn("environment", claim)
         self.assertEqual(workflow["jobs"]["apply"]["needs"], ["plan", "claim"])
         rerunnable = deepcopy(workflow)
-        rerunnable["jobs"]["apply"]["if"] = "github.ref == 'refs/heads/main' && inputs.mode == 'apply'"
+        del rerunnable["jobs"]["apply"]["steps"][0]
         self.assertTrue(production_migrate_errors(rerunnable))
         claim["steps"][2]["run"] = claim["steps"][2]["run"].rsplit("python3", 1)[0]
         self.assertTrue(production_migrate_errors(workflow))

@@ -108,9 +108,10 @@ def authorize(fresh, claim, env, now, api=github):
     run = dispatch(env, api)
     verify_environment(api)
     require(build_claim(fresh, env) == claim, "production_approval_claim_changed")
+    require(claim["expected_pending"] or claim["expected_store_pending"], "production_migration_plan_empty")
     producing, artifact = authenticated_plan(claim["plan_run_id"], api, workflow=WORKFLOW_PATH, artifact_name=ARTIFACT)
-    require(build_claim(producing, env) == claim and stable_plan(producing) == stable_plan(fresh)
-            and bool(claim["expected_pending"] or claim["expected_store_pending"]), "production_migration_plan_changed")
+    require(build_claim(producing, env) == claim and stable_plan(producing) == stable_plan(fresh),
+            "production_migration_plan_changed")
     external_id = f"production-apply:{claim['plan_run_id']}:{artifact['archive_digest'].removeprefix('sha256:')}"
     check_id, approved_at = verify_check(api, run, external_id, now)
     plan_run = mapping(api(f"actions/runs/{claim['plan_run_id']}"))
