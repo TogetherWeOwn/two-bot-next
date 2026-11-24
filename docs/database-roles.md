@@ -321,6 +321,11 @@ Rollback is an operator-reviewed restoration of the prior ownership/ACL inventor
 and login configuration, not dropping groups or deleting data. Save that inventory
 before changing permissions. Never rotate/delete a credential as a side effect.
 
+For a separately authorized staging recovery to a pre-0482 build, restore
+the prior ACL by revoking the runtime and read-only migrator grants on
+`public.live_sequence_watermarks`. Preserve the table and verify roles with
+the recovery SHA before dispatching. The forward role plan restores the grants.
+
 ### Voice heat staging backout
 
 For separately authorized staging recovery to a pre-heat build with

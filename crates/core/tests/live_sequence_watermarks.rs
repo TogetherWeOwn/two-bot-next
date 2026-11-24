@@ -114,7 +114,31 @@ async fn sql_and_reservation_enforce_the_wire_bounds() {
         .execute(pool)
         .await
         .unwrap();
+    // The fixture uses one session here. A deferred trigger checks the setting
+    // during COMMIT, so the reservation fails if its local override disappears.
+    sqlx::raw_sql(
+        "SET synchronous_commit = 'off';
+         CREATE FUNCTION require_durable_reservation() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF current_setting('synchronous_commit') <> 'on' THEN
+             RAISE EXCEPTION 'reservation requires synchronous commit';
+           END IF;
+           RETURN NULL;
+         END;
+         $$;
+         CREATE CONSTRAINT TRIGGER require_durable_reservation
+         AFTER UPDATE ON public.live_sequence_watermarks DEFERRABLE INITIALLY DEFERRED
+         FOR EACH ROW EXECUTE FUNCTION require_durable_reservation();",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
     reserve(pool, guild, MAX_SEQ - 1, MAX_SEQ).await.unwrap();
+    let session_default: String = sqlx::query_scalar("SHOW synchronous_commit")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(session_default, "off");
     assert_eq!(read(pool, guild).await, Ok(MAX_SEQ));
     assert_eq!(
         reserve(pool, guild, MAX_SEQ, MAX_SEQ + 1).await,
