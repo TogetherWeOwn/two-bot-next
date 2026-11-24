@@ -188,8 +188,10 @@ class Rehearsal:
         hashed = hashlib.sha256(key.encode()).hexdigest()
         return self.sql(f"SELECT state FROM internal_idempotency WHERE key_hash = '{hashed}';")
 
-    def restore_database(self):
-        archive = run("docker", "exec", self.pg, "pg_dump", "-U", "postgres", "--format=p", self.database)
+    def snapshot_database(self):
+        return run("docker", "exec", self.pg, "pg_dump", "-U", "postgres", "--format=p", self.database)
+
+    def restore_database(self, archive):
         original = self.database
         self.database = f"event_cutoff_restored_{self.generation + 1}"
         self.sql(f"CREATE DATABASE {self.database};", "postgres")
@@ -241,12 +243,13 @@ class Rehearsal:
 
         self.stop_bot("current")
         self.stop_bot("retained")
-        self.restore_database()
+        self.restore_database(self.snapshot_database())
         self.restart_recorder_with_cutoff()
         self.start_bot("retained")
         answer = self.request("retained", "rollback-create", create)
         require(answer["code"] == "discord_rejected", "A restored rollback bypassed the cutoff")
         self.start_bot("current")
+        before_lost_claim = self.snapshot_database()
         self.set_policy("open")
         key = "lost-create"
         answer = self.paused("current", key, create, "after")
@@ -255,17 +258,27 @@ class Rehearsal:
         answer = self.request("retained", key, create)
         require(answer["code"] == "needs_reconciliation", "Rollback replay did not preserve ambiguity")
         self.stop_bot("retained")
-        self.restore_database()
+        self.restore_database(self.snapshot_database())
         self.restart_recorder_with_cutoff()
         self.start_bot("retained")
         require(self.claim(key) == "unknown", "Restored claim lost ambiguity")
         answer = self.request("retained", key, create)
         require(answer["code"] == "needs_reconciliation", "Restored replay did not preserve ambiguity")
 
+        self.stop_bot("retained")
+        self.restore_database(before_lost_claim)
+        self.restart_recorder_with_cutoff()
+        self.start_bot("retained")
+        require(self.claim(key) == "", "Preclaim backup unexpectedly contains the lost attempt")
+        # Force the orphaned original key through the retained Bot only in
+        # this fixture. Web must keep ambiguous work held across this restore.
+        answer = self.request("retained", key, create)
+        require(answer["code"] == "discord_rejected", "Restore without the claim bypassed the cutoff")
+
         entries = self.journal()
         denied = [operation for _, _, operation, outcome in entries if outcome == "denied"]
-        require(denied == ["create", "edit", "cancel", "create", "edit", "cancel", "create"],
-                "Expected ordered event denials on both runtimes and after restore")
+        require(denied == ["create", "edit", "cancel", "create", "edit", "cancel", "create", "create"],
+                "Expected ordered event denials on both runtimes and after both relevant restores")
         applied = [operation for _, _, operation, outcome in entries if outcome == "applied"]
         require(applied == ["role", "role", "create"], "Expected two role writes and one pre-cutoff event effect")
         require(all(row[3] != "unexpected" for row in entries), "Unexpected fixture mutation route")

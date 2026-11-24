@@ -208,14 +208,18 @@ PYTHONDONTWRITEBYTECODE=1 python3 tests/event_write_cutoff/rehearse.py \
   --current "$current_digest_reference" --retained "$retained_digest_reference"
 ```
 
-The recorder models the documented Discord permission decision and uses
-a fixture policy file external to the app database. The script records the
-policy order, intent and token admission at each barrier, per-route recorder
-counts, immutable Bot image references and the recorder source hash. A
-successful run proves the installed binaries exercise the modeled boundary.
-It does not establish that the live guild policy has been configured or read
-back. The same image may back both positions when the serving and retained
-receipts agree. Such a run covers two processes and the recorded rollback pair.
+The recorder models a guild-wide grant or denial for external events. Its
+policy file lives outside the app database. Real role hierarchy and channel
+overwrites require a separate effective-permission readback. The script records
+policy order, intent and token admission at each barrier, per-route counts,
+immutable Bot image references and the recorder source hash. It checks that an
+original key remains ambiguous after restoring a snapshot containing the claim.
+It also forces a synthetic request under that same key after restoring a
+snapshot from before the claim, to verify that the cutoff still denies the
+request. Web keeps ambiguous work held in both cases.
+
+The runner uses the current artifact's schema for both positions. The same
+image may back both positions when the serving and retained receipts agree.
 The full verdict requires both positive controls. A retained announcement
 transport using compiled WebPKI roots rejects the synthetic CA before the
 request reaches the recorder. Its announcement control remains incomplete
