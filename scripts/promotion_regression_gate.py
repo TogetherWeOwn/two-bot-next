@@ -47,6 +47,7 @@ from pathlib import Path
 import re
 import sys
 
+from build_identity import staging_source
 from script_intake import decode_legacy_json, unique_object as _unique_json_object
 
 RATIO_MARGIN = 1.5
@@ -142,7 +143,7 @@ def serving_run_promotes(revision, runs):
     """
     promoted = False
     for row in runs or []:
-        if not isinstance(row, dict) or row.get("head_sha") != revision:
+        if not isinstance(row, dict) or staging_source(row) != revision:
             continue
         if row.get("head_branch", "main") != "main":
             continue

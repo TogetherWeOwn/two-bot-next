@@ -6,6 +6,7 @@ import re
 SHA = re.compile(r"[0-9a-f]{40}")
 DIGITS = re.compile(r"[0-9]+")
 UNSTAMPED = "unknown"
+REVIEWED_STAGING_TITLE = "reviewed staging source "
 
 # Remote build IDs are `<run id>-<attempt>` (digits-digits); bound both the
 # total and each half so an overlong value never reaches diagnostics.
@@ -16,6 +17,21 @@ MAX_BUILD_ID_PART_LEN = 20
 def is_build_revision_shape(value):
     """Return whether a compiled revision is a canonical 40-character SHA."""
     return isinstance(value, str) and len(value) == 40 and SHA.fullmatch(value) is not None
+
+
+def reviewed_staging_run(run):
+    title = run.get("display_title")
+    return isinstance(title, str) and title.startswith(REVIEWED_STAGING_TITLE)
+
+
+def staging_source(run):
+    """Resolve the advertised source after the caller verifies the workflow origin."""
+    if not reviewed_staging_run(run):
+        return run.get("head_sha")
+    source = run["display_title"].removeprefix(REVIEWED_STAGING_TITLE)
+    if run.get("event") == "workflow_dispatch" and is_build_revision_shape(source):
+        return source
+    return None
 
 
 def is_build_id_shape(value):

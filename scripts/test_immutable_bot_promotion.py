@@ -259,6 +259,26 @@ class PromotionFixture(unittest.TestCase):
 
 
 class ImmutablePromotionIntakeTests(PromotionFixture):
+    def test_reviewed_artifact_binds_both_workflow_and_serving_shas(self):
+        workflow_sha = "e" * 40
+        with patch.multiple(sys.modules[__name__], ATTEMPT=1, BUILD="501-1", NAME="bot-promotion-501-1"):
+            self.github.run.update(run_attempt=1, head_sha=workflow_sha, event="workflow_dispatch",
+                                   display_title=f"reviewed staging source {SHA}")
+            run = self.github.run
+            self.assertEqual(self.certify(), 0)
+            archive = self.output_zip.read_bytes()
+            self.github = GitHubFixture(archive)
+            self.github.run = run
+            self.refused()  # Artifact metadata still names the serving SHA as the workflow head.
+            self.github.artifact["workflow_run"]["head_sha"] = workflow_sha
+            self.github.refreshed_run = {**run, "head_sha": "f" * 40}
+            self.github.run_reads = 0
+            self.refused()  # The workflow head changed between admission reads.
+            self.github.refreshed_run = None
+            self.assertEqual(self.admit(), 0)
+            self.assertEqual(self.mutations, [(STAGE_IMAGE, PROD_REPO)])
+            self.assertEqual(json.loads((self.out / "admitted.json").read_text())["receipt"]["source"]["sha"], SHA)
+
     def test_exact_staged_bytes_and_digest_reach_real_production_render_without_build(self):
         self.assertEqual(self.certify(), 0)
         self.github = GitHubFixture(self.output_zip.read_bytes())
