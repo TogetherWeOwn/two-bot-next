@@ -37,7 +37,7 @@ BROAD_STEP = "Full workspace sweep including ignored tests"
 PUBLIC_RUNNER = "ubuntu-latest"
 
 TIMEOUT_EXPR = "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}"
-CONTAINER_IMAGE = 'rust:1.100-trixie@sha256:e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31'
+CONTAINER_IMAGE = 'rust:1.100-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8'
 POSTGRES_IMAGE = 'postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722'
 REQUIRED_ENV = {'TWO_LFG_TESTDB_CI': '1',
  'TWO_GATEWAY_TEST_DATABASE_URL': 'postgresql://agent_test@localhost:5432/agent_test',
