@@ -119,7 +119,9 @@ async fn fifth_page_caps_and_cooldown_survives_failed_delivery() {
     drop(page);
     assert!(matches!(state.start(scope, id(4)), Err(Status::Busy)));
     advance(COOLDOWN).await;
-    assert!(state.start(scope, id(4)).is_ok());
+    let (late, _) = offer(state.start(scope, id(4)).unwrap());
+    advance(LIFETIME).await;
+    assert_eq!(late.confirm(), Err(Status::Expired));
 }
 
 #[tokio::test(start_paused = true)]
@@ -133,9 +135,9 @@ async fn full_session_and_cooldown_maps_refuse_without_eviction() {
     let other = invocation(8, 1, 3);
     assert!(matches!(state.start(other, id(4)), Err(Status::Busy)));
     advance(COOLDOWN).await;
+    drop(flights);
     let same_actor = invocation(1, 1, 9);
     assert_eq!(state.start(same_actor, id(5)).err(), Some(Status::Busy));
-    drop(flights);
     for actor in 2..=MAX_COOLDOWNS as u64 {
         drop(state.start(invocation(1, actor, 3), id(4)).unwrap());
     }
