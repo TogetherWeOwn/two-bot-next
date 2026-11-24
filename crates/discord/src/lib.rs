@@ -76,6 +76,8 @@ mod test_clock;
 pub mod test_wire;
 pub mod voice_rooms;
 pub mod voice_rooms_board;
+#[cfg(feature = "db")]
+pub mod warning_history;
 
 #[cfg(feature = "db")]
 pub use leveling_runtime::{
