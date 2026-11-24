@@ -262,8 +262,11 @@ applies rolling nominal windows when invoked: raw presence/voice rows use a
 requires full schema coverage, scoped reservation deletion and settled replay
 guards. The runtime lacks reservation DELETE, so both drains keep work queued
 and report overdue requests. Standalone erasure needs migrator-only audit access.
-Store's history backfill records author IDs without a guild key, so it also
-blocks both drains until its rows can be scoped safely.
+Store's history backfill records author IDs without a guild key. Both drains
+and standalone erasure require proof that the Store 0409 history table is
+empty. Execute checks the table under a writer-excluding lock held through
+commit. Dry run uses a read-only snapshot. Populated or unverifiable history
+defers the drains, and independent age-based expiry continues.
 Raw event attendance sessions expire strictly more than 90 elapsed days
 (2,160 hours) after `joined_at`, whether open or closed. Member erasure removes
 only that member's sessions in the requested guild. Attendance window records

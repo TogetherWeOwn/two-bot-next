@@ -15,10 +15,49 @@
 //! key and free-text reason, remains covered by the erasure manifest.
 
 use serde::Deserialize;
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Acquire, PgConnection, PgPool, Postgres, Transaction};
 
 pub(crate) const SCHEMA_GAP_REFUSAL: &str = "erasure schema coverage incomplete";
 pub(crate) const REPLAY_GUARD_REFUSAL: &str = "unresolved erasure replay guard";
+const HISTORY_GAP: &str = "uncovered identity: backfill_history_messages.author_id";
+
+// The scoped role plan assigns Store tables and their ledger to the public
+// schema owner. Bind to those catalog identities without needing ledger rows.
+const HISTORY_RELATION: &str = "
+    SELECT h.oid::bigint,
+           l.oid IS NOT NULL OR counts.oid IS NOT NULL,
+           COALESCE(
+               pg_catalog.current_schema() = 'public'
+               AND h.relkind = 'r' AND h.relpersistence = 'p'
+               AND h.relam = (SELECT oid FROM pg_catalog.pg_am WHERE amname = 'heap')
+               AND h.relowner = n.nspowner AND h.relowner = l.relowner
+               AND l.relkind = 'r' AND l.relpersistence = 'p'
+               AND NOT h.relrowsecurity AND NOT h.relforcerowsecurity
+               AND pg_catalog.has_schema_privilege(n.oid, 'USAGE')
+               AND pg_catalog.has_table_privilege(h.oid, 'SELECT')
+               AND NOT EXISTS (SELECT FROM pg_catalog.pg_inherits
+                               WHERE inhparent = h.oid OR inhrelid = h.oid)
+               AND ARRAY(SELECT CASE
+                       WHEN a.attnotnull AND NOT a.attisdropped AND NOT a.atthasdef
+                       AND a.atttypid = CASE WHEN a.attnum = 4
+                           THEN 'pg_catalog.timestamptz'::pg_catalog.regtype
+                           ELSE 'pg_catalog.text'::pg_catalog.regtype END
+                       THEN a.attname::text END
+                   FROM pg_catalog.pg_attribute a
+                   WHERE a.attrelid = h.oid AND a.attnum > 0 ORDER BY a.attnum)
+                   = ARRAY['message_id', 'channel_id', 'author_id', 'sent_at']
+               AND EXISTS (SELECT FROM pg_catalog.pg_constraint
+                           WHERE conrelid = h.oid AND contype = 'p'
+                             AND conkey = ARRAY[1::smallint]),
+               false)
+    FROM pg_catalog.pg_namespace n
+    LEFT JOIN pg_catalog.pg_class h
+      ON h.relnamespace = n.oid AND h.relname = 'backfill_history_messages'
+    LEFT JOIN pg_catalog.pg_class l
+      ON l.relnamespace = n.oid AND l.relname = '_two_bot_migrations'
+    LEFT JOIN pg_catalog.pg_class counts
+      ON counts.relnamespace = n.oid AND counts.relname = 'backfill_history_counts'
+    WHERE n.nspname = 'public'";
 
 #[derive(Debug, Deserialize)]
 pub struct ErasurePlan {
@@ -139,6 +178,96 @@ pub async fn schema_gaps(conn: &mut PgConnection) -> Result<Vec<String>, sqlx::E
         }
     }
     Ok(gaps)
+}
+
+/// Runtime coverage may discharge only the exact 0409 gap. The inspection
+/// API above still reports it because the table has no guild attribution.
+pub(crate) async fn privacy_coverage_gaps(
+    tx: &mut Transaction<'_, Postgres>,
+    dry_run: bool,
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut gaps = schema_gaps(tx).await?;
+    if !gaps.is_empty() && gaps != [HISTORY_GAP] {
+        return Ok(gaps);
+    }
+    // A refused lock or read must not abort independent retention expiry.
+    // Releasing this savepoint on execute keeps its locks until outer commit.
+    let mut probe = tx.begin().await?;
+    let covered = prove_empty_history(&mut probe, dry_run, !gaps.is_empty()).await;
+    match covered {
+        Ok(true) if !dry_run => probe.commit().await?,
+        _ => probe.rollback().await?,
+    }
+    match covered {
+        Ok(true) => gaps.clear(),
+        Ok(false) | Err(sqlx::Error::Database(_)) => {
+            if gaps.is_empty() {
+                gaps.push(HISTORY_GAP.to_owned());
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(gaps)
+}
+
+async fn prove_empty_history(
+    conn: &mut PgConnection,
+    dry_run: bool,
+    gap_found: bool,
+) -> Result<bool, sqlx::Error> {
+    let relation = sqlx::query_as::<_, (Option<i64>, bool, bool)>(HISTORY_RELATION)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some((Some(oid), _, true)) = relation else {
+        // Cutover-only installations have no Store footprint. A missing or
+        // malformed 0409 table in a Store installation needs investigation.
+        return Ok(!gap_found && relation == Some((None, false, false)));
+    };
+    let (lock, mode) = if dry_run {
+        // Preview is read-only and uses its existing repeatable-read snapshot.
+        sqlx::query("SET LOCAL row_security = off")
+            .execute(&mut *conn)
+            .await?;
+        (
+            "LOCK TABLE ONLY public.backfill_history_messages IN ACCESS SHARE MODE NOWAIT",
+            "AccessShareLock",
+        )
+    } else {
+        // The coverage scan can already have taken a snapshot. READ COMMITTED
+        // gives the post-lock reads a fresh one, including writes committed
+        // before SHARE was acquired. Refuse fixed-snapshot isolation.
+        let fresh: bool = sqlx::query_scalar(
+            "SELECT pg_catalog.current_setting('transaction_isolation') = 'read committed'",
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        if !fresh {
+            return Ok(false);
+        }
+        (
+            "LOCK TABLE ONLY public.backfill_history_messages IN SHARE MODE",
+            "ShareLock",
+        )
+    };
+    sqlx::query(lock).execute(&mut *conn).await?;
+    let locked: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT FROM pg_catalog.pg_locks
+         WHERE locktype = 'relation' AND pid = pg_catalog.pg_backend_pid()
+           AND relation::bigint = $1 AND mode = $2 AND granted)",
+    )
+    .bind(oid)
+    .bind(mode)
+    .fetch_one(&mut *conn)
+    .await?;
+    let current = sqlx::query_as::<_, (Option<i64>, bool, bool)>(HISTORY_RELATION)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if !locked || current != relation {
+        return Ok(false);
+    }
+    sqlx::query_scalar("SELECT NOT EXISTS (SELECT FROM ONLY public.backfill_history_messages)")
+        .fetch_one(conn)
+        .await
 }
 
 /// Guard fences shared by the per-member probe below and the guild-wide
@@ -291,7 +420,10 @@ pub async fn erase_member(
             .execute(&mut *tx)
             .await?;
     }
-    if !schema_gaps(&mut tx).await?.is_empty() {
+    if !privacy_coverage_gaps(&mut tx, matches!(mode, ErasureMode::DryRun))
+        .await?
+        .is_empty()
+    {
         return Err(sqlx::Error::InvalidArgument(SCHEMA_GAP_REFUSAL.into()));
     }
     let mut counts = Vec::new();
