@@ -54,7 +54,8 @@ def local_gh(script):
 def gh_output(value, *, status=None):
     payload = json.dumps(value).encode()
     if status is not None:
-        payload = f"HTTP/2.0 {status} Fixture\r\nX-Example: private-header\r\n\r\n".encode() + payload
+        # gh prints the status line with LF and response headers with CRLF.
+        payload = f"HTTP/2.0 {status} Fixture\nX-Example: private-header\r\n\r\n".encode() + payload
     return (f"import sys; sys.stdin.buffer.read(); sys.stdout.buffer.write({payload!r}); "
             f"sys.stderr.write('private-stderr'); sys.exit({int(status not in (None, 200))})")
 

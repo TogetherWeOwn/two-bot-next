@@ -115,7 +115,8 @@ def gh(path, *, body=None, binary=False, first_child_read=False):
         # gh --include writes the HTTP status and headers ahead of its JSON.
         # Only classify the status line, never remote JSON or stderr.
         headers, separator, output = output.partition(b"\r\n\r\n")
-        status = re.fullmatch(rb"HTTP/[0-9.]+ ([1-5][0-9]{2})(?: .*)?", headers.partition(b"\r\n")[0])
+        status_line = headers.partition(b"\n")[0].removesuffix(b"\r")
+        status = re.fullmatch(rb"HTTP/[0-9.]+ ([1-5][0-9]{2})(?: .*)?", status_line)
         code = status[1] if separator and status else None
         if child.returncode and code in (b"404", b"500", b"502", b"503", b"504"):
             raise ChildRunReadUnavailable("child_run_read_unavailable")
