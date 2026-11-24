@@ -63,11 +63,12 @@ async function withinLease(lease, now, operation) {
 /**
  * Exercise a previously opened #2427 window. The enclosing protected job must
  * retain ownership of the window and keep its protected finish fallback for
- * runner loss. The pin comes from trusted lease outputs, never the caller.
+ * runner loss. The pin, including epoch, comes from the protected ready receipt.
  *
- * control returns the existing staging-use projections. caller binds its one
- * staging session and returns {status, body} for the Bot envelope. observe
- * reads independent staging account/channel facts at each named checkpoint.
+ * control uses the staging-use client's projections and bounded deadlines,
+ * including during finish. caller binds its one staging session and returns
+ * {status, body} for the Bot envelope. observe reads independent staging
+ * account/channel facts at each named checkpoint.
  * Both probe adapters must honor the supplied signal. This source ships only
  * mock evidence and no transport.
  */

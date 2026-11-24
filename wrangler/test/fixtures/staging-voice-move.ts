@@ -1,11 +1,14 @@
 import { newRequestId } from "../../src/request-id.ts";
+import contract from "../../../crates/core/tests/fixtures/bot-site-contract-v2.json" with { type: "json" };
+
+const wire = contract.verbs["voice.move_member"];
 
 export function mockVoiceMoveWindow() {
   const fixture = {
     environment: "staging",
     guildId: "100",
-    discordId: "200",
-    channelIds: ["300", "400"],
+    discordId: wire.request.discord_id,
+    channelIds: [wire.results.moved.from_channel_id, wire.request.channel_id],
   };
   const [source, destination] = fixture.channelIds;
   const session = { discordId: fixture.discordId };
@@ -66,19 +69,21 @@ export function mockVoiceMoveWindow() {
           signal.throwIfAborted();
           if (released || !fixture.channelIds.includes(channelId)) throw new Error("mock caller refused");
           // Model the Web signing boundary without credentials or transport.
-          signed.push({ action: "voice.move_member", discord_id: session.discordId, channel_id: channelId });
+          signed.push({ ...wire.request, discord_id: session.discordId, channel_id: channelId });
           const request_id = newRequestId(now(), new Uint8Array(16).fill(signed.length));
-          let result;
+          let outcome;
           if (connectedChannelId === null) {
-            result = { outcome: "not_connected" };
+            outcome = "not_connected";
           } else if (!canConnect(channelId)) {
-            result = { outcome: "not_permitted" };
+            outcome = "not_permitted";
+          } else if (connectedChannelId === channelId) {
+            outcome = "already_in_room";
           } else {
-            result = { outcome: "moved", from_channel_id: connectedChannelId };
+            outcome = "moved";
             connectedChannelId = channelId;
             moves.push({ discordId: session.discordId, channelId });
           }
-          return { status: 200, body: { ok: true, request_id, result } };
+          return { status: 200, body: { ok: true, request_id, result: { ...wire.results[outcome] } } };
         },
       },
     },
