@@ -1,0 +1,518 @@
+{
+  "admission": {
+    "lease": {
+      "environment": "staging",
+      "phase": "active",
+      "epoch": 3,
+      "deploymentId": "fixture",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "runId": "12345",
+      "runAttempt": 2,
+      "acquiredAt": 1000,
+      "expiresAt": 60000
+    },
+    "publishBefore": 55000,
+    "baselineAbsent": true
+  },
+  "env": {
+    "TWO_DEPLOY_ENV": "staging",
+    "DISCORD_APPLICATION_ID": "1469137636663758888",
+    "GUILD_ID": "1545644954272137297",
+    "DISCORD_TOKEN": "synthetic"
+  },
+  "grant": {
+    "owned": {
+      "intent": {
+        "lease": {
+          "environment": "staging",
+          "phase": "active",
+          "epoch": 3,
+          "deploymentId": "fixture",
+          "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "runId": "12345",
+          "runAttempt": 2,
+          "acquiredAt": 1000,
+          "expiresAt": 60000
+        },
+        "publishBefore": 55000,
+        "target": {
+          "applicationId": "1469137636663758888",
+          "guildId": "1545644954272137297",
+          "name": "automod-preview"
+        },
+        "baseline": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "id": "123456789012345678",
+      "version": "223456789012345678"
+    },
+    "removeBefore": 70000
+  },
+  "definition": {
+    "name": "automod-preview",
+    "type": 1,
+    "default_member_permissions": "32",
+    "description": "Preview which automod filter fires on text. Smallest synthetic phrase; do not paste personal data.",
+    "options": [
+      {
+        "name": "text",
+        "description": "Sample text to evaluate (1-2000 characters)",
+        "type": 3,
+        "required": true,
+        "min_length": 1,
+        "max_length": 2000
+      },
+      {
+        "name": "mentions",
+        "description": "Synthetic explicit user-mention count (0-100, default 0)",
+        "type": 4,
+        "required": false,
+        "min_value": 0,
+        "max_value": 100
+      },
+      {
+        "name": "attachments",
+        "description": "1-10 bare filenames separated only by comma + ASCII space (e.g. a.txt, b.png); no trimming",
+        "type": 3,
+        "required": false,
+        "max_length": 1000
+      }
+    ]
+  },
+  "identity": {"id": "1469137636663758888", "bot": true},
+  "replies": {
+    "help": {
+      "application_id": "1469137636663758888",
+      "guild_id": "1545644954272137297",
+      "name": "help",
+      "type": 1,
+      "description": "Get help",
+      "id": "1000000000000000001",
+      "version": "1000000000000000002",
+      "name_localizations": {"de": "hilfe"}
+    },
+    "ping": {
+      "application_id": "1469137636663758888",
+      "guild_id": "1545644954272137297",
+      "name": "ping",
+      "type": 1,
+      "description": "Get help",
+      "id": "1000000000000000004",
+      "version": "1000000000000000002",
+      "name_localizations": {}
+    },
+    "preview": {
+      "application_id": "1469137636663758888",
+      "guild_id": "1545644954272137297",
+      "name": "automod-preview",
+      "type": 1,
+      "default_member_permissions": "32",
+      "description": "Preview which automod filter fires on text. Smallest synthetic phrase; do not paste personal data.",
+      "options": [
+        {
+          "name": "text",
+          "description": "Sample text to evaluate (1-2000 characters)",
+          "type": 3,
+          "required": true,
+          "min_length": 1,
+          "max_length": 2000,
+          "autocomplete": false,
+          "choices": [],
+          "name_localizations": {},
+          "description_localizations": {}
+        },
+        {
+          "name": "mentions",
+          "description": "Synthetic explicit user-mention count (0-100, default 0)",
+          "type": 4,
+          "min_value": 0,
+          "max_value": 100,
+          "autocomplete": false,
+          "choices": [],
+          "name_localizations": {},
+          "description_localizations": {}
+        },
+        {
+          "name": "attachments",
+          "description": "1-10 bare filenames separated only by comma + ASCII space (e.g. a.txt, b.png); no trimming",
+          "type": 3,
+          "required": false,
+          "max_length": 1000,
+          "autocomplete": false,
+          "choices": [],
+          "name_localizations": {},
+          "description_localizations": {}
+        }
+      ],
+      "default_permission": true,
+      "nsfw": false,
+      "dm_permission": true,
+      "contexts": [0, 1],
+      "integration_types": [0],
+      "name_localizations": {},
+      "description_localizations": {},
+      "id": "123456789012345678",
+      "version": "223456789012345678"
+    },
+    "helpReordered": {
+      "name_localizations": {"de": "hilfe"},
+      "version": "1000000000000000002",
+      "id": "1000000000000000001",
+      "description": "Get help",
+      "type": 1,
+      "name": "help",
+      "guild_id": "1545644954272137297",
+      "application_id": "1469137636663758888"
+    },
+    "identity": {"id": "1469137636663758888", "bot": true},
+    "wrongBot": {"id": "1545644954272137297", "bot": true},
+    "human": {"id": "1469137636663758888", "bot": false},
+    "baseline": ["help", "ping"],
+    "present": ["preview"],
+    "published": ["ping", "preview", "helpReordered"],
+    "duplicateIdRow2": {"$copy": "help", "name": "different"},
+    "duplicateId": ["help", "duplicateIdRow2"],
+    "duplicateNameRow2": {"$copy": "help", "id": "123456789012345678"},
+    "duplicateName": ["help", "duplicateNameRow2"],
+    "wrongGuildRow1": {"$copy": "help", "guild_id": "1000000000000000005"},
+    "wrongGuild": ["wrongGuildRow1"],
+    "wrongAppRow1": {"$copy": "help", "application_id": "1545644954272137297"},
+    "wrongApp": ["wrongAppRow1"],
+    "overflowIdRow1": {"$copy": "help", "id": "18446744073709551616"},
+    "overflowId": ["overflowIdRow1"],
+    "badVersionRow1": {"$copy": "help", "version": "0"},
+    "badVersion": ["badVersionRow1"],
+    "sameNameOtherKindRow1": {"$copy": "preview", "type": 2},
+    "sameNameOtherKind": ["sameNameOtherKindRow1"],
+    "wrongVersion": {"$copy": "preview", "version": "1000000000000000002"},
+    "wrongPermissions": {"$copy": "preview", "default_member_permissions": "0"},
+    "collidingId": {"$copy": "preview", "id": "1000000000000000001"},
+    "changedLocalizationsRow1": {"$copy": "help", "name_localizations": {"de": "changed"}},
+    "changedLocalizations": ["changedLocalizationsRow1", "ping"],
+    "alteredDetail": {
+      "$copy": "preview",
+      "options": [
+        {
+          "name": "text",
+          "description": "Sample text to evaluate (1-2000 characters)",
+          "type": 3,
+          "required": true,
+          "min_length": 1,
+          "max_length": 2000,
+          "autocomplete": true,
+          "choices": [],
+          "name_localizations": {},
+          "description_localizations": {}
+        },
+        {
+          "name": "mentions",
+          "description": "Synthetic explicit user-mention count (0-100, default 0)",
+          "type": 4,
+          "min_value": 0,
+          "max_value": 100,
+          "autocomplete": false,
+          "choices": [],
+          "name_localizations": {},
+          "description_localizations": {}
+        },
+        {
+          "name": "attachments",
+          "description": "1-10 bare filenames separated only by comma + ASCII space (e.g. a.txt, b.png); no trimming",
+          "type": 3,
+          "required": false,
+          "max_length": 1000,
+          "autocomplete": false,
+          "choices": [],
+          "name_localizations": {},
+          "description_localizations": {}
+        }
+      ]
+    },
+    "localizedPreview": {"$copy": "preview", "name_localizations": {"de": "anderer-command"}},
+    "missing": {"code": 10063},
+    "incorrect404": {"code": 10002},
+    "empty": [],
+    "replacedRow1": {"$copy": "preview", "id": "1000000000000000005"},
+    "replaced": ["replacedRow1", "help"],
+    "duplicatePreviewRow2": {"$copy": "preview", "type": 3, "id": "1000000000000000005"},
+    "duplicatePreview": ["preview", "duplicatePreviewRow2"]
+  },
+  "cases": {
+    "published": {
+      "real admission and server-added guild metadata": {
+        "fromPreflight": true,
+        "steps": [
+          ["bot", "identity"],
+          ["list", "baseline"],
+          ["intent"],
+          ["list", "baseline"],
+          ["post", "preview", 201],
+          ["receipt"],
+          ["list", "published"],
+          ["detail", "preview"]
+        ]
+      }
+    },
+    "refused": {
+      "missing admission": {"error": "refused", "steps": [], "input": null},
+      "expired admission": {"error": "refused", "steps": [], "time": 55000},
+      "wrong application": {
+        "error": "refused",
+        "steps": [],
+        "env": {"DISCORD_APPLICATION_ID": "1545644954272137297"}
+      },
+      "wrong guild": {"error": "refused", "steps": [], "env": {"GUILD_ID": "1469137636663758888"}},
+      "wrong environment": {"error": "refused", "steps": [], "env": {"TWO_DEPLOY_ENV": "production"}},
+      "rebound admission": {
+        "error": "refused",
+        "steps": [],
+        "input": {
+          "lease": {
+            "environment": "staging",
+            "phase": "active",
+            "epoch": 4,
+            "deploymentId": "fixture",
+            "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "runId": "12345",
+            "runAttempt": 2,
+            "acquiredAt": 1000,
+            "expiresAt": 60000
+          }
+        }
+      },
+      "voice admission": {
+        "error": "refused",
+        "steps": [],
+        "input": {
+          "lease": {
+            "environment": "staging",
+            "phase": "active",
+            "epoch": 3,
+            "deploymentId": "fixture",
+            "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "runId": "12345",
+            "runAttempt": 2,
+            "acquiredAt": 1000,
+            "expiresAt": 60000,
+            "voiceMove": true
+          }
+        }
+      },
+      "wrong token principal": {"error": "refused", "steps": [["bot", "wrongBot"]]},
+      "same user ID without bot identity": {"error": "refused", "steps": [["bot", "human"]]},
+      "present": {"error": "refused", "steps": [["bot", "identity"], ["list", "present"]]},
+      "duplicateId": {"error": "refused", "steps": [["bot", "identity"], ["list", "duplicateId"]]},
+      "duplicateName": {"error": "refused", "steps": [["bot", "identity"], ["list", "duplicateName"]]},
+      "wrongGuild": {"error": "refused", "steps": [["bot", "identity"], ["list", "wrongGuild"]]},
+      "wrongApp": {"error": "refused", "steps": [["bot", "identity"], ["list", "wrongApp"]]},
+      "overflowId": {"error": "refused", "steps": [["bot", "identity"], ["list", "overflowId"]]},
+      "badVersion": {"error": "refused", "steps": [["bot", "identity"], ["list", "badVersion"]]},
+      "sameNameOtherKind": {"error": "refused", "steps": [["bot", "identity"], ["list", "sameNameOtherKind"]]},
+      "registry at slash capacity": {"error": "refused", "steps": [["bot", "identity"], ["list", "full"]]}
+    },
+    "intent": {
+      "durable intent refused": {
+        "error": "uncertain",
+        "steps": [["bot", "identity"], ["list", "baseline"], ["intent"]],
+        "persist": false
+      },
+      "durable commit failed": {
+        "error": "uncertain",
+        "steps": [["bot", "identity"], ["list", "baseline"], ["intent"]],
+        "persist": "throw"
+      },
+      "cutoff elapsed during durable commit": {
+        "error": "uncertain",
+        "steps": [["bot", "identity"], ["list", "baseline"], ["intent"]],
+        "persist": "expire"
+      },
+      "lease revoked while committing intent": {
+        "error": "uncertain",
+        "steps": [["bot", "identity"], ["list", "baseline"], ["intent"], ["list", "baseline"]],
+        "revoke": true
+      },
+      "another command appeared": {
+        "error": "uncertain",
+        "steps": [["bot", "identity"], ["list", "baseline"], ["intent"], ["list", "present"]]
+      },
+      "localized registry drift": {
+        "error": "uncertain",
+        "steps": [
+          ["bot", "identity"],
+          ["list", "baseline"],
+          ["intent"],
+          ["list", "changedLocalizations"]
+        ]
+      }
+    },
+    "uncertain": {
+      "upsert never grants ownership": {
+        "error": "uncertain",
+        "steps": [
+          ["bot", "identity"],
+          ["list", "baseline"],
+          ["intent"],
+          ["list", "baseline"],
+          ["post", "preview", 200]
+        ]
+      },
+      "existing id never grants ownership": {
+        "error": "uncertain",
+        "steps": [
+          ["bot", "identity"],
+          ["list", "baseline"],
+          ["intent"],
+          ["list", "baseline"],
+          ["post", "collidingId", 201]
+        ]
+      },
+      "wrong permissions never grant ownership": {
+        "error": "uncertain",
+        "steps": [
+          ["bot", "identity"],
+          ["list", "baseline"],
+          ["intent"],
+          ["list", "baseline"],
+          ["post", "wrongPermissions", 201]
+        ]
+      },
+      "localizations never grant ownership": {
+        "error": "uncertain",
+        "steps": [
+          ["bot", "identity"],
+          ["list", "baseline"],
+          ["intent"],
+          ["list", "baseline"],
+          ["post", "localizedPreview", 201]
+        ]
+      },
+      "receipt commit failed": {
+        "error": "uncertain",
+        "steps": [
+          ["bot", "identity"],
+          ["list", "baseline"],
+          ["intent"],
+          ["list", "baseline"],
+          ["post", "preview", 201],
+          ["receipt"]
+        ],
+        "record": false
+      },
+      "unrelated rows disappeared": {
+        "error": "uncertain",
+        "steps": [
+          ["bot", "identity"],
+          ["list", "baseline"],
+          ["intent"],
+          ["list", "baseline"],
+          ["post", "preview", 201],
+          ["receipt"],
+          ["list", "present"]
+        ]
+      },
+      "detail version differs": {
+        "error": "uncertain",
+        "steps": [
+          ["bot", "identity"],
+          ["list", "baseline"],
+          ["intent"],
+          ["list", "baseline"],
+          ["post", "preview", 201],
+          ["receipt"],
+          ["list", "published"],
+          ["detail", "wrongVersion"]
+        ]
+      }
+    },
+    "removed": {
+      "fresh grant after the original lease expired": {
+        "time": 60001,
+        "steps": [
+          ["bot", "identity"],
+          ["list", "published"],
+          ["detail", "preview"],
+          ["delete", null, 204],
+          ["list", "baseline"],
+          ["detail", "missing", 404]
+        ]
+      }
+    },
+    "unsafeCleanup": {
+      "missing grant": {"error": "refused", "steps": [], "grant": null},
+      "expired grant": {"error": "refused", "steps": [], "time": 70000},
+      "grant for another command": {
+        "error": "refused",
+        "steps": [],
+        "grant": {
+          "owned": {
+            "intent": {
+              "lease": {
+                "environment": "staging",
+                "phase": "active",
+                "epoch": 3,
+                "deploymentId": "fixture",
+                "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "runId": "12345",
+                "runAttempt": 2,
+                "acquiredAt": 1000,
+                "expiresAt": 60000
+              },
+              "publishBefore": 55000,
+              "target": {
+                "applicationId": "1469137636663758888",
+                "guildId": "1545644954272137297",
+                "name": "help"
+              },
+              "baseline": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "id": "123456789012345678",
+            "version": "223456789012345678"
+          }
+        }
+      },
+      "durable owned record changed before delete": {
+        "error": "refused",
+        "steps": [["bot", "identity"], ["list", "published"], ["detail", "preview"]],
+        "revoke": true
+      },
+      "replaced": {"error": "refused", "steps": [["bot", "identity"], ["list", "replaced"]]},
+      "ambiguous same-name command": {"error": "refused", "steps": [["bot", "identity"], ["list", "duplicatePreview"]]},
+      "changed detail version": {
+        "error": "refused",
+        "steps": [["bot", "identity"], ["list", "published"], ["detail", "wrongVersion"]]
+      },
+      "nonmatching options": {
+        "error": "refused",
+        "steps": [["bot", "identity"], ["list", "published"], ["detail", "alteredDetail"]]
+      }
+    },
+    "uncertainCleanup": {
+      "unrelated commands disappeared": {
+        "error": "uncertain",
+        "steps": [
+          ["bot", "identity"],
+          ["list", "published"],
+          ["detail", "preview"],
+          ["delete", null, 204],
+          ["list", "empty"]
+        ]
+      },
+      "wrong not-found reason": {
+        "error": "uncertain",
+        "steps": [
+          ["bot", "identity"],
+          ["list", "published"],
+          ["detail", "preview"],
+          ["delete", null, 204],
+          ["list", "baseline"],
+          ["detail", "incorrect404", 404]
+        ]
+      }
+    },
+    "malformed": {
+      "invalidUtf8": {"error": "refused", "steps": [["bot", "identity"], ["list", "invalidUtf8"]]},
+      "duplicateKey": {"error": "refused", "steps": [["bot", "identity"], ["list", "duplicateKey"]]},
+      "redirect": {"error": "refused", "steps": [["bot", "identity"], ["list", "redirect"]]},
+      "oversized": {"error": "refused", "steps": [["bot", "identity"], ["list", "oversized"]]}
+    }
+  }
+}

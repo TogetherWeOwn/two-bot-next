@@ -1,4 +1,5 @@
 import { isSnowflake } from "./container-env.ts";
+import { boundRead, readReceiverBytes, releaseUpstream } from "./internal-actions.ts";
 import type { admitStagingAutomod } from "./staging-automod.ts";
 import { MAX_STAGING_USE_MS, parseStagingUseChange, type StagingUse } from "./staging-lifecycle.ts";
 import { parseRegistryJson, type PreviewEnv } from "./staging-preview.ts";
@@ -10,7 +11,7 @@ const target = Object.freeze({
 });
 const api = "https://discord.com/api/v10";
 const commands = `${api}/applications/${target.applicationId}/guilds/${target.guildId}/commands`;
-// Mirror automod_preview_definition in crates/core/src/automod_preview.rs.
+// Match automod_preview_definition and command_to_twilight for the guild endpoint.
 const definition = {
   name: target.name,
   type: 1,
@@ -25,8 +26,6 @@ const definition = {
       type: 3, required: false, max_length: 1000 },
   ],
 };
-const maxRegistryBytes = 256 * 1024;
-const maxOperationMs = 8_000;
 const refused = () => new Error("staging_automod_publication_refused");
 const uncertain = () => new Error("staging_automod_publication_uncertain");
 
@@ -37,15 +36,8 @@ export type StagingAutomodPublicationIntent = Readonly<{
   target: typeof target;
   baseline: string;
 }>;
-export type StagingAutomodOwnedCommand = Readonly<{
-  intent: StagingAutomodPublicationIntent;
-  id: string;
-  version: string;
-}>;
-export type StagingAutomodCleanupGrant = Readonly<{
-  owned: StagingAutomodOwnedCommand;
-  removeBefore: number;
-}>;
+export type StagingAutomodOwnedCommand = Readonly<{ intent: StagingAutomodPublicationIntent; id: string; version: string }>;
+export type StagingAutomodCleanupGrant = Readonly<{ owned: StagingAutomodOwnedCommand; removeBefore: number }>;
 
 type DiscordTransport = {
   env: Readonly<PreviewEnv> & { readonly TWO_DEPLOY_ENV?: string };
@@ -53,22 +45,16 @@ type DiscordTransport = {
   request: (url: string, init: RequestInit) => Promise<Response>;
 };
 type Publication = DiscordTransport & {
-  // The protected caller holds the ownership gate across this operation and
-  // returns admission only while the same exclusive AutoMod window is current.
+  // Return admission only while the caller holds the exclusive AutoMod window.
   currentAdmission: () => Promise<StagingAutomodAdmission | undefined>;
-  // Atomically commit the stopped baseline and an exclusive, one-shot intent.
-  // Return true only for a new committed intent. A replay or unknown commit
-  // result must refuse. Keep the intent until recovery verifies settlement.
+  // Return true only for a new, exclusive durable intent. Keep it for recovery.
   persistIntent: (intent: StagingAutomodPublicationIntent) => Promise<boolean>;
-  // Attach the validated 201 receipt to that exact intent, durably, even if
-  // later registry readback fails. Return true only after the commit.
+  // Bind the validated 201 receipt to its intent. Return true after durable commit.
   recordCreated: (owned: StagingAutomodOwnedCommand) => Promise<boolean>;
 };
 type Cleanup = DiscordTransport & {
-  // The protected caller returns this short-lived grant only after fencing
-  // and draining publication and re-reading the exact durable owned record.
-  // The original publication lease may have expired. Keep its identity and
-  // hold until the recovery layer records affirmative absence and stop.
+  // Issue only after publication is fenced and drained and the durable owned
+  // record is reread. Recovery retains the original lease and the hold.
   currentCleanupGrant: () => Promise<StagingAutomodCleanupGrant | undefined>;
 };
 
@@ -116,14 +102,18 @@ async function fingerprint(rows: RegistryRow[]): Promise<string> {
   return Array.from(hash, byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function emptyLocalizations(value: unknown): boolean {
+  const map = record(value);
+  return value == null || (map !== undefined && Object.keys(map).length === 0);
+}
+
 function preview(row: JsonRecord | undefined): row is RegistryRow {
+  // Global-only contexts, integration types and DM permissions do not apply here.
   return identity(row) && row.name === definition.name && row.type === definition.type
     && row.description === definition.description && row.default_member_permissions === definition.default_member_permissions
     && (row.default_permission === undefined || row.default_permission === true)
-    && (row.dm_permission === undefined || typeof row.dm_permission === "boolean")
-    && (row.nsfw === undefined || row.nsfw === false)
-    && ["name_localizations", "description_localizations", "contexts", "integration_types", "handler"]
-      .every(key => row[key] == null)
+    && (row.nsfw === undefined || row.nsfw === false) && row.handler == null
+    && emptyLocalizations(row.name_localizations) && emptyLocalizations(row.description_localizations)
     && Array.isArray(row.options) && row.options.length === definition.options.length
     && definition.options.every((expected, index) => {
       const option = record((row.options as unknown[])[index]);
@@ -134,7 +124,7 @@ function preview(row: JsonRecord | undefined): row is RegistryRow {
           option[key] === expected[key as keyof typeof expected])
         && ["choices", "options", "channel_types"].every(key =>
           option[key] === undefined || (Array.isArray(option[key]) && option[key].length === 0))
-        && option.name_localizations == null && option.description_localizations == null;
+        && emptyLocalizations(option.name_localizations) && emptyLocalizations(option.description_localizations);
     });
 }
 
@@ -178,24 +168,14 @@ function transport(deps: DiscordTransport, cutoff: number, now: () => number) {
   const left = cutoff - now();
   if (deps.env.TWO_DEPLOY_ENV !== "staging" || deps.env.DISCORD_APPLICATION_ID !== target.applicationId
     || deps.env.GUILD_ID !== target.guildId || !token?.trim() || !Number.isSafeInteger(left) || left <= 0) throw refused();
-  const signal = AbortSignal.timeout(Math.min(left, maxOperationMs));
+  const signal = AbortSignal.timeout(Math.min(left, 8_000));
   const check = () => {
     if (signal.aborted || !(now() < cutoff)) throw refused();
   };
   const settle = async <T>(work: Promise<T>): Promise<T> => {
-    let abort = () => {};
-    const expired = new Promise<never>((_, reject) => {
-      abort = () => reject(refused());
-      signal.addEventListener("abort", abort, { once: true });
-      if (signal.aborted) abort();
-    });
-    try {
-      const result = await Promise.race([work, expired]);
-      check();
-      return result;
-    } finally {
-      signal.removeEventListener("abort", abort);
-    }
+    const result = await boundRead(work, signal);
+    check();
+    return result;
   };
   const json = async (method: "GET" | "POST" | "DELETE", url: string, status: number): Promise<unknown> => {
     check();
@@ -204,35 +184,21 @@ function transport(deps: DiscordTransport, cutoff: number, now: () => number) {
       headers: { authorization: `Bot ${token}`, ...(method === "POST" ? { "content-type": "application/json" } : {}) },
       ...(method === "POST" ? { body: JSON.stringify(definition) } : {}),
     }).then(response => {
-      if (signal.aborted || !(now() < cutoff)) void response.body?.cancel().catch(() => {});
+      if (signal.aborted || !(now() < cutoff)) releaseUpstream(response);
       return response;
     }));
     if (response.status !== status || response.redirected || response.headers.has("location")) {
-      void response.body?.cancel().catch(() => {});
+      releaseUpstream(response);
       throw refused();
     }
     if (status === 204) return;
-    const reader = response.body?.getReader();
-    if (!reader) throw refused();
-    const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
-    let size = 0, text = "", doneReading = false;
-    try {
-      for (;;) {
-        const { done, value } = await settle(reader.read());
-        if (done) { doneReading = true; break; }
-        size += value.byteLength;
-        if (size > maxRegistryBytes) throw refused();
-        text += decoder.decode(value, { stream: true });
-      }
-      return parseRegistryJson(text + decoder.decode());
-    } finally {
-      if (!doneReading) void reader.cancel().catch(() => {});
-      reader.releaseLock();
-    }
+    const bytes = await settle(readReceiverBytes(response, 256 * 1024, signal));
+    if (!bytes) throw refused();
+    return parseRegistryJson(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
   };
   return {
     check, settle, json,
-    list: async () => registry(await json("GET", commands, 200)),
+    list: async () => registry(await json("GET", `${commands}?with_localizations=true`, 200)),
     bot: async () => {
       const bot = record(await json("GET", `${api}/users/@me`, 200));
       if (bot?.id !== target.applicationId || bot.bot !== true) throw refused();
@@ -240,18 +206,15 @@ function transport(deps: DiscordTransport, cutoff: number, now: () => number) {
   };
 }
 
-/** Dormant publication. Unknown writes, receipt persistence and readback
- * failures retain intent for recovery. Discord POST is an upsert. The caller
- * must exclude all other writers across this entire operation. */
+/** Discord POST is an upsert. The ownership gate must exclude other writers
+ * throughout this operation. Uncertain results retain intent for recovery. */
 export async function publishStagingAutomod(admission: StagingAutomodAdmission | undefined, deps: Publication,
   now = Date.now): Promise<StagingAutomodOwnedCommand> {
   let intentAttempted = false;
   try {
     if (admission?.baselineAbsent !== true || !validLease(admission.lease)) throw refused();
-    const { publishBefore } = admission;
-    const lease = Object.freeze({ ...admission.lease });
-    if (!validCutoff(lease, publishBefore)
-      || !(now() >= lease.acquiredAt)) throw refused();
+    const { publishBefore } = admission, lease = Object.freeze({ ...admission.lease });
+    if (!validCutoff(lease, publishBefore) || !(now() >= lease.acquiredAt)) throw refused();
     const discord = transport(deps, publishBefore, now);
     const requireCurrent = async () => {
       const current = await discord.settle(deps.currentAdmission());
@@ -271,13 +234,16 @@ export async function publishStagingAutomod(admission: StagingAutomodAdmission |
     const intent = Object.freeze({ lease, publishBefore, target, baseline });
     await requireCurrent();
     intentAttempted = true;
-    if (await discord.settle(deps.persistIntent(intent)) !== true) throw refused();
+    // Hold the gate through each durable commit, even past the Discord cutoff.
+    if (await deps.persistIntent(intent) !== true) throw refused();
+    discord.check();
     if (await discord.settle(fingerprint(await absent())) !== baseline) throw refused();
     await requireCurrent();
     const created = record(await discord.json("POST", commands, 201));
     if (!preview(created) || before.some(row => row.id === created.id)) throw refused();
     const owned = Object.freeze({ intent, id: created.id, version: created.version });
-    if (await discord.settle(deps.recordCreated(owned)) !== true) throw refused();
+    if (await deps.recordCreated(owned) !== true) throw refused();
+    discord.check();
     if (await discord.settle(fingerprint(matching(await discord.list(), owned))) !== baseline
       || !sameCommand(record(await discord.json("GET", `${commands}/${owned.id}`, 200)), owned)) throw refused();
     await requireCurrent();
@@ -287,8 +253,7 @@ export async function publishStagingAutomod(admission: StagingAutomodAdmission |
   }
 }
 
-/** Dormant recovery effect. Only a fresh, exact grant for the durable owned
- * record can remove it. Leave durable state and affirmative stop to recovery. */
+/** Delete the exact durable owned record. Recovery owns state and affirmative stop. */
 export async function removeOwnedStagingAutomod(grant: StagingAutomodCleanupGrant | undefined, deps: Cleanup,
   now = Date.now): Promise<string> {
   let deleteAttempted = false;
