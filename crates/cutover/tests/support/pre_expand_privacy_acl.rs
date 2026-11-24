@@ -315,6 +315,7 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     .unwrap();
     assert_eq!(fence, migration_fence);
     assert_eq!(rollback_rows(&runtime).await, legacy_rows);
+    assert_undo_refused(&runtime, "SELECT 1", "invalid rehearsal binding").await;
     exercise_schema_undo(&migrator).await;
     let restored = candidate_readout(&audit, name).await;
     let boundary = applied
@@ -336,6 +337,14 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     install_roles(&mut grants, name, Phase::Full).await.unwrap();
     grants.commit().await.unwrap();
     assert_eq!(recovery_fence(&runtime).await, fence);
+    // Sequence advances survive rollback. Exercise this condition after the
+    // positive undo, before the existing fixture inserts attendance rows.
+    assert_undo_refused(
+        &migrator,
+        "SELECT nextval('public.event_voice_sessions_id_seq')",
+        "new schema contains evidence",
+    )
+    .await;
     sqlx::raw_sql(
         "INSERT INTO event_attendance_windows
              (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at)
@@ -397,6 +406,10 @@ async fn rollback_catalog(pool: &PgPool) -> String {
           'audit_constraints', (SELECT jsonb_agg(jsonb_build_array(conname, pg_get_constraintdef(oid), convalidated)
                                                  ORDER BY conname)
                                 FROM pg_constraint WHERE conrelid = 'public.internal_action_log'::regclass),
+          'audit_columns', (SELECT jsonb_agg(jsonb_build_array(attname, format_type(atttypid, atttypmod), attnotnull)
+                                             ORDER BY attnum)
+                            FROM pg_attribute WHERE attrelid = 'public.internal_action_log'::regclass
+                              AND attnum > 0 AND NOT attisdropped),
           'web_version', (SELECT contract_version FROM public.web_contract_meta WHERE singleton)
         )::text",
     )
@@ -429,23 +442,75 @@ async fn recovery_fence(pool: &PgPool) -> String {
 }
 
 async fn exercise_schema_undo(migrator: &PgPool) {
-    let undo = include_str!("../fixtures/production_schema_undo.sql");
+    let catalog = rollback_catalog(migrator).await;
+    for seed in [
+        "INSERT INTO voice_heat_hours (hour_start_utc) VALUES ('2026-01-01T00:00:00Z')",
+        "INSERT INTO event_attendance_windows
+           (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at)
+         VALUES ('1', 'fixture', '2', now(), now(), now() + interval '1 hour')",
+        // An explicit ID keeps the sequence uncalled in the disposable probe.
+        "INSERT INTO event_voice_sessions (id, guild_id, member_id, channel_id, joined_at)
+         VALUES (1, '1', '2', '3', now())",
+        "INSERT INTO live_sequence_watermarks (guild_id, seq) VALUES ('1', 1)",
+    ] {
+        assert_undo_refused(migrator, seed, "new schema contains evidence").await;
+    }
+    for assignment in [
+        "intent_id = NULL",
+        "action = 'voice.move_member'",
+        "delivery_hash = repeat('d', 64)",
+        "from_channel_id = '100000000000000001'",
+        "request_id = repeat('A', 26)",
+    ] {
+        // Isolate each condition, including shapes normally excluded by the
+        // forward receipt CHECK. The test transaction never reaches commit.
+        let seed = format!(
+            "ALTER TABLE internal_action_log DROP CONSTRAINT internal_action_log_receipt_check;
+             UPDATE internal_action_log SET {assignment}"
+        );
+        assert_undo_refused(migrator, &seed, "new schema contains evidence").await;
+    }
+    for seed in [
+        "DELETE FROM _sqlx_migrations WHERE version = 482",
+        "UPDATE _sqlx_migrations SET version = 499 WHERE version = 482",
+        "UPDATE _sqlx_migrations SET success = false WHERE version = 473",
+        "UPDATE _sqlx_migrations SET checksum = decode(repeat('00', 48), 'hex') WHERE version = 481",
+        "DELETE FROM _two_bot_migrations WHERE version = 478",
+        "UPDATE _two_bot_migrations SET version = 499 WHERE version = 478",
+        "UPDATE _two_bot_migrations SET success = false WHERE version = 465",
+        "UPDATE _two_bot_migrations SET checksum = decode(repeat('00', 48), 'hex') WHERE version = 478",
+        "UPDATE web_contract_meta SET contract_version = '1.0' WHERE singleton",
+    ] {
+        assert_undo_refused(migrator, seed, "unexpected rehearsal schema or ledgers").await;
+    }
+    assert_eq!(rollback_catalog(migrator).await, catalog);
+    let mut undo_tx = migrator.begin().await.unwrap();
+    sqlx::raw_sql(SCHEMA_UNDO)
+        .execute(&mut *undo_tx)
+        .await
+        .unwrap();
+    undo_tx.commit().await.unwrap();
+}
+
+const SCHEMA_UNDO: &str = include_str!("../fixtures/production_schema_undo.sql");
+
+async fn assert_undo_refused(migrator: &PgPool, seed: &str, message: &str) {
     let mut refusal = migrator.begin().await.unwrap();
-    sqlx::query("INSERT INTO live_sequence_watermarks (guild_id, seq) VALUES ('1', 1)")
+    sqlx::raw_sql(sqlx::AssertSqlSafe(seed))
         .execute(&mut *refusal)
         .await
         .unwrap();
-    assert_sqlstate(
-        &sqlx::raw_sql(undo)
-            .execute(&mut *refusal)
-            .await
-            .unwrap_err(),
-        "23514",
+    let error = sqlx::raw_sql(SCHEMA_UNDO)
+        .execute(&mut *refusal)
+        .await
+        .unwrap_err();
+    assert_sqlstate(&error, "23514");
+    assert_eq!(
+        error.as_database_error().unwrap().message(),
+        message,
+        "{seed}"
     );
     refusal.rollback().await.unwrap();
-    let mut undo_tx = migrator.begin().await.unwrap();
-    sqlx::raw_sql(undo).execute(&mut *undo_tx).await.unwrap();
-    undo_tx.commit().await.unwrap();
 }
 
 struct CandidateReadout {
