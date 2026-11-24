@@ -271,8 +271,7 @@ async fn protected_preview_keeps_dry_run_and_suppresses_member_deliveries() {
     ]);
     let config = AutomodConfig::from_map(&boot).expect("valid enforcing boot config");
     let until = OffsetDateTime::now_utc() + TimeDuration::minutes(10);
-    let app = STAGING_BOT_APPLICATION_ID;
-    let guild = STAGING_GUILD_ID;
+    let (app, guild) = (STAGING_BOT_APPLICATION_ID, STAGING_GUILD_ID);
     let new =
         |app, guild, until| AutomodRuntime::new_staging_preview(config.clone(), app, guild, until);
     assert!(new("1", guild, until).is_none());
@@ -322,6 +321,7 @@ async fn protected_preview_keeps_dry_run_and_suppresses_member_deliveries() {
             row("TWO_AUTOMOD_REPEAT_COUNT", json!(999)),
         ],
         vec![row("TWO_AUTOMOD_SANCTIONS", json!("2:warn"))],
+        vec![row("TWO_AUTOMOD_BAD_WORDS", json!(["recovered"]))],
     ]
     .into_iter()
     .enumerate()
@@ -333,7 +333,7 @@ async fn protected_preview_keeps_dry_run_and_suppresses_member_deliveries() {
         if i == 1 {
             writer.apply_ops(Some(&ops), std::time::Instant::now());
         }
-        refresh_live(&active, &boot, guild, &live);
+        assert_eq!(refresh_live(&active, &boot, guild, &live), i != 2);
         assert_eq!(
             resolve_live_config(&boot, guild, &live).map(|config| config.dry_run),
             (i != 2).then_some(false)

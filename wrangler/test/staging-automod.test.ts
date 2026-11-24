@@ -34,6 +34,7 @@ test("AutoMod admission proves stopped absence and spare capacity under the exac
   assert.deepEqual(calls, ["stopped", "https://discord.com/api/v10/users/@me",
     `https://discord.com/api/v10/applications/${app}/guilds/${guild}/commands`, "stopped"]);
   assert.deepEqual(result, { lease, baselineAbsent: true, publishBefore: 55_000 });
+  assert.equal(Object.isFrozen(result.lease), true);
 });
 
 test("AutoMod admission refuses mixed modes, invalid bindings, missing proofs and uncertain absence", async () => {
