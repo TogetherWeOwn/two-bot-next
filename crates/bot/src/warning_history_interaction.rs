@@ -35,12 +35,6 @@ enum Outcome {
     End,
 }
 
-impl From<Status> for Outcome {
-    fn from(status: Status) -> Self {
-        Self::Session(status)
-    }
-}
-
 enum Reply {
     Status(Outcome),
     Page(Box<InteractionResponseData>, Controls),
@@ -55,9 +49,9 @@ async fn handle(state: &HistoryState, io: &Fake, input: Input<'_>) {
         Input::Initial(raw) if raw.len() <= 20 && canonical_snowflake(raw) => raw
             .parse()
             .map_err(|_| Outcome::Invalid)
-            .and_then(|target| state.start(caller, target).map_err(Into::into)),
+            .and_then(|target| state.start(caller, target).map_err(Outcome::Session)),
         Input::Initial(_) => Err(Outcome::Invalid),
-        Input::Next(handle) => state.next(caller, handle).map_err(Into::into),
+        Input::Next(handle) => state.next(caller, handle).map_err(Outcome::Session),
     };
     if within(deadline, io.defer()).await != Ok(Some(true)) {
         return;
@@ -66,15 +60,13 @@ async fn handle(state: &HistoryState, io: &Fake, input: Input<'_>) {
         Ok(attempt) => page(io, caller, attempt, deadline).await,
         Err(status) => Err(status),
     };
-    match page {
-        Ok((reply, prepared)) => {
-            if within(deadline, io.edit_original(reply)).await == Ok(true) {
-                let _ = prepared.confirm();
-            }
-        }
-        Err(status) => {
-            let _ = within(deadline, io.edit_original(Reply::Status(status))).await;
-        }
+    let (reply, prepared) = match page {
+        Ok((reply, prepared)) => (reply, Some(prepared)),
+        Err(status) => (Reply::Status(status), None),
+    };
+    let delivered = within(deadline, io.edit_original(reply)).await;
+    if let (Ok(true), Some(prepared)) = (delivered, prepared) {
+        let _ = prepared.confirm();
     }
 }
 
@@ -84,13 +76,13 @@ async fn page<'a>(
     attempt: Attempt<'a>,
     deadline: Instant,
 ) -> Result<(Reply, Prepared<'a>), Outcome> {
-    let (target, _) = attempt.request()?;
+    let (target, _) = attempt.request().map_err(Outcome::Session)?;
     let started = Instant::now();
     within(deadline.min(started + REFRESH), io.fresh(caller, target))
         .await?
         .map_err(Outcome::Authority)?;
     let remaining = AUTHORITY.saturating_sub(started.elapsed());
-    let (target, cursor) = attempt.request()?;
+    let (target, cursor) = attempt.request().map_err(Outcome::Session)?;
     let read_deadline = deadline.min(Instant::now() + READ);
     let read = io.read_closed((caller.principal.0, target), cursor);
     let page = within(read_deadline, read).await?;
@@ -102,7 +94,7 @@ async fn page<'a>(
     within(final_deadline, io.fresh(caller, target))
         .await?
         .map_err(Outcome::Authority)?;
-    let (prepared, controls) = attempt.prepare(page.next)?;
+    let (prepared, controls) = attempt.prepare(page.next).map_err(Outcome::Session)?;
     let reply = match (empty, continuation) {
         (true, false) => Reply::Status(Outcome::Empty),
         (true, true) => Reply::Status(Outcome::End),

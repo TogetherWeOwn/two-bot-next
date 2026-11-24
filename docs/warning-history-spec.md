@@ -32,6 +32,7 @@ The dormant authorizer reuses the moderation resolver and checks current channel
 overwrites with at most five Discord GETs per refresh. Synthetic tests compile
 the seam alongside the dormant [continuation state](../crates/core/src/member_moderation_store/warning_history/continuation.rs).
 [Read authorizer](../crates/bot/src/warning_history_authorizer.rs)
+
 The [synthetic interaction flow](../crates/bot/src/warning_history_interaction.rs)
 exercises private initial and Next delivery with fake authority, reads and replies.
 AutoMod preview delivery gates activation.
