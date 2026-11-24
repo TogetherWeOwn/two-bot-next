@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use serde_json::json;
 use two_bot_core::member_moderation_store::WarningHistoryEntry;
 
