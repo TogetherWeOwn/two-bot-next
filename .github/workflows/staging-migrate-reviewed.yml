@@ -9,13 +9,14 @@ permissions: {}
 concurrency:
   group: staging-migrate
   cancel-in-progress: false
+  queue: max
 
 jobs:
   authorize:
     if: github.repository == 'TogetherWeOwn/two-bot-next' && github.ref_protected && github.run_attempt == 1
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions: {contents: read, actions: read, pull-requests: read}
+    permissions: {contents: read, actions: read, pull-requests: read, checks: read}
     outputs:
       source_sha: ${{ steps.request.outputs.source_sha }}
     steps:

@@ -149,7 +149,7 @@ Reuse a plan only when the apply dispatch's fresh read-only plan matches both le
 
 ## Authorize one apply through a protected merge
 
-When native review lacks an eligible independent identity, use a separate T0 PR
+When the Environment has no required reviewers, use a separate T0 PR
 that adds one `.github/staging-apply/<32-lowercase-hex>.json` request. Use a new
 name for every request. The JSON contains `plan_run_id` as a decimal string,
 `plan_archive_digest` and `recovery_archive_digest` as `sha256:` digests. Use an
@@ -167,5 +167,6 @@ requirement under the repository review policy.
 The merge starts `staging-migrate-reviewed` once. It authenticates the producing
 plan and capture, compares a fresh read-only plan, then uses the same scoped
 staging apply Environment and migrator. Watch the run through its result.
+GitHub also enforces any native Environment reviewers configured there.
 If it fails, reconcile both ledgers before preparing a new reviewed request.
 GitHub reruns, expired requests and previously used request names refuse.

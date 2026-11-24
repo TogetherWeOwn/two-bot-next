@@ -1514,7 +1514,7 @@ def production_claim_errors(claim):
 
 def reviewed_migrate_errors(workflow):
     if (workflow.get("on") != {"push": {"branches": ["main"], "paths": [".github/staging-apply/*.json"]}}
-            or workflow.get("concurrency") != {"group": "staging-migrate", "cancel-in-progress": "false"}
+            or workflow.get("concurrency") != {"group": "staging-migrate", "cancel-in-progress": "false", "queue": "max"}
             or workflow.get("permissions") != {}):
         return ["reviewed staging migration trigger or serialization changed"]
     jobs = workflow.get("jobs", {})
@@ -1637,6 +1637,8 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         return errors
     plan, claim, apply = jobs.get("plan", {}), jobs.get("claim", {}), jobs.get("apply", {})
     if name == "staging-migrate.yml":
+        if workflow.get("concurrency") != {"group": "staging-migrate", "cancel-in-progress": "false", "queue": "max"}:
+            errors.append(f"{name}: must preserve all pending staging migration requests")
         errors.extend(staging_claim_errors(claim))
     else:
         errors.extend(production_claim_errors(claim))
@@ -11039,7 +11041,7 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("pr-evidence.yml", "pr-evidence"):
                         expected.update({"actions": "read", "pull-requests": "read"})
                     elif (name, job_id) == ("staging-migrate-reviewed.yml", "authorize"):
-                        expected.update({"actions": "read", "pull-requests": "read"})
+                        expected.update({"actions": "read", "pull-requests": "read", "checks": "read"})
                     elif (name, job_id) == ("check.yml", "ci-evidence"):
                         expected["actions"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
