@@ -66,16 +66,11 @@ fn assert_reads(rest: &MockRest, count: usize) {
 }
 
 async fn check(docs: [Value; 5], expected: Result<(), Refusal>, reads: usize) {
-    let responses = docs
-        .into_iter()
-        .map(|doc| ScriptedResponse::json(200, doc))
-        .collect();
+    let responses = Vec::from(docs.map(|doc| ScriptedResponse::json(200, doc)));
     let rest = MockRest::start(responses, ScriptedResponse::status(500)).await;
     let deadline = Instant::now() + Duration::from_secs(10);
-    assert_eq!(
-        refresh(&rest, Some(Id::new(22)), 88, deadline).await,
-        expected
-    );
+    let decision = refresh(&rest, Some(Id::new(22)), 88, deadline).await;
+    assert_eq!(decision, expected);
     assert_reads(&rest, reads);
 }
 
@@ -90,7 +85,7 @@ async fn admits_current_staff_with_discord_overwrite_precedence() {
         overwrite("99", 1, VIEW, 0),
     ]);
     check(docs.clone(), Ok(()), 5).await;
-    docs[4]["permission_overwrites"][3] = overwrite("44", 1, 0, VIEW);
+    docs[4]["permission_overwrites"][3] = overwrite("44", 1, COMMANDS, VIEW);
     check(docs.clone(), Err(Refusal::Denied), 5).await;
     docs[0]["owner_id"] = json!("44");
     docs[1]["roles"] = json!([]);
@@ -144,17 +139,22 @@ async fn refuses_unknown_or_insufficient_live_evidence() {
 }
 
 #[tokio::test]
-async fn stalled_read_exhausts_the_remaining_budget_without_retry() {
-    let stalled = ScriptedResponse::json(200, evidence()[0].clone());
-    let rest =
-        MockRest::start_with_stalled_bodies(vec![stalled], ScriptedResponse::status(500)).await;
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let attempt = refresh(&rest, Some(Id::new(22)), 88, deadline);
-    assert_eq!(
-        timeout_at(deadline + Duration::from_secs(1), attempt).await,
-        Ok(Err(Refusal::Unavailable))
-    );
-    assert_reads(&rest, 1);
+async fn slow_reads_share_the_caller_budget_and_refresh_cap_without_retry() {
+    for (caller_seconds, outer_seconds, reads) in [(1, 2, 1), (10, 6, 3)] {
+        let responses = evidence().map(|doc| ScriptedResponse::json(200, doc));
+        let rest = MockRest::start_with_body_delay(
+            Vec::from(responses),
+            ScriptedResponse::status(500),
+            Duration::from_millis(1800),
+        )
+        .await;
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(caller_seconds);
+        let attempt = refresh(&rest, Some(Id::new(22)), 88, deadline);
+        let decision = timeout_at(now + Duration::from_secs(outer_seconds), attempt).await;
+        assert_eq!(decision, Ok(Err(Refusal::Unavailable)));
+        assert_reads(&rest, reads);
+    }
 }
 
 #[tokio::test]
@@ -175,10 +175,8 @@ async fn wrong_scope_and_expired_budget_never_fetch_and_failed_reads_never_retry
     assert_reads(&rest, 0);
     for status in [403, 404, 429, 503] {
         let rest = MockRest::start(vec![], ScriptedResponse::status(status)).await;
-        assert_eq!(
-            refresh(&rest, Some(Id::new(22)), 88, later).await,
-            Err(Refusal::Unavailable)
-        );
+        let decision = refresh(&rest, Some(Id::new(22)), 88, later).await;
+        assert_eq!(decision, Err(Refusal::Unavailable));
         assert_reads(&rest, 1);
     }
 }
