@@ -2788,11 +2788,11 @@ username branch suffix does not match the pin refuses the same way, in both
 gates. The manifest carries `migration_target`
 (`staging` or `production`); the claim publisher requires the matching value.
 
-The workflow has three jobs (`plan`, `claim`, `apply`). It uses
-`production-migrate-plan` for read-only planning and the main-only
-`production-migrate-apply` Environment for apply. Restrict apply to the
-single `main` branch and disable administrator bypass. It uses pinned actions,
-an explicit `ubuntu-latest` runner, a pipefail shell, and artifact names
+The workflow mirrors the staging shape with the `production-migrate-` prefix:
+three jobs (`plan`, `claim`, `apply`), environments
+`production-migrate-plan` (no reviewer, plan only) and
+`production-migrate-apply` (main-only, administrator bypass disabled), the same pinned
+actions, explicit `ubuntu-latest` runner, pipefail shell, and artifact names
 (`production-migrate-manifest`, `production-migrate-apply-claim`, 14-day
 retention, stored ZIP entries). The `claim` job runs
 `scripts/ci/production_migrate_claim.py`, which binds the same projection hash
@@ -2804,23 +2804,13 @@ and both secrets must exist before dispatch; the host provisions them after
 this change merges. The cutover itself does not need this path: the fresh
 `two_bot` bootstrap uses the tested provisioner flow.
 
-After the independent release reviewer approves the production change, give
-the independent approval App operator the producing plan run, its artifact SHA-256 and the protected
-workflow SHA that will receive the apply dispatch. The operator records a
-successful `production-migration-approval` check on that workflow SHA with
-external ID `production-apply:<plan run ID>:<archive SHA-256 without prefix>`
-before dispatch. Use an attempt-one plan-only run. The approval expires after
-23 hours and 30 minutes. A revised decision or a renewal needs a fresh
-plan run. Keep the approval App credential under the independent operator's
-control.
-
-The `claim` job authenticates the producing run and archive and compares
-the fresh production plan, including both ledgers and role findings. It
-requires the matching check from the designated App before the apply job can
-receive its migrator binding. The apply job rechecks approval and Environment
-policy immediately before DDL. Any intervening apply attempt consumes older
-plans. After a refusal or uncertain outcome, reconcile both ledgers and use
-a fresh plan and approval before another dispatch.
+After the independent release review, the designated App operator publishes
+a successful `production-migration-approval` check on the protected apply
+workflow SHA with external ID `production-apply:<plan run ID>:<archive SHA-256 without prefix>`.
+Use a fresh attempt-one plan-only run. Approval expires after 23 hours and
+30 minutes. The workflow compares the fresh ledgers and role audit and
+rechecks approval immediately before DDL. After an intervening apply,
+reconcile both ledgers and use a fresh plan and approval.
 
 ### Redeploy the approved revision
 

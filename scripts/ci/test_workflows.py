@@ -1632,6 +1632,8 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
             errors.append(f"{name}: must preserve all pending staging migration requests")
         errors.extend(staging_claim_errors(claim))
     else:
+        if workflow.get("concurrency") != {"group": "production-migrate", "cancel-in-progress": "false"}:
+            errors.append(f"{name}: must serialize production plan and apply runs")
         errors.extend(production_claim_errors(claim))
     if plan.get("environment") != plan_env:
         errors.append(f"{name}:plan: must read the {plan_env} Environment binding")
@@ -1648,7 +1650,7 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         errors.append(f"{name}:plan: must run only from main")
     apply_condition = "github.ref == 'refs/heads/main' && inputs.mode == 'apply'"
     if apply.get("if") != apply_condition:
-        errors.append(f"{name}:apply: must preserve dispatch and attempt restrictions")
+        errors.append(f"{name}:apply: must run from main in apply mode")
     if apply.get("needs") != ["plan", "claim"]:
         errors.append(f"{name}:apply: must wait for a green plan and pre-approval claim")
     if name == "staging-migrate.yml":
@@ -1673,10 +1675,7 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
             errors.append(f"{name}:apply: must load the verifier at the trusted workflow SHA")
     else:
         steps = apply.get("steps", [])
-        refusal = {"name": "Refuse reruns of production migration apply", "run": (
-            'if [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then\n'
-            '  echo "::error::Production migration apply requires a fresh plan and dispatch." >&2\n'
-            '  exit 1\nfi\n')}
+        refusal = {"name": "Refuse reruns of production migration apply", "run": 'test "$GITHUB_RUN_ATTEMPT" = 1'}
         if steps[:1] != [refusal]:
             errors.append(f"{name}:apply: must fail on reruns before checkout")
         ddl = [i for i, step in enumerate(steps) if "--apply " in str(step.get("run", ""))]

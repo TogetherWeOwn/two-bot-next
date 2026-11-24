@@ -8,7 +8,7 @@ name: production-migrate
 # changes credentials. `plan` reads only TWO_BOT_PRODUCTION_PLAN_DATABASE_URL (a
 # login holding only two_bot_migrator_ro, physically read-only) from the
 # no-reviewer `production-migrate-plan` environment and always runs; `apply`
-# reads only TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL from the reviewed
+# reads only TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL from the protected
 # `production-migrate-apply` environment and runs only for mode=apply, after a
 # green plan and independent App approval. Both environments must exist before dispatch; a missing
 # environment fails the job instead of leaking a binding.
@@ -229,11 +229,7 @@ jobs:
       image: rust:1.100-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8
     steps:
       - name: Refuse reruns of production migration apply
-        run: |
-          if [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then
-            echo "::error::Production migration apply requires a fresh plan and dispatch." >&2
-            exit 1
-          fi
+        run: test "$GITHUB_RUN_ATTEMPT" = 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
