@@ -1,6 +1,5 @@
 """Offline signed attendance acceptance with synthetic response envelopes."""
 
-from copy import deepcopy
 from pathlib import Path
 import sys
 import time
@@ -34,8 +33,9 @@ class AcceptanceTests(unittest.TestCase):
                     "lifecycle": lifecycle}
         check = acceptance.validate_configuration
         self.assertEqual(check("finalized", ORIGIN, ROLLOUT, observed), IDENTITY)
-        for field, bad in {"guild_id": "2", "build_id": "1234-2", "attendance_read": 1, "attendance_capture": True,
-                           "signed_ingress": False, "foreign_fixture": "missing"}.items():
+        mismatches = {"guild_id": "2", "origin": "https://other.example.test", "build_id": "1234-2",
+                      "attendance_read": 1, "attendance_capture": True, "foreign_fixture": "missing"}
+        for field, bad in mismatches.items():
             with self.assertRaises((acceptance.Refused, acceptance.SmokeError)):
                 check("finalized", ORIGIN, ROLLOUT, {**observed, field: bad})
         lease["expiresAt"] = 1
@@ -67,9 +67,7 @@ class AcceptanceTests(unittest.TestCase):
             headers = {"cache-control": "no-store"}
             envelope = {"request_id": request.get_header("X-request-id")}
             if phase == "finalized" and key == EVENT:
-                result = deepcopy(RESULT)
-                if wrong_result:
-                    result["final"] = 1
+                result = {**RESULT, "final": 1} if wrong_result else RESULT
                 return 200, headers, dict(envelope, ok=True, result=result)
             status, code = (403, "action_not_allowed") if phase == "off" else (404, "not_found")
             return status, headers, dict(envelope, ok=False, error={
@@ -84,10 +82,12 @@ class AcceptanceTests(unittest.TestCase):
             acceptance.probe(phase, ORIGIN, IDENTITY, START, signer, check)
             self.assertEqual(requests, keys)
             self.assertEqual(len(readies), len(keys) + 1)
-        for mismatch in ({"wrong_result": True}, {"drift": True}):
-            check, _, _ = self.signed_peer("finalized", **mismatch)
+        for check in (self.signed_peer("finalized", wrong_result=True)[0], self.signed_peer("finalized", drift=True)[0]):
             with self.assertRaises(acceptance.Refused):
                 acceptance.probe("finalized", ORIGIN, IDENTITY, START, signer, check)
+        check, _, _ = self.signed_peer("pending")
+        with patch.object(acceptance.time, "monotonic", side_effect=[0, 2.5]), self.assertRaisesRegex(acceptance.Refused, "Web deadline"):
+            acceptance.probe("pending", ORIGIN, IDENTITY, START, signer, check)
 
     def test_signature_matches_shared_wire_vectors(self):
         path = Path(__file__).resolve().parents[2] / "crates/core/tests/fixtures/internal-action-signing.json"
@@ -97,6 +97,6 @@ class AcceptanceTests(unittest.TestCase):
             self.assertEqual(headers["x-two-signature"], vector["signature"])
 
     def test_without_execute_sends_nothing(self):
-        args = ["pending", "--staging-url", ORIGIN, "--rollout", "rollout", "--observed", "observed"]
+        args = ["pending", "--rollout", "rollout", "--observed", "observed"]
         with patch.object(acceptance, "read_object"), patch.object(acceptance, "validate_configuration"):
             self.assertEqual(acceptance.main(args, env={}, check=lambda _: self.fail("network call")), 2)

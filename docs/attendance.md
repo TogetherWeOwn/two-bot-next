@@ -10,7 +10,7 @@ a pending event in TWO Staging. Use a recent UTC whole-minute start, end 30
 minutes later, and seed one closed 12-minute session starting one minute
 after the start. Use fabricated member `300000000000000001` and room
 `400000000000000001` with observed name `Synthetic attendance room`. Finalize
-the same event and wait for grace to elapse. Seed the equivalent finalized
+after completion and 15 minutes of grace (start + 45 minutes). Seed the equivalent
 record at the `:foreign` suffix key only in a different synthetic tenant.
 Use the same finalized primary event for OFF. The wire request has no guild
 selector, so the foreign-only key tests the configured reader's tenant scope.
@@ -32,16 +32,16 @@ Inject `STAGING_ATTENDANCE_KEY_ID` and `STAGING_ATTENDANCE_SIGNING_SECRET` for
 the dedicated staging caller. Pass the 64-character lowercase hex secret as ASCII.
 
 ```sh
-python3 scripts/staging_attendance_acceptance.py "$phase" \
-  --staging-url "$STAGING_WORKER_URL" --rollout rollout.json \
+python3 scripts/staging_attendance_acceptance.py "$phase" --rollout rollout.json \
   --observed observed.json --fixture-start "$fixture_start" --execute
 ```
 
-- `pending` requires signed `404 not_found` without a result.
-- `finalized` requires the exact event-bound v1 `final: true` result and a signed `404 not_found` for the foreign key.
-- `off` requires signed `403 action_not_allowed` while the fixture stays finalized.
+- `pending` requires `404 not_found` without a result.
+- `finalized` requires the exact event-bound v1 `final: true` result and `404 not_found` for the foreign key.
+- `off` requires `403 action_not_allowed` while the fixture stays finalized.
 - `cleanup` checks OFF, stopped and fixture removal offline. Omit `--execute` and `--fixture-start`.
 
-Exit `0` means pass, `1` means fail, and `2` includes preflight without
-`--execute`. Run cleanup even after failure. Record rollout and phase verdicts
-without credentials, signing headers or raw responses. CI uses synthetic envelopes.
+The v2 fixture lists the `not_found` outcome. The [Web reader](https://github.com/TogetherWeOwn/two-web-next/blob/cba63716d12421bcf054240cbfe8b036861bce62/src/bot/attendance-read.ts#L17-L109) consumes it as a `404` error and allows 2.5 seconds per signed read.
+
+Exit `0` means pass, `1` means fail, and `2` includes preflight without `--execute`.
+Run cleanup even after failure. Record verdicts without credentials, signing headers or raw responses.

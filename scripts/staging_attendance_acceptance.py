@@ -20,7 +20,7 @@ from urllib.request import Request
 from build_identity import is_build_id_shape, is_build_revision_shape, is_deploy_id_shape
 from script_intake import decode_json, no_redirect_opener, read_with_overflow
 from staging_automation_read_smoke import SmokeError, guild_fence
-from staging_health_contract_probe import BODY_CAP, ProbeError, parse_readyz, staging_origin
+from staging_health_contract_probe import BODY_CAP, ProbeError, parse_readyz
 from staging_rollout import UUID, readiness_identity
 
 ACTION_PATH = "/internal/actions"
@@ -30,8 +30,9 @@ MEMBER = "300000000000000001"
 ROOM = "400000000000000001"
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 PHASES = ("pending", "finalized", "off", "cleanup")
-TIMEOUT = 10
-RUN_BUDGET = 3 * TIMEOUT
+READY_TIMEOUT = 5
+WEB_TIMEOUT = 2.5
+RUN_BUDGET = 25
 
 
 class Refused(Exception):
@@ -134,7 +135,7 @@ def credentials(env):
 def send(request):
     opener = no_redirect_opener(use_proxy=False)
     try:
-        response = opener.open(request, timeout=TIMEOUT)
+        response = opener.open(request, timeout=READY_TIMEOUT if request.data is None else WEB_TIMEOUT)
     except HTTPError as error:
         response = error
     with response:
@@ -169,7 +170,9 @@ def signed_read(check, origin, signer, event_key, expected_status, expected):
     request_id = "".join(secrets.choice(CROCKFORD) for _ in range(26))
     headers = signing_headers(*signer, str(int(time.time())), secrets.token_hex(16), body)
     headers.update({"Content-Type": "application/json", "x-request-id": request_id})
+    started = time.monotonic()
     status, response_headers, result = check(request(origin + ACTION_PATH, body=body, headers=headers))
+    require(time.monotonic() - started < WEB_TIMEOUT, "signed read exceeded the Web deadline")
     envelope = {"ok": expected_status == 200, "request_id": request_id, **expected}
     # Canonical JSON equality preserves JSON types (Python bool/int equality does not).
     require(status == expected_status and response_headers.get("cache-control") == "no-store"
@@ -201,18 +204,15 @@ def deadline(_signum, _frame):
 def main(argv=None, *, env=None, check=send):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("phase", choices=PHASES)
-    parser.add_argument("--staging-url", required=True)
     parser.add_argument("--rollout", required=True, type=Path)
     parser.add_argument("--observed", required=True, type=Path)
     parser.add_argument("--fixture-start")
     parser.add_argument("--execute", action="store_true", help="enable signed HTTPS reads")
     args = parser.parse_args(argv)
     try:
-        origin = staging_origin(args.staging_url)
-        require(origin == STAGING_ORIGIN, "staging origin did not match the attendance target")
-        identity = validate_configuration(args.phase, origin, read_object(args.rollout), read_object(args.observed))
+        identity = validate_configuration(args.phase, STAGING_ORIGIN, read_object(args.rollout), read_object(args.observed))
         if args.phase == "cleanup":
-            require(not args.execute, "cleanup only accepts offline readback")
+            require(not args.execute and args.fixture_start is None, "cleanup only accepts offline readback")
         elif not args.execute:
             print("DRY RUN: attendance configuration matched, no signed check performed")
             return 2
@@ -222,7 +222,7 @@ def main(argv=None, *, env=None, check=send):
             old_handler = signal.signal(signal.SIGALRM, deadline)
             try:
                 signal.alarm(RUN_BUDGET)
-                probe(args.phase, origin, identity, start, signer, check)
+                probe(args.phase, STAGING_ORIGIN, identity, start, signer, check)
             finally:
                 signal.alarm(0)
                 signal.signal(signal.SIGALRM, old_handler)
