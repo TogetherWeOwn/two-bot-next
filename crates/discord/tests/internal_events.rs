@@ -1048,6 +1048,7 @@ mod database {
                 include_str!("../../cutover/migrations/0452_scheduled_events_tombstone.sql"),
                 include_str!("../../cutover/migrations/0455_event_voice_channels.sql"),
                 include_str!("../../cutover/migrations/0472_event_instance_windows.sql"),
+                include_str!("../../cutover/migrations/0475_attendance_recovery_boundary.sql"),
             ] {
                 sqlx::raw_sql(migration).execute(&pool).await.unwrap();
             }

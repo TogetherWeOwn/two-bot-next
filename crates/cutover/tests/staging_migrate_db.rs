@@ -363,6 +363,26 @@ impl Fixture {
         PgConnection::connect_with(&admin_options(&self.host, &self.database)).await
     }
 
+    async fn migrator_pool(&self) -> Result<sqlx::PgPool, sqlx::Error> {
+        let options = PgConnectOptions::new_without_pgpass()
+            .host(&self.host)
+            .port(5432)
+            .username(&self.mlogin)
+            .password("")
+            .database(&self.database)
+            .ssl_mode(PgSslMode::Disable);
+        PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn: &mut PgConnection, _meta| {
+                Box::pin(async move {
+                    conn.execute("SET ROLE two_bot_migrator").await?;
+                    Ok::<_, sqlx::Error>(())
+                })
+            })
+            .connect_with(options)
+            .await
+    }
+
     /// A session as the read-only plan login with its group assumed, exactly
     /// as the runner's `after_connect` does for `--plan`.
     async fn ro_session(&self) -> Result<PgConnection, sqlx::Error> {
@@ -448,23 +468,7 @@ fn fixture_tag_is_unique_under_concurrency() {
 /// Seed the 29-version staging state through a filtered SQLx migrator, as the
 /// non-superuser member login with SET ROLE on the single pooled connection.
 async fn seed_staging_state(fx: &Fixture) -> TestResult {
-    let options = PgConnectOptions::new_without_pgpass()
-        .host(&fx.host)
-        .port(5432)
-        .username(&fx.mlogin)
-        .password("")
-        .database(&fx.database)
-        .ssl_mode(PgSslMode::Disable);
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .after_connect(|conn: &mut PgConnection, _meta| {
-            Box::pin(async move {
-                conn.execute("SET ROLE two_bot_migrator").await?;
-                Ok::<_, sqlx::Error>(())
-            })
-        })
-        .connect_with(options)
-        .await?;
+    let pool = fx.migrator_pool().await?;
     let seed: Vec<_> = two_bot_cutover::staging_migrate::MIGRATOR
         .iter()
         .filter(|m| SEED_VERSIONS.contains(&m.version))
@@ -478,6 +482,112 @@ async fn seed_staging_state(fx: &Fixture) -> TestResult {
     Migrator::with_migrations(seed).run(&pool).await?;
     pool.close().await;
     Ok(())
+}
+
+async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestResult {
+    use two_bot_cutover::staging_migrate::MIGRATOR;
+
+    let fx = Fixture::new().await?;
+    let pool = fx.migrator_pool().await?;
+    // Build the pre-0475 schema and ledgers through the real migration
+    // sources, so 0481 is already applied when the runner fills the gap.
+    let seed = MIGRATOR
+        .iter()
+        .filter(|m| m.version != 475)
+        .cloned()
+        .collect();
+    Migrator::with_migrations(seed).run(&pool).await?;
+    two_bot_store::migrate(&pool).await?;
+    pool.close().await;
+    let mut conn = fx.scratch().await?;
+    conn.execute(
+        "GRANT SELECT ON public._sqlx_migrations, public._two_bot_migrations TO two_bot_migrator_ro",
+    )
+    .await?;
+    let boundary_column = "SELECT data_type, is_nullable FROM information_schema.columns
+                           WHERE table_schema = 'public' AND table_name = 'event_instance_windows'
+                             AND column_name = 'attendance_recovered_at'";
+    let before: Option<(String, String)> = sqlx::query_as(boundary_column)
+        .fetch_optional(&mut conn)
+        .await?;
+    assert!(before.is_none());
+
+    let (host, db) = (&fx.host, &fx.database);
+    let (code, stdout, err) = fx
+        .run(
+            "--plan",
+            Some(fx.url(&fx.rologin, db)),
+            host,
+            db,
+            RunExpect::default(),
+        )
+        .await;
+    assert_eq!(code, 0, "{err}");
+    let plan = manifest(&stdout);
+    let before = plan["ledger_before"].as_array().unwrap();
+    assert!(before
+        .iter()
+        .any(|row| row["version"] == 481 && row["success"] == true));
+    assert_eq!(plan["ledger_before"], plan["ledger_after"]);
+    assert_eq!(pending_list(&plan["pending_before"]), [475]);
+    assert!(pending_list(&plan["pending_store_before"]).is_empty());
+    assert!(!plan["ledger_store_before"].as_array().unwrap().is_empty());
+
+    let artifact = snapshot_plan_manifest(&stdout);
+    let (code, stdout, err) = fx
+        .run(
+            "--apply",
+            Some(fx.url(&fx.mlogin, db)),
+            host,
+            db,
+            RunExpect::bound(
+                Some("475"),
+                Some(""),
+                (
+                    plan["plan_manifest_sha256"].as_str().unwrap(),
+                    plan["store_plan_manifest_sha256"].as_str().unwrap(),
+                    "424475",
+                    &artifact,
+                ),
+            ),
+        )
+        .await;
+    std::fs::remove_file(artifact)?;
+    assert_eq!(code, 0, "{err}");
+    let applied = manifest(&stdout);
+    assert_eq!(applied["plan_provenance_verified"], true);
+    assert_eq!(applied["applied_count"], 1);
+    assert_eq!(applied["applied_store_count"], 0);
+    assert_eq!(applied["ledger_before"], plan["ledger_before"]);
+    assert_eq!(applied["ledger_store_before"], plan["ledger_store_before"]);
+    assert_eq!(applied["ledger_store_after"], plan["ledger_store_before"]);
+    let mut after = applied["ledger_after"].as_array().unwrap().clone();
+    let boundary = after.iter().position(|row| row["version"] == 475).unwrap();
+    let applied_row = after.remove(boundary);
+    assert_eq!(
+        &after, before,
+        "only migration 0475 was added to the ledger"
+    );
+    let expected = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 475)
+        .unwrap();
+    let (success, sha384): (bool, String) = sqlx::query_as(
+        "SELECT success, encode(checksum, 'hex') FROM public._sqlx_migrations WHERE version = 475",
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    assert!(success);
+    assert_eq!(sha384, hex::encode(&expected.checksum));
+    assert_eq!(applied_row["success"], success);
+    assert_eq!(applied_row["sha384"], sha384);
+    let column: (String, String) = sqlx::query_as(boundary_column).fetch_one(&mut conn).await?;
+    assert_eq!(
+        column,
+        ("timestamp with time zone".to_owned(), "YES".to_owned())
+    );
+    conn.close().await?;
+    fx.finish().await
 }
 
 #[tokio::test]
@@ -1182,7 +1292,10 @@ async fn real_sqlx_runner_cases() -> TestResult {
     assert!(err.contains("incomplete"));
 
     c.close().await?;
-    fx.finish().await
+    fx.finish().await?;
+    // Use a fresh fixture on the same guarded CI route to verify a single
+    // missing migration below the ledger maximum.
+    applies_missing_0475_after_0481_and_reads_back_both_ledgers().await
 }
 
 /// Marker the runner records when the ledger cannot be read after a run.

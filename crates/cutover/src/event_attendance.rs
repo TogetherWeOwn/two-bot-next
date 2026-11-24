@@ -1,4 +1,4 @@
-//! Dormant, read-only lookup of finalized event attendance. No capture or backfill.
+//! Dormant attendance storage. No capture or backfill.
 //!
 //! Writers must tag each session in `event_voice_sessions.event_keys` with
 //! `event_key/event_id/instance_start_unix_micros` (signed decimal, no padding).
@@ -12,6 +12,8 @@ use two_bot_core::{
     internal_actions::{is_snowflake, valid_event_key},
     Snowflake,
 };
+
+pub mod finalization;
 
 const MAX_SESSIONS: usize = 4096;
 

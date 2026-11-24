@@ -26,7 +26,7 @@ from staging_retention_census import (
 ROOT = Path(__file__).resolve().parents[1]
 CAPTURE = Path("staging-recovery.cms")
 MAX_CAPTURE_BYTES = 4 * 1024 * 1024
-RECIPIENT_SHA256 = "eeecda3d0f93a43abf5907d482a98ba9d4b14b523c25039ce1ce5800f795bd81"
+RECIPIENT_SHA256 = "278940b22ac30d798774250303002b4f3e79dd75ff171efa02b738babcf7c959"
 
 
 def encrypt(payload, certificate):

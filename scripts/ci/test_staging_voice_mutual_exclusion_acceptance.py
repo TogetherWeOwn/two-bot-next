@@ -1834,8 +1834,9 @@ class ExistingSafetyControls(unittest.TestCase):
         rollback = by_id["auto_rollback"]
         self.assertIn("worker_container_rollback.py rollback", rollback["run"])
         self.assertIn("--variant staging", rollback["run"])
-        self.assertEqual(rollback["if"], "failure() && steps.deploy.outcome == 'success' "
-                         "&& steps.snapshot.outcome == 'success'")
+        self.assertEqual(rollback["if"], "failure() && inputs.recovery_mode != 'bootstrap' "
+                         "&& steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success' "
+                         "&& (inputs.recovery_mode == 'standard' || steps.use.outcome == 'success')")
 
     def test_certify_promotion_still_needs_every_live_gate(self):
         job = load_all()[DEPLOY]["jobs"]["certify-promotion"]

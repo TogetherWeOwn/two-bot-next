@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import tomllib
 import unittest
 
 import yaml
@@ -153,6 +154,17 @@ class RequiredChecksReportTests(unittest.TestCase):
         agg = workflow["jobs"]["ci-ok"]
         self.assertIn("fuzz-compile", agg["needs"])
         self.assertIn("FUZZ_COMPILE_RESULT", "\n".join(step.get("run", "") for step in agg["steps"]))
+
+    def test_database_url_fuzz_replay_uses_runtime_sqlx_parser(self):
+        def parser_versions(lockfile):
+            packages = tomllib.loads((ROOT / lockfile).read_text())["package"]
+            return {name: {entry["version"] for entry in packages if entry["name"] == name}
+                    for name in ("sqlx-core", "sqlx-postgres")}
+
+        runtime = parser_versions("Cargo.lock")
+        for name, versions in runtime.items():
+            self.assertEqual(len(versions), 1, name)
+        self.assertEqual(parser_versions("fuzz/Cargo.lock"), runtime)
 
     def test_ignored_db_runtime_has_bounded_time_for_serial_suites(self):
         job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]

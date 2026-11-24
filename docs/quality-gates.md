@@ -74,6 +74,12 @@ lint-only `check` lane.
   The corresponding Rust review checklist is available at the same source commit
   ([`rust-bot.yaml`](https://github.com/TogetherWeOwn/paperclip-ops-tooling/blob/a10103b5f8c9846b8d12cc2d19c7bc2246d12349/quality/meta-only/checklists/rust-bot.yaml));
   it is review guidance with fail-unknown evidence rules, not an automated CI gate.
+- Test schema allocation (HARD): the same ast-grep step rejects added
+  `CREATE SCHEMA` lines in Rust test files and inline tests outside testsupport.
+  Use `two_bot_testsupport::create_test_schema` with the fixture's existing
+  disposable executor. The caller still owns the search path, setup and teardown.
+  Keep DDL that a migration or schema-behavior test specifically exercises in
+  its SQL fixture, loaded with `include_str!` or `sqlx::migrate!`.
 - Semgrep Rust rules (HARD): vendored `.semgrep/rust-warn.yml` (local rules
   only, no registry) fails the PR on newly added `todo!`/`unimplemented!`,
   empty `.expect("")`, `panic!` in non-test code or `process::exit` in

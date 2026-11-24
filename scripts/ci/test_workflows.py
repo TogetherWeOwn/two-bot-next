@@ -162,9 +162,9 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    # After every staging deploy; its failure fails deploy-staging (promotion gate).
                    ("deploy-staging.yml", "help-embed-synthetic"): "./.github/workflows/help-embed-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
-                   ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
+                   ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@8059ac2b121b63443db656b1e10e927b8af8133c",
                    # Read-only shadow engine, pinned to the published central merge commit.
-                   ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
+                   ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@8059ac2b121b63443db656b1e10e927b8af8133c",
                    # SDLC 2.3 CI speed pilot, promoted: required check.yml
                    # caller to the shared nextest lane (local path until
                    # the central move).
@@ -555,7 +555,7 @@ def filter_pattern_matches(pattern, path):
 
 
 def staging_dispatch_errors(workflow):
-    """Only workflow_dispatch can start staging, with eight fenced inputs.
+    """Only workflow_dispatch can start staging, with validated inputs.
 
     `release_fence` exists on main (TOG-11143) so post-handoff release of an
     uninitialized/parked singleton is explicit and auditable; it defaults to
@@ -585,9 +585,9 @@ def staging_dispatch_errors(workflow):
     inputs = dispatch.get("inputs") if isinstance(dispatch, dict) and set(dispatch) == {"inputs"} else None
     expected_booleans = {"release_fence", "inject_gateway_failure", "inject_error_rate_spike",
                          "inject_voice_stall", "inject_unpaired_disconnect", "recover_prior_sha", "verify_automod_preview"}
-    expected = expected_booleans | {"sha"}
+    expected = expected_booleans | {"sha", "recovery_mode", "recovery_pair"}
     if not isinstance(inputs, dict) or set(inputs) != expected:
-        return [f"{name}: workflow_dispatch must carry only the release_fence, drill and sha inputs"]
+        return [f"{name}: workflow_dispatch inputs must match the reviewed set"]
     for input_name in expected_booleans:
         spec = inputs[input_name]
         if (not isinstance(spec, dict) or set(spec) != {"description", "type", "default"}
@@ -599,6 +599,13 @@ def staging_dispatch_errors(workflow):
             or sha.get("default") != ""):
         errors.append(f"{name}: sha must be an optional string defaulting to empty "
                       "(empty deploys the workflow head)")
+    mode, pair = inputs["recovery_mode"], inputs["recovery_pair"]
+    if (not isinstance(mode, dict) or mode.get("type") != "choice" or mode.get("default") != "standard"
+            or mode.get("options") != ["standard", "bootstrap", "verified"]):
+        errors.append(f"{name}: recovery_mode must opt in to bootstrap or verified recovery")
+    if (not isinstance(pair, dict) or pair.get("type") != "string" or pair.get("required") != "false"
+            or "default" in pair):
+        errors.append(f"{name}: recovery_pair must be an optional string without a default")
     return errors
 
 
@@ -2586,11 +2593,10 @@ def staging_ownership_status_errors(workflow):
     return errors
 
 
-# Pinned central gradual-promote action (verified 2026-10-18; re-verify HEAD
-# before repinning). Every error-rate input stays explicit so a central
+# Pinned central gradual-promote action. Every error-rate input stays explicit so a central
 # default change cannot silently widen the gate.
 GRADUAL_PROOF_ACTION = ("TogetherWeOwn/.github/actions/gradual-promote"
-                        "@2ef8ad6447e11d019ac3098bcfd011193b75266a")
+                        "@8059ac2b121b63443db656b1e10e927b8af8133c")
 GRADUAL_PROOF_WORKER = "two-bot-next-gradual-proof"
 GRADUAL_PROOF_WITH = {
     "worker-name": GRADUAL_PROOF_WORKER,
@@ -3356,10 +3362,14 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
     if "schema-gate" not in needs:
         errors.append(f"{name}:deploy: must needs the schema-gate (drift must block the deploy)")
     steps = gate.get("steps") or []
-    if len(steps) != 4:
-        errors.append(f"{name}:schema-gate: must run exactly checkout, SHA check, build and the gate")
+    if len(steps) != 5:
+        errors.append(f"{name}:schema-gate: must run exactly checkout, SHA check, build, gate and recovery proof")
         return errors
-    checkout, sha_check, build, run = steps
+    checkout, sha_check, build, run, proof = steps
+    if proof != {"name": "Verify the recovery plan and both ledgers", "id": "recovery-plan",
+                 "if": "${{ inputs.recovery_mode != 'standard' }}",
+                 "run": "python3 scripts/staging_bootstrap.py plan"}:
+        errors.append(f"{name}:schema-gate: recovery proof must read only the successful gate's local plan")
     if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
             or (checkout.get("with") or {}).get("persist-credentials") != "false" \
             or (checkout.get("with") or {}).get("fetch-depth") != "0":
@@ -5222,6 +5232,10 @@ class ProductionPromotionSkipTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_cargo_deny_keeps_transitive_unmaintained_advisories(self):
+        config = tomllib.loads((ROOT / "deny.toml").read_text())
+        self.assertEqual(config["advisories"]["unmaintained"], "all")
+
     def setUp(self):
         self.workflows = load_workflows()
 
@@ -7646,6 +7660,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(steps[preflights[0]].get("if"), "${{ !inputs.release_fence }}")
         self.assertFalse(steps[preflights[0]].get("continue-on-error", False))
         self.assertNotIn("if", steps[deploy])
+        labels = [step.get("id") or step.get("name") for step in steps]
+        names = ["snapshot", "Check the stopped recovery predecessor and pin the approved target", "deploy",
+                 "Prove the serving Worker database before ownership or startup", "takeover", "use"]
+        self.assertEqual([name for name in labels if name in names], names)
+        self.assertNotIn("continue-on-error", steps[labels.index(names[3])])
+        exclude = steps[labels.index("Keep the bootstrap baseline out of staging qualification")]
+        self.assertEqual(exclude["if"], "${{ inputs.recovery_mode == 'bootstrap' }}")
+        self.assertIn("exit 1", exclude["run"])
 
     def test_staging_takeover_fence_hint_is_scoped_to_the_fenced_refusal(self):
         # Execute the actual workflow shell with a stub control client. This
@@ -8537,6 +8559,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(dispatch["inputs"]), {
             "release_fence", "inject_gateway_failure", "inject_error_rate_spike",
             "inject_voice_stall", "inject_unpaired_disconnect", "recover_prior_sha", "sha", "verify_automod_preview",
+            "recovery_mode", "recovery_pair",
         })
         self.assertEqual(dispatch["inputs"]["sha"]["default"], "")
         self.assertEqual(dispatch["inputs"]["recover_prior_sha"]["default"], "false")
@@ -8622,8 +8645,8 @@ class WorkflowTests(unittest.TestCase):
                                           ("voice-rest-measurement.yml", "voice-first"): "./.github/workflows/voice-synthetic.yml",
                                           ("voice-rest-measurement.yml", "voice-second"): "./.github/workflows/voice-synthetic.yml",
                                           ("deploy-staging.yml", "help-embed-synthetic"): "./.github/workflows/help-embed-synthetic.yml",
-                                          ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
-                                          ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
+                                          ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@8059ac2b121b63443db656b1e10e927b8af8133c",
+                                          ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@8059ac2b121b63443db656b1e10e927b8af8133c",
                                           ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
                                           ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
                                           ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",

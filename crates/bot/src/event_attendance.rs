@@ -5,6 +5,7 @@ use two_bot_core::{funnel::format_iso_millis, Snowflake};
 
 pub mod planning;
 pub mod read;
+pub mod recovery;
 
 const GRACE_US: i64 = 15 * 60 * 1_000_000;
 const THRESHOLD_MINUTES: u8 = 10;

@@ -1,0 +1,79 @@
+id: rust-inline-test-schema-allocation
+snapshots:
+  ? |
+    #![cfg(test)]
+    fn setup() { sqlx::query("/* setup */ CREATE SCHEMA scratch"); }
+  : labels:
+    - source: '"/* setup */ CREATE SCHEMA scratch"'
+      style: primary
+      start: 39
+      end: 74
+    - source: '#![cfg(test)]'
+      style: secondary
+      start: 0
+      end: 13
+    - source: |
+        #![cfg(test)]
+        fn setup() { sqlx::query("/* setup */ CREATE SCHEMA scratch"); }
+      style: secondary
+      start: 0
+      end: 79
+  ? |
+    #[cfg(all(feature = "db", test))]
+    mod tests {
+        fn setup() { sqlx::query("CREATE SCHEMA scratch"); }
+    }
+  : labels:
+    - source: '"CREATE SCHEMA scratch"'
+      style: primary
+      start: 75
+      end: 98
+    - source: '#[cfg(all(feature = "db", test))]'
+      style: secondary
+      start: 0
+      end: 33
+    - source: |-
+        mod tests {
+            fn setup() { sqlx::query("CREATE SCHEMA scratch"); }
+        }
+      style: secondary
+      start: 34
+      end: 104
+  ? |
+    #[cfg(test)]
+    mod tests {
+        fn setup() { sqlx::query("CREATE SCHEMA scratch"); }
+    }
+  : labels:
+    - source: '"CREATE SCHEMA scratch"'
+      style: primary
+      start: 54
+      end: 77
+    - source: '#[cfg(test)]'
+      style: secondary
+      start: 0
+      end: 12
+    - source: |-
+        mod tests {
+            fn setup() { sqlx::query("CREATE SCHEMA scratch"); }
+        }
+      style: secondary
+      start: 13
+      end: 83
+  ? |
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires disposable test database"]
+    async fn example() { sqlx::query("CREATE SCHEMA scratch"); }
+  : labels:
+    - source: '"CREATE SCHEMA scratch"'
+      style: primary
+      start: 121
+      end: 144
+    - source: '#[tokio::test(flavor = "multi_thread")]'
+      style: secondary
+      start: 0
+      end: 39
+    - source: async fn example() { sqlx::query("CREATE SCHEMA scratch"); }
+      style: secondary
+      start: 88
+      end: 148

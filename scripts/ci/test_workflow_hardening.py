@@ -19,6 +19,23 @@ def workflow(name):
 
 
 class WorkflowHardeningTests(unittest.TestCase):
+    def test_setup_python_uses_github_distribution_with_reviewed_versions(self):
+        pin = "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+        callers = (
+            ("mutation.yml", "python-mutation", "3.12.16", "steps.plan.outputs.python_fixture == 'true'"),
+            ("pr-evidence.yml", "pr-evidence", "3.12", None),
+        )
+        for filename, job_id, version, condition in callers:
+            with self.subTest(workflow=filename):
+                job = workflow(filename)["jobs"][job_id]
+                self.assertEqual(job["runs-on"], "ubuntu-latest")
+                steps = [step for step in job["steps"]
+                         if step.get("uses", "").startswith("actions/setup-python@")]
+                self.assertEqual(len(steps), 1)
+                self.assertEqual(steps[0]["uses"], pin)
+                self.assertEqual(steps[0]["with"], {"python-version": version})
+                self.assertEqual(steps[0].get("if"), condition)
+
     def test_selectors_treat_event_as_data_and_keep_fail_closed_defaults(self):
         jobs = workflow("check.yml")["jobs"]
         for job_id in ("job-inputs", "container-inputs"):

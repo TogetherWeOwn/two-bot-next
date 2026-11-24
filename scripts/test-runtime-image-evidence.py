@@ -187,11 +187,13 @@ class EvidenceTests(unittest.TestCase):
 
     def test_preflight_consumes_the_collected_report_shape(self):
         report = self.collect()
-        purl = "pkg:deb/debian/zlib1g@1.3.dfsg%2Breally1.3.1-1%2Bb1?arch=amd64&distro=debian-13.7&epoch=1"
+        purl = ("pkg:deb/debian/zlib1g@1.3.dfsg%2Breally1.3.1-1%2Bb1"
+                f"?arch=amd64&distro={preflight.DISTRO}&epoch=1")
+        release = preflight.DISTRO.removeprefix("debian-")
         version = "1:1.3.dfsg+really1.3.1-1+b1"
         package = {"ID": "zlib1g@" + version, "Name": "zlib1g", "Arch": "amd64", "Identifier": {"PURL": purl}}
         scan = {"SchemaVersion": 2, "Trivy": {"Version": "0.69.3"}, "ArtifactType": "container_image",
-                "Metadata": {"ImageID": IMAGE_ID, "OS": {"Family": "debian", "Name": "13.7"},
+                "Metadata": {"ImageID": IMAGE_ID, "OS": {"Family": "debian", "Name": release},
                              "ImageConfig": {"architecture": "amd64", "os": "linux"}},
                 "Results": [{"Class": "os-pkgs", "Type": "debian", "Packages": [package], "Vulnerabilities": [
                     {"VulnerabilityID": "CVE-2026-99999", "Severity": "HIGH", "PkgName": "zlib1g",

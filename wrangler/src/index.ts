@@ -156,6 +156,8 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   OWNERSHIP_CONTROL_TOKEN?: string;
   /** Staging-only lifecycle policy. Activation is separate from protocol rollout. */
   STAGING_RUNTIME_POLICY?: string;
+  /** Approved database fingerprint stamped only by protected staging recovery. */
+  STAGING_RECOVERY_DB_FINGERPRINT?: string;
   DISCORD_TOKEN?: string;
   DATABASE_URL?: string;
   GUILD_ID?: string;
@@ -870,6 +872,7 @@ export class TwoBotContainer extends Container<Env> {
       try {
         const owner = await this.ownership.require(this.id());
         if (this.boundedStaging()) {
+          await this.requireRecoveryDatabase();
           const use = await this.stagingUse.require({ deploymentId: this.id(), sha: this.env.CONTAINER_RELEASE ?? "", owner });
           await this.scheduleStagingExpiry(use.expiresAt);
         }
@@ -916,8 +919,26 @@ export class TwoBotContainer extends Container<Env> {
     return this.env.TWO_DEPLOY_ENV === "staging" && this.env.STAGING_RUNTIME_POLICY === "bounded";
   }
 
+  private recoveryDatabasePin(): string | undefined {
+    return this.boundedStaging() ? this.env.STAGING_RECOVERY_DB_FINGERPRINT : undefined;
+  }
+
+  private async requireRecoveryDatabase(): Promise<void> {
+    const pin = this.recoveryDatabasePin();
+    if (pin === undefined) return;
+    const evidence = await stagingDatabaseEvidence(`?runtime_db_fingerprint=${pin}`, this.envVars["DATABASE_URL"]);
+    if (evidence.runtimeDatabaseFingerprint !== pin) throw new OwnershipRefused("staging_database_unverified");
+  }
+
+  private checkRecoveryStartOptions(options: Parameters<Container<Env>["start"]>[0]): void {
+    if (this.recoveryDatabasePin() !== undefined && (options?.envVars !== undefined || options?.entrypoint !== undefined)) {
+      throw new OwnershipRefused("staging_start_options_refused");
+    }
+  }
+
   private async requireStagingUse(): Promise<StagingUse> {
     try {
+      await this.requireRecoveryDatabase();
       const owner = await this.ownership.require(this.id());
       const use = await this.stagingUse.require({ deploymentId: this.id(), sha: this.env.CONTAINER_RELEASE ?? "", owner });
       await this.scheduleStagingExpiry(use.expiresAt);
@@ -1463,6 +1484,7 @@ export class TwoBotContainer extends Container<Env> {
         let use = await this.stagingUse.read();
         if (change) {
           if (change.action === "acquire") {
+            await this.requireRecoveryDatabase();
             use = await this.stagingUse.acquire(change, identity,
               () => this.stopStagingUse(), (expiry) => this.scheduleStagingExpiry(expiry));
             this.recoveryFailed = false;
@@ -1507,9 +1529,12 @@ export class TwoBotContainer extends Container<Env> {
           const evidence = this.boundedStaging()
             ? await stagingDatabaseEvidence(new URL(request.url).search, this.envVars["DATABASE_URL"])
             : {};
+          const pin = this.recoveryDatabasePin();
+          const recovery = pin !== undefined && evidence.runtimeDatabaseFingerprint === pin
+            ? { runtimeDatabaseStartupGuard: true } : {};
           // Takeover does not start the gateway. A subsequent owned probe does.
           return Response.json({ deploymentId: id, owner: owner ?? null,
-            running: this.ctx.container?.running ?? false, ...evidence }, {
+            running: this.ctx.container?.running ?? false, ...evidence, ...recovery }, {
             headers: withSecurityHeaders({ "cache-control": "no-store" }),
           });
         }
@@ -1626,6 +1651,7 @@ export class TwoBotContainer extends Container<Env> {
   // SDK 0.3.7 containerFetch auto-starts via startAndWaitForPorts, NOT start.
   // Guard all three supported entries, including direct binding/RPC calls.
   override async start(...args: Parameters<Container<Env>["start"]>): Promise<void> {
+    this.checkRecoveryStartOptions(args[0]);
     return this.owned(() => super.start(...args));
   }
 
@@ -1633,6 +1659,9 @@ export class TwoBotContainer extends Container<Env> {
     // containerFetch always names one port. While a receiver is enabled its
     // port is checked with it; the explicit port stays first for the SDK.
     const [ports, ...rest] = args;
+    const options = typeof ports === "object" && ports !== null && !Array.isArray(ports)
+      ? ports.startOptions : rest[1];
+    this.checkRecoveryStartOptions(options);
     let checked = ports;
     if (typeof ports === "number" && (receiverEnabled(this.env) || eventsubReceiverForwarded(this.env))) {
       const extra = [ports, this.defaultPort ?? ports];

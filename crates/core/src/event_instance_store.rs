@@ -6,6 +6,7 @@
 //! never advances an occurrence. There is deliberately no inferred recurrence.
 
 use sqlx::{PgConnection, PgPool};
+use time::OffsetDateTime;
 
 use crate::scheduled_events::ScheduledEvent;
 
@@ -30,6 +31,33 @@ pub async fn lock_event(connection: &mut PgConnection, event_id: &str) -> Result
     Ok(())
 }
 
+/// Check the lifecycle floor before adding a first attendance tag at close.
+/// Use the original join time under the caller's guild lifecycle lock.
+/// Window overlap, continuity, and privacy are separate admission checks.
+pub async fn attendance_close_follows_recovery_in(
+    connection: &mut PgConnection,
+    guild_id: &str,
+    event_id: &str,
+    instance_starts_at: OffsetDateTime,
+    joined_at: OffsetDateTime,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM event_instance_windows
+             WHERE guild_id = $1 AND event_id = $2 AND instance_starts_at = $3
+               AND is_current AND NOT identity_ambiguous AND revoked_at IS NULL
+               AND status IN ('scheduled', 'active', 'completed')
+               AND (attendance_recovered_at IS NULL OR attendance_recovered_at <= $4)
+         )",
+    )
+    .bind(guild_id)
+    .bind(event_id)
+    .bind(instance_starts_at)
+    .bind(joined_at)
+    .fetch_one(connection)
+    .await
+}
+
 /// Synchronize an accepted mirror row in its writer's transaction. An absent
 /// mirror does not defeat retained ordering, omission or revocation fences.
 /// Equal-stamp terminal observations win over live evidence, never vice versa.
@@ -37,6 +65,9 @@ pub async fn lock_event(connection: &mut PgConnection, event_id: &str) -> Result
 /// live mutations and equal snapshot replays respect the committed absence fence.
 /// Completion may advance an established instance's confirmed lifecycle behind
 /// an omission, but cannot establish an unknown instance behind that fence.
+/// New observations opt out of the legacy attendance fence. A transition out
+/// of missing records a lower bound for future attendance evidence, never
+/// earlier than the omitted epoch or a retained migration/restore fence.
 pub(crate) async fn observe_in(
     connection: &mut PgConnection,
     guild_id: &str,
@@ -48,13 +79,13 @@ pub(crate) async fn observe_in(
     sqlx::query(
         "INSERT INTO event_instance_windows AS w
            (guild_id, event_id, instance_starts_at, starts_at, ends_at,
-            status, observed_at, revoked_at, identity_ambiguous)
+            status, observed_at, revoked_at, identity_ambiguous, attendance_recovered_at)
          SELECT $1, $2,
                 COALESCE((SELECT MIN(c.instance_starts_at) FROM event_voice_channels c
                           WHERE c.event_id = $2 HAVING COUNT(*) = 1), $3::text::timestamptz),
                 $3::text::timestamptz, $4::text::timestamptz, $5, $6,
                 CASE WHEN $5 = 'cancelled' THEN $6 ELSE NULL END,
-                (SELECT COUNT(*) > 1 FROM event_voice_channels c WHERE c.event_id = $2)
+                (SELECT COUNT(*) > 1 FROM event_voice_channels c WHERE c.event_id = $2), NULL
          WHERE $5 = 'cancelled' OR (
            $5 = 'completed' AND EXISTS (
              SELECT 1 FROM event_instance_windows confirmed
@@ -81,6 +112,11 @@ pub(crate) async fn observe_in(
          ON CONFLICT (guild_id, event_id) WHERE is_current DO UPDATE SET
            starts_at = EXCLUDED.starts_at, ends_at = EXCLUDED.ends_at,
            status = EXCLUDED.status, observed_at = EXCLUDED.observed_at,
+           attendance_recovered_at = CASE
+             WHEN w.status = 'missing' AND EXCLUDED.status IN ('scheduled', 'active', 'completed')
+             THEN GREATEST(w.attendance_recovered_at, w.omitted_at::timestamptz,
+                           EXCLUDED.observed_at::timestamptz)
+             ELSE w.attendance_recovered_at END,
            revoked_at = CASE WHEN EXCLUDED.status = 'cancelled'
                              THEN EXCLUDED.observed_at ELSE w.revoked_at END
          WHERE w.observed_at <= EXCLUDED.observed_at

@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import sys
 from time import monotonic
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request
 from zipfile import BadZipFile, ZipFile
 
@@ -202,7 +202,7 @@ def provider_sample(client, account):
                           "image_digest": image.removeprefix(prefix)}}
 
 
-def read_ownership(token, expected_fingerprint, *, opener=None):
+def read_ownership(token, expected_fingerprint, *, opener=None, deferred=False):
     endpoint = ORIGIN + "/internal/ownership"
     if expected_fingerprint is not None:
         require(matches(HEX64, expected_fingerprint), "invalid_plan_fingerprint")
@@ -214,6 +214,13 @@ def read_ownership(token, expected_fingerprint, *, opener=None):
         with opener.open(request, timeout=15) as response:
             require(response.status == 200, "ownership_get_failed")
             body = read_with_overflow(response, MAX_OWNER)
+    except HTTPError as error:
+        with error:
+            if deferred and error.code == 503:
+                body = read_with_overflow(error, MAX_OWNER)
+                if len(body) <= MAX_OWNER and mapping(decode(body)).get("reason") == "deployment_mismatch":
+                    raise GateError("ownership_deployment_mismatch") from None
+        raise GateError("ownership_get_failed") from None
     except (URLError, TimeoutError, OSError):
         raise GateError("ownership_get_failed") from None
     require(len(body) <= MAX_OWNER, "ownership_response_too_large")

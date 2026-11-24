@@ -436,7 +436,7 @@ merge or an unverified deployment is not `t0`.
    from the deployed checkout's lockfile after `npm ci`, so an older pinned drill
    uses that commit's CLI and receipt guard, not the workflow head's newer pin.
    Require at least one session, all pinned to that checkout's version (currently
-   4.161.0) with record version 1, exactly one `deploy` invocation and every other
+   4.165.0) with record version 1, exactly one `deploy` invocation and every other
    session exactly `--version` or `-v`, and exactly one staging deploy record
    with the expected Worker name, fresh timestamp and concrete Worker version.
    The `receipt` step runs this check **before** `deployment-takeover`, so
@@ -683,6 +683,28 @@ fingerprint support or the plan is omitted. A supporting Worker refuses
 a mismatch. Recovery requires a fresh plan and a separate check of the
 predecessor against both ledgers. If none qualifies, use the separately
 authorized baseline transition.
+
+With a verified clean plan, run `scripts/ci/staging_rollback_compatibility.py`
+against the plan, forward and recovery source SHAs to check both migration
+trees byte for byte. This is an operator-run preflight. Automatic rollback
+enforcement requires wiring it into the protected workflow before the first
+restore mutation. The workflow also owns binding, artifact and runtime acceptance.
+
+### Recover a baseline when the serving pair is incompatible
+
+1. Confirm the approved fingerprint and successful cutover 0475/0481 and store
+   0478 in the exact-source plan. Require a fresh clean plan after any authorized apply.
+2. Confirm the stopped predecessor's window is released or expired. Dispatch
+   `bootstrap` on current `main`. The authenticated GET must prove the exact
+   serving Worker's binding and startup guard before takeover or acquisition.
+3. Bootstrap stays red and excludes the predecessor from rollback. Reconcile
+   publication with read-only inventory. Confirm the window ended and staging stopped.
+4. After rollout, readiness, error-rate and release checks pass, authenticate
+   the protected artifact and set `recovery_pair` to its `UUID@sha256:digest`.
+   Dispatch `verified` to check both migration trees and the pinned stopped pair
+   before replacement. Unconfirmed acquisition skips rollback. Confirm release
+   or expiry and stopped state before rolling forward. A confirmed grant
+   permits rollback to the pinned pair within its original expiry.
 
 ## Verification boundaries
 
