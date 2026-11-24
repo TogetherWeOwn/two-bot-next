@@ -7,7 +7,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from production_migrate_claim import build_claim, projection_hash, Refused
+from production_migrate_claim import build_claim, projection_hash, store_projection_hash, Refused
 from test_workflows import load_workflows, production_migrate_errors
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -198,6 +198,29 @@ class ProductionApprovalTests(unittest.TestCase):
         fresh["audit"]["connection_usage"]["used"] = 11
         evidence = self.authorize(fresh)
         self.assertEqual(evidence["check_id"], self.check["id"])
+        self.assertEqual(evidence["atomic_release"], "false")
+
+    def test_atomic_release_requires_both_exact_pending_lists(self):
+        for store_versions, selected in (([478], "true"), ([477, 478], "false")):
+            with self.subTest(store_versions=store_versions):
+                plan = deepcopy(self.plan)
+                cutover_versions = [475, 479, 480, 481, 482]
+                plan.update(pending_before=cutover_versions, pending_store_before=store_versions)
+                for key, versions in (("source_migrations", cutover_versions),
+                                      ("source_store_migrations", store_versions)):
+                    plan[key] = [{"version": version, "description": "fixture", "sha384": "a" * 96}
+                                 for version in versions]
+                plan["plan_manifest_sha256"] = projection_hash(plan)
+                plan["store_plan_manifest_sha256"] = store_projection_hash(plan)
+                env = {**self.env, "PLAN_MANIFEST_SHA256": plan["plan_manifest_sha256"],
+                       "STORE_PLAN_MANIFEST_SHA256": plan["store_plan_manifest_sha256"],
+                       "EXPECTED_PENDING": ",".join(map(str, cutover_versions)),
+                       "EXPECTED_STORE_PENDING": ",".join(map(str, store_versions))}
+                artifact = {"run_id": int(env["PLAN_RUN_ID"]), "archive_digest": "sha256:" + "a" * 64}
+                with patch.object(approval, "authenticated_plan", return_value=(plan, artifact)):
+                    result = approval.authorize(plan, build_claim(plan, env), env, self.now,
+                                                self.responses.__getitem__)
+                self.assertEqual(result["atomic_release"], selected)
 
     def test_refuses_fresh_ledger_or_role_audit_drift(self):
         for field in ("ledger_before", "ledger_store_before", "audit"):

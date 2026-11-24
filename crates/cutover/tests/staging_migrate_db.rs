@@ -484,7 +484,6 @@ async fn seed_staging_state(fx: &Fixture) -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
 async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> TestResult {
     use two_bot_core::database_roles::{plan_for_phase, Phase};
     use two_bot_cutover::staging_migrate::{apply_release_schema, Chain, LedgerRow};
@@ -563,6 +562,16 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     let (cutover, store) = apply_release_schema(&pool, &expected[0], &expected[1]).await?;
     assert_eq!(cutover.len(), expected[0].len() + 5);
     assert_eq!(store.len(), expected[1].len() + 1);
+    let installed: bool = sqlx::query_scalar(
+        "SELECT (SELECT contract_version = '1.1' FROM web_contract_meta WHERE singleton)
+            AND to_regclass('web_v1.voice_heat') IS NOT NULL
+            AND has_table_privilege('two_web_reader', 'web_v1.voice_heat', 'SELECT')
+            AND has_table_privilege('two_bot_runtime', 'public.live_sequence_watermarks', 'UPDATE')
+            AND NOT has_table_privilege('two_bot_runtime', 'public.live_sequence_watermarks', 'DELETE')",
+    )
+    .fetch_one(&mut admin)
+    .await?;
+    assert!(installed);
     assert!(apply_release_schema(&pool, &expected[0], &expected[1])
         .await
         .is_err());
@@ -1660,7 +1669,8 @@ async fn real_sqlx_runner_cases() -> TestResult {
     // Use a fresh fixture on the same guarded CI route to verify a single
     // missing migration below the ledger maximum.
     applies_missing_0475_after_0481_and_reads_back_both_ledgers().await?;
-    recovery_inventory_proves_pre_0482_absence().await
+    recovery_inventory_proves_pre_0482_absence().await?;
+    release_schema_is_atomic_across_migrations_contract_and_grants().await
 }
 
 /// Marker the runner records when the ledger cannot be read after a run.

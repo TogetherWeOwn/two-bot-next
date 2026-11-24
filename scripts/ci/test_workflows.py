@@ -1698,6 +1698,15 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
               or 'true) runner=./approval-tools/target/debug/staging-migrate ;;' not in steps[ddl[0]]["run"]
               or '*) exit 2 ;;' not in steps[ddl[0]]["run"]):
             errors.append(f"{name}:apply: must use the trusted runner for the approved release bundle")
+        source_build = [step for step in steps if step.get("name") == "Build runner"]
+        release_build = [step for step in steps if step.get("name") == "Build the protected release transaction runner"]
+        if (len(source_build) != 1 or source_build[0].get("if") != "needs.claim.outputs.atomic_release == 'false'"
+                or len(release_build) != 1 or release_build[0].get("if") != "needs.claim.outputs.atomic_release == 'true'"
+                or release_build[0].get("working-directory") != "approval-tools"
+                or 'for path in database_role_matrix.sql verify_database_roles.sql web_v1.sql; do'
+                not in release_build[0].get("run", "")
+                or 'cmp "sql/$path" "../sql/$path"' not in release_build[0].get("run", "")):
+            errors.append(f"{name}:apply: must build the selected runner with matched role and contract files")
         checkouts = [step for step in steps if (step.get("with") or {}).get("path") == "approval-tools"]
         if (len(checkouts) != 1 or not str(checkouts[0].get("uses", "")).startswith("actions/checkout@")
                 or checkouts[0].get("with") != {"path": "approval-tools", "persist-credentials": "false",
