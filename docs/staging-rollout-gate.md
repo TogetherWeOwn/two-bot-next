@@ -246,7 +246,7 @@ Retain start/assert and stop/refusal artifacts for the run and attempt. Verify
 on exact-head Actions that the existing staging control secret resolves in each
 called staging job; a missing token fails closed, never warrants a new credential.
 
-**Before any qualification dispatch:** subject to existing holds and
+**Before a default qualification dispatch:** subject to existing holds and
 authorization, check that `main` resolves to the intended merged 40-hex SHA
 immediately before dispatch. Use `main` as the workflow ref and that exact SHA
 as `sha` only if they match. If `main` has moved or the match cannot be verified,
@@ -255,10 +255,38 @@ staging before the history guard fails it, and cannot produce B1 or a promotion
 certificate. Verify the run's recorded `headSha` against the target too: the
 pre-dispatch check does not lock `main`. A mismatch is not qualification.
 
+**Reviewed-source qualification:** When unrelated commits have advanced
+`main`, dispatch `deploy-staging.yml` from protected `main` with the full
+reviewed `sha`, `recovery_mode=verified`, the approved stopped
+`recovery_pair`, and `reviewed_plan=<run-id>@sha256:<archive-digest>` from the
+protected read-only staging migration plan for that exact source. Use the
+same holds and staging Environment approval. Leave the recovery-pin, fault,
+fence release and AutoMod preview switches off. Use a fresh attempt.
+
+The serialized deployment job verifies the exact source's successful push CI
+and supply-chain checks, authenticates the plan artifact, compares it to the
+fresh schema gate and checks that the stopped rollback pair still matches
+before replacing it. The deploy job runs its gates from the protected workflow
+checkout and packages the reviewed source's build and configuration. The
+candidate's Wrangler version must match the protected receipt gate. The
+read-only schema and roles jobs use the candidate's checkout and binaries.
+The deploy job checks both SHAs against protected main. Changes to workflow
+or deployment tooling after dispatch require a fresh dispatch.
+The source must contain the most recent successful staging revision. A newer
+successful run also supersedes an older queued dispatch of the same source.
+
+Retain `reviewed-staging-source.json` from the rollout evidence and the
+existing rollout, certificate and stop receipts. The run title identifies the
+serving SHA. GitHub's `head_sha` identifies the workflow checkout. Verify both
+identities against the exact attempt and the deployment and promotion receipts.
+Production continues to select its candidate by the same successful-staging
+and latest-outcome rules, using the serving SHA for a reviewed-source run.
+The same production soak and artifact checks still apply.
+
 **Queued staging work:** Every holder uses `queue: max` and preserves the
 running holder. The queue is bounded; admission order is not a freshness check.
 After acquiring the lock, `deploy-staging` rechecks the fetched main tip before
-changing staging. A superseded workflow head fails red. A stale repeat can
+changing staging. A superseded workflow head fails red on the default path. A stale repeat can
 become the newest outcome for the still-serving SHA and block promotion even
 with an older green run. Do not skip that failure; qualify current `main`
 with a fresh dispatch only if the match above holds. To intentionally recover a
@@ -428,7 +456,8 @@ merge or an unverified deployment is not `t0`.
    failure fails the run red with the service already restored. Both ID steps
    run reviewed tooling from the workflow's own
    commit, so a pinned drill deploys a commit whose checkout may predate the
-   script while the gate scripts stay on the deployed checkout.
+   script. Recovery drills use the deployed checkout's gate scripts. Reviewed
+   qualification runs the deploy job's gate scripts from the workflow checkout.
 3. Read the **fresh** `WRANGLER_OUTPUT_FILE_PATH` NDJSON only after Wrangler exits
    successfully. Every Wrangler invocation appends its own `wrangler-session`
    record, and `wrangler-action` runs `wrangler --version` before deploying, so

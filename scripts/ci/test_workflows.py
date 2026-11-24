@@ -575,7 +575,8 @@ def staging_dispatch_errors(workflow):
     arm/disarm at one exact revision: an optional string, empty by default
     (empty deploys the workflow head), readable only through the pinned
     dispatch-or-head expression in staging_pinned_sha_errors. The explicit
-    `recover_prior_sha` switch defaults to false. Anything else
+    `recover_prior_sha` switch defaults to false. A nonempty `reviewed_plan`
+    separately opts in to reviewed-source qualification. Anything else
     in the dispatch block (an arming switch, a deploy flag, a default of
     true) is an unreviewed deploy route outside the pinned shape.
     """
@@ -588,7 +589,7 @@ def staging_dispatch_errors(workflow):
     inputs = dispatch.get("inputs") if isinstance(dispatch, dict) and set(dispatch) == {"inputs"} else None
     expected_booleans = {"release_fence", "inject_gateway_failure", "inject_error_rate_spike",
                          "inject_voice_stall", "inject_unpaired_disconnect", "recover_prior_sha", "verify_automod_preview"}
-    expected = expected_booleans | {"sha", "recovery_mode", "recovery_pair"}
+    expected = expected_booleans | {"sha", "recovery_mode", "recovery_pair", "reviewed_plan"}
     if not isinstance(inputs, dict) or set(inputs) != expected:
         return [f"{name}: workflow_dispatch inputs must match the reviewed set"]
     for input_name in expected_booleans:
@@ -602,6 +603,11 @@ def staging_dispatch_errors(workflow):
             or sha.get("default") != ""):
         errors.append(f"{name}: sha must be an optional string defaulting to empty "
                       "(empty deploys the workflow head)")
+    plan = inputs["reviewed_plan"]
+    if (not isinstance(plan, dict) or set(plan) != {"description", "required", "type", "default"}
+            or plan.get("type") != "string" or str(plan.get("required")).lower() != "false"
+            or plan.get("default") != ""):
+        errors.append(f"{name}: reviewed plan must be an optional string defaulting to empty")
     mode, pair = inputs["recovery_mode"], inputs["recovery_pair"]
     if (not isinstance(mode, dict) or mode.get("type") != "choice" or mode.get("default") != "standard"
             or mode.get("options") != ["standard", "bootstrap", "verified"]):
@@ -637,7 +643,10 @@ DEPLOY_SHA_EXPRESSION = "${{ github.event_name == 'workflow_dispatch' && inputs.
 SOAK_HOLD_ENV = {"HOLD_UNTIL": "${{ vars.STAGING_SOAK_HOLD_UNTIL }}",
                  "EVENT": "${{ github.event_name }}",
                  "REHEARSAL": "${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'true' || 'false' }}"}
-REHEARSAL_RUN_NAME = "${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'staging rollback proof' || github.workflow }}"
+REHEARSAL_RUN_NAME = (
+    "${{ inputs.reviewed_plan && format('reviewed staging source {0}', inputs.sha) || "
+    "(github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'staging rollback proof') || github.workflow }}"
+)
 
 
 def staging_gateway_injection_errors(workflows):
@@ -876,11 +885,10 @@ def staging_pinned_sha_errors(workflows):
     stale workflow head or an unintentional prior pin. The workflow-ref refusal comes
     first: the job must itself run from `refs/heads/main`, an in-file
     fail-closed backstop behind the Environment branch policy (a job-level
-    `if:` would skip silently instead, so the job still carries none). Exactly nine reads exist (three checkout refs, three
+    `if:` would skip silently instead, so the job still carries none). Eight reads use the pinned expression (three checkout refs, three
     SHA-step envs, the schema gate's --source-sha env, the user-flow
-    synthetic's expected SHA, the history guard's comparison env): eight use
-    the pinned expression and the ninth is the guard's raw pin-vs-head
-    comparison, so no other step can resolve or judge a different commit. Build identity and provenance then follow the
+    synthetic's expected SHA). The other reads bind the reviewed run title,
+    reviewed plan source and history verdict. Build identity and provenance follow the
     validated SHA through the deploy job's DEPLOY_SHA export, pinned by
     staging_deploy_identity_errors. Every other workflow must not mention the
     switch at all, except deploy-production, which carries its own reviewed
@@ -899,37 +907,34 @@ def staging_pinned_sha_errors(workflows):
             errors.append(f"{name}: pinned-sha marker inputs.sha outside the deploy workflows")
     staging = workflows.get("deploy-staging.yml") or {}
     text = str(staging)
-    if text.count("inputs.sha") != 9:
-        errors.append("deploy-staging.yml: sha must be read exactly nine times "
+    if text.count("inputs.sha") != 11:
+        errors.append("deploy-staging.yml: sha must be read exactly eleven times "
                       "(three checkouts, three SHA steps, the schema gate env, "
-                      "the user-flow synthetic expected SHA, the history guard comparison)")
+                      "the user-flow synthetic expected SHA, the history guard comparison, "
+                      "the reviewed run identity and the reviewed plan source)")
     if text.count(DEPLOY_SHA_EXPRESSION) != 8:
-        errors.append("deploy-staging.yml: every sha read but the history guard comparison "
-                      "must use the pinned dispatch-or-head expression")
+        errors.append("deploy-staging.yml: eight SHA reads must use the pinned dispatch-or-head expression")
     jobs = staging.get("jobs") or {}
     for job_id in ("schema-gate", "roles-gate", "deploy"):
         job = jobs.get(job_id) or {}
         steps = job.get("steps") or []
         checkouts = [step for step in steps
                      if str(step.get("uses", "")).startswith("actions/checkout@")]
-        if job_id == "deploy":
-            # The deploy job carries one extra checkout: reviewed tooling
-            # from the workflow head, so the deploy-ID steps run even when
-            # the deployed pin predates the script. It must be exactly that
-            # shape — the workflow head at shallow depth, never the
-            # deployed ref — and credentialless like every checkout.
+        if job_id in ("deploy", "schema-gate"):
+            # The deploy and reviewed plan proof use workflow-head tooling
+            # even when the deployed pin predates these scripts.
             tooling = [step for step in checkouts
                        if (step.get("with") or {}).get("path") == "tooling"]
             if len(tooling) != 1:
-                errors.append("deploy-staging.yml:deploy: must carry exactly one "
+                errors.append(f"deploy-staging.yml:{job_id}: must carry exactly one "
                               "workflow-head tooling checkout")
             else:
                 tooling_with = tooling[0].get("with") or {}
                 if tooling_with.get("ref") != "${{ github.sha }}":
-                    errors.append("deploy-staging.yml:deploy: tooling checkout must pin "
+                    errors.append(f"deploy-staging.yml:{job_id}: tooling checkout must pin "
                                   "the workflow head, never the deployed ref")
                 if tooling_with.get("fetch-depth") != "1":
-                    errors.append("deploy-staging.yml:deploy: tooling checkout must stay shallow")
+                    errors.append(f"deploy-staging.yml:{job_id}: tooling checkout must stay shallow")
             checkouts = [step for step in checkouts
                          if (step.get("with") or {}).get("path") != "tooling"]
         if len(checkouts) != 1:
@@ -964,6 +969,19 @@ def staging_pinned_sha_errors(workflows):
                     or step.get("env", {}).get("RECOVER_PRIOR_SHA") != "${{ inputs.recover_prior_sha }}"
                     or {"if", "continue-on-error"} & step.keys()):
                 errors.append("deploy-staging.yml:deploy: recovery opt-in must be bound only to the SHA step and preview exclusion")
+            reviewed = [entry for entry in steps if entry.get("id") == "reviewed-source"]
+            expected_env = {"GH_TOKEN": "${{ github.token }}", "SOURCE_SHA": "${{ env.DEPLOY_SHA }}",
+                            "REVIEWED_PLAN": "${{ inputs.reviewed_plan }}", "RECOVERY_PAIR": "${{ inputs.recovery_pair }}",
+                            "FRESH_PLAN": "${{ needs.schema-gate.outputs.recovery_plan }}",
+                            "VOICE_SYNTHETIC_REQUIRED": "${{ vars.VOICE_SYNTHETIC_REQUIRED }}"}
+            if (step.get("env", {}).get("REVIEWED_PLAN") != "${{ inputs.reviewed_plan }}"
+                    or 'if [ -z "${REVIEWED_PLAN:-}" ]; then' not in run
+                    or len(reviewed) != 1 or reviewed[0].get("if") != "${{ inputs.reviewed_plan != '' }}"
+                    or reviewed[0].get("env") != expected_env or "continue-on-error" in reviewed[0]
+                    or "python3 ../tooling/scripts/staging_qualification.py" not in reviewed[0].get("run", "")
+                    or steps.index(reviewed[0]) != steps.index(step) + 2
+                    or job.get("outputs", {}).get("reviewed_source") != "${{ steps.reviewed-source.outputs.source_sha }}"):
+                errors.append("deploy-staging.yml:deploy: reviewed opt-in must run the protected authorizer before staging writes")
         # Flipping any refusal green, including the ancestry check, trips this count.
         if run.count("exit 1") != (7 if job_id == "deploy" else 5):
             errors.append(f"deploy-staging.yml:{job_id}: SHA step must preserve every pinned refusal")
@@ -1241,7 +1259,7 @@ def pinned_history_guard_errors(workflow, name="deploy-staging.yml"):
     job = jobs.get("pinned-history-guard") or {}
     if job.get("name") != "pinned drill deploys stay red (not staging history)":
         errors.append(f"{name}:pinned-history-guard: consumer job identity changed")
-    if job.get("needs") != "voice-synthetic":
+    if job.get("needs") != ["deploy", "voice-synthetic"]:
         errors.append(f"{name}:pinned-history-guard: must run after the voice synthetic "
                       "(it judges a deployed drill)")
     if job.get("permissions") != {"contents": "read"}:
@@ -1263,12 +1281,13 @@ def pinned_history_guard_errors(workflow, name="deploy-staging.yml"):
         errors.append(f"{name}:pinned-history-guard: must run exactly one unconditional verdict step")
         return errors
     step = steps[0]
-    if step.get("env") != {"PINNED_SHA": "${{ inputs.sha }}", "HEAD_SHA": "${{ github.sha }}"}:
+    if step.get("env") != {"PINNED_SHA": "${{ inputs.sha }}", "HEAD_SHA": "${{ github.sha }}",
+                           "REVIEWED_SOURCE": "${{ needs.deploy.outputs.reviewed_source }}"}:
         errors.append(f"{name}:pinned-history-guard: step must bind exactly the pin and the head "
                       "via the environment")
     run = str(step.get("run") or "")
     for needle in ("set -euo pipefail", '[ -z "$PINNED_SHA" ]', '[ "$PINNED_SHA" = "$HEAD_SHA" ]',
-                   "not staging history", "::error::"):
+                   '[ "$PINNED_SHA" = "${REVIEWED_SOURCE:-}" ]', "not staging history", "::error::"):
         if needle not in run:
             errors.append(f"{name}:pinned-history-guard: missing pin {needle}")
     if run.count("exit 1") != 1 or run.count("exit 0") != 1:
@@ -3418,6 +3437,20 @@ def staging_active_errors(workflow):
         errors.append(f"{name}:deploy: must stay scoped to the staging environment")
     if not runner_allowed("deploy", job.get("runs-on")):
         errors.append(f"{name}:deploy: must use the explicit ubuntu-latest runner for job 'deploy'")
+    gate_root = "${{ inputs.reviewed_plan != '' && '../tooling' || '..' }}"
+    gate_commands = (
+        "wrangler/scripts/ownership-control.mjs preflight",
+        "scripts/staging_rollout.py prepare",
+        "scripts/worker_container_rollback.py snapshot",
+        "scripts/staging_rollout.py receipt",
+        "wrangler/scripts/ownership-control.mjs deployment-takeover",
+        "scripts/staging_rollout.py verify",
+        "wrangler/scripts/promotion-error-gate.mjs",
+    )
+    scripts = "\n".join(str(step.get("run") or "") for step in job.get("steps", []))
+    if (job.get("env", {}).get("STAGING_GATE_ROOT") != gate_root
+            or any(f'"${{STAGING_GATE_ROOT:-..}}"/{command}' not in scripts for command in gate_commands)):
+        errors.append(f"{name}:deploy: reviewed-source deploy gates must use workflow-head tooling")
     for step in job.get("steps", []):
         if step.get("if") == STATIC_FALSE:
             errors.append(f"{name}:deploy: a statically-disabled step would report success without deploying")
@@ -3464,13 +3497,21 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
     if "schema-gate" not in needs:
         errors.append(f"{name}:deploy: must needs the schema-gate (drift must block the deploy)")
     steps = gate.get("steps") or []
-    if len(steps) != 5:
-        errors.append(f"{name}:schema-gate: must run exactly checkout, SHA check, build, gate and recovery proof")
+    if len(steps) != 6:
+        errors.append(f"{name}:schema-gate: must run exactly checkout, SHA check, build, gate, tooling checkout and recovery proof")
         return errors
-    checkout, sha_check, build, run, proof = steps
+    checkout, sha_check, build, run, tooling, proof = steps
+    if tooling != {"uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+                   "if": "${{ inputs.reviewed_plan != '' }}",
+                   "with": {"ref": "${{ github.sha }}", "path": "tooling", "persist-credentials": "false",
+                            "fetch-depth": "1"}}:
+        errors.append(f"{name}:schema-gate: reviewed plan proof must use the credentialless workflow checkout")
     if proof != {"name": "Verify the recovery plan and both ledgers", "id": "recovery-plan",
                  "if": "${{ inputs.recovery_mode != 'standard' }}",
-                 "run": "python3 scripts/staging_bootstrap.py plan"}:
+                 "env": {"RECOVERY_PLAN_SOURCE": "${{ inputs.reviewed_plan && inputs.sha || github.sha }}",
+                         "REVIEWED_PLAN": "${{ inputs.reviewed_plan }}"},
+                 "run": 'if [ -n "$REVIEWED_PLAN" ]; then\n  python3 tooling/scripts/staging_bootstrap.py plan\n'
+                        'else\n  python3 scripts/staging_bootstrap.py plan\nfi\n'}:
         errors.append(f"{name}:schema-gate: recovery proof must read only the successful gate's local plan")
     if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
             or (checkout.get("with") or {}).get("persist-credentials") != "false" \
@@ -8409,7 +8450,7 @@ class WorkflowTests(unittest.TestCase):
     def test_pinned_drill_deploy_stays_red(self):
         staging = self.workflows["deploy-staging.yml"]
         self.assertEqual(pinned_history_guard_errors(staging), [])
-        self.assertEqual(staging["jobs"]["pinned-history-guard"].get("needs"), "voice-synthetic")
+        self.assertEqual(staging["jobs"]["pinned-history-guard"].get("needs"), ["deploy", "voice-synthetic"])
         self.assertNotIn("if", staging["jobs"]["pinned-history-guard"])
         # The guard judges after the synthetic ran: a pinned drill still
         # deploys and still runs the synthetic; only the run verdict is red,
@@ -8457,14 +8498,16 @@ class WorkflowTests(unittest.TestCase):
         shell = step["run"]
         head, pin = "a" * 40, "b" * 40
         cases = (
-            ("empty pin deploys the head", "", head, 0),
-            ("pin equal to the head deploys the head", head, head, 0),
-            ("pin below the head stays red", pin, head, 1),
+            ("empty pin deploys the head", "", "", 0),
+            ("pin equal to the head deploys the head", head, "", 0),
+            ("pin below the head stays red", pin, "", 1),
+            ("exact reviewed source qualifies", pin, pin, 0),
+            ("wrong reviewed source stays red", pin, "c" * 40, 1),
         )
-        for label, pinned, head_sha, expected_code in cases:
+        for label, pinned, reviewed, expected_code in cases:
             with self.subTest(label):
                 with tempfile.TemporaryDirectory() as temp_dir:
-                    env = dict(os.environ, PINNED_SHA=pinned, HEAD_SHA=head_sha)
+                    env = dict(os.environ, PINNED_SHA=pinned, HEAD_SHA=head, REVIEWED_SOURCE=reviewed)
                     proc = subprocess.run(
                         ["bash", "-c", shell], cwd=str(ROOT), env=env,
                         capture_output=True, text=True, timeout=10,
@@ -8474,7 +8517,7 @@ class WorkflowTests(unittest.TestCase):
                     if expected_code == 1:
                         self.assertIn("not staging history", output)
                         self.assertIn(pinned, output)
-                        self.assertIn(head_sha, output)
+                        self.assertIn(head, output)
 
     def test_pinned_sha_shell_behaves(self):
         # Execute the actual SHA-check shells in a scratch git repo: a valid
@@ -8669,7 +8712,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(dispatch["inputs"]), {
             "release_fence", "inject_gateway_failure", "inject_error_rate_spike",
             "inject_voice_stall", "inject_unpaired_disconnect", "recover_prior_sha", "sha", "verify_automod_preview",
-            "recovery_mode", "recovery_pair",
+            "recovery_mode", "recovery_pair", "reviewed_plan",
         })
         self.assertEqual(dispatch["inputs"]["sha"]["default"], "")
         self.assertEqual(dispatch["inputs"]["recover_prior_sha"]["default"], "false")
@@ -8686,6 +8729,7 @@ class WorkflowTests(unittest.TestCase):
             "extra sha field": lambda on: on["workflow_dispatch"]["inputs"]["sha"].update({"options": ["main"]}),
             "preview by default": lambda on: on["workflow_dispatch"]["inputs"]["verify_automod_preview"].update({"default": "true"}),
             "nonempty sha default": lambda on: on["workflow_dispatch"]["inputs"]["sha"].update({"default": "main"}),
+            "reviewed plan by default": lambda on: on["workflow_dispatch"]["inputs"]["reviewed_plan"].update({"default": "13"}),
         }
         for label, mutate in mutations.items():
             with self.subTest(label=label):
@@ -11111,7 +11155,7 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("deploy-staging.yml", "deploy"):
                         # Derives the deploy ID from today's staging
                         # Deployments, then records this one.
-                        expected = {"contents": "read", "deployments": "write"}
+                        expected = {"contents": "read", "deployments": "write", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-staging.yml", "certify-promotion"):
                         # Reads the immutable artifact and asserts the live grant;
                         # only the exact readiness step holds the control credential.
