@@ -2,8 +2,7 @@
 
 The claim is non-secret evidence of the staging apply request, not an approval
 or permission to apply migrations. The staging gate combines the `main`-only
-GitHub environment branch rule, a successful claim job and explicit owner
-approval recorded **before** dispatch. See the
+Environment branch rule and native reviewer approval. See the
 [staging migration runbook](runbook.md#staging-only-migration-runner) for recovery
 and ACL prerequisites. Production has its own approval and protection rules:
 `production-migrate.yml` with `scripts/ci/production_migrate_claim.py`, which
@@ -28,16 +27,16 @@ directions.
 
 `staging-migrate.yml` has a `claim` job named `staging-migrate (claim)`. It runs
 only for an apply dispatch on `main`, after the read-only `plan` job succeeds.
-It has no environment, no database binding and only `contents: read` permission.
+It has no environment or database binding. It uses `actions: read` for plan provenance.
 It checks out `github.sha` (the workflow revision), downloads this dispatch's plan
 artifact and runs `scripts/ci/staging_migrate_claim.py`. Inputs enter through
 step environment variables, not shell interpolation. Refusal fails the job;
 there is no continue-on-error or upload-on-failure path.
 
-The `apply` job needs **both** `plan` and `claim`. Owner approval precedes
-workflow dispatch, so it reviews the producing plan, not this later claim.
-The `staging-migrate-apply` environment restricts deployment to `main`; do not
-expect a GitHub reviewer or custom protection rule to pause the job.
+The `apply` job needs **both** `plan` and `claim`. In `staging-migrate-apply`,
+allow `main` only, name independent maintainers with read access as **Required
+reviewers**, enable **Prevent self-review** and disable administrator bypass.
+Keep direct owner approval until the reviewed workflow and protections are active.
 
 ## Exact artifact names and v1 document
 
@@ -133,23 +132,17 @@ recovery/ACL references. Recompute both projection digests losslessly and
 compare them with the embedded digests. Do not dispatch if the artifact is
 missing, expired, ambiguous or cannot be authenticated.
 
-Before dispatch, verify and retain [direct owner approval](../CONTRIBUTING.md#production-merge-evidence)
-for the full source SHA, producing plan run ID, both pending lists, both manifest
-digests and the recovery reference. Keep restricted evidence in the private task
-thread. Require fresh approval for any changed input, even when hashes match.
-
 Before submitting `mode: apply` on `main`, compare the actual dispatch inputs
 with the authenticated producing manifest and its run ID. Match the source SHA,
 both pending lists, both digests, the pinned target (`staging_host`,
 `staging_database`, `staging_branch_id`) and both evidence references
 (`recovery_evidence_ref`, `acl_plan_ref`). The digests do not cover the target or
-either reference. Do not dispatch if any value differs, the exact binding lacks approval or a hold applies.
+either reference. Do not dispatch if any value differs or a hold applies.
 
-After dispatch, verify that the claim came from the successful
-`staging-migrate (claim)` job on that run and attempt, agrees with the
-workflow-head SHA and matches the pre-dispatch inputs. This operator comparison
-is audit evidence, not an approval gate; apply does not wait for it. The apply
-job downloads the separate producing run's manifest, and the runner checks its
-pending sets, hashes and provenance **before DDL**. The claim neither replaces
-those checks nor weakens read-only/apply credential separation, main-only
-protections or shell failure propagation.
+The designated maintainer checks the plan, recovery and ACL evidence against
+the claim. In **Review deployments**, select `staging-migrate-apply` and enter
+`approve-staging-migration sha256:<digest>` from the claim summary. The digest
+binds the full claim and producing artifact ID and archive digest.
+
+Apply checks approval within 23h30m of dispatch. Retry or change inputs with a new dispatch and approval.
+Reuse a plan only when the apply dispatch's fresh read-only plan matches both ledgers and audit findings.

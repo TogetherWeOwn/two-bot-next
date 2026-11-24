@@ -1435,12 +1435,14 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
     """
     errors = []
     prefix = f"{name}:claim:"
+    staging = name == "staging-migrate.yml"
     if claim.get("name") != job_name:
         errors.append(f"{prefix} consumer job identity changed")
     if "environment" in claim or "secrets." in str(claim) or "uses" in claim:
         errors.append(f"{prefix} must be unprotected with no secrets or reusable job")
-    if claim.get("permissions") != {"contents": "read"}:
-        errors.append(f"{prefix} must keep contents:read only")
+    permissions = {"contents": "read", **({"actions": "read"} if staging else {})}
+    if claim.get("permissions") != permissions:
+        errors.append(f"{prefix} must keep only the trusted checkout and plan read grants")
     if claim.get("needs") != "plan" or claim.get("if") != "github.ref == 'refs/heads/main' && inputs.mode == 'apply'":
         errors.append(f"{prefix} must wait for a green plan, main and mode=apply")
     if not runner_allowed("claim", claim.get("runs-on")):
@@ -1467,6 +1469,13 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
                   ("STORE_PLAN_MANIFEST_SHA256", "store_plan_manifest_sha256"),
                   ("PLAN_RUN_ID", "plan_run_id")])
     expected_env = {key: "${{ inputs." + value + " }}" for key, value in pairs}
+    if staging:
+        expected_env["GH_TOKEN"] = "${{ github.token }}"
+        if (publish.get("id") != "request" or claim.get("outputs") != {
+                "approval_digest": "${{ steps.request.outputs.digest }}",
+                "approval_plan_sha256": "${{ steps.request.outputs.plan_sha256 }}",
+        } or "python3 scripts/staging_migrate_approval.py prepare" not in str(publish.get("run", ""))):
+            errors.append(f"{prefix} must authenticate the producing plan and export the approval binding")
     if publish.get("env") != expected_env or publish.get("shell") != "bash":
         errors.append(f"{prefix} must pass exactly the dispatch fields via env, in bash")
     script_text = str(publish.get("run", ""))
@@ -1617,6 +1626,26 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         errors.append(f"{name}:apply: must run only from main for mode=apply")
     if apply.get("needs") != ["plan", "claim"]:
         errors.append(f"{name}:apply: must wait for a green plan and pre-approval claim")
+    if name == "staging-migrate.yml":
+        steps = apply.get("steps", [])
+        ddl = [i for i, step in enumerate(steps) if "--apply " in str(step.get("run", ""))]
+        verifier = {"name": "Verify the native staging approval", "env": {
+            "GH_TOKEN": "${{ github.token }}",
+            "APPROVAL_DIGEST": "${{ needs.claim.outputs.approval_digest }}",
+            "APPROVAL_PLAN_SHA256": "${{ needs.claim.outputs.approval_plan_sha256 }}",
+        }, "run": "python3 approval-tools/scripts/staging_migrate_approval.py verify "
+                  "producing-plan/staging-migrate-manifest.json"}
+        build = {"name": "Build runner", "run": "cargo build -p two-bot-cutover --bin staging-migrate --locked"}
+        if (len(ddl) != 1 or ddl[0] < 2 or steps[ddl[0] - 2:ddl[0]] != [verifier, build]
+                or "continue-on-error" in apply or apply.get("timeout-minutes") != "30"
+                or "if" in steps[ddl[0]] or "continue-on-error" in steps[ddl[0]]):
+            errors.append(f"{name}:apply: must verify the exact native approval before building and running DDL")
+        checkouts = [step for step in steps if (step.get("with") or {}).get("path") == "approval-tools"]
+        if (len(checkouts) != 1 or not str(checkouts[0].get("uses", "")).startswith("actions/checkout@")
+                or checkouts[0].get("with") != {"path": "approval-tools", "persist-credentials": "false",
+                                               "ref": "${{ github.sha }}"}
+                or "if" in checkouts[0] or "continue-on-error" in checkouts[0]):
+            errors.append(f"{name}:apply: must load the verifier at the trusted workflow SHA")
     for job_id, job in (("plan", plan), ("apply", apply)):
         if not runner_allowed(job_id, job.get("runs-on")):
             errors.append(f"{name}:{job_id}: must use the explicit ubuntu-latest runner for job '{job_id}'")
@@ -9232,16 +9261,14 @@ class WorkflowTests(unittest.TestCase):
                         step["run"] = step["run"].replace(
                             " --plan-manifest-path producing-plan/production-migrate-manifest.json", "")
             self.assertTrue(mutated(drop_path))
-        # Production and staging stay mirrors: same job ids, same step counts,
-        # same pinned actions and container, differing only by the documented
-        # production prefix (names, envs, secrets, artifacts, flags).
+        # Compare shared routing. Each workflow pins its own grants and approval steps.
         staging = self.workflows["staging-migrate.yml"]
         self.assertEqual(set(migrate["jobs"]), set(staging["jobs"]))
+        self.assertIn("cargo build -p two-bot-cutover --bin staging-migrate --locked",
+                      [step.get("run") for step in migrate["jobs"]["plan"]["steps"]])
         for job_id in ("plan", "claim", "apply"):
             with self.subTest(mirror=job_id):
                 prod_job, stag_job = migrate["jobs"][job_id], staging["jobs"][job_id]
-                self.assertEqual(len(prod_job.get("steps", [])), len(stag_job.get("steps", [])))
-                self.assertEqual(prod_job.get("permissions"), stag_job.get("permissions"))
                 self.assertEqual(prod_job.get("if"), stag_job.get("if"))
                 self.assertEqual(prod_job.get("runs-on"), stag_job.get("runs-on"))
 
@@ -10984,7 +11011,8 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
                         # Marker-label actor audit via the issue-events API.
                         expected["pull-requests"] = "read"
-                    elif (name, job_id) in (("staging-migrate.yml", "apply"),
+                    elif (name, job_id) in (("staging-migrate.yml", "claim"),
+                                                 ("staging-migrate.yml", "apply"),
                                                  ("production-migrate.yml", "apply")):
                         # Read-only fetch of the producing plan
                         # run's manifest artifact for the provenance gate.
