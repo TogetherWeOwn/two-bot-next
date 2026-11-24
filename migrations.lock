@@ -2,7 +2,7 @@
   "version": 1,
   "migrations": {
     "crates/cutover/migrations/0482_live_sequence_watermarks.sql": {
-      "sha256": "3bb2f4ac14dbb5df883c0c8fa22f143300ced3cba5842ebff4612ee74b507933",
+      "sha256": "50d83ac3393e4e524f0394dbda8a71af89f13d3326759866573860f38b0168d7",
       "justification": "Create the dormant live-hub reservation watermark for each guild."
     },
     "crates/cutover/migrations/0481_internal_voice_move_audit.sql": {
