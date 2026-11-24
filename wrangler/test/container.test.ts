@@ -482,6 +482,13 @@ test("staging registry absence is a stopped, authenticated GET under the exact l
     assert.deepEqual(await rejected.json(), { error: "ownership_fenced", reason: "operation_failed" });
   }
   list = Response.json([]);
+  afterList = () => { h.runtime.running = true; };
+  const resumed = await send();
+  assert.equal(resumed.status, 503);
+  assert.deepEqual(await resumed.json(), { error: "ownership_fenced", reason: "operation_failed" });
+  assert.deepEqual(h.values.get(STAGING_USE_KEY), grant);
+  h.runtime.running = false;
+  list = Response.json([]);
   afterList = () => { h.values.set(STAGING_USE_KEY, { ...grant, phase: "released" }); };
   assert.equal((await send()).status, 503);
   assert.deepEqual(h.starts, []);
