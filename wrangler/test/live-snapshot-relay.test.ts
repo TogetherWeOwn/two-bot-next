@@ -6,7 +6,8 @@ import {
 } from "../src/live-snapshot-relay.ts";
 import { DEPLOYMENT_HEADER } from "../src/ownership.ts";
 import {
-  body, origin, path, receiver, request, scope, signature, snapshot, strippedHeaders, verifyForwarded,
+  body, invalidSnapshots, origin, path, receiver, request, scope, signature, snapshot,
+  stalledBody, stalledUpload, strippedHeaders, verifyForwarded,
 } from "./fixtures/live-snapshot-peer.ts";
 
 test("snapshot verifies untouched signed bytes and returns bounded direct v1 JSON", async () => {
@@ -65,12 +66,7 @@ test("snapshot refuses invalid, oversize and unavailable peers without logging p
     cancel() { cancelled = true; },
   });
   for (const serve of [
-    () => Response.json({ ...snapshot, guild_id: "4" }),
-    () => Response.json({ ...snapshot, seq: Number.MAX_SAFE_INTEGER + 1 }),
-    () => Response.json({ ...snapshot, observed_at: "2026-02-30T00:00:00Z" }),
-    () => Response.json({ ...snapshot, topics: { ...snapshot.topics, guild: { ...snapshot.topics.guild, extra: marker } } }),
-    () => Response.json({ ...snapshot, topics: { ...snapshot.topics, roles: [] } }),
-    () => Response.json({ ok: true, result: snapshot }),
+    ...invalidSnapshots.map((value) => () => Response.json(value)),
     () => new Response(marker, { headers: { "content-type": "application/json" } }),
     () => new Response(marker, { status: 502 }),
     () => new Response(oversize, { headers: { "content-type": "application/json" } }),
@@ -85,17 +81,17 @@ test("snapshot refuses invalid, oversize and unavailable peers without logging p
   assert.equal(logs.reduce((calls, log) => calls + log.mock.callCount(), 0), 0);
 });
 
-test("snapshot deadline bounds a stalled reply and ordinary actions still require their envelope", async (t) => {
+test("snapshot deadline bounds a stalled reply and ordinary actions still require their envelope", { timeout: 1_000 }, async (t) => {
   const timeout = AbortSignal.timeout;
   t.mock.method(AbortSignal, "timeout", (ms: number) => {
     assert.equal(ms, LIVE_SNAPSHOT_TIMEOUT_MS);
     return timeout(25);
   });
-  const stalled = new ReadableStream<Uint8Array>({ pull: () => new Promise(() => {}) });
   // Retain a referenced timer so Node waits for the unref'ed AbortSignal timer.
   const keepAlive = setTimeout(() => {}, 250);
   try {
-    const peer = receiver(async () => new Response(stalled, { headers: { "content-type": "application/json" } }));
+    const peer = receiver(async () => new Response(stalledBody(), { headers: { "content-type": "application/json" } }));
+    assert.equal((await handleLiveSnapshotRelay(stalledUpload(), "fixture-stall", scope, peer)).status, 408);
     assert.equal((await handleLiveSnapshotRelay(request(), "fixture-stall", scope, peer)).status, 503);
   } finally {
     clearTimeout(keepAlive);

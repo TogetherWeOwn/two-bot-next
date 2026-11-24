@@ -25,8 +25,9 @@ const oneOf = (...values: string[]): Check => (value) => typeof value === "strin
 const text = (min: number, max: number): Check => (value) =>
   typeof value === "string" && value.length >= min && value.length <= max;
 const sequence: Check = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+const position: Check = (value) => typeof value === "number" && value <= 0xffff_ffff && sequence(value);
 const boolean: Check = (value) => typeof value === "boolean";
-const permission: Check = (value) => typeof value === "string" && /^(0|[1-9]\d{0,39})$/.test(value);
+const permission: Check = (value) => value === "0" || isLiveId(value);
 const distinct = (values: unknown[]) => new Set(values).size === values.length;
 
 function rows(value: unknown, limit: number, schema: Record<string, Check>, key: string):
@@ -45,7 +46,7 @@ const overwriteFields = { kind: oneOf("role", "member"), id: isLiveId, allow: pe
 const guildFields = { ownerId: isLiveId, afkChannelId: nullable(isLiveId) };
 const channelFields = {
   id: isLiveId, name: text(1, 100), kind: oneOf("voice", "stage", "category", "other"),
-  parentId: nullable(isLiveId), position: nullable(sequence), overwrites,
+  parentId: nullable(isLiveId), position: nullable(position), overwrites,
 };
 const roleFields = { id: isLiveId, permissions: permission };
 const memberFields = {
