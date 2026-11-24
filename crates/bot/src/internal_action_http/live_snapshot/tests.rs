@@ -221,14 +221,15 @@ async fn snapshot_http_refuses_disabled_unauthorized_and_unbounded_requests() {
     *oversized.body_mut() = Body::from(vec![b' '; MAX_BODY_BYTES + 1]);
     let response = endpoint.handle(oversized).await;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-
+    let pull = async || {
+        tokio::time::timeout(Duration::from_secs(5), endpoint.handle(signed(BODY)))
+            .await
+            .expect("snapshot request exceeded test deadline")
+    };
     let saturated = endpoint.capacity.try_acquire_many(32).expect("32 permits");
-    closed(endpoint.handle(signed(BODY)).await, ErrorCode::RateLimited).await;
+    closed(pull().await, ErrorCode::RateLimited).await;
     drop(saturated);
-    let response = tokio::time::timeout(Duration::from_secs(5), endpoint.handle(signed(BODY)))
-        .await
-        .expect("snapshot deadline while the owner is locked");
-    closed(response, ErrorCode::UpstreamTimeout).await;
+    closed(pull().await, ErrorCode::UpstreamTimeout).await;
     assert_eq!(endpoint.capacity.available_permits(), 32);
     db.close().await.unwrap();
 }
