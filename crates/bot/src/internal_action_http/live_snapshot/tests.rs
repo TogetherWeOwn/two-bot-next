@@ -135,10 +135,11 @@ async fn signed_snapshot_http_covers_the_committed_cursor_and_withdraws_stale_or
     let read = || request(&secret, KEY_ID, BODY, &nonce());
 
     let old = WireTime(OffsetDateTime::now_utc() - time::Duration::seconds(31));
+    let unavailable = ErrorCode::DiscordUnavailable;
     let roster = begin(&mut *owner.write().await, old).await;
-    closed(endpoint.handle(read()).await, ErrorCode::DiscordUnavailable).await;
+    closed(endpoint.handle(read()).await, unavailable).await;
     complete(&mut *owner.write().await, old, &roster).await;
-    closed(endpoint.handle(read()).await, ErrorCode::DiscordUnavailable).await;
+    closed(endpoint.handle(read()).await, unavailable).await;
 
     let now = WireTime(OffsetDateTime::now_utc());
     let mut live = owner.write().await;
@@ -173,11 +174,7 @@ async fn signed_snapshot_http_covers_the_committed_cursor_and_withdraws_stale_or
     let other = Id(DiscordId::<GuildMarker>::new(11).into_nonzero());
     let other_endpoint = LiveSnapshotEndpoint::new(owner, store, Some(credential(&secret, other)));
     let wrong = request(&secret, KEY_ID, WRONG_GUILD, &nonce());
-    closed(
-        other_endpoint.handle(wrong).await,
-        ErrorCode::DiscordUnavailable,
-    )
-    .await;
+    closed(other_endpoint.handle(wrong).await, unavailable).await;
     db.close().await.unwrap();
 }
 
@@ -218,15 +215,20 @@ async fn snapshot_http_refuses_disabled_unauthorized_and_unbounded_requests() {
 
     let mut wrong_target = signed(BODY);
     *wrong_target.uri_mut() = "/internal/actions?extra=1".parse().unwrap();
-    assert_eq!(
-        endpoint.handle(wrong_target).await.status(),
-        StatusCode::NOT_FOUND
-    );
+    let response = endpoint.handle(wrong_target).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let mut oversized = signed(BODY);
     *oversized.body_mut() = Body::from(vec![b' '; MAX_BODY_BYTES + 1]);
-    assert_eq!(
-        endpoint.handle(oversized).await.status(),
-        StatusCode::PAYLOAD_TOO_LARGE
-    );
+    let response = endpoint.handle(oversized).await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let saturated = endpoint.capacity.try_acquire_many(32).expect("32 permits");
+    closed(endpoint.handle(signed(BODY)).await, ErrorCode::RateLimited).await;
+    drop(saturated);
+    let response = tokio::time::timeout(Duration::from_secs(5), endpoint.handle(signed(BODY)))
+        .await
+        .expect("snapshot deadline while the owner is locked");
+    closed(response, ErrorCode::UpstreamTimeout).await;
+    assert_eq!(endpoint.capacity.available_permits(), 32);
     db.close().await.unwrap();
 }
