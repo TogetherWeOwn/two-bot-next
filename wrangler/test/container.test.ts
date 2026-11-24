@@ -302,9 +302,12 @@ test("protected staging admits only the checked startup environment", async (t) 
   assert.equal((await stage.bot.fetch(stagingUseRequest("acquire", stagingWindow()))).status, 200);
   const override = { envVars: { DATABASE_URL: "different" } };
   await assert.rejects(stage.bot.start(override), /staging_start_options_refused/);
+  assert.deepEqual(stage.starts, []);
   await assert.rejects(stage.bot.startAndWaitForPorts(8080, undefined, override), /staging_start_options_refused/);
+  assert.deepEqual(stage.starts, []);
   await assert.rejects(stage.bot.startAndWaitForPorts({ ports: 8080, startOptions: { entrypoint: ["other"] } }),
     /staging_start_options_refused/);
+  assert.deepEqual(stage.starts, []);
   await stage.bot.startAndWaitForPorts(8080);
   assert.equal(stage.starts.length, 1);
   assert.equal(stage.starts[0]?.env?.DATABASE_URL, database);

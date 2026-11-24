@@ -684,11 +684,15 @@ a mismatch. Recovery requires a fresh plan and a separate check of the
 predecessor against both ledgers. If none qualifies, use the separately
 authorized baseline transition.
 
-With a verified clean plan, run `scripts/ci/staging_rollback_compatibility.py`
-against the plan, forward and recovery source SHAs to check both migration
-trees byte for byte. This is an operator-run preflight. Automatic rollback
-enforcement requires wiring it into the protected workflow before the first
-restore mutation. The workflow also owns binding, artifact and runtime acceptance.
+In `standard` mode, the operator runs
+`scripts/ci/staging_rollback_compatibility.py` with the verified clean plan's
+source SHA and the forward and recovery source SHAs before dispatching a rollout
+that may restore the predecessor. The script compares both migration trees byte
+for byte.
+
+In `verified` mode, the protected workflow runs this comparison automatically
+while preparing the pinned stopped predecessor, before replacing it. The
+workflow also checks the recovery pair, database binding and runtime acceptance.
 
 ### Recover a baseline when the serving pair is incompatible
 
