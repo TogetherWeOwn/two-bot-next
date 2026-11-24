@@ -479,7 +479,7 @@ test("staging registry absence is a stopped, authenticated GET under the exact l
     list = bad;
     const rejected = await send();
     assert.equal(rejected.status, 503);
-    assert.deepEqual(await rejected.json(), { error: "ownership_fenced", reason: "staging_preview_absence_unconfirmed" });
+    assert.deepEqual(await rejected.json(), { error: "ownership_fenced", reason: "operation_failed" });
   }
   list = Response.json([]);
   afterList = () => { h.values.set(STAGING_USE_KEY, { ...grant, phase: "released" }); };

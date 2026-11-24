@@ -1218,12 +1218,14 @@ export class TwoBotContainer extends Container<Env> {
         return parseRegistryJson(body ?? "");
       });
     } catch {
-      throw new OwnershipRefused("staging_preview_absence_unconfirmed");
+      // A Discord read failure uses the existing operation_failed response.
+      // It is not a new ownership refusal shared with the control clients.
+      throw new Error("staging_preview_absence_unconfirmed");
     }
     const after = await this.previewUse(request);
     if (signal.aborted || after.epoch !== use.epoch || after.acquiredAt !== use.acquiredAt
       || this.ctx.container?.running !== false) {
-      throw new OwnershipRefused("staging_preview_absence_unconfirmed");
+      throw new Error("staging_preview_absence_unconfirmed");
     }
   }
 
