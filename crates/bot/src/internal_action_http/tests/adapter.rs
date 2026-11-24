@@ -711,6 +711,7 @@ async fn receiver_bind_matches_the_voice_move_gate() {
         voice_snapshot::new_shared_cache(),
         VoiceOccupancyClock::new(),
         connected_gateway(),
+        None,
     )
     .await
     .unwrap();

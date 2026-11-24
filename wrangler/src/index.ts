@@ -58,6 +58,7 @@ import {
   ACTIONS_PATH,
   CONTAINER_MARKER,
   CONTAINER_MARKER_VALUE,
+  LIVE_SNAPSHOT_DISPATCH_HEADER,
   RECEIVER_BIND,
   RECEIVER_PORT,
   REQUEST_TIMEOUT_MS,
@@ -74,6 +75,7 @@ import {
   relayReceiverResponse,
 } from "./internal-actions.ts";
 import { handleLiveSnapshotRelay, type SnapshotScope } from "./live-snapshot-relay.ts";
+import { isLiveId } from "./live-snapshot-wire.ts";
 import {
   EVENTSUB_PATH,
   EVENTSUB_RECEIVER_BIND,
@@ -270,6 +272,19 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_INTERNAL_KEYS?: string;
   /** Operator-set staging capability for the private self-move receiver. */
   TWO_INTERNAL_ALLOW_VOICE_MOVE?: string;
+  TWO_INTERNAL_LIVE_SNAPSHOT_ENABLED?: string;
+  TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID?: string;
+  TWO_INTERNAL_LIVE_SNAPSHOT_SECRET?: string;
+}
+
+function liveSnapshotScope(env: Env): SnapshotScope | undefined {
+  const keyId = env.TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID;
+  if (env.TWO_DEPLOY_ENV === "staging" && env.STAGING_RUNTIME_POLICY === "bounded" &&
+      ingressEnabled(env) && env.TWO_INTERNAL_LIVE_SNAPSHOT_ENABLED === "1" &&
+      keyId && /^[\w.:-]{1,128}$/.test(keyId) && env.TWO_INTERNAL_LIVE_SNAPSHOT_SECRET &&
+      isLiveId(env.GUILD_ID)) {
+    return { keyId, guildId: env.GUILD_ID };
+  }
 }
 
 /** Both alert senders share this exact Discord-only destination boundary. */
@@ -789,6 +804,12 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
     if (env.TWO_DEPLOY_ENV === "staging" && env.TWO_INTERNAL_ALLOW_VOICE_MOVE === "1") {
       vars["TWO_INTERNAL_ALLOW_VOICE_MOVE"] = "1";
     }
+    const snapshot = liveSnapshotScope(env);
+    if (snapshot && env.TWO_INTERNAL_LIVE_SNAPSHOT_SECRET) {
+      vars["TWO_INTERNAL_LIVE_SNAPSHOT_ENABLED"] = "1";
+      vars["TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID"] = snapshot.keyId;
+      vars["TWO_INTERNAL_LIVE_SNAPSHOT_SECRET"] = env.TWO_INTERNAL_LIVE_SNAPSHOT_SECRET;
+    }
   }
   // Private EventSub receiver. Dark unless the Operator sets TWO_EVENTSUB to
   // exactly "1" with the signing secret present; any other state forwards
@@ -917,7 +938,7 @@ export class TwoBotContainer extends Container<Env> {
     });
   }
 
-  /** Unmounted composition. Static so the DO instance exposes no snapshot RPC. */
+  /** Snapshot composition. Static so the DO instance exposes no snapshot RPC. */
   static relayLiveSnapshot(
     bot: TwoBotContainer,
     request: Request,
@@ -1389,6 +1410,11 @@ export class TwoBotContainer extends Container<Env> {
    */
   private async internalActions(request: Request): Promise<Response> {
     if (!ingressEnabled(this.env) || !isActionsRequest(request)) return notFound();
+    if (request.headers.get(LIVE_SNAPSHOT_DISPATCH_HEADER) === "1") {
+      return TwoBotContainer.relayLiveSnapshot(
+        this, request, this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "", liveSnapshotScope(this.env),
+      );
+    }
     // The Worker's stamped id (or a fresh one): the forward already carries
     // it via the allowlisted headers, and these envelopes echo it so a 503
     // still joins the flow's Worker and container logs.
@@ -2300,6 +2326,7 @@ export default {
           return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         },
         env.CONTAINER_RELEASE,
+        liveSnapshotScope(env)?.keyId,
       );
     }
 

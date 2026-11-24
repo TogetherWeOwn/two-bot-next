@@ -1,18 +1,39 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { DEPLOYMENT_HEADER, OwnershipFence } from "../../src/ownership.ts";
+import type { StagingUse } from "../../src/staging-lifecycle.ts";
 
 export const origin = "https://bot.test";
 export const path = "/internal/actions";
+// https://github.com/TogetherWeOwn/two-web-next/blob/0d1f56a0965820afab0e9f3cdf8f5b79cc3e798e/src/live/transport.ts
+// https://github.com/TogetherWeOwn/two-web-next/blob/0d1f56a0965820afab0e9f3cdf8f5b79cc3e798e/src/live/ingress.ts
+export const webSnapshot = { responseBytes: 1_048_576, deadlineMs: 2_500 };
 export const scope = { keyId: "snapshot-fixture", guildId: "18446744073709551615" };
 export const body = `{ "guild_id": "${scope.guildId}",\n  "action": "live.snapshot" }\n`;
-const secret = randomBytes(32);
+const snapshotSecret = randomBytes(32).toString("hex");
 const timestamp = "1790000000";
 const nonce = "0123456789abcdef0123456789abcdef";
 
+export function snapshotStaging(deploymentId: string, epoch: number, enabled: boolean) {
+  const sha = "a".repeat(40);
+  const acquiredAt = Date.now();
+  const stagingUse: StagingUse = {
+    environment: "staging", phase: "active", deploymentId, epoch, sha,
+    runId: "100", runAttempt: 1, acquiredAt, expiresAt: acquiredAt + 120_000,
+  };
+  return {
+    stagingUse,
+    env: {
+      TWO_DEPLOY_ENV: "staging", STAGING_RUNTIME_POLICY: "bounded", CONTAINER_RELEASE: sha,
+      GUILD_ID: scope.guildId, TWO_INTERNAL_LIVE_SNAPSHOT_ENABLED: enabled ? "1" : undefined,
+      TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID: scope.keyId, TWO_INTERNAL_LIVE_SNAPSHOT_SECRET: snapshotSecret,
+    },
+  };
+}
+
 export function signature(bytes: string | Uint8Array, target = path, signedAt = timestamp, requestNonce = nonce): string {
   const digest = createHash("sha256").update(bytes).digest("hex");
-  return `sha256=${createHmac("sha256", secret).update(`POST\n${target}\n${signedAt}\n${requestNonce}\n${digest}`).digest("hex")}`;
+  return `sha256=${createHmac("sha256", snapshotSecret).update(`POST\n${target}\n${signedAt}\n${requestNonce}\n${digest}`).digest("hex")}`;
 }
 
 export function request(payload = body, url = origin + path, signedAt = timestamp, requestNonce = nonce): Request {

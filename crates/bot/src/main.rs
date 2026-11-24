@@ -180,7 +180,7 @@ use two_bot_core::{ComponentStatus, Config, VoiceGates};
 use futures_util::FutureExt as _;
 use gateway::{
     build_persistent_pipeline, build_shard, build_voice_runtime, ensure_crypto_provider,
-    intents_from_env, run_shard, GatewayState,
+    intents_from_env, run_shard, GatewayState, ShardState,
 };
 use gateway_failure::{step_failure, FailureClass, FailureSlot, GatewayFailure};
 use server::SharedState;
@@ -452,8 +452,9 @@ async fn run(cli_args: &[String]) {
     let voice_clock = voice_snapshot::VoiceOccupancyClock::new();
     // Capture the authoritative pool before the gateway's async move owns it.
     // Bind privately before starting tasks; enabled failures never fall back.
+    let mut live_snapshot_owner = None;
     let receiver = match receiver_config {
-        Some(receiver_config) => {
+        Some(mut receiver_config) => {
             let token =
                 internal_receiver_prerequisites(&config).expect("validated receiver prerequisites");
             let pool = store
@@ -461,6 +462,18 @@ async fn run(cli_args: &[String]) {
                 .expect("required receiver store")
                 .pool()
                 .clone();
+            let snapshot = receiver_config.take_live_snapshot_key().map(|key| {
+                let guild = twilight_model::id::Id::new(config.guild_id.expect("validated guild"));
+                let (live, _) = two_bot::live_gateway::LiveGateway::for_guild(guild, pool.clone());
+                let owner = Arc::new(RwLock::new(live));
+                let snapshot = LiveSnapshotEndpoint::new(
+                    Arc::clone(&owner),
+                    two_bot_core::internal_action_store::InternalActionStore::new(pool.clone()),
+                    Some((key, two_bot_core::realtime_wire::Id(guild.into_nonzero()))),
+                );
+                live_snapshot_owner = Some(owner);
+                snapshot
+            });
             Some(
                 internal_action_http::bind(
                     receiver_config,
@@ -469,6 +482,7 @@ async fn run(cli_args: &[String]) {
                     Arc::clone(&voice_cache),
                     Arc::clone(&voice_clock),
                     Arc::clone(&gateway),
+                    snapshot,
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -935,7 +949,11 @@ async fn run(cli_args: &[String]) {
                     // unless TWO_MUSIC=1; the tap refuses non-staging guilds.
                     let voice = music_capture::MusicVoiceTap::wrap(voice, Some(guild_id));
 
-                    let intents = intents_from_env(&activation);
+                    let shard_state = ShardState {
+                        readiness: Arc::clone(&state),
+                        snapshot_owner: live_snapshot_owner,
+                    };
+                    let intents = shard_state.intents(intents_from_env(&activation));
                     // Voice-room game names need GUILD_PRESENCES; record
                     // whether this boot requested it so a missing game
                     // rename is diagnosable from logs alone (the flag may
@@ -962,7 +980,7 @@ async fn run(cli_args: &[String]) {
                     run_shard(
                         shard,
                         pipeline,
-                        Arc::clone(&state),
+                        shard_state,
                         store,
                         interactions,
                         onboarding,
