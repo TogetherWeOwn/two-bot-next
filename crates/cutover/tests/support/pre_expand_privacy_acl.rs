@@ -5,11 +5,16 @@ use sqlx::{
     Postgres, Transaction,
 };
 use two_bot_core::backup::dump::{dump, restore};
-use two_bot_core::database_roles::{plan_for_phase, Phase};
+use two_bot_core::database_roles::{plan_for_phase, verification_sql, Phase};
+use two_bot_cutover::legacy_verify::read_only_transaction;
 use two_bot_cutover::member_erasure::{erase_member, ErasureMode};
 use two_bot_cutover::retention::{
     fulfill_user_deletion, handle_guild_delete, request_user_deletion, run_retention, RetentionMode,
 };
+use two_bot_cutover::rollback_candidate::{
+    roles_sha256, verify, ArtifactEvidence, CandidatePin, DatabaseEvidence, PrivacyAccess, Refusal,
+};
+use two_bot_cutover::staging_migrate::{manifest_hash, Chain, LedgerRow};
 use two_bot_cutover::{member_erasure, staging_migrate::MIGRATOR as CUTOVER};
 use two_bot_testsupport::TestDatabase;
 
@@ -77,21 +82,23 @@ async fn install_legacy_contract(tx: &mut PgConnection) -> Result<(), sqlx::Erro
 }
 
 async fn install_roles(tx: &mut PgConnection, name: &str, phase: Phase) -> Result<(), sqlx::Error> {
-    validate_name(name);
     let plan = plan_for_phase(phase);
     let body = plan
         .split_once("\nBEGIN;\n")
         .and_then(|(_, body)| body.strip_suffix("\nCOMMIT;\n"))
         .expect("role plan transaction wrapper");
-    let scoped = body
-        .replace("two_bot_migrator_ro", &format!("{name}_r"))
-        .replace("two_bot_migrator", &format!("{name}_m"))
-        .replace("two_web_reader", &format!("{name}_w"))
-        .replace("two_bot_runtime", &format!("{name}_b"));
-    sqlx::raw_sql(sqlx::AssertSqlSafe(scoped))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(scope_roles(body, name)))
         .execute(&mut *tx)
         .await?;
     Ok(())
+}
+
+fn scope_roles(sql: &str, name: &str) -> String {
+    validate_name(name);
+    sql.replace("two_bot_migrator_ro", &format!("{name}_r"))
+        .replace("two_bot_migrator", &format!("{name}_m"))
+        .replace("two_web_reader", &format!("{name}_w"))
+        .replace("two_bot_runtime", &format!("{name}_b"))
 }
 
 async fn probe(pool: &PgPool) -> Result<(), sqlx::Error> {
@@ -278,6 +285,8 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     CUTOVER.run(&migrator).await.unwrap();
     two_bot_store::migrate(&migrator).await.unwrap();
     two_bot_core::apply_web_contract(&migrator).await.unwrap();
+    let audit = role_pool(pool, format!("{name}_r")).await;
+    let before_grants = candidate_readout(&audit, name).await;
     let mut grants = pool.begin().await.unwrap();
     install_roles(&mut grants, name, Phase::Full).await.unwrap();
     grants.commit().await.unwrap();
@@ -293,6 +302,7 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     .await
     .unwrap();
     restore_v17(&migrator, name).await;
+    verify_rollback_candidate(&audit, &migrator, name, &before_grants).await;
     assert_counts(&runtime, &[(SESSIONS, 3), (WINDOWS, 2)]).await;
     assert_eq!(count(&migrator, AUDITS).await, 0);
     let denied = fulfill_user_deletion(&runtime, &request).await.unwrap_err();
@@ -326,6 +336,206 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     );
     assert_counts(&runtime, &[(WINDOWS, 1), (RESERVATIONS, 1), (QUEUE, 0)]).await;
     assert_eq!(count(&runtime, "SELECT count(*) FROM moderation_idempotency WHERE state = 'done' AND outcome = 'operator_released'").await, 2);
+}
+
+struct CandidateReadout {
+    cutover: Vec<LedgerRow>,
+    store: Vec<LedgerRow>,
+    roles_match: bool,
+    history_rows_present: bool,
+}
+
+impl CandidateReadout {
+    fn evidence<'a>(&'a self, pin: &CandidatePin<'a>, roles: &'a str) -> DatabaseEvidence<'a> {
+        DatabaseEvidence {
+            source_sha: pin.source_sha,
+            image_digest: pin.image_digest,
+            cutover: &self.cutover,
+            store: &self.store,
+            // The fixture substitutes only role identifiers in the canonical SQL.
+            roles: Some((roles, self.roles_match)),
+            history_rows_present: Some(self.history_rows_present),
+        }
+    }
+}
+
+async fn candidate_readout(audit: &PgPool, name: &str) -> CandidateReadout {
+    let mut conn = audit.acquire().await.unwrap();
+    let mut tx = read_only_transaction(&mut conn).await.unwrap();
+    sqlx::raw_sql(
+        "SET LOCAL statement_timeout = '5s';
+         SET LOCAL search_path = pg_catalog, pg_temp;
+         SET LOCAL row_security = off;",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let role: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(role, format!("{name}_r"));
+    let roles_match = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(scope_roles(
+        &verification_sql(),
+        name,
+    )))
+    .fetch_optional(&mut *tx)
+    .await
+    .unwrap()
+    .is_none();
+    let cutover = candidate_ledger(&mut tx,
+        "SELECT version, description, success, encode(checksum, 'hex') FROM public._sqlx_migrations"
+    ).await;
+    let store = candidate_ledger(&mut tx,
+        "SELECT version, description, success, encode(checksum, 'hex') FROM public._two_bot_migrations"
+    ).await;
+    let history_rows_present =
+        sqlx::query_scalar("SELECT EXISTS (SELECT FROM public.backfill_history_messages)")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    tx.rollback().await.unwrap();
+    CandidateReadout {
+        cutover,
+        store,
+        roles_match,
+        history_rows_present,
+    }
+}
+
+async fn candidate_ledger(conn: &mut PgConnection, sql: &'static str) -> Vec<LedgerRow> {
+    sqlx::query_as::<_, (i64, String, bool, String)>(sql)
+        .fetch_all(conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(version, description, success, checksum_hex)| LedgerRow {
+            version,
+            description,
+            success,
+            checksum_hex,
+        })
+        .collect()
+}
+
+async fn verify_rollback_candidate(
+    audit: &PgPool,
+    migrator: &PgPool,
+    name: &str,
+    before_grants: &CandidateReadout,
+) {
+    const SOURCE: &str = "0123456789abcdef0123456789abcdef01234567";
+    const MANIFEST: &[u8] = b"synthetic image manifest";
+    const DIGEST: &str = "sha256:9a7a62e0d09caf3bb1299712cfea3f935aa1c5f2b3046d1c4425612cfd29a38a";
+    let store = Chain::Store.migrator().unwrap();
+    let roles = roles_sha256();
+    let mut pin = CandidatePin {
+        source_sha: SOURCE,
+        image_digest: DIGEST,
+        cutover_sha256: &manifest_hash(SOURCE, &[], &CUTOVER),
+        store_sha256: &manifest_hash(SOURCE, &[], &store),
+        roles_sha256: &roles,
+        privacy_access: PrivacyAccess::SeparateOperator,
+    };
+    let mut artifact = ArtifactEvidence {
+        image_manifest: MANIFEST,
+        cutover: &CUTOVER,
+        store: &store,
+    };
+    let readout = candidate_readout(audit, name).await;
+    assert_eq!(
+        verify(&pin, &artifact, &before_grants.evidence(&pin, &roles)),
+        Err(Refusal::Access)
+    );
+    let mut evidence = readout.evidence(&pin, &roles);
+    assert_eq!(verify(&pin, &artifact, &evidence), Ok(()));
+
+    artifact.image_manifest = b"different image manifest";
+    assert_eq!(verify(&pin, &artifact, &evidence), Err(Refusal::Artifact));
+    artifact.image_manifest = MANIFEST;
+    evidence.image_digest = "";
+    assert_eq!(verify(&pin, &artifact, &evidence), Err(Refusal::Artifact));
+    evidence.image_digest = DIGEST;
+    evidence.cutover = &[];
+    assert_eq!(
+        verify(&pin, &artifact, &evidence),
+        Err(Refusal::CutoverLedger)
+    );
+    evidence.cutover = &readout.cutover;
+    let mut bad_store = readout.store.clone();
+    bad_store[0].checksum_hex = "00".repeat(48);
+    evidence.store = &bad_store;
+    assert_eq!(
+        verify(&pin, &artifact, &evidence),
+        Err(Refusal::StoreLedger)
+    );
+    evidence.store = &readout.store;
+    pin.store_sha256 = "";
+    assert_eq!(
+        verify(&pin, &artifact, &evidence),
+        Err(Refusal::StoreLedger)
+    );
+    let store_sha256 = manifest_hash(SOURCE, &[], &store);
+    pin.store_sha256 = &store_sha256;
+    evidence.roles = None;
+    assert_eq!(verify(&pin, &artifact, &evidence), Err(Refusal::Access));
+    evidence.roles = Some(("", true));
+    assert_eq!(verify(&pin, &artifact, &evidence), Err(Refusal::Access));
+    evidence.roles = Some((&roles, readout.roles_match));
+    pin.privacy_access = PrivacyAccess::GatewayNeedsOperatorPrivileges;
+    assert_eq!(verify(&pin, &artifact, &evidence), Err(Refusal::Access));
+    pin.privacy_access = PrivacyAccess::SeparateOperator;
+    evidence.history_rows_present = None;
+    assert_eq!(verify(&pin, &artifact, &evidence), Err(Refusal::History));
+
+    // These observations exercise the no-link, apparent exact match,
+    // conflicting and ambiguous cases. None supplies a guild for 0409.
+    sqlx::query("INSERT INTO backfill_history_messages VALUES ('10','20','30',now())")
+        .execute(migrator)
+        .await
+        .unwrap();
+    for observations in [
+        &[][..],
+        &[("101", "30", "rollback-fixture-a")][..],
+        &[("102", "31", "rollback-fixture-a")][..],
+        &[
+            ("101", "30", "rollback-fixture-a"),
+            ("102", "30", "rollback-fixture-b"),
+        ][..],
+    ] {
+        for &(guild, author, key) in observations {
+            let inserted = sqlx::query(
+                "INSERT INTO event_store
+                    (event_type, guild_id, channel_id, message_id, user_id, event_time, dedup_key)
+                 SELECT 'MESSAGE_CREATE', $1, channel_id, message_id, $2, sent_at, $3
+                 FROM backfill_history_messages WHERE message_id = '10'",
+            )
+            .bind(guild)
+            .bind(author)
+            .bind(key)
+            .execute(migrator)
+            .await
+            .unwrap();
+            assert_eq!(inserted.rows_affected(), 1);
+        }
+        let readout = candidate_readout(audit, name).await;
+        assert_eq!(
+            verify(&pin, &artifact, &readout.evidence(&pin, &roles)),
+            Err(Refusal::History)
+        );
+        let removed = sqlx::query(
+            "DELETE FROM event_store WHERE dedup_key IN ('rollback-fixture-a', 'rollback-fixture-b')",
+        )
+        .execute(migrator)
+        .await
+        .unwrap();
+        assert_eq!(removed.rows_affected(), observations.len() as u64);
+    }
+    assert_counts(
+        migrator,
+        &[("SELECT count(*) FROM backfill_history_messages", 1)],
+    )
+    .await;
 }
 
 async fn assert_runtime_refusal(runtime: &PgPool, request: &str, state: &str) {

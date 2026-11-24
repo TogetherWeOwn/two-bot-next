@@ -58,12 +58,17 @@ pub async fn verify(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::raw_sql("SET TRANSACTION READ ONLY; SET LOCAL search_path = pg_catalog, pg_temp;")
         .execute(&mut *tx)
         .await?;
-    let sql = VERIFY.replace("-- @matrix", MATRIX);
-    let findings = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+    let findings = sqlx::query_scalar(sqlx::AssertSqlSafe(verification_sql()))
         .fetch_all(&mut *tx)
         .await?;
     tx.rollback().await?;
     Ok(findings)
+}
+
+/// Render the read-only verifier with its checked-in grant matrix.
+#[must_use]
+pub fn verification_sql() -> String {
+    VERIFY.replace("-- @matrix", MATRIX)
 }
 
 #[cfg(test)]

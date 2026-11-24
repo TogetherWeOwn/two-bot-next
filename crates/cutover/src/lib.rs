@@ -43,6 +43,7 @@ pub mod raid_tools;
 pub mod reengagement;
 pub mod rest;
 pub mod retention;
+pub mod rollback_candidate;
 pub mod rollback_delta;
 pub mod rollback_import;
 pub mod self_role_store;
