@@ -35,6 +35,11 @@ the seam alongside the dormant [continuation state](../crates/core/src/member_mo
 
 The [synthetic interaction flow](../crates/bot/src/warning_history_interaction.rs)
 exercises private initial and Next delivery with fake authority, reads and replies.
+Stop confirms a private acknowledgement, discards the caller's transient binding
+and attempts one status-only edit to retire the controls. Stop prevents a pending
+Next from committing a continuation. An edit already in flight can still land,
+and earlier ephemeral copies may remain visible. Their controls expire with the
+binding.
 AutoMod preview delivery gates activation.
 
 ## Decision and alternatives

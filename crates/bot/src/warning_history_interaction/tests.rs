@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use tokio::time::{advance, sleep};
 use two_bot_core::member_moderation_store::{
@@ -23,6 +23,7 @@ pub(super) struct Fake {
     script: [Action; 5], // ACK, first authority, read, final authority, original edit
     trace: RefCell<Vec<&'static str>>,
     reply: RefCell<Option<Reply>>,
+    delivered: Cell<bool>,
 }
 
 const fn id(value: u64) -> NonZeroU64 {
@@ -43,6 +44,7 @@ impl Fake {
             script,
             trace: RefCell::default(),
             reply: RefCell::default(),
+            delivered: Cell::default(),
             caller: CALLER,
         }
     }
@@ -62,6 +64,11 @@ impl Fake {
     fn status(&self, expected: Outcome) {
         let reply = self.reply.borrow();
         assert!(matches!(&*reply, Some(Reply::Status(actual)) if *actual == expected));
+    }
+
+    fn control_status(&self, expected: Outcome) {
+        assert_eq!(*self.trace.borrow(), ["ack", "edit"]);
+        self.status(expected);
     }
 
     async fn step(&self, event: &'static str, phase: usize) -> Action {
@@ -118,7 +125,9 @@ impl Fake {
 
     pub(super) async fn edit_original(&self, reply: Reply) -> bool {
         *self.reply.borrow_mut() = Some(reply);
-        self.step("edit", 4).await != Fail
+        let delivered = self.step("edit", 4).await != Fail;
+        self.delivered.set(delivered);
+        delivered
     }
 }
 
@@ -215,5 +224,123 @@ async fn deadlines_and_revocation_discard_the_projection() {
         run(&HistoryState::default(), &fake, INITIAL).await;
         fake.status(outcome);
         assert_eq!(fake.trace.borrow().contains(&"read"), read);
+    }
+}
+
+async fn assert_retired(state: &HistoryState, handle: &str) {
+    for input in [Input::Next(handle), Input::Stop(handle)] {
+        let fake = Fake::new([Pass; 5]);
+        run(state, &fake, input).await;
+        fake.control_status(EXPIRED);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_requires_private_ack_before_retiring_the_binding() {
+    let state = HistoryState::default();
+    let initial = Fake::new([Pass; 5]);
+    run(&state, &initial, INITIAL).await;
+    let handle = initial.next(0);
+
+    for action in [Fail, Public, Wait(12)] {
+        let fake = Fake::new([action, Pass, Pass, Pass, Pass]);
+        run(&state, &fake, Input::Stop(&handle)).await;
+        assert_eq!(*fake.trace.borrow(), ["ack"]);
+        assert!(fake.reply.borrow().is_none());
+    }
+    let stopped = Fake::new([Pass; 5]);
+    run(&state, &stopped, Input::Stop(&handle)).await;
+    stopped.control_status(Outcome::Stopped);
+    assert!(stopped.delivered.get());
+    assert_retired(&state, &handle).await;
+
+    // The earlier ephemeral copy can still contain the retired controls.
+    assert!(initial.delivered.get());
+    assert!(initial.next(0) == handle);
+    assert!(state.start(CALLER, id(4)).is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_uses_the_same_expired_status_for_invalid_scope_and_handles() {
+    let state = HistoryState::default();
+    let handle = offer(&state).await;
+    let wrong = handle.replacen("wh1:", "wh2:", 1);
+    let last = if handle.ends_with('0') { '1' } else { '0' };
+    let unknown = format!("{}{last}", &handle[..handle.len() - 1]);
+    for (caller, token) in [
+        (
+            Invocation {
+                principal: (id(9), id(2)),
+                ..CALLER
+            },
+            handle.as_str(),
+        ),
+        (
+            Invocation {
+                principal: (id(1), id(9)),
+                ..CALLER
+            },
+            &handle,
+        ),
+        (
+            Invocation {
+                channel: id(9),
+                ..CALLER
+            },
+            &handle,
+        ),
+        (CALLER, "wh1:☃"),
+        (CALLER, &wrong),
+        (CALLER, &unknown),
+    ] {
+        let mut fake = Fake::new([Pass; 5]);
+        fake.caller = caller;
+        run(&state, &fake, Input::Stop(token)).await;
+        fake.control_status(EXPIRED);
+    }
+    // A failed retirement edit spends the binding and is attempted only once.
+    let failed = Fake::new([Pass, Pass, Pass, Pass, Fail]);
+    run(&state, &failed, Input::Stop(&handle)).await;
+    failed.control_status(Outcome::Stopped);
+    assert!(!failed.delivered.get());
+    assert_retired(&state, &handle).await;
+
+    advance(Duration::from_secs(5)).await;
+    let handle = offer(&state).await;
+    advance(Duration::from_secs(119)).await;
+    let late_ack = Fake::new([Wait(2), Pass, Pass, Pass, Pass]);
+    run(&state, &late_ack, Input::Stop(&handle)).await;
+    late_ack.control_status(EXPIRED);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_during_next_discards_prepared_continuation() {
+    for phase in [3, 4] {
+        let state = HistoryState::default();
+        let handle = offer(&state).await;
+        advance(Duration::from_secs(5)).await;
+        let mut next = Fake::new([Pass; 5]);
+        next.script[phase] = Wait(2);
+        let stopped = Fake::new([Pass; 5]);
+        tokio::join!(run(&state, &next, Input::Next(&handle)), async {
+            sleep(Duration::from_secs(1)).await;
+            // Stop uses the handle already seen by the caller while Next owns
+            // the rotated one. Final authority or delivery is still pending.
+            assert!(!next.delivered.get());
+            assert_eq!(next.reply.borrow().is_some(), phase == 4);
+            run(&state, &stopped, Input::Stop(&handle)).await;
+            stopped.control_status(Outcome::Stopped);
+        });
+        ordered(&next, "next");
+        advance(Duration::from_secs(5)).await;
+        assert_retired(&state, &handle).await;
+        if phase == 3 {
+            next.status(EXPIRED);
+        } else {
+            // An edit already in flight can land. Its controls are inert.
+            assert!(next.delivered.get());
+            assert_retired(&state, &next.next(5)).await;
+        }
+        assert!(state.start(CALLER, id(4)).is_ok());
     }
 }

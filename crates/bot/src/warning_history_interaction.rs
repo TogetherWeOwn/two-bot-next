@@ -23,6 +23,7 @@ const READ: Duration = Duration::from_secs(2);
 enum Input<'a> {
     Initial(&'a str),
     Next(&'a str),
+    Stop(&'a str),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,10 +34,13 @@ enum Outcome {
     Unavailable,
     Empty,
     End,
+    Stopped,
 }
 
 enum Reply {
+    // A status replaces the original response with no page or controls.
     Status(Outcome),
+    // Next and Stop use the same opaque handle with distinct actions.
     Page(Box<InteractionResponseData>, Controls),
 }
 
@@ -52,8 +56,17 @@ async fn handle(state: &HistoryState, io: &Fake, input: Input<'_>) {
             .and_then(|target| state.start(caller, target).map_err(Outcome::Session)),
         Input::Initial(_) => Err(Outcome::Invalid),
         Input::Next(handle) => state.next(caller, handle).map_err(Outcome::Session),
+        Input::Stop(handle) => {
+            if acknowledged(io, deadline).await {
+                let status = state
+                    .stop(caller, handle)
+                    .map_or_else(Outcome::Session, |()| Outcome::Stopped);
+                let _ = within(deadline, io.edit_original(Reply::Status(status))).await;
+            }
+            return;
+        }
     };
-    if within(deadline, io.defer()).await != Ok(Some(true)) {
+    if !acknowledged(io, deadline).await {
         return;
     }
     let page = match attempt {
@@ -68,6 +81,10 @@ async fn handle(state: &HistoryState, io: &Fake, input: Input<'_>) {
     if let (Ok(true), Some(prepared)) = (delivered, prepared) {
         let _ = prepared.confirm();
     }
+}
+
+async fn acknowledged(io: &Fake, deadline: Instant) -> bool {
+    within(deadline, io.defer()).await == Ok(Some(true))
 }
 
 async fn page<'a>(
