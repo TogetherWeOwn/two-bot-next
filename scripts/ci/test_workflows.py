@@ -3,6 +3,7 @@
 import ast
 from contextlib import nullcontext
 from copy import deepcopy
+import hashlib
 import importlib.util
 import json
 import os
@@ -74,6 +75,7 @@ JOB_INVENTORY = {
     # plus the missing-digest alert; pinned shape below.
     "daily-digest.yml": {"digest", "alert"},
     "staging-migrate.yml": {"plan", "claim", "apply"},
+    "staging-migrate-reviewed.yml": {"authorize", "plan", "apply"},
     "production-migrate.yml": {"plan", "claim", "apply"},
     # On-demand staging automatic recovery proof plus the manual Worker-only drill.
     "staging-rollback-drill.yml": {"drill", "proof", "alert"},
@@ -1511,6 +1513,14 @@ def production_claim_errors(claim):
     )
 
 
+def reviewed_migrate_errors(workflow):
+    # Pin the reviewed trigger, checkouts, containers, job order, shells and secret scopes.
+    encoded = json.dumps(workflow, sort_keys=True, separators=(",", ":")).encode()
+    digest = hashlib.sha256(encoded).hexdigest()
+    return [] if digest == "b7ea9bfd21484f7a8c6dc0d49ea703ab8c25c68b18affeab45f2ec4a04fa7ab2" else [
+        "reviewed staging migration workflow contract changed"]
+
+
 def job_env_text(job):
     """Job-level `env` plus every step's `env`: everywhere a binding can be exported."""
     return " ".join([str(job.get("env", ""))]
@@ -1608,6 +1618,8 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         return errors
     plan, claim, apply = jobs.get("plan", {}), jobs.get("claim", {}), jobs.get("apply", {})
     if name == "staging-migrate.yml":
+        if workflow.get("concurrency") != {"group": "staging-migrate", "cancel-in-progress": "false", "queue": "max"}:
+            errors.append(f"{name}: must preserve all pending staging migration requests")
         errors.extend(staging_claim_errors(claim))
     else:
         errors.extend(production_claim_errors(claim))
@@ -4803,6 +4815,9 @@ def workflow_policy_errors(workflows):
             # staging-deploy policy. The generic environment/marker scan
             # below would flag its staging-migrate Environment binding.
             errors.extend(staging_migrate_errors(workflow))
+            continue
+        if name == "staging-migrate-reviewed.yml":
+            errors.extend(reviewed_migrate_errors(workflow))
             continue
         if name == "production-migrate.yml":
             # Manual production runner: pinned shape above, not the
@@ -11006,6 +11021,10 @@ class WorkflowTests(unittest.TestCase):
                         expected["pull-requests"] = "read"
                     elif (name, job_id) == ("pr-evidence.yml", "pr-evidence"):
                         expected.update({"actions": "read", "pull-requests": "read"})
+                    elif name == "staging-migrate-reviewed.yml" and job_id in ("authorize", "apply"):
+                        expected.update({"actions": "read", "checks": "read"})
+                        if job_id == "authorize":
+                            expected["pull-requests"] = "read"
                     elif (name, job_id) == ("check.yml", "ci-evidence"):
                         expected["actions"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):

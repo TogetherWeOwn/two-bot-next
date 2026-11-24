@@ -146,3 +146,26 @@ binds the full claim and producing artifact ID and archive digest.
 
 Apply checks approval within 23h30m of dispatch. Retry or change inputs with a new dispatch and approval.
 Reuse a plan only when the apply dispatch's fresh read-only plan matches both ledgers and audit findings.
+
+## Authorize one apply through a protected merge
+
+In a reviewer-free Environment, make one new request file the sole change in a T0 PR.
+Use `.github/staging-apply/<32-lowercase-hex>.json` with decimal string `plan_run_id`
+and `sha256:` digests `plan_archive_digest` and `recovery_archive_digest`.
+The authenticated plan binds the source, target, both ledgers and pending sets,
+verified staging capture and ACL reference. CI validates the request fixture.
+
+Obtain independent general and security T0 approvals on the exact request PR
+head, including explicit approval of staging apply and its private recovery proof.
+An independent operator verifies both reviews and uses the existing TogetherWeOwn
+App with a token narrowed to repository Checks write to publish the approval.
+Create a completed successful `staging-migration-approval` check run on that head,
+with external ID `staging-apply:<PR number>`. Keep private evidence out of GitHub.
+Squash-merge the pinned head after the App check and required CI pass. The workflow
+authenticates the App approval, protected merge and exact request blob before apply.
+
+The merge starts `staging-migrate-reviewed` once. It authenticates the producing
+plan and capture, compares a fresh read-only plan, then uses the same scoped
+staging apply Environment and honors any native reviewers configured there.
+If it fails, reconcile both ledgers before preparing a new reviewed request.
+GitHub reruns, expired requests and previously used request names refuse.

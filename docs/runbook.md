@@ -2624,6 +2624,7 @@ the authenticated manifest and run ID, including
 the pinned staging host, database and branch ID, `recovery_evidence_ref` and
 `acl_plan_ref`. Stop for mismatched inputs or a hold. Follow the
 [staging approval procedure](staging-migrate-claim.md#verify-the-plan-before-dispatch-and-the-claim-after-dispatch).
+For a reviewer-free Environment, see [protected request merges](staging-migrate-claim.md#authorize-one-apply-through-a-protected-merge).
 
 For `mode: apply`, the `claim` job validates the dispatch against its fresh
 read-only plan and uploads `staging-migrate-apply-claim.json` as the

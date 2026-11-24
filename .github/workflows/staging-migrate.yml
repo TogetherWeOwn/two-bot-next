@@ -65,6 +65,7 @@ permissions: {}
 concurrency:
   group: staging-migrate
   cancel-in-progress: false
+  queue: max
 
 jobs:
   plan:
