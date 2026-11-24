@@ -178,16 +178,12 @@ Before enabling self-move, verify the receiver can write terminal receipts and t
 is applied. Use the existing exclusive finite staging window with verified serving and
 rollback identities, a dedicated account and channels, and cleanup within that window.
 
-The manual [staging-voice-move workflow](../.github/workflows/staging-voice-move.yml)
-exercises lease selection and cleanup on the exact serving main SHA when
-`verify_lease` is selected. Ordinary leases and rebinds have self-move OFF.
-The private relay's deadline caps the signed receiver's wire deadline.
-Cleanup releases the same lease and reads back `voiceMoveEnabled: false`
-and `running: false`. After runner interruption, check both fields in protected
-status after native expiry. Match the run, attempt, expiry, deployment and SHA.
-A failed shutdown can leave the container running after authorization ends.
-Live qualification needs a Web signer bound to the dedicated account's own
-session and two staging voice channels with verifiable Connect and occupancy.
+Select `verify_lease` in the [manual workflow](../.github/workflows/staging-voice-move.yml) for the exact serving main SHA.
+Cleanup reads back `voiceMoveEnabled: false` and `running: false`. After interruption, confirm both after native
+expiry in protected status for the same run, attempt, expiry, deployment and SHA.
+Live qualification needs a signer bound to the dedicated account's own Web session and two dedicated staging
+voice channels with verifiable Connect permissions and occupancy.
+
 Attaching the executor gives all signed verbs a five-second nonce deadline. The guild turn
 ends at adapter settlement. The child holds capacity through the audit, with up to five
 seconds beyond the wire deadline. An audit failure or timeout is logged as unconfirmed.

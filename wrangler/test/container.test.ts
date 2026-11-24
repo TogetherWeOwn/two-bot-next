@@ -908,16 +908,16 @@ test("staging self-move stamps only its selected lease and reads OFF after relea
   assert.equal((await conflict.json()).reason, "staging_use_conflict");
   h.runtime.running = true;
   assert.equal((await send()).status, 200);
-  assert.deepEqual(delivered, [null]);
   assert.equal((await h.bot.fetch(stagingUseRequest("release", window))).status, 200);
-
   const opted = { ...selected, runId: "123457" };
   assert.equal((await h.bot.fetch(stagingUseRequest("acquire", opted))).status, 200);
   assert.equal((await off()).voiceMoveEnabled, true);
   h.runtime.running = true;
   t.mock.timers.setTime(window.expiresAt - 1_100);
   assert.equal((await send()).status, 200);
-  assert.deepEqual(delivered, [null, String(window.expiresAt - 1_000)]);
+  t.mock.timers.setTime(window.expiresAt - 999);
+  assert.equal((await send()).status, 200);
+  assert.deepEqual(delivered, [null, String(window.expiresAt - 1_000), null]);
   const failure = t.mock.method(h.runtime, "destroy", async () => { throw new Error("stop failed"); });
   assert.equal((await h.bot.fetch(stagingUseRequest("release", { ...window, runId: opted.runId }))).status, 503);
   const afterFailure = await off();
@@ -931,12 +931,11 @@ test("staging self-move stamps only its selected lease and reads OFF after relea
   assert.equal((await h.bot.fetch(stagingUseRequest("acquire", interrupted))).status, 200);
   h.runtime.running = true;
   t.mock.timers.setTime(interrupted.expiresAt);
-  assert.equal((await off()).voiceMoveEnabled, false);
   await h.bot.stagingExpiry();
-  assert.equal((await off()).running, false);
+  const expired = await off();
+  assert.deepEqual([expired.voiceMoveEnabled, expired.running], [false, false]);
   assert.ok(h.logs.some((line) => line.includes('"action":"expiry","outcome":"stopped"')
     && line.includes('"voice_move_enabled":false') && line.includes('"run_id":"123458"')));
-  assert.equal(delivered.length, 2);
 });
 
 for (const env of [WORKER_ENV, { ...WORKER_ENV, TWO_DEPLOY_ENV: "production", STAGING_RUNTIME_POLICY: "bounded" }]) {

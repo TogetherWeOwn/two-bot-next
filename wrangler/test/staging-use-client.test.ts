@@ -50,6 +50,19 @@ test("staging client: acquire binds version, build, epoch, run/attempt and immut
   }
 });
 
+test("staging client: self-move uses an acquire-only bit and requires affirmative ON", async () => {
+  const selected = { ...args, voiceMove: true };
+  for (const voiceMoveEnabled of [true, undefined]) {
+    const h = responses([Response.json(state), Response.json({ ...state, voiceMoveEnabled })]);
+    const request = stagingUse(selected, h.send, async () => {}, clock);
+    if (voiceMoveEnabled) assert.equal((await request).voiceMoveEnabled, true);
+    else await assert.rejects(request, /staging_voice_move_unconfirmed/);
+    assert.equal(JSON.parse(String(h.calls[1].init.body)).voiceMove, true);
+  }
+  await assert.rejects(stagingUse({ ...selected, action: "release" }, responses([]).send), /staging_voice_move_invalid/);
+  assert.equal(parseStagingState({ ...state, voiceMoveEnabled: "false" }), null);
+});
+
 test("staging client: stop requires a confirmed stop on the same epoch and active window", async () => {
   const stop = { ...args, action: "stop" };
   const before = { ...state, running: true };

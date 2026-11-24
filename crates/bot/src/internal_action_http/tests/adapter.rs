@@ -893,10 +893,12 @@ fn voice_move_lease_clamps_wire_deadline_and_refuses_ambiguous_headers() {
     let config = config_with_bind("0.0.0.0:8091");
     let check = |headers| voice_move::lease_deadline(&config, headers, wire, (now, 10_000));
     let mut headers = HeaderMap::new();
-    for raw in ["010001", "10001x", "30001"] {
+    for raw in ["010001", "10001x", "10000", "30001"] {
         headers.insert("x-two-voice-move-until", HeaderValue::from_static(raw));
         assert_eq!(check(&headers), None);
     }
+    headers.insert("x-two-voice-move-until", HeaderValue::from_static("30000"));
+    assert_eq!(check(&headers), Some(wire));
     headers.insert("x-two-voice-move-until", HeaderValue::from_static("10001"));
     assert_eq!(check(&headers), Some(now + Duration::from_millis(1)));
     headers.append("x-two-voice-move-until", HeaderValue::from_static("10002"));
