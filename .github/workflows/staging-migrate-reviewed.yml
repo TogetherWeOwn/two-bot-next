@@ -32,6 +32,8 @@ jobs:
     needs: authorize
     environment: staging-migrate-plan
     runs-on: ubuntu-latest
+    container:
+      image: rust:1.100-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8
     timeout-minutes: 30
     permissions: {contents: read}
     steps:
@@ -41,11 +43,9 @@ jobs:
         with: {name: approved-staging-request}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {ref: '${{ needs.authorize.outputs.source_sha }}', path: source, persist-credentials: false}
-      - name: Build the pinned runner
-        working-directory: source
-        run: |
-          rustup toolchain install 1.100.0 --profile minimal --no-self-update
-          cargo +1.100.0 build -p two-bot-cutover --bin staging-migrate --locked
+      - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 >/dev/null
+      - working-directory: source
+        run: cargo build -p two-bot-cutover --bin staging-migrate --locked
       - name: Plan on the read-only staging binding
         env:
           TWO_BOT_STAGING_PLAN_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}
@@ -57,8 +57,10 @@ jobs:
     needs: [authorize, plan]
     environment: staging-migrate-apply
     runs-on: ubuntu-latest
+    container:
+      image: rust:1.100-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8
     timeout-minutes: 30
-    permissions: {contents: read, actions: read}
+    permissions: {contents: read, actions: read, checks: read}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {ref: '${{ github.sha }}', persist-credentials: false}
@@ -66,16 +68,14 @@ jobs:
         with: {name: approved-staging-request}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: {name: fresh-reviewed-staging-plan}
+      - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 >/dev/null
       - name: Verify single delivery and the fresh plan
         env: {GH_TOKEN: '${{ github.token }}'}
         run: python3 scripts/staging_migrate_reviewed.py verify
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {ref: '${{ needs.authorize.outputs.source_sha }}', path: source, persist-credentials: false}
-      - name: Build the pinned runner
-        working-directory: source
-        run: |
-          rustup toolchain install 1.100.0 --profile minimal --no-self-update
-          cargo +1.100.0 build -p two-bot-cutover --bin staging-migrate --locked
+      - working-directory: source
+        run: cargo build -p two-bot-cutover --bin staging-migrate --locked
       - name: Apply the reviewed staging tuple
         env:
           TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}

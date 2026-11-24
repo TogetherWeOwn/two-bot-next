@@ -157,16 +157,17 @@ authenticated plan whose recovery reference names a verified staging capture.
 The plan archive binds the full source, target, both ledgers and pending sets,
 and the recovery and ACL references. The request fixture is checked in CI.
 
-The requester obtains independent general and security T0 approvals on the
-exact request PR head. Reviewers explicitly approve the staging apply and see
-the private recovery proof. Record both reviews on the PR, then squash-merge
-the pinned head after required checks pass. The workflow authenticates that
-protected merge and exact request blob. The T0 review record is a merge
-requirement under the repository review policy.
+Obtain independent general and security T0 approvals on the exact request PR
+head, including explicit approval of staging apply and its private recovery proof.
+An independent operator verifies both reviews and uses the existing TogetherWeOwn
+App with a token narrowed to repository Checks write to publish the approval.
+Create a completed successful `staging-migration-approval` check run on that head,
+with external ID `staging-apply:<PR number>`. Keep private evidence out of GitHub.
+Squash-merge the pinned head after the App check and required CI pass. The workflow
+authenticates the App approval, protected merge and exact request blob before apply.
 
 The merge starts `staging-migrate-reviewed` once. It authenticates the producing
 plan and capture, compares a fresh read-only plan, then uses the same scoped
-staging apply Environment and migrator. Watch the run through its result.
-GitHub also enforces any native Environment reviewers configured there.
+staging apply Environment and honors any native reviewers configured there.
 If it fails, reconcile both ledgers before preparing a new reviewed request.
 GitHub reruns, expired requests and previously used request names refuse.

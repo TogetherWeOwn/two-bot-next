@@ -12,12 +12,13 @@ import sys
 from ci.staging_migrate_claim import DECIMAL, SHA40, Refused, versions
 from rollback_proof import ProofError, moment, run_identity
 from script_intake import decode_json
-from staging_migrate_approval import MAX_REVIEW_AGE, load_document
+from staging_migrate_approval import MAX_REVIEW_AGE, api_get, load_document
 from staging_recovery_status import authenticated_plan, github
 from staging_rollout import GateError, mapping, require
 
 REPO = "TogetherWeOwn/two-bot-next"
 WORKFLOW = "staging-migrate-reviewed.yml"
+APP_ID, APP_BOT_ID = 4685085, 319968614
 REQUEST = re.compile(r"\.github/staging-apply/[a-f0-9]{32}\.json")
 RECOVERY = re.compile(r"staging-recovery-capture/([1-9][0-9]{0,19})/artifacts/([1-9][0-9]{0,19})")
 DIGEST = re.compile(r"sha256:[a-f0-9]{64}")
@@ -38,8 +39,9 @@ def parse_request(raw):
 
 
 def context(env, event, api):
-    sha, before = env.get("GITHUB_SHA", ""), event.get("before", "")
-    require(env.get("GITHUB_REPOSITORY") == REPO and env.get("GITHUB_EVENT_NAME") == "push"
+    sha, before, actor = env.get("GITHUB_SHA", ""), event.get("before", ""), env.get("GITHUB_ACTOR_ID", "")
+    require(env.get("GITHUB_REPOSITORY") == REPO and env.get("GITHUB_REPOSITORY_ID") == "1396224242"
+            and env.get("GITHUB_EVENT_NAME") == "push" and DECIMAL.fullmatch(actor) and actor != str(APP_BOT_ID)
             and env.get("GITHUB_REF_PROTECTED") == "true" and env.get("GITHUB_REF") == event.get("ref") == "refs/heads/main"
             and env.get("GITHUB_WORKFLOW_REF") == f"{REPO}/.github/workflows/{WORKFLOW}@refs/heads/main"
             and SHA40.fullmatch(sha) and SHA40.fullmatch(before) and event.get("after") == sha
@@ -55,6 +57,17 @@ def context(env, event, api):
 def still_fresh(merged_at, now):
     age = now - moment(merged_at)
     require(age.days >= 0 and age <= MAX_REVIEW_AGE, "reviewed_request_expired")
+
+
+def verify_approval(api, head, number, merged_at):
+    approval = api(f"commits/{head}/check-runs?check_name=staging-migration-approval&filter=all&per_page=10")
+    checks = [row for row in approval["check_runs"] if row["app"]["id"] == APP_ID]
+    require(approval["total_count"] < 10 and len(checks) == 1, "independent_staging_approval_missing")
+    check = checks[0]
+    require(check["name"] == "staging-migration-approval" and check["head_sha"] == head
+            and check["external_id"] == f"staging-apply:{number}"
+            and check["conclusion"] == "success" and moment(check["completed_at"]) <= moment(merged_at),
+            "independent_staging_approval_invalid")
 
 
 def authorize(env, event, api, now, run_git=git, fetch_plan=authenticated_plan):
@@ -76,6 +89,10 @@ def authorize(env, event, api, now, run_git=git, fetch_plan=authenticated_plan):
             and all(pull[key]["repo"]["full_name"] == REPO for key in ("base", "head"))
             and SHA40.fullmatch(head) and type(number) is int and number > 0, "request_merge_unproved")
     still_fresh(pull["merged_at"], now)
+    merged = api(f"pulls/{number}")
+    require(merged["merged"] is True and merged["merge_commit_sha"] == sha and merged["head"]["sha"] == head
+            and APP_BOT_ID not in (pull["user"]["id"], merged["merged_by"]["id"]), "request_merge_actor_unproved")
+    verify_approval(api, head, number, pull["merged_at"])
     checks = api(f"commits/{head}/check-runs?check_name=ci-ok&per_page=10")["check_runs"]
     require(any(check["app"]["id"] == 15368 and check["name"] == "ci-ok" and check["head_sha"] == head
                 and check["conclusion"] == "success" for check in checks), "request_head_ci_unproved")
@@ -98,7 +115,8 @@ def authorize(env, event, api, now, run_git=git, fetch_plan=authenticated_plan):
             and receipt["name"] == "staging-recovery-capture" and receipt["expired"] is False
             and receipt["workflow_run"]["id"] == int(recovery[1])
             and receipt["digest"] == request["recovery_archive_digest"], "reviewed_recovery_unproved")
-    return {"plan": plan, "plan_run_id": request["plan_run_id"], "merged_at": pull["merged_at"], "request_sha": sha}
+    return {"plan": plan, "plan_run_id": request["plan_run_id"], "merged_at": pull["merged_at"], "request_sha": sha,
+            "pr_head": head, "pr_number": number}
 
 
 def compare_plans(approved, fresh):
@@ -139,9 +157,10 @@ def main(mode, env):
             with Path(env["GITHUB_OUTPUT"]).open("a") as output:
                 print(f"source_sha={claim['plan']['source_sha']}", file=output)
         elif mode == "verify":
-            context(env, load_document(env["GITHUB_EVENT_PATH"]), github)
+            context(env, load_document(env["GITHUB_EVENT_PATH"]), api_get)
             claim = load_document("approved.json")
             still_fresh(claim["merged_at"], datetime.now(timezone.utc))
+            verify_approval(api_get, claim["pr_head"], claim["pr_number"], claim["merged_at"])
             compare_plans(claim["plan"], load_document("fresh.json"))
         elif mode in ("plan", "apply"):
             run(mode, load_document("approved.json"), env)

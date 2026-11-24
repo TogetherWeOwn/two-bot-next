@@ -17,6 +17,7 @@ class ReviewedMigrationTests(unittest.TestCase):
         self.path = f".github/staging-apply/{'a' * 32}.json"
         repo = {"full_name": "TogetherWeOwn/two-bot-next"}
         self.env = {"GITHUB_REPOSITORY": repo["full_name"], "GITHUB_SHA": sha, "GITHUB_WORKFLOW_SHA": sha,
+                    "GITHUB_REPOSITORY_ID": "1396224242", "GITHUB_ACTOR_ID": "11",
                     "GITHUB_REF_PROTECTED": "true", "GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_NAME": "push",
                     "GITHUB_WORKFLOW_REF": f"{repo['full_name']}/.github/workflows/staging-migrate-reviewed.yml@refs/heads/main",
                     "GITHUB_RUN_ID": "20", "GITHUB_RUN_ATTEMPT": "1"}
@@ -24,6 +25,7 @@ class ReviewedMigrationTests(unittest.TestCase):
                       "created": False, "deleted": False}
         self.merged_at = "2026-11-24T03:00:00Z"
         self.pull = {"number": 10, "state": "closed", "merge_commit_sha": sha, "merged_at": self.merged_at,
+                     "user": {"id": 11},
                      "base": {"ref": "main", "repo": repo}, "head": {"sha": head, "repo": repo}}
         self.plan = {"mode": "plan", "migration_target": "staging", "role": "two_bot_migrator_ro",
                      "source_sha": parent, "pending_before": [475], "pending_store_before": [],
@@ -32,9 +34,14 @@ class ReviewedMigrationTests(unittest.TestCase):
         self.request = {"plan_run_id": "25", "plan_archive_digest": "sha256:" + "d" * 64,
                         "recovery_archive_digest": "sha256:" + "e" * 64}
         self.runs = {"total_count": 1, "workflow_runs": [{"id": 20}]}
+        self.approval = {"app": {"id": 4685085}, "name": "staging-migration-approval", "head_sha": head,
+                         "external_id": "staging-apply:10", "conclusion": "success", "completed_at": self.merged_at}
         self.routes = {
             f"actions/workflows/staging-migrate-reviewed.yml/runs?event=push&head_sha={sha}&branch=main&per_page=2": self.runs,
             f"commits/{sha}/pulls?per_page=2": [self.pull],
+            "pulls/10": {**self.pull, "merged": True, "merged_by": self.pull["user"]},
+            f"commits/{head}/check-runs?check_name=staging-migration-approval&filter=all&per_page=10": {
+                "total_count": 1, "check_runs": [self.approval]},
             f"commits/{head}/check-runs?check_name=ci-ok&per_page=10": {"check_runs": [
                 {"app": {"id": 15368}, "name": "ci-ok", "head_sha": head, "conclusion": "success"}]},
             "actions/runs/31": {"id": 31, "run_attempt": 1, "head_branch": "main", "head_sha": parent,
@@ -64,6 +71,7 @@ class ReviewedMigrationTests(unittest.TestCase):
             lambda: self.env.update(GITHUB_RUN_ATTEMPT="2"), lambda: self.runs.update(total_count=2),
             lambda: self.git.update(log=b"already-committed"), lambda: self.pull.update(state="open"),
             lambda: self.git.update(diff=self.git["diff"] + b"\nM\tDockerfile"),
+            lambda: self.approval["app"].update(id=15368), lambda: self.approval.update(external_id="staging-apply:9"),
             lambda: self.pull.update(merged_at="2026-11-23T01:00:00Z"),
             lambda: self.routes["actions/artifacts/32"].update(digest="sha256:" + "f" * 64),
         ):
