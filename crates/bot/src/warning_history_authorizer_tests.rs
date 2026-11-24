@@ -14,7 +14,7 @@ const PATHS: [&str; 5] = [
 const VIEW: u64 = Permissions::VIEW_CHANNEL.bits();
 const COMMANDS: u64 = Permissions::USE_SLASH_COMMANDS.bits();
 
-fn evidence() -> [Value; 5] {
+pub(in crate::member_runtime) fn evidence() -> [Value; 5] {
     [
         json!({"id":"22","owner_id":"55","roles":[
             {"id":"22","position":0,"permissions":VIEW.to_string()},
@@ -28,11 +28,11 @@ fn evidence() -> [Value; 5] {
     ]
 }
 
-fn overwrite(id: &str, kind: u8, allow: u64, deny: u64) -> Value {
+pub(in crate::member_runtime) fn overwrite(id: &str, kind: u8, allow: u64, deny: u64) -> Value {
     json!({"id":id,"type":kind,"allow":allow.to_string(),"deny":deny.to_string()})
 }
 
-fn executor(rest: &MockRest) -> ActionExecutor {
+pub(in crate::member_runtime) fn executor(rest: &MockRest) -> ActionExecutor {
     let guard = Arc::new(RateLimitGuard::new(GuardConfig::default()).unwrap());
     ActionExecutor::with_proxy_and_guard("fixture-only".into(), Some(rest.origin()), guard).unwrap()
 }
@@ -55,10 +55,13 @@ async fn refresh(
     .await
 }
 
-fn assert_reads(rest: &MockRest, count: usize) {
+pub(in crate::member_runtime) fn assert_reads(rest: &MockRest, batches: &[usize]) {
     let requests = rest.requests();
-    assert_eq!(requests.len(), count);
-    for (request, path) in requests.iter().zip(PATHS) {
+    assert_eq!(requests.len(), batches.iter().sum::<usize>());
+    let paths = batches
+        .iter()
+        .flat_map(|&count| PATHS[..count].iter().copied());
+    for (request, path) in requests.iter().zip(paths) {
         assert_eq!(request.method, "GET");
         assert_eq!(request.path, path);
         assert!(request.body.is_empty());
@@ -71,7 +74,7 @@ async fn check(docs: [Value; 5], expected: Result<(), Refusal>, reads: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
     let decision = refresh(&rest, Some(Id::new(22)), 88, deadline).await;
     assert_eq!(decision, expected);
-    assert_reads(&rest, reads);
+    assert_reads(&rest, &[reads]);
 }
 
 #[tokio::test]
@@ -155,7 +158,7 @@ async fn slow_reads_share_the_caller_budget_and_refresh_cap_without_retry() {
         assert_eq!(decision, Ok(Err(Refusal::Unavailable)));
         let reads = rest.requests().len();
         assert!(allowed_reads.contains(&reads), "observed {reads} GETs");
-        assert_reads(&rest, reads);
+        assert_reads(&rest, &[reads]);
     }
 }
 
@@ -174,11 +177,11 @@ async fn wrong_scope_and_expired_budget_never_fetch_and_failed_reads_never_retry
         refresh(&rest, Some(Id::new(22)), 88, now).await,
         Err(Refusal::Unavailable)
     );
-    assert_reads(&rest, 0);
+    assert_reads(&rest, &[]);
     for status in [403, 404, 429, 503] {
         let rest = MockRest::start(vec![], ScriptedResponse::status(status)).await;
         let decision = refresh(&rest, Some(Id::new(22)), 88, later).await;
         assert_eq!(decision, Err(Refusal::Unavailable));
-        assert_reads(&rest, 1);
+        assert_reads(&rest, &[1]);
     }
 }

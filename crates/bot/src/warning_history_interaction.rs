@@ -46,7 +46,7 @@ enum Reply {
 
 // The bound transport stands in for an authenticated human interaction in the
 // configured application and guild. Its caller scope cannot come from input.
-async fn handle(state: &HistoryState, io: &Fake, input: Input<'_>) {
+async fn handle(state: &HistoryState, io: &Fake<'_>, input: Input<'_>) {
     let deadline = Instant::now() + TOTAL;
     let caller = io.caller;
     let attempt = match input {
@@ -83,19 +83,20 @@ async fn handle(state: &HistoryState, io: &Fake, input: Input<'_>) {
     }
 }
 
-async fn acknowledged(io: &Fake, deadline: Instant) -> bool {
+async fn acknowledged(io: &Fake<'_>, deadline: Instant) -> bool {
     within(deadline, io.defer()).await == Ok(Some(true))
 }
 
 async fn page<'a>(
-    io: &Fake,
+    io: &Fake<'_>,
     caller: Invocation,
     attempt: Attempt<'a>,
     deadline: Instant,
 ) -> Result<(Reply, Prepared<'a>), Outcome> {
     let (target, _) = attempt.request().map_err(Outcome::Session)?;
     let started = Instant::now();
-    within(deadline.min(started + REFRESH), io.fresh(caller, target))
+    let first_deadline = deadline.min(started + REFRESH);
+    within(first_deadline, io.fresh(caller, target, first_deadline))
         .await?
         .map_err(Outcome::Authority)?;
     let remaining = AUTHORITY.saturating_sub(started.elapsed());
@@ -108,7 +109,7 @@ async fn page<'a>(
     let content =
         render_warning_history(&target.to_string(), &page).map_err(|_| Outcome::Unavailable)?;
     let final_deadline = deadline.min(Instant::now() + REFRESH.min(remaining));
-    within(final_deadline, io.fresh(caller, target))
+    within(final_deadline, io.fresh(caller, target, final_deadline))
         .await?
         .map_err(Outcome::Authority)?;
     let (prepared, controls) = attempt.prepare(page.next).map_err(Outcome::Session)?;
