@@ -29,6 +29,62 @@ directory mixed with a plain host (the driver's socket slot is sticky) —
 is refused the same way: name the scratch database explicitly.
 `--dry-run` still previews without that comparison.
 
+## Readback and compatible rollback for 0475
+
+Use this rehearsal when the proposed production change applies cutover
+migration 0475 to existing event windows. Check exact membership in the
+candidate's [read-only migration plan](runbook.md#production-migration-runner).
+Reconcile both ledgers on the temporary copy against the pinned candidate
+and pre-change plan. Require a successful 0472 with its source checksum,
+0475 absent before apply and successful with its source checksum afterward,
+and only the reviewed changes to either ledger. A higher version can already
+be present. Use the existing [rollback checks](migrations.md#rollback-compatibility-at-promotion)
+for the full forward and previous app pair.
+
+Use a fresh clone-only Bot runtime login and a separately pinned direct
+endpoint, restored branch ID, SQL database and effective SQL login. Confirm
+the PlanetScale routing username ends in the restored branch ID and require
+`verify-full` on port 5432. The SQL checks the database and session role;
+branch identity comes from the connection binding. In a clean environment,
+configure a private libpq service named `restore_bot` with that connection
+and a bounded connect timeout. Supply its password out of band.
+
+```sh
+read_0475() {
+  psql -XqAtw --dbname='service=restore_bot' \
+    --set="expected_database=${RESTORE_DATABASE:?}" \
+    --set="expected_role=${RESTORE_BOT_LOGIN:?}" \
+    --set="phase=$1" --set="expected_legacy=${2-}" \
+    --file=sql/attendance_0475_readback.sql 2>/dev/null
+}
+```
+
+The successful line contains `ok`, the window count, legacy-field SHA-256,
+non-null fence count and fence SHA-256. Any nonzero exit invalidates the
+readback. The probe refuses tables above 100,000 rows. Keep evidence to the
+counts, digests and fixed status. Compare `before` on the restored copy with
+the independently selected pre-change `capture` summary for the recovery point,
+passing its legacy SHA-256 as the second argument. Apply the exact candidate on
+the isolated copy. Run `after` with the same legacy SHA-256 before any app writes.
+It checks that all preexisting rows acquired one common fence and the original
+fields survived. Compare the row counts to the baseline in both phases.
+
+Rehearse app rollback with the pinned previous compatible build's affected
+read under its runtime login and with external egress disabled. Keep the
+column, ledger entry and fence values. Repeat `after` and require the entire
+summary to match the first `after` result. The disposable CI fixture exercises
+the previous event-voice window SELECT, whose explicit projection ignores
+the new column. Qualify the exact previous artifact independently.
+
+If Web consumes these windows or a projection derived from them in the pinned
+release, run the affected query under Web's own clone-only role and compare its
+expected result before, after and after rollback. The current upcoming-events
+view reads `scheduled_events`, and the Bot result covers only the Bot path.
+Keep staging pins independent. The production release owns exact qualification,
+the fresh provider backup and temporary restore when required, no-egress and
+private handling, verified same-day copy deletion and credential removal, and
+independent release approval. This invocation reads only the affected table.
+
 ## Stable failure codes
 
 Every `backup`, `restore`, `backup-upload`, `guild-config-snapshot` and

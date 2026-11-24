@@ -484,6 +484,66 @@ async fn seed_staging_state(fx: &Fixture) -> TestResult {
     Ok(())
 }
 
+fn attendance_psql(fx: &Fixture, login: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("psql");
+    command.env_clear().kill_on_drop(true).args([
+        "-XqAtw",
+        "--dbname",
+        &format!("{}&connect_timeout=5", fx.url(login, &fx.database)),
+    ]);
+    command
+}
+
+async fn attendance_readback(
+    fx: &Fixture,
+    login: &str,
+    database: &str,
+    role: &str,
+    phase: &str,
+    legacy: &str,
+) -> (bool, String) {
+    let out = attendance_psql(fx, login)
+        .args([
+            "--file",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../sql/attendance_0475_readback.sql"
+            ),
+            "--set",
+            &format!("expected_database={database}"),
+            "--set",
+            &format!("expected_role={role}"),
+            "--set",
+            &format!("phase={phase}"),
+            "--set",
+            &format!("expected_legacy={legacy}"),
+        ])
+        .output()
+        .await
+        .expect("run readback with the CI PostgreSQL client");
+    (out.status.success(), String::from_utf8(out.stdout).unwrap())
+}
+
+async fn previous_attendance_reader(fx: &Fixture) -> Vec<u8> {
+    // The event-voice window SELECT from the parent of #2158. Only the
+    // bound event parameter is replaced with a synthetic literal.
+    let out = attendance_psql(fx, &fx.outsider)
+        .args([
+            "--command",
+            "SELECT instance_starts_at, starts_at, ends_at,
+                    NOT identity_ambiguous AND revoked_at IS NULL
+                    AND status IN ('scheduled', 'active')
+             FROM event_instance_windows WHERE event_id = 'fixture-event' AND is_current",
+        ])
+        .output()
+        .await
+        .expect("run previous event-voice reader");
+    assert!(out.status.success());
+    assert_eq!(out.stdout.iter().filter(|&&byte| byte == b'\n').count(), 1);
+    assert!(out.stdout.ends_with(b"|t\n"));
+    out.stdout
+}
+
 async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestResult {
     use two_bot_cutover::staging_migrate::MIGRATOR;
 
@@ -504,6 +564,21 @@ async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestRe
         "GRANT SELECT ON public._sqlx_migrations, public._two_bot_migrations TO two_bot_migrator_ro",
     )
     .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT ON public.event_instance_windows TO {}",
+        fx.outsider
+    )))
+    .execute(&mut conn)
+    .await?;
+    conn.execute(
+        "INSERT INTO public.event_instance_windows
+           (guild_id, event_id, instance_starts_at, starts_at, status, observed_at)
+         VALUES ('fixture-guild', 'fixture-event', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                 'active', '2026-01-01T00:00:00.000Z'),
+                ('fixture-other', 'fixture-missed', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z',
+                 'missing', '2026-01-02T00:00:00.000Z')",
+    )
+    .await?;
     let boundary_column = "SELECT data_type, is_nullable FROM information_schema.columns
                            WHERE table_schema = 'public' AND table_name = 'event_instance_windows'
                              AND column_name = 'attendance_recovered_at'";
@@ -513,6 +588,68 @@ async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestRe
     assert!(before.is_none());
 
     let (host, db) = (&fx.host, &fx.database);
+    let reader = &fx.outsider;
+    let legacy_reader_result = previous_attendance_reader(&fx).await;
+    let (ok, baseline) = attendance_readback(&fx, reader, db, reader, "capture", "").await;
+    assert!(ok, "unexpected capture result {baseline:?}");
+    let fields: Vec<_> = baseline.split_whitespace().collect();
+    let ["ok", "2", legacy, "0", before_fence] = fields.as_slice() else {
+        panic!("unexpected capture summary {baseline:?}");
+    };
+    assert_eq!(legacy.len(), 64);
+    assert_eq!(before_fence.len(), 64);
+    for (database, role, phase, digest, status) in [
+        (
+            "wrong_database",
+            reader.as_str(),
+            "capture",
+            "",
+            "refused_binding\n",
+        ),
+        (
+            db.as_str(),
+            fx.rologin.as_str(),
+            "capture",
+            "",
+            "refused_binding\n",
+        ),
+        (
+            db.as_str(),
+            reader.as_str(),
+            "before",
+            "",
+            "refused_binding\n",
+        ),
+        (
+            db.as_str(),
+            reader.as_str(),
+            "after",
+            *legacy,
+            "refused_schema\n",
+        ),
+    ] {
+        assert_eq!(
+            attendance_readback(&fx, reader, database, role, phase, digest).await,
+            (false, status.to_owned())
+        );
+    }
+    assert_eq!(
+        attendance_readback(&fx, &fx.mlogin, db, &fx.mlogin, "capture", "").await,
+        (false, "refused_binding\n".to_owned())
+    );
+    let (ok, no_grant) =
+        attendance_readback(&fx, &fx.rologin, db, &fx.rologin, "capture", "").await;
+    assert!(!ok && no_grant.is_empty());
+    let denied = attendance_psql(&fx, reader)
+        .args(["--command", "SELECT count(*) FROM public._sqlx_migrations"])
+        .output()
+        .await?;
+    assert!(!denied.status.success() && denied.stdout.is_empty());
+    assert_eq!(
+        attendance_readback(&fx, reader, db, reader, "before", legacy).await,
+        (true, baseline.clone())
+    );
+
     let (code, stdout, err) = fx
         .run(
             "--plan",
@@ -585,6 +722,46 @@ async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestRe
     assert_eq!(
         column,
         ("timestamp with time zone".to_owned(), "YES".to_owned())
+    );
+    let (ok, migrated) = attendance_readback(&fx, reader, db, reader, "after", legacy).await;
+    assert!(ok, "unexpected migrated result {migrated:?}");
+    let fields: Vec<_> = migrated.split_whitespace().collect();
+    let ["ok", "2", after_legacy, "2", after_fence] = fields.as_slice() else {
+        panic!("unexpected migrated summary {migrated:?}");
+    };
+    assert_eq!(after_legacy, legacy);
+    assert_ne!(after_fence, before_fence);
+
+    // Simulate app rollback by running the previous read on the migrated
+    // table. Both the fence summary and the legacy query stay intact.
+    assert_eq!(previous_attendance_reader(&fx).await, legacy_reader_result);
+    assert_eq!(
+        attendance_readback(&fx, reader, db, reader, "after", legacy).await,
+        (true, migrated)
+    );
+    let exact_fence: bool = sqlx::query_scalar(
+        "SELECT bool_and(w.attendance_recovered_at IS NOT DISTINCT FROM m.installed_on)
+           FROM public.event_instance_windows w
+           CROSS JOIN public._sqlx_migrations m WHERE m.version = 475",
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    assert!(exact_fence);
+    assert_eq!(
+        attendance_readback(&fx, reader, db, reader, "after", &"0".repeat(64)).await,
+        (false, "refused_data\n".to_owned())
+    );
+    conn.execute("UPDATE public.event_instance_windows SET attendance_recovered_at = NULL")
+        .await?;
+    assert_eq!(
+        attendance_readback(&fx, reader, db, reader, "after", legacy).await,
+        (false, "refused_data\n".to_owned())
+    );
+    conn.execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at DROP DEFAULT")
+        .await?;
+    assert_eq!(
+        attendance_readback(&fx, reader, db, reader, "after", legacy).await,
+        (false, "refused_schema\n".to_owned())
     );
     conn.close().await?;
     fx.finish().await
