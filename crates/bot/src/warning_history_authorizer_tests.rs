@@ -140,7 +140,7 @@ async fn refuses_unknown_or_insufficient_live_evidence() {
 
 #[tokio::test]
 async fn slow_reads_share_the_caller_budget_and_refresh_cap_without_retry() {
-    for (caller_seconds, outer_seconds, reads) in [(1, 2, 1), (10, 6, 3)] {
+    for (caller_seconds, outer_seconds, allowed_reads) in [(1, 2, 1..=1), (10, 6, 2..=3)] {
         let responses = evidence().map(|doc| ScriptedResponse::json(200, doc));
         let rest = MockRest::start_with_body_delay(
             Vec::from(responses),
@@ -153,6 +153,8 @@ async fn slow_reads_share_the_caller_budget_and_refresh_cap_without_retry() {
         let attempt = refresh(&rest, Some(Id::new(22)), 88, deadline);
         let decision = timeout_at(now + Duration::from_secs(outer_seconds), attempt).await;
         assert_eq!(decision, Ok(Err(Refusal::Unavailable)));
+        let reads = rest.requests().len();
+        assert!(allowed_reads.contains(&reads), "observed {reads} GETs");
         assert_reads(&rest, reads);
     }
 }
