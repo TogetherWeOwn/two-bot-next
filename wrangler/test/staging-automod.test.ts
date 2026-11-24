@@ -27,8 +27,7 @@ test("AutoMod admission proves stopped absence and spare capacity under the exac
     return stopped();
   }, async (url, token, signal) => {
     calls.push(url);
-    assert.equal(token, "fixture");
-    assert.equal(signal.aborted, false);
+    assert.deepEqual([token, signal.aborted], ["fixture", false]);
     return url.endsWith("/@me") ? { id: app, bot: true } : [command];
   }, now);
   assert.deepEqual(calls, ["stopped", "https://discord.com/api/v10/users/@me",
@@ -81,7 +80,8 @@ test("AutoMod admission rechecks the lease and cleanup deadline after registry r
   }
 });
 
-test("AutoMod admission settles if the Discord adapter ignores abort", { timeout: 500 }, async () => {
-  await assert.rejects(admitStagingAutomod(input, env, stopped,
-    () => new Promise(() => {}), () => 54_995), refused);
+test("AutoMod admission settles if the Discord adapter ignores abort", { timeout: 500 }, async t => {
+  const keepAlive = setTimeout(() => {}, 500);
+  t.after(() => clearTimeout(keepAlive));
+  await assert.rejects(admitStagingAutomod(input, env, stopped, () => new Promise(() => {}), () => 54_995), refused);
 });

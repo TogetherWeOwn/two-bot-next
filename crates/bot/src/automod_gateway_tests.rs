@@ -281,7 +281,7 @@ async fn protected_preview_keeps_dry_run_and_suppresses_member_deliveries() {
     assert!(runtime.dry_run() && runtime.admits(Some(guild)));
     let router = InteractionRouter::new(RouterGates::from_slices(
         Some(GUILD),
-        &FeatureGates::from_map(&boot),
+        &FeatureGates::from_map(&boot).expect("valid feature gates"),
         &ModerationGates::from_map(&boot).expect("moderation on"),
         Default::default(),
     ));
