@@ -690,6 +690,22 @@ trees byte for byte. This is an operator-run preflight. Automatic rollback
 enforcement requires wiring it into the protected workflow before the first
 restore mutation. The workflow also owns binding, artifact and runtime acceptance.
 
+### Recover a baseline when the serving pair is incompatible
+
+1. Confirm the approved fingerprint and successful cutover 0475/0481 and store
+   0478 in the exact-source plan. Require a fresh clean plan after any authorized apply.
+2. Confirm the stopped predecessor's window is released or expired. Dispatch
+   `bootstrap` on current `main`. The authenticated GET must prove the exact
+   serving Worker's binding and startup guard before takeover or acquisition.
+3. Bootstrap stays red and excludes the predecessor from rollback. Reconcile
+   publication with read-only inventory. Confirm the window ended and staging stopped.
+4. After rollout, readiness, error-rate and release checks pass, authenticate
+   the protected artifact and set `recovery_pair` to its `UUID@sha256:digest`.
+   Dispatch `verified` to check both migration trees and the pinned stopped pair
+   before replacement. Unconfirmed acquisition skips rollback. Confirm release
+   or expiry and stopped state before rolling forward. A confirmed grant
+   permits rollback to the pinned pair within its original expiry.
+
 ## Verification boundaries
 
 Offline standard-library fixtures exercise selection, schema/error handling,

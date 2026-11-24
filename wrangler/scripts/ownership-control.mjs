@@ -21,6 +21,7 @@ export const REFUSAL_REASONS = new Set([
   "deployment_id_missing", "storage_unavailable", "storage_invalid", "not_owner", "epoch_conflict",
   "epoch_exhausted", "shutdown_unconfirmed", "deployment_mismatch", "stale_keepalive", "operation_failed",
   "staging_storage_unavailable", "staging_storage_invalid", "staging_use_required", "staging_expiry_invalid",
+  "staging_database_unverified", "staging_start_options_refused",
   "staging_use_conflict", "staging_use_ended",
 ]);
 const MAX_REFUSAL_BODY_BYTES = 1024;
