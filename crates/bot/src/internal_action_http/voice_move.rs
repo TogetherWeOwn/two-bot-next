@@ -1,5 +1,5 @@
 //! Signed, keyless terminal receipt for a staged move.
-use super::{json, now_ms, one_header, AuthDecision, ErrorCode, Failure, ReceiverState, Value};
+use super::{json, one_header, AuthDecision, ErrorCode, Failure, ReceiverState, Value};
 use crate::gateway::GatewayState;
 use axum::http::HeaderMap;
 use std::{
@@ -27,6 +27,7 @@ pub(super) fn lease_deadline(
     config: &InternalActionConfig,
     headers: &HeaderMap,
     wire_deadline: Instant,
+    (instant, now_ms): (Instant, u64),
 ) -> Option<Instant> {
     if !config.listen_addr().ip().is_unspecified() {
         return Some(wire_deadline);
@@ -35,10 +36,8 @@ pub(super) fn lease_deadline(
     if raw.starts_with('0') || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    let instant = Instant::now();
-    let remaining = raw.parse::<u64>().ok()?.checked_sub(now_ms())?;
-    // Matches the private relay's existing request deadline. A short proof
-    // bounds the receiver even if a timed-out fetch finishes delivering late.
+    let remaining = raw.parse::<u64>().ok()?.checked_sub(now_ms)?;
+    // Bound late delivery as well as a timely request.
     if remaining == 0 || remaining > 20_000 {
         return None;
     }

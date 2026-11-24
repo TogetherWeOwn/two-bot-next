@@ -886,6 +886,23 @@ async fn signed_self_move_refuses_without_a_patch_then_moves_only_the_signed_mem
     db.close().await.unwrap();
 }
 
+#[test]
+fn voice_move_lease_clamps_wire_deadline_and_refuses_ambiguous_headers() {
+    let now = Instant::now();
+    let wire = now + Duration::from_secs(5);
+    let config = config_with_bind("0.0.0.0:8091");
+    let check = |headers| voice_move::lease_deadline(&config, headers, wire, (now, 10_000));
+    let mut headers = HeaderMap::new();
+    for raw in ["010001", "10001x", "30001"] {
+        headers.insert("x-two-voice-move-until", HeaderValue::from_static(raw));
+        assert_eq!(check(&headers), None);
+    }
+    headers.insert("x-two-voice-move-until", HeaderValue::from_static("10001"));
+    assert_eq!(check(&headers), Some(now + Duration::from_millis(1)));
+    headers.append("x-two-voice-move-until", HeaderValue::from_static("10002"));
+    assert_eq!(check(&headers), None);
+}
+
 async fn signed_voice_move(uncertain: bool, with_retry_after: bool) {
     use VoiceMoveOutcome::{BotNotPermitted, DiscordUnavailable, Moved, RateLimited};
     const FIRST: &str = "111111111111111141";

@@ -26,6 +26,10 @@
       },
       "runs-on": "ubuntu-latest",
       "timeout-minutes": "10",
+      "env": {
+        "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+        "STAGING_USE_VOICE_MOVE": "1"
+      },
       "steps": [
         {
           "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
@@ -45,11 +49,9 @@
           "name": "Acquire the exact staging lease with self-move selected",
           "id": "use",
           "env": {
-            "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
             "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
             "STAGING_USE_EXPECTED_SHA": "${{ github.sha }}",
             "STAGING_USE_MINUTES": "15",
-            "STAGING_USE_VOICE_MOVE": "1",
             "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-voice-move-start.jsonl"
           },
           "run": "node wrangler/scripts/staging-use-pipeline.mjs begin"
@@ -58,10 +60,8 @@
           "name": "Release the same lease and read back OFF",
           "if": "always() && steps.use.outputs.expires_at != ''",
           "env": {
-            "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
             "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
             "STAGING_USE_EXPIRES_AT": "${{ steps.use.outputs.expires_at }}",
-            "STAGING_USE_VOICE_MOVE": "1",
             "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-voice-move-stop.jsonl"
           },
           "run": "node wrangler/scripts/staging-use-pipeline.mjs finish"

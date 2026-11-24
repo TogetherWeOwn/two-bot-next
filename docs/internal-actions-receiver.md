@@ -180,23 +180,14 @@ rollback identities, a dedicated account and channels, and cleanup within that w
 
 The manual [staging-voice-move workflow](../.github/workflows/staging-voice-move.yml)
 exercises lease selection and cleanup on the exact serving main SHA when
-`verify_lease` is selected. The protected staging lease records `voiceMove: true`
-at acquisition. Ordinary leases omit it. Rebinding clears it. The DO caps the
-private deadline at the lease expiry and rebuilds headers so caller input
-cannot grant a deadline. The receiver verifies the original signed bytes and
-uses the earlier of its normal wire deadline and the private deadline.
-
-The cleanup step releases the same run and attempt, then reads back
-`voiceMoveEnabled: false` and `running: false`. If the runner is interrupted
-before cleanup, the protected staging status read can confirm both fields
-after native expiry. Correlate its run, attempt, expiry, deployment and SHA.
-The native `staging_use` receipt also reports OFF and whether shutdown was
-confirmed. A failed shutdown can return OFF while the container still runs.
-
-Live move qualification needs a separately coordinated Web signer bound to
-the dedicated staging account's own authenticated session and two dedicated
-staging voice channels with verifiable Connect permissions and occupancy.
-
+`verify_lease` is selected. Ordinary leases and rebinds have self-move OFF.
+The private relay's deadline caps the signed receiver's wire deadline.
+Cleanup releases the same lease and reads back `voiceMoveEnabled: false`
+and `running: false`. After runner interruption, check both fields in protected
+status after native expiry. Match the run, attempt, expiry, deployment and SHA.
+A failed shutdown can leave the container running after authorization ends.
+Live qualification needs a Web signer bound to the dedicated account's own
+session and two staging voice channels with verifiable Connect and occupancy.
 Attaching the executor gives all signed verbs a five-second nonce deadline. The guild turn
 ends at adapter settlement. The child holds capacity through the audit, with up to five
 seconds beyond the wire deadline. An audit failure or timeout is logged as unconfirmed.

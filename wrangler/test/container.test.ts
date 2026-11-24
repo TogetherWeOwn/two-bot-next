@@ -915,9 +915,9 @@ test("staging self-move stamps only its selected lease and reads OFF after relea
   assert.equal((await h.bot.fetch(stagingUseRequest("acquire", opted))).status, 200);
   assert.equal((await off()).voiceMoveEnabled, true);
   h.runtime.running = true;
-  t.mock.timers.setTime(window.expiresAt - 100);
+  t.mock.timers.setTime(window.expiresAt - 1_100);
   assert.equal((await send()).status, 200);
-  assert.deepEqual(delivered, [null, String(window.expiresAt)]);
+  assert.deepEqual(delivered, [null, String(window.expiresAt - 1_000)]);
   const failure = t.mock.method(h.runtime, "destroy", async () => { throw new Error("stop failed"); });
   assert.equal((await h.bot.fetch(stagingUseRequest("release", { ...window, runId: opted.runId }))).status, 503);
   const afterFailure = await off();

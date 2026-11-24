@@ -1426,9 +1426,9 @@ export class TwoBotContainer extends Container<Env> {
         if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
         const identity = { deploymentId: this.id(), sha: this.env.CONTAINER_RELEASE ?? "", owner };
         if (use && this.voiceMoveConfigured() && voiceMoveAllowed(use, identity) && !signal.aborted) {
-          // The signed bytes are untouched. Neither ingress allowlist accepts
-          // this private header. Even late delivery cannot outlive the grant.
-          forward.headers.set(VOICE_MOVE_LEASE_HEADER, String(Math.min(use.expiresAt, forwardingDeadline)));
+          // Reserve one second for clock skew across the private relay.
+          const expiry = Math.min(use.expiresAt, forwardingDeadline) - 1_000;
+          if (expiry > Date.now()) forward.headers.set(VOICE_MOVE_LEASE_HEADER, String(expiry));
         }
         let upstream: Response;
         try {
