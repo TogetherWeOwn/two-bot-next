@@ -414,7 +414,7 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     assert!(fulfill_user_deletion(&migrator, &request).await.is_err());
     assert_counts(&runtime, &[(RECEIPTS, 1), (SESSIONS, 2), (RESERVATIONS, 2)]).await;
     assert_eq!(count(&runtime, "SELECT count(*) FROM members WHERE guild_id = '100000000000000002' AND member_id = '200000000000000001'").await, 1);
-    request_user_deletion(&runtime, OTHER_GUILD, MEMBER)
+    request_user_deletion(&runtime, GUILD, "200000000000000003")
         .await
         .unwrap();
     let drained = run_retention(&migrator, RetentionMode::Execute)
@@ -432,6 +432,7 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
         [(GUILD.to_owned(), "200000000000000002".to_owned())]
     );
     assert_counts(&runtime, &[(WINDOWS, 1), (RESERVATIONS, 1), (QUEUE, 0)]).await;
+    assert_eq!(count(&runtime, MEMBERS).await, 1);
     assert_eq!(count(&runtime, "SELECT count(*) FROM moderation_idempotency WHERE state = 'done' AND outcome = 'operator_released'").await, 2);
     let repeat = run_retention(&migrator, RetentionMode::Execute)
         .await
@@ -890,6 +891,7 @@ async fn verify_rollback_candidate(
                 .await
                 .unwrap(),
         );
+        assert_preserved(migrator).await;
         let removed = sqlx::query(
             "DELETE FROM event_store WHERE dedup_key IN ('rollback-fixture-a', 'rollback-fixture-b')",
         )

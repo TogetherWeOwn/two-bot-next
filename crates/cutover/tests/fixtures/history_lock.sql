@@ -19,3 +19,7 @@ $$;
 CREATE CONSTRAINT TRIGGER fixture_check_history_lock
 AFTER DELETE ON public.members DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW EXECUTE FUNCTION public.fixture_check_history_lock();
+
+-- Scheduled member deletion and guild purge need different rows.
+INSERT INTO public.members (guild_id, member_id)
+VALUES ('100000000000000001', '200000000000000003');
