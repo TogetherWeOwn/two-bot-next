@@ -133,13 +133,8 @@ async fn sql_and_reservation_enforce_the_wire_bounds() {
     .await
     .unwrap();
     // Give every connection in a fresh fixture pool the asynchronous default.
-    let options = pool.connect_options();
-    pool.set_connect_options(
-        options
-            .as_ref()
-            .clone()
-            .options([("synchronous_commit", "off")]),
-    );
+    let options = pool.connect_options().as_ref().clone();
+    pool.set_connect_options(options.options([("synchronous_commit", "off")]));
     let asynchronous = db.independent_pool().await.unwrap();
     let session_default: String = sqlx::query_scalar("SHOW synchronous_commit")
         .fetch_one(&asynchronous)
