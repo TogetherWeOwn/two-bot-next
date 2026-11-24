@@ -2205,20 +2205,20 @@ mod tests {
 
     #[test]
     fn release_ledgers_match_both_producing_plan_ledgers() {
-        let row = LedgerRow {
-            version: 1,
-            description: "expected".to_owned(),
-            success: true,
-            checksum_hex: "a".repeat(96),
-        };
-        let rows = &[row];
-        let plan =
-            json!({"ledger_before": ledger_json(rows), "ledger_store_before": ledger_json(rows)});
+        let [cutover, store] = [1, 2].map(|version| {
+            [LedgerRow {
+                version,
+                description: "expected".to_owned(),
+                success: true,
+                checksum_hex: "a".repeat(96),
+            }]
+        });
+        let plan = json!({"ledger_before": ledger_json(&cutover), "ledger_store_before": ledger_json(&store)});
         let path = temp_manifest(&plan.to_string());
         let name = path.to_str().unwrap();
-        let exact = check_release_ledgers(name, rows, rows);
-        let cutover_drift = check_release_ledgers(name, &[], rows);
-        let store_drift = check_release_ledgers(name, rows, &[]);
+        let exact = check_release_ledgers(name, &cutover, &store);
+        let cutover_drift = check_release_ledgers(name, &store, &store);
+        let store_drift = check_release_ledgers(name, &cutover, &cutover);
         std::fs::remove_file(&path).unwrap();
         assert!(exact.is_ok());
         for error in [cutover_drift, store_drift] {
@@ -2228,7 +2228,7 @@ mod tests {
             );
         }
         assert_eq!(
-            check_release_ledgers(name, rows, rows)
+            check_release_ledgers(name, &cutover, &store)
                 .unwrap_err()
                 .to_string(),
             "refused: release plan unavailable"

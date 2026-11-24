@@ -201,10 +201,11 @@ class ProductionApprovalTests(unittest.TestCase):
         self.assertEqual(evidence["atomic_release"], "false")
 
     def test_atomic_release_requires_both_exact_pending_lists(self):
-        for store_versions, selected in (([478], "true"), ([477, 478], "false")):
-            with self.subTest(store_versions=store_versions):
+        release = [475, 479, 480, 481, 482]
+        for cutover_versions, store_versions, selected in (
+                (release, [478], "true"), (release, [477, 478], "false"), (release[1:], [478], "false")):
+            with self.subTest(cutover=cutover_versions, store=store_versions):
                 plan = deepcopy(self.plan)
-                cutover_versions = [475, 479, 480, 481, 482]
                 plan.update(pending_before=cutover_versions, pending_store_before=store_versions)
                 for key, versions in (("source_migrations", cutover_versions),
                                       ("source_store_migrations", store_versions)):

@@ -1705,7 +1705,8 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                 or release_build[0].get("working-directory") != "approval-tools"
                 or 'for path in database_role_matrix.sql verify_database_roles.sql web_v1.sql; do'
                 not in release_build[0].get("run", "")
-                or 'cmp "sql/$path" "../sql/$path"' not in release_build[0].get("run", "")):
+                or 'cmp "sql/$path" "../sql/$path"' not in release_build[0].get("run", "")
+                or release_build[0].get("run", "").splitlines()[-1:] != [source_build[0].get("run")]):
             errors.append(f"{name}:apply: must build the selected runner with matched role and contract files")
         checkouts = [step for step in steps if (step.get("with") or {}).get("path") == "approval-tools"]
         if (len(checkouts) != 1 or not str(checkouts[0].get("uses", "")).startswith("actions/checkout@")
