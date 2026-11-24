@@ -210,11 +210,11 @@ class ProductionApprovalTests(unittest.TestCase):
                 with self.assertRaisesRegex(GateError, "production_migration_plan_changed"):
                     self.authorize(fresh)
 
-    def test_refuses_wrong_app_or_duplicate_approval(self):
-        self.check["app"]["id"] = 15368
-        with self.assertRaises(GateError):
-            self.authorize()
-        self.check["app"]["id"] = approval.APP_ID
+    def test_refuses_wrong_app_archive_or_duplicate_approval(self):
+        other_archive = self.check["external_id"].replace("a" * 64, "b" * 64)
+        for mismatch in ({"app": {"id": 15368}}, {"external_id": other_archive}):
+            with patch.dict(self.check, mismatch), self.assertRaises(GateError):
+                self.authorize()
         self.checks.update(total_count=2, check_runs=[self.check, self.check])
         with self.assertRaises(GateError):
             self.authorize()
