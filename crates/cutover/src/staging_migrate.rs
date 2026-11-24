@@ -1687,7 +1687,15 @@ mod tests {
     #[test]
     fn sqlx_pin_matches_lockfile() {
         let lock = include_str!("../../../Cargo.lock");
-        assert!(lock.contains(&format!("name = \"sqlx\"\nversion = \"{SQLX_VERSION}\"")));
+        let expected = format!("version = \"{SQLX_VERSION}\"");
+        for package in ["sqlx", "sqlx-core", "sqlx-postgres"] {
+            let name = format!("name = \"{package}\"\n");
+            let versions: Vec<_> = lock
+                .split("[[package]]\n")
+                .filter_map(|entry| entry.strip_prefix(&name)?.lines().next())
+                .collect();
+            assert_eq!(versions, [expected.as_str()], "{package}");
+        }
     }
 
     #[test]
