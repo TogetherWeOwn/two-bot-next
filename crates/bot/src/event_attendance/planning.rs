@@ -1,8 +1,11 @@
-//! Pure planning for mapped event attendance windows. No runtime caller.
+//! Mapped event attendance planning and dormant open admission. No runtime caller.
 
-use std::ops::Range;
+use std::{io, ops::Range, time::Duration};
 
+use sqlx::PgPool;
+use time::OffsetDateTime;
 use two_bot_core::Snowflake;
+use two_bot_cutover::event_attendance::writer::{open_mapped_session, NewAttendanceSession};
 
 const ATTENDANCE_GRACE_MS: i64 = 15 * 60 * 1_000;
 
@@ -114,6 +117,58 @@ pub fn plan_transition(
         (!tags.is_empty()).then_some(OpenPlan { tags })
     });
     TransitionPlan { closes, open }
+}
+
+/// The guild actor must opt in and settle recovery before requesting an open.
+#[derive(Clone, Copy, Default)]
+pub enum OpenCapture {
+    #[default]
+    Off,
+    Enabled,
+}
+
+#[derive(Clone, Copy)]
+pub struct VoiceObservation<'a> {
+    pub guild_id: Snowflake,
+    pub member_id: Snowflake,
+    pub previous: Option<Snowflake>,
+    pub current: Option<Snowflake>,
+    pub channel_name: &'a str,
+    pub is_bot: bool,
+    pub afk_channel: Option<Snowflake>,
+    /// Original gateway observation time.
+    pub observed_at: OffsetDateTime,
+}
+
+impl OpenCapture {
+    /// Admit a fresh guild voice join or move. The caller must have settled
+    /// continuity and any prior closes. Never retry an uncertain write from
+    /// this frame. Storage resolves mappings and privacy for the same scope.
+    pub async fn write_observation(
+        self,
+        pool: &PgPool,
+        observation: &VoiceObservation<'_>,
+    ) -> io::Result<bool> {
+        if matches!(self, Self::Off) || observation.previous == observation.current {
+            return Ok(false);
+        }
+        let Some(channel_id) = observation.current else {
+            return Ok(false);
+        };
+        let new = NewAttendanceSession {
+            guild_id: observation.guild_id,
+            member_id: observation.member_id,
+            channel_id,
+            channel_name: observation.channel_name,
+            is_bot: observation.is_bot,
+            afk: observation.afk_channel == Some(channel_id),
+            joined_at: observation.observed_at,
+        };
+        match tokio::time::timeout(Duration::from_secs(1), open_mapped_session(pool, &new)).await {
+            Ok(Ok(opened)) => Ok(opened),
+            Ok(Err(_)) | Err(_) => Err(io::Error::other("attendance open storage unavailable")),
+        }
+    }
 }
 
 #[cfg(test)]

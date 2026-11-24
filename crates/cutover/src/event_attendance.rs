@@ -1,4 +1,4 @@
-//! Dormant attendance storage. No capture or backfill.
+//! Dormant attendance storage for mapped event windows.
 //!
 //! Writers must tag each session in `event_voice_sessions.event_keys` with
 //! `event_key/event_id/instance_start_unix_micros` (signed decimal, no padding).
@@ -14,6 +14,7 @@ use two_bot_core::{
 };
 
 pub mod finalization;
+pub mod writer;
 
 const MAX_SESSIONS: usize = 4096;
 

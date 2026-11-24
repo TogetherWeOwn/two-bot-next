@@ -32,7 +32,7 @@
 //! skips the purge locks and writes no new receipt; a first opt-out still
 //! writes a receipt even when there are no stored rows to purge.
 
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgConnection, Postgres, Transaction};
 
 use crate::db::CutoverDb;
 use crate::member_erasure::{plan, TableCount};
@@ -124,13 +124,33 @@ async fn begin_member_change<'a>(
     sqlx::query("SET LOCAL statement_timeout = '15s'")
         .execute(&mut *tx)
         .await?;
-    // Always take this before table/row locks, including when no suppression
-    // row exists. Transaction scope releases it on commit, error or cancel.
+    lock_member_change(&mut tx, guild, member).await?;
+    Ok(tx)
+}
+
+/// Order capture with suppression changes, including an absent opt-out row.
+pub(crate) async fn lock_member_change(
+    connection: &mut PgConnection,
+    guild: &str,
+    member: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("privacy:{guild}:{member}"))
-        .execute(&mut *tx)
+        .execute(connection)
         .await?;
-    Ok(tx)
+    Ok(())
+}
+
+/// Order capture with settings changes, including the first settings write.
+pub(crate) async fn lock_analytics_settings(
+    connection: &mut PgConnection,
+    guild: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("analytics_settings:{guild}"))
+        .execute(connection)
+        .await?;
+    Ok(())
 }
 
 async fn opt_out(
@@ -349,6 +369,8 @@ pub async fn set_analytics_settings(
             "invalid analytics settings identity".into(),
         ));
     }
+    let mut tx = db.pool().begin().await?;
+    lock_analytics_settings(&mut tx, guild).await?;
     sqlx::query(
         "INSERT INTO guild_analytics_settings (guild_id, presence_enabled, activity_enabled, voice_enabled, updated_at)
          VALUES ($1, $2, $3, $4, clock_timestamp())
@@ -362,9 +384,9 @@ pub async fn set_analytics_settings(
     .bind(presence)
     .bind(activity)
     .bind(voice)
-    .execute(db.pool())
+    .execute(&mut *tx)
     .await?;
-    Ok(())
+    tx.commit().await
 }
 
 #[cfg(test)]
