@@ -24,8 +24,11 @@ The store returns five entries with guild- and target-bound continuation keys.
 The command has no registry or runtime caller.
 [Warning history store](../crates/core/src/member_moderation_store/warning_history.rs)
 
-The index extends the 0110 order. Fix shared-schema fixture deadlocks before
-registering it. Check combined guild, target and warning key sizes before release.
+The index extends the 0110 order. The community database lane isolates parallel
+fixtures in separate databases and builds the candidate while a peer SQLx
+migrator runs with a held snapshot. Verify the full migration lanes before
+registering the candidate. Check combined guild, target and warning key sizes
+before release.
 [Cutover index candidate](../crates/cutover/migration-candidates/moderation_warning_history_order.sql)
 
 Reuse the existing moderation resolver for fresh guild permissions, add channel
