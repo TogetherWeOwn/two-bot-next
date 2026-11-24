@@ -48,8 +48,8 @@ def prepare(current, claim, env, api, fetch_plan=authenticated_plan):
     producing, artifact = fetch_plan(claim["plan_run_id"])
     require(build_claim(current, env) == build_claim(producing, env) == claim,
             "producing_plan_does_not_match_claim")
-    for manifest in (current, producing):
-        require(mapping(manifest.get("audit")).get("verify_findings") == [], "staging_role_findings")
+    current_findings, reviewed_findings = (mapping(plan.get("audit")).get("verify_findings") for plan in (current, producing))
+    require(sequence(current_findings) == reviewed_findings, "staging_role_findings_changed")
     require(all(current[key] == producing[key] for key in ("ledger_before", "ledger_store_before")),
             "staging_ledger_changed_since_plan")
     return digest_json({"claim": claim, "producing_plan": artifact}), digest_json(producing), artifact

@@ -152,3 +152,4 @@ Before building the runner, apply checks the Environment policy, reviewer,
 approval comment and producing plan. Attempt 1 must leave 30 minutes within
 the 24-hour window. Retry or change the tuple with a new dispatch and approval. Reuse
 an available producing plan if the fresh read-only plan still matches it.
+Review unchanged audit findings, including objects the migration will create.

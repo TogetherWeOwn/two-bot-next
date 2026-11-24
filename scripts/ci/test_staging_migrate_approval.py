@@ -59,6 +59,7 @@ class StagingMigrationApprovalTests(unittest.TestCase):
         return approval.verify(self.env, self.plan, self.responses.__getitem__, self.now)
 
     def test_independent_exact_native_approval_succeeds(self):
+        self.plan["audit"]["verify_findings"] = ["missing object: public.pending_fixture_table"]
         self.authorize()
         self.assertEqual(self.verify(), self.reviewer["id"])
         later_request = {**self.env, "GITHUB_RUN_ID": "37110947192"}
@@ -88,7 +89,7 @@ class StagingMigrationApprovalTests(unittest.TestCase):
             lambda: self.settings.update(can_admins_bypass=True),
             lambda: self.settings["protection_rules"][1].update(prevent_self_review=False),
             lambda: self.env.update(GITHUB_RUN_ATTEMPT="2"),
-            lambda: self.responses[self.route].update(created_at="2026-11-23T11:00:00Z"),
+            lambda: self.responses[self.route].update(created_at="2026-11-23T12:20:00Z"),
             lambda: self.review["environments"][0].update(id=34),
             lambda: self.plan.update(acl_plan_ref="changed"),
         ):
