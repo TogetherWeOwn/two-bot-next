@@ -665,17 +665,17 @@ async fn signed_worker_requires_a_covering_snapshot_after_a_gap() {
     let (tx, mut attempts) = mpsc::channel(1);
     let web = Router::new().route(
         INGEST_PATH,
-        post(move |headers: HeaderMap, raw: Bytes| {
+        post(move |headers: HeaderMap, body: Bytes| {
             let tx = tx.clone();
             let key = key.clone();
             async move {
                 assert_eq!(headers["x-two-key-id"], KEY_ID);
                 let timestamp = headers["x-two-timestamp"].to_str().unwrap();
                 let nonce = headers["x-two-nonce"].to_str().unwrap();
-                let expected = web_signature(&key, timestamp, nonce, &raw);
+                let expected = web_signature(&key, timestamp, nonce, &body);
                 assert_eq!(headers["x-two-signature"], expected.as_str());
                 let (reply, status) = oneshot::channel();
-                tx.send((decoded(&raw), reply)).await.unwrap();
+                tx.send((decoded(&body), reply)).await.unwrap();
                 status.await.unwrap()
             }
         }),
@@ -749,6 +749,10 @@ async fn signed_worker_requires_a_covering_snapshot_after_a_gap() {
             json!([{"userId":"31","channelId":"21"}])
         );
         assert_eq!(ingest(8, Some(&covering)).await, StatusCode::NO_CONTENT);
+        // The worker must finish the recovery attempt before this can arrive.
+        live.receive(&VOICE.replace(r#""20""#, "null"), now, |_| false)
+            .await;
+        assert_eq!(ingest(9, None).await, StatusCode::NO_CONTENT);
         stop.send(()).unwrap();
     };
     let worker = receiver.run_signed_until(async { shutdown.await.unwrap() }, &transport);
@@ -757,7 +761,7 @@ async fn signed_worker_requires_a_covering_snapshot_after_a_gap() {
     })
     .await
     .unwrap();
-    assert_eq!(applied, 8);
+    assert_eq!(applied, 9);
     live.disconnect();
     assert!(pull(&live, AT).is_none());
     server.abort();
