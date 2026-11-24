@@ -489,7 +489,8 @@ impl InteractionRouter {
     /// Open staging preview publication after attaching the gateway's AutoMod runtime.
     /// The existing moderation gate must also allow the router to serve the command.
     pub fn enable_staging_automod_preview(&self, automod: &AutomodRuntime) {
-        if self.gates.moderation
+        if automod.accepts_member_messages()
+            && self.gates.moderation
             && self
                 .gates
                 .configured_guild

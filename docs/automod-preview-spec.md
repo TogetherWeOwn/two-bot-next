@@ -667,6 +667,39 @@ preview-by-message-id, dashboard parity, live-guild scope, and any change
 to matcher semantics (corpus rows are added only as preview-parity
 expectations, never as behavior changes).
 
+### Protected staging readback
+
+The dormant AutoMod-only admission consumes the protected lifecycle's
+authoritative lease and stopped state under its ownership gate. It requires
+the exact run, attempt, build, deployment, owner epoch and deadline, the
+existing staging app and guild, a verified recovery pair and database binding,
+gateway-intent evidence, valid existing moderation configuration and a finite
+cleanup reserve. The baseline needs an affirmative GET absence result and a
+spare slash-command slot. Admission checks the same stopped lease again after
+the read. Help, voice, ordinary staging certification and promotion cannot
+share this mode. A durable voice selection also disqualifies the lease.
+
+A later boot must use a fresh isolated shard with the dedicated intents, with
+no saved gateway session or ordinary registry/publisher path. The isolated
+runtime suppresses member deliveries and keeps enforcement off at boot and
+through every settings overlay or fallback. The readback lane consumes no
+interactions. This source slice has no workflow or boot caller.
+
+Before a later slice enables that caller, the lifecycle owner must persist the
+exact admitted lease, stopped and absent baseline, registry comparison evidence
+and single-command write intent before authorizing any Discord write. Recheck
+authority and reserve at the write boundary. Keep automatic guild registry
+publication disconnected and compare the full registry before and after the
+targeted change. Use the protected positive GET to verify the staged command.
+
+On expiry, cancellation or a lost write response, fence new work and drain
+in-flight publication before reconciling under the original durable intent.
+Keep the lifecycle held across restart until idempotent recovery confirms the
+staged command's exact identity or affirmative absence. Delete only the command
+attributable to that intent. An ambiguous match leaves the hold in place. Clear
+the intent and admit later uses only after affirmative absence and a confirmed
+runtime stop. Activation remains pending that publication and cleanup slice.
+
 ## 10. Spec self-check (doctest)
 
 The numbers asserted above, verified against themselves. This checks the

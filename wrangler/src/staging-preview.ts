@@ -17,8 +17,11 @@ const OPTIONS = [
 const BOUNDS = ["min_length", "max_length", "min_value", "max_value"];
 const EMPTY = ["choices", "options", "channel_types"];
 const refuse = () => new Error("staging_preview_registry_mismatch");
-type PreviewEnv = { GUILD_ID?: string; DISCORD_APPLICATION_ID?: string; DISCORD_TOKEN?: string };
+export type PreviewEnv = { GUILD_ID?: string; DISCORD_APPLICATION_ID?: string; DISCORD_TOKEN?: string };
 type DiscordGet = (url: string, token: string) => Promise<unknown>;
+export function stagingPreviewScope(env: PreviewEnv): boolean {
+  return env.GUILD_ID === GUILD && env.DISCORD_APPLICATION_ID === APP;
+}
 export async function previewRefusal(request: Request, url: URL, token?: string): Promise<Response | null> {
   const reply = (status: number, extra = {}) =>
     new Response(null, { status, headers: withSecurityHeaders({ "cache-control": "no-store", ...extra }) });
@@ -40,7 +43,7 @@ function identity(row: Record<string, unknown> | undefined): boolean {
 
 async function registry(env: PreviewEnv, get: DiscordGet) {
   const token = env.DISCORD_TOKEN;
-  if (env.GUILD_ID !== GUILD || env.DISCORD_APPLICATION_ID !== APP || !token?.trim()) throw refuse();
+  if (!stagingPreviewScope(env) || !token?.trim()) throw refuse();
   const bot = record(await get(`${API}/users/@me`, token));
   if (bot?.id !== APP || bot.bot !== true) throw refuse();
   const list = await get(COMMANDS, token);
@@ -68,9 +71,10 @@ export function parseRegistryJson(text: string): unknown {
   return value;
 }
 
-export async function readPreviewAbsent(env: PreviewEnv, get: DiscordGet): Promise<void> {
+export async function readPreviewAbsent(env: PreviewEnv, get: DiscordGet): Promise<number> {
   const { list } = await registry(env, get);
   const ids = new Set<string>(), commands = new Set<string>();
+  let slashCount = 0;
   for (const raw of list) {
     const row = record(raw);
     const type = row && !Object.hasOwn(row, "type") ? 1 : row?.type;
@@ -82,7 +86,9 @@ export async function readPreviewAbsent(env: PreviewEnv, get: DiscordGet): Promi
     if (ids.has(row.id) || commands.has(command)) throw refuse();
     ids.add(row.id);
     commands.add(command);
+    if (type === 1) slashCount++;
   }
+  return slashCount;
 }
 
 export async function readPreview(env: PreviewEnv, get: DiscordGet): Promise<void> {

@@ -158,6 +158,9 @@ impl<L: AutomodClaimLedger, F: AutomodFacts> AutomodActivation<L, F> {
         let kind = delivery.kind;
         let (admitted, dry_run) = {
             let runtime = self.runtime();
+            if !runtime.accepts_member_messages() {
+                return activation(FunnelDisposition::None, ActivationOutcome::Bypassed);
+            }
             (
                 runtime.admits(delivery.guild_id.as_deref()),
                 runtime.dry_run(),

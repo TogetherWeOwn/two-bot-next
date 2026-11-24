@@ -255,6 +255,119 @@ fn delivery(kind: MessageDeliveryKind) -> MessageDelivery {
     }
 }
 
+#[tokio::test]
+async fn protected_preview_keeps_dry_run_and_suppresses_member_deliveries() {
+    use time::{Duration as TimeDuration, OffsetDateTime};
+    use two_bot_core::backup::guild_config::STAGING_BOT_APPLICATION_ID;
+    use two_bot_core::settings::{live_channel, OpsRecord, SettingRow, SettingsSnapshot};
+    use two_bot_core::{FeatureGates, InteractionRouter, RouterGates};
+    use two_bot_discord::automod_activation::ActivationOutcome;
+
+    let boot = vars(&[
+        ("TWO_AUTOMOD", "1"),
+        ("TWO_AUTOMOD_ENFORCE", "1"),
+        ("TWO_MODERATION", "1"),
+        ("TWO_OWEN_USER_ID", OWEN),
+    ]);
+    let config = AutomodConfig::from_map(&boot).expect("valid enforcing boot config");
+    let until = OffsetDateTime::now_utc() + TimeDuration::minutes(10);
+    let app = STAGING_BOT_APPLICATION_ID;
+    let guild = STAGING_GUILD_ID;
+    for (application, scope, expires) in [
+        ("1", guild, until),
+        (app, "1", until),
+        (app, guild, OffsetDateTime::UNIX_EPOCH),
+    ] {
+        assert!(
+            AutomodRuntime::new_staging_preview(config.clone(), application, scope, expires)
+                .is_none()
+        );
+    }
+    let mut runtime =
+        AutomodRuntime::new_staging_preview(config, app, guild, until).expect("protected runtime");
+    assert!(runtime.dry_run() && runtime.admits(Some(guild)));
+    assert!(!runtime.admits(Some("1")));
+    let router = InteractionRouter::new(RouterGates::from_slices(
+        Some(GUILD),
+        &FeatureGates::from_map(&boot),
+        &ModerationGates::from_map(&boot).expect("moderation on"),
+        Default::default(),
+    ));
+    router.enable_staging_automod_preview(&runtime);
+    assert!(router
+        .publish_set(&[])
+        .expect("registry")
+        .iter()
+        .all(|def| def.name != "automod-preview"));
+    assert_eq!(
+        runtime.inspect(&delivery(MessageDeliveryKind::Create)),
+        two_bot_core::automod_runtime::Inspection::Ignore
+    );
+    crate::gateway::ensure_crypto_provider();
+    let executor = ActionExecutor::with_proxy(
+        "test-token".to_owned(),
+        Some("http://127.0.0.1:9".to_owned()),
+    )
+    .expect("executor");
+    let active = AutomodActivation::new(runtime, HangingLedger, HangingFacts, executor);
+    let (mut writer, live) = live_channel();
+    let row = |key: &str, value| SettingRow {
+        guild_id: guild.into(),
+        key: key.into(),
+        value,
+        version: 1,
+    };
+    let ops = OpsRecord {
+        epoch: 1,
+        overrides: vars(&[
+            ("TWO_AUTOMOD_ENFORCE", "1"),
+            ("TWO_AUTOMOD_BAD_WORDS", "synthetic"),
+        ]),
+    };
+    for (i, rows) in [
+        vec![
+            row("TWO_AUTOMOD_ENFORCE", json!(true)),
+            row("TWO_AUTOMOD_BAD_WORDS", json!(["synthetic"])),
+        ],
+        vec![row("TWO_AUTOMOD_REPEAT_COUNT", json!(999))],
+        vec![row("TWO_AUTOMOD_SANCTIONS", json!("2:warn"))],
+        vec![],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        writer.publish(&SettingsSnapshot {
+            revision: i as i64 + 1,
+            rows,
+        });
+        if i == 1 {
+            writer.apply_ops(Some(&ops), std::time::Instant::now());
+        }
+        refresh_live(&active, &boot, guild, &live);
+        let overlay = resolve_live_config(&boot, guild, &live);
+        assert_eq!(
+            overlay.as_ref().map(|config| config.dry_run),
+            (i != 2).then_some(false)
+        );
+        active.preview(|runtime| {
+            assert!(runtime.effective_preview_config(overlay).dry_run);
+            assert!(runtime.effective_config().dry_run);
+        });
+    }
+    for kind in [MessageDeliveryKind::Create, MessageDeliveryKind::Update] {
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), active.process(delivery(kind), ""))
+                .await
+                .expect("suppression must precede ledger and REST");
+        assert_eq!(result.disposition, FunnelDisposition::None);
+        assert!(matches!(result.outcome, ActivationOutcome::Bypassed));
+    }
+    assert_eq!(
+        two_bot_discord::intents::staging_automod_preview_intents().bits(),
+        1
+    );
+}
+
 /// TOG-19027: stored automod lists/thresholds reach the consumer through
 /// the live snapshot, without a restart. The poller publishes; the same
 /// process re-resolves and observes the stored values.
