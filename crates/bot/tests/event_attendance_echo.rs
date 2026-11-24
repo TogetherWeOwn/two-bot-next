@@ -38,31 +38,31 @@ fn iso(at: OffsetDateTime) -> String {
     format_iso_millis(i64::try_from(at.unix_timestamp_nanos().div_euclid(1_000_000)).unwrap())
 }
 
+fn random_nonce() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
 async fn signed_request(
     store: &InternalActionStore,
+    key: &SigningKey,
+    keys: &KeyRing,
     now: u64,
-    nonce: u64,
+    nonce: &str,
 ) -> Result<AttendanceReadRequest, ErrorCode> {
     // The Web signer sends a canonical body with no idempotency key or guild selector.
     let body = br#"{"action":"event.attendance.read","event_key":"echo-fixture"}"#;
-    let key_id = "echo-fixture";
-    let key = SigningKey {
-        id: key_id.into(),
-        secret: Secret::new(vec![0; 32]),
-    };
     let timestamp = now.to_string();
-    let nonce = format!("{nonce:032x}");
-    let signature = sign(key.secret.expose(), &timestamp, &nonce, body);
+    let signature = sign(key.secret.expose(), &timestamp, nonce, body);
     let headers = AuthHeaders {
-        key_id,
+        key_id: &key.id,
         timestamp: &timestamp,
-        nonce: &nonce,
+        nonce,
         signature: &signature,
     };
     let verified = AuthenticatedRequest::verify(
         &headers,
         body,
-        &KeyRing::new(vec![key]),
+        keys,
         SKEW_SECONDS,
         now * 1_000,
         &mut ClockGuard::new(),
@@ -152,8 +152,15 @@ async fn exercise_echo(pool: PgPool) {
     };
     assert!(capture.write_observation(pool, &observation).await.unwrap());
 
-    let echo = async |nonce| {
-        let request = signed_request(&store, now_secs, nonce).await.unwrap();
+    let key = SigningKey {
+        id: "echo-fixture".into(),
+        secret: Secret::new(rand::random::<[u8; 32]>().to_vec()),
+    };
+    let keys = KeyRing::new(vec![key.clone()]);
+    let echo = async |nonce: &str| {
+        let request = signed_request(&store, &key, &keys, now_secs, nonce)
+            .await
+            .unwrap();
         read(request, pool, |scope| {
             assert_eq!(scope, guild_id);
             // This fixture holds a stable read epoch for the duration of each lookup.
@@ -161,7 +168,11 @@ async fn exercise_echo(pool: PgPool) {
         })
         .await
     };
-    assert_eq!(echo(1).await, Err(ReadRefusal::NotFound), "active event");
+    assert_eq!(
+        echo(&random_nonce()).await,
+        Err(ReadRefusal::NotFound),
+        "active event"
+    );
 
     let mut recovery = AttendanceRecovery::new(guild_id, MemberLossFence::default());
     recovery.retain_departure(MEMBER, CHANNEL, left_at);
@@ -186,7 +197,7 @@ async fn exercise_echo(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(
-        echo(2).await,
+        echo(&random_nonce()).await,
         Err(ReadRefusal::NotFound),
         "grace still open"
     );
@@ -195,9 +206,10 @@ async fn exercise_echo(pool: PgPool) {
     let ends_at = joined_at - Duration::minutes(15) + Duration::seconds(10);
     event.ends_at = Some(iso(ends_at));
     upsert_event(pool, guild, &iso(now), &event).await.unwrap();
+    let final_nonce = random_nonce();
     // Web Echo can freeze this v1 result. A real but short visit has zero whole minutes.
     assert_eq!(
-        echo(3).await.unwrap(),
+        echo(&final_nonce).await.unwrap(),
         json!({
             "v": 1,
             "event_key": EVENT_KEY,
@@ -215,7 +227,9 @@ async fn exercise_echo(pool: PgPool) {
         })
     );
     assert_eq!(
-        signed_request(&store, now_secs, 3).await.err(),
+        signed_request(&store, &key, &keys, now_secs, &final_nonce)
+            .await
+            .err(),
         Some(ErrorCode::Replayed),
         "the same signed request cannot reach the finalized reader again"
     );
@@ -234,7 +248,7 @@ async fn exercise_echo(pool: PgPool) {
     };
     mark_ambiguous(true).await;
     assert_eq!(
-        echo(4).await,
+        echo(&random_nonce()).await,
         Err(ReadRefusal::NotFound),
         "ambiguous occurrence"
     );
@@ -243,7 +257,7 @@ async fn exercise_echo(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(
-        echo(5).await,
+        echo(&random_nonce()).await,
         Err(ReadRefusal::NotFound),
         "suppressed member"
     );
@@ -260,5 +274,9 @@ async fn exercise_echo(pool: PgPool) {
         !capture.write_observation(pool, &observation).await.unwrap(),
         "erased history cannot be backfilled"
     );
-    assert_eq!(echo(6).await, Err(ReadRefusal::NotFound), "erased span");
+    assert_eq!(
+        echo(&random_nonce()).await,
+        Err(ReadRefusal::NotFound),
+        "erased span"
+    );
 }
