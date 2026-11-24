@@ -19,7 +19,7 @@ REPO = "TogetherWeOwn/two-bot-next"
 ENVIRONMENT = "staging-migrate-apply"
 POLICY = f"environments/{ENVIRONMENT}"
 APPROVE = "approve-staging-migration sha256:"
-MAX_REQUEST_AGE = timedelta(hours=24)
+MAX_REVIEW_AGE = timedelta(hours=23, minutes=30)  # Leave the 30-minute apply job its full window.
 MAX_RESPONSE = 128 * 1024
 
 
@@ -96,7 +96,7 @@ def verify(env, producing, api, now):
     require(run.get("id") == int(env["GITHUB_RUN_ID"]) and run.get("run_attempt") == 1
             and run.get("head_sha") == env.get("GITHUB_SHA") and actor == triggering_actor
             and str(actor) == env.get("GITHUB_ACTOR_ID"), "approval_requester_unverified")
-    require(timedelta() <= now - moment(run.get("created_at")) <= MAX_REQUEST_AGE, "approval_request_expired")
+    require(timedelta() <= now - moment(run.get("created_at")) <= MAX_REVIEW_AGE, "approval_request_expired")
     environment_id, allowed = environment_reviewers(api)
 
     decisions = []

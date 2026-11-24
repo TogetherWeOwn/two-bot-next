@@ -239,8 +239,6 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           git fetch origin main
           git merge-base --is-ancestor "$SOURCE_SHA" origin/main
-      - name: Build runner
-        run: cargo build -p two-bot-cutover --bin staging-migrate --locked
       - name: Fetch producing plan manifest
         # Provenance gate (TOG-15157 gap 2): the apply runner proves the bound
         # plan_manifest_sha256 came from the reviewed plan run by parsing this
@@ -269,6 +267,8 @@ jobs:
           APPROVAL_DIGEST: ${{ needs.claim.outputs.approval_digest }}
           APPROVAL_PLAN_SHA256: ${{ needs.claim.outputs.approval_plan_sha256 }}
         run: python3 approval-tools/scripts/staging_migrate_approval.py verify producing-plan/staging-migrate-manifest.json
+      - name: Build runner
+        run: cargo build -p two-bot-cutover --bin staging-migrate --locked
       - name: Run
         env:
           # Must already exist as a staging-migrate-apply environment secret; absent means refusal.

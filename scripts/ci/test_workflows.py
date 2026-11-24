@@ -1635,9 +1635,11 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
             "APPROVAL_PLAN_SHA256": "${{ needs.claim.outputs.approval_plan_sha256 }}",
         }, "run": "python3 approval-tools/scripts/staging_migrate_approval.py verify "
                   "producing-plan/staging-migrate-manifest.json"}
-        if (len(ddl) != 1 or ddl[0] == 0 or steps[ddl[0] - 1] != verifier or "continue-on-error" in apply
+        build = {"name": "Build runner", "run": "cargo build -p two-bot-cutover --bin staging-migrate --locked"}
+        if (len(ddl) != 1 or ddl[0] < 2 or steps[ddl[0] - 2:ddl[0]] != [verifier, build]
+                or "continue-on-error" in apply or apply.get("timeout-minutes") != "30"
                 or "if" in steps[ddl[0]] or "continue-on-error" in steps[ddl[0]]):
-            errors.append(f"{name}:apply: must verify the exact native approval immediately before DDL")
+            errors.append(f"{name}:apply: must verify the exact native approval before building and running DDL")
         checkouts = [step for step in steps if (step.get("with") or {}).get("path") == "approval-tools"]
         if (len(checkouts) != 1 or not str(checkouts[0].get("uses", "")).startswith("actions/checkout@")
                 or checkouts[0].get("with") != {"path": "approval-tools", "persist-credentials": "false",

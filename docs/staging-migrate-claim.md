@@ -1,8 +1,8 @@
 # Staging migration apply-claim contract
 
 The claim is non-secret evidence of the staging apply request, not an approval
-or permission to apply migrations. Apply requires native approval from an
-independent designated staging maintainer. See the
+or permission to apply migrations. The staging gate combines the `main`-only
+Environment branch rule and native reviewer approval. See the
 [staging migration runbook](runbook.md#staging-only-migration-runner) for recovery
 and ACL prerequisites. Production has its own approval and protection rules:
 `production-migrate.yml` with `scripts/ci/production_migrate_claim.py`, which
@@ -148,7 +148,7 @@ against the claim. Use **Review deployments** on the apply run, select
 from the claim summary. It binds the full claim and producing artifact ID and
 archive digest to the apply run and attempt.
 
-Before DDL, apply rechecks the Environment policy, reviewer identity, approval
-comment and producing plan. Only attempt 1 within 24 hours of dispatch can
-apply. For a retry or changed tuple, dispatch and obtain fresh approval. Reuse
+Before building the runner, apply checks the Environment policy, reviewer,
+approval comment and producing plan. Attempt 1 must leave 30 minutes within
+the 24-hour window. Retry or change the tuple with a new dispatch and approval. Reuse
 an available producing plan if the fresh read-only plan still matches it.

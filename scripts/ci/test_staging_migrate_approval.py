@@ -55,9 +55,8 @@ class StagingMigrationApprovalTests(unittest.TestCase):
         self.env.update(APPROVAL_DIGEST=digest, APPROVAL_PLAN_SHA256=plan_digest)
         self.review["comment"] = approval.APPROVE + digest
 
-    def verify(self, *, producing=None):
-        producing = self.plan if producing is None else producing
-        return approval.verify(self.env, producing, self.responses.__getitem__, self.now)
+    def verify(self):
+        return approval.verify(self.env, self.plan, self.responses.__getitem__, self.now)
 
     def test_independent_exact_native_approval_succeeds(self):
         self.authorize()
@@ -91,6 +90,7 @@ class StagingMigrationApprovalTests(unittest.TestCase):
             lambda: self.env.update(GITHUB_RUN_ATTEMPT="2"),
             lambda: self.responses[self.route].update(created_at="2026-11-23T11:00:00Z"),
             lambda: self.review["environments"][0].update(id=34),
+            lambda: self.plan.update(acl_plan_ref="changed"),
         ):
             with self.subTest(mutation=mutation):
                 self.setUp()
@@ -98,7 +98,3 @@ class StagingMigrationApprovalTests(unittest.TestCase):
                 mutation()
                 with self.assertRaises(approval.GateError):
                     self.verify()
-        self.setUp()
-        self.authorize()
-        with self.assertRaisesRegex(approval.GateError, "staging_approved_plan_changed"):
-            self.verify(producing={**self.plan, "acl_plan_ref": "changed"})
