@@ -27,9 +27,13 @@ The command has no registry or runtime caller.
 The index extends the 0110 order. The community database lane isolates parallel
 fixtures in separate databases and builds the candidate while a peer SQLx
 migrator runs with a held snapshot. Verify the full migration lanes before
-registering the candidate. Check combined guild, target and warning key sizes
-before release.
-[Cutover index candidate](../crates/cutover/migration-candidates/moderation_warning_history_order.sql)
+registering the candidate. A [disposable regression](../crates/core/src/member_moderation_store/warning_history/tests.rs)
+builds the [index candidate](../crates/cutover/migration-candidates/moderation_warning_history_order.sql)
+at the B-tree tuple limit for 8 KiB PostgreSQL pages. One extra byte across the
+combined guild, target and warning IDs can make an otherwise storable historical
+row fail the concurrent build with `54000`, leaving an invalid index and the
+row intact. The test sizes are specific to that tuple layout. Check retained
+key sizes before registration and hold registration if any row cannot fit.
 
 The dormant authorizer reuses the moderation resolver and checks current channel
 overwrites with at most five Discord GETs per refresh. Synthetic tests compile
