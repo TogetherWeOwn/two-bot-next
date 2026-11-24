@@ -660,90 +660,110 @@ pub async fn run_closed_week(
 
 #[cfg(test)]
 mod tests {
-    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use sqlx::migrate::{Migrate, Migrator};
+    use two_bot_testsupport::TestDatabase;
 
     use super::*;
 
-    /// Only an absent URL skips the test. Configured setup failures are errors.
-    async fn test_pool(prefix: &str) -> Result<Option<(Pool<Postgres>, String)>, sqlx::Error> {
-        let url = match std::env::var("TWO_TEST_DATABASE_URL") {
-            Ok(url) => url,
-            Err(std::env::VarError::NotPresent) => return Ok(None),
+    static MIGRATIONS: Migrator = sqlx::migrate!("../cutover/migrations");
+
+    fn test_database_url() -> Option<String> {
+        match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(url) => Some(url),
+            Err(std::env::VarError::NotPresent) => None,
             Err(_) => panic!("TWO_TEST_DATABASE_URL must be Unicode"),
-        };
-        test_pool_with_url(prefix, &url).await.map(Some)
+        }
     }
 
-    async fn test_pool_with_url(
-        prefix: &str,
-        url: &str,
-    ) -> Result<(Pool<Postgres>, String), sqlx::Error> {
-        let options: PgConnectOptions = url.parse()?;
-        // No DATABASE_URL or inherited credentials: tests accept only the
-        // approved agent container or the ephemeral Postgres service in
-        // GitHub Actions (see the `community-db` CI job).
-        let host = options.get_host();
-        assert!(
-            host == "agent-testdb"
-                || (host == "localhost"
-                    && std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")),
-            "test-container-only URL"
-        );
-        assert_eq!(
-            options.get_username(),
-            "agent_test",
-            "test-container-only user"
-        );
-        // No shared fixed-name fixtures: each invocation owns its schema,
-        // including concurrent invocations of the same test in other processes.
-        static NEXT_SCHEMA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        let schema = format!(
-            "{prefix}_{}_{nonce}_{}",
-            std::process::id(),
-            NEXT_SCHEMA.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        assert!(is_test_schema_name(&schema), "safe unique test schema");
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with(options.clone())
-            .await?;
-        // SAFETY: only the guarded identifier interpolates; values bind.
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-            .execute(&admin)
-            .await?;
-        admin.close().await;
-        let pool = PgPoolOptions::new()
-            .max_connections(3)
-            .connect_with(options.options([("search_path", schema.as_str())]))
-            .await?;
-        // Use the runtime migration chain, including 0160's community_facts,
-        // rather than a test-only table that could hide migration conflicts.
-        sqlx::migrate!("../cutover/migrations").run(&pool).await?;
-        Ok((pool, schema))
-    }
-
-    /// Test-only schema names: lowercase identifier characters, so DDL
-    /// interpolation cannot break out of the identifier position.
-    fn is_test_schema_name(schema: &str) -> bool {
-        !schema.is_empty()
-            && schema.len() <= 63
-            && schema
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-    }
-
-    async fn drop_schema(pool: &Pool<Postgres>, schema: &str) {
-        assert!(is_test_schema_name(schema));
-        // SAFETY: guarded by `is_test_schema_name` (see `test_pool`).
-        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-            .execute(pool)
+    async fn create_test_db(url: &str) -> Result<TestDatabase, String> {
+        // SQLx's migration lock and concurrent index snapshot waits are both
+        // database-wide. Give each parallel fixture its own database.
+        TestDatabase::create(url, &MIGRATIONS)
             .await
-            .expect("clean up owned test schema");
-        pool.close().await;
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    /// Only an absent URL skips the test. Configured setup failures are errors.
+    async fn test_db() -> Option<TestDatabase> {
+        let url = test_database_url()?;
+        Some(create_test_db(&url).await.expect("test database setup"))
+    }
+
+    async fn build_warning_index_with_peer_migrator(
+        builder: &TestDatabase,
+        peer: &TestDatabase,
+    ) -> Result<bool, sqlx::Error> {
+        let mut build_conn = builder.pool().acquire().await?;
+        build_conn.lock().await?;
+
+        // Keep the peer's snapshot alive for the entire build. In a shared
+        // database it would hold up the build while the peer waited for the
+        // builder's SQLx advisory lock, even with distinct search paths.
+        let mut snapshot = peer.pool().begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *snapshot)
+            .await?;
+        sqlx::query("SELECT pg_current_snapshot()")
+            .execute(&mut *snapshot)
+            .await?;
+        let (built, migrated) = tokio::join!(
+            sqlx::raw_sql(include_str!(
+                "../../cutover/migration-candidates/moderation_warning_history_order.sql"
+            ))
+            .execute(&mut *build_conn),
+            MIGRATIONS.run(&mut *snapshot),
+        );
+        let rolled_back = snapshot.rollback().await;
+        let unlocked = build_conn.unlock().await;
+        built?;
+        migrated?;
+        rolled_back?;
+        unlocked?;
+        sqlx::query_scalar(
+            "SELECT indisvalid AND indisready FROM pg_index
+             WHERE indexrelid = to_regclass('idx_moderation_warnings_history_order')
+               AND indrelid = 'moderation_warnings'::regclass",
+        )
+        .fetch_one(&mut *build_conn)
+        .await
+    }
+
+    #[tokio::test]
+    async fn warning_index_build_overlaps_a_peer_migrator() -> Result<(), String> {
+        let Some(url) = test_database_url() else {
+            assert_ne!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+            return Ok(());
+        };
+        let (builder, peer) = tokio::join!(create_test_db(&url), create_test_db(&url));
+        let (builder, peer) = match (builder, peer) {
+            (Ok(builder), Ok(peer)) => (builder, peer),
+            (Ok(db), Err(error)) | (Err(error), Ok(db)) => {
+                let cleanup = db.close().await;
+                return Err(format!(
+                    "paired fixture setup failed: {error}. Sibling cleanup: {cleanup:?}"
+                ));
+            }
+            (Err(builder), Err(peer)) => {
+                return Err(format!("builder setup failed: {builder}. Peer: {peer}"));
+            }
+        };
+
+        // Await explicit teardown before reporting failures from either session.
+        let valid = build_warning_index_with_peer_migrator(&builder, &peer).await;
+        let builder_name = builder.name().to_owned();
+        let builder_closed = builder.close().await;
+        let builder_gone: Result<bool, _> =
+            sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+                .bind(builder_name)
+                .fetch_one(peer.pool())
+                .await;
+        let peer_closed = peer.close().await;
+
+        builder_closed.expect("drop builder database");
+        peer_closed.expect("drop peer database");
+        assert!(valid.expect("build warning-history candidate with a peer SQLx migrator"));
+        assert!(builder_gone.expect("check builder database teardown from peer"));
+        Ok(())
     }
 
     const GUILD: &str = "guild-a";
@@ -906,13 +926,11 @@ mod tests {
 
     #[tokio::test]
     async fn monday_run_matches_legacy_golden_output() {
-        let Some((pool, schema)) = test_pool("tog_10092_scorecard")
-            .await
-            .expect("test database setup")
-        else {
+        let Some(db) = test_db().await else {
             eprintln!("skipping community_store test: TWO_TEST_DATABASE_URL not set");
             return;
         };
+        let pool = db.pool().clone();
         seed_fixture(&pool).await;
         let load = ScorecardLoad {
             guild_id: GUILD.to_owned(),
@@ -970,18 +988,16 @@ mod tests {
         assert!(reused2);
         assert!(!alerted2);
         assert_eq!(json2, json);
-        drop_schema(&pool, &schema).await;
+        db.close().await.expect("drop community test database");
     }
 
     #[tokio::test]
     async fn midweek_start_fails_closed_with_null_numerators() {
-        let Some((pool, schema)) = test_pool("tog_10092_failclosed")
-            .await
-            .expect("test database setup")
-        else {
+        let Some(db) = test_db().await else {
             eprintln!("skipping community_store test: TWO_TEST_DATABASE_URL not set");
             return;
         };
+        let pool = db.pool().clone();
         // A process started mid-week cannot cover the whole closed week.
         for stream in COMMUNITY_FACT_TYPES {
             mark_stream_coverage(
@@ -1018,7 +1034,7 @@ mod tests {
         assert_eq!(scorecard["weeklyActiveHumans"], serde_json::Value::Null);
         assert_eq!(scorecard["humanMessages"], serde_json::Value::Null);
         assert_eq!(scorecard["intervention"]["code"], "INGESTION_INCOMPLETE");
-        drop_schema(&pool, &schema).await;
+        db.close().await.expect("drop community test database");
     }
 
     #[test]
@@ -1148,13 +1164,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a disposable test database; routed to a check.yml step"]
     async fn voice_session_start_end_round_trip_is_idempotent() {
-        let Some((pool, schema)) = test_pool("tog_19605_voice")
-            .await
-            .expect("test database setup")
-        else {
+        let Some(db) = test_db().await else {
             eprintln!("skipping community_store test: TWO_TEST_DATABASE_URL not set");
             return;
         };
+        let pool = db.pool().clone();
         let at = "2026-09-02T10:00:00.000Z";
         let end_at = "2026-09-02T10:05:30.000Z";
         let input = actor("human-1");
@@ -1236,7 +1250,7 @@ mod tests {
         .await
         .expect("voice heartbeats present");
         assert_eq!(beats.len(), 2, "both voice stream heartbeats present");
-        drop_schema(&pool, &schema).await;
+        db.close().await.expect("drop community test database");
     }
 
     /// Gateway `MessageCreate` round-trip (TOG-19603): one fact inserts, the
@@ -1245,13 +1259,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a disposable test database; routed to a check.yml step"]
     async fn message_created_fact_round_trip_is_idempotent() {
-        let Some((pool, schema)) = test_pool("tog_19603_message")
-            .await
-            .expect("test database setup")
-        else {
+        let Some(db) = test_db().await else {
             eprintln!("skipping community_store test: TWO_TEST_DATABASE_URL not set");
             return;
         };
+        let pool = db.pool().clone();
         let at = "2026-09-02T10:00:00.000Z";
         let input = actor("human-1");
         let first = record_message_fact(
@@ -1308,6 +1320,6 @@ mod tests {
         .await
         .expect("heartbeat present");
         assert_eq!(beats.len(), 1, "stream heartbeat present");
-        drop_schema(&pool, &schema).await;
+        db.close().await.expect("drop community test database");
     }
 }
