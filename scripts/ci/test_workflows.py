@@ -1442,7 +1442,9 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
         errors.append(f"{prefix} consumer job identity changed")
     if "environment" in claim or "secrets." in str(claim) or "uses" in claim:
         errors.append(f"{prefix} must be unprotected with no secrets or reusable job")
-    permissions = {"contents": "read", **({"actions": "read"} if staging else {})}
+    permissions = {"contents": "read", "actions": "read"}
+    if not staging:
+        permissions["checks"] = "read"
     if claim.get("permissions") != permissions:
         errors.append(f"{prefix} must keep only the trusted checkout and plan read grants")
     if claim.get("needs") != "plan" or claim.get("if") != "github.ref == 'refs/heads/main' && inputs.mode == 'apply'":
@@ -1471,13 +1473,18 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
                   ("STORE_PLAN_MANIFEST_SHA256", "store_plan_manifest_sha256"),
                   ("PLAN_RUN_ID", "plan_run_id")])
     expected_env = {key: "${{ inputs." + value + " }}" for key, value in pairs}
+    expected_env["GH_TOKEN"] = "${{ github.token }}"
     if staging:
-        expected_env["GH_TOKEN"] = "${{ github.token }}"
         if (publish.get("id") != "request" or claim.get("outputs") != {
                 "approval_digest": "${{ steps.request.outputs.digest }}",
                 "approval_plan_sha256": "${{ steps.request.outputs.plan_sha256 }}",
         } or "python3 scripts/staging_migrate_approval.py prepare" not in str(publish.get("run", ""))):
             errors.append(f"{prefix} must authenticate the producing plan and export the approval binding")
+    else:
+        approval = ("python3 scripts/production_migrate_approval.py "
+                    f"current-plan/{manifest}.json {claim_artifact}.json")
+        if str(publish.get("run", "")).strip().splitlines()[-1:] != [approval]:
+            errors.append(f"{prefix} must verify independent approval of the exact producing plan")
     if publish.get("env") != expected_env or publish.get("shell") != "bash":
         errors.append(f"{prefix} must pass exactly the dispatch fields via env, in bash")
     script_text = str(publish.get("run", ""))
@@ -1634,8 +1641,11 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                       "(provenance artifact fetch, nothing more)")
     if plan.get("if") != "github.ref == 'refs/heads/main'":
         errors.append(f"{name}:plan: must run only from main")
-    if apply.get("if") != "github.ref == 'refs/heads/main' && inputs.mode == 'apply'":
-        errors.append(f"{name}:apply: must run only from main for mode=apply")
+    apply_condition = "github.ref == 'refs/heads/main' && inputs.mode == 'apply'"
+    if name == "production-migrate.yml":
+        apply_condition += " && github.run_attempt == 1"
+    if apply.get("if") != apply_condition:
+        errors.append(f"{name}:apply: must preserve dispatch and attempt restrictions")
     if apply.get("needs") != ["plan", "claim"]:
         errors.append(f"{name}:apply: must wait for a green plan and pre-approval claim")
     if name == "staging-migrate.yml":

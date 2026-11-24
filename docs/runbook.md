@@ -2788,11 +2788,10 @@ username branch suffix does not match the pin refuses the same way, in both
 gates. The manifest carries `migration_target`
 (`staging` or `production`); the claim publisher requires the matching value.
 
-The workflow mirrors the staging shape with the `production-migrate-` prefix:
-three jobs (`plan`, `claim`, `apply`), environments
-`production-migrate-plan` (no reviewer, plan only) and
-`production-migrate-apply` (required reviewer, main-only), the same pinned
-actions, explicit `ubuntu-latest` runner, pipefail shell, and artifact names
+The workflow has three jobs (`plan`, `claim`, `apply`). It uses
+`production-migrate-plan` for read-only planning and the main-only
+`production-migrate-apply` Environment for apply. It uses pinned actions,
+an explicit `ubuntu-latest` runner, a pipefail shell, and artifact names
 (`production-migrate-manifest`, `production-migrate-apply-claim`, 14-day
 retention, stored ZIP entries). The `claim` job runs
 `scripts/ci/production_migrate_claim.py`, which binds the same projection hash
@@ -2803,6 +2802,21 @@ pin that does not match the plan). Both environments
 and both secrets must exist before dispatch; the host provisions them after
 this change merges. The cutover itself does not need this path: the fresh
 `two_bot` bootstrap uses the tested provisioner flow.
+
+After the production release gate is satisfied, give the independent approval
+App operator the producing plan run, its artifact SHA-256 and the protected
+workflow SHA that will receive the apply dispatch. The operator records a
+successful `production-migration-approval` check on that workflow SHA with
+external ID `production-apply:<plan run ID>:<archive SHA-256 without prefix>`
+before dispatch. Use an attempt-one plan-only run. The approval expires after
+23 hours and 30 minutes. An approval on a different workflow SHA or artifact
+requires a new decision.
+
+The `claim` job authenticates the producing run and archive and compares
+the fresh production plan, including both ledgers and role findings. It
+requires the matching check from the designated App before the apply job can
+receive its migrator binding. Environment protections still apply. After a
+refusal or uncertain outcome, reconcile both ledgers before another dispatch.
 
 ### Redeploy the approved revision
 

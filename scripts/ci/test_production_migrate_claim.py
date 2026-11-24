@@ -1,13 +1,23 @@
 """Offline production-claim contract tests; no Actions dispatch, database or approval."""
 from copy import deepcopy
+from datetime import datetime, timezone
+from hashlib import sha256
+from io import BytesIO
 import json
 from pathlib import Path
+import sys
 import unittest
+from zipfile import ZipFile
 
 from production_migrate_claim import build_claim, projection_hash, Refused
 from test_workflows import load_workflows, production_migrate_errors
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+import production_migrate_approval as approval
+from rollback_proof import ProofError
+from staging_rollout import GateError
+
 FIXTURES = ROOT / "crates/cutover/tests/fixtures"
 PLAN = FIXTURES / "staging-migrate-plan.json"
 ENV = {
@@ -143,6 +153,103 @@ class ProductionClaimTests(unittest.TestCase):
         claim = workflow["jobs"]["claim"]
         self.assertNotIn("environment", claim)
         self.assertEqual(workflow["jobs"]["apply"]["needs"], ["plan", "claim"])
+        rerunnable = deepcopy(workflow)
+        rerunnable["jobs"]["apply"]["if"] = "github.ref == 'refs/heads/main' && inputs.mode == 'apply'"
+        self.assertTrue(production_migrate_errors(rerunnable))
+        claim["steps"][2]["run"] = claim["steps"][2]["run"].rsplit("python3", 1)[0]
+        self.assertTrue(production_migrate_errors(workflow))
+
+
+class ProductionApprovalTests(unittest.TestCase):
+    def setUp(self):
+        self.plan = production_plan()
+        self.plan.update(role_verified_connections=1, audit={"verify_findings": [], "connection_usage": {"used": 10}})
+        self.env = {**ENV, "PLAN_MANIFEST_SHA256": self.plan["plan_manifest_sha256"],
+                    "STORE_PLAN_MANIFEST_SHA256": self.plan["store_plan_manifest_sha256"],
+                    "EXPECTED_STORE_PENDING": "400,9007199254740992",
+                    "GITHUB_WORKFLOW_SHA": ENV["GITHUB_SHA"], "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_REF_PROTECTED": "true", "GITHUB_ACTOR_ID": "42"}
+        self.claim = build_claim(self.plan, self.env)
+        archive = BytesIO()
+        with ZipFile(archive, "w") as writer:
+            writer.writestr(f"{approval.ARTIFACT}.json", json.dumps(self.plan))
+        raw = archive.getvalue()
+        digest = sha256(raw).hexdigest()
+        producing = f"actions/runs/{ENV['PLAN_RUN_ID']}"
+        applying = f"actions/runs/{ENV['GITHUB_RUN_ID']}"
+        run = {"path": approval.WORKFLOW_PATH, "event": "workflow_dispatch",
+               "head_branch": "main", "head_sha": ENV["GITHUB_SHA"], "run_attempt": 1,
+               "repository": {"full_name": ENV["GITHUB_REPOSITORY"]},
+               "head_repository": {"full_name": ENV["GITHUB_REPOSITORY"]}}
+        self.check = {
+            "name": approval.CHECK_NAME, "head_sha": ENV["GITHUB_SHA"], "app": {"id": approval.APP_ID},
+            "status": "completed", "conclusion": "success", "completed_at": "2026-11-24T10:00:00Z",
+            "external_id": f"production-apply:{ENV['PLAN_RUN_ID']}:{digest}",
+        }
+        self.checks = {"total_count": 1, "check_runs": [self.check]}
+        self.responses = {
+            applying: {**run, "id": int(ENV["GITHUB_RUN_ID"]), "actor": {"id": 42},
+                       "triggering_actor": {"id": 42}, "created_at": "2026-11-24T10:01:00Z"},
+            producing: {**run, "id": int(ENV["PLAN_RUN_ID"]), "status": "completed", "conclusion": "success"},
+            f"{producing}/attempts/1/jobs?per_page=4": {"total_count": 3, "jobs": [
+                {"name": f"production-migrate ({job})", "conclusion": conclusion}
+                for job, conclusion in (("plan", "success"), ("claim", "skipped"), ("apply", "skipped"))
+            ]},
+            f"{producing}/artifacts?per_page=2": {"total_count": 1, "artifacts": [
+                {"id": 99, "expired": False, "name": approval.ARTIFACT,
+                 "size_in_bytes": len(raw), "digest": f"sha256:{digest}"},
+            ]},
+            "actions/artifacts/99/zip": raw,
+            f"commits/{ENV['GITHUB_SHA']}/check-runs?check_name={approval.CHECK_NAME}&filter=all&per_page=100": self.checks,
+        }
+        self.now = datetime(2026, 11, 24, 11, tzinfo=timezone.utc)
+
+    def authorize(self, fresh=None, env=None):
+        def api(path, *, binary=False):
+            value = self.responses[path]
+            self.assertEqual(isinstance(value, bytes), binary)
+            return value
+
+        return approval.authorize(fresh or self.plan, self.claim, env or self.env, self.now, api)
+
+    def test_exact_app_approval_admits_unchanged_plan(self):
+        fresh = deepcopy(self.plan)
+        fresh["audit"]["connection_usage"]["used"] = 11
+        fresh["expected_pending"] = []
+        fresh["role_verified_connections"] = 2
+        self.assertEqual(self.authorize(fresh), 99)
+
+    def test_refuses_fresh_ledger_or_role_audit_drift(self):
+        for field in ("ledger_before", "ledger_store_before", "audit"):
+            with self.subTest(field=field):
+                fresh = deepcopy(self.plan)
+                if field == "audit":
+                    fresh["audit"]["verify_findings"] = ["drift"]
+                else:
+                    fresh[field] = fresh[field.replace("before", "after")] = []
+                with self.assertRaisesRegex(GateError, "production_migration_plan_changed"):
+                    self.authorize(fresh)
+
+    def test_refuses_wrong_stale_or_duplicate_approval(self):
+        good = deepcopy(self.check)
+        for changed in ({"app": {"id": 15368}}, {"external_id": "staging-apply:8"},
+                        {"conclusion": "failure"}, {"completed_at": "2026-11-24T10:02:00Z"},
+                        {"completed_at": "2026-11-23T10:00:00Z"}):
+            with self.subTest(changed=changed):
+                self.check.update({**good, **changed})
+                with self.assertRaises(GateError):
+                    self.authorize()
+        self.check.update(good)
+        self.checks.update(total_count=2, check_runs=[self.check, self.check])
+        with self.assertRaises(GateError):
+            self.authorize()
+
+    def test_refuses_replayed_dispatch_and_unverified_artifact(self):
+        with self.assertRaisesRegex(GateError, "production_approval_dispatch_untrusted"):
+            self.authorize(env={**self.env, "GITHUB_RUN_ATTEMPT": "2"})
+        self.responses["actions/artifacts/99/zip"] += b"x"
+        with self.assertRaises((GateError, ProofError)):
+            self.authorize()
 
 
 if __name__ == "__main__":

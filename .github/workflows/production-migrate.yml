@@ -10,7 +10,7 @@ name: production-migrate
 # no-reviewer `production-migrate-plan` environment and always runs; `apply`
 # reads only TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL from the reviewed
 # `production-migrate-apply` environment and runs only for mode=apply, after a
-# green plan. Both environments must exist before dispatch; a missing
+# green plan and independent App approval. Both environments must exist before dispatch; a missing
 # environment fails the job instead of leaking a binding.
 on:
   workflow_dispatch:
@@ -144,11 +144,12 @@ jobs:
     name: production-migrate (claim)
     permissions:
       contents: read
+      actions: read
+      checks: read
     if: github.ref == 'refs/heads/main' && inputs.mode == 'apply'
     needs: plan
-    # No Environment and no DB secrets: this artifact must exist BEFORE the
-    # protected apply job can be approved. A step inside apply is too late.
-    # https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments
+    # No Environment or DB secrets. Verify the independent approval of the
+    # producing artifact and unchanged fresh plan before apply can start.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -165,6 +166,7 @@ jobs:
           path: current-plan
       - name: Publish apply claim
         env:
+          GH_TOKEN: ${{ github.token }}
           MODE: ${{ inputs.mode }}
           SOURCE_SHA: ${{ inputs.source_sha }}
           PRODUCTION_HOST: ${{ inputs.production_host }}
@@ -183,6 +185,7 @@ jobs:
           python3 scripts/ci/production_migrate_claim.py \
             --manifest current-plan/production-migrate-manifest.json \
             --output production-migrate-apply-claim.json
+          python3 scripts/production_migrate_approval.py current-plan/production-migrate-manifest.json production-migrate-apply-claim.json
       - name: Upload apply claim
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -202,14 +205,14 @@ jobs:
       actions: read # Provenance gate downloads the producing plan run manifest artifact.
     # Dispatch from main only, mode=apply only, and only after a green plan.
     # The binding must be scoped to the production-migrate-apply environment
-    # (required reviewer, main-only deployment branches) so a workflow edited
+    # (main-only deployment branches) so a workflow edited
     # on another branch cannot read it.
     # Required follow-up (fail-closed deploy gate): migrations create tables
     # but grant nothing. After the apply, the operator reapplies the full role
     # plan (`two-bot db roles plan`) and `two-bot db roles verify` must read
     # 0; deploy-production refuses any new build while findings remain (the
     # 2026-10-16 crash-loop: migrations 0424-0441 without the role reapply).
-    if: github.ref == 'refs/heads/main' && inputs.mode == 'apply'
+    if: github.ref == 'refs/heads/main' && inputs.mode == 'apply' && github.run_attempt == 1
     needs: [plan, claim]
     environment: production-migrate-apply
     # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
