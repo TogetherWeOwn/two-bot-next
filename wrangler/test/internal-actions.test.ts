@@ -641,14 +641,27 @@ test("unmounted snapshot composition returns direct v1 while ordinary ingress ke
 });
 
 test("unmounted snapshot composition requires the configured guild, key, owner and staging use", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"] });
   const sha = "a".repeat(40);
   const stagingUse: StagingUse = {
     environment: "staging", phase: "active", deploymentId: ID, epoch: OWNER.epoch, sha,
     runId: "100", runAttempt: 1, acquiredAt: Date.now(), expiresAt: Date.now() + 120_000,
   };
-  const h = await harness(t, {
+  const stage = () => harness(t, {
     ...ENABLED_ENV, TWO_DEPLOY_ENV: "staging", STAGING_RUNTIME_POLICY: "bounded", CONTAINER_RELEASE: sha,
   }, { stagingUse });
+  const released = await stage();
+  await released.warm();
+  released.values.set(STAGING_USE_KEY, { ...stagingUse, phase: "released" });
+  assert.equal(released.runtime.running, true);
+  await snapshotRefused(
+    await TwoBotContainer.relayLiveSnapshot(released.bot, webSnapshotRequest(), "fixture", ID, scope),
+    503, "unavailable",
+  );
+  assert.deepEqual(released.receiverCalls(), []);
+  assert.equal(released.runtime.running, false);
+
+  const h = await stage();
   const pull = (request: Request, stamp = ID) => TwoBotContainer.relayLiveSnapshot(h.bot, request, "fixture", stamp, scope);
   await snapshotRefused(await pull(webSnapshotRequest()), 503, "unavailable");
   assert.deepEqual(h.starts, [], "snapshot cannot start a cold container");
@@ -670,18 +683,24 @@ test("unmounted snapshot composition requires the configured guild, key, owner a
   assert.deepEqual(h.receiverCalls(), []);
 
   h.values.set(OWNER_KEY, OWNER);
-  assert.equal(h.runtime.running, true);
+  t.mock.timers.setTime(stagingUse.expiresAt - 1);
   const fresh = { ...snapshot, observed_at: new Date().toISOString() };
+  h.setReceiver(() => Response.json(fresh));
+  const active = await pull(webSnapshotRequest());
+  assert.equal(active.status, 200);
+  assert.equal(active.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await active.json(), fresh);
+
   h.setReceiver(() => new Response(new ReadableStream<Uint8Array>({
     pull(controller) {
-      // No eager pull. Release authority when the relay reads the response body.
-      h.values.set(STAGING_USE_KEY, { ...stagingUse, phase: "released" });
+      // No eager pull. The grant expires when the relay reads the body.
+      t.mock.timers.setTime(stagingUse.expiresAt);
       controller.enqueue(new TextEncoder().encode(JSON.stringify(fresh)));
       controller.close();
     },
   }, { highWaterMark: 0 }), { headers: { "content-type": "application/json" } }));
   await snapshotRefused(await pull(webSnapshotRequest()), 503, "unavailable");
-  assert.equal(h.receiverCalls().length, 1);
+  assert.equal(h.receiverCalls().length, 2);
   assert.equal(h.runtime.running, false, "the owned body read rechecks staging use before releasing the response");
 });
 
