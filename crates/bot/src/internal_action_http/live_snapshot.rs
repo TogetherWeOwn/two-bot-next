@@ -1,4 +1,4 @@
-//! Unmounted receiver for the Web hub's signed snapshot pull.
+//! Private receiver for the Web hub's signed snapshot pull.
 
 use super::{
     now_ms, wire_headers, AuthenticatedRequest, ClockGuard, ErrorCode, Failure, TokenBuckets,
@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 use tokio::{
@@ -36,8 +36,8 @@ struct SnapshotScope {
 
 /// Accepts only a dedicated, guild-scoped snapshot credential. The caller
 /// must supply the same ordered owner that processes the guild's dispatches.
-pub struct LiveSnapshotEndpoint<W> {
-    owner: Arc<RwLock<LiveGateway<W>>>,
+pub struct LiveSnapshotEndpoint<W = sqlx::PgPool> {
+    owner: Weak<RwLock<LiveGateway<W>>>,
     scope: Option<SnapshotScope>,
     store: InternalActionStore,
     capacity: Semaphore,
@@ -49,12 +49,12 @@ impl<W: SequenceWatermark> LiveSnapshotEndpoint<W> {
     /// Construct from trusted server state. With no credential scope, the
     /// endpoint refuses all reads without touching the store or owner.
     pub fn new(
-        owner: Arc<RwLock<LiveGateway<W>>>,
+        owner: &Arc<RwLock<LiveGateway<W>>>,
         store: InternalActionStore,
         scope: Option<(SigningKey, Id)>,
     ) -> Self {
         Self {
-            owner,
+            owner: Arc::downgrade(owner),
             scope: scope.map(|(key, guild_id)| SnapshotScope {
                 key_id: key.id.clone(),
                 guild_id,
@@ -144,7 +144,11 @@ impl<W: SequenceWatermark> LiveSnapshotEndpoint<W> {
             )
             .map_err(Failure::from_action)?;
 
-        let owner = self.owner.read().await;
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or_else(|| Failure::code(ErrorCode::DiscordUnavailable))?;
+        let owner = owner.read().await;
         owner
             .read_snapshot(grant, || WireTime(time::OffsetDateTime::now_utc()))
             .ok_or_else(|| Failure::code(ErrorCode::DiscordUnavailable))

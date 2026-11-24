@@ -32,35 +32,26 @@ Adding secrets cannot enable unforwarded role/capability gates. Do not stage
 those inputs to try to enable them. Widening forwarding requires a separate
 reviewed change; direct-container configuration support is not rollout authority.
 
-The dormant `live.snapshot` boundary takes a committed nonce and a dedicated
+The `live.snapshot` boundary takes a committed nonce and a dedicated
 signing-key scope for one guild before it looks up recovery state. A current,
 fresh generation can return the complete v1 snapshot directly as JSON. The
-dormant guild owner advances the snapshot cut with each committed reservation.
+guild owner advances the snapshot cut with each committed reservation.
 After a failed reservation, reads stay unavailable until the owner rebuilds.
 The Web hub requires a snapshot covering its highest observed sequence after
 a gap. A cut expires 30 seconds after its observation and remains unavailable
-while it exceeds the snapshot size limit. The serving action registry and
-ingress have no `live.snapshot` entry.
+while it exceeds the snapshot size limit.
 
-The unregistered Worker relay accepts the Web hub's signed `POST /internal/actions`
-under a dedicated `DISCORD_LIVE_SNAPSHOT_KEY_ID` and `DISCORD_GUILD_ID` scope.
-The unmounted `TwoBotContainer` adapter uses the existing ownership and staging-use
-gate and reads from the running receiver's private port. The relay serves
-validated direct v1 JSON up to 1 MiB with `Cache-Control: no-store`. With no
-scope it refuses the request.
-Offline tests call the adapter directly with a signed Web-shaped request and
-an in-memory receiver peer. The Rust receiver tests exercise the unmounted
-handler's signature checks, durable replay prevention and guild recovery state.
+The Worker dispatches `live.snapshot` on the existing signed `POST /internal/actions`
+at Web's `BOT_ENDPOINT_URL`. The Durable Object checks ownership and staging use
+and forwards the exact signed bytes to the private receiver. Ordinary actions
+keep their envelope. Bounded staging, both receiver switches and
+`TWO_INTERNAL_ALLOW_LIVE_SNAPSHOT=1` are required. Rust uses the dedicated
+`TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID` and `TWO_INTERNAL_LIVE_SNAPSHOT_SECRET` for
+the Bot's configured `GUILD_ID`.
 
-Web currently uses `BOT_ENDPOINT_URL` for both snapshots and ordinary actions
-at the same signed path. Activation needs agreement with Web on dispatch. A
-shared origin must dispatch snapshots to the dedicated relay and private Rust
-handler while preserving the ordinary action envelope. A dedicated origin
-requires a separate snapshot origin setting in Web so ordinary callers keep
-their endpoint. Either choice requires mounting the Worker and Rust boundaries,
-gating ingress on the private receiver being enabled, and provisioning the
-dedicated snapshot credential and guild scope under the existing holds. Web
-still checks freshness and cursor coverage.
+The Worker caps direct v1 JSON at 1 MiB with `Cache-Control: no-store`.
+Its 2.25-second budget fits Web's 2.5-second deadline.
+Outbound delivery and the Web-first rollout have a [separate qualification](https://github.com/TogetherWeOwn/two-web-next/issues/2705).
 
 No signing key, secret custodian or export authority is supplied by this code.
 Key creation and transfer into the website's staging secret store stay on HOLD

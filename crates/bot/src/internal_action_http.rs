@@ -96,6 +96,8 @@ use two_bot_discord::{ActionExecutor, DiscordError, EventActionError, EventCall}
 use crate::voice_snapshot::{self, SnapshotRefusal, VoiceOccupancyClock};
 
 pub mod live_snapshot;
+
+const LIVE_SNAPSHOT_DISPATCH_HEADER: &str = "x-two-live-snapshot";
 mod voice_move;
 
 const MAX_HEADER_BYTES: usize = 8192;
@@ -935,6 +937,7 @@ struct ReceiverState {
     /// stamped on stale occupancy.
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
     voice_move: Option<ActionExecutor>,
+    live_snapshot: Option<live_snapshot::LiveSnapshotEndpoint>,
     voice_move_turn: tokio::sync::Mutex<()>,
     clock: Mutex<ClockGuard>,
     buckets: Mutex<TokenBuckets>,
@@ -989,6 +992,7 @@ impl ReceiverState {
             voice_clock: VoiceOccupancyClock::new(),
             gateway_state: Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
             voice_move: None,
+            live_snapshot: None,
             voice_move_turn: tokio::sync::Mutex::new(()),
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
@@ -1268,6 +1272,7 @@ pub async fn bind(
     voice_cache: Arc<two_bot_discord::SharedCache>,
     voice_clock: Arc<VoiceOccupancyClock>,
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
+    live_snapshot: Option<live_snapshot::LiveSnapshotEndpoint>,
 ) -> std::io::Result<BoundReceiver> {
     use two_bot_core::send_admission::{PgSendAdmission, SendAdmission};
     use two_bot_discord::internal_actions::CooldownGovernor;
@@ -1313,8 +1318,9 @@ pub async fn bind(
     let listener = TcpListener::bind(config.listen_addr()).await?;
     Ok(BoundReceiver {
         listener,
-        state: Arc::new(
-            ReceiverState::new(
+        state: Arc::new(ReceiverState {
+            live_snapshot,
+            ..ReceiverState::new(
                 config,
                 pool.clone(),
                 Arc::new(executor),
@@ -1327,8 +1333,8 @@ pub async fn bind(
             .with_voice_cache(voice_cache)
             .with_voice_clock(voice_clock)
             .with_gateway_state(gateway_state)
-            .with_voice_move(&InternalFlags::from_env(), events),
-        ),
+            .with_voice_move(&InternalFlags::from_env(), events)
+        }),
     })
 }
 
@@ -1479,6 +1485,19 @@ async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Re
     let id = crate::logging::incoming_request_id(request.headers());
     let span = crate::logging::request_span(&id);
     async move {
+        // The Worker stamps this marker. The endpoint verifies the signed body.
+        if let Some(dispatch) = request.headers().get(LIVE_SNAPSHOT_DISPATCH_HEADER) {
+            if let Some(endpoint) = state.live_snapshot.as_ref().filter(|_| dispatch == "1") {
+                let response = endpoint.handle(request).await;
+                if response.status() == StatusCode::OK
+                    && *state.gateway_state.read().await != crate::gateway::GatewayState::Connected
+                {
+                    return Failure::code(ErrorCode::DiscordUnavailable).response(&id);
+                }
+                return response;
+            }
+            return Failure::code(ErrorCode::ActionNotAllowed).response(&id);
+        }
         let Ok(permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
             return state.reject(
                 Failure::http(

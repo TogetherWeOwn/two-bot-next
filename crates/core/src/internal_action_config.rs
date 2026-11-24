@@ -7,8 +7,10 @@ use std::{collections::HashMap, env, net::SocketAddr};
 use crate::{
     config::ConfigError,
     internal_actions::{
-        assert_private_bind, build_channel_keys, build_role_keys, parse_keys, KeyRing,
+        assert_private_bind, build_channel_keys, build_role_keys, parse_keys, KeyRing, SigningKey,
+        MIN_KEY_SECRET_LEN,
     },
+    Secret,
 };
 
 /// Validated configuration; no public constructor or secret-bearing Debug.
@@ -19,6 +21,7 @@ pub struct InternalActionConfig {
     callers: HashMap<String, String>,
     channel_keys: HashMap<String, String>,
     role_keys: HashMap<String, String>,
+    live_snapshot_key: Option<SigningKey>,
 }
 
 impl std::fmt::Debug for InternalActionConfig {
@@ -198,12 +201,40 @@ impl InternalActionConfig {
             }
         }
 
+        let live_snapshot_key = if lookup("TWO_DEPLOY_ENV").as_deref() == Ok("staging")
+            && lookup("TWO_INTERNAL_ALLOW_LIVE_SNAPSHOT").as_deref() == Ok("1")
+        {
+            let id = required(&mut lookup, "TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID")?;
+            let secret = required(&mut lookup, "TWO_INTERNAL_LIVE_SNAPSHOT_SECRET")?.into_bytes();
+            if id.len() > 128
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+                || secret.len() < MIN_KEY_SECRET_LEN
+                || keys
+                    .iter()
+                    .any(|key| key.id == id || key.secret.expose() == &secret)
+            {
+                return Err(invalid(
+                    "TWO_INTERNAL_ALLOW_LIVE_SNAPSHOT",
+                    "requires a dedicated snapshot ID and distinct secret of at least 32 bytes",
+                ));
+            }
+            Some(SigningKey {
+                id,
+                secret: Secret::new(secret),
+            })
+        } else {
+            None
+        };
+
         Ok(Some(Self {
             listen_addr,
             keys: KeyRing::new(keys),
             callers,
             channel_keys,
             role_keys,
+            live_snapshot_key,
         }))
     }
 
@@ -215,6 +246,10 @@ impl InternalActionConfig {
     #[must_use]
     pub fn keys(&self) -> &KeyRing {
         &self.keys
+    }
+
+    pub fn take_live_snapshot_key(&mut self) -> Option<SigningKey> {
+        self.live_snapshot_key.take()
     }
 
     /// Resolve only after signature verification. Never use a raw key ID as
@@ -335,6 +370,31 @@ mod tests {
             vars.insert("TWO_INTERNAL_ACTIONS", value.to_owned());
             assert!(load(&vars).is_err());
         }
+    }
+
+    #[test]
+    fn snapshot_key_requires_explicit_staging_opt_in_and_isolated_credentials() {
+        let mut vars = vars();
+        vars.insert("TWO_INTERNAL_ALLOW_LIVE_SNAPSHOT", "1".into());
+        let mut dark = load(&vars).unwrap().unwrap();
+        assert!(dark.take_live_snapshot_key().is_none());
+        vars.insert("TWO_DEPLOY_ENV", "staging".into());
+        assert!(load(&vars).is_err());
+        for (id, secret) in [
+            ("old", fixture_secret(1)),
+            ("web:snapshot", fixture_secret(0)),
+        ] {
+            vars.insert("TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID", id.into());
+            vars.insert("TWO_INTERNAL_LIVE_SNAPSHOT_SECRET", secret);
+            assert!(load(&vars).is_err());
+        }
+        let read_secret = fixture_secret(1);
+        vars.insert("TWO_INTERNAL_LIVE_SNAPSHOT_SECRET", read_secret.clone());
+        let mut config = load(&vars).unwrap().unwrap();
+        assert!(!format!("{config:?}").contains(&read_secret));
+        assert!(!config.keys().contains("web:snapshot"));
+        assert_eq!(config.take_live_snapshot_key().unwrap().id, "web:snapshot");
+        assert!(config.take_live_snapshot_key().is_none());
     }
 
     #[test]

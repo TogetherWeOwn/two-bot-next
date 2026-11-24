@@ -1,6 +1,6 @@
-// Dormant seam for the signed Web hub pull. Neither Worker nor DO routing calls it.
 import {
-  ACTIONS_PATH, IDEMPOTENCY_HEADER, MAX_IN_FLIGHT, RECEIVER_PORT, allowlistedHeaders,
+  ACTIONS_PATH, IDEMPOTENCY_HEADER, LIVE_SNAPSHOT_DISPATCH_HEADER, LIVE_SNAPSHOT_TIMEOUT_MS,
+  MAX_IN_FLIGHT, RECEIVER_PORT, allowlistedHeaders,
   boundRead, envelope, isActionsRequest, isJsonObject, readBody, readReceiverBytes, releaseUpstream,
 } from "./internal-actions.ts";
 import { type OwnershipFence } from "./ownership.ts";
@@ -10,7 +10,6 @@ import { withSecurityHeaders } from "./security-headers.ts";
 import { isLiveId, isSnapshot } from "./live-snapshot-wire.ts";
 
 export const LIVE_SNAPSHOT_BYTES = 1024 * 1024;
-export const LIVE_SNAPSHOT_TIMEOUT_MS = 2_250; // Inside the Web loader's 2.5-second budget.
 const buckets = new TokenBuckets({ capacity: 20, refillPerSecond: 1 });
 let inFlight = 0;
 
@@ -75,6 +74,7 @@ export async function handleLiveSnapshotRelay(
     pending = receiver.whileOwned(async () => {
       await receiver.fence.require(receiver.deploymentId, receiver.stampedDeploymentId);
       if (signal.aborted || !receiver.running()) return unavailable();
+      headers.set(LIVE_SNAPSHOT_DISPATCH_HEADER, "1");
       const forward = new Request(`http://c${ACTIONS_PATH}`, {
         method: "POST", headers, body: body.bytes, signal, redirect: "manual",
       });

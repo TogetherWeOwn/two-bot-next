@@ -1,16 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { MAX_BODY_BYTES, relayReceiverResponse } from "../src/internal-actions.ts";
+import { LIVE_SNAPSHOT_TIMEOUT_MS, MAX_BODY_BYTES, relayReceiverResponse } from "../src/internal-actions.ts";
 import {
-  handleLiveSnapshotRelay, LIVE_SNAPSHOT_BYTES, LIVE_SNAPSHOT_TIMEOUT_MS,
+  handleLiveSnapshotRelay, LIVE_SNAPSHOT_BYTES,
 } from "../src/live-snapshot-relay.ts";
 import { DEPLOYMENT_HEADER } from "../src/ownership.ts";
 import {
   body, invalidSnapshots, origin, path, receiver, request, scope, signature, snapshot,
-  stalledBody, stalledUpload, strippedHeaders, verifyForwarded,
+  stalledBody, stalledUpload, strippedHeaders, verifyForwarded, webSnapshot,
 } from "./fixtures/live-snapshot-peer.ts";
 
 test("snapshot verifies untouched signed bytes and returns bounded direct v1 JSON", async () => {
+  assert.equal(LIVE_SNAPSHOT_BYTES, webSnapshot.responseBytes);
   const inbound = request();
   for (const name of strippedHeaders) inbound.headers.set(name, "synthetic-caller-value");
   const json = JSON.stringify(snapshot);
@@ -82,6 +83,7 @@ test("snapshot refuses invalid, oversize and unavailable peers without logging p
 });
 
 test("snapshot deadline bounds a stalled reply and ordinary actions still require their envelope", { timeout: 1_000 }, async (t) => {
+  assert.ok(LIVE_SNAPSHOT_TIMEOUT_MS < webSnapshot.deadlineMs);
   const timeout = AbortSignal.timeout;
   t.mock.method(AbortSignal, "timeout", (ms: number) => {
     assert.equal(ms, LIVE_SNAPSHOT_TIMEOUT_MS);

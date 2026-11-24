@@ -4,15 +4,18 @@ import { DEPLOYMENT_HEADER, OwnershipFence } from "../../src/ownership.ts";
 
 export const origin = "https://bot.test";
 export const path = "/internal/actions";
+// https://github.com/TogetherWeOwn/two-web-next/blob/0d1f56a0965820af0e9f3cdf8f5b79cc3e798e/src/live/transport.ts
+// https://github.com/TogetherWeOwn/two-web-next/blob/0d1f56a0965820af0e9f3cdf8f5b79cc3e798e/src/live/ingress.ts
+export const webSnapshot = { responseBytes: 1_048_576, deadlineMs: 2_500 };
 export const scope = { keyId: "snapshot-fixture", guildId: "18446744073709551615" };
 export const body = `{ "guild_id": "${scope.guildId}",\n  "action": "live.snapshot" }\n`;
-const secret = randomBytes(32);
+export const snapshotSecret = randomBytes(32).toString("hex");
 const timestamp = "1790000000";
 const nonce = "0123456789abcdef0123456789abcdef";
 
 export function signature(bytes: string | Uint8Array, target = path, signedAt = timestamp, requestNonce = nonce): string {
   const digest = createHash("sha256").update(bytes).digest("hex");
-  return `sha256=${createHmac("sha256", secret).update(`POST\n${target}\n${signedAt}\n${requestNonce}\n${digest}`).digest("hex")}`;
+  return `sha256=${createHmac("sha256", snapshotSecret).update(`POST\n${target}\n${signedAt}\n${requestNonce}\n${digest}`).digest("hex")}`;
 }
 
 export function request(payload = body, url = origin + path, signedAt = timestamp, requestNonce = nonce): Request {
