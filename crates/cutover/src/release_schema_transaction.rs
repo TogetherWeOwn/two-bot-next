@@ -7,6 +7,7 @@ use super::{read_ledger, read_store_ledger, reconcile, Chain, LedgerRow, RunErro
 
 const CUTOVER: [i64; 5] = [475, 479, 480, 481, 482];
 const STORE: [i64; 1] = [478];
+const INVERSE: &str = include_str!("../../../sql/release_schema_inverse.sql");
 const WEB_CONTRACT: &str = include_str!("../../../sql/web_v1.sql");
 const GRANTS: &str = "
     GRANT SELECT, INSERT, DELETE ON public.voice_heat_hours TO two_bot_runtime;
@@ -30,6 +31,121 @@ async fn ledgers(conn: &mut PgConnection) -> Result<(Vec<LedgerRow>, Vec<LedgerR
         .await
         .map_err(|_| failure("release store ledger read failed"))?;
     Ok((cutover, store))
+}
+
+fn legacy_verifier() -> String {
+    // All existing grants stay in place. The inverse drops only these
+    // release-created objects, along with their grants.
+    let matrix = super::AUDIT_MATRIX.trim_end().trim_end_matches(';');
+    let legacy = format!(
+        "SELECT * FROM ({matrix}) AS matrix WHERE (schema_name, name) NOT IN (
+            ('public', 'voice_heat_hours'), ('public', 'event_attendance_windows'),
+            ('public', 'event_voice_sessions'), ('public', 'event_voice_sessions_id_seq'),
+            ('public', 'live_sequence_watermarks'), ('web_v1', 'voice_heat')
+        )"
+    );
+    super::AUDIT_VERIFY.replace("-- @matrix", &legacy)
+}
+
+async fn release_roles_clean(conn: &mut PgConnection, query: String) -> Result<bool, RunError> {
+    let finding: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+        .fetch_optional(conn)
+        .await
+        .map_err(|_| failure("release role readback failed"))?;
+    Ok(finding.is_none())
+}
+
+async fn attendance_fence(conn: &mut PgConnection) -> Result<Vec<u8>, RunError> {
+    sqlx::query_scalar(
+        "SELECT timestamptz_send(installed_on) FROM public._sqlx_migrations
+         WHERE version = 475 AND success",
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(|_| failure("release attendance fence readback failed"))
+}
+
+/// Reverse the exact release bundle on the already verified target. This is
+/// the database operation only: the protected caller must authenticate the
+/// complete post-apply ledgers, target, and stopped writer's fence epoch.
+/// No CLI or workflow invokes it directly.
+#[doc(hidden)]
+pub async fn undo_release_schema(
+    pool: &PgPool,
+    expected_cutover: &[LedgerRow],
+    expected_store: &[LedgerRow],
+) -> Result<(Vec<LedgerRow>, Vec<LedgerRow>), RunError> {
+    let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
+    let store = Chain::Store.migrator().map_err(RunError::Refused)?;
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|_| failure("release connection unavailable"))?;
+    conn.close_on_drop();
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|_| failure("release inverse transaction unavailable"))?;
+    sqlx::raw_sql(
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+         SET LOCAL search_path = pg_catalog, pg_temp;
+         SET LOCAL lock_timeout = '2s';
+         SET LOCAL statement_timeout = '15s';",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| failure("release inverse transaction setup failed"))?;
+    tx.lock()
+        .await
+        .map_err(|_| failure("release migration lock unavailable"))?;
+    sqlx::raw_sql(
+        "LOCK TABLE public._sqlx_migrations, public._two_bot_migrations, public.web_contract_meta
+         IN SHARE ROW EXCLUSIVE MODE NOWAIT",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| failure("release inverse ledgers busy or unavailable"))?;
+
+    let (before_cutover, before_store) = ledgers(&mut tx).await?;
+    let migrator: bool = sqlx::query_scalar("SELECT current_user::text = $1")
+        .bind(MIGRATOR_ROLE)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| failure("release inverse role read failed"))?;
+    if !migrator
+        || before_cutover != expected_cutover
+        || before_store != expected_store
+        || !reconcile(&before_cutover, &cutover).is_ok_and(|pending| pending.is_empty())
+        || !reconcile(&before_store, &store).is_ok_and(|pending| pending.is_empty())
+        || !release_roles_clean(&mut tx, two_bot_core::database_roles::verification_sql()).await?
+    {
+        return Err(RunError::Refused(
+            "release inverse post-apply evidence changed".to_owned(),
+        ));
+    }
+
+    let fence = attendance_fence(&mut tx).await?;
+    sqlx::raw_sql(INVERSE)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| failure("guarded release inverse refused or failed"))?;
+    let after = ledgers(&mut tx).await?;
+    let retained = |rows: Vec<LedgerRow>, removed: &[i64]| -> Vec<LedgerRow> {
+        rows.into_iter()
+            .filter(|row| !removed.contains(&row.version))
+            .collect()
+    };
+    if after.0 != retained(before_cutover, &CUTOVER[1..])
+        || after.1 != retained(before_store, &STORE)
+        || attendance_fence(&mut tx).await? != fence
+        || !release_roles_clean(&mut tx, legacy_verifier()).await?
+    {
+        return Err(failure("release inverse readback refused"));
+    }
+    tx.commit()
+        .await
+        .map_err(|_| failure("release inverse commit outcome unknown; reconcile both ledgers"))?;
+    Ok(after)
 }
 
 /// Apply only the pinned expansion, contract delta, and new-object grants.
@@ -130,13 +246,7 @@ pub async fn apply_release_schema(
         .await
         .map_err(|_| failure("release grants failed"))?;
     let after = ledgers(&mut tx).await?;
-    let findings: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
-        two_bot_core::database_roles::verification_sql(),
-    ))
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|_| failure("release role readback failed"))?;
-    if findings.is_some()
+    if !release_roles_clean(&mut tx, two_bot_core::database_roles::verification_sql()).await?
         || !reconcile(&after.0, &cutover).is_ok_and(|pending| pending.is_empty())
         || !reconcile(&after.1, &store).is_ok_and(|pending| pending.is_empty())
     {

@@ -486,7 +486,9 @@ async fn seed_staging_state(fx: &Fixture) -> TestResult {
 
 async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> TestResult {
     use two_bot_core::database_roles::{plan_for_phase, Phase};
-    use two_bot_cutover::staging_migrate::{apply_release_schema, Chain, LedgerRow};
+    use two_bot_cutover::staging_migrate::{
+        apply_release_schema, undo_release_schema, Chain, LedgerRow,
+    };
 
     let fx = Fixture::new().await?;
     let mut admin = fx.scratch().await?;
@@ -585,6 +587,43 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     assert!(apply_release_schema(&pool, &expected[0], &expected[1])
         .await
         .is_err());
+    assert_eq!(
+        undo_release_schema(&pool, &cutover, &expected[1])
+            .await
+            .unwrap_err()
+            .to_string(),
+        "refused: release inverse post-apply evidence changed"
+    );
+    admin
+        .execute("INSERT INTO live_sequence_watermarks (guild_id, seq) VALUES ('1', 1)")
+        .await?;
+    assert_eq!(
+        undo_release_schema(&pool, &cutover, &store)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "failed: guarded release inverse refused or failed"
+    );
+    let preserved: i64 = sqlx::query_scalar("SELECT count(*) FROM live_sequence_watermarks")
+        .fetch_one(&mut admin)
+        .await?;
+    assert_eq!(preserved, 1);
+    admin
+        .execute("DELETE FROM live_sequence_watermarks WHERE guild_id = '1'")
+        .await?;
+    let (restored_cutover, restored_store) = undo_release_schema(&pool, &cutover, &store).await?;
+    expected[0].push(cutover.into_iter().find(|row| row.version == 475).unwrap());
+    assert_eq!(restored_cutover, expected[0]);
+    assert_eq!(restored_store, expected[1]);
+    let prior_contract: bool = sqlx::query_scalar(
+        "SELECT (SELECT contract_version = '1.0' FROM web_contract_meta WHERE singleton)
+            AND to_regclass('web_v1.voice_heat') IS NULL
+            AND to_regclass('public.event_voice_sessions_id_seq') IS NULL
+            AND to_regclass('public.live_sequence_watermarks') IS NULL",
+    )
+    .fetch_one(&mut admin)
+    .await?;
+    assert!(prior_contract);
     pool.close().await;
     admin.close().await?;
     fx.finish().await

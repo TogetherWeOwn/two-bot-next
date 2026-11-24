@@ -41,7 +41,7 @@ use crate::intake_cap::{read_bytes_capped, IntakeReadError, INTAKE_CAP_LABEL};
 
 #[path = "release_schema_transaction.rs"]
 mod release_schema_transaction;
-pub use release_schema_transaction::apply_release_schema;
+pub use release_schema_transaction::{apply_release_schema, undo_release_schema};
 
 /// Fixed binding names; each value is a secret and is never echoed.
 /// Plan reads only the RO binding; apply reads only the migrator binding.
