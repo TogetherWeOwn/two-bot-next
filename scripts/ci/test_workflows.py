@@ -74,6 +74,7 @@ JOB_INVENTORY = {
     # plus the missing-digest alert; pinned shape below.
     "daily-digest.yml": {"digest", "alert"},
     "staging-migrate.yml": {"plan", "claim", "apply"},
+    "staging-migrate-reviewed.yml": {"authorize", "plan", "apply"},
     "production-migrate.yml": {"plan", "claim", "apply"},
     # On-demand staging automatic recovery proof plus the manual Worker-only drill.
     "staging-rollback-drill.yml": {"drill", "proof", "alert"},
@@ -1509,6 +1510,34 @@ def production_claim_errors(claim):
         branch_env="PRODUCTION_BRANCH_ID",
         branch_input="production_branch_id",
     )
+
+
+def reviewed_migrate_errors(workflow):
+    if (workflow.get("on") != {"push": {"branches": ["main"], "paths": [".github/staging-apply/*.json"]}}
+            or workflow.get("concurrency") != {"group": "staging-migrate", "cancel-in-progress": "false"}
+            or workflow.get("permissions") != {}):
+        return ["reviewed staging migration trigger or serialization changed"]
+    jobs = workflow.get("jobs", {})
+    if set(jobs) != {"authorize", "plan", "apply"}:
+        return ["reviewed staging migration job inventory changed"]
+    for mode, need, binding in (
+        ("plan", "authorize", "TWO_BOT_STAGING_PLAN_DATABASE_URL"),
+        ("apply", ["authorize", "plan"], "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL"),
+    ):
+        job = jobs[mode]
+        steps = job.get("steps", [])
+        secret_steps = [step for step in steps if "secrets." in str(step)]
+        if (job.get("environment") != f"staging-migrate-{mode}" or job.get("needs") != need
+                or job.get("timeout-minutes") != "30" or "if" in job or "continue-on-error" in job
+                or len(secret_steps) != 1 or secret_steps[0].get("env") != {binding: "${{ secrets." + binding + " }}"}
+                or any("if" in step or "continue-on-error" in step for step in steps)):
+            return [f"reviewed staging migration {mode} gate or credential scope changed"]
+    commands = [step["run"] for step in jobs["apply"]["steps"] if "run" in step]
+    if (len(commands) != 3 or commands[0] != "python3 scripts/staging_migrate_reviewed.py verify"
+            or commands[-1] != "python3 scripts/staging_migrate_reviewed.py apply | tee applied.json"
+            or jobs["authorize"].get("environment") or "secrets." in str(jobs["authorize"])):
+        return ["reviewed staging authorization must precede compilation and apply"]
+    return []
 
 
 def job_env_text(job):
@@ -4803,6 +4832,9 @@ def workflow_policy_errors(workflows):
             # staging-deploy policy. The generic environment/marker scan
             # below would flag its staging-migrate Environment binding.
             errors.extend(staging_migrate_errors(workflow))
+            continue
+        if name == "staging-migrate-reviewed.yml":
+            errors.extend(reviewed_migrate_errors(workflow))
             continue
         if name == "production-migrate.yml":
             # Manual production runner: pinned shape above, not the
@@ -11006,6 +11038,8 @@ class WorkflowTests(unittest.TestCase):
                         expected["pull-requests"] = "read"
                     elif (name, job_id) == ("pr-evidence.yml", "pr-evidence"):
                         expected.update({"actions": "read", "pull-requests": "read"})
+                    elif (name, job_id) == ("staging-migrate-reviewed.yml", "authorize"):
+                        expected.update({"actions": "read", "pull-requests": "read"})
                     elif (name, job_id) == ("check.yml", "ci-evidence"):
                         expected["actions"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
@@ -11013,6 +11047,7 @@ class WorkflowTests(unittest.TestCase):
                         expected["pull-requests"] = "read"
                     elif (name, job_id) in (("staging-migrate.yml", "claim"),
                                                  ("staging-migrate.yml", "apply"),
+                                                 ("staging-migrate-reviewed.yml", "apply"),
                                                  ("production-migrate.yml", "apply")):
                         # Read-only fetch of the producing plan
                         # run's manifest artifact for the provenance gate.

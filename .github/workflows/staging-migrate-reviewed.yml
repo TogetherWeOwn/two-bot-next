@@ -1,0 +1,84 @@
+name: staging-migrate-reviewed
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/staging-apply/*.json']
+
+permissions: {}
+concurrency:
+  group: staging-migrate
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    if: github.repository == 'TogetherWeOwn/two-bot-next' && github.ref_protected && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {contents: read, actions: read, pull-requests: read}
+    outputs:
+      source_sha: ${{ steps.request.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: '${{ github.sha }}', persist-credentials: false, fetch-depth: 0}
+      - id: request
+        env: {GH_TOKEN: '${{ github.token }}'}
+        run: python3 scripts/staging_migrate_reviewed.py authorize
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: {name: approved-staging-request, path: approved.json, if-no-files-found: error, retention-days: 14}
+
+  plan:
+    needs: authorize
+    environment: staging-migrate-plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions: {contents: read}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: '${{ github.sha }}', persist-credentials: false}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: {name: approved-staging-request}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: '${{ needs.authorize.outputs.source_sha }}', path: source, persist-credentials: false}
+      - name: Build the pinned runner
+        working-directory: source
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal --no-self-update
+          cargo +1.100.0 build -p two-bot-cutover --bin staging-migrate --locked
+      - name: Plan on the read-only staging binding
+        env:
+          TWO_BOT_STAGING_PLAN_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}
+        run: python3 scripts/staging_migrate_reviewed.py plan > fresh.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: {name: fresh-reviewed-staging-plan, path: fresh.json, if-no-files-found: error, retention-days: 14}
+
+  apply:
+    needs: [authorize, plan]
+    environment: staging-migrate-apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions: {contents: read, actions: read}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: '${{ github.sha }}', persist-credentials: false}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: {name: approved-staging-request}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: {name: fresh-reviewed-staging-plan}
+      - name: Verify single delivery and the fresh plan
+        env: {GH_TOKEN: '${{ github.token }}'}
+        run: python3 scripts/staging_migrate_reviewed.py verify
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: '${{ needs.authorize.outputs.source_sha }}', path: source, persist-credentials: false}
+      - name: Build the pinned runner
+        working-directory: source
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal --no-self-update
+          cargo +1.100.0 build -p two-bot-cutover --bin staging-migrate --locked
+      - name: Apply the reviewed staging tuple
+        env:
+          TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}
+        shell: bash
+        run: python3 scripts/staging_migrate_reviewed.py apply | tee applied.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: {name: reviewed-staging-migration-result, path: applied.json, if-no-files-found: error, retention-days: 14}

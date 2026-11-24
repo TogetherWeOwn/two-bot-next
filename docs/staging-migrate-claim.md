@@ -146,3 +146,26 @@ binds the full claim and producing artifact ID and archive digest.
 
 Apply checks approval within 23h30m of dispatch. Retry or change inputs with a new dispatch and approval.
 Reuse a plan only when the apply dispatch's fresh read-only plan matches both ledgers and audit findings.
+
+## Authorize one apply through a protected merge
+
+When native review lacks an eligible independent identity, use a separate T0 PR
+that adds one `.github/staging-apply/<32-lowercase-hex>.json` request. Use a new
+name for every request. The JSON contains `plan_run_id` as a decimal string,
+`plan_archive_digest` and `recovery_archive_digest` as `sha256:` digests. Use an
+authenticated plan whose recovery reference names a verified staging capture.
+The plan archive binds the full source, target, both ledgers and pending sets,
+and the recovery and ACL references. The request fixture is checked in CI.
+
+The requester obtains independent general and security T0 approvals on the
+exact request PR head. Reviewers explicitly approve the staging apply and see
+the private recovery proof. Record both reviews on the PR, then squash-merge
+the pinned head after required checks pass. The workflow authenticates that
+protected merge and exact request blob. The T0 review record is a merge
+requirement under the repository review policy.
+
+The merge starts `staging-migrate-reviewed` once. It authenticates the producing
+plan and capture, compares a fresh read-only plan, then uses the same scoped
+staging apply Environment and migrator. Watch the run through its result.
+If it fails, reconcile both ledgers before preparing a new reviewed request.
+GitHub reruns, expired requests and previously used request names refuse.
