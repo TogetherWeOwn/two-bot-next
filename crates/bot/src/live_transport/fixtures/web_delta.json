@@ -1,0 +1,1 @@
+{"v":1,"guild_id":"100","seq":41,"occurred_at":"2026-11-20T06:00:00Z","ops":[{"topic":"channels","op":"upsert","id":"200","value":{"id":"200","name":"Café","kind":"voice","parentId":null,"position":null,"overwrites":[]}}]}
