@@ -487,6 +487,18 @@ async fn seed_staging_state(fx: &Fixture) -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI service"]
+async fn warning_history_recovers_on_current_schema() -> TestResult {
+    warning_history_recovery::exercise(false).await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI service"]
+async fn warning_history_recovers_on_retained_schema() -> TestResult {
+    warning_history_recovery::exercise(true).await
+}
+
 fn attendance_psql(fx: &Fixture, login: &str) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("psql");
     command.env_clear().kill_on_drop(true).args([

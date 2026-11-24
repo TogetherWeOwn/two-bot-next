@@ -1662,6 +1662,8 @@ jobs:
             --skip parity_mismatch_cursor_and_read_only_acceptance \
             --skip legacy_verify_policy_gates_the_real_test_endpoints \
             --skip real_sqlx_runner_cases \
+            --skip warning_history_recovers_on_current_schema \
+            --skip warning_history_recovers_on_retained_schema \
             --skip post_failure_unreadable_ledger_is_unknown_not_empty \
             --skip post_failure_readable_ledger_keeps_array_output \
             --skip post_apply_unreadable_ledger_is_unknown_not_empty \

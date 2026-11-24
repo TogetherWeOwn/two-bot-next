@@ -156,7 +156,7 @@ async fn rehearse(pool: PgPool, mut blocker: PgConnection, retained: bool) -> Te
     Ok(())
 }
 
-async fn exercise(retained: bool) -> TestResult {
+pub(super) async fn exercise(retained: bool) -> TestResult {
     let fixture = Fixture::new().await?;
     let outcome = async {
         let pool = fixture.migrator_pool().await?;
@@ -166,16 +166,4 @@ async fn exercise(retained: bool) -> TestResult {
     .await;
     fixture.finish().await?;
     outcome
-}
-
-#[tokio::test]
-#[ignore = "requires disposable agent-testdb or CI Postgres service"]
-async fn warning_history_recovers_on_current_schema() -> TestResult {
-    exercise(false).await
-}
-
-#[tokio::test]
-#[ignore = "requires disposable agent-testdb or CI Postgres service"]
-async fn warning_history_recovers_on_retained_schema() -> TestResult {
-    exercise(true).await
 }
