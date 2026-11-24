@@ -28,10 +28,9 @@ function reply(key: string): unknown {
   }
   return value;
 }
-
 async function replay(operation: "publish" | "remove", scenarios: Record<string, Scenario>) {
   for (const [name, scenario] of Object.entries(scenarios)) {
-    const calls: unknown[] = [], committed: unknown[] = [];
+    const calls: unknown[] = [], committed: unknown[] = [], requests: RequestInit[] = [];
     const steps = [...scenario.steps];
     const input = scenario.input === null ? undefined : { ...admission, ...scenario.input };
     let time = scenario.time ?? 2_000;
@@ -54,16 +53,10 @@ async function replay(operation: "publish" | "remove", scenarios: Record<string,
         return scenario.record !== false;
       },
       request: async (url: string, init: RequestInit) => {
+        requests.push(init);
         const step = next(init.method, url);
         if (!step) throw new Error("unexpected Discord request");
-        const [route, payload, status = 200] = step;
-        const headers = new Headers(init.headers);
-        assert.deepEqual([init.redirect, init.cache, init.signal?.aborted, headers.get("authorization")],
-          ["error", "no-store", false, "Bot synthetic"]);
-        if (route === "post") {
-          assert.equal(headers.get("content-type"), "application/json");
-          assert.deepEqual(JSON.parse(init.body as string), definition);
-        }
+        const [, payload, status = 200] = step;
         if (payload === "invalidUtf8") return new Response(new Uint8Array([0xff]));
         if (payload === "oversized") return new Response(" ".repeat(256 * 1024 + 1));
         if (payload === "redirect") return Response.json([], { headers: { location: "https://example.com" } });
@@ -91,6 +84,13 @@ async function replay(operation: "publish" | "remove", scenarios: Record<string,
       }
     }
     assert.deepEqual(calls, scenario.steps.map(([kind]) => routes[kind as keyof typeof routes] ?? [kind]), name);
+    for (const init of requests) {
+      const headers = new Headers(init.headers);
+      assert.deepEqual([init.redirect, init.cache, init.signal?.aborted, headers.get("authorization")],
+        ["error", "no-store", false, "Bot synthetic"], name);
+      if (init.method === "POST") assert.deepEqual([headers.get("content-type"), JSON.parse(init.body as string)],
+        ["application/json", definition], name);
+    }
   }
 }
 test("AutoMod publication commits intent before one guild create and verifies the full delta and detail", () => replay("publish", cases.published));
