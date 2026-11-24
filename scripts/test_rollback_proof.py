@@ -39,14 +39,24 @@ def local_gh(script):
     """Replace only gh's executable, retaining real pipes, timeouts and cleanup."""
     popen = subprocess.Popen
     children = []
+    scripts = None if isinstance(script, str) else iter(script)
 
     def launch(args, **kwargs):
-        child = popen([sys.executable, "-c", script], **kwargs)
+        source = script if scripts is None else next(scripts)
+        child = popen([sys.executable, "-c", source], **kwargs)
         children.append(child)
         return child
 
     with patch.object(proof.subprocess, "Popen", side_effect=launch) as call:
         yield call, children
+
+
+def gh_output(value, *, status=None):
+    payload = json.dumps(value).encode()
+    if status is not None:
+        payload = f"HTTP/2.0 {status} Fixture\r\nX-Example: private-header\r\n\r\n".encode() + payload
+    return (f"import sys; sys.stdin.buffer.read(); sys.stdout.buffer.write({payload!r}); "
+            f"sys.stderr.write('private-stderr'); sys.exit({int(status not in (None, 200))})")
 
 
 NOW = datetime(2026, 10, 23, 6, 23, tzinfo=timezone.utc)
@@ -284,8 +294,85 @@ class RollbackProofTests(unittest.TestCase):
                     with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": attempt}):
                         self.assertEqual(proof.main(args), 1)
                     self.assertEqual(gh.call_count, 1)
-                    self.assertEqual(json.loads(errors.getvalue().splitlines()[-1])["code"], code)
-                    self.assertFalse(path.exists())
+                    receipt = json.loads(path.read_text())
+                    self.assertEqual(receipt, json.loads(errors.getvalue().splitlines()[-1]))
+                    self.assertEqual(receipt["verdict"], "fail")
+                    self.assertEqual(receipt["code"], code)
+                    self.assertNotIn("child_run_id", receipt)
+
+    def test_first_exact_child_reads_can_recover_and_prove_restore_and_shutdown(self):
+        responses = [gh_output({"workflow_run_id": 123}), gh_output({}, status=404),
+                     gh_output({}, status=502), gh_output(run(), status=200), gh_output(jobs())]
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, ENV), \
+                local_gh(responses) as (gh, _), patch.object(proof.time, "sleep") as pause, \
+                patch.object(proof, "artifact_files", side_effect=[files(), stop_files()]) as artifacts, \
+                redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            path = Path(directory) / "proof.json"
+            self.assertEqual(proof.main(["run", "--sha", "a" * 40, "--evidence", str(path)]), 0)
+            raw = path.read_text()
+        commands = [call.args[0] for call in gh.call_args_list]
+        self.assertEqual([command[3] for command in commands], ["POST", "GET", "GET", "GET", "GET"])
+        self.assertEqual(commands[1:4], [commands[1]] * 3)
+        self.assertEqual(commands[1][-1], f"repos/{proof.REPO}/actions/runs/123")
+        self.assertIn("--include", commands[1])
+        self.assertEqual([call.args for call in pause.call_args_list], [(5,), (10,)])
+        self.assertEqual([call.args for call in artifacts.call_args_list],
+                         [(123, "staging-rollout-evidence"), (123, "staging-use-deploy-stop-123-1")])
+        receipt = json.loads(raw)
+        self.assertEqual((receipt["verdict"], receipt["child_run_id"], receipt["child_conclusion"]),
+                         ("pass", 123, "failure"))
+        self.assertEqual((receipt["restored_version"], receipt["restored_image_digest"]), (VERSION, DIGEST))
+        self.assertNotIn("private-", raw + output.getvalue() + errors.getvalue())
+
+    def test_exact_child_refusal_keeps_red_receipt_and_never_redispatches(self):
+        scenarios = [([404, 503, 504], "child_run_read_unavailable"),
+                     ([401], "github_request_failed_no_retry"), ([403], "github_request_failed_no_retry"),
+                     ([429], "github_request_failed_no_retry")]
+        for statuses, code in scenarios:
+            responses = [gh_output({"workflow_run_id": 123})]
+            responses.extend(gh_output({"message": "private-body"}, status=status) for status in statuses)
+            with self.subTest(statuses=statuses), tempfile.TemporaryDirectory() as directory, \
+                    patch.dict(os.environ, ENV), local_gh(responses) as (gh, _), \
+                    patch.object(proof.time, "sleep") as pause, patch.object(proof, "artifact_files") as artifacts, \
+                    redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                path = Path(directory) / "proof.json"
+                self.assertEqual(proof.main(["run", "--sha", "a" * 40, "--evidence", str(path)]), 1)
+                self.assertTrue(path.exists(), "failed proof must leave an uploadable receipt")
+                raw = path.read_text()
+                commands = [call.args[0] for call in gh.call_args_list]
+                self.assertEqual([command[3] for command in commands], ["POST"] + ["GET"] * len(statuses))
+                self.assertEqual(pause.call_count, len(statuses) - 1)
+                artifacts.assert_not_called()
+                receipt = json.loads(raw)
+                self.assertEqual(receipt, json.loads(errors.getvalue()))
+                self.assertEqual((receipt["verdict"], receipt["code"], receipt["child_run_id"]), ("fail", code, 123))
+                self.assertIs(receipt["retryable"], False)
+                self.assertNotIn("private-", raw + output.getvalue() + errors.getvalue())
+
+    def test_completed_child_with_unproved_restore_or_shutdown_leaves_red_receipt(self):
+        wrong_restore = files()
+        wrong_restore["auto-rollback-evidence.json"]["restored_image_digest"] = "sha256:" + "b" * 64
+        running = stop_files()
+        running["staging-use-release.jsonl"][-1]["running"] = True
+        wrong_attempt = dict(run(), run_attempt=2)
+        cases = [
+            (wrong_attempt, files(), stop_files(), "run_id_or_attempt_changed"),
+            (run(conclusion="success"), files(), stop_files(), "child_must_remain_red"),
+            (run(), wrong_restore, stop_files(), "restored_snapshot_mismatch"),
+            (run(), files(), {}, "shutdown_receipt_invalid"),
+            (run(), files(), running, "shutdown_receipt_mismatch"),
+            (dict(run(), updated_at="private-timestamp"), files(), stop_files(), "invalid_timestamp"),
+        ]
+        for child, rollout, stop, code in cases:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory, \
+                    patch.dict(os.environ, ENV), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
+                    patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, child, jobs()]), \
+                    patch.object(proof, "artifact_files", side_effect=[rollout, stop]):
+                path = Path(directory) / "proof.json"
+                self.assertEqual(proof.main(["run", "--sha", "a" * 40, "--evidence", str(path)]), 1)
+                receipt = json.loads(path.read_text())
+                self.assertEqual((receipt["verdict"], receipt["code"], receipt["child_run_id"]), ("fail", code, 123))
+                self.assertNotIn("restored_version", receipt)
 
     def test_child_provenance_or_unexpected_outcome_is_not_a_proof(self):
         mutations = [lambda r: r.update(conclusion="success"), lambda r: r.update(conclusion="cancelled"),
