@@ -1484,7 +1484,7 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
         approval = ("python3 scripts/production_migrate_approval.py authorize "
                     f"current-plan/{manifest}.json {claim_artifact}.json")
         outputs = {key: "${{ steps.request.outputs." + key + " }}"
-                   for key in ("external_id", "check_id", "plan_sha256")}
+                   for key in ("external_id", "check_id", "plan_sha256", "atomic_release")}
         if (str(publish.get("run", "")).strip().splitlines()[-1:] != [approval]
                 or publish.get("id") != "request" or claim.get("outputs") != outputs):
             errors.append(f"{prefix} must verify independent approval of the exact producing plan")
@@ -1694,6 +1694,10 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                 or "continue-on-error" in apply or "if" in steps[ddl[0]]
                 or "continue-on-error" in steps[ddl[0]]):
             errors.append(f"{name}:apply: must recheck approval immediately before DDL")
+        elif ((steps[ddl[0]].get("env") or {}).get("ATOMIC_RELEASE") != "${{ needs.claim.outputs.atomic_release }}"
+              or 'true) runner=./approval-tools/target/debug/staging-migrate ;;' not in steps[ddl[0]]["run"]
+              or '*) exit 2 ;;' not in steps[ddl[0]]["run"]):
+            errors.append(f"{name}:apply: must use the trusted runner for the approved release bundle")
         checkouts = [step for step in steps if (step.get("with") or {}).get("path") == "approval-tools"]
         if (len(checkouts) != 1 or not str(checkouts[0].get("uses", "")).startswith("actions/checkout@")
                 or checkouts[0].get("with") != {"path": "approval-tools", "persist-credentials": "false",

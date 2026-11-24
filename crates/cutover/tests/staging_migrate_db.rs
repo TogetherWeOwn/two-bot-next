@@ -484,6 +484,93 @@ async fn seed_staging_state(fx: &Fixture) -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> TestResult {
+    use two_bot_core::database_roles::{plan_for_phase, Phase};
+    use two_bot_cutover::staging_migrate::{apply_release_schema, Chain, LedgerRow};
+
+    let fx = Fixture::new().await?;
+    let mut admin = fx.scratch().await?;
+    let pool = fx.migrator_pool().await?;
+    let mut expected = Vec::new();
+    for (chain, limit) in [(Chain::Cutover, 473), (Chain::Store, 465)] {
+        let source = chain.migrator()?;
+        let mut seed = Migrator::with_migrations(
+            source
+                .iter()
+                .filter(|migration| migration.version <= limit)
+                .cloned()
+                .collect(),
+        );
+        seed.dangerous_set_table_name(chain.table());
+        seed.run(&pool).await?;
+        expected.push(
+            seed.iter()
+                .map(|m| LedgerRow {
+                    version: m.version,
+                    description: m.description.to_string(),
+                    success: true,
+                    checksum_hex: hex::encode(&m.checksum),
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    let (contract, _) = include_str!("../../../sql/web_v1.sql")
+        .split_once("-- Voice heat contract 1.1:")
+        .unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(contract))
+        .execute(&mut admin)
+        .await?;
+    for group in ["two_bot_runtime", "two_web_reader"] {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DO $$ BEGIN CREATE ROLE {group} NOLOGIN;
+             EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+        )))
+        .execute(&mut admin)
+        .await?;
+    }
+    sqlx::raw_sql(sqlx::AssertSqlSafe(plan_for_phase(Phase::Bootstrap)))
+        .execute(&mut admin)
+        .await?;
+
+    // Fail the final canonical privilege readback, after the uncommitted
+    // schema, both ledgers and ACL delta have all been applied.
+    admin
+        .execute("GRANT CREATE ON SCHEMA public TO two_bot_runtime")
+        .await?;
+    let error = apply_release_schema(&pool, &expected[0], &expected[1])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        two_bot_cutover::staging_migrate::RunError::Failed(message, _)
+            if message == "release schema or role readback refused"
+    ));
+    let pre: (i64, i64, String, bool) = sqlx::query_as(
+        "SELECT (SELECT max(version) FROM _sqlx_migrations),
+                (SELECT max(version) FROM _two_bot_migrations),
+                (SELECT contract_version FROM web_contract_meta WHERE singleton),
+                to_regclass('public.voice_heat_hours') IS NULL
+                  AND to_regclass('web_v1.voice_heat') IS NULL
+                  AND to_regclass('public.live_sequence_watermarks') IS NULL",
+    )
+    .fetch_one(&mut admin)
+    .await?;
+    assert_eq!(pre, (473, 465, "1.0".to_owned(), true));
+    admin
+        .execute("REVOKE CREATE ON SCHEMA public FROM two_bot_runtime")
+        .await?;
+    let (cutover, store) = apply_release_schema(&pool, &expected[0], &expected[1]).await?;
+    assert_eq!(cutover.len(), expected[0].len() + 5);
+    assert_eq!(store.len(), expected[1].len() + 1);
+    assert!(apply_release_schema(&pool, &expected[0], &expected[1])
+        .await
+        .is_err());
+    pool.close().await;
+    admin.close().await?;
+    fx.finish().await
+}
+
 fn attendance_psql(fx: &Fixture, login: &str) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("psql");
     command.env_clear().kill_on_drop(true).args([

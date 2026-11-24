@@ -118,7 +118,9 @@ def authorize(fresh, claim, env, now, api=github):
     created = moment(plan_run.get("created_at"))
     require(created <= approved_at, "independent_production_approval_stale")
     require_unused_plan(api, artifact["run_id"], run["id"], created)
-    return {"external_id": external_id, "check_id": check_id, "plan_sha256": digest_json(producing)}
+    atomic_release = claim["expected_pending"] == ["475", "479", "480", "481", "482"] and claim["expected_store_pending"] == ["478"]
+    return {"external_id": external_id, "check_id": check_id, "plan_sha256": digest_json(producing),
+            "atomic_release": "true" if atomic_release else "false"}
 
 
 def recheck(producing, env, now, api=api_get):

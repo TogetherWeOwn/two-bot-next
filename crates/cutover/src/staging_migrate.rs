@@ -39,6 +39,10 @@ use two_bot_core::database_tls::{self, TlsPolicy};
 
 use crate::intake_cap::{read_bytes_capped, IntakeReadError, INTAKE_CAP_LABEL};
 
+#[path = "release_schema_transaction.rs"]
+mod release_schema_transaction;
+pub use release_schema_transaction::apply_release_schema;
+
 /// Fixed binding names; each value is a secret and is never echoed.
 /// Plan reads only the RO binding; apply reads only the migrator binding.
 /// Staging keeps its names; production reads only its own pair.
@@ -1532,7 +1536,25 @@ async fn run_on_pool(
     let mut after = before.clone();
     let mut store_applied = 0usize;
     let mut store_after = store_before.clone();
-    if req.apply {
+    if req.apply
+        && req.target == Target::Production
+        && pending == [475, 479, 480, 481, 482]
+        && store_pending == [478]
+    {
+        let path = req.plan_manifest_path.as_deref().unwrap_or_default().trim();
+        let plan: Value = read_bytes_capped(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(|| RunError::Refused("release plan unavailable".to_owned()))?;
+        if plan.get("ledger_before") != Some(&ledger_json(&before))
+            || plan.get("ledger_store_before") != Some(&ledger_json(&store_before))
+        {
+            return refuse("release ledgers differ from the producing plan");
+        }
+        (after, store_after) = apply_release_schema(pool, &before, &store_before).await?;
+        applied = after.len() - before.len();
+        store_applied = store_after.len() - store_before.len();
+    } else if req.apply {
         if !pending.is_empty() {
             let (rows, count) = apply_chain(pool, Chain::Cutover, &cutover, &before).await?;
             after = rows;
