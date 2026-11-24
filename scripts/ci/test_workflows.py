@@ -9264,6 +9264,8 @@ class WorkflowTests(unittest.TestCase):
         # Compare shared routing. Each workflow pins its own grants and approval steps.
         staging = self.workflows["staging-migrate.yml"]
         self.assertEqual(set(migrate["jobs"]), set(staging["jobs"]))
+        self.assertIn("cargo build -p two-bot-cutover --bin staging-migrate --locked",
+                      [step.get("run") for step in migrate["jobs"]["plan"]["steps"]])
         for job_id in ("plan", "claim", "apply"):
             with self.subTest(mirror=job_id):
                 prod_job, stag_job = migrate["jobs"][job_id], staging["jobs"][job_id]

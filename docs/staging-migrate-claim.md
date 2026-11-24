@@ -144,7 +144,5 @@ the claim. In **Review deployments**, select `staging-migrate-apply` and enter
 `approve-staging-migration sha256:<digest>` from the claim summary. The digest
 binds the full claim and producing artifact ID and archive digest.
 
-Before building, apply checks the Environment, reviewer, comment and plan.
-Attempt 1 must leave 30 minutes within the 24-hour window. Retry or change the
-tuple with fresh approval. Reuse an available plan if the fresh plan matches.
-Review unchanged audit findings, including objects the migration will create.
+Apply checks approval within 23h30m of dispatch. Retry or change inputs with a new dispatch and approval.
+Reuse a matching plan and review its audit findings, including expected missing objects.
