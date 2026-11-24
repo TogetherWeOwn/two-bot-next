@@ -532,6 +532,16 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
         .execute(&mut admin)
         .await?;
 
+    sqlx::raw_sql("BEGIN; LOCK TABLE public.web_contract_meta IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut admin)
+        .await?;
+    let busy = apply_release_schema(&pool, &expected[0], &expected[1]).await;
+    admin.execute("ROLLBACK").await?;
+    assert_eq!(
+        busy.unwrap_err().to_string(),
+        "failed: release schema tables busy or unavailable"
+    );
+
     // Fail the final canonical privilege readback, after the uncommitted
     // schema, both ledgers and ACL delta have all been applied.
     admin

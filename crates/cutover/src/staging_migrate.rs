@@ -971,6 +971,23 @@ fn ledger_json(rows: &[LedgerRow]) -> Value {
     )
 }
 
+fn check_release_ledgers(
+    path: &str,
+    cutover: &[LedgerRow],
+    store: &[LedgerRow],
+) -> Result<(), RunError> {
+    let plan: Value = read_bytes_capped(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| RunError::Refused("release plan unavailable".to_owned()))?;
+    if plan.get("ledger_before") != Some(&ledger_json(cutover))
+        || plan.get("ledger_store_before") != Some(&ledger_json(store))
+    {
+        return refuse("release ledgers differ from the producing plan");
+    }
+    Ok(())
+}
+
 /// Recorded in place of a ledger that could not be read after a run. Never an
 /// empty list: `[]` reads as "nothing applied".
 const LEDGER_UNKNOWN: &str = "unknown: ledger unreadable";
@@ -1542,15 +1559,7 @@ async fn run_on_pool(
         && store_pending == [478]
     {
         let path = req.plan_manifest_path.as_deref().unwrap_or_default().trim();
-        let plan: Value = read_bytes_capped(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .ok_or_else(|| RunError::Refused("release plan unavailable".to_owned()))?;
-        if plan.get("ledger_before") != Some(&ledger_json(&before))
-            || plan.get("ledger_store_before") != Some(&ledger_json(&store_before))
-        {
-            return refuse("release ledgers differ from the producing plan");
-        }
+        check_release_ledgers(path, &before, &store_before)?;
         (after, store_after) = apply_release_schema(pool, &before, &store_before).await?;
         applied = after.len() - before.len();
         store_applied = store_after.len() - store_before.len();
@@ -2192,6 +2201,38 @@ mod tests {
         ));
         std::fs::write(&path, contents).expect("temp manifest must be writable");
         path
+    }
+
+    #[test]
+    fn release_ledgers_match_both_producing_plan_ledgers() {
+        let row = LedgerRow {
+            version: 1,
+            description: "expected".to_owned(),
+            success: true,
+            checksum_hex: "a".repeat(96),
+        };
+        let rows = &[row];
+        let plan =
+            json!({"ledger_before": ledger_json(rows), "ledger_store_before": ledger_json(rows)});
+        let path = temp_manifest(&plan.to_string());
+        let name = path.to_str().unwrap();
+        let exact = check_release_ledgers(name, rows, rows);
+        let cutover_drift = check_release_ledgers(name, &[], rows);
+        let store_drift = check_release_ledgers(name, rows, &[]);
+        std::fs::remove_file(&path).unwrap();
+        assert!(exact.is_ok());
+        for error in [cutover_drift, store_drift] {
+            assert_eq!(
+                error.unwrap_err().to_string(),
+                "refused: release ledgers differ from the producing plan"
+            );
+        }
+        assert_eq!(
+            check_release_ledgers(name, rows, rows)
+                .unwrap_err()
+                .to_string(),
+            "refused: release plan unavailable"
+        );
     }
 
     /// A producing-run manifest artifact carrying `hash` and `store_hash` in
