@@ -729,19 +729,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warning_index_build_overlaps_a_peer_migrator() {
+    async fn warning_index_build_overlaps_a_peer_migrator() -> Result<(), String> {
         let Some(url) = test_database_url() else {
             assert_ne!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
-            return;
+            return Ok(());
         };
         let (builder, peer) = tokio::join!(create_test_db(&url), create_test_db(&url));
         let (builder, peer) = match (builder, peer) {
             (Ok(builder), Ok(peer)) => (builder, peer),
             (Ok(db), Err(error)) | (Err(error), Ok(db)) => {
                 let cleanup = db.close().await;
-                panic!("paired fixture setup failed: {error}. Sibling cleanup: {cleanup:?}");
+                return Err(format!(
+                    "paired fixture setup failed: {error}. Sibling cleanup: {cleanup:?}"
+                ));
             }
-            (Err(builder), Err(peer)) => panic!("builder setup failed: {builder}. Peer: {peer}"),
+            (Err(builder), Err(peer)) => {
+                return Err(format!("builder setup failed: {builder}. Peer: {peer}"));
+            }
         };
 
         // Await explicit teardown before reporting failures from either session.
@@ -759,6 +763,7 @@ mod tests {
         peer_closed.expect("drop peer database");
         assert!(valid.expect("build warning-history candidate with a peer SQLx migrator"));
         assert!(builder_gone.expect("check builder database teardown from peer"));
+        Ok(())
     }
 
     const GUILD: &str = "guild-a";
