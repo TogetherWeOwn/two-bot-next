@@ -1,4 +1,6 @@
-use std::convert::Infallible;
+#![cfg(test)]
+
+use std::{cell::Cell, convert::Infallible};
 
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
@@ -9,7 +11,7 @@ use crate::{
         burn_in_memory, is_implemented, sign, AuthHeaders, AuthenticatedRequest, KeyRing,
         NonceCache, SigningKey, NONCE_TTL_SECONDS, SKEW_SECONDS,
     },
-    realtime_wire::{Guild, Member, Permissions, Role, Topics},
+    realtime_wire::{recovery::PublishError, Guild, Member, Permissions, Role, Topics},
     Secret,
 };
 
@@ -62,7 +64,7 @@ impl Client {
         &mut self,
         raw: &[u8],
         key_id: &str,
-        load: impl FnOnce(Id) -> Option<(&'a Recovery, &'a Generation)>,
+        load: impl FnOnce(Id, &Cell<WireTime>) -> Option<(&'a Recovery, &'a Generation)>,
     ) -> Result<Option<&'a [u8]>, ActionError> {
         // Freeze authentication time independently of the baseline lease tests.
         let seconds = observed().0.unix_timestamp();
@@ -91,11 +93,12 @@ impl Client {
         )?;
         let grant = burn_in_memory(verified, &mut self.nonces)?
             .authorize_live_snapshot(self.authority, &mut self.buckets)?;
-        Ok(grant.read(load, || self.now))
+        let now = Cell::new(self.now);
+        Ok(grant.read(|guild| load(guild, &now), || now.get()))
     }
 
     fn refusal(&mut self, raw: &[u8], key: &str) -> ErrorCode {
-        self.request(raw, key, |_| {
+        self.request(raw, key, |_, _| {
             panic!("refused request looked up recovery state")
         })
         .unwrap_err()
@@ -107,7 +110,7 @@ impl Client {
         source: &'a Recovery,
         generation: &'a Generation,
     ) -> Option<&'a [u8]> {
-        self.request(BODY, READ_KEY, |guild| {
+        self.request(BODY, READ_KEY, |guild, _| {
             assert!(guild == GUILD);
             Some((source, generation))
         })
@@ -201,7 +204,7 @@ async fn returns_exact_web_reply_only_for_a_current_scoped_baseline() {
     let mut client = Client::new();
     let mut recovery = Recovery::new(GUILD);
     let generation = recovery.begin();
-    assert_eq!(client.request(BODY, READ_KEY, |_| None).unwrap(), None);
+    assert_eq!(client.request(BODY, READ_KEY, |_, _| None).unwrap(), None);
     assert_eq!(client.snapshot(&recovery, &generation), None);
 
     publish(&mut recovery, GUILD, &generation, 6).await;
@@ -218,6 +221,11 @@ async fn returns_exact_web_reply_only_for_a_current_scoped_baseline() {
         assert_eq!(client.snapshot(&recovery, &generation), None);
     }
     client.now = observed();
+    let delayed = client.request(BODY, READ_KEY, |_, now| {
+        now.set(WireTime(now.get().0 + Duration::seconds(30)));
+        Some((&recovery, &generation))
+    });
+    assert_eq!(delayed.unwrap(), None);
 
     let mut other = Recovery::new(OTHER_GUILD);
     let other_generation = other.begin();
@@ -226,6 +234,16 @@ async fn returns_exact_web_reply_only_for_a_current_scoped_baseline() {
 
     recovery.retire();
     assert_eq!(client.snapshot(&recovery, &generation), None);
+    let retired = recovery
+        .publish(
+            &generation,
+            8,
+            observed(),
+            synthetic_topics(GUILD),
+            async |_, _, _| panic!("retired generation reached persistence"),
+        )
+        .await;
+    assert_eq!(retired, Err(PublishError::<Infallible>::StaleGeneration));
     let next = recovery.begin();
     publish(&mut recovery, GUILD, &next, 8).await;
     assert_eq!(client.snapshot(&recovery, &generation), None);
