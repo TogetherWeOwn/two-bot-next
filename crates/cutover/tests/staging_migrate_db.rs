@@ -501,6 +501,7 @@ async fn attendance_readback(
     role: &str,
     phase: &str,
     legacy: &str,
+    fence: &str,
 ) -> (bool, String) {
     let out = attendance_psql(fx, login)
         .args([
@@ -517,6 +518,8 @@ async fn attendance_readback(
             &format!("phase={phase}"),
             "--set",
             &format!("expected_legacy={legacy}"),
+            "--set",
+            &format!("expected_fence={fence}"),
         ])
         .output()
         .await
@@ -570,6 +573,15 @@ async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestRe
     )))
     .execute(&mut conn)
     .await?;
+    let db = &fx.database;
+    let reader = &fx.outsider;
+    let (ok, empty_baseline) =
+        attendance_readback(&fx, reader, db, reader, "capture", "", "").await;
+    assert!(ok, "unexpected empty capture result {empty_baseline:?}");
+    let empty_fields: Vec<_> = empty_baseline.split_whitespace().collect();
+    let ["empty", "0", empty_legacy, "0", _] = empty_fields.as_slice() else {
+        panic!("unexpected empty capture summary {empty_baseline:?}");
+    };
     conn.execute(
         "INSERT INTO public.event_instance_windows
            (guild_id, event_id, instance_starts_at, starts_at, status, observed_at)
@@ -588,9 +600,8 @@ async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestRe
     assert!(before.is_none());
 
     let (host, db) = (&fx.host, &fx.database);
-    let reader = &fx.outsider;
     let legacy_reader_result = previous_attendance_reader(&fx).await;
-    let (ok, baseline) = attendance_readback(&fx, reader, db, reader, "capture", "").await;
+    let (ok, baseline) = attendance_readback(&fx, reader, db, reader, "capture", "", "").await;
     assert!(ok, "unexpected capture result {baseline:?}");
     let fields: Vec<_> = baseline.split_whitespace().collect();
     let ["ok", "2", legacy, "0", before_fence] = fields.as_slice() else {
@@ -598,47 +609,28 @@ async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestRe
     };
     assert_eq!(legacy.len(), 64);
     assert_eq!(before_fence.len(), 64);
-    for (database, role, phase, digest, status) in [
-        (
-            "wrong_database",
-            reader.as_str(),
-            "capture",
-            "",
-            "refused_binding\n",
-        ),
-        (
-            db.as_str(),
-            fx.rologin.as_str(),
-            "capture",
-            "",
-            "refused_binding\n",
-        ),
-        (
-            db.as_str(),
-            reader.as_str(),
-            "before",
-            "",
-            "refused_binding\n",
-        ),
-        (
-            db.as_str(),
-            reader.as_str(),
-            "after",
-            *legacy,
-            "refused_schema\n",
-        ),
+    for (database, role, phase, digest) in [
+        ("wrong_database", reader.as_str(), "capture", ""),
+        (db.as_str(), fx.rologin.as_str(), "capture", ""),
+        (db.as_str(), reader.as_str(), "before", ""),
+        (db.as_str(), reader.as_str(), "after", *legacy),
     ] {
         assert_eq!(
-            attendance_readback(&fx, reader, database, role, phase, digest).await,
-            (false, status.to_owned())
+            attendance_readback(&fx, reader, database, role, phase, digest, "").await,
+            (false, "refused_binding\n".to_owned())
         );
     }
+    let wrong_checksum = "0".repeat(64);
     assert_eq!(
-        attendance_readback(&fx, &fx.mlogin, db, &fx.mlogin, "capture", "").await,
+        attendance_readback(&fx, reader, db, reader, "after", legacy, &wrong_checksum).await,
+        (false, "refused_schema\n".to_owned())
+    );
+    assert_eq!(
+        attendance_readback(&fx, &fx.mlogin, db, &fx.mlogin, "capture", "", "").await,
         (false, "refused_binding\n".to_owned())
     );
     let (ok, no_grant) =
-        attendance_readback(&fx, &fx.rologin, db, &fx.rologin, "capture", "").await;
+        attendance_readback(&fx, &fx.rologin, db, &fx.rologin, "capture", "", "").await;
     assert!(!ok && no_grant.is_empty());
     let denied = attendance_psql(&fx, reader)
         .args(["--command", "SELECT count(*) FROM public._sqlx_migrations"])
@@ -646,7 +638,7 @@ async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestRe
         .await?;
     assert!(!denied.status.success() && denied.stdout.is_empty());
     assert_eq!(
-        attendance_readback(&fx, reader, db, reader, "before", legacy).await,
+        attendance_readback(&fx, reader, db, reader, "before", legacy, "").await,
         (true, baseline.clone())
     );
 
@@ -723,7 +715,16 @@ async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestRe
         column,
         ("timestamp with time zone".to_owned(), "YES".to_owned())
     );
-    let (ok, migrated) = attendance_readback(&fx, reader, db, reader, "after", legacy).await;
+    let mut ledger_reader = fx.ro_session().await?;
+    let expected_fence: String = sqlx::query_scalar(
+        "SELECT encode(sha256(timestamptz_send(installed_on)), 'hex')
+           FROM public._sqlx_migrations WHERE version = 475 AND success",
+    )
+    .fetch_one(&mut ledger_reader)
+    .await?;
+    ledger_reader.close().await?;
+    let (ok, migrated) =
+        attendance_readback(&fx, reader, db, reader, "after", legacy, &expected_fence).await;
     assert!(ok, "unexpected migrated result {migrated:?}");
     let fields: Vec<_> = migrated.split_whitespace().collect();
     let ["ok", "2", after_legacy, "2", after_fence] = fields.as_slice() else {
@@ -736,31 +737,60 @@ async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestRe
     // table. Both the fence summary and the legacy query stay intact.
     assert_eq!(previous_attendance_reader(&fx).await, legacy_reader_result);
     assert_eq!(
-        attendance_readback(&fx, reader, db, reader, "after", legacy).await,
+        attendance_readback(&fx, reader, db, reader, "after", legacy, &expected_fence).await,
         (true, migrated)
     );
-    let exact_fence: bool = sqlx::query_scalar(
-        "SELECT bool_and(w.attendance_recovered_at IS NOT DISTINCT FROM m.installed_on)
-           FROM public.event_instance_windows w
-           CROSS JOIN public._sqlx_migrations m WHERE m.version = 475",
-    )
-    .fetch_one(&mut conn)
-    .await?;
-    assert!(exact_fence);
     assert_eq!(
-        attendance_readback(&fx, reader, db, reader, "after", &"0".repeat(64)).await,
+        attendance_readback(
+            &fx,
+            reader,
+            db,
+            reader,
+            "after",
+            &wrong_checksum,
+            &expected_fence
+        )
+        .await,
+        (false, "refused_data\n".to_owned())
+    );
+    conn.execute(
+        "UPDATE public.event_instance_windows
+            SET attendance_recovered_at = attendance_recovered_at - interval '1 second'",
+    )
+    .await?;
+    assert_eq!(
+        attendance_readback(&fx, reader, db, reader, "after", legacy, &expected_fence).await,
         (false, "refused_data\n".to_owned())
     );
     conn.execute("UPDATE public.event_instance_windows SET attendance_recovered_at = NULL")
         .await?;
     assert_eq!(
-        attendance_readback(&fx, reader, db, reader, "after", legacy).await,
+        attendance_readback(&fx, reader, db, reader, "after", legacy, &expected_fence).await,
         (false, "refused_data\n".to_owned())
+    );
+    conn.execute("DELETE FROM public.event_instance_windows")
+        .await?;
+    assert_eq!(
+        attendance_readback(&fx, reader, db, reader, "after", legacy, &expected_fence).await,
+        (false, "refused_data\n".to_owned())
+    );
+    assert_eq!(
+        attendance_readback(
+            &fx,
+            reader,
+            db,
+            reader,
+            "after",
+            empty_legacy,
+            &expected_fence
+        )
+        .await,
+        (true, empty_baseline.clone())
     );
     conn.execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at DROP DEFAULT")
         .await?;
     assert_eq!(
-        attendance_readback(&fx, reader, db, reader, "after", legacy).await,
+        attendance_readback(&fx, reader, db, reader, "after", legacy, &expected_fence).await,
         (false, "refused_schema\n".to_owned())
     );
     conn.close().await?;

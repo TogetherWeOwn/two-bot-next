@@ -5,6 +5,10 @@
 \else
   \set expected_legacy ''
 \endif
+\if :{?expected_fence}
+\else
+  \set expected_fence ''
+\endif
 
 BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SET LOCAL search_path = pg_catalog, pg_temp;
@@ -24,9 +28,10 @@ SELECT current_database()::text = :'expected_database'
          AND pg_has_role(r.oid, elevated.oid, 'MEMBER')
    )
    AND CASE :'phase'
-       WHEN 'capture' THEN :'expected_legacy' = ''
-       WHEN 'before' THEN :'expected_legacy' ~ '^[0-9a-f]{64}$'
+       WHEN 'capture' THEN :'expected_legacy' = '' AND :'expected_fence' = ''
+       WHEN 'before' THEN :'expected_legacy' ~ '^[0-9a-f]{64}$' AND :'expected_fence' = ''
        WHEN 'after' THEN :'expected_legacy' ~ '^[0-9a-f]{64}$'
+                     AND :'expected_fence' ~ '^[0-9a-f]{64}$'
        ELSE false
    END AS binding_ok
 FROM pg_roles r WHERE r.rolname = current_user
@@ -67,21 +72,23 @@ WITH windows AS (
                w.status, w.observed_at, w.omitted_at, w.revoked_at,
                w.is_current, w.identity_ambiguous
            )::text, 'UTF8')) AS legacy,
-           to_jsonb(w) ->> 'attendance_recovered_at' AS fence
+           sha256(timestamptz_send((to_jsonb(w) ->> 'attendance_recovered_at')::timestamptz)) AS fence
     FROM public.event_instance_windows w LIMIT 100001
 ), totals AS (
-    SELECT count(*) AS rows, count(fence) AS fenced, count(DISTINCT fence) AS fence_times,
+    SELECT count(*) AS rows, count(fence) AS fenced,
+           count(*) FILTER (WHERE encode(fence, 'hex') = :'expected_fence') AS matching_fences,
            encode(sha256(COALESCE(string_agg(legacy, ''::bytea ORDER BY
                guild_id COLLATE "C", event_id COLLATE "C", instance_starts_at), ''::bytea)), 'hex') AS legacy_sha,
-           encode(sha256(COALESCE(string_agg(sha256(convert_to(COALESCE(fence, ''), 'UTF8')),
+           encode(sha256(COALESCE(string_agg(COALESCE(fence, sha256(''::bytea)),
                ''::bytea ORDER BY guild_id COLLATE "C", event_id COLLATE "C", instance_starts_at),
                ''::bytea)), 'hex') AS fence_sha
     FROM windows
 )
-SELECT rows, legacy_sha, fenced, fence_sha,
+SELECT CASE WHEN rows = 0 THEN 'empty' ELSE 'ok' END AS status,
+       rows, legacy_sha, fenced, fence_sha,
        rows <= 100000
        AND (:'phase' = 'capture' OR legacy_sha = :'expected_legacy')
-       AND (:'phase' <> 'after' OR (fenced = rows AND fence_times <= 1)) AS data_ok
+       AND (:'phase' <> 'after' OR matching_fences = rows) AS data_ok
 FROM totals
 \gset
 \if :data_ok
@@ -91,4 +98,4 @@ FROM totals
 \endif
 
 ROLLBACK;
-\echo ok :rows :legacy_sha :fenced :fence_sha
+\echo :status :rows :legacy_sha :fenced :fence_sha

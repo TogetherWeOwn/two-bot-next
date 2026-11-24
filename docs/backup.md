@@ -54,20 +54,32 @@ read_0475() {
   psql -XqAtw --dbname='service=restore_bot' \
     --set="expected_database=${RESTORE_DATABASE:?}" \
     --set="expected_role=${RESTORE_BOT_LOGIN:?}" \
-    --set="phase=$1" --set="expected_legacy=${2-}" \
+    --set="phase=$1" --set="expected_legacy=${2-}" --set="expected_fence=${3-}" \
     --file=sql/attendance_0475_readback.sql 2>/dev/null
 }
 ```
 
-The successful line contains `ok`, the window count, legacy-field SHA-256,
-non-null fence count and fence SHA-256. Any nonzero exit invalidates the
-readback. The probe refuses tables above 100,000 rows. Keep evidence to the
-counts, digests and fixed status. Compare `before` on the restored copy with
-the independently selected pre-change `capture` summary for the recovery point,
-passing its legacy SHA-256 as the second argument. Apply the exact candidate on
-the isolated copy. Run `after` with the same legacy SHA-256 before any app writes.
-It checks that all preexisting rows acquired one common fence and the original
-fields survived. Compare the row counts to the baseline in both phases.
+A successful line contains `ok` or `empty`, the window count, legacy-field
+SHA-256, non-null fence count and fence SHA-256. `empty` records zero windows
+and zero row-level fence coverage. Any nonzero exit invalidates the readback.
+The probe refuses tables above 100,000 rows. Keep evidence to the counts,
+digests and fixed status. Compare `before` on the restored copy with the
+independently selected pre-change `capture` summary for the recovery point,
+passing its legacy SHA-256 as the second argument. Compare row counts to the
+baseline throughout the rehearsal.
+
+Apply the exact candidate on the isolated copy. After verifying the 0475 ledger
+entry, run this query in a read-only transaction with the copy's migration-plan
+reader and keep its single digest.
+
+```sql
+SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.timestamptz_send(installed_on)), 'hex')
+FROM public._sqlx_migrations WHERE version = 475 AND success;
+```
+
+Before any app writes, call `read_0475 after` with the legacy SHA-256 as the
+second argument and the ledger timestamp digest as the third. It requires
+every preexisting row to have the exact migration-time fence.
 
 Rehearse app rollback with the pinned previous compatible build's affected
 read under its runtime login and with external egress disabled. Keep the
