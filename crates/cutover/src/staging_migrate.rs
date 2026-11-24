@@ -39,6 +39,10 @@ use two_bot_core::database_tls::{self, TlsPolicy};
 
 use crate::intake_cap::{read_bytes_capped, IntakeReadError, INTAKE_CAP_LABEL};
 
+#[path = "release_schema_transaction.rs"]
+mod release_schema_transaction;
+pub use release_schema_transaction::apply_release_schema;
+
 /// Fixed binding names; each value is a secret and is never echoed.
 /// Plan reads only the RO binding; apply reads only the migrator binding.
 /// Staging keeps its names; production reads only its own pair.
@@ -967,6 +971,23 @@ fn ledger_json(rows: &[LedgerRow]) -> Value {
     )
 }
 
+fn check_release_ledgers(
+    path: &str,
+    cutover: &[LedgerRow],
+    store: &[LedgerRow],
+) -> Result<(), RunError> {
+    let plan: Value = read_bytes_capped(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| RunError::Refused("release plan unavailable".to_owned()))?;
+    if plan.get("ledger_before") != Some(&ledger_json(cutover))
+        || plan.get("ledger_store_before") != Some(&ledger_json(store))
+    {
+        return refuse("release ledgers differ from the producing plan");
+    }
+    Ok(())
+}
+
 /// Recorded in place of a ledger that could not be read after a run. Never an
 /// empty list: `[]` reads as "nothing applied".
 const LEDGER_UNKNOWN: &str = "unknown: ledger unreadable";
@@ -1532,7 +1553,17 @@ async fn run_on_pool(
     let mut after = before.clone();
     let mut store_applied = 0usize;
     let mut store_after = store_before.clone();
-    if req.apply {
+    if req.apply
+        && req.target == Target::Production
+        && pending == [475, 479, 480, 481, 482]
+        && store_pending == [478]
+    {
+        let path = req.plan_manifest_path.as_deref().unwrap_or_default().trim();
+        check_release_ledgers(path, &before, &store_before)?;
+        (after, store_after) = apply_release_schema(pool, &before, &store_before).await?;
+        applied = after.len() - before.len();
+        store_applied = store_after.len() - store_before.len();
+    } else if req.apply {
         if !pending.is_empty() {
             let (rows, count) = apply_chain(pool, Chain::Cutover, &cutover, &before).await?;
             after = rows;
@@ -2170,6 +2201,38 @@ mod tests {
         ));
         std::fs::write(&path, contents).expect("temp manifest must be writable");
         path
+    }
+
+    #[test]
+    fn release_ledgers_match_both_producing_plan_ledgers() {
+        let [cutover, store] = [1, 2].map(|version| {
+            [LedgerRow {
+                version,
+                description: "expected".to_owned(),
+                success: true,
+                checksum_hex: "a".repeat(96),
+            }]
+        });
+        let plan = json!({"ledger_before": ledger_json(&cutover), "ledger_store_before": ledger_json(&store)});
+        let path = temp_manifest(&plan.to_string());
+        let name = path.to_str().unwrap();
+        let exact = check_release_ledgers(name, &cutover, &store);
+        let cutover_drift = check_release_ledgers(name, &store, &store);
+        let store_drift = check_release_ledgers(name, &cutover, &cutover);
+        std::fs::remove_file(&path).unwrap();
+        assert!(exact.is_ok());
+        for error in [cutover_drift, store_drift] {
+            assert_eq!(
+                error.unwrap_err().to_string(),
+                "refused: release ledgers differ from the producing plan"
+            );
+        }
+        assert_eq!(
+            check_release_ledgers(name, &cutover, &store)
+                .unwrap_err()
+                .to_string(),
+            "refused: release plan unavailable"
+        );
     }
 
     /// A producing-run manifest artifact carrying `hash` and `store_hash` in

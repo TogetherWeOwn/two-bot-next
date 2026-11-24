@@ -2812,6 +2812,16 @@ Use a fresh attempt-one plan-only run. Approval expires after 23 hours and
 rechecks approval immediately before DDL. After an intervening apply,
 reconcile both ledgers and use a fresh plan and approval.
 
+The exact Cutover 0475/0479–0482 and Store 0478 plan uses the runner from
+the approved workflow revision. It compares the contract and role policy
+with the planned source, then applies both migration chains, the voice
+heat contract and the new-object grants in a single transaction. A readback
+failure rolls back that transaction. The affected tables can block Bot
+writes until commit or rollback, even though individual statements have
+timeouts. For an uncertain commit, classify both
+ledgers and role state before retrying. A committed change still requires
+an independently qualified recovery route before rollout.
+
 ### Redeploy the approved revision
 
 With the correct revision already selected in a separate clean operator checkout,
