@@ -111,7 +111,7 @@ gate. New findings must be triaged on the same PR, never bypassed to get green.
 ### Exact-tuple preflight (no acceptance, no suppression)
 
 `scripts/vulnerability-preflight.py` binds the raw pinned-Trivy v0.69.3 image
-report to the source SHA, immutable image ID, Debian 13.7/amd64 metadata (the
+report to the source SHA, immutable image ID, Debian 13.8/amd64 metadata (the
 measured release of the digest-pinned distroless runtime) and complete, lossless
 filesystem evidence (below). It checks each HIGH/CRITICAL finding against both
 the scan inventory and the image's `status.d` package inventory, including PURL
