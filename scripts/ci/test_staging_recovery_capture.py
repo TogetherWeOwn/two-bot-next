@@ -16,6 +16,21 @@ import staging_recovery_capture as capture
 
 
 class StagingRecoveryCaptureTests(unittest.TestCase):
+    def test_only_absent_pre_0482_table_can_be_missing_from_inventory(self):
+        table = "public.live_sequence_watermarks"
+        for missing, before_0482, allowed in (
+            ([], False, True),
+            ([table], True, True),
+            ([table], False, False),
+            ([table], 1, False),
+            (["public.events"], True, False),
+            (["public.events", table], True, False),
+        ):
+            with self.subTest(missing=missing, before_0482=before_0482):
+                self.assertEqual(capture.expected_objects_covered({
+                    "missing_expected": missing, "missing_before_0482": before_0482,
+                }), allowed)
+
     def test_shipped_pin_matches_staging_recipient_certificate(self):
         cert = Path(__file__).with_name("fixtures") / "staging_recovery_recipient.pem"
         der = ssl.PEM_cert_to_DER_cert(cert.read_text(encoding="ascii"))
@@ -42,7 +57,8 @@ class StagingRecoveryCaptureTests(unittest.TestCase):
             source = "a" * 40
             inventory = {
                 "database": {"name": target["database"]}, "role": capture.DB_ROLE,
-                "missing_expected": [], "unsupported": False,
+                "missing_expected": ["public.live_sequence_watermarks"],
+                "missing_before_0482": True, "unsupported": False,
                 "cutover_ledger": [{"version": 481}], "store_ledger": [{"version": 478}],
                 "relations": ["x" * 140_000],
             }

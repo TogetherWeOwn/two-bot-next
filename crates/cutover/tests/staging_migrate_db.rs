@@ -23,7 +23,7 @@ use serde_json::Value;
 use sqlx::{
     migrate::Migrator,
     postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
-    Connection, Executor, PgConnection,
+    Connection, Executor, PgConnection, Row,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -797,6 +797,76 @@ async fn applies_missing_0475_after_0481_and_reads_back_both_ledgers() -> TestRe
     fx.finish().await
 }
 
+async fn recovery_inventory(
+    reader: &mut PgConnection,
+    query: &str,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(query.to_owned()))
+        .fetch_all(reader)
+        .await?;
+    let [report] = rows.as_slice() else {
+        return Err("fixture inventory must return one report".into());
+    };
+    Ok(report.try_get(0)?)
+}
+
+async fn recovery_inventory_proves_pre_0482_absence() -> TestResult {
+    let fx = Fixture::new().await?;
+    let mut conn = fx.scratch().await?;
+    sqlx::raw_sql(
+        "CREATE TABLE public._sqlx_migrations (
+            version bigint PRIMARY KEY, description text, success boolean, checksum bytea,
+            installed_on timestamptz DEFAULT now(), execution_time bigint DEFAULT 0);
+         CREATE TABLE public._two_bot_migrations (LIKE public._sqlx_migrations INCLUDING ALL);
+         GRANT SELECT ON public._sqlx_migrations, public._two_bot_migrations TO two_bot_migrator_ro;
+         INSERT INTO public._sqlx_migrations (version, description, success) VALUES (481, 'fixture', true);
+         INSERT INTO public._two_bot_migrations (version, description, success) VALUES (478, 'fixture', true);",
+    )
+    .execute(&mut conn)
+    .await?;
+    // psql's gset only consumes the guard row. Execute the same guard and
+    // inventory on either side of a committed DDL change in a second session.
+    let (begin, query) = include_str!("../../../scripts/staging_recovery_inventory.sql")
+        .split_once("\n\\gset\n")
+        .ok_or("fixture inventory is missing the psql guard boundary")?;
+    let query = query.replace(
+        "-- @matrix",
+        include_str!("../../../sql/database_role_matrix.sql"),
+    );
+    let mut reader = fx.ro_session().await?;
+    sqlx::raw_sql(begin).execute(&mut reader).await?;
+    conn.execute("CREATE INDEX live_sequence_watermarks ON public._sqlx_migrations (success)")
+        .await?;
+    let report = recovery_inventory(&mut reader, &query).await?;
+    assert_eq!(report["missing_before_0482"], true);
+    assert!(report["missing_expected"]
+        .as_array()
+        .expect("missing-object list")
+        .contains(&Value::from("public.live_sequence_watermarks")));
+
+    sqlx::raw_sql(begin).execute(&mut reader).await?;
+    assert_eq!(
+        recovery_inventory(&mut reader, &query).await?["missing_before_0482"],
+        false
+    );
+
+    sqlx::raw_sql(
+        "DROP INDEX public.live_sequence_watermarks;
+         INSERT INTO public._sqlx_migrations (version, description, success) VALUES (482, 'fixture', false);",
+    )
+    .execute(&mut conn)
+    .await?;
+    sqlx::raw_sql(begin).execute(&mut reader).await?;
+    assert_eq!(
+        recovery_inventory(&mut reader, &query).await?["missing_before_0482"],
+        false
+    );
+
+    reader.close().await?;
+    conn.close().await?;
+    fx.finish().await
+}
+
 #[tokio::test]
 #[ignore = "requires agent-testdb or the CI service"]
 async fn real_sqlx_runner_cases() -> TestResult {
@@ -1502,7 +1572,8 @@ async fn real_sqlx_runner_cases() -> TestResult {
     fx.finish().await?;
     // Use a fresh fixture on the same guarded CI route to verify a single
     // missing migration below the ledger maximum.
-    applies_missing_0475_after_0481_and_reads_back_both_ledgers().await
+    applies_missing_0475_after_0481_and_reads_back_both_ledgers().await?;
+    recovery_inventory_proves_pre_0482_absence().await
 }
 
 /// Marker the runner records when the ledger cannot be read after a run.

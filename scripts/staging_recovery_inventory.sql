@@ -91,6 +91,11 @@ SELECT jsonb_build_object(
               AND p.kind = CASE WHEN e.kind IN ('sequence', 'view', 'function')
                                 THEN e.kind ELSE 'table' END)
         ORDER BY e.schema_name, e.name),
+    -- Read every relation kind from the same MVCC snapshot as the ledger.
+    'missing_before_0482', NOT EXISTS (
+        SELECT 1 FROM pg_class c JOIN schemas s ON s.oid = c.relnamespace
+        WHERE s.nspname = 'public' AND c.relname = 'live_sequence_watermarks')
+        AND NOT EXISTS (SELECT 1 FROM public._sqlx_migrations WHERE version = 482),
     'unsupported', EXISTS (SELECT 1 FROM relations WHERE relkind IN ('f', 'c'))
         OR EXISTS (SELECT 1 FROM routines WHERE prokind = 'a')
         OR EXISTS (SELECT 1 FROM pg_shdepend d JOIN pg_database b ON b.oid = d.dbid
