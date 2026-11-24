@@ -128,7 +128,7 @@ async fn refuses_unknown_or_insufficient_live_evidence() {
         (json!([malformed]), Unavailable),
         (json!([overwrite("22", 2, 0, 0)]), Unavailable),
         (json!([overwrite("404", 0, 0, 0)]), Unavailable),
-        (json!([overwrite("22", 0, 0, 0); 2]), Unavailable),
+        (Value::Array(vec![overwrite("22", 0, 0, 0); 2]), Unavailable),
         (json!([overwrite("44", 1, 0, COMMANDS)]), Denied),
         (json!([overwrite("99", 1, 0, VIEW)]), Denied),
     ] {
