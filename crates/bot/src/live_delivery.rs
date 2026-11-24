@@ -1,8 +1,8 @@
 //! Bounded, ordered, best-effort delivery for normalized site deltas.
 
-use std::time::Duration;
+use std::{future::pending, time::Duration};
 use tokio::{
-    sync::mpsc,
+    sync::mpsc::{self, error::TrySendError},
     time::{sleep, timeout_at, Instant},
 };
 
@@ -40,44 +40,83 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 impl<T> Sender<T> {
     /// Never waits on the worker. Returns false if full or closed.
     pub fn offer(&self, delta: T) -> bool {
-        self.0
-            .try_send(Queued {
-                delta,
-                expires_at: Instant::now() + MAX_AGE,
-            })
-            .is_ok()
+        match self.0.try_send(Queued {
+            delta,
+            expires_at: Instant::now() + MAX_AGE,
+        }) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                tracing::debug!(msg = "live_delivery_failed", reason = "queue_full");
+                false
+            }
+            Err(TrySendError::Closed(_)) => false,
+        }
     }
 }
 
 impl<T> Receiver<T> {
     /// Sends serially, keeping the same delta (and sequence) on retry.
     /// The caller owns the worker future and may cancel it on shutdown.
-    pub async fn run(mut self, mut attempt: impl AsyncFnMut(&T) -> Delivery) {
+    pub async fn run(self, attempt: impl AsyncFnMut(&T) -> Delivery) {
+        self.run_with_retirement(async |_| pending().await, attempt)
+            .await;
+    }
+
+    pub(crate) async fn run_with_retirement(
+        mut self,
+        mut retired: impl AsyncFnMut(&T),
+        mut attempt: impl AsyncFnMut(&T) -> Delivery,
+    ) {
         while let Some(item) = self.0.recv().await {
-            for index in 0..MAX_ATTEMPTS {
-                let now = Instant::now();
-                if now >= item.expires_at {
-                    break;
-                }
-                let deadline = (now + ATTEMPT_TIMEOUT).min(item.expires_at);
-                match timeout_at(deadline, attempt(&item.delta)).await {
-                    Ok(Delivery::Accepted | Delivery::Rejected) => break,
-                    Ok(Delivery::Retry) | Err(_) if index + 1 < MAX_ATTEMPTS => {
-                        if Instant::now() + RETRY_DELAY >= item.expires_at {
-                            break;
-                        }
-                        sleep(RETRY_DELAY).await;
-                    }
-                    _ => break,
-                }
+            // A retired generation loses even when a retry delay or attempt
+            // is ready on the same poll.
+            tokio::select! {
+                biased;
+                () = retired(&item.delta) => {}
+                () = deliver(&item, &mut attempt) => {}
             }
         }
     }
 }
 
+async fn deliver<T>(item: &Queued<T>, attempt: &mut impl AsyncFnMut(&T) -> Delivery) {
+    for index in 0..MAX_ATTEMPTS {
+        let now = Instant::now();
+        if now >= item.expires_at {
+            delivery_failed("expired");
+            return;
+        }
+        let deadline = (now + ATTEMPT_TIMEOUT).min(item.expires_at);
+        match timeout_at(deadline, attempt(&item.delta)).await {
+            Ok(Delivery::Accepted) => return,
+            Ok(Delivery::Rejected) => {
+                delivery_failed("rejected");
+                return;
+            }
+            Ok(Delivery::Retry) | Err(_) => {
+                if index + 1 == MAX_ATTEMPTS {
+                    delivery_failed("retry_exhausted");
+                    return;
+                }
+                if Instant::now() + RETRY_DELAY >= item.expires_at {
+                    delivery_failed("expired");
+                    return;
+                }
+                sleep(RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
+fn delivery_failed(reason: &'static str) {
+    tracing::warn!(msg = "live_delivery_failed", reason);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tuning_test_support::Capture;
+    use tracing::instrument::WithSubscriber;
 
     #[tokio::test(start_paused = true)]
     async fn a_full_queue_drops_the_new_delta_without_reordering_the_rest() {
@@ -106,6 +145,7 @@ mod tests {
         drop(sender);
         let start = Instant::now();
         let mut calls = Vec::new();
+        let capture = Capture::default();
         receiver
             .run(async |&seq| {
                 calls.push(seq);
@@ -116,11 +156,24 @@ mod tests {
                     _ => Delivery::Accepted,
                 }
             })
+            .with_subscriber(capture.subscriber())
             .await;
         assert_eq!(calls, [1, 1, 1, 2, 3]);
         let expected = ATTEMPT_TIMEOUT + RETRY_DELAY * 2;
         assert!(start.elapsed() >= expected);
         assert!(start.elapsed() <= expected + Duration::from_millis(50));
+        let records = capture.records();
+        assert_eq!(records.len(), 2);
+        for (record, reason) in records.iter().zip(["retry_exhausted", "rejected"]) {
+            assert_eq!(
+                record.fields,
+                [
+                    ("msg".into(), "live_delivery_failed".into()),
+                    ("reason".into(), reason.into()),
+                ]
+                .into()
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

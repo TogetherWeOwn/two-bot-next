@@ -1,6 +1,6 @@
 //! Ordered, dormant gateway intake for realtime deltas.
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, future::Future, time::Duration};
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -108,8 +108,10 @@ impl LiveGateway {
     ) {
         let Some(intake) = &mut self.0 else { return };
         match intake.receive(raw, at) {
-            Ok(Some(request)) if !request_members(&request) => intake.retire(),
-            Err(()) => intake.retire(),
+            Ok(Some(request)) if !request_members(&request) => {
+                intake.retire("member_request_refused")
+            }
+            Err(()) => intake.retire("dispatch_refused"),
             _ => {}
         }
     }
@@ -117,48 +119,65 @@ impl LiveGateway {
 
 impl LiveReceiver {
     /// Drive this borrowing worker alongside its receive owner. Every retry
-    /// uses the same bytes, and retirement cancels pending attempts.
+    /// uses the same bytes. Retirement skips queued deltas and cancels both
+    /// pending attempts and retry delays for that generation.
     pub async fn run(self, mut attempt: impl AsyncFnMut(&[u8]) -> Delivery) {
         self.0
-            .run(async |delta| {
-                let mut generation = delta.generation.clone();
-                tokio::select! {
-                    biased;
-                    _ = generation.changed() => Delivery::Rejected,
-                    result = attempt(&delta.body) => result,
-                }
-            })
+            .run_with_retirement(
+                async |delta| {
+                    let _ = delta.generation.clone().changed().await;
+                },
+                async |delta| attempt(&delta.body).await,
+            )
             .await;
+    }
+
+    /// Run until the owning scope requests shutdown or the intake is dropped.
+    /// Shutdown closes the queue and drops buffered work and any in-flight
+    /// attempt. Drive the returned future directly so no task outlives it.
+    pub async fn run_until(
+        self,
+        shutdown: impl Future<Output = ()>,
+        attempt: impl AsyncFnMut(&[u8]) -> Delivery,
+    ) {
+        tokio::select! {
+            biased;
+            () = shutdown => {}
+            () = self.run(attempt) => {}
+        }
     }
 }
 
 impl Intake {
     fn disconnect(&mut self) {
         self.identified = false;
-        self.retire();
+        self.retire("disconnect");
     }
 
-    fn retire(&mut self) {
+    fn retire(&mut self, reason: &'static str) {
         self.join.retire();
-        self.pending_until = None;
-        self.active = None;
+        let pending = self.pending_until.take().is_some();
+        let active = self.active.take().is_some();
+        if pending || active {
+            tracing::info!(msg = "live_generation_retired", reason);
+        }
     }
 
     fn receive(&mut self, raw: &str, at: WireTime) -> Result<Option<RequestGuildMembers>, ()> {
         let Ok(dispatch @ Dispatch { op: 0, .. }) = object::<Dispatch<'_>>(raw) else {
-            self.disconnect();
+            self.identified = false;
             return Err(());
         };
         if self
             .pending_until
             .is_some_and(|until| Instant::now() >= until)
         {
-            self.retire();
+            self.retire("baseline_timeout");
         }
         let kind = dispatch.t.as_str();
         match kind {
             "READY" | "RESUMED" => {
-                self.disconnect();
+                self.retire("session_changed");
                 self.identified = kind == "READY";
             }
             _ if !self.identified => {}
@@ -166,7 +185,7 @@ impl Intake {
                 if object::<GuildRow>(dispatch.d.ok_or(())?.get())?.id != self.guild {
                     return Ok(None);
                 }
-                self.retire();
+                self.retire("guild_baseline_changed");
                 if kind == "GUILD_CREATE" {
                     let nonce = hex::encode(rand::random::<[u8; 16]>());
                     let request = self.join.begin(raw, nonce).map_err(|_| ())?;

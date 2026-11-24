@@ -119,6 +119,8 @@ draining state is observable via `/readyz` and `shutdown_started/completed`.
 | `shard_closed` | Gateway close received; optional `code`, no close reason/session |
 | `gateway_reconnect_failed` | Twilight reconnect failed; retry/backoff remain Twilight-owned; `wait_ms` (completed non-growing 500 ms–1 s decorrelation wait before the next receive) |
 | `gateway_failed` | Durable gateway task failed; no SQL/task error or URL |
+| `live_generation_retired` | Dormant live-hub intake retires a pending or active generation; `reason` is `disconnect`, `session_changed`, `guild_baseline_changed`, `baseline_timeout`, `member_request_refused` or `dispatch_refused` |
+| `live_delivery_failed` | Dormant live-hub worker drops a delta; `reason` is `queue_full` (DEBUG), `expired`, `retry_exhausted` or `rejected` |
 | `http_listening` | Listener bound; `addr` (bind address only) |
 | `settings_applied` | Hot-setting refresh report logged; `revision`, `hot_keys` |
 | `settings_reloaded` | Preserved legacy refresh event; revisions and row counts |

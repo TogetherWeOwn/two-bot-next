@@ -1,6 +1,8 @@
 use super::*;
+use crate::tuning_test_support::Capture;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
+use tracing::instrument::WithSubscriber;
 use twilight_model::id::marker::ScheduledEventMarker;
 
 const GUILD: GuildId = Id::new(10);
@@ -308,4 +310,105 @@ async fn rejected_or_superseded_baselines_cannot_send() {
     });
     assert_eq!(retired_at.elapsed(), Duration::ZERO);
     assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn disconnect_discards_retry_and_backlog_before_a_fresh_baseline_delivers() {
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, 0);
+    receive(&mut live, READY);
+    let nonce = begin(&mut live);
+    complete(&mut live, &nonce);
+    receive(&mut live, VOICE);
+    receive(&mut live, VOICE);
+
+    let capture = Capture::default();
+    let (tx, mut rx) = mpsc::channel(3);
+    let worker = receiver.run(async move |body| {
+        let seq = decoded(body)["seq"].as_u64().expect("wire sequence");
+        tx.try_send(seq).expect("bounded fixture attempts");
+        if seq == 1 {
+            Delivery::Retry
+        } else {
+            Delivery::Accepted
+        }
+    });
+    let rebuild = async {
+        assert_eq!(rx.recv().await, Some(1));
+        let retired_at = Instant::now();
+        live.disconnect();
+        live.disconnect();
+        receive(&mut live, r#"{"op":0,"t":"RESUMED","d":{}}"#);
+        receive(&mut live, CREATE);
+        receive(&mut live, VOICE);
+        receive(&mut live, READY);
+        let nonce = begin(&mut live);
+        complete(&mut live, &nonce);
+        receive(&mut live, VOICE);
+        assert_eq!(rx.recv().await, Some(3));
+        assert_eq!(retired_at.elapsed(), Duration::ZERO);
+        drop(live);
+        assert_eq!(rx.recv().await, None);
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(worker, rebuild);
+    })
+    .with_subscriber(capture.subscriber())
+    .await
+    .expect("retirement and rebuild complete");
+    let records = capture.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].fields,
+        [
+            ("msg".into(), "live_generation_retired".into()),
+            ("reason".into(), "disconnect".into()),
+        ]
+        .into()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_drops_in_flight_and_buffered_work_with_intake_still_alive() {
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, 0);
+    receive(&mut live, READY);
+    let nonce = begin(&mut live);
+    complete(&mut live, &nonce);
+    receive(&mut live, VOICE);
+    receive(&mut live, VOICE);
+
+    let (shutdown, stop) = oneshot::channel();
+    let (tx, mut rx) = mpsc::channel(2);
+    let (in_flight, cancelled) = oneshot::channel::<()>();
+    let mut in_flight = Some(in_flight);
+    let worker = receiver.run_until(
+        async { stop.await.expect("shutdown signal") },
+        async move |body| {
+            let _drop_signal = in_flight.take();
+            tx.try_send(body.to_vec())
+                .expect("bounded fixture attempts");
+            std::future::pending().await
+        },
+    );
+    let stop_worker = async {
+        let body = rx.recv().await.expect("first attempt");
+        assert_eq!(decoded(&body)["seq"], 1);
+        let stopped_at = Instant::now();
+        shutdown.send(()).expect("worker waiting for shutdown");
+        assert!(cancelled.await.is_err());
+        assert_eq!(rx.recv().await, None);
+        assert_eq!(stopped_at.elapsed(), Duration::ZERO);
+        body
+    };
+    let (_, body) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(worker, stop_worker)
+    })
+    .await
+    .expect("worker shuts down while the intake still owns the sender");
+
+    let intake = live.0.as_ref().expect("intake");
+    let generation = intake.active.as_ref().expect("active baseline");
+    assert!(!intake.sender.offer(QueuedDelta {
+        body,
+        generation: generation.lifetime.subscribe(),
+    }));
 }
