@@ -1,0 +1,141 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import {
+  type AutomodIntent, StagingAutomodRecovery, STAGING_AUTOMOD_SCOPE as scope,
+} from "../src/staging-automod-recovery.ts";
+import { admission, created, intent, lease, now, observe, other, Registry, Storage } from "./fixtures/staging-automod-recovery.ts";
+
+test("AutoMod recovery reloads the exact intent and receipt after restart", async () => {
+  const store = new Storage();
+  let recovery = new StagingAutomodRecovery(store);
+  assert.equal(await recovery.pending(), undefined);
+  await recovery.persistIntent(intent, admission, observe, now);
+  assert.deepEqual(await recovery.pending(), intent);
+  await recovery.recordCreated(intent, created);
+  await recovery.recordCreated(intent, created);
+
+  recovery = new StagingAutomodRecovery(store);
+  const registry = new Registry();
+  registry.target = created;
+  const pending = await recovery.pending();
+  assert.deepEqual(pending, intent);
+  await recovery.recover(pending!.lease, registry);
+  assert.deepEqual(registry.calls, [created.id, "delete", created.id]);
+  assert.deepEqual([...registry.sameGuild], [["help", other]]);
+  assert.deepEqual([...registry.otherGuild], [[scope.name, other]]);
+  assert.equal(await recovery.pending(), undefined);
+  await recovery.recover(lease, registry);
+  assert.equal(registry.calls.length, 3, "completion replay does not contact the registry");
+  await assert.rejects(recovery.persistIntent(intent, admission, observe, now), /intent_held/);
+
+  const nextLease = { ...lease, runAttempt: 3 };
+  await recovery.persistIntent({ ...intent, lease: nextLease }, { ...admission, lease: nextLease },
+    async () => nextLease, now);
+  await assert.rejects(recovery.recover(lease, registry), /recovery_mismatch/);
+  assert.equal(registry.calls.length, 3);
+});
+
+test("AutoMod recovery fences publication on expiry or cancellation without renewing authority", async () => {
+  for (const current of [lease, { ...lease, phase: "released" as const }]) {
+    const store = new Storage();
+    const recovery = new StagingAutomodRecovery(store);
+    let at = now();
+    let observed = lease as AutomodIntent["lease"];
+    store.afterWrite = () => {
+      at = current === lease ? lease.expiresAt : now();
+      observed = current;
+    };
+    await assert.rejects(recovery.persistIntent(intent, admission, async () => observed, () => at),
+      /admission_mismatch/);
+    assert.deepEqual(await recovery.pending(), intent);
+    const registry = new Registry();
+    registry.authorized = false;
+    await assert.rejects(recovery.recover(lease, registry), /cleanup_unverified/);
+    await assert.rejects(recovery.recordCreated(intent, created), /receipt_mismatch/);
+    await assert.rejects(recovery.persistIntent(intent, admission, observe, now), /intent_held/);
+    registry.authorized = true;
+    await new StagingAutomodRecovery(store).recover(lease, registry);
+    assert.deepEqual(registry.calls, ["unknown", "unknown"]);
+    assert.equal(await recovery.pending(), undefined);
+  }
+});
+
+test("AutoMod recovery holds a lost create response until ownership or absence is proven", async () => {
+  const store = new Storage();
+  const recovery = new StagingAutomodRecovery(store);
+  await recovery.persistIntent(intent, admission, observe, now);
+  const registry = new Registry();
+  registry.drained = false;
+  await assert.rejects(recovery.recover(lease, registry), /cleanup_unverified/);
+  assert.deepEqual(await recovery.pending(), intent, "an in-flight POST might still land");
+  registry.drained = true;
+  registry.target = created;
+  registry.attributable = false;
+  await assert.rejects(recovery.recover(lease, registry), /cleanup_unverified/);
+  assert.deepEqual(registry.calls, ["unknown", "unknown"]);
+  assert.deepEqual(await recovery.pending(), intent, "a matching command may belong to another writer");
+
+  registry.attributable = true;
+  registry.loseDeleteResponse = true;
+  await assert.rejects(recovery.recover(lease, registry), /removal_unverified/);
+  assert.deepEqual(registry.calls, ["unknown", "unknown", "unknown", "delete"]);
+  const restarted = new StagingAutomodRecovery(store);
+  assert.deepEqual(await restarted.pending(), intent);
+  await restarted.recover(lease, registry);
+  assert.deepEqual(registry.calls, ["unknown", "unknown", "unknown", "delete", created.id]);
+  assert.equal(await restarted.pending(), undefined);
+});
+
+test("AutoMod recovery refuses a wrong scope, lease or command revision", async () => {
+  const recovery = new StagingAutomodRecovery(new Storage());
+  for (const changed of [
+    { ...scope, applicationId: other.id }, { ...scope, guildId: other.id },
+    { ...scope, name: "help" }, { ...scope, type: 2 },
+  ]) await assert.rejects(recovery.persistIntent({ ...intent, scope: changed }, admission, observe, now), /intent_invalid/);
+  const registry = new Registry();
+  const wrongLease = { ...lease, epoch: lease.epoch + 1 };
+  await assert.rejects(recovery.persistIntent(intent, admission, async () => wrongLease, now), /admission_mismatch/);
+  assert.equal(await recovery.pending(), undefined);
+  await recovery.persistIntent(intent, admission, observe, now);
+  await assert.rejects(recovery.recordCreated({ ...intent, lease: wrongLease }, created), /receipt_mismatch/);
+  await assert.rejects(recovery.recordCreated({ ...intent, baselineDigest: "c".repeat(64) }, created), /receipt_mismatch/);
+  await assert.rejects(recovery.recordCreated(intent, { ...created, id: "18446744073709551616" }), /receipt_mismatch/);
+  await recovery.recordCreated(intent, created);
+  await assert.rejects(recovery.recordCreated(intent, other), /receipt_mismatch/);
+  await assert.rejects(recovery.recover(wrongLease, registry), /recovery_mismatch/);
+  assert.deepEqual(registry.calls, []);
+  registry.proofIntent = { ...intent, scope: { ...scope, guildId: other.id } };
+  await assert.rejects(recovery.recover(lease, registry), /cleanup_unverified/);
+  registry.proofIntent = intent;
+  for (const command of [other, { ...created, version: other.version }]) {
+    registry.target = command;
+    await assert.rejects(recovery.recover(lease, registry), /cleanup_unverified/);
+    assert.deepEqual(registry.target, command);
+  }
+  assert.deepEqual(registry.calls, [created.id, created.id, created.id]);
+  assert.deepEqual(await recovery.pending(), intent);
+});
+
+test("AutoMod recovery needs a durable hold and a stopped, affirmative absence read", async () => {
+  const store = new Storage();
+  const recovery = new StagingAutomodRecovery(store);
+  const registry = new Registry();
+  store.afterWrite = () => { store.beforeSync = () => { throw new Error("storage unavailable"); }; };
+  await assert.rejects(recovery.persistIntent(intent, admission, observe, now), /storage_unavailable/);
+  await assert.rejects(recovery.recover(lease, registry), /storage_unavailable/);
+  assert.deepEqual(registry.calls, []);
+  delete store.afterWrite;
+  delete store.beforeSync;
+  await assert.rejects(recovery.persistIntent(intent, admission, observe, now), /intent_held/);
+  await recovery.recordCreated(intent, created);
+  registry.stopped = false;
+  await assert.rejects(recovery.recover(lease, registry), /cleanup_unverified/);
+  registry.stopped = true;
+  registry.target = created;
+  registry.keepAfterDelete = true;
+  await assert.rejects(recovery.recover(lease, registry), /absence_unverified/);
+  assert.deepEqual(registry.calls, [created.id, created.id, "delete", created.id]);
+  assert.deepEqual(await recovery.pending(), intent);
+  store.value = { ...store.value as object, phase: "unknown" };
+  await assert.rejects(recovery.pending(), /storage_invalid/);
+});
