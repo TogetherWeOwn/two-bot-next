@@ -29,11 +29,10 @@ pub(super) fn member(row: &Member) -> bool {
 pub(super) fn event(row: &Event) -> bool {
     let description = row.description.as_deref().unwrap_or_default();
     // The site's Date.parse compares milliseconds, not nanoseconds.
-    let millis = |t: super::WireTime| t.0.unix_timestamp_nanos().div_euclid(1_000_000);
     event_text_is_valid(&row.title, description, row.location.as_deref())
         && row
             .ends_at
-            .is_none_or(|end| millis(end) > millis(row.starts_at))
+            .is_none_or(|end| end.unix_millis() > row.starts_at.unix_millis())
 }
 
 /// Check the site's event text bounds before a source row is projected.

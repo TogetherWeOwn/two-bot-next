@@ -32,6 +32,11 @@ Adding secrets cannot enable unforwarded role/capability gates. Do not stage
 those inputs to try to enable them. Widening forwarding requires a separate
 reviewed change; direct-container configuration support is not rollout authority.
 
+The dormant `live.snapshot` boundary takes a committed nonce and a dedicated
+signing-key scope for one guild before it looks up recovery state. A current,
+fresh generation can return the complete v1 snapshot directly as JSON. The
+serving action registry and ingress have no `live.snapshot` entry.
+
 No signing key, secret custodian or export authority is supplied by this code.
 Key creation and transfer into the website's staging secret store stay on HOLD
 until separately approved and recorded. Never use the signing test fixture as a

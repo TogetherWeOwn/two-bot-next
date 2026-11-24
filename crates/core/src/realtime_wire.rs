@@ -40,6 +40,12 @@ impl Serialize for Permissions {
 #[derive(Clone, Copy)]
 pub struct WireTime(pub OffsetDateTime);
 
+impl WireTime {
+    fn unix_millis(self) -> i128 {
+        self.0.unix_timestamp_nanos().div_euclid(1_000_000)
+    }
+}
+
 impl Serialize for WireTime {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let utc = self

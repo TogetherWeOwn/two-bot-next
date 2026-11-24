@@ -53,6 +53,9 @@ use subtle::ConstantTimeEq as _;
 use super::clock_guard::ClockGuard;
 use super::moderation::{require_moderation_reason, ModerationAction, ReasonError};
 
+mod live_snapshot;
+pub use live_snapshot::{AuthorizedLiveSnapshotRead, LiveSnapshotReadAuthority};
+
 /// Route path the canonical string signs (legacy `ACTIONS_PATH`).
 pub const ACTIONS_PATH: &str = "/internal/actions";
 /// Timestamp freshness window each way, seconds (legacy default `skewSeconds`).
@@ -1974,7 +1977,6 @@ pub struct AuthenticatedRequest<'a> {
     key_id: &'a str,
     #[cfg(feature = "db")]
     timestamp: &'a str,
-    #[cfg(feature = "db")]
     skew_seconds: u64,
     nonce: &'a str,
     raw: &'a [u8],
@@ -2057,7 +2059,6 @@ impl<'a> AuthenticatedRequest<'a> {
             key_id: headers.key_id,
             #[cfg(feature = "db")]
             timestamp: headers.timestamp,
-            #[cfg(feature = "db")]
             skew_seconds,
             nonce: headers.nonce,
             raw,
@@ -2175,6 +2176,14 @@ pub fn authorize(
     clock: &mut ClockGuard,
 ) -> Result<AuthDecision, ActionError> {
     let verified = AuthenticatedRequest::verify(headers, raw, keys, skew_seconds, now_ms, clock)?;
+    burn_in_memory(verified, nonces)?.authorize(flags, has_store, has_settings, buckets)
+}
+
+fn burn_in_memory<'a>(
+    verified: AuthenticatedRequest<'a>,
+    nonces: &mut NonceCache,
+) -> Result<NonceBurnedRequest<'a>, ActionError> {
+    let skew_seconds = verified.skew_seconds;
     // The skew is configurable independently of the cache TTL, so enforce the
     // coverage relation on the live pair: a nonce must still be live at every
     // instant its signed timestamp is fresh. A skew-180/TTL-240 wiring would
@@ -2196,7 +2205,7 @@ pub fn authorize(
     if !nonces.offer(verified.nonce, verified.guarded_ms) {
         return Err(replayed_nonce());
     }
-    NonceBurnedRequest(verified).authorize(flags, has_store, has_settings, buckets)
+    Ok(NonceBurnedRequest(verified))
 }
 
 fn rate_limited_body(
