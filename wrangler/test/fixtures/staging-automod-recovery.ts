@@ -1,18 +1,18 @@
 import assert from "node:assert/strict";
 import {
-  type AutomodCleanup, type AutomodIntent, type CommandRevision, STAGING_AUTOMOD_SCOPE as scope,
+  type AutomodCleanup, type AutomodIntent, type AutomodOwnedCommand, type CommandRevision, STAGING_AUTOMOD_TARGET as target,
 } from "../../src/staging-automod-recovery.ts";
 
 export const lease = {
   environment: "staging", phase: "active", deploymentId: "fixture", sha: "a".repeat(40),
   epoch: 3, runId: "12345", runAttempt: 2, acquiredAt: 1_000, expiresAt: 60_000,
 } as const;
-export const intent = { lease, scope, baselineDigest: "b".repeat(64) };
 export const admission = { lease, baselineAbsent: true, publishBefore: 55_000 } as const;
+export const intent = { lease, target, baseline: "b".repeat(64), publishBefore: admission.publishBefore };
 export const created = { id: "1000000000000000000", version: "1000000000000000001" };
 export const other = { id: "1000000000000000002", version: "1000000000000000003" };
 export const now = () => 2_000;
-export const observe = async () => lease;
+export const observe = async () => admission;
 
 export class Storage {
   value: unknown;
@@ -43,7 +43,7 @@ export class Storage {
 export class Registry implements AutomodCleanup {
   calls: string[] = [];
   target: CommandRevision | undefined;
-  otherGuild = new Map([[scope.name, other]]);
+  otherGuild = new Map([[target.name, other]]);
   sameGuild = new Map([["help", other]]);
   attributable = true;
   authorized = true;
@@ -52,6 +52,7 @@ export class Registry implements AutomodCleanup {
   keepAfterDelete = false;
   loseDeleteResponse = false;
   proofIntent = intent as AutomodIntent;
+  beforeDelete?: (command: CommandRevision) => void;
 
   async inspect(received: AutomodIntent, known: CommandRevision | null) {
     assert.deepEqual(received, intent);
@@ -68,8 +69,10 @@ export class Registry implements AutomodCleanup {
       : { ...proof, registry: "absent" as const };
   }
 
-  async removeOwned(received: AutomodIntent, command: CommandRevision) {
+  async removeOwned({ intent: received, id, version }: AutomodOwnedCommand) {
     assert.deepEqual(received, intent);
+    const command = { id, version };
+    this.beforeDelete?.(command);
     assert.deepEqual(command, this.target);
     this.calls.push("delete");
     if (!this.keepAfterDelete) this.target = undefined;

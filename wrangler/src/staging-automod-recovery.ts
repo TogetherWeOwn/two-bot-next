@@ -5,24 +5,24 @@ import { MAX_STAGING_USE_MS, type StagingUse } from "./staging-lifecycle.ts";
 
 const KEY = "two-bot:staging-automod-recovery:v1";
 // Same fixed guild slash identity as the protected staging preview reader.
-export const STAGING_AUTOMOD_SCOPE = Object.freeze({
+export const STAGING_AUTOMOD_TARGET = Object.freeze({
   applicationId: "1469137636663758888", guildId: "1545644954272137297",
-  name: "automod-preview", type: 1,
+  name: "automod-preview",
 } as const);
 
 type Lease = Readonly<StagingUse>;
 type Admission = Readonly<Awaited<ReturnType<typeof admitStagingAutomod>>>;
-type Scope = Readonly<{ applicationId: string; guildId: string; name: string; type: number }>;
 export type CommandRevision = Readonly<{ id: string; version: string }>;
 export type AutomodIntent = Readonly<{
   lease: Lease;
-  scope: Scope;
-  baselineDigest: string;
+  publishBefore: number;
+  target: typeof STAGING_AUTOMOD_TARGET;
+  baseline: string;
 }>;
+export type AutomodOwnedCommand = CommandRevision & Readonly<{ intent: AutomodIntent }>;
 
 type Journal = Readonly<{
   intent: AutomodIntent;
-  publishBefore: number;
   phase: "publishing" | "cleanup" | "complete";
   created: CommandRevision | null;
 }>;
@@ -53,7 +53,7 @@ export interface AutomodCleanup {
   inspect(intent: AutomodIntent, created: CommandRevision | null): Promise<CleanupProof>;
   /** Recheck cleanup authority and exact scoped ID/version at the DELETE. No
    * registry replacement, name-based removal, or mutation of a changed command. */
-  removeOwned(intent: AutomodIntent, command: CommandRevision): Promise<void>;
+  removeOwned(owned: AutomodOwnedCommand): Promise<void>;
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -81,12 +81,13 @@ function sameLease(expected: Lease, other: unknown): boolean {
 }
 
 function validIntent(value: unknown): value is AutomodIntent {
-  if (!record(value) || !record(value.scope) || !validLease(value.lease)) return false;
-  const { scope, baselineDigest } = value;
-  const expected = STAGING_AUTOMOD_SCOPE;
-  return scope.applicationId === expected.applicationId && scope.guildId === expected.guildId
-    && scope.name === expected.name && scope.type === expected.type
-    && typeof baselineDigest === "string" && /^[0-9a-f]{64}$/.test(baselineDigest);
+  if (!record(value) || !record(value.target) || !validLease(value.lease)) return false;
+  const { target, publishBefore, baseline, lease } = value;
+  const expected = STAGING_AUTOMOD_TARGET;
+  return Object.keys(target).length === 3 && target.applicationId === expected.applicationId && target.guildId === expected.guildId
+    && target.name === expected.name && typeof publishBefore === "number" && Number.isSafeInteger(publishBefore)
+    && publishBefore > lease.acquiredAt && publishBefore < lease.expiresAt
+    && typeof baseline === "string" && /^[0-9a-f]{64}$/.test(baseline);
 }
 
 function copyIntent(intent: AutomodIntent): AutomodIntent {
@@ -95,18 +96,15 @@ function copyIntent(intent: AutomodIntent): AutomodIntent {
     lease: Object.freeze({
       environment: "staging", phase: "active", deploymentId, sha, epoch, runId, runAttempt, acquiredAt, expiresAt,
     }),
-    scope: STAGING_AUTOMOD_SCOPE,
-    baselineDigest: intent.baselineDigest,
+    target: STAGING_AUTOMOD_TARGET,
+    publishBefore: intent.publishBefore,
+    baseline: intent.baseline,
   });
 }
 
 function sameIntent(expected: AutomodIntent, other: unknown): boolean {
-  return validIntent(other) && expected.baselineDigest === other.baselineDigest && sameLease(expected.lease, other.lease);
-}
-
-function validCutoff(publishBefore: unknown, lease: Lease): publishBefore is number {
-  return typeof publishBefore === "number" && Number.isSafeInteger(publishBefore)
-    && publishBefore > lease.acquiredAt && publishBefore < lease.expiresAt;
+  return validIntent(other) && expected.baseline === other.baseline
+    && expected.publishBefore === other.publishBefore && sameLease(expected.lease, other.lease);
 }
 
 function snowflake(value: unknown): value is string {
@@ -139,46 +137,46 @@ export class StagingAutomodRecovery {
     return journal?.phase === "complete" ? undefined : journal?.intent;
   }
 
-  /** Success grants the caller a single POST under the still-current lease.
-   * The lease observer and the adapter's send-boundary check must honor
-   * cancellation. Any repeat, including
-   * an uncertain storage acknowledgment, goes to recovery instead of POST. */
-  async persistIntent(intent: AutomodIntent, admission: Admission, observeLease: () => Promise<Lease>,
-    now = Date.now): Promise<void> {
+  /** The publication adapter supplies a digest from its fresh absent registry
+   * read under current admission. Success permits a single POST, subject to
+   * the adapter's own send-boundary checks. A repeat must go to recovery. */
+  async persistIntent(intent: AutomodIntent, currentAdmission: () => Promise<Admission | undefined>,
+    now = Date.now): Promise<true> {
     if (!validIntent(intent)) throw new OwnershipRefused("staging_automod_intent_invalid");
     const saved = copyIntent(intent);
-    const { lease } = saved;
-    const { publishBefore } = admission;
-    if (admission.baselineAbsent !== true || !sameLease(lease, admission.lease) || !validCutoff(publishBefore, lease)) {
-      throw new OwnershipRefused("staging_automod_admission_mismatch");
-    }
+    const { lease, publishBefore } = saved;
     const old = await this.read();
     if (old && (old.phase !== "complete" || sameLease(old.intent.lease, lease))) {
       throw new OwnershipRefused("staging_automod_intent_held");
     }
     const requireActive = async () => {
-      const current = await observeLease();
+      let current: Admission | undefined;
+      try { current = await currentAdmission(); }
+      catch { throw new OwnershipRefused("staging_automod_admission_mismatch"); }
       const at = now();
-      if (!sameLease(lease, current) || !Number.isSafeInteger(at) || at < lease.acquiredAt || at >= publishBefore) {
+      if (current?.baselineAbsent !== true || current.publishBefore !== publishBefore || !sameLease(lease, current.lease)
+        || !Number.isSafeInteger(at) || at < lease.acquiredAt || at >= publishBefore) {
         throw new OwnershipRefused("staging_automod_admission_mismatch");
       }
     };
     await requireActive();
-    await this.write({ intent: saved, publishBefore, phase: "publishing", created: null });
+    await this.write({ intent: saved, phase: "publishing", created: null });
     await requireActive();
+    return true;
   }
 
   /** Record only a validated fresh-create receipt. The adapter still owes
    * the positive detail and full-registry delta before it reports success. */
-  async recordCreated(intent: AutomodIntent, command: CommandRevision): Promise<void> {
+  async recordCreated(command: AutomodOwnedCommand): Promise<true> {
     const journal = await this.read();
-    if (!journal || journal.phase !== "publishing" || !sameIntent(journal.intent, intent) || !validRevision(command)
+    if (!journal || journal.phase !== "publishing" || !validRevision(command) || !sameIntent(journal.intent, command.intent)
       || (journal.created !== null && !sameRevision(journal.created, command))) {
       throw new OwnershipRefused("staging_automod_receipt_mismatch");
     }
     if (journal.created === null) {
       await this.write({ ...journal, created: { id: command.id, version: command.version } });
     }
+    return true;
   }
 
   /** Fence new publication before inspection. Finish only on affirmative
@@ -202,7 +200,7 @@ export class StagingAutomodRecovery {
         journal = { ...journal, created: command };
         await this.write(journal);
       }
-      try { await adapter.removeOwned(intent, command); }
+      try { await adapter.removeOwned(Object.freeze({ intent, ...command })); }
       catch { throw new OwnershipRefused("staging_automod_removal_unverified"); }
       if ((await this.inspect(adapter, intent, command)).registry !== "absent") {
         throw new OwnershipRefused("staging_automod_absence_unverified");
@@ -236,13 +234,13 @@ export class StagingAutomodRecovery {
     }
     catch { throw new OwnershipRefused("staging_automod_storage_unavailable"); }
     if (value === undefined) return undefined;
-    if (!record(value) || !validIntent(value.intent) || !validCutoff(value.publishBefore, value.intent.lease)
+    if (!record(value) || !validIntent(value.intent)
       || (value.phase !== "publishing" && value.phase !== "cleanup" && value.phase !== "complete")
       || (value.created !== null && !validRevision(value.created))) {
       throw new OwnershipRefused("staging_automod_storage_invalid");
     }
     const created = value.created === null ? null : Object.freeze({ id: value.created.id, version: value.created.version });
-    return { intent: copyIntent(value.intent), publishBefore: value.publishBefore, phase: value.phase, created };
+    return { intent: copyIntent(value.intent), phase: value.phase, created };
   }
 
   private async write(journal: Journal): Promise<void> {
