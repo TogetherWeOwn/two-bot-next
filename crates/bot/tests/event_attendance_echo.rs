@@ -417,4 +417,9 @@ async fn staged_echo_enablement_and_rollback(
     assert_eq!(web_first.frozen, bot_first.frozen);
     assert_eq!(bot_first.frozen.as_slice(), std::slice::from_ref(finalized));
     assert_eq!(stored_spans().await, before);
+    assert_eq!(
+        &steady(enabled).await.unwrap(),
+        finalized,
+        "re-enabling reads still resolves the preserved event and span"
+    );
 }
