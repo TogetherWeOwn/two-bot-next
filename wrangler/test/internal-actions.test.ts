@@ -19,6 +19,7 @@ import {
   ACTIONS_PATH,
   CONTAINER_MARKER,
   CONTAINER_MARKER_VALUE,
+  LIVE_SNAPSHOT_DISPATCH_HEADER,
   MAX_BODY_BYTES,
   MAX_IN_FLIGHT,
   MAX_RESPONSE_BYTES,
@@ -28,7 +29,9 @@ import {
   relayReceiverResponse,
   resetIngressLimits,
 } from "../src/internal-actions.ts";
-import { request as signedSnapshot, scope, signature, snapshot } from "./fixtures/live-snapshot-peer.ts";
+import {
+  request as signedSnapshot, scope, signature, snapshot, snapshotStaging, stalledUpload, webSnapshot,
+} from "./fixtures/live-snapshot-peer.ts";
 
 const ID = "deployment-A";
 const OWNER = {
@@ -189,6 +192,7 @@ async function harness(t: TestContext, env: Record<string, unknown>,
   };
   return {
     bot, runtime, starts, seen, logs, values, call, warm,
+    closeReceiverPort: () => listening.delete(RECEIVER_PORT),
     setReceiver: (fn: typeof receiver) => { receiver = fn; },
     receiverCalls: () => seen.filter((r) => r.port === RECEIVER_PORT && r.pathname === ACTIONS_PATH),
   };
@@ -409,6 +413,10 @@ test("a stalled upstream is cut at the request deadline with a fixed envelope", 
   const response = await pending;
   assert.equal(response.status, 504);
   assert.deepEqual((await response.json() as { error: { code: string } }).error.code, "upstream_timeout");
+  const snapshot = worker.fetch(webSnapshotRequest(), env, {} as ExecutionContext);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(webSnapshot.deadlineMs);
+  assert.equal((await snapshot).status, 504);
   assert.deepEqual(h.seen, []);
 });
 
@@ -571,6 +579,10 @@ const webSnapshotUrl = `https://worker.invalid${ACTIONS_PATH}`;
 const webSnapshotBody = (guildId = scope.guildId) => JSON.stringify({ action: "live.snapshot", guild_id: guildId });
 const webSnapshotRequest = (payload = webSnapshotBody()) =>
   signedSnapshot(payload, webSnapshotUrl, String(Math.floor(Date.now() / 1000)), randomBytes(16).toString("hex"));
+function snapshotHarness(t: TestContext, enabled = true) {
+  const { env, stagingUse } = snapshotStaging(ID, OWNER.epoch, enabled);
+  return harness(t, { ...ENABLED_ENV, ...env }, { stagingUse });
+}
 
 async function snapshotRefused(reply: Response, status: number, code: string) {
   assert.equal(reply.status, status);
@@ -582,19 +594,21 @@ async function snapshotRefused(reply: Response, status: number, code: string) {
   });
 }
 
-test("unmounted snapshot composition returns direct v1 while ordinary ingress keeps its envelope", async (t) => {
-  const h = await harness(t, ENABLED_ENV);
+test("snapshot dispatch returns direct v1 while ordinary ingress keeps its envelope", async (t) => {
+  const h = await snapshotHarness(t);
   await h.warm();
   const fresh = { ...snapshot, observed_at: new Date().toISOString() };
   let authenticated = 0;
   let refusalCancelled = false;
   h.setReceiver(({ headers, body, method, pathname }) => {
     if (headers["x-two-key-id"] === SIGNED_HEADERS["x-two-key-id"]) {
+      assert.equal(headers[LIVE_SNAPSHOT_DISPATCH_HEADER], undefined);
       return Response.json({ ok: true, request_id: headers["x-request-id"], result: { message_id: "1" } });
     }
     // In-memory peer for the Rust snapshot HTTP contract. Verify the MAC on
     // received bytes so a syntactically valid but mismatched MAC is refused.
-    if (method !== "POST" || !body || headers["x-two-key-id"] !== scope.keyId ||
+    if (headers[LIVE_SNAPSHOT_DISPATCH_HEADER] !== "1" || method !== "POST" || !body ||
+      headers["x-two-key-id"] !== scope.keyId ||
       !headers["x-two-timestamp"] || !headers["x-two-nonce"] ||
       headers["x-two-signature"] !== signature(body, pathname, headers["x-two-timestamp"], headers["x-two-nonce"])) {
       const refusal = new ReadableStream<Uint8Array>({
@@ -610,7 +624,7 @@ test("unmounted snapshot composition returns direct v1 while ordinary ingress ke
   });
 
   const inbound = webSnapshotRequest();
-  const pull = (request: Request) => TwoBotContainer.relayLiveSnapshot(h.bot, request, "fixture", ID, scope);
+  const pull = h.call;
   const reply = await pull(inbound);
   assert.equal(reply.status, 200);
   assert.equal(reply.headers.get("cache-control"), "no-store");
@@ -630,17 +644,41 @@ test("unmounted snapshot composition returns direct v1 while ordinary ingress ke
   assert.equal(authenticated, 1);
   assert.equal(refusalCancelled, true);
 
-  await snapshotRefused(await h.call(webSnapshotRequest()), 503, "unavailable");
-  assert.equal(authenticated, 2, "routed ordinary ingress still refuses a direct v1 reply");
-  const ordinary = await h.call(post());
+  const ordinary = await h.call(post(BODY, { ...SIGNED_HEADERS, [LIVE_SNAPSHOT_DISPATCH_HEADER]: "1" }));
   assert.equal(ordinary.status, 200);
   assert.equal(ordinary.headers.get("cache-control"), "no-store");
   assert.deepEqual(await ordinary.json(), {
     ok: true, request_id: h.receiverCalls().at(-1)?.headers["x-request-id"], result: { message_id: "1" },
   });
+  h.setReceiver(() => Response.json(fresh));
+  await snapshotRefused(await h.call(post()), 503, "unavailable");
+  h.values.delete(OWNER_KEY);
+  await snapshotRefused(await pull(webSnapshotRequest()), 503, "unavailable");
 });
 
-test("unmounted snapshot composition requires the configured guild, key, owner and staging use", async (t) => {
+test("snapshot dispatch is default-off and requires a listening private receiver", async (t) => {
+  for (const enabled of [false, true]) {
+    const h = await snapshotHarness(t, enabled);
+    await h.warm();
+    assert.equal(h.closeReceiverPort(), true);
+    const reply = await h.call(webSnapshotRequest());
+    assert.equal(reply.status, enabled ? 503 : 404);
+    assert.equal(reply.headers.get("cache-control"), "no-store");
+  }
+});
+
+test("snapshot intake uses the Web deadline for a stalled signed upload", async (t) => {
+  const h = await snapshotHarness(t);
+  const timeout = new AbortController();
+  const deadline = t.mock.method(AbortSignal, "timeout", () => timeout.signal);
+  const pending = h.call(stalledUpload());
+  assert.ok(Number(deadline.mock.calls[0]?.arguments[0]) < webSnapshot.deadlineMs);
+  timeout.abort();
+  assert.equal((await pending).status, 408);
+  assert.deepEqual(h.seen, []);
+});
+
+test("snapshot relay requires the configured guild, key, owner and staging use", async (t) => {
   t.mock.timers.enable({ apis: ["Date"] });
   const sha = "a".repeat(40);
   const stagingUse: StagingUse = {

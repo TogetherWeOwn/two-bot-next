@@ -7,10 +7,11 @@ import {
 import { DEPLOYMENT_HEADER } from "../src/ownership.ts";
 import {
   body, invalidSnapshots, origin, path, receiver, request, scope, signature, snapshot,
-  stalledBody, stalledUpload, strippedHeaders, verifyForwarded,
+  stalledBody, stalledUpload, strippedHeaders, verifyForwarded, webSnapshot,
 } from "./fixtures/live-snapshot-peer.ts";
 
 test("snapshot verifies untouched signed bytes and returns bounded direct v1 JSON", async () => {
+  assert.equal(LIVE_SNAPSHOT_BYTES, webSnapshot.responseBytes);
   const inbound = request();
   for (const name of strippedHeaders) inbound.headers.set(name, "synthetic-caller-value");
   const json = JSON.stringify(snapshot);

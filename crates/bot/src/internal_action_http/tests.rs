@@ -222,6 +222,18 @@ fn state(pool: sqlx::PgPool, effect: Arc<MockEffect>) -> Arc<ReceiverState> {
     state_with_reads(pool, effect, Arc::new(MockEventRead::default()))
 }
 
+pub(super) fn snapshot_app(
+    pool: sqlx::PgPool,
+    snapshot: Option<live_snapshot::LiveSnapshotEndpoint>,
+) -> (Router, Arc<RwLock<crate::gateway::GatewayState>>) {
+    let mut state = state(pool, Arc::new(MockEffect::new(MockOutcome::Success)));
+    let receiver = Arc::get_mut(&mut state).unwrap();
+    receiver.live_snapshot = snapshot;
+    let gateway = Arc::new(RwLock::new(crate::gateway::GatewayState::Connected));
+    receiver.gateway_state = gateway.clone();
+    (router(state), gateway)
+}
+
 fn state_with_reads(
     pool: sqlx::PgPool,
     effect: Arc<MockEffect>,

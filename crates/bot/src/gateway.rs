@@ -24,6 +24,7 @@ use futures_util::StreamExt as _;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use twilight_gateway::{Event, EventTypeFlags, Intents, Message, Session, Shard, ShardId};
+use two_bot::live_gateway::LiveGateway;
 use two_bot::voice_rooms::{build_production_runtime, VoiceEventSink};
 use two_bot_core::gateway_funnel::GatewayFunnelBuffer;
 use two_bot_core::gateway_session::{
@@ -1433,6 +1434,35 @@ fn apply_dispatch<I: InviteSource>(
     }
 }
 
+async fn disconnect_live(live: Option<&RwLock<LiveGateway>>) {
+    if let Some(live) = live {
+        live.write().await.disconnect();
+    }
+}
+
+pub struct ShardState {
+    pub readiness: Arc<RwLock<GatewayState>>,
+    pub snapshot_owner: Option<Arc<RwLock<LiveGateway>>>,
+}
+
+impl ShardState {
+    pub fn intents(&self, mut base: Intents) -> Intents {
+        if self.snapshot_owner.is_some() {
+            base.insert(Intents::GUILD_SCHEDULED_EVENTS);
+        }
+        base
+    }
+}
+
+impl From<Arc<RwLock<GatewayState>>> for ShardState {
+    fn from(readiness: Arc<RwLock<GatewayState>>) -> Self {
+        Self {
+            readiness,
+            snapshot_owner: None,
+        }
+    }
+}
+
 /// Raw packets retain unmapped dispatch sequences too. Poll transport separately
 /// from the serial effects/checkpoint writer. Metadata may advance in reception;
 /// only the worker's successful transaction advances the durable replay cursor.
@@ -1455,7 +1485,7 @@ fn apply_dispatch<I: InviteSource>(
 pub async fn run_shard<I: InviteSource + 'static>(
     shard: Shard,
     pipeline: Arc<GatewayPipeline<I>>,
-    state: Arc<RwLock<GatewayState>>,
+    state: impl Into<ShardState>,
     store: GatewaySessionStore,
     interactions: Option<Arc<two_bot_discord::interactions::InteractionRuntime>>,
     onboarding: Option<Arc<crate::onboarding::OnboardingRuntime>>,
@@ -1464,6 +1494,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
     voice: Option<Arc<dyn VoiceEventSink>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), sqlx::Error> {
+    let ShardState {
+        readiness: state,
+        snapshot_owner: live,
+    } = state.into();
     let _dispatch_guard = runtime.as_ref().map(|runtime| runtime.dispatch_guard());
     let _voice_connection = VoiceConnectionGuard(voice.clone());
     let generation = Arc::new(AtomicU64::new(0));
@@ -1576,9 +1610,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
             CHECKPOINT_IO_MAX,
             crate::gateway_metrics::Observer::default(),
             None::<tokio::sync::oneshot::Receiver<()>>,
-            two_bot::live_gateway::LiveGateway::default(),
+            live,
         ),
-        move |(mut shard, mut received, mut deadline, mut observer, mut bootstrap, mut live)| {
+        move |(mut shard, mut received, mut deadline, mut observer, mut bootstrap, live)| {
             let state = Arc::clone(&receive_state);
             let generation = Arc::clone(&receive_generation);
             let generation_wake = Arc::clone(&receive_generation_wake);
@@ -1602,7 +1636,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         if committed.await.is_err() {
                             return Ok(None);
                         }
-                        live.disconnect();
+                        disconnect_live(live.as_deref()).await;
                         transport_disconnected(&state, &generation, &generation_wake).await;
                         voice_disconnected(voice.as_ref());
                         // Twilight consumes the boot session from config on
@@ -1622,7 +1656,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         let message = match item {
                             Ok(message) => message,
                             Err(error) if matches!(error.kind(), twilight_gateway::error::ReceiveMessageErrorType::Reconnect) => {
-                                live.disconnect();
+                                disconnect_live(live.as_deref()).await;
                                 transport_disconnected(&state, &generation, &generation_wake).await;
                                 voice_disconnected(voice.as_ref());
                                 // Twilight already backed off the failed connect.
@@ -1643,7 +1677,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         };
                         observer.observe(&message, &shard);
                         let Message::Text(text) = message else {
-                            live.disconnect();
+                            disconnect_live(live.as_deref()).await;
                             crate::logging::shard_closed(&message);
                             transport_disconnected(&state, &generation, &generation_wake).await;
                             voice_disconnected(voice.as_ref());
@@ -1655,7 +1689,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         };
                         let observed_at = two_bot_core::now_iso();
                         let header: Header = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway header".into()))?;
-                        if matches!(header.op, 7 | 9) { live.disconnect(); }
+                        if matches!(header.op, 7 | 9) { disconnect_live(live.as_deref()).await; }
                         if header.op == 10 {
                             let hello: HelloPacket = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway hello".into()))?;
                             if hello.d.heartbeat_interval == 0 { return Err(sqlx::Error::InvalidArgument("zero heartbeat interval".into())); }
@@ -1705,7 +1739,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             two_bot_core::metrics::global().gateway_missed_events(missed);
                         }
                         if missed > 0 || received.as_ref().is_none_or(|prev| prev.session_id != checkpoint.session_id) {
-                            live.disconnect();
+                            disconnect_live(live.as_deref()).await;
                         }
                         // A duplicate key in a MESSAGE_UPDATE refuses the
                         // automod edit below; selection is by decoded `t` so
@@ -1735,7 +1769,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         } else {
                             None
                         };
-                        let live_raw = live.enabled().then(|| text.clone());
+                        let live_raw = live.as_ref().map(|live| (live, text.clone()));
                         let parsed = if duplicate_refused {
                             None
                         } else {
@@ -1745,10 +1779,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                 Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
                             }
                         };
-                        if let Some(raw) = live_raw {
+                        if let Some((live, packet)) = live_raw {
                             let at = two_bot_core::realtime_wire::WireTime(time::OffsetDateTime::now_utc());
                             let sender = shard.sender();
-                            live.receive(&raw, at, |request| sender.command(request).is_ok()).await;
+                            live.write().await.receive(&packet, at, |request| sender.command(request).is_ok()).await;
                         }
                         received = Some(checkpoint.clone());
                         let mut dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at, received: received_at, completion: None }));
@@ -1880,9 +1914,11 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         };
                         // Only READY sets the current user, so a RESUMED without
                         // one is a cold resume across a process restart.
+                        // A retired realtime snapshot also needs a fresh READY.
                         let mut committed = None;
-                        if let (Some(voice), Some(dispatch)) = (voice.as_ref(), dispatch.as_ref()) {
-                            if matches!(dispatch.event, Event::Resumed) && voice.needs_bootstrap(pipeline.cache()) {
+                        if let Some(dispatch) = dispatch.as_ref() {
+                            if matches!(dispatch.event, Event::Resumed) && (live.is_some() ||
+                                voice.as_ref().is_some_and(|voice| voice.needs_bootstrap(pipeline.cache()))) {
                                 let (sender, receiver) = tokio::sync::oneshot::channel();
                                 committed = Some(sender);
                                 bootstrap = Some(receiver);
@@ -1893,7 +1929,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     Ok(None)
                 }.await;
                 if work.is_err() {
-                    live.disconnect();
+                    disconnect_live(live.as_deref()).await;
                 }
                 match work {
                     Ok(Some(work)) => {
@@ -2555,6 +2591,15 @@ mod deferred_poison_acceptance;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_owner_subscribes_to_scheduled_events() {
+        let mut state = ShardState::from(Arc::new(RwLock::new(GatewayState::Armed)));
+        let base = Intents::GUILDS;
+        assert_eq!(state.intents(base), base);
+        state.snapshot_owner = Some(Arc::new(RwLock::new(LiveGateway::default())));
+        assert_eq!(state.intents(base), base | Intents::GUILD_SCHEDULED_EVENTS);
+    }
 
     #[test]
     fn activation_intents_refuse_uncleared_automod_and_tickets() {

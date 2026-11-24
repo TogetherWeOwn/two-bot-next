@@ -52,6 +52,8 @@ export const CONTAINER_MARKER_VALUE = "1";
 export const MAX_BODY_BYTES = 2 * 1024 * 1024;
 export const BODY_TIMEOUT_MS = 5_000;
 export const REQUEST_TIMEOUT_MS = 20_000;
+export const LIVE_SNAPSHOT_TIMEOUT_MS = 2_250;
+export const LIVE_SNAPSHOT_DISPATCH_HEADER = "x-two-live-snapshot";
 /** Concurrent ingress requests per isolate; the receiver itself admits 32. */
 export const MAX_IN_FLIGHT = 8;
 export const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -258,6 +260,15 @@ export function forwardRequest(
   return new Request(url, { method: "POST", headers, body: bytes, ...(signal ? { signal } : {}) });
 }
 
+function isLiveSnapshotAction(bytes: Uint8Array): boolean {
+  try {
+    const value: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
+    return isJsonObject(value) && value["action"] === "live.snapshot";
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Worker half: gate, rate-cap, validate, then hand byte-exact bytes to the
  * fenced DO through `forward`. Called only when `ingressEnabled(env)`.
@@ -267,8 +278,10 @@ export async function handleActionsIngress(
   clientKey: string,
   forward: (sanitized: Request) => Promise<Response>,
   release: unknown = UNKNOWN_RELEASE,
+  snapshotKeyId?: string,
 ): Promise<Response> {
   if (!isActionsRequest(request)) return notFound();
+  const started = performance.now();
   const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
   const verdict = actionsBuckets.take(clientKey);
   if (!verdict.allowed) {
@@ -280,9 +293,17 @@ export async function handleActionsIngress(
   inFlight++;
   let forwardPromise: Promise<Response> | undefined;
   try {
-    const body = await readBody(request, requestId, release);
+    const snapshotIntake = checked.headers.get("x-two-key-id") === snapshotKeyId
+      ? AbortSignal.any([request.signal, AbortSignal.timeout(LIVE_SNAPSHOT_TIMEOUT_MS)])
+      : undefined;
+    const body = await readBody(request, requestId, release, snapshotIntake);
     if ("refusal" in body) return body.refusal;
-    const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const snapshot = isLiveSnapshotAction(body.bytes);
+    const remaining = snapshot
+      ? Math.ceil(LIVE_SNAPSHOT_TIMEOUT_MS - (performance.now() - started))
+      : REQUEST_TIMEOUT_MS;
+    if (remaining <= 0) return refuse(504, "upstream_timeout", true, undefined, requestId, release);
+    const timeoutSignal = AbortSignal.timeout(remaining);
     const abortController = new AbortController();
     const abortOrphan = (): void => {
       try {
@@ -300,6 +321,7 @@ export async function handleActionsIngress(
       body.bytes,
       signal,
     );
+    if (snapshot) sanitized.headers.set(LIVE_SNAPSHOT_DISPATCH_HEADER, "1");
     try {
       forwardPromise = forward(sanitized);
     } catch {
@@ -318,7 +340,7 @@ export async function handleActionsIngress(
     );
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => resolve("timeout"), REQUEST_TIMEOUT_MS);
+        timer = setTimeout(() => resolve("timeout"), remaining);
     });
     try {
       const upstream = await Promise.race([forwardPromise, deadline]);
