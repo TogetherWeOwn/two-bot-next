@@ -153,7 +153,7 @@ only while `TWO_INTERNAL_ACTIONS` is exactly `1`:
 | `TWO_INTERNAL_CONTAINER` | Worker constant `1`: the Worker sets it to mark the process as running inside the container network, where the wildcard bind is reachable only via `containerFetch` and the startup port check. That network is presumed private but unverified. The marker is a deployment claim, not a proof: the bot trusts it only because the Worker (not the Operator) sets it. A wildcard bind without exactly this marker is refused. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Worker secret, e.g. `smoke-throwaway:<channel snowflake in the TWO Staging guild>` |
 | `TWO_INTERNAL_KEYS` | Worker secret `web-staging:<64 hex>`; never a var, never logged |
-| `TWO_INTERNAL_ALLOW_VOICE_MOVE` | Optional staging Worker secret. Forwarded only as exactly `1` with the private receiver enabled and `TWO_DEPLOY_ENV=staging`. The container repeats the staging and exact-value checks at bind. |
+| `TWO_INTERNAL_ALLOW_VOICE_MOVE` | Optional staging Worker secret. Forwarded only as exactly `1` with the private receiver enabled and `TWO_DEPLOY_ENV=staging`. The container repeats those checks at bind. Its wildcard listener also requires the private relay's per-request lease deadline. |
 
 `NOT_FORWARDED` in `wrangler/src/container-env.ts` deliberately excludes the
 following. Setting them as Worker secrets cannot change the container's
@@ -177,6 +177,26 @@ Before enabling self-move, verify the receiver can write terminal receipts and t
 [voice receipt migration](../crates/cutover/migrations/0481_internal_voice_move_audit.sql)
 is applied. Use the existing exclusive finite staging window with verified serving and
 rollback identities, a dedicated account and channels, and cleanup within that window.
+
+The manual [staging-voice-move workflow](../.github/workflows/staging-voice-move.yml)
+exercises lease selection and cleanup on the exact serving main SHA when
+`verify_lease` is selected. The protected staging lease records `voiceMove: true`
+at acquisition. Ordinary leases omit it. Rebinding clears it. The DO caps the
+private deadline at the lease expiry and rebuilds headers so caller input
+cannot grant a deadline. The receiver verifies the original signed bytes and
+uses the earlier of its normal wire deadline and the private deadline.
+
+The cleanup step releases the same run and attempt, then reads back
+`voiceMoveEnabled: false` and `running: false`. If the runner is interrupted
+before cleanup, the protected staging status read can confirm both fields
+after native expiry. Correlate its run, attempt, expiry, deployment and SHA.
+The native `staging_use` receipt also reports OFF and whether shutdown was
+confirmed. A failed shutdown can return OFF while the container still runs.
+
+Live move qualification needs a separately coordinated Web signer bound to
+the dedicated staging account's own authenticated session and two dedicated
+staging voice channels with verifiable Connect permissions and occupancy.
+
 Attaching the executor gives all signed verbs a five-second nonce deadline. The guild turn
 ends at adapter settlement. The child holds capacity through the audit, with up to five
 seconds beyond the wire deadline. An audit failure or timeout is logged as unconfirmed.

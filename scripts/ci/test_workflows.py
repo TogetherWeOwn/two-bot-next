@@ -95,6 +95,7 @@ JOB_INVENTORY = {
     "staging-recovery-capture.yml": {"capture"},
     # Manual read-only authenticated MCP prove-out (TOG-23456); pinned shape below.
     "staging-mcp-proveout.yml": {"proveout"},
+    "staging-voice-move.yml": {"verify-lease"},
     # Manual read-only staging ownership status read; pinned shape below.
     "staging-ownership-status.yml": {"status", "inventory"},
     "production-ownership-status.yml": {"guard", "status"},
@@ -4845,6 +4846,11 @@ def workflow_policy_errors(workflows):
             # above; the generic environment scan below would flag its
             # staging Environment binding.
             errors.extend(staging_mcp_proveout_errors(workflow))
+            continue
+        if name == "staging-voice-move.yml":
+            contract = Path(__file__).parent / "fixtures/staging_voice_move_workflow.json"
+            if workflow != json.loads(contract.read_text()):
+                errors.append(f"{name}: expected the reviewed dispatch, lease and cleanup steps")
             continue
         if name == "gradual-promote-proof.yml":
             # Manual gradual-promote proof caller (passive until the fixture

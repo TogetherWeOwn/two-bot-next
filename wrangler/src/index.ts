@@ -28,7 +28,10 @@ import {
   OwnershipFence, OwnershipRefused, CONTROL_PATH, DEPLOYMENT_HEADER,
   authenticated, deploymentId, readChange, readControlBody, refused,
 } from "./ownership.ts";
-import { StagingLifecycle, STAGING_USE_PATH, parseStagingUseChange, type StagingUse } from "./staging-lifecycle.ts";
+import {
+  StagingLifecycle, STAGING_USE_PATH, VOICE_MOVE_LEASE_HEADER, parseStagingUseChange,
+  voiceMoveAllowed, type StagingUse,
+} from "./staging-lifecycle.ts";
 import { stagingDatabaseEvidence } from "./staging-database-fingerprint.ts";
 import { PREVIEW_HEADER, previewRefusal, readPreview } from "./staging-preview.ts";
 import {
@@ -268,7 +271,7 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_INTERNAL_CHANNEL_KEYS?: string;
   /** Signing keys: a secret, forwarded by its own explicit line and never logged. */
   TWO_INTERNAL_KEYS?: string;
-  /** Operator-set staging capability for the private self-move receiver. */
+  /** Operator-set staging ceiling. The wildcard receiver also needs a lease. */
   TWO_INTERNAL_ALLOW_VOICE_MOVE?: string;
 }
 
@@ -905,15 +908,19 @@ export class TwoBotContainer extends Container<Env> {
     return result.value;
   }
 
-  private async owned<T>(operation: () => Promise<T>): Promise<T> {
+  private async owned<T>(operation: (use?: StagingUse) => Promise<T>): Promise<T> {
     return this.gated(async () => {
       if (this.recoveryFailed) throw new OwnershipRefused("shutdown_unconfirmed");
       await this.ownership.require(this.id());
       if (!this.boundedStaging()) return operation();
-      await this.requireStagingUse();
-      try { return await operation(); }
+      const use = await this.requireStagingUse();
+      try { return await operation(use); }
       finally { await this.requireStagingUse(); }
     });
+  }
+
+  private voiceMoveConfigured(): boolean {
+    return this.boundedStaging() && ingressEnabled(this.env) && this.env.TWO_INTERNAL_ALLOW_VOICE_MOVE === "1";
   }
 
   /** Unmounted composition. Static so the DO instance exposes no snapshot RPC. */
@@ -1006,6 +1013,8 @@ export class TwoBotContainer extends Container<Env> {
     // cannot upload artifacts, so native expiry also leaves a runtime receipt.
     console.log(JSON.stringify({ event: "staging_use", action, outcome, environment: "staging",
       observed_at: new Date().toISOString(), running: this.ctx.container?.running ?? false,
+      ...(action === "release" || (action === "expiry" && use
+        && (use.phase === "released" || Date.now() >= use.expiresAt)) ? { voice_move_enabled: false } : {}),
       ...(use ? { run_id: use.runId, run_attempt: use.runAttempt, expires_at_ms: use.expiresAt,
         deployment_id: use.deploymentId, sha: use.sha, epoch: use.epoch } : {}) }));
   }
@@ -1366,6 +1375,7 @@ export class TwoBotContainer extends Container<Env> {
     if ("refusal" in checked) return checked.refusal;
     const body = await readBody(request, requestId, this.lastRelease);
     if ("refusal" in body) return body.refusal;
+    const forwardingDeadline = Date.now() + REQUEST_TIMEOUT_MS;
     const forward = forwardRequest(
       `http://c${ACTIONS_PATH}`,
       checked.headers,
@@ -1380,9 +1390,15 @@ export class TwoBotContainer extends Container<Env> {
     // signed action and never proves the receiver stood down.
     const signal = forward.signal;
     try {
-      return await this.owned(async () => {
-        await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
+      return await this.owned(async (use) => {
+        const owner = await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
         if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
+        const identity = { deploymentId: this.id(), sha: this.env.CONTAINER_RELEASE ?? "", owner };
+        if (use && this.voiceMoveConfigured() && voiceMoveAllowed(use, identity) && !signal.aborted) {
+          // The signed bytes are untouched. Neither ingress allowlist accepts
+          // this private header. Even late delivery cannot outlive the grant.
+          forward.headers.set(VOICE_MOVE_LEASE_HEADER, String(Math.min(use.expiresAt, forwardingDeadline)));
+        }
         let upstream: Response;
         try {
           upstream = await deadlineFetch(this.containerFetch(forward, RECEIVER_PORT), signal);
@@ -1509,6 +1525,9 @@ export class TwoBotContainer extends Container<Env> {
         let use = await this.stagingUse.read();
         if (change) {
           if (change.action === "acquire") {
+            if (change.voiceMove && !this.voiceMoveConfigured()) {
+              throw new OwnershipRefused("voice_move_unavailable");
+            }
             await this.requireRecoveryDatabase();
             use = await this.stagingUse.acquire(change, identity,
               () => this.stopStagingUse(), (expiry) => this.scheduleStagingExpiry(expiry));
@@ -1527,6 +1546,7 @@ export class TwoBotContainer extends Container<Env> {
         // Acquisition authorizes, but does not itself start or certify the
         // container. The pipeline must probe and verify the exact build next.
         return Response.json({ deploymentId: id, sha: identity.sha, owner, use: use ?? null,
+          voiceMoveEnabled: !this.recoveryFailed && this.voiceMoveConfigured() && voiceMoveAllowed(use, identity),
           running: this.ctx.container?.running ?? false }, {
           headers: withSecurityHeaders({ "cache-control": "no-store" }),
         });

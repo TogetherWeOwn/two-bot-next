@@ -1636,12 +1636,17 @@ async fn receive(
         return read_voice_snapshot(state, id, key, action).await;
     }
     if decision.action == "voice.move_member" {
+        let Some(deadline) =
+            voice_move::lease_deadline(&state.config, &parts.headers, wire_deadline)
+        else {
+            return reject(Failure::code(ErrorCode::ActionNotAllowed), action);
+        };
         return match voice_move::execute(
             state,
             decision,
             permit,
             (id, headers.auth.nonce),
-            wire_deadline,
+            deadline,
         )
         .await
         {

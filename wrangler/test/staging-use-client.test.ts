@@ -70,6 +70,22 @@ test("staging client: stop requires a confirmed stop on the same epoch and activ
   assert.equal(wrongRun.calls.length, 1);
 });
 
+test("staging client sends self-move selection only on acquire and rejects missing ON readback", async () => {
+  const selected = { ...args, voiceMove: true };
+  const baseline = Response.json({ ...state, use: null, voiceMoveEnabled: false });
+  const h = responses([baseline, Response.json({ ...state, voiceMoveEnabled: true })]);
+  const receipt = await stagingUse(selected, h.send, async () => {}, clock);
+  assert.equal(JSON.parse(String(h.calls[1].init.body)).voiceMove, true);
+  assert.equal(receipt.voiceMoveEnabled, true);
+  const old = responses([Response.json(state), Response.json(state)]);
+  await assert.rejects(stagingUse(selected, old.send, async () => {}, clock), /staging_voice_move_unconfirmed/);
+  const unused = responses([]);
+  await assert.rejects(stagingUse({ ...selected, action: "release" }, unused.send, async () => {}, clock),
+    /staging_voice_move_invalid/);
+  assert.equal(unused.calls.length, 0);
+  assert.equal(parseStagingState({ ...state, voiceMoveEnabled: "false" }), null);
+});
+
 test("staging client CLI: stop defaults its timeout when the override is unset", () => {
   const dir = mkdtempSync(join(tmpdir(), "staging-use-cli-test-"));
   try {

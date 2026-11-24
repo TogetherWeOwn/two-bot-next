@@ -1,0 +1,83 @@
+{
+  "name": "staging-voice-move",
+  "on": {
+    "workflow_dispatch": {
+      "inputs": {
+        "verify_lease": {
+          "description": "Exercise the staging self-move lease and prove it returns to OFF",
+          "type": "boolean",
+          "default": "false"
+        }
+      }
+    }
+  },
+  "permissions": {},
+  "concurrency": {
+    "group": "${{ inputs.verify_lease && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1 && 'staging-lifecycle' || format('staging-voice-move-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
+    "cancel-in-progress": "false",
+    "queue": "max"
+  },
+  "jobs": {
+    "verify-lease": {
+      "if": "inputs.verify_lease && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1",
+      "environment": "staging",
+      "permissions": {
+        "contents": "read"
+      },
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": "10",
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "persist-credentials": "false",
+            "fetch-depth": "1"
+          }
+        },
+        {
+          "uses": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+          "with": {
+            "node-version": "22",
+            "package-manager-cache": "false"
+          }
+        },
+        {
+          "name": "Acquire the exact staging lease with self-move selected",
+          "id": "use",
+          "env": {
+            "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+            "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+            "STAGING_USE_EXPECTED_SHA": "${{ github.sha }}",
+            "STAGING_USE_MINUTES": "15",
+            "STAGING_USE_VOICE_MOVE": "1",
+            "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-voice-move-start.jsonl"
+          },
+          "run": "node wrangler/scripts/staging-use-pipeline.mjs begin"
+        },
+        {
+          "name": "Release the same lease and read back OFF",
+          "if": "always() && steps.use.outputs.expires_at != ''",
+          "env": {
+            "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+            "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+            "STAGING_USE_EXPIRES_AT": "${{ steps.use.outputs.expires_at }}",
+            "STAGING_USE_VOICE_MOVE": "1",
+            "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-voice-move-stop.jsonl"
+          },
+          "run": "node wrangler/scripts/staging-use-pipeline.mjs finish"
+        },
+        {
+          "name": "Retain lease and readback evidence",
+          "if": "always() && steps.use.outcome != 'skipped'",
+          "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "with": {
+            "name": "staging-voice-move-lease-${{ github.run_id }}-${{ github.run_attempt }}",
+            "path": "${{ runner.temp }}/staging-voice-move-start.jsonl\n${{ runner.temp }}/staging-voice-move-stop.jsonl\n",
+            "if-no-files-found": "error",
+            "retention-days": "14"
+          }
+        }
+      ]
+    }
+  }
+}
