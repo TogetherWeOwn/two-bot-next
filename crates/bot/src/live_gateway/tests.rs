@@ -188,6 +188,7 @@ async fn cancelling_or_timing_out_a_committed_reservation_withdraws_delivery() {
     assert!(live.recovery().is_some());
     watermark.0.lock().expect("fake watermark").ack = Some(Ack::Pending);
     assert!(live.receive(VOICE, AT, |_| false).now_or_never().is_none());
+    assert!(live.0.as_ref().expect("intake").active.is_none());
     receive(&mut live, VOICE);
     assert!(live.recovery().is_none());
     assert_eq!(watermark.0.lock().expect("fake watermark").seq, 5);
@@ -397,8 +398,7 @@ async fn voice_only_is_encoded_once_in_receive_order_and_retried_unchanged() {
 
 #[tokio::test(start_paused = true)]
 async fn rejected_or_superseded_baselines_cannot_send() {
-    let watermark = FakeWatermark::new(0);
-    let (mut live, receiver) = LiveGateway::for_guild(GUILD, watermark.clone());
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, FakeWatermark::new(0));
     let scheduled_event = |field: &str, value: Value| {
         let mut row = event_row(91);
         row[field] = value;
@@ -418,6 +418,8 @@ async fn rejected_or_superseded_baselines_cannot_send() {
     ];
     let fixture = decoded(TOPOLOGY);
     let extra = fixture["invalid"].as_array().expect("invalid dispatches");
+    // Each completed old generation reserves a marker (+2) and a voice delta (+1).
+    let current_seq = (invalidations.len() + extra.len() + 1) * 3 + 2;
     let invalidations = invalidations
         .into_iter()
         .chain(extra.iter().map(Value::to_string));
@@ -441,7 +443,6 @@ async fn rejected_or_superseded_baselines_cannot_send() {
     let current = begin(&mut live);
     complete(&mut live, &stale);
     receive(&mut live, VOICE);
-    let current_seq = watermark.0.lock().expect("fake watermark").seq + 2;
     complete(&mut live, &current);
     receive(&mut live, VOICE);
 
