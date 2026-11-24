@@ -70,7 +70,7 @@ RUN . /etc/os-release && test "$VERSION_CODENAME" = trixie \
 
 # The base provides glibc, CA trust data and uid/gid 65532. Add only the
 # official libgcc library, copyright files and truthful status.d records.
-FROM gcr.io/distroless/base-nossl-debian13:nonroot@sha256:89815d620ac01d8de13cdaf04d19ed874447ca2296d4985b14b818f6e5e47854 AS runtime
+FROM gcr.io/distroless/base-nossl-debian13:nonroot@sha256:4006ac92504be607b70de01d1f64f38288c69fcd8faa820f6d3aed266ea32ac5 AS runtime
 
 # Non-secret build provenance (main #137/#156), recorded as image labels.
 ARG BOT_BUILD_REVISION=unknown
