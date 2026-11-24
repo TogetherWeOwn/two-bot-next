@@ -57,14 +57,14 @@ def verify_main(env, api=github):
             "dispatch_is_not_current_main")
 
 
-def plan_manifest(raw, digest):
+def plan_manifest(raw, digest, artifact_name=PLAN_ARTIFACT):
     require(len(raw) <= MAX_PLAN and matches(DIGEST, digest),
             "invalid_plan_archive")
     require(f"sha256:{sha256(raw).hexdigest()}" == digest, "plan_archive_digest_mismatch")
     try:
         with ZipFile(BytesIO(raw)) as archive:
             members = archive.infolist()
-            require(len(members) == 1 and members[0].filename == f"{PLAN_ARTIFACT}.json"
+            require(len(members) == 1 and members[0].filename == f"{artifact_name}.json"
                     and 0 < members[0].file_size <= MAX_PLAN, "invalid_plan_archive")
             return mapping(decode(archive.read(members[0])))
     except (BadZipFile, RuntimeError, OSError, ValueError, NotImplementedError):
@@ -108,16 +108,16 @@ def plan_projection(plan):
             "cutover_projection_sha256": cutover_digest, "store_projection_sha256": store_digest}
 
 
-def authenticated_plan(run_id, api=github):
+def authenticated_plan(run_id, api=github, *, workflow=PLAN_WORKFLOW, artifact_name=PLAN_ARTIFACT):
     require(matches(RUN_ID, run_id), "invalid_plan_run_id")
     route = f"actions/runs/{run_id}"
     run = mapping(api(route))
-    run_identity(run, PLAN_WORKFLOW, "workflow_dispatch")
+    run_identity(run, workflow, "workflow_dispatch")
     require(run.get("id") == int(run_id) and run.get("run_attempt") == 1
             and run.get("status") == "completed" and run.get("conclusion") == "success", "invalid_plan_run")
     jobs = mapping(api(f"{route}/attempts/1/jobs?per_page=4"))
-    expected = {"staging-migrate (plan)": "success", "staging-migrate (claim)": "skipped",
-                "staging-migrate (apply)": "skipped"}
+    name = Path(workflow).stem
+    expected = {f"{name} (plan)": "success", f"{name} (claim)": "skipped", f"{name} (apply)": "skipped"}
     rows = sequence(jobs.get("jobs"))
     require(jobs.get("total_count") == len(rows) == len(expected)
             and {mapping(row).get("name"): row.get("conclusion") for row in rows} == expected, "invalid_plan_jobs")
@@ -126,10 +126,10 @@ def authenticated_plan(run_id, api=github):
     require(listing.get("total_count") == len(artifacts) == 1, "invalid_plan_artifacts")
     artifact = mapping(artifacts[0])
     artifact_id = number(artifact.get("id"))
-    require(artifact_id > 0 and artifact.get("name") == PLAN_ARTIFACT and artifact.get("expired") is False
+    require(artifact_id > 0 and artifact.get("name") == artifact_name and artifact.get("expired") is False
             and 0 < number(artifact.get("size_in_bytes")) <= MAX_PLAN, "invalid_plan_artifact")
     digest = artifact.get("digest")
-    plan = plan_manifest(api(f"actions/artifacts/{artifact_id}/zip", binary=True), digest)
+    plan = plan_manifest(api(f"actions/artifacts/{artifact_id}/zip", binary=True), digest, artifact_name)
     return plan, {"run_id": int(run_id), "artifact_id": artifact_id, "archive_digest": digest}
 
 
