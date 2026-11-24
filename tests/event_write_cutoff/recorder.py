@@ -48,23 +48,25 @@ class Handler(BaseHTTPRequestHandler):
         raw = b"" if body is None else json.dumps(body).encode()
         self.send_response(status)
         self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Connection", "close")
+        self.close_connection = True
         if raw:
             self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(raw)
 
-    def record(self, outcome):
+    def record(self, operation, outcome):
         with self.server.lock, (self.server.state / "journal.jsonl").open("a") as out:
-            print(json.dumps([self.command, self.path, outcome]), file=out, flush=True)
+            print(json.dumps([self.command, self.path, operation, outcome]), file=out, flush=True)
 
-    def wait_at(self, phase):
-        self.record(phase)
+    def wait_at(self, operation, phase):
+        self.record(operation, phase)
         deadline = time.monotonic() + 6
         while time.monotonic() < deadline:
             if (self.server.state / "resume").exists():
                 return
             time.sleep(0.01)
-        self.record("barrier-timeout")
+        self.record(operation, "barrier-timeout")
         raise TimeoutError("fixture barrier deadline")
 
     def dispatch(self):
@@ -78,21 +80,26 @@ class Handler(BaseHTTPRequestHandler):
             return
         body = json.loads(self.rfile.read(length)) if length else {}
         if event_write(self.command, path):
-            mode_file = self.server.state / "barrier"
-            mode = mode_file.read_text().strip()
+            operation = {"POST": "create", "PATCH": "cancel" if body.get("status") == 4 else "edit",
+                         "DELETE": "delete"}.get(self.command)
+            if operation is None:
+                self.record("unknown", "unexpected")
+                self.reply(405)
+                return
+            mode = (self.server.state / "barrier").read_text().strip()
             if mode == "before":
-                self.wait_at("paused-before-permission")
+                self.wait_at(operation, "paused-before-permission")
             # The operator owns this state outside both Bot processes and Postgres.
             # Missing or unrecognized state leaves event writes denied.
             policy = self.server.state / "policy"
             permissions = CREATE_EVENTS | MANAGE_EVENTS if policy.exists() and policy.read_text() == "open\n" else 0
             if not permits_event(self.command, permissions, created_by_bot=True):
-                self.record("denied")
+                self.record(operation, "denied")
                 self.reply(403, {"code": 50013, "message": "Missing Permissions"})
                 return
-            self.record("applied")
+            self.record(operation, "applied")
             if mode == "after":
-                self.wait_at("paused-after-effect")
+                self.wait_at(operation, "paused-after-effect")
                 self.close_connection = True
                 return
             self.reply(200, {
@@ -101,15 +108,15 @@ class Handler(BaseHTTPRequestHandler):
                 "scheduled_start_time": "2099-01-01T00:00:00Z",
             })
         elif self.command == "PUT" and path == ROLE_PATH:
-            self.record("applied")
+            self.record("role", "applied")
             self.reply(204)
         elif self.command == "POST" and path == MESSAGE_PATH:
-            self.record("applied")
-            self.reply(200, {"id": MESSAGE})
+            self.record("announcement", "applied")
+            self.reply(200, {"id": MESSAGE, "channel_id": CHANNEL})
         elif self.command == "GET":
             self.read_route(path)
         else:
-            self.record("unexpected")
+            self.record("unknown", "unexpected")
             self.reply(404, {"code": 0, "message": "Unexpected fixture route"})
 
     def read_route(self, path):

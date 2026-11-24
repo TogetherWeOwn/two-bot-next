@@ -143,6 +143,9 @@ class Rehearsal:
                     "LISTEN_ADDR": f"127.0.0.1:{port + 100}", "DISCORD_TOKEN": self.token,
                     "GUILD_ID": GUILD, "DATABASE_URL": f"postgres://postgres:{self.password}@127.0.0.1/{self.database}",
                     "TWO_DATABASE_TLS": "local-only", "DISCORD_GATEWAY_URL": "ws://127.0.0.1:9999",
+                    # Park background REST clients. The shipping internal receiver
+                    # ignores this override and uses its actual Discord TLS path.
+                    "DISCORD_API_BASE": "invalid fixture background origin",
                     "TWO_INTERNAL_ACTIONS": "1", "TWO_INTERNAL_BIND": f"127.0.0.1:{port}",
                     "TWO_INTERNAL_KEYS": f"rehearsal:{self.key}", "TWO_INTERNAL_CALLERS": "rehearsal:fixture",
                     "TWO_INTERNAL_CHANNEL_KEYS": f"ann:{CHANNEL}", "TWO_INTERNAL_ROLE_KEYS": f"member:{ROLE}",
@@ -188,7 +191,7 @@ class Rehearsal:
     def restore_database(self):
         archive = run("docker", "exec", self.pg, "pg_dump", "-U", "postgres", "--format=p", self.database)
         original = self.database
-        self.database = "event_cutoff_restored"
+        self.database = f"event_cutoff_restored_{self.generation + 1}"
         self.sql(f"CREATE DATABASE {self.database};", "postgres")
         self.sql(archive.decode())
         self.generation += 1
@@ -202,7 +205,10 @@ class Rehearsal:
         with ThreadPoolExecutor(max_workers=1) as worker:
             response = worker.submit(self.request, which, key, body)
             try:
-                wait_for(lambda: any(row[2] == outcome for row in self.journal()[since:]), outcome, timeout=4)
+                wait_for(lambda: response.done() or any(row[3] == outcome for row in self.journal()[since:]),
+                         outcome, timeout=4)
+                require(any(row[3] == outcome for row in self.journal()[since:]),
+                        f"Receiver answered before the {outcome} barrier")
                 require(self.claim(key) == "in_flight", "Missing committed in-flight claim at barrier")
                 require(self.sql("SELECT count(*) FROM discord_send_admission WHERE in_flight;") == "1",
                         "Missing Bot token permit at barrier")
@@ -223,7 +229,6 @@ class Rehearsal:
         create = {**update, "event_key": "unmapped"}
         cancel = {"action": "event.cancel", "event_key": "mapped"}
         role = {"action": "role.assign", "discord_id": MEMBER, "role_key": "member"}
-        announcement = {"action": "announcement.post", "channel_key": "ann", "body": "Synthetic announcement"}
         self.start_bot("current")
         self.start_bot("retained")
         cases = (("create", create), ("edit", update), ("cancel", cancel))
@@ -233,9 +238,15 @@ class Rehearsal:
                 answer = self.paused(which, f"{which}-{label}", body, "before")
                 require(answer["code"] == "discord_rejected", "Event denial was not a Discord rejection")
             require(self.request(which, f"{which}-role", role)["outcome"] == "assigned", "Role was not assigned")
-            require(self.request(which, f"{which}-announcement", announcement)["status"] == 200,
-                    "Announcement was not posted")
 
+        self.stop_bot("current")
+        self.stop_bot("retained")
+        self.restore_database()
+        self.restart_recorder_with_cutoff()
+        self.start_bot("retained")
+        answer = self.request("retained", "rollback-create", create)
+        require(answer["code"] == "discord_rejected", "A restored rollback bypassed the cutoff")
+        self.start_bot("current")
         self.set_policy("open")
         key = "lost-create"
         answer = self.paused("current", key, create, "after")
@@ -245,22 +256,35 @@ class Rehearsal:
         require(answer["code"] == "needs_reconciliation", "Rollback replay did not preserve ambiguity")
         self.stop_bot("retained")
         self.restore_database()
-        run("docker", "stop", "-t", "1", self.recorder)
-        self.start_recorder()
-        require((self.work / "policy").read_text() == "closed\n", "Restore or restart reopened event authority")
+        self.restart_recorder_with_cutoff()
         self.start_bot("retained")
         require(self.claim(key) == "unknown", "Restored claim lost ambiguity")
         answer = self.request("retained", key, create)
         require(answer["code"] == "needs_reconciliation", "Restored replay did not preserve ambiguity")
 
         entries = self.journal()
-        require(sum(row[2] == "denied" for row in entries) == 6, "Expected six event denials")
-        require(sum(row[2] == "applied" and "/scheduled-events" in row[1] for row in entries) == 1,
-                "Expected one pre-cutoff event effect")
-        require(sum(row[0] == "PUT" and row[2] == "applied" for row in entries) == 2, "Expected two role writes")
-        require(sum(row[1].endswith("/messages") and row[2] == "applied" for row in entries) == 2,
-                "Expected two announcements")
-        print(json.dumps({"recorder": entries, "verdict": "passed"}), flush=True)
+        denied = [operation for _, _, operation, outcome in entries if outcome == "denied"]
+        require(denied == ["create", "edit", "cancel", "create", "edit", "cancel", "create"],
+                "Expected ordered event denials on both runtimes and after restore")
+        applied = [operation for _, _, operation, outcome in entries if outcome == "applied"]
+        require(applied == ["role", "role", "create"], "Expected two role writes and one pre-cutoff event effect")
+        require(all(row[3] != "unexpected" for row in entries), "Unexpected fixture mutation route")
+        print(json.dumps({"recorder": entries, "event_and_role_verdict": "passed"}), flush=True)
+
+    def restart_recorder_with_cutoff(self):
+        run("docker", "stop", "-t", "1", self.recorder)
+        self.start_recorder()
+        require((self.work / "policy").read_text() == "closed\n", "Restore or restart reopened event authority")
+
+    def announcement_control(self, which):
+        self.set_policy("closed")
+        self.start_bot(which)
+        body = {"action": "announcement.post", "channel_key": "ann", "body": "Synthetic announcement"}
+        answer = self.request(which, f"{which}-announcement", body)
+        writes = sum(operation == "announcement" and outcome == "applied"
+                     for _, _, operation, outcome in self.journal())
+        print(json.dumps({"runtime": which, "announcement_recorder_writes": writes}), flush=True)
+        return answer["status"] == 200 and writes == 1
 
 
 def main():
@@ -285,6 +309,22 @@ def main():
         rehearsal = Rehearsal(Path(directory), cleanup, images)
         rehearsal.start(revisions["current"])
         rehearsal.exercise()
+
+    # An ambiguous announcement can hold the token-wide lane. Give each
+    # distinct image its own isolated probe so a refusal cannot mask the other.
+    seen = set()
+    announcements_passed = True
+    for which, image in images.items():
+        if image in seen:
+            continue
+        seen.add(image)
+        with tempfile.TemporaryDirectory(prefix="two-bot-event-cutoff-") as directory, contextlib.ExitStack() as cleanup:
+            rehearsal = Rehearsal(Path(directory), cleanup, images)
+            rehearsal.start(revisions["current"])
+            passed = rehearsal.announcement_control(which)
+            announcements_passed = announcements_passed and passed
+    require(announcements_passed, "Announcement positive control did not reach and settle at the recorder")
+    print(json.dumps({"verdict": "passed"}), flush=True)
 
 
 if __name__ == "__main__":
