@@ -1624,6 +1624,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         // A cold RESUME replayed missed dispatches but cannot
                         // populate a fresh cache. IDENTIFY only once RESUMED has
                         // committed; READY + GuildCreate then rebuild voice state.
+                        // The realtime snapshot uses the same bootstrap.
                         if committed.await.is_err() {
                             return Ok(None);
                         }
@@ -1905,9 +1906,11 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         };
                         // Only READY sets the current user, so a RESUMED without
                         // one is a cold resume across a process restart.
+                        // A retired realtime snapshot also needs a fresh READY.
                         let mut committed = None;
-                        if let (Some(voice), Some(dispatch)) = (voice.as_ref(), dispatch.as_ref()) {
-                            if matches!(dispatch.event, Event::Resumed) && voice.needs_bootstrap(pipeline.cache()) {
+                        if let Some(dispatch) = dispatch.as_ref() {
+                            if matches!(dispatch.event, Event::Resumed) && (live.is_some() ||
+                                voice.as_ref().is_some_and(|voice| voice.needs_bootstrap(pipeline.cache()))) {
                                 let (sender, receiver) = tokio::sync::oneshot::channel();
                                 committed = Some(sender);
                                 bootstrap = Some(receiver);

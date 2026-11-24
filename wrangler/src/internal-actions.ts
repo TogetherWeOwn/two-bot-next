@@ -279,6 +279,7 @@ export async function handleActionsIngress(
   clientKey: string,
   forward: (sanitized: Request) => Promise<Response>,
   release: unknown = UNKNOWN_RELEASE,
+  snapshotKeyId?: string,
 ): Promise<Response> {
   if (!isActionsRequest(request)) return notFound();
   const started = performance.now();
@@ -293,7 +294,10 @@ export async function handleActionsIngress(
   inFlight++;
   let forwardPromise: Promise<Response> | undefined;
   try {
-    const body = await readBody(request, requestId, release);
+    const snapshotIntake = checked.headers.get("x-two-key-id") === snapshotKeyId
+      ? AbortSignal.any([request.signal, AbortSignal.timeout(LIVE_SNAPSHOT_TIMEOUT_MS)])
+      : undefined;
+    const body = await readBody(request, requestId, release, snapshotIntake);
     if ("refusal" in body) return body.refusal;
     const snapshot = isLiveSnapshotAction(body.bytes);
     const remaining = snapshot

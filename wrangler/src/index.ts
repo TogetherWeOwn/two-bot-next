@@ -272,7 +272,7 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_INTERNAL_KEYS?: string;
   /** Operator-set staging capability for the private self-move receiver. */
   TWO_INTERNAL_ALLOW_VOICE_MOVE?: string;
-  TWO_INTERNAL_ALLOW_LIVE_SNAPSHOT?: string;
+  TWO_INTERNAL_LIVE_SNAPSHOT_ENABLED?: string;
   TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID?: string;
   TWO_INTERNAL_LIVE_SNAPSHOT_SECRET?: string;
 }
@@ -280,7 +280,7 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
 function liveSnapshotScope(env: Env): SnapshotScope | undefined {
   const keyId = env.TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID;
   if (env.TWO_DEPLOY_ENV === "staging" && env.STAGING_RUNTIME_POLICY === "bounded" &&
-      ingressEnabled(env) && env.TWO_INTERNAL_ALLOW_LIVE_SNAPSHOT === "1" &&
+      ingressEnabled(env) && env.TWO_INTERNAL_LIVE_SNAPSHOT_ENABLED === "1" &&
       keyId && /^[\w.:-]{1,128}$/.test(keyId) && env.TWO_INTERNAL_LIVE_SNAPSHOT_SECRET &&
       isLiveId(env.GUILD_ID)) {
     return { keyId, guildId: env.GUILD_ID };
@@ -805,7 +805,7 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
     }
     const snapshot = liveSnapshotScope(env);
     if (snapshot && env.TWO_INTERNAL_LIVE_SNAPSHOT_SECRET) {
-      vars["TWO_INTERNAL_ALLOW_LIVE_SNAPSHOT"] = "1";
+      vars["TWO_INTERNAL_LIVE_SNAPSHOT_ENABLED"] = "1";
       vars["TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID"] = snapshot.keyId;
       vars["TWO_INTERNAL_LIVE_SNAPSHOT_SECRET"] = env.TWO_INTERNAL_LIVE_SNAPSHOT_SECRET;
     }
@@ -2290,6 +2290,7 @@ export default {
           return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         },
         env.CONTAINER_RELEASE,
+        liveSnapshotScope(env)?.keyId,
       );
     }
 

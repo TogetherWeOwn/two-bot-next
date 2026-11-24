@@ -41,17 +41,13 @@ The Web hub requires a snapshot covering its highest observed sequence after
 a gap. A cut expires 30 seconds after its observation and remains unavailable
 while it exceeds the snapshot size limit.
 
-The Worker dispatches `live.snapshot` on the existing signed `POST /internal/actions`
-at Web's `BOT_ENDPOINT_URL`. The Durable Object checks ownership and staging use
-and forwards the exact signed bytes to the private receiver. Ordinary actions
-keep their envelope. Bounded staging, both receiver switches and
-`TWO_INTERNAL_ALLOW_LIVE_SNAPSHOT=1` are required. Rust uses the dedicated
-`TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID` and `TWO_INTERNAL_LIVE_SNAPSHOT_SECRET` for
-the Bot's configured `GUILD_ID`.
-
-The Worker caps direct v1 JSON at 1 MiB with `Cache-Control: no-store`.
-Its 2.25-second budget fits Web's 2.5-second deadline.
-Outbound delivery and the Web-first rollout have a [separate qualification](https://github.com/TogetherWeOwn/two-web-next/issues/2705).
+Web uses `BOT_ENDPOINT_URL` and sends `live.snapshot` to `POST /internal/actions`.
+The Worker forwards the exact signed bytes through the existing ownership and staging-use
+gate. Ordinary actions keep their envelope. Bounded staging, both receiver switches and
+`TWO_INTERNAL_LIVE_SNAPSHOT_ENABLED=1` are required. The dedicated read credential uses
+`TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID` and `TWO_INTERNAL_LIVE_SNAPSHOT_SECRET` for `GUILD_ID`.
+The relay serves 1 MiB at most, with `Cache-Control: no-store`, inside Web's 2.5-second deadline.
+[Web live qualification](https://github.com/TogetherWeOwn/two-web-next/issues/2705) covers outbound delivery and the Web-first rollout.
 
 No signing key, secret custodian or export authority is supplied by this code.
 Key creation and transfer into the website's staging secret store stay on HOLD

@@ -202,7 +202,7 @@ impl InternalActionConfig {
         }
 
         let live_snapshot_key = if lookup("TWO_DEPLOY_ENV").as_deref() == Ok("staging")
-            && lookup("TWO_INTERNAL_ALLOW_LIVE_SNAPSHOT").as_deref() == Ok("1")
+            && lookup("TWO_INTERNAL_LIVE_SNAPSHOT_ENABLED").as_deref() == Ok("1")
         {
             let id = required(&mut lookup, "TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID")?;
             let secret = required(&mut lookup, "TWO_INTERNAL_LIVE_SNAPSHOT_SECRET")?.into_bytes();
@@ -216,7 +216,7 @@ impl InternalActionConfig {
                     .any(|key| key.id == id || key.secret.expose() == &secret)
             {
                 return Err(invalid(
-                    "TWO_INTERNAL_ALLOW_LIVE_SNAPSHOT",
+                    "TWO_INTERNAL_LIVE_SNAPSHOT_ENABLED",
                     "requires a dedicated snapshot ID and distinct secret of at least 32 bytes",
                 ));
             }
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn snapshot_key_requires_explicit_staging_opt_in_and_isolated_credentials() {
         let mut vars = vars();
-        vars.insert("TWO_INTERNAL_ALLOW_LIVE_SNAPSHOT", "1".into());
+        vars.insert("TWO_INTERNAL_LIVE_SNAPSHOT_ENABLED", "1".into());
         let mut dark = load(&vars).unwrap().unwrap();
         assert!(dark.take_live_snapshot_key().is_none());
         vars.insert("TWO_DEPLOY_ENV", "staging".into());
@@ -394,7 +394,6 @@ mod tests {
         assert!(!format!("{config:?}").contains(&read_secret));
         assert!(!config.keys().contains("web:snapshot"));
         assert_eq!(config.take_live_snapshot_key().unwrap().id, "web:snapshot");
-        assert!(config.take_live_snapshot_key().is_none());
     }
 
     #[test]

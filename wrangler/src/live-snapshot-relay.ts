@@ -9,6 +9,7 @@ import { REQUEST_ID_HEADER, ensureRequestId } from "./request-id.ts";
 import { withSecurityHeaders } from "./security-headers.ts";
 import { isLiveId, isSnapshot } from "./live-snapshot-wire.ts";
 
+export { LIVE_SNAPSHOT_TIMEOUT_MS };
 export const LIVE_SNAPSHOT_BYTES = 1024 * 1024;
 const buckets = new TokenBuckets({ capacity: 20, refillPerSecond: 1 });
 let inFlight = 0;

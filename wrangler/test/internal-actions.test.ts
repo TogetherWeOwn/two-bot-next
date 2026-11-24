@@ -30,7 +30,7 @@ import {
   resetIngressLimits,
 } from "../src/internal-actions.ts";
 import {
-  request as signedSnapshot, scope, signature, snapshot, snapshotSecret, webSnapshot,
+  request as signedSnapshot, scope, signature, snapshot, snapshotStaging, stalledUpload, webSnapshot,
 } from "./fixtures/live-snapshot-peer.ts";
 
 const ID = "deployment-A";
@@ -580,17 +580,8 @@ const webSnapshotBody = (guildId = scope.guildId) => JSON.stringify({ action: "l
 const webSnapshotRequest = (payload = webSnapshotBody()) =>
   signedSnapshot(payload, webSnapshotUrl, String(Math.floor(Date.now() / 1000)), randomBytes(16).toString("hex"));
 function snapshotHarness(t: TestContext, enabled = true) {
-  const sha = "a".repeat(40);
-  const stagingUse: StagingUse = {
-    environment: "staging", phase: "active", deploymentId: ID, epoch: OWNER.epoch, sha,
-    runId: "100", runAttempt: 1, acquiredAt: Date.now(), expiresAt: Date.now() + 120_000,
-  };
-  return harness(t, {
-    ...ENABLED_ENV, TWO_DEPLOY_ENV: "staging", STAGING_RUNTIME_POLICY: "bounded",
-    CONTAINER_RELEASE: sha, GUILD_ID: scope.guildId,
-    TWO_INTERNAL_ALLOW_LIVE_SNAPSHOT: enabled ? "1" : undefined,
-    TWO_INTERNAL_LIVE_SNAPSHOT_KEY_ID: scope.keyId, TWO_INTERNAL_LIVE_SNAPSHOT_SECRET: snapshotSecret,
-  }, { stagingUse });
+  const { env, stagingUse } = snapshotStaging(ID, OWNER.epoch, enabled);
+  return harness(t, { ...ENABLED_ENV, ...env }, { stagingUse });
 }
 
 async function snapshotRefused(reply: Response, status: number, code: string) {
@@ -675,6 +666,17 @@ test("snapshot dispatch is default-off and requires a listening private receiver
     assert.equal(reply.headers.get("cache-control"), "no-store");
     assert.deepEqual(h.receiverCalls(), []);
   }
+});
+
+test("snapshot intake uses the Web deadline for a stalled signed upload", async (t) => {
+  const h = await snapshotHarness(t);
+  const timeout = new AbortController();
+  const deadline = t.mock.method(AbortSignal, "timeout", () => timeout.signal);
+  const pending = h.call(stalledUpload());
+  assert.ok(Number(deadline.mock.calls[0]?.arguments[0]) < webSnapshot.deadlineMs);
+  timeout.abort();
+  assert.equal((await pending).status, 408);
+  assert.deepEqual(h.seen, []);
 });
 
 test("snapshot relay requires the configured guild, key, owner and staging use", async (t) => {

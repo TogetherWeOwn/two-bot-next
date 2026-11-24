@@ -81,7 +81,7 @@ fn nonce() -> String {
     hex::encode(rand::random::<[u8; 16]>())
 }
 
-async fn begin(owner: &mut LiveGateway<Watermark>, at: WireTime) -> String {
+async fn begin(owner: &mut LiveGateway, at: WireTime) -> String {
     owner
         .receive(r#"{"op":0,"t":"READY","d":{}}"#, at, |_| false)
         .await;
@@ -96,7 +96,7 @@ async fn begin(owner: &mut LiveGateway<Watermark>, at: WireTime) -> String {
     nonce.expect("snapshot roster request")
 }
 
-async fn complete(owner: &mut LiveGateway<Watermark>, at: WireTime, roster_nonce: &str) {
+async fn complete(owner: &mut LiveGateway, at: WireTime, roster_nonce: &str) {
     let chunk = json!({"op":0,"t":"GUILD_MEMBERS_CHUNK","d":{"guild_id":"10","nonce":roster_nonce,
         "chunk_index":0,"chunk_count":1,"members":[{"user":{"id":"31"},"roles":[],"pending":false}]}});
     owner.receive(&chunk.to_string(), at, |_| false).await;
@@ -136,17 +136,17 @@ async fn signed_snapshot_http_covers_the_committed_cursor_and_withdraws_stale_or
     let owner = Arc::new(RwLock::new(live));
     let store = InternalActionStore::new(db.pool().clone());
     let secret = key();
-    let endpoint =
-        LiveSnapshotEndpoint::new(&owner, store.clone(), Some(credential(&secret, GUILD_ID)));
+    let endpoint = LiveSnapshotEndpoint::new(
+        Arc::clone(&owner),
+        store.clone(),
+        Some(credential(&secret, GUILD_ID)),
+    );
     let (app, gateway) = super::super::tests::snapshot_app(db.pool().clone(), Some(endpoint));
     let (disabled, _) = super::super::tests::snapshot_app(db.pool().clone(), None);
     let read = || request(&secret, KEY_ID, BODY, &nonce());
     let serve = async |request| app.clone().oneshot(request).await.unwrap();
-    closed(
-        disabled.oneshot(read()).await.unwrap(),
-        ErrorCode::ActionNotAllowed,
-    )
-    .await;
+    let no_endpoint = disabled.oneshot(read()).await.unwrap();
+    closed(no_endpoint, ErrorCode::ActionNotAllowed).await;
 
     let old = WireTime(OffsetDateTime::now_utc() - time::Duration::seconds(31));
     let unavailable = ErrorCode::DiscordUnavailable;
@@ -186,7 +186,8 @@ async fn signed_snapshot_http_covers_the_committed_cursor_and_withdraws_stale_or
     closed(serve(pull()).await, ErrorCode::Replayed).await;
 
     let other = Id(DiscordId::<GuildMarker>::new(11).into_nonzero());
-    let other_endpoint = LiveSnapshotEndpoint::new(&owner, store, Some(credential(&secret, other)));
+    let other_endpoint =
+        LiveSnapshotEndpoint::new(Arc::clone(&owner), store, Some(credential(&secret, other)));
     let wrong = request(&secret, KEY_ID, WRONG_GUILD, &nonce());
     closed(other_endpoint.handle(wrong).await, unavailable).await;
     *gateway.write().await = crate::gateway::GatewayState::Draining;
@@ -201,9 +202,12 @@ async fn snapshot_http_refuses_disabled_unauthorized_and_unbounded_requests() {
     let owner = Arc::new(RwLock::new(live));
     let store = InternalActionStore::new(db.pool().clone());
     let secret = key();
-    let endpoint =
-        LiveSnapshotEndpoint::new(&owner, store.clone(), Some(credential(&secret, GUILD_ID)));
-    let disabled = LiveSnapshotEndpoint::new(&owner, store, None);
+    let endpoint = LiveSnapshotEndpoint::new(
+        Arc::clone(&owner),
+        store.clone(),
+        Some(credential(&secret, GUILD_ID)),
+    );
+    let disabled = LiveSnapshotEndpoint::new(Arc::clone(&owner), store, None);
     let signed = |body| request(&secret, KEY_ID, body, &nonce());
 
     // Any accidental read of the owner would wait for the deadline.

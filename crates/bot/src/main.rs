@@ -467,7 +467,7 @@ async fn run(cli_args: &[String]) {
                 let (live, _) = two_bot::live_gateway::LiveGateway::for_guild(guild, pool.clone());
                 let owner = Arc::new(RwLock::new(live));
                 let snapshot = LiveSnapshotEndpoint::new(
-                    &owner,
+                    Arc::clone(&owner),
                     two_bot_core::internal_action_store::InternalActionStore::new(pool.clone()),
                     Some((key, two_bot_core::realtime_wire::Id(guild.into_nonzero()))),
                 );
@@ -949,7 +949,10 @@ async fn run(cli_args: &[String]) {
                     // unless TWO_MUSIC=1; the tap refuses non-staging guilds.
                     let voice = music_capture::MusicVoiceTap::wrap(voice, Some(guild_id));
 
-                    let intents = intents_from_env(&activation);
+                    let mut intents = intents_from_env(&activation);
+                    if live_snapshot_owner.is_some() {
+                        intents |= twilight_gateway::Intents::GUILD_SCHEDULED_EVENTS;
+                    }
                     // Voice-room game names need GUILD_PRESENCES; record
                     // whether this boot requested it so a missing game
                     // rename is diagnosable from logs alone (the flag may

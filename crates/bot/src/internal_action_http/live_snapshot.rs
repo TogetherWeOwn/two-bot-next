@@ -49,12 +49,12 @@ impl<W: SequenceWatermark> LiveSnapshotEndpoint<W> {
     /// Construct from trusted server state. With no credential scope, the
     /// endpoint refuses all reads without touching the store or owner.
     pub fn new(
-        owner: &Arc<RwLock<LiveGateway<W>>>,
+        owner: Arc<RwLock<LiveGateway<W>>>,
         store: InternalActionStore,
         scope: Option<(SigningKey, Id)>,
     ) -> Self {
         Self {
-            owner: Arc::downgrade(owner),
+            owner: Arc::downgrade(&owner),
             scope: scope.map(|(key, guild_id)| SnapshotScope {
                 key_id: key.id.clone(),
                 guild_id,

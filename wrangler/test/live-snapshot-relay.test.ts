@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { LIVE_SNAPSHOT_TIMEOUT_MS, MAX_BODY_BYTES, relayReceiverResponse } from "../src/internal-actions.ts";
+import { MAX_BODY_BYTES, relayReceiverResponse } from "../src/internal-actions.ts";
 import {
-  handleLiveSnapshotRelay, LIVE_SNAPSHOT_BYTES,
+  handleLiveSnapshotRelay, LIVE_SNAPSHOT_BYTES, LIVE_SNAPSHOT_TIMEOUT_MS,
 } from "../src/live-snapshot-relay.ts";
 import { DEPLOYMENT_HEADER } from "../src/ownership.ts";
 import {
