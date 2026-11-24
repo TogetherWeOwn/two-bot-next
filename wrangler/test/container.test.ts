@@ -900,8 +900,8 @@ test("staging self-move stamps only its selected lease and reads OFF after relea
     headers: { "content-type": "application/json", "x-two-key-id": "fixture",
       "x-two-timestamp": "1800000000", "x-two-nonce": "fixture",
       "x-two-signature": "fixture", [VOICE_MOVE_LEASE_HEADER]: String(window.expiresAt) } }));
-  assert.equal((await inert.bot.fetch(stagingUseRequest("acquire", selected))).status, 503);
-  assert.equal(inert.values.has(STAGING_USE_KEY), false);
+  const refusal = await inert.bot.fetch(stagingUseRequest("acquire", selected));
+  assert.deepEqual([refusal.status, (await refusal.json()).reason, inert.values.has(STAGING_USE_KEY)], [503, "staging_use_required", false]);
   assert.equal((await h.bot.fetch(stagingUseRequest("acquire", window))).status, 200);
   assert.equal((await off()).voiceMoveEnabled, false);
   const conflict = await h.bot.fetch(stagingUseRequest("acquire", selected));
