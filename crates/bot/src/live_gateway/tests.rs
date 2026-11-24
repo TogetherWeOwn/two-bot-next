@@ -113,6 +113,10 @@ fn chunk(nonce: &str) -> String {
         "chunk_index":0,"chunk_count":1,"members":[{"user":{"id":"31"},"roles":[],"pending":false}]}}).to_string()
 }
 
+fn active(live: &LiveGateway<FakeWatermark>) -> Option<&BaselineFence> {
+    live.0.as_ref().expect("intake").active.as_ref()
+}
+
 fn decoded(body: &[u8]) -> Value {
     serde_json::from_slice(body).expect("wire delta")
 }
@@ -125,7 +129,7 @@ async fn conflict_or_lost_ack_requires_a_new_covering_baseline() {
         receive(&mut live, READY);
         let old = begin(&mut live);
         complete(&mut live, &old);
-        assert!(live.recovery().is_some());
+        assert!(active(&live).is_some());
         receive(&mut live, VOICE); // Queue a confirmed delta at 3.
         {
             let mut store = watermark.0.lock().expect("fake watermark");
@@ -139,21 +143,22 @@ async fn conflict_or_lost_ack_requires_a_new_covering_baseline() {
         receive(&mut live, VOICE);
         receive(&mut live, VOICE);
         complete(&mut live, &old);
-        assert!(live.0.as_ref().expect("intake").active.is_none());
+        assert!(active(&live).is_none());
         assert_eq!(watermark.0.lock().expect("fake watermark").seq, 4);
 
         let fresh = begin(&mut live);
         complete(&mut live, &old);
-        assert!(live.recovery().is_none());
+        assert!(active(&live).is_none());
         complete(&mut live, &fresh);
-        let (recovery, generation) = live.recovery().expect("replacement published baseline");
-        assert!(recovery.is_current(generation));
-        let baseline = recovery.baseline().expect("replacement snapshot");
-        let snapshot = decoded(&baseline.snapshot);
+        let snapshot = {
+            let active = active(&live).expect("replacement published baseline");
+            assert!(active.recovery.is_current(&active.generation));
+            let baseline = active.recovery.baseline().expect("replacement snapshot");
+            decoded(&baseline.snapshot)
+        };
         assert_eq!(snapshot["seq"], 6);
         assert_eq!(snapshot["topics"]["members"][0]["userId"], "31");
         receive(&mut live, VOICE);
-        assert!(live.recovery().is_none());
         assert_eq!(watermark.0.lock().expect("fake watermark").seq, 7);
 
         let mut received = Vec::new();
@@ -180,17 +185,17 @@ async fn cancelling_or_timing_out_a_committed_reservation_withdraws_delivery() {
     let first = begin(&mut live);
     watermark.0.lock().expect("fake watermark").ack = Some(Ack::Pending);
     live.receive(&chunk(&first), AT, |_| false).await;
-    assert!(live.recovery().is_none());
+    assert!(active(&live).is_none());
     assert_eq!(watermark.0.lock().expect("fake watermark").seq, 2);
 
     let second = begin(&mut live);
     complete(&mut live, &second);
-    assert!(live.recovery().is_some());
+    assert!(active(&live).is_some());
     watermark.0.lock().expect("fake watermark").ack = Some(Ack::Pending);
     assert!(live.receive(VOICE, AT, |_| false).now_or_never().is_none());
-    assert!(live.0.as_ref().expect("intake").active.is_none());
+    assert!(active(&live).is_none());
     receive(&mut live, VOICE);
-    assert!(live.recovery().is_none());
+    assert!(active(&live).is_none());
     assert_eq!(watermark.0.lock().expect("fake watermark").seq, 5);
 
     let fresh = begin(&mut live);
@@ -226,13 +231,9 @@ async fn scheduled_events_share_voice_order_and_emit_only_allowlisted_fields() {
     let nonce = begin(&mut live);
     event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(90));
     complete(&mut live, &nonce);
-    let baseline = live
-        .0
-        .as_ref()
-        .and_then(|intake| intake.active.as_ref())
-        .expect("completed baseline");
-    assert_eq!(baseline.events.len(), 1);
     let joined_event = wire::Id(Id::<ScheduledEventMarker>::new(90).into_nonzero());
+    let baseline = active(&live).expect("completed baseline");
+    assert_eq!(baseline.events.len(), 1);
     assert!(baseline.events.contains_key(&joined_event));
 
     let mut foreign = event_row(92);
@@ -315,11 +316,10 @@ async fn scheduled_event_limit_counts_baseline_rows_and_releases_removed_rows() 
     event(&mut live, "GUILD_SCHEDULED_EVENT_DELETE", event_row(1001));
     event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(1100));
     event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(1101));
-    assert!(live.0.as_ref().expect("intake").active.is_some());
+    assert!(active(&live).is_some());
     event(&mut live, "GUILD_SCHEDULED_EVENT_CREATE", event_row(1102));
     receive(&mut live, VOICE);
-    let intake = live.0.as_ref().expect("intake");
-    assert!(intake.active.is_none());
+    assert!(active(&live).is_none());
     assert_eq!(watermark.0.lock().expect("fake watermark").seq, 7);
 }
 
@@ -335,8 +335,16 @@ async fn topology_and_roster_share_receive_order_with_voice_and_events() {
         let kind = row[0].as_str().expect("dispatch type");
         event(&mut disabled, kind, row[1].clone());
         event(&mut live, kind, row[1].clone());
+        let cut = active(&live).expect("ordered cut");
+        if kind == "GUILD_ROLE_DELETE" {
+            assert!(cut.members.values().all(|row| row.role_ids.is_empty()));
+        }
     }
     assert!(!disabled.enabled());
+    let cut = active(&live).expect("ordered cut");
+    assert!(cut.events.is_empty());
+    assert_eq!(cut.members.len(), 1);
+    assert_eq!(cut.voice.len(), 1);
 
     let mut deltas = Vec::new();
     let worker = receiver.run(async |body| {
@@ -429,7 +437,7 @@ async fn rejected_or_superseded_baselines_cannot_send() {
         complete(&mut live, &nonce);
         receive(&mut live, VOICE);
         receive(&mut live, &invalid);
-        assert!(live.0.as_ref().expect("intake").active.is_none());
+        assert!(active(&live).is_none());
         receive(&mut live, VOICE);
     }
     let stale = begin(&mut live);
@@ -437,7 +445,7 @@ async fn rejected_or_superseded_baselines_cannot_send() {
     receive(&mut live, VOICE);
     let member = fixture["missing_screening"].clone();
     event(&mut live, "GUILD_MEMBER_ADD", member);
-    assert!(live.0.as_ref().expect("intake").active.is_none());
+    assert!(active(&live).is_none());
     receive(&mut live, VOICE);
     let stale = begin(&mut live);
     let current = begin(&mut live);
@@ -567,4 +575,170 @@ async fn shutdown_drops_in_flight_and_buffered_work_with_intake_still_alive() {
         body,
         generation: generation.lifetime.subscribe(),
     }));
+}
+
+#[tokio::test]
+async fn signed_worker_requires_a_covering_snapshot_after_a_gap() {
+    use crate::live_transport::tests::{web_signature, KEY_ID};
+    use http_body_util::BodyExt as _;
+    use hyper::{Method, StatusCode};
+    use std::cell::{Cell, RefCell};
+    use two_bot_core::{
+        clock_guard::ClockGuard,
+        internal_action_store::InternalActionStore,
+        internal_actions::{
+            sign, AuthHeaders, AuthenticatedRequest, KeyRing, LiveSnapshotReadAuthority,
+            SigningKey, TokenBuckets, SKEW_SECONDS,
+        },
+        realtime_signing::INGEST_PATH,
+        Secret,
+    };
+
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test database");
+    let db = two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate::Migrator::DEFAULT)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../../tests/fixtures/live_snapshot_nonce.sql"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let store = InternalActionStore::new(db.pool().clone());
+    let secret = Secret::new(rand::random::<[u8; 32]>().to_vec());
+    let authority = LiveSnapshotReadAuthority {
+        key_id: "snapshot-fixture",
+        guild_id: wire::Id(GUILD.into_nonzero()),
+    };
+    let keys = KeyRing::new(vec![SigningKey {
+        id: authority.key_id.into(),
+        secret: secret.clone(),
+    }]);
+    let pull = async |source: &LiveGateway<FakeWatermark>, now| {
+        let body = br#"{"action":"live.snapshot","guild_id":"10"}"#;
+        let now_ms = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as u64;
+        let timestamp = (now_ms / 1000).to_string();
+        let nonce = hex::encode(rand::random::<[u8; 16]>());
+        let signature = sign(secret.expose(), &timestamp, &nonce, body);
+        let headers = AuthHeaders {
+            key_id: authority.key_id,
+            timestamp: &timestamp,
+            nonce: &nonce,
+            signature: &signature,
+        };
+        let grant = AuthenticatedRequest::verify(
+            &headers,
+            body,
+            &keys,
+            SKEW_SECONDS,
+            now_ms,
+            &mut ClockGuard::new(),
+        )
+        .unwrap()
+        .burn_durably(&store)
+        .await
+        .unwrap()
+        .authorize_live_snapshot(Some(&authority), &mut TokenBuckets::new())
+        .unwrap();
+        source
+            .read_snapshot(grant, || now)
+            .map(|body| decoded(&body))
+    };
+
+    let key = Secret::new(hex::encode(rand::random::<[u8; 32]>()));
+    let transport = LiveTransport::new("https://site.example", KEY_ID, key.clone()).unwrap();
+    let watermark = FakeWatermark::new(0);
+    let (mut live, receiver) = LiveGateway::for_guild(GUILD, watermark.clone());
+    let snapshot = RefCell::new(None::<Value>);
+    let cursor = Cell::new(0);
+    let minimum = Cell::new(0);
+    let attempts = RefCell::new(Vec::new());
+    let mut worker = std::pin::pin!(receiver.run(async |body| {
+        transport
+            .attempt_with(body, async |request| {
+                let (parts, raw) = request.into_parts();
+                let raw = raw.collect().await.unwrap().to_bytes();
+                assert_eq!(parts.method, Method::POST);
+                assert_eq!(parts.uri.path(), INGEST_PATH);
+                let headers = parts.headers;
+                assert_eq!(headers["x-two-key-id"], KEY_ID);
+                let timestamp = headers["x-two-timestamp"].to_str().unwrap();
+                let nonce = headers["x-two-nonce"].to_str().unwrap();
+                let expected = web_signature(&key, timestamp, nonce, &raw);
+                assert_eq!(headers["x-two-signature"], expected.as_str());
+                let delta = decoded(&raw);
+                assert_eq!(delta["guild_id"], "10");
+                let seq = delta["seq"].as_u64().unwrap();
+                // Mirror the Web hub's cursor gate with a synthetic signed pull result.
+                let current = cursor.get();
+                let was_ready = minimum.get() == current;
+                minimum.set(minimum.get().max(seq));
+                let covered = snapshot.borrow().as_ref().and_then(|reply| {
+                    assert_eq!(reply["guild_id"], delta["guild_id"]);
+                    reply["seq"].as_u64().filter(|&cut| cut >= minimum.get())
+                });
+                let status = match covered {
+                    _ if seq <= current || (was_ready && current > 0 && seq == current + 1) => {
+                        cursor.set(current.max(seq));
+                        StatusCode::NO_CONTENT
+                    }
+                    Some(cut) => {
+                        cursor.set(cut);
+                        minimum.set(cut);
+                        StatusCode::NO_CONTENT
+                    }
+                    None => StatusCode::CONFLICT,
+                };
+                attempts.borrow_mut().push((seq, status));
+                Some(status)
+            })
+            .await
+    }));
+
+    receive(&mut live, READY);
+    let nonce = begin(&mut live);
+    complete(&mut live, &nonce);
+    receive(&mut live, VOICE);
+    let first = pull(&live, AT).await.unwrap();
+    assert_eq!(first["seq"], 3);
+    assert_eq!(
+        first["topics"]["voice"],
+        json!([{"userId":"31","channelId":"20"}])
+    );
+    snapshot.replace(Some(first));
+    assert!(worker.as_mut().now_or_never().is_none());
+
+    receive(&mut live, VOICE); // Queued at 4, then retired before the worker can send it.
+    watermark.0.lock().unwrap().ack = Some(Ack::Lost);
+    receive(&mut live, VOICE); // May have committed 5.
+    assert!(pull(&live, AT).await.is_none());
+    let nonce = begin(&mut live);
+    complete(&mut live, &nonce);
+    let now = WireTime(AT.0 + time::Duration::seconds(30));
+    assert!(pull(&live, now).await.is_none());
+    assert!(worker.as_mut().now_or_never().is_none());
+    assert_eq!(cursor.get(), 3);
+
+    live.receive(&VOICE.replace(r#""20""#, r#""21""#), now, |_| false)
+        .await;
+    let covering = pull(&live, now).await.unwrap();
+    assert_eq!(covering["seq"], 8);
+    assert_eq!(covering["observed_at"], "1970-01-01T00:00:30Z");
+    assert_eq!(
+        covering["topics"]["voice"],
+        json!([{"userId":"31","channelId":"21"}])
+    );
+    snapshot.replace(Some(covering));
+    assert!(worker.as_mut().now_or_never().is_none());
+    assert_eq!(cursor.get(), 8);
+    assert_eq!(
+        *attempts.borrow(),
+        [
+            (2, StatusCode::NO_CONTENT),
+            (3, StatusCode::NO_CONTENT),
+            (7, StatusCode::CONFLICT),
+            (8, StatusCode::NO_CONTENT),
+        ]
+    );
+    live.disconnect();
+    assert!(pull(&live, now).await.is_none());
+    db.close().await.unwrap();
 }

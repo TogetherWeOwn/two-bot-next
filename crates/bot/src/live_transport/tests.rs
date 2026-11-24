@@ -19,7 +19,7 @@ use super::*;
 use crate::live_delivery;
 
 const ORIGIN: &str = "https://site.example";
-const KEY_ID: &str = "ingress-fixture";
+pub(crate) const KEY_ID: &str = "ingress-fixture";
 const WEB_PATH: &str = "/internal/discord-live/v1/ingest";
 const WEB_DELTA: &str = include_str!("fixtures/web_delta.json");
 
@@ -27,7 +27,12 @@ fn fixture_key() -> Secret<String> {
     Secret::new(hex::encode(rand::random::<[u8; 32]>()))
 }
 
-fn web_signature(key: &Secret<String>, timestamp: &str, nonce: &str, body: &[u8]) -> String {
+pub(crate) fn web_signature(
+    key: &Secret<String>,
+    timestamp: &str,
+    nonce: &str,
+    body: &[u8],
+) -> String {
     // Match the Web verifier's canonical string independently of sign_ingest.
     let digest = hex::encode(Sha256::digest(body));
     let mut mac = Hmac::<Sha256>::new_from_slice(key.expose().as_bytes()).unwrap();

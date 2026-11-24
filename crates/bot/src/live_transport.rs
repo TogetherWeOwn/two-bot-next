@@ -63,16 +63,27 @@ impl LiveTransport {
     /// Send one attempt with a fresh signature over the supplied encoded delta.
     /// Run under the existing delivery worker, which owns deadlines and retries.
     pub async fn attempt(&self, encoded_delta: &[u8]) -> Delivery {
+        self.attempt_with(encoded_delta, async |request| {
+            self.client.request(request).await.ok().map(|r| r.status())
+        })
+        .await
+    }
+
+    pub(crate) async fn attempt_with(
+        &self,
+        encoded_delta: &[u8],
+        send: impl AsyncFnOnce(Request<Full<Bytes>>) -> Option<StatusCode>,
+    ) -> Delivery {
         let timestamp = OffsetDateTime::now_utc().unix_timestamp();
         let Some(request) = self.request(encoded_delta, timestamp, rand::random()) else {
             return Delivery::Rejected;
         };
-        let Ok(response) = self.client.request(request).await else {
+        let Some(status) = send(request).await else {
             return Delivery::Retry;
         };
         // The ingress contract is status-only. In particular, 409 means the
         // hub needs recovery and repeating the same delta cannot supply it.
-        match response.status() {
+        match status {
             StatusCode::NO_CONTENT => Delivery::Accepted,
             StatusCode::TOO_MANY_REQUESTS => Delivery::Retry,
             status if status.is_server_error() => Delivery::Retry,
@@ -109,4 +120,4 @@ fn build_client(connector: HttpsConnector<HttpConnector>) -> HttpClient {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

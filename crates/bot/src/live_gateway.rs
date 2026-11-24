@@ -13,13 +13,17 @@ use twilight_model::{
     gateway::payload::outgoing::RequestGuildMembers,
     id::{marker::GuildMarker, Id},
 };
-use two_bot_core::{duplicate_keys::reject_duplicate_keys, realtime_wire as wire};
+use two_bot_core::{
+    duplicate_keys::reject_duplicate_keys, internal_actions::AuthorizedLiveSnapshotRead,
+    realtime_wire as wire,
+};
 use two_bot_discord::{realtime_baseline_join::BaselineJoin, realtime_gateway, realtime_roster};
 use wire::recovery::{Generation, Recovery};
 use wire::watermark::{self, ReservationError};
 use wire::{Change, ChannelKind, Operation, OverwriteKind, WireTime};
 
 use crate::live_delivery::{self, Delivery};
+use crate::live_transport::LiveTransport;
 
 const BASELINE_TIMEOUT: Duration = Duration::from_secs(30);
 const RESERVATION_TIMEOUT: Duration = Duration::from_secs(1);
@@ -82,13 +86,15 @@ struct Intake<W> {
 /// applies the channel, member and role removal cascades below.
 struct BaselineFence {
     seq: u64,
+    observed_at: WireTime,
     recovery: Recovery,
     generation: Generation,
     guild: wire::Guild,
     channels: Rows<wire::Channel>,
     roles: Rows<wire::Role>,
     members: Rows<wire::Member>,
-    events: Rows<Option<wire::Id>>,
+    voice: Rows<wire::Voice>,
+    events: Rows<wire::Event>,
     lifetime: watch::Sender<()>,
 }
 
@@ -133,12 +139,21 @@ impl<W: SequenceWatermark> LiveGateway<W> {
         self.0.is_some()
     }
 
-    /// The published recovery view while it covers the active cursor.
-    /// Serving later deltas requires a snapshot source that advances with them.
-    pub fn recovery(&self) -> Option<(&Recovery, &Generation)> {
+    /// Serve a post-replay read from this ordered owner. The shared borrow
+    /// binds encoding to one committed cursor, observation time and guild.
+    pub fn read_snapshot(
+        &self,
+        grant: AuthorizedLiveSnapshotRead,
+        now: impl FnOnce() -> WireTime,
+    ) -> Option<Vec<u8>> {
         let active = self.0.as_ref()?.active.as_ref()?;
-        (active.recovery.baseline()?.seq == active.seq)
-            .then_some((&active.recovery, &active.generation))
+        grant.read_current(
+            &active.recovery,
+            &active.generation,
+            (active.seq, active.observed_at),
+            now(),
+            || active.topics(),
+        )
     }
 
     /// Retire before processing any further dispatch after a transport loss,
@@ -168,6 +183,13 @@ impl<W: SequenceWatermark> LiveGateway<W> {
 }
 
 impl LiveReceiver {
+    /// Drive signed Web delivery with the same bounds and retirement as the
+    /// underlying receiver. The owner supplies the worker's shutdown future.
+    pub async fn run_signed_until(self, shutdown: impl Future<Output = ()>, sink: &LiveTransport) {
+        self.run_until(shutdown, async |body| sink.attempt(body).await)
+            .await;
+    }
+
     /// Drive this borrowing worker alongside its receive owner. Every retry
     /// uses the same bytes. Retirement skips queued deltas and cancels both
     /// pending attempts and retry delays for that generation.
@@ -284,15 +306,13 @@ impl<W: SequenceWatermark> Intake<W> {
         let topics = &baseline.topics;
         let active = BaselineFence {
             seq: baseline.seq,
+            observed_at: at,
             guild: topics.guild.clone(),
             channels: index(&topics.channels, |row| row.id),
             roles: index(&topics.roles, |row| row.id),
             members: index(&topics.members, |row| row.user_id),
-            events: topics
-                .events
-                .iter()
-                .map(|row| (row.id, row.channel_id))
-                .collect(),
+            voice: index(&topics.voice, |row| row.user_id),
+            events: index(&topics.events, |row| row.id),
             recovery,
             generation,
             lifetime: watch::channel(()).0,
@@ -375,6 +395,7 @@ impl<W: SequenceWatermark> Intake<W> {
             return Err(());
         }
         active.seq = seq;
+        active.observed_at = at;
         self.offer(active, body);
         Ok(())
     }
@@ -387,6 +408,17 @@ impl<W: SequenceWatermark> Intake<W> {
 }
 
 impl BaselineFence {
+    fn topics(&self) -> wire::Topics {
+        wire::Topics {
+            guild: self.guild.clone(),
+            channels: self.channels.values().cloned().collect(),
+            roles: self.roles.values().cloned().collect(),
+            members: self.members.values().cloned().collect(),
+            voice: self.voice.values().cloned().collect(),
+            events: self.events.values().cloned().collect(),
+        }
+    }
+
     fn apply(&mut self, guild: wire::Id, operation: Operation) -> Result<(), ()> {
         match operation {
             Operation::Guild(Change::Upsert { value, .. })
@@ -405,7 +437,8 @@ impl BaselineFence {
                     return Err(());
                 }
                 self.channels.remove(&id);
-                self.events.retain(|_, room| *room != Some(id));
+                self.voice.retain(|_, row| row.channel_id != id);
+                self.events.retain(|_, row| row.channel_id != Some(id));
             }
             Operation::Roles(Change::Upsert { id, value }) => {
                 insert(&mut self.roles, id, value, wire::MAX_SNAPSHOT_ROLES)?;
@@ -419,11 +452,16 @@ impl BaselineFence {
             }
             Operation::Members(Change::Remove { id }) if id != self.guild.owner_id => {
                 self.members.remove(&id);
+                self.voice.remove(&id);
             }
             Operation::Voice(Change::Upsert { id, value })
-                if self.members.contains_key(&id) && is_voice_room(self.kind(value.channel_id)) => {
+                if self.members.contains_key(&id) && is_voice_room(self.kind(value.channel_id)) =>
+            {
+                self.voice.insert(id, value);
             }
-            Operation::Voice(Change::Remove { id }) if self.members.contains_key(&id) => {}
+            Operation::Voice(Change::Remove { id }) if self.members.contains_key(&id) => {
+                self.voice.remove(&id);
+            }
             Operation::Events(Change::Upsert { id, value }) => {
                 if value
                     .channel_id
@@ -431,12 +469,7 @@ impl BaselineFence {
                 {
                     return Err(());
                 }
-                insert(
-                    &mut self.events,
-                    id,
-                    value.channel_id,
-                    wire::MAX_SNAPSHOT_EVENTS,
-                )?;
+                insert(&mut self.events, id, value, wire::MAX_SNAPSHOT_EVENTS)?;
             }
             Operation::Events(Change::Remove { id }) => {
                 self.events.remove(&id);

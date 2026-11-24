@@ -35,7 +35,10 @@ reviewed change; direct-container configuration support is not rollout authority
 The dormant `live.snapshot` boundary takes a committed nonce and a dedicated
 signing-key scope for one guild before it looks up recovery state. A current,
 fresh generation can return the complete v1 snapshot directly as JSON. The
-serving action registry and ingress have no `live.snapshot` entry.
+dormant guild owner advances the snapshot cut with each committed reservation.
+After a failed reservation, reads stay unavailable until the owner rebuilds.
+The Web hub requires a snapshot covering its highest observed sequence after
+a gap. The serving action registry and ingress have no `live.snapshot` entry.
 
 No signing key, secret custodian or export authority is supplied by this code.
 Key creation and transfer into the website's staging secret store stay on HOLD
