@@ -146,6 +146,7 @@ def main():
         server.token = "Bot " + os.environ["SYNTHETIC_BOT_TOKEN"]
         server.lock = threading.Lock()
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.minimum_version = ssl.TLSVersion.TLSv1_2
         tls.load_cert_chain(state / "server.crt", state / "server.key")
         server.socket = tls.wrap_socket(server.socket, server_side=True)
         (state / "recorder-ready").touch()
