@@ -110,15 +110,15 @@ class EventCutoffPermissionAttributionTest(unittest.TestCase):
                 self.assertEqual(self.compare("retained"), f"attribution gap: {field}")
                 self.requests[1][field] = original
 
-    def run_handoff(self, exit_code=0):
+    def run_handoff(self, exit_code=0, *, rehearsal_pins=PINS):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pins = root / "pins.json"
             transcript = root / "cutoff.log"
             attribution = root / "attribution.json"
             pins.write_text(json.dumps(self.releases), encoding="utf-8")
-            capture = capture_runner(PINS)
-            REHEARSAL.verify(PINS, capture, 0)
+            capture = capture_runner(rehearsal_pins)
+            REHEARSAL.verify(rehearsal_pins, capture, 0)
             transcript.write_text(capture, encoding="utf-8")
             attribution.write_text(json.dumps({
                 "receipts": self.receipts, "requests": self.requests,
@@ -162,6 +162,13 @@ class EventCutoffPermissionAttributionTest(unittest.TestCase):
 
     def test_handoff_cli_leaves_failed_rehearsal_unresolved(self):
         self.assert_handoff_unresolved(self.run_handoff(exit_code=1), "Rehearsal exited 1")
+
+    def test_handoff_cli_leaves_mismatched_rehearsal_unresolved(self):
+        swapped = {"current": PINS["retained"], "retained": PINS["current"]}
+        self.assert_handoff_unresolved(
+            self.run_handoff(rehearsal_pins=swapped),
+            "Rehearsal current image differs from selected pin",
+        )
 
 
 if __name__ == "__main__":
