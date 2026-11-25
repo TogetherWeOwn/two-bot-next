@@ -203,10 +203,12 @@ the protected context.
    room and the permission facts needed to verify Connect. Its `readChannels`
    supplies `source` and `destination` at preflight and `observe` supplies
    a new read at each case checkpoint. Each observation includes `guildId`,
-   `discordId`, `channelId`, `channelType` (`2` for guild voice),
-   `connectedChannelId` (`null` for a confirmed disconnect), `canConnect`
-   and `observedAt`. Take these readings independently of the Web session
-   and move response.
+   `discordId` and `observedAt`. The checked room supplies `channelId`,
+   `channelType` (`2` for guild voice) and the member's effective `canConnect`.
+   The member's actual occupancy supplies `connectedChannelId` (`null` for
+   a confirmed disconnect). For the refused return, the checked room is A
+   and the member stays in B. Take these readings independently of the Web
+   session and move response.
 2. **Web Operations.** Confirm that the serving staging build includes the
    [current-session receipt](https://github.com/TogetherWeOwn/two-web-next/pull/2794)
    and that its protected settings match the approved member and ordered pair.
@@ -234,15 +236,18 @@ the protected context.
    a separate proof window acquires its own selected lease on the same SHA,
    deployment and owner epoch. The proof lease lasts at most 15 minutes.
    Leave time for cleanup inside the window.
-   After successful
+   The existing voice lease selection uses `STAGING_USE_VOICE_MOVE=1` at
    [`staging-use-pipeline.mjs begin`](../wrangler/scripts/staging-use-pipeline.mjs),
+   which must succeed before proof.
    [`runStagingVoiceMoveJob(env, proofInputs)`](../wrangler/scripts/staging-voice-move-job.mjs)
-   consumes the current run and attempt, the `expires_at`, `deployment_id`
-   and `sha` outputs, and the final ready receipt, which supplies the epoch.
+   requires `STAGING_VOICE_MOVE_PROOF=true` in the protected in-process
+   invocation. It consumes the current run and attempt, the `expires_at`,
+   `deployment_id` and `sha` outputs, and the final ready receipt, which
+   supplies the epoch.
    Its protected inputs are `fixture`, `previousReady`, `previousOff`,
    `expectedRevision`, `webSession`, `observer` and the bounded staging-use
-   `control` adapter for lease assertion, status and release. The proof
-   selector defaults off. The workflow CLI has no live input provider. The
+   `control` adapter for lease assertion, status and release. The workflow
+   keeps the proof selector off and its CLI has no live input provider. The
    in-process job returns `disabled`, `failed` or `passed`. A pass is mock evidence.
 
    For a protected live invocation, coordinate the custodian with the
@@ -251,9 +256,9 @@ the protected context.
    (`not_permitted`, still in B), then a move to B while disconnected
    (`not_connected`). The custodian has the account leave B after the
    `after:not_permitted` observation completes. The `before:not_connected`
-   checkpoint starts immediately. The observer must get a fresh disconnect
-   readback within that checkpoint's budget of up to 20 seconds, shortened
-   by the remaining lease time.
+   checkpoint starts immediately. The observer must return a fresh readback
+   after the departure within that same checkpoint call. Its budget is up to
+   20 seconds, shortened by the remaining lease time.
 4. **Stop and verify cleanup.** Stop the proof on any unconfirmed input,
    observation or move result, then proceed to cleanup. Never resubmit a move.
    Once `begin` emits `expires_at`, keep the enclosing unconditional
