@@ -33,6 +33,7 @@ class InterruptedReleaseTests(unittest.TestCase):
         self.origin = "123"
         self.epoch = 21
         self.actor = f"production-schema-release:{self.origin}:{self.pin.candidate_sha}"
+        self.foreign_actor = f"production-schema-release:124:{self.pin.candidate_sha}"
         self.stopped = {
             "worker": {
                 "version_id": self.pin.rollback_worker,
@@ -143,9 +144,12 @@ class InterruptedReleaseTests(unittest.TestCase):
         env, routes, _ = self.recovery_admission()
         root = f"actions/runs/{self.origin}"
         jobs = f"{root}/attempts/1/jobs?per_page=30"
+        compare = f"compare/{self.pin.workflow_sha}...{env['GITHUB_SHA']}"
         cases = {
             "in progress": lambda routes: routes[root].update(status="in_progress", conclusion=None),
             "rerun": lambda routes: routes[root].update(run_attempt=2),
+            "successful origin": lambda routes: routes[root].update(conclusion="success"),
+            "different workflow lineage": lambda routes: routes[compare].update(merge_base_commit={"sha": "e" * 40}),
             "cancelled intent upload": lambda routes: routes[jobs]["jobs"][0]["steps"][1].update(
                 conclusion="cancelled",
             ),
@@ -199,20 +203,22 @@ class InterruptedReleaseTests(unittest.TestCase):
         for classification in (
             {"state": "ambiguous"},
             {"state": "post"},
+            {"state": "post", "attendance_fence_sha256": "D" * 64},
             {"state": "pre", "attendance_fence_sha256": "d" * 64},
         ):
             with self.subTest(classification=classification), self.assertRaises(GateError):
                 self.reconcile(classification)
         self.control.assert_not_called()
         self.recover_post.assert_not_called()
-        self.assertEqual(self.live, self.stopped)
+        self.observe.assert_not_called()
 
     def test_verified_database_rejects_changed_worker_image_or_fence(self):
         for section, field, value in (
             ("worker", "version_id", "88888888-8888-4888-8888-888888888888"),
             ("container", "image_digest", self.pin.candidate_image),
-            ("ownership", "owner_actor", f"production-schema-release:124:{self.pin.candidate_sha}"),
+            ("ownership", "owner_actor", self.foreign_actor),
             ("ownership", "epoch", self.epoch + 1),
+            ("ownership", "running", True),
         ):
             for classification in ({"state": "pre"}, {"state": "post", "attendance_fence_sha256": "d" * 64}):
                 with self.subTest(section=section, field=field, classification=classification):
@@ -223,21 +229,35 @@ class InterruptedReleaseTests(unittest.TestCase):
         self.control.assert_not_called()
         self.recover_post.assert_not_called()
 
-    def test_pre_pending_epoch_after_lost_reply_cannot_start_a_second_writer(self):
-        def reserve_then_lose_reply(*_args, **_kwargs):
-            self.live["ownership"]["epoch"] += 1
-            raise GateError("fixture_takeover_reply_lost")
+    def test_lost_pre_reply_does_not_retry_at_pending_or_foreign_active_epoch(self):
+        for phase, actor, running in (("fenced", self.actor, False), ("active", self.foreign_actor, True)):
+            with self.subTest(phase=phase):
+                after = {"epoch": self.epoch + 1, "phase": phase, "owner_actor": actor, "running": running}
 
-        self.control.side_effect = reserve_then_lose_reply
-        with self.assertRaises(GateError):
-            self.reconcile({"state": "pre"})
-        with self.assertRaises(GateError):
-            self.reconcile({"state": "pre"})
-        self.control.assert_called_once_with(
-            "takeover-fenced", self.epoch, expected_deployment=self.pin.rollback_worker,
-        )
+                def lose_reply(*_args, **_kwargs):
+                    self.live["ownership"].update(after)
+                    raise GateError("fixture_takeover_reply_lost")
+
+                self.live = deepcopy(self.stopped)
+                self.control.reset_mock()
+                self.control.side_effect = lose_reply
+                with self.assertRaisesRegex(GateError, "fixture_takeover_reply_lost"):
+                    self.reconcile({"state": "pre"})
+                with self.assertRaises(GateError):
+                    self.reconcile({"state": "pre"})
+                self.control.assert_called_once_with(
+                    "takeover-fenced", self.epoch, expected_deployment=self.pin.rollback_worker,
+                )
+                self.assertEqual(self.live["ownership"], after)
         self.recover_post.assert_not_called()
-        self.assertEqual(self.live["ownership"], {**self.stopped["ownership"], "epoch": self.epoch + 1})
+
+    def test_post_cannot_enter_inverse_after_any_writer_has_resumed(self):
+        for actor in (self.actor, self.foreign_actor):
+            with self.subTest(actor=actor), self.assertRaises(GateError):
+                self.live["ownership"].update(epoch=self.epoch + 1, phase="active", owner_actor=actor, running=True)
+                self.reconcile({"state": "post", "attendance_fence_sha256": "d" * 64})
+        self.control.assert_not_called()
+        self.recover_post.assert_not_called()
 
 
 if __name__ == "__main__":
