@@ -80,6 +80,9 @@ def observed_phase(pin, observe):
         if (owner["phase"] == "active" and owner["epoch"] == pin.fence_epoch + 1
                 and owner["owner_actor"] == pin.actor):
             return "active"
+        if (owner["phase"] == "fenced" and owner["epoch"] == pin.fence_epoch + 1
+                and owner["owner_actor"] == pin.actor and not owner["running"]):
+            raise GateError("production_recovery_takeover_pending_reconcile")
         raise GateError("production_recovery_fence_changed")
     except (KeyError, TypeError):
         raise GateError("production_recovery_observation_invalid") from None

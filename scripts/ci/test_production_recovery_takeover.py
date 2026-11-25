@@ -4,10 +4,11 @@ from dataclasses import asdict
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from production_recovery_takeover import GateError, RecoveryPin, complete_legacy_takeover
+import worker_container_rollback as rollback
 
 
 class ProductionRecoveryTakeoverTests(unittest.TestCase):
@@ -87,3 +88,19 @@ class ProductionRecoveryTakeoverTests(unittest.TestCase):
         with self.assertRaisesRegex(GateError, "^production_recovery_takeover_unconfirmed$"):
             self.complete()
         self.control.assert_called_once_with("takeover-fenced", 21, expected_deployment=self.pin.worker_version)
+
+    def test_persisted_pending_takeover_refuses_another_post(self):
+        self.state["ownership"].update(epoch=22, phase="fenced", owner_actor=self.pin.actor)
+        with self.assertRaisesRegex(GateError, "^production_recovery_takeover_pending_reconcile$"):
+            self.complete()
+        self.control.assert_not_called()
+
+    def test_recovery_adapter_pins_release_flag_epoch_and_deployment(self):
+        control = rollback.control_client("production", "synthetic-token", "https://fixture.invalid", "", self.pin.actor)
+        with patch.object(rollback.subprocess, "run", return_value=Mock(returncode=0, stdout="{}")) as run:
+            control("takeover-fenced", 21, expected_deployment=self.pin.worker_version)
+        args, options = run.call_args
+        self.assertEqual(args[0][-2:], ["takeover-fenced", "21"])
+        self.assertEqual(options["env"]["OWNERSHIP_RELEASE_FENCE"], "true")
+        self.assertEqual(options["env"]["OWNERSHIP_EXPECTED_DEPLOYMENT"], self.pin.worker_version)
+        self.assertEqual(options["env"]["OWNERSHIP_ACTOR"], self.pin.actor)

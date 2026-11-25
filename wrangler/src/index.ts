@@ -1644,7 +1644,7 @@ export class TwoBotContainer extends Container<Env> {
           // Takeover does not start the gateway. A subsequent owned probe does.
           return Response.json({ deploymentId: id, owner: owner ?? null,
             running: this.ctx.container?.running ?? false, ...evidence, ...recovery }, {
-            headers: withSecurityHeaders({ "cache-control": "no-store" }),
+            headers: withSecurityHeaders({ "cache-control": "no-store", "x-two-bot-exact-takeover": "1" }),
           });
         }
         // Recovery re-runs the full write/destroy/write sequence even for a
