@@ -37,6 +37,17 @@ def recovery_plan_fixture():
     return plan
 
 
+def reviewed_plan_output(root, plan, source):
+    (root / "staging-schema-gate-manifest.json").write_text(json.dumps(plan))
+    event, output = root / "event.json", root / "output"
+    event.write_text(json.dumps({"inputs": {"recovery_mode": "verified"}}))
+    env = {"GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(output), "GITHUB_SHA": "f" * 40,
+           "RECOVERY_PLAN_SOURCE": source, "REVIEWED_PLAN": "fixture", "PYTHONDONTWRITEBYTECODE": "1"}
+    subprocess.run([sys.executable, bootstrap.__file__, "plan"], cwd=root, env=env,
+                   capture_output=True, text=True, timeout=5, check=True)
+    return dict(line.split("=", 1) for line in output.read_text().splitlines())
+
+
 class StagingBootstrapTests(unittest.TestCase):
     def setUp(self):
         self.routes = provider_fixture()
@@ -55,7 +66,8 @@ class StagingBootstrapTests(unittest.TestCase):
         (root / "staging-schema-gate-manifest.json").write_text(json.dumps(recovery_plan_fixture()))
         event, output = root / "event.json", root / "output"
         env = {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_EVENT_PATH": str(event),
-               "GITHUB_OUTPUT": str(output), "GITHUB_SHA": SOURCE, "PYTHONDONTWRITEBYTECODE": "1"}
+               "GITHUB_OUTPUT": str(output), "GITHUB_SHA": SOURCE, "PYTHONDONTWRITEBYTECODE": "1",
+               "RECOVERY_PLAN_SOURCE": "f" * 40}
         drills = dict.fromkeys(("inject_gateway_failure", "inject_error_rate_spike",
                                 "inject_voice_stall", "inject_unpaired_disconnect"), "false")
         for mode in ("bootstrap", "verified"):
@@ -79,15 +91,7 @@ class StagingBootstrapTests(unittest.TestCase):
     def test_reviewed_plan_emits_source_projection_with_a_later_workflow_sha(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="staging-reviewed-plan-")))
         plan = recovery_plan_fixture()
-        (root / "staging-schema-gate-manifest.json").write_text(json.dumps(plan))
-        event, output = root / "event.json", root / "output"
-        event.write_text(json.dumps({"inputs": {"recovery_mode": "verified"}}))
-        env = {"GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(output), "GITHUB_SHA": "f" * 40,
-               "RECOVERY_PLAN_SOURCE": SOURCE, "REVIEWED_PLAN": "fixture", "PYTHONDONTWRITEBYTECODE": "1"}
-        run = subprocess.run([sys.executable, bootstrap.__file__, "plan"], cwd=root, env=env,
-                             capture_output=True, text=True, timeout=5)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        fields = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        fields = reviewed_plan_output(root, plan, SOURCE)
         self.assertEqual(fields["fingerprint"], FINGERPRINT)
         self.assertEqual(json.loads(fields["plan"]), bootstrap.verified_plan(plan, SOURCE))
 
@@ -190,6 +194,17 @@ class StagingBootstrapTests(unittest.TestCase):
             "worker_version": VERSION, "source_sha": SOURCE, "target_fingerprint": FINGERPRINT,
             "running": False, "startup_guard": True,
         })
+
+    def test_reviewed_forward_verify_requires_verified_mode(self):
+        env, evidence = self.forward_fixture()
+        env.update(GITHUB_SHA="f" * 40, REVIEWED_SOURCE=SOURCE)
+        with patch.object(bootstrap, "Client", return_value=self), patch.object(bootstrap, "read_ownership", return_value=self.state):
+            self.assertEqual(bootstrap.main(["verify"], env), 0)
+        self.assertEqual(json.loads(evidence.read_text())["source_sha"], SOURCE)
+        with patch.object(bootstrap, "Client") as client, redirect_stderr(StringIO()) as stderr:
+            self.assertEqual(bootstrap.main(["verify"], dict(env, RECOVERY_MODE="bootstrap")), 1)
+        client.assert_not_called()
+        self.assertIn("reviewed_source_requires_verified_recovery", stderr.getvalue())
 
     def test_forward_verify_refuses_when_slow_provider_exhausts_deadline(self):
         env, evidence = self.forward_fixture()

@@ -104,11 +104,12 @@ def main(argv, env):
         if argv == ["plan"]:
             inputs = mapping(read_json(Path(env["GITHUB_EVENT_PATH"]), MAX_PLAN).get("inputs"))
             require(all(inputs.get(name, "false") == "false" for name in DRILLS), "recovery_drill_refused")
-            proof = verified_plan(read_json(Path("staging-schema-gate-manifest.json"), MAX_PLAN),
-                                  env.get("RECOVERY_PLAN_SOURCE") or env["GITHUB_SHA"])
+            reviewed_plan = env.get("REVIEWED_PLAN")
+            source = env.get("RECOVERY_PLAN_SOURCE") if reviewed_plan else env["GITHUB_SHA"]
+            proof = verified_plan(read_json(Path("staging-schema-gate-manifest.json"), MAX_PLAN), source)
             with Path(env["GITHUB_OUTPUT"]).open("a") as out:
                 out.write(f"fingerprint={proof['target_fingerprint']}\n")
-                if env.get("REVIEWED_PLAN"):
+                if reviewed_plan:
                     out.write(f"plan={json.dumps(proof, separators=(',', ':'))}\n")
             return 0
         source = env.get("DEPLOY_SHA")

@@ -10,10 +10,11 @@ import tempfile
 import unittest
 from urllib.parse import parse_qs, urlsplit
 
-from test_staging_recovery_status import archive_fixture, github_fixture, plan_fixture
+from test_staging_bootstrap import recovery_plan_fixture, reviewed_plan_output
+from test_staging_recovery_status import archive_fixture, github_fixture
 
 import staging_qualification as qualification
-from staging_recovery_status import plan_projection, projection_hash, store_projection_hash
+from staging_recovery_status import projection_hash, store_projection_hash
 from staging_rollout import GateError
 
 
@@ -48,9 +49,9 @@ class ReviewedStagingTests(unittest.TestCase):
         self.workdir.mkdir()
         self.lockfile = {"packages": {"node_modules/wrangler": {"version": qualification.WRANGLER}}}
 
-        plan = {**plan_fixture(), "source_sha": self.source}
+        plan = {**recovery_plan_fixture(), "source_sha": self.source}
         plan.update(plan_manifest_sha256=projection_hash(plan), store_plan_manifest_sha256=store_projection_hash(plan))
-        self.fresh = plan_projection(plan)
+        self.fresh = json.loads(reviewed_plan_output(self.workdir, plan, self.source)["plan"])
         self.routes = github_fixture()
         archive = archive_fixture(json.dumps(plan))
         digest = "sha256:" + sha256(archive).hexdigest()

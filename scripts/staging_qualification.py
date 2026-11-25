@@ -128,8 +128,8 @@ def authorize(env, inputs, fresh_plan, lockfile, api=github, git=check_git):
     latest = sequence(mapping(api("actions/workflows/deploy-staging.yml/runs?branch=main&status=success&per_page=1"))
                       .get("workflow_runs"))
     # The live stopped pair is independently re-attested immediately before
-    # the write. Run history also prevents moving behind already-certified
-    # source, even after a recovery restored an older pair.
+    # the write. Run history also prevents moving behind a successful staging
+    # deployment, including when its production certification was skipped.
     require(len(latest) == 1, "staging_history_unproved")
     prior = mapping(latest[0])
     run_identity(prior, WORKFLOW, prior.get("event"))
