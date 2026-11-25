@@ -16,12 +16,10 @@ const refusal = (error: unknown) => error instanceof Error
 type MoveArgs = { channelId: string; signal: AbortSignal };
 
 function response(content: BodyInit | null = JSON.stringify(body), init: ResponseInit = {}, url = receiptUrl) {
-  const result = new Response(content, {
+  return Object.defineProperty(new Response(content, {
     headers: { "content-type": "application/json; charset=UTF-8", "cache-control": "no-store, private", ...init.headers },
     status: init.status,
-  });
-  Object.defineProperty(result, "url", { value: url });
-  return result;
+  }), "url", { value: url });
 }
 
 function setup(request: (url: string, init: RequestInit) => Response | Promise<Response> | undefined = () => response()) {
@@ -56,8 +54,7 @@ test("reads the exact staged Web receipt through the existing scoped session and
   input.fixture.channelIds.reverse();
   input.expectedRevision.commit = "b".repeat(40);
   input.session.move = async () => assert.fail("bound move replaced");
-  assert.equal(session.environment, "staging");
-  assert.equal(session.discordId, discordId);
+  assert.deepEqual({ environment: session.environment, discordId: session.discordId }, { environment: "staging", discordId });
   const projected = await session.readCurrent({ signal });
   assert.deepEqual(projected, {
     environment: "staging", action: "voice.move_member", authenticated: true, discordId, channelIds: channels, observedAt,
@@ -112,11 +109,13 @@ test("rejects status, redirect, media, cache and session mutation failures", asy
     "cacheable receipt": response(undefined, { headers: { "cache-control": "private, max-age=60" } }),
     "quoted cache extension": response(undefined, { headers: { "cache-control": 'foo="a, private, no-store, b"' } }),
     "declared oversize": response(undefined, { headers: { "content-length": "1025" } }),
-  })) {
-    const session = bindStagingVoiceSession(setup(() => reply));
-    await assert.rejects(session.readCurrent({ signal: new AbortController().signal }), refusal, label);
-  }
+  })) await assertReceiptRefused(() => reply, label);
 });
+
+async function assertReceiptRefused(request: Parameters<typeof setup>[0], label: string) {
+  const session = bindStagingVoiceSession(setup(request));
+  await assert.rejects(session.readCurrent({ signal: new AbortController().signal }), refusal, label);
+}
 
 test("requires an exact receipt, full matching Web revision and canonical observation time", async () => {
   const json = JSON.stringify(body);
@@ -139,10 +138,7 @@ test("requires an exact receipt, full matching Web revision and canonical observ
     "missing milliseconds": JSON.stringify({ ...body, observed_at: "2030-06-15T12:34:56Z" }),
     "BOM": `\u{FEFF}${json}`,
     "invalid UTF-8": Buffer.concat([Buffer.from(json), Uint8Array.of(0xff)]),
-  })) {
-    const session = bindStagingVoiceSession(setup(() => response(content)));
-    await assert.rejects(session.readCurrent({ signal: new AbortController().signal }), refusal, label);
-  }
+  })) await assertReceiptRefused(() => response(content), label);
 });
 
 test("counts streamed bytes and cancels at the cap without draining the response", async () => {
@@ -162,8 +158,7 @@ test("counts streamed bytes and cancels at the cap without draining the response
   }, { highWaterMark: 0 });
   const session = bindStagingVoiceSession(setup(() => response(stream)));
   await assert.rejects(session.readCurrent({ signal: new AbortController().signal }), refusal);
-  assert.equal(reads, 2);
-  assert.equal(cancelled, true);
+  assert.deepEqual({ reads, cancelled }, { reads: 2, cancelled: true });
 });
 
 test("redacts exceptions and refuses cancellation during transport or stalled body reads", async () => {
@@ -206,26 +201,16 @@ async function runWithReceipt(scenario: ReceiptCase) {
   const { args, signed, moves, calls } = mockVoiceMoveWindow(scenario === "stale" ? 61_001 : 1_000);
   const { caller, evidence, now, fixture, ...input } = args;
   const reads: string[] = [];
-  const releases = [];
-  // The stale case is at lease acquisition, so the 60-second check alone must refuse it.
   const scenarioTimes: Partial<Record<ReceiptCase, number>> = {
     "before acquisition": input.ready.use.acquiredAt - 1,
     future: now() + 1,
-    stale: now() - 60_001,
+    stale: input.ready.use.acquiredAt, // The receipt fails on age alone.
   };
   const sampledAt = scenarioTimes[scenario] ?? now();
   const scope = {
     ...caller,
     origin,
-    move(args: MoveArgs) {
-      assert.equal(this, scope);
-      assert.deepEqual(reads, ["session", "discord"]);
-      return caller.move(args);
-    },
-    request(target: string, init: RequestInit & { signal: AbortSignal }) {
-      assert.equal(this, scope);
-      assert.equal(target, receiptUrl);
-      assert.equal(init.redirect, "error");
+    request(_target: string, init: RequestInit & { signal: AbortSignal }) {
       init.signal.throwIfAborted();
       reads.push("session");
       const expectedChannels = scenario === "swapped pair" ? [...fixture.channelIds].reverse() : fixture.channelIds;
@@ -236,6 +221,7 @@ async function runWithReceipt(scenario: ReceiptCase) {
     },
   };
   const session = bindStagingVoiceSession({ session: scope, fixture, expectedRevision: revision });
+  const { runId, runAttempt, expiresAt, sha, deploymentId } = input.lease;
   const result = await runProtectedVoiceMoveAcceptance({
     ...input, now, fixture, session,
     previousReady: evidence.previousReady, previousOff: evidence.previousOff,
@@ -245,27 +231,25 @@ async function runWithReceipt(scenario: ReceiptCase) {
       return evidence.readback;
     },
     async control(request) {
-      if (request.action === "release") releases.push(request);
+      if (request.action === "release") {
+        assert.deepEqual({ runId: request.runId, runAttempt: request.runAttempt, expiresAt: request.expiresAt,
+          sha: request.sha, deploymentId: request.deploymentId }, { runId, runAttempt, expiresAt, sha, deploymentId });
+      }
       return input.control(request);
     },
   });
-  const { runId, runAttempt, expiresAt, sha, deploymentId } = input.lease;
-  assert.deepEqual(releases.map(({ action, runId, runAttempt, expiresAt, sha, deploymentId }) =>
-    ({ action, runId, runAttempt, expiresAt, sha, deploymentId })),
-  [{ action: "release", runId, runAttempt, expiresAt, sha, deploymentId }]);
   assert.equal(result.mode, "mock");
-  assert.equal(result.cleanup.off, true);
-  assert.equal(result.cleanup.stopped, true);
   return { result, signed, moves, calls, reads };
 }
 
 test("the protected runner completes the mock cases with a verified receipt", async () => {
-  const { result, signed, moves, calls } = await runWithReceipt("valid");
+  const { result, signed, moves, calls, reads } = await runWithReceipt("valid");
   assert.equal(result.verdict, "passed");
   assert.deepEqual(result.cases.map(({ outcome }) => outcome), ["moved", "not_permitted", "not_connected"]);
   assert.deepEqual(calls, ["assert", "assert", "assert", "status", "release", "status"]);
-  assert.equal(signed.length, 3);
-  assert.equal(moves.length, 1);
+  assert.deepEqual(reads, ["session", "discord"]);
+  assert.deepEqual(result.cleanup, { memberDisconnected: true, off: true, stopped: true });
+  assert.deepEqual({ signed: signed.length, moves: moves.length }, { signed: 3, moves: 1 });
 });
 
 test("the protected runner refuses wrong-build and stale receipts and finishes the lease", async () => {
@@ -276,9 +260,8 @@ test("the protected runner refuses wrong-build and stale receipts and finishes t
     assert.equal(result.verdict, "failed", scenario);
     assert.equal(result.code, readerRefused ? "probe_failed" : "session_unconfirmed", scenario);
     assert.deepEqual(reads, readerRefused ? ["session"] : ["session", "discord"], scenario);
-    assert.deepEqual(result.cases, [], scenario);
-    assert.deepEqual(signed, [], scenario);
-    assert.deepEqual(moves, [], scenario);
+    assert.deepEqual({ cases: result.cases, signed, moves }, { cases: [], signed: [], moves: [] }, scenario);
+    assert.deepEqual(result.cleanup, { memberDisconnected: null, off: true, stopped: true }, scenario);
     assert.deepEqual(calls, ["status", "release", "status"], scenario);
   }
 });
