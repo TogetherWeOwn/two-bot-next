@@ -615,6 +615,42 @@ Hosted source-level CI runs the
 [synthetic refusal case](../scripts/ci/test_predecessor_serving_identity.py)
 for both choices of `rollback_sha`.
 
+### Prepare the predecessor image for isolated staging
+
+Open [`materialize_predecessor_bundle`](../scripts/materialize_predecessor.py)
+with the same private verified ZIP and its reviewed pins. Within that context,
+call [`plan_predecessor_image`](../scripts/predecessor_image.py) with the
+protected caller's authorized staging repository. Use a dedicated repository
+named `two-bot-next-attendance-predecessor-staging` in that registry namespace.
+The plan checks the local image archive hash and the stamped manifest digest
+against the build receipt. Keep the materialization private and stable until
+the copy completes.
+
+The planned argv uses `skopeo copy --preserve-digests --dest-tls-verify=true oci-archive:<archive>
+docker://<repository>@<manifest-digest>`. Skopeo 1.20.0 selects the single
+unnamed image from the OCI archive and uploads its manifest at the digest
+reference. The OCI layout index locates that image. The protected publisher
+needs an approved Skopeo build and registry access with blob upload, digest
+manifest PUT and digest GET for the dedicated repository. The staging runtime
+also needs pull access to the digest in that repository. Keep registry auth
+in the protected adapter's private auth file.
+[Skopeo copy](https://github.com/containers/skopeo/blob/v1.20.0/docs/skopeo-copy.1.md) ·
+[OCI Distribution manifest PUT](https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pushing-manifests)
+
+After copy success, the protected adapter must make a fresh authenticated
+`GET /v2/<namespace>/<repository>/manifests/<manifest-digest>` with
+`Accept: application/vnd.oci.image.manifest.v1+json` on the planned registry.
+Require HTTP 200 from the exact request scope without redirects. Supply the
+effective digest reference, the `Content-Type` media type and
+`Docker-Content-Digest` as descriptor fields, and the original response bytes
+with a 1 MiB cap plus one overflow byte. Set descriptor size to the observed
+byte count. `verify_registry_manifest` returns `<repository>@<manifest-digest>`
+only when scope, descriptor and the hash of those bytes match the plan. The
+expected digest is the producer's `image_manifest_digest` from `build.json`.
+Keep admission pending until the protected publisher proves registry authority,
+digest readback and runtime access. This source change supplies an offline
+contract and synthetic evidence.
+
 ## Regression gate against production
 
 Before any production mutation, every ordinary promotion compares the
