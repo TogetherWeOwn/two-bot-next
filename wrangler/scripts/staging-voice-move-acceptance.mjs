@@ -74,6 +74,19 @@ function assertCaller(caller, discordId, observe) {
     && typeof caller.move === "function" && typeof observe === "function", "caller_unconfirmed");
 }
 
+export function priorVoiceCleanupMatches(binding, ready, previousReady, previousOff) {
+  const previous = leaseBinding(previousReady?.use);
+  const previousReadyAt = observedAt(previousReady);
+  const offAt = observedAt(previousOff);
+  return previous !== null && (previous.runId !== binding.runId || previous.runAttempt !== binding.runAttempt)
+    && previous.sha === binding.sha && previous.deploymentId === binding.deploymentId && previous.epoch === binding.epoch
+    && active(previousReady, previous, "ready", previousReadyAt)
+    && offAt >= previousReadyAt && offAt <= ready.use.acquiredAt && ready.use.acquiredAt - offAt <= LEASE_MS
+    && leaseMatches(previousOff, previous, "status") && previousOff.running === false
+    && previousOff.voiceMoveEnabled === false && previousOff.use.acquiredAt === previousReady.use.acquiredAt
+    && (previousOff.use.phase === "released" || (previousOff.use.phase === "active" && offAt >= previous.expiresAt));
+}
+
 function assertPreflight(binding, ready, fixture, evidence, at) {
   assertReady(binding, ready, at);
   const [source, destination] = assertFixture(fixture);
@@ -92,17 +105,7 @@ function assertPreflight(binding, ready, fixture, evidence, at) {
   require(confirmsChannel(readback?.source, source, false) && confirmsChannel(readback?.destination, destination, true),
     "discord_unconfirmed");
 
-  const previous = leaseBinding(previousReady?.use);
-  const previousReadyAt = observedAt(previousReady);
-  const offAt = observedAt(previousOff);
-  require(previous && (previous.runId !== binding.runId || previous.runAttempt !== binding.runAttempt)
-    && previous.sha === binding.sha && previous.deploymentId === binding.deploymentId && previous.epoch === binding.epoch
-    && active(previousReady, previous, "ready", previousReadyAt)
-    && offAt >= previousReadyAt && offAt <= ready.use.acquiredAt && ready.use.acquiredAt - offAt <= LEASE_MS
-    && leaseMatches(previousOff, previous, "status") && previousOff.running === false
-    && previousOff.voiceMoveEnabled === false && previousOff.use.acquiredAt === previousReady.use.acquiredAt
-    && (previousOff.use.phase === "released" || (previousOff.use.phase === "active" && offAt >= previous.expiresAt)),
-    "prior_cleanup_unconfirmed");
+  require(priorVoiceCleanupMatches(binding, ready, previousReady, previousOff), "prior_cleanup_unconfirmed");
   return [source, destination];
 }
 

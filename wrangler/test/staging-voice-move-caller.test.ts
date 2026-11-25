@@ -33,7 +33,9 @@ test("protected caller forwards one pinned invocation and returns the proof rece
   const options = protectedInputs();
   const receipt = { verdict: "passed", mode: "mock" };
   const calls = [];
-  const result = await runProtectedStagingVoiceMove({ ...options, unrelated: true }, async (request) => {
+  const result = await runProtectedStagingVoiceMove({ ...options, unrelated: true,
+    fixture: { ...options.fixture, unrelated: true }, expectedRevision: { ...options.expectedRevision, unrelated: true },
+  }, async (request) => {
     calls.push(request);
     return receipt;
   });
@@ -43,6 +45,30 @@ test("protected caller forwards one pinned invocation and returns the proof rece
   assert.equal(calls[0].previousReady, options.previousReady);
   assert.equal(calls[0].previousOff, options.previousOff);
   assert.equal(result, receipt);
+});
+
+test("protected input setup refuses missing adapters or mismatched pins before proof", async () => {
+  const options = protectedInputs();
+  const { expectedRevision, previousOff, previousReady, ready, webSession } = options;
+  const cases = [
+    [{ webSession: { ...webSession, origin: "https://example.invalid" } }, "proof_inputs_incomplete"],
+    [{ webSession: { ...webSession, request: undefined } }, "proof_inputs_incomplete"],
+    [{ webSession: { ...webSession, move: undefined } }, "proof_inputs_incomplete"],
+    [{ expectedRevision: { ...expectedRevision, version_id: "unattributed" } }, "proof_inputs_incomplete"],
+    [{ expectedRevision: { ...expectedRevision, commit: "unattributed" } }, "proof_inputs_incomplete"],
+    [{ observer: { readChannels: unexpectedCall } }, "proof_inputs_incomplete"],
+    [{ observer: { observe: unexpectedCall } }, "proof_inputs_incomplete"],
+    [{ control: undefined }, "proof_inputs_incomplete"],
+    [{ previousReady: undefined }, "proof_inputs_incomplete"],
+    [{ previousOff: { ...previousOff, running: true } }, "prior_cleanup_unconfirmed"],
+    [{ previousOff: { ...previousOff, voiceMoveEnabled: true } }, "prior_cleanup_unconfirmed"],
+    [{ previousOff: { ...previousOff, use: { ...previousOff.use, runId: ready.use.runId } } }, "prior_cleanup_unconfirmed"],
+    [{ previousReady: { ...previousReady, use: { ...previousReady.use, sha: "c".repeat(40) } } }, "prior_cleanup_unconfirmed"],
+  ];
+  for (const [change, code] of cases) {
+    assert.deepEqual(await runProtectedStagingVoiceMove({ ...options, ...change }, unexpectedCall),
+      { verdict: "failed", code });
+  }
 });
 
 test("protected caller returns before invoking the proof when protected inputs are unconfirmed", async () => {
