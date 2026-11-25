@@ -50,6 +50,7 @@ mod drop_poison_test_serial;
 mod duplicate_pool_registration_acceptance_tests;
 mod erasure_cli;
 mod event_cli;
+mod event_permission_readback;
 mod eventsub_delivery;
 mod eventsub_http;
 mod eventsub_reconcile;
@@ -459,6 +460,9 @@ async fn run(cli_args: &[String]) {
     // never saw reads `null`, never a fabricated start.
     let voice_cache = voice_snapshot::new_shared_cache();
     let voice_clock = voice_snapshot::VoiceOccupancyClock::new();
+    let state = state.with_event_permission_readback(
+        event_permission_readback::Readback::from_env(config.guild_id, Arc::clone(&voice_cache)),
+    );
     // Capture the authoritative pool before the gateway's async move owns it.
     // Bind privately before starting tasks; enabled failures never fall back.
     let mut live_snapshot_owner = None;

@@ -303,8 +303,24 @@ impl KeyRing {
         nonce: &str,
         raw: &[u8],
     ) -> bool {
+        self.verify_post(ACTIONS_PATH, key_id, signature, timestamp, nonce, raw)
+    }
+
+    /// Verify a POST against a fixed protocol path and its dedicated key ring.
+    /// The caller owns header validation, freshness and replay protection.
+    #[must_use]
+    pub fn verify_post(
+        &self,
+        path: &'static str,
+        key_id: &str,
+        signature: &str,
+        timestamp: &str,
+        nonce: &str,
+        raw: &[u8],
+    ) -> bool {
         let secret = self.keys.get(key_id);
-        let expected = sign(
+        let expected = sign_post(
+            path,
             secret.map_or(self.decoy.expose().as_slice(), |key| {
                 key.expose().as_slice()
             }),

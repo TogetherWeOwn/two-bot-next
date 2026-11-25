@@ -192,6 +192,26 @@ An authenticated outcome proven against the original attempt may settle that
 attempt. A lost response, timeout, stale owner, revoked permit, permission
 readback, or elapsed time cannot settle it. Never dispatch under a second key.
 
+### Bot permission readback
+
+The container mounts `POST /ops/event-permissions` only with
+`TWO_EVENT_PERMISSION_READBACK=1`, `GUILD_ID`, a canonical
+`TWO_EVENT_PERMISSION_READBACK_BOT_ID` and a dedicated `id:secret` in
+`TWO_EVENT_PERMISSION_READBACK_KEY`. Access stays inside the container and
+works while signed action ingress is off. Send JSON with the string fields
+`guild_id` and `bot_id` and use the existing four `x-two-*` headers to sign
+`POST\n/ops/event-permissions\n{timestamp}\n{nonce}\n{sha256_hex(body)}`.
+The process-local nonce cache refuses replay within the signature window.
+The redacted response contains the signed nonce, sample time, owner or
+administrator bypass, guild event bits and voice and stage counts for each
+bit and their union after overwrites. The read uses the connected gateway
+cache without I/O. Gateway startup still requires its normal database.
+Refusals carry no result (503 unavailable, 404 wrong scope or disabled,
+401 unauthenticated). The operator ties the nonce to the pinned runtime
+and private scope. The time dates the local sample. Qualification needs
+separate evidence of the applied policy revision, channel prerequisites,
+permission recovery paths, other writers, and role and announcement controls.
+
 ### Disposable rehearsal
 
 Pull the admitted Bot images by digest through the registry's read-only path

@@ -3433,6 +3433,10 @@ fn one_header<'a>(
         .map_err(|_| Failure::code(ErrorCode::Malformed))
 }
 
+pub(super) fn signed_json_headers(headers: &HeaderMap) -> Option<AuthHeaders<'_>> {
+    wire_headers(headers).ok().map(|wire| wire.auth)
+}
+
 fn wire_headers(headers: &HeaderMap) -> Result<WireHeaders<'_>, Failure> {
     if headers.len() > MAX_HEADERS
         || headers
