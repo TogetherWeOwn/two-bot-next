@@ -2058,8 +2058,7 @@ class GuardBehaviourTests(unittest.TestCase):
         code, outputs, summary, calls, _ = self.guard(
             event="workflow_run", sha="", run_sha=old_run_sha, run_conclusion="success",
             **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
-               **dict.fromkeys(("staging", "staging-all"),
-                               {"total_count": 1, "workflow_runs": [{**staging_run(), "updated_at": green_at}]})})
+               "staging": {"total_count": 1, "workflow_runs": [{**staging_run(), "updated_at": green_at}]}})
         self.assertEqual(code, 0)
         self.assertEqual(outputs["sha"], SHA)
         self.assertNotEqual(outputs["sha"], old_run_sha)
@@ -2258,8 +2257,7 @@ class GuardBehaviourTests(unittest.TestCase):
         _, outputs, _, _, _ = self.guard(
             event="schedule", sha="",
             **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
-               **dict.fromkeys(("staging", "staging-all"),
-                               {"total_count": 1, "workflow_runs": [{**staging_run(), "updated_at": green_at}]})})
+               "staging": {"total_count": 1, "workflow_runs": [{**staging_run(), "updated_at": green_at}]}})
         self.assertEqual(outputs["skip"], "")
         self.assertEqual(outputs["soak_seconds"], "0")
 
