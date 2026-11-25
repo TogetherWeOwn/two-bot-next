@@ -1,10 +1,13 @@
 """Exercise private materialization with synthetic, verified ZIPs."""
 
 from hashlib import sha256
+import ntpath
 from pathlib import Path
+from shutil import copyfileobj
 import stat
 import sys
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -82,4 +85,26 @@ class MaterializePredecessorTests(unittest.TestCase):
         with patch("materialize_predecessor.copyfileobj", short_image_copy):
             with self.assertRaisesRegex(GateError, "^predecessor_materialization_failed$"), materialization:
                 self.fail("published a directory after a short copy")
+        self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_refuses_extra_file_in_written_inventory(self):
+        _, materialization = self.materialize()
+
+        def copy_with_extra_file(source, destination):
+            copyfileobj(source, destination)
+            if source.name == BUILD:
+                Path(destination.name).with_name("extra").touch()
+
+        with patch("materialize_predecessor.copyfileobj", copy_with_extra_file):
+            with self.assertRaisesRegex(GateError, "^predecessor_materialization_failed$"), materialization:
+                self.fail("published a directory with extra files")
+        self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_refuses_windows_reserved_path(self):
+        self.add_module("assets/NUL/nested.js", b"reserved")
+        _, materialization = self.materialize()
+
+        with patch("materialize_predecessor.os", SimpleNamespace(name="nt", path=ntpath)):
+            with self.assertRaisesRegex(GateError, "^predecessor_materialization_failed$"), materialization:
+                self.fail("published a directory with a Windows device name")
         self.assertEqual(list(self.output.iterdir()), [])

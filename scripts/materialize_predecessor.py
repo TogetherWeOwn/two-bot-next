@@ -2,7 +2,7 @@
 
 from contextlib import contextmanager
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from shutil import copyfileobj
 from struct import error as StructError
 from tempfile import TemporaryDirectory
@@ -19,7 +19,7 @@ def _reserved_on_windows(relative):
     if hasattr(os.path, "isreserved"):
         return os.path.isreserved(relative)
     # Windows on Python 3.12 and earlier exposes the check through pathlib.
-    return any(Path(part).is_reserved() for part in relative.parts)
+    return any(PureWindowsPath(part).is_reserved() for part in relative.parts)
 
 
 @contextmanager
