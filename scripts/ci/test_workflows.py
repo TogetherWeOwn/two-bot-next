@@ -19,10 +19,11 @@ from unittest.mock import Mock, patch
 
 import yaml
 
+from staging_pre_reaper_policy import PRE_REAPER, PRE_REAPER_QUEUE, dormant_pre_reaper_errors
 from staging_soak_policy import PRODUCTION_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, GUARDS as MEASUREMENT_GUARDS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
-    TARGET as MEASUREMENT_TARGET, WORKFLOW as MEASUREMENT, is_measurement_caller,
+    TARGET as MEASUREMENT_TARGET, WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -99,6 +100,7 @@ JOB_INVENTORY = {
     "staging-mcp-proveout.yml": {"proveout"},
     "staging-voice-move.yml": {"verify-lease"},
     "staging-automod-preview.yml": {"dry-run"},
+    PRE_REAPER: {"sweep"},
     # Manual read-only staging ownership status read; pinned shape below.
     "staging-ownership-status.yml": {"status", "inventory"},
     "production-ownership-status.yml": {"guard", "status"},
@@ -4829,8 +4831,59 @@ def measurement_deploy_scan_text(job_id, job):
     return str(dict(job, steps=[*steps[:index], sanitized, *steps[index + 1:]])).lower()
 
 
+# Existing expression-only groups with fixed disjoint results. An expression
+# with a disjoint literal prefix needs no separate entry.
+DISJOINT_PRE_REAPER_EXPRESSIONS = {
+    (file, None): "${{ (inputs.deploy_staging_call || inputs.staging_use_expires_at != '') && "
+                  f"format('staging-{consumer}-consumer-{{0}}', github.run_id) || 'staging-lifecycle' }}}}"
+    for file, consumer in (("help-embed-synthetic.yml", "help"), ("voice-synthetic.yml", "voice"))
+}
+DISJOINT_PRE_REAPER_EXPRESSIONS.update({
+    (MEASUREMENT, None): measurement_queue("staging-lifecycle")["group"],
+    (STAGING_SOAK, None): "${{ github.run_attempt == 1 && github.ref == 'refs/heads/main' && "
+                          "github.ref_protected && 'staging-lifecycle' || "
+                          "format('staging-soak-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
+    ("staging-voice-move.yml", None): "${{ inputs.verify_lease && github.ref == 'refs/heads/main' && "
+                                    "github.ref_protected && github.run_attempt == 1 && 'staging-lifecycle' || "
+                                    "format('staging-voice-move-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
+    ("pipeline-benchmark.yml", None): "${{ github.workflow }}-pipeline-benchmark-"
+                                     "${{ github.event.pull_request.number || github.ref }}",
+    ("deploy-production.yml", "production"): PRODUCTION_GROUP,
+})
+
+
+def staging_pre_reaper_errors(workflows):
+    errors = dormant_pre_reaper_errors(workflows)
+    for file, workflow in workflows.items():
+        if file == PRE_REAPER:
+            continue
+        for job, node in ((None, workflow), *workflow.get("jobs", {}).items()):
+            if "concurrency" not in node:
+                continue
+            lock = node["concurrency"]
+            group = lock.get("group", "") if isinstance(lock, dict) else lock
+            prefix, expression, _ = group.casefold().strip().partition("${{")
+            if not expression:
+                may_collide = prefix == PRE_REAPER_QUEUE
+            elif not PRE_REAPER_QUEUE.startswith(prefix):
+                may_collide = False
+            elif (file, job) == ("pr-size.yml", None):
+                # This expression's first term is the top-level workflow name.
+                may_collide = not (
+                    workflow.get("name") == "pr-size" and "workflow_call" not in workflow.get("on", {})
+                    and group == "${{ github.workflow }}-"
+                                 "${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}"
+                )
+            else:
+                may_collide = DISJOINT_PRE_REAPER_EXPRESSIONS.get((file, job)) != group
+            if may_collide:
+                errors.append(f"{file}: the PRE sweep queue must remain exclusive")
+    return errors
+
+
 def workflow_policy_errors(workflows):
     errors = []
+    errors.extend(staging_pre_reaper_errors(workflows))
     errors.extend(cloudflare_environment_errors(workflows))
     errors.extend(staging_gateway_injection_errors(workflows))
     errors.extend(staging_error_rate_gate_errors(workflows))
@@ -4971,6 +5024,8 @@ def workflow_policy_errors(workflows):
             if workflow != json.loads(contract.read_text()):
                 errors.append(f"{name}: expected the pinned protected workflow")
             continue
+        if name == PRE_REAPER:
+            continue  # Exact job and caller closure pinned by staging_pre_reaper_errors.
         if name == "gradual-promote-proof.yml":
             # Manual gradual-promote proof caller (passive until the fixture
             # lands): pinned shape above; the generic environment/marker
@@ -7655,6 +7710,43 @@ class WorkflowTests(unittest.TestCase):
         workflows["check.yml"]["jobs"]["worker"] = {"uses": f"./.github/workflows/{name}"}
         self.assertIn("check.yml:worker: deployment/probe alternative outside approved deploy workflows",
                       workflow_policy_errors(workflows))
+
+    def test_staging_pre_reaper_is_dormant(self):
+        self.assertEqual(staging_pre_reaper_errors(self.workflows), [])
+        for keys, change in (
+                (("on",), {"schedule": [{"cron": "17 * * * *"}]}),
+                (("on",), {"workflow_dispatch": ""}),
+                (("jobs", "sweep"), {"if": "github.ref == 'refs/heads/main'"}),
+                (("jobs", "sweep", "environment"), {"name": "production"}),
+                (("jobs", "sweep", "permissions"), {"issues": "write"}),
+                (("jobs", "sweep", "concurrency"), {"cancel-in-progress": "true"}),
+                (("jobs", "sweep", "concurrency"), {"queue": "single"}),
+                (("jobs", "sweep", "steps", 1), {"continue-on-error": "true"}),
+                (("jobs", "sweep", "steps", 1), {"env": {"TOKEN": "${{ secrets.PROVIDER_TOKEN }}"}}),
+                (("jobs", "sweep", "steps", 2), {"run": 'echo "$PROVIDER_RESPONSE"'})):
+            with self.subTest(keys=keys, change=change):
+                workflows = deepcopy(self.workflows)
+                node = workflows[PRE_REAPER]
+                for key in keys:
+                    node = node[key]
+                node.update(change)
+                self.assertTrue(staging_pre_reaper_errors(workflows))
+
+        workflows = deepcopy(self.workflows)
+        workflows["check.yml"]["jobs"]["worker"] = {"uses": f"./.github/workflows/{PRE_REAPER}"}
+        self.assertIn("check.yml: the PRE reaper must remain unwired", staging_pre_reaper_errors(workflows))
+
+        workflows = deepcopy(self.workflows)
+        for group in (
+            "STAGING-PRE-REAPER",
+            " staging-pre-reaper ",
+            "${{ format('staging-{0}-reaper', 'pre') }}",
+            "staging-pre-${{ vars.CLEANUP_SUFFIX }}",
+        ):
+            with self.subTest(group=group):
+                workflows["check.yml"]["concurrency"] = {"group": group}
+                self.assertIn("check.yml: the PRE sweep queue must remain exclusive",
+                              staging_pre_reaper_errors(workflows))
 
     def test_staging_deploy_holds_the_full_window_and_releases_after_every_consumer(self):
         import copy
@@ -11557,6 +11649,7 @@ class WorkflowTests(unittest.TestCase):
             "deploy-production-recovery.yml",
             "reusable-rust-nextest.yml",
             "sbom.yml",
+            PRE_REAPER,  # The guarded sweep job alone acquires its dedicated queue.
         }
         exempt = {
             *pure_callees,
