@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import check_staging_help_evidence as evidence_check
 import staging_help_embed_smoke as smoke
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -228,6 +229,78 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         self.assertTrue(all("message_id" in row for row in evidence["rows"]))
         self.assertNotIn(TOKEN, out)
         self.assertNotIn(TOKEN, Path(self.evidence).read_text())
+
+    def test_deploy_called_help_evidence_requires_exact_rollout_and_cleanup(self):
+        run, sha = "1234567890", "a" * 40
+        worker = "11111111-1111-4111-8111-111111111111"
+        rollout = {"revision": sha, "build_id": f"{run}-1",
+                   "deploy_id": "2026.11.25.2+aaaaaaa", "worker_version": worker,
+                   "health": 200, "readyz": 200}
+        binding = {"environment": "staging", "runId": run, "runAttempt": 1,
+                   "expiresAt": 1795600000000}
+        attempt = dict(binding, schema="two-bot-staging-use.v1", action="attempt",
+                       observedAt="2026-11-25T10:00:00.000Z")
+        use = dict(binding, sha=sha, deploymentId=worker, epoch=9, phase="active",
+                   acquiredAt=1795599900000)
+        ready = dict(attempt, action="ready", sha=sha, deploymentId=worker,
+                     epoch=9, running=True, use=use)
+        rollout_path = self.dir / "evidence.json"
+        start_path = self.dir / "staging-use.jsonl"
+        self.evidence = str(self.dir / f"help-embed-synthetic-{run}-2.json")
+        fake = FakeDiscord()
+        code, _ = self.run_main(fake)
+        self.assertEqual(0, code)
+        self.assertEqual({}, fake.messages)
+        report = self.evidence_json()
+
+        def check(*, pin=rollout, window=(attempt, ready), rows=report,
+                  report_path=Path(self.evidence)):
+            rollout_path.write_text(json.dumps(pin))
+            start_path.write_text("".join(json.dumps(line) + "\n" for line in window))
+            report_path.write_text(json.dumps(rows))
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(out):
+                code = evidence_check.main(["--rollout", str(rollout_path), "--start", str(start_path),
+                                            "--report", str(report_path)])
+            return code, out.getvalue()
+
+        code, out = check()
+        self.assertEqual(0, code)
+        self.assertIn("message deletions match the intended rollout", out)
+
+        wrong_worker = "22222222-2222-4222-8222-222222222222"
+        old_run = "1234567889"
+        missing_cleanup = copy.deepcopy(report)
+        missing_cleanup["rows"][0].pop("actual")
+        failed_cleanup = copy.deepcopy(report)
+        failed_cleanup["rows"][0]["cleanup_failed"] = True
+        repeated_id = copy.deepcopy(report)
+        repeated_id["rows"][1]["message_id"] = repeated_id["rows"][0]["message_id"]
+
+        for inputs, reason in (
+            ({"report_path": self.dir / f"help-embed-synthetic-{old_run}-2.json"}, "different run"),
+            ({"window": (dict(attempt, runId=old_run),
+                         dict(ready, runId=old_run, use=dict(use, runId=old_run)))}, "different run"),
+            ({"window": (attempt,)}, "receipt is incomplete"),
+            ({"window": (attempt, dict(ready, deploymentId=wrong_worker,
+                                       use=dict(use, deploymentId=wrong_worker)))}, "different serving deployment"),
+            ({"window": (attempt, dict(ready, use=dict(use, deploymentId=wrong_worker)))},
+             "different serving deployment"),
+            ({"window": (attempt, dict(ready, sha="b" * 40, use=dict(use, sha="b" * 40)))},
+             "different serving deployment"),
+            ({"pin": dict(rollout, deploy_id=None)}, "rollout is incomplete"),
+            ({"pin": dict(rollout, build_id=f"{run}-2")}, "not a first attempt"),
+            ({"rows": dict(report, schema="help_embed_smoke.v2")}, "current schema"),
+            ({"rows": dict(report, rows=report["rows"][:-1])}, "incomplete readback inventory"),
+            ({"rows": missing_cleanup}, "missing a readback or deletion acknowledgement"),
+            ({"rows": failed_cleanup}, "missing a readback or deletion acknowledgement"),
+            ({"rows": repeated_id}, "repeats a message ID"),
+        ):
+            with self.subTest(reason=reason):
+                code, out = check(**inputs)
+                self.assertEqual(1, code)
+                self.assertIn(reason, out)
+                self.assertNotIn("PASS", out)
 
     def test_assertions_run_on_the_read_back_not_the_post_echo(self):
         def strip_brand(message):
