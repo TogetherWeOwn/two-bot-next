@@ -9195,6 +9195,17 @@ class WorkflowTests(unittest.TestCase):
                 change(workflow)
                 self.assertTrue(production_errors(workflow), label)
 
+    def test_production_apply_uses_the_protected_preflight_epoch(self):
+        jobs = self.workflows["deploy-production.yml"]["jobs"]
+        prepare = jobs["release-prepare"]
+        preflight = next(step for step in prepare["steps"] if step.get("id") == "preflight")
+        self.assertEqual(preflight["run"], "python3 scripts/production_release.py prepare")
+        self.assertEqual(prepare["outputs"].get("epoch"), "${{ steps.preflight.outputs.epoch }}")
+        apply = jobs["release-apply"]
+        self.assertIn("release-prepare", apply["needs"])
+        transaction = next(step for step in apply["steps"] if step.get("run") == "python3 scripts/production_release.py apply")
+        self.assertEqual(transaction["env"].get("RELEASE_PREFLIGHT_EPOCH"), "${{ needs.release-prepare.outputs.epoch }}")
+
     def test_soak_rejects_unsafe_handoffs(self):
         for mutate in (
             lambda w: w["deploy-production.yml"]["jobs"]["soak"]["secrets"].pop("STAGING_METRICS_SCRAPE_TOKEN"),

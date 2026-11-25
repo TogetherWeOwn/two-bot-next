@@ -1464,6 +1464,7 @@ jobs:
     permissions: *release-permissions
     env: *release-env
     outputs:
+      epoch: ${{ steps.preflight.outputs.epoch }}
       stopped: ${{ steps.release-stop.outputs.ack }}
     steps:
       - &release-checkout
@@ -1549,6 +1550,7 @@ jobs:
       - name: Apply the protected forward transaction
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_PREFLIGHT_EPOCH: ${{ needs.release-prepare.outputs.epoch }}
           RELEASE_STOPPED: ${{ needs.release-prepare.outputs.stopped }}
           RELEASE_RUNNER: ${{ github.workspace }}/target/debug/staging-migrate
           TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}
