@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { StagingAutomodLifecycle } from "../src/staging-automod-lifecycle.ts";
+import type { StagingUse } from "../src/staging-lifecycle.ts";
 import publication from "./fixtures/staging-automod-publication.json" with { type: "json" };
 import { lease, Storage } from "./fixtures/staging-automod-recovery.ts";
 
@@ -13,14 +14,21 @@ const input = {
   verifiedRecoveryPair: true, verifiedRuntimeDatabase: true, verifiedGatewayIntents: true, cleanupReserveMs: 5_000,
 };
 const refusal = /staging_automod_/;
+const dryRun = {
+  memberIntake: false, enforcement: false, resume: false, registrySync: false, interactionDispatch: false,
+  dedicatedIntents: true,
+};
+type Dependencies = ConstructorParameters<typeof StagingAutomodLifecycle>[0];
 
 function fixture() {
   const storage = new Storage();
   const events: string[] = [];
+  const drainedLease: Readonly<StagingUse> = lease;
   const state = {
-    at: 2_000, lease: { ...lease }, running: false, stopped: true, leaveRunning: false, drain: true, absenceCode: 10063,
-    loseDelete: false, command: undefined as typeof preview | undefined, help,
-    post: async () => {},
+    at: 2_000, lease: { ...lease }, running: false, stopped: true, leaveRunning: false, drain: true,
+    startupDrained: true, drainedLease, cleanupBefore: 90_000, absenceCode: 10063,
+    loseDelete: false, loseDetail: false, command: undefined as typeof preview | undefined, help,
+    planned: { ...dryRun }, effective: { ...dryRun }, post: async () => {}, boot: async () => {},
   };
   const journal = () => storage.value as { phase: string; created: unknown } | undefined;
   const rows = () => state.command ? [state.help, state.command] : [state.help];
@@ -30,18 +38,32 @@ function fixture() {
     tail = result.then(() => {}, () => {});
     return result;
   }
-  const start = (enabled?: boolean) => new StagingAutomodLifecycle({
+  const boot: NonNullable<Dependencies["dryRun"]>["start"] = async (bound, policy, before) => {
+    assert.deepEqual(bound, lease);
+    assert.deepEqual(policy, dryRun);
+    assert.ok(Object.isFrozen(policy));
+    assert.equal(before, lease.expiresAt - input.cleanupReserveMs);
+    assert.equal(journal()?.phase, "starting");
+    events.push("boot");
+    await state.boot();
+    state.running = true;
+  };
+  const start = (enabled?: boolean, runtime = true) => new StagingAutomodLifecycle({
     ...(enabled === undefined ? {} : { enabled }), storage, exclusive, now: () => state.at,
     env: { ...env, STAGING_RUNTIME_POLICY: "bounded", TWO_MODERATION: "1", TWO_OWEN_USER_ID: preview.id },
-    observe: async () => ({ lease: state.lease, purpose: "automod-preview", running: state.running, cleanupBefore: 90_000 }),
-    fenceAndDrain: async bound => {
+    ...(runtime ? { dryRun: { policy: state.planned, start: boot } } : {}),
+    observe: async () => ({ lease: state.lease, purpose: "automod-preview", running: state.running,
+      policy: state.effective, cleanupBefore: state.cleanupBefore }),
+    fenceAndDrain: async (bound, before) => {
       assert.deepEqual(bound, lease);
+      assert.equal(before, state.cleanupBefore);
       assert.equal(journal()?.phase, "cleanup");
       events.push("drain");
-      return state.drain;
+      return { lease: state.drainedLease, publicationDrained: state.drain, startupDrained: state.startupDrained };
     },
-    stop: async bound => {
+    stop: async (bound, before) => {
       assert.deepEqual(bound, lease);
+      assert.equal(before, state.cleanupBefore);
       events.push("stop");
       if (state.stopped && !state.leaveRunning) state.running = false;
       return state.stopped;
@@ -81,8 +103,10 @@ function fixture() {
       switch (url) {
         case "https://discord.com/api/v10/users/@me": return Response.json(identity);
         case `${guild}?with_localizations=true`: return Response.json(rows());
-        case detail: return state.command?.id === preview.id ? Response.json(state.command)
-          : Response.json({ code: state.absenceCode }, { status: 404 });
+        case detail:
+          if (state.loseDetail) throw new Error("lost detail response");
+          return state.command?.id === preview.id ? Response.json(state.command)
+            : Response.json({ code: state.absenceCode }, { status: 404 });
         default: throw new Error("unexpected synthetic route");
       }
     },
@@ -100,6 +124,93 @@ test("AutoMod lifecycle is off by default and rejects mixed or stale staging use
   await f.start().recover();
   assert.deepEqual(f.events, []);
   await f.start().otherUse(f.other);
+});
+
+test("AutoMod dry-run start requires verified publication and intake-off admission", async () => {
+  const f = fixture();
+  await assert.rejects(f.start(true).startDryRun(lease), refusal);
+  f.state.loseDetail = true;
+  await assert.rejects(f.start(true).publish(input), refusal);
+  assert.ok(f.journal()?.created);
+  await assert.rejects(f.start(true).startDryRun(lease), refusal);
+  assert.equal(f.events.includes("boot"), false);
+  f.state.loseDetail = false;
+  await f.start().recover();
+
+  const ready = fixture();
+  await ready.start(true).publish(input);
+  await assert.rejects(ready.start().startDryRun(lease), refusal);
+  await assert.rejects(ready.start(true, false).startDryRun(lease), refusal);
+  await assert.rejects(ready.start(true).startDryRun({ ...lease, voiceMove: true }), refusal);
+  ready.state.lease.runAttempt++;
+  await assert.rejects(ready.start(true).startDryRun(lease), refusal);
+  ready.state.lease.runAttempt--;
+  ready.state.planned.memberIntake = true;
+  await assert.rejects(ready.start(true).startDryRun(lease), refusal);
+  ready.state.planned.memberIntake = false;
+  ready.state.at = lease.expiresAt - input.cleanupReserveMs;
+  await assert.rejects(ready.start(true).startDryRun(lease), refusal);
+  assert.equal(ready.journal()?.phase, "ready");
+  assert.equal(ready.events.includes("boot"), false);
+});
+
+test("AutoMod dry-run start spends its grant under the staging gate", async () => {
+  const f = fixture();
+  await f.start(true).publish(input);
+  const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+  f.state.boot = async () => { entered.resolve(); await finish.promise; };
+  const starting = f.start(true).startDryRun(lease);
+  await entered.promise;
+  const replay = assert.rejects(f.start(true).startDryRun(lease), refusal);
+  const competing = assert.rejects(f.start().otherUse(f.other), refusal);
+  finish.resolve();
+  await Promise.all([starting, replay, competing]);
+  assert.equal(f.state.running, true);
+  assert.equal(f.events.filter(e => e === "boot").length, 1);
+
+  const expired = fixture();
+  await expired.start(true).publish(input);
+  expired.storage.afterCommit = () => {
+    delete expired.storage.afterCommit;
+    expired.state.at = lease.expiresAt - input.cleanupReserveMs;
+  };
+  await assert.rejects(expired.start(true).startDryRun(lease), refusal);
+  assert.equal(expired.journal()?.phase, "starting");
+  assert.equal(expired.events.includes("boot"), false);
+  await expired.start().recover(lease);
+});
+
+test("AutoMod startup recovery needs same-lease drain stopped readback and absence", async () => {
+  const f = fixture();
+  await f.start(true).publish(input);
+  // Simulate a start that returned without establishing runtime isolation.
+  f.state.effective.memberIntake = true;
+  await assert.rejects(f.start(true).startDryRun(lease), refusal);
+  assert.equal(f.state.running, true);
+  f.state.at = lease.expiresAt;
+  const recovered = f.start(undefined, false);
+  f.state.startupDrained = false;
+  await assert.rejects(recovered.recover(lease), refusal);
+  f.state.startupDrained = true;
+  f.state.drainedLease = { ...lease, epoch: lease.epoch + 1 };
+  await assert.rejects(recovered.recover(lease), refusal);
+  assert.equal(f.events.includes("stop"), false);
+
+  f.state.drainedLease = lease;
+  f.state.leaveRunning = true;
+  const reads = f.events.filter(e => e === "read").length;
+  await assert.rejects(recovered.recover(lease), refusal);
+  assert.equal(f.events.filter(e => e === "read").length, reads);
+  f.state.leaveRunning = false;
+  f.state.absenceCode = 10004;
+  await assert.rejects(recovered.recover(lease), refusal);
+  await assert.rejects(recovered.otherUse(f.other), refusal);
+  assert.equal(f.journal()?.phase, "cleanup");
+  f.state.absenceCode = 10063;
+  await recovered.recover(lease);
+  await recovered.otherUse(f.other);
+  assert.equal(f.journal()?.phase, "complete");
+  assert.equal(f.events.filter(e => e === "delete").length, 1);
 });
 
 test("AutoMod lifecycle serializes writers and holds the journal until exact cleanup", async () => {
@@ -130,7 +241,7 @@ test("AutoMod lifecycle recovers committed intent after cancellation, expiry or 
   for (const reason of ["cancel", "expiry", "interrupt"]) {
     const f = fixture(), cancel = new AbortController();
     f.storage.afterCommit = () => {
-      f.storage.afterCommit = undefined;
+      delete f.storage.afterCommit;
       if (reason === "cancel") cancel.abort();
       if (reason === "expiry") f.state.at = lease.expiresAt;
       if (reason === "interrupt") throw new Error("interrupted after intent commit");
