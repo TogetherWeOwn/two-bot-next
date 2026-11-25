@@ -707,16 +707,34 @@ and readback. A lost response or a failed readback keeps the hold for recovery.
 Recovery requires same-lease remote drain of both publication and startup,
 followed by confirmed stop and a separate registry absence read.
 
-The protected caller still has to bind the same gate to staging ownership,
-lease acquisition and release, expiry, startup and all registry writers.
-It needs authoritative same-lease purpose and cleanup authority after expiry,
-remote drain evidence after an interrupted write or boot, and affirmative
-container stop and isolated boot readbacks. A lost receipt with a command
+The durable staging lease can reserve sole AutoMod purpose for the exact
+issued window, build and owner epoch. Ordinary and signed voice leases cannot
+satisfy that binding. Competing startup, Help preview, voice dispatch and
+staging mutations check the purpose and pending journal in the Container
+ownership gate before acting. The staging-use request parser refuses AutoMod
+purpose selection.
+
+During preparation the reservation blocks competing admission and allows
+native shutdown and retry of the previous process. If neither record can
+affirm an active AutoMod lease or pending journal during a storage failure,
+emergency shutdown still stops the native process and retries a failed stop.
+Reconstruction retains the scheduled stop retry even while the lease is active.
+Authenticated cleanup verifies its original scope before an emergency stop.
+The refusal leaves lease and owner records intact until a later verified retry.
+Protected cleanup continues to require fresh remote drain and stopped
+readbacks before releasing the lease.
+
+The dependent private caller needs to use the stored scope for startup and
+release on same-lease cleanup completion. Live qualification still needs the
+authenticated workflow entry, native expiry and restart recovery, a way to
+retire an unused reservation before intent, an isolated runtime adapter and
+authoritative remote drain and stopped readbacks. A lost receipt with a command
 still present needs separately proven attribution or independently verified
-absence. Older Workers refuse journal entries with the new startup phases.
-Before a future rollback to one of those builds, finish recovery with a
-Worker that understands both phases. Live qualification requires the reviewed
-bindings and the sole staging writer's exclusive window.
+absence. Older Workers
+ignore stored AutoMod purpose on the staging lease and refuse journal entries
+with the new startup phases. Before rollback to one of those builds, finish
+recovery and retire the AutoMod lease with a Worker that understands both.
+Live qualification uses the sole staging writer's exclusive window.
 
 ## 10. Spec self-check (doctest)
 

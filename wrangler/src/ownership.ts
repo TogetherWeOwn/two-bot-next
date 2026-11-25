@@ -100,12 +100,7 @@ export class OwnershipFence {
     return owner;
   }
 
-  /**
-   * Persist revocation BEFORE destroying the old process. Only a confirmed
-   * teardown permits release. A crash/write/stop failure leaves durable denial.
-   * Record and audit are written atomically, with an optimistic epoch check.
-   */
-  async change(id: string, change: OwnershipChange, destroy: () => Promise<void>, opts?: { force?: boolean }): Promise<OwnerRecord> {
+  async requireChange(id: string, change: OwnershipChange): Promise<OwnerRecord | undefined> {
     deploymentId(id);
     if (change.expectedDeploymentId !== undefined && change.expectedDeploymentId !== id) {
       throw new OwnershipRefused("deployment_mismatch");
@@ -119,6 +114,17 @@ export class OwnershipFence {
       const active = old?.phase === "active" && old.deploymentId === id;
       if (!stopped && !(change.action === "fence" && active)) throw new OwnershipRefused("epoch_conflict");
     }
+    return old;
+  }
+
+  /**
+   * Persist revocation BEFORE destroying the old process. Only a confirmed
+   * teardown permits release. A crash/write/stop failure leaves durable denial.
+   * Record and audit are written atomically, with an optimistic epoch check.
+   */
+  async change(id: string, change: OwnershipChange, destroy: () => Promise<void>, opts?: { force?: boolean }): Promise<OwnerRecord> {
+    const old = await this.requireChange(id, change);
+    const oldEpoch = old?.epoch ?? 0;
     // Idempotent repeat: the deployment that already owns the active singleton,
     // re-posting at its own epoch, gets the stored record back unchanged: no
     // write, no audit row, no destroy. A fenced (crash-recovery) record and an
