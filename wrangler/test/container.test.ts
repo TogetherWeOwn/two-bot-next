@@ -390,11 +390,12 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   const guild = `https://discord.com/api/v10/applications/${env.DISCORD_APPLICATION_ID}/guilds/${env.GUILD_ID}/commands`;
   let commandPresent = true;
   let cleanupLease = issued;
+  let reportedRunning: boolean | undefined;
   const effects: ProtectedAutomodEffects = {
     readRuntime: async lease => {
       calls.push("runtime");
       assert.deepEqual(lease, issued);
-      return { lease, running: h.runtime.running, policy: options };
+      return { lease, running: reportedRunning ?? h.runtime.running, policy: options };
     },
     readCleanupGrant: async lease => {
       calls.push("grant");
@@ -465,11 +466,15 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   await assert.rejects(run("recover", { ...issued, expiresAt: issued.expiresAt + 1 }), refused);
   cleanupLease = { ...issued, epoch: issued.epoch + 1 };
   await assert.rejects(run("recover", issued, false), refused);
+
+  cleanupLease = issued;
+  reportedRunning = false;
+  await assert.rejects(run("recover", issued, false), refused);
   assert.equal(h.runtime.running, true);
   assert.equal(calls.includes("drain"), false);
   assert.ok(await journal.pending());
 
-  cleanupLease = issued;
+  reportedRunning = undefined;
   // An expired original lease also recovers and persists the release.
   values.set(STAGING_USE_KEY, issued);
   await run("recover", issued, false);

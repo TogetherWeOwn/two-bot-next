@@ -65,7 +65,7 @@ export async function runProtectedAutomod(call: ProtectedAutomodCall, authority:
         // A missing journal is not successful cleanup. The same-lease
         // completion receipt also covers retry after an interrupted release.
         if (!await journal.completedFor(issued)) throw refused();
-        await staging.releaseAutomod(issued, await authority.identity(), Date.now());
+        await staging.releaseAutomod(issued, await authority.identity());
       }
       return result;
     }),
