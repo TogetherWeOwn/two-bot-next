@@ -1,20 +1,27 @@
 """Exercise dormant PRE orchestration with synthetic authorities and runtime."""
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 import sys
+from threading import Barrier
 import unittest
 from unittest.mock import Mock, call, patch
 from uuid import UUID
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
-    from pre_start_stop import Deployment, Endpoint, Operation, ProbeReply, ProtectedPre, StartupAdmission
+    from pre_start_stop import (Deployment, Endpoint, OfflineExternalStop, Operation, ProbeReply,
+                                ProtectedPre, StartupAdmission)
     from pre_target import Inventory, Target, TargetError, verify_cleanup
 
 
 PRE_SHAPES = ("0473/0465", "0475/0465")
 TARGET = Target("pre-fixture-test", 123, 1_800_000_000, PRE_SHAPES[0])
 START = UUID(int=1)
+
+
+def cleared(target):
+    return Inventory(target, None, None, 0, False, True, startup_settled=True, assigned_count=0)
 
 
 @dataclass(frozen=True)
@@ -25,7 +32,7 @@ class Upload:
 
 
 class PreFixture:
-    def __init__(self, target=TARGET):
+    def __init__(self, target=TARGET, *, external_stop=None):
         self.target = target
         self.deployment = Deployment(target, START, UUID(int=2), UUID(int=3))
         self.upload = Upload(target)
@@ -36,8 +43,7 @@ class PreFixture:
         self.admission.settle.return_value = True
         self.effects = Mock(admission=self.admission)
         self.now = target.started_at
-        self.armed = None
-        self.fenced = False
+        self.external_stop = external_stop if external_stop is not None else OfflineExternalStop(lambda: self.now)
         self.created = None
         self.before_create = Mock()
         self.after_create = Mock()
@@ -49,18 +55,14 @@ class PreFixture:
 
     def arm(self, target, start_id):
         self.effects.arm(target, start_id)
-        if self.fenced or not target.started_at <= self.now < target.expires_at:
-            return False
-        self.armed = (target, start_id)
-        return True
+        return self.external_stop.arm(target, start_id)
 
     def fence(self, target):
         self.effects.fence(target)
-        self.fenced = True
-        return True
+        return self.external_stop.fence(target)
 
     def allow_effect(self, target, start_id):
-        if self.fenced or self.armed != (target, start_id) or self.now >= target.expires_at:
+        if not self.external_stop.allows_effect(target, start_id):
             raise OSError("effect refused")
 
     def create_private(self, target, start_id, upload):
@@ -106,6 +108,76 @@ class ProtectedPreTests(unittest.TestCase):
         self.fixture.now = TARGET.expires_at
         self.assert_refuses("pre_external_stop_unarmed", self.controller.start, self.fixture.upload)
         self.assertEqual(self.fixture.effects.mock_calls, [call.admission.admit_start(TARGET), call.arm(TARGET, START)])
+
+    def test_colliding_scope_or_shape_cannot_create_fence_or_release_the_winner(self):
+        neighbors = (replace(TARGET, scope="pre-fixture-neighbor"), replace(TARGET, shape=PRE_SHAPES[1]))
+        for neighbor in neighbors:
+            with self.subTest(neighbor=neighbor):
+                self.assertEqual(neighbor.provider_names, TARGET.provider_names)
+                authority = OfflineExternalStop(lambda: TARGET.started_at)
+                rendezvous = Barrier(2, timeout=5)
+                fixtures = [PreFixture(target, external_stop=authority) for target in (TARGET, neighbor)]
+                with ThreadPoolExecutor(max_workers=2) as runners:
+                    starts = []
+                    for fixture in fixtures:
+                        fixture.effects.arm.side_effect = lambda *_: rendezvous.wait()
+                        controller = fixture.controller(fixture.authorize)
+                        starts.append(runners.submit(controller.start, fixture.upload))
+                    outcomes = [(fixture, start.exception()) for fixture, start in zip(fixtures, starts, strict=True)]
+                winners = [fixture for fixture, error in outcomes if error is None]
+                self.assertEqual(len(winners), 1)
+                winner = winners[0]
+                loser, refusal = next((fixture, error) for fixture, error in outcomes if fixture is not winner)
+                self.assertIsInstance(refusal, TargetError)
+                self.assertEqual(str(refusal), "pre_external_stop_unarmed")
+                loser.effects.create.assert_not_called()
+                loser_stop = loser.controller(lambda t, op: (t, op) == (loser.target, Operation.STOP))
+                self.assertFalse(loser_stop.stop())
+                loser.admission.close.assert_called_once_with(loser.target)
+                loser.admission.settle.assert_not_called()
+                self.assertFalse(authority.release(loser.target, START, inventory=cleared(loser.target)))
+                self.assertFalse(authority.allows_effect(loser.target, START))
+                winner_probe = winner.controller(winner.authorize)
+                self.assertEqual(winner_probe.probe(winner.deployment, Endpoint.HEALTH), winner.reply)
+
+    def test_release_requires_exact_fenced_claim_and_target_cleanup(self):
+        authority = self.fixture.external_stop
+        self.controller.start(self.fixture.upload)
+        self.assertFalse(authority.arm(TARGET, START))
+        self.assertFalse(authority.arm(TARGET, UUID(int=4)))
+        self.assertFalse(authority.allows_effect(TARGET, UUID(int=4)))
+        self.assertFalse(authority.release(TARGET, START, inventory=cleared(TARGET)))
+        self.assertTrue(self.controller.stop())
+        self.assertTrue(self.controller.stop())
+        self.assertFalse(authority.allows_effect(TARGET, START))
+        foreign = replace(TARGET, shape=PRE_SHAPES[1])
+        self.assertFalse(authority.arm(foreign, START))
+        self.assertFalse(authority.fence(foreign))
+        self.assertFalse(authority.release(foreign, START, inventory=cleared(foreign)))
+        self.assertFalse(authority.release(TARGET, UUID(int=4), inventory=cleared(TARGET)))
+        self.assert_refuses("pre_startup_unsettled", lambda: authority.release(
+            TARGET, START, inventory=replace(cleared(TARGET), startup_settled=False)))
+        successor = replace(TARGET, scope="pre-fixture-successor")
+        self.assert_refuses("wrong_pre_inventory_target", lambda: authority.release(
+            TARGET, START, inventory=cleared(successor)))
+        self.assertTrue(authority.release(TARGET, START, inventory=cleared(TARGET)))
+        self.assertFalse(authority.arm(TARGET, START))
+        self.assertFalse(authority.arm(foreign, START))
+        self.assertTrue(authority.arm(successor, START))
+        self.assertFalse(authority.fence(TARGET))
+        self.assertFalse(authority.release(TARGET, START, inventory=cleared(TARGET)))
+        self.assertTrue(authority.allows_effect(successor, START))
+
+    def test_pre_arm_fence_is_exact_and_distinct_names_can_be_claimed(self):
+        authority = self.fixture.external_stop
+        foreign = replace(TARGET, shape=PRE_SHAPES[1])
+        distinct = replace(TARGET, run_id=TARGET.run_id + 1)
+        self.assertFalse(authority.fence(foreign))
+        self.assertFalse(authority.arm(foreign, START))
+        self.assertEqual(self.controller.start(self.fixture.upload), self.fixture.deployment)
+        self.assertTrue(authority.arm(distinct, START))
+        self.assertTrue(authority.allows_effect(TARGET, START))
+        self.assertTrue(authority.allows_effect(distinct, START))
 
     def test_delayed_create_refused_when_stop_races_after_arm(self):
         fixture = self.fixture

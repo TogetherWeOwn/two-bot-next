@@ -11,10 +11,11 @@ provide that fence. There is no concrete provider adapter or workflow caller.
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from threading import Lock
 from typing import Protocol
 from uuid import UUID
 
-from pre_target import Target, TargetError, require
+from pre_target import Inventory, Target, TargetError, require, verify_cleanup
 from staging_health_contract_probe import BODY_CAP
 
 
@@ -99,12 +100,80 @@ class ExternalStop(Protocol):
     Target. The runtime checks ownership and the fence at the effect boundary,
     including for delayed requests. Fence persists even if create never
     replied or never began. It prevents new effects and initiates stop of the
-    exact runtime, including internal keepalive. Repeating it is safe.
+    exact runtime, including internal keepalive, only for the claim holder.
+    A conflicting reservation cannot fence or release those names.
     The admission settlement observer verifies drain and no restart separately.
     """
 
     def arm(self, target: Target, start_id: UUID) -> bool: ...
     def fence(self, target: Target) -> bool: ...
+
+
+class OfflineExternalStop:
+    """In-memory claim and fence model for one fixed provider account.
+
+    Share one instance across the synthetic callers for that account. The
+    clock supplies trusted, nondecreasing time. ProtectedPre supplies the
+    consumed start ID. A live adapter needs durable, account-wide state and
+    must enforce the fence at the actual provider effect boundary.
+    """
+
+    def __init__(self, clock: Callable[[], int]):
+        self._clock = clock
+        self._lock = Lock()
+        self._claims: dict[tuple[str, str], tuple[Target, UUID]] = {}
+        self._fenced: set[Target] = set()
+
+    def _in_window(self, target: Target) -> bool:
+        now = self._clock()
+        return type(now) is int and target.started_at <= now < target.expires_at
+
+    def arm(self, target: Target, start_id: UUID) -> bool:
+        if type(target) is not Target or type(start_id) is not UUID or not start_id.int:
+            return False
+        with self._lock:
+            if target in self._fenced or not self._in_window(target):
+                return False
+            names = target.provider_names
+            owner = self._claims.get(names)
+            if owner is not None:
+                if owner[0] != target:
+                    self._fenced.add(target)
+                return False
+            self._claims[names] = (target, start_id)
+            return True
+
+    def fence(self, target: Target) -> bool:
+        if type(target) is not Target:
+            return False
+        with self._lock:
+            self._fenced.add(target)
+            owner = self._claims.get(target.provider_names)
+            return owner is not None and owner[0] == target
+
+    def allows_effect(self, target: Target, start_id: UUID) -> bool:
+        """Model the check at a synchronous synthetic create or probe."""
+        if type(target) is not Target or type(start_id) is not UUID:
+            return False
+        with self._lock:
+            return (self._claims.get(target.provider_names) == (target, start_id)
+                    and target not in self._fenced and self._in_window(target))
+
+    def release(self, target: Target, start_id: UUID, *, inventory: Inventory) -> bool:
+        """Release only the fenced claim after independently verified cleanup.
+
+        The caller supplies fresh, authenticated inventory for the claim.
+        Keep the full-Target fence after releasing the account names.
+        """
+        if type(target) is not Target or type(start_id) is not UUID:
+            return False
+        with self._lock:
+            names = target.provider_names
+            if self._claims.get(names) != (target, start_id) or target not in self._fenced:
+                return False
+            verify_cleanup(target, inventory)
+            del self._claims[names]
+            return True
 
 
 def _call(operation, *args, failure):

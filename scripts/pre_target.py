@@ -59,6 +59,15 @@ class Target:
         return self.worker_name + "-c"
 
     @property
+    def provider_names(self) -> tuple[str, str]:
+        """Worker and Container names form one pair in the fixed account.
+
+        The Container name is derived from the Worker name, so either name
+        collides exactly when the pair collides. Scope and shape are omitted.
+        """
+        return self.worker_name, self.container_name
+
+    @property
     def service_name(self):
         return f"{self.worker_name}-{self.shape.replace('/', '-')}"
 
