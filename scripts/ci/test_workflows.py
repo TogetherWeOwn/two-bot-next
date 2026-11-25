@@ -86,6 +86,7 @@ JOB_INVENTORY = {
     "staging-migrate-reviewed.yml": {"authorize", "plan", "apply"},
     "production-migrate.yml": {"plan", "claim", "apply"},
     "deploy-production-recovery.yml": {"fence", "inverse", "restore"},
+    "deploy-production-interrupted.yml": {"admit", "database", "restart"},
     # On-demand staging automatic recovery proof plus the manual Worker-only drill.
     "staging-rollback-drill.yml": {"drill", "proof", "alert"},
     # Container-image backout/restore drill: manual, staging-only, pinned shape below.
@@ -242,6 +243,7 @@ DEPLOY_MARKERS = (
 # Canonical parsed graph for the protected recovery callee. This pins the
 # caller guard, Environment split, exact commands, permissions, and handoffs.
 PRODUCTION_RECOVERY_GRAPH = "2fd050ea4e2f4ca60328d2c54c077a7219cc3c29269c96313b52d7fbcc69b3a2"
+PRODUCTION_INTERRUPTED_GRAPH = "924989beeaa9bbc3ccb03608d183f33b8894eb65f29d5f1cb331191db59ce48d"
 
 
 class UniqueKeyLoader(yaml.BaseLoader):
@@ -5218,9 +5220,11 @@ def workflow_policy_errors(workflows):
             # below would flag its production-migrate Environment binding.
             errors.extend(production_migrate_errors(workflow))
             continue
-        if name == "deploy-production-recovery.yml":
+        if name in ("deploy-production-recovery.yml", "deploy-production-interrupted.yml"):
+            expected = (PRODUCTION_RECOVERY_GRAPH if name == "deploy-production-recovery.yml"
+                        else PRODUCTION_INTERRUPTED_GRAPH)
             graph = hashlib.sha256(json.dumps(workflow, sort_keys=True).encode()).hexdigest()
-            if graph != PRODUCTION_RECOVERY_GRAPH:
+            if graph != expected:
                 errors.append(f"{name}: protected recovery graph changed")
             continue
         if name == "staging-ownership-status.yml":
@@ -12288,6 +12292,7 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "read", "actions": "read"}
                     elif (name == "production-migrate.yml" and job_id in ("claim", "apply")
                           or name == "deploy-production-recovery.yml"
+                          or name == "deploy-production-interrupted.yml"
                           or (name == "deploy-production.yml" and job_id.startswith("release-"))):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-staging.yml", "deploy"):
