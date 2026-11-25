@@ -113,8 +113,7 @@ test("rejects status, redirect, media, cache and session mutation failures", asy
 });
 
 async function assertReceiptRefused(request: Parameters<typeof setup>[0], label: string) {
-  const session = bindStagingVoiceSession(setup(request));
-  await assert.rejects(session.readCurrent({ signal: new AbortController().signal }), refusal, label);
+  await assert.rejects(bindStagingVoiceSession(setup(request)).readCurrent({ signal: new AbortController().signal }), refusal, label);
 }
 
 test("requires an exact receipt, full matching Web revision and canonical observation time", async () => {
@@ -196,7 +195,6 @@ test("redacts exceptions and refuses cancellation during transport or stalled bo
 });
 
 type ReceiptCase = "valid" | "wrong build" | "swapped pair" | "before acquisition" | "future" | "stale";
-
 async function runWithReceipt(scenario: ReceiptCase) {
   const { args, signed, moves, calls } = mockVoiceMoveWindow(scenario === "stale" ? 61_001 : 1_000);
   const { caller, evidence, now, fixture, ...input } = args;
@@ -210,6 +208,10 @@ async function runWithReceipt(scenario: ReceiptCase) {
   const scope = {
     ...caller,
     origin,
+    move(args: MoveArgs) {
+      assert.deepEqual(reads, ["session", "discord"], "both evidence reads precede the move");
+      return caller.move(args);
+    },
     request(_target: string, init: RequestInit & { signal: AbortSignal }) {
       init.signal.throwIfAborted();
       reads.push("session");
@@ -238,16 +240,14 @@ async function runWithReceipt(scenario: ReceiptCase) {
       return input.control(request);
     },
   });
-  assert.equal(result.mode, "mock");
   return { result, signed, moves, calls, reads };
 }
 
 test("the protected runner completes the mock cases with a verified receipt", async () => {
-  const { result, signed, moves, calls, reads } = await runWithReceipt("valid");
-  assert.equal(result.verdict, "passed");
+  const { result, signed, moves, calls } = await runWithReceipt("valid");
+  assert.deepEqual({ verdict: result.verdict, mode: result.mode }, { verdict: "passed", mode: "mock" });
   assert.deepEqual(result.cases.map(({ outcome }) => outcome), ["moved", "not_permitted", "not_connected"]);
   assert.deepEqual(calls, ["assert", "assert", "assert", "status", "release", "status"]);
-  assert.deepEqual(reads, ["session", "discord"]);
   assert.deepEqual(result.cleanup, { memberDisconnected: true, off: true, stopped: true });
   assert.deepEqual({ signed: signed.length, moves: moves.length }, { signed: 3, moves: 1 });
 });
@@ -257,7 +257,7 @@ test("the protected runner refuses wrong-build and stale receipts and finishes t
   for (const scenario of cases) {
     const { result, signed, moves, calls, reads } = await runWithReceipt(scenario);
     const readerRefused = scenario === "wrong build" || scenario === "swapped pair";
-    assert.equal(result.verdict, "failed", scenario);
+    assert.deepEqual({ verdict: result.verdict, mode: result.mode }, { verdict: "failed", mode: "mock" }, scenario);
     assert.equal(result.code, readerRefused ? "probe_failed" : "session_unconfirmed", scenario);
     assert.deepEqual(reads, readerRefused ? ["session"] : ["session", "discord"], scenario);
     assert.deepEqual({ cases: result.cases, signed, moves }, { cases: [], signed: [], moves: [] }, scenario);
