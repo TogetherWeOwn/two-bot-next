@@ -7634,6 +7634,8 @@ class WorkflowTests(unittest.TestCase):
                 (("jobs", "dry-run", "permissions"), {"id-token": "write"}),
                 (("jobs", "dry-run", "steps", 2), {"run": "node wrangler/scripts/staging-use-pipeline.mjs finish"}),
                 (("jobs", "dry-run", "steps", 3), {
+                    "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
+                (("jobs", "dry-run", "steps", 4), {
                     "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}})):
             with self.subTest(keys=keys, change=change):
                 workflows = deepcopy(self.workflows)

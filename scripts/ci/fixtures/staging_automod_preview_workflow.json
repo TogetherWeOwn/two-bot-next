@@ -26,6 +26,10 @@
         {
           "name": "Exercise the private AutoMod binding with synthetic authority",
           "run": "node --test wrangler/test/staging-automod-workflow-binding.test.ts"
+        },
+        {
+          "name": "Exercise the AutoMod operator entry with synthetic run evidence",
+          "run": "node --test wrangler/test/staging-automod-operator-entry.test.ts"
         }
       ]
     }

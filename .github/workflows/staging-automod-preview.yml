@@ -1,6 +1,6 @@
 name: staging-automod-preview
 
-# Reserved for a separate protected staging caller. Both steps use synthetic authority and effects.
+# Reserved for a separate protected staging caller. The steps use synthetic authority and effects.
 on:
   workflow_call:
 permissions: {}
@@ -37,3 +37,5 @@ jobs:
         run: node --test wrangler/test/staging-automod-workflow.test.ts
       - name: Exercise the private AutoMod binding with synthetic authority
         run: node --test wrangler/test/staging-automod-workflow-binding.test.ts
+      - name: Exercise the AutoMod operator entry with synthetic run evidence
+        run: node --test wrangler/test/staging-automod-operator-entry.test.ts

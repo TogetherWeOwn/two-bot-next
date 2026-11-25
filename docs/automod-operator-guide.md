@@ -173,6 +173,12 @@ uses a fresh isolated session with dedicated intents and session resume,
 member intake, enforcement, registry sync and interaction dispatch off.
 See the [protected staging readback](automod-preview-spec.md#protected-staging-readback).
 
+The dormant operator entry checks GitHub's runner metadata against the
+authenticated Actions run before handing the approved serving selection to
+the rehearsal caller. The protected staging host must supply the existing
+lease and action approvals, authenticated inventory, and private invocation.
+The workflow continues to run synthetic checks only until that host is wired.
+
 - [ ] **Confirm existing admission evidence.** Check the stopped staging
   baseline, verified recovery, database and gateway proofs, moderation
   eligibility, cleanup reserve and affirmative registry absence with spare
