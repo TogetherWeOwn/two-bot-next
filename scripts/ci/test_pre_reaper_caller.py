@@ -104,6 +104,13 @@ class PreReaperCallerTests(unittest.TestCase):
         self.finalizer.assert_not_called()
         self.assertEqual(self.staging.events, [("status", self.target)])
 
+    def test_terminal_run_before_cutoff_reaches_the_finalizer(self):
+        self.authority.now = self.target.expires_at - 1
+        self.staging.status = "terminal"
+        self.assertIs(self.reap(), RegistryDisposition.ALREADY_ABSENT)
+        self.assertIs(self.finalizer.call_args.args[0], self.target)
+        self.assertEqual([event[0] for event in self.mutations()], list(OPERATIONS))
+
     def test_unknown_status_or_clock_refuses_even_at_cutoff(self):
         for status, now in (("unknown", self.target.expires_at), ("terminal", True),
                             ("active", self.target.started_at - 1), ("terminal", 10**10)):
@@ -112,6 +119,15 @@ class PreReaperCallerTests(unittest.TestCase):
                 with self.assertRaisesRegex(SweepError, "reservation or eligibility"):
                     self.reap()
                 claim.assert_not_called()
+        self.finalizer.assert_not_called()
+        self.assertEqual(self.mutations(), [])
+
+    def test_claim_refuses_a_different_reference_for_the_same_target(self):
+        wrong_reservation = replace(self.authority.reservation, reference=UUID(int=1))
+        claim = CleanupClaim(wrong_reservation, self.staging)
+        with patch.object(self.authority, "cleanup_claim", return_value=nullcontext(claim)):
+            with self.assertRaisesRegex(SweepError, "claim or finalization"):
+                self.reap()
         self.finalizer.assert_not_called()
         self.assertEqual(self.mutations(), [])
 
