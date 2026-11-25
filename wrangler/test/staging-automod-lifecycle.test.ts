@@ -25,7 +25,7 @@ function fixture() {
   const events: string[] = [];
   const drainedLease: Readonly<StagingUse> = lease;
   const state = {
-    at: 2_000, lease: { ...lease }, running: false, stopped: true, leaveRunning: false, drain: true,
+    at: 2_000, lease: { ...lease }, active: true, running: false, stopped: true, leaveRunning: false, drain: true,
     startupDrained: true, drainedLease, cleanupBefore: 90_000, absenceCode: 10063,
     loseDelete: false, loseDetail: false, command: undefined as typeof preview | undefined, help,
     planned: { ...dryRun }, effective: { ...dryRun }, post: async () => {}, boot: async () => {},
@@ -52,7 +52,7 @@ function fixture() {
     ...(enabled === undefined ? {} : { enabled }), storage, exclusive, now: () => state.at,
     env: { ...env, STAGING_RUNTIME_POLICY: "bounded", TWO_MODERATION: "1", TWO_OWEN_USER_ID: preview.id },
     ...(runtime ? { dryRun: { policy: state.planned, start: boot } } : {}),
-    observe: async () => ({ lease: state.lease, purpose: "automod-preview", running: state.running,
+    observe: async () => ({ lease: state.lease, purpose: "automod-preview", active: state.active, running: state.running,
       policy: state.effective, cleanupBefore: state.cleanupBefore }),
     fenceAndDrain: async (bound, before) => {
       assert.deepEqual(bound, lease);
@@ -121,6 +121,9 @@ test("AutoMod lifecycle is off by default and rejects mixed or stale staging use
   await assert.rejects(f.start(true).publish({ ...input, purposes: ["automod-preview", "help"] }), refusal);
   f.state.lease.runAttempt++;
   await assert.rejects(f.start(true).publish(input), refusal);
+  f.state.lease.runAttempt--;
+  f.state.active = false;
+  await assert.rejects(f.start(true).publish(input), refusal);
   await f.start().recover();
   assert.deepEqual(f.events, []);
   await f.start().otherUse(f.other);
@@ -145,6 +148,9 @@ test("AutoMod dry-run start requires verified publication and intake-off admissi
   ready.state.lease.runAttempt++;
   await assert.rejects(ready.start(true).startDryRun(lease), refusal);
   ready.state.lease.runAttempt--;
+  ready.state.active = false;
+  await assert.rejects(ready.start(true).startDryRun(lease), refusal);
+  ready.state.active = true;
   ready.state.planned.memberIntake = true;
   await assert.rejects(ready.start(true).startDryRun(lease), refusal);
   ready.state.planned.memberIntake = false;
@@ -188,6 +194,7 @@ test("AutoMod startup recovery needs same-lease drain stopped readback and absen
   await assert.rejects(f.start(true).startDryRun(lease), refusal);
   assert.equal(f.state.running, true);
   f.state.at = lease.expiresAt;
+  f.state.active = false;
   const recovered = f.start(undefined, false);
   f.state.startupDrained = false;
   await assert.rejects(recovered.recover(lease), refusal);

@@ -14,6 +14,7 @@ type RuntimePolicy = { readonly [K in keyof typeof DRY_RUN_POLICY]: boolean };
 type Observation = {
   lease: Lease;
   purpose: "automod-preview";
+  active: boolean;
   running: boolean;
   policy?: RuntimePolicy;
   // Separate bounded authority for cleanup, including after lease expiry.
@@ -30,8 +31,8 @@ interface Dependencies {
   // One shared gate across all callers and registry/runtime writers. Every
   // competing use enters through otherUse, including on a fresh instance.
   exclusive<T>(operation: () => Promise<T>): Promise<T>;
-  // Read authoritative ownership and sole purpose for the exact original
-  // lease. Recovery can return that binding after expiry, but never rebind it.
+  // Read current ownership, active status and sole purpose for the exact lease.
+  // Recovery can return its original binding after expiry or release.
   observe(lease: Lease): Promise<Observation | undefined>;
   // Fence both kinds of work on this lease and prove earlier remote effects cannot land.
   // Client abort, timeout and local task completion alone cannot prove this.
@@ -80,9 +81,9 @@ export class StagingAutomodLifecycle {
       if (this.deps.enabled !== true || signal?.aborted) throw refused();
       await this.requireIdle();
       const admission = await admitStagingAutomod(input, this.deps.env,
-        () => this.observe(input.lease), this.deps.get, this.now);
+        () => this.observe(input.lease, true), this.deps.get, this.now);
       const currentAdmission = async () => {
-        const observed = await this.observe(admission.lease);
+        const observed = await this.observe(admission.lease, true);
         return observed.running === false && !signal?.aborted ? admission : undefined;
       };
       const command = await publishStagingAutomod(admission, {
@@ -109,7 +110,7 @@ export class StagingAutomodLifecycle {
         || env.STAGING_RUNTIME_POLICY !== "bounded" || !isolated(dryRun.policy)) throw refused();
 
       const requireRuntime = async ({ lease, publishBefore }: AutomodIntent, running: boolean) => {
-        const observed = await this.observe(lease);
+        const observed = await this.observe(lease, true);
         const at = this.now();
         if (!Number.isSafeInteger(at) || at < lease.acquiredAt || at >= publishBefore || observed.running !== running
           || !isolated(running ? observed.policy : dryRun.policy)) throw refused();
@@ -172,9 +173,10 @@ export class StagingAutomodLifecycle {
     if (await this.journal.pending()) throw refused();
   }
 
-  private async observe(lease: Lease): Promise<Observation> {
+  private async observe(lease: Lease, requireActive = false): Promise<Observation> {
     const observed = await this.deps.observe(lease).catch(() => { throw refused(); });
-    if (observed?.purpose !== "automod-preview" || !sameLease(lease, observed.lease)) throw refused();
+    if (observed?.purpose !== "automod-preview" || !sameLease(lease, observed.lease)
+      || (requireActive && observed.active !== true)) throw refused();
     return observed;
   }
 
