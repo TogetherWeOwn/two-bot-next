@@ -38,7 +38,6 @@ impl RehearsalAnnouncementConnector {
         ))
     }
 
-    /// Match the release rehearsal's generated credential form.
     #[must_use]
     pub fn is_synthetic_token(token: &str) -> bool {
         token.strip_prefix("synthetic-").is_some_and(|value| {
@@ -55,7 +54,7 @@ fn dial_recorder(uri: Uri) -> RecorderDial {
         if uri.scheme_str() != Some("https")
             || uri.authority().map(http::uri::Authority::as_str) != Some("discord.com")
         {
-            return Err(io::Error::other("announcement rehearsal origin refused"));
+            return Err(io::ErrorKind::InvalidInput.into());
         }
         TcpStream::connect((Ipv4Addr::LOCALHOST, 443))
             .await
@@ -71,6 +70,9 @@ async fn socket_connector_refuses_any_other_authority() {
         "https://discord.com:443",
         "https://127.0.0.1",
     ] {
-        assert!(dial_recorder(uri.parse().unwrap()).await.is_err());
+        let result = dial_recorder(uri.parse().unwrap())
+            .await
+            .map_err(|e| e.kind());
+        assert!(matches!(result, Err(io::ErrorKind::InvalidInput)));
     }
 }

@@ -144,7 +144,7 @@ class Rehearsal:
         return subprocess.run(["docker", "inspect", name], check=False,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode == 0
 
-    def start_bot(self, which, *, fixture=False, refusal=None, **overrides):
+    def start_bot(self, which, *, fixture=False, refusal=None, args=(), **overrides):
         name = self.bot_name(which) + (f"-{refusal}" if refusal else "")
         port = BOT_PORTS[which]
         if self.was_started(name):
@@ -154,7 +154,7 @@ class Rehearsal:
                 name, "--mount", f"type=bind,src={self.work / 'ca.crt'},dst=/etc/ssl/certs/ca-certificates.crt,readonly",
                 "--mount", f"type=bind,src={self.work / 'announcement-ca.der'},dst=/fixture/announcement-ca.der,readonly",
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--no-healthcheck",
-                self.images[which], *(("rehearse-internal-actions",) if fixture else ()), namespace=self.pg, env={
+                self.images[which], *(("rehearse-internal-actions",) if fixture else ()), *args, namespace=self.pg, env={
                     "LISTEN_ADDR": f"127.0.0.1:{port + 100}", "DISCORD_TOKEN": self.token,
                     "GUILD_ID": GUILD,
                     "DATABASE_URL": f"postgres://postgres:{self.password}@127.0.0.1:5432/{self.database}?sslmode=disable",
@@ -319,6 +319,8 @@ class Rehearsal:
     def announcement_control(self, which, case):
         self.set_policy("closed")
         self.start_bot(which, fixture=case != "off")
+        sni = self.work / "discord-sni"
+        sni.unlink(missing_ok=True)
         body = {"action": "announcement.post", "channel_key": "ann", "body": "Synthetic announcement"}
         key = f"{which}-announcement"
         answer = self.request(which, key, body)
@@ -329,8 +331,8 @@ class Rehearsal:
                     and self.journal() == [("POST", MESSAGE_PATH, "announcement", "applied")],
                     "Expected a durable receipt, same-key replay and one recorder write")
         else:
-            require(answer["code"] == "needs_reconciliation" and self.claim(key) == "unknown" and not self.journal(),
-                    f"{case}: announcement reached HTTP or its claim was not held unknown")
+            require(sni.exists() and answer["code"] == "needs_reconciliation"
+                    and self.claim(key) == "unknown" and not self.journal(), f"{case}: expected TLS refusal before HTTP")
         print(json.dumps({"runtime": which, "case": case, "writes": len(self.journal()), "verdict": "passed"}), flush=True)
 
 
@@ -367,15 +369,13 @@ def main():
             ("token_not_synthetic", {"DISCORD_TOKEN": "ordinary.fixture.token"}),
             ("database_invalid", {"DATABASE_URL": "postgres://postgres@192.0.2.1/db"}),
             ("receiver_invalid", {"TWO_INTERNAL_ACTIONS": "0"}),
+            ("arguments_invalid", {"args": ("unexpected",)}),
         ):
             rehearsal.start_bot("current", fixture=True, refusal=f"rehearsal_{suffix}", **overrides)
         rehearsal.exercise()
 
-    # An ambiguous announcement can hold the token-wide lane. Give each
-    # distinct image its own isolated probe so a refusal cannot mask the other.
-    cases = [("current", case) for case in ("positive", "off", "wrong-ca", "wrong-san")]
-    if images["retained"] != images["current"]:
-        cases.append(("retained", "positive"))
+    # Give each probe a fresh database and token because ambiguity holds admission.
+    cases = [("current", case) for case in ("positive", "off", "wrong-ca", "wrong-san")] + [("retained", "positive")]
     for which, case in cases:
         with tempfile.TemporaryDirectory(prefix="two-bot-event-cutoff-") as directory, contextlib.ExitStack() as cleanup:
             rehearsal = Rehearsal(Path(directory), cleanup, images)

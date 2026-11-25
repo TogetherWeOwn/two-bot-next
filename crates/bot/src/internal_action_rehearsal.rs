@@ -76,7 +76,6 @@ pub(crate) async fn serve(args: &[String]) -> Result<(), &'static str> {
 }
 
 fn isolated(interfaces: &str, status: &str) -> bool {
-    // Inspect the actual namespace and refuse privileges that could change it.
     interfaces
         .lines()
         .skip(2)
@@ -93,7 +92,6 @@ fn isolated(interfaces: &str, status: &str) -> bool {
 }
 
 fn fixture_database(url: &str) -> bool {
-    // Match the complete URL to rule out driver and query overrides.
     url.strip_prefix("postgres://postgres:")
         .and_then(|url| url.strip_suffix("@127.0.0.1:5432/event_cutoff?sslmode=disable"))
         .is_some_and(Connector::is_synthetic_token)

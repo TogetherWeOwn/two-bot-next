@@ -153,7 +153,7 @@ def main():
         tls.minimum_version = ssl.TLSVersion.TLSv1_2
         tls.load_cert_chain(state / "server.crt", state / "server.key")
         tls.sni_callback = lambda _sock, name, _ctx: (
-            None if name == "discord.com" else ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+            (state / "discord-sni").touch() if name == "discord.com" else ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
         )
         server.socket = tls.wrap_socket(server.socket, server_side=True)
         (state / "recorder-ready").touch()
