@@ -1424,7 +1424,7 @@ fn project_release_ledger(
     pending: &[i64],
     migrator: &Migrator,
 ) -> Result<Vec<LedgerRow>, RunError> {
-    let invalid = || RunError::Refused("release ledger projection invalid".to_owned());
+    let invalid = || RunError::Refused("release inverse ledger projection invalid".to_owned());
     let mut rows: Vec<LedgerRow> =
         serde_json::from_value(baseline.clone()).map_err(|_| invalid())?;
     if rows
@@ -1449,32 +1449,11 @@ fn project_release_ledger(
     Ok(rows)
 }
 
-fn bound_release_ledgers(
-    req: &Request,
-    operation: &str,
-) -> Result<(Vec<LedgerRow>, Vec<LedgerRow>), RunError> {
-    const CUTOVER: &[i64] = &[475, 479, 480, 481, 482];
-    const STORE: &[i64] = &[478];
-    for (raw, expected) in [
-        (req.expected_pending.as_deref(), CUTOVER),
-        (req.expected_store_pending.as_deref(), STORE),
-    ] {
-        let pending = parse_expected_pending(raw.unwrap_or_default()).map_err(RunError::Refused)?;
-        if pending.as_slice() != expected {
-            return refuse(format!(
-                "release {operation} pending lists do not match the protected bundle"
-            ));
-        }
-    }
-    let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
-    let store = Chain::Store.migrator().map_err(RunError::Refused)?;
-    let cutover_hash = check_plan_binding(req, CUTOVER, &cutover)?;
-    let store_hash = check_store_binding(req, STORE, &store)?;
-    let plan = bound_plan_artifact(req, &cutover_hash, &store_hash)?;
-    Ok((
-        project_release_ledger(&plan["ledger_before"], CUTOVER, &cutover)?,
-        project_release_ledger(&plan["ledger_store_before"], STORE, &store)?,
-    ))
+/// The protected workflow authenticates the read-only plan and writer fence
+/// before calling this entry point with the existing production binding.
+#[doc(hidden)]
+pub async fn run_release_inverse(req: &Request, fence_sha256: &str) -> Result<Value, RunError> {
+    run_release_recovery(req, Some(fence_sha256)).await
 }
 
 /// Classify under the production apply binding. The caller authenticates
@@ -1484,53 +1463,64 @@ pub async fn run_release_classification(req: &Request) -> Result<Value, RunError
     if req.target != Target::Production || !req.apply {
         return refuse("release classification requires the production apply binding");
     }
-    validate_request(req)?;
-    let (cutover, store) = bound_release_ledgers(req, "classification")?;
-    let options = verify_target(req, tls_policy_from_env()?)?;
-    let pool = connect(options, MIGRATOR_ROLE, Arc::new(AtomicUsize::new(0))).await?;
-    let result = classify_interrupted_release(&pool, &cutover, &store).await;
-    pool.close().await;
-    match result? {
-        InterruptedRelease::Pre => Ok(json!({"state": "pre"})),
-        InterruptedRelease::Post {
-            attendance_fence_sha256,
-        } => Ok(json!({"state": "post", "attendance_fence_sha256": attendance_fence_sha256})),
-    }
+    run_release_recovery(req, None).await
 }
 
-/// The protected workflow authenticates the read-only plan and writer fence
-/// before calling this entry point with the existing production binding.
-#[doc(hidden)]
-pub async fn run_release_inverse(req: &Request, fence_sha256: &str) -> Result<Value, RunError> {
+async fn run_release_recovery(
+    req: &Request,
+    fence_sha256: Option<&str>,
+) -> Result<Value, RunError> {
+    const CUTOVER: &[i64] = &[475, 479, 480, 481, 482];
+    const STORE: &[i64] = &[478];
     validate_request(req)?;
     if req.target != Target::Production
         || !req.apply
-        || fence_sha256.len() != 64
-        || !fence_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || fence_sha256.is_some_and(|fence| {
+            fence.len() != 64
+                || !fence
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
     {
         return refuse(
             "release inverse requires the production apply binding and attendance fence",
         );
     }
-    let expected = bound_release_ledgers(req, "inverse")?;
+    for (raw, expected) in [
+        (req.expected_pending.as_deref(), CUTOVER),
+        (req.expected_store_pending.as_deref(), STORE),
+    ] {
+        let pending = parse_expected_pending(raw.unwrap_or_default()).map_err(RunError::Refused)?;
+        if pending.as_slice() != expected {
+            return refuse("release inverse pending lists do not match the protected bundle");
+        }
+    }
+    let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
+    let store = Chain::Store.migrator().map_err(RunError::Refused)?;
+    let cutover_hash = check_plan_binding(req, CUTOVER, &cutover)?;
+    let store_hash = check_store_binding(req, STORE, &store)?;
+    let plan = bound_plan_artifact(req, &cutover_hash, &store_hash)?;
+    let expected = (
+        project_release_ledger(&plan["ledger_before"], CUTOVER, &cutover)?,
+        project_release_ledger(&plan["ledger_store_before"], STORE, &store)?,
+    );
     let options = verify_target(req, tls_policy_from_env()?)?;
     let pool = connect(options, MIGRATOR_ROLE, Arc::new(AtomicUsize::new(0))).await?;
-    let result = release_schema_transaction::recover_release_schema(
-        &pool,
-        &expected.0,
-        &expected.1,
-        Some(fence_sha256),
-    )
-    .await;
+    let result = if let Some(fence) = fence_sha256 {
+        recover_release_schema(&pool, &expected.0, &expected.1, Some(fence))
+            .await
+            .map(|after| {
+                json!({"state": "restored", "attendance_fence_sha256": fence,
+                "expanded": [ledger_json(&expected.0), ledger_json(&expected.1)],
+                "restored": [ledger_json(&after.0), ledger_json(&after.1)]})
+            })
+    } else {
+        classify_interrupted_release(&pool, &expected.0, &expected.1)
+            .await
+            .map(|state| json!(state))
+    };
     pool.close().await;
-    let after = result?;
-    Ok(
-        json!({"state": "restored", "attendance_fence_sha256": fence_sha256,
-        "expanded": [ledger_json(&expected.0), ledger_json(&expected.1)],
-        "restored": [ledger_json(&after.0), ledger_json(&after.1)]}),
-    )
+    result
 }
 
 /// Apply one chain's pending migrations and verify its ledger. Runs only
@@ -2286,7 +2276,7 @@ mod tests {
         invalid_cutover["ledger_before"][0]["description"] = Value::Null;
         let mut invalid_store = plan.clone();
         invalid_store["ledger_store_before"][0]["sha384"] = json!("wrong");
-        let invalid_projection = "refused: release ledger projection invalid";
+        let invalid_projection = "refused: release inverse ledger projection invalid";
         for (plan, stamp, refusal) in [
             (&invalid_cutover, &fence, invalid_projection),
             (&invalid_store, &fence, invalid_projection),

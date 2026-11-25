@@ -19,7 +19,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::{
     migrate::Migrator,
     postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
@@ -578,7 +578,7 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     use two_bot_core::database_roles::{plan_for_phase, Phase};
     use two_bot_cutover::staging_migrate::{
         apply_release_schema, classify_interrupted_release, confirm_release_pre,
-        recover_release_schema, undo_release_schema, Chain, InterruptedRelease, LedgerRow,
+        recover_release_schema, undo_release_schema, Chain, LedgerRow,
     };
 
     let fx = Fixture::new().await?;
@@ -639,7 +639,7 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     let confirm_pre = || confirm_release_pre(&pool, &expected[0], &expected[1]);
     let classify = || classify_interrupted_release(&pool, &expanded[0], &expanded[1]);
     confirm_pre().await?;
-    assert_eq!(classify().await?, InterruptedRelease::Pre);
+    assert_eq!(json!(classify().await?), json!({"state": "pre"}));
 
     sqlx::raw_sql("BEGIN; LOCK TABLE public.web_contract_meta IN SHARE ROW EXCLUSIVE MODE")
         .execute(&mut admin)
@@ -730,14 +730,27 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     .fetch_one(&mut admin)
     .await?;
     assert_eq!(
-        classify().await?,
-        InterruptedRelease::Post {
-            attendance_fence_sha256: expected_fence.clone()
-        }
+        json!(classify().await?),
+        json!({"state": "post", "attendance_fence_sha256": expected_fence})
     );
-    admin.execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at SET DEFAULT '2000-01-01 00:00:00+00'").await?;
-    assert!(classify().await.is_err());
-    admin.execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at SET DEFAULT CURRENT_TIMESTAMP").await?;
+    let receipt: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+         WHERE conrelid = 'public.internal_action_log'::regclass
+           AND conname = 'internal_action_log_receipt_check'",
+    )
+    .fetch_one(&mut admin)
+    .await?;
+    for definition in ["CHECK (true) NOT VALID", &receipt] {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE public.internal_action_log DROP CONSTRAINT internal_action_log_receipt_check,
+             ADD CONSTRAINT internal_action_log_receipt_check {definition}"
+        )))
+        .execute(&mut admin)
+        .await?;
+        if definition != receipt {
+            assert!(classify().await.is_err());
+        }
+    }
     assert!(
         recover_release_schema(&pool, &cutover, &store, Some(&"0".repeat(64)))
             .await
