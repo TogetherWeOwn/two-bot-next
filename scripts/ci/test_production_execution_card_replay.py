@@ -94,18 +94,24 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
             self.assertIs(serving["ownership"]["running"], True)
 
         rollback, control = Mock(), Mock(side_effect=takeover)
-        rollback.post_worker_restore.side_effect = lambda version: serving["worker"].update(
-            version_id=version, sha=pin.rollback_sha,
-        )
+
+        def wait_worker_restore(version):
+            # The provider can acknowledge the restore before that version is visible.
+            rollback.post_worker_restore.assert_called_once_with(version)
+            serving["worker"].update(version_id=version, sha=pin.rollback_sha)
+
+        rollback.wait_worker_restore.side_effect = wait_worker_restore
         rollback.restore_image.side_effect = lambda _image: serving["container"].update(image_digest=pin.image_digest)
         rollback.wait_stable.side_effect = wait_stable
         observe = Mock(side_effect=lambda: deepcopy(serving))
         restore_under_fence(pin, inverse, observe, control, rollback, "fixture-image", candidate)
         if before == candidate:
             rollback.post_worker_restore.assert_called_once_with(pin.worker_version)
+            rollback.wait_worker_restore.assert_called_once_with(pin.worker_version)
             rollback.restore_image.assert_called_once_with("fixture-image")
         else:
             rollback.post_worker_restore.assert_not_called()
+            rollback.wait_worker_restore.assert_not_called()
             rollback.restore_image.assert_not_called()
         control.assert_called_once_with("takeover-fenced", pin.fence_epoch, expected_deployment=pin.worker_version)
         rollback.wait_stable.assert_called_once_with(pin.worker_version, rollback.now.return_value)
