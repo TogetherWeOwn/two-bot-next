@@ -85,6 +85,23 @@ test("recovery keeps the startup pin after the observation ages out and the roll
   assert.equal(invoke.mock.callCount(), 2);
 });
 
+test("a second startup cannot use an aged out cached pin while its lease is still active", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now });
+  const call = { action: "start", issuedLease: { ...issuedLease, expiresAt: now + 30_000 } } as const;
+  const approval = { ...call, target };
+  const read = t.mock.fn<Read>(async () => ({ ...inventory, observed_at: new Date(now - 50_000).toISOString() }));
+  const invoke = t.mock.fn<Invoke>(async () => {});
+  const transport = bindStagingAutomodDeploymentTransport(worker, read, invoke);
+
+  const first = await transport(call, approval, new AbortController().signal);
+  assert.equal((await first.json() as { verdict: string }).verdict, "passed");
+  t.mock.timers.setTime(now + 12_000);
+  const second = await transport(call, approval, new AbortController().signal);
+  assert.equal((await second.json() as { code: string }).code, "operation_unconfirmed");
+  assert.equal(read.mock.callCount(), 1);
+  assert.equal(invoke.mock.callCount(), 1);
+});
+
 test("missing stale and mismatched serving inventory never reaches the private invoker", async t => {
   t.mock.timers.enable({ apis: ["Date"], now });
   const invoke = t.mock.fn<Invoke>(async () => {});
