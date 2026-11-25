@@ -436,7 +436,8 @@ test("the private AutoMod host acquires the exact approved lease and recovers wi
   const context = { environment: change.environment, deploymentId: version, sha: change.sha,
     runId: change.runId, runAttempt: change.runAttempt, target };
   const signal = new AbortController().signal;
-  let reservation = { change, pin, target };
+  type Reservation = Awaited<ReturnType<Parameters<typeof TwoBotContainer.bindProtectedAutomodInstance>[2]["readReservation"]>>;
+  let reservation: Reservation = { change, pin, target };
   let serving = pin;
   const effects: ProtectedAutomodEffects = {
     enabled: false,
@@ -457,6 +458,7 @@ test("the private AutoMod host acquires the exact approved lease and recovers wi
   const host = bind();
   const refuse = /staging_use_conflict/;
   assert.equal("bindProtectedAutomodInstance" in h.bot, false);
+  assert.equal("isProtectedAutomodStage" in h.bot, false);
   await assert.rejects(host.acquireLease(pin, change, signal), refuse);
   effects.enabled = true;
   await assert.rejects(bind(new Request(request.url)).acquireLease(pin, change, signal), refuse);
@@ -469,6 +471,10 @@ test("the private AutoMod host acquires the exact approved lease and recovers wi
   }));
   assert.equal(ordinary.status, 400);
   assert.equal(readReservation.mock.callCount(), 0);
+  reservation = undefined;
+  await assert.rejects(host.acquireLease(pin, change, signal), refuse);
+  reservation = { change, pin, target: { ...target, guildId: "111111111111111111" } };
+  await assert.rejects(host.acquireLease(pin, change, signal), refuse);
   reservation = { change: { ...change, expiresAt: change.expiresAt + 1 }, pin, target };
   await assert.rejects(host.acquireLease(pin, change, signal), refuse);
   reservation = { change, pin: { ...pin, rolloutId: "different-rollout" }, target };
@@ -481,10 +487,17 @@ test("the private AutoMod host acquires the exact approved lease and recovers wi
     ...adapters, readServing: async () => { cancelled.abort(); return pin; },
   });
   await assert.rejects(interrupted.acquireLease(pin, change, cancelled.signal), { name: "AbortError" });
+  serving = pin;
+  const wrongEpoch = { ...change, expectedEpoch: change.expectedEpoch + 1 };
+  reservation = { change: wrongEpoch, pin, target };
+  await assert.rejects(host.acquireLease(pin, wrongEpoch, signal), /epoch_conflict/);
+  reservation = { change, pin, target };
+  h.runtime.running = true;
+  await assert.rejects(host.acquireLease(pin, change, signal), /shutdown_unconfirmed/);
+  h.runtime.running = false;
   assert.equal(h.values.has(STAGING_USE_KEY), false);
   assert.equal(h.runtime.destroys, 0);
 
-  serving = pin;
   const issued = await host.acquireLease(pin, change, signal);
   assert.equal(issued.purpose, AUTOMOD_STAGING_PURPOSE);
   assert.deepEqual(await host.authority.readIssuedLease(context, signal), issued);
@@ -511,6 +524,32 @@ test("the private AutoMod host acquires the exact approved lease and recovers wi
   assert.equal(await host.authority.readIssuedLease(context, signal), undefined);
   assert.deepEqual(h.starts, []);
   assert.deepEqual(h.requests, []);
+
+  // Expire after the preparing record is persisted but before issuance.
+  effects.enabled = true;
+  const next = { ...change, runId: "123457", expiresAt: Date.now() + 2_000 };
+  reservation = { change: next, pin, target };
+  const setAlarm = h.ctx.storage.setAlarm;
+  const expire = t.mock.method(h.ctx.storage, "setAlarm", async (when: number) => {
+    await setAlarm(when);
+    t.mock.timers.setTime(next.expiresAt);
+  });
+  await assert.rejects(host.acquireLease(pin, next, signal), /staging_expiry_invalid/);
+  expire.mock.restore();
+  const preparing = h.values.get(STAGING_USE_KEY) as StagingUse;
+  assert.equal(preparing.phase, "preparing");
+  assert.equal(await host.authority.readIssuedLease({ ...context, runId: next.runId }, signal), undefined);
+  assert.equal(await new StagingAutomodRecovery(h.ctx.storage as unknown as DurableObjectStorage).pending(), undefined);
+  await h.bot.stagingExpiry();
+  assert.deepEqual(h.values.get(STAGING_USE_KEY), { ...preparing, phase: "released" });
+  assert.deepEqual(await h.bot.listSchedules("stagingExpiry"), []);
+
+  const retry = { ...next, expiresAt: Date.now() + 2_000 };
+  reservation = { change: retry, pin, target };
+  await assert.rejects(host.acquireLease(pin, retry, signal), /staging_use_ended/);
+  const following = { ...retry, runId: "123458" };
+  reservation = { change: following, pin, target };
+  assert.equal((await host.acquireLease(pin, following, signal)).runId, following.runId);
 });
 
 test("protected AutoMod retires an unused reservation and retries an interrupted release", async t => {
@@ -1412,6 +1451,10 @@ test("bounded staging: preparing AutoMod reservation retries native stop", async
   h.runtime.running = true;
   await h.bot.onActivityExpired();
   assert.equal(h.runtime.running, false);
+
+  t.mock.timers.setTime(use.expiresAt);
+  await h.bot.stagingExpiry();
+  assert.deepEqual(values.get(STAGING_USE_KEY), { ...use, phase: "released" });
 });
 
 test("bounded staging: uncertain reservation permits only scoped emergency stop", async (t) => {
