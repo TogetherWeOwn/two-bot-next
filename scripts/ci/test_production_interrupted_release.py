@@ -237,17 +237,19 @@ class InterruptedReleaseTests(unittest.TestCase):
                 steps = (interrupted.CLASSIFY_STEP, interrupted.DECISION_STEP)
                 producer(interrupted.DATABASE_JOB, steps)
                 if state == "post":
-                    self.assertEqual(interrupted.main(["restart"], env, api), 1)
-                    self.control.assert_not_called()
                     self.assertEqual(interrupted.main(["inverse", "fixture-migrator"], env, api), 0)
                     self.assertEqual(process.call_args.args[0][-2:], ["--inverse-attendance-fence-sha256", stamp])
                     upload(interrupted.INVERSE, 703, "INVERSE")
+                    # Even the exact inverse artifact needs a successful protected producer.
+                    self.assertEqual(interrupted.main(["restart"], env, api), 1)
+                    self.control.assert_not_called()
                     jobs.pop()
                     producer(interrupted.DATABASE_JOB, (*steps, *interrupted.INVERSE_STEPS))
                 self.control.assert_not_called()
                 self.assertEqual(interrupted.main(["restart"], env, api), 0)
 
         self.assertEqual(process.call_count, 2 if state == "post" else 1)
+        self.assertEqual([call.kwargs["timeout"] for call in process.call_args_list], [120] * process.call_count)
         if state == "uncertain":
             self.control.assert_not_called()
             rollback.wait_stable.assert_not_called()
