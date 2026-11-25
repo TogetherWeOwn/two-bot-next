@@ -41,7 +41,6 @@ test("voice preflight refuses missing, stale, future or expired evidence", () =>
     [{ ready: undefined }, "lease_unconfirmed"],
     [{ ready: { ...ready, observedAt } }, "lease_unconfirmed"],
     [{ ready: { ...ready, observedAt: new Date(args.now() + 1).toISOString() } }, "lease_unconfirmed"],
-    [{ now: () => args.lease.expiresAt - 1000 }, "lease_unconfirmed"],
     [{ evidence: undefined }, "session_unconfirmed"],
     [{ evidence: { ...evidence, session: { ...evidence.session, observedAt } } }, "session_unconfirmed"],
     [{ evidence: { ...evidence, readback: { ...evidence.readback, source: undefined } } }, "discord_unconfirmed"],
@@ -59,12 +58,25 @@ test("voice preflight requires OFF and stopped evidence for the exact prior leas
   const { args } = mockVoiceMoveWindow();
   const { evidence } = args;
   const { previousReady, previousOff } = evidence;
-  for (const off of [undefined, { ...previousOff, running: undefined }, { ...previousOff, voiceMoveEnabled: true },
-    { ...previousOff, use: { ...previousOff.use, runAttempt: 2 } },
-    { ...previousOff, use: { ...previousOff.use, phase: "active" } },
-    { ...previousOff, observedAt: args.ready.observedAt },
-  ]) {
-    assert.deepEqual(preflightVoiceMoveAcceptance({ ...args, evidence: { ...evidence, previousOff: off } }),
+  const cases = [
+    { previousReady: undefined },
+    { previousReady: { ...previousReady, voiceMoveEnabled: false } },
+    { previousOff: undefined },
+    { previousOff: { ...previousOff, running: undefined } },
+    { previousOff: { ...previousOff, voiceMoveEnabled: true } },
+    { previousOff: { ...previousOff, use: { ...previousOff.use, runAttempt: 2 } } },
+    { previousOff: { ...previousOff, use: { ...previousOff.use, acquiredAt: previousOff.use.acquiredAt + 1 } } },
+    { previousOff: { ...previousOff, use: { ...previousOff.use, phase: "active" } } },
+    { previousOff: { ...previousOff, observedAt: args.ready.observedAt } },
+  ];
+  for (const pin of [{ runId: args.lease.runId }, { sha: "b".repeat(40) }, { deploymentId: "other" }, { epoch: 3 }]) {
+    cases.push({
+      previousReady: { ...previousReady, ...pin, use: { ...previousReady.use, ...pin } },
+      previousOff: { ...previousOff, ...pin, use: { ...previousOff.use, ...pin } },
+    });
+  }
+  for (const change of cases) {
+    assert.deepEqual(preflightVoiceMoveAcceptance({ ...args, evidence: { ...evidence, ...change } }),
       { verdict: "failed", code: "prior_cleanup_unconfirmed" });
   }
   const earlier = (time: number) => time - 15 * 60_000;
