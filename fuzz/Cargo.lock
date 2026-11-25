@@ -2334,6 +2334,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tower",
  "tracing",
  "twilight-cache-inmemory",
  "twilight-gateway",
