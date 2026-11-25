@@ -489,8 +489,11 @@ class PromotionCleanExecutionTests(unittest.TestCase):
 
     def run_prepare(self, gateway="false", voice="false", unpaired="false"):
         box = Sandbox(self)
+        box._write("git", f"#!/bin/sh\n[ \"$*\" = 'rev-parse HEAD' ] && printf '%s\\n' {SHA}\n")
         result = box.run(self.prepare_body(), extra_env={
             "GITHUB_SHA": SHA,
+            "STAGING_SOURCE_SHA": SHA,
+            "ROLLBACK_REHEARSAL_PREPARE": "false",
             "INJECT_GATEWAY_FAILURE": gateway,
             "INJECT_VOICE_STALL": voice,
             "INJECT_UNPAIRED_DISCONNECT": unpaired,
