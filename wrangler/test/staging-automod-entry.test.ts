@@ -57,11 +57,24 @@ test("private AutoMod entry denies unauthenticated or mismatched work before inv
     ["duplicate action", request(raw.replace("{", '{"action":"recover",')), env, approval],
     ["duplicate lease field", request(raw.replace('"runAttempt":', '"runAttempt":999,"runAttempt":')), env, approval],
     ["oversized body", request(raw + " ".repeat(1024)), env, approval],
-    ["invalid UTF-8", request(new Uint8Array([0xff, ...new TextEncoder().encode(raw)])), env, approval],
   ];
   for (const [name, req, worker, approved] of denied) {
     assert.deepEqual(await invokeProtectedAutomodJob(req, worker, approved, invoke), refused(), name);
   }
+
+  // A permissive decoder would replace the invalid byte inside the string
+  // and pass syntactically valid JSON on to the parser.
+  const invalidUtf8 = new TextEncoder().encode(raw.replace('"start"', '"start!"'));
+  invalidUtf8[invalidUtf8.indexOf(0x21)] = 0xff;
+  const invalidRequest = request(invalidUtf8);
+  const parse = t.mock.method(JSON, "parse");
+  try {
+    assert.deepEqual(await invokeProtectedAutomodJob(invalidRequest, env, approval, invoke), refused());
+    assert.equal(parse.mock.callCount(), 0, "invalid UTF-8 must be rejected before JSON parsing");
+  } finally {
+    parse.mock.restore();
+  }
+
   for (const changed of [{ runId: "12346" }, { runAttempt: lease.runAttempt + 1 }, { epoch: lease.epoch + 1 },
     { deploymentId: "other" }, { sha: "b".repeat(40) }, { acquiredAt: lease.acquiredAt + 1 },
     { expiresAt: lease.expiresAt + 1 }, { purpose: "voice" }, { purpose: undefined }, { voiceMove: true },
