@@ -149,6 +149,37 @@ as a staging incident. Keep admission closed and qualification pending,
 reconcile the exact reservation, and repeat cleanup with fresh inventory until
 verification passes.
 
+##### Startup refusal handoff
+
+When the protected caller refuses startup or loses the create reply, keep
+qualification pending. In the private release task record, retain the rehearsal
+run and attempt, pinned predecessor artifact, full reservation (scope, run ID,
+original start and PRE shape), original expiry, and start ID if confirmed.
+Record the bounded refusal code if available and the last confirmed step, and
+link the protected run and relevant jobs or receipts. Preserve independent
+provider or runtime observations for that same reservation and start ID if
+issued. Mark missing evidence and any unverified effects as unresolved. Keep
+raw provider responses and credentials out of the record.
+
+The staging release operator keeps custody of that reservation through cleanup.
+Use the protected stop path for the same reservation, including when startup
+was refused before admission. If the start runner is gone or loses authority,
+the separately authorized stop caller handles fencing, close and settlement.
+Retain the independent post-close proof that pending starts have drained or
+cannot take effect and that recreation and restart are fenced. Keep the
+reservation closed to startup. [Startup and stop contract](../scripts/pre_start_stop.py) ·
+[Settlement evidence](../scripts/pre_admission.py).
+
+Record the cleanup outcome in the same private release task record. Link the
+fresh exact-target readback from step 4 and the direct zero-count proof for the
+pinned app ID or affirmative proof the app was never created. If a registry
+reference was reserved, link its
+[separate disposition](production-deploy.md#check-the-shared-rollback-sha).
+Record verified absence only where the evidence proves it. If proof is missing,
+record the unresolved step and last confirmed observation there and track the
+open cleanup as a staging incident under the same operator until fresh
+verification passes.
+
 ### Trusted client and receipt contract (partial wiring, not activated)
 
 `wrangler/scripts/staging-use.mjs` is the pipeline client for the protocol.
