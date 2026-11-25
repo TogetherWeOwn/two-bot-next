@@ -199,36 +199,61 @@ python3 scripts/t0_acceptance_report.py --handoff handoff.json \
 
 After the authorized watch establishes the exact serving window, copy the
 Help and naming observations from the [execution card](production-deploy.md#watch-rows-one-per-finding-and-per-checkpoint)
-into one JSON file per signal. Use the UTC timestamp, signal, observation and
-disposition columns. Keep the card and the underlying readbacks as provenance.
-The projection accepts only the fields below. Omit raw messages, names,
-member or room IDs, URLs and free-text diagnostics.
-
-Synthetic `production-help.json` and `production-naming.json`:
-
-```json
-{"schema":"production_watch.v1","signal":"help","rows":[
-  {"utc":"2026-11-25T02:01:00Z","observation":"branding-readbacks-and-deletions","disposition":"pass"}
-]}
-```
-```json
-{"schema":"production_watch.v1","signal":"naming","rows":[
-  {"utc":"2026-11-25T02:02:00Z","observation":"empty-room-rename","disposition":"pass"},
-  {"utc":"2026-11-25T02:03:00Z","observation":"occupied-room-return","disposition":"pass"}
-]}
-```
+into one local TSV file per signal. Use UTF-8 and LF line endings. Include only
+the four columns `utc`, `signal`, `observation` and `disposition` with the
+header shown below. Use the exact codes shown for the signal and observation.
+Keep the card and underlying readbacks as provenance. Omit raw messages,
+names, member or room IDs, URLs and free-text diagnostics.
 
 Record Help as `pass` when the approved branding readbacks and deletions
 are complete. For naming, use the approved occupied, empty-before-cleanup and
 occupied-again readbacks on one room. Record each transition once and give
 passing transitions increasing UTC timestamps. Use `fail` for an observed
-failure and `not_observed` for an unavailable check. Use an in-window UTC
-timestamp for every row. Omit a missing transition or an entire missing file.
-A supplied projection needs at least one row.
+failure and `not_observed` when the card explicitly records an unavailable
+check. Use the card's in-window UTC timestamp for every row.
+
+Save the independently verified serving identity and bounds in `window.json`
+with the same fields as the report's `expected` window. This example uses a
+synthetic window and synthetic watch rows for both signals.
+
+```json
+{
+  "environment": "production",
+  "build_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "build_id": "900-1",
+  "deploy_id": "2026.11.25.1+aaaaaaa",
+  "image_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "worker_version": "11111111-1111-4111-8111-111111111111",
+  "application_id": "22222222-2222-4222-8222-222222222222",
+  "start": "2026-11-25T02:00:00Z",
+  "end": "2026-11-25T02:05:00Z"
+}
+```
+
+```sh
+printf '%s\t%s\t%s\t%s\n' utc signal observation disposition \
+  2026-11-25T02:01:00Z help branding-readbacks-and-deletions pass > help.tsv
+printf '%s\t%s\t%s\t%s\n' utc signal observation disposition \
+  2026-11-25T02:02:00Z naming empty-room-rename pass \
+  2026-11-25T02:03:00Z naming occupied-room-return pass > naming.tsv
+python3 scripts/assemble_production_watch.py --signal help --rows help.tsv \
+  --window window.json > production-help.json
+python3 scripts/assemble_production_watch.py --signal naming --rows naming.tsv \
+  --window window.json > production-naming.json
+```
+
+Each command writes a `production_watch.v1` JSON report on exit 0. A missing
+row, an invalid field or a timestamp outside the verified bounds gives exit 2
+with an empty stdout. For example, removing the occupied-room row or changing
+its timestamp to `2026-11-25T02:05:00.000000001Z` causes refusal. Use fresh
+output paths and bind only files from successful commands. Omit an unavailable
+report from the handoff.
 
 1. In `handoff.json`, use `environment: production` in the independently
-   verified `expected` window. Bind each saved file to its verified window and
-   exact `sha256sum` under `observations`. For a combined report, use a passive
+   verified `expected` window. When the approved card evidence independently
+   ties a saved file to its serving window, record that window and the file's
+   exact `sha256sum` under `observations.help` or `observations.naming` as
+   appropriate. For a combined report, use a passive
    gateway summary from the same application and single-image window, with
    UTC-second bounds and a span of at most 30 minutes. When the observations
    cover different windows, run the report separately for each verified window
