@@ -936,6 +936,67 @@ class ProvenanceReceiptTests(unittest.TestCase):
 class MainProvenanceTests(unittest.TestCase):
     """Manual and snapshot rollbacks refuse a bad receipt before any POST."""
 
+    def test_ordinary_production_rollback_guards_before_restore_during_propagation(self):
+        application = rollback.APPLICATIONS["production"]
+        image = f"registry.cloudflare.com/{ACCOUNT}/{application}@sha256:" + "a" * 64
+        serving_sha = "b" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = self.write_snapshot(directory, worker=rollback.WORKERS["production"],
+                                           application=application, serving_image=image)
+            argv = ["rollback", "--variant", "production", "--worker-url",
+                    "https://two-bot-next-production.acct.workers.dev", "--snapshot", str(snapshot),
+                    "--actor", "fixture-actor", "--evidence", str(Path(directory) / "evidence.json")]
+            client = mock.Mock(api=mock.Mock(return_value=rollout_row("r-prev", image)))
+            for phase, actor, target_tree, refusal in (
+                ("active", "fixture-actor", b"", "production_rollback_requires_protected_inverse"),
+                ("fenced", f"production-schema-release:123:{serving_sha}", b"0480_event_attendance.sql", "production_rollback_fence_reserved"),
+                ("active", "fixture-actor", b"0480_event_attendance.sql", None),
+            ):
+                with (self.subTest(refusal=refusal),
+                      mock.patch.object(rollback, "validate_receipt_against_live"),
+                      mock.patch.object(rollback, "serving_version", return_value=BAD_VERSION),
+                      mock.patch.object(rollback, "version_sha", return_value=serving_sha),
+                      mock.patch.object(rollback, "application_by_name", return_value={"id": APP_ID}),
+                      mock.patch.object(rollback.subprocess, "run", side_effect=lambda args, **_: mock.Mock(
+                          stdout={serving_sha: b"0480_event_attendance.sql", SHA: target_tree}[args[4]],
+                      )),
+                      mock.patch.object(rollback, "control_client", return_value=mock.Mock(return_value={
+                          "deploymentId": GOOD_VERSION, "owner": {"phase": phase, "actor": actor},
+                      })),
+                      mock.patch.object(rollback.Rollback, "run", return_value={}) as restore):
+                    code, output = self.run_main(argv, client)
+                    self.assertEqual(code, int(refusal is not None), output)
+                    if refusal:
+                        self.assertIn(refusal, output)
+                        restore.assert_not_called()
+                    else:
+                        restore.assert_called_once_with(GOOD_VERSION, image)
+
+    def test_production_snapshot_requires_its_own_sha_even_with_explicit_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = self.write_snapshot(directory, worker=rollback.WORKERS["production"],
+                                           application=rollback.APPLICATIONS["production"], serving_sha=None)
+            argv = ["rollback", "--variant", "production", "--worker-url",
+                    "https://two-bot-next-production.acct.workers.dev", "--snapshot", str(snapshot),
+                    "--expected-sha", SHA, "--actor", "fixture-actor",
+                    "--evidence", str(Path(directory) / "evidence.json")]
+            for extra in ([], ["--dry-run"]):
+                with self.subTest(extra=extra):
+                    client = mock.Mock()
+                    client.api.side_effect = rollback.GateError("unexpected_provider_read")
+                    code, output = self.run_main([*argv, *extra], client)
+                    self.assertEqual(code, 1, output)
+                    self.assertIn("production_rollback_source_unproved", output)
+                    client.api.assert_not_called()
+
+    def test_production_schema_guard_requires_an_inspectable_source(self):
+        with self.assertRaisesRegex(rollback.GateError, "^production_rollback_source_unproved$"):
+            rollback.source_has_attendance_schema(None)
+        git_error = rollback.subprocess.CalledProcessError(128, "git")
+        with (mock.patch.object(rollback.subprocess, "run", side_effect=git_error),
+              self.assertRaisesRegex(rollback.GateError, "^production_rollback_source_unproved$")):
+            rollback.source_has_attendance_schema(SHA)
+
     URL = "https://two-bot-next-staging.acct.workers.dev"
 
     def base_env(self):
@@ -1097,9 +1158,9 @@ class MainProvenanceTests(unittest.TestCase):
         state = {"has_previous": True, "worker": WORKER, "application": APPLICATION,
                  "application_id": APP_ID, "namespace_id": NAMESPACE,
                  "serving_version": GOOD_VERSION, "serving_sha": SHA,
-                 "provenance_complete": True, "serving_rollout_id": "r-prev",
-                 "serving_image": good_image(), "recorded_at": 1.0}
+                 "serving_rollout_id": "r-prev", "serving_image": good_image(), "recorded_at": 1.0}
         state.update(overrides)
+        state.setdefault("provenance_complete", state["serving_sha"] is not None)
         path = Path(tmp) / "snapshot.json"
         path.write_text(json.dumps(state))
         return path

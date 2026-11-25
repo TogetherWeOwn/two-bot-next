@@ -44,13 +44,14 @@ export function deploymentId(id: unknown): string {
 export function parseChange(value: unknown): OwnershipChange | null {
   if (!value || typeof value !== "object") return null;
   const v = value as Record<string, unknown>;
-  if (v.action !== "takeover" && v.action !== "fence" && v.action !== "takeover-exact") return null;
+  if (v.action !== "takeover" && v.action !== "fence" && v.action !== "takeover-exact" && v.action !== "fence-exact") return null;
   if (!Number.isSafeInteger(v.expectedEpoch) || (v.expectedEpoch as number) < 0) return null;
   // Actor is the caller's audit label; authentication is the control token, not this label.
   if (typeof v.actor !== "string" || !/^[a-zA-Z0-9_.:@/-]{1,128}$/.test(v.actor)) return null;
-  if (v.action === "takeover-exact") {
+  if (v.action === "takeover-exact" || v.action === "fence-exact") {
     if (!validId(v.expectedDeploymentId)) return null;
-    return { action: "takeover", expectedEpoch: v.expectedEpoch as number, actor: v.actor,
+    return { action: v.action === "takeover-exact" ? "takeover" : "fence",
+      expectedEpoch: v.expectedEpoch as number, actor: v.actor,
       expectedDeploymentId: v.expectedDeploymentId };
   }
   return { action: v.action, expectedEpoch: v.expectedEpoch as number, actor: v.actor };
@@ -113,8 +114,10 @@ export class OwnershipFence {
     const oldEpoch = old?.epoch ?? 0;
     if (oldEpoch !== change.expectedEpoch) throw new OwnershipRefused("epoch_conflict");
     if (oldEpoch === Number.MAX_SAFE_INTEGER) throw new OwnershipRefused("epoch_exhausted");
-    if (change.expectedDeploymentId !== undefined && (old?.phase !== "fenced" || old.deploymentId !== null)) {
-      throw new OwnershipRefused("epoch_conflict");
+    if (change.expectedDeploymentId !== undefined) {
+      const stopped = old?.phase === "fenced" && old.deploymentId === null;
+      const active = old?.phase === "active" && old.deploymentId === id;
+      if (!stopped && !(change.action === "fence" && active)) throw new OwnershipRefused("epoch_conflict");
     }
     // Idempotent repeat: the deployment that already owns the active singleton,
     // re-posting at its own epoch, gets the stored record back unchanged: no

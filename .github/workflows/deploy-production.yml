@@ -1631,6 +1631,13 @@ jobs:
           fi
           echo "PRODUCTION_DEPLOY_CONFIG=$config" >> "$GITHUB_ENV"
       - *automatic_recheck
+      - name: Refuse to replace a pair protected by a schema recovery fence
+        if: env.MODE == 'deploy'
+        env:
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
+        run: node ../tooling/wrangler/scripts/production-ownership-control.mjs unreserved
       - name: Deploy to production
         id: deploy
         if: env.MODE == 'deploy'
@@ -1979,9 +1986,8 @@ jobs:
           set -euo pipefail
           # No pinned-revision flag here: the snapshot's recorded serving
           # SHA is the receipt member the stable gate pins (the restored
-          # build reports the previous revision, not the failed SHA). A
-          # pre-stamp snapshot carries none; identity then rests on the
-          # restored Worker version header.
+          # build reports the previous revision, not the failed SHA).
+          # Production rollback requires a stamped snapshot.
           python3 ../tooling/scripts/worker_container_rollback.py rollback \
             --variant production \
             --worker-url "$PRODUCTION_WORKER_URL" \
