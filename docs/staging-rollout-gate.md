@@ -429,7 +429,7 @@ merge or an unverified deployment is not `t0`.
 2. Generate a temporary JSON Wrangler config from the checked-in TOML. Keep the
    staging Container/DO wiring, use absolute source/build paths, and pass three
    non-secret Docker build arguments as `image_vars`: `BOT_BUILD_REVISION` (the
-   exact `GITHUB_SHA`), `BOT_BUILD_ID` (the unique
+   validated serving `DEPLOY_SHA`, passed as `STAGING_SOURCE_SHA`), `BOT_BUILD_ID` (the unique
    `GITHUB_RUN_ID-GITHUB_RUN_ATTEMPT`), and `BOT_DEPLOY_ID` (the
    `YYYY.MM.DD.N+sha7` deploy ID derived in-lane by the compute step). The Rust
    `/readyz` response compiles these values into the binary as
@@ -452,7 +452,8 @@ merge or an unverified deployment is not `t0`.
    record, and `wrangler-action` runs `wrangler --version` before deploying, so
    the file holds several sessions. The action selects its exact CLI version
    from the deployed checkout's lockfile after `npm ci`, so an older pinned drill
-   uses that commit's CLI and receipt guard, not the workflow head's newer pin.
+   uses that commit's CLI and receipt guard. A prior-source recovery pin needs
+   a prepare script that reads `STAGING_SOURCE_SHA` when the workflow SHA differs.
    Require at least one session, all pinned to that checkout's version (currently
    4.165.0) with record version 1, exactly one `deploy` invocation and every other
    session exactly `--version` or `-v`, and exactly one staging deploy record
