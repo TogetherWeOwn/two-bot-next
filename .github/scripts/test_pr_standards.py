@@ -6,6 +6,7 @@ import os
 import re
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 
 import pr_standards as ps
 
@@ -535,6 +536,27 @@ class Template(unittest.TestCase):
         sections = ps.parse_sections(self.text)
         for heading, _, _ in ps.REQUIRED_SECTIONS:
             self.assertIn(heading.lower(), sections, heading)
+
+    def test_generated_footer_stays_outside_attestation(self):
+        headings = [line for line in self.text.splitlines() if line.startswith("## ")]
+        self.assertEqual("## Notes for reviewers", headings[-1])
+        footer = Path(HERE, "fixtures", "cubic-pr-footer.txt").read_text(encoding="utf-8")
+        intro = GOOD_BODY.replace("Refs: TOG-1234", "Synthetic regression fixture.")
+        notes = f"\n{headings[-1]}\n\n"
+
+        def findings(attestation, suffix):
+            return ps.evaluate(env(BODY=intro + attestation + suffix, REPO_PRIVATE="false",
+                                   CHANGED_FILES=AttestationFloor.T0_FILES))
+
+        self.assertEqual([], findings(FULL_ATTESTATION, notes + footer))
+        for attestation, suffix in (
+                (FULL_ATTESTATION, "\n" + footer),
+                (FULL_ATTESTATION + "\n" + footer, notes),
+                (FULL_ATTESTATION + "\n<div>Unexpected evidence</div>\n", notes + footer),
+                (FULL_ATTESTATION.replace("[x] D8", "[ ] D8"), notes + footer),
+                ("", notes + footer)):
+            with self.subTest(attestation=attestation[-70:], suffix=suffix[:30]):
+                self.assertIn(("error", "Attestation"), levels(findings(attestation, suffix)))
 
     def test_unfilled_template_fails_in_error_mode(self):
         f = ps.evaluate(env(BODY=self.text, PR_STANDARDS_MODE="error"))
