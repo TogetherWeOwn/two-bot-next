@@ -41,7 +41,7 @@ JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
 PROBE_STEPS = _HISTORY_MODULE.PROBE_STEPS
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
-    "staging-predecessor.yml": {"qualify"},
+    "build-predecessor.yml": {"build"},
     # The nextest branch adds its required lane; main adds the production schema gate.
     # The inventory pin must retain both changes.
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
@@ -4957,11 +4957,11 @@ def workflow_policy_errors(workflows):
             if workflow != json.loads(contract.read_text()):
                 errors.append(f"{name}: expected the reviewed dispatch, lease and cleanup steps")
             continue
-        if name in ("staging-automod-preview.yml", "staging-predecessor.yml"):
+        if name in ("staging-automod-preview.yml", "build-predecessor.yml"):
             fixture = name.removesuffix(".yml").replace("-", "_") + "_workflow.json"
             contract = Path(__file__).parent / "fixtures" / fixture
             if workflow != json.loads(contract.read_text()):
-                errors.append(f"{name}: expected the disabled, synthetic-only staging job")
+                errors.append(f"{name}: expected the pinned protected workflow")
             continue
         if name == "gradual-promote-proof.yml":
             # Manual gradual-promote proof caller (passive until the fixture

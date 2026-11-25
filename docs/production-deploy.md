@@ -523,10 +523,10 @@ for the full ledgers and retained timestamp.
 
 ### Check the shared rollback SHA
 
-Coordinate exclusive staging before dispatching `staging-predecessor`. It
-requires `PREDECESSOR_STAGING_ENABLED`, dedicated protected Environment bindings
-for synthetic Postgres and Discord, and the independently recorded 0475 timestamp
-digest for retained PRE. A green run ends with the isolated singleton fenced.
+Dispatch `build-predecessor` from protected main to build the reviewed export.
+It emits the Worker modules, OCI image and their recorded identities. This
+receipt covers packaging. Staging qualification at either PRE endpoint requires
+a compatible isolated target that stops the exact runtime when its use window expires.
 
 1. For the reviewed rollback predecessor, record its Worker source SHA and
    module digests, container image digest and expected runtime
