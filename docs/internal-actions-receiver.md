@@ -166,83 +166,6 @@ capabilities; this table is not an instruction to create or stage them.
 | `TWO_INTERNAL_ALLOW_SETTINGS` | Settings get/set stay gated off |
 | `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | `voice.snapshot` stays gated off |
 
-Before enabling self-move, verify the receiver can write terminal receipts and the
-[voice receipt migration](../crates/cutover/migrations/0481_internal_voice_move_audit.sql)
-is applied. Use the existing exclusive finite staging window with verified serving and
-rollback identities, a dedicated account and channels, and cleanup within that window.
-
-Select `verify_lease` in the [manual workflow](../.github/workflows/staging-voice-move.yml) for the exact serving main SHA.
-The self-move proof step defaults off in the workflow source. It uses the same job's lease
-outputs and final ready receipt. Selection requires a protected invocation that supplies
-`runStagingVoiceMoveJob(env, proofInputs)` with in-process `fixture`, `previousReady`,
-`previousOff`, `expectedRevision`, `webSession`, `observer` and `control`. The input
-provider checks the Web scope and prior cleanup against the job's lease before
-invoking proof. The proof independently checks the current Web receipt and Discord
-readbacks before dispatch. The job returns only `disabled`, `failed` or `passed`.
-The workflow's unconditional finish uses the original expiry even if admission fails.
-Cleanup reads back `voiceMoveEnabled: false` and `running: false`. After interruption, confirm both after native
-expiry in protected status for the same run, attempt, expiry, deployment and SHA.
-Live qualification needs a signer bound to the dedicated account's own Web session and two dedicated staging
-voice channels with verifiable Connect permissions and occupancy.
-
-The [offline self-move preflight](../wrangler/scripts/staging-voice-move-acceptance.mjs)
-checks the fixture before the acceptance runner can dispatch a move. Its
-`preflightVoiceMoveAcceptance` export takes the following inputs with `enabled: true`.
-
-- `fixture` pins `environment: "staging"`, the guild and dedicated member
-  (`guildId`, `discordId`), and `channelIds` in source-then-destination order.
-- `lease` pins `runId`, `runAttempt`, `expiresAt`, `sha`, `deploymentId` and
-  `epoch` from the protected window. `ready` is its unmodified ready receipt.
-- `evidence.session` projects the Web signer's staging session and configured
-  channel pair. Use `environment: "staging"`, `authenticated: true`,
-  `action: "voice.move_member"`, `discordId`, `channelIds` and `observedAt`.
-- `evidence.readback.source` and `.destination` come from Discord independently
-  of the Web signer and the Bot's move response. Each provides `guildId`,
-  `discordId`, `channelId`, `channelType` (`2` for guild voice),
-  `connectedChannelId`, `canConnect` and `observedAt`. The member starts in the
-  source. Effective Connect is denied there and allowed in the destination.
-- `evidence.previousReady` and `evidence.previousOff` are the ready and final
-  status receipts from `verify_lease` on the same SHA, deployment and epoch.
-  The workflow uploads them after cleanup. Use those receipts for the prior
-  lease and get `ready` from the separate active window that owns the moves.
-  The earlier lease must be released or expired, OFF and stopped within 15
-  minutes before the current acquisition.
-
-Use UTC ISO timestamps with milliseconds for `observedAt`. Current ready,
-session and Discord readbacks must be at most 60 seconds old and belong to
-the current lease window. Start the runner promptly after ready and feed it
-projections directly from the protected Web, Discord and staging readers.
-Keep fixture IDs and readbacks in the protected context. The preflight checks the
-consistency of trusted readbacks offline and returns a verdict with a fixed
-failure code on refusal. The protected Web caller verifies the signed session
-at dispatch. The runner rechecks lease and Discord observations for each case
-and still requires OFF and stopped for its own window.
-
-The same module exports `runProtectedVoiceMoveAcceptance` for the job holding
-the active lease. It defaults off. Pass the current lease and ready receipt,
-the prior ready and OFF receipts, and the protected fixture pin. The bound Web
-session exposes `environment: "staging"` and `discordId` matching the fixture
-member. Its `readCurrent({ signal })` and destination-only `move` use the same
-installed session.
-An independent fixture reader supplies `readChannels({ signal })` and the
-per-case `observe` callback. The control callback uses the existing staging-use
-client. Pass those readbacks directly without rewriting their timestamps or
-subject. Readback failure enters the runner's same-window finish path. The
-enclosing job still holds the staging lock and owns its unconditional finish
-fallback. This adapter has no workflow caller or live transport. Its current
-receipts are marked `mock`.
-
-For the dormant proof composition, call `runStagingVoiceMoveProof` from the
-same module with the current and prior lease receipts. Inject
-`bindStagingVoiceSession` as `bindSession`, the protected `webSession` that
-owns both `request` and `move`, and independently pinned Web `version_id` and
-`commit` in `expectedRevision`. Pass the independent fixture-scoped Discord
-reader as `observer` with `readChannels` and `observe`. Each case checkpoint
-requires a guild-voice observation captured during that read. The protected
-caller arranges the fixture's own departure before the disconnected case and
-retains the enclosing unconditional finish. A session binding refusal takes
-the same exact-window cleanup path as a failed readback.
-
 Attaching the executor gives all signed verbs a five-second nonce deadline. The guild turn
 ends at adapter settlement. The child holds capacity through the audit, with up to five
 seconds beyond the wire deadline. An audit failure or timeout is logged as unconfirmed.
@@ -256,6 +179,81 @@ loopback-only socket is unreachable from the Containers port check and
 `containerFetch`, so the Worker binds the wildcard and the bot accepts it only
 with the `TWO_INTERNAL_CONTAINER` marker; other binds still pass
 `assert_private_bind`.
+
+### Staging self-move operator handoff
+
+Use the existing protected staging window. Confirm the serving and rollback
+identities and that the receiver can write terminal receipts with the
+[voice receipt migration](../crates/cutover/migrations/0481_internal_voice_move_audit.sql)
+applied. Keep fixture references, session material and raw observations in
+the protected context.
+
+1. **Discord administration and account custodian.** The Bot lead routes
+   initial custody to the authorized staging guild admin and the designated
+   custodian of one dedicated, non-QA normal account. The admin confirms
+   staging membership, designates two distinct restricted guild-voice rooms
+   in source A, destination B order, and records the original overwrites for
+   restoration. Hand Bot Operations the protected `fixture` with
+   `environment: "staging"`, `guildId`, `discordId` and `channelIds: [A, B]`.
+   The custodian signs in normally in the protected Web context and handles
+   the account's own joins and departures. Put the account in A before denying
+   its effective Connect there. It must still be in A at preflight, with
+   Connect denied in A and allowed in B. The admin scopes a separate read-only
+   `observer` to the fixture, including access to observe occupancy in either
+   room and the permission facts needed to verify Connect. Its `readChannels`
+   supplies `source` and `destination` at preflight and `observe` supplies
+   a new read at each case checkpoint. Both report the pinned guild, member and
+   room, guild-voice type, occupied room or explicit disconnect, effective
+   Connect and observation time independently of the Web session and move response.
+2. **Web Operations.** Confirm that the serving staging build includes the
+   [current-session receipt](https://github.com/TogetherWeOwn/two-web-next/pull/2794)
+   and that its protected settings match the approved member and ordered pair.
+   Record the settings to restore. Hand Bot Operations the independently
+   verified serving Worker UUID and full commit from staging readiness
+   metadata as `expectedRevision: { version_id, commit }`. Supply one scoped
+   `webSession` pinned to staging, the exact Web origin and the fixture member.
+   It supplies `request` and destination-only `move` using the same
+   installed current session with fresh membership. The
+   [session binder](../wrangler/scripts/staging-voice-session.mjs) submits the
+   ordered fixture assertions and requires a bounded, private/no-store match
+   receipt with the exact revision pin. It projects the pinned member and
+   ordered pair into preflight with the receipt's `observed_at` unchanged as
+   `observedAt`. Ready, session and Discord preflight observations must be
+   from the active window, at most 60 seconds old and never in the future.
+   Preserve the producers' UTC timestamps with milliseconds.
+3. **Bot Operations.** Coordinate fresh exclusive admission under the existing
+   `staging-lifecycle` lock. Use `verify_lease=true` in the
+   [manual workflow](../.github/workflows/staging-voice-move.yml) from protected
+   main on the first attempt for the exact serving Bot SHA. Take the unmodified
+   ready and final status projections from its retained
+   `staging-voice-move-lease-<run>-<attempt>` artifact as
+   `previousReady` and `previousOff`. That rehearsal lease must be released
+   or expired, OFF and stopped, with the final status within 15 minutes before
+   a separate proof window acquires its own finite selected lease on the same
+   SHA, deployment and owner epoch. Leave time for cleanup inside the window.
+   After successful
+   [`staging-use-pipeline.mjs begin`](../wrangler/scripts/staging-use-pipeline.mjs),
+   [`runStagingVoiceMoveJob(env, proofInputs)`](../wrangler/scripts/staging-voice-move-job.mjs)
+   consumes the current run and attempt, the `expires_at`, `deployment_id`
+   and `sha` outputs, and the final ready receipt, which supplies the epoch.
+   Its protected inputs are `fixture`, `previousReady`, `previousOff`,
+   `expectedRevision`, `webSession`, `observer` and the bounded staging-use
+   `control` adapter for lease assertion, status and release. The proof
+   selector defaults off. The workflow CLI has no live input provider. The
+   in-process job returns `disabled`, `failed` or `passed`. A pass is mock evidence.
+4. **Stop and verify cleanup.** Stop the proof on any unconfirmed input,
+   observation or move result, then proceed to cleanup. Never resubmit a move.
+   The fixture account leaves voice before the disconnected case, with
+   occupancy checked by the observer. Keep the enclosing unconditional
+   `staging-use-pipeline.mjs finish` on the original expiry, including after
+   admission failure. Confirm the
+   protected final status is for the same run, attempt, expiry, SHA, deployment
+   and epoch, with the lease released or expired, `voiceMoveEnabled: false`
+   and `running: false`. After interruption, verify this status after native
+   expiry. Confirm the account is disconnected, restore any changed Discord
+   overwrites and temporary Web settings, and verify Discord permissions are
+   restored and Web refuses the staging probes with the fixture disabled.
+   Treat any unconfirmed readback as incomplete cleanup.
 
 ### Enable order and rollback
 
