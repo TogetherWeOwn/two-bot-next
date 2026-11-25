@@ -653,6 +653,9 @@ REHEARSAL_RUN_NAME = (
     "${{ inputs.reviewed_plan && format('reviewed staging source {0}', inputs.sha) || "
     "(github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'staging rollback proof') || github.workflow }}"
 )
+ROLLBACK_REHEARSAL_PREPARE = (
+    "${{ github.event_name == 'workflow_dispatch' && inputs.recover_prior_sha && inputs.inject_error_rate_spike }}"
+)
 
 
 def staging_gateway_injection_errors(workflows):
@@ -800,8 +803,8 @@ def staging_error_rate_gate_errors(workflows):
                 errors.append(f"{name}: error-rate gate marker {marker} outside deploy-staging/deploy-production")
     staging = workflows.get("deploy-staging.yml") or {}
     text = str(staging)
-    if text.count("inputs.inject_error_rate_spike") != 4:
-        errors.append("deploy-staging.yml: rehearsal input belongs only to identity, hold, error gate and preview exclusion")
+    if text.count("inputs.inject_error_rate_spike") != 5:
+        errors.append("deploy-staging.yml: rehearsal input belongs only to identity, hold, prepare, error gate and preview exclusion")
     if staging.get("run-name") != REHEARSAL_RUN_NAME:
         errors.append("deploy-staging.yml: rehearsal identity must be pinned to the dispatch-only switch")
     hold = ((staging.get("jobs") or {}).get("soak-hold") or {}).get("steps") or []
@@ -971,10 +974,10 @@ def staging_pinned_sha_errors(workflows):
             if needle not in run:
                 errors.append(f"deploy-staging.yml:{job_id}: SHA step must contain {needle}")
         if job_id == "deploy":
-            if (str(staging).count("inputs.recover_prior_sha") != 2
+            if (str(staging).count("inputs.recover_prior_sha") != 3
                     or step.get("env", {}).get("RECOVER_PRIOR_SHA") != "${{ inputs.recover_prior_sha }}"
                     or {"if", "continue-on-error"} & step.keys()):
-                errors.append("deploy-staging.yml:deploy: recovery opt-in must be bound only to the SHA step and preview exclusion")
+                errors.append("deploy-staging.yml:deploy: recovery opt-in belongs only to the SHA step, prepare and preview exclusion")
             reviewed = [entry for entry in steps if entry.get("id") == "reviewed-source"]
             expected_env = {"GH_TOKEN": "${{ github.token }}", "SOURCE_SHA": "${{ env.DEPLOY_SHA }}",
                             "REVIEWED_PLAN": "${{ inputs.reviewed_plan }}", "RECOVERY_PAIR": "${{ inputs.recovery_pair }}",
@@ -1361,6 +1364,11 @@ def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
         env = prepare.get("env") or {}
         if env.get("STAGING_SOURCE_SHA") != "${{ env.DEPLOY_SHA }}" or "GITHUB_SHA" in env:
             errors.append(f"{name}:deploy: prepare must bind STAGING_SOURCE_SHA and preserve the workflow GITHUB_SHA")
+        if (env.get("ROLLBACK_REHEARSAL_PREPARE") != ROLLBACK_REHEARSAL_PREPARE
+                or {"if", "continue-on-error"} & prepare.keys()
+                or 'python3 "$prepare_root"/scripts/staging_rollout.py prepare' not in prepare.get("run", "")
+                or "--config wrangler.toml" not in prepare.get("run", "")):
+            errors.append(f"{name}:deploy: prepare must route rollback rehearsals with the candidate config")
     wrangler = find("wrangler deploy step", lambda step: step.get("id") == "deploy")
     if wrangler is not None:
         command = str((wrangler.get("with") or {}).get("command") or "")
@@ -3464,7 +3472,6 @@ def staging_active_errors(workflow):
     gate_root = "${{ inputs.reviewed_plan != '' && '../tooling' || '..' }}"
     gate_commands = (
         "wrangler/scripts/ownership-control.mjs preflight",
-        "scripts/staging_rollout.py prepare",
         "scripts/worker_container_rollback.py snapshot",
         "scripts/staging_rollout.py receipt",
         "wrangler/scripts/ownership-control.mjs deployment-takeover",
@@ -8796,6 +8803,12 @@ class WorkflowTests(unittest.TestCase):
                 .__setitem__("STAGING_SOURCE_SHA", "${{ github.sha }}"),
             "prepare overrides the reserved workflow SHA": lambda w: prepare_step(w)["env"]
                 .__setitem__("GITHUB_SHA", "${{ env.DEPLOY_SHA }}"),
+            "prepare drops the recovery opt-in": lambda w: prepare_step(w)["env"]
+                .__setitem__("ROLLBACK_REHEARSAL_PREPARE",
+                             ROLLBACK_REHEARSAL_PREPARE.replace("inputs.recover_prior_sha && ", "")),
+            "prepare reads tooling config": lambda w: prepare_step(w)
+                .__setitem__("run", prepare_step(w)["run"].replace(
+                    "--config wrangler.toml", "--config ../tooling/wrangler/wrangler.toml")),
             "deploy message stamps the head": lambda w: step_by_id(w, "deploy")["with"]
                 .__setitem__("command", step_by_id(w, "deploy")["with"]["command"]
                              .replace("${{ env.DEPLOY_SHA }}", "${{ github.sha }}")),

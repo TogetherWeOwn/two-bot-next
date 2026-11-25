@@ -962,7 +962,7 @@ class DeploymentWiringTests(unittest.TestCase):
         source = (root / ".github" / "workflows" / "deploy-staging.yml").read_text()
         steps = re.split(r"(?m)^      - ", source)[1:]
         gate = 'python3 "${STAGING_GATE_ROOT:-..}"/scripts/staging_rollout.py'
-        prepare = [step for step in steps if f"{gate} prepare" in step]
+        prepare = [step for step in steps if 'python3 "$prepare_root"/scripts/staging_rollout.py prepare' in step]
         deploy = [step for step in steps if "command: deploy --config" in step]
         receipt = [step for step in steps if f"{gate} receipt" in step]
         takeover = [step for step in steps if "ownership-control.mjs deployment-takeover" in step]

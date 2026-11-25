@@ -445,15 +445,21 @@ merge or an unverified deployment is not `t0`.
    failure fails the run red with the service already restored. Both ID steps
    run reviewed tooling from the workflow's own
    commit, so a pinned drill deploys a commit whose checkout may predate the
-   script. Recovery drills use the deployed checkout's gate scripts. Reviewed
+   script. The error-rate rollback wrapper sends both `recover_prior_sha` and
+   `inject_error_rate_spike`. With those inputs, prepare runs from the workflow
+   checkout and reads the pinned candidate's Wrangler config and Dockerfile
+   paths. The rehearsal's receipt validation, rollout verification and error-rate
+   gate use the candidate checkout. Automatic rollback and staging-window release
+   use the workflow checkout. Other prior-source recovery dispatches need a
+   candidate prepare script that reads
+   `STAGING_SOURCE_SHA` when the workflow and serving SHAs differ. Reviewed
    qualification runs the deploy job's gate scripts from the workflow checkout.
 3. Read the **fresh** `WRANGLER_OUTPUT_FILE_PATH` NDJSON only after Wrangler exits
    successfully. Every Wrangler invocation appends its own `wrangler-session`
    record, and `wrangler-action` runs `wrangler --version` before deploying, so
    the file holds several sessions. The action selects its exact CLI version
    from the deployed checkout's lockfile after `npm ci`, so an older pinned drill
-   uses that commit's CLI and receipt guard. A prior-source recovery pin needs
-   a prepare script that reads `STAGING_SOURCE_SHA` when the workflow SHA differs.
+   uses that commit's CLI and receipt guard.
    Require at least one session, all pinned to that checkout's version (currently
    4.165.0) with record version 1, exactly one `deploy` invocation and every other
    session exactly `--version` or `-v`, and exactly one staging deploy record
@@ -630,9 +636,8 @@ gh workflow run deploy-staging.yml --ref main -f inject_error_rate_spike=true
 ```
 
 `inject_error_rate_spike` is a `workflow_dispatch`-only boolean (default
-false; `deploy-production` never reads it). It
-reaches only the `error_rate_gate` step's `INJECT_ERROR_RATE_SPIKE` env
-through the pinned dispatch-only expression: the step passes
+false; `deploy-production` never reads it). At the `error_rate_gate` step,
+the pinned dispatch-only expression binds `INJECT_ERROR_RATE_SPIKE`. The step passes
 `--rehearsal-firing '["rest_5xx_rate"]'` to
 `wrangler/scripts/promotion-error-gate.mjs`, which judges it through the
 real `evaluatePromotionGate` helper and exits non-zero, so the existing
