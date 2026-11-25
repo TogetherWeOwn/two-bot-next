@@ -23,6 +23,8 @@ from worker_container_rollback import app_rollouts, application_by_name, replace
 WORKFLOW = ".github/workflows/staging-ownership-status.yml"
 PLAN_WORKFLOW = ".github/workflows/staging-migrate.yml"
 PLAN_ARTIFACT = "staging-migrate-manifest"
+REPOSITORY_ID = 1396224242
+COMPARE_FILE_LIMIT = 300  # GitHub returns at most 300 changed files, on page one only.
 WORKER, APPLICATION = WORKERS["staging"], APPLICATIONS["staging"]
 ORIGIN = f"https://{WORKER}.5150.workers.dev"
 RUN_ID = re.compile(r"[1-9][0-9]{0,19}")
@@ -44,17 +46,55 @@ def github(path, *, binary=False):
     return gh(f"repos/{REPO}/{path}", binary=binary)
 
 
-def verify_main(env, api=github):
+def status_control_path(path):
+    # Keep Python import paths in scope, including added modules. The fixture
+    # tests can change independently of the runner's inventory tooling.
+    return path in (WORKFLOW, PLAN_WORKFLOW, "scripts") or (
+        path.startswith("scripts/") and not path.startswith(("scripts/ci/test_", "scripts/test_"))
+    )
+
+
+def verify_dispatch(env, api=github):
     sha = env.get("GITHUB_SHA")
-    require(env.get("GITHUB_REPOSITORY") == REPO and env.get("GITHUB_REPOSITORY_ID") == "1396224242"
+    run_id = env.get("GITHUB_RUN_ID")
+    require(env.get("GITHUB_REPOSITORY") == REPO and env.get("GITHUB_REPOSITORY_ID") == str(REPOSITORY_ID)
             and env.get("GITHUB_EVENT_NAME") == "workflow_dispatch" and env.get("GITHUB_RUN_ATTEMPT") == "1"
             and env.get("GITHUB_REF") == "refs/heads/main" and env.get("GITHUB_REF_PROTECTED") == "true"
-            and matches(SHA, sha) and env.get("GITHUB_WORKFLOW_SHA") == sha
+            and matches(SHA, sha) and env.get("GITHUB_WORKFLOW_SHA") == sha and matches(RUN_ID, run_id)
             and env.get("GITHUB_WORKFLOW_REF") == f"{REPO}/{WORKFLOW}@refs/heads/main",
             "untrusted_status_dispatch")
+    run = mapping(api(f"actions/runs/{run_id}"))
+    require(number(run.get("id")) == int(run_id) and number(run.get("run_attempt")) == 1
+            and run.get("path") == WORKFLOW and run.get("head_sha") == sha
+            and all(number(mapping(run.get(key)).get("id")) == REPOSITORY_ID
+                    for key in ("repository", "head_repository")), "untrusted_status_dispatch")
+    run_identity(run, WORKFLOW, "workflow_dispatch")
+
     head = mapping(api("branches/main"))
-    require(head.get("protected") is True and mapping(head.get("commit")).get("sha") == sha,
-            "dispatch_is_not_current_main")
+    tip = mapping(head.get("commit")).get("sha")
+    require(head.get("protected") is True and matches(SHA, tip), "status_main_unproved")
+    if tip == sha:
+        return
+
+    # Accept an advanced main only with ancestry and unchanged controls proven
+    # for the two immutable commits. Never execute code from the moving tip.
+    comparison = mapping(api(f"compare/{sha}...{tip}?per_page=1&page=1"))
+    require(comparison.get("status") == "ahead" and number(comparison.get("behind_by")) == 0
+            and number(comparison.get("ahead_by")) > 0
+            and mapping(comparison.get("base_commit")).get("sha") == sha
+            and mapping(comparison.get("merge_base_commit")).get("sha") == sha, "status_main_unproved")
+    files = sequence(comparison.get("files"))
+    require(len(files) < COMPARE_FILE_LIMIT, "status_main_unproved")
+    for entry in map(mapping, files):
+        kind, path, previous = (entry.get(key) for key in ("status", "filename", "previous_filename"))
+        require(isinstance(path, str) and path and kind in ("added", "removed", "modified", "renamed", "copied", "changed"),
+                "status_main_unproved")
+        if kind in ("renamed", "copied"):
+            require(isinstance(previous, str) and previous, "status_main_unproved")
+        else:
+            require(previous is None, "status_main_unproved")
+        require(not status_control_path(path) and (previous is None or not status_control_path(previous)),
+                "status_dispatch_superseded")
 
 
 def plan_manifest(raw, digest, artifact_name=PLAN_ARTIFACT):
@@ -266,7 +306,7 @@ def read_status(env, plan, *, client_factory=Client, read=read_ownership):
 def main(argv, env):
     try:
         if argv == ["plan"]:
-            verify_main(env)
+            verify_dispatch(env)
             run_id = env.get("PLAN_RUN_ID")
             print(json.dumps(verified_plan(run_id) if run_id else None, sort_keys=True))
         elif argv == ["inventory"]:
@@ -275,8 +315,8 @@ def main(argv, env):
             require(len(body) <= MAX_OWNER, "plan_projection_too_large")
             print(json.dumps(read_status(env, checked_plan_summary(decode(body))), sort_keys=True))
         else:
-            require(argv == ["verify-main"], "invalid_operation")
-            verify_main(env)
+            require(argv == ["verify-dispatch"], "invalid_operation")
+            verify_dispatch(env)
         return 0
     except (GateError, ProofError, Refused, KeyError, OSError, TypeError, ValueError, OverflowError) as error:
         reason = str(error) if isinstance(error, (GateError, ProofError)) else "invalid_evidence"

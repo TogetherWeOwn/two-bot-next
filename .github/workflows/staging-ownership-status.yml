@@ -72,7 +72,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
-      - name: Verify current main and authenticate the supplied plan
+      - name: Verify protected dispatch and authenticate the supplied plan
         env:
           GH_TOKEN: ${{ github.token }}
           PLAN_RUN_ID: ${{ inputs.plan_run_id }}
@@ -84,10 +84,10 @@ jobs:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
         run: python3 scripts/staging_recovery_status.py inventory > "$RUNNER_TEMP/staging-recovery-status.json"
-      - name: Recheck current main before publishing
+      - name: Recheck protected dispatch before publishing
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/staging_recovery_status.py verify-main
+        run: python3 scripts/staging_recovery_status.py verify-dispatch
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: staging-recovery-status-${{ github.run_id }}-${{ github.run_attempt }}
