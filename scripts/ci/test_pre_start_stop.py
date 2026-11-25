@@ -163,13 +163,26 @@ class ProtectedPreTests(unittest.TestCase):
         self.admission.close.assert_called_once_with(TARGET)
         self.admission.settle.assert_not_called()
 
+    def test_reports_both_uncertain_stop_operations_without_provider_detail(self):
+        self.external.fence = Mock(side_effect=OSError("provider detail must stay private"))
+        self.admission.close.side_effect = OSError("store detail must stay private")
+        with self.assertRaisesRegex(TargetError, "^pre_external_stop_and_close_unconfirmed$") as caught:
+            self.controller.stop()
+        self.assertIsInstance(caught.exception.__context__, TargetError)
+        self.assertIsNone(caught.exception.__context__.__context__)
+        self.admission.settle.assert_not_called()
+
     def test_rejects_wrong_create_operation(self):
         with patch.object(self.runtime, "create_private", return_value=replace(DEPLOYMENT, start_id=UUID(int=4))):
             with self.assertRaisesRegex(TargetError, "^pre_deployment_unconfirmed$"):
                 self.controller.start(Upload())
 
-    def test_rejects_wrong_probe_version(self):
+    def test_rejects_forged_deployment_or_wrong_probe_version(self):
         deployment = self.controller.start(Upload())
+        forged = replace(deployment, container_id=UUID(int=5))
+        with self.assertRaisesRegex(TargetError, "^pre_probe_unconfirmed$"):
+            self.controller.probe(forged, Endpoint.READINESS)
+        self.assertEqual([entry[0] for entry in self.calls], ["arm", "create"])
         self.runtime.reply = replace(self.runtime.reply, worker_version=UUID(int=5))
         with self.assertRaisesRegex(TargetError, "^pre_probe_unconfirmed$"):
             self.controller.probe(deployment, Endpoint.READINESS)

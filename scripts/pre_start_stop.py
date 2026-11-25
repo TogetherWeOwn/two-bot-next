@@ -30,7 +30,13 @@ class Endpoint(Enum):
 
 
 class StartupAdmission(Protocol):
-    """The durable admission and settlement methods used by this controller."""
+    """Durable startup admission and settlement for the full Target.
+
+    Admit once across all runners, with authority time in the half-open
+    admission window at commit. Never return the ID again, including after a
+    lost reply. Close permanently prevents admission and retains the start ID.
+    Settle requires affirmative drain and restart-fence evidence for that ID.
+    """
 
     def admit_start(self, target: Target) -> UUID | None: ...
     def close(self, target: Target) -> bool: ...
@@ -38,6 +44,8 @@ class StartupAdmission(Protocol):
 
 
 class WorkerUpload(Protocol):
+    """The protected caller supplies the immutable, verified upload payload."""
+
     @property
     def target(self) -> Target: ...
     @property
@@ -69,9 +77,11 @@ class PrivateRuntime(Protocol):
     Return a deployment only after verifying the exact artifact and isolated
     app identity, private ingress from first create, current unrouted readback
     and an authenticated service binding restricted to this exact Worker.
-    Revalidate the binding and exact deployment on each bounded GET without
-    following redirects. Refuse effects outside the admission window, after a
-    fence, or for unverified identities. Treat a lost reply as uncertain.
+    Resolve and compare the deployment against the authoritative identity for
+    the full reservation on each bounded GET without following redirects.
+    Controller instances can span different runners, so retain that identity
+    outside the controller. Refuse effects outside the admission window,
+    after a fence, or for unverified identities. Treat a lost reply as uncertain.
     """
 
     def create_private(self, target: Target, start_id: UUID, upload: WorkerUpload) -> Deployment: ...
@@ -83,10 +93,13 @@ class ExternalStop(Protocol):
 
     Arm before create and enforce the deadline in Target even after runner
     loss. Arm is bound to the admitted start ID and cannot reopen a fenced or
-    expired reservation. The runtime must consult the same authority before
-    any effect, including delayed requests. Fence persists even if create
-    never replied or never began. It prevents new effects and initiates stop
-    of the exact runtime, including internal keepalive. Repeating it is safe.
+    expired reservation. Arm must atomically reserve the exact provider names
+    in their account and refuse a collision with any other reservation. Two
+    full Targets can have the same names. Key ownership and stop by the full
+    Target. The runtime checks ownership and the fence at the effect boundary,
+    including for delayed requests. Fence persists even if create never
+    replied or never began. It prevents new effects and initiates stop of the
+    exact runtime, including internal keepalive. Repeating it is safe.
     The admission settlement observer verifies drain and no restart separately.
     """
 
@@ -98,7 +111,8 @@ def _call(operation, *args, failure):
     try:
         return operation(*args)
     except Exception:
-        raise TargetError(failure) from None
+        pass
+    raise TargetError(failure) from None
 
 
 class ProtectedPre:
@@ -123,6 +137,13 @@ class ProtectedPre:
                 "pre_deployment_unconfirmed")
 
     def start(self, upload: WorkerUpload) -> Deployment:
+        """Start once and reconcile an uncertain outcome through the stop path.
+
+        The protected operator invokes stop after a failure or abandonment
+        past admission. An independent, authorized stop caller owns close and
+        settlement if the start runner disappears or loses authorization.
+        The already armed deadline applies even if that caller is unavailable.
+        """
         self._allow(Operation.START)
         target = self._target
         upload_target = getattr(upload, "target", None)
@@ -150,10 +171,13 @@ class ProtectedPre:
         """Fence effects, close admission and persist independent settlement."""
         self._allow(Operation.STOP)
         target = self._target
+        fence_confirmed = False
         try:
-            fenced = _call(self._external_stop.fence, target, failure="pre_external_stop_unconfirmed")
+            fence_confirmed = _call(self._external_stop.fence, target, failure="pre_external_stop_unconfirmed") is True
         finally:
-            closed = _call(self._admission.close, target, failure="pre_admission_close_unconfirmed")
-        if fenced is not True or closed is not True:
+            close_failure = ("pre_admission_close_unconfirmed" if fence_confirmed
+                             else "pre_external_stop_and_close_unconfirmed")
+            closed = _call(self._admission.close, target, failure=close_failure)
+        if not fence_confirmed or closed is not True:
             return False
         return _call(self._admission.settle, target, failure="pre_stop_unsettled") is True
