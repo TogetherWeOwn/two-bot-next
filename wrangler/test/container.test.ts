@@ -347,6 +347,11 @@ test("protected AutoMod purpose excludes ordinary and voice staging callers", as
     headers: { authorization: `Bearer ${CONTROL_TOKEN}` }, body: JSON.stringify({ ...change, purpose: AUTOMOD_STAGING_PURPOSE }) });
   assert.equal((await h.bot.fetch(publicSelection)).status, 400);
   assert.equal(values.has(STAGING_USE_KEY), false);
+  const stopInterrupted = async () => { throw new Error("preparation interrupted"); };
+  await assert.rejects(staging.acquire(change, identity, stopInterrupted, async () => {}, Date.now(), AUTOMOD_STAGING_PURPOSE),
+    /preparation interrupted/);
+  assert.deepEqual(values.get(STAGING_USE_KEY), { ...issued, phase: "preparing" });
+  assert.equal(values.has(AUTOMOD_JOURNAL_KEY), false);
   assert.deepEqual(await staging.acquire(change, identity, async () => {
     assert.deepEqual(values.get(STAGING_USE_KEY), { ...issued, phase: "preparing" });
   }, async () => {}, Date.now(), AUTOMOD_STAGING_PURPOSE), issued);
@@ -368,6 +373,142 @@ test("protected AutoMod purpose excludes ordinary and voice staging callers", as
   assert.deepEqual(await staging.automodBinding(issued, identity, Date.now()), { lease: issued, active: false });
   await assert.rejects(staging.automodBinding({ ...issued, expiresAt: issued.expiresAt + 1 }, identity, Date.now()),
     /staging_use_conflict/);
+});
+
+const AUTOMOD_JOURNAL_KEY = "two-bot:staging-automod-recovery:v1";
+
+async function unusedAutomodReservation(t: TestContext) {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const h = await harness(t, BOUNDED_STAGING_ENV);
+  const storage = h.ctx.storage as unknown as DurableObjectStorage;
+  const staging = new StagingLifecycle(storage);
+  const sha = BOUNDED_STAGING_ENV.CONTAINER_RELEASE;
+  const identity = { deploymentId: ID, sha, owner: { ...ACTIVE_OWNER, phase: "active" as const } };
+  const change = { ...stagingWindow(), action: "acquire" as const, deploymentId: ID, sha, expectedEpoch: ACTIVE_OWNER.epoch };
+  const reserve = (stop = async () => {}) =>
+    h.ctx.blockConcurrencyWhile(() => staging.acquire(change, identity, stop, async () => {}, Date.now(), AUTOMOD_STAGING_PURPOSE));
+  const issued = await reserve();
+  const calls: string[] = [];
+  const effects: ProtectedAutomodEffects = {
+    readRuntime: async lease => ({ lease, running: h.runtime.running }),
+    readCleanupGrant: async lease => ({ lease, before: issued.expiresAt + 5_000 }),
+    stop: async (lease, before) => {
+      assert.deepEqual(lease, issued);
+      assert.equal(before, issued.expiresAt + 5_000);
+      calls.push("stop");
+      await h.runtime.destroy();
+      return true;
+    },
+    fenceAndDrain: async () => assert.fail("unused reservation has no work to drain"),
+    request: async () => assert.fail("unused reservation does not access the registry"),
+  };
+  const recover = (lease = issued, adapter = effects, bot = h.bot) =>
+    TwoBotContainer.runProtectedAutomod(bot, { action: "recover", issuedLease: lease }, adapter);
+  return { ...h, staging, storage, identity, change, issued, effects, calls, recover };
+}
+
+test("protected AutoMod retires an unused reservation and retries an interrupted release", async t => {
+  const h = await unusedAutomodReservation(t);
+  const { issued, values, ctx, staging, calls, recover } = h;
+  const journal = new StagingAutomodRecovery(h.storage);
+  assert.deepEqual(await journal.pending(), { lease: issued, phase: "reserved" });
+  await assert.rejects(journal.claimStartup(issued, async () => assert.fail("unused lease cannot start")),
+    /staging_automod_startup_refused/);
+  h.runtime.running = true;
+  t.mock.timers.setTime(issued.expiresAt + 1);
+
+  const loseStopReply = { ...h.effects, stop: async (lease: StagingUse, before: number) => {
+    await h.effects.stop(lease, before);
+    throw new Error("lost stop acknowledgement");
+  } };
+  await assert.rejects(recover(issued, loseStopReply), /staging_automod_lifecycle_refused/);
+  assert.deepEqual(await staging.read(), issued);
+  assert.equal(await journal.completedFor(issued), false);
+
+  const put = ctx.storage.put;
+  const write = t.mock.method(ctx.storage, "put", async (key: Parameters<typeof put>[0], value?: unknown) => {
+    if (typeof key !== "string" && (key[STAGING_USE_KEY] as StagingUse | undefined)?.phase === "released") {
+      throw new Error("release write interrupted");
+    }
+    await put(key, value);
+  });
+  await assert.rejects(recover(), /staging_storage_unavailable/);
+  assert.deepEqual(calls, ["stop", "stop"]);
+  assert.deepEqual(await staging.read(), issued);
+  assert.equal(await journal.completedFor(issued), true);
+  write.mock.restore();
+
+  const restarted = await harness(t, BOUNDED_STAGING_ENV, values);
+  t.mock.timers.setTime(issued.expiresAt + 5_000);
+  const noEffects = { ...h.effects, readCleanupGrant: async () => assert.fail("completion receipt already durable") };
+  await recover(issued, noEffects, restarted.bot);
+  await recover(issued, noEffects, restarted.bot);
+  assert.deepEqual(await staging.read(), { ...issued, phase: "released" });
+  assert.deepEqual(calls, ["stop", "stop"]);
+
+  await assert.rejects(staging.acquire({ ...h.change, expiresAt: Date.now() + 10_000 }, h.identity,
+    async () => assert.fail("ended attempt cannot reserve again"), async () => {}, Date.now(), AUTOMOD_STAGING_PURPOSE),
+  /staging_use_ended/);
+  const next = await staging.acquire({ ...h.change, runAttempt: issued.runAttempt + 1, expiresAt: Date.now() + 10_000 },
+    h.identity, async () => {}, async () => {}, Date.now(), AUTOMOD_STAGING_PURPOSE);
+  await assert.rejects(recover(issued, noEffects), /staging_use_conflict/);
+  assert.deepEqual(await staging.read(), next);
+});
+
+test("protected AutoMod refuses unused retirement without exact durable evidence and confirmed stop", async t => {
+  const { issued, values, ctx, staging, change, identity, calls, effects, recover, runtime } = await unusedAutomodReservation(t);
+  const other = { ...issued, runAttempt: issued.runAttempt + 1 };
+  const reserved = values.get(AUTOMOD_JOURNAL_KEY);
+  const get = ctx.storage.get;
+  const unreadable = t.mock.method(ctx.storage, "get", async (key: string) => {
+    if (key === AUTOMOD_JOURNAL_KEY) throw new Error("journal unavailable");
+    return get(key);
+  });
+  await assert.rejects(recover(), /staging_automod_storage_unavailable/);
+  unreadable.mock.restore();
+  values.delete(AUTOMOD_JOURNAL_KEY);
+  assert.deepEqual(await staging.acquire(change, identity, async () => assert.fail("already active"),
+    async () => {}, Date.now(), AUTOMOD_STAGING_PURPOSE), issued);
+  assert.equal(values.has(AUTOMOD_JOURNAL_KEY), false, "acquire retry cannot recreate missing evidence");
+  await assert.rejects(recover(), /staging_use_conflict/);
+  for (const journal of [{ phase: "reserved", lease: issued, created: null }, { phase: "reserved", lease: other },
+    { phase: "retired", lease: other }]) {
+    values.set(AUTOMOD_JOURNAL_KEY, journal);
+    await assert.rejects(recover(), /staging_(automod_|use_conflict)/);
+  }
+  values.set(AUTOMOD_JOURNAL_KEY, reserved);
+  await assert.rejects(recover(other), /staging_use_conflict/);
+  await assert.rejects(recover(issued, { ...effects, readCleanupGrant: async () => ({ lease: other, before: issued.expiresAt }) }),
+    /staging_automod_lifecycle_refused/);
+  assert.deepEqual(calls, []);
+
+  runtime.running = true;
+  for (const acknowledged of [false, true]) {
+    const stop = t.mock.fn(async () => acknowledged);
+    await assert.rejects(recover(issued, { ...effects, stop }), /staging_automod_lifecycle_refused/);
+    assert.equal(stop.mock.callCount(), 1);
+    assert.deepEqual(await staging.read(), issued);
+    assert.deepEqual(values.get(AUTOMOD_JOURNAL_KEY), reserved);
+  }
+  await recover();
+  assert.deepEqual(calls, ["stop"]);
+  assert.equal(runtime.running, false);
+  assert.deepEqual(await staging.read(), { ...issued, phase: "released" });
+});
+
+test("protected AutoMod publication intent spends unused reservation evidence before recovery", async t => {
+  const { issued, storage, staging, calls, effects, recover } = await unusedAutomodReservation(t);
+  const journal = new StagingAutomodRecovery(storage);
+  const intent = { lease: issued, target: STAGING_AUTOMOD_TARGET, publishBefore: issued.expiresAt - 5_000, baseline: "b".repeat(64) };
+  await journal.persistIntent(intent, async () => ({ lease: issued, baselineAbsent: true, publishBefore: intent.publishBefore }));
+  await assert.rejects(recover(issued, { ...effects, fenceAndDrain: async lease => {
+    calls.push("drain");
+    return { lease, publicationDrained: true, startupDrained: false };
+  } }), /staging_automod_cleanup_unverified/);
+  assert.deepEqual(calls, ["drain"]);
+  assert.deepEqual(await staging.read(), issued);
+  assert.equal(await journal.completedFor(issued), false);
+  assert.equal((await journal.pending())?.lease.runAttempt, issued.runAttempt);
 });
 
 test("protected AutoMod scopes startup and cleanup to the exact exclusive staging purpose", async (t) => {

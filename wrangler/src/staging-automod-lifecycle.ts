@@ -55,9 +55,9 @@ function isolated(policy: RuntimePolicy | undefined): boolean {
     && policy.registrySync === false && policy.interactionDispatch === false && policy.dedicatedIntents === true;
 }
 
-/** Dormant coordinator. With the gate held, all work before the journal
- * intent is read-only. Thereafter the durable intent excludes competing use
- * until the recovery journal commits completion. */
+/** Dormant coordinator. Publication stays read-only until it commits the
+ * intent under the gate. The reservation and intent each exclude competing
+ * use until the recovery journal commits completion. */
 export class StagingAutomodLifecycle {
   private readonly deps: Dependencies;
   private readonly journal: StagingAutomodRecovery;
@@ -79,7 +79,8 @@ export class StagingAutomodLifecycle {
   publish(input: Parameters<typeof admitStagingAutomod>[0], signal?: AbortSignal) {
     return this.deps.exclusive(async () => {
       if (this.deps.enabled !== true || signal?.aborted) throw refused();
-      await this.requireIdle();
+      const pending = await this.journal.pending();
+      if (pending && (!("phase" in pending) || !sameLease(pending.lease, input.lease))) throw refused();
       const admission = await admitStagingAutomod(input, this.deps.env,
         () => this.observe(input.lease, true), this.deps.get, this.now);
       const currentAdmission = async () => {
@@ -136,6 +137,17 @@ export class StagingAutomodLifecycle {
       if (!pending) return;
       const { lease } = pending;
       if (expected !== undefined && !sameLease(lease, expected)) throw refused();
+      if ("phase" in pending) {
+        // Only an explicitly bound caller can retire a reservation. A durable
+        // reserved phase proves neither publication nor startup got a claim.
+        if (expected === undefined) throw refused();
+        await this.journal.retireReservation(expected, async () => {
+          const deadline = await this.cleanupDeadline(lease);
+          await this.confirmStop(lease, deadline);
+          if (await this.cleanupDeadline(lease, true) !== deadline) throw refused();
+        });
+        return;
+      }
       let prepared: number | undefined;
       await this.journal.recover(lease, {
         inspect: async (intent, command) => {
@@ -144,7 +156,7 @@ export class StagingAutomodLifecycle {
             const drained = await this.deps.fenceAndDrain(lease, deadline).catch(() => { throw refused(); });
             if (drained?.publicationDrained !== true || drained.startupDrained !== true
               || !sameLease(lease, drained.lease) || await this.cleanupDeadline(lease) !== deadline) throw refused();
-            if (await this.deps.stop(lease, deadline).catch(() => { throw refused(); }) !== true) throw refused();
+            await this.confirmStop(lease, deadline);
             prepared = deadline;
           }
           const deadline = await this.cleanupDeadline(lease, true);
@@ -171,6 +183,10 @@ export class StagingAutomodLifecycle {
 
   private async requireIdle(): Promise<void> {
     if (await this.journal.pending()) throw refused();
+  }
+
+  private async confirmStop(lease: Lease, before: number): Promise<void> {
+    if (await this.deps.stop(lease, before).catch(() => { throw refused(); }) !== true) throw refused();
   }
 
   private async observe(lease: Lease, requireActive = false): Promise<Observation> {

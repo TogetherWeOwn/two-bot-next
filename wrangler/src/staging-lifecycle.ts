@@ -1,30 +1,13 @@
 import { OwnershipRefused, type OwnerRecord } from "./ownership.ts";
+import { StagingAutomodRecovery } from "./staging-automod-recovery.ts";
+import { AUTOMOD_STAGING_PURPOSE, MAX_STAGING_USE_MS, type StagingUse, type StagingWindow } from "./staging-use-window.ts";
+
+export { AUTOMOD_STAGING_PURPOSE, MAX_STAGING_USE_MS, type StagingUse, type StagingWindow } from "./staging-use-window.ts";
 
 export const STAGING_USE_PATH = "/internal/staging-use";
 export const STAGING_USE_KEY = "two-bot:staging-use:v1";
 export const VOICE_MOVE_LEASE_HEADER = "x-two-voice-move-until";
-export const AUTOMOD_STAGING_PURPOSE = "automod-preview";
 const USED_PREFIX = "two-bot:staging-use-ended:v1:";
-// Allows an explicitly authorized four-ACTIVE-hour soak plus startup/cleanup;
-// routine synthetics and deployment callers must request much shorter windows.
-export const MAX_STAGING_USE_MS = 6 * 60 * 60 * 1000;
-
-export interface StagingWindow {
-  environment: "staging";
-  runId: string;
-  runAttempt: number;
-  expiresAt: number;
-}
-
-export interface StagingUse extends StagingWindow {
-  deploymentId: string;
-  sha: string;
-  epoch: number;
-  acquiredAt: number;
-  phase: "preparing" | "active" | "released";
-  voiceMove?: true;
-  purpose?: typeof AUTOMOD_STAGING_PURPOSE;
-}
 
 export interface StagingIdentity {
   deploymentId: string;
@@ -130,6 +113,7 @@ export class StagingLifecycle {
   async releaseAutomod(expected: Readonly<StagingUse>, identity: StagingIdentity): Promise<void> {
     const use = await this.requireAutomodLease(expected, identity);
     if (use.phase !== "released") await this.write({ ...use, phase: "released" });
+    await this.sync();
   }
 
   private async requireAutomodLease(expected: Readonly<StagingUse>, identity: StagingIdentity): Promise<StagingUse> {
@@ -152,6 +136,7 @@ export class StagingLifecycle {
     if (change.expiresAt <= now || change.expiresAt - now > MAX_STAGING_USE_MS) {
       throw new OwnershipRefused("staging_expiry_invalid");
     }
+    if (purpose !== undefined) await this.sync();
     const old = await this.read();
     if (old?.purpose === AUTOMOD_STAGING_PURPOSE && old.phase !== "released"
       && (purpose !== old.purpose || old.expiresAt <= now)) throw new OwnershipRefused("staging_use_conflict");
@@ -186,15 +171,18 @@ export class StagingLifecycle {
       ...(change.voiceMove === true ? { voiceMove: true } : {}),
       ...(purpose === undefined ? {} : { purpose }),
     };
+    const active = { ...pending, phase: "active" as const };
+    const reservation = purpose === undefined ? {} : await new StagingAutomodRecovery(this.storage).reservation(active);
     // Durable denial precedes both teardown and scheduling. A crash cannot
     // publish an active grant lacking its expiry alarm. End markers prevent a
     // delayed acquire retry from resurrecting a released workflow attempt.
-    await this.write(pending, true);
+    await this.write(pending, { [`${USED_PREFIX}${pending.runId}:${pending.runAttempt}`]: pending.expiresAt });
     await stop();
     await scheduleExpiry(pending.expiresAt);
     if (Date.now() >= pending.expiresAt) throw new OwnershipRefused("staging_expiry_invalid");
-    const active = { ...pending, phase: "active" as const };
-    await this.write(active);
+    // The active grant and its unused evidence must become durable together.
+    await this.write(active, reservation);
+    if (purpose !== undefined) await this.sync();
     return active;
   }
 
@@ -231,12 +219,14 @@ export class StagingLifecycle {
     }
   }
 
-  private async write(use: StagingUse, markUsed = false): Promise<void> {
+  private async write(use: StagingUse, entries: Record<string, unknown> = {}): Promise<void> {
     try {
-      await this.storage.put({
-        [STAGING_USE_KEY]: use,
-        ...(markUsed ? { [`${USED_PREFIX}${use.runId}:${use.runAttempt}`]: use.expiresAt } : {}),
-      });
+      await this.storage.put({ ...entries, [STAGING_USE_KEY]: use });
     } catch { throw new OwnershipRefused("staging_storage_unavailable"); }
+  }
+
+  private async sync(): Promise<void> {
+    try { await this.storage.sync(); }
+    catch { throw new OwnershipRefused("staging_storage_unavailable"); }
   }
 }

@@ -707,6 +707,16 @@ and readback. A lost response or a failed readback keeps the hold for recovery.
 Recovery requires same-lease remote drain of both publication and startup,
 followed by confirmed stop and a separate registry absence read.
 
+Lease activation writes an unused reservation to the durable journal in the
+same storage operation. The journal replaces that evidence with the publication
+intent before any create can be sent. Protected recovery can retire an unused
+reservation only with its exact journaled lease, a fresh cleanup grant, a
+confirmed stop and an independent stopped readback under the Container gate.
+It records durable retirement before releasing the lease, so an interrupted
+release can retry with the original tuple. A missing, unreadable or ambiguous
+journal leaves the lease held. Once an intent exists, the publication and
+startup drain and registry checks still apply.
+
 The durable staging lease can reserve sole AutoMod purpose for the exact
 issued window, build and owner epoch. Ordinary and signed voice leases cannot
 satisfy that binding. Competing startup, Help preview, voice dispatch and
@@ -745,11 +755,10 @@ the invocation to that Container. The receipt is evidence for the job summary
 or artifact. Authority stays with the protected job and Worker checks. Only the
 synthetic test invokes the adapter today.
 
-Live qualification also needs native expiry and restart recovery, a way to
-retire an unused reservation before intent, an isolated runtime adapter and
-authoritative remote drain and stopped readbacks. A lost receipt with a command
-still present needs separately proven attribution or independently verified
-absence. Older Workers
+Live qualification also needs native expiry and restart recovery, an isolated
+runtime adapter and authoritative remote drain and stopped readbacks. A lost
+receipt with a command still present needs separately proven attribution or
+independently verified absence. Older Workers
 ignore stored AutoMod purpose on the staging lease and refuse journal entries
 with the new startup phases. Before rollback to one of those builds, finish
 recovery and retire the AutoMod lease with a Worker that understands both.
