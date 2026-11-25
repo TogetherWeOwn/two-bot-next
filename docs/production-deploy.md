@@ -602,8 +602,9 @@ Before handing the bundle to a staging caller, use
 workflow SHA, run ID, artifact ID and ZIP digest, the authenticated GitHub run
 and artifact records, and the same private ZIP the caller would use. The
 offline check binds the full Worker file inventory and OCI image stamps to
-the first successful producer attempt. Staging still needs the serving proof
-below.
+the first successful producer attempt. It also verifies that every layer named
+in the selected OCI manifest is present at its declared size and SHA-256 digest.
+Staging still needs the serving proof below.
 
 1. For the reviewed rollback predecessor, record its Worker source SHA and
    module digests, container image digest and expected runtime
