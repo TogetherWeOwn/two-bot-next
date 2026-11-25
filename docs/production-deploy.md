@@ -408,12 +408,18 @@ once per bot production release, after deploying the candidate to staging.
 
 If a protected attendance release fails or is cancelled after it may have
 stopped the writer and the database apply result cannot be verified, stop
-and notify the release operator immediately. A failed or cancelled job, a
-missing forward receipt, or a stop intent alone leaves the outcome unknown.
-Keep the existing production promotion hold and leave any ownership fence in
-place. Do not rerun the release or apply, dispatch a redeploy or ordinary
-rollback, release ownership, run manual SQL, or use a probe that can start
-the bot.
+and notify the operator responsible for the release task immediately. A failed
+or cancelled job, a missing forward receipt, or a stop intent alone leaves
+the outcome unknown. Leave any ownership fence in place. Do not use Actions
+**Re-run jobs** or dispatch another release, apply, redeploy or ordinary
+rollback. Avoid manual SQL, ownership release, startup-capable probes and
+changes to the production Worker version, secrets, container image or traffic.
+
+Have the release operator confirm that `PRODUCTION_AUTO_PROMOTE_DISABLED=true`
+and keep it set while the handoff is open. Record the effective setting and
+update time. Report any other value or missing readback immediately. An
+expiry-based hold can lapse during the handoff.
+[Automatic promotion](#automatic-promotion).
 
 Use the original run's GitHub Actions page to preserve and hand off the
 following evidence while it is available.
@@ -423,6 +429,8 @@ following evidence while it is available.
   conclusion or last observed status. Link the prepare/STOP and apply jobs.
   Record the last completed step and the conclusion of each relevant step,
   including the forward receipt upload. Mark missing evidence explicitly.
+  Report any still-running origin or other queued or active production run to
+  the release operator for coordination. Leave any in-flight apply alone.
 - Preserve the reviewed plan run and its approval, candidate staging archive
   and image digests, and the pinned predecessor's Worker version, SHA and
   image digest. Keep any existing preflight, stop intent, stopped-writer,
@@ -431,7 +439,9 @@ following evidence while it is available.
   a prior recovery attempt.
 - Record each artifact's producer run, attempt and job, artifact name and ID,
   archive SHA-256 and expiry when available. Preserve the original artifacts
-  and sanitized job evidence in the release record using approved access.
+  in GitHub Actions and call out the earliest expiry for required evidence.
+  Keep sanitized job evidence in the approved release record. Any saved copy
+  is for audit only. Recovery authenticates the original run's artifacts.
   Keep credentials, database contents and raw provider responses out of the
   handoff.
 
@@ -452,9 +462,7 @@ predecessor and ownership epoch before using the database classification.
 - **Confirmed PRE.** The protected job checks both migration ledgers, schema
   and grants under the migration locks. Exact original PRE permits one
   takeover of the pinned predecessor from the proved stopped epoch, followed
-  by stable readiness. If a takeover reply is lost, only the exact active
-  predecessor at the next epoch under the expected release actor can confirm
-  it. A pending or foreign owner leaves the handoff open.
+  by stable readiness.
 - **Confirmed POST.** The protected job checks the exact expanded state under
   the same locks and requires evidence that the original apply step ran.
   Keep the writer fenced until the protected inverse succeeds and its result
@@ -465,6 +473,10 @@ predecessor and ownership epoch before using the database classification.
   The restored endpoint that retains 0475 requires protected reconciliation
   with verified inverse evidence. Keep the fence and escalate to the release
   operator without starting a writer or sending another takeover.
+
+In either takeover path, a lost reply can be confirmed only by readback of the
+exact active predecessor at the next epoch under the expected actor. A pending
+or foreign owner leaves the handoff open without another takeover.
 
 ## Attendance predecessor identity at both PRE endpoints
 
