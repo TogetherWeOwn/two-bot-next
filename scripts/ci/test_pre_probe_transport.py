@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from functools import partial
+from http import HTTPStatus
 from pathlib import Path
 import sys
 import unittest
@@ -82,7 +83,7 @@ class PrivateProbeTransportTests(unittest.TestCase):
         self.binding.request.assert_not_called()
 
     def test_refuses_invalid_http_status(self):
-        for status in (199, 600, True, "200"):
+        for status in (199, 600, True, "200", HTTPStatus.OK):
             with self.subTest(status=status):
                 self.binding.request.reset_mock()
                 self.binding.request.return_value = replace(HEALTH, status=status)
