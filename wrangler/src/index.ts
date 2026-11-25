@@ -32,6 +32,7 @@ import {
   StagingLifecycle, STAGING_USE_PATH, VOICE_MOVE_LEASE_HEADER, hasAutomodReservation, parseStagingUseChange,
   voiceMoveAllowed, type StagingUse,
 } from "./staging-lifecycle.ts";
+import { runProtectedAutomod, type ProtectedAutomodCall, type ProtectedAutomodEffects } from "./staging-automod-caller.ts";
 import { StagingAutomodRecovery } from "./staging-automod-recovery.ts";
 import { stagingDatabaseEvidence } from "./staging-database-fingerprint.ts";
 import { PREVIEW_HEADER, parseRegistryJson, previewRefusal, readPreview, readPreviewAbsent } from "./staging-preview.ts";
@@ -981,6 +982,37 @@ export class TwoBotContainer extends Container<Env> {
   private async confirmedTeardownHold(): Promise<boolean> {
     const use = await this.stagingUse.read().catch(() => undefined);
     return this.deferStagingTeardown(use).catch(() => false);
+  }
+
+  /** Internal composition for a future authenticated caller. Static methods
+   * are not exposed through the Durable Object instance or Worker routes. */
+  static runProtectedAutomod(bot: TwoBotContainer, call: ProtectedAutomodCall, effects: ProtectedAutomodEffects): Promise<void> {
+    const { dryRun } = effects;
+    return runProtectedAutomod(call, {
+      staging: bot.stagingUse, storage: bot.ctx.storage, env: bot.env,
+      exclusive: operation => bot.gated(operation),
+      identity: async () => {
+        const deploymentId = bot.id();
+        return { deploymentId, sha: bot.env.CONTAINER_RELEASE ?? "", owner: await bot.ownership.require(deploymentId) };
+      },
+    }, {
+      ...effects,
+      ...(dryRun === undefined ? {} : { dryRun: {
+        policy: dryRun.policy,
+        start: async (lease, policy, before) => {
+          if (bot.recoveryFailed || bot.ctx.container?.running !== false) {
+            throw new OwnershipRefused("shutdown_unconfirmed");
+          }
+          await bot.requireRecoveryDatabase();
+          if (!(Date.now() < before)) throw new OwnershipRefused("staging_expiry_invalid");
+          await dryRun.start(lease, policy, before);
+        },
+      } }),
+      readRuntime: async lease => {
+        const runtime = await effects.readRuntime(lease);
+        return runtime?.running === bot.ctx.container?.running ? runtime : undefined;
+      },
+    });
   }
 
   /** Snapshot composition. Static so the DO instance exposes no snapshot RPC. */

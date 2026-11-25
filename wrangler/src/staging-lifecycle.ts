@@ -122,13 +122,24 @@ export class StagingLifecycle {
   /** Retain the original issued tuple for recovery after release or expiry.
    * Ownership remains fenced to the same deployment, build and epoch. */
   async automodBinding(expected: Readonly<StagingUse>, identity: StagingIdentity, now: number) {
+    const use = await this.requireAutomodLease(expected, identity);
+    return { lease: Object.freeze({ ...use, phase: "active" as const }), active: activeFor(use, identity, now) };
+  }
+
+  /** The protected caller checks completed cleanup under the same gate first. */
+  async releaseAutomod(expected: Readonly<StagingUse>, identity: StagingIdentity): Promise<void> {
+    const use = await this.requireAutomodLease(expected, identity);
+    if (use.phase !== "released") await this.write({ ...use, phase: "released" });
+  }
+
+  private async requireAutomodLease(expected: Readonly<StagingUse>, identity: StagingIdentity): Promise<StagingUse> {
     const use = await this.read();
     if (use?.purpose !== AUTOMOD_STAGING_PURPOSE || use.phase === "preparing" || !ownedBy(use, identity)
       || expected?.purpose !== AUTOMOD_STAGING_PURPOSE || expected.environment !== use.environment
       || expected.phase !== "active" || "voiceMove" in expected || !sameWindow(use, expected)
       || expected.deploymentId !== use.deploymentId || expected.sha !== use.sha || expected.epoch !== use.epoch
       || expected.acquiredAt !== use.acquiredAt) throw new OwnershipRefused("staging_use_conflict");
-    return { lease: Object.freeze({ ...use, phase: "active" as const }), active: activeFor(use, identity, now) };
+    return use;
   }
 
   async acquire(change: StagingUseChange, identity: StagingIdentity,

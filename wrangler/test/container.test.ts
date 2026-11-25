@@ -17,6 +17,9 @@ import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src
 import { Container } from "@cloudflare/containers";
 import detail from "./fixtures/staging-automod-preview.json" with { type: "json" };
 import databaseTargets from "./fixtures/staging-database-fingerprint.json" with { type: "json" };
+import automodPublication from "./fixtures/staging-automod-publication.json" with { type: "json" };
+import type { ProtectedAutomodEffects } from "../src/staging-automod-caller.ts";
+import { STAGING_AUTOMOD_TARGET, StagingAutomodRecovery } from "../src/staging-automod-recovery.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
 import { PREVIEW_HEADER } from "../src/staging-preview.ts";
 import {
@@ -365,6 +368,138 @@ test("protected AutoMod purpose excludes ordinary and voice staging callers", as
   assert.deepEqual(await staging.automodBinding(issued, identity, Date.now()), { lease: issued, active: false });
   await assert.rejects(staging.automodBinding({ ...issued, expiresAt: issued.expiresAt + 1 }, identity, Date.now()),
     /staging_use_conflict/);
+});
+
+test("protected AutoMod scopes startup and cleanup to the exact exclusive staging purpose", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const { env, replies: { preview } } = automodPublication;
+  const stageEnv = { ...BOUNDED_STAGING_ENV, ...env };
+  const window = stagingWindow();
+  const ordinary: StagingUse = {
+    ...window, deploymentId: ID, sha: stageEnv.CONTAINER_RELEASE, epoch: ACTIVE_OWNER.epoch,
+    acquiredAt: Date.now(), phase: "active",
+  };
+  const issued = { ...ordinary, purpose: AUTOMOD_STAGING_PURPOSE };
+  const values = new Map<string, unknown>([[OWNER_KEY, ACTIVE_OWNER], [STAGING_USE_KEY, issued]]);
+  const h = await harness(t, stageEnv, values);
+  const storage = h.ctx.storage as unknown as DurableObjectStorage;
+  const options = { memberIntake: false, enforcement: false, resume: false, registrySync: false,
+    interactionDispatch: false, dedicatedIntents: true };
+  const calls: string[] = [];
+  const cutoff = issued.expiresAt - 5_000, cleanupBefore = issued.expiresAt + 5_000;
+  const guild = `https://discord.com/api/v10/applications/${env.DISCORD_APPLICATION_ID}/guilds/${env.GUILD_ID}/commands`;
+  let commandPresent = true;
+  let cleanupLease = issued;
+  let reportedRunning: boolean | undefined;
+  const effects: ProtectedAutomodEffects = {
+    readRuntime: async lease => {
+      calls.push("runtime");
+      assert.deepEqual(lease, issued);
+      return { lease, running: reportedRunning ?? h.runtime.running, policy: options };
+    },
+    readCleanupGrant: async lease => {
+      calls.push("grant");
+      assert.deepEqual(lease, issued);
+      return { lease: cleanupLease, before: cleanupBefore };
+    },
+    dryRun: { policy: options, start: async (lease, policy, before) => {
+      calls.push("start");
+      assert.deepEqual(lease, issued);
+      assert.deepEqual(policy, options);
+      assert.equal(before, cutoff);
+      h.runtime.running = true;
+    } },
+    fenceAndDrain: async (lease, before) => {
+      assert.deepEqual(lease, issued);
+      assert.equal(before, cleanupBefore);
+      calls.push("drain");
+      return { lease, publicationDrained: true, startupDrained: true };
+    },
+    stop: async (lease, before) => {
+      assert.deepEqual(lease, issued);
+      assert.equal(before, cleanupBefore);
+      calls.push("stop");
+      h.runtime.running = false;
+      return true;
+    },
+    request: async (url, init) => {
+      if (init.method === "DELETE") {
+        assert.equal(url, `${guild}/${preview.id}`);
+        assert.equal(h.runtime.running, false);
+        calls.push("delete");
+        commandPresent = false;
+        return new Response(null, { status: 204 });
+      }
+      assert.equal(init.method, "GET");
+      if (url === "https://discord.com/api/v10/users/@me") return Response.json(automodPublication.identity);
+      if (url === `${guild}?with_localizations=true`) return Response.json(commandPresent ? [preview] : []);
+      assert.equal(url, `${guild}/${preview.id}`);
+      return commandPresent ? Response.json(preview) : Response.json({ code: 10063 }, { status: 404 });
+    },
+  };
+  const run = (action: "start" | "recover", issuedLease = issued, enabled = true) => {
+    // A loosely typed adapter may carry extra properties. Only the Worker clock is authoritative.
+    const adapter = { ...effects, enabled, now: () => 0 };
+    return TwoBotContainer.runProtectedAutomod(h.bot, { action, issuedLease }, adapter);
+  };
+  const refused = /staging_(automod_|use_conflict)/;
+  await assert.rejects(run("start", issued, false), refused);
+  await assert.rejects(run("recover"), refused);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(values.get(STAGING_USE_KEY), issued);
+
+  // Seed the journal through its offline storage API. Launch runs through
+  // the real DO entry and cleanup never calls a live provider.
+  const journal = new StagingAutomodRecovery(storage);
+  const intent = { lease: issued, target: STAGING_AUTOMOD_TARGET, publishBefore: cutoff, baseline: "b".repeat(64) };
+  await journal.persistIntent(intent, async () => ({ lease: issued, baselineAbsent: true, publishBefore: cutoff }));
+  const receipt = { intent, id: preview.id, version: preview.version };
+  await journal.recordCreated(receipt);
+  await journal.confirmPublication(receipt);
+  await run("start");
+  assert.equal(h.runtime.running, true);
+  assert.equal(calls.filter(call => call === "start").length, 1);
+  await assert.rejects(run("start"), refused);
+
+  t.mock.timers.tick(issued.expiresAt - Date.now());
+  values.set(STAGING_USE_KEY, { ...issued, phase: "released" });
+  await assert.rejects(h.bot.start(), /staging_use_conflict/);
+  await h.bot.stagingExpiry();
+  assert.equal(h.runtime.running, true);
+  await assert.rejects(run("recover", { ...issued, expiresAt: issued.expiresAt + 1 }), refused);
+  cleanupLease = { ...issued, epoch: issued.epoch + 1 };
+  await assert.rejects(run("recover", issued, false), refused);
+
+  cleanupLease = issued;
+  reportedRunning = false;
+  await assert.rejects(run("recover", issued, false), refused);
+  assert.equal(h.runtime.running, true);
+  assert.equal(calls.includes("drain"), false);
+  assert.ok(await journal.pending());
+
+  reportedRunning = undefined;
+  // The journal can finish before the lease retirement write succeeds.
+  values.set(STAGING_USE_KEY, issued);
+  const put = h.ctx.storage.put;
+  const failRelease = t.mock.method(h.ctx.storage, "put", async (...args: Parameters<typeof put>) => {
+    const [key] = args;
+    if (typeof key !== "string" && Object.hasOwn(key, STAGING_USE_KEY)) throw new Error("synthetic lease write failure");
+    await put(...args);
+  });
+  await assert.rejects(run("recover", issued, false), /staging_storage_unavailable/);
+  failRelease.mock.restore();
+  assert.deepEqual(calls.filter(call => ["start", "drain", "stop", "delete"].includes(call)),
+    ["start", "drain", "stop", "delete"]);
+  assert.equal(await journal.completedFor(issued), true);
+  assert.deepEqual(values.get(STAGING_USE_KEY), issued);
+  await assert.rejects(h.bot.start(), /staging_use_conflict/);
+
+  const afterCleanup = calls.length;
+  await run("recover", issued, false);
+  assert.deepEqual(values.get(STAGING_USE_KEY), { ...issued, phase: "released" });
+  await run("recover", issued, false);
+  assert.equal(calls.length, afterCleanup);
+  assert.equal(h.runtime.running, false);
 });
 
 test("staging preview extends readiness without extra cold lifecycle activity", async (t) => {
