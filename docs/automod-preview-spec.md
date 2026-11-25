@@ -708,8 +708,10 @@ Recovery requires same-lease remote drain of both publication and startup,
 followed by confirmed stop and a separate registry absence read.
 
 Lease activation writes an unused reservation to the durable journal in the
-same storage operation. The journal replaces that evidence with the publication
-intent before any create can be sent. Protected recovery can retire an unused
+same storage operation. Reservation phases use a separate storage key so
+older Workers can still read the publication journal after retirement. The
+publication intent and consumption of unused evidence commit together before
+any create can be sent. Protected recovery can retire an unused
 reservation only with its exact journaled lease, a fresh cleanup grant, a
 confirmed stop and an independent stopped readback under the Container gate.
 It records durable retirement before releasing the lease, so an interrupted

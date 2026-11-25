@@ -16,24 +16,28 @@ export const observe = async () => admission;
 
 export class Storage {
   value: unknown;
-  staged: unknown;
+  reservation: unknown;
+  staged: Record<string, unknown> | undefined;
   beforeSync?: () => void;
   afterWrite?: () => void;
   afterCommit?: () => void;
 
-  async get<T>(_key: string): Promise<T | undefined> {
-    return structuredClone(this.value) as T | undefined;
+  async get<T>(key: string): Promise<T | undefined> {
+    return structuredClone(key === "two-bot:staging-automod-recovery:v1" ? this.value : this.reservation) as T | undefined;
   }
 
-  async put<T>(_key: string, value: T): Promise<void> {
-    this.staged = structuredClone(value);
+  async put(key: string | Record<string, unknown>, value?: unknown): Promise<void> {
+    this.staged = structuredClone(typeof key === "string" ? { [key]: value } : key);
     this.afterWrite?.();
   }
 
   async sync(): Promise<void> {
     this.beforeSync?.();
     if (this.staged !== undefined) {
-      this.value = this.staged;
+      for (const [key, value] of Object.entries(this.staged)) {
+        if (key === "two-bot:staging-automod-recovery:v1") this.value = value;
+        else this.reservation = value;
+      }
       this.staged = undefined;
       this.afterCommit?.();
     }

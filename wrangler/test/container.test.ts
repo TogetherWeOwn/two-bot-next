@@ -19,6 +19,7 @@ import detail from "./fixtures/staging-automod-preview.json" with { type: "json"
 import databaseTargets from "./fixtures/staging-database-fingerprint.json" with { type: "json" };
 import automodPublication from "./fixtures/staging-automod-publication.json" with { type: "json" };
 import type { ProtectedAutomodEffects } from "../src/staging-automod-caller.ts";
+import { StagingAutomodLifecycle } from "../src/staging-automod-lifecycle.ts";
 import { STAGING_AUTOMOD_TARGET, StagingAutomodRecovery } from "../src/staging-automod-recovery.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
 import { PREVIEW_HEADER } from "../src/staging-preview.ts";
@@ -323,6 +324,9 @@ test("protected staging admits only the checked startup environment", async (t) 
   assert.equal(stage.starts[0]?.env?.STAGING_RECOVERY_DB_FINGERPRINT, undefined);
 });
 
+const AUTOMOD_JOURNAL_KEY = "two-bot:staging-automod-recovery:v1";
+const AUTOMOD_RESERVATION_KEY = "two-bot:staging-automod-reservation:v1";
+
 test("protected AutoMod purpose excludes ordinary and voice staging callers", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
   const window = stagingWindow(), sha = BOUNDED_STAGING_ENV.CONTAINER_RELEASE;
@@ -351,10 +355,20 @@ test("protected AutoMod purpose excludes ordinary and voice staging callers", as
   await assert.rejects(staging.acquire(change, identity, stopInterrupted, async () => {}, Date.now(), AUTOMOD_STAGING_PURPOSE),
     /preparation interrupted/);
   assert.deepEqual(values.get(STAGING_USE_KEY), { ...issued, phase: "preparing" });
-  assert.equal(values.has(AUTOMOD_JOURNAL_KEY), false);
+  assert.equal(values.has(AUTOMOD_RESERVATION_KEY), false);
+  const put = h.ctx.storage.put;
+  const writes = t.mock.method(h.ctx.storage, "put", async (key: Parameters<typeof put>[0], value?: unknown) => {
+    if (typeof key !== "string" && (key[STAGING_USE_KEY] as StagingUse | undefined)?.phase === "active") {
+      assert.deepEqual(key[AUTOMOD_RESERVATION_KEY], { lease: issued, phase: "reserved" });
+    }
+    await put(key, value);
+  });
   assert.deepEqual(await staging.acquire(change, identity, async () => {
     assert.deepEqual(values.get(STAGING_USE_KEY), { ...issued, phase: "preparing" });
   }, async () => {}, Date.now(), AUTOMOD_STAGING_PURPOSE), issued);
+  assert.equal(writes.mock.calls.filter(({ arguments: [key] }) => typeof key !== "string"
+    && (key[STAGING_USE_KEY] as StagingUse | undefined)?.phase === "active").length, 1);
+  writes.mock.restore();
   assert.deepEqual(await staging.automodBinding(issued, identity, Date.now()), { lease: issued, active: true });
   await assert.rejects(h.bot.start(), /staging_use_conflict/);
   await assert.rejects(h.bot.containerFetch("http://c/readyz"), /staging_use_conflict/);
@@ -374,8 +388,6 @@ test("protected AutoMod purpose excludes ordinary and voice staging callers", as
   await assert.rejects(staging.automodBinding({ ...issued, expiresAt: issued.expiresAt + 1 }, identity, Date.now()),
     /staging_use_conflict/);
 });
-
-const AUTOMOD_JOURNAL_KEY = "two-bot:staging-automod-recovery:v1";
 
 async function unusedAutomodReservation(t: TestContext) {
   t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
@@ -444,6 +456,7 @@ test("protected AutoMod retires an unused reservation and retries an interrupted
   await recover(issued, noEffects, restarted.bot);
   await recover(issued, noEffects, restarted.bot);
   assert.deepEqual(await staging.read(), { ...issued, phase: "released" });
+  assert.equal(values.has(AUTOMOD_JOURNAL_KEY), false, "retirement leaves the older publication journal readable");
   assert.deepEqual(calls, ["stop", "stop"]);
 
   await assert.rejects(staging.acquire({ ...h.change, expiresAt: Date.now() + 10_000 }, h.identity,
@@ -458,25 +471,25 @@ test("protected AutoMod retires an unused reservation and retries an interrupted
 test("protected AutoMod refuses unused retirement without exact durable evidence and confirmed stop", async t => {
   const { issued, values, ctx, staging, change, identity, calls, effects, recover, runtime } = await unusedAutomodReservation(t);
   const other = { ...issued, runAttempt: issued.runAttempt + 1 };
-  const reserved = values.get(AUTOMOD_JOURNAL_KEY);
+  const reserved = values.get(AUTOMOD_RESERVATION_KEY);
   const get = ctx.storage.get;
   const unreadable = t.mock.method(ctx.storage, "get", async (key: string) => {
-    if (key === AUTOMOD_JOURNAL_KEY) throw new Error("journal unavailable");
+    if (key === AUTOMOD_RESERVATION_KEY) throw new Error("reservation unavailable");
     return get(key);
   });
   await assert.rejects(recover(), /staging_automod_storage_unavailable/);
   unreadable.mock.restore();
-  values.delete(AUTOMOD_JOURNAL_KEY);
+  values.delete(AUTOMOD_RESERVATION_KEY);
   assert.deepEqual(await staging.acquire(change, identity, async () => assert.fail("already active"),
     async () => {}, Date.now(), AUTOMOD_STAGING_PURPOSE), issued);
-  assert.equal(values.has(AUTOMOD_JOURNAL_KEY), false, "acquire retry cannot recreate missing evidence");
+  assert.equal(values.has(AUTOMOD_RESERVATION_KEY), false, "acquire retry cannot recreate missing evidence");
   await assert.rejects(recover(), /staging_use_conflict/);
   for (const journal of [{ phase: "reserved", lease: issued, created: null }, { phase: "reserved", lease: other },
     { phase: "retired", lease: other }]) {
-    values.set(AUTOMOD_JOURNAL_KEY, journal);
+    values.set(AUTOMOD_RESERVATION_KEY, journal);
     await assert.rejects(recover(), /staging_(automod_|use_conflict)/);
   }
-  values.set(AUTOMOD_JOURNAL_KEY, reserved);
+  values.set(AUTOMOD_RESERVATION_KEY, reserved);
   await assert.rejects(recover(other), /staging_use_conflict/);
   await assert.rejects(recover(issued, { ...effects, readCleanupGrant: async () => ({ lease: other, before: issued.expiresAt }) }),
     /staging_automod_lifecycle_refused/);
@@ -488,7 +501,7 @@ test("protected AutoMod refuses unused retirement without exact durable evidence
     await assert.rejects(recover(issued, { ...effects, stop }), /staging_automod_lifecycle_refused/);
     assert.equal(stop.mock.callCount(), 1);
     assert.deepEqual(await staging.read(), issued);
-    assert.deepEqual(values.get(AUTOMOD_JOURNAL_KEY), reserved);
+    assert.deepEqual(values.get(AUTOMOD_RESERVATION_KEY), reserved);
   }
   await recover();
   assert.deepEqual(calls, ["stop"]);
@@ -497,18 +510,49 @@ test("protected AutoMod refuses unused retirement without exact durable evidence
 });
 
 test("protected AutoMod publication intent spends unused reservation evidence before recovery", async t => {
-  const { issued, storage, staging, calls, effects, recover } = await unusedAutomodReservation(t);
+  const { issued, storage, staging, values, ctx, calls, effects, recover } = await unusedAutomodReservation(t);
   const journal = new StagingAutomodRecovery(storage);
-  const intent = { lease: issued, target: STAGING_AUTOMOD_TARGET, publishBefore: issued.expiresAt - 5_000, baseline: "b".repeat(64) };
-  await journal.persistIntent(intent, async () => ({ lease: issued, baselineAbsent: true, publishBefore: intent.publishBefore }));
+  const { env, identity, replies: { help, preview } } = automodPublication;
+  const { purpose: _purpose, ...lease } = issued;
+  const owner = "https://discord.com/api/v10/users/@me";
+  const put = ctx.storage.put;
+  t.mock.method(ctx.storage, "put", async (key: Parameters<typeof put>[0], value?: unknown) => {
+    const journal = typeof key === "string" ? value : key[AUTOMOD_JOURNAL_KEY];
+    if ((journal as { phase?: string } | undefined)?.phase === "publishing") {
+      assert.notEqual(typeof key, "string");
+      assert.equal((key as Record<string, unknown>)[AUTOMOD_RESERVATION_KEY], null);
+    }
+    await put(key, value);
+  });
+  const lifecycle = new StagingAutomodLifecycle({
+    ...effects, enabled: true, storage, exclusive: operation => ctx.blockConcurrencyWhile(operation),
+    env: { ...env, STAGING_RUNTIME_POLICY: "bounded", TWO_MODERATION: "1", TWO_OWEN_USER_ID: preview.id },
+    observe: async () => ({ lease: issued, purpose: AUTOMOD_STAGING_PURPOSE, active: true, running: false }),
+    get: async url => url === owner ? identity : [help],
+    request: async (url, init) => {
+      if (init.method === "GET") return Response.json(url === owner ? identity : [help]);
+      assert.equal(init.method, "POST");
+      assert.equal(values.get(AUTOMOD_RESERVATION_KEY), null);
+      calls.push("post");
+      throw new Error("creation response lost");
+    },
+  });
+  await assert.rejects(lifecycle.publish({
+    lease, origin: "https://two-bot-next-staging.example.workers.dev", purposes: [AUTOMOD_STAGING_PURPOSE],
+    verifiedRecoveryPair: true, verifiedRuntimeDatabase: true, verifiedGatewayIntents: true, cleanupReserveMs: 5_000,
+  }), /staging_automod_publication_uncertain/);
   await assert.rejects(recover(issued, { ...effects, fenceAndDrain: async lease => {
     calls.push("drain");
     return { lease, publicationDrained: true, startupDrained: false };
   } }), /staging_automod_cleanup_unverified/);
-  assert.deepEqual(calls, ["drain"]);
+  assert.deepEqual(calls, ["post", "drain"]);
   assert.deepEqual(await staging.read(), issued);
   assert.equal(await journal.completedFor(issued), false);
   assert.equal((await journal.pending())?.lease.runAttempt, issued.runAttempt);
+  values.delete(AUTOMOD_JOURNAL_KEY);
+  await assert.rejects(recover(), /staging_use_conflict/);
+  assert.deepEqual(calls, ["post", "drain"]);
+  assert.deepEqual(await staging.read(), issued);
 });
 
 test("protected AutoMod scopes startup and cleanup to the exact exclusive staging purpose", async (t) => {
