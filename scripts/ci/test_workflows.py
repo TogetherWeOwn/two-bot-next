@@ -11493,10 +11493,13 @@ class WorkflowTests(unittest.TestCase):
         # Pure callees are serialized by their callers instead; the two
         # deploy-side workflows below serialize at the lane jobs on purpose
         # (a top-level group would queue work that must stay unqueued).
-        exempt = {
-            # Pure `workflow_call` callees: the caller holds the group.
-            "sbom.yml",
+        pure_callees = {
+            "deploy-production-recovery.yml",
             "reusable-rust-nextest.yml",
+            "sbom.yml",
+        }
+        exempt = {
+            *pure_callees,
             # Serializes at the `production` lane job only, so a sleeping
             # promotion can never queue an operator rollback behind it (see
             # the header comment in the workflow).
@@ -11508,7 +11511,7 @@ class WorkflowTests(unittest.TestCase):
         for name, workflow in self.workflows.items():
             on = workflow.get("on") or {}
             triggers = {on} if isinstance(on, str) else set(on)
-            if name in ("sbom.yml", "reusable-rust-nextest.yml"):
+            if name in pure_callees:
                 # Gaining an own trigger forces a concurrency decision here.
                 self.assertEqual(triggers, {"workflow_call"}, name)
             if name == "deploy-production.yml":
