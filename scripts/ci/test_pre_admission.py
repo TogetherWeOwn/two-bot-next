@@ -10,7 +10,7 @@ from uuid import UUID
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_admission import AdmissionRecord, SettlementEvidence, SettlementSource, StartupAdmission
-    from pre_start_stop import Deployment
+    from pre_start_stop import Deployment, ExternalStop, Operation, PrivateRuntime, ProtectedPre, WorkerUpload
     from pre_target import Inventory, Target, TargetError, verify_cleanup
 
 
@@ -135,33 +135,43 @@ class StartupAdmissionTests(unittest.TestCase):
             verify_cleanup(TARGET, inventory)
 
     def test_late_start_reply_preserves_close_and_cannot_settle_startup(self):
-        start_id = self.authority.admit_start(TARGET)
-        self.assertIsInstance(start_id, UUID)
-        stop = StartupAdmission(self.store, self.observe)
-        closed = AdmissionRecord(TARGET, start_id, closed=True)
+        runtime = Mock(spec_set=PrivateRuntime)
+        external_stop = Mock(spec_set=ExternalStop)
+        external_stop.arm.return_value = True
+        external_stop.fence.return_value = True
+        start = ProtectedPre(TARGET, authorize=lambda t, op: (t, op) == (TARGET, Operation.START),
+                             admission=self.authority, runtime=runtime, external_stop=external_stop)
+        stop = ProtectedPre(TARGET, authorize=lambda t, op: (t, op) == (TARGET, Operation.STOP),
+                            admission=StartupAdmission(self.store, self.observe),
+                            runtime=runtime, external_stop=external_stop)
 
-        def reply_after_close(target, admitted_id):
-            self.assertTrue(stop.close(target))
-            self.assertFalse(stop.settle(target))
-            self.assertEqual(self.store.read(target), closed)
-            return Deployment(target, admitted_id, UUID(int=2), UUID(int=3))
+        def reply_after_close(target, start_id, _upload):
+            deployment = Deployment(target, start_id, UUID(int=2), UUID(int=3))
+            self.assertFalse(stop.stop())
+            self.assertEqual(self.store.read(target), AdmissionRecord(target, start_id, closed=True))
+            return deployment
 
-        dispatch = Mock(side_effect=reply_after_close)
-        self.observe.return_value = dispatch(TARGET, start_id)
-        self.assertFalse(stop.settle(TARGET))
+        upload = Mock(spec_set=WorkerUpload, target=TARGET)
+        runtime.create_private.side_effect = reply_after_close
+        reply = start.start(upload)
+        closed = AdmissionRecord(TARGET, reply.start_id, closed=True)
+        self.observe.return_value = reply
+        self.assertFalse(stop.stop())
         self.assertEqual(self.store.read(TARGET), closed)
-        self.assertIsNone(self.authority.admit_start(TARGET))
+        with self.assertRaisesRegex(TargetError, "^pre_start_not_admitted$"):
+            start.start(upload)
         inventory = Inventory(TARGET, None, None, 0, False, True,
-                              startup_settled=stop.startup_settled(TARGET), assigned_count=0)
+                              startup_settled=self.authority.startup_settled(TARGET), assigned_count=0)
         with self.assertRaisesRegex(TargetError, "^pre_startup_unsettled$"):
             verify_cleanup(TARGET, inventory)
 
         self.observe.return_value = SettlementEvidence(closed, SettlementSource.RUNTIME, True, True)
-        self.assertTrue(stop.settle(TARGET))
+        self.assertTrue(stop.stop())
         self.assertEqual(self.store.read(TARGET), replace(closed, settled_by=SettlementSource.RUNTIME))
-        self.assertIsNone(self.authority.admit_start(TARGET))
+        with self.assertRaisesRegex(TargetError, "^pre_start_not_admitted$"):
+            start.start(upload)
         verify_cleanup(TARGET, replace(inventory, startup_settled=self.authority.startup_settled(TARGET)))
-        dispatch.assert_called_once_with(TARGET, start_id)
+        runtime.create_private.assert_called_once_with(TARGET, reply.start_id, upload)
 
     def test_only_affirmative_exact_post_close_evidence_settles(self):
         self.authority.admit_start(TARGET)
