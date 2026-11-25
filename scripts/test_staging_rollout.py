@@ -961,11 +961,12 @@ class DeploymentWiringTests(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         source = (root / ".github" / "workflows" / "deploy-staging.yml").read_text()
         steps = re.split(r"(?m)^      - ", source)[1:]
-        prepare = [step for step in steps if "python3 ../scripts/staging_rollout.py prepare" in step]
+        gate = 'python3 "${STAGING_GATE_ROOT:-..}"/scripts/staging_rollout.py'
+        prepare = [step for step in steps if f"{gate} prepare" in step]
         deploy = [step for step in steps if "command: deploy --config" in step]
-        receipt = [step for step in steps if "python3 ../scripts/staging_rollout.py receipt" in step]
+        receipt = [step for step in steps if f"{gate} receipt" in step]
         takeover = [step for step in steps if "ownership-control.mjs deployment-takeover" in step]
-        verify = [step for step in steps if "python3 ../scripts/staging_rollout.py verify" in step]
+        verify = [step for step in steps if f"{gate} verify" in step]
         self.assertEqual((len(prepare), len(deploy), len(receipt), len(takeover), len(verify)),
                          (1, 1, 1, 1, 1))
         # The local Wrangler receipt is accepted after the deploy and before ownership moves.

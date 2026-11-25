@@ -21,6 +21,8 @@ CHECKS = {"check.yml": ("ci-ok", "worker check"), "supply-chain.yml": ("pr-lint"
 # The error-rate gate imports these Worker modules directly.
 TRUSTED_PATHS = (".github/workflows", ".github/scripts", "scripts", "wrangler/scripts",
                  "wrangler/src/alert-rules.ts", "wrangler/src/metrics-scrape.ts")
+# This runner is imported only by its offline Worker test.
+OFFLINE_ACCEPTANCE = ":(top,exclude)wrangler/scripts/staging-voice-move-acceptance.mjs"
 INCOMPATIBLE_INPUTS = ("recover_prior_sha", "release_fence", "inject_gateway_failure",
                        "inject_error_rate_spike", "inject_voice_stall",
                        "inject_unpaired_disconnect", "verify_automod_preview")
@@ -117,7 +119,8 @@ def authorize(env, inputs, fresh_plan, lockfile, api=github, git=check_git):
     # advanced after dispatch. A changed control file requires a new dispatch.
     git("merge-base", "--is-ancestor", workflow, tip)
     git("merge-base", "--is-ancestor", source, tip)
-    git("diff", "--quiet", workflow, tip, "--", *(f":(top){path}" for path in TRUSTED_PATHS))
+    git("diff", "--quiet", workflow, tip, "--", *(f":(top){path}" for path in TRUSTED_PATHS),
+        OFFLINE_ACCEPTANCE)
     run_id = env.get("GITHUB_RUN_ID", "")
     require(re.fullmatch(r"[1-9][0-9]{0,19}", run_id), "untrusted_reviewed_dispatch")
     current = mapping(api(f"actions/runs/{run_id}"))

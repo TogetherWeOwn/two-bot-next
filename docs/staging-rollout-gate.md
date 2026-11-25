@@ -246,7 +246,7 @@ Retain start/assert and stop/refusal artifacts for the run and attempt. Verify
 on exact-head Actions that the existing staging control secret resolves in each
 called staging job; a missing token fails closed, never warrants a new credential.
 
-**Before any qualification dispatch:** subject to existing holds and
+**Before a default qualification dispatch:** subject to existing holds and
 authorization, check that `main` resolves to the intended merged 40-hex SHA
 immediately before dispatch. Use `main` as the workflow ref and that exact SHA
 as `sha` only if they match. If `main` has moved or the match cannot be verified,
@@ -255,10 +255,27 @@ staging before the history guard fails it, and cannot produce B1 or a promotion
 certificate. Verify the run's recorded `headSha` against the target too: the
 pre-dispatch check does not lock `main`. A mismatch is not qualification.
 
+**Reviewed-source qualification:** Dispatch `deploy-staging.yml` from protected
+`main` with the full reviewed `sha`, `recovery_mode=verified`, the approved
+stopped `recovery_pair` and `reviewed_plan=<run-id>@sha256:<archive-digest>` for
+the exact source's protected read-only plan. Use a fresh attempt and existing
+staging approval and holds. Leave recovery-pin, fault, fence and AutoMod switches off.
+
+Under the staging lock, the deploy job checks both SHAs against protected main,
+exact push CI, the plan against the fresh schema projection, the stopped pair
+and Wrangler compatibility. Read-only drift jobs use the candidate. The deploy
+gates use the protected workflow checkout and package the candidate. Workflow
+or deployment tooling changes require a fresh dispatch. The candidate must
+contain the latest successful staging source. A newer success supersedes a queued run.
+
+Retain `reviewed-staging-source.json`, the rollout, certificate and stop receipts.
+Check the run title's serving SHA and GitHub's workflow `head_sha` against the exact attempt.
+Production selects the serving SHA with the same latest-outcome, soak and immutable artifact gates.
+
 **Queued staging work:** Every holder uses `queue: max` and preserves the
 running holder. The queue is bounded; admission order is not a freshness check.
 After acquiring the lock, `deploy-staging` rechecks the fetched main tip before
-changing staging. A superseded workflow head fails red. A stale repeat can
+changing staging. A superseded workflow head fails red on the default path. A stale repeat can
 become the newest outcome for the still-serving SHA and block promotion even
 with an older green run. Do not skip that failure; qualify current `main`
 with a fresh dispatch only if the match above holds. To intentionally recover a
@@ -428,7 +445,8 @@ merge or an unverified deployment is not `t0`.
    failure fails the run red with the service already restored. Both ID steps
    run reviewed tooling from the workflow's own
    commit, so a pinned drill deploys a commit whose checkout may predate the
-   script while the gate scripts stay on the deployed checkout.
+   script. Recovery drills use the deployed checkout's gate scripts. Reviewed
+   qualification runs the deploy job's gate scripts from the workflow checkout.
 3. Read the **fresh** `WRANGLER_OUTPUT_FILE_PATH` NDJSON only after Wrangler exits
    successfully. Every Wrangler invocation appends its own `wrangler-session`
    record, and `wrangler-action` runs `wrangler --version` before deploying, so
