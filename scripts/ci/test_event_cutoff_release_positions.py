@@ -1,12 +1,17 @@
 """Exercise the offline verifier with synthetic pins and runner output."""
 
 import copy
+from contextlib import redirect_stdout
+import importlib.util
+import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 
 VERIFIER = (
@@ -35,20 +40,75 @@ def records_for(pins):
     ]
 
 
+def load_fixture(name):
+    spec = importlib.util.spec_from_file_location(name, VERIFIER.with_name(f"{name}.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def capture_runner(pins):
+    with patch.dict(sys.modules, recorder=load_fixture("recorder")):
+        runner = load_fixture("rehearse")
+    by_image = {pin["image"]: pin["source_revision"] for pin in pins.values()}
+
+    def preflight(*argv):
+        if argv[:3] == ("docker", "image", "inspect") and len(argv) == 4:
+            return json.dumps([{
+                "RepoDigests": [argv[3]], "Config": {"Labels": {runner.REVISION: by_image[argv[3]]}},
+            }]).encode()
+        if argv == ("git", "cat-file", "-e", f'{pins["current"]["source_revision"]}:sql/web_v1.sql'):
+            return b""
+        raise AssertionError(f"Unexpected rehearsal command {argv}")
+
+    def exercise(_):
+        print(json.dumps({"recorder": [], "event_and_role_verdict": "passed"}))
+
+    original_probe = runner.Rehearsal.announcement_control
+
+    def probe(rehearsal, position, case):
+        if case != "positive":
+            return
+        reply = {"status": 200, "message_id": runner.MESSAGE, "replay": False}
+        with patch.multiple(
+            rehearsal,
+            request=Mock(side_effect=[reply, {**reply, "replay": True}]),
+            claim=Mock(return_value="completed"),
+            journal=Mock(return_value=[("POST", runner.MESSAGE_PATH, "announcement", "applied")]),
+        ):
+            original_probe(rehearsal, position, case)
+
+    argv = ["rehearse.py", "--current", pins["current"]["image"], "--retained", pins["retained"]["image"]]
+    with (
+        patch.object(sys, "argv", argv),
+        patch.object(runner, "run", side_effect=preflight),
+        patch.object(subprocess, "run", side_effect=AssertionError("Rehearsal subprocess disabled")),
+        patch.multiple(runner.Rehearsal, start=Mock(), start_bot=Mock(), exercise=exercise,
+                       announcement_control=probe),
+        redirect_stdout(io.StringIO()) as output,
+    ):
+        runner.main()
+    return output.getvalue()
+
+
 class EventCutoffReleasePositionsTest(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.pins = copy.deepcopy(PINS)
         self.records = records_for(PINS)
 
-    def run_verifier(self, exit_code=0):
+    def run_verifier(self, exit_code=0, *, capture=None, pipe=False):
         pins = self.root / "pins.json"
         transcript = self.root / "cutoff.log"
         pins.write_text(json.dumps(self.pins), encoding="utf-8")
-        transcript.write_text(
-            "".join((row if isinstance(row, str) else json.dumps(row)) + "\n" for row in self.records),
-            encoding="utf-8",
-        )
+        if pipe:
+            os.mkfifo(transcript)
+        else:
+            if capture is None:
+                capture = "".join(
+                    (row if isinstance(row, str) else json.dumps(row)) + "\n" for row in self.records
+                )
+            transcript.write_text(capture, encoding="utf-8")
         return subprocess.run(
             [sys.executable, str(VERIFIER), "--pins", str(pins), "--transcript", str(transcript),
              "--runner-exit-code", str(exit_code)],
@@ -62,9 +122,15 @@ class EventCutoffReleasePositionsTest(unittest.TestCase):
         self.assertIn(reason, result.stderr)
 
     def test_complete_run_matches_selected_positions(self):
-        result = self.run_verifier()
+        result = self.run_verifier(capture=capture_runner(self.pins))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("matches both selected Bot positions", result.stdout)
+
+    def test_non_regular_transcript_refuses_without_waiting_for_a_writer(self):
+        result = self.run_verifier(pipe=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("rehearsal transcript must be a regular file", result.stderr)
 
     def test_swapped_positions_refuse(self):
         self.records = records_for({"current": PINS["retained"], "retained": PINS["current"]})

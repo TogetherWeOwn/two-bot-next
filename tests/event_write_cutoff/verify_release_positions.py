@@ -8,7 +8,7 @@ and rollback records as JSON:
       "retained": {"image": "<repo>@sha256:<64 hex>", "source_revision": "<40 hex>"}
     }
 
-Use the admitted-image runner with both per-position announcement controls.
+Use the admitted-image runner from #2460 with both per-position announcement controls.
 Capture stdout and preserve the exit code (without piping through tee):
 
     result=0
@@ -17,14 +17,16 @@ Capture stdout and preserve the exit code (without piping through tee):
     python3 tests/event_write_cutoff/verify_release_positions.py \
         --pins selected.json --transcript cutoff.log --runner-exit-code "$result"
 
-Use pins independent of the transcript and capture the exit code and stdout
-from the same invocation. This checks Bot evidence from the isolated runner.
-Worker identity and effective Discord permissions come from separate evidence.
+Use pins independent of the transcript, run the reviewed fixture, and capture
+its exit code and stdout together. The verifier checks consistency across those
+inputs. Worker identity and effective Discord permissions come from separate evidence.
 """
 
 import argparse
 import json
+import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -37,7 +39,9 @@ PASS = {"verdict": "passed"}
 
 def read_text(path, label, limit):
     try:
-        with path.open("rb") as stream:
+        with open(path, "rb", opener=lambda path, flags: os.open(path, flags | os.O_NONBLOCK)) as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError(f"{label} must be a regular file")
             data = stream.read(limit + 1)
         if len(data) > limit:
             raise ValueError(f"{label} exceeds {limit} bytes")
