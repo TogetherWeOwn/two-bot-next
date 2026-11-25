@@ -12,7 +12,8 @@ const approvals = {
   start: { action: "start", target, issuedLease },
   recover: { action: "recover", target, issuedLease },
 } as const;
-const controlBearer = "fixture-ownership-control";
+// Match the Worker's minimum configured bearer length with synthetic bytes.
+const controlBearer = "a".repeat(32);
 const env = {
   TWO_DEPLOY_ENV: "staging", STAGING_RUNTIME_POLICY: "bounded",
   DISCORD_APPLICATION_ID: target.applicationId, GUILD_ID: target.guildId,
@@ -50,7 +51,7 @@ test("the workflow binding preserves scope and reports unconfirmed actions", asy
   assert.deepEqual(await runStagingAutomodBoundJob({ ...context, runAttempt: 2 }, issuedLease, approvals, worker),
     { verdict: "failed", code: "lease_unconfirmed" });
   assert.deepEqual(await runStagingAutomodBoundJob(context, issuedLease, approvals,
-    { ...worker, controlBearer: "unrelated-fixture-credential" }), { verdict: "failed", start: false, recover: false });
+    { ...worker, controlBearer: "b".repeat(controlBearer.length) }), { verdict: "failed", start: false, recover: false });
   assert.deepEqual(await runStagingAutomodBoundJob(context, issuedLease,
     { start: approvals.recover, recover: approvals.start }, worker), { verdict: "failed", start: false, recover: false });
   assert.equal(invoke.mock.callCount(), 0);
