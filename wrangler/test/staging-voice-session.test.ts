@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { runProtectedVoiceMoveAcceptance } from "../scripts/staging-voice-move-acceptance.mjs";
 import { bindStagingVoiceSession } from "../scripts/staging-voice-session.mjs";
+import { mockVoiceMoveWindow } from "./fixtures/staging-voice-move.ts";
 
 const origin = "https://next.togetherweown.com";
 const receiptUrl = `${origin}/__probe/voice-move/session`;
@@ -196,4 +198,87 @@ test("redacts exceptions and refuses cancellation during transport or stalled bo
   stalled.abort(sentinel);
   await assert.rejects(readingBody, refusal);
   assert.equal(cancelled, true);
+});
+
+type ReceiptCase = "valid" | "wrong build" | "swapped pair" | "before acquisition" | "future" | "stale";
+
+async function runWithReceipt(scenario: ReceiptCase) {
+  const { args, signed, moves, calls } = mockVoiceMoveWindow(scenario === "stale" ? 61_001 : 1_000);
+  const { caller, evidence, now, fixture, ...input } = args;
+  const reads: string[] = [];
+  const releases = [];
+  // The stale case is at lease acquisition, so the 60-second check alone must refuse it.
+  const scenarioTimes: Partial<Record<ReceiptCase, number>> = {
+    "before acquisition": input.ready.use.acquiredAt - 1,
+    future: now() + 1,
+    stale: now() - 60_001,
+  };
+  const sampledAt = scenarioTimes[scenario] ?? now();
+  const scope = {
+    ...caller,
+    origin,
+    move(args: MoveArgs) {
+      assert.equal(this, scope);
+      assert.deepEqual(reads, ["session", "discord"]);
+      return caller.move(args);
+    },
+    request(target: string, init: RequestInit & { signal: AbortSignal }) {
+      assert.equal(this, scope);
+      assert.equal(target, receiptUrl);
+      assert.equal(init.redirect, "error");
+      init.signal.throwIfAborted();
+      reads.push("session");
+      const expectedChannels = scenario === "swapped pair" ? [...fixture.channelIds].reverse() : fixture.channelIds;
+      const matches = init.body === JSON.stringify({ discord_id: fixture.discordId, channel_ids: expectedChannels });
+      if (!matches) return response(JSON.stringify({ error: "forbidden" }), { status: 403 });
+      const servedRevision = scenario === "wrong build" ? { ...revision, commit: "c".repeat(40) } : revision;
+      return response(JSON.stringify({ matched: true, observed_at: new Date(sampledAt).toISOString(), revision: servedRevision }));
+    },
+  };
+  const session = bindStagingVoiceSession({ session: scope, fixture, expectedRevision: revision });
+  const result = await runProtectedVoiceMoveAcceptance({
+    ...input, now, fixture, session,
+    previousReady: evidence.previousReady, previousOff: evidence.previousOff,
+    async readChannels({ signal }) {
+      signal.throwIfAborted();
+      reads.push("discord");
+      return evidence.readback;
+    },
+    async control(request) {
+      if (request.action === "release") releases.push(request);
+      return input.control(request);
+    },
+  });
+  const { runId, runAttempt, expiresAt, sha, deploymentId } = input.lease;
+  assert.deepEqual(releases.map(({ action, runId, runAttempt, expiresAt, sha, deploymentId }) =>
+    ({ action, runId, runAttempt, expiresAt, sha, deploymentId })),
+  [{ action: "release", runId, runAttempt, expiresAt, sha, deploymentId }]);
+  assert.equal(result.mode, "mock");
+  assert.equal(result.cleanup.off, true);
+  assert.equal(result.cleanup.stopped, true);
+  return { result, signed, moves, calls, reads };
+}
+
+test("the protected runner completes the mock cases with a verified receipt", async () => {
+  const { result, signed, moves, calls } = await runWithReceipt("valid");
+  assert.equal(result.verdict, "passed");
+  assert.deepEqual(result.cases.map(({ outcome }) => outcome), ["moved", "not_permitted", "not_connected"]);
+  assert.deepEqual(calls, ["assert", "assert", "assert", "status", "release", "status"]);
+  assert.equal(signed.length, 3);
+  assert.equal(moves.length, 1);
+});
+
+test("the protected runner refuses wrong-build and stale receipts and finishes the lease", async () => {
+  const cases = ["wrong build", "swapped pair", "before acquisition", "future", "stale"] as const;
+  for (const scenario of cases) {
+    const { result, signed, moves, calls, reads } = await runWithReceipt(scenario);
+    const readerRefused = scenario === "wrong build" || scenario === "swapped pair";
+    assert.equal(result.verdict, "failed", scenario);
+    assert.equal(result.code, readerRefused ? "probe_failed" : "session_unconfirmed", scenario);
+    assert.deepEqual(reads, readerRefused ? ["session"] : ["session", "discord"], scenario);
+    assert.deepEqual(result.cases, [], scenario);
+    assert.deepEqual(signed, [], scenario);
+    assert.deepEqual(moves, [], scenario);
+    assert.deepEqual(calls, ["status", "release", "status"], scenario);
+  }
 });
