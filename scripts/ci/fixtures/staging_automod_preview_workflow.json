@@ -22,6 +22,10 @@
         {
           "name": "Exercise the AutoMod dry-run job with a synthetic invoker",
           "run": "node --test wrangler/test/staging-automod-workflow.test.ts"
+        },
+        {
+          "name": "Exercise the private AutoMod binding with synthetic authority",
+          "run": "node --test wrangler/test/staging-automod-workflow-binding.test.ts"
         }
       ]
     }

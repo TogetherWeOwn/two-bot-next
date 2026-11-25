@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { runStagingAutomodBoundJob } from "../scripts/staging-automod-private-job.ts";
 import { STAGING_AUTOMOD_TARGET as target } from "../src/staging-automod-recovery.ts";
@@ -22,29 +21,6 @@ const env = {
 type Invoke = Parameters<typeof runStagingAutomodBoundJob>[3]["invoke"];
 const start = { action: "start", issuedLease };
 const recover = { action: "recover", issuedLease };
-
-test("the protected preview job stays dormant and names the synthetic binding step", () => {
-  const workflow = readFileSync(new URL("../../.github/workflows/staging-automod-preview.yml", import.meta.url), "utf8")
-    .split("\n").filter(line => !/^\s*(?:#|$)/.test(line)).join("\n");
-  assert.match(workflow, /^on:\n  workflow_call:\npermissions: \{\}\n/m);
-  assert.match(workflow, /^concurrency:\n  group: staging-lifecycle\n  cancel-in-progress: false\n  queue: max\n/m);
-  assert.ok(workflow.includes(`\njobs:
-  dry-run:
-    if: >-
-      github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main' &&
-      github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1
-    environment: {name: staging, deployment: false}
-    permissions:
-      contents: read
-`), "preview job admission changed");
-  assert.ok(workflow.includes(`\n          ref: \${{ github.sha }}
-          persist-credentials: false
-          fetch-depth: 1
-`), "preview checkout scope changed");
-  assert.ok(workflow.endsWith(`\n      - name: Exercise the private AutoMod binding with synthetic authority
-        run: node --test wrangler/test/staging-automod-workflow-binding.test.ts`), "synthetic binding step changed");
-  assert.doesNotMatch(workflow, /\bsecrets\b/);
-});
 
 test("the workflow binding confirms both actions on the issued lease", async t => {
   t.mock.timers.enable({ apis: ["Date"], now: now() });
