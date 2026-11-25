@@ -4957,9 +4957,13 @@ def workflow_policy_errors(workflows):
             if workflow != json.loads(contract.read_text()):
                 errors.append(f"{name}: expected the reviewed dispatch, lease and cleanup steps")
             continue
-        if name in ("staging-automod-preview.yml", "build-predecessor.yml"):
-            fixture = name.removesuffix(".yml").replace("-", "_") + "_workflow.json"
-            contract = Path(__file__).parent / "fixtures" / fixture
+        if name == "staging-automod-preview.yml":
+            contract = Path(__file__).parent / "fixtures/staging_automod_preview_workflow.json"
+            if workflow != json.loads(contract.read_text()):
+                errors.append(f"{name}: expected the disabled, synthetic-only staging job")
+            continue
+        if name == "build-predecessor.yml":
+            contract = Path(__file__).parent / "fixtures/build_predecessor_workflow.json"
             if workflow != json.loads(contract.read_text()):
                 errors.append(f"{name}: expected the pinned protected workflow")
             continue
