@@ -1304,10 +1304,9 @@ def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
     The checkout builds the pinned commit, so every build-identity and
     provenance consumer in the deploy job must stamp the validated
     dispatch-or-head SHA: the deploy SHA step exports it as DEPLOY_SHA, the
-    prepare step overrides GITHUB_SHA with it (staging_rollout.py prepare
-    reads GITHUB_SHA as the build revision for BOT_BUILD_REVISION,
+    prepare step supplies it as STAGING_SOURCE_SHA for BOT_BUILD_REVISION,
     CONTAINER_RELEASE and the baseline receipt the verify step judges
-    against), and the wrangler --message, the ownership and rollback actors
+    against, and the wrangler --message, the ownership and rollback actors
     and the promotion-gate SHA resolve it. Stamping the head instead would
     serve the pin labeled as the head, break the runbook's read-the-serving-
     SHA-from-build_revision step and poison the next rollback snapshot's
@@ -1335,8 +1334,10 @@ def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
         errors.append(f"{name}:deploy: SHA step must export the validated dispatch-or-head SHA")
     prepare = find("staging identity snapshot step",
                    lambda step: step.get("name") == "Snapshot staging identity and generate per-deploy image provenance")
-    if prepare is not None and (prepare.get("env") or {}).get("GITHUB_SHA") != "${{ env.DEPLOY_SHA }}":
-        errors.append(f"{name}:deploy: prepare step must stamp the validated deploy SHA as GITHUB_SHA")
+    if prepare is not None:
+        env = prepare.get("env") or {}
+        if env.get("STAGING_SOURCE_SHA") != "${{ env.DEPLOY_SHA }}" or "GITHUB_SHA" in env:
+            errors.append(f"{name}:deploy: prepare must bind STAGING_SOURCE_SHA and preserve the workflow GITHUB_SHA")
     wrangler = find("wrangler deploy step", lambda step: step.get("id") == "deploy")
     if wrangler is not None:
         command = str((wrangler.get("with") or {}).get("command") or "")
@@ -8679,7 +8680,9 @@ class WorkflowTests(unittest.TestCase):
                 .__setitem__("run", "\n".join(line for line in sha_step(w)["run"].splitlines()
                                              if "DEPLOY_SHA" not in line)),
             "prepare stamps the head": lambda w: prepare_step(w)["env"]
-                .__setitem__("GITHUB_SHA", "${{ github.sha }}"),
+                .__setitem__("STAGING_SOURCE_SHA", "${{ github.sha }}"),
+            "prepare overrides the reserved workflow SHA": lambda w: prepare_step(w)["env"]
+                .__setitem__("GITHUB_SHA", "${{ env.DEPLOY_SHA }}"),
             "deploy message stamps the head": lambda w: step_by_id(w, "deploy")["with"]
                 .__setitem__("command", step_by_id(w, "deploy")["with"]["command"]
                              .replace("${{ env.DEPLOY_SHA }}", "${{ github.sha }}")),
