@@ -84,6 +84,51 @@ test("the startup deadline reaches recovery when the invoker loses the reply", a
   assert.deepEqual(calls, ["start", "recover"]);
 });
 
+test("a receipt at the byte cap must reach EOF before the action deadline", async t => {
+  for (const ending of ["before deadline", "pending at deadline", "closes on abort"] as const) {
+    await t.test(ending, async t => {
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: now() });
+      const readingEnd = Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>();
+      const calls: Parameters<Invoke>[0][] = [];
+      const cancel = t.mock.fn(() => new Promise<void>(() => {}));
+      const boundary = syntheticBoundary();
+      let body: ReadableStream<Uint8Array> | undefined;
+      const run = runStagingAutomodDryRun(job, issuedLease, async (call, signal) => {
+        calls.push(call);
+        const response = await boundary(call, signal);
+        if (call.action === "recover") return response;
+        const bytes = new TextEncoder().encode((await response.text()).padEnd(1024));
+        assert.equal(bytes.byteLength, 1024);
+        body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            if (ending === "closes on abort") {
+              signal.addEventListener("abort", () => controller.close(), { once: true });
+            }
+            controller.enqueue(bytes);
+          },
+          pull: controller => readingEnd.resolve(controller),
+          cancel,
+        }, { highWaterMark: 0 });
+        return new Response(body);
+      });
+
+      const controller = await Promise.race([readingEnd.promise, run.then(() => undefined)]);
+      assert.ok(controller, "runner finished before reading to the byte cap");
+      assert.deepEqual(calls, [{ action: "start", issuedLease }]);
+      if (ending === "before deadline") {
+        t.mock.timers.tick(14_999);
+        controller.close();
+      } else {
+        t.mock.timers.tick(15_000);
+      }
+      assert.deepEqual(await run, ending === "before deadline" ? passed : startupUnconfirmed);
+      assert.deepEqual(calls, [{ action: "start", issuedLease }, { action: "recover", issuedLease }]);
+      assert.equal(cancel.mock.callCount(), ending === "pending at deadline" ? 1 : 0);
+      assert.equal(body?.locked, false);
+    });
+  }
+});
+
 test("only bounded, exact receipt evidence can confirm either action", async t => {
   t.mock.timers.enable({ apis: ["Date"], now: now() });
   for (const mutate of [

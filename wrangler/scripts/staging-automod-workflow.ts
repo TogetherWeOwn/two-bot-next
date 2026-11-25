@@ -25,7 +25,10 @@ async function readReceipt(response: Response, signal: AbortSignal): Promise<unk
   let bytes = 0;
   try {
     for (;;) {
+      signal.throwIfAborted();
       const { done, value } = await boundRead(reader.read(), signal);
+      // An upstream abort handler can settle the pending read before the race rejects.
+      signal.throwIfAborted();
       if (done) return JSON.parse(text + decoder.decode());
       bytes += value.byteLength;
       if (bytes > MAX_RECEIPT_BYTES) return;
