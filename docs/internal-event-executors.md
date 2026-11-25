@@ -191,3 +191,46 @@ and payload, and attest no wire attempt was admitted on any covered path.
 An authenticated outcome proven against the original attempt may settle that
 attempt. A lost response, timeout, stale owner, revoked permit, permission
 readback, or elapsed time cannot settle it. Never dispatch under a second key.
+
+### Disposable rehearsal
+
+Pull the admitted Bot images by digest through the registry's read-only path
+and pre-pull the pinned Postgres and recorder images below. The script launches
+only locally present images. It starts a fresh
+loopback-only network namespace with no external interface, supplies synthetic
+credentials, and routes the original binary's TLS requests for `discord.com`
+to the local recorder. It uses the shipping receiver's compile-time guild
+fence as an inert fixture identifier. It does not use a live guild or the
+Worker ingress.
+
+The runner reads the schema from the current image's
+`org.opencontainers.image.revision` commit. If that revision is missing from
+the checkout, fetch it from `origin` before starting.
+
+```sh
+docker pull postgres@sha256:372621a978f4513b082d946d6320e2b11a3b359648b81fba8a2ba0df33958f62 &&
+docker pull node@sha256:e7add2a490bb17d97b485b8641bd88455fff7839ade0f5eba493c3508124d413 &&
+current_revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$current_digest_reference")" &&
+(git cat-file -e "${current_revision}^{commit}" || git fetch origin "$current_revision") &&
+git cat-file -e "$current_revision:sql/web_v1.sql" &&
+PYTHONDONTWRITEBYTECODE=1 python3 tests/event_write_cutoff/rehearse.py \
+  --current "$current_digest_reference" --retained "$retained_digest_reference"
+```
+
+The recorder models a guild-wide grant or denial for external events. Its
+policy file lives outside the app database. Real role hierarchy and channel
+overwrites require a separate effective-permission readback. The script records
+policy order, intent and token admission at each barrier, per-route counts,
+immutable Bot image references and the recorder source hash. It checks that an
+original key remains ambiguous after restoring a snapshot containing the claim.
+It also forces a synthetic request under that same key after restoring a
+snapshot from before the claim, to verify that the cutoff still denies the
+request. Web must keep ambiguous work held in both cases.
+
+The runner uses the current artifact's schema for both positions. The same
+image may back both positions when the serving and retained receipts agree.
+The full verdict requires both positive controls. A retained announcement
+transport using compiled WebPKI roots rejects the synthetic CA before the
+request reaches the recorder. Its announcement control remains incomplete
+until both admitted images can use the disposable trust root at the same
+Discord origin.
