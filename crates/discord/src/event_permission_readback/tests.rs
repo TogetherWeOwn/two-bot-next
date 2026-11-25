@@ -1,6 +1,12 @@
 use super::*;
 use serde_json::{json, Value};
-use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
+use twilight_model::{
+    channel::Channel,
+    gateway::{
+        event::Event,
+        payload::incoming::{GuildCreate, ThreadCreate, ThreadUpdate},
+    },
+};
 
 fn ready(cache: &SharedCache) {
     cache.update(&Event::Ready(
@@ -41,21 +47,6 @@ fn permission_projection_resolves_event_bits_and_bypass() {
         guild["channels"][0]["permission_overwrites"] = json!([{
             "id":"999","type":1,"allow":"0","deny":Permissions::CREATE_EVENTS.bits().to_string()
         }]);
-        guild["channels"]
-            .as_array_mut()
-            .expect("channels")
-            .push(json!({"id":"300","type":15,"name":"forum fixture"}));
-        guild["threads"] = Value::Array(
-            (1_000..3_049)
-                .map(|id: u64| {
-                    json!({
-                        "id":id.to_string(),"type":11,"parent_id":"300",
-                        "thread_metadata":{"archived":true,"auto_archive_duration":1440,
-                            "archive_timestamp":"2026-09-30T00:00:00+00:00","locked":false}
-                    })
-                })
-                .collect(),
-        );
         seed(&cache, guild);
         let evidence = cache
             .event_permission_evidence(Id::new(100), Id::new(999))
@@ -66,6 +57,59 @@ fn permission_projection_resolves_event_bits_and_bypass() {
         assert_eq!(evidence.guild_manage_events, bypass);
         assert_eq!(evidence.voice.channels, 1);
         assert_eq!(evidence.voice.either_event_permission, usize::from(bypass));
+    }
+}
+
+#[test]
+fn threads_archived_through_gateway_updates_leave_event_coverage_available() {
+    let cache = SharedCache::default();
+    ready(&cache);
+    let mut guild = guild();
+    guild["channels"]
+        .as_array_mut()
+        .expect("channels")
+        .push(json!({"id":"300","type":15,"name":"forum fixture"}));
+    seed(&cache, guild);
+    for id in 1_000..3_049 {
+        let mut thread: Channel = serde_json::from_value(json!({
+            "id":id.to_string(),"guild_id":"100","type":11,"parent_id":"300",
+            "thread_metadata":{"archived":false,"auto_archive_duration":1440,
+                "archive_timestamp":"2026-09-30T00:00:00+00:00","locked":false}
+        }))
+        .expect("thread fixture");
+        cache.update(&Event::ThreadCreate(Box::new(ThreadCreate(thread.clone()))));
+        thread
+            .thread_metadata
+            .as_mut()
+            .expect("thread metadata")
+            .archived = true;
+        cache.update(&Event::ThreadUpdate(Box::new(ThreadUpdate(thread))));
+    }
+    let guild_id = Id::new(100);
+    let indexed = cache.with_guild_snapshot(guild_id.get(), |cache| {
+        cache.guild_channels(guild_id).expect("channel index").len()
+    });
+    assert_eq!(indexed, Some(2052));
+    let evidence = cache
+        .event_permission_evidence(guild_id, Id::new(999))
+        .expect("retained threads cannot exhaust the event channel limit");
+    assert_eq!((evidence.voice.channels, evidence.stage.channels), (1, 0));
+}
+
+#[test]
+fn combined_voice_and_stage_limit_refuses_incomplete_coverage() {
+    for total in [500, 501] {
+        let cache = SharedCache::default();
+        ready(&cache);
+        let mut guild = guild();
+        guild["channels"] = Value::Array((0..total).map(|index| {
+            let kind = if index < 250 { 2 } else { 13 };
+            json!({"id": (1_000 + index).to_string(), "type":kind, "permission_overwrites":[]})
+        }).collect());
+        seed(&cache, guild);
+        let evidence = cache.event_permission_evidence(Id::new(100), Id::new(999));
+        let counts = evidence.map(|sample| (sample.voice.channels, sample.stage.channels));
+        assert_eq!(counts, (total == 500).then_some((250, 250)));
     }
 }
 
