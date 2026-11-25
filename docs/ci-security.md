@@ -177,20 +177,21 @@ completed with a runner or results-upload failure.
    failed run to agree on the full SHA and verify the run belongs to this PR.
    Stop on a mismatch. Once the run is terminal and the affected service has
    recovered, check whether GitHub accepts a manual rerun of that run. If
-   accepted, verify the new attempt on the same head. Record an explicit
-   run-level refusal before considering a fresh head. Resolve permission,
-   quota or transient API errors through their normal paths.
+   accepted, use the original SHA and the new attempt in step 4. Record an
+   explicit run-level refusal before considering a fresh head. Resolve
+   permission, quota or transient API errors through their normal paths.
 3. If GitHub refuses the rerun and the failure is confirmed infrastructure-only,
    the branch maintainer may make one normal fast-forward on the existing PR
    branch. Prepare an empty commit whose sole parent is the failed head. Verify
    both commit tree IDs match, then re-read the PR and both remote refs
    immediately before pushing. Proceed only while the incident is clear and
    all three still point to the failed head. Stop if the push is rejected.
-4. Verify the branch, PR metadata and `refs/pull/<number>/head` all show the
-   child SHA. If the PR ref stays stale, stop and investigate synchronization.
-   Once the refs agree, require a completed, passing default CodeQL scan for
-   this PR ref and exact SHA. For either recovery path, check the run's current
-   attempt and its jobs for every required language. Confirm GitHub shows the
+4. After a same-head rerun, verify the branch, PR metadata and
+   `refs/pull/<number>/head` still show the original SHA. After a fast-forward,
+   verify all three show the child SHA. Stop if they disagree or the PR ref
+   stays stale. Require a completed, passing default CodeQL scan for this PR
+   ref and exact SHA. Check the current attempt of the rerun or replacement
+   scan and its jobs for every required language. Confirm GitHub shows the
    required code scanning results on that head. Record the run and job links
    with the full SHA and keep the PR blocked if any required check is missing
    or failing on that head.
