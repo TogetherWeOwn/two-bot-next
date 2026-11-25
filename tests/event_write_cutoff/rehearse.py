@@ -322,6 +322,7 @@ def main():
         source = info["Config"]["Labels"].get(REVISION, "")
         require(re.fullmatch(r"[0-9a-f]{40}", source), "Missing exact source revision")
         revisions[which] = source
+    run("git", "cat-file", "-e", f"{revisions['current']}:sql/web_v1.sql")
     print(json.dumps({
         "images": images, "source_revisions": revisions, "postgres": DB_IMAGE, "recorder_image": RECORDER_IMAGE,
         "recorder_sha256": hashlib.sha256((HERE / "recorder.py").read_bytes()).hexdigest(),

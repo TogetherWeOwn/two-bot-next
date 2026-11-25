@@ -208,10 +208,11 @@ The runner reads the schema from the current image's
 the checkout, fetch it from `origin` before starting.
 
 ```sh
-docker pull postgres@sha256:372621a978f4513b082d946d6320e2b11a3b359648b81fba8a2ba0df33958f62
-docker pull node@sha256:e7add2a490bb17d97b485b8641bd88455fff7839ade0f5eba493c3508124d413
-current_revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$current_digest_reference")"
-git cat-file -e "${current_revision}^{commit}" || git fetch origin "$current_revision"
+docker pull postgres@sha256:372621a978f4513b082d946d6320e2b11a3b359648b81fba8a2ba0df33958f62 &&
+docker pull node@sha256:e7add2a490bb17d97b485b8641bd88455fff7839ade0f5eba493c3508124d413 &&
+current_revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$current_digest_reference")" &&
+(git cat-file -e "${current_revision}^{commit}" || git fetch origin "$current_revision") &&
+git cat-file -e "$current_revision:sql/web_v1.sql" &&
 PYTHONDONTWRITEBYTECODE=1 python3 tests/event_write_cutoff/rehearse.py \
   --current "$current_digest_reference" --retained "$retained_digest_reference"
 ```
