@@ -73,18 +73,6 @@ enum AnnouncementHttp {
     Rehearsal(RehearsalAnnouncementConnector),
 }
 
-impl AnnouncementHttp {
-    async fn request(
-        &self,
-        request: http::Request<Full<Bytes>>,
-    ) -> Result<http::Response<hyper::body::Incoming>, hyper_util::client::legacy::Error> {
-        match self {
-            Self::Discord(client) => client.request(request).await,
-            Self::Rehearsal(connector) => connector.request(request).await,
-        }
-    }
-}
-
 /// No free-text provider errors or request values may enter this contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -488,7 +476,11 @@ impl AnnouncementExecutor {
         channel_id: Id<ChannelMarker>,
         deadline: tokio::time::Instant,
     ) -> ExecutionOutcome {
-        let response = match tokio::time::timeout_at(deadline, self.http.request(outbound)).await {
+        let request = match &self.http {
+            AnnouncementHttp::Discord(client) => client.request(outbound),
+            AnnouncementHttp::Rehearsal(connector) => connector.0.request(outbound),
+        };
+        let response = match tokio::time::timeout_at(deadline, request).await {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => return ExecutionOutcome::Unknown(UnknownReason::Transport),
             Err(_) => return ExecutionOutcome::Unknown(UnknownReason::Timeout),

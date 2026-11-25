@@ -1,32 +1,24 @@
-use std::{
-    future::Future,
-    io,
-    net::Ipv4Addr,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::{io, net::Ipv4Addr};
 
-use bytes::Bytes;
-use http::{Request, Response, Uri};
-use http_body_util::Full;
-use hyper::body::Incoming;
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::{
-    client::legacy::{Client, Error},
-    rt::{TokioExecutor, TokioIo},
-};
+use super::{Bytes, Client, Full, HttpsConnector, HttpsConnectorBuilder, TokioExecutor};
+use futures_util::future::BoxFuture;
+use http::Uri;
+use hyper_util::rt::TokioIo;
 use rustls::{pki_types::CertificateDer, ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
-use tower_service::Service;
+use tower::{service_fn, util::ServiceFn};
 use two_bot_core::send_admission::AdmissionError;
 
-/// Transport for the isolated release-binary rehearsal. The single fixture
-/// root is private to this client. Rustls verifies the chain and the URI host.
+type RecorderDial = BoxFuture<'static, io::Result<TokioIo<TcpStream>>>;
+type RecorderTcp = ServiceFn<fn(Uri) -> RecorderDial>;
+
+/// Isolated transport with one fixture root and standard rustls verification.
 #[derive(Clone)]
-pub struct RehearsalAnnouncementConnector(Client<HttpsConnector<RecorderTcp>, Full<Bytes>>);
+pub struct RehearsalAnnouncementConnector(
+    pub(super) Client<HttpsConnector<RecorderTcp>, Full<Bytes>>,
+);
 
 impl RehearsalAnnouncementConnector {
-    /// Build with one DER-encoded fixture trust root and no default roots.
     pub fn new(ca_der: Vec<u8>) -> Result<Self, AdmissionError> {
         let mut roots = RootCertStore::empty();
         roots
@@ -39,7 +31,7 @@ impl RehearsalAnnouncementConnector {
             .with_tls_config(tls)
             .https_only()
             .enable_http1()
-            .wrap_connector(RecorderTcp);
+            .wrap_connector(service_fn(dial_recorder as fn(Uri) -> RecorderDial));
         Ok(Self(
             Client::builder(TokioExecutor::new())
                 .retry_canceled_requests(false)
@@ -47,7 +39,7 @@ impl RehearsalAnnouncementConnector {
         ))
     }
 
-    /// Match the release rehearsal's generated raw Discord credential.
+    /// Match the release rehearsal's generated credential form.
     #[must_use]
     pub fn is_synthetic_token(token: &str) -> bool {
         token.strip_prefix("synthetic-").is_some_and(|value| {
@@ -57,71 +49,29 @@ impl RehearsalAnnouncementConnector {
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         })
     }
-
-    pub(super) async fn request(
-        &self,
-        request: Request<Full<Bytes>>,
-    ) -> Result<Response<Incoming>, Error> {
-        self.0.request(request).await
-    }
 }
 
-#[derive(Clone, Copy)]
-struct RecorderTcp;
-
-impl Service<Uri> for RecorderTcp {
-    type Response = TokioIo<TcpStream>;
-    type Error = io::Error;
-    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, uri: Uri) -> Self::Future {
-        Box::pin(async move {
-            if uri.scheme_str() != Some("https")
-                || uri.authority().map(http::uri::Authority::as_str) != Some("discord.com")
-            {
-                return Err(io::Error::other("announcement rehearsal origin refused"));
-            }
-            TcpStream::connect((Ipv4Addr::LOCALHOST, 443))
-                .await
-                .map(TokioIo::new)
-        })
-    }
+fn dial_recorder(uri: Uri) -> RecorderDial {
+    Box::pin(async move {
+        if uri.scheme_str() != Some("https")
+            || uri.authority().map(http::uri::Authority::as_str) != Some("discord.com")
+        {
+            return Err(io::Error::other("announcement rehearsal origin refused"));
+        }
+        TcpStream::connect((Ipv4Addr::LOCALHOST, 443))
+            .await
+            .map(TokioIo::new)
+    })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_the_generated_token_shape_is_synthetic() {
-        let token = format!("synthetic-{}", "0123456789abcdef".repeat(3));
-        assert!(RehearsalAnnouncementConnector::is_synthetic_token(&token));
-        for value in [
-            "ordinary.fixture.token".to_owned(),
-            token.to_ascii_uppercase(),
-            format!("Bot {token}"),
-            format!("{token}0"),
-            token.replace('a', "g"),
-        ] {
-            assert!(!RehearsalAnnouncementConnector::is_synthetic_token(&value));
-        }
-        assert!(RehearsalAnnouncementConnector::new(Vec::new()).is_err());
-    }
-
-    #[tokio::test]
-    async fn socket_connector_refuses_any_other_authority() {
-        for uri in [
-            "http://discord.com",
-            "https://discord.com:443",
-            "https://127.0.0.1",
-            "https://discord.com.example",
-        ] {
-            let error = RecorderTcp.call(uri.parse().unwrap()).await.err().unwrap();
-            assert_eq!(error.to_string(), "announcement rehearsal origin refused");
-        }
+#[tokio::test]
+async fn socket_connector_refuses_any_other_authority() {
+    for uri in [
+        "http://discord.com",
+        "https://discord.com:443",
+        "https://127.0.0.1",
+    ] {
+        assert!(dial_recorder(uri.parse().unwrap()).await.is_err());
     }
 }

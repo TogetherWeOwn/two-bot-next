@@ -152,16 +152,12 @@ def main():
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.minimum_version = ssl.TLSVersion.TLSv1_2
         tls.load_cert_chain(state / "server.crt", state / "server.key")
-        tls.sni_callback = require_discord_sni
+        tls.sni_callback = lambda _sock, name, _ctx: (
+            None if name == "discord.com" else ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+        )
         server.socket = tls.wrap_socket(server.socket, server_side=True)
         (state / "recorder-ready").touch()
         server.serve_forever()
-
-
-def require_discord_sni(_socket, name, _context):
-    if name != "discord.com":
-        return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
-    return None
 
 
 if __name__ == "__main__":

@@ -202,7 +202,11 @@ async fn main() {
         .is_some_and(|arg| arg == "rehearse-internal-actions")
     {
         logging::init();
-        std::process::exit(internal_action_rehearsal::dispatch(&cli_args[1..]).await);
+        if let Err(error_class) = internal_action_rehearsal::serve(&cli_args[1..]).await {
+            tracing::error!(error_class, "internal-action rehearsal refused");
+            std::process::exit(1);
+        }
+        return;
     }
     // Docker HEALTHCHECK probe: GET /health on the configured port and exit
     // 0/1. Kept dependency-free (std + tokio only) so the check path cannot

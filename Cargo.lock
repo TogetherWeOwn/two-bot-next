@@ -2355,7 +2355,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-websockets",
- "tower-service",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "twilight-cache-inmemory",
