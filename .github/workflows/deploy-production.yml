@@ -43,12 +43,11 @@ name: deploy-production
 # deploy-production run. A deploy always takes over ownership (only the
 # explicit `cutover_hold` input keeps the fence held). Fault switches have no
 # input or execution path here; daily recovery proofs run only on staging.
-# The 30-minute
-# soak sleeps in its own `soak` job OUTSIDE the deploy-production lane, and a
-# `recheck` job re-reads the disable, the hold and the live revision
-# immediately before the deploy: a disable set, a hold set, or a target gone
-# stale, while the gates built or
-# the soak slept skips green instead of deploying through the incident. A
+# The 30-minute automatic promotion soak runs outside the deploy-production
+# lane. The schema and role gates start after soak evidence and release-apply
+# resolve, even when ordinary deploys skip release-apply. The `recheck` job
+# reads the disable, the hold and the live revision after those gates and
+# skips green if any of them now rule out promotion. A
 # regression gate (`staging-soak-evidence` plus a step in `production`)
 # compares the soaked candidate on staging with production before any
 # mutation: no journey that passes on production may fail on staging, and
@@ -1161,9 +1160,8 @@ jobs:
               output.write(f"skip={skip}\nevidence={evidence}\n")
 
   # Pre-deploy recheck for automatic runs: the guard's hold and live checks
-  # go stale while the gates build, the Environment approval waits and the
-  # soak sleeps. It waits for the soak AND both gates, so the fresh read
-  # happens after the last long build, immediately before the deploy: a hold
+  # can go stale during the soak and subsequent gate builds. It waits for
+  # the soak and both gates, so the fresh read happens before the deploy: a hold
   # set mid-run, an already-live target, a target the live build already
   # contains, or an active operator dispatch skips green instead of deploying
   # through the incident.

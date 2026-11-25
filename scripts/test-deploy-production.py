@@ -1014,7 +1014,7 @@ class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
               ref="refs/heads/main", auto="", resolved_sha=None, event="workflow_dispatch",
               run_sha="", run_conclusion="", run_updated="", hold="", auto_disabled="", spike="",
-              run_path="", run_event="", cutover_hold="", **responses):
+              run_path="", run_event="", cutover_hold="", release_plan="", release_pins="", **responses):
         if image is None:
             image = IMAGE if rollback else ""
         api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]},
@@ -1137,6 +1137,7 @@ class GuardBehaviourTests(unittest.TestCase):
                 "GITHUB_REPOSITORY": REPO, "GITHUB_REF": ref, "SHA": sha, "ROLLBACK": rollback,
                 "IMAGE": image, "TAKEOVER": takeover, "ALLOW_UNSTAGED": allow_unstaged,
                 "EVENT_NAME": event,
+                "GITHUB_RUN_ATTEMPT": "1", "RELEASE_PLAN_ID": release_plan, "RELEASE_PINS": release_pins,
                 "WORKFLOW_RUN_SHA": run_sha, "WORKFLOW_RUN_CONCLUSION": run_conclusion,
                 "WORKFLOW_RUN_UPDATED_AT": run_updated, "HOLD_UNTIL": hold,
                 "AUTO_DISABLED": auto_disabled,
@@ -1491,6 +1492,18 @@ class GuardBehaviourTests(unittest.TestCase):
             with self.subTest(ref=ref):
                 result = self.guard(ref=ref)
                 self.assertRefused(result, "from main only")
+                self.assertEqual(result[3], [])
+
+    def test_dormant_protected_dispatch_refuses_before_api_calls(self):
+        for plan, pins, reason in (
+            ("123", "{}", "protected release requires the activation follow-up"),
+            ("123", "", "with both release inputs"),
+            ("", "{}", "with both release inputs"),
+        ):
+            with self.subTest(plan=plan, pins=pins):
+                result = self.guard(takeover="true", cutover_hold="false", auto_disabled="true",
+                                    release_plan=plan, release_pins=pins)
+                self.assertRefused(result, reason)
                 self.assertEqual(result[3], [])
 
     def test_sha_not_on_main_is_refused(self):
