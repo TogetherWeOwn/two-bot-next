@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 from zipfile import ZIP_DEFLATED, ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -22,7 +23,6 @@ RUN_ROUTE = f"actions/runs/{RUN}"
 LIST_ROUTE = f"{RUN_ROUTE}/artifacts?per_page=2"
 ZIP_ROUTE = "actions/artifacts/42/zip"
 COMPARE_ROUTE = f"compare/{SHA}...{TIP}?per_page=1&page=1"
-FILENAME = "staging-recovery-status.json"
 
 
 def receipt():
@@ -49,7 +49,7 @@ class InventoryReaderTests(unittest.TestCase):
         self.assertEqual(binary, path == ZIP_ROUTE)
         return self.routes[path]
 
-    def archive(self, content, *, member=FILENAME, extra=False):
+    def archive(self, content, *, member="staging-recovery-status.json", extra=False):
         buffer = BytesIO()
         with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
             archive.writestr(member, content)
@@ -133,10 +133,9 @@ class InventoryReaderTests(unittest.TestCase):
             (json.dumps({key: value for key, value in receipt().items() if key != "container"}), {}),
         ]
         for content, options in cases:
-            with self.subTest(content=content, options=options):
+            with self.subTest(content=content, options=options), self.assertRaises(GateError):
                 self.archive(content, **options)
-                with self.assertRaises(GateError):
-                    self.read()
+                self.read()
         self.archive(complete)
         self.artifact["size_in_bytes"] += 1
         with self.assertRaises(GateError):
@@ -148,8 +147,8 @@ class InventoryReaderTests(unittest.TestCase):
     def test_cli_refuses_oversized_projections_and_malformed_evidence(self):
         self.archive(json.dumps({**receipt(), "observed_at": "x" * reader.MAX_OUTPUT_BYTES}))
         self.assert_cli_refusal()
-        del self.routes[LIST_ROUTE]
-        self.assert_cli_refusal()
+        with patch("zipfile._get_decompressor", side_effect=reader.ZlibError("synthetic decompression error")):
+            self.assert_cli_refusal()
 
     def assert_cli_refusal(self):
         stdout, stderr = StringIO(), StringIO()
