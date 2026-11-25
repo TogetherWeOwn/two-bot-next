@@ -28,26 +28,42 @@ const blockedProviders: Providers = {
   get authority() { return unreachable(); }, readWorker: unreachable, readInventory: unreachable, invoke: unreachable,
 };
 
-test("default off and an untrusted runner access no providers", async () => {
-  assert.deepEqual(await runStagingAutomodOperatorEntry({ runner, serving }, unreachable, blockedProviders),
+test("default off and an untrusted runner access no providers", async t => {
+  const readRun = t.mock.fn(unreachable);
+  assert.deepEqual(await runStagingAutomodOperatorEntry({ runner, serving }, readRun, blockedProviders),
     { verdict: "disabled" });
+  assert.deepEqual(await runStagingAutomodOperatorEntry({ enabled: true, runner }, readRun, blockedProviders), unconfirmed);
   for (const changes of [{ GITHUB_RUN_ATTEMPT: "2" }, { GITHUB_EVENT_NAME: "workflow_call" },
     { GITHUB_REF_PROTECTED: "false" }, { GITHUB_WORKFLOW_REF: runner.GITHUB_WORKFLOW_REF.replace(path, "other.yml") },
-    { GITHUB_WORKFLOW_SHA: "b".repeat(40) }, { GITHUB_RUN_ID: "9007199254740993" }, { GITHUB_REPOSITORY_ID: "1" }]) {
+    { GITHUB_REF: "refs/heads/other" }, { GITHUB_SHA: "b".repeat(40) },
+    { GITHUB_RUN_ID: "9007199254740993" }, { GITHUB_REPOSITORY_ID: "1" }]) {
     assert.deepEqual(await runStagingAutomodOperatorEntry({ enabled: true, runner: { ...runner, ...changes }, serving },
-      unreachable, blockedProviders), unconfirmed);
+      readRun, blockedProviders), unconfirmed);
   }
+  assert.equal(readRun.mock.callCount(), 0);
 });
 
 test("wrong or unreadable GitHub run evidence leaves rehearsal providers untouched", async () => {
   const options = { enabled: true, runner, serving };
   for (const changes of [{ id: run.id + 1 }, { run_attempt: 2 }, { event: "push" }, { status: "completed" },
-    { path: `${path}@other` }, { head_branch: "other" }, { head_sha: "b".repeat(40) }, { head_repository: { id: 1 } }]) {
+    { path: `${path}@other` }, { head_branch: "other" }, { head_sha: "b".repeat(40) },
+    { repository: { id: 1 } }, { head_repository: { id: 1 } }]) {
     const readRun = async () => ({ ...run, ...changes });
     assert.deepEqual(await runStagingAutomodOperatorEntry(options, readRun, blockedProviders), unconfirmed);
   }
   const unavailable = async () => { throw new Error("unavailable"); };
   assert.deepEqual(await runStagingAutomodOperatorEntry(options, unavailable, blockedProviders), unconfirmed);
+});
+
+test("a stalled Actions read settles at the deadline without accessing rehearsal providers", { timeout: 1_000 }, async t => {
+  const deadline = new AbortController();
+  const timeout = t.mock.method(AbortSignal, "timeout", () => deadline.signal);
+  const readRun = t.mock.fn((_id: string, _signal: AbortSignal) => new Promise<never>(() => {}));
+  const result = runStagingAutomodOperatorEntry({ enabled: true, runner, serving }, readRun, blockedProviders);
+  assert.deepEqual(timeout.mock.calls[0]?.arguments, [2_000]);
+  assert.deepEqual(readRun.mock.calls[0]?.arguments, [issuedLease.runId, deadline.signal]);
+  deadline.abort();
+  assert.deepEqual(await result, unconfirmed);
 });
 
 test("the protected operator entry reaches the caller with the original serving lease", async t => {

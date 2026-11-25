@@ -177,7 +177,9 @@ The dormant operator entry checks GitHub's runner metadata against the
 authenticated Actions run before handing the approved serving selection to
 the rehearsal caller. The protected staging host must supply the existing
 lease and action approvals, authenticated inventory, and private invocation.
-The workflow continues to run synthetic checks only until that host is wired.
+Both entry points pin this workflow's own protected main identity. A separate
+dispatching workflow supplies its own identity, so it cannot call this path.
+A future activation must review the direct dispatch trigger and provider wiring.
 
 - [ ] **Confirm existing admission evidence.** Check the stopped staging
   baseline, verified recovery, database and gateway proofs, moderation
