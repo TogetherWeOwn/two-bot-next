@@ -149,6 +149,11 @@ test("ordinary and signed-voice leases cannot start AutoMod or lose their cleanu
 
 test("AutoMod lease refuses other startup lanes and retains exact cleanup ownership", async (t) => {
   const h = await fixture(t, autoModLease);
+  // AutoMod acquisition persists this deadline before marking the lease active.
+  await h.bot.schedule(new Date(autoModLease.expiresAt), "stagingExpiry", null);
+  const expiry = await h.bot.listSchedules("stagingExpiry");
+  assert.equal(expiry.length, 1);
+  assert.equal(expiry[0]?.time, autoModLease.expiresAt / 1000);
   const reserved = structuredClone(h.values);
   // Prove the purpose alone bars both lanes before the journal can supply its own hold.
   await assert.rejects(h.bot.startAndWaitForPorts(8080), purposeConflict);
@@ -156,6 +161,7 @@ test("AutoMod lease refuses other startup lanes and retains exact cleanup owners
   assert.equal(voice.status, 503);
   assert.equal((await voice.json() as { reason: string }).reason, "staging_use_conflict");
   assert.deepEqual(h.values, reserved);
+  assert.deepEqual(await h.bot.listSchedules("stagingExpiry"), expiry);
 
   // A pending intent with an empty baseline is sufficient for recovery without a registry mutation.
   const pending = { ...intent, lease: autoModLease, baseline: createHash("sha256").update("[]").digest("hex") };
@@ -166,6 +172,7 @@ test("AutoMod lease refuses other startup lanes and retains exact cleanup owners
   await assert.rejects(h.startAutoMod(voiceLease), purposeConflict);
   h.assertNoEffects();
   assert.deepEqual(h.values, before);
+  assert.deepEqual(await h.bot.listSchedules("stagingExpiry"), expiry);
 
   const drained = t.mock.fn(async (lease: Readonly<StagingUse>) => {
     assert.deepEqual(lease, autoModLease);
