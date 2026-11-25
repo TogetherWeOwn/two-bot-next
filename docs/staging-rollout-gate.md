@@ -269,9 +269,8 @@ or deployment tooling changes require a fresh dispatch. The candidate must
 contain the latest successful staging source. A newer success supersedes a queued run.
 
 Retain `reviewed-staging-source.json`, the rollout, certificate and stop receipts.
-The run title names the serving SHA. GitHub's `head_sha` identifies the workflow
-checkout. Check both against the exact attempt. Production selection uses the
-serving SHA with the same latest-outcome, soak and immutable artifact gates.
+Check the run title's serving SHA and GitHub's workflow `head_sha` against the exact attempt.
+Production selects the serving SHA with the same latest-outcome, soak and immutable artifact gates.
 
 **Queued staging work:** Every holder uses `queue: max` and preserves the
 running holder. The queue is bounded; admission order is not a freshness check.
