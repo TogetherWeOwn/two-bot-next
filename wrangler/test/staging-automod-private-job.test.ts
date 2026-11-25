@@ -133,6 +133,29 @@ test("bound job confirms recovery on the original lease after a failed startup r
     [{ action: "start", issuedLease }, { action: "recover", issuedLease }]);
 });
 
+test("bound job requests original-lease recovery while Worker startup is pending", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: now() });
+  const entered = Promise.withResolvers<boolean>();
+  const startup = Promise.withResolvers<void>();
+  const invoke = t.mock.fn<Invoke>(async call => {
+    if (call.action === "start") {
+      entered.resolve(true);
+      await startup.promise;
+    }
+  });
+
+  const run = runStagingAutomodBoundJob(context, issuedLease, approvals, { env, controlBearer, invoke });
+  try {
+    assert.equal(await Promise.race([entered.promise, run.then(() => false)]), true);
+    t.mock.timers.tick(15_000);
+    assert.deepEqual(await run, { verdict: "failed", start: false, recover: true });
+    assert.deepEqual(invoke.mock.calls.map(call => call.arguments[0]),
+      [{ action: "start", issuedLease }, { action: "recover", issuedLease }]);
+  } finally {
+    startup.resolve();
+  }
+});
+
 test("startup timeout aborts the private transport and still reaches original-lease recovery", async t => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: now() });
   const startup = Promise.withResolvers<{ signal: AbortSignal; response: Response }>();
