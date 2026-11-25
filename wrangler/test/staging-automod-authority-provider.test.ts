@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
+import { TwoBotContainer, type Env } from "../src/index.ts";
+import { OWNER_KEY } from "../src/ownership.ts";
 import { bindStagingAutomodAuthorityProvider, type ReadProtectedAutomodApproval } from "../src/staging-automod-authority-provider.ts";
 import { boundStagingAutomodAuthority } from "../src/staging-automod-bounded-authority.ts";
 import { readStagingAutomodJobInputs } from "../src/staging-automod-inputs.ts";
@@ -104,4 +106,49 @@ test("lease retirement during an approval read invalidates the result", async t 
     return h.approvals[action];
   });
   assert.deepEqual((await authority.inputs())?.approvals, {});
+});
+
+test("Container authority reads under the gate and refuses a fenced owner", async t => {
+  const h = await fixture(t);
+  h.records.set(OWNER_KEY, owner);
+  const initialization: Promise<unknown>[] = [];
+  let insideGate = false;
+  const reads = t.mock.fn((key: string) => {
+    if (key === OWNER_KEY || key === STAGING_USE_KEY) assert.equal(insideGate, true);
+    return structuredClone(h.records.get(key));
+  });
+  const bot = new TwoBotContainer({
+    container: { running: false },
+    storage: {
+      get: async (key: string) => reads(key),
+      put: async (key: string, value: unknown) => { h.records.set(key, structuredClone(value)); },
+      kv: { get: () => undefined },
+      sql: { exec: () => [] },
+      deleteAlarm: async () => {},
+      sync: async () => {},
+    },
+    blockConcurrencyWhile<T>(operation: () => Promise<T>) {
+      // Serialize the real SDK and Bot constructor gates as a DO does.
+      const result = Promise.all(initialization.slice(-1)).then(async () => {
+        insideGate = true;
+        try { return await operation(); }
+        finally { insideGate = false; }
+      });
+      initialization.push(result);
+      return result;
+    },
+  } as unknown as DurableObjectState<{}>, env as Env);
+  await Promise.all(initialization);
+  reads.mock.resetCalls();
+
+  const approve = t.mock.fn<ReadProtectedAutomodApproval>(async action => h.approvals[action]);
+  const authority = TwoBotContainer.bindProtectedAutomodAuthority(bot, request, approve);
+  assert.deepEqual(await readStagingAutomodJobInputs(context, boundStagingAutomodAuthority(authority)),
+    { context, issuedLease: h.issued, approvals: h.approvals });
+  assert.ok(reads.mock.calls.some(call => call.arguments[0] === OWNER_KEY));
+  assert.equal(approve.mock.callCount(), 2);
+
+  h.records.set(OWNER_KEY, { ...owner, phase: "fenced" });
+  assert.equal(await readStagingAutomodJobInputs(context, boundStagingAutomodAuthority(authority)), undefined);
+  assert.equal(approve.mock.callCount(), 2);
 });
