@@ -144,6 +144,46 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(run(boundary), (1, "FAIL: staging lease did not cover the probe\n"))
         check.assert_not_called()
 
+    def test_finalized_probe_stops_on_signed_read_refusal_after_preflight(self):
+        observed = deepcopy(FIXTURE["observed"])
+        now = int(START.timestamp()) + 3600
+        observed["lifecycle"]["use"]["expiresAt"] = (now + 60) * 1000
+        env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
+               "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
+        signer = acceptance.credentials(env)
+        ready_peer, _, _ = self.signed_peer("finalized")
+        calls = []
+
+        def check(request):
+            calls.append((request.get_method(), request.full_url))
+            if request.get_method() == "GET" and len(calls) == 1:
+                return ready_peer(request)
+            self.assertEqual(request.get_method(), "POST")
+            self.assertEqual(decode_json(request.data), {"action": acceptance.ACTION, "event_key": EVENT})
+            expected = acceptance.signing_headers(
+                *signer, str(now), request.get_header("X-two-nonce"), request.data,
+            )
+            self.assertEqual({name: request.get_header(name.capitalize()) for name in expected}, expected)
+            # Stand in for a receiver that refuses a read after healthy preflight.
+            # Even a retryable refusal must stop the finalized probe.
+            return 502, {"cache-control": "no-store"}, {
+                "ok": False, "request_id": request.get_header("X-request-id"),
+                "error": {"code": "discord_unavailable", "message": "synthetic diagnostic", "retryable": True},
+            }
+
+        args = ["finalized", "--rollout", "rollout", "--observed", "observed",
+                "--fixture-start", START.strftime("%Y-%m-%dT%H:%M:%SZ"), "--execute"]
+        with (patch.object(acceptance, "read_object", side_effect=[ROLLOUT, observed]),
+              patch.object(acceptance.time, "time", return_value=now),
+              patch.object(acceptance.time, "monotonic", return_value=0),
+              patch("sys.stdout", new_callable=StringIO) as stdout,
+              patch("sys.stderr", new_callable=StringIO) as stderr):
+            status = acceptance.main(args, env=env, check=check)
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "FAIL: signed attendance response did not match the expected envelope\n")
+        self.assertEqual(calls, [("GET", ORIGIN + "/readyz"), ("POST", ORIGIN + "/internal/actions")])
+
     def test_acceptance_sequence_uses_one_pinned_rollout(self):
         env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
                "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
