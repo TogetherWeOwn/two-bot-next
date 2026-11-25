@@ -1,4 +1,4 @@
-"""Exercise the offline verifier with synthetic pins and runner output."""
+"""Exercise offline rehearsal preparation and verification with synthetic evidence."""
 
 import copy
 from contextlib import redirect_stdout
@@ -190,6 +190,72 @@ class EventCutoffReleasePositionsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         del self.records[-2]
         self.assert_refused("Missing retained announcement positive control")
+
+
+class EventCutoffPreparationTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        # Rollback appears first in the file to exercise lookup by position.
+        self.pins = {
+            "retained": {**PINS["retained"], "worker_version": "00000000-0000-4000-8000-000000000002"},
+            "current": {**PINS["current"], "worker_version": "00000000-0000-4000-8000-000000000001"},
+        }
+
+    def run_preparation(self, raw=None):
+        pins = self.root / "selected.json"
+        pins.write_text(json.dumps(self.pins) if raw is None else raw, encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, str(VERIFIER.with_name("prepare_rehearsal.py")), "--pins", str(pins)],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+
+    def assert_prepared(self, current, retained):
+        result = self.run_preparation()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "{} {} {} {}\n".format(
+            current["image"], current["source_revision"], retained["image"], retained["source_revision"],
+        ))
+        self.assertEqual(result.stderr, "")
+
+    def assert_refused(self, reason, raw=None):
+        result = self.run_preparation(raw)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, f"Rehearsal preparation refused: {reason}\n")
+
+    def test_preparation_orders_reviewed_positions_by_name(self):
+        self.assert_prepared(PINS["current"], PINS["retained"])
+
+    def test_preparation_keeps_both_positions_for_a_shared_image(self):
+        self.pins["retained"].update(PINS["current"])
+        self.assert_prepared(PINS["current"], PINS["current"])
+
+    def test_preparation_refuses_missing_or_invalid_pins(self):
+        for position in ("current", "retained"):
+            pin = self.pins.pop(position)
+            with self.subTest(position=position, missing=position):
+                self.assert_refused("Selected pins must contain current and retained positions")
+            self.pins[position] = pin
+            for field, invalid, requirement in (
+                ("image", "registry.example/bot:latest", "an immutable"),
+                ("source_revision", "main", "an immutable"),
+                ("worker_version", " \t", "a reviewed"),
+            ):
+                with self.subTest(position=position, field=field):
+                    reviewed = pin.pop(field)
+                    self.assert_refused(f"{position} requires {requirement} {field}")
+                    pin[field] = invalid
+                    self.assert_refused(f"{position} requires {requirement} {field}")
+                    pin[field] = reviewed
+
+    def test_preparation_refuses_duplicate_keys(self):
+        raw = json.dumps(self.pins)
+        for duplicated in (
+            '{"current": {}, ' + raw[1:],
+            raw.replace('"retained": {', '"retained": {"image": null, '),
+        ):
+            with self.subTest(input=duplicated):
+                self.assert_refused("Selected pins contains invalid JSON or duplicate keys", duplicated)
 
 
 if __name__ == "__main__":

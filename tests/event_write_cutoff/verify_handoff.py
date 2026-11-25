@@ -5,7 +5,7 @@ import re
 import sys
 from pathlib import Path
 
-from verify_release_positions import POSITIONS, json_object, read_text, verify
+from verify_release_positions import POSITIONS, json_object, read_selected_pins, read_text, verify
 
 
 NONCE = re.compile(r"[0-9a-fA-F]{32}")
@@ -76,7 +76,7 @@ def main():
     parser.add_argument("--attribution", type=Path, required=True, help="sanitized permission JSON")
     args = parser.parse_args()
     try:
-        pins = json_object(read_text(args.pins, "selected pins", 4096), "Selected pins")
+        pins = read_selected_pins(args.pins)
         transcript = read_text(args.transcript, "rehearsal transcript", 1024 * 1024)
         attribution = json_object(
             read_text(args.attribution, "permission attribution", 8192), "Permission attribution",

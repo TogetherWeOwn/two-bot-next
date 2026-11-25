@@ -1,19 +1,15 @@
 """Verify a captured admitted-image rehearsal offline.
 
-Before running rehearse.py, save the selected Bot pins from the serving
-and rollback records as JSON:
+The Bot pins used by this verifier come from the serving and rollback records:
 
     {
       "current": {"image": "<repo>@sha256:<64 hex>", "source_revision": "<40 hex>"},
       "retained": {"image": "<repo>@sha256:<64 hex>", "source_revision": "<40 hex>"}
     }
 
-Use the admitted-image runner from #2460 with both per-position announcement controls.
-Capture stdout and preserve the exit code (without piping through tee):
+Prepare and run the admitted-image rehearsal as documented in
+docs/internal-event-executors.md. With its stdout and exit code:
 
-    result=0
-    PYTHONDONTWRITEBYTECODE=1 python3 tests/event_write_cutoff/rehearse.py \
-        --current "$current_image" --retained "$retained_image" > cutoff.log || result=$?
     python3 tests/event_write_cutoff/verify_release_positions.py \
         --pins selected.json --transcript cutoff.log --runner-exit-code "$result"
 
@@ -69,7 +65,11 @@ def json_object(line, label):
     return result
 
 
-def verify(pins, transcript, runner_exit_code):
+def read_selected_pins(path):
+    return json_object(read_text(path, "selected pins", 4096), "Selected pins")
+
+
+def validate_selected_pins(pins):
     if set(pins) != set(POSITIONS):
         raise ValueError("Selected pins must contain current and retained positions")
     for position in POSITIONS:
@@ -81,6 +81,9 @@ def verify(pins, transcript, runner_exit_code):
             if not isinstance(value, str) or not pattern.fullmatch(value):
                 raise ValueError(f"{position} requires an immutable {field}")
 
+
+def verify(pins, transcript, runner_exit_code):
+    validate_selected_pins(pins)
     if runner_exit_code != 0:
         raise ValueError(f"Rehearsal exited {runner_exit_code}")
     lines = [line.strip() for line in transcript.splitlines() if line.strip()]
@@ -134,7 +137,7 @@ def main():
     parser.add_argument("--runner-exit-code", type=int, required=True, help="exit status of that run")
     args = parser.parse_args()
     try:
-        pins = json_object(read_text(args.pins, "selected pins", 4096), "Selected pins")
+        pins = read_selected_pins(args.pins)
         transcript = read_text(args.transcript, "rehearsal transcript", 1024 * 1024)
         verify(pins, transcript, args.runner_exit_code)
     except ValueError as error:
