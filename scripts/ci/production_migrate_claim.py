@@ -108,19 +108,9 @@ def store_projection_hash(manifest):
     return hashlib.sha256("".join(rows).encode()).hexdigest()
 
 
-def build_claim(manifest, env):
+def validate_read_only_plan(manifest):
+    """Require the runner's unchanged v1 plan shape for both ledgers."""
     require(isinstance(manifest, dict), "plan manifest is invalid")
-    require(env.get("GITHUB_REPOSITORY") == REPOSITORY, "repository is outside scope")
-    require(env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
-            and env.get("GITHUB_REF") == "refs/heads/main", "dispatch must be on main")
-    head = env.get("GITHUB_SHA", "")
-    require(SHA40.fullmatch(head), "workflow head SHA is invalid")
-    require(env.get("GITHUB_WORKFLOW_REF") == f"{REPOSITORY}/{WORKFLOW_PATH}@refs/heads/main",
-            "workflow identity is invalid")
-    require(env.get("MODE") == "apply", "claim is apply-only")
-    for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "PLAN_RUN_ID"):
-        require(DECIMAL.fullmatch(env.get(key, "")), "run identity is invalid")
-    require(env["PLAN_RUN_ID"] != env["GITHUB_RUN_ID"], "plan producer must be a different run")
     require(manifest.get("mode") == "plan", "manifest must be read-only plan mode")
     require(type(manifest.get("runner_version")) is int and manifest["runner_version"] == 1,
             "manifest runner version is unsupported")
@@ -139,6 +129,22 @@ def build_claim(manifest, env):
             and isinstance(manifest.get("ledger_store_before"), list)
             and manifest["ledger_store_before"] == manifest.get("ledger_store_after"),
             "manifest is not an unchanged read-only plan")
+
+
+def build_claim(manifest, env):
+    require(isinstance(manifest, dict), "plan manifest is invalid")
+    require(env.get("GITHUB_REPOSITORY") == REPOSITORY, "repository is outside scope")
+    require(env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+            and env.get("GITHUB_REF") == "refs/heads/main", "dispatch must be on main")
+    head = env.get("GITHUB_SHA", "")
+    require(SHA40.fullmatch(head), "workflow head SHA is invalid")
+    require(env.get("GITHUB_WORKFLOW_REF") == f"{REPOSITORY}/{WORKFLOW_PATH}@refs/heads/main",
+            "workflow identity is invalid")
+    require(env.get("MODE") == "apply", "claim is apply-only")
+    for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "PLAN_RUN_ID"):
+        require(DECIMAL.fullmatch(env.get(key, "")), "run identity is invalid")
+    require(env["PLAN_RUN_ID"] != env["GITHUB_RUN_ID"], "plan producer must be a different run")
+    validate_read_only_plan(manifest)
     digest = env.get("PLAN_MANIFEST_SHA256", "")
     require(SHA256.fullmatch(digest), "claimed projection hash is invalid")
     require(projection_hash(manifest) == manifest.get("plan_manifest_sha256") == digest,
