@@ -15,15 +15,19 @@ from staging_rollout import GateError
 class ReleaseForwardTests(unittest.TestCase):
     def setUp(self):
         def source(versions):
-            return [{"version": version, "description": "fixture", "sha384": "b" * 96}
+            return [{"version": version, "description": "fixture", "sha384": "b" * 96,
+                     "sha384_recomputed": "b" * 96}
                     for version in versions]
 
         self.plan = {"source_sha": "a" * 40, "target": {"host": "prod.invalid", "database": "two_bot"},
                      "recovery_evidence_ref": "recovery", "acl_plan_ref": "roles",
                      "pending_before": list(CUTOVER), "pending_store_before": list(STORE),
                      "source_migrations": source((473, *CUTOVER)), "source_store_migrations": source((465, *STORE))}
-        self.expanded = [[dict(row, success=True) for row in self.plan[key]]
+        self.expanded = [[{**{key: row[key] for key in ("version", "description", "sha384")}, "success": True}
+                          for row in self.plan[key]]
                          for key in ("source_migrations", "source_store_migrations")]
+        self.expanded[0][0]["description"] = "historical cutover baseline"
+        self.expanded[1][0]["description"] = "historical store baseline"
         self.plan.update(plan_manifest_sha256=projection_hash(self.plan),
                          store_plan_manifest_sha256=store_projection_hash(self.plan),
                          ledger_before=self.expanded[0][:1], ledger_after=self.expanded[0][:1],
@@ -49,3 +53,7 @@ class ReleaseForwardTests(unittest.TestCase):
                 forward_receipt("123", self.plan, {**self.outcome, key: value})
         with self.assertRaisesRegex(GateError, "production_release_plan_ledgers_invalid"):
             forward_receipt("123", {**self.plan, "ledger_store_before": []}, self.outcome)
+        bad_source = deepcopy(self.plan)
+        bad_source["source_migrations"][0]["sha384_recomputed"] = "c" * 96
+        with self.assertRaisesRegex(GateError, "production_release_plan_checksum_invalid"):
+            forward_receipt("123", bad_source, self.outcome)
