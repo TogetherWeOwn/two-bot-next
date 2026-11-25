@@ -8969,6 +8969,25 @@ class WorkflowTests(unittest.TestCase):
         workflows["pr-size.yml"]["jobs"]["pr-size-gate"]["if"] = expected["pr-size-weekly"]
         self.assertTrue(workflow_policy_errors(workflows))
 
+    def test_pr_size_gate_queues_overlapping_pr_and_review_runs(self):
+        workflow = self.workflows["pr-size.yml"]
+        # One group for both event families prevents overlapping verdicts.
+        # Both settings matter: disabling active cancellation alone still
+        # lets a third run evict a pending required check.
+        self.assertEqual(workflow["concurrency"], {
+            "group": "${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}",
+            "cancel-in-progress": "false",
+            "queue": "max",
+        })
+        self.assertEqual(workflow["jobs"]["pr-size-gate"]["name"], "pr-size-gate")
+
+    def test_pr_size_gate_rechecks_on_grants_and_revocations(self):
+        triggers = self.workflows["pr-size.yml"]["on"]
+        self.assertCountEqual(triggers["pull_request"]["types"], [
+            "opened", "synchronize", "reopened", "ready_for_review", "labeled", "unlabeled",
+        ])
+        self.assertCountEqual(triggers["pull_request_review"]["types"], ["submitted", "dismissed"])
+
     def test_production_dispatch_safety_rules_are_pinned(self):
         # 10-20 incidents: a manual deploy without takeover left production
         # fenced (13:31Z), the rollback then refused for want of a human
