@@ -73,7 +73,7 @@ function validLease(lease: unknown): lease is Lease {
     && v.expiresAt - v.acquiredAt <= MAX_STAGING_USE_MS;
 }
 
-function sameLease(expected: Lease, other: unknown): boolean {
+export function sameLease(expected: Lease, other: unknown): boolean {
   return validLease(other) && expected.deploymentId === other.deploymentId && expected.sha === other.sha
     && expected.epoch === other.epoch && expected.runId === other.runId && expected.runAttempt === other.runAttempt
     && expected.acquiredAt === other.acquiredAt && expected.expiresAt === other.expiresAt;

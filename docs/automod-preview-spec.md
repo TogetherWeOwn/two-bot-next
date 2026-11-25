@@ -686,6 +686,25 @@ Hold across restart and remove only the command attributable to that intent.
 Ambiguity keeps the hold in place. Clear intent and admit later uses only
 after affirmative absence and confirmed stop. Activation awaits those controls.
 
+The dormant Worker lifecycle uses the pending journal as the durable hold.
+Before intent, it performs only stopped admission and registry reads under
+the shared writer gate. After intent, every competing use must enter that
+same gate and check the hold, including across restart. Recovery fences and
+drains remote publication before stopping, then reads the scoped registry
+independently. With a receipt, cleanup requires its exact ID and version and
+verifies absence in both the list and detail. With a lost receipt, the full
+registry must match the absent baseline. A present command without a durable
+receipt leaves the hold in place.
+
+The protected caller still has to bind the same gate to staging ownership,
+lease acquisition and release, expiry, startup and all registry writers.
+It needs authoritative same-lease purpose and cleanup authority after expiry,
+remote drain evidence after an interrupted write, and affirmative container
+stop readback. A lost receipt with a command still present needs separately
+proven attribution or independently verified absence. Wire the isolated
+dry-run boot separately with member intake suppressed. Live qualification
+requires those reviewed bindings and the sole staging writer's exclusive window.
+
 ## 10. Spec self-check (doctest)
 
 The numbers asserted above, verified against themselves. This checks the
