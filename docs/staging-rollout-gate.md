@@ -88,6 +88,26 @@ rollout: deleting a marker without an independent replay horizon would let a
 late retry mint another window. It is not ongoing Container/DO runtime-use
 proof or a claim that storage is free.
 
+### Attendance rollback predecessor
+
+The [reviewed predecessor export](https://github.com/TogetherWeOwn/two-bot-next/pull/2479)
+has exact takeover but no native staging-use expiry. An Actions cancellation
+can release `staging-lifecycle` while the historical Worker still renews the
+container. Keep this pair out of the shared staging route. The [PRE planner and
+startup fixture](https://github.com/TogetherWeOwn/two-bot-next/pull/2481) covers
+0473/0465 and retained 0475/0465 offline. The [serving identity
+check](https://github.com/TogetherWeOwn/two-bot-next/pull/2482) requires one
+reviewed SHA across the Worker and container.
+
+The `container smoke` CI job rehearses an isolated Docker boundary with a
+synthetic writer. A watchdog inside the container's PID namespace stops the
+writer if the startup client disappears or startup stalls. The job also
+verifies explicit stop and empty runtime state. The fixture has no network or
+host file mounts. The staging release operator still needs a supported isolated
+target that runs the exact Worker bundle and image against approved PRE
+fixtures, fences access to shared writers, and verifies independent expiry and
+normal stop. The Docker rehearsal covers only the synthetic process lifetime.
+
 ### Trusted client and receipt contract (partial wiring, not activated)
 
 `wrangler/scripts/staging-use.mjs` is the pipeline client for the protocol.
