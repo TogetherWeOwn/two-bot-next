@@ -1,5 +1,6 @@
 """Check predecessor artifact packaging with synthetic build outputs."""
 
+from gzip import compress
 from hashlib import sha256
 from io import BytesIO
 import json
@@ -15,23 +16,30 @@ from build_predecessor import GateError, image_manifest, package_worker
 LABELS = {"org.opencontainers.image.revision": "a" * 40, "com.togetherweown.build-id": "123-1"}
 
 
-def oci_fixture(path, *, bad_config_digest=False):
+def oci_fixture(path, *, labels=LABELS, bad_config_digest=False):
     def add(archive, name, raw):
         member = tarfile.TarInfo(name)
         member.size = len(raw)
         archive.addfile(member, BytesIO(raw))
 
-    def blob(archive, subtype, payload, invalid=False):
-        raw = json.dumps(payload).encode()
+    def blob(archive, media_type, raw, invalid=False):
         digest = ("0" * 64) if invalid else sha256(raw).hexdigest()
         add(archive, f"blobs/sha256/{digest}", raw)
-        return {"digest": f"sha256:{digest}", "size": len(raw), "mediaType": f"application/vnd.oci.image.{subtype}.v1+json"}
+        return {"digest": f"sha256:{digest}", "size": len(raw), "mediaType": f"application/vnd.oci.image.{media_type}"}
 
+    layer_tar = BytesIO()
+    with tarfile.open(fileobj=layer_tar, mode="w") as layer:
+        add(layer, "app/two-bot", b"synthetic binary")
+    layer_bytes = layer_tar.getvalue()
     with tarfile.open(path, "w") as archive:
-        config = blob(archive, "config", {"os": "linux", "architecture": "amd64", "config": {"Labels": LABELS}},
-                      invalid=bad_config_digest)
-        manifest = blob(archive, "manifest", {"config": config})
-        add(archive, "index.json", json.dumps({"manifests": [manifest]}).encode())
+        layer = blob(archive, "layer.v1.tar+gzip", compress(layer_bytes, mtime=0))
+        config = {"os": "linux", "architecture": "amd64", "config": {"Labels": labels},
+                  "rootfs": {"type": "layers", "diff_ids": ["sha256:" + sha256(layer_bytes).hexdigest()]}}
+        config = blob(archive, "config.v1+json", json.dumps(config).encode(), invalid=bad_config_digest)
+        manifest = {"schemaVersion": 2, "config": config, "layers": [layer]}
+        manifest = blob(archive, "manifest.v1+json", json.dumps(manifest).encode())
+        add(archive, "oci-layout", b'{"imageLayoutVersion":"1.0.0"}')
+        add(archive, "index.json", json.dumps({"schemaVersion": 2, "manifests": [manifest]}).encode())
     return manifest["digest"]
 
 
