@@ -28,6 +28,7 @@ test("private AutoMod entry denies unauthenticated or mismatched work before inv
   const start = { action: "start", issuedLease } as const;
   const approval = { ...start, target };
   const raw = JSON.stringify(start);
+  const leaseJson = JSON.stringify(issuedLease);
 
   const unopened: [string, Request, Inputs[1], Inputs[2]][] = [
     ["missing bearer", request(raw, ""), env, approval],
@@ -54,8 +55,8 @@ test("private AutoMod entry denies unauthenticated or mismatched work before inv
     ["wrong approved guild", request(raw), env, { ...approval, target: { ...target, guildId: "other" } }],
     ["different action", request(raw), env, { ...approval, action: "recover" }],
     ["malformed JSON", request("{"), env, approval],
-    ["duplicate action", request(raw.replace("{", '{"action":"recover",')), env, approval],
-    ["duplicate lease field", request(raw.replace('"runAttempt":', '"runAttempt":999,"runAttempt":')), env, approval],
+    ["duplicate action", request(`{"action":"recover","action":"start","issuedLease":${leaseJson}}`), env, approval],
+    ["duplicate lease field", request(`{"action":"start","issuedLease":{"runAttempt":999,${leaseJson.slice(1)}}`), env, approval],
     ["oversized body", request(raw + " ".repeat(1024)), env, approval],
   ];
   for (const [name, req, worker, approved] of denied) {
@@ -64,7 +65,7 @@ test("private AutoMod entry denies unauthenticated or mismatched work before inv
 
   // A permissive decoder would replace the invalid byte inside the string
   // and pass syntactically valid JSON on to the parser.
-  const invalidUtf8 = new TextEncoder().encode(raw.replace('"start"', '"start!"'));
+  const invalidUtf8 = new TextEncoder().encode(`{"action":"start!","issuedLease":${leaseJson}}`);
   invalidUtf8[invalidUtf8.indexOf(0x21)] = 0xff;
   const invalidRequest = request(invalidUtf8);
   const parse = t.mock.method(JSON, "parse");
