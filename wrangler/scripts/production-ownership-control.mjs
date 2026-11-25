@@ -333,9 +333,8 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
       try {
         return await readState();
       } catch (error) {
-        const propagating = expectedDeploymentId !== undefined && (
-          (error instanceof HttpFailure && error.status === 503 && error.reason === "deployment_mismatch") ||
-          (!(error instanceof HttpFailure) && /^Production deployment mismatch/.test(error.message)));
+        const propagating = (error instanceof HttpFailure && error.status === 503 && error.reason === "deployment_mismatch") ||
+          (expectedDeploymentId !== undefined && !(error instanceof HttpFailure) && /^Production deployment mismatch/.test(error.message));
         if ((!propagating && !(error instanceof TransientFailure)) || attempt >= statusAttempts ||
             now() - started + statusRetryDelayMs > statusWindowMs) throw error;
         await wait(statusRetryDelayMs);

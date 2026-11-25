@@ -69,7 +69,7 @@ async fn attendance_fence(conn: &mut PgConnection) -> Result<Vec<u8>, RunError> 
 /// Reverse the exact release bundle on the already verified target. This is
 /// the database operation only: the protected caller must authenticate the
 /// complete post-apply ledgers, target, and stopped writer's fence epoch.
-/// No CLI or workflow invokes it directly.
+/// The protected CLI uses `recover_release_schema` to require the stamp.
 #[doc(hidden)]
 pub async fn undo_release_schema(
     pool: &PgPool,

@@ -282,6 +282,17 @@ test("status never retries other refusals", async () => {
   assert.equal(calls, 1);
 });
 
+test("unbound rollback status retries edge propagation and accepts the owning deployment", async () => {
+  const current = { deploymentId: "A", owner: { epoch: 3, deploymentId: "A", phase: "active" }, running: true };
+  let calls = 0;
+  const state = await control({ ...args, action: "status", expectedDeploymentId: undefined }, async () => {
+    calls++;
+    return calls === 1 ? Response.json({ reason: "deployment_mismatch" }, { status: 503 }) : Response.json(current);
+  }, async () => {});
+  assert.deepEqual(state, current);
+  assert.equal(calls, 2);
+});
+
 test("production refusal vocabulary equals the Worker OwnershipRefused set and the staging client set", async () => {
   const srcDir = new URL("../src/", import.meta.url);
   const sources = readdirSync(srcDir, { recursive: true }).filter((name) => name.endsWith(".ts"))

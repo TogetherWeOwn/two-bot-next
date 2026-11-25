@@ -922,8 +922,9 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
         control = control_client(args.variant, token, url, args.staging_url, args.actor)
         if args.variant == "production":
             version = serving_version(client, worker)
-            state = control("observe")
-            require(state.get("deploymentId") == version, "production_rollback_ownership_unproved")
+            # The routed version can lag the provider during a failed deploy.
+            # Read the shared ownership record with the normal retry budget.
+            state = control("status")
             require_ordinary_production_rollback(version_sha(client, worker, version), expected_sha, state)
         staging_use = (staging_restore_client(
             env, url, token, restore_version, expected_sha, args.evidence + ".staging-use.jsonl")

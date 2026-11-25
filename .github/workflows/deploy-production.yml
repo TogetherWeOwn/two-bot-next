@@ -2001,9 +2001,8 @@ jobs:
           set -euo pipefail
           # No pinned-revision flag here: the snapshot's recorded serving
           # SHA is the receipt member the stable gate pins (the restored
-          # build reports the previous revision, not the failed SHA). A
-          # pre-stamp snapshot carries none; identity then rests on the
-          # restored Worker version header.
+          # build reports the previous revision, not the failed SHA).
+          # Production rollback requires a stamped snapshot.
           python3 ../tooling/scripts/worker_container_rollback.py rollback \
             --variant production \
             --worker-url "$PRODUCTION_WORKER_URL" \
