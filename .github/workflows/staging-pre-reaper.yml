@@ -1,0 +1,40 @@
+name: staging-pre-reaper
+
+# The qualification caller can sweep before admission and after closing it.
+# The separate periodic caller is a cleanup backstop. GitHub can delay or drop
+# scheduled runs, so the reservation deadline needs independent enforcement.
+# Both callers and the staging provider adapter are reserved for later wiring.
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  sweep:
+    if: >-
+      github.repository_id == '1396224242' &&
+      github.ref == 'refs/heads/main' && github.ref_protected &&
+      ((github.event_name == 'workflow_dispatch' &&
+        github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-pre-qualification.yml@refs/heads/main') ||
+       (github.event_name == 'schedule' &&
+        github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-pre-periodic.yml@refs/heads/main'))
+    environment: {name: staging, deployment: false}
+    concurrency:
+      group: staging-pre-reaper
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read # Checkout of the protected caller's exact commit.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Exercise the PRE sweep against synthetic inventory
+        run: python3 -B -m unittest scripts.ci.test_staging_pre_reaper_fixture
+      - name: Signal unverified PRE cleanup
+        if: failure() || cancelled()
+        run: echo '::error title=PRE cleanup incident::Cleanup could not be verified. Inspect the staging PRE sweep run.'

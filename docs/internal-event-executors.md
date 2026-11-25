@@ -268,11 +268,19 @@ git cat-file -e "$current_revision:sql/web_v1.sql" && {
 Keep `cutoff.log` and `$result` from the same run for the handoff check below.
 
 The recorder models a guild-wide grant or denial for external events. Its
-policy file lives outside the app database. Real role hierarchy and channel
-overwrites require a separate effective-permission readback. The script records
-policy order, intent and token admission at each barrier, per-route counts,
-immutable Bot image references and the recorder source hash. It checks that an
-original key remains ambiguous after restoring a snapshot containing the claim.
+permission files live outside the app database. With external writes closed,
+the current Bot edits a mapped event in an approved fixture channel. The
+recorder moves the approval to a second channel before the retained Bot starts
+on the restored database. The retained Bot replays the completed key with the
+original event ID and no recorder request, including reads. It receives a
+Discord rejection on a fresh key for the former channel and can edit the event
+in the replacement channel. Use the channel-specific recorder rows from this
+run as evidence of that change. Real role hierarchy and channel overwrites
+require a separate effective-permission readback. The script records policy
+order, intent and token admission at each barrier,
+per-route counts, immutable Bot image references and the recorder source hash.
+It checks that an original key remains ambiguous after restoring a snapshot
+containing the claim.
 It also forces a synthetic request under that same key after restoring a
 snapshot from before the claim, to verify that the cutoff still denies the
 request. Web must keep ambiguous work held in both cases.
