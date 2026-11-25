@@ -2,7 +2,8 @@
 
 from dataclasses import dataclass
 
-from rollback_proof import ProofError, VERSION, require
+from build_identity import is_build_revision_shape, is_deploy_id_shape
+from rollback_proof import DIGEST, ProofError, VERSION, require
 from staging_rollout import GateError, decode, runtime_ready
 from worker_container_rollback import gateway_state
 
@@ -35,6 +36,11 @@ class SchemaState:
     store: tuple[int, int]
     attendance_recovered_at: bool
     installed_0475_at: int | None
+
+    def matches(self, expected):
+        return (self == expected and type(self.attendance_recovered_at) is bool
+                and type(self.installed_0475_at) is type(expected.installed_0475_at)
+                and all(type(value) is int for value in (*self.cutover, *self.store)))
 
 
 # Stub the reviewed plan and inverse endpoint projections. The timestamp is a
@@ -98,7 +104,12 @@ def accept(reservation, build, *, receipt, schema, serving, worker, sweep):
     for #2558's verified #2556 build.json. Schema, serving, probes and sweep
     stand in for evidence captured against each independently observed target.
     """
-    require(receipt.get("source_sha") == receipt.get("worker_message")
+    require(type(build.run_id) is int and 0 < build.run_id < 10**20
+            and is_build_revision_shape(build.revision) and is_deploy_id_shape(build.deploy_id)
+            and build.deploy_id.endswith(f".1+{build.revision[:7]}")
+            and isinstance(build.image_digest, str) and DIGEST.fullmatch(build.image_digest),
+            "pre_build_pin_invalid")
+    require(isinstance(receipt, dict) and receipt.get("source_sha") == receipt.get("worker_message")
             == receipt.get("BOT_BUILD_REVISION") == build.revision
             and receipt.get("BOT_BUILD_ID") == build.build_id
             and receipt.get("BOT_DEPLOY_ID") == build.deploy_id
@@ -109,9 +120,10 @@ def accept(reservation, build, *, receipt, schema, serving, worker, sweep):
             "pre_endpoint_evidence_missing")
     require(all(evidence.reservation == reservation for evidence in (schema, serving, worker)),
             "pre_endpoint_reservation_mismatch")
-    require(reservation.shape in PRE_STATES and schema.state == PRE_STATES[reservation.shape],
+    require(reservation.shape in PRE_STATES and schema.state.matches(PRE_STATES[reservation.shape]),
             "pre_schema_mismatch")
-    require(bool(VERSION.fullmatch(serving.worker_version)) and serving.worker_message == build.revision
+    require(isinstance(serving.worker_version, str) and VERSION.fullmatch(serving.worker_version)
+            and serving.worker_message == build.revision
             and serving.image_digest == build.image_digest, "pre_serving_identity_mismatch")
 
     health, readyz = worker.health, worker.readyz
