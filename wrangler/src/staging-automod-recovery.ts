@@ -1,5 +1,4 @@
 import { isSnowflake } from "./container-env.ts";
-import { OwnershipRefused } from "./ownership.ts";
 import type { admitStagingAutomod } from "./staging-automod.ts";
 import { MAX_STAGING_USE_MS, type StagingUse } from "./staging-lifecycle.ts";
 
@@ -142,21 +141,21 @@ export class StagingAutomodRecovery {
    * the adapter's own send-boundary checks. A repeat must go to recovery. */
   async persistIntent(intent: AutomodIntent, currentAdmission: () => Promise<Admission | undefined>,
     now = Date.now): Promise<true> {
-    if (!validIntent(intent)) throw new OwnershipRefused("staging_automod_intent_invalid");
+    if (!validIntent(intent)) throw new Error("staging_automod_intent_invalid");
     const saved = copyIntent(intent);
     const { lease, publishBefore } = saved;
     const old = await this.read();
     if (old && (old.phase !== "complete" || sameLease(old.intent.lease, lease))) {
-      throw new OwnershipRefused("staging_automod_intent_held");
+      throw new Error("staging_automod_intent_held");
     }
     const requireActive = async () => {
       let current: Admission | undefined;
       try { current = await currentAdmission(); }
-      catch { throw new OwnershipRefused("staging_automod_admission_mismatch"); }
+      catch { throw new Error("staging_automod_admission_mismatch"); }
       const at = now();
       if (current?.baselineAbsent !== true || current.publishBefore !== publishBefore || !sameLease(lease, current.lease)
         || !Number.isSafeInteger(at) || at < lease.acquiredAt || at >= publishBefore) {
-        throw new OwnershipRefused("staging_automod_admission_mismatch");
+        throw new Error("staging_automod_admission_mismatch");
       }
     };
     await requireActive();
@@ -171,7 +170,7 @@ export class StagingAutomodRecovery {
     const journal = await this.read();
     if (!journal || journal.phase !== "publishing" || !validRevision(command) || !sameIntent(journal.intent, command.intent)
       || (journal.created !== null && !sameRevision(journal.created, command))) {
-      throw new OwnershipRefused("staging_automod_receipt_mismatch");
+      throw new Error("staging_automod_receipt_mismatch");
     }
     if (journal.created === null) {
       await this.write({ ...journal, created: { id: command.id, version: command.version } });
@@ -184,7 +183,7 @@ export class StagingAutomodRecovery {
   async recover(lease: Lease, adapter: AutomodCleanup): Promise<void> {
     let journal = await this.read();
     if (!journal || !sameLease(journal.intent.lease, lease)) {
-      throw new OwnershipRefused("staging_automod_recovery_mismatch");
+      throw new Error("staging_automod_recovery_mismatch");
     }
     if (journal.phase === "complete") return;
     if (journal.phase === "publishing") {
@@ -201,9 +200,9 @@ export class StagingAutomodRecovery {
         await this.write(journal);
       }
       try { await adapter.removeOwned(Object.freeze({ intent, ...command })); }
-      catch { throw new OwnershipRefused("staging_automod_removal_unverified"); }
+      catch { throw new Error("staging_automod_removal_unverified"); }
       if ((await this.inspect(adapter, intent, command)).registry !== "absent") {
-        throw new OwnershipRefused("staging_automod_absence_unverified");
+        throw new Error("staging_automod_absence_unverified");
       }
     }
     // Retain a singleton replay tombstone. The staging lifecycle prevents an
@@ -215,12 +214,12 @@ export class StagingAutomodRecovery {
     Promise<CleanupProof> {
     let proof: CleanupProof;
     try { proof = await adapter.inspect(intent, created); }
-    catch { throw new OwnershipRefused("staging_automod_cleanup_unverified"); }
+    catch { throw new Error("staging_automod_cleanup_unverified"); }
     if (!proof || !sameIntent(intent, proof.intent) || proof.authorized !== true
       || proof.stopped !== true || proof.publicationDrained !== true
       || (proof.registry !== "absent" && (proof.registry !== "owned" || !validRevision(proof.command)
         || (created !== null && !sameRevision(created, proof.command))))) {
-      throw new OwnershipRefused("staging_automod_cleanup_unverified");
+      throw new Error("staging_automod_cleanup_unverified");
     }
     return proof;
   }
@@ -232,12 +231,12 @@ export class StagingAutomodRecovery {
       await this.storage.sync();
       value = await this.storage.get(KEY);
     }
-    catch { throw new OwnershipRefused("staging_automod_storage_unavailable"); }
+    catch { throw new Error("staging_automod_storage_unavailable"); }
     if (value === undefined) return undefined;
     if (!record(value) || !validIntent(value.intent)
       || (value.phase !== "publishing" && value.phase !== "cleanup" && value.phase !== "complete")
       || (value.created !== null && !validRevision(value.created))) {
-      throw new OwnershipRefused("staging_automod_storage_invalid");
+      throw new Error("staging_automod_storage_invalid");
     }
     const created = value.created === null ? null : Object.freeze({ id: value.created.id, version: value.created.version });
     return { intent: copyIntent(value.intent), phase: value.phase, created };
@@ -247,6 +246,6 @@ export class StagingAutomodRecovery {
     try {
       await this.storage.put(KEY, journal);
       await this.storage.sync();
-    } catch { throw new OwnershipRefused("staging_automod_storage_unavailable"); }
+    } catch { throw new Error("staging_automod_storage_unavailable"); }
   }
 }
