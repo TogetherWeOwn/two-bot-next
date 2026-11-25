@@ -125,6 +125,31 @@ class Resource:
 
 
 @dataclass(frozen=True)
+class ProtectedRouteReadback:
+    target: Target
+    worker_id: str
+    app: Resource
+
+
+def confirm_protected_route(target, *, pinned_app_id, readback):
+    """Bind a fresh private route observation to the admitted PRE resources.
+
+    The caller authenticates the read context that supplies readback.target
+    and obtains pinned_app_id independently from the current reservation's
+    provisioned app. The readback describes the actual route destinations.
+    """
+    require(type(target) is Target and type(readback) is ProtectedRouteReadback
+            and type(readback.target) is Target and readback.target == target, "wrong_pre_route_target")
+    require(type(readback.worker_id) is str and readback.worker_id == target.worker_name, "wrong_pre_route_worker")
+    app = readback.app
+    require(type(pinned_app_id) is str and APP_ID.fullmatch(pinned_app_id)
+            and type(app) is Resource
+            and type(app.name) is str and app.name == target.container_name
+            and type(app.id) is str and app.id == pinned_app_id,
+            "wrong_pre_route_app")
+
+
+@dataclass(frozen=True)
 class Inventory:
     """A fresh, complete exact-target observation from the caller's adapter.
 

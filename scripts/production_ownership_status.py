@@ -66,7 +66,7 @@ def environment_policy(auto_approve, api=github_get):
     return hashlib.sha256(json.dumps([rules, branches, auto_approve], sort_keys=True).encode()).hexdigest()
 
 
-def provider_sample(client, account):
+def provider_sample(client, account, *, allow_rollout=False):
     route = f"/workers/scripts/{WORKER}"
     deployments = sequence(mapping(client.api(f"{route}/deployments")).get("deployments"))
     require(bool(deployments), "worker_deployment_missing")
@@ -95,7 +95,8 @@ def provider_sample(client, account):
                     key=lambda item: item[0], reverse=True)
     require(bool(ranked) and (len(ranked) == 1 or ranked[0][0] > ranked[1][0]), "latest_rollout_unbound")
     rollout = ranked[0][1]
-    require(matches(UUID, rollout["id"]) and rollout.get("status") == "completed", "latest_rollout_unbound")
+    statuses = ("pending", "progressing", "completed") if allow_rollout else ("completed",)
+    require(matches(UUID, rollout["id"]) and rollout.get("status") in statuses, "latest_rollout_unbound")
     image = rollout_image(rollout, APPLICATION)
     prefix = f"registry.cloudflare.com/{account}/{APPLICATION}@"
     require(image.startswith(prefix) and mapping(app.get("configuration")).get("image") == image,
@@ -103,12 +104,13 @@ def provider_sample(client, account):
     return {
         "worker": {"deployment_id": deployment["id"], "version_id": version, "sha": sha, "traffic_percent": 100},
         "container": {"application_id": app_id, "namespace_id": namespace, "rollout_id": rollout["id"],
-                      "rollout_status": "completed", "image_digest": image.removeprefix(prefix)},
+                      "rollout_status": rollout["status"], "image_digest": image.removeprefix(prefix)},
     }
 
 
 def ownership_get(token):
-    return read_json(["node", "wrangler/scripts/production-ownership-control.mjs", "observe"], 20,
+    script = Path(__file__).resolve().parents[1] / "wrangler/scripts/production-ownership-control.mjs"
+    return read_json(["node", str(script), "observe"], 20,
                      {"PATH": os.environ.get("PATH", os.defpath), "PRODUCTION_WORKER_URL": PRODUCTION_URL,
                       "OWNERSHIP_CONTROL_TOKEN": token})
 
@@ -132,20 +134,21 @@ def ownership_projection(state, version):
     release_fence = phase == "fenced" and matches(RELEASE_FENCE_ACTOR, actor)
     require(not release_fence or ("deploymentId" in owner and owner["deploymentId"] is None),
             "production_release_fence_target_invalid")
-    return {"phase": phase, "epoch": epoch, "owner_actor": actor if release_fence or matches(CI_ACTOR, actor) else "redacted",
+    return {"phase": phase, "epoch": epoch,
+            "owner_actor": actor if matches(RELEASE_FENCE_ACTOR, actor) or matches(CI_ACTOR, actor) else "redacted",
             "running": running}
 
 
-def read_status(env, *, client_factory=provider.Client, read=ownership_get):
+def read_status(env, *, client_factory=provider.Client, read=ownership_get, allow_rollout=False):
     require(env.get("PRODUCTION_WORKER_URL") in (PRODUCTION_URL, PRODUCTION_URL + "/"), "worker_origin_mismatch")
     token = env.get("OWNERSHIP_CONTROL_TOKEN", "")
     require(len(token) >= 32, "ownership_token_missing")
     account = env.get("CLOUDFLARE_ACCOUNT_ID")
     client = client_factory(account, env.get("CLOUDFLARE_API_TOKEN"), deadline=monotonic() + 95)
-    before = provider_sample(client, account)
+    before = provider_sample(client, account, allow_rollout=allow_rollout)
     state = ownership_projection(read(token), before["worker"]["version_id"])
     observed = datetime.now(timezone.utc).isoformat()
-    after = provider_sample(client, account)
+    after = provider_sample(client, account, allow_rollout=allow_rollout)
     require(after == before, "provider_state_drift")
     return {"ownership_observed_at": observed, **after, "ownership": state}
 

@@ -11,8 +11,11 @@ from unittest.mock import patch
 SCRIPTS = str(Path(__file__).resolve().parents[1])
 
 with patch.object(sys, "path", [SCRIPTS, *sys.path]):
-    from pre_target import (Action, Inventory, Resource, Target, TargetError, confirm_container_stopped,
-                            make_config, plan_cleanup, verify_cleanup)
+    from bot_promotion import PRODUCTION_APP, STAGING_APP
+    from pre_target import (Action, Inventory, ProtectedRouteReadback, Resource, Target, TargetError,
+                            confirm_container_stopped, confirm_protected_route, make_config, plan_cleanup,
+                            verify_cleanup)
+    from worker_container_rollback import WORKERS
 
 
 TARGET = Target("pre-fixture-test", 123, 1_800_000_000, "0473/0465")
@@ -47,6 +50,63 @@ class FakeTransport:
 
 
 class PreTargetTests(unittest.TestCase):
+    def test_valid_config_refuses_shared_or_replayed_protected_route(self):
+        revision = "a" * 40
+        receipt = {"source_sha": revision, "worker_message": revision, "BOT_BUILD_REVISION": revision,
+                   "image_manifest_digest": "sha256:" + "b" * 64}
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / "worker").mkdir()
+            (root / "worker/index.js").write_bytes(b"export default {};")
+            (root / "image.oci.tar").write_bytes(b"synthetic OCI archive bytes")
+            config = make_config(TARGET, now=TARGET.started_at, receipt=receipt, material_root=root,
+                                 synthetic_service=TARGET.service_name)
+
+        route = ProtectedRouteReadback(TARGET, config["name"], Resource(config["containers"][0]["name"], APP_ID))
+        self.assertIsNone(confirm_protected_route(TARGET, pinned_app_id=APP_ID, readback=route))
+
+        # The plan stays valid in every case. Only the observed destination or its read context changes.
+        earlier = replace(TARGET, run_id=TARGET.run_id - 1, started_at=TARGET.started_at - 60)
+        earlier_app = Resource(earlier.container_name, "bcf0c525-7a87-4741-9bd7-cde8a22e4cb0")
+        foreign_scope = replace(TARGET, scope="pre-fixture-other")
+        other_shape = replace(TARGET, shape="0475/0465")
+        self.assertEqual(foreign_scope.worker_name, route.worker_id)
+        self.assertEqual(foreign_scope.container_name, route.app.name)
+        self.assertEqual(other_shape.worker_name, route.worker_id)
+        self.assertEqual(other_shape.container_name, route.app.name)
+        for readback, reason in (
+            (replace(route, worker_id=WORKERS["staging"]), "wrong_pre_route_worker"),
+            (replace(route, worker_id=WORKERS["production"]), "wrong_pre_route_worker"),
+            (replace(route, app=replace(route.app, name=STAGING_APP)), "wrong_pre_route_app"),
+            (replace(route, app=replace(route.app, name=PRODUCTION_APP)), "wrong_pre_route_app"),
+            (ProtectedRouteReadback(earlier, earlier.worker_name, earlier_app), "wrong_pre_route_target"),
+            (replace(route, target=foreign_scope), "wrong_pre_route_target"),
+            (replace(route, target=other_shape), "wrong_pre_route_target"),
+            (replace(route, app=replace(route.app, id=earlier_app.id)), "wrong_pre_route_app"),
+        ):
+            with self.subTest(readback=readback), self.assertRaisesRegex(TargetError, f"^{reason}$"):
+                confirm_protected_route(TARGET, pinned_app_id=APP_ID, readback=readback)
+
+    def test_protected_route_refuses_malformed_identity_fields(self):
+        class UnnormalizedString(str):
+            pass
+
+        route = ProtectedRouteReadback(TARGET, WORKER.id, CONTAINER)
+        for case, readback, pin, reason in (
+            ("readback type", None, APP_ID, "wrong_pre_route_target"),
+            ("Worker ID type", replace(route, worker_id=None), APP_ID, "wrong_pre_route_worker"),
+            ("app type", replace(route, app=None), APP_ID, "wrong_pre_route_app"),
+            ("pin type", route, None, "wrong_pre_route_app"),
+            ("pin format", route, "not-a-uuid", "wrong_pre_route_app"),
+            ("pin subclass", route, UnnormalizedString(APP_ID), "wrong_pre_route_app"),
+            ("app name subclass", replace(route, app=replace(CONTAINER, name=UnnormalizedString(CONTAINER.name))),
+             APP_ID, "wrong_pre_route_app"),
+            ("app ID subclass", replace(route, app=replace(CONTAINER, id=UnnormalizedString(APP_ID))), APP_ID,
+             "wrong_pre_route_app"),
+        ):
+            with self.subTest(case=case), self.assertRaisesRegex(TargetError, f"^{reason}$"):
+                confirm_protected_route(TARGET, pinned_app_id=pin, readback=readback)
+
     def test_config_preserves_artifacts_and_uses_only_disposable_names(self):
         with (patch.object(sys, "path", [SCRIPTS, *sys.path]),
               tempfile.TemporaryDirectory() as scratch):
