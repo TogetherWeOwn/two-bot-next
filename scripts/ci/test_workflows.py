@@ -41,6 +41,7 @@ JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
 PROBE_STEPS = _HISTORY_MODULE.PROBE_STEPS
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
+    "staging-predecessor.yml": {"qualify"},
     # The nextest branch adds its required lane; main adds the production schema gate.
     # The inventory pin must retain both changes.
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
@@ -4956,8 +4957,9 @@ def workflow_policy_errors(workflows):
             if workflow != json.loads(contract.read_text()):
                 errors.append(f"{name}: expected the reviewed dispatch, lease and cleanup steps")
             continue
-        if name == "staging-automod-preview.yml":
-            contract = Path(__file__).parent / "fixtures/staging_automod_preview_workflow.json"
+        if name in ("staging-automod-preview.yml", "staging-predecessor.yml"):
+            fixture = name.removesuffix(".yml").replace("-", "_") + "_workflow.json"
+            contract = Path(__file__).parent / "fixtures" / fixture
             if workflow != json.loads(contract.read_text()):
                 errors.append(f"{name}: expected the disabled, synthetic-only staging job")
             continue

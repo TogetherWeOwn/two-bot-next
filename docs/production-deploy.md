@@ -523,6 +523,11 @@ for the full ledgers and retained timestamp.
 
 ### Check the shared rollback SHA
 
+Coordinate exclusive staging before dispatching `staging-predecessor`. It
+requires `PREDECESSOR_STAGING_ENABLED`, dedicated protected Environment bindings
+for synthetic Postgres and Discord, and the independently recorded 0475 timestamp
+digest for retained PRE. A green run ends with the isolated singleton fenced.
+
 1. For the reviewed rollback predecessor, record its Worker source SHA and
    module digests, container image digest and expected runtime
    `build_revision`, `build_id` and `deploy_id`. The forward candidate has
