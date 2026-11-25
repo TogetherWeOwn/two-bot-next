@@ -52,7 +52,9 @@ async fn attempt(migrator: &Migrator, pool: &PgPool) -> Result<(), MigrateError>
     let mut conn = pool.acquire().await?;
     conn.execute("SET statement_timeout = '15s'").await?;
     conn.execute("SET lock_timeout = '2s'").await?;
-    let result = migrator.run(&mut *conn).await;
+    // SQLx's direct entry point avoids the generic Acquire lifetime in the
+    // spawned rehearsal and keeps the session settings in force.
+    let result = migrator.run_direct(None, &mut *conn, false).await;
     // On an error SQLx can leave its session advisory lock held. Close the
     // session as a failed migration process would before inspecting or retrying.
     conn.close().await?;
@@ -76,11 +78,11 @@ async fn rehearse(pool: PgPool, mut blocker: PgConnection, retained: bool) -> Te
         .await?;
         conn.execute(INSERT_WARNING).await?;
         let before = warnings(&mut conn).await?;
-        MIGRATOR.run(&mut *conn).await?;
+        MIGRATOR.run_direct(None, &mut *conn, false).await?;
         assert_eq!(warnings(&mut conn).await?, before);
         before
     } else {
-        MIGRATOR.run(&mut *conn).await?;
+        MIGRATOR.run_direct(None, &mut *conn, false).await?;
         conn.execute(INSERT_WARNING).await?;
         warnings(&mut conn).await?
     };
