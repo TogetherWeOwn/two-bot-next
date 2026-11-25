@@ -265,8 +265,7 @@ class AcceptanceTests(unittest.TestCase):
         env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
                "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
         signer = acceptance.credentials(env)
-        args = ["finalized", "--rollout", "rollout", "--observed", "observed",
-                "--fixture-start", START.strftime("%Y-%m-%dT%H:%M:%SZ"), "--execute"]
+        args = ["finalized", "--rollout", "rollout", "--observed", "observed", "--plan", "plan", "--execute"]
         refused = (1, "", "FAIL: staging lease did not cover the probe\n")
         future_readback = START + timedelta(seconds=admitted_at - START.timestamp() + 0.25)
 
@@ -286,6 +285,7 @@ class AcceptanceTests(unittest.TestCase):
                 observed = active_observation()
                 observed["lifecycle"].update(receipt_fields)
                 observed["lifecycle"]["use"].update(lease_fields)
+                plan = plan_for_observation(observed)
                 now = admitted_at
                 peer, reads, readies = self.signed_peer("finalized")
 
@@ -310,7 +310,7 @@ class AcceptanceTests(unittest.TestCase):
                     return peer(request)
 
                 check = Mock(side_effect=authenticated_peer)
-                with (patch.object(acceptance, "read_object", side_effect=[ROLLOUT, observed]),
+                with (patch.object(acceptance, "read_object", side_effect=[plan, ROLLOUT, observed]),
                       patch.object(acceptance.time, "time", side_effect=lambda: now),
                       patch.object(acceptance.time, "monotonic", side_effect=lambda: now - admitted_at),
                       patch.object(acceptance, "credentials", side_effect=delayed_credentials),
@@ -323,7 +323,8 @@ class AcceptanceTests(unittest.TestCase):
                 if arm_delay:
                     self.assertEqual(alarm.call_args_list, [call(acceptance.RUN_BUDGET), call(0)])
                 if passes:
-                    self.assertEqual(verdict, (0, "PASS: attendance finalized\n", ""))
+                    receipt = json.dumps(signed_receipt("finalized", plan), sort_keys=True)
+                    self.assertEqual(verdict, (0, f"{receipt}\nPASS: attendance finalized\n", ""))
                     self.assertEqual(reads, [EVENT, EVENT + ":foreign"])
                     self.assertEqual(len(readies), 3)
                 else:
