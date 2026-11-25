@@ -1,12 +1,14 @@
 """Protected attendance release entry points. All provider reads and writes use exact pins."""
 
 from dataclasses import asdict
+from functools import partial
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+from time import sleep
 
 import production_recovery_artifact as artifacts
 from production_ownership_status import read_status
@@ -15,11 +17,12 @@ from production_release_ledgers import CUTOVER, STORE, ledger_endpoints
 from production_release_preflight import ReleasePreflight, approved_plan, apply_under_prepared_fence, prepared_epoch
 from production_release_preflight import verify_preflight
 from rollback_proof import ProofError
-from rollback_target_preflight import image_in_registry
+from rollback_target_preflight import command, image_in_registry
 from staging_migrate_approval import digest_json
 from staging_recovery_status import github
 from staging_rollout import GateError, decode, mapping, require
 from worker_container_rollback import APPLICATIONS, WORKERS, ProvenanceReceipt, RollbackClient
+from worker_container_rollback import WORKER_RESTORE_POLL_SECONDS, WORKER_RESTORE_READS
 from worker_container_rollback import check_url, control_client, validate_receipt_against_live
 
 
@@ -112,18 +115,29 @@ def produced_version(output):
     return versions[0]
 
 
-def take_over(pin, recovery, version, observe, control):
+def take_over(pin, recovery, version, observe, control, *, pause=sleep):
     require(UUID.fullmatch(version) and version != pin.rollback_worker, "production_release_worker_version_unproved")
     actor = release_actor(recovery.run_id, pin.candidate_sha)
-    state = observe()
-    require(matches_pair(state, pin, version, pin.candidate_sha, pin.candidate_image)
-            and is_stopped(state, recovery.fence_epoch, actor), "production_release_candidate_pair_unproved")
+    for attempt in range(WORKER_RESTORE_READS):
+        if attempt:
+            pause(WORKER_RESTORE_POLL_SECONDS)
+        state = observe()
+        require(is_stopped(state, recovery.fence_epoch, actor), "production_stopped_fence_unproved")
+        if matches_pair(state, pin, version, pin.candidate_sha, pin.candidate_image):
+            break
+        require(any(matches_pair(state, pin, worker, sha, digest)
+                    for worker, sha in ((pin.rollback_worker, pin.rollback_sha), (version, pin.candidate_sha))
+                    for digest in (pin.rollback_image, pin.candidate_image)),
+                "production_release_candidate_pair_unproved")
+    else:
+        raise GateError("production_release_candidate_pair_unproved")
     control("takeover-fenced", recovery.fence_epoch, expected_deployment=version)
     state = observe()
     owner = mapping(state.get("ownership"))
     require(matches_pair(state, pin, version, pin.candidate_sha, pin.candidate_image)
             and owner.get("phase") == "active" and owner.get("epoch") == recovery.fence_epoch + 1
-            and owner.get("owner_actor") == actor, "production_release_takeover_unconfirmed")
+            and owner.get("owner_actor") == actor and owner.get("running") is False,
+            "production_release_takeover_unconfirmed")
 
 
 def database(binary, directory, plan, env, *, plan_id=None):
@@ -199,7 +213,7 @@ def main(argv, env):
             image = f"registry.cloudflare.com/{account}/{app}@{pin.rollback_image}"
             validate_receipt_against_live(client, ProvenanceReceipt(
                 WORKERS["production"], app, pin.rollback_worker, pin.rollback_sha, image))
-            image_in_registry(image, account)
+            image_in_registry(image, account, partial(command, cwd=Path(__file__).resolve().parents[1] / "wrangler"))
             fresh = mapping(decode((directory / "fresh-plan.json").read_bytes()))
             epoch = verify_preflight(pin, plan["target"], plan, fresh, lambda: read_status(env), control)
             write_json(directory / "preflight.json", {"pin": asdict(pin), "epoch": epoch,
