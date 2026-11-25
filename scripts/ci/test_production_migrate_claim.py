@@ -1,9 +1,11 @@
 """Offline production-claim contract tests; no Actions dispatch, database or approval."""
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 import json
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -224,11 +226,24 @@ class ProductionApprovalTests(unittest.TestCase):
                 self.assertEqual(result["atomic_release"], selected)
 
     def test_attendance_apply_refuses_without_protected_recovery(self):
-        for pending in (["480"], ["475", "479", "480", "481", "482"]):
-            with self.subTest(pending=pending), self.assertRaisesRegex(
-                    GateError, "^production_attendance_recovery_unavailable$"):
-                approval.require_supported_recovery({"expected_pending": pending})
-        approval.require_supported_recovery({"expected_pending": ["475", "479"]})
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            fresh, claim, output = (root / name for name in ("fresh.json", "claim.json", "outputs"))
+            fresh.write_text("{}", encoding="utf-8")
+            args = ["authorize", str(fresh), str(claim)]
+            env = {"GITHUB_OUTPUT": str(output)}
+            for pending in (["480"], ["475", "479", "480", "481", "482"]):
+                claim.write_text(json.dumps({"expected_pending": pending}), encoding="utf-8")
+                with (self.subTest(pending=pending),
+                      patch.object(approval, "authorize", return_value={"atomic_release": "true"}),
+                      patch("sys.stderr", new_callable=StringIO) as errors):
+                    self.assertEqual(approval.main(args, env), 2)
+                    self.assertIn("production_attendance_recovery_unavailable", errors.getvalue())
+                    self.assertFalse(output.exists())
+            claim.write_text('{"expected_pending":["475","479"]}', encoding="utf-8")
+            with patch.object(approval, "authorize", return_value={"atomic_release": "false"}):
+                self.assertEqual(approval.main(args, env), 0)
+            self.assertEqual(output.read_text(encoding="utf-8"), "atomic_release=false\n")
 
     def test_refuses_fresh_ledger_or_role_audit_drift(self):
         for field in ("ledger_before", "ledger_store_before", "audit"):

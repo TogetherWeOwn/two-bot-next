@@ -1,4 +1,4 @@
--- Disposable rehearsal only. One statement keeps the guard and inverse atomic.
+-- Disposable binding guard. The fixture runs this and the shared inverse in one transaction.
 -- Retain 0475 and its fence. Refuse to discard any post-expansion evidence.
 SET LOCAL statement_timeout = '15s';
 DO $undo$
