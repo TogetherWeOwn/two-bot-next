@@ -23,13 +23,15 @@ MODULE_TYPES = {
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
 DNS_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 DATABASE_NAME = r"[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,62}"
+DATABASE_TLS = r"sslmode=(?:require|verify-ca|verify-full)"
+DATABASE_CHANNEL_BINDING = "channel_binding=require"
 # SQLx accepts query overrides for the destination and user. Admit only the
 # TLS options used by the archived runtime and require explicit TCP identity.
 DATABASE_URL = re.compile(
     rf"postgres(?:ql)?://(?P<user>{DATABASE_NAME}):(?:[a-zA-Z0-9._~-]|%[0-9a-fA-F]{{2}})+@"
     rf"(?P<host>(?:{DNS_LABEL}\.)+[a-z](?:[a-z0-9-]{{0,61}}[a-z0-9])?)"
     rf":(?P<port>[1-9][0-9]{{0,4}})/(?P<database>{DATABASE_NAME})"
-    r"\?sslmode=(?:require|verify-ca|verify-full)(?:&channel_binding=require)?"
+    rf"\?(?:{DATABASE_TLS}(?:&{DATABASE_CHANNEL_BINDING})?|{DATABASE_CHANNEL_BINDING}&{DATABASE_TLS})"
 )
 
 
@@ -115,14 +117,17 @@ def assemble_worker_upload(target, *, now, receipt, material_root, config, datab
     emitted by pre_target.make_config. The protected caller authenticates the
     disposable database pin independently of the supplied URL. The URL uses
     a canonical DNS name and explicit TCP port, database, user, password and
-    TLS mode. Its only optional query setting is channel_binding=require.
+    TLS mode. Its only optional query setting is channel_binding=require in
+    either order. The archived runtime's default TLS policy uses verify-full.
     Keep the result private and paired with its full Target. Hold exclusive
     access to material until assembly returns, and use the returned body
     directly at the upload boundary.
 
     The body matches Wrangler's script PUT module and metadata layout. The
     protected caller owns account selection, collision checks, ingress settings,
-    Container application setup and proof of restricted invocation.
+    Container application setup and proof of restricted invocation. It must
+    confirm the reservation still owns the database at the startup effect
+    boundary and keep the endpoint exclusive through use.
     """
     require(type(target) is Target, "invalid_pre_worker_target")
     root = Path(material_root)
@@ -156,9 +161,10 @@ def assemble_worker_upload(target, *, now, receipt, material_root, config, datab
         "code_update_strategy": {"mode": "deferred", "max_delay": 300},
         "annotations": {"workers/message": receipt["worker_message"]},
     }, separators=(",", ":")).encode()
-    # Stable framing for identical input. Refuse any delimiter collision.
-    boundary = sha256(metadata + b"".join(bytes.fromhex(hashes[name]) for name in sorted(modules))).hexdigest()
+    # Derive the public header only from verified module digests.
+    boundary = sha256(b"".join(bytes.fromhex(hashes[name]) for name in sorted(modules))).hexdigest()
     delimiter = b"--" + boundary.encode()
+    require(delimiter not in metadata, "pre_worker_boundary_collision")
     parts = [b'Content-Disposition: form-data; name="metadata"\r\n\r\n' + metadata]
     for name, data in sorted(modules.items()):
         require(delimiter not in data, "pre_worker_boundary_collision")

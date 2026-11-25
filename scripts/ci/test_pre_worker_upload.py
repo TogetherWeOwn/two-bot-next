@@ -102,6 +102,31 @@ class PreWorkerUploadTests(unittest.TestCase):
         for name, (_, data) in MODULES.items():
             self.assertEqual((self.worker / name).read_bytes(), data)
 
+    def test_accepts_tls_query_options_in_either_order(self):
+        database_url = database_fixture(self.target)["database_url"]
+        base, _ = database_url.split("?")
+        for query in ("sslmode=require&channel_binding=require", "channel_binding=require&sslmode=require"):
+            with self.subTest(query=query):
+                url = base + "?" + query
+                upload = self.assemble(database_url=url)
+                metadata = decode_json(receive_multipart(upload.content_type, upload.body)[0][3])
+                self.assertIn({"name": "DATABASE_URL", "type": "secret_text", "text": url}, metadata["bindings"])
+        for query in ("sslmode=require&sslmode=verify-full", "channel_binding=require&channel_binding=require&sslmode=require",
+                      "sslmode=disable&channel_binding=require", "channel_binding=require"):
+            with self.subTest(query=query), self.assertRaisesRegex(TargetError, "^invalid_pre_database_url$"):
+                self.assemble(database_url=base + "?" + query)
+
+    def test_multipart_boundary_is_independent_of_database_password(self):
+        database_url = database_fixture(self.target)["database_url"]
+        original = self.assemble()
+        changed = self.assemble(database_url=database_url.replace("fixture%40password", "another-fixture"))
+        self.assertEqual(original.content_type, changed.content_type)
+        self.assertNotEqual(original.body, changed.body)
+
+        boundary = original.content_type.split("boundary=", 1)[1]
+        with self.assertRaisesRegex(TargetError, "^pre_worker_boundary_collision$"):
+            self.assemble(database_url=database_url.replace("fixture%40password", "--" + boundary))
+
     def test_refuses_wrong_entrypoint_and_missing_entrypoint_hash(self):
         self.config["main"] = str(self.worker / "lib/helper.mjs")
         with self.assertRaisesRegex(TargetError, "^wrong_pre_worker_entrypoint$"):
