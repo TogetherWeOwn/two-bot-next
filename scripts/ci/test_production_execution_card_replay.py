@@ -69,8 +69,10 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
         window_path = self.root / "window.json"
         window_path.write_text(json.dumps(PRODUCTION), encoding="utf-8")
         help_report = self.assemble_watch("help", WATCH_HELP, window_path)
+        naming = self.assemble_watch("naming", WATCH_EMPTY + WATCH_RETURN, window_path)
         gateway = self.summarize_gateway(PRODUCTION, "ready", "2026-11-25T02:04:00.000Z", "gateway.json")
-        reports = {"help": (help_report, PRODUCTION), "gateway": (gateway, PRODUCTION)}
+        reports = {"help": (help_report, PRODUCTION), "naming": (naming, PRODUCTION),
+                   "gateway": (gateway, PRODUCTION)}
 
         identity = {key: value for key, value in PRODUCTION.items() if key not in ("start", "end")}
         readbacks = [dict(identity, utc=at) for at in (
@@ -78,8 +80,9 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
         )]
         same_build = self.replay_report(PRODUCTION, reports, serving_readbacks=readbacks)
         self.assertEqual(same_build, self.replay_report(PRODUCTION, reports))
-        help_row, gateway_row = (same_build["observations"][kind] for kind in reports)
+        help_row, naming_row, gateway_row = (same_build["observations"][kind] for kind in reports)
         self.assertEqual((help_row["status"], help_row["result"]), ("attributed", "readbacks_and_deletions_recorded"))
+        self.assertEqual((naming_row["status"], naming_row["result"]), ("attributed", "transitions_recorded"))
         self.assertEqual((gateway_row["status"], gateway_row["readiness"]), ("attributed", "observed"))
 
         # Receipts, hashes, the expected SHA, and opening and closing readbacks stay fixed.
@@ -100,7 +103,12 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
                     row = interrupted["observations"][kind]
                     self.assertEqual(row["status"], "mismatched")
                     self.assertTrue({"result", "signals", "readiness"}.isdisjoint(row))
-                self.assertEqual(interrupted["observations"]["naming"]["status"], "missing")
+
+        without_naming = {"help": reports["help"], "gateway": reports["gateway"]}
+        interrupted = self.replay_report(PRODUCTION, without_naming, serving_readbacks=[
+            dict(readbacks[1], deploy_id="2026.11.25.2+aaaaaaa"),
+        ])
+        self.assertEqual(interrupted["observations"]["naming"]["status"], "missing")
 
     def test_invalid_serving_readbacks_refuse_the_handoff_without_echo(self):
         handoff = self.root / "invalid.json"
