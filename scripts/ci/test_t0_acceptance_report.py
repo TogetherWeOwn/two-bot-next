@@ -182,6 +182,8 @@ class T0AcceptanceReportTests(unittest.TestCase):
         observed = self.run_report({"naming": binding}, PRODUCTION)["naming"]
         self.assertEqual((observed["status"], observed["result"], observed["missing_transitions"]),
                          ("attributed", "not_observed", ["occupied-room-return"]))
+        staging = self.run_report({"naming": self.save("naming", naming)}, WINDOW)["naming"]
+        self.assertEqual(staging["status"], "unverified")
 
         for change in ({"build_id": "901-1"}, {"end": "2026-11-25T02:04:00Z"}):
             row = self.run_report({"naming": binding}, PRODUCTION | change)["naming"]
@@ -203,6 +205,15 @@ class T0AcceptanceReportTests(unittest.TestCase):
             row = self.run_report({"naming": self.save("naming", invalid, PRODUCTION)}, PRODUCTION)["naming"]
             self.assertEqual(row["status"], "unverified")
             self.assertNotIn("synthetic private value", json.dumps(row))
+
+    def test_production_naming_failure_also_reports_missing_readback(self):
+        failure = ("empty-room-rename", "fail")
+        for other in ((), (("occupied-room-return", "not_observed"),)):
+            with self.subTest(other=other):
+                naming = watch_rows("naming", failure, *other)
+                row = self.run_report({"naming": self.save("naming", naming, PRODUCTION)}, PRODUCTION)["naming"]
+                self.assertEqual((row["status"], row["result"], row["missing_transitions"]),
+                                 ("attributed", "probe_failed", ["occupied-room-return"]))
 
     def test_partial_observations_and_reported_gateway_mismatch(self):
         checks = [NAMING["checks"][0], dict(NAMING["checks"][1], verdict="skip")]

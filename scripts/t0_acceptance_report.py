@@ -139,7 +139,10 @@ def production_watch_observation(kind, report, window):
         return None
     missing = [check for check in checks if outcomes.get(check, "not_observed") == "not_observed"]
     if "fail" in outcomes.values():
-        return {"result": "probe_failed"}
+        failure = {"result": "probe_failed"}
+        if kind == "naming" and missing:
+            failure["missing_transitions"] = missing
+        return failure
     if kind == "help":
         return {"result": "not_observed" if missing else "readbacks_and_deletions_recorded"}
     if not missing and times[TRANSITIONS[0]] >= times[TRANSITIONS[1]]:
