@@ -825,6 +825,18 @@ policy pins this ordering, condition, local snapshot command and red outcome.
 Without a takeover or a successful deploy/snapshot the run fails for the
 operator; a failed restore is never a reason to wait for the next deployment.
 
+The reusable `deploy-production-recovery.yml` provides the recovery phase for
+the protected attendance release. Its parent must hold the production lane
+and supply the approved candidate and prior pair, both ledger digests and
+the original 0475 timestamp digest. It passes the approved PlanetScale host,
+database and branch as call inputs, which recovery matches to the authenticated
+plan and target fingerprint in every job. The production job
+confirms the stopped writer at the pinned epoch. The migration apply job
+authenticates that job before running the inverse with its scoped binding.
+The restore job authenticates the inverse artifact and rereads the stopped
+epoch before releasing ownership. The attendance expansion remains unavailable
+through the standalone production migration dispatch.
+
 After the production rollback script posts a Worker restore once,
 it checks the current deployment immediately. A valid but nonmatching serving
 version allows up to six more readbacks, ten seconds apart. The target must serve

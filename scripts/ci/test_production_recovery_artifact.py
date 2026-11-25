@@ -90,6 +90,13 @@ class RecoveryArtifactTests(unittest.TestCase):
             with self.subTest(spec=spec), self.assertRaises(GateError):
                 self.authenticated(*self.artifact_fixture(**spec))
 
+    def test_inverse_accepts_the_upload_digest_but_refuses_other_prefixes(self):
+        env, digest, routes = self.artifact_fixture()
+        self.assertEqual(self.authenticated(env, f"sha256:{digest}", routes), self.result)
+        for prefix in ("sha512:", "sha256:sha256:"):
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(GateError, "artifact_pin_invalid"):
+                self.authenticated(env, prefix + digest, routes)
+
     def test_inverse_archive_rejects_duplicate_key_in_valid_envelope(self):
         valid = {"operation": "undo-0480", "approval": self.approval, "result": self.result}
         duplicate = '{"operation":"other",' + json.dumps(valid)[1:]

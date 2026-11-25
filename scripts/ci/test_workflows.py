@@ -77,6 +77,7 @@ JOB_INVENTORY = {
     "staging-migrate.yml": {"plan", "claim", "apply"},
     "staging-migrate-reviewed.yml": {"authorize", "plan", "apply"},
     "production-migrate.yml": {"plan", "claim", "apply"},
+    "deploy-production-recovery.yml": {"fence", "inverse", "restore"},
     # On-demand staging automatic recovery proof plus the manual Worker-only drill.
     "staging-rollback-drill.yml": {"drill", "proof", "alert"},
     # Container-image backout/restore drill: manual, staging-only, pinned shape below.
@@ -236,6 +237,9 @@ DEPLOY_MARKERS = (
     "cloudflare/wrangler-action", "wrangler deploy", "wrangler publish",
     "cloudflare_api_token", "staging_worker_url", "production_worker_url", "/health", "/readyz",
 )
+# Canonical parsed graph for the protected recovery callee. This pins the
+# caller guard, Environment split, exact commands, permissions, and handoffs.
+PRODUCTION_RECOVERY_GRAPH = "581651c0eb95b463adaf47dfbb9465ff8d886a829911bce50e34aede33bf907d"
 
 
 class UniqueKeyLoader(yaml.BaseLoader):
@@ -4981,6 +4985,11 @@ def workflow_policy_errors(workflows):
             # staging-deploy policy. The generic environment/marker scan
             # below would flag its production-migrate Environment binding.
             errors.extend(production_migrate_errors(workflow))
+            continue
+        if name == "deploy-production-recovery.yml":
+            graph = hashlib.sha256(json.dumps(workflow, sort_keys=True).encode()).hexdigest()
+            if graph != PRODUCTION_RECOVERY_GRAPH:
+                errors.append(f"{name}: protected recovery graph changed")
             continue
         if name == "staging-ownership-status.yml":
             # Manual read-only ownership status read: pinned shape above;
@@ -11327,7 +11336,8 @@ class WorkflowTests(unittest.TestCase):
                         # Read-only fetch of the producing plan
                         # run's manifest artifact for the provenance gate.
                         expected = {"contents": "read", "actions": "read"}
-                    elif name == "production-migrate.yml" and job_id in ("claim", "apply"):
+                    elif (name == "production-migrate.yml" and job_id in ("claim", "apply")
+                          or name == "deploy-production-recovery.yml"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-staging.yml", "deploy"):
                         # Derives the deploy ID from today's staging
@@ -11532,10 +11542,13 @@ class WorkflowTests(unittest.TestCase):
         # Pure callees are serialized by their callers instead; the two
         # deploy-side workflows below serialize at the lane jobs on purpose
         # (a top-level group would queue work that must stay unqueued).
-        exempt = {
-            # Pure `workflow_call` callees: the caller holds the group.
-            "sbom.yml",
+        pure_callees = {
+            "deploy-production-recovery.yml",
             "reusable-rust-nextest.yml",
+            "sbom.yml",
+        }
+        exempt = {
+            *pure_callees,
             # Serializes at the `production` lane job only, so a sleeping
             # promotion can never queue an operator rollback behind it (see
             # the header comment in the workflow).
@@ -11547,7 +11560,7 @@ class WorkflowTests(unittest.TestCase):
         for name, workflow in self.workflows.items():
             on = workflow.get("on") or {}
             triggers = {on} if isinstance(on, str) else set(on)
-            if name in ("sbom.yml", "reusable-rust-nextest.yml"):
+            if name in pure_callees:
                 # Gaining an own trigger forces a concurrency decision here.
                 self.assertEqual(triggers, {"workflow_call"}, name)
             if name == "deploy-production.yml":

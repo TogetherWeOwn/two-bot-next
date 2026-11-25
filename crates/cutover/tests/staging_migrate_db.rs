@@ -792,7 +792,8 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     admin
         .execute("REVOKE CREATE ON SCHEMA public FROM two_bot_runtime")
         .await?;
-    let (cutover, store) = apply_release_schema(&pool, &expected[0], &expected[1]).await?;
+    let applied = apply_release_schema(&pool, &expected[0], &expected[1]).await?;
+    let (cutover, store) = (applied.cutover, applied.store);
     assert_eq!(cutover.len(), expected[0].len() + 5);
     assert_eq!(store.len(), expected[1].len() + 1);
     let installed: bool = sqlx::query_scalar(
@@ -837,6 +838,7 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     )
     .fetch_one(&mut admin)
     .await?;
+    assert_eq!(applied.attendance_fence_sha256, expected_fence);
     assert_eq!(
         json!(classify().await?),
         json!({"state": "post", "attendance_fence_sha256": expected_fence})
@@ -875,8 +877,13 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
         .execute("SELECT 1 FROM public.live_sequence_watermarks LIMIT 0")
         .await?;
     admin.execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at SET DEFAULT CURRENT_TIMESTAMP").await?;
-    let (restored_cutover, restored_store) =
-        recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await?;
+    let (restored_cutover, restored_store) = recover_release_schema(
+        &pool,
+        &cutover,
+        &store,
+        Some(&applied.attendance_fence_sha256),
+    )
+    .await?;
     assert!(confirm_pre().await.is_err());
     assert!(classify().await.is_err());
     assert_eq!(
