@@ -15,7 +15,23 @@ TARGET = Target("pre-fixture-lookup", 42, 1_800_000_000, "0473/0465")
 ACCOUNT = "a" * 32
 PATH = f"/accounts/{ACCOUNT}/workers/workers/two-bot-next-pre-42-1800003600"
 IDENTITY = {"id": "b" * 32, "name": "two-bot-next-pre-42-1800003600"}
-SUCCESS = {"success": True, "errors": [], "messages": [], "result": IDENTITY}
+WORKER = IDENTITY | {
+    "created_on": "2026-01-01T00:00:00Z",
+    "updated_on": "2026-01-01T00:00:00Z",
+    "logpush": False,
+    "observability": {"enabled": False},
+    "references": {
+        "dispatch_namespace_outbounds": [],
+        "domains": [],
+        "durable_objects": [],
+        "queues": [],
+        "workers": [],
+    },
+    "subdomain": {"enabled": False, "previews_enabled": False},
+    "tags": [],
+    "tail_consumers": [],
+}
+SUCCESS = {"success": True, "errors": [], "messages": [], "result": WORKER}
 MISSING_ERROR = {"code": 10007, "message": "Worker not found."}
 MISSING = {"success": False, "errors": [MISSING_ERROR], "messages": [], "result": None}
 
@@ -53,10 +69,10 @@ class PreWorkerLookupTests(unittest.TestCase):
                 self.read(Mock(return_value=WorkerLookupResponse(path, 404, MISSING)))
 
     def test_mismatched_or_malformed_identity_remains_unknown(self):
-        for result in (None, [], [IDENTITY, IDENTITY], {"id": IDENTITY["id"]},
-                       IDENTITY | {"name": TARGET.worker_name + "-shadow"},
-                       IDENTITY | {"name": "two-bot-next-staging"},
-                       IDENTITY | {"id": None}, IDENTITY | {"id": "  "}, IDENTITY | {"id": "bad\n"}):
+        for result in (None, [], [WORKER, WORKER], {"id": IDENTITY["id"]},
+                       WORKER | {"name": TARGET.worker_name + "-shadow"},
+                       WORKER | {"name": "two-bot-next-staging"},
+                       WORKER | {"id": None}, WORKER | {"id": "  "}, WORKER | {"id": "bad\n"}):
             with self.subTest(result=result), self.assertRaises(TargetError):
                 self.read(Mock(return_value=WorkerLookupResponse(PATH, 200, SUCCESS | {"result": result})))
 
