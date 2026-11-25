@@ -41,7 +41,9 @@ use crate::intake_cap::{read_bytes_capped, IntakeReadError, INTAKE_CAP_LABEL};
 
 #[path = "release_schema_transaction.rs"]
 mod release_schema_transaction;
-pub use release_schema_transaction::{apply_release_schema, undo_release_schema};
+pub use release_schema_transaction::{
+    apply_release_schema, recover_release_schema, undo_release_schema,
+};
 
 /// Fixed binding names; each value is a secret and is never echoed.
 /// Plan reads only the RO binding; apply reads only the migrator binding.
@@ -1405,6 +1407,79 @@ pub async fn run(req: &Request) -> Result<Value, RunError> {
     let result = run_on_pool(req, &pool, &verified).await;
     pool.close().await;
     result
+}
+
+/// The protected workflow authenticates the read-only plan and writer fence
+/// before calling this entry point with the existing production binding.
+#[doc(hidden)]
+pub async fn run_release_inverse(req: &Request, fence_sha256: &str) -> Result<Value, RunError> {
+    const CUTOVER: &[i64] = &[475, 479, 480, 481, 482];
+    const STORE: &[i64] = &[478];
+    validate_request(req)?;
+    if req.target != Target::Production
+        || !req.apply
+        || fence_sha256.len() != 64
+        || !fence_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return refuse(
+            "release inverse requires the production apply binding and attendance fence",
+        );
+    }
+    let cutover = check_plan_binding(
+        req,
+        CUTOVER,
+        &Chain::Cutover.migrator().map_err(RunError::Refused)?,
+    )?;
+    let store = check_store_binding(
+        req,
+        STORE,
+        &Chain::Store.migrator().map_err(RunError::Refused)?,
+    )?;
+    check_plan_provenance(req, &cutover, &store)?;
+    let plan: Value = req
+        .plan_manifest_path
+        .as_deref()
+        .and_then(|path| read_bytes_capped(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| RunError::Refused("release inverse plan unavailable".to_owned()))?;
+    let expanded = |key: &str| -> Result<Vec<LedgerRow>, RunError> {
+        let invalid = || RunError::Refused("release inverse ledger projection invalid".to_owned());
+        plan[key]
+            .as_array()
+            .ok_or_else(invalid)?
+            .iter()
+            .map(|row| {
+                Ok(LedgerRow {
+                    version: row["version"].as_i64().ok_or_else(invalid)?,
+                    description: row["description"].as_str().ok_or_else(invalid)?.to_owned(),
+                    checksum_hex: row["sha384"].as_str().ok_or_else(invalid)?.to_owned(),
+                    success: true,
+                })
+            })
+            .collect()
+    };
+    let expected = (
+        expanded("source_migrations")?,
+        expanded("source_store_migrations")?,
+    );
+    let options = verify_target(req, tls_policy_from_env()?)?;
+    let pool = connect(options, MIGRATOR_ROLE, Arc::new(AtomicUsize::new(0))).await?;
+    let result = release_schema_transaction::recover_release_schema(
+        &pool,
+        &expected.0,
+        &expected.1,
+        Some(fence_sha256),
+    )
+    .await;
+    pool.close().await;
+    let after = result?;
+    Ok(
+        json!({"state": "restored", "attendance_fence_sha256": fence_sha256,
+        "expanded": [ledger_json(&expected.0), ledger_json(&expected.1)],
+        "restored": [ledger_json(&after.0), ledger_json(&after.1)]}),
+    )
 }
 
 /// Apply one chain's pending migrations and verify its ledger. Runs only

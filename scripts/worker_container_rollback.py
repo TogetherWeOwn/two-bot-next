@@ -339,6 +339,26 @@ def version_sha(client, worker, version):
     return message if isinstance(message, str) and SHA.fullmatch(message) else None
 
 
+def source_has_attendance_schema(sha):
+    require(isinstance(sha, str) and SHA.fullmatch(sha), "production_rollback_source_unproved")
+    try:
+        change = subprocess.run(["git", "ls-tree", "--full-tree", "--name-only", sha, "--",
+                                 "crates/cutover/migrations/0480_event_attendance.sql"],
+                                capture_output=True, check=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        raise GateError("production_rollback_source_unproved") from None
+    return bool(change.stdout)
+
+
+def require_ordinary_production_rollback(current_sha, target_sha, state, *, has_schema=source_has_attendance_schema):
+    owner = base.mapping(state.get("owner"))
+    actor = owner.get("actor")
+    require(owner.get("phase") in ("active", "fenced") and isinstance(actor, str),
+            "production_rollback_ownership_unproved")
+    require(not actor.startswith("production-schema-release:"), "production_rollback_fence_reserved")
+    require(has_schema(current_sha) == has_schema(target_sha), "production_rollback_requires_protected_inverse")
+
+
 def replaced_converged(row):
     """Convergence evidence for a `replaced` provenance row.
 
@@ -900,6 +920,11 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
         require(len(token) >= 32, "missing_ownership_token")
         require(ACTOR.fullmatch(args.actor), "invalid_actor")
         control = control_client(args.variant, token, url, args.staging_url, args.actor)
+        if args.variant == "production":
+            version = serving_version(client, worker)
+            state = control("observe")
+            require(state.get("deploymentId") == version, "production_rollback_ownership_unproved")
+            require_ordinary_production_rollback(version_sha(client, worker, version), expected_sha, state)
         staging_use = (staging_restore_client(
             env, url, token, restore_version, expected_sha, args.evidence + ".staging-use.jsonl")
             if args.variant == "staging" else None)

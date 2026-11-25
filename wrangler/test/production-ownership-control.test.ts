@@ -92,6 +92,30 @@ test("fenced recovery requires a stopped matching epoch before takeover", async 
   }
 });
 
+test("the release fence requires a confirmed stop and excludes ordinary takeover", async () => {
+  const actor = `production-schema-release:123:${"a".repeat(40)}`;
+  const held = { deploymentId: null, phase: "fenced", epoch: 4, oldEpoch: 3, actor };
+  const active = { deploymentId: "B", phase: "active", epoch: 3 };
+  for (const running of [true, false]) {
+    const calls: string[] = [];
+    const result = control({ ...args, action: "fence-exact", expectedEpoch: 3, actor }, async (_url, init) => {
+      calls.push(String(init.method));
+      if (init.method === "GET") return Response.json({ deploymentId: "B", running: true, owner: active });
+      assert.deepEqual(JSON.parse(String(init.body)), { action: "fence", actor, expectedEpoch: 3 });
+      return Response.json({ deploymentId: "B", running, owner: held });
+    });
+    if (running) await assert.rejects(result, /shutdown was not confirmed/);
+    else assert.equal((await result).owner.epoch, 4);
+    assert.deepEqual(calls, ["GET", "POST"]);
+  }
+  for (const action of ["takeover", "unreserved", "fence"]) {
+    const blocked = sender(held);
+    await assert.rejects(control({ ...args, action, expectedEpoch: 4, releaseFence: true }, blocked.send),
+      /Protected schema recovery owns the fence/);
+    assert.deepEqual(blocked.calls.map((call) => call.method), ["GET"]);
+  }
+});
+
 test("fenced recovery never retries an interrupted takeover at a new epoch", async () => {
   const recovery = { ...args, action: "takeover-fenced", releaseFence: true, expectedEpoch: 3 };
   for (const interrupt of [true, false]) {

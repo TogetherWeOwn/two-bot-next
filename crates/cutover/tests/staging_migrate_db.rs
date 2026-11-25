@@ -485,9 +485,10 @@ async fn seed_staging_state(fx: &Fixture) -> TestResult {
 }
 
 async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> TestResult {
+    use sha2::{Digest, Sha256};
     use two_bot_core::database_roles::{plan_for_phase, Phase};
     use two_bot_cutover::staging_migrate::{
-        apply_release_schema, undo_release_schema, Chain, LedgerRow,
+        apply_release_schema, recover_release_schema, undo_release_schema, Chain, LedgerRow,
     };
 
     let fx = Fixture::new().await?;
@@ -611,7 +612,23 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     admin
         .execute("DELETE FROM live_sequence_watermarks WHERE guild_id = '1'")
         .await?;
-    let (restored_cutover, restored_store) = undo_release_schema(&pool, &cutover, &store).await?;
+    let fence: Vec<u8> = sqlx::query_scalar(
+        "SELECT timestamptz_send(installed_on) FROM _sqlx_migrations WHERE version = 475",
+    )
+    .fetch_one(&mut admin)
+    .await?;
+    let expected_fence = hex::encode(Sha256::digest(fence));
+    assert!(
+        recover_release_schema(&pool, &cutover, &store, Some(&"0".repeat(64)))
+            .await
+            .is_err()
+    );
+    let (restored_cutover, restored_store) =
+        recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await?;
+    assert_eq!(
+        recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await?,
+        (restored_cutover.clone(), restored_store.clone())
+    );
     expected[0].push(cutover.into_iter().find(|row| row.version == 475).unwrap());
     assert_eq!(restored_cutover, expected[0]);
     assert_eq!(restored_store, expected[1]);
