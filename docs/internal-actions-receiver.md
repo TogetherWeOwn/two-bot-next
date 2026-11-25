@@ -247,15 +247,17 @@ and public records.
    `confirmDisabled` on the same installed session. Give each read a deadline.
    Both reads use the companion route, which does not submit a signed move.
    Keep the completion handle in process.
-3. **Bot Operations.** The current Bot staging custodian confirms release of
-   prior staging use from fresh protected status and hands exclusive use to
-   the fixture executor for the agreed nonoverlapping window. The protected
-   handoff records the executor's acknowledgement and the serving Bot SHA,
-   deployment and owner epoch. Run under the existing
+3. **Bot Operations.** The Bot staging custodian holds exclusive staging
+   custody. That custodian confirms release of prior staging use from fresh
+   protected status and hands the agreed nonoverlapping window to the operator
+   responsible for running the fixture. The protected handoff
+   records that operator's acknowledgement and the serving Bot SHA, deployment
+   and owner epoch. Run under the existing
    [`staging-lifecycle` lock](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
    Treat a missing, stale or mismatched admission receipt, an overlapping
    staging use or an unconfirmed writer as incomplete admission.
-   Use `verify_lease=true` in the [manual workflow](../.github/workflows/staging-voice-move.yml) from protected
+   Use `verify_lease=true` in the
+   [manual workflow](../.github/workflows/staging-voice-move.yml) from protected
    main on the first attempt for the exact serving Bot SHA. Take the unmodified
    ready and final status projections from its retained
    `staging-voice-move-lease-<run>-<attempt>` artifact as
@@ -299,12 +301,12 @@ and public records.
    no live input provider. The in-process job returns `disabled`, `failed`
    or `passed`. A pass is mock evidence.
 
-   For a protected live invocation, coordinate the custodian with the
-   [proof runner](../wrangler/scripts/staging-voice-move-acceptance.mjs)
+   For a protected live invocation, coordinate the ordinary-member custodian
+   with the [proof runner](../wrangler/scripts/staging-voice-move-acceptance.mjs)
    before the cases. The runner confirms A to B (`moved`), then B to A
    (`not_permitted`, still in B), then a move to B while disconnected
-   (`not_connected`). The custodian has the account leave B after the
-   `after:not_permitted` observation completes. The `before:not_connected`
+   (`not_connected`). The ordinary-member custodian has the account leave B
+   after the `after:not_permitted` observation completes. The `before:not_connected`
    checkpoint starts immediately. The observer must return a fresh readback
    after the departure within that same checkpoint call. Its budget is up to
    20 seconds, shortened by the remaining lease time.
@@ -315,7 +317,14 @@ and public records.
    proof admission failure. Confirm the protected final status is for the same
    run, attempt, expiry, SHA, deployment and epoch, with the lease released or
    expired, `voiceMoveEnabled: false` and `running: false`. After interruption,
-   verify this status after native expiry. Record the outcome and the minimum
+   verify this status after native expiry. If cancellation leaves no
+   `expires_at` output, Bot Operations checks protected `status` and native
+   lifecycle evidence for that run and attempt. If the attempt acquired a
+   lease, require the same-window OFF and stopped readback after native
+   expiry. Record no lease only if the evidence confirms the attempt never
+   acquired one and staging is OFF and stopped.
+
+   Record the outcome and the minimum
    terminal readback from each owner against the same protected run reference,
    including when the proof stops early or is cancelled.
 
@@ -324,7 +333,7 @@ and public records.
    | Ordinary-member custodian and independent Discord observer | The custodian confirms departure and the observer independently confirms `connectedChannelId: null`. |
    | Discord administrator | Changed overwrites are restored and effective permissions match the recorded baseline. |
    | Web Operations | Temporary settings are restored, the fixture is disabled and the session companion probe returns the private `404 not_found` refusal. |
-   | Bot Operations and staging custodian | Exact-window protected status confirms the lease released or expired, `voiceMoveEnabled: false` and `running: false`. The custodian acknowledges return of exclusive staging custody with no outstanding fixture writer. |
+   | Bot Operations and Bot staging custodian | Protected readback confirms lease settlement as above, `voiceMoveEnabled: false` and `running: false`. The Bot staging custodian acknowledges return of exclusive staging custody with no outstanding fixture writer. |
 
    Treat missing, conflicting or unconfirmed readback as incomplete cleanup
    and leave custody return pending. A mock verdict or a workflow conclusion
