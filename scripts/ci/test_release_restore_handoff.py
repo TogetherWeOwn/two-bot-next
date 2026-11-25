@@ -1,7 +1,7 @@
 """Exercise the restore handoff using synthetic observations and the checked-in inverse."""
 
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -10,10 +10,12 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = Path(__file__).with_name("fixtures") / "release_restore_handoff.json"
+INVERSE = ROOT / "sql" / "release_schema_inverse.sql"
+UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def utc_time(observation):
-    return datetime.strptime(observation["at"], "%Y-%m-%dT%H:%M:%SZ")
+    return datetime.strptime(observation["at"], UTC_FORMAT)
 
 
 class ReleaseRestoreHandoffTests(unittest.TestCase):
@@ -21,15 +23,15 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
         self.handoff = json.loads(FIXTURE.read_text(encoding="utf-8"))
         self.plan = self.handoff["plan"]
 
-    def assert_handoff(self, observed):
-        copy_id = self.plan["copy_id"]
-        retained_ledgers = self.plan["retained_ledger_sha256"]
+    def assert_handoff(self, observed, plan):
+        copy_id = plan["copy_id"]
+        retained_ledgers = plan["retained_ledger_sha256"]
         self.assertEqual(set(retained_ledgers), {"cutover", "store"}, "retained ledger digest scope")
         for digest in retained_ledgers.values():
             self.assertIsInstance(digest, str, "retained ledger digest")
             self.assertRegex(digest, r"^[0-9a-f]{64}\Z", "retained ledger digest")
         restored = observed["restored"]
-        self.assertEqual(restored["backup_id"], self.plan["backup_id"], "backup lineage")
+        self.assertEqual(restored["backup_id"], plan["backup_id"], "backup lineage")
         self.assertEqual(restored["copy_id"], copy_id, "restored copy")
 
         sequence = ("restored", "before", "forward", "undo", "after_undo")
@@ -38,18 +40,18 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
                             "rehearsal order")
         expected_phases = (
             ("before", "forward", "1.0", [], [], None),
-            ("forward", "undo", "1.1", [475, 479, 480, 481, 482], [478], self.plan["fence_0475"]),
-            ("after_undo", None, "1.0", [475], [], self.plan["fence_0475"]),
+            ("forward", "undo", "1.1", [475, 479, 480, 481, 482], [478], plan["fence_0475"]),
+            ("after_undo", None, "1.0", [475], [], plan["fence_0475"]),
         )
         for phase, next_phase, contract, cutover, store, fence in expected_phases:
             result = observed[phase]
             self.assertEqual(result["copy_id"], copy_id, f"{phase} evidence target")
             bot = {
-                "copy_id": copy_id, "role": "two_bot_runtime", "windows": self.plan["bot_windows"],
+                "copy_id": copy_id, "role": "two_bot_runtime", "windows": plan["bot_windows"],
             }
             web = {
                 "copy_id": copy_id, "role": "two_web_reader", "contract": contract,
-                "upcoming": self.plan["web_upcoming"],
+                "upcoming": plan["web_upcoming"],
             }
             if phase == "forward":
                 bot["attendance_windows"] = 0
@@ -71,7 +73,9 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
 
         undo = observed["undo"]
         self.assertEqual(undo["copy_id"], copy_id, "undo target")
-        self.assertEqual(undo["sha256"], self.plan["undo_sha256"], "selected schema inverse")
+        self.assertEqual(plan["undo_sha256"], sha256(INVERSE.read_bytes()).hexdigest(),
+                         "reviewed schema inverse digest")
+        self.assertEqual(undo["sha256"], plan["undo_sha256"], "selected schema inverse")
         self.assertEqual(undo["outcome"], "committed", "schema undo outcome")
         cleanup = observed["cleanup"]
         copy = cleanup["copy_readback"]
@@ -79,7 +83,7 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
         self.assertEqual(copy["state"], "absent", "copy absence")
         entries = cleanup["credential_readback"]
         self.assertEqual(entries["copy_id"], copy_id, "credential cleanup target")
-        self.assertEqual(entries["entries"], dict.fromkeys(self.plan["temporary_entries"], "absent"),
+        self.assertEqual(entries["entries"], dict.fromkeys(plan["temporary_entries"], "absent"),
                          "temporary entry absence")
         last_app_read = max(utc_time(observed["after_undo"][app]) for app in ("bot", "web"))
         for readback in (copy, entries):
@@ -93,12 +97,62 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
             parent = parent[key]
         parent[path[-1]] = value
         with self.subTest(path=path, reason=reason), self.assertRaisesRegex(AssertionError, reason):
-            self.assert_handoff(observed)
+            self.assert_handoff(observed, self.plan)
 
     def test_complete_handoff_matches_reviewed_inverse(self):
-        inverse = ROOT / "sql" / "release_schema_inverse.sql"
-        self.assertEqual(self.plan["undo_sha256"], sha256(inverse.read_bytes()).hexdigest())
-        self.assert_handoff(self.handoff)
+        self.assert_handoff(self.handoff, self.plan)
+
+    def test_fresh_restore_rejects_prior_role_and_cleanup_readbacks(self):
+        prior = self.handoff
+        self.assert_handoff(prior, self.plan)
+        current = deepcopy(prior)
+        plan = current.pop("plan")
+        plan.update(
+            backup_id="fixture-retry-backup",
+            copy_id="fixture-retry-restore",
+            temporary_entries=[f"{entry}-retry" for entry in plan["temporary_entries"]],
+        )
+        current["restored"]["backup_id"] = plan["backup_id"]
+        current["cleanup"]["credential_readback"]["entries"] = dict.fromkeys(plan["temporary_entries"], "absent")
+        readbacks = [
+            (phase, app, f"{phase} {app.capitalize()} readback", "readback precedes phase")
+            for phase in ("before", "forward", "after_undo") for app in ("bot", "web")
+        ] + [
+            ("cleanup", "copy_readback", "copy cleanup target", "cleanup order"),
+            ("cleanup", "credential_readback", "credential cleanup target", "cleanup order"),
+        ]
+        observations = [current[key] for key in ("restored", "before", "forward", "undo", "after_undo")]
+        observations.extend(current[section][key] for section, key, _, _ in readbacks)
+        for observation in observations:
+            observation["copy_id"] = plan["copy_id"]
+            observation["at"] = (utc_time(observation) + timedelta(hours=1)).strftime(UTC_FORMAT)
+
+        self.assert_handoff(current, plan)
+        with self.assertRaisesRegex(AssertionError, "backup lineage"):
+            self.assert_handoff(prior, plan)
+
+        for phase, reason in (("restored", "restored copy"), ("before", "before evidence target"),
+                              ("forward", "forward evidence target"), ("undo", "undo target"),
+                              ("after_undo", "after_undo evidence target")):
+            with self.subTest(phase=phase, stale="copy_id"):
+                replay = deepcopy(current)
+                replay[phase]["copy_id"] = prior[phase]["copy_id"]
+                with self.assertRaisesRegex(AssertionError, reason):
+                    self.assert_handoff(replay, plan)
+
+        # Keep the other fields current to exercise the copy and time checks independently.
+        for section, key, copy_reason, time_reason in readbacks:
+            for field, reason in (("copy_id", copy_reason), ("at", time_reason)):
+                with self.subTest(section=section, readback=key, stale=field):
+                    replay = deepcopy(current)
+                    replay[section][key][field] = prior[section][key][field]
+                    with self.assertRaisesRegex(AssertionError, reason):
+                        self.assert_handoff(replay, plan)
+
+        replay = deepcopy(current)
+        replay["cleanup"]["credential_readback"]["entries"] = prior["cleanup"]["credential_readback"]["entries"]
+        with self.assertRaisesRegex(AssertionError, "temporary entry absence"):
+            self.assert_handoff(replay, plan)
 
     def test_requires_distinct_app_role_observations_on_the_restored_copy(self):
         self.assert_refuses_change(("restored", "backup_id"), "other-backup", "backup lineage")
@@ -132,9 +186,8 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
             observed = deepcopy(self.handoff)
             for stage in ("plan", "before", "forward", "after_undo"):
                 observed[stage]["retained_ledger_sha256"][chain] = None
-            self.plan = observed["plan"]
             with self.subTest(chain=chain), self.assertRaisesRegex(AssertionError, "retained ledger digest"):
-                self.assert_handoff(observed)
+                self.assert_handoff(observed, observed["plan"])
 
     def test_requires_same_day_absence_of_copy_and_all_temporary_entries(self):
         prefix = ("cleanup", "copy_readback")
