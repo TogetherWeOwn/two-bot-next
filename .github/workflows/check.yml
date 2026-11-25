@@ -3271,6 +3271,9 @@ jobs:
           if docker image inspect "$IMAGE" > /dev/null 2>&1; then
             docker image rm "$IMAGE"
           fi
+      - name: Rehearse a finite synthetic predecessor writer (no network)
+        if: ${{ !cancelled() }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_predecessor_execution_boundary.py -v
 
   community-db:
     name: community db
