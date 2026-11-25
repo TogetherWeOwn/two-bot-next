@@ -259,10 +259,21 @@ class HelpEmbedSmokeTests(unittest.TestCase):
 
         fake = FakeDiscord()
         fake.next_id = snowflake(before_ms + 1)
-        code, _ = self.run_main(fake)
+
+        def advance_discord_clock(seconds):
+            fake.next_id += round(seconds * 1000) << 22
+
+        with (mock.patch.object(smoke, "make_transport", return_value=fake),
+              mock.patch.object(smoke.time, "sleep", side_effect=advance_discord_clock)):
+            code, _ = self.run_main(None)
         self.assertEqual(0, code)
         self.assertEqual({}, fake.messages)
         report = self.evidence_json()
+        self.assertEqual(
+            [snowflake(before_ms + 1 + 1100 * index) >> 22
+             for index in range(len(ROW_CONTRACTS))],
+            [int(row["message_id"]) >> 22 for row in report["rows"]],
+        )
 
         def check(*, pin=rollout, run_metadata=metadata, window=(attempt, ready),
                   finish=(certify_attempt, certify), rows=report,
