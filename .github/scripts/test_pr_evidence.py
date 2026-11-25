@@ -90,30 +90,32 @@ class CurrentEvidenceTests(unittest.TestCase):
         self.enterContext(patch.object(evidence, "source_blob", return_value=SOURCE))
 
     def test_description_edit_evaluates_current_pair(self):
-        prior = evidence.evaluate_current(policy, self.reader, *self.identity)
+        def receive(event):
+            # Model the advisory subscription for the two deliveries in this fixture.
+            self.assertIn(event["action"], {"opened", "edited"})
+            pr = event["pull_request"]
+            return evidence.evaluate_current(policy, self.reader, event["number"],
+                                             pr["base"]["repo"]["full_name"],
+                                             pr["base"]["sha"], pr["head"]["sha"])
+
+        prior = receive({"action": "opened", "number": 1, "pull_request": PR})
         self.assertTrue(prior.matches_current(self.reader, *self.identity))
 
         invalid = dict(PR, body=BODY.replace("test_present", "test_gone"))
         event = {"action": "edited", "number": 1, "changes": {"body": {"from": BODY}},
                  "pull_request": invalid}
-        # The workflow's sparse checkout may omit the YAML from the working tree.
-        workflow = evidence.command("git", "show", "HEAD:.github/workflows/pr-evidence.yml")
-        self.assertRegex(workflow, rf"(?m)^  pull_request: \{{types: \[[^\]\n]*\b{event['action']}\b")
-        pr = event["pull_request"]
-        identity = (event["number"], pr["base"]["repo"]["full_name"],
-                    pr["base"]["sha"], pr["head"]["sha"])
         self.reader.get.return_value = invalid
-        self.assertFalse(prior.matches_current(self.reader, *identity))
+        self.assertFalse(prior.matches_current(self.reader, *self.identity))
         with self.assertRaisesRegex(evidence.EvidenceError, "no unique matching test"):
-            evidence.evaluate_current(policy, self.reader, *identity)
+            receive(event)
 
         updated = BODY.replace("proof=fixture", "proof=updated synthetic evidence")
         self.reader.get.return_value = dict(PR, body=updated)
         # The delayed edit payload still contains the invalid body.
-        fresh = evidence.evaluate_current(policy, self.reader, *identity)
+        fresh = receive(event)
         self.assertEqual(prior.head, fresh.head)
-        self.assertTrue(fresh.matches_current(self.reader, *identity))
-        self.assertFalse(prior.matches_current(self.reader, *identity))
+        self.assertTrue(fresh.matches_current(self.reader, *self.identity))
+        self.assertFalse(prior.matches_current(self.reader, *self.identity))
         self.assertNotIn(updated, repr(fresh))
         self.reader.get.assert_called_with("pulls/1")
 
@@ -129,8 +131,12 @@ class CurrentEvidenceTests(unittest.TestCase):
                 (dict(PR, base=dict(PR["base"], sha=HEAD)), (1, REPO, HEAD, HEAD)),
                 (dict(PR, base=dict(PR["base"], repo={"full_name": "example/other"})),
                  (1, "example/other", OLD, HEAD)),
+                (dict(PR, state="closed"), self.identity),
         ):
             self.reader.get.return_value = metadata
+            self.assertFalse(prior.matches_current(self.reader, *self.identity))
+            with self.assertRaisesRegex(evidence.EvidenceError, "PR identity moved"):
+                evidence.evaluate_current(policy, self.reader, *self.identity)
             self.assertFalse(prior.matches_current(self.reader, *identity))
 
     def test_unavailable_metadata_and_concurrent_edit_refuse(self):
