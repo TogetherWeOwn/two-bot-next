@@ -3,16 +3,17 @@
 from hashlib import sha256
 from pathlib import Path
 import stat
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from test_predecessor_bundle import fixture, metadata, pack
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from materialize_predecessor import materialize_predecessor_bundle
 from predecessor_bundle import BUILD, IMAGE
 from staging_rollout import GateError
+from test_predecessor_bundle import fixture, metadata, pack
 
 
 class MaterializePredecessorTests(unittest.TestCase):
@@ -47,6 +48,15 @@ class MaterializePredecessorTests(unittest.TestCase):
             )
         self.assertEqual(list(self.output.iterdir()), [])
         self.assertFalse(archive.closed)
+
+    def test_cleans_output_when_consumer_raises(self):
+        _, materialization = self.materialize()
+        consumer_error = RuntimeError("synthetic consumer failure")
+        with self.assertRaises(RuntimeError) as raised, materialization as root:
+            self.assertTrue(root.is_dir())
+            raise consumer_error
+        self.assertIs(raised.exception, consumer_error)
+        self.assertEqual(list(self.output.iterdir()), [])
 
     def test_rejects_traversal_before_materializing(self):
         self.add_module("../../escape.js", b"escape")
