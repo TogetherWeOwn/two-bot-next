@@ -173,12 +173,13 @@ summary has no release-gate wiring.
 
 ### Recording endpoint-policy evidence
 
-Use the existing [execution card](production-deploy.md#watch-rows-one-per-finding-and-per-checkpoint).
+Use the `gateway` signal on the existing
+[execution card](production-deploy.md#watch-rows-one-per-finding-and-per-checkpoint).
 Reference the full reviewed revision and its verified serving identity (build ID,
 image digest, Container application and UTC window). The examples below are
 synthetic. Each row can be recorded as its evidence becomes available.
 
-| Signal | Example observation and disposition |
+| Evidence | Example observation and disposition |
 |---|---|
 | Gateway readiness | One planned IDENTIFY and one committed READY in the verified serving window. Record readiness as `observed` and deployed endpoint rejection as `unverified`. |
 | Endpoint policy coverage | The existing release reviewer confirmed passing hosted endpoint-policy regressions on the revision bound to this exact artifact. Record `verified in hosted tests` with the run/job and reviewer references. Cite [#2075](https://github.com/TogetherWeOwn/two-bot-next/pull/2075) for the original coverage. Deployed endpoint rejection remains `unverified`. |
