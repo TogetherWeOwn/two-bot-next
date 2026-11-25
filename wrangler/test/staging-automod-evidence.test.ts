@@ -87,7 +87,7 @@ test("rejects ambiguous, malformed, and oversized CLI input without echoing it",
   for (const invalid of [
     input.replace('"start":true', '"start":false,"st\\u0061rt":true'),
     'synthetic-evidence-credential',
-    Buffer.concat([Buffer.from(input), Buffer.from([0xff])]),
+    Buffer.concat([Buffer.from(input.slice(0, -1) + ',"ignored":"'), Buffer.from([0xff]), Buffer.from('"}')]),
     input.padEnd(4097, " "),
   ]) {
     const run = spawnSync(process.execPath, [cli], { input: invalid, encoding: "utf8" });
