@@ -301,7 +301,7 @@ function mockWebHandoff(inputs: ReturnType<typeof jobInputs>["inputs"]) {
   };
   const qualification = { ...structuredClone(soakReceipt), verdict: "qualified" };
   const match = {
-    matched: true, observed_at: new Date(now()).toISOString(), revision: dependencies.expectedRevision,
+    matched: true, observed_at: new Date(Date.now()).toISOString(), revision: dependencies.expectedRevision,
   };
   const reply = { status: 200, body: match as object };
   let reads = 0;
@@ -331,14 +331,16 @@ function mockWebHandoff(inputs: ReturnType<typeof jobInputs>["inputs"]) {
   }
   function enableCompanion() {
     reply.status = 200;
-    reply.body = match;
+    reply.body = { ...match, observed_at: new Date(Date.now()).toISOString() };
   }
   return { scopedInputs, qualification, soakReceipt, reply, readReady, complete, enableCompanion, readCount: () => reads };
 }
 
 test("qualified Web handoff reaches the existing mock proof with a fresh preflight", async (t) => {
   const { env, inputs, signed, calls, finish } = jobInputs(t);
-  t.mock.method(Date, "now", inputs.now);
+  // Earlier readbacks can be followed by a fresh qualification of the restored Worker.
+  let now = inputs.now() - 35 * 60_000;
+  t.mock.method(Date, "now", () => now);
   const web = mockWebHandoff(inputs);
   try {
     const webHandoff = await web.complete(t.signal);
@@ -349,6 +351,7 @@ test("qualified Web handoff reaches the existing mock proof with a fresh preflig
     });
     assert.equal(await runStagingVoiceMoveEntry({}, provider), "disabled");
     assert.equal(web.readCount(), 2);
+    now = inputs.now();
     web.enableCompanion();
     assert.equal(await runStagingVoiceMoveEntry(env, provider), "passed");
     assert.equal(web.readCount(), 3, "the proof reads its own current session");
@@ -386,11 +389,16 @@ test("Web handoff refuses stale qualification and cross-session or unconfirmed e
     const { qualification, soakReceipt, scopedInputs } = web;
     const evidence = { qualification, soakReceipt, webHandoff };
     const futureSample = { ...soakReceipt, sample: { ...soakReceipt.sample, observedAt: new Date(inputs.now() + 1).toISOString() } };
+    const staleSha = { ...soakReceipt, sha: "d".repeat(40) };
+    const differentVersion = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const wrongSampleWorker = { ...soakReceipt, sample: { ...soakReceipt.sample, workerVersion: differentVersion } };
+    const wrongWorker = { ...soakReceipt, workerVersion: differentVersion };
     for (const [label, change] of Object.entries({
       "missing soak receipt": { soakReceipt: undefined },
       "soak receipt without a terminal decision": { qualification: soakReceipt },
-      "stale Web SHA": { soakReceipt: { ...soakReceipt, sha: "d".repeat(40) } },
-      "different Worker": { soakReceipt: { ...soakReceipt, workerVersion: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" } },
+      "stale Web SHA": { soakReceipt: staleSha, qualification: { ...staleSha, verdict: "qualified" } },
+      "different Worker": { soakReceipt: wrongWorker, qualification: { ...wrongWorker, verdict: "qualified" } },
+      "different sample Worker": { soakReceipt: wrongSampleWorker, qualification: { ...wrongSampleWorker, verdict: "qualified" } },
       "superseded soak": { soakReceipt: { ...soakReceipt, status: "superseded" } },
       "different E2E run": { soakReceipt: { ...soakReceipt, e2eRunId: soakReceipt.e2eRunId + 1 } },
       "different sample": { soakReceipt: { ...soakReceipt, sample: { ...soakReceipt.sample, requests: 51 } } },
