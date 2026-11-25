@@ -7,7 +7,6 @@ const CA: &str = concat!(
     "/../../tests/event_write_cutoff/fixtures/recorder-ca.der"
 );
 const SIGNING: &str = "rehearsal:synthetic-efefefefefefefefefefefefefefefefefefefefefefefef";
-
 fn config() -> Config {
     Config {
         discord_token: Some(Secret::new(format!("synthetic-{}", "ab".repeat(24)))),
@@ -46,10 +45,8 @@ fn fixture_rejects_external_network_and_non_fixture_database() {
     assert!(verify_config(&cfg, &bind, SIGNING, []).is_ok());
     let url = cfg.database_url.as_ref().unwrap().expose();
     cfg.database_url = Some(Secret::new(format!("{url}&host=192.0.2.1")));
-    assert_eq!(
-        verify_config(&cfg, &bind, SIGNING, []),
-        Err("rehearsal_database_invalid")
-    );
+    let error = verify_config(&cfg, &bind, SIGNING, []).unwrap_err();
+    assert_eq!(error, "rehearsal_database_invalid");
 }
 
 #[test]
@@ -72,6 +69,9 @@ fn fixture_rejects_ordinary_credentials_and_non_loopback_receiver() {
 
 #[tokio::test]
 async fn verified_fixture_binds_and_drains_the_shared_receiver() {
+    let _flags = internal_action_http::tests::MODERATION_FLAG_LOCK
+        .lock()
+        .await;
     crate::gateway::ensure_crypto_provider();
     let root = Path::new(CA);
     assert!(fixture_connector(root.parent().unwrap()).is_none());

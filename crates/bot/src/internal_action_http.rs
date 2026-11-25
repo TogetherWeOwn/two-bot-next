@@ -3721,7 +3721,7 @@ pub(crate) static MODERATION_METRICS_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 #[path = "internal_action_envelope_tests.rs"]

@@ -1,11 +1,10 @@
 //! Receiver-only entry point for the disposable installed-binary fixture.
 
+use crate::internal_action_http::{self, ReceiverMode};
 use std::{ffi::OsString, fs, io::Read, path::Path, sync::Arc};
 use tokio::sync::{watch, RwLock};
 use two_bot_core::{database_tls::TlsPolicy, internal_action_config::InternalActionConfig, Config};
 use two_bot_discord::internal_actions::RehearsalAnnouncementConnector as Connector;
-
-use crate::internal_action_http::{self, ReceiverMode};
 
 pub(crate) async fn serve(args: &[String]) -> Result<(), &'static str> {
     if !args.is_empty() {
