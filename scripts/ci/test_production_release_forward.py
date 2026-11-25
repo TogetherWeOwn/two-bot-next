@@ -115,10 +115,13 @@ class ReleaseForwardTests(unittest.TestCase):
                    "OWNERSHIP_CONTROL_TOKEN": "fixture", "CLOUDFLARE_ACCOUNT_ID": "fixture",
                    "CLOUDFLARE_API_TOKEN": "fixture"}
             with (patch.object(release, "release_context", return_value=(pin, run, "123", plan, artifact)),
-                  patch.object(release, "check_url"), patch.object(release, "control_client"),
+                  patch.object(release, "check_url"), patch.object(release, "control_client") as control,
+                  patch.object(release, "require_unused_attendance_plan") as unused,
                   patch.object(release, "read_status") as observe,
                   patch.object(release, "RollbackClient") as provider):
                 self.assertEqual(release.main(["prepare"], env), 1)
+            unused.assert_not_called()
+            control.assert_not_called()
             observe.assert_not_called()
             provider.assert_not_called()
 
