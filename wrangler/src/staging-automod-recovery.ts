@@ -1,6 +1,7 @@
 import { isSnowflake } from "./container-env.ts";
 import type { admitStagingAutomod } from "./staging-automod.ts";
-import { AUTOMOD_STAGING_PURPOSE, MAX_STAGING_USE_MS, type StagingUse } from "./staging-use-window.ts";
+import type { StagingUse } from "./staging-lifecycle.ts";
+import { AUTOMOD_STAGING_PURPOSE, MAX_STAGING_USE_MS } from "./staging-use-window.ts";
 
 const KEY = "two-bot:staging-automod-recovery:v1";
 const RESERVATION_KEY = "two-bot:staging-automod-reservation:v1";

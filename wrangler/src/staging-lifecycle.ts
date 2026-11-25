@@ -1,13 +1,30 @@
 import { OwnershipRefused, type OwnerRecord } from "./ownership.ts";
 import { StagingAutomodRecovery } from "./staging-automod-recovery.ts";
-import { AUTOMOD_STAGING_PURPOSE, MAX_STAGING_USE_MS, type StagingUse, type StagingWindow } from "./staging-use-window.ts";
+import { AUTOMOD_STAGING_PURPOSE, MAX_STAGING_USE_MS } from "./staging-use-window.ts";
 
-export { AUTOMOD_STAGING_PURPOSE, MAX_STAGING_USE_MS, type StagingUse, type StagingWindow } from "./staging-use-window.ts";
+export { AUTOMOD_STAGING_PURPOSE, MAX_STAGING_USE_MS } from "./staging-use-window.ts";
 
 export const STAGING_USE_PATH = "/internal/staging-use";
 export const STAGING_USE_KEY = "two-bot:staging-use:v1";
 export const VOICE_MOVE_LEASE_HEADER = "x-two-voice-move-until";
 const USED_PREFIX = "two-bot:staging-use-ended:v1:";
+
+export interface StagingWindow {
+  environment: "staging";
+  runId: string;
+  runAttempt: number;
+  expiresAt: number;
+}
+
+export interface StagingUse extends StagingWindow {
+  deploymentId: string;
+  sha: string;
+  epoch: number;
+  acquiredAt: number;
+  phase: "preparing" | "active" | "released";
+  voiceMove?: true;
+  purpose?: typeof AUTOMOD_STAGING_PURPOSE;
+}
 
 export interface StagingIdentity {
   deploymentId: string;
