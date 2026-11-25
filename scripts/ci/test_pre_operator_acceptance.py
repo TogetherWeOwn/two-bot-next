@@ -203,11 +203,13 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
         retained = RegistryReadback(EXPIRED, reservation.reference, reservation.reference in present_refs)
         registry = RegistryCleanupEvidence(provider.inventory(EXPIRED), retained, now + 1,
                                            provider.run_status(EXPIRED), True)
+        other_repository = reservation.reference.replace(f"/{EXPIRED.scope}/", "/retained/")
         for change, reason in (
             ({}, "pre_registry_cleanup_unproved"),
             ({"present": None}, "unconfirmed_pre_registry_readback"),
             ({"target": SIBLING, "present": False}, "wrong_pre_registry_scope"),
             ({"reference": sibling_reference, "present": False}, "wrong_pre_registry_scope"),
+            ({"reference": other_repository, "present": False}, "wrong_pre_registry_scope"),
         ):
             with self.subTest(change=change), self.assertRaisesRegex(ProofError, f"^{reason}$"):
                 accept(reservation, self.build, **(evidence | {
