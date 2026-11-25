@@ -177,9 +177,7 @@ exact head; this worker cannot compile `ring`/`rustls` locally.
 
 ## Optional operator handoff report
 
-The offline report prints advisory JSON. Exit 0 confirms output. Use the protected workflow for release decisions.
-
-In `handoff.json`, set `expected` to the verified serving window with these fields:
+The offline report prints advisory JSON. Exit 0 confirms output. In `handoff.json`, set `expected` to the verified serving window.
 
 - `environment` (`staging` or `production`) and `build_revision`, `build_id`, `deploy_id` from `/readyz`. Production binaries retain their original staging deploy stamp.
 - `image_digest` (the manifest digest including `sha256:`), `worker_version` and `application_id` (UUIDs), `start` and `end` (UTC with `Z` or a zero offset, preserving fractions).
@@ -189,17 +187,17 @@ Include an entry only when existing evidence independently ties those bytes to t
 
 ```sh
 python3 scripts/t0_acceptance_report.py --handoff handoff.json \
-  --help-report help-embed-synthetic.json \
-  --naming-report staging-voice-naming-evidence.json \
+  --help-report help.json --naming-report staging-voice-naming-evidence.json \
   --gateway-report passive-gateway-summary.json
 ```
 
-- **Help.** Use the saved Help report and #2463's staging-window check for branding readbacks and deletions. Production needs its own authorized observations.
-- **Naming.** Use the #2464 fixture report for same-room occupied, empty before cleanup, and occupied-again readbacks. Record creator-rename HTTP 403 separately. Production needs its own authorized observations.
+- **Help.** Use the saved Help report and #2463's staging-window check for branding readbacks and deletions.
+- **Naming.** Use the #2464 fixture report for same-room occupied, empty before cleanup, and occupied-again readbacks. Record creator-rename HTTP 403 separately.
 - **Gateway.** Use #2467's passive summary with its verified application and single-image window. Only committed READY or RESUMED indicates observed readiness. Endpoint denial needs explicit passive evidence. See #2075 for separate hosted checkpoint coverage.
 
-Omit a file flag when an observation is missing. Invalid or unattributed evidence is `unverified`.
-Different bytes or windows are `mismatched`. A bare gateway summary can also flag a revision, service, window, or build conflict. An `attributed` row can still show failure or an unobserved signal.
+Record authorized production Help and naming on the [execution card](production-deploy.md#watch-rows-one-per-finding-and-per-checkpoint). The report leaves those production rows unverified.
+Omit missing files. Invalid or unattributed evidence is `unverified`.
+Different bytes or windows are `mismatched`. A bare gateway summary can flag a revision, service, window, or build conflict. An `attributed` row can still show failure or an unobserved signal.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p test_t0_acceptance_report.py -v

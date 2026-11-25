@@ -87,11 +87,12 @@ class T0AcceptanceReportTests(unittest.TestCase):
                     "gateway": self.save("gateway", GATEWAY, other_build)}
         rows = self.run_report(bindings)
         self.assertEqual(rows["help"]["status"], "attributed")
-        self.assertEqual(rows["gateway"]["status"], "mismatched")
-        self.assertEqual(rows["gateway"]["fields"], ["build_id", "deploy_id", "image_digest"])
+        self.assertEqual((rows["gateway"]["status"], rows["gateway"]["fields"]),
+                         ("mismatched", ["build_id", "deploy_id", "image_digest"]))
         self.assertEqual((rows["naming"]["status"], rows["naming"]["fields"]), ("mismatched", ["start", "end"]))
         self.assertNotIn("signals", rows["gateway"])
-        self.assertEqual(self.run_report(bindings, other_build)["gateway"]["signals"], GATEWAY["signals"])
+        rows = self.run_report(bindings, other_build)
+        self.assertEqual((rows["help"]["status"], rows["gateway"]["signals"]), ("mismatched", GATEWAY["signals"]))
         self.assertEqual(self.run_report(bindings, other_window)["naming"]["status"], "attributed")
 
     def test_utc_spellings_preserve_fractional_window_differences(self):
@@ -155,7 +156,8 @@ class T0AcceptanceReportTests(unittest.TestCase):
         reconnect = dict(dict.fromkeys(GATEWAY["signals"], 0), gateway_reconnect_failed=1)
         gateway = self.save("gateway", dict(GATEWAY, signals=reconnect))
         rows = self.run_report({"naming": naming, "gateway": gateway})
-        self.assertEqual(rows["naming"]["missing_transitions"], ["occupied-room-return"])
+        self.assertEqual((rows["naming"]["result"], rows["naming"]["missing_transitions"]),
+                         ("not_observed", ["occupied-room-return"]))
         self.assertEqual(rows["gateway"]["readiness"], "not_observed")
         self.assertIn("readiness_needed", rows["gateway"])
         self.save("gateway", {"verdict": "stale_evidence"})
