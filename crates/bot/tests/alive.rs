@@ -51,6 +51,7 @@ type Logs = Arc<Mutex<String>>;
 
 fn fixture_token(schema: &str) -> String {
     // Send admission is database-wide, even across different search paths.
+    // A force-killed holder can occupy the lane for its 60-second lease.
     // Keep one synthetic identity per fixture and reuse it on restart.
     format!("alive-synthetic-token-{schema}")
 }
@@ -830,6 +831,7 @@ async fn lifecycle(
     let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = reserved.local_addr().unwrap();
     drop(reserved);
+    let authorization = format!("Bot {}", fixture_token(&db.schema));
     // Registry-sync requests consumed by the per-boot assertion below.
     let mut consumed = 0usize;
     for boot in 0..2 {
@@ -882,6 +884,11 @@ async fn lifecycle(
             );
             &fresh[fresh.len() - 3..]
         };
+        assert!(
+            sync.iter()
+                .all(|request| request.header("authorization") == Some(authorization.as_str())),
+            "registry sync must use the fixture's synthetic identity on both boots"
+        );
         let bootstrap_identity = &sync[0];
         assert_eq!(bootstrap_identity.method, "GET");
         assert_eq!(bootstrap_identity.path, "/api/v10/applications/@me");
