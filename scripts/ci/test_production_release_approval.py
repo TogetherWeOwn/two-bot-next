@@ -79,6 +79,28 @@ class AttendanceApprovalHistoryTests(unittest.TestCase):
         with self.assertRaises(GateError):
             self.verify()
 
+    def test_refuses_unstamped_rerun_with_skipped_first_attempt(self):
+        self.history(self.current, run(202, 5, display_title="deploy-production", status="completed", run_attempt=2))
+        self.api_rows[JOBS] = {"total_count": 1, "jobs": [
+            job(501, "Production release / Prepare and stop the prior pair", "skipped"),
+        ]}
+        with self.assertRaisesRegex(GateError, "production_attendance_history_incomplete"):
+            self.verify()
+
+    def test_refuses_unproved_legacy_job_inventory(self):
+        legacy = run(202, 5, display_title="deploy-production", status="completed")
+        guard = job(501, "guard", "success")
+        self.history(self.current, {**legacy, "status": "in_progress"})
+        with self.assertRaises(GateError):
+            self.verify()
+
+        self.history(self.current, legacy)
+        for jobs, total in (([], 0), ([guard], 2), ([guard, guard], 2),
+                            ([job(i, "ordinary job", "success") for i in range(501, 532)], 31)):
+            with self.subTest(rows=len(jobs), total=total), self.assertRaises(GateError):
+                self.api_rows[JOBS] = {"total_count": total, "jobs": jobs}
+                self.verify()
+
     def test_refuses_wrong_producer_or_current_attempt(self):
         for fields in ({"artifact_id": True}, {"archive_digest": "a" * 64}, {"run_id": False}):
             with self.subTest(producer=fields), self.assertRaises(GateError):

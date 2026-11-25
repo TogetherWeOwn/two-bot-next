@@ -45,9 +45,9 @@ def inventory(api, path, key):
 
 
 def require_legacy_non_attempt(api, run):
-    # Older runs shared the default title. First-attempt job metadata must show
-    # that no attendance job ran. A canceled or unidentifiable job is ambiguous.
-    require(run.get("status") == "completed", INCOMPLETE)
+    # Older runs shared the default title. A single completed attempt's jobs
+    # must show that no attendance job ran. Reruns and unproved jobs refuse.
+    require(run.get("status") == "completed" and run["run_attempt"] == 1, INCOMPLETE)
     jobs = inventory(api, f"actions/runs/{run['id']}/attempts/1/jobs?per_page={HISTORY_LIMIT}", "jobs")
     require(bool(jobs), INCOMPLETE)
     seen = set()
@@ -66,10 +66,11 @@ def require_unused_attendance_plan(api, producer, release_attempt):
 
     Pass authenticated_plan's artifact metadata and production_recovery_artifact's
     current_run record after verifying the bound approval. The protected workflow
-    must stamp ATTENDANCE_TITLE plus its release_plan_run_id at dispatch, before
-    any attendance work. A matching dispatch consumes the producer as a whole,
-    including when it fails before writing a receipt. Call before stopping the
-    writer, using complete retained GitHub history for the approval window.
+    must limit attendance work to main workflow_dispatch runs on attempt 1 and
+    stamp ATTENDANCE_TITLE plus its release_plan_run_id at dispatch. A matching
+    dispatch consumes the producer as a whole, including when it fails before
+    writing a receipt. Call before stopping the writer, using complete retained
+    GitHub history for the approval window.
     """
     producer = mapping(producer)
     producer_id = producer.get("run_id")
