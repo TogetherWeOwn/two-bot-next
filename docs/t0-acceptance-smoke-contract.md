@@ -237,12 +237,15 @@ python3 scripts/t0_acceptance_report.py --handoff handoff.json \
   are counted separately. Endpoint denial needs explicit passive evidence.
   The hosted checkpoint exercise in #2075 covers that path separately.
 
-Omit a file flag for a missing observation. A bare or invalid source remains
-`unverified`. Different observation bytes, build stamps, or window bounds
-are `mismatched`. An `attributed` row identifies the matching window and
-can still show a failed probe or an unobserved signal. The output contains
-no combined pass verdict. Rerun the focused synthetic examples for mixed
-same-SHA builds and windows, missing observations, and unattributed inputs.
+Omit a file flag for a missing observation. Invalid evidence or missing
+attribution leaves an observation `unverified`. Different observation bytes,
+build stamps, or window bounds are `mismatched`. A bare gateway summary can
+also report a mismatch if it names a different revision or the passive
+validator flagged a different service, stale window, or build conflict. An
+`attributed` row identifies the matching window and can still show a failed
+probe or an unobserved signal. The output contains no combined pass verdict.
+Rerun the focused synthetic examples for mixed same-SHA builds and windows,
+missing observations, and unattributed inputs.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p test_t0_acceptance_report.py -v
