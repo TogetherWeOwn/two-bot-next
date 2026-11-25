@@ -177,6 +177,36 @@ expiry in protected status for the same run, attempt, expiry, deployment and SHA
 Live qualification needs a signer bound to the dedicated account's own Web session and two dedicated staging
 voice channels with verifiable Connect permissions and occupancy.
 
+The [offline self-move preflight](../wrangler/scripts/staging-voice-move-acceptance.mjs)
+checks the fixture before the acceptance runner can dispatch a move. Its
+`preflightVoiceMoveAcceptance` export takes the following inputs with `enabled: true`.
+
+- `fixture` pins `environment: "staging"`, the guild and dedicated member
+  (`guildId`, `discordId`), and `channelIds` in source-then-destination order.
+- `lease` pins `runId`, `runAttempt`, `expiresAt`, `sha`, `deploymentId` and
+  `epoch` from the protected window. `ready` is its unmodified ready receipt.
+- `evidence.session` projects the Web signer's staging session and configured
+  channel pair. Use `environment: "staging"`, `authenticated: true`,
+  `action: "voice.move_member"`, `discordId`, `channelIds` and `observedAt`.
+- `evidence.readback.source` and `.destination` come from Discord independently
+  of the Web signer and the Bot's move response. Each provides `guildId`,
+  `discordId`, `channelId`, `channelType` (`2` for guild voice),
+  `connectedChannelId`, `canConnect` and `observedAt`. The member starts in the
+  source. Effective Connect is denied there and allowed in the destination.
+- `evidence.previousReady` and `evidence.previousOff` are the ready and final
+  status receipts from an earlier protected lease verification on the same
+  SHA, deployment and epoch. That exact earlier lease must be released or
+  expired, OFF and stopped within 15 minutes before the current acquisition.
+
+Use UTC ISO timestamps with milliseconds for `observedAt`. Current ready,
+session and Discord readbacks must be at most 60 seconds old and belong to
+the current lease window. Keep fixture IDs and readbacks in the protected
+operator context. Supply only projected facts. The preflight checks the
+consistency of trusted readbacks offline and returns a verdict with a fixed
+failure code on refusal. The protected Web caller verifies the signed session
+at dispatch. The runner rechecks lease and Discord observations for each case
+and still requires OFF and stopped for its own window.
+
 Attaching the executor gives all signed verbs a five-second nonce deadline. The guild turn
 ends at adapter settlement. The child holds capacity through the audit, with up to five
 seconds beyond the wire deadline. An audit failure or timeout is logged as unconfirmed.
