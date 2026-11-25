@@ -725,9 +725,27 @@ Protected cleanup continues to require fresh remote drain and stopped
 readbacks before releasing the lease.
 
 The dormant private caller uses the stored scope for startup and releases
-the lease on durable same-lease cleanup completion. Live qualification still
-needs the
-authenticated workflow entry, native expiry and restart recovery, a way to
+the lease on durable same-lease cleanup completion. The dormant job adapter
+accepts a bounded, decoded `action` and `issuedLease` request. It checks the
+approved application and guild, exact action and original finite lease before
+handing off to the caller. The caller checks the current owner, stored lease and
+journal under the Container gate. Startup requires an unexpired lease. Recovery
+can use the expired original lease with fresh same-lease cleanup authority or
+durable completion. The versioned job receipt carries a timestamp, verdict and
+scoped lease metadata for admitted requests. The job must treat a failed verdict
+as failure. A recovery pass means cleanup and lease retirement were confirmed.
+
+The remaining authentication boundary lies between the protected GitHub
+`staging` job and the private in-process Container caller. The future transport
+must authenticate the protected job and derive approval independently of the
+request body. Bind the allowed action to the job run and attempt, the approved
+staging application and guild, and the exact issued deployment, build and owner
+epoch. Supply the original issued lease from the protected authority and bind
+the invocation to that Container. The receipt is evidence for the job summary
+or artifact. Authority stays with the protected job and Worker checks. Only the
+synthetic test invokes the adapter today.
+
+Live qualification also needs native expiry and restart recovery, a way to
 retire an unused reservation before intent, an isolated runtime adapter and
 authoritative remote drain and stopped readbacks. A lost receipt with a command
 still present needs separately proven attribution or independently verified
