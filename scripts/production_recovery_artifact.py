@@ -12,6 +12,7 @@ WORKFLOW = ".github/workflows/deploy-production.yml"
 REPO_ID = 1396224242
 ARTIFACT = "production-release-inverse"
 FORWARD_ARTIFACT = "production-release-forward"
+STOP_INTENT_ARTIFACT = "production-release-stop-intent"
 FORWARD_JOB = "Production release / Apply the approved schema"
 FORWARD_STEPS = ("Apply the protected forward transaction", "Upload the verified forward result")
 JOB = "Production release / Recover production schema / Apply or reconcile the protected inverse"
@@ -45,7 +46,24 @@ def current_run(env, api=github):
     return run
 
 
-def protected_job(run, api, name, expected_steps):
+def interrupted_origin(origin_run_id, current_run_id, api=github):
+    """Read terminal attempt-one identity before authenticating its stop intent."""
+    require(isinstance(origin_run_id, str) and RUN_ID.fullmatch(origin_run_id)
+            and origin_run_id != current_run_id, "production_interrupted_origin_invalid")
+    origin = mapping(api(f"actions/runs/{origin_run_id}"))
+    run_identity(origin, WORKFLOW, "workflow_dispatch")
+    actor_id = mapping(origin.get("actor")).get("id")
+    require(type(origin.get("id")) is int and origin["id"] == int(origin_run_id)
+            and type(origin.get("run_attempt")) is int and origin["run_attempt"] == 1
+            and origin.get("status") == "completed" and origin.get("conclusion") in ("failure", "cancelled")
+            and all(mapping(origin.get(key)).get("id") == REPO_ID for key in ("repository", "head_repository"))
+            and type(actor_id) is int and actor_id > 0 and actor_id != APP_BOT_ID
+            and mapping(origin.get("triggering_actor")).get("id") == actor_id,
+            "production_interrupted_origin_invalid")
+    return origin
+
+
+def attempt_job(run, api, name):
     jobs = mapping(api(f"actions/runs/{run['id']}/attempts/1/jobs?per_page=30"))
     rows = sequence(jobs.get("jobs"))
     require(jobs.get("total_count") == len(rows) <= 30, "production_inverse_job_inventory_invalid")
@@ -53,20 +71,31 @@ def protected_job(run, api, name, expected_steps):
     require(len(protected) == 1, "production_inverse_job_missing_or_ambiguous")
     job = protected[0]
     require(job.get("run_id") == run["id"] and type(job.get("run_attempt")) is int and job["run_attempt"] == 1
-            and job.get("head_sha") == run["head_sha"] and job.get("status") == "completed"
-            and job.get("conclusion") == "success", "production_inverse_job_invalid")
+            and job.get("head_sha") == run["head_sha"] and job.get("status") == "completed",
+            "production_inverse_job_invalid")
+    return job
+
+
+def protected_job(run, api, name, expected_steps):
+    job = attempt_job(run, api, name)
+    require(job.get("conclusion") == "success", "production_inverse_job_invalid")
     steps = [step for step in sequence(job.get("steps")) if mapping(step).get("name") in expected_steps]
     require([(step.get("name"), step.get("status"), step.get("conclusion")) for step in steps]
             == [(step, "completed", "success") for step in expected_steps],
             "production_inverse_step_invalid")
 
 
-def authentic_document(run, artifact, artifact_id, archive_sha, api):
-    require(RUN_ID.fullmatch(artifact_id) and HEX.fullmatch(archive_sha),
-            "production_inverse_artifact_pin_invalid")
+def artifact_entries(run, api):
     listing = mapping(api(f"actions/runs/{run['id']}/artifacts?per_page=30"))
     rows = sequence(listing.get("artifacts"))
     require(listing.get("total_count") == len(rows) <= 30, "production_inverse_artifact_inventory_invalid")
+    return [mapping(row) for row in rows]
+
+
+def authentic_document(run, artifact, artifact_id, archive_sha, api):
+    require(RUN_ID.fullmatch(artifact_id) and HEX.fullmatch(archive_sha),
+            "production_inverse_artifact_pin_invalid")
+    rows = artifact_entries(run, api)
     name, digest = f"{artifact}-{run['id']}-1", f"sha256:{archive_sha}"
     candidates = [row for row in rows if mapping(row).get("name") == name or row.get("id") == int(artifact_id)]
     require(len(candidates) == 1, "production_inverse_artifact_missing_or_ambiguous")

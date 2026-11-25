@@ -7,16 +7,19 @@ import re
 from ci.production_migrate_claim import WORKFLOW_PATH
 from production_migrate_approval import ARTIFACT, stable_plan, verify_check, verify_environment
 from rollback_proof import moment
-from production_recovery_artifact import protected_job
+from production_recovery_artifact import (STOP_INTENT_ARTIFACT, artifact_entries, attempt_job, authentic_document,
+                                          current_run, interrupted_origin, protected_job)
 from production_recovery_takeover import HEX, RUN_ID, SHA, UUID
 from production_release_forward import forward_receipt, ledger_endpoints
 from staging_migrate_approval import digest_json
 from staging_recovery_status import DIGEST, authenticated_plan, github, matches
-from staging_rollout import mapping, require
+from staging_rollout import mapping, require, sequence
 
 NAMESPACE = re.compile(r"[0-9a-f]{32}")
 PREPARE_JOB = "Production release / Prepare and stop the prior pair"
 PREPARE_STEPS = ("Verify forward release preflight", "Confirm the exact stopped writer")
+STOP_INTENT_STEP = "Retain the exact recovery stop intent"
+STOP_INTENT_STEPS = (PREPARE_STEPS[0], STOP_INTENT_STEP, PREPARE_STEPS[1])
 
 
 @dataclass(frozen=True)
@@ -87,16 +90,28 @@ def prepared_epoch(pin, run, plan_id, stopped):
     return epoch
 
 
-def approved_plan(pin, run, plan_id, target, api=github):
+def _plan_for_target(pin, run, plan_id, matches_target, api):
     require(matches(RUN_ID, plan_id) and plan_id != str(run["id"]), "production_forward_plan_changed")
     plan, artifact = authenticated_plan(plan_id, api, workflow=WORKFLOW_PATH, artifact_name=ARTIFACT)
     require(plan.get("mode") == "plan" and plan.get("migration_target") == "production"
-            and plan.get("role") == "two_bot_migrator_ro" and plan.get("target") == target
+            and plan.get("role") == "two_bot_migrator_ro"
+            and matches_target(plan.get("target"))
             and plan.get("source_sha") == pin.candidate_sha
             and plan.get("recovery_evidence_ref") == pin.recovery_reference(),
             "production_forward_plan_changed")
     ledger_endpoints(plan)
     verify_environment(api)
+    return plan, artifact
+
+
+def bound_plan(pin, run, plan_id, target_fingerprint, api=github):
+    """Authenticate the plan identity used by the current protected attempt."""
+    return _plan_for_target(pin, run, plan_id, lambda target: matches(HEX, target_fingerprint)
+                            and digest_json(mapping(target)) == target_fingerprint, api)
+
+
+def approved_plan(pin, run, plan_id, target, api=github):
+    plan, artifact = _plan_for_target(pin, run, plan_id, lambda planned: planned == target, api)
     _, approved_at = verify_check(
         api, run, f"production-apply:{plan_id}:{artifact['archive_digest'].removeprefix('sha256:')}",
         datetime.now(timezone.utc),
@@ -104,6 +119,50 @@ def approved_plan(pin, run, plan_id, target, api=github):
     require(moment(api(f"actions/runs/{plan_id}").get("created_at")) <= approved_at,
             "independent_production_approval_stale")
     return plan, artifact
+
+
+def stop_intent(pin, run, plan_id, plan, artifact, epoch):
+    return {"operation": STOP_INTENT_ARTIFACT, "pin": asdict(pin), "epoch": epoch,
+            "run_id": str(run["id"]), "run_attempt": 1, "plan_run_id": plan_id,
+            "plan_archive_sha256": artifact["archive_digest"],
+            "target_fingerprint": digest_json(mapping(plan["target"]))}
+
+
+def interrupted_release_context(env, api=github):
+    """Authenticate the original, durable stop intent without a forward result."""
+    current = current_run(env, api)
+    origin = interrupted_origin(env.get("RELEASE_RECOVERY_RUN_ID"), str(current["id"]), api)
+    if origin["head_sha"] != current["head_sha"]:
+        compare = mapping(api(f"compare/{origin['head_sha']}...{current['head_sha']}"))
+        require(compare.get("status") == "ahead"
+                and mapping(compare.get("merge_base_commit")).get("sha") == origin["head_sha"],
+                "production_interrupted_origin_not_ancestor")
+    job = attempt_job(origin, api, PREPARE_JOB)
+    require(job.get("conclusion") in ("success", "failure", "cancelled"),
+            "production_interrupted_stop_producer_invalid")
+    steps = [step for step in sequence(job.get("steps")) if mapping(step).get("name") in STOP_INTENT_STEPS]
+    require(tuple(step["name"] for step in steps) == STOP_INTENT_STEPS
+            and all(step.get("status") == "completed" for step in steps)
+            and all(step.get("conclusion") == "success" for step in steps[:2])
+            and steps[-1].get("conclusion") in ("success", "failure", "cancelled"),
+            "production_interrupted_stop_steps_invalid")
+
+    name = f"{STOP_INTENT_ARTIFACT}-{origin['id']}-1"
+    candidates = [entry for entry in artifact_entries(origin, api) if entry.get("name") == name]
+    require(len(candidates) == 1, "production_interrupted_stop_intent_missing_or_ambiguous")
+    entry = candidates[0]
+    require(type(entry.get("id")) is int and matches(DIGEST, entry.get("digest")),
+            "production_interrupted_stop_intent_invalid")
+    intent = authentic_document(origin, STOP_INTENT_ARTIFACT, str(entry["id"]),
+                                entry["digest"].removeprefix("sha256:"), api)
+    pin = ReleasePreflight(**mapping(intent.get("pin")))
+    plan_id, fingerprint, epoch = intent.get("plan_run_id"), intent.get("target_fingerprint"), intent.get("epoch")
+    require(pin.workflow_sha == origin["head_sha"] and type(epoch) is int and 0 < epoch < 2**53 - 4,
+            "production_interrupted_stop_intent_invalid")
+    plan, artifact = bound_plan(pin, origin, plan_id, fingerprint, api)
+    require(type(intent.get("run_attempt")) is int and intent == stop_intent(pin, origin, plan_id, plan, artifact, epoch),
+            "production_interrupted_stop_intent_invalid")
+    return pin, origin, plan_id, plan, artifact, epoch + 1
 
 
 def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_database, api=github):
