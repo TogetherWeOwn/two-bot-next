@@ -263,6 +263,7 @@ class ImmutablePromotionIntakeTests(PromotionFixture):
         workflow_sha = "e" * 40
         with patch.multiple(sys.modules[__name__], ATTEMPT=1, BUILD="501-1", NAME="bot-promotion-501-1"):
             self.github.run.update(run_attempt=1, head_sha=workflow_sha, event="workflow_dispatch",
+                                   path=".github/workflows/deploy-staging.yml@refs/heads/main",
                                    display_title=f"reviewed staging source {SHA}")
             run = self.github.run
             self.assertEqual(self.certify(), 0)

@@ -25,6 +25,7 @@ Output (stdout), newest line last:
   {"schema_version": 1,
    "service": "<application id>",
    "window": {"start": "...Z", "end": "...Z"},
+   "contains": <true when a message filter was supplied>,
    "limit": 100,
    "event_count": <lines kept>,
    "possibly_truncated": <true when the query returned exactly `limit` lines>,
@@ -91,6 +92,7 @@ TOKEN_RE = re.compile(r"[\x21-\x7e]{20,200}")
 INSTANT_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 CONTAINS_RE = re.compile(r"[\x20-\x7e]{1,%d}" % MAX_CONTAINS)
 RUN_ID_RE = re.compile(r"[0-9]{10,20}-[0-9]{1,6}")
+BUILD_SHA_RE = re.compile(r"[0-9a-f]{40}")
 # The two calls the transport will send; anything else is refused before the socket.
 ACCOUNTS_PATH_RE = re.compile(r"/accounts")
 QUERY_PATH_RE = re.compile(r"/accounts/[0-9a-f]{32}/workers/observability/telemetry/query")
@@ -100,7 +102,7 @@ QUERY_PATH_RE = re.compile(r"/accounts/[0-9a-f]{32}/workers/observability/teleme
 FIELD_KEYS = (
     "msg", "target", "run_id", "error_class", "startup_phase", "phase", "class",
     "step", "cause", "reason", "message_type", "signal", "missing", "job", "code",
-    "count", "revision", "persist_class", "persist_op",
+    "count", "revision", "persist_class", "persist_op", "build_sha",
 )
 
 # Ordered: URLs go first so a token inside one is not split by a later rule.
@@ -174,6 +176,10 @@ def redact(text):
 
 def clean_value(key, value):
     """Redact one structured value; returns (value, replacements) or None to drop."""
+    if key == "build_sha":
+        if isinstance(value, str) and BUILD_SHA_RE.fullmatch(value):
+            return value, 0
+        return REDACTED, 1
     if isinstance(value, bool) or value is None:
         return (value, 0) if isinstance(value, bool) else None
     if key == "run_id":
@@ -327,6 +333,8 @@ def sanitize_event(raw):
             if cleaned is not None:
                 event[key] = cleaned[0]
                 replaced += cleaned[1]
+    if event.get("msg") == "gateway_connecting" and type(source.get("resume")) is bool:
+        event["resume"] = source["resume"]
     return event, replaced
 
 
@@ -363,6 +371,7 @@ def read(transport, service, minutes, end, limit, contains, account_id=None, que
         "schema_version": SCHEMA_VERSION,
         "service": service,
         "window": {"start": format_instant(start), "end": format_instant(end)},
+        "contains": bool(contains),
         "limit": limit,
         "event_count": len(kept),
         "possibly_truncated": len(events) >= limit,

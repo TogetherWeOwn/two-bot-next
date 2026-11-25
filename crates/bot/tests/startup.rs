@@ -32,6 +32,21 @@ fn command(listen_addr: &str) -> Command {
     command
 }
 
+#[test]
+fn rehearsal_command_refuses_an_unprepared_process() {
+    for (extra, expected) in [
+        (None, "internal-action startup refused"),
+        (Some("unexpected"), "rehearsal_arguments_invalid"),
+    ] {
+        let mut cli = command("invalid-listener");
+        cli.args(["rehearse-internal-actions"].into_iter().chain(extra));
+        cli.envs(std::env::var_os("LLVM_PROFILE_FILE").map(|file| ("LLVM_PROFILE_FILE", file)));
+        let output = cli.stdout(Stdio::piped()).output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
+    }
+}
+
 fn get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
     let timeout = Duration::from_millis(250);
     let mut stream = TcpStream::connect_timeout(&addr, timeout)?;

@@ -168,13 +168,10 @@ can be replaced before it finishes, so status alone never proves the
 image served). A merely CI-green SHA paired
 with the wrong version therefore refuses before traffic moves instead of
 failing the gate after the restore; do not widen the guard to admit one.
-The `/readyz` gate after the
-rollback must report that revision, or a pre-stamp version on 200 with
-gateway ready (see below). A version with no stamped SHA — deployed before
-SHA stamping began, or created by a secret change without `--message` —
-cannot form a receipt and a manual rollback to it refuses; the
-in-run auto-rollback to such a snapshot keeps its legacy version-header
-identity and records `provenance: legacy-no-sha` in its evidence. Keep
+The `/readyz` gate after rollback must report that revision and a ready
+gateway. All production rollback paths require both Worker versions to be
+stamped. Crossing Cutover 0480 or releasing its reserved fence requires
+protected recovery. Keep
 every serving version stamped: a secret change publishes a new Worker
 version too, so stage secrets with `wrangler versions secret put --env <env> <KEY>
 --message <sha>` — where `<sha>` is the SHA of the last successful deploy
@@ -406,6 +403,67 @@ bodies. A rollback and the live-SHA redeploy skip it: recovery never waits on
 it. The Release Manager exercises the restore path with the [on-demand staging proof](#on-demand-staging-proof)
 once per bot production release, after deploying the candidate to staging.
 
+## Attendance predecessor identity at both PRE endpoints
+
+Use the same Worker and container identity check at both database endpoints.
+Derive the endpoints from the authenticated forward plan using `ledger_endpoints`
+at the pinned release revision.
+[Protected release source](https://github.com/TogetherWeOwn/two-bot-next/blob/46bd2f2bd50edd5c9ad73f1f8174e6f923ce1650/scripts/production_release_forward.py#L13).
+
+| Endpoint | Cutover | Store | Schema marker |
+| --- | --- | --- | --- |
+| Before apply | 115 rows through `0473` | 20 rows through `0465` | `attendance_recovered_at` absent. |
+| After guarded inverse | 116 rows through `0475` | 20 rows through `0465` | `attendance_recovered_at` and the original `0475` ledger timestamp retained. |
+
+Match the original endpoint to the authenticated forward plan and the
+restored endpoint to the authenticated inverse result. Use the separate
+[planner receipt checks](https://github.com/TogetherWeOwn/two-bot-next/pull/2478)
+for the full ledgers and retained timestamp.
+
+### Check the shared rollback SHA
+
+1. For the reviewed rollback predecessor, record its Worker source SHA and
+   module digests, container image digest and expected runtime
+   `build_revision`, `build_id` and `deploy_id`. The forward candidate has
+   its own source SHA and image digest. Pin the reviewed predecessor inputs
+   and keep its Worker UUID pending until observed.
+   [Same-source build inputs](https://github.com/TogetherWeOwn/two-bot-next/pull/2479).
+2. For staged proof at each endpoint, match the protected artifact and
+   endpoint receipt to those pins. Record the actual staged Worker UUID and
+   annotation beside the observed image digest and runtime stamps. Use the
+   [promotion evidence contract](#build-identity-and-the-readyz-gate) for
+   artifact validation. The
+   [prior staging certificate](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/45464932482/artifacts/14955502728)
+   and [restored inventory](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/45471105110/artifacts/14956218306)
+   demonstrate that identity comparison on the expanded schema.
+3. For authenticated serving readback, match the protected provider evidence
+   to the endpoint. Before apply, preflight verifies the exact serving pair,
+   takeover capability and original plan. After inverse, match the
+   authenticated inverse to the restored pair and stable-readiness result.
+   Record the production Worker UUID separately from the staged UUID.
+   Preflight records pins and an epoch. The recovery result records the
+   provider state and stable poll count. Use a separate authenticated runtime
+   observation of the same Worker and image for the actual runtime stamps.
+   Keep the runtime identity pending when that observation is missing.
+
+`production_ownership_status.provider_sample` reads `workers/message` on the
+exact 100%-serving Worker version. Release preflight and interrupted recovery
+require that annotation to equal `rollback_sha`. Recovery also uses
+`rollback_sha` as the expected stamped runtime `build_revision` for
+`Rollback.wait_stable`, which checks the Worker version header and gateway
+readiness. The older pre-stamp readiness path can pass with unknown stamps.
+Require observed stamps when claiming a stamped runtime identity.
+
+When the Worker backport is annotated with its own revision and the retained
+image is stamped with an earlier one, the earlier SHA fails the Worker
+identity check and the later SHA fails readiness. Record the two actual
+revisions and the image digest as a release integration dependency and keep
+qualification pending at both endpoints. Preserve truthful source stamps.
+
+Hosted source-level CI runs the
+[synthetic refusal case](../scripts/ci/test_predecessor_serving_identity.py)
+for both choices of `rollback_sha`.
+
 ## Regression gate against production
 
 Before any production mutation, every ordinary promotion compares the
@@ -546,8 +604,8 @@ deploy-called voice and help synthetics refuse every rerun, and a partial rerun
 can also reuse earlier deploy evidence. Subject to existing holds and
 authorization, follow the
 [staging qualification and recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
-for the intended exact `main` SHA. An older pin cannot certify a different
-workflow head. Wait for all qualifying jobs and release, and retain the fresh
+for the intended exact `main` SHA. A reviewed run certifies its serving SHA.
+Verify its workflow SHA separately. Wait for all qualifying jobs and release, and retain the fresh
 receipts.
 
 The certificate contains only a closed version-1 receipt and `modules/`: source

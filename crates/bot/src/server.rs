@@ -447,7 +447,7 @@ pub(crate) async fn shutdown_requested(mut shutdown: tokio::sync::watch::Receive
     }
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
 
     let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");

@@ -3,7 +3,7 @@ import contract from "../../../crates/core/tests/fixtures/bot-site-contract-v2.j
 
 const wire = contract.verbs["voice.move_member"];
 
-export function mockVoiceMoveWindow() {
+export function mockVoiceMoveWindow(elapsedMs = 1000) {
   const fixture = {
     environment: "staging",
     guildId: "100",
@@ -13,7 +13,7 @@ export function mockVoiceMoveWindow() {
   const [source, destination] = fixture.channelIds;
   const session = { discordId: fixture.discordId };
   const acquiredAt = 1_800_000_000_000;
-  const now = () => acquiredAt + 1000;
+  const now = () => acquiredAt + elapsedMs;
   const lease = {
     runId: "12345",
     runAttempt: 1,
@@ -35,9 +35,38 @@ export function mockVoiceMoveWindow() {
     sha: lease.sha,
     deploymentId: lease.deploymentId,
     epoch: lease.epoch,
+    observedAt: new Date(now()).toISOString(),
     voiceMoveEnabled: !released,
     running: !released,
     use: { ...lease, acquiredAt, environment: "staging", phase: released ? "released" : "active" },
+  });
+  const previousUse = {
+    ...projection("ready").use,
+    runId: "12344",
+    acquiredAt: acquiredAt - 60_000,
+    expiresAt: acquiredAt - 30_000,
+  };
+  const previousReady = {
+    ...projection("ready"),
+    use: previousUse,
+    observedAt: new Date(previousUse.acquiredAt + 1000).toISOString(),
+  };
+  const previousOff = {
+    ...previousReady,
+    action: "status",
+    use: { ...previousUse, phase: "released" },
+    observedAt: new Date(previousUse.expiresAt - 1000).toISOString(),
+    running: false,
+    voiceMoveEnabled: false,
+  };
+  const discordReadback = (channelId: string) => ({
+    observedAt: new Date(now()).toISOString(),
+    guildId: fixture.guildId,
+    discordId: fixture.discordId,
+    channelId,
+    channelType: 2,
+    connectedChannelId: source,
+    canConnect: canConnect(channelId),
   });
   return {
     signed, moves, calls,
@@ -46,6 +75,15 @@ export function mockVoiceMoveWindow() {
       fixture,
       lease,
       ready: projection("ready"),
+      evidence: {
+        session: {
+          environment: "staging", authenticated: true, action: "voice.move_member",
+          discordId: session.discordId, channelIds: [source, destination], observedAt: new Date(now()).toISOString(),
+        },
+        readback: { source: discordReadback(source), destination: discordReadback(destination) },
+        previousReady,
+        previousOff,
+      },
       now,
       async control({ action }: { action: string }) {
         calls.push(action);

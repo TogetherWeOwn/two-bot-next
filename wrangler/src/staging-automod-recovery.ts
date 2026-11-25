@@ -22,7 +22,7 @@ export type AutomodOwnedCommand = CommandRevision & Readonly<{ intent: AutomodIn
 
 type Journal = Readonly<{
   intent: AutomodIntent;
-  phase: "publishing" | "cleanup" | "complete";
+  phase: "publishing" | "ready" | "starting" | "cleanup" | "complete";
   created: CommandRevision | null;
 }>;
 
@@ -178,6 +178,29 @@ export class StagingAutomodRecovery {
     return true;
   }
 
+  /** A create receipt alone does not authorize boot. Call after the full
+   * registry delta and scoped detail match have been verified. */
+  async confirmPublication(command: AutomodOwnedCommand): Promise<void> {
+    const journal = await this.read();
+    if (!journal || journal.phase !== "publishing" || !journal.created
+      || !sameIntent(journal.intent, command.intent) || !sameRevision(journal.created, command)) {
+      throw new Error("staging_automod_receipt_mismatch");
+    }
+    await this.write({ ...journal, phase: "ready" });
+  }
+
+  /** Spend the startup grant before invoking the runtime. A lost response
+   * leaves recovery as the only allowed operation on this intent. */
+  async claimStartup(expected: Lease, check: (intent: AutomodIntent) => Promise<void>): Promise<AutomodIntent> {
+    const journal = await this.read();
+    if (!journal || journal.phase !== "ready" || !sameLease(journal.intent.lease, expected)) {
+      throw new Error("staging_automod_startup_refused");
+    }
+    await check(journal.intent);
+    await this.write({ ...journal, phase: "starting" });
+    return journal.intent;
+  }
+
   /** Fence new publication before inspection. Finish only on affirmative
    * absence and confirmed stop under the existing cleanup authority. */
   async recover(lease: Lease, adapter: AutomodCleanup): Promise<void> {
@@ -186,7 +209,7 @@ export class StagingAutomodRecovery {
       throw new Error("staging_automod_recovery_mismatch");
     }
     if (journal.phase === "complete") return;
-    if (journal.phase === "publishing") {
+    if (journal.phase !== "cleanup") {
       journal = { ...journal, phase: "cleanup" };
       await this.write(journal);
     }
@@ -234,7 +257,9 @@ export class StagingAutomodRecovery {
     catch { throw new Error("staging_automod_storage_unavailable"); }
     if (value === undefined) return undefined;
     if (!record(value) || !validIntent(value.intent)
-      || (value.phase !== "publishing" && value.phase !== "cleanup" && value.phase !== "complete")
+      || (value.phase !== "publishing" && value.phase !== "ready" && value.phase !== "starting"
+        && value.phase !== "cleanup" && value.phase !== "complete")
+      || (value.created === null && (value.phase === "ready" || value.phase === "starting"))
       || (value.created !== null && !validRevision(value.created))) {
       throw new Error("staging_automod_storage_invalid");
     }
