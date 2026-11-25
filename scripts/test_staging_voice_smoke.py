@@ -174,13 +174,20 @@ class VoiceSmokeTests(unittest.TestCase):
 
     def test_naming_receipt_refuses_invalid_input_without_echoing_it(self):
         fixture = self.naming_fixture()
-        fixture["empty_name"] = fixture["occupied_name"]
-        for raw in (json.dumps(fixture).encode(), b'{"readbacks":[],"readbacks":[]}',
-                    b" " * (smoke.BODY_CAP + 1), b"raw-body-sentinel"):
-            with self.subTest(size=len(raw)):
+        duplicate = b'{"occupied_name":"ignored",' + json.dumps(fixture).encode()[1:]
+        identical = {**fixture, "empty_name": fixture["occupied_name"]}
+        invalid_id = {**fixture, "readbacks": [dict(row, room_id="030") for row in fixture["readbacks"]]}
+        for raw, reason in (
+                (json.dumps(identical).encode(), "expected two distinct room names"),
+                (duplicate, "invalid naming observations JSON"),
+                (json.dumps(invalid_id).encode(), "invalid room readback"),
+                (b" " * (smoke.BODY_CAP + 1), "naming observations exceed the body cap"),
+                (b"raw-body-sentinel", "invalid naming observations JSON")):
+            with self.subTest(reason=reason):
                 code, out, evidence = self.run_naming(raw)
                 self.assertEqual(code, 1)
                 self.assertEqual(evidence["result"], "fail")
+                self.assertIn(reason, out)
                 self.assertNotIn("raw-body-sentinel", out + Path(self.evidence).read_text())
                 self.assertNotIn("Traceback", out)
 
@@ -193,6 +200,14 @@ class VoiceSmokeTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("observation and receipt paths must differ", out)
         self.assertEqual(source.read_text(encoding="utf-8"), original)
+
+    def test_naming_receipt_cannot_create_a_missing_source_at_an_aliased_path(self):
+        source = Path(self.evidence).parent / "alias.json"
+        source.symlink_to(self.evidence)
+        code, out = self.run_main(["--naming-observations", str(source)], {})
+        self.assertEqual(code, 1)
+        self.assertIn("observation and receipt paths must differ", out)
+        self.assertFalse(Path(self.evidence).exists())
 
     def test_live_guild_refuses_before_any_request(self):
         code, out = self.run_main(["--guild-id", LIVE_GUILD, "--staging-url", ""],

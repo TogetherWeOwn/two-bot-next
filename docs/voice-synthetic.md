@@ -215,13 +215,13 @@ The ordinary synthetic reads a template name on the created room and verifies
 empty-room deletion. Its optional `rename` check acts on the creator. For name
 changes on the same temporary room, use the local readback mode of
 `staging_voice_smoke.py`. It takes observations from a disposable fixture and
-uses no credentials or network. The receipt reports the observed transitions
-in the input. Release qualification and the live synthetic use their existing
-checks.
+uses no credentials or network. The receipt describes only the supplied
+fixture, which cannot establish live release acceptance.
 
 Save the fixture as `observations.json`. Record the distinct expected names
-from the fixture template, followed by three readback slots in order: occupied,
-empty before cleanup, and occupied again. Each slot binds the room's read-back
+from a fixture template that renders the same occupied name on return. Supply
+three readback slots in order: occupied, empty before cleanup, and occupied
+again. Each slot binds the room's read-back
 name and observed human count to the same room ID and a strictly increasing
 Unix timestamp in milliseconds. Use `null` for a slot you could not observe.
 

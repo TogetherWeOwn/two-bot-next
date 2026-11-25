@@ -695,13 +695,17 @@ def naming_transition(check, before, after):
 def run_naming_observations(source, evidence):
     # Keep the original observations when the requested receipt path aliases them.
     try:
-        if os.path.samefile(source, evidence):
-            print("FAIL room-naming-input: observation and receipt paths must differ")
-            return 1
-    except FileNotFoundError:
-        pass
+        same_path = os.path.realpath(source) == os.path.realpath(evidence)
+        if not same_path:
+            try:
+                same_path = os.path.samefile(source, evidence)
+            except FileNotFoundError:
+                pass
     except OSError:
         print("FAIL room-naming-input: could not check observation and receipt paths")
+        return 1
+    if same_path:
+        print("FAIL room-naming-input: observation and receipt paths must differ")
         return 1
 
     try:
