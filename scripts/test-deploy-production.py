@@ -998,7 +998,7 @@ class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
               ref="refs/heads/main", auto="", resolved_sha=None, event="workflow_dispatch",
               run_sha="", run_conclusion="", run_updated="", hold="", auto_disabled="", spike="",
-              run_path="", run_event="", cutover_hold="", reviewed_history="true", **responses):
+              run_path="", run_event="", cutover_hold="", reviewed_history="false", **responses):
         if image is None:
             image = IMAGE if rollback else ""
         api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]},
@@ -1226,6 +1226,7 @@ class GuardBehaviourTests(unittest.TestCase):
             "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
         }
         fixtures = {
+            "reviewed_history": "true",
             "staging-latest": {"total_count": 1, "workflow_runs": [reviewed]},
             "staging-all": {"total_count": 0, "workflow_runs": []},
             "staging-reviewed": {"total_count": 1, "workflow_runs": [reviewed]},
@@ -2057,7 +2058,8 @@ class GuardBehaviourTests(unittest.TestCase):
         code, outputs, summary, calls, _ = self.guard(
             event="workflow_run", sha="", run_sha=old_run_sha, run_conclusion="success",
             **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
-               "staging-all": {"total_count": 1, "workflow_runs": [{**staging_run(), "updated_at": green_at}]}})
+               **dict.fromkeys(("staging", "staging-all"),
+                               {"total_count": 1, "workflow_runs": [{**staging_run(), "updated_at": green_at}]})})
         self.assertEqual(code, 0)
         self.assertEqual(outputs["sha"], SHA)
         self.assertNotEqual(outputs["sha"], old_run_sha)
@@ -2256,7 +2258,8 @@ class GuardBehaviourTests(unittest.TestCase):
         _, outputs, _, _, _ = self.guard(
             event="schedule", sha="",
             **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
-               "staging-all": {"total_count": 1, "workflow_runs": [{**staging_run(), "updated_at": green_at}]}})
+               **dict.fromkeys(("staging", "staging-all"),
+                               {"total_count": 1, "workflow_runs": [{**staging_run(), "updated_at": green_at}]})})
         self.assertEqual(outputs["skip"], "")
         self.assertEqual(outputs["soak_seconds"], "0")
 
@@ -2432,11 +2435,16 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("tooling/scripts/ci/roles_gate.py", roles_gate)
 
     def test_api_failures_fail_closed(self):
-        for key in ("compare", "ci-runs", "ci-run", "ci-jobs", "ci-ok", "worker check", "staging-all",
-                    "staging-reviewed", "branches"):
+        for key in ("compare", "ci-runs", "ci-run", "ci-jobs", "ci-ok", "worker check", "staging",
+                    "staging-all", "branches"):
             for broken in (failed_call(), "not json"):
                 with self.subTest(key=key, broken=broken):
                     self.assertRefused(self.guard(**{key: broken}), "failing closed")
+
+    def test_reviewed_history_api_failures_fail_closed(self):
+        for broken in (failed_call(), "not json"):
+            with self.subTest(broken=broken):
+                self.assertRefused(self.guard(reviewed_history="true", **{"staging-reviewed": broken}), "failing closed")
 
 
 def deployment(*versions):
