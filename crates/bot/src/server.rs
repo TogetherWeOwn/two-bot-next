@@ -58,6 +58,7 @@ pub struct SharedState {
     /// layer — so the handler stays a `State + Request` pair like the
     /// receiver's `handle`.
     pub backfill_ring: crate::ops_backfill::SharedRing,
+    event_permission_readback: Option<Arc<crate::event_permission_readback::Readback>>,
     /// Resolved staging-drill injection (see
     /// [`gateway_failure_injection_active`]); false unless production wiring
     /// attaches the fenced env read. The gateway itself keeps running —
@@ -79,6 +80,7 @@ impl SharedState {
             database,
             failure: FailureSlot::default(),
             backfill_ring: crate::ops_backfill::SharedRing::empty(),
+            event_permission_readback: None,
             gateway_fail_injected: false,
             ops_snapshot_failed: Arc::new(AtomicBool::new(false)),
         }
@@ -87,6 +89,14 @@ impl SharedState {
     /// Attach the backfill verifier without disturbing the other fields.
     pub fn with_backfill_ring(mut self, ring: crate::ops_backfill::SharedRing) -> Self {
         self.backfill_ring = ring;
+        self
+    }
+
+    pub(crate) fn with_event_permission_readback(
+        mut self,
+        readback: Option<crate::event_permission_readback::Readback>,
+    ) -> Self {
+        self.event_permission_readback = readback.map(Arc::new);
         self
     }
 
@@ -122,6 +132,10 @@ pub(crate) fn router_with_guard(
     // both pool and ring from listener state (a `State + Request` pair like
     // the internal-action receiver's `handle`), never an `Extension` layer.
     let state = state.with_backfill_ring(crate::ops_backfill::SharedRing::from_env());
+    let readback = crate::event_permission_readback::router(
+        state.event_permission_readback.clone(),
+        Arc::clone(&state.gateway),
+    );
     Router::new()
         .route("/health", get(health))
         .route("/healthz", get(health))
@@ -134,6 +148,7 @@ pub(crate) fn router_with_guard(
         .merge(crate::ops_backfill::router())
         .with_state((state.clone(), jobs.clone()))
         .layer(axum::Extension(Arc::clone(&guard)))
+        .merge(readback)
         // Metrics and readiness sample the same guard as production executors.
         .merge(crate::metrics_http::router_with_guard(Arc::clone(&guard)))
         // Read-only operator roll-ups; the Worker gates off-container reads
@@ -178,6 +193,7 @@ pub(crate) fn router_with_guard(
 /// Routes the public listener serves; the only paths a span may record.
 /// Keep in sync with `router_with_guard`, `metrics_http::router_with_guard`
 /// `ops_backfill::router` and `ops_http::router_with_state`.
+/// The private event permission readback path is deliberately redacted.
 const TRACED_PATHS: [&str; 10] = [
     "/health",
     "/healthz",
