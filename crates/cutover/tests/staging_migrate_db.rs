@@ -26,6 +26,9 @@ use sqlx::{
     Connection, Executor, PgConnection, Row,
 };
 
+#[path = "support/warning_history_recovery.rs"]
+mod warning_history_recovery;
+
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -482,6 +485,18 @@ async fn seed_staging_state(fx: &Fixture) -> TestResult {
     Migrator::with_migrations(seed).run(&pool).await?;
     pool.close().await;
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI service"]
+async fn warning_history_recovers_on_current_schema() -> TestResult {
+    warning_history_recovery::exercise(false).await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI service"]
+async fn warning_history_recovers_on_retained_schema() -> TestResult {
+    warning_history_recovery::exercise(true).await
 }
 
 async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> TestResult {

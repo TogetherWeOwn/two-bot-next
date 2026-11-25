@@ -1,12 +1,18 @@
 use std::cell::{Cell, RefCell};
 
 use tokio::time::{advance, sleep};
+use twilight_model::id::Id;
 use two_bot_core::member_moderation_store::{
     continuation::synthetic_cursor, WarningHistoryCursor, WarningHistoryEntry, WarningHistoryPage,
 };
+use two_bot_discord::ActionExecutor;
 
 use super::handle as run;
 use super::*;
+use crate::member_runtime::warning_history_authorizer::authorize;
+
+#[path = "fresh_context.rs"]
+mod fresh_context;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -18,8 +24,9 @@ enum Action {
 }
 use Action::{Empty, Fail, Pass, Public, Wait};
 
-pub(super) struct Fake {
+pub(super) struct Fake<'a> {
     pub(super) caller: Invocation,
+    executor: Option<&'a ActionExecutor>,
     script: [Action; 5], // ACK, first authority, read, final authority, original edit
     trace: RefCell<Vec<&'static str>>,
     reply: RefCell<Option<Reply>>,
@@ -31,14 +38,15 @@ const fn id(value: u64) -> NonZeroU64 {
 }
 
 const CALLER: Invocation = Invocation {
-    principal: (id(1), id(2)),
-    channel: id(3),
+    principal: (id(22), id(44)),
+    channel: id(77),
 };
-const INITIAL: Input<'_> = Input::Initial("4");
+const TARGET: NonZeroU64 = id(88);
+const INITIAL: Input<'_> = Input::Initial("88");
 const EXPIRED: Outcome = Outcome::Session(Status::Expired);
 const DENIED: Outcome = Outcome::Authority(Refusal::Denied);
 
-impl Fake {
+impl Fake<'_> {
     fn new(script: [Action; 5]) -> Self {
         Self {
             script,
@@ -46,6 +54,7 @@ impl Fake {
             reply: RefCell::default(),
             delivered: Cell::default(),
             caller: CALLER,
+            executor: None,
         }
     }
 
@@ -88,10 +97,27 @@ impl Fake {
         }
     }
 
-    // A fake refresh represents one merged resolver call of at most five GETs.
-    pub(super) async fn fresh(&self, who: Invocation, target: NonZeroU64) -> Result<(), Refusal> {
+    pub(super) async fn fresh(
+        &self,
+        who: Invocation,
+        target: NonZeroU64,
+        deadline: Instant,
+    ) -> Result<(), Refusal> {
+        if let Some(executor) = self.executor {
+            self.trace.borrow_mut().push("fresh");
+            return authorize(
+                executor,
+                Id::new(CALLER.principal.0.get()),
+                Some(Id::new(who.principal.0.get())),
+                Id::new(who.channel.get()),
+                Id::new(who.principal.1.get()),
+                Id::new(target.get()),
+                deadline,
+            )
+            .await;
+        }
         assert_eq!(who.principal, CALLER.principal);
-        assert_eq!((who.channel, target), (CALLER.channel, id(4)));
+        assert_eq!((who.channel, target), (CALLER.channel, TARGET));
         let read_closed = self.trace.borrow().contains(&"closed");
         let phase = if read_closed { 3 } else { 1 };
         (self.step("fresh", phase).await != Fail)
@@ -104,7 +130,7 @@ impl Fake {
         scope: (NonZeroU64, NonZeroU64),
         cursor: Option<&WarningHistoryCursor>,
     ) -> WarningHistoryPage {
-        assert_eq!(scope, (id(1), id(4)));
+        assert_eq!(scope, (CALLER.principal.0, TARGET));
         let next = cursor.is_some();
         let event = if next { "next" } else { "read" };
         let start = if next { 5 } else { 0 };
@@ -131,7 +157,7 @@ impl Fake {
     }
 }
 
-fn ordered(fake: &Fake, read: &str) {
+fn ordered(fake: &Fake<'_>, read: &str) {
     let expected = ["ack", "fresh", read, "closed", "fresh", "edit"];
     assert_eq!(*fake.trace.borrow(), expected);
 }
@@ -257,7 +283,7 @@ async fn stop_requires_private_ack_before_retiring_the_binding() {
     // The earlier ephemeral copy can still contain the retired controls.
     assert!(initial.delivered.get());
     assert!(initial.next(0) == handle);
-    assert!(state.start(CALLER, id(4)).is_ok());
+    assert!(state.start(CALLER, TARGET).is_ok());
 }
 
 #[tokio::test(start_paused = true)]
@@ -270,14 +296,14 @@ async fn stop_uses_the_same_expired_status_for_invalid_scope_and_handles() {
     for (caller, token) in [
         (
             Invocation {
-                principal: (id(9), id(2)),
+                principal: (id(9), CALLER.principal.1),
                 ..CALLER
             },
             handle.as_str(),
         ),
         (
             Invocation {
-                principal: (id(1), id(9)),
+                principal: (CALLER.principal.0, id(9)),
                 ..CALLER
             },
             &handle,
@@ -341,6 +367,6 @@ async fn stop_during_next_discards_prepared_continuation() {
             assert!(next.delivered.get());
             assert_retired(&state, &next.next(5)).await;
         }
-        assert!(state.start(CALLER, id(4)).is_ok());
+        assert!(state.start(CALLER, TARGET).is_ok());
     }
 }

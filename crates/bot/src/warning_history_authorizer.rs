@@ -190,4 +190,4 @@ fn check_channel(
 
 #[cfg(test)]
 #[path = "warning_history_authorizer_tests.rs"]
-mod tests;
+pub(super) mod tests;

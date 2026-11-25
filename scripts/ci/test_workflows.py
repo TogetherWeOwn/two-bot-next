@@ -1902,7 +1902,7 @@ def rollback_proof_job_errors(job, mode):
     steps = job.get("steps") or []
     if len(steps) != (3 if mode == "run" else 2):
         return errors + [f"rollback proof {mode}: unexpected steps"]
-    if any("if" in step or "continue-on-error" in step for step in steps):
+    if any("if" in step for step in steps[:2]) or any("continue-on-error" in step for step in steps):
         errors.append(f"rollback proof {mode}: steps must run and fail closed")
     checkout, command = steps[:2]
     if (not str(checkout.get("uses") or "").startswith("actions/checkout@")
@@ -1913,11 +1913,15 @@ def rollback_proof_job_errors(job, mode):
         env["REQUESTED_SHA"] = "${{ inputs.sha }}"
         run += ' --sha "$REQUESTED_SHA" --evidence "$RUNNER_TEMP/proof.json"'
         upload = steps[2]
-        if (not str(upload.get("uses") or "").startswith("actions/upload-artifact@")
-                or (upload.get("with") or {}).get("name") != "staging-rollback-proof"
-                or (upload.get("with") or {}).get("path") != "${{ runner.temp }}/proof.json"
-                or (upload.get("with") or {}).get("if-no-files-found") != "error"):
-            errors.append("rollback proof run: must upload the non-empty proof artifact")
+        upload_inputs = upload.get("with") or {}
+        artifact_name = ("${{ github.run_attempt == '1' && 'staging-rollback-proof' || "
+                         "format('staging-rollback-proof-attempt-{0}', github.run_attempt) }}")
+        if (upload.get("if") != "${{ !cancelled() }}"
+                or not str(upload.get("uses") or "").startswith("actions/upload-artifact@")
+                or upload_inputs.get("name") != artifact_name
+                or upload_inputs.get("path") != "${{ runner.temp }}/proof.json"
+                or upload_inputs.get("if-no-files-found") != "error" or "overwrite" in upload_inputs):
+            errors.append("rollback proof run: must upload a non-empty receipt without overwriting another attempt")
     if command.get("run") != run or command.get("env") != env:
         errors.append(f"rollback proof {mode}: only the reviewed script and bindings may run")
     return errors
@@ -9428,6 +9432,11 @@ class WorkflowTests(unittest.TestCase):
             "proof command conditional": lambda w: w["jobs"]["proof"]["steps"][1].update({"if": "false"}),
             "proof failure tolerated": lambda w: w["jobs"]["proof"]["steps"][1].update({"continue-on-error": "true"}),
             "missing evidence": lambda w: w["jobs"]["proof"]["steps"].pop(),
+            "receipt skipped on proof failure": lambda w: w["jobs"]["proof"]["steps"][2].pop("if"),
+            "upload failure tolerated": lambda w: w["jobs"]["proof"]["steps"][2].update({"continue-on-error": "true"}),
+            "missing receipt allowed": lambda w: w["jobs"]["proof"]["steps"][2]["with"].update({"if-no-files-found": "warn"}),
+            "rerun shares original artifact name": lambda w: w["jobs"]["proof"]["steps"][2]["with"].update({"name": "staging-rollback-proof"}),
+            "existing receipt can be overwritten": lambda w: w["jobs"]["proof"]["steps"][2]["with"].update({"overwrite": "true"}),
             "alert on success": lambda w: w["jobs"]["alert"].update({"if": "always()"}),
             "alert cannot write the incident issue": lambda w: w["jobs"]["alert"]["permissions"].pop("issues"),
             "alert reads an environment": lambda w: w["jobs"]["alert"].update({"environment": "synthetic-alerts"}),

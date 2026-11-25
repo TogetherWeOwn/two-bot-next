@@ -317,6 +317,8 @@ jobs:
           --skip list_is_guild_scoped_selector_shaped_and_read_only
           --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
           --skip real_sqlx_runner_cases
+          --skip warning_history_recovers_on_current_schema
+          --skip warning_history_recovers_on_retained_schema
           --skip post_failure_unreadable_ledger_is_unknown_not_empty
           --skip post_failure_readable_ledger_keeps_array_output
           --skip post_apply_unreadable_ledger_is_unknown_not_empty

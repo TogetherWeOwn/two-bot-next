@@ -43,9 +43,12 @@ jobs:
           REQUESTED_SHA: ${{ inputs.sha }}
         run: python3 scripts/rollback_proof.py run --sha "$REQUESTED_SHA" --evidence "$RUNNER_TEMP/proof.json"
       - name: Upload the rollback proof
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: staging-rollback-proof
+          name: >-
+            ${{ github.run_attempt == '1' && 'staging-rollback-proof' ||
+            format('staging-rollback-proof-attempt-{0}', github.run_attempt) }}
           path: ${{ runner.temp }}/proof.json
           if-no-files-found: error
           retention-days: 14
