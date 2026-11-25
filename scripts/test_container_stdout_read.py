@@ -253,6 +253,17 @@ class PassiveGatewayEvidenceTests(unittest.TestCase):
                         "gateway_reconnect_failed": 1, "identify_planned": 1, "resume_planned": 1},
         }))
 
+    def test_planned_identify_and_ready_report_only_passive_signals(self):
+        packet = self.packet(
+            self.event("gateway_connecting", "two_bot", resume=False),
+            self.event("ready", "two_bot::gateway"),
+        )
+        self.assertEqual(self.summarize(packet), (0, {
+            "verdict": "observed", "build_sha": self.SHA,
+            "signals": {"ready": 1, "gateway_resumed": 0, "shard_closed": 0,
+                        "gateway_reconnect_failed": 0, "identify_planned": 1, "resume_planned": 0},
+        }))
+
     def test_quiet_window_does_not_infer_unseen_paths(self):
         packet = self.packet(self.event("ready", "other::target"))
         code, result = self.summarize(packet)
