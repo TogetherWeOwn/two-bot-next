@@ -404,6 +404,29 @@ bodies. A rollback and the live-SHA redeploy skip it: recovery never waits on
 it. The Release Manager exercises the restore path with the [on-demand staging proof](#on-demand-staging-proof)
 once per bot production release, after deploying the candidate to staging.
 
+## Shared Bot and Web production window
+
+Bot and Web take turns making production changes. In the private release
+coordination record, both teams acknowledge who has custody and which team
+is holding its own production changes. The team with custody records its
+actual start and expected end when the run is admitted under the existing
+[production release gate](../CONTRIBUTING.md#production-release-gate).
+
+- **Abort before dispatch.** Verify that no production run was dispatched and
+  no production change occurred. Confirm that any temporary controls set for
+  the attempt are cleared and any held runs are reconciled. Explicitly tell
+  the other team that the attempt was abandoned and the window is released.
+- **After dispatch.** Keep custody through the required
+  [post-deploy watch](#post-deploy-watch), any recovery, and verified cleanup.
+  Record the outcome and explicitly tell the other team when the window is
+  released. Keep custody while recovery or cleanup remains unresolved.
+
+Before admitting its run, the receiving team reads back the current custody
+agreement and both teams' production run status. Confirm there is no
+conflicting queued, approval-pending or active run, watch, recovery or
+cleanup. If the readback is unclear, keep production changes on hold and
+reconcile with the other team. A later attempt uses fresh coordination.
+
 ## Interrupted protected release
 
 If a protected attendance release fails or is cancelled after it may have
