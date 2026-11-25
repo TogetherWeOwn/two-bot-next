@@ -74,6 +74,19 @@ test("protected voice adapter refuses an unrelated ready receipt and cleans up o
   assert.deepEqual(result.cleanup, { memberDisconnected: null, off: true, stopped: true });
 });
 
+test("protected voice adapter rejects an unbound caller before collecting readbacks", async () => {
+  for (const sessionPresent of [false, true]) {
+    const { input, reads, calls, signed } = protectedWindow();
+    const session = sessionPresent ? { ...input.session, discordId: input.fixture.channelIds[0] } : undefined;
+    const result = await runProtectedVoiceMoveAcceptance({ ...input, session });
+    assert.equal(result.verdict, "failed");
+    assert.equal(result.code, "caller_unconfirmed");
+    assert.deepEqual({ reads, signed }, { reads: [], signed: [] });
+    assert.deepEqual(calls, ["status", "release", "status"]);
+    assert.deepEqual(result.cleanup, { memberDisconnected: null, off: true, stopped: true });
+  }
+});
+
 test("protected voice adapter finishes the window on mismatched or failed readbacks", async () => {
   const sentinel = "private diagnostic from the fixture reader";
   for (const fault of ["session", "observer", "prior window"]) {
@@ -107,6 +120,7 @@ test("protected voice adapter finishes the window on mismatched or failed readba
 
 test("protected voice adapter closes the lease when a scoped readback stalls", async () => {
   const { input, calls, signed, reads } = protectedWindow(15 * 60_000 - 1010);
+  const lateSession = Promise.withResolvers<object>();
   let signal: AbortSignal | undefined;
   const result = await runProtectedVoiceMoveAcceptance({
     ...input,
@@ -114,13 +128,19 @@ test("protected voice adapter closes the lease when a scoped readback stalls", a
       ...input.session,
       readCurrent(request) {
         signal = request.signal;
-        return new Promise(() => {});
+        return lateSession.promise;
       },
+    },
+    readChannels(request) {
+      reads.push("channels invoked");
+      return input.readChannels(request);
     },
   });
   assert.equal(result.verdict, "failed");
   assert.equal(result.code, "probe_timeout");
   assert.equal(signal?.aborted, true);
+  lateSession.resolve({});
+  await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual({ signed, reads }, { signed: [], reads: [] });
   assert.deepEqual(calls, ["status", "release", "status"]);
   assert.deepEqual(result.cleanup, { memberDisconnected: null, off: true, stopped: true });
