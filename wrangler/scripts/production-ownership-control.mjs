@@ -141,7 +141,7 @@ async function observationJson(response) {
 export async function control({ action, url, productionUrl = process.env.PRODUCTION_WORKER_URL ?? "", stagingUrl = process.env.STAGING_WORKER_URL ?? "", token, actor, expectedEpoch, expectedDeploymentId, releaseFence = false, takeoverAttempts = 34, takeoverRetryDelayMs = 10000, takeoverWindowMs = 330000, statusAttempts = 34, statusRetryDelayMs = 10000, statusWindowMs = 330000 }, send = fetch, wait = sleep, now = Date.now) {
   const origin = checkOrigin(url, productionUrl, stagingUrl);
   if (!token || token.length < 32) throw new ControlError("OWNERSHIP_CONTROL_TOKEN is missing or invalid; stop before deployment");
-  if (!["preflight", "status", "observe", "takeover", "takeover-fenced", "takeover-capability", "fence"].includes(action)) {
+  if (!["preflight", "status", "observe", "unreserved", "takeover", "takeover-fenced", "takeover-capability", "fence", "fence-exact"].includes(action)) {
     throw new ControlError("Unknown action");
   }
   if (action === "preflight") return { configured: true };
@@ -214,6 +214,26 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
     }
     return { deploymentId: current.deploymentId, exactTakeover: true };
   }
+  if (action === "fence-exact") {
+    if (!expectedDeploymentId || !/^production-schema-release:[1-9][0-9]{0,19}:[0-9a-f]{40}$/.test(actor) ||
+        !Number.isSafeInteger(expectedEpoch) || expectedEpoch < 1 || !Number.isSafeInteger(expectedEpoch + 1)) {
+      throw new ControlError("Exact production fence requires the serving deployment, epoch and release actor");
+    }
+    attempts = 1;
+    const current = await read({ method: "GET" });
+    if (current.deploymentId !== expectedDeploymentId || current.owner?.epoch !== expectedEpoch ||
+        (current.owner.phase === "active" && current.owner.deploymentId !== expectedDeploymentId)) {
+      throw new ControlError("Exact production fence refused; ownership changed");
+    }
+    const result = await read({ method: "POST",
+      body: JSON.stringify({ action: "fence-exact", actor, expectedEpoch, expectedDeploymentId }) });
+    if (result.deploymentId !== expectedDeploymentId || result.running || result.owner?.phase !== "fenced" ||
+        result.owner.deploymentId !== null || result.owner.actor !== actor || result.owner.epoch !== expectedEpoch + 1 ||
+        result.owner.oldEpoch !== expectedEpoch) {
+      throw new ControlError("Production shutdown was not confirmed; reconcile while fenced");
+    }
+    return result;
+  }
   if (action === "takeover-fenced") {
     if (!releaseFence || !expectedDeploymentId || !actor || !/^[a-zA-Z0-9_.:@/-]{1,128}$/.test(actor) ||
         !Number.isSafeInteger(expectedEpoch) || expectedEpoch < 1 ||
@@ -244,6 +264,10 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
     attempts += 1;
     const current = await readState();
     if (!actor || !/^[a-zA-Z0-9_.:@/-]{1,128}$/.test(actor)) throw new ControlError("Explicit audit actor is required");
+    if (current.owner?.phase === "fenced" && current.owner.actor?.startsWith("production-schema-release:") &&
+        (action !== "fence" || current.owner.actor !== actor)) {
+      throw new ControlError("Protected schema recovery owns the fence; use the verified release operation");
+    }
     // A routine deploy never unparks the singleton: a fenced or pristine
     // record needs the explicit release handoff (the production workflow's
     // `takeover` dispatch input), never a default.
@@ -284,6 +308,13 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
   };
   // The protected status workflow binds the returned version after a single GET.
   if (action === "observe") return read({ method: "GET" });
+  if (action === "unreserved") {
+    const current = await readState();
+    if (current.owner?.phase === "fenced" && current.owner.actor?.startsWith("production-schema-release:")) {
+      throw new ControlError("Protected schema recovery owns the fence; use the verified release operation");
+    }
+    return { unreserved: true };
+  }
   if (action === "status") {
     // After a version change the ownership Durable Object keeps running the
     // previous code until Cloudflare's deferred update reaches it (up to

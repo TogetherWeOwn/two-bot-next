@@ -21,6 +21,7 @@ WORKER, APPLICATION = WORKERS["production"], APPLICATIONS["production"]
 PRODUCTION_URL = f"https://{WORKER}.5150.workers.dev"
 NAMESPACE = re.compile(r"[0-9a-f]{32}")
 CI_ACTOR = re.compile(r"github-actions:[1-9][0-9]{0,19}:[0-9a-f]{40}")
+RELEASE_FENCE_ACTOR = re.compile(r"production-schema-release:[1-9][0-9]{0,19}:[0-9a-f]{40}")
 
 
 def matches(pattern, value):
@@ -128,7 +129,10 @@ def ownership_projection(state, version):
             or (phase == "fenced" and not running
                 and (owner.get("deploymentId") is None or owner.get("deploymentId") == version)),
             "ownership_target_mismatch")
-    return {"phase": phase, "epoch": epoch, "owner_actor": actor if matches(CI_ACTOR, actor) else "redacted",
+    release_fence = phase == "fenced" and matches(RELEASE_FENCE_ACTOR, actor)
+    require(not release_fence or ("deploymentId" in owner and owner["deploymentId"] is None),
+            "production_release_fence_target_invalid")
+    return {"phase": phase, "epoch": epoch, "owner_actor": actor if release_fence or matches(CI_ACTOR, actor) else "redacted",
             "running": running}
 
 

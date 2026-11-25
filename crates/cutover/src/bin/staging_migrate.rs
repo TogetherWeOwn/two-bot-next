@@ -44,7 +44,8 @@
 #![allow(clippy::print_stdout)]
 
 use two_bot_cutover::staging_migrate::{
-    run, Request, RunError, Target, PLAN_URL_ENV, PROD_PLAN_URL_ENV, PROD_URL_ENV, URL_ENV,
+    run, run_release_inverse, Request, RunError, Target, PLAN_URL_ENV, PROD_PLAN_URL_ENV,
+    PROD_URL_ENV, URL_ENV,
 };
 
 fn main() {
@@ -75,6 +76,7 @@ fn real_main() -> i32 {
             | "--plan-manifest-sha256"
             | "--store-plan-manifest-sha256"
             | "--plan-run-id"
+            | "--inverse-attendance-fence-sha256"
             | "--plan-manifest-path" => match it.next() {
                 Some(v) => {
                     values.insert(arg.clone(), v.clone());
@@ -162,7 +164,12 @@ fn real_main() -> i32 {
         Ok(r) => r,
         Err(_) => return refused("runtime init failed"),
     };
-    match runtime.block_on(run(&req)) {
+    match runtime.block_on(async {
+        match values.get("--inverse-attendance-fence-sha256") {
+            Some(fence) => run_release_inverse(&req, fence).await,
+            None => run(&req).await,
+        }
+    }) {
         Ok(manifest) => {
             println!("{manifest}");
             0

@@ -168,13 +168,12 @@ can be replaced before it finishes, so status alone never proves the
 image served). A merely CI-green SHA paired
 with the wrong version therefore refuses before traffic moves instead of
 failing the gate after the restore; do not widen the guard to admit one.
-The `/readyz` gate after the
-rollback must report that revision, or a pre-stamp version on 200 with
-gateway ready (see below). A version with no stamped SHA — deployed before
-SHA stamping began, or created by a secret change without `--message` —
-cannot form a receipt and a manual rollback to it refuses; the
-in-run auto-rollback to such a snapshot keeps its legacy version-header
-identity and records `provenance: legacy-no-sha` in its evidence. Keep
+The `/readyz` gate after rollback must report that revision with the gateway
+ready. Manual, post-takeover and post-watch rollback all require stamped
+source revisions for both the serving and restored version. A rollback that
+crosses the attendance schema boundary at Cutover 0480 requires the protected
+database inverse. The ordinary rollback also refuses a fence held by that
+recovery operation. Keep
 every serving version stamped: a secret change publishes a new Worker
 version too, so stage secrets with `wrangler versions secret put --env <env> <KEY>
 --message <sha>` — where `<sha>` is the SHA of the last successful deploy
