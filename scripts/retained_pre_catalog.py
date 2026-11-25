@@ -7,9 +7,14 @@ build or database authority. The historical retained commit is a label and
 need not be present in the local object store.
 """
 
+import argparse
 from hashlib import sha256, sha384
+from itertools import islice
 import json
+import os
+from pathlib import Path
 import re
+import stat
 
 from ci.staging_migrate_claim import projection_hash, store_projection_hash
 from ci.staging_rollback_compatibility import MIGRATION_PATHS, Refused, git, migration_trees
@@ -126,3 +131,54 @@ def verify_retained_catalog(repo, reconstruction_sha):
             "lock_blob": lock_blob.decode("ascii"), "landed_0475_blob": landed_blob.decode("ascii"),
             "landed_0475_sha384": sha384(fence_sql).hexdigest(),
             **_projection_digests(repo, RETAINED, cutover, store_tree)}
+
+
+def _require_checkout_file(path, expected):
+    mode = path.lstat().st_mode
+    if not stat.S_ISREG(mode) or mode & 0o111:
+        raise Refused("planner_catalog_checkout_mismatch")
+    with path.open("rb") as stream:
+        if stream.read(len(expected) + 1) != expected:
+            raise Refused("planner_catalog_checkout_mismatch")
+
+
+def verify_predecessor_checkout(repo, *, shape):
+    """Verify the exact planner inputs in a private checkout kept stable through loading."""
+    repo = Path(repo)
+    if git(repo, "rev-parse", "--show-prefix") != b"\n":
+        raise Refused("planner_checkout_root_required")
+    candidate = git(repo, "rev-parse", "--verify", "HEAD").decode("ascii").strip()
+    proof = verify_predecessor_plan_source(repo, candidate, shape=shape)
+    try:
+        for relative, tree in zip(MIGRATION_PATHS, ("cutover_tree", "store_tree")):
+            blobs = _migration_blobs(repo, proof[tree].encode("ascii"))
+            directory = repo
+            for part in Path(relative).parts:
+                directory /= part
+                if not stat.S_ISDIR(directory.lstat().st_mode):
+                    raise Refused("planner_catalog_checkout_mismatch")
+            with os.scandir(directory) as entries:
+                if {entry.name for entry in islice(entries, len(blobs) + 1)} != blobs.keys():
+                    raise Refused("planner_catalog_checkout_mismatch")
+            for name, blob in blobs.items():
+                _require_checkout_file(directory / name, _read_blob(repo, blob))
+        if shape == "0475/0465":
+            _require_checkout_file(repo / LOCK, _read_blob(repo, proof["lock_blob"].encode("ascii")))
+    except OSError:
+        raise Refused("planner_catalog_checkout_mismatch") from None
+    return proof
+
+
+def main():
+    parser = argparse.ArgumentParser(description=verify_predecessor_checkout.__doc__)
+    parser.add_argument("--repo", required=True, type=Path)
+    parser.add_argument("--shape", required=True)
+    args = parser.parse_args()
+    try:
+        verify_predecessor_checkout(args.repo, shape=args.shape)
+    except Refused as error:
+        parser.exit(1, f"{error}\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -89,19 +89,36 @@ class RetainedPreCatalogTests(unittest.TestCase):
             ("0475/0465", "retained-pre", self.reconstruction, self.original, "retained_catalog_tree_mismatch"),
         ):
             with self.subTest(shape=shape):
-                proof = catalog.verify_predecessor_plan_source(self.repo, candidate, shape=shape)
+                self.git("checkout", "--detach", candidate)
+                proof = catalog.verify_predecessor_checkout(self.repo, shape=shape)
                 expected = CATALOGS[endpoint]
                 self.assertEqual(proof["candidate_sha"], candidate)
                 self.assertEqual(proof["source_sha"], expected.source_sha)
                 self.assertEqual(proof["cutover_sha256"], expected.cutover_sha256)
                 self.assertEqual(proof["store_sha256"], expected.store_sha256)
+                self.git("checkout", "--detach", swapped)
                 with self.assertRaisesRegex(Refused, f"^{refusal}$"):
-                    catalog.verify_predecessor_plan_source(self.repo, swapped, shape=shape)
+                    catalog.verify_predecessor_checkout(self.repo, shape=shape)
+
+        with self.assertRaisesRegex(Refused, "^unsupported_pre_shape$"):
+            catalog.verify_predecessor_checkout(self.repo, shape="0475/0478")
 
     def test_retained_plan_refuses_wrong_fence_source(self):
         self.fence.write_bytes(b"SELECT 1;\n")
+        with self.assertRaisesRegex(Refused, "^planner_catalog_checkout_mismatch$"):
+            catalog.verify_predecessor_checkout(self.repo, shape="0475/0465")
+        self.commit()
         with self.assertRaisesRegex(Refused, "^retained_catalog_tree_mismatch$"):
-            catalog.verify_predecessor_plan_source(self.repo, self.commit(), shape="0475/0465")
+            catalog.verify_predecessor_checkout(self.repo, shape="0475/0465")
+
+    def test_plan_checkout_refuses_dirty_store_catalog_and_retained_lock(self):
+        for path, changed in ((self.repo / STORE, b"SELECT 1;\n"), (self.lock, self.lock_bytes + b"\n")):
+            original = path.read_bytes()
+            with self.subTest(path=path.name):
+                path.write_bytes(changed)
+                with self.assertRaisesRegex(Refused, "^planner_catalog_checkout_mismatch$"):
+                    catalog.verify_predecessor_checkout(self.repo, shape="0475/0465")
+                path.write_bytes(original)
 
     def test_refuses_omitted_altered_and_extra_cutover_sql(self):
         self.assert_refused(self.original, "retained_catalog_tree_mismatch")

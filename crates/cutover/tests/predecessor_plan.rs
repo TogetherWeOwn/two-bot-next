@@ -1,8 +1,13 @@
 //! Offline reconciliation for the two PRE ledger endpoints. Set
-//! PREDECESSOR_PLAN_SOURCE to the source root of the proposed
-//! qualification planner and run the case for the intended PRE endpoint.
+//! PREDECESSOR_PLAN_SOURCE to the root of a stable private Git checkout
+//! and run the case for the intended PRE endpoint. The opt-in path uses
+//! Python 3 and local Git objects to verify the checkout before loading SQL.
 
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use sqlx::migrate::Migrator;
 use two_bot_cutover::staging_migrate::{manifest_hash, reconcile, Chain, LedgerRow};
@@ -56,6 +61,40 @@ fn check_plan_catalog(
     Ok(())
 }
 
+fn check_plan_catalogs(
+    cutover: &Migrator,
+    store: &Migrator,
+    cutover_ledger: &[LedgerRow],
+    store_ledger: &[LedgerRow],
+    cutover_projection: &str,
+) -> Result<(), String> {
+    check_plan_catalog(cutover, cutover_ledger, cutover_projection)?;
+    check_plan_catalog(store, store_ledger, STORE_0465)
+}
+
+fn relabel_tip(source: &Migrator, ledger: &[LedgerRow]) -> Migrator {
+    let mut migrations: Vec<_> = source.iter().cloned().collect();
+    migrations.last_mut().expect("catalog tip").description = "different migration name".into();
+    let candidate = Migrator::with_migrations(migrations);
+    assert_eq!(reconcile(ledger, &candidate), Ok(vec![]));
+    candidate
+}
+
+fn verify_checkout(root: &Path, cutover_tip: i64) {
+    let verifier =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/retained_pre_catalog.py");
+    let status = Command::new("python3")
+        .args(["-E", "-B"])
+        .arg(verifier)
+        .arg("--repo")
+        .arg(root)
+        .arg("--shape")
+        .arg(format!("{cutover_tip:04}/0465"))
+        .status()
+        .expect("run local PRE checkout verifier");
+    assert!(status.success(), "PRE checkout verification refused");
+}
+
 async fn assert_pre(cutover_tip: i64, cutover_count: usize, cutover_projection: &str) {
     let cutover = Chain::Cutover.migrator().expect("embedded Cutover source");
     let store = Chain::Store.migrator().expect("embedded Store source");
@@ -66,10 +105,22 @@ async fn assert_pre(cutover_tip: i64, cutover_count: usize, cutover_projection: 
     let store_ledger = synthetic_ledger(&pre_store, 465, 20, STORE_0465);
 
     let swapped = through(&cutover, if cutover_tip == 473 { 475 } else { 473 });
-    assert_eq!(
-        check_plan_catalog(&swapped, &cutover_ledger, cutover_projection),
-        Err("PRE planner catalog projection mismatch".to_owned())
-    );
+    for (candidate_cutover, candidate_store) in [
+        (&swapped, &pre_store),
+        (&relabel_tip(&pre_cutover, &cutover_ledger), &pre_store),
+        (&pre_cutover, &relabel_tip(&pre_store, &store_ledger)),
+    ] {
+        assert_eq!(
+            check_plan_catalogs(
+                candidate_cutover,
+                candidate_store,
+                &cutover_ledger,
+                &store_ledger,
+                cutover_projection,
+            ),
+            Err("PRE planner catalog projection mismatch".to_owned())
+        );
+    }
 
     // The retained image predates applied 0472. Its own inventory cannot
     // produce the clean qualification plan, even if the Worker can boot it.
@@ -79,6 +130,7 @@ async fn assert_pre(cutover_tip: i64, cutover_count: usize, cutover_projection: 
     );
     let (plan_cutover, plan_store) = if let Some(root) = env::var_os("PREDECESSOR_PLAN_SOURCE") {
         let root = PathBuf::from(root);
+        verify_checkout(&root, cutover_tip);
         (
             Migrator::new(root.join("crates/cutover/migrations"))
                 .await
@@ -95,10 +147,14 @@ async fn assert_pre(cutover_tip: i64, cutover_count: usize, cutover_projection: 
         (pre_cutover, pre_store)
     };
 
-    check_plan_catalog(&plan_cutover, &cutover_ledger, cutover_projection)
-        .expect("exact Cutover planner catalog");
-    check_plan_catalog(&plan_store, &store_ledger, STORE_0465)
-        .expect("exact Store planner catalog");
+    check_plan_catalogs(
+        &plan_cutover,
+        &plan_store,
+        &cutover_ledger,
+        &store_ledger,
+        cutover_projection,
+    )
+    .expect("exact Cutover and Store planner catalogs");
 }
 
 #[tokio::test]
@@ -109,20 +165,4 @@ async fn predecessor_plan_accepts_pre_0473() {
 #[tokio::test]
 async fn predecessor_plan_accepts_pre_0475() {
     assert_pre(475, 116, CUTOVER_0475).await;
-}
-
-#[test]
-fn predecessor_plan_refuses_relabelled_retained_fence() {
-    let cutover = Chain::Cutover.migrator().expect("embedded Cutover source");
-    let retained = through(&cutover, 475);
-    let ledger = synthetic_ledger(&retained, 475, 116, CUTOVER_0475);
-    let mut migrations: Vec<_> = retained.iter().cloned().collect();
-    let fence = migrations.last_mut().expect("retained fence migration");
-    fence.description = "different fence source".into();
-    let candidate = Migrator::with_migrations(migrations);
-    assert_eq!(reconcile(&ledger, &candidate), Ok(vec![]));
-    assert_eq!(
-        check_plan_catalog(&candidate, &ledger, CUTOVER_0475),
-        Err("PRE planner catalog projection mismatch".to_owned())
-    );
 }
