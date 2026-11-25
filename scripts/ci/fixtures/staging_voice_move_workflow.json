@@ -7,6 +7,11 @@
           "description": "Exercise the staging self-move lease and prove it returns to OFF",
           "type": "boolean",
           "default": "false"
+        },
+        "verify_self_move": {
+          "description": "Select the self-move proof seam (requires separately supplied protected adapters)",
+          "type": "boolean",
+          "default": "false"
         }
       }
     }
@@ -55,6 +60,18 @@
             "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-voice-move-start.jsonl"
           },
           "run": "node wrangler/scripts/staging-use-pipeline.mjs begin"
+        },
+        {
+          "name": "Prove self-move within the same staging lease",
+          "if": "inputs.verify_self_move && steps.use.outcome == 'success'",
+          "env": {
+            "STAGING_VOICE_MOVE_PROOF": "${{ inputs.verify_self_move }}",
+            "STAGING_USE_EXPIRES_AT": "${{ steps.use.outputs.expires_at }}",
+            "STAGING_USE_SHA": "${{ steps.use.outputs.sha }}",
+            "STAGING_USE_DEPLOYMENT": "${{ steps.use.outputs.deployment_id }}",
+            "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-voice-move-start.jsonl"
+          },
+          "run": "node wrangler/scripts/staging-voice-move-job.mjs"
         },
         {
           "name": "Release the same lease and read back OFF",
