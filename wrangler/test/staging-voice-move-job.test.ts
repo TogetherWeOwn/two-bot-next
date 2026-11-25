@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -134,10 +134,11 @@ test("selected job refuses incomplete or mismatched inputs before any self-move"
   }
   assert.equal(await runStagingVoiceMoveJob(env, { ...inputs, previousOff: undefined }), "failed");
   // A ready line followed by a failure or malformed row must not authorize the proof.
-  appendFileSync(env.STAGING_USE_RECEIPT, '{"action":"failed"}\n');
-  assert.equal(await runStagingVoiceMoveJob(env, inputs), "failed");
-  appendFileSync(env.STAGING_USE_RECEIPT, "{\n");
-  assert.equal(await runStagingVoiceMoveJob(env, inputs), "failed");
+  const beginReceipt = readFileSync(env.STAGING_USE_RECEIPT, "utf8");
+  for (const invalidRow of ['{"action":"failed"}', "{"]) {
+    writeFileSync(env.STAGING_USE_RECEIPT, beginReceipt + invalidRow + "\n");
+    assert.equal(await runStagingVoiceMoveJob(env, inputs), "failed", invalidRow);
+  }
   assert.deepEqual({ signed, calls, reads }, { signed: [], calls: [], reads: [] });
   await finish();
   assert.deepEqual(calls, ["status", "release", "status"]);
