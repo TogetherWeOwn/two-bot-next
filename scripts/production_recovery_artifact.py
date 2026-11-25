@@ -60,6 +60,7 @@ def protected_job(run, api, name, expected_steps):
 
 def authenticated_inverse(pin, approval, artifact_id, archive_sha, env, api=github):
     run = current_run(env, api)
+    archive_sha = archive_sha.removeprefix("sha256:")
     require(str(run["id"]) == pin.run_id and pin.run_attempt == 1
             and RUN_ID.fullmatch(artifact_id) and HEX.fullmatch(archive_sha),
             "production_inverse_artifact_pin_invalid")
