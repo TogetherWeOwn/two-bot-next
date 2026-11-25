@@ -202,9 +202,11 @@ the protected context.
    `observer` to the fixture, including access to observe occupancy in either
    room and the permission facts needed to verify Connect. Its `readChannels`
    supplies `source` and `destination` at preflight and `observe` supplies
-   a new read at each case checkpoint. Both report the pinned guild, member and
-   room, guild-voice type, occupied room or explicit disconnect, effective
-   Connect and observation time independently of the Web session and move response.
+   a new read at each case checkpoint. Each observation includes `guildId`,
+   `discordId`, `channelId`, `channelType` (`2` for guild voice),
+   `connectedChannelId` (`null` for a confirmed disconnect), `canConnect`
+   and `observedAt`. Take these readings independently of the Web session
+   and move response.
 2. **Web Operations.** Confirm that the serving staging build includes the
    [current-session receipt](https://github.com/TogetherWeOwn/two-web-next/pull/2794)
    and that its protected settings match the approved member and ordered pair.
@@ -229,8 +231,9 @@ the protected context.
    `staging-voice-move-lease-<run>-<attempt>` artifact as
    `previousReady` and `previousOff`. That rehearsal lease must be released
    or expired, OFF and stopped, with the final status within 15 minutes before
-   a separate proof window acquires its own finite selected lease on the same
-   SHA, deployment and owner epoch. Leave time for cleanup inside the window.
+   a separate proof window acquires its own selected lease on the same SHA,
+   deployment and owner epoch. The proof lease lasts at most 15 minutes.
+   Leave time for cleanup inside the window.
    After successful
    [`staging-use-pipeline.mjs begin`](../wrangler/scripts/staging-use-pipeline.mjs),
    [`runStagingVoiceMoveJob(env, proofInputs)`](../wrangler/scripts/staging-voice-move-job.mjs)
@@ -241,18 +244,27 @@ the protected context.
    `control` adapter for lease assertion, status and release. The proof
    selector defaults off. The workflow CLI has no live input provider. The
    in-process job returns `disabled`, `failed` or `passed`. A pass is mock evidence.
+
+   For a protected live invocation, coordinate the custodian with the
+   [proof runner](../wrangler/scripts/staging-voice-move-acceptance.mjs)
+   before the cases. The runner confirms A to B (`moved`), then B to A
+   (`not_permitted`, still in B), then a move to B while disconnected
+   (`not_connected`). The custodian has the account leave B after the
+   `after:not_permitted` observation completes. The `before:not_connected`
+   checkpoint starts immediately. The observer must get a fresh disconnect
+   readback within that checkpoint's budget of up to 20 seconds, shortened
+   by the remaining lease time.
 4. **Stop and verify cleanup.** Stop the proof on any unconfirmed input,
    observation or move result, then proceed to cleanup. Never resubmit a move.
-   The fixture account leaves voice before the disconnected case, with
-   occupancy checked by the observer. Keep the enclosing unconditional
-   `staging-use-pipeline.mjs finish` on the original expiry, including after
-   admission failure. Confirm the
-   protected final status is for the same run, attempt, expiry, SHA, deployment
-   and epoch, with the lease released or expired, `voiceMoveEnabled: false`
-   and `running: false`. After interruption, verify this status after native
-   expiry. Confirm the account is disconnected, restore any changed Discord
-   overwrites and temporary Web settings, and verify Discord permissions are
-   restored and Web refuses the staging probes with the fixture disabled.
+   Once `begin` emits `expires_at`, keep the enclosing unconditional
+   `staging-use-pipeline.mjs finish` on that original expiry, including after
+   proof admission failure. Confirm the protected final status is for the same
+   run, attempt, expiry, SHA, deployment and epoch, with the lease released or
+   expired, `voiceMoveEnabled: false` and `running: false`. After interruption,
+   verify this status after native expiry. Confirm the account is disconnected,
+   restore any changed Discord overwrites and temporary Web settings, and verify
+   Discord permissions are restored and Web refuses the staging probes with the
+   fixture disabled.
    Treat any unconfirmed readback as incomplete cleanup.
 
 ### Enable order and rollback
