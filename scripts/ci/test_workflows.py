@@ -11323,6 +11323,9 @@ class WorkflowTests(unittest.TestCase):
                         expected.update({"actions": "read", "checks": "read"})
                         if job_id == "authorize":
                             expected["pull-requests"] = "read"
+                    elif (name, job_id) == ("build-predecessor.yml", "build"):
+                        # Verify the pinned source's Actions attempts and check runs.
+                        expected.update({"actions": "read", "checks": "read"})
                     elif (name, job_id) == ("check.yml", "ci-evidence"):
                         expected["actions"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
