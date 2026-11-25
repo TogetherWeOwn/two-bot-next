@@ -4048,6 +4048,8 @@ def voice_synthetic_errors(workflow):
         if (set(budget) - {"name"} != {"id", "env", "run"} or budget.get("id") != "budget"
                 or budget.get("env") != {**bindings, "VOICE_SYNTHETIC_REQUIRED": "${{ vars.VOICE_SYNTHETIC_REQUIRED }}"}):
             errors.append(f"{name}:synthetic: must check the original grant and predecessor clock before checkout")
+        if "GITHUB_" in budget.get("run", ""):
+            errors.append(f"{name}:synthetic: budget check must not access Actions command files")
         if checkout != {"uses": STAGING_CHECKOUT_USES,
                         "with": {"persist-credentials": "false", "fetch-depth": "1"}}:
             errors.append(f"{name}:synthetic: checkout must be pinned and wait for the budget check")
@@ -7448,6 +7450,7 @@ class WorkflowTests(unittest.TestCase):
             (lambda w: w["jobs"]["rerun-refusal"]["needs"].remove("synthetic"), "terminal failure sentinel"),
             (lambda w: w["jobs"]["synthetic"]["steps"][0].update({"env": {"TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}}), "only the Run step may hold a secret"),
             (lambda w: w["jobs"]["synthetic"]["steps"][0].update({"continue-on-error": "true"}), "before checkout"),
+            (lambda w: w["jobs"]["synthetic"]["steps"][0].update({"run": 'echo /tmp >> "$GITHUB_PATH"'}), "Actions command files"),
             (lambda w: w["jobs"]["synthetic"]["steps"][1].update({"if": "always()"}), "wait for the budget check"),
             (lambda w: w["jobs"]["synthetic"]["steps"][-2].update({"run": "wrangler deploy"}), "reviewed script"),
         )
@@ -7641,8 +7644,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(steps[2].get("id"), "voice")
         budget, _, voice, _ = steps
 
-        def run(step, now, grant, required="", token="fixture"):
-            env = {"VOICE_JOB_ANCHOR": "1000", "GRANT_EXPIRES_AT": str(grant),
+        def run(step, now, grant, *, anchor=1000, required="", token="fixture"):
+            env = {"VOICE_JOB_ANCHOR": str(anchor), "GRANT_EXPIRES_AT": str(grant),
                    "VOICE_WORK_SECONDS": voice["env"]["VOICE_WORK_SECONDS"],
                    "VOICE_SYNTHETIC_REQUIRED": required, "GITHUB_OUTPUT": "/dev/stdout",
                    "RUN_ID": "1", "NOW": str(now), "PATH": "/nonexistent"}
@@ -7653,11 +7656,13 @@ class WorkflowTests(unittest.TestCase):
             return subprocess.run(["/bin/bash", "-c", fake + step["run"]], env=env,
                                   capture_output=True, text=True, timeout=5, check=False)
 
-        # The known setup deficit and an already-expired grant both fail the
-        # first step, so Actions' default success guard skips checkout and Run.
-        for now, grant in ((1135, 4000000), (1000, 1000000), (1000, 1452000)):
-            with self.subTest(now=now, grant=grant):
-                refused = run(budget, now, grant)
+        # Actions' default success guard skips checkout and Run on refusal.
+        for now, anchor, grant in ((1135, 1000, 4000000), (1088, 1000, 4000000),
+                                   (1000, 1000, 1000000), (1000, 1000, 1452000),
+                                   (1000, 1001, 4000000), (1000, "", 4000000),
+                                   (1000, 1000, "4e6")):
+            with self.subTest(now=now, anchor=anchor, grant=grant):
+                refused = run(budget, now, grant, anchor=anchor)
                 self.assertEqual(refused.returncode, 1, refused.stderr)
                 self.assertIn("::error::not enough runner or staging grant time", refused.stdout)
                 self.assertNotIn("voice invoked", refused.stdout)
