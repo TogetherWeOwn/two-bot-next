@@ -904,6 +904,28 @@ test("bounded staging: unreadable AutoMod journal preserves native stop and retr
   assert.deepEqual(await h.bot.listSchedules("stagingExpiry"), []);
 });
 
+test("bounded staging: preparing AutoMod reservation retries native stop", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const use: StagingUse = { ...stagingWindow(), deploymentId: ID, sha: BOUNDED_STAGING_ENV.CONTAINER_RELEASE,
+    epoch: ACTIVE_OWNER.epoch, acquiredAt: Date.now(), phase: "preparing", purpose: AUTOMOD_STAGING_PURPOSE };
+  const values = new Map<string, unknown>([[OWNER_KEY, ACTIVE_OWNER], [STAGING_USE_KEY, use]]);
+  // A reconstruction can find the durable reservation after the old process's stop failed.
+  const h = await harness(t, BOUNDED_STAGING_ENV, { running: true, stopError: true, values });
+  assert.equal(h.runtime.destroys, 1);
+  assert.equal(h.runtime.running, true);
+  const [retry] = await h.bot.listSchedules("stagingExpiry");
+  assert.equal(retry?.time, Math.ceil((Date.now() + 15_000) / 1000));
+  await assert.rejects(h.bot.start(), /staging_automod_reserved/);
+
+  t.mock.method(h.runtime, "destroy", async () => { h.runtime.running = false; });
+  await h.bot.stagingExpiry();
+  assert.equal(h.runtime.running, false);
+  assert.deepEqual(values.get(STAGING_USE_KEY), use);
+  h.runtime.running = true;
+  await h.bot.onActivityExpired();
+  assert.equal(h.runtime.running, false);
+});
+
 test("bounded staging: failed control teardown persists a prompt stop-only retry", async (t) => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
   for (const action of ["acquire", "release"] as const) {

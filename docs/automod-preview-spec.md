@@ -714,10 +714,12 @@ staging mutations check the purpose and pending journal in the Container
 ownership gate before acting. The staging-use request parser refuses AutoMod
 purpose selection.
 
-If neither record can affirm an AutoMod reservation during a storage failure,
-the existing emergency shutdown still stops the native process and retries a
-failed stop. Protected cleanup continues to require fresh remote drain and
-stopped readbacks before releasing the lease.
+During preparation the reservation blocks competing admission and allows
+native shutdown and retry of the previous process. If neither record can
+affirm an active AutoMod lease or pending journal during a storage failure,
+emergency shutdown still stops the native process and retries a failed stop.
+Protected cleanup continues to require fresh remote drain and stopped
+readbacks before releasing the lease.
 
 The dependent private caller needs to use the stored scope for startup and
 release on same-lease cleanup completion. Live qualification still needs the

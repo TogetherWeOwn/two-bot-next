@@ -898,7 +898,7 @@ export class TwoBotContainer extends Container<Env> {
     // ingress or alarms are delivered, not just before the next cold start.
     this.initialization = ctx.blockConcurrencyWhile(async () => {
       try {
-        if (this.boundedStaging() && await this.automodReserved()) return;
+        if (this.boundedStaging() && await this.deferStagingTeardown(await this.stagingUse.read())) return;
         const owner = await this.ownership.require(this.id());
         if (this.boundedStaging()) {
           await this.requireRecoveryDatabase();
@@ -907,7 +907,7 @@ export class TwoBotContainer extends Container<Env> {
         }
       } catch (error) {
         refused(error);
-        if (this.boundedStaging() && await this.confirmedAutomodReservation()) {
+        if (this.boundedStaging() && await this.confirmedTeardownHold()) {
           this.recoveryFailed = true;
           return;
         }
@@ -963,11 +963,16 @@ export class TwoBotContainer extends Container<Env> {
     return hasAutomodReservation(await this.stagingUse.read()) || !!await this.automodRecovery.pending();
   }
 
-  /** Emergency teardown still stops unverified ordinary staging. Either
-   * readable record can affirm an AutoMod reservation and defer to recovery. */
-  private async confirmedAutomodReservation(): Promise<boolean> {
+  private async deferStagingTeardown(use: StagingUse | undefined): Promise<boolean> {
+    // Preparation reserves admission before the previous runtime has stopped.
+    return (use?.phase === "active" && hasAutomodReservation(use)) || !!await this.automodRecovery.pending();
+  }
+
+  /** Emergency teardown still stops unverified staging. A readable active
+   * AutoMod lease or pending journal defers teardown to protected recovery. */
+  private async confirmedTeardownHold(): Promise<boolean> {
     const use = await this.stagingUse.read().catch(() => undefined);
-    return hasAutomodReservation(use) || await this.automodRecovery.pending().then(Boolean, () => false);
+    return this.deferStagingTeardown(use).catch(() => false);
   }
 
   /** Snapshot composition. Static so the DO instance exposes no snapshot RPC. */
@@ -1073,7 +1078,7 @@ export class TwoBotContainer extends Container<Env> {
       let use: StagingUse | undefined;
       try {
         use = await this.stagingUse.read();
-        if (hasAutomodReservation(use) || await this.automodRecovery.pending()) return;
+        if (await this.deferStagingTeardown(use)) return;
         if (use?.phase === "active" && use.expiresAt > Date.now() && !this.recoveryFailed) {
           await this.scheduleStagingExpiry(use.expiresAt);
           return;
@@ -1085,7 +1090,7 @@ export class TwoBotContainer extends Container<Env> {
       } catch {
         // A storage failure is denial too. Do not keep a healthy gateway or
         // an idle retry loop alive just because authority could not be read.
-        if (await this.confirmedAutomodReservation()) return;
+        if (await this.confirmedTeardownHold()) return;
         try {
           if (this.ctx.container?.running) await super.destroy();
           if (this.ctx.container?.running) throw new OwnershipRefused("shutdown_unconfirmed");
@@ -1109,7 +1114,7 @@ export class TwoBotContainer extends Container<Env> {
     if (!this.boundedStaging()) return super.onActivityExpired();
     // Native inactivity is a second stop path, never a staging restart path.
     await this.gated(async () => {
-      if (!await this.confirmedAutomodReservation()) await this.stopStagingUse();
+      if (!await this.confirmedTeardownHold()) await this.stopStagingUse();
     });
   }
 
