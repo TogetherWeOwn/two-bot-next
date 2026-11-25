@@ -97,6 +97,26 @@ the fresh provider backup and temporary restore when required, no-egress and
 private handling, verified same-day copy deletion and credential removal, and
 independent release approval. This invocation reads only the affected table.
 
+### Synthetic release restore handoff
+
+The [offline fixture](../scripts/ci/fixtures/release_restore_handoff.json)
+shows evidence for the release bundle that applies 0475, Cutover 0479–0482
+and Store 0478. It pairs before, forward and post-undo Bot runtime and Web
+reader results with the same restored copy. The reads include the legacy
+windows and upcoming events, plus empty attendance and voice heat on the
+expanded schema. The selected [schema inverse](../sql/release_schema_inverse.sql)
+retains 0475 and its fence, removes only the expansion entries from both
+ledgers and returns the Web contract to 1.0. The example retains only
+aggregate results for each app read.
+
+Record the provider readback showing the exact copy is absent on the UTC
+day it was restored. Record a separate absence check for all temporary
+credential entries after removal. An accepted delete or a check of a
+different copy or entry leaves cleanup unverified. The fixture and its
+[acceptance test](../scripts/ci/test_release_restore_handoff.py) run offline
+in the existing CI suite. The release thread supplies actual observations
+and owns the restore, undo rehearsal and cleanup.
+
 ## Stable failure codes
 
 Every `backup`, `restore`, `backup-upload`, `guild-config-snapshot` and
