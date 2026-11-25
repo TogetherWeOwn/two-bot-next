@@ -5,9 +5,17 @@ serving the signed verb in a protected staging window. Keep the same compiled
 revision, build ID, deploy ID and tenant. For each Worker version, use its
 verified [staging rollout receipt](staging-rollout-gate.md).
 
-In an isolated synthetic store, map `attendance-acceptance:<build_id>` to a
-pending TWO Staging event with a recent UTC whole-minute start and a 30-minute
-window. Seed a closed 12-minute session starting one minute in for fabricated
+Save a trusted `plan.json` for the current reservation before collecting phase
+observations. Set `event_key` to a fresh `attendance-acceptance:<fixture>` key
+for this rehearsal. The suffix is 1–34 ASCII letters, digits, dots,
+underscores or hyphens. Set `fixture_start` to a recent UTC whole-minute start
+(`YYYY-MM-DDTHH:MM:00Z`). Set `lease` to the reservation's `epoch`, `runId`,
+`runAttempt`, `acquiredAt` and `expiresAt`, with `runId` as a string and all
+other values as integers. Keep the same plan for every phase.
+
+In an isolated synthetic store, map the planned key to a pending TWO
+Staging event at that start with a 30-minute window. Seed a closed 12-minute
+session starting one minute in for fabricated
 member `300000000000000001` and room `400000000000000001` named `Synthetic attendance room`.
 Finalize after completion and 15 minutes of grace (start + 45 minutes). Use that
 event for OFF. Seed an equivalent finalized record at `:foreign` only in a
@@ -21,47 +29,53 @@ Put trusted configuration and fixture readback from that window into `observed` 
 | `worker_version`, `build_revision`, `build_id`, `deploy_id` | Verified rollout identity |
 | `attendance_read` | Effective `TWO_INTERNAL_ALLOW_ATTENDANCE_READ`. JSON `true` for pending and finalized, `false` for OFF and cleanup |
 | `attendance_capture`, `signed_ingress` | Capture `false` throughout. Signed ingress `true` during the three wire phases |
+| `fixture_event_key` | Primary event key from the fixture readback, or the primary key checked for absence at cleanup |
 | `primary_fixture`, `foreign_fixture` | Primary `pending` or `finalized` per phase. For finalized, `foreign-only` after checking the key exists only in the foreign tenant |
 | `lifecycle`, `fixture_rows` | Successful `staging-use.mjs` JSONL `ready` record for wire phases. Cleanup requires a stopped `release` record with lease `released` in the matching owner epoch and `0` fixture rows across both tenants |
 
-Use Python 3.11+, the same fixture start (`YYYY-MM-DDTHH:MM:00Z`) and each phase's readback.
+Use Python 3.11+ and each phase's readback.
 Inject `STAGING_ATTENDANCE_KEY_ID` and a dedicated `STAGING_ATTENDANCE_SIGNING_SECRET` of 64 lowercase hex characters as ASCII.
 
 ```sh
 python3 scripts/staging_attendance_acceptance.py "$phase" --rollout rollout.json \
-  --observed observed.json --fixture-start "$fixture_start" --execute
+  --observed observed.json --plan plan.json --execute
 ```
 
 - `pending` requires `404 not_found` without a result.
 - `finalized` requires the exact event-bound v1 `final: true` result and `404 not_found` for the foreign key.
 - `off` requires `403 action_not_allowed` while the fixture stays finalized.
-- `cleanup` checks OFF, stopped and fixture removal offline. Omit `--execute` and `--fixture-start`.
+- `cleanup` checks OFF, stopped and absence of the planned primary and foreign fixtures offline. Omit `--execute`.
 
 The v2 fixture lists the `not_found` outcome. The [Web reader](https://github.com/TogetherWeOwn/two-web-next/blob/cba63716d12421bcf054240cbfe8b036861bce62/src/bot/attendance-read.ts#L17-L109) consumes it as a `404` error and allows 2.5 seconds per signed read.
 
 Exit `0` means pass, `1` means fail, and `2` includes preflight without `--execute`.
-Run cleanup even after failure. Record verdicts without credentials, signing headers or raw responses.
+Run cleanup even after failure. On a successful signed probe, the script
+prints a JSON receipt before the `PASS` line. Save that JSON object as
+`signed_receipt` in the corresponding phase observation. The receipt carries
+the phase, rollout, fixture and lease identity. Keep credentials, signing
+headers and raw responses out of the evidence.
 
 ## Compare one rehearsal offline
 
 Keep the full sanitized `lifecycle` record in each phase's observation. Save
 the four observations in `rehearsal.json` as one JSON object keyed by `pending`,
 `finalized`, `off` and `cleanup`. Each value is the observed JSON object for
-that phase. Use the rollout receipt from the original pending phase.
+that phase. Supply the pinned rollout receipt and the plan saved for the
+current reservation.
 
 ```sh
 python3 scripts/staging_attendance_acceptance.py rehearsal --rollout rollout.json \
-  --observed rehearsal.json
+  --observed rehearsal.json --plan plan.json
 ```
 
 The comparison uses each `ready` record's `observedAt` to check that the
-lease covered the probe budget. It uses the pending lease's owner epoch,
-`runId`, `runAttempt`, `acquiredAt` and `expiresAt` for all four phases. A
-later lease on the same rollout may retain the same owner epoch. Its stopped
-release and zero fixture rows belong to that later rehearsal. If the original
-lease has no matching cleanup receipt, leave its cleanup verdict unverified.
-Record `PASS: attendance rehearsal` alongside the separately recorded signed
-probe verdicts from the protected run.
+lease covered the probe budget. All four fixture and lifecycle readbacks
+must match the planned fixture key and exact lease. Each wire phase also
+needs its matching signed probe receipt, with the planned key and start,
+rollout identity, phase and full lease. Another rehearsal can keep the same
+rollout and owner epoch. Its signed probe receipts and cleanup readback
+belong to its own plan. If the current lease has no matching cleanup
+readback, leave its cleanup verdict unverified.
 
 ## Enablement and rollback evidence
 
