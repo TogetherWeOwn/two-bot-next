@@ -2,6 +2,7 @@
 """Compare operator-captured advisory evidence without contacting GitHub."""
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 import sys
 
@@ -11,6 +12,7 @@ import pr_evidence as evidence
 from script_intake import decode_json, read_with_overflow
 
 MAX_CAPTURE = 1024 * 1024
+GITHUB_TIME = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def load(path):
@@ -30,8 +32,8 @@ class CapturedPR:
 
 
 def hosted_result(capture, verdict):
-    run, job = capture.get("run"), capture.get("job")
-    if run is None and job is None:
+    run, listing = capture.get("run"), capture.get("jobs")
+    if run is None and listing is None:
         return "unavailable"
     if (run["repository"]["full_name"], run["head_sha"], run["event"], run["path"]) != (
             verdict.repo, verdict.head, "pull_request", ".github/workflows/pr-evidence.yml"):
@@ -39,19 +41,26 @@ def hosted_result(capture, verdict):
     if not any(type(pr["number"]) is int and pr["number"] == verdict.number
                and pr["head"]["sha"] == verdict.head for pr in run["pull_requests"]):
         raise ValueError("Missing PR association.")
-    if (job["name"], job["run_id"], job["run_attempt"], job["head_sha"]) != (
+    if type(listing["total_count"]) is not int or listing["total_count"] != 1:
+        raise ValueError("Expected the single job from the attempt-scoped jobs endpoint.")
+    job, = listing["jobs"]
+    job_attempt = job.get("run_attempt", 1)
+    if (job["name"], job["run_id"], job_attempt, job["head_sha"]) != (
             "pr-evidence", run["id"], run["run_attempt"], verdict.head):
         raise ValueError("Unexpected advisory job.")
     if not all(type(value) is int and value > 0 for value in (
-            run["id"], run["run_attempt"], job["run_id"], job["run_attempt"], job["id"])):
+            run["id"], run["run_attempt"], job["run_id"], job_attempt, job["id"])):
         raise ValueError("Invalid advisory identity.")
     if run["status"] != "completed" or job["status"] != "completed":
         return "unavailable"
     verify, = [step for step in job["steps"] if step["name"] == "Verify and publish evidence"]
     result = verify["conclusion"]
-    if verify["status"] == "completed" and result in ("success", "failure") and (
-            run["conclusion"] == job["conclusion"] == result):
+    if verify["status"] != "completed" or result not in ("success", "failure"):
+        return "unavailable"
+    if run["conclusion"] == job["conclusion"] == result:
         return result
+    if result == "success" and run["conclusion"] == job["conclusion"] == "failure":
+        return "failed_after_verification"
     return "unavailable"
 
 
@@ -65,8 +74,12 @@ def compare(before, current):
         raise ValueError("Expected the same target ref.")
     if hosted_result(before, old) != "success":
         raise ValueError("Expected a matching prior green capture.")
-    if current.get("run") is not None and current["run"]["id"] == before["run"]["id"]:
-        raise ValueError("Expected a distinct advisory run after the edit.")
+    if (run := current.get("run")) is not None:
+        prior_run = before["run"]
+        created = datetime.strptime(run["created_at"], GITHUB_TIME)
+        prior_created = datetime.strptime(prior_run["created_at"], GITHUB_TIME)
+        if run["id"] == prior_run["id"] or created <= prior_created:
+            raise ValueError("Expected a distinct, later advisory run after the edit.")
     return hosted_result(current, now), old != now
 
 
@@ -93,7 +106,7 @@ def main():
         return 2
     print(f"current_advisory={current}")
     print(f"prior_hosted={'stale_green' if stale else 'green_same_description'}")
-    return {"success": 0, "failure": 1, "unavailable": 2}[current]
+    return {"success": 0, "failure": 1, "failed_after_verification": 1, "unavailable": 2}[current]
 
 
 if __name__ == "__main__":

@@ -28,15 +28,20 @@ registration criteria in [Exact-head CI evidence](../CONTRIBUTING.md#exact-head-
 
 On a task draft, capture `GET /pulls/{number}` before a description-only edit
 while the advisory check is green. Retain the matching workflow run attempt
-(`GET /actions/runs/{run_id}/attempts/{attempt}`) and its `pr-evidence` job
-(`GET /actions/jobs/{job_id}`). After the edit, capture the PR again and keep
-the distinct advisory run and job triggered by that edit. Use the Actions job
+(`GET /actions/runs/{run_id}/attempts/{attempt}`) and its jobs response
+(`GET /actions/runs/{run_id}/attempts/{attempt}/jobs`). A job may omit
+`run_attempt` on the first attempt. Reruns require an explicit match to
+exclude jobs from earlier attempts.
+After the edit, capture the PR again and keep the later advisory run attempt
+and jobs response triggered by that edit. Use the Actions job
 log to confirm the reason if `Verify and publish evidence` fails. Keep each
 description stable through its run and capture. Restore a valid description
 after the rehearsal and confirm the resulting advisory run succeeds.
 
+Use a same-repository draft against a stable base SHA. A moved base or a run
+without the PR in its associations makes the comparison unavailable.
 Save each set of REST response objects in a local JSON file under the keys
-`pr`, `run` and `job`. Omit both `run` and `job` in the current capture if the
+`pr`, `run` and `jobs`. Omit both `run` and `jobs` in the current capture if the
 edit has no run receipt yet. The files contain PR descriptions. Keep them out
 of the repository and retain only the run and job links and the reported results.
 
@@ -48,10 +53,11 @@ python3 -B scripts/ci/rehearse_pr_evidence.py group checks-requested.json
 The PR report distinguishes a failed verification step in the current advisory
 run (`current_advisory=failure`) from a prior passing run paired with a different
 description at the same head (`prior_hosted=stale_green`). Both can appear in
-one report. Exit status is 0 for current advisory success, 1 for current
-verification failure, and 2 for unavailable or unmatched evidence. The advisory
-job publishes no description digest. The comparison relies on the operator's
-pairing of each stable description with its run and job. GitHub can retain the
+one report. A workflow failure after verification passed reports
+`current_advisory=failed_after_verification`. Exit status is 0 for current
+advisory success, 1 for a reported failure, and 2 for unavailable or unmatched
+evidence. The advisory job publishes no description digest. The comparison relies
+on the operator pairing each stable description with its run and job. GitHub can retain the
 earlier successful result on the same head, so the receipt cannot establish
 freshness at merge time.
 
