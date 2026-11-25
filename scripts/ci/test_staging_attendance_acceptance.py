@@ -519,6 +519,20 @@ class AcceptanceTests(unittest.TestCase):
                                                  vector["nonce"], vector["body"].encode())
             self.assertEqual(headers["x-two-signature"], vector["signature"])
 
+    def test_rehearsal_plan_requires_exact_fields_and_a_bounded_key(self):
+        prefix = "attendance-acceptance:"
+        longest_plan = {**PLAN, "event_key": prefix + "a" * 34}
+        observations = self.observations(longest_plan, START)
+        self.assertEqual(self.offline(longest_plan, observations), (0, "PASS: attendance rehearsal\n", ""))
+        invalid_plans = (
+            {**longest_plan, "event_key": longest_plan["event_key"] + "a"},
+            {**longest_plan, "unknown": "unexpected"},
+            {**longest_plan, "lease": {**PLAN["lease"], "unknown": 0}},
+        )
+        for invalid in invalid_plans:
+            with self.subTest(plan=invalid):
+                self.assertEqual(self.offline(invalid, observations), (1, "", "FAIL: invalid synthetic fixture plan\n"))
+
     def test_without_execute_sends_nothing(self):
         args = ["pending", "--rollout", "rollout", "--observed", "observed", "--plan", "plan"]
         with (patch.object(acceptance, "read_object", return_value=PLAN),

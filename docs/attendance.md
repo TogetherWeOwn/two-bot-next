@@ -6,9 +6,10 @@ revision, build ID, deploy ID and tenant. For each Worker version, use its
 verified [staging rollout receipt](staging-rollout-gate.md).
 
 Save a trusted `plan.json` for the current reservation before collecting phase
-observations. Set `event_key` to a fresh `attendance-acceptance:<fixture>` key
-for this rehearsal. The suffix is 1–34 ASCII letters, digits, dots,
-underscores or hyphens. Set `fixture_start` to a recent UTC whole-minute start
+observations. Assign this rehearsal its own `attendance-acceptance:<fixture>`
+key, including when an earlier rehearsal still awaits cleanup. Use 1–34
+ASCII letters, digits, dots, underscores or hyphens for the suffix.
+Set `fixture_start` to a recent UTC whole-minute start
 (`YYYY-MM-DDTHH:MM:00Z`). Set `lease` to the reservation's `epoch`, `runId`,
 `runAttempt`, `acquiredAt` and `expiresAt`, with `runId` as a string and all
 other values as integers. Keep the same plan for every phase.
@@ -50,10 +51,11 @@ The v2 fixture lists the `not_found` outcome. The [Web reader](https://github.co
 
 Exit `0` means pass, `1` means fail, and `2` includes preflight without `--execute`.
 Run cleanup even after failure. On a successful signed probe, the script
-prints a JSON receipt before the `PASS` line. Save that JSON object as
-`signed_receipt` in the corresponding phase observation. The receipt carries
-the phase, rollout, fixture and lease identity. Keep credentials, signing
-headers and raw responses out of the evidence.
+prints a JSON receipt before the `PASS` line. Keep the protected run's
+transcript as evidence that the probe ran and passed. Copy the JSON object
+directly from that transcript into `signed_receipt` in the corresponding
+phase observation. Keep credentials, signing headers and raw responses out
+of the evidence.
 
 ## Compare one rehearsal offline
 
@@ -72,9 +74,11 @@ The comparison uses each `ready` record's `observedAt` to check that the
 lease covered the probe budget. All four fixture and lifecycle readbacks
 must match the planned fixture key and exact lease. Each wire phase also
 needs its matching signed probe receipt, with the planned key and start,
-rollout identity, phase and full lease. Another rehearsal can keep the same
-rollout and owner epoch. Its signed probe receipts and cleanup readback
-belong to its own plan. If the current lease has no matching cleanup
+rollout identity, phase and full lease. The offline verdict confirms that
+the trusted records belong to the plan. Keep it with the protected run's
+transcript when recording a rehearsal pass. Another rehearsal can keep the
+same rollout and owner epoch. Its signed probe receipts and cleanup
+readback belong to its own plan. If the current lease has no matching cleanup
 readback, leave its cleanup verdict unverified.
 
 ## Enablement and rollback evidence

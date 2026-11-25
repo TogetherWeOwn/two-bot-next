@@ -172,10 +172,13 @@ def fixture_start(value):
 
 def read_plan(path):
     plan = read_object(path)
+    require(set(plan) == {"event_key", "fixture_start", "lease"}
+            and isinstance(plan["lease"], dict) and set(plan["lease"]) == set(LEASE_FIELDS),
+            "invalid synthetic fixture plan")
     event_key = plan.get("event_key")
-    require(isinstance(event_key, str) and re.fullmatch(r"attendance-acceptance:[A-Za-z0-9._-]{1,34}", event_key)
-            and isinstance(plan.get("lease"), dict), "invalid synthetic fixture plan")
-    return plan, fixture_start(plan.get("fixture_start"))
+    require(isinstance(event_key, str) and re.fullmatch(r"attendance-acceptance:[A-Za-z0-9._-]{1,34}", event_key),
+            "invalid synthetic fixture plan")
+    return plan, fixture_start(plan["fixture_start"])
 
 
 def signing_headers(key_id, secret, timestamp, nonce, body):
