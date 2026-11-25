@@ -1665,7 +1665,7 @@ class GuardBehaviourTests(unittest.TestCase):
                 )
 
     def test_sha_without_a_successful_staging_deploy_is_refused(self):
-        self.assertRefused(self.guard(staging={"total_count": 0, "workflow_runs": []}),
+        self.assertRefused(self.guard(**{"staging-all": {"total_count": 0, "workflow_runs": []}}),
                            "deploy-staging has no successful run")
 
     def test_missing_production_environment_is_refused(self):
@@ -1706,7 +1706,7 @@ class GuardBehaviourTests(unittest.TestCase):
     def test_auto_approve_refuses_unless_the_latest_staging_deploy_succeeded(self):
         environment = {**green()["environment"], "protection_rules": []}
         for runs, reason in (
-            ([], "no verifiable latest run"),
+            ([], "no successful run"),
             ([staging_run(conclusion="failure")], "not a completed success"),
             ([staging_run(), staging_run(run_id=502, number=6, conclusion="failure")], "not a completed success"),
             ([staging_run(), staging_run(run_id=502, number=6, status="in_progress", conclusion=None)],
@@ -1721,7 +1721,7 @@ class GuardBehaviourTests(unittest.TestCase):
     def test_auto_approve_keeps_every_other_guard(self):
         environment = {**green()["environment"], "protection_rules": []}
         self.assertRefused(self.guard(auto="true", environment=environment,
-                                      staging={"total_count": 0, "workflow_runs": []}),
+                                      **{"staging-all": {"total_count": 0, "workflow_runs": []}}),
                            "deploy-staging has no successful run")
         self.assertRefused(self.guard(auto="true", environment=environment, compare={"status": "behind"}),
                            "not an ancestor of origin/main")
