@@ -167,10 +167,11 @@ coverage.
 
 Mixed builds, a foreign build, an unstamped signal event, and a stale window
 or event return nonzero without signal counts. Filtered and possibly truncated
-pages are also refused. Use shorter subwindows within the verified serving
-interval when the readback fills a page. `no_build_events` means the packet
-contains no stamped record for the verified build. This optional summary has
-no release-gate wiring.
+pages are also refused. Older captures need a fresh unfiltered readback of the
+verified window because they lack the filter marker. Use shorter subwindows
+within that interval when the readback fills a page. `no_build_events` means
+the packet contains no stamped record for the verified build. This optional
+summary has no release-gate wiring.
 
 ## Verification (test containers only)
 

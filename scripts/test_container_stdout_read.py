@@ -302,8 +302,14 @@ class PassiveGatewayEvidenceTests(unittest.TestCase):
                          (1, {"verdict": "incomplete_window"}))
         self.assertEqual(self.summarize(dict(packet, service="[redacted]")),
                          (1, {"verdict": "service_mismatch"}))
-        self.assertEqual(self.summarize(b'{"events":[],"events":[]}'),
-                         (1, {"verdict": "invalid_packet"}))
+
+    def test_duplicate_key_refuses_an_otherwise_valid_packet(self):
+        packet = self.packet(self.event("ready", "two_bot::gateway"))
+        code, summary = self.summarize(packet)
+        self.assertEqual((code, summary["verdict"]), (0, "observed"))
+        raw = json.dumps(packet).encode()
+        duplicate = b'{"schema_version": 1, ' + raw[1:]
+        self.assertEqual(self.summarize(duplicate), (1, {"verdict": "invalid_packet"}))
 
 
 class RedactionTests(unittest.TestCase):
