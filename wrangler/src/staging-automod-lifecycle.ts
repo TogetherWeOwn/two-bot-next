@@ -1,3 +1,4 @@
+import { boundRead } from "./internal-actions.ts";
 import { admitStagingAutomod } from "./staging-automod.ts";
 import {
   inspectStagingAutomod, publishStagingAutomod, removeOwnedStagingAutomod,
@@ -112,12 +113,17 @@ export class StagingAutomodLifecycle {
         const at = this.now();
         if (!Number.isSafeInteger(at) || at < lease.acquiredAt || at >= publishBefore || observed.running !== running
           || !isolated(running ? observed.policy : dryRun.policy)) throw refused();
+        return at;
       };
-      const intent = await this.journal.claimStartup(expected, intent => requireRuntime(intent, false));
-      await requireRuntime(intent, false);
-      try { await dryRun.start(intent.lease, DRY_RUN_POLICY, intent.publishBefore); }
-      catch { throw refused(); }
-      await requireRuntime(intent, true);
+      const intent = await this.journal.claimStartup(expected, async intent => { await requireRuntime(intent, false); });
+      const at = await requireRuntime(intent, false);
+      const deadline = AbortSignal.timeout(intent.publishBefore - at);
+      // A lost response cannot retain the gate past the cutoff. The durable
+      // claim stays pending and recovery still requires authoritative drain.
+      try {
+        await boundRead(dryRun.start(intent.lease, DRY_RUN_POLICY, intent.publishBefore), deadline);
+        await boundRead(requireRuntime(intent, true), deadline);
+      } catch { throw refused(); }
     });
   }
 

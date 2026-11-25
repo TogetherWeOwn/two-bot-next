@@ -702,10 +702,10 @@ precedes a durable, single-use startup claim bound to the exact lease and
 cutoff. The launch policy requires a fresh session with dedicated intents and
 member intake, enforcement, registry sync and interaction dispatch off. The
 entry refuses an unsafe planned policy and requires independent runtime
-readback of the same policy. A lost startup response or a failed readback
-keeps the hold for recovery. Recovery requires same-lease remote drain of
-both publication and startup, followed by confirmed stop and a separate
-registry absence read.
+readback of the same policy. The cutoff bounds the wait for the startup reply
+and readback. A lost response or a failed readback keeps the hold for recovery.
+Recovery requires same-lease remote drain of both publication and startup,
+followed by confirmed stop and a separate registry absence read.
 
 The protected caller still has to bind the same gate to staging ownership,
 lease acquisition and release, expiry, startup and all registry writers.
