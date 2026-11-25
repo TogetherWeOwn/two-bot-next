@@ -172,9 +172,9 @@ is applied. Use the existing exclusive finite staging window with verified servi
 rollback identities, a dedicated account and channels, and cleanup within that window.
 
 Select `verify_lease` in the [manual workflow](../.github/workflows/staging-voice-move.yml) for the exact serving main SHA.
-Leave `verify_self_move` off for lease verification. The proof step uses the same job's
-lease outputs and final ready receipt. It refuses a selected run until a protected
-invocation supplies the approved fixture, prior receipts, Web revision and scoped adapters.
+The self-move proof step defaults off in the workflow source. It uses the same job's lease
+outputs and final ready receipt. Selection requires a protected invocation that supplies
+the approved fixture, prior receipts, Web revision and scoped adapters.
 Cleanup reads back `voiceMoveEnabled: false` and `running: false`. After interruption, confirm both after native
 expiry in protected status for the same run, attempt, expiry, deployment and SHA.
 Live qualification needs a signer bound to the dedicated account's own Web session and two dedicated staging

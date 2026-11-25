@@ -7,11 +7,6 @@
           "description": "Exercise the staging self-move lease and prove it returns to OFF",
           "type": "boolean",
           "default": "false"
-        },
-        "verify_self_move": {
-          "description": "Select the self-move proof seam (requires separately supplied protected adapters)",
-          "type": "boolean",
-          "default": "false"
         }
       }
     }
@@ -33,7 +28,8 @@
       "timeout-minutes": "10",
       "env": {
         "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
-        "STAGING_USE_VOICE_MOVE": "1"
+        "STAGING_USE_VOICE_MOVE": "1",
+        "STAGING_VOICE_MOVE_PROOF": "false"
       },
       "steps": [
         {
@@ -63,9 +59,8 @@
         },
         {
           "name": "Prove self-move within the same staging lease",
-          "if": "inputs.verify_self_move && steps.use.outcome == 'success'",
+          "if": "env.STAGING_VOICE_MOVE_PROOF == 'true' && steps.use.outcome == 'success'",
           "env": {
-            "STAGING_VOICE_MOVE_PROOF": "${{ inputs.verify_self_move }}",
             "STAGING_USE_EXPIRES_AT": "${{ steps.use.outputs.expires_at }}",
             "STAGING_USE_SHA": "${{ steps.use.outputs.sha }}",
             "STAGING_USE_DEPLOYMENT": "${{ steps.use.outputs.deployment_id }}",
