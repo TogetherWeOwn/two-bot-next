@@ -41,7 +41,9 @@ use crate::intake_cap::{read_bytes_capped, IntakeReadError, INTAKE_CAP_LABEL};
 
 #[path = "release_schema_transaction.rs"]
 mod release_schema_transaction;
-pub use release_schema_transaction::{apply_release_schema, undo_release_schema};
+pub use release_schema_transaction::{
+    apply_release_schema, recover_release_schema, undo_release_schema,
+};
 
 /// Fixed binding names; each value is a secret and is never echoed.
 /// Plan reads only the RO binding; apply reads only the migrator binding.
@@ -1407,6 +1409,88 @@ pub async fn run(req: &Request) -> Result<Value, RunError> {
     result
 }
 
+/// The protected workflow authenticates the read-only plan and writer fence
+/// before calling this entry point with the existing production binding.
+#[doc(hidden)]
+pub async fn run_release_inverse(req: &Request, fence_sha256: &str) -> Result<Value, RunError> {
+    const CUTOVER: &[i64] = &[475, 479, 480, 481, 482];
+    const STORE: &[i64] = &[478];
+    validate_request(req)?;
+    if req.target != Target::Production
+        || !req.apply
+        || fence_sha256.len() != 64
+        || !fence_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return refuse(
+            "release inverse requires the production apply binding and attendance fence",
+        );
+    }
+    for (raw, expected) in [
+        (req.expected_pending.as_deref(), CUTOVER),
+        (req.expected_store_pending.as_deref(), STORE),
+    ] {
+        let pending = parse_expected_pending(raw.unwrap_or_default()).map_err(RunError::Refused)?;
+        if pending.as_slice() != expected {
+            return refuse("release inverse pending lists do not match the protected bundle");
+        }
+    }
+    let cutover = check_plan_binding(
+        req,
+        CUTOVER,
+        &Chain::Cutover.migrator().map_err(RunError::Refused)?,
+    )?;
+    let store = check_store_binding(
+        req,
+        STORE,
+        &Chain::Store.migrator().map_err(RunError::Refused)?,
+    )?;
+    check_plan_provenance(req, &cutover, &store)?;
+    let plan: Value = req
+        .plan_manifest_path
+        .as_deref()
+        .and_then(|path| read_bytes_capped(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| RunError::Refused("release inverse plan unavailable".to_owned()))?;
+    let expanded = |key: &str| -> Result<Vec<LedgerRow>, RunError> {
+        let invalid = || RunError::Refused("release inverse ledger projection invalid".to_owned());
+        plan[key]
+            .as_array()
+            .ok_or_else(invalid)?
+            .iter()
+            .map(|row| {
+                Ok(LedgerRow {
+                    version: row["version"].as_i64().ok_or_else(invalid)?,
+                    description: row["description"].as_str().ok_or_else(invalid)?.to_owned(),
+                    checksum_hex: row["sha384"].as_str().ok_or_else(invalid)?.to_owned(),
+                    success: true,
+                })
+            })
+            .collect()
+    };
+    let expected = (
+        expanded("source_migrations")?,
+        expanded("source_store_migrations")?,
+    );
+    let options = verify_target(req, tls_policy_from_env()?)?;
+    let pool = connect(options, MIGRATOR_ROLE, Arc::new(AtomicUsize::new(0))).await?;
+    let result = release_schema_transaction::recover_release_schema(
+        &pool,
+        &expected.0,
+        &expected.1,
+        Some(fence_sha256),
+    )
+    .await;
+    pool.close().await;
+    let after = result?;
+    Ok(
+        json!({"state": "restored", "attendance_fence_sha256": fence_sha256,
+        "expanded": [ledger_json(&expected.0), ledger_json(&expected.1)],
+        "restored": [ledger_json(&after.0), ledger_json(&after.1)]}),
+    )
+}
+
 /// Apply one chain's pending migrations and verify its ledger. Runs only
 /// when `pending` is non-empty; returns the post-apply ledger and the
 /// applied count. Every failure carries that chain's ledger evidence under
@@ -2102,6 +2186,62 @@ mod tests {
             store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn release_inverse_refuses_either_mismatched_pending_list() {
+        let cutover = [475, 479, 480, 481, 482];
+        let refusal = "refused: release inverse pending lists do not match the protected bundle";
+        for (pending, store) in [(cutover.as_slice(), "479"), (&cutover[1..], "478")] {
+            let mut req = bound_production_apply(pending, &"a".repeat(40));
+            req.expected_store_pending = Some(store.to_owned());
+            let result = run_release_inverse(&req, &"a".repeat(64)).await;
+            assert_eq!(result.unwrap_err().to_string(), refusal);
+        }
+    }
+
+    #[tokio::test]
+    async fn release_inverse_checks_both_plan_projections_before_using_binding() {
+        let sha = "a".repeat(40);
+        let fence = "b".repeat(64);
+        let store = Chain::Store.migrator().unwrap();
+        let mut req = bound_production_apply(&[475, 479, 480, 481, 482], &sha);
+        req.expected_store_pending = Some("478".to_owned());
+        req.store_plan_manifest_sha256 = Some(manifest_hash(&sha, &[478], &store));
+        // Use a binding that cannot connect under either TLS policy. With
+        // intact projections, the runner must reach the binding refusal.
+        req.url = Some("not-a-postgres-url".to_owned());
+        let plan = json!({
+            "plan_manifest_sha256": req.plan_manifest_sha256,
+            "store_plan_manifest_sha256": req.store_plan_manifest_sha256,
+            "source_migrations": source_manifest(&MIGRATOR),
+            "source_store_migrations": source_manifest(&store),
+        });
+        let mut invalid_cutover = plan.clone();
+        invalid_cutover["source_migrations"][0]["description"] = Value::Null;
+        let mut invalid_store = plan.clone();
+        invalid_store["source_store_migrations"] = Value::Null;
+        let invalid_projection = "refused: release inverse ledger projection invalid";
+        for (plan, stamp, refusal) in [
+            (&invalid_cutover, &fence, invalid_projection),
+            (&invalid_store, &fence, invalid_projection),
+            (
+                &plan,
+                &fence,
+                "refused: TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL value is not a Postgres URL",
+            ),
+            (
+                &plan,
+                &"A".repeat(64),
+                "refused: release inverse requires the production apply binding and attendance fence",
+            ),
+        ] {
+            let path = temp_manifest(&plan.to_string());
+            req.plan_manifest_path = Some(path.to_str().unwrap().to_owned());
+            let result = run_release_inverse(&req, stamp).await;
+            std::fs::remove_file(path).unwrap();
+            assert_eq!(result.unwrap_err().to_string(), refusal);
         }
     }
 
