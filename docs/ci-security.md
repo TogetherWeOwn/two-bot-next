@@ -24,6 +24,86 @@ explain the existing grants without changing their values.
 For the advisory `pr-evidence` check, follow the maintainer procedure and
 registration criteria in [Exact-head CI evidence](../CONTRIBUTING.md#exact-head-ci-evidence).
 
+### Merge-group evidence and PR membership
+
+GitHub supports `merge_group: checks_requested` for protected ruleset
+workflows. The event identifies a synthetic group commit and ref. The
+`merge_group` object has `head_sha`, `head_ref`, `base_sha`, `base_ref` and
+`head_commit`, with no member list or per-PR head SHAs. GitHub documents
+that the group includes changes from PRs ahead of the named entry. Its
+two-PR example shows the temporary branch for PR #2 containing both PRs.
+The queue ref's PR number and the group's base and head SHAs therefore
+cannot supply all the PR identities the verifier needs.
+[Ruleset events][ruleset-events] · [Webhook schema][group-schema] ·
+[Merge queue behavior][queue-behavior]
+
+GraphQL `Repository.mergeQueue(branch:)` exposes the current queue.
+`MergeQueue.entries` exposes each entry's position, PR, and nullable base
+and head commits. The schema describes those commits at entry scope and
+provides no documented mapping from the event's group SHA to the complete
+set of entries and their PR heads. Queue positions can change as groups
+are rebuilt. The REST commit-to-PR endpoint promises commit associations,
+and `GET /pulls/{number}` can refresh an already identified PR. Neither
+supplies that mapping. For example, the archived run below has an empty
+`pull_requests` array in the workflow-run API, while the commit-to-PR
+lookup for its group SHA returned #1861. Those responses provide no proof
+of the full group membership.
+[GraphQL queue entries][queue-entry] · [Commit associations][commit-pulls] ·
+[PR details][pr-details] · [Archived run][archived-group] ·
+[Run API response][archived-run-api] · [Commit lookup][archived-commit-pulls]
+
+The verifier refuses `merge_group` in verify mode before publishing
+evidence. A future adapter needs a supported source that binds the exact
+group to every member, then must validate each member with its own current
+repository, PR number, base SHA and head SHA. Missing or ambiguous
+membership, or a changed member snapshot at the final read, must refuse
+the whole group. Even with that mapping, a PR description can change
+after the last read without changing a commit SHA. The documented merge
+API precondition pins the PR head SHA, and GitHub documents no group
+invalidation on same-head description edits. Keep the advisory edit
+procedure in force.
+[PR merge API][merge-api] · [Exact-head CI evidence](../CONTRIBUTING.md#exact-head-ci-evidence)
+
+#### Validate in a disposable queue
+
+1. Use an already-provisioned disposable repository with an isolated merge
+   queue that can build two groups concurrently. Use an existing required
+   check that permits the synthetic PR heads to enter the queue and stays
+   pending on group SHAs so the fixture cannot merge. Use two drafts with
+   harmless, independent changes and synthetic descriptions. Mark them
+   ready only in the fixture, then queue them in order. Drafts cannot be
+   merged. Leave the pending check untouched.
+   [Draft PR behavior][draft-prs]
+2. From a trusted recorder, capture the group base and head refs and SHAs
+   for each `checks_requested` delivery. The group for the second PR
+   should contain both fixture PRs while the first remains ahead of it.
+   Compare that set to the candidate API's result for the exact SHA.
+   Read all queue-entry pages and collect the
+   entry position, entry base and head OIDs, PR number and PR head OID.
+   Also read the REST workflow-run associations, commit-to-PR associations
+   and current metadata for each known fixture PR. Record the response
+   status, identity fields and description digest. Keep the raw bodies,
+   actor data and credentials out of the capture.
+3. Edit only the first PR's description. Check whether the group SHA and
+   deliveries change, and compare both PR metadata snapshots. Then dequeue
+   the first PR and repeat the lookup for the original and replacement
+   group SHAs. A missing, partial or ambiguous membership response, or a
+   changed snapshot, is a refusal case. A matching sample documents observed
+   behavior. Require a documented binding before relying on it as a gate.
+   Remove both fixture PRs from the queue and close them.
+
+[ruleset-events]: https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#supported-event-triggers
+[group-schema]: https://docs.github.com/en/webhooks/webhook-events-and-payloads?apiVersion=2022-11-28#merge_group
+[queue-behavior]: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue#how-merge-queues-work
+[queue-entry]: https://docs.github.com/en/graphql/reference/pulls#object-mergequeueentry
+[commit-pulls]: https://docs.github.com/en/rest/commits/commits?apiVersion=2022-11-28#list-pull-requests-associated-with-a-commit
+[pr-details]: https://docs.github.com/en/rest/pulls/pulls?apiVersion=2022-11-28#get-a-pull-request
+[archived-group]: https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40761465005
+[archived-run-api]: https://api.github.com/repos/TogetherWeOwn/two-bot-next/actions/runs/40761465005
+[archived-commit-pulls]: https://api.github.com/repos/TogetherWeOwn/two-bot-next/commits/76b048e3b39c757742e0f7d0af9ce2c425354dfb/pulls
+[merge-api]: https://docs.github.com/en/rest/pulls/pulls?apiVersion=2022-11-28#merge-a-pull-request
+[draft-prs]: https://docs.github.com/en/pull-requests/reference/pull-requests#draft-pull-requests
+
 ## Staging deployment
 
 Staging deployment is governed by `deploy-staging.yml`. Consult the workflow
