@@ -574,6 +574,85 @@ async fn warning_history_recovers_on_retained_schema() -> TestResult {
     warning_history_recovery::exercise(true).await
 }
 
+async fn release_apply_observations(
+    admin: &mut PgConnection,
+) -> Result<(bool, bool, bool, bool), sqlx::Error> {
+    sqlx::query_as(
+        "SELECT (SELECT is_called FROM fixture_release_order.cutover_read),
+                (SELECT is_called FROM fixture_release_order.store_read),
+                (SELECT is_called FROM fixture_release_order.ddl_attempt),
+                (SELECT is_called FROM fixture_release_order.grant_attempt)",
+    )
+    .fetch_one(admin)
+    .await
+}
+
+async fn check_locked_release_pre_ledgers(
+    admin: &mut PgConnection,
+    pool: &sqlx::PgPool,
+    cutover: &[two_bot_cutover::staging_migrate::LedgerRow],
+    store: &[two_bot_cutover::staging_migrate::LedgerRow],
+) -> TestResult {
+    use two_bot_cutover::staging_migrate::apply_release_schema;
+
+    sqlx::raw_sql(include_str!("fixtures/release_apply_order.sql"))
+        .execute(&mut *admin)
+        .await?;
+    for (table, approved) in [
+        ("public._sqlx_migrations", cutover),
+        ("public._two_bot_migrations", store),
+    ] {
+        let row = approved.last().expect("seeded PRE ledger");
+        // A changed description still reconciles. It isolates the exact
+        // approved-ledger comparison from the source-version/checksum checks.
+        for (change, changed_version) in [
+            ("version = -1", -1),
+            ("checksum = decode(repeat('00', 48), 'hex')", row.version),
+            ("description = 'changed synthetic PRE row'", row.version),
+        ] {
+            let changed = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {table} SET {change} WHERE version = $1"
+            )))
+            .bind(row.version)
+            .execute(&mut *admin)
+            .await?;
+            assert_eq!(changed.rows_affected(), 1, "{table}: {change}");
+
+            let error = apply_release_schema(pool, cutover, store)
+                .await
+                .expect_err("changed PRE ledger was applied");
+            assert_eq!(
+                error.to_string(),
+                "refused: release schema baseline changed",
+                "{table}: {change}"
+            );
+            assert_eq!(
+                release_apply_observations(admin).await?,
+                (true, true, false, false),
+                "{table}: {change}"
+            );
+
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {table} SET version = $1, checksum = decode($2, 'hex'), description = $3
+                 WHERE version = $4"
+            )))
+            .bind(row.version)
+            .bind(&row.checksum_hex)
+            .bind(&row.description)
+            .bind(changed_version)
+            .execute(&mut *admin)
+            .await?;
+            sqlx::query(
+                "SELECT setval('fixture_release_order.cutover_read', 1, false),
+                        setval('fixture_release_order.store_read', 1, false)",
+            )
+            .execute(&mut *admin)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> TestResult {
     use two_bot_core::database_roles::{plan_for_phase, Phase};
     use two_bot_cutover::staging_migrate::{
@@ -684,7 +763,21 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     admin
         .execute("REVOKE CREATE ON SCHEMA public FROM two_bot_runtime")
         .await?;
+    check_locked_release_pre_ledgers(&mut admin, &pool, &expected[0], &expected[1]).await?;
     let (cutover, store) = apply_release_schema(&pool, &expected[0], &expected[1]).await?;
+    assert_eq!(
+        release_apply_observations(&mut admin).await?,
+        (true, true, true, true),
+        "valid PRE ledgers must reach both DDL and grants after the locked reads"
+    );
+    sqlx::raw_sql(
+        "DROP EVENT TRIGGER fixture_release_mutation;
+         ALTER TABLE public._sqlx_migrations DISABLE ROW LEVEL SECURITY;
+         ALTER TABLE public._two_bot_migrations DISABLE ROW LEVEL SECURITY;
+         DROP SCHEMA fixture_release_order CASCADE;",
+    )
+    .execute(&mut admin)
+    .await?;
     assert_eq!(cutover.len(), expected[0].len() + 5);
     assert_eq!(store.len(), expected[1].len() + 1);
     let installed: bool = sqlx::query_scalar(
