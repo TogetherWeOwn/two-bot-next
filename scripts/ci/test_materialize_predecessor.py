@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from zipfile import ZIP_DEFLATED, ZipFile
+from zlib import error as CompressionError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from materialize_predecessor import materialize_predecessor_bundle
@@ -87,6 +88,20 @@ class MaterializePredecessorTests(unittest.TestCase):
                 self.fail("published a directory after a short copy")
         self.assertEqual(list(self.output.iterdir()), [])
 
+    def test_normalizes_copy_error_and_cleans_partial_output(self):
+        _, materialization = self.materialize()
+
+        def fail_image_copy(source, destination):
+            if source.name == IMAGE:
+                destination.write(source.read(1))
+                raise CompressionError("synthetic decompression error")
+            copyfileobj(source, destination)
+
+        with patch("materialize_predecessor.copyfileobj", fail_image_copy):
+            with self.assertRaisesRegex(GateError, "^predecessor_materialization_failed$"), materialization:
+                self.fail("published a directory after a copy error")
+        self.assertEqual(list(self.output.iterdir()), [])
+
     def test_refuses_extra_file_in_written_inventory(self):
         _, materialization = self.materialize()
 
@@ -107,4 +122,17 @@ class MaterializePredecessorTests(unittest.TestCase):
         with patch("materialize_predecessor.os", SimpleNamespace(name="nt", path=ntpath)):
             with self.assertRaisesRegex(GateError, "^predecessor_materialization_failed$"), materialization:
                 self.fail("published a directory with a Windows device name")
+        self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_refuses_windows_trailing_dot_with_newer_path_api(self):
+        self.add_module("assets./nested.js", b"reserved trailing dot")
+        _, materialization = self.materialize()
+        # Simulate the modern Windows API on runners where ntpath lacks it.
+        windows_path = SimpleNamespace(isreserved=getattr(
+            ntpath, "isreserved", lambda path: path.as_posix() == "worker/assets./nested.js",
+        ))
+
+        with patch("materialize_predecessor.os", SimpleNamespace(name="nt", path=windows_path)):
+            with self.assertRaisesRegex(GateError, "^predecessor_materialization_failed$"), materialization:
+                self.fail("published a directory with a Windows trailing-dot component")
         self.assertEqual(list(self.output.iterdir()), [])
