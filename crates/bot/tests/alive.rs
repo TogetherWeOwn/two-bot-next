@@ -35,6 +35,7 @@ use tokio::{
 };
 use tokio_websockets::{Message, ServerBuilder};
 use two_bot_core::database_tls::TlsPolicy;
+use two_bot_core::send_admission::{PgSendAdmission, SendAdmission as _};
 use two_bot_cutover::gateway_session::GatewaySessionStore;
 
 const STEP: Duration = Duration::from_secs(5);
@@ -47,6 +48,12 @@ const GUILD_PATH: &str = "/api/v10/guilds/222200000000000001";
 const COMMANDS_PATH: &str = "/api/v10/applications/1111/guilds/222200000000000001/commands";
 const SESSION: &str = "alive-mock-session";
 type Logs = Arc<Mutex<String>>;
+
+fn fixture_token(schema: &str) -> String {
+    // Send admission is database-wide, even across different search paths.
+    // Keep one synthetic identity per fixture and reuse it on restart.
+    format!("alive-synthetic-token-{schema}")
+}
 
 struct TestDb {
     admin: PgPool,
@@ -229,13 +236,20 @@ impl Bot {
         let mut command = Command::new(env!("CARGO_BIN_EXE_two-bot"));
         command.env_clear();
         // No gateway override is a strict-boot probe: onboarding must reject.
-        match gateway {
-            Some(gateway) => command.env("DISCORD_GATEWAY_URL", gateway),
-            None => command.env("TWO_ONBOARDING_MODE", "invalid-probe"),
+        let token = match gateway {
+            Some(gateway) => {
+                command.env("DISCORD_GATEWAY_URL", gateway);
+                fixture_token(&db.schema)
+            }
+            None => {
+                command.env("TWO_ONBOARDING_MODE", "invalid-probe");
+                // A force-killed probe must not leave the next boot's lane held.
+                fixture_token(&TestDb::new_schema_name())
+            }
         };
         let mut child = command
             .env("LISTEN_ADDR", addr.to_string())
-            .env("DISCORD_TOKEN", "alive-synthetic-token")
+            .env("DISCORD_TOKEN", token)
             .env("GUILD_ID", GUILD)
             .env("DATABASE_URL", &db.child_url)
             // Website jobs open the same CI-service URL through cutover.
@@ -1042,7 +1056,20 @@ async fn binary_lifecycle(accepting_decoy: bool) {
     let logs = Logs::default();
     let mut bots = Vec::new();
     let decoy = MockDiscord::new().await; // Accepting listener: any dial is counted.
+    let mut peer_permit = None;
     let exercise = async {
+        // Keep a peer fixture's database-wide lane occupied throughout startup,
+        // the website-job GET, and restart. Sharing its token would block REST
+        // before the mock could see the request, despite separate schemas.
+        let peer_token = fixture_token(&TestDb::new_schema_name());
+        let peer_admission = PgSendAdmission::new(db.pool.clone(), &peer_token)
+            .expect("synthetic peer admission configuration");
+        peer_permit = Some(
+            timeout(STEP, peer_admission.admit())
+                .await
+                .expect("synthetic peer admission deadline")
+                .expect("claim synthetic peer admission lane"),
+        );
         strict_boot_probes(&db, &discord.api, &mut bots, &logs, &decoy.url).await;
         let owned = discord.connections.load(SeqCst) + decoy.connections.load(SeqCst);
         assert_eq!(owned, 0, "no override-absent listener connections");
@@ -1070,6 +1097,10 @@ async fn binary_lifecycle(accepting_decoy: bool) {
     }
     cleaned &= decoy.stop().await;
     cleaned &= discord.stop().await;
+    let peer_released = match peer_permit {
+        Some(permit) => matches!(timeout(STEP, permit.complete(None)).await, Ok(Ok(()))),
+        None => true, // Claim failure is reported by the exercise result below.
+    };
     if cleaned {
         db.close().await;
     } else {
@@ -1079,6 +1110,7 @@ async fn binary_lifecycle(accepting_decoy: bool) {
         eprintln!("captured child logs:\n{}", logs.lock().await);
     }
     assert!(cleaned, "all children reaped and log readers joined");
+    assert!(peer_released, "synthetic peer admission lane released");
     match result {
         Ok(Ok(())) => eprintln!("real-binary lifecycle PASS in {:?}", started.elapsed()),
         other => {
@@ -1249,25 +1281,36 @@ async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outc
         let logs = Logs::default();
         let mut bot = Bot::spawn(&db, addr, Some(&discord.url), &discord.api, &logs);
         let phase = Cell::new("health readiness");
-        let exercised = AssertUnwindSafe(timeout(STEP, async {
-            if outcome == 4 {
-                std::future::pending::<()>().await;
-            }
-            wait_http(&mut bot, addr, "/healthz", 200).await;
-            // Health precedes gateway initialization. Finish the upgrade before
-            // intentionally killing the child, but keep HELLO gated.
-            phase.set("gateway upgrade");
-            if outcome == 5 {
-                std::future::pending::<()>().await;
-            }
-            discord.handshakes.recv().await.expect("mock handshake");
+        let exercised = AssertUnwindSafe(async {
+            timeout(STEP, async {
+                if outcome == 4 {
+                    std::future::pending::<()>().await;
+                }
+                wait_http(&mut bot, addr, "/healthz", 200).await;
+                // Health precedes gateway initialization. Finish the upgrade before
+                // intentionally killing the child, but keep HELLO gated.
+                phase.set("gateway upgrade");
+                if outcome == 5 {
+                    std::future::pending::<()>().await;
+                }
+                tokio::select! {
+                    biased;
+                    status = bot.child.wait() => {
+                        panic!("child exited before gateway upgrade: {}", status.expect("child status"));
+                    }
+                    handshake = discord.handshakes.recv() => handshake.expect("mock handshake"),
+                }
+            })
+            .await?;
             phase.set("injected outcome");
+            // Start the injected timer only after the mock confirmed the
+            // upgrade. A startup timeout still fails the phase assertion.
             match outcome {
                 1 => panic!("injected fixture assertion"),
-                2 => std::future::pending::<()>().await,
-                _ => {}
+                2 => timeout(STEP, std::future::pending()).await,
+                _ => Ok(()),
             }
-        }))
+        })
         .catch_unwind()
         .await;
         if outcome == 3 {
