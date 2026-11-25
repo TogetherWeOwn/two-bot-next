@@ -104,6 +104,10 @@ def restore_under_fence(pin, result, observe, control, rollback, image, candidat
         require(state["worker"]["version_id"] == pin.worker_version and recoverable_pair(state, pin, candidate),
                 "production_inverse_serving_pair_changed")
         if not pair_matches(state, pin, *restored):
+            # A prior-image rollout may already be in flight. Leave the
+            # fence in place and avoid submitting a duplicate image write.
+            require(state["container"]["image_digest"] != pin.image_digest,
+                    "production_recovery_prior_rollout_pending")
             try:
                 rollback.restore_image(image)
             except GateError:

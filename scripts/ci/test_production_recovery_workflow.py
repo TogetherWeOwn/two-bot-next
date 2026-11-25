@@ -74,13 +74,15 @@ class RecoveryWorkflowTests(unittest.TestCase):
                                      Mock(side_effect=[before, after]), self.control)
         self.control.assert_called_once_with("fence-exact", 20, expected_deployment=self.candidate[0])
 
-    def test_cli_requires_reviewed_plan_approval(self):
-        approval = {"plan_run_id": "321", "plan_archive_sha256": "sha256:" + "8" * 64}
-        with (patch.object(recovery, "current_run"), patch.object(recovery, "verify_environment"),
-              patch.object(recovery, "release_admission", return_value=(self.pin, self.candidate, {}, approval)),
-              patch.object(recovery, "verify_check", side_effect=GateError("unapproved")) as check):
-            self.assertEqual(recovery.main(["fence"], {}), 1)
-            check.assert_called_once()
+    def test_cli_requires_authenticated_forward_apply(self):
+        release, run, plan_id, plan, artifact = object(), {}, "321", {}, {}
+        env = {"FORWARD_ARTIFACT_ID": "789", "PRODUCTION_WORKER_URL": "https://fixture.invalid"}
+        with (patch.object(recovery, "release_context", return_value=(release, run, plan_id, plan, artifact)),
+              patch.object(recovery, "forward_document", side_effect=GateError("unproved")) as authenticate,
+              patch.object(recovery, "check_url") as provider_url):
+            self.assertEqual(recovery.main(["fence"], env), 1)
+        authenticate.assert_called_once_with(env, release, run, plan_id, plan, artifact)
+        provider_url.assert_not_called()
 
     def test_inverse_refuses_incomplete_database_readback(self):
         plan = dict(target=dict(host="db", database="fixture", branch_id="branch"),
@@ -110,6 +112,15 @@ class RecoveryWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(GateError, "provider_rollout_refused"):
             self.restore()
         self.rollback.post_worker_restore.assert_not_called()
+        self.control.assert_not_called()
+        self.rollback.wait_stable.assert_not_called()
+
+    def test_pending_prior_rollout_keeps_the_writer_stopped(self):
+        self.state["worker"].update(version_id=self.pin.worker_version, sha=self.pin.rollback_sha)
+        self.state["container"].update(image_digest=self.pin.image_digest, rollout_status="progressing")
+        with self.assertRaisesRegex(GateError, "production_recovery_prior_rollout_pending"):
+            self.restore()
+        self.rollback.restore_image.assert_not_called()
         self.control.assert_not_called()
         self.rollback.wait_stable.assert_not_called()
 
