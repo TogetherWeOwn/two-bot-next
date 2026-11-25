@@ -141,6 +141,7 @@ class StartupAdmissionTests(unittest.TestCase):
         proof = SettlementEvidence(closed, SettlementSource.PROVIDER, True, True)
         wrong_target = replace(TARGET, shape="0475/0465")
         for reply in (replace(proof, closed=opened), replace(proof, closed=replace(closed, start_id=None)),
+                      replace(proof, closed=replace(closed, start_id=UUID(int=1))),
                       replace(proof, closed=replace(closed, target=wrong_target)),
                       replace(proof, startup_drained=False), replace(proof, restart_fenced=1),
                       replace(proof, source="provider")):
@@ -158,6 +159,18 @@ class StartupAdmissionTests(unittest.TestCase):
         inventory = Inventory(TARGET, None, None, 0, False, True,
                               startup_settled=self.authority.startup_settled(TARGET), assigned_count=0)
         verify_cleanup(TARGET, inventory)
+
+    def test_settlement_retry_uses_saved_proof_without_reobserving(self):
+        self.assertTrue(self.authority.close(TARGET))
+        closed = self.store.read(TARGET)
+        self.observe.return_value = SettlementEvidence(closed, SettlementSource.PROVIDER, True, True)
+        self.assertTrue(self.authority.settle(TARGET))
+        restarted_observer = Mock(side_effect=TimeoutError("synthetic provider unavailable"))
+        restarted = StartupAdmission(self.store, restarted_observer)
+        with patch.object(self.store, "compare_and_swap", wraps=self.store.compare_and_swap) as swap:
+            self.assertTrue(restarted.settle(TARGET))
+            swap.assert_not_called()
+        restarted_observer.assert_not_called()
 
     def test_settlement_race_cannot_overwrite_durable_terminal_proof(self):
         self.assertTrue(self.authority.close(TARGET))
