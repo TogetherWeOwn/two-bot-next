@@ -3508,10 +3508,9 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
         errors.append(f"{name}:schema-gate: reviewed plan proof must use the credentialless workflow checkout")
     if proof != {"name": "Verify the recovery plan and both ledgers", "id": "recovery-plan",
                  "if": "${{ inputs.recovery_mode != 'standard' }}",
-                 "env": {"RECOVERY_PLAN_SOURCE": "${{ inputs.reviewed_plan && inputs.sha || github.sha }}",
-                         "REVIEWED_PLAN": "${{ inputs.reviewed_plan }}"},
-                 "run": 'if [ -n "$REVIEWED_PLAN" ]; then\n  python3 tooling/scripts/staging_bootstrap.py plan\n'
-                        'else\n  python3 scripts/staging_bootstrap.py plan\nfi\n'}:
+                 "env": {"RECOVERY_PLAN_SOURCE": "${{ inputs.sha }}", "REVIEWED_PLAN": "${{ inputs.reviewed_plan }}",
+                         "PLAN_TOOLING": "${{ inputs.reviewed_plan && 'tooling' || '.' }}"},
+                 "run": 'python3 "$PLAN_TOOLING/scripts/staging_bootstrap.py" plan'}:
         errors.append(f"{name}:schema-gate: recovery proof must read only the successful gate's local plan")
     if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
             or (checkout.get("with") or {}).get("persist-credentials") != "false" \

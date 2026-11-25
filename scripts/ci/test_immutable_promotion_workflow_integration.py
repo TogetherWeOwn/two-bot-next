@@ -527,14 +527,23 @@ class CertifyExecutionTests(unittest.TestCase):
         raise AssertionError("no certify step")
 
     def test_certify_packages_evidence_stamped_archive(self):
+        for reviewed in (False, True):
+            with self.subTest(reviewed=reviewed):
+                self.check_certificate_packaging(reviewed)
+
+    def check_certificate_packaging(self, reviewed):
         box = Sandbox(self)
+        if reviewed:
+            box._write("git", f"#!/bin/sh\n[ \"$*\" = '-C reviewed-source rev-parse HEAD' ] && printf '%s\\n' {SHA}\n")
         source = box.runner_temp / "promotion-source"
         (source / "worker-modules").mkdir(parents=True)
         (source / "worker-modules" / "index.js").write_text("export default {}", encoding="utf-8")
         (source / "evidence.json").write_text(
             json.dumps({"deploy_id": DEPLOY_ID}), encoding="utf-8")
         result = box.run(self.certify_body(), extra_env={
-            "SOURCE_SHA": SHA, "GITHUB_RUN_ID": "501", "GITHUB_RUN_ATTEMPT": "2",
+            "SOURCE_SHA": SHA, "GITHUB_SHA": "f" * 40 if reviewed else SHA,
+            "REVIEWED_SOURCE": SHA if reviewed else "", "GITHUB_RUN_ID": "501",
+            "GITHUB_RUN_ATTEMPT": "1" if reviewed else "2",
             "GH_TOKEN": "synthetic-token",
         })
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -554,6 +563,9 @@ class CertifyExecutionTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--fault-mode") + 1], "none")
         self.assertEqual(argv[argv.index("--readiness-result") + 1], "success")
         self.assertEqual(argv[argv.index("--synthetic-result") + 1], "success")
+        self.assertEqual(argv[argv.index("--sha") + 1], SHA)
+        self.assertEqual(argv[argv.index("--config") + 1],
+                         ("reviewed-source/" if reviewed else "") + "wrangler/wrangler.toml")
 
     def test_promotion_artifact_is_separate_from_rollout_diagnostics(self):
         workflow = load_workflow(STAGING_PATH)

@@ -255,33 +255,23 @@ staging before the history guard fails it, and cannot produce B1 or a promotion
 certificate. Verify the run's recorded `headSha` against the target too: the
 pre-dispatch check does not lock `main`. A mismatch is not qualification.
 
-**Reviewed-source qualification:** When unrelated commits have advanced
-`main`, dispatch `deploy-staging.yml` from protected `main` with the full
-reviewed `sha`, `recovery_mode=verified`, the approved stopped
-`recovery_pair`, and `reviewed_plan=<run-id>@sha256:<archive-digest>` from the
-protected read-only staging migration plan for that exact source. Use the
-same holds and staging Environment approval. Leave the recovery-pin, fault,
-fence release and AutoMod preview switches off. Use a fresh attempt.
+**Reviewed-source qualification:** Dispatch `deploy-staging.yml` from protected
+`main` with the full reviewed `sha`, `recovery_mode=verified`, the approved
+stopped `recovery_pair` and `reviewed_plan=<run-id>@sha256:<archive-digest>` for
+the exact source's protected read-only plan. Use a fresh attempt and existing
+staging approval and holds. Leave recovery-pin, fault, fence and AutoMod switches off.
 
-The serialized deployment job verifies the exact source's successful push CI
-and supply-chain checks, authenticates the plan artifact, compares it to the
-fresh schema gate and checks that the stopped rollback pair still matches
-before replacing it. The deploy job runs its gates from the protected workflow
-checkout and packages the reviewed source's build and configuration. The
-candidate's Wrangler version must match the protected receipt gate. The
-read-only schema and roles jobs use the candidate's checkout and binaries.
-The deploy job checks both SHAs against protected main. Changes to workflow
-or deployment tooling after dispatch require a fresh dispatch.
-The source must contain the most recent successful staging revision. A newer
-successful run also supersedes an older queued dispatch of the same source.
+Under the staging lock, the deploy job checks both SHAs against protected main,
+exact push CI, the plan against the fresh schema projection, the stopped pair
+and Wrangler compatibility. Read-only drift jobs use the candidate. The deploy
+gates use the protected workflow checkout and package the candidate. Workflow
+or deployment tooling changes require a fresh dispatch. The candidate must
+contain the latest successful staging source. A newer success supersedes a queued run.
 
-Retain `reviewed-staging-source.json` from the rollout evidence and the
-existing rollout, certificate and stop receipts. The run title identifies the
-serving SHA. GitHub's `head_sha` identifies the workflow checkout. Verify both
-identities against the exact attempt and the deployment and promotion receipts.
-Production continues to select its candidate by the same successful-staging
-and latest-outcome rules, using the serving SHA for a reviewed-source run.
-The same production soak and artifact checks still apply.
+Retain `reviewed-staging-source.json`, the rollout, certificate and stop receipts.
+The run title names the serving SHA. GitHub's `head_sha` identifies the workflow
+checkout. Check both against the exact attempt. Production selection uses the
+serving SHA with the same latest-outcome, soak and immutable artifact gates.
 
 **Queued staging work:** Every holder uses `queue: max` and preserves the
 running holder. The queue is bounded; admission order is not a freshness check.

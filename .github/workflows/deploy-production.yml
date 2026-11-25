@@ -269,7 +269,7 @@ jobs:
                   source = title.removeprefix("reviewed staging source ")
                   if (re.fullmatch(r"[0-9a-f]{40}", source)
                           and run.get("event") == "workflow_dispatch"
-                          and run.get("path") == ".github/workflows/deploy-staging.yml"
+                          and str(run.get("path") or "").split("@", 1)[0] == ".github/workflows/deploy-staging.yml"
                           and run.get("head_branch") == "main"
                           and (run.get("repository") or {}).get("full_name") == repo
                           and (run.get("head_repository") or {}).get("full_name") == repo):

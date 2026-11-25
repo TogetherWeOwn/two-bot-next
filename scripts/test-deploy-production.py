@@ -1216,7 +1216,8 @@ class GuardBehaviourTests(unittest.TestCase):
         workflow_sha = "e" * 40
         reviewed = {
             **staging_run(attempt=1, sha=workflow_sha), "event": "workflow_dispatch", "head_branch": "main",
-            "display_title": f"reviewed staging source {SHA}", "path": ".github/workflows/deploy-staging.yml",
+            "display_title": f"reviewed staging source {SHA}",
+            "path": ".github/workflows/deploy-staging.yml@refs/heads/main",
             "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
         }
         fixtures = {

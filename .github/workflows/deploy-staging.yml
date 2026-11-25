@@ -20,8 +20,7 @@ run-name: ${{ inputs.reviewed_plan && format('reviewed staging source {0}', inpu
 # a dispatch-only string, empty by default (empty deploys the workflow head).
 # Every job checks out that ref and refuses anything that is not a full
 # 40-hex ancestor of origin/main. After the queue, the deploy job requires a
-# current workflow head by default. A bound reviewed_plan can qualify an
-# ancestor using unchanged protected workflow/tooling. Recovery pins stay red.
+# current workflow head by default. A bound reviewed_plan can qualify an ancestor.
 #
 # A merge is not a deploy or qualification. Authorized dispatch and all
 # existing staging and production gates remain required.
@@ -211,14 +210,10 @@ jobs:
         id: recovery-plan
         if: ${{ inputs.recovery_mode != 'standard' }}
         env:
-          RECOVERY_PLAN_SOURCE: ${{ inputs.reviewed_plan && inputs.sha || github.sha }}
+          RECOVERY_PLAN_SOURCE: ${{ inputs.sha }}
           REVIEWED_PLAN: ${{ inputs.reviewed_plan }}
-        run: |
-          if [ -n "$REVIEWED_PLAN" ]; then
-            python3 tooling/scripts/staging_bootstrap.py plan
-          else
-            python3 scripts/staging_bootstrap.py plan
-          fi
+          PLAN_TOOLING: ${{ inputs.reviewed_plan && 'tooling' || '.' }}
+        run: python3 "$PLAN_TOOLING/scripts/staging_bootstrap.py" plan
   # Pre-deploy role-drift gate: a database whose grants lag the migrations
   # fails this job (and, through `needs`, the deploy below) instead of
   # crash-looping the new build at gateway startup with SQLSTATE 42501.
@@ -326,9 +321,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Reviewed qualifications run the deployment gates from this
-          # checkout. Default deploys and recovery drills retain their gate
-          # source. Shared recovery and deploy-ID tooling always runs here.
+          # Reviewed deploy gates plus shared recovery and deploy-ID tooling.
           ref: ${{ github.sha }}
           path: tooling
           persist-credentials: false
@@ -835,8 +828,8 @@ jobs:
 
   # Pinned-drill history guard: the production guard keys staging runs by head
   # SHA, so a dispatch that deploys a pinned SHA below the workflow head must
-  # not read as staging history for the head. An authorized reviewed source
-  # is separately attributed to its exact serving SHA. This job runs after the voice
+  # not read as staging history for the head. A reviewed run names its serving SHA.
+  # This job runs after the voice
   # synthetic (a deploy-job verdict step cannot judge: its failure would
   # auto-roll back the drill build) and fails the run red with the reason when
   # the pin differs from the head. An empty pin, or a pin equal to the head,
