@@ -81,6 +81,14 @@ class PrivateProbeTransportTests(unittest.TestCase):
         self.assert_refuses("invalid_pre_probe", self.probe, DEPLOYMENT, "/readyz?other=1")
         self.binding.request.assert_not_called()
 
+    def test_refuses_invalid_http_status(self):
+        for status in (199, 600, True, "200"):
+            with self.subTest(status=status):
+                self.binding.request.reset_mock()
+                self.binding.request.return_value = replace(HEALTH, status=status)
+                self.assert_refuses("pre_probe_unconfirmed", self.probe, DEPLOYMENT, Endpoint.HEALTH)
+                self.assert_sent_once(Endpoint.HEALTH)
+
     def test_checks_version_and_body_bounds_without_retry(self):
         for stamps in ((), HEALTH.worker_versions * 2, (str(UUID(int=4)),)):
             with self.subTest(stamps=stamps):
