@@ -51,13 +51,17 @@ Tie each verdict to the protected run, the verified serving revision, build
 and deploy IDs, and the tenant. Read back the effective controls on that
 runtime and keep only sanitized outcomes in the evidence.
 
-- **Bot capture.** Read back capture enabled. Verify that the runtime processes
-  an eligible fresh voice observation in a mapped synthetic event window and
-  writes a new attendance span linked to that window in the isolated store.
+- **Bot capture.** The signed-reader recipe keeps capture OFF. Keep capture
+  readiness unverified until a separate protected check can use an exclusive
+  staging window, synthetic identities and an isolated store. Read back the
+  qualified Bot release's effective capture control as enabled. Verify that
+  the runtime processes an eligible fresh voice observation in a mapped
+  synthetic event window and writes a new attendance span linked to it.
   After rollback, read back capture OFF. Verify that the runtime processes a
   fresh, otherwise eligible mapped observation and that storage readback shows
   no new attendance window or span for it. Confirm a previously finalized
-  fixture remains stored before cleanup.
+  fixture remains stored before cleanup. Verify removal of the synthetic
+  capture fixtures at cleanup.
 - **Bot signed reader.** Read back active private signed ingress for the
   tenant and effective `TWO_INTERNAL_ALLOW_ATTENDANCE_READ`. Use the staging
   recipe above with capture OFF to prove the serving receiver dispatches
@@ -81,9 +85,9 @@ capture is enabled. Use a later eligible window to prove new capture.
 
 As source evidence, [#2522](https://github.com/TogetherWeOwn/two-bot-next/pull/2522)
 covers mapped capture dormancy, public listener `404`, unsafe startup bind
-and guild refusals, and ordinary signed receiver refusal even with the read
-flag set. The flag alone leaves the documented
-[receiver route unmounted](internal-actions-receiver.md#container-wiring).
+and guild refusals, and the ordinary signed receiver's refusal of the verb
+even with the read flag set. See the documented
+[receiver wiring](internal-actions-receiver.md#container-wiring).
 [#2417](https://github.com/TogetherWeOwn/two-bot-next/pull/2417) exercises both
 enablement and rollback orders with a synthetic Web peer and verifies that a
 fresh signed read after re-enablement resolves the same finalized record.
