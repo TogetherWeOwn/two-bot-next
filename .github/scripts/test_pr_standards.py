@@ -417,16 +417,17 @@ class AttestationFloor(unittest.TestCase):
         f = ps.evaluate(env(BODY=prose_tests, CHANGED_FILES=self.T0_FILES))
         self.assertIn(("error", "Attestation"), levels(f))
 
-    def test_generated_exemption_needs_a_bot_author(self):
-        # A human branch wearing the release-please-- prefix still hits the gate.
-        f = ps.evaluate(env(BODY=GOOD_BODY, HEAD_REF="release-please--branches--main",
-                            CHANGED_FILES=self.T0_FILES))
-        self.assertIn(("error", "Attestation"), levels(f))
-        # Automation-authored release PRs stay exempt.
-        f = ps.evaluate(env(BODY=GOOD_BODY, AUTHOR="release-please[bot]",
-                            HEAD_REF="release-please--branches--main",
-                            CHANGED_FILES=self.T0_FILES))
-        self.assertEqual([], f)
+    def test_legacy_release_branch_t0_path_requires_attestation_for_both_authors(self):
+        body = GOOD_BODY.replace("Refs: TOG-1234", "Describe the signing key rotation.")
+        for author in ("togetherweown[bot]", "maintainer"):
+            inputs = env(AUTHOR=author, HEAD_REF="release-please--branches--main",
+                         CHANGED_FILES=self.T0_FILES, REPO_PRIVATE="false",
+                         PR_STANDARDS_MODE="warn")
+            with self.subTest(author=author, attestation="missing"):
+                self.assertEqual([("error", "Attestation")],
+                                 levels(ps.evaluate(dict(inputs, BODY=body))))
+            with self.subTest(author=author, attestation="complete"):
+                self.assertEqual([], ps.evaluate(dict(inputs, BODY=body + FULL_ATTESTATION)))
 
     def test_dependency_bot_t0_path_still_needs_attestation(self):
         f = ps.evaluate(env(BODY=GOOD_BODY, AUTHOR="dependabot[bot]",
