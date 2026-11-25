@@ -83,9 +83,12 @@ exact reserved pair at a time.
    `0475/0465`, invoke the unchanged Worker through the exact private binding.
    Record its response version stamp, runtime build/revision/deploy stamps,
    running digest, effective isolated database writer and PRE ledger including
-   the retained timestamp. Require health (`/health`) 200 and readiness
-   (`/readyz`) to progress from 503 to 200. Correlate final readiness with both
-   the synthetic gateway checkpoint and nonempty REST command sync.
+   the retained timestamp. Require `/health` 200. Before releasing mock READY,
+   require the pinned bot's `/readyz` 503 with matching runtime stamps, process
+   and database ready, and gateway starting or down. After release, require
+   the same pinned runtime's `/readyz` 200 with database and gateway ready.
+   Correlate it with the synthetic gateway checkpoint and nonempty REST command
+   sync.
 4. **Independent stop and cleanup.** Arm the original cutoff before create.
    Show that runner loss, delayed create and legacy keepalive cannot defeat
    the independent fence. Retain exact-scope settlement, writer revocation,
