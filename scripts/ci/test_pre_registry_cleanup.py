@@ -54,10 +54,11 @@ class PreRegistryCleanupTests(unittest.TestCase):
                           RegistryDisposition.ALREADY_ABSENT)
         self.assertEqual(manifests, {retained_reference: MANIFEST})
 
-    def test_settlement_from_a_different_reservation_with_the_same_digest_is_refused(self):
+    def test_settlement_requires_the_exact_reservation_and_reference(self):
         for other in (
             replace(RESERVATION, target=replace(TARGET, run_id=124)),
             replace(RESERVATION, reference=REFERENCE.replace("/staging/", "/retained/")),
+            replace(RESERVATION, reference=f"{REPOSITORY}@sha256:{'0' * 64}"),
         ):
             with self.subTest(other=other), self.assertRaisesRegex(TargetError, "^wrong_pre_registry_publication_scope$"):
                 self.disposition(publication_settlement=PublicationSettlement(other))
