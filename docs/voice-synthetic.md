@@ -126,8 +126,11 @@ no permanent staging keepalive, host timer or new always-on cost is authorized.
 
 Live runs retry up to twice after 60 s only when the pause and another
 450-second attempt fit the original staging grant and the runner budget
-anchored before job setup. The 300-second work cutoff supports the 180-second
-empty-room grace and leaves 150 seconds for separately bounded restoration.
+anchored before job setup. When voice is required, a budget check before checkout
+refuses runs that already lack time for the first attempt. The workflow checks
+the budget again before every attempt and retry pause. The 300-second work cutoff
+supports the 180-second empty-room grace and leaves 150 seconds for separately
+bounded restoration.
 Evidence JSON is uploaded as the `voice-synthetic-<run id>` artifact for 14 days. A reusable
 workflow caller can provide the optional `artifact_invocation` label to append
 `-<label>` to that artifact and the `staging-use-voice-start-<run id>-<attempt>`

@@ -173,6 +173,21 @@ jobs:
     timeout-minutes: 10
     outputs: {exercised: "${{ steps.voice.outputs.exercised }}"}
     steps:
+      - name: Refuse an exhausted voice budget before checkout
+        id: budget
+        env:
+          VOICE_SYNTHETIC_REQUIRED: ${{ vars.VOICE_SYNTHETIC_REQUIRED }}
+          GRANT_EXPIRES_AT: ${{ inputs.staging_use_expires_at || needs.staging-window.outputs.expires_at }}
+          VOICE_JOB_ANCHOR: ${{ needs.staging-window.outputs.checked_at }}
+        run: |
+          set -euo pipefail
+          # Leave the optional binding decision to the only step with the token.
+          if [ "${VOICE_SYNTHETIC_REQUIRED:-true}" = false ]; then exit 0; fi
+          now=$(date +%s)
+          finish=$((now + 452)) # 300 s work, 150 s restoration, 2 s margin.
+          if [[ ! "$VOICE_JOB_ANCHOR" =~ ^[1-9][0-9]{0,9}$ || ! "$GRANT_EXPIRES_AT" =~ ^[1-9][0-9]{0,12}$ ]] || (( VOICE_JOB_ANCHOR > now || finish >= VOICE_JOB_ANCHOR + 540 || finish * 1000 >= GRANT_EXPIRES_AT )); then
+            echo '::error::not enough runner or staging grant time for voice work and cleanup'; exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
