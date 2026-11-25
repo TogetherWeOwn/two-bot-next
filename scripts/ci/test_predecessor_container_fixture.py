@@ -19,7 +19,8 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
         for token, body, status in [(fixture.TOKEN, b'[{"name":"help"}]', b"200"),
                                     ("foreign", b"[]", b"401"), (fixture.TOKEN, b"{}", b"400"),
                                     (fixture.TOKEN, b'[{"k":1,"k":2}]', b"400"),
-                                    (fixture.TOKEN, b'[{"k":NaN}]', b"400")]:
+                                    (fixture.TOKEN, b'[{"k":NaN}]', b"400"),
+                                    (fixture.TOKEN, b'[{"k":1e400}]', b"400")]:
             client, server = socket.socketpair()
             with self.subTest(status=status), client, server:
                 request = (f"PUT {COMMANDS} HTTP/1.1\r\nConnection: close\r\n"
