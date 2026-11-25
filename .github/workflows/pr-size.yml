@@ -55,8 +55,14 @@ permissions:
   contents: read
 
 concurrency:
+  # PR activity and reviews share one queue so required checks cannot race
+  # to publish verdicts. Each run reads live PR state when it executes,
+  # including when GitHub admits events in a different order than dispatch.
+  # The default single pending slot evicts a queued check on the next event.
+  # GitHub's max queue holds up to 100 pending runs per group.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   pr-size:
