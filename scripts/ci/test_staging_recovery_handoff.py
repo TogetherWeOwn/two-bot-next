@@ -77,7 +77,7 @@ def drill(run_id=DRILL_RUN, *, restored_version=VERSION, restored_image=IMAGE, r
         restored_version=restored_version, restored_image_digest=restored_image.split("@", 1)[1])
     rollout["evidence.json"]["revision"] = SOURCE
     acquired_at = int(NOW.timestamp()) * 1000
-    expires_at = acquired_at + 40 * 60 * 1000
+    expires_at = acquired_at + 120 * 60 * 1000
     rollout["staging-use.jsonl"][0].update(runId=str(run_id), sha=SOURCE, expiresAt=expires_at)
     for row in shutdown["staging-use-release.jsonl"]:
         row["runId"] = str(run_id)
