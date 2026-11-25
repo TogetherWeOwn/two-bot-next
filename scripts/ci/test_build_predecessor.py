@@ -4,10 +4,12 @@ from hashlib import sha256
 from io import BytesIO
 import json
 from pathlib import Path
+import sys
 import tarfile
 import tempfile
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from build_predecessor import GateError, image_manifest
 
 LABELS = {"org.opencontainers.image.revision": "a" * 40, "com.togetherweown.build-id": "123-1"}
