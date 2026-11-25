@@ -8,8 +8,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pre_target import ADMISSION_SECONDS
-
 ROOT = Path(__file__).resolve().parents[1]
 CUTOVER_DOCS = sorted((ROOT / "docs").glob("cutover*.md"))
 AUTOMOD_DOCS = [ROOT / "docs" / "automod-runtime.md"]
@@ -144,7 +142,10 @@ class CutoverDocLinks(unittest.TestCase):
         self.assertTrue(heading)
         section = rest.split("\n### ", 1)[0]
         self.assertIn("../scripts/pre_target.py", LINK.findall(section))
-        self.assertIn(f"expires {ADMISSION_SECONDS / 60:g} minutes", section)
+        source = (ROOT / "scripts" / "pre_target.py").read_text(encoding="utf-8")
+        cutoff = re.search(r"^ADMISSION_SECONDS = ([0-9]+)$", source, re.MULTILINE)
+        self.assertIsNotNone(cutoff, "PRE admission cutoff must be a literal in pre_target.py")
+        self.assertIn(f"expires {int(cutoff[1]) / 60:g} minutes", section)
         self.assertEqual(_problems(doc, section), [])
 
     def test_automod_runtime_doc_is_found(self):

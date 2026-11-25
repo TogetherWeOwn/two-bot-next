@@ -142,11 +142,12 @@ offline configuration and validates cleanup evidence.
    both counts proved zero. Workflow status and resource disappearance alone
    leave stop unverified. See the [cleanup fixtures](../scripts/ci/test_pre_target.py).
 
-The proposed [scheduled sweep](https://github.com/TogetherWeOwn/two-bot-next/pull/2563)
-is a cleanup fallback that can run late or be dropped. The staging release
-operator owns an unverified stop or cleanup as a staging incident. Keep
-admission closed and qualification pending, reconcile the exact reservation,
-and repeat cleanup with fresh inventory until verification passes.
+The [dormant sweep workflow](https://github.com/TogetherWeOwn/two-bot-next/blob/b3e6030f0493683efd94413aacdd04379e45b2fb/.github/workflows/staging-pre-reaper.yml)
+is intended as a scheduled cleanup fallback. Scheduled runs can arrive late
+or be dropped. The staging release operator owns an unverified stop or cleanup
+as a staging incident. Keep admission closed and qualification pending,
+reconcile the exact reservation, and repeat cleanup with fresh inventory until
+verification passes.
 
 ### Trusted client and receipt contract (partial wiring, not activated)
 
