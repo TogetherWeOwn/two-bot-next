@@ -32,11 +32,15 @@ use two_bot_testsupport::TestDatabase;
 
 const EVENT: &str = "200000000000000001";
 const EVENT_KEY: &str = "echo-fixture";
+const PRE_ENABLE_EVENT: &str = "200000000000000002";
+const PRE_ENABLE_KEY: &str = "echo-pre-enable";
 const MEMBER: u64 = 300000000000000001;
 const CHANNEL: u64 = 400000000000000001;
 const ROOM: &str = "Fixture room";
 // Canonical Web signer body, without an idempotency key or guild selector.
 const READ_BODY: &[u8] = br#"{"action":"event.attendance.read","event_key":"echo-fixture"}"#;
+const PRE_ENABLE_BODY: &[u8] =
+    br#"{"action":"event.attendance.read","event_key":"echo-pre-enable"}"#;
 
 fn iso(at: OffsetDateTime) -> String {
     format_iso_millis(i64::try_from(at.unix_timestamp_nanos().div_euclid(1_000_000)).unwrap())
@@ -111,11 +115,6 @@ async fn exercise_echo(pool: PgPool) {
     set_analytics_settings(&privacy, guild, true, true, true)
         .await
         .unwrap();
-    opt_out_member(&privacy, guild, &member, "fixture")
-        .await
-        .unwrap();
-    store.put_event_key(guild, EVENT_KEY, EVENT).await.unwrap();
-
     // Anchor fresh gateway and signed inputs to the same clock used by storage.
     let now: OffsetDateTime = sqlx::query_scalar("SELECT date_trunc('second', clock_timestamp())")
         .fetch_one(pool)
@@ -123,6 +122,22 @@ async fn exercise_echo(pool: PgPool) {
         .unwrap();
     let now_secs = u64::try_from(now.unix_timestamp()).unwrap();
     let joined_at = now - Duration::seconds(20);
+    let observation = VoiceObservation {
+        guild_id,
+        member_id: MEMBER,
+        previous: None,
+        current: Some(CHANNEL),
+        channel_name: ROOM,
+        is_bot: false,
+        afk_channel: None,
+        observed_at: joined_at,
+    };
+    exercise_pre_enable_window(&store, pool, observation, now).await;
+
+    opt_out_member(&privacy, guild, &member, "fixture")
+        .await
+        .unwrap();
+    store.put_event_key(guild, EVENT_KEY, EVENT).await.unwrap();
     let left_at = joined_at + Duration::seconds(5);
     let starts_at = joined_at - Duration::minutes(30);
     let mut event = ScheduledEvent {
@@ -137,16 +152,6 @@ async fn exercise_echo(pool: PgPool) {
     upsert_event(pool, guild, &iso(joined_at - Duration::seconds(2)), &event)
         .await
         .unwrap();
-    let observation = VoiceObservation {
-        guild_id,
-        member_id: MEMBER,
-        previous: None,
-        current: Some(CHANNEL),
-        channel_name: ROOM,
-        is_bot: false,
-        afk_channel: None,
-        observed_at: joined_at,
-    };
     let capture = OpenCapture::Enabled;
     assert!(
         !capture.write_observation(pool, &observation).await.unwrap(),
@@ -180,9 +185,9 @@ async fn exercise_echo(pool: PgPool) {
     let enabled = InternalFlags::from_map(
         &[("TWO_INTERNAL_ALLOW_ATTENDANCE_READ".into(), "1".into())].into(),
     );
-    let echo = async |nonce: &str| {
+    let echo = async |body: &[u8], nonce: &str| {
         let request = signed
-            .request(&enabled, READ_BODY, now_secs, nonce)
+            .request(&enabled, body, now_secs, nonce)
             .await
             .unwrap();
         read(request, pool, |scope| {
@@ -193,7 +198,7 @@ async fn exercise_echo(pool: PgPool) {
         .await
     };
     assert_eq!(
-        echo(&random_nonce()).await,
+        echo(READ_BODY, &random_nonce()).await,
         Err(ReadRefusal::NotFound),
         "active event"
     );
@@ -221,7 +226,7 @@ async fn exercise_echo(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(
-        echo(&random_nonce()).await,
+        echo(READ_BODY, &random_nonce()).await,
         Err(ReadRefusal::NotFound),
         "grace still open"
     );
@@ -232,7 +237,7 @@ async fn exercise_echo(pool: PgPool) {
     upsert_event(pool, guild, &iso(now), &event).await.unwrap();
     let final_nonce = random_nonce();
     // Web Echo can freeze this v1 result. A real but short visit has zero whole minutes.
-    let finalized = echo(&final_nonce).await.unwrap();
+    let finalized = echo(READ_BODY, &final_nonce).await.unwrap();
     assert_eq!(
         finalized,
         json!({
@@ -250,6 +255,11 @@ async fn exercise_echo(pool: PgPool) {
             }],
             "final": true,
         })
+    );
+    assert_eq!(
+        echo(PRE_ENABLE_BODY, &random_nonce()).await,
+        Err(ReadRefusal::NotFound),
+        "the signed key for the pre-enable event has no attendance record"
     );
     assert_eq!(
         signed
@@ -275,7 +285,7 @@ async fn exercise_echo(pool: PgPool) {
     };
     mark_ambiguous(true).await;
     assert_eq!(
-        echo(&random_nonce()).await,
+        echo(READ_BODY, &random_nonce()).await,
         Err(ReadRefusal::NotFound),
         "ambiguous occurrence"
     );
@@ -284,7 +294,7 @@ async fn exercise_echo(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(
-        echo(&random_nonce()).await,
+        echo(READ_BODY, &random_nonce()).await,
         Err(ReadRefusal::NotFound),
         "suppressed member"
     );
@@ -302,9 +312,74 @@ async fn exercise_echo(pool: PgPool) {
         "erased history cannot be backfilled"
     );
     assert_eq!(
-        echo(&random_nonce()).await,
+        echo(READ_BODY, &random_nonce()).await,
         Err(ReadRefusal::NotFound),
         "erased span"
+    );
+}
+
+async fn exercise_pre_enable_window(
+    store: &InternalActionStore,
+    pool: &PgPool,
+    mut observation: VoiceObservation<'_>,
+    now: OffsetDateTime,
+) {
+    let guild = TWO_STAGING_GUILD_ID;
+    observation.observed_at -= Duration::seconds(5);
+    let joined_at = observation.observed_at;
+    let mut event = ScheduledEvent {
+        id: PRE_ENABLE_EVENT.into(),
+        name: "Pre-enable fixture event".into(),
+        starts_at: iso(joined_at - Duration::hours(2)),
+        ends_at: Some(iso(joined_at + Duration::minutes(1))),
+        channel_id: Some(CHANNEL.to_string()),
+        description: None,
+        status: EventStatus::Active,
+    };
+    store
+        .put_event_key(guild, PRE_ENABLE_KEY, PRE_ENABLE_EVENT)
+        .await
+        .unwrap();
+    upsert_event(pool, guild, &iso(joined_at - Duration::seconds(1)), &event)
+        .await
+        .unwrap();
+    assert!(
+        !OpenCapture::default()
+            .write_observation(pool, &observation)
+            .await
+            .unwrap(),
+        "capture is off for the earlier join"
+    );
+
+    // Confirm an earlier actual end to model elapsed grace without sleeping.
+    // The original join still sits inside that window's grace and is fresh
+    // enough to reach the writer's elapsed-window check after enablement.
+    event.status = EventStatus::Completed;
+    event.ends_at = Some(iso(joined_at - Duration::minutes(15) + Duration::seconds(2)));
+    upsert_event(pool, guild, &iso(now), &event).await.unwrap();
+    let elapsed: bool = sqlx::query_scalar(
+        "SELECT w.status = 'completed' AND w.ends_at + INTERVAL '15 minutes' > $3
+             AND w.ends_at + INTERVAL '15 minutes' <= statement_timestamp()
+             AND $3 >= statement_timestamp() - INTERVAL '1 minute'
+         FROM internal_event_keys k JOIN event_instance_windows w USING (guild_id, event_id)
+         WHERE k.guild_id = $1 AND k.event_key = $2 AND w.is_current",
+    )
+    .bind(guild)
+    .bind(PRE_ENABLE_KEY)
+    .bind(joined_at)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        elapsed,
+        "mapped window elapsed while the join was still fresh"
+    );
+    assert!(
+        !OpenCapture::Enabled
+            .write_observation(pool, &observation)
+            .await
+            .unwrap(),
+        "enabling capture must not backfill the completed window"
     );
 }
 
