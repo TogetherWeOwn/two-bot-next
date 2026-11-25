@@ -4846,6 +4846,12 @@ DISJOINT_PRE_REAPER_EXPRESSIONS.update({
     ("staging-voice-move.yml", None): "${{ inputs.verify_lease && github.ref == 'refs/heads/main' && "
                                     "github.ref_protected && github.run_attempt == 1 && 'staging-lifecycle' || "
                                     "format('staging-voice-move-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
+    ("staging-automod-preview.yml", None): (
+        "${{ inputs.rehearse && github.repository_id == '1396224242' && github.ref == 'refs/heads/main' && "
+        "github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main' && "
+        "github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1 && "
+        "'staging-lifecycle' || format('staging-automod-refused-{0}-{1}', github.run_id, github.run_attempt) }}"
+    ),
     ("pipeline-benchmark.yml", None): "${{ github.workflow }}-pipeline-benchmark-"
                                      "${{ github.event.pull_request.number || github.ref }}",
     ("deploy-production.yml", "production"): PRODUCTION_GROUP,
@@ -7714,6 +7720,11 @@ class WorkflowTests(unittest.TestCase):
         workflows["check.yml"]["jobs"]["worker"] = {"uses": f"./.github/workflows/{name}"}
         self.assertIn("check.yml:worker: deployment/probe alternative outside approved deploy workflows",
                       workflow_policy_errors(workflows))
+
+        workflows = deepcopy(self.workflows)
+        lock = workflows[name]["concurrency"]
+        lock["group"] = lock["group"].replace("staging-automod-refused-{0}-{1}", PRE_REAPER_QUEUE)
+        self.assertIn(f"{name}: the PRE sweep queue must remain exclusive", staging_pre_reaper_errors(workflows))
 
     def test_staging_pre_reaper_is_dormant(self):
         self.assertEqual(staging_pre_reaper_errors(self.workflows), [])
