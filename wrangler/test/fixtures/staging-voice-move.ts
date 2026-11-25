@@ -3,7 +3,7 @@ import contract from "../../../crates/core/tests/fixtures/bot-site-contract-v2.j
 
 const wire = contract.verbs["voice.move_member"];
 
-export function mockVoiceMoveWindow(elapsedMs = 1000) {
+export function mockVoiceMoveWindow(elapsedMs = 1000, scope?: { runId: string; deploymentId: string }) {
   const fixture = {
     environment: "staging",
     guildId: "100",
@@ -21,6 +21,7 @@ export function mockVoiceMoveWindow(elapsedMs = 1000) {
     sha: "a".repeat(40),
     deploymentId: "synthetic-deployment",
     epoch: 2,
+    ...scope,
   };
   let connectedChannelId: string | null = source;
   let released = false;
