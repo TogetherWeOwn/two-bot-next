@@ -120,9 +120,9 @@ pre-enable window. Use protected runtime evidence for deployed readiness.
 ## Recover the capture-only handoff
 
 Use this evidence handoff when a separately qualified capture-only state
-precedes the protected signed-reader rehearsal. Use the existing protected release and
-[staging recovery](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
-paths for any runtime action.
+precedes the protected signed-reader rehearsal. The enablement hold above
+applies. Use the existing protected release and staging recovery paths for
+runtime action. [Staging recovery](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
 
 The merged source trail covers the retained `0475` recovery fence, the
 conservative observation floor and the dormant mapped writer.
@@ -134,10 +134,12 @@ conservative observation floor and the dormant mapped writer.
    effective capture ON, reader OFF and ingress state. Attach its qualified
    artifact, runtime and tenant identifiers and the synthetic capture evidence
    described above. Record the reader candidate's verified rollout and link its
-   protected run, original lease, acceptance tool source SHA and synthetic
-   fixture scope to that baseline. Keep prior capture evidence outside the
-   reader fixture cleanup scope. The signed-reader rehearsal begins with
-   effective capture OFF and uses the acceptance and offline comparison above.
+   protected run, original lease acquisition record, acceptance tool source
+   SHA and synthetic fixture scope to that baseline. Keep prior capture
+   evidence outside the reader fixture cleanup scope. Link the capture OFF
+   readback and behavioral evidence described above to the handoff before
+   the first signed probe. Use the reader acceptance and offline comparison
+   above for the capture-OFF window.
 2. If a reader probe fails or cleanup is invalid, keep the transition
    unqualified. Preserve the failed or missing verdict in the protected run
    record and use the existing recovery path. When the original reader window
@@ -146,13 +148,22 @@ conservative observation floor and the dormant mapped writer.
    original fixture is unavailable.
 3. Retain two affirmative receipts in the protected run evidence. Bind the
    reader cleanup to the original lease and reader fixture scope using the
-   stopped release and zero-row readback above. Bind capture-only restoration
-   to the pinned prior artifact and tenant with a verified serving rollout,
-   effective capture ON, reader OFF and the prior ingress state. Use the
+   stopped release and zero-row readback above. If a probe failed before all
+   phase evidence was recorded, check the standalone cleanup result against
+   the saved rollout and original lease acquisition record, comparing every
+   lease field listed above. Verify that the zero-row readback covers the
+   pinned reader fixture scope in both tenants. Leave cleanup unverified if
+   any part of that match is missing.
+4. Confirm the original reader window stopped before opening a restoration
+   window. Use the staging lifecycle's recovery if the stop is unconfirmed.
+   After the recovery action takes effect, verify the serving rollout and
+   read back effective capture ON, reader OFF and the prior ingress state
+   on the pinned prior artifact and tenant. Record these fresh observations
+   with their UTC times and the protected restoration run and attempt. Use the
    capture ON behavior above to confirm a fresh eligible synthetic observation
-   under the authorized restoration window. Its fixtures follow that window's
-   cleanup. Use the staging lifecycle's recovery for any unconfirmed stop
-   before opening another window.
+   in that window. Its fixtures follow that window's cleanup. Leave restoration
+   unverified if the rollout or control readback cannot be attributed to the
+   post-recovery window.
 
 The protected run record carries the sanitized baseline, phase evidence,
 failure and receipts through closeout. If recovery continues in another
