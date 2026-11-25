@@ -133,6 +133,42 @@ adoption. Local execution remains limited to one failing test or crate under the
 Keep exact-head CI and independent review as gates; this seam does not enable
 broader automation or retry authority.
 
+## Passive release observations
+
+Use the release watch's verified serving image and `/readyz` build identity
+(`build_revision` and `build_id`) to bound the observation window to one
+Container application and one deployed build. Save the sanitized JSON from
+[`container_stdout_read.py`](startup-diagnostics.md#reading-container-stdout)
+for that same window with `--contains` omitted. The offline validator reads
+the saved packet on stdin.
+
+```sh
+python3 scripts/passive_gateway_evidence.py --service "$application_id" \
+  --sha "$build_revision" --start "$window_start_utc" --end "$window_end_utc" \
+  < sanitized-container-stdout.json
+```
+
+The window bounds are UTC seconds ending in `Z`, matching the readback's
+`--end` and `--minutes`. Logs carry the full `build_sha`. For distinct images
+built from the same commit, the release watch must establish which image served
+throughout the supplied window before those logs can be attributed to it.
+
+`ready` records a committed READY after IDENTIFY. `gateway_resumed` records a
+committed RESUMED that published readiness. These are historical gateway
+readiness observations. `gateway_connecting.resume` records the planned boot
+path. `shard_closed` and `gateway_reconnect_failed` record a close and a failed
+reconnect attempt, respectively. Record each signal separately. A count of zero
+or `not_observed` means the packet contains no matching observation. A cold
+resume can commit without emitting `gateway_resumed` if it needs a fresh READY
+to publish readiness. The existing logs do not distinguish endpoint rejection
+from other reasons for IDENTIFY. Keep that observation unverified unless
+explicit passive evidence is available and cite #2075 for the hosted checkpoint
+coverage.
+
+Mixed builds, a foreign or unstamped build, a stale window or event, and a
+possibly truncated page return nonzero without signal counts. This optional
+summary has no release-gate wiring.
+
 ## Verification (test containers only)
 
 The full suite and CI gates are GitHub Actions-owned. Push the PR branch and

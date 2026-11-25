@@ -18,6 +18,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import container_stdout_read as reader  # noqa: E402
+import passive_gateway_evidence as gateway_evidence
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = Path(__file__).with_name("container_stdout_read.py")
@@ -204,6 +205,95 @@ class OutputTests(unittest.TestCase):
         code, out, err = run_main(["--service", SERVICE, "--end", END], FakeTransport())
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(json.loads(out)["event_count"], 4)
+
+
+class PassiveGatewayEvidenceTests(unittest.TestCase):
+    SHA = "a1" * 20
+
+    def event(self, msg, target, **fields):
+        return hostile_event("[redacted]", msg=msg, target=target,
+                             **{"build_sha": self.SHA, **fields})
+
+    def packet(self, *events):
+        answer = fixture_response()
+        answer["result"]["events"]["events"] = list(events)
+        return read_with(FakeTransport(answer))
+
+    def summarize(self, packet):
+        out = io.StringIO()
+        argv = ["--service", SERVICE, "--sha", self.SHA,
+                "--start", "2026-10-11T12:15:00Z", "--end", END]
+        data = packet if isinstance(packet, bytes) else json.dumps(packet).encode()
+        code = gateway_evidence.main(argv, stdin=io.BytesIO(data), stdout=out)
+        return code, json.loads(out.getvalue())
+
+    def test_gateway_build_and_boot_choice_survive_sanitization(self):
+        raw = hostile_event("durable gateway initialized; shard connecting",
+                            msg="gateway_connecting", target="two_bot",
+                            build_sha=self.SHA, resume=False, resume_url="[redacted]",
+                            session_id="[redacted]")
+        event, _ = reader.sanitize_event(raw)
+        self.assertEqual(event["build_sha"], self.SHA)
+        self.assertIs(event["resume"], False)
+        self.assertNotIn("resume_url", event)
+        self.assertNotIn("session_id", event)
+
+    def test_passive_signals_are_counted_from_the_expected_build(self):
+        packet = self.packet(
+            self.event("gateway_connecting", "two_bot", resume=False),
+            self.event("gateway_connecting", "two_bot", resume=True),
+            self.event("shard_closed", "two_bot::logging"),
+            self.event("gateway_reconnect_failed", "two_bot::gateway"),
+            self.event("ready", "two_bot::gateway"),
+            self.event("gateway_resumed", "two_bot::gateway"),
+        )
+        self.assertEqual(self.summarize(packet), (0, {
+            "verdict": "observed", "build_sha": self.SHA,
+            "signals": {"ready": 1, "gateway_resumed": 1, "shard_closed": 1,
+                        "gateway_reconnect_failed": 1, "identify_planned": 1, "resume_planned": 1},
+        }))
+
+    def test_quiet_window_does_not_infer_unseen_paths(self):
+        for packet in (self.packet(), self.packet(self.event("ready", "other::target"))):
+            with self.subTest(event_count=packet["event_count"]):
+                code, result = self.summarize(packet)
+                self.assertEqual((code, result["verdict"]), (0, "not_observed"))
+                self.assertEqual(set(result["signals"].values()), {0})
+        packet = self.packet(self.event("ready", "two_bot::gateway"))
+        _, result = self.summarize(packet)
+        self.assertEqual(result["signals"], {"ready": 1, "gateway_resumed": 0, "shard_closed": 0,
+                                            "gateway_reconnect_failed": 0, "identify_planned": 0,
+                                            "resume_planned": 0})
+
+    def test_mixed_and_wrong_builds_refuse_partial_credit(self):
+        ready = self.event("ready", "two_bot::gateway")
+        other = self.event("http_listening", "two_bot", build_sha="b2" * 20)
+        self.assertEqual(self.summarize(self.packet(other, ready)), (1, {"verdict": "mixed_build"}))
+        self.assertEqual(self.summarize(self.packet(other)), (1, {"verdict": "build_mismatch"}))
+
+    def test_same_build_stale_window_or_event_refuses_credit(self):
+        ready = self.event("ready", "two_bot::gateway")
+        packet = self.packet(ready)
+        packet["window"]["start"] = "2026-10-11T12:14:00.000Z"
+        self.assertEqual(self.summarize(packet), (1, {"verdict": "stale_evidence"}))
+        packet = self.packet(ready)
+        packet["events"][0]["ts"] = "2026-10-11T12:14:59.999Z"
+        self.assertEqual(self.summarize(packet), (1, {"verdict": "stale_evidence"}))
+
+    def test_unstamped_truncated_and_malformed_packets_stay_unobserved(self):
+        unstamped = self.packet(self.event("ready", "two_bot::gateway", build_sha="[redacted]"))
+        self.assertEqual(unstamped["events"][0]["build_sha"], "[redacted]")
+        self.assertEqual(self.summarize(unstamped), (1, {"verdict": "unbound_build"}))
+        malformed = self.packet(self.event("gateway_connecting", "two_bot", resume=0))
+        self.assertNotIn("resume", malformed["events"][0])
+        self.assertEqual(self.summarize(malformed), (1, {"verdict": "invalid_packet"}))
+        packet = self.packet(self.event("ready", "two_bot::gateway"))
+        self.assertEqual(self.summarize(dict(packet, limit=1, possibly_truncated=True)),
+                         (1, {"verdict": "incomplete_window"}))
+        self.assertEqual(self.summarize(dict(packet, service="[redacted]")),
+                         (1, {"verdict": "service_mismatch"}))
+        self.assertEqual(self.summarize(b'{"events":[],"events":[]}'),
+                         (1, {"verdict": "invalid_packet"}))
 
 
 class RedactionTests(unittest.TestCase):
