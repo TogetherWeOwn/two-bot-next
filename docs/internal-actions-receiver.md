@@ -210,6 +210,20 @@ failure code on refusal. The protected Web caller verifies the signed session
 at dispatch. The runner rechecks lease and Discord observations for each case
 and still requires OFF and stopped for its own window.
 
+The same module exports `runProtectedVoiceMoveAcceptance` for the job holding
+the active lease. It defaults off. Pass the current lease and ready receipt,
+the prior ready and OFF receipts, and the protected fixture pin. The bound Web
+session exposes `environment: "staging"` and `discordId` matching the fixture
+member. Its `readCurrent({ signal })` and destination-only `move` use the same
+installed session.
+An independent fixture reader supplies `readChannels({ signal })` and the
+per-case `observe` callback. The control callback uses the existing staging-use
+client. Pass those readbacks directly without rewriting their timestamps or
+subject. Readback failure enters the runner's same-window finish path. The
+enclosing job still holds the staging lock and owns its unconditional finish
+fallback. This adapter has no workflow caller or live transport. Its current
+receipts are marked `mock`.
+
 Attaching the executor gives all signed verbs a five-second nonce deadline. The guild turn
 ends at adapter settlement. The child holds capacity through the audit, with up to five
 seconds beyond the wire deadline. An audit failure or timeout is logged as unconfirmed.

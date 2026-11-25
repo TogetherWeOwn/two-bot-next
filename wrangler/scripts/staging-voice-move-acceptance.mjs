@@ -52,11 +52,13 @@ function observationMatches(state, fixture, channelId, connectedChannelId, canCo
     && state.canConnect === canConnect;
 }
 
-function assertPreflight(binding, ready, fixture, evidence, at) {
+function assertReady(binding, ready, at) {
   const readyAt = observedAt(ready);
   require(positive(at) && active(ready, binding, "ready", readyAt) && readyAt <= at
     && at - readyAt <= READBACK_MAX_AGE_MS && at < binding.expiresAt - 1000, "lease_unconfirmed");
+}
 
+function assertFixture(fixture) {
   const { environment, guildId, discordId, channelIds } = fixture ?? {};
   require(environment === "staging" && snowflake(guildId) && Array.isArray(channelIds)
     && channelIds.length === 2, "fixture_invalid");
@@ -64,7 +66,18 @@ function assertPreflight(binding, ready, fixture, evidence, at) {
   // The Web staging caller accepts only 17–20 digit member/channel snowflakes.
   require([discordId, source, destination].every((id) => snowflake(id) && id.length >= 17)
     && new Set([guildId, discordId, source, destination]).size === 4, "fixture_invalid");
+  return [source, destination];
+}
 
+function assertCaller(caller, discordId, observe) {
+  require(caller?.environment === "staging" && caller.discordId === discordId
+    && typeof caller.move === "function" && typeof observe === "function", "caller_unconfirmed");
+}
+
+function assertPreflight(binding, ready, fixture, evidence, at) {
+  assertReady(binding, ready, at);
+  const [source, destination] = assertFixture(fixture);
+  const { discordId } = fixture;
   const { session, readback, previousReady, previousOff } = evidence ?? {};
   const fresh = (value) => {
     const captured = observedAt(value);
@@ -141,9 +154,13 @@ async function withinLease(lease, now, operation) {
  * Both probe adapters must honor the supplied signal. This source ships only
  * mock evidence and no transport.
  */
-export async function runVoiceMoveAcceptance({
+export function runVoiceMoveAcceptance(options) {
+  return runAcceptance(options);
+}
+
+async function runAcceptance({
   enabled = false, lease, ready, fixture, evidence, caller, observe, control, now = Date.now,
-} = {}) {
+} = {}, readEvidence) {
   const receipt = {
     schema: "two-bot-staging-voice-move-acceptance.v1",
     environment: "staging",
@@ -162,10 +179,16 @@ export async function runVoiceMoveAcceptance({
   const { runId, runAttempt, expiresAt, sha, deploymentId } = binding;
 
   try {
-    const [source, destination] = assertPreflight(binding, ready, fixture, evidence, now());
+    let currentEvidence = evidence;
+    if (readEvidence !== undefined) {
+      assertReady(binding, ready, now());
+      assertFixture(fixture);
+      assertCaller(caller, fixture.discordId, observe);
+      currentEvidence = await withinLease(binding, now, readEvidence);
+    }
+    const [source, destination] = assertPreflight(binding, ready, fixture, currentEvidence, now());
     const { guildId, discordId } = fixture;
-    require(caller?.environment === "staging" && caller.discordId === discordId
-      && typeof caller.move === "function" && typeof observe === "function", "caller_unconfirmed");
+    assertCaller(caller, discordId, observe);
 
     const cases = [
       { outcome: "moved", before: source, target: destination, after: destination, canConnect: true },
@@ -222,4 +245,23 @@ export async function runVoiceMoveAcceptance({
   if (!receipt.code && receipt.cleanup.memberDisconnected === true
     && receipt.cleanup.off === true && receipt.cleanup.stopped === true) receipt.verdict = "passed";
   return receipt;
+}
+
+/**
+ * Entry for the protected job that owns the active window and its finish fallback.
+ * session.readCurrent and session.move use the same existing scoped Web session.
+ * readChannels and observe use the independent reader bound to the pinned fixture.
+ * Readbacks carry the producers' timestamps. Both readers must honor the signal.
+ */
+export function runProtectedVoiceMoveAcceptance({
+  enabled = false, lease, ready, fixture, previousReady, previousOff,
+  session, readChannels, observe, control, now,
+} = {}) {
+  return runAcceptance({ enabled, lease, ready, fixture, caller: session, observe, control, now },
+    async (signal) => {
+      const currentSession = await session.readCurrent({ signal });
+      signal.throwIfAborted();
+      const readback = await readChannels({ signal });
+      return { session: currentSession, readback, previousReady, previousOff };
+    });
 }
