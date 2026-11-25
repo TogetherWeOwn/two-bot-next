@@ -1,0 +1,162 @@
+{
+  "run": {
+    "id": 123,
+    "head_sha": "dddddddddddddddddddddddddddddddddddddddd"
+  },
+  "env": {
+    "PRODUCTION_HOST": "db",
+    "PRODUCTION_DATABASE": "fixture",
+    "PRODUCTION_BRANCH_ID": "branch"
+  },
+  "admission": {
+    "pin": {
+      "run_id": "123",
+      "run_attempt": 1,
+      "candidate_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rollback_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "worker_version": "11111111-1111-1111-1111-111111111111",
+      "image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "application_id": "22222222-2222-2222-2222-222222222222",
+      "namespace_id": "22222222222222222222222222222222",
+      "database_fingerprint": "f6a18707c652e8df138ba00e096b0aac7636b506da2da49c9d318f6b9c2909fd",
+      "expanded_ledgers_sha256": "04d8c14d4b994fbb8ae4977b3fc65e8256b3fff0bc8f89919f9b6810fa27a943",
+      "restored_ledgers_sha256": "064f5a3271d4bb06c09de03bdeaa4cd38be0cf1d0810a916b37b45ac56c80b9a",
+      "attendance_fence_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "fence_epoch": 21
+    },
+    "plan_run_id": "321",
+    "candidate_worker": "33333333-3333-3333-3333-333333333333",
+    "candidate_image": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "plan": {
+    "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "target": {
+      "host": "db",
+      "database": "fixture",
+      "branch_id": "branch"
+    },
+    "migration_target": "production",
+    "mode": "plan",
+    "role": "two_bot_migrator_ro",
+    "recovery_evidence_ref": "inverse-a2eaf592a43b7d416ad1bcc6c6b6a0592d14fc83440e7707a088dff72849ccfa",
+    "pending_before": [
+      475,
+      479,
+      480,
+      481,
+      482
+    ],
+    "pending_store_before": [
+      478
+    ],
+    "source_migrations": [
+      {
+        "version": 474,
+        "description": "migration 474",
+        "sha384": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001da",
+        "sha384_recomputed": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001da"
+      },
+      {
+        "version": 475,
+        "description": "migration 475",
+        "sha384": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001db",
+        "sha384_recomputed": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001db"
+      },
+      {
+        "version": 479,
+        "description": "migration 479",
+        "sha384": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001df",
+        "sha384_recomputed": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001df"
+      },
+      {
+        "version": 480,
+        "description": "migration 480",
+        "sha384": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001e0",
+        "sha384_recomputed": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001e0"
+      },
+      {
+        "version": 481,
+        "description": "migration 481",
+        "sha384": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001e1",
+        "sha384_recomputed": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001e1"
+      },
+      {
+        "version": 482,
+        "description": "migration 482",
+        "sha384": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001e2",
+        "sha384_recomputed": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001e2"
+      }
+    ],
+    "source_store_migrations": [
+      {
+        "version": 477,
+        "description": "migration 477",
+        "sha384": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001dd",
+        "sha384_recomputed": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001dd"
+      },
+      {
+        "version": 478,
+        "description": "migration 478",
+        "sha384": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001de",
+        "sha384_recomputed": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001de"
+      }
+    ],
+    "ledger_before": [
+      {
+        "version": 474,
+        "description": "original cutover description",
+        "success": true,
+        "sha384": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001da"
+      }
+    ],
+    "ledger_after": [
+      {
+        "version": 474,
+        "description": "original cutover description",
+        "success": true,
+        "sha384": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001da"
+      }
+    ],
+    "ledger_store_before": [
+      {
+        "version": 477,
+        "description": "original store description",
+        "success": true,
+        "sha384": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001dd"
+      }
+    ],
+    "ledger_store_after": [
+      {
+        "version": 477,
+        "description": "original store description",
+        "success": true,
+        "sha384": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001dd"
+      }
+    ],
+    "plan_manifest_sha256": "3e079a06fdcb4ae585ae185fe39d1af82c0b7cd216c16466a0a646feddcd10fa",
+    "store_plan_manifest_sha256": "f0463dc9b2f185dbb68e9d7dbe7ae5e8085840070ade11c611add05dcb82ef60"
+  },
+  "artifact": {
+    "archive_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+  },
+  "source_admission": {
+    "pin": {
+      "run_id": "123",
+      "run_attempt": 1,
+      "candidate_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rollback_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "worker_version": "11111111-1111-1111-1111-111111111111",
+      "image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "application_id": "22222222-2222-2222-2222-222222222222",
+      "namespace_id": "22222222222222222222222222222222",
+      "database_fingerprint": "f6a18707c652e8df138ba00e096b0aac7636b506da2da49c9d318f6b9c2909fd",
+      "expanded_ledgers_sha256": "d45249f0d882d205c0056b38eea75dad3d7f93c033187524296308a6ace201a8",
+      "restored_ledgers_sha256": "c29de03decafd0fc9f438ecdb5c37b2a4d56f024d730aca5da90ae5ff33fad93",
+      "attendance_fence_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "fence_epoch": 21
+    },
+    "plan_run_id": "321",
+    "candidate_worker": "33333333-3333-3333-3333-333333333333",
+    "candidate_image": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+  }
+}

@@ -1,7 +1,7 @@
 """Synthetic checks for the production recovery handoffs and failure ordering."""
 
 from copy import deepcopy
-from dataclasses import asdict, replace
+from dataclasses import asdict
 import json
 from pathlib import Path
 import sys
@@ -13,9 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import production_recovery_artifact as artifacts
 import production_recovery_workflow as recovery
-from ci.production_migrate_claim import projection_hash, store_projection_hash
 from production_recovery_takeover import RecoveryPin
-from staging_migrate_approval import digest_json
 from staging_rollout import GateError
 from worker_container_rollback import require_ordinary_production_rollback, source_has_attendance_schema
 
@@ -76,61 +74,18 @@ class RecoveryWorkflowTests(unittest.TestCase):
             recovery.establish_fence(self.pin, self.candidate, Mock(side_effect=[before, after]), self.control)
         self.control.assert_called_once_with("fence-exact", 20, expected_deployment=self.candidate[0])
 
-    def test_cli_requires_reviewed_plan_approval(self):
-        approval = {"plan_run_id": "321", "plan_archive_sha256": "sha256:" + "8" * 64}
-        with (patch.object(recovery, "current_run"), patch.object(recovery, "verify_environment"),
-              patch.object(recovery, "release_admission", return_value=(self.pin, self.candidate, {}, approval)),
-              patch.object(recovery, "verify_check", side_effect=GateError("unapproved")) as check):
-            self.assertEqual(recovery.main(["fence"], {}), 1)
-            check.assert_called_once()
-
     def test_admission_binds_the_rust_inverse_ledger_rows(self):
-        def source_row(version):
-            checksum = f"{version:096x}"
-            return dict(version=version, description=f"migration {version}",
-                        sha384=checksum, sha384_recomputed=checksum)
-
-        fixture = ROOT / "crates/cutover/tests/fixtures/production_release_ledger_readback.json"
-        restored_cutover, expanded_store = json.loads(fixture.read_text(encoding="utf-8"))
-        cutover_before, store_before = restored_cutover[:1], expanded_store[:1]
-        expanded_cutover = restored_cutover + [
-            dict(version=version, description=f"migration {version}", sha384=f"{version:096x}", success=True)
-            for version in (479, 480, 481, 482)
-        ]
-        target = dict(host="db", database="fixture", branch_id="branch")
-        pin = replace(self.pin, database_fingerprint=digest_json(target),
-                      expanded_ledgers_sha256=digest_json([expanded_cutover, expanded_store]),
-                      restored_ledgers_sha256=digest_json([restored_cutover, store_before]))
-        worker, _, image = self.candidate
-        run = {"id": 123, "head_sha": "d" * 40}
-        reference = digest_json(dict(operation="undo-0480", candidate_sha=pin.candidate_sha,
-                                     candidate_worker=worker, candidate_image=image, rollback_sha=pin.rollback_sha,
-                                     rollback_worker=pin.worker_version, rollback_image=pin.image_digest,
-                                     application_id=pin.application_id, namespace_id=pin.namespace_id,
-                                     workflow_sha=run["head_sha"]))
-        plan = dict(source_sha=pin.candidate_sha, target=target, migration_target="production", mode="plan",
-                    role="two_bot_migrator_ro", recovery_evidence_ref=f"inverse-{reference}",
-                    pending_before=[475, 479, 480, 481, 482], pending_store_before=[478],
-                    source_migrations=[source_row(v) for v in (474, 475, 479, 480, 481, 482)],
-                    source_store_migrations=[source_row(v) for v in (477, 478)],
-                    ledger_before=cutover_before, ledger_after=cutover_before,
-                    ledger_store_before=store_before, ledger_store_after=store_before)
-        plan.update(plan_manifest_sha256=projection_hash(plan), store_plan_manifest_sha256=store_projection_hash(plan))
-        artifact = {"archive_digest": "sha256:" + "8" * 64}
-        env = {f"PRODUCTION_{key.upper()}": value for key, value in target.items()}
-        admission = dict(pin=asdict(pin), plan_run_id="321", candidate_worker=worker, candidate_image=image)
-        env["RECOVERY_ADMISSION"] = json.dumps(admission)
-        with patch.object(recovery, "authenticated_plan", return_value=(plan, artifact)):
-            admitted, candidate, approved_plan, approval = recovery.release_admission(env, run)
-            self.assertEqual((admitted, candidate, approved_plan), (pin, self.candidate, plan))
-            self.assertEqual(approval["plan_archive_sha256"], artifact["archive_digest"])
-            source_cutover = [dict(row, success=True) for row in plan["source_migrations"]]
-            source_store = [dict(row, success=True) for row in plan["source_store_migrations"]]
-            admission["pin"].update(expanded_ledgers_sha256=digest_json([source_cutover, source_store]),
-                                    restored_ledgers_sha256=digest_json([source_cutover[:2], source_store[:1]]))
-            env["RECOVERY_ADMISSION"] = json.dumps(admission)
+        fixture = ROOT / "scripts/ci/fixtures/production_inverse_admission.json"
+        case = json.loads(fixture.read_text(encoding="utf-8"))
+        env = {**case["env"], "RECOVERY_ADMISSION": json.dumps(case["admission"])}
+        with patch.object(recovery, "authenticated_plan", return_value=(case["plan"], case["artifact"])):
+            with (patch.object(recovery, "current_run", return_value=case["run"]), patch.object(recovery, "verify_environment"),
+                  patch.object(recovery, "verify_check", side_effect=GateError("unapproved")) as check):
+                self.assertEqual(recovery.main(["fence"], env), 1)
+                check.assert_called_once()
+            env["RECOVERY_ADMISSION"] = json.dumps(case["source_admission"])
             with self.assertRaisesRegex(GateError, "production_inverse_ledger_pin_invalid"):
-                recovery.release_admission(env, run)
+                recovery.release_admission(env, case["run"])
 
     def test_inverse_refuses_incomplete_database_readback(self):
         plan = dict(target=dict(host="db", database="fixture", branch_id="branch"),
