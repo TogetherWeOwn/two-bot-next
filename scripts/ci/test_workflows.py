@@ -19,14 +19,14 @@ from unittest.mock import Mock, patch
 
 import yaml
 
+from staging_pre_reaper_policy import PRE_REAPER, PRE_REAPER_QUEUE, dormant_pre_reaper_errors
 from staging_soak_policy import PRODUCTION_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, GUARDS as MEASUREMENT_GUARDS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
-    TARGET as MEASUREMENT_TARGET, WORKFLOW as MEASUREMENT, is_measurement_caller,
+    TARGET as MEASUREMENT_TARGET, WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
-PRE_REAPER = "staging-pre-reaper.yml"
 _HISTORY_SPEC = importlib.util.spec_from_file_location(
     "synthetic_alert_history", ROOT / "scripts/synthetic_alert_history.py")
 _HISTORY_MODULE = importlib.util.module_from_spec(_HISTORY_SPEC)
@@ -4831,60 +4831,53 @@ def measurement_deploy_scan_text(job_id, job):
     return str(dict(job, steps=[*steps[:index], sanitized, *steps[index + 1:]])).lower()
 
 
+# Existing expression-only groups with fixed disjoint results. An expression
+# with a disjoint literal prefix needs no separate entry.
+DISJOINT_PRE_REAPER_EXPRESSIONS = {
+    (file, None): "${{ (inputs.deploy_staging_call || inputs.staging_use_expires_at != '') && "
+                  f"format('staging-{consumer}-consumer-{{0}}', github.run_id) || 'staging-lifecycle' }}}}"
+    for file, consumer in (("help-embed-synthetic.yml", "help"), ("voice-synthetic.yml", "voice"))
+}
+DISJOINT_PRE_REAPER_EXPRESSIONS.update({
+    (MEASUREMENT, None): measurement_queue("staging-lifecycle")["group"],
+    (STAGING_SOAK, None): "${{ github.run_attempt == 1 && github.ref == 'refs/heads/main' && "
+                          "github.ref_protected && 'staging-lifecycle' || "
+                          "format('staging-soak-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
+    ("staging-voice-move.yml", None): "${{ inputs.verify_lease && github.ref == 'refs/heads/main' && "
+                                    "github.ref_protected && github.run_attempt == 1 && 'staging-lifecycle' || "
+                                    "format('staging-voice-move-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
+    ("pipeline-benchmark.yml", None): "${{ github.workflow }}-pipeline-benchmark-"
+                                     "${{ github.event.pull_request.number || github.ref }}",
+    ("deploy-production.yml", "production"): PRODUCTION_GROUP,
+})
+
+
 def staging_pre_reaper_errors(workflows):
-    """Pin the dormant staging-only cleanup entry and its dedicated queue."""
-    guard = (
-        "github.repository_id == '1396224242' && "
-        "github.ref == 'refs/heads/main' && github.ref_protected && "
-        "((github.event_name == 'workflow_dispatch' && "
-        "github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/"
-        "staging-pre-qualification.yml@refs/heads/main') || "
-        "(github.event_name == 'schedule' && "
-        "github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/"
-        "staging-pre-periodic.yml@refs/heads/main'))"
-    )
-    queue = "staging-pre-reaper"
-    expected = {
-        "name": queue,
-        "on": {"workflow_call": ""},
-        "permissions": {},
-        "jobs": {"sweep": {
-            "if": guard,
-            "environment": {"name": "staging", "deployment": "false"},
-            "concurrency": {"group": queue, "cancel-in-progress": "false", "queue": "max"},
-            "permissions": {"contents": "read"},
-            "runs-on": PUBLIC_RUNNER,
-            "timeout-minutes": "5",
-            "steps": [
-                {"uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-                 "with": {"ref": "${{ github.sha }}", "persist-credentials": "false", "fetch-depth": "1"}},
-                {"name": "Exercise the PRE sweep against synthetic inventory",
-                 "run": "python3 -B -m unittest scripts.ci.test_staging_pre_reaper_fixture"},
-                {"name": "Signal unverified PRE cleanup", "if": "failure() || cancelled()",
-                 "run": "echo '::error title=PRE cleanup incident::Cleanup could not be verified. "
-                        "Inspect the staging PRE sweep run.'"},
-            ],
-        }},
-    }
-    actual = deepcopy(workflows.get(PRE_REAPER, {}))
-    sweep = actual.get("jobs", {}).get("sweep", {})
-    if "if" in sweep:
-        sweep["if"] = " ".join(sweep["if"].split())
-    errors = []
-    if actual != expected:
-        errors.append(f"{PRE_REAPER}: expected the protected, synthetic-only sweep and static incident signal")
-    for name, workflow in workflows.items():
-        if name == PRE_REAPER:
+    errors = dormant_pre_reaper_errors(workflows)
+    for file, workflow in workflows.items():
+        if file == PRE_REAPER:
             continue
-        for job in workflow.get("jobs", {}).values():
-            path = job.get("uses", "").partition("@")[0].lower()
-            if path.endswith(f"/{PRE_REAPER}"):
-                errors.append(f"{name}: the PRE reaper must remain unwired")
-        for node in (workflow, *workflow.get("jobs", {}).values()):
-            concurrency = node.get("concurrency", {})
-            group = concurrency.get("group", "") if isinstance(concurrency, dict) else concurrency
-            if group.casefold() == queue:
-                errors.append(f"{name}: the PRE sweep queue must remain exclusive")
+        for job, node in ((None, workflow), *workflow.get("jobs", {}).items()):
+            if "concurrency" not in node:
+                continue
+            lock = node["concurrency"]
+            group = lock.get("group", "") if isinstance(lock, dict) else lock
+            prefix, expression, _ = group.casefold().partition("${{")
+            if not expression:
+                may_collide = prefix == PRE_REAPER_QUEUE
+            elif not PRE_REAPER_QUEUE.startswith(prefix):
+                may_collide = False
+            elif (file, job) == ("pr-size.yml", None):
+                # This expression's first term is the top-level workflow name.
+                may_collide = not (
+                    workflow.get("name") == "pr-size" and "workflow_call" not in workflow.get("on", {})
+                    and group == "${{ github.workflow }}-"
+                                 "${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}"
+                )
+            else:
+                may_collide = DISJOINT_PRE_REAPER_EXPRESSIONS.get((file, job)) != group
+            if may_collide:
+                errors.append(f"{file}: the PRE sweep queue must remain exclusive")
     return errors
 
 
@@ -7742,8 +7735,15 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("check.yml: the PRE reaper must remain unwired", staging_pre_reaper_errors(workflows))
 
         workflows = deepcopy(self.workflows)
-        workflows["check.yml"]["concurrency"] = {"group": "STAGING-PRE-REAPER"}
-        self.assertIn("check.yml: the PRE sweep queue must remain exclusive", staging_pre_reaper_errors(workflows))
+        for group in (
+            "STAGING-PRE-REAPER",
+            "${{ format('staging-{0}-reaper', 'pre') }}",
+            "staging-pre-${{ vars.CLEANUP_SUFFIX }}",
+        ):
+            with self.subTest(group=group):
+                workflows["check.yml"]["concurrency"] = {"group": group}
+                self.assertIn("check.yml: the PRE sweep queue must remain exclusive",
+                              staging_pre_reaper_errors(workflows))
 
     def test_staging_deploy_holds_the_full_window_and_releases_after_every_consumer(self):
         import copy

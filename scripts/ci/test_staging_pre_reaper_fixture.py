@@ -175,15 +175,23 @@ class PreReaperFixtureTests(unittest.TestCase):
                     self.sweep()
 
     def test_late_start_requires_another_sweep_before_success(self):
+        arrived = self.staging.snapshot
         self.staging.snapshot = replace(
             self.staging.snapshot, worker=None, container=None, instance_count=0,
             assigned_count=0, write_access=False, startup_settled=False,
         )
-        with self.assertRaisesRegex(SweepError, "^PRE cleanup readback could not be verified$"):
-            self.sweep()
-        self.assertEqual([event[0] for event in self.staging.events], ["status", "inventory", "inventory"])
+        inventory = self.staging.inventory
 
-        self.staging = SyntheticStaging(self.target)
+        def read_then_land(target):
+            observed = inventory(target)
+            self.staging.snapshot = arrived
+            return observed
+
+        with patch.object(self.staging, "inventory", side_effect=read_then_land):
+            with self.assertRaisesRegex(SweepError, "^PRE cleanup readback could not be verified$"):
+                self.sweep()
+        self.assertEqual([event[0] for event in self.staging.events], ["status", "inventory", "inventory"])
+        self.assertEqual(self.staging.snapshot, arrived)
         self.assertEqual(self.sweep(), "cleared")
 
     def test_adapter_errors_do_not_expose_raw_details(self):
