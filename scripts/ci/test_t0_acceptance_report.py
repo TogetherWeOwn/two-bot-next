@@ -19,6 +19,10 @@ WINDOW = {
     "start": "2026-11-25T02:00:00Z", "end": "2026-11-25T02:05:00Z",
 }
 PRODUCTION = dict(WINDOW, environment="production")
+WATCH_HEADER = b"utc\tsignal\tobservation\tdisposition\n"
+WATCH_HELP = b"2026-11-25T02:01:00Z\thelp\tbranding-readbacks-and-deletions\tpass\n"
+WATCH_EMPTY = b"2026-11-25T02:02:00Z\tnaming\tempty-room-rename\tpass\n"
+WATCH_RETURN = b"2026-11-25T02:03:00.125+00:00\tnaming\toccupied-room-return\tpass\n"
 HELP = {"schema": "help_embed_smoke.v3", "verdict": "PASS", "rows": [
     {"name": name, "result": "pass", "actual": "read-back branding, text and fields match; message deleted",
      "message_id": str(1000000000000000000 + i), "duration_ms": 10}
@@ -66,6 +70,67 @@ class T0AcceptanceReportTests(unittest.TestCase):
         raw = self.invoke("t0_acceptance_report.py", *args)
         self.assertNotIn(b"1000000000000000000", raw)
         return json.loads(raw)["observations"]
+
+    def assemble_watch(self, signal, rows, window=PRODUCTION):
+        source = self.root / "watch.tsv"
+        source.write_bytes(WATCH_HEADER + rows)
+        window_path = self.root / "window.json"
+        window_path.write_bytes(json.dumps(window).encode() if isinstance(window, dict) else window)
+        return subprocess.run(
+            [sys.executable, "-B", str(SCRIPTS / "assemble_production_watch.py"),
+             "--signal", signal, "--rows", str(source), "--window", str(window_path)],
+            capture_output=True, timeout=10,
+        )
+
+    def test_assembled_watch_signals_round_trip_with_independent_binding(self):
+        bindings = {}
+        for signal, source in (("help", WATCH_HELP), ("naming", WATCH_EMPTY + WATCH_RETURN)):
+            assembled = self.assemble_watch(signal, source)
+            self.assertEqual((assembled.returncode, assembled.stderr), (0, b""))
+            self.assertEqual(self.assemble_watch(signal, source).stdout, assembled.stdout)
+            bindings[signal] = self.save(signal, assembled.stdout, PRODUCTION)
+        naming = json.loads(self.paths["naming"].read_bytes())
+        self.assertEqual(naming["rows"][1]["utc"], "2026-11-25T02:03:00.125+00:00")
+
+        rows = self.run_report({}, PRODUCTION)
+        self.assertEqual([rows[signal]["status"] for signal in bindings], ["unverified", "unverified"])
+        rows = self.run_report(bindings, PRODUCTION)
+        self.assertEqual((rows["help"]["status"], rows["help"]["result"]),
+                         ("attributed", "readbacks_and_deletions_recorded"))
+        self.assertEqual((rows["naming"]["status"], rows["naming"]["result"]),
+                         ("attributed", "transitions_recorded"))
+        unavailable = self.assemble_watch("naming", WATCH_EMPTY + WATCH_RETURN.replace(b"pass", b"not_observed"))
+        self.assertEqual((unavailable.returncode, unavailable.stderr), (0, b""))
+        bindings["naming"] = self.save("naming", unavailable.stdout, PRODUCTION)
+        row = self.run_report(bindings, PRODUCTION)["naming"]
+        self.assertEqual((row["status"], row["result"], row["missing_transitions"]),
+                         ("attributed", "not_observed", ["occupied-room-return"]))
+
+    def test_watch_assembly_refuses_late_incomplete_or_unapproved_input_without_echo(self):
+        late = WATCH_RETURN.replace(b"02:03:00.125+00:00", b"02:05:00.000000001Z")
+        sentinel = b"synthetic private value"
+        duplicate_key = b'{"environment":"' + sentinel + b'",' + json.dumps(PRODUCTION).encode()[1:]
+        for index, (signal, source, window) in enumerate((
+            ("naming", WATCH_EMPTY + late, PRODUCTION),
+            ("naming", WATCH_EMPTY, PRODUCTION),
+            ("naming", WATCH_EMPTY + WATCH_EMPTY, PRODUCTION),
+            ("naming", WATCH_EMPTY + WATCH_HELP, PRODUCTION),
+            ("naming", WATCH_EMPTY.replace(b"02:02:00", b"02:04:00") + WATCH_RETURN, PRODUCTION),
+            ("help", WATCH_HELP.replace(b"pass", b"pass\t" + sentinel), PRODUCTION),
+            ("help", WATCH_HELP.replace(b"pass", sentinel), PRODUCTION),
+            ("help", WATCH_HELP.replace(b"pass", b" pass"), PRODUCTION),
+            ("help", WATCH_HELP.replace(b"pass", b"\xff"), PRODUCTION),
+            ("help", WATCH_HELP + b"0" * 65536, PRODUCTION),
+            ("help", WATCH_HELP, WINDOW),
+            ("help", WATCH_HELP, dict(PRODUCTION, end=None)),
+            ("help", WATCH_HELP, dict(PRODUCTION, note=sentinel.decode())),
+            ("help", WATCH_HELP, duplicate_key),
+            (sentinel.decode(), WATCH_HELP, PRODUCTION),
+        )):
+            with self.subTest(case=index):
+                refused = self.assemble_watch(signal, source, window)
+                self.assertEqual((refused.returncode, refused.stdout), (2, b""))
+                self.assertEqual(refused.stderr, b"production watch refused: missing or invalid rows or serving window\n")
 
     def test_reads_outputs_from_the_offline_naming_and_gateway_producers(self):
         readbacks = self.root / "readbacks.json"
