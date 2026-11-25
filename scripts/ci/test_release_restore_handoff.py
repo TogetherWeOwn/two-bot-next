@@ -106,8 +106,8 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
         prior = self.handoff
         self.assert_handoff(prior, self.plan)
         current = deepcopy(prior)
-        plan = {**self.plan, "backup_id": "fixture-retry-backup", "copy_id": "fixture-retry-restore"}
-        current["plan"] = deepcopy(plan)
+        plan = current.pop("plan")
+        plan.update(backup_id="fixture-retry-backup", copy_id="fixture-retry-restore")
         current["restored"]["backup_id"] = plan["backup_id"]
         readbacks = [
             (phase, app, f"{phase} {app.capitalize()} readback", "readback precedes phase")
@@ -125,6 +125,15 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
         self.assert_handoff(current, plan)
         with self.assertRaisesRegex(AssertionError, "backup lineage"):
             self.assert_handoff(prior, plan)
+
+        for phase, reason in (("restored", "restored copy"), ("before", "before evidence target"),
+                              ("forward", "forward evidence target"), ("undo", "undo target"),
+                              ("after_undo", "after_undo evidence target")):
+            with self.subTest(phase=phase, stale="copy_id"):
+                replay = deepcopy(current)
+                replay[phase]["copy_id"] = prior[phase]["copy_id"]
+                with self.assertRaisesRegex(AssertionError, reason):
+                    self.assert_handoff(replay, plan)
 
         # Keep the other fields current to exercise the copy and time checks independently.
         for section, key, copy_reason, time_reason in readbacks:
