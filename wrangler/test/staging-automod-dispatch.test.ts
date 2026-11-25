@@ -1,0 +1,74 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { test } from "node:test";
+import { URL, fileURLToPath } from "node:url";
+import { runStagingAutomodDispatch } from "../scripts/staging-automod-dispatch.ts";
+import { STAGING_AUTOMOD_TARGET as target } from "../src/staging-automod-recovery.ts";
+
+type Binding = NonNullable<Parameters<typeof runStagingAutomodDispatch>[1]>;
+const workflow = ".github/workflows/staging-automod-preview.yml";
+const head = "a".repeat(40);
+const runner = { STAGING_AUTOMOD_REHEARSAL: "true", GITHUB_REPOSITORY_ID: "1396224242",
+  GITHUB_WORKFLOW_REF: `TogetherWeOwn/two-bot-next/${workflow}@refs/heads/main`,
+  GITHUB_REF: "refs/heads/main", GITHUB_REF_PROTECTED: "true", GITHUB_EVENT_NAME: "workflow_dispatch",
+  GITHUB_RUN_ID: "11223344", GITHUB_RUN_ATTEMPT: "1", GITHUB_SHA: head, GITHUB_WORKFLOW_SHA: head };
+const repo = { id: Number(runner.GITHUB_REPOSITORY_ID) };
+const run = { id: Number(runner.GITHUB_RUN_ID), event: "workflow_dispatch", run_attempt: 1, status: "in_progress",
+  path: workflow, head_branch: "main", head_sha: head, repository: repo, head_repository: repo };
+const serving = { deploymentId: "11111111-1111-1111-1111-111111111111", sha: "b".repeat(40) };
+const inventorySource = { workflowSha: "c".repeat(40), runId: run.id + 1 };
+const unconfirmed = { verdict: "failed", code: "context_unconfirmed" };
+
+function unexpected(): never {
+  return assert.fail("unexpected rehearsal provider access");
+}
+
+test("the rehearsal dispatch requires explicit opt in and an approved host binding", async () => {
+  const unused: Binding = { get host() { return unexpected(); }, get serving() { return unexpected(); },
+    get inventorySource() { return unexpected(); } };
+  for (const selection of ["", "false", "1", "TRUE"]) {
+    assert.deepEqual(await runStagingAutomodDispatch({ ...runner, STAGING_AUTOMOD_REHEARSAL: selection }, unused),
+      { verdict: "disabled" });
+  }
+  assert.deepEqual(await runStagingAutomodDispatch({}, unused), { verdict: "disabled" });
+  assert.deepEqual(await runStagingAutomodDispatch(runner), { verdict: "failed", code: "host_unavailable" });
+});
+
+test("indirect or unprotected dispatch never reads the Actions run or rehearsal authority", async t => {
+  const readRun = t.mock.fn(unexpected);
+  const binding: Binding = { serving, inventorySource, host: { readRun, get authority() { return unexpected(); },
+    readWorker: unexpected, readAuthenticatedInventory: unexpected, invokePrivate: unexpected } };
+  for (const drift of [{ GITHUB_WORKFLOW_REF: runner.GITHUB_WORKFLOW_REF.replace(workflow, ".github/workflows/other.yml") },
+    { GITHUB_REF: "refs/heads/other" }, { GITHUB_EVENT_NAME: "workflow_call" }, { GITHUB_REF_PROTECTED: "false" },
+    { GITHUB_RUN_ATTEMPT: "2" }, { GITHUB_REPOSITORY_ID: "1" }]) {
+    assert.deepEqual(await runStagingAutomodDispatch({ ...runner, ...drift }, binding), unconfirmed);
+  }
+  assert.equal(readRun.mock.callCount(), 0);
+});
+
+test("direct dispatch authenticates the current run before asking for the exact lease", async () => {
+  const reads: unknown[] = [];
+  let evidence = { ...run, head_sha: "d".repeat(40) };
+  const binding: Binding = { serving, inventorySource, host: {
+    readRun: async (id, signal) => { reads.push(id); assert.equal(signal.aborted, false); return evidence; },
+    authority: { readIssuedLease: async (context, signal) => {
+      reads.push(context); assert.equal(signal.aborted, false); return undefined;
+    }, readApproval: unexpected },
+    readWorker: unexpected, readAuthenticatedInventory: unexpected, invokePrivate: unexpected,
+  } };
+  assert.deepEqual(await runStagingAutomodDispatch(runner, binding), unconfirmed);
+  assert.deepEqual(reads, [runner.GITHUB_RUN_ID]);
+  evidence = run;
+  assert.deepEqual(await runStagingAutomodDispatch(runner, binding), { verdict: "failed", code: "lease_unconfirmed" });
+  assert.deepEqual(reads, [runner.GITHUB_RUN_ID, runner.GITHUB_RUN_ID, {
+    ...serving, environment: "staging", runId: runner.GITHUB_RUN_ID, runAttempt: 1, target,
+  }]);
+});
+
+test("the checked-in workflow command fails closed without an in-process host", () => {
+  const script = fileURLToPath(new URL("../scripts/staging-automod-dispatch.ts", import.meta.url));
+  const disabled = spawnSync(process.execPath, [script], { encoding: "utf8", env: {} });
+  assert.deepEqual([disabled.status, disabled.stdout, disabled.stderr], [0, "", ""]);
+  const selected = spawnSync(process.execPath, [script], { encoding: "utf8", env: runner });
+  assert.deepEqual([selected.status, selected.stdout, selected.stderr], [1, "", "staging_automod_rehearsal_failed\n"]);
+});

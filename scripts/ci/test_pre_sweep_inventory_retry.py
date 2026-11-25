@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import DEFAULT, call, patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_inventory import normalize_inventory
@@ -23,7 +23,8 @@ def listing(rows):
 
 
 class FakeProvider:
-    def __init__(self):
+    def __init__(self, *, lose_worker_delete_reply=True):
+        self.lose_worker_delete_reply = lose_worker_delete_reply
         self.app_ids = {EXPIRED: APP_ID, SIBLING: SIBLING_APP_ID}
         self.workers = {target.worker_name for target in self.app_ids}
         self.writers = {target.service_name for target in self.app_ids}
@@ -68,8 +69,9 @@ class FakeProvider:
             self.writers.remove(action.id)
         elif action.operation == "delete_worker":
             self.workers.remove(action.id)
-            # The provider commits the delete, but the caller loses the reply.
-            raise OSError("synthetic lost delete reply")
+            if self.lose_worker_delete_reply:
+                # The provider commits the delete, but the caller loses the reply.
+                raise OSError("synthetic lost delete reply")
         elif action.operation == "delete_container":
             del self.apps[action.id]
         else:
@@ -110,3 +112,31 @@ class PreSweepInventoryRetryTests(unittest.TestCase):
         with self.assertRaisesRegex(SweepError, "^PRE cleanup readback could not be verified$"):
             sweep_target(EXPIRED, provider, now=now + 3)
         self.assertEqual(provider.effects, cleanup)
+
+    def test_timed_out_cleanup_readback_requires_fresh_absence_proof(self):
+        provider = FakeProvider(lose_worker_delete_reply=False)
+        sibling_before = provider.inventory(SIBLING)
+        now = EXPIRED.expires_at
+        cleanup = [
+            Action("revoke_write_access", EXPIRED.service_name, EXPIRED.service_name),
+            Action("delete_worker", EXPIRED.worker_name, EXPIRED.worker_name),
+            Action("stop_container", EXPIRED.container_name, APP_ID),
+            Action("delete_container", EXPIRED.container_name, APP_ID),
+        ]
+
+        # Planning and direct stop reads succeed. Only final readback times out.
+        reads = [DEFAULT, DEFAULT, TimeoutError("synthetic provider read timeout"), DEFAULT, DEFAULT]
+        with patch.object(provider, "inventory", wraps=provider.inventory, side_effect=reads) as inventory:
+            with self.assertRaisesRegex(SweepError, "^PRE cleanup readback could not be verified$"):
+                sweep_target(EXPIRED, provider, now=now)
+            self.assertEqual(inventory.call_args_list, [call(EXPIRED)] * 3)
+            self.assertEqual(provider.effects, cleanup)
+            self.assertEqual(provider.app_ids[EXPIRED], APP_ID)
+            self.assertEqual(provider.stop_proofs, {(EXPIRED, APP_ID): (0, 0)})
+
+            # A separate sweep plans and verifies from fresh reads for the same reservation.
+            self.assertEqual(sweep_target(EXPIRED, provider, now=now + 1), "cleared")
+            self.assertEqual(inventory.call_args_list, [call(EXPIRED)] * 5)
+
+        self.assertEqual(provider.effects, cleanup)
+        self.assertEqual(provider.inventory(SIBLING), sibling_before)

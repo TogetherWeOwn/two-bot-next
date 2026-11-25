@@ -518,7 +518,8 @@ predecessor and ownership epoch before using the database classification.
   is authenticated. Then the recovery workflow can take over with the pinned
   predecessor and verify stable readiness.
 - **Ambiguous.** Mixed ledgers, mismatched serving identity, unproved stop,
-  an uncertain inverse, or missing or mismatched evidence stop recovery.
+  an uncertain inverse, or missing or mismatched required evidence stop
+  recovery.
   The restored endpoint that retains 0475 requires protected reconciliation
   with verified inverse evidence. Keep the fence and escalate to the release
   operator without starting a writer or sending another takeover.
@@ -526,6 +527,51 @@ predecessor and ownership epoch before using the database classification.
 In either takeover path, a lost reply can be confirmed only by readback of the
 exact active predecessor at the next epoch under the expected actor. A pending
 or foreign owner leaves the handoff open without another takeover.
+
+### Missing forward receipt after apply
+
+Once the protected attendance release ships, a forward transaction can commit
+even if its receipt upload fails or the artifact is lost before takeover.
+Without the receipt, candidate takeover and same-run recovery refuse and the
+writer stays fenced. Establish the outcome through protected classification.
+Even a successful apply step cannot substitute for the original
+`production-release-forward-<run_id>-1` artifact.
+The verifier requires the unique, successful apply job at the same workflow
+SHA and run attempt 1, with both the transaction and upload steps successful.
+It matches the unexpired artifact by name and ID, checks its repository, run,
+branch and head SHA, and verifies the downloaded ZIP's size (at most 16 KiB),
+SHA-256 and single expected JSON file. The receipt binds the original plan run
+and archive, candidate SHA, release reference, target fingerprint, stopped
+epoch, expanded and restored ledger digests, and 0475 timestamp digest. A log,
+saved copy or hand-built receipt is audit evidence only.
+
+Once the interrupted-release workflow ships and its dispatch is documented,
+the release operator can use it under the production release gate above.
+With automatic promotion disabled, start a fresh protected `deploy-production`
+dispatch on `main` in the same production lane. Supply only the original run
+ID as the recovery input. Both runs must be attempt 1. The origin must be a
+completed protected dispatch on `main` that failed or was cancelled, at the
+same workflow SHA or an ancestor of the recovery workflow SHA. Its workflow
+must have retained the stop intent before STOP.
+
+Recovery authenticates `production-release-stop-intent-<origin_run_id>-1`
+from the original prepare job using the same archive checks. It verifies
+that preflight and intent upload succeeded before STOP and that the original
+plan archive and target fingerprint match. The POST path requires the exact
+pinned predecessor Worker and completed container image rollout serving at
+100%, with the original actor fenced and stopped at preflight epoch plus one.
+The workflow classifies both ledgers, schema and grants under lock. If it
+confirms original PRE, follow the PRE path above. For POST, the original apply
+step must have reached a terminal conclusion of success, failure or
+cancellation. Restart after POST requires an authenticated inverse bound to
+that classification.
+
+Keep the release held and escalate to the release operator if the workflow
+is unavailable, the serving pair or stopped epoch has drifted, or any required
+evidence is missing, expired or mismatched. For this path, that evidence includes
+the original stop intent and plan, the recovery admission and classification,
+and the inverse result for POST. Preserve the fence and the run's evidence.
+Leave any uncertain restart to the exact readback described above.
 
 ## Attendance predecessor identity at both PRE endpoints
 
