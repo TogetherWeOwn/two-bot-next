@@ -223,7 +223,8 @@ strings. Keep the position's Worker version in this file for the handoff check.
 The [offline preparation command](../tests/event_write_cutoff/prepare_rehearsal.py)
 prints one line with four space-separated values in this order: current image,
 current revision, retained image, retained revision. It exits with no stdout
-when the reviewed pair is incomplete or ambiguous.
+when the reviewed pair is incomplete or ambiguous. Both positions must agree
+on the source revision when they use the same image digest.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 tests/event_write_cutoff/prepare_rehearsal.py --pins selected.json

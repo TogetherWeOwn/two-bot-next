@@ -19,11 +19,15 @@ def main():
             worker = pins[position].get("worker_version")
             if not isinstance(worker, str) or not worker.strip():
                 raise ValueError(f"{position} requires a reviewed worker_version")
+        current, retained = (pins[position] for position in POSITIONS)
+        current_digest = current["image"].split("@", 1)[1]
+        retained_digest = retained["image"].split("@", 1)[1]
+        if current_digest == retained_digest and current["source_revision"] != retained["source_revision"]:
+            raise ValueError("shared image has conflicting source revisions")
     except ValueError as error:
         print(f"Rehearsal preparation refused: {error}", file=sys.stderr)
         return 1
 
-    current, retained = (pins[position] for position in POSITIONS)
     print(current["image"], current["source_revision"], retained["image"], retained["source_revision"])
     return 0
 
