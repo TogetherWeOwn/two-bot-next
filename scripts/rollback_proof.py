@@ -54,6 +54,10 @@ class ProofError(Exception):
     """Fixed-vocabulary error, never a remote response or subprocess stderr."""
 
 
+class ChildRunReadUnavailable(ProofError):
+    """The first exact child lookup received a retryable HTTP status."""
+
+
 def require(condition, code):
     if not condition:
         raise ProofError(code)
@@ -63,9 +67,12 @@ def unique_object(pairs):
     return _unique_json_object(pairs, error=ProofError, message="duplicate_json_key")
 
 
-def gh(path, *, body=None, binary=False):
+def gh(path, *, body=None, binary=False, first_child_read=False):
     args = ["gh", "api", "--method", "POST" if body is not None else "GET",
             "-H", "X-GitHub-Api-Version: 2026-03-10", path]
+    if first_child_read:
+        require(body is None and not binary, "child_run_read_must_be_json_get")
+        args.insert(4, "--include")
     if body is not None:
         args += ["--input", "-"]
     payload = json.dumps(body).encode() if body is not None else b""
@@ -98,13 +105,24 @@ def gh(path, *, body=None, binary=False):
                             if stream == "stdout":
                                 output.extend(chunk)
                 child.wait(timeout=max(0.001, deadline - time.monotonic()))
-                require(child.returncode == 0, "github_request_failed_no_retry")
             finally:
                 if child.poll() is None:
                     child.kill()
                 child.wait()
     except (OSError, subprocess.TimeoutExpired):
         raise ProofError("github_transport_failure") from None
+    if first_child_read:
+        # gh --include writes the HTTP status and headers ahead of its JSON.
+        # Only classify the status line, never remote JSON or stderr.
+        headers, separator, output = output.partition(b"\r\n\r\n")
+        status_line = headers.partition(b"\n")[0].removesuffix(b"\r")
+        status = re.fullmatch(rb"HTTP/[0-9.]+ ([1-5][0-9]{2})(?: .*)?", status_line)
+        code = status[1] if separator and status else None
+        if child.returncode and code in (b"404", b"500", b"502", b"503", b"504"):
+            raise ChildRunReadUnavailable("child_run_read_unavailable")
+        if child.returncode == 0:
+            require(code == b"200", "child_run_read_invalid_http_status")
+    require(child.returncode == 0, "github_request_failed_no_retry")
     if binary:
         return bytes(output)
     try:
@@ -247,16 +265,30 @@ def proof_dispatch(sha):
     return {"ref": "main", "inputs": {"inject_error_rate_spike": True, "recover_prior_sha": True, "sha": sha}}
 
 
-def prove(*, requested_sha, sleep=time.sleep, clock=time.monotonic):
+def first_child_run(path, sleep):
+    # The dispatch can return the ID before GitHub exposes that run to GET.
+    for delay in (5, 10):
+        try:
+            return gh(path, first_child_read=True)
+        except ChildRunReadUnavailable:
+            sleep(delay)
+    return gh(path, first_child_read=True)
+
+
+def prove(*, requested_sha, on_dispatch=None, sleep=None, clock=time.monotonic):
     require(isinstance(requested_sha, str) and SHA.fullmatch(requested_sha), "requested_sha_invalid")
+    sleep = time.sleep if sleep is None else sleep
     dispatch = proof_dispatch(requested_sha)
     response = gh(f"repos/{REPO}/actions/workflows/deploy-staging.yml/dispatches", body=dispatch)
     run_id = response.get("workflow_run_id")
     require(type(run_id) is int and run_id > 0, "dispatch_missing_exact_run_id_no_retry")
-    print(json.dumps({"child_run_id": run_id, "next_action": "wait_for_exact_staging_run"}))
+    if on_dispatch is not None:
+        on_dispatch(run_id)
+    print(json.dumps({"child_run_id": run_id, "next_action": "wait_for_exact_staging_run"}), flush=True)
     deadline = clock() + MAX_WAIT
+    path = f"repos/{REPO}/actions/runs/{run_id}"
+    run = first_child_run(path, sleep)
     while True:
-        run = gh(f"repos/{REPO}/actions/runs/{run_id}")
         run_identity(run, WORKFLOW, "workflow_dispatch")
         require(run.get("id") == run_id and run.get("run_attempt") == 1, "run_id_or_attempt_changed")
         if run.get("status") == "completed":
@@ -267,6 +299,7 @@ def prove(*, requested_sha, sleep=time.sleep, clock=time.monotonic):
             break
         require(clock() < deadline, "staging_run_timeout_inspect_child_no_redispatch")
         sleep(30)
+        run = gh(path)
     require(run.get("conclusion") == "failure", "child_must_remain_red")
     jobs = gh(f"repos/{REPO}/actions/runs/{run_id}/attempts/1/jobs?per_page=100")
     require(jobs.get("total_count", 101) <= 100, "jobs_listing_truncated")
@@ -285,7 +318,7 @@ def prove(*, requested_sha, sleep=time.sleep, clock=time.monotonic):
     validate_shutdown(files, stop_files, run_id, requested_sha)
     return dict(evidence, schema_version=1, verdict="pass", child_run_id=run_id,
                 child_sha=requested_sha, workflow_sha=run["head_sha"], child_run_attempt=1, child_conclusion="failure",
-                environment="staging", completed_at=run["updated_at"])
+                environment="staging", completed_at=moment(run.get("updated_at")).isoformat())
 
 
 def check_freshness(*, now=None):
@@ -344,6 +377,10 @@ def resolve(proof_completed_at):
         raise ProofError("incident_close_failed") from None
 
 
+def write_evidence(path, evidence):
+    path.write_text(json.dumps(evidence, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("mode", choices=("run", "watch", "alert"))
@@ -355,6 +392,7 @@ def main(argv=None):
         dispatch = proof_dispatch(args.sha or "<full-commit-sha>")
         print(json.dumps({"environment": "staging", "dispatch": dispatch, "mode": args.mode}))
         return 0
+    child = {}
     try:
         require(os.environ.get("GITHUB_REPOSITORY") == REPO
                 and os.environ.get("GITHUB_REF") == "refs/heads/main", "repository_or_ref_refused")
@@ -364,8 +402,8 @@ def main(argv=None):
         if args.mode == "run":
             require(args.evidence is not None, "evidence_path_required_before_dispatch")
             require(os.environ.get("GITHUB_RUN_ATTEMPT") == "1", "wrapper_rerun_refused")
-            evidence = prove(requested_sha=args.sha)
-            args.evidence.write_text(json.dumps(evidence, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            evidence = prove(requested_sha=args.sha, on_dispatch=lambda run_id: child.update(child_run_id=run_id))
+            write_evidence(args.evidence, evidence)
         else:
             try:
                 evidence = check_freshness()
@@ -378,8 +416,15 @@ def main(argv=None):
         return 0
     except (ProofError, ValueError, TypeError, KeyError, AttributeError, OSError) as error:
         code = str(error) if isinstance(error, ProofError) else "proof_or_alert_failure"
-        print(json.dumps({"verdict": "fail", "code": code, "retryable": False,
-                          "next_action": "inspect_exact_child_run_and_staging_state_before_retry"}), file=sys.stderr)
+        failure = dict(child, verdict="fail", code=code, retryable=False,
+                       next_action="inspect_exact_child_run_and_staging_state_before_retry")
+        if args.mode == "run" and args.evidence is not None:
+            failure.update(schema_version=1)
+            try:
+                write_evidence(args.evidence, failure)
+            except OSError:
+                print("Could not write the staging proof receipt.", file=sys.stderr)
+        print(json.dumps(failure), file=sys.stderr)
         return 1
 
 

@@ -683,7 +683,9 @@ and `sha` set to the full 40-character lowercase candidate commit.
    error-rate gate rehearsal and explicit prior-SHA opt-in. No production dispatch
    or traffic fault is involved. The GitHub REST `2026-03-10` dispatch response provides the exact
    child run ID; a missing ID refuses without redispatch or guessing "latest".
-2. Waits up to 70 minutes for that run, including queue time. A timeout does
+2. Waits up to 70 minutes for that run, including queue time. The initial
+   lookup of the exact child run can retry twice on HTTP 404, 500, 502, 503
+   or 504, with delays of 5 and 10 seconds. A timeout does
    not cancel the child: inspect the exact `child_run_id` in the wrapper log
    and its staging outcome without redispatching. The snapshot, deploy and
    rollout readiness steps must pass, the injected error-rate gate must fail,
@@ -691,13 +693,19 @@ and `sha` set to the full 40-character lowercase candidate commit.
    **must remain red**; a green child does not prove recovery.
 3. Checks `staging-rollout-evidence`: the restore must name the exact pre-deploy
    Worker version and image digest, with takeover and the stable 200/gateway-ready
-   gate. It uploads a sanitized `staging-rollback-proof` artifact (`proof.json`)
-   containing the child run ID/SHA and restored members, retained for 14 days.
-   The deployed `child_sha` must equal the requested SHA; `workflow_sha` can differ.
+   gate. The deployed `child_sha` must equal the requested SHA. The
+   `workflow_sha` can differ.
 4. Requires a green `staging-use-release` job and ordered finish, status and stop
    receipts in `staging-use-deploy-stop-<run>-1` for the same window and attempt.
    Status and release must agree on the restored build; `not-owned` is not a stop.
    The wrapper passes only after validation and artifact upload.
+5. Uploads the sanitized `staging-rollback-proof` artifact (`proof.json`) on
+   success or failure, retained for 14 days. A passing receipt records the
+   child run ID/SHA and restored members. A failed receipt records a fixed
+   error code and the child run ID when dispatch returned one. The wrapper
+   remains red, and a failed receipt does not confirm recovery or shutdown.
+   A refused rerun uploads `staging-rollback-proof-attempt-<attempt>` so the
+   first attempt's artifact stays available under its original name.
 
 The child is named `staging rollback proof`, not a staging certification run.
 Production excludes it from latest-certification history only after re-reading
