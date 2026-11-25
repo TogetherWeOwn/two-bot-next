@@ -86,6 +86,27 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertIn("DECISION_ARCHIVE_SHA256", restart["env"])
         self.assertIn("INVERSE_ARCHIVE_SHA256", restart["env"])
 
+    def test_release_plan_target_fingerprint_reaches_each_consumer(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production.yml").read_text())
+        jobs = workflow["jobs"]
+        plan = jobs["release-plan"]
+        self.assertEqual(plan["outputs"].get("target-fingerprint"),
+                         "${{ steps.release-target.outputs.target-fingerprint }}")
+        producer = next(step for step in plan["steps"] if step.get("id") == "release-target")
+        self.assertEqual(producer["run"], "python3 scripts/production_release.py plan")
+        fingerprint = "${{ needs.release-plan.outputs.target-fingerprint }}"
+        for phase in ("release-prepare", "release-apply", "production", "release-recover"):
+            self.assertIn("release-plan", jobs[phase]["needs"], phase)
+        for phase in ("release-prepare", "release-apply"):
+            self.assertEqual(jobs[phase]["env"].get("RELEASE_TARGET_FINGERPRINT"), fingerprint, phase)
+        commands = {"python3 scripts/production_release.py authorize-deploy",
+                    "python3 scripts/production_release.py takeover"}
+        consumers = [step for step in jobs["production"]["steps"] if step.get("run") in commands]
+        self.assertEqual(len(consumers), 3)
+        for step in consumers:
+            self.assertEqual(step["env"].get("RELEASE_TARGET_FINGERPRINT"), fingerprint, step["name"])
+        self.assertEqual(jobs["release-recover"]["with"].get("target-fingerprint"), fingerprint)
+
     def test_release_retains_the_stop_intent_before_stopping(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production.yml").read_text())
         prepare = workflow["jobs"]["release-prepare"]["steps"]
@@ -93,6 +114,7 @@ class RecoveryWiringTests(unittest.TestCase):
         retain = order.index("Retain the exact recovery stop intent")
         self.assertLess(retain, order.index("Confirm the exact stopped writer"))
         upload = prepare[retain]["with"]
+        self.assertEqual(upload.get("name"), "production-release-stop-intent-${{ github.run_id }}-${{ github.run_attempt }}")
         self.assertEqual(upload["if-no-files-found"], "error")
         self.assertTrue(upload["path"].endswith("/production-release-stop-intent.json"))
 
