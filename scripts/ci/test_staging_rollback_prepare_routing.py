@@ -67,6 +67,10 @@ class StagingRollbackPrepareTests(unittest.TestCase):
                 return subprocess.run(["git", *args], cwd=cwd, env=git_env, check=True,
                                       capture_output=True, text=True, timeout=30).stdout.strip()
 
+            # The hosted check container runs as root over a runner-owned checkout.
+            git(temp, "config", "--global", "--add", "safe.directory", str(ROOT))
+            git_dir = git(ROOT, "rev-parse", "--absolute-git-dir")
+            git(temp, "config", "--global", "--add", "safe.directory", git_dir)
             workflow_sha = git(ROOT, "rev-parse", "HEAD")
             self.assertNotEqual(workflow_sha, RETAINED_PIN)
             origin = temp / "origin.git"

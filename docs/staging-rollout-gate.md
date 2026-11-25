@@ -448,8 +448,10 @@ merge or an unverified deployment is not `t0`.
    script. The error-rate rollback wrapper sends both `recover_prior_sha` and
    `inject_error_rate_spike`. With those inputs, prepare runs from the workflow
    checkout and reads the pinned candidate's Wrangler config and Dockerfile
-   paths. The remaining rehearsal gates use the deployed checkout. Other
-   prior-source recovery dispatches need a candidate prepare script that reads
+   paths. The rehearsal's receipt validation, rollout verification and error-rate
+   gate use the candidate checkout. Automatic rollback and staging-window release
+   use the workflow checkout. Other prior-source recovery dispatches need a
+   candidate prepare script that reads
    `STAGING_SOURCE_SHA` when the workflow and serving SHAs differ. Reviewed
    qualification runs the deploy job's gate scripts from the workflow checkout.
 3. Read the **fresh** `WRANGLER_OUTPUT_FILE_PATH` NDJSON only after Wrangler exits
