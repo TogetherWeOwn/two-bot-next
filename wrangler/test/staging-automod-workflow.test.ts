@@ -89,13 +89,17 @@ test("only bounded, exact receipt evidence can confirm either action", async t =
     (receipt: Receipt) => Response.json({ ...receipt, detail: "synthetic debug" }),
     (receipt: Receipt) => Response.json({ ...receipt, lease: { ...issuedLease, epoch: issuedLease.epoch + 1 } }),
     (receipt: Receipt) => Response.json({ ...receipt, lease: { ...issuedLease, purpose: null } }),
-    (receipt: Receipt) => Response.json({ ...receipt, action: "recover" }),
+    (receipt: Receipt) => Response.json({ ...receipt,
+      action: "action" in receipt && receipt.action === "recover" ? "start" : "recover" }),
     (receipt: Receipt) => Response.json({ ...receipt, observedAt: "yesterday" }),
     (receipt: Receipt) => Response.json(receipt, { status: 503 }),
   ]) {
-    const invoke = syntheticBoundary(undefined, receipt =>
-      "action" in receipt && receipt.action === "start" ? mutate(receipt) : Response.json(receipt));
-    assert.deepEqual(await runStagingAutomodDryRun(job, issuedLease, invoke), startupUnconfirmed);
+    for (const action of ["start", "recover"] as const) {
+      const invoke = syntheticBoundary(undefined, receipt =>
+        "action" in receipt && receipt.action === action ? mutate(receipt) : Response.json(receipt));
+      assert.deepEqual(await runStagingAutomodDryRun(job, issuedLease, invoke),
+        { ...passed, verdict: "failed", [action]: false });
+    }
   }
   const refusedCleanup = syntheticBoundary(action => {
     if (action === "recover") throw new Error("synthetic cleanup refusal");
