@@ -28,7 +28,7 @@ function fixture() {
     at: 2_000, lease: { ...lease }, active: true, running: false, stopped: true, leaveRunning: false, drain: true,
     startupDrained: true, drainedLease, cleanupBefore: 90_000, absenceCode: 10063,
     loseDelete: false, loseDetail: false, command: undefined as typeof preview | undefined, help,
-    planned: { ...dryRun }, effective: { ...dryRun }, post: async () => {}, boot: async () => {},
+    planned: { ...dryRun }, effective: { ...dryRun }, post: async () => {}, boot: async () => {}, readback: async () => {},
   };
   const journal = () => storage.value as { phase: string; created: unknown } | undefined;
   const rows = () => state.command ? [state.help, state.command] : [state.help];
@@ -52,8 +52,11 @@ function fixture() {
     ...(enabled === undefined ? {} : { enabled }), storage, exclusive, now: () => state.at,
     env: { ...env, STAGING_RUNTIME_POLICY: "bounded", TWO_MODERATION: "1", TWO_OWEN_USER_ID: preview.id },
     ...(runtime ? { dryRun: { policy: state.planned, start: boot } } : {}),
-    observe: async () => ({ lease: state.lease, purpose: "automod-preview", active: state.active, running: state.running,
-      policy: state.effective, cleanupBefore: state.cleanupBefore }),
+    observe: async () => {
+      if (state.running) await state.readback();
+      return { lease: state.lease, purpose: "automod-preview", active: state.active, running: state.running,
+        policy: state.effective, cleanupBefore: state.cleanupBefore };
+    },
     fenceAndDrain: async (bound, before) => {
       assert.deepEqual(bound, lease);
       assert.equal(before, state.cleanupBefore);
@@ -221,34 +224,37 @@ test("AutoMod startup recovery needs same-lease drain stopped readback and absen
 });
 
 test("AutoMod startup timeout lets recovery check remote drain", async t => {
-  const f = fixture();
-  await f.start(true).publish(input);
-  const deadline = new AbortController();
-  const timeout = t.mock.method(AbortSignal, "timeout", () => deadline.signal);
-  const entered = Promise.withResolvers<void>();
-  f.state.boot = () => {
-    entered.resolve();
-    return new Promise<void>(() => {});
-  };
-  const starting = assert.rejects(f.start(true).startDryRun(lease), refusal);
-  await entered.promise;
-  assert.deepEqual(timeout.mock.calls[0]?.arguments, [lease.expiresAt - input.cleanupReserveMs - f.state.at]);
-  f.state.at = lease.expiresAt - input.cleanupReserveMs;
-  f.state.startupDrained = false;
-  const recovering = assert.rejects(f.start().recover(lease), refusal);
-  deadline.abort();
-  timeout.mock.restore();
-  await Promise.all([starting, recovering]);
-  assert.equal(f.journal()?.phase, "cleanup");
-  assert.equal(f.events.includes("stop"), false);
-  await assert.rejects(f.start().otherUse(f.other), refusal);
+  for (const stall of ["boot", "readback"] as const) {
+    const f = fixture();
+    await f.start(true).publish(input);
+    const deadline = new AbortController();
+    const timeout = t.mock.method(AbortSignal, "timeout", () => deadline.signal);
+    const entered = Promise.withResolvers<void>();
+    f.state[stall] = () => {
+      entered.resolve();
+      return new Promise<void>(() => {});
+    };
+    const starting = assert.rejects(f.start(true).startDryRun(lease), refusal);
+    await entered.promise;
+    assert.deepEqual(timeout.mock.calls[0]?.arguments, [lease.expiresAt - input.cleanupReserveMs - f.state.at]);
+    f.state.at = lease.expiresAt - input.cleanupReserveMs;
+    f.state.readback = async () => {};
+    f.state.startupDrained = false;
+    const recovering = assert.rejects(f.start().recover(lease), refusal);
+    deadline.abort();
+    timeout.mock.restore();
+    await Promise.all([starting, recovering]);
+    assert.equal(f.journal()?.phase, "cleanup");
+    assert.equal(f.events.includes("stop"), false);
+    await assert.rejects(f.start().otherUse(f.other), refusal);
 
-  // The remote side settled even though the client never got its response.
-  f.state.running = true;
-  f.state.startupDrained = true;
-  await f.start().recover(lease);
-  assert.equal(f.state.running, false);
-  assert.equal(f.journal()?.phase, "complete");
+    // The remote side settled even though the client never got its response.
+    f.state.running = true;
+    f.state.startupDrained = true;
+    await f.start().recover(lease);
+    assert.equal(f.state.running, false);
+    assert.equal(f.journal()?.phase, "complete");
+  }
 });
 
 test("AutoMod lifecycle serializes writers and holds the journal until exact cleanup", async () => {
