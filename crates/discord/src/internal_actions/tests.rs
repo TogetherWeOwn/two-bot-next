@@ -756,6 +756,50 @@ impl SendAdmission for BlockedLane {
     }
 }
 
+#[tokio::test]
+async fn rehearsal_transport_requires_a_synthetic_admitted_executor() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let root = include_bytes!("../../../../tests/event_write_cutoff/fixtures/recorder-ca.der");
+    let connector = || RehearsalAnnouncementConnector::new(root.to_vec()).unwrap();
+    assert!(RehearsalAnnouncementConnector::new(Vec::new()).is_err());
+    let token = format!("synthetic-{}", "ab".repeat(24));
+    let twilight = |token: &str| Arc::new(TwilightClient::new(token.to_owned()));
+    let admitted = |token: &str| {
+        AnnouncementExecutor::with_admission(
+            twilight(token),
+            keys(),
+            CooldownGovernor::new(),
+            BlockedLane::for_token(token),
+        )
+        .unwrap()
+    };
+    assert!(
+        AnnouncementExecutor::new(twilight(&token), keys(), CooldownGovernor::new())
+            .with_rehearsal_connector(connector())
+            .is_err()
+    );
+    assert!(admitted("ordinary.fixture.token")
+        .with_rehearsal_connector(connector())
+        .is_err());
+    let fixture = admitted(&token)
+        .with_rehearsal_connector(connector())
+        .unwrap();
+    let invalid = http::Request::builder()
+        .uri("https://discord.com:443")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .post_admitted(
+                invalid,
+                CHANNEL.parse().unwrap(),
+                tokio::time::Instant::now() + Duration::from_secs(5)
+            )
+            .await,
+        ExecutionOutcome::Unknown(UnknownReason::Transport)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn non_loopback_origin_never_sends_without_admission() {
     let mock = MockDiscord::start(Reply::success()).await;
