@@ -1,7 +1,6 @@
 //! Atomic expansion for the 0475/0479–0482 and Store 0478 bundle.
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use sqlx::{migrate::Migrate, Acquire, PgConnection, PgPool};
 
 use super::{read_ledger, read_store_ledger, reconcile, Chain, LedgerRow, RunError, MIGRATOR_ROLE};
@@ -69,23 +68,12 @@ async fn attendance_fence(conn: &mut PgConnection) -> Result<Vec<u8>, RunError> 
 /// Reverse the exact release bundle on the already verified target. This is
 /// the database operation only: the protected caller must authenticate the
 /// complete post-apply ledgers, target, and stopped writer's fence epoch.
-/// The protected CLI uses `recover_release_schema` to require the stamp.
+/// No CLI or workflow invokes it directly.
 #[doc(hidden)]
 pub async fn undo_release_schema(
     pool: &PgPool,
     expected_cutover: &[LedgerRow],
     expected_store: &[LedgerRow],
-) -> Result<(Vec<LedgerRow>, Vec<LedgerRow>), RunError> {
-    recover_release_schema(pool, expected_cutover, expected_store, None).await
-}
-
-/// Verify the 0475 timestamp before undo, or reconcile a completed inverse.
-#[doc(hidden)]
-pub async fn recover_release_schema(
-    pool: &PgPool,
-    expected_cutover: &[LedgerRow],
-    expected_store: &[LedgerRow],
-    expected_fence: Option<&str>,
 ) -> Result<(Vec<LedgerRow>, Vec<LedgerRow>), RunError> {
     let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
     let store = Chain::Store.migrator().map_err(RunError::Refused)?;
@@ -124,61 +112,11 @@ pub async fn recover_release_schema(
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| failure("release inverse role read failed"))?;
-    let fence = attendance_fence(&mut tx).await?;
-    let retained = |rows: &[LedgerRow], removed: &[i64]| -> Vec<LedgerRow> {
-        rows.iter()
-            .filter(|row| !removed.contains(&row.version))
-            .cloned()
-            .collect()
-    };
-    let expected_restored = (
-        retained(expected_cutover, &CUTOVER[1..]),
-        retained(expected_store, &STORE),
-    );
     if !migrator
-        || expected_fence.is_some_and(|expected| expected != hex::encode(Sha256::digest(&fence)))
-        || !reconcile(expected_cutover, &cutover).is_ok_and(|pending| pending.is_empty())
-        || !reconcile(expected_store, &store).is_ok_and(|pending| pending.is_empty())
-    {
-        return Err(RunError::Refused(
-            "release inverse post-apply evidence changed".to_owned(),
-        ));
-    }
-    if expected_fence.is_some()
-        && before_cutover == expected_restored.0
-        && before_store == expected_restored.1
-    {
-        let restored: bool = sqlx::query_scalar(
-            "SELECT COALESCE((SELECT contract_version FROM public.web_contract_meta WHERE singleton) = '1.0', false)
-                AND to_regclass('web_v1.voice_heat') IS NULL
-                AND to_regclass('public.voice_heat_hours') IS NULL
-                AND to_regclass('public.event_attendance_windows') IS NULL
-                AND to_regclass('public.event_voice_sessions') IS NULL
-                AND to_regclass('public.event_voice_sessions_id_seq') IS NULL
-                AND to_regclass('public.live_sequence_watermarks') IS NULL
-                AND EXISTS (SELECT FROM pg_attribute
-                    WHERE attrelid = 'public.internal_action_log'::regclass AND attname = 'intent_id' AND attnotnull AND NOT attisdropped)
-                AND NOT EXISTS (SELECT FROM pg_attribute WHERE attrelid = 'public.internal_action_log'::regclass
-                    AND attname IN ('delivery_hash', 'from_channel_id', 'request_id') AND NOT attisdropped)
-                AND EXISTS (SELECT FROM pg_constraint WHERE conrelid = 'public.internal_action_log'::regclass
-                    AND conname = 'internal_action_log_outcome_check' AND contype = 'c' AND convalidated
-                    AND pg_get_expr(conbin, conrelid) = '(outcome = ANY (ARRAY[''created''::text, ''updated''::text, ''cancelled''::text]))')
-                AND NOT EXISTS (SELECT FROM pg_constraint WHERE conrelid = 'public.internal_action_log'::regclass
-                    AND conname = 'internal_action_log_receipt_check')",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|_| failure("release restored schema read failed"))?;
-        if restored && release_roles_clean(&mut tx, legacy_verifier()).await? {
-            tx.rollback()
-                .await
-                .map_err(|_| failure("release restored readback failed"))?;
-            return Ok(expected_restored);
-        }
-        return Err(failure("release restored state refused"));
-    }
-    if before_cutover != expected_cutover
+        || before_cutover != expected_cutover
         || before_store != expected_store
+        || !reconcile(&before_cutover, &cutover).is_ok_and(|pending| pending.is_empty())
+        || !reconcile(&before_store, &store).is_ok_and(|pending| pending.is_empty())
         || !release_roles_clean(&mut tx, two_bot_core::database_roles::verification_sql()).await?
     {
         return Err(RunError::Refused(
@@ -186,12 +124,19 @@ pub async fn recover_release_schema(
         ));
     }
 
+    let fence = attendance_fence(&mut tx).await?;
     sqlx::raw_sql(INVERSE)
         .execute(&mut *tx)
         .await
         .map_err(|_| failure("guarded release inverse refused or failed"))?;
     let after = ledgers(&mut tx).await?;
-    if after != expected_restored
+    let retained = |rows: Vec<LedgerRow>, removed: &[i64]| -> Vec<LedgerRow> {
+        rows.into_iter()
+            .filter(|row| !removed.contains(&row.version))
+            .collect()
+    };
+    if after.0 != retained(before_cutover, &CUTOVER[1..])
+        || after.1 != retained(before_store, &STORE)
         || attendance_fence(&mut tx).await? != fence
         || !release_roles_clean(&mut tx, legacy_verifier()).await?
     {
