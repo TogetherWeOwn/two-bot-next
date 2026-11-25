@@ -2181,7 +2181,9 @@ class GuardBehaviourTests(unittest.TestCase):
 
     # The removed environment variable cannot arm anything, even if inherited
     # from a stale runner. Input absence itself is pinned against raw YAML.
-    def test_removed_drill_environment_cannot_change_guard_decisions(self):
+    @patch("datetime.datetime", wraps=datetime.datetime)
+    def test_removed_drill_environment_cannot_change_guard_decisions(self, clock):
+        clock.now.return_value = datetime.datetime(2026, 11, 25, tzinfo=datetime.timezone.utc)
         for kwargs in ({"takeover": "true"}, {"takeover": "false"}, {"cutover_hold": "true"},
                        {"event": "schedule", "sha": ""}):
             baseline = self.guard(**kwargs)
