@@ -73,6 +73,10 @@ class InventoryReaderTests(unittest.TestCase):
                                          (LIST_ROUTE, False), (ZIP_ROUTE, True)])
 
     def test_refuses_wrong_run_producer_attempt_or_completion(self):
+        for sha, run in (("main", RUN), (SHA, "0"), (SHA, "01234"), (SHA, str(2**53))):
+            with self.subTest(sha=sha, run=run), self.assertRaises(GateError):
+                reader.read_inventory(sha, run, self.api)
+        self.assertEqual(self.requests, [])
         for change in (
             {"id": int(RUN) + 1}, {"head_sha": TIP}, {"run_attempt": 2}, {"run_attempt": True},
             {"path": ".github/workflows/staging-automod-preview.yml"}, {"path": reader.WORKFLOW + "@other"},
@@ -142,9 +146,7 @@ class InventoryReaderTests(unittest.TestCase):
         self.assert_cli_refusal()
 
     def test_cli_refuses_oversized_projections_and_malformed_evidence(self):
-        value = receipt()
-        value["worker"]["version_id"] = "x" * reader.MAX_OUTPUT_BYTES
-        self.archive(json.dumps(value))
+        self.archive(json.dumps({**receipt(), "observed_at": "x" * reader.MAX_OUTPUT_BYTES}))
         self.assert_cli_refusal()
         del self.routes[LIST_ROUTE]
         self.assert_cli_refusal()
