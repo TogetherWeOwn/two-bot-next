@@ -60,7 +60,8 @@ JOB_INVENTORY = {
                   "nextest", "db-compatibility"},
     STAGING_SOAK: {"begin", "voice", "finish"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
-                              "promotion-skipped", "production", "release-plan", "release-prepare", "release-apply", "release-recover"},
+                              "promotion-skipped", "production", "release-plan", "release-prepare", "release-apply", "release-recover",
+                              "release-reconcile"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "help-embed-synthetic",
                            "user-flow-synthetic", "pinned-history-guard", "certify-promotion",
                            "staging-use-release"},
@@ -159,6 +160,7 @@ JOB_INVENTORY = {
 REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
                    ("deploy-production.yml", "soak"): "$/.github/workflows/staging-soak.yml",
                    ("deploy-production.yml", "release-recover"): "./.github/workflows/deploy-production-recovery.yml",
+                   ("deploy-production.yml", "release-reconcile"): "./.github/workflows/deploy-production-interrupted.yml",
                    (STAGING_SOAK, "voice"): "$/.github/workflows/voice-synthetic.yml",
                    ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
                    ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
@@ -726,7 +728,8 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
     """
     errors = []
     inputs = (((workflow.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {})
-    if set(inputs) != {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold", "release_plan_run_id", "release_pins"}:
+    if set(inputs) != {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold",
+                       "release_plan_run_id", "release_pins", "release_recovery_run_id"}:
         errors.append(f"{name}: production inputs must contain only the reviewed deploy/restore controls")
     jobs = workflow.get("jobs", {}) or {}
     steps = ((jobs.get("production") or {}).get("steps") or [])
@@ -3165,7 +3168,8 @@ def production_errors(workflow):
     needs = production.get("needs")
     needs = [needs] if isinstance(needs, str) else (needs or [])
     expected_production_if = (
-        "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
+        "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.mode != 'interrupted-recovery' "
+        "&& needs.guard.outputs.skip == '' && "
         "(needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') && "
         "(needs.soak.result == 'success' || needs.soak.result == 'skipped') && "
         "((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || "
@@ -3182,6 +3186,10 @@ def production_errors(workflow):
     if production.get("if") != expected_production_if:
         errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates, "
                       "a completed soak, a fresh recheck and no skip; cancelled runs never deploy")
+    recovery = jobs.get("release-reconcile", {})
+    if (recovery.get("needs") != "guard" or recovery.get("if") != "needs.guard.outputs.mode == 'interrupted-recovery'"
+            or recovery.get("with") != {"origin-run-id": "${{ inputs.release_recovery_run_id }}"}):
+        errors.append(f"{name}: interrupted recovery must run only from the protected recovery guard")
     # The production job shares its lane with the protected status read. The guard, gates,
     # soak and recheck run outside it, so a sleeping automatic promotion can
     # never delay an operator rollback.
@@ -8952,6 +8960,7 @@ class WorkflowTests(unittest.TestCase):
                                           ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                                           ("deploy-production.yml", "soak"): "$/.github/workflows/staging-soak.yml",
                                           ("deploy-production.yml", "release-recover"): "./.github/workflows/deploy-production-recovery.yml",
+                                          ("deploy-production.yml", "release-reconcile"): "./.github/workflows/deploy-production-interrupted.yml",
                                           (STAGING_SOAK, "voice"): "$/.github/workflows/voice-synthetic.yml",
                                           ("voice-rest-measurement.yml", "voice-first"): "./.github/workflows/voice-synthetic.yml",
                                           ("voice-rest-measurement.yml", "voice-second"): "./.github/workflows/voice-synthetic.yml",
@@ -9034,7 +9043,6 @@ class WorkflowTests(unittest.TestCase):
                 without('origin.get("head_repository_id") != origin.get("repository_id")'),
         }
         self.assertIn("inputs.cutover_hold", str(guard_step))
-        self.assertIn('refuse("protected release requires the activation follow-up")', guard_step["run"])
         for label, change in mutations.items():
             with self.subTest(label):
                 workflow = deepcopy(production)

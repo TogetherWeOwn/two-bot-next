@@ -326,7 +326,7 @@ missing proof rather than renew or promote. This holder does not authorize B2.
 Lifecycle NDJSON and available
 measurement JSON are always retained as
 `staging-soak[-start]-<run_id>-<run_attempt>` for seven days. The soak runs outside the
-`deploy-production` lane — only the `production` job holds it in this workflow —
+`deploy-production` lane — ordinary promotions acquire it in the `production` job —
 so a staging wait never queues an operator production rollback behind it. A `recheck`
 job waits for the soak and both gates, then re-reads the disable, the hold,
 the live revision and the active dispatches immediately before the deploy: a
@@ -724,15 +724,95 @@ policy pins this ordering, condition, local snapshot command and red outcome.
 Without a takeover or a successful deploy/snapshot the run fails for the
 operator; a failed restore is never a reason to wait for the next deployment.
 
-The reusable `deploy-production-recovery.yml` provides the recovery phase for
-the protected attendance release. Its parent must hold the production lane
-and supply the approved candidate and prior pair, Planetscale target, both
-ledger digests and the original 0475 timestamp digest. The production job
-confirms the stopped writer at the pinned epoch. The migration apply job
-authenticates that job before running the inverse with its scoped binding.
-The restore job authenticates the inverse artifact and rereads the stopped
-epoch before releasing ownership. The attendance expansion remains unavailable
-through the standalone production migration dispatch.
+### Protected attendance release
+
+Dispatch `deploy-production.yml` from protected `main` with the exact staged
+`sha`, takeover on and `release_plan_run_id` set to the reviewed first-attempt
+production plan run. Keep automatic production promotion disabled. Supply
+`release_pins` as a JSON object with the following fields.
+
+| Fields | Approved evidence |
+| --- | --- |
+| `candidate_archive`, `candidate_image` | SHA-256 digests of the immutable staging archive and its container image, both with the `sha256:` prefix |
+| `rollback_sha`, `rollback_worker`, `rollback_image` | Prior serving commit, exact Worker version UUID and image digest with the `sha256:` prefix |
+| `application_id`, `namespace_id` | The shared production container application UUID and Worker namespace ID |
+| `restore_proof_sha256` | SHA-256 of the reviewed backup, isolated restore and recovery rehearsal evidence, without a prefix |
+
+Use `ReleasePreflight.recovery_reference()` in
+[`scripts/production_release_preflight.py`](../scripts/production_release_preflight.py)
+with these fields plus the candidate and trusted workflow SHAs to compute the
+production plan's `recovery_evidence_ref`. Obtain the independent
+`production-migration-approval` App check for that exact plan archive on the
+trusted workflow SHA before dispatch. The forward and inverse use the
+main-only `production-migrate-apply` Environment with administrator bypass
+disabled. Ordinary migration apply, protected release, and production deploy
+and recovery share the `deploy-production` lane. The ordinary migration
+dispatch refuses the attendance expansion.
+
+Before stopping the writer, the workflow requires the existing full staging
+soak and production regression gate, a fresh matching read-only plan, the
+approved staging archive and the prior pair's live identity, registry digest
+and exact takeover support. The protected workflow keeps its lane while it
+applies and verifies the schema, uploads the staged build, takes over at the
+expected epoch and completes the 30-minute production watch. The upload's
+Worker version must match the version serving 100% before takeover.
+The prebuilt forward runner is retained for one day. If it expires after the
+writer stops, preserve the stop and use the protected interrupted-release path.
+
+A post-apply failure calls `deploy-production-recovery.yml`. Recovery
+authenticates the forward artifact and both ledger digests, then verifies the
+original stop or stops the exact active candidate at the next epoch. The
+inverse verifies the original 0475 timestamp digest and refuses on any new
+write evidence. The restore job authenticates the inverse artifact, checks the
+stopped epoch and restores the exact prior pair before taking over and waiting
+for stable readiness. The failed release stays red after recovery. Retain the
+preflight, forward, stop, inverse, restore and watch artifacts with the run.
+
+If the forward apply was interrupted or its artifact is missing, preserve the
+stop. Use a fresh protected `deploy-production.yml` dispatch on `main` with
+only `release_recovery_run_id` set to the failed or cancelled original run.
+Keep automatic promotion disabled. The recovery dispatch acquires the same
+`deploy-production` lane. It authenticates the intent uploaded before STOP,
+the exact original plan and the original writer epoch. Both the original
+attempt and the recovery dispatch must be attempt one.
+
+Recovery requires that the exact prior Worker and image still serve, with an
+authenticated original stop. Review and qualify that exact PRE-compatible
+predecessor build before using it as a release pin. Its approved Worker
+version, container image digest and runtime build identity must be recorded,
+alongside the planner inventory for the exact PRE endpoint and the retained
+0475 endpoint after inverse.
+
+Under the migration and ledger locks, exact PRE permits a single takeover of
+the prior pair and requires stable gateway readiness. Exact POST must also
+prove the forward apply step ran. The protected database job retains the
+locked classification with its 0475 stamp before invoking the existing
+guarded inverse. The restart job verifies the inverse artifact before
+taking over. A lost PRE takeover reply can be reconciled only at the exact
+next active epoch under the original release actor.
+
+If the inverse commits but its authenticated receipt or successful producer
+proof is lost, the retained 0475 endpoint is distinct from the original PRE.
+A new interrupted dispatch can refuse classification at that endpoint. Preserve
+the stop, original plan, classification and any inverse evidence. Compare the
+read-only production plan against both retained ledgers and verify the 0475
+catalog contract. Confirm the stopped Worker, image, actor and epoch with
+[protected ownership status](#read-production-ownership-without-starting-the-bot).
+Keep the writer stopped pending a reviewed protected recovery plan for that
+exact state.
+
+If POST takeover succeeded before a readiness timeout, the prior pair can be
+active at the next epoch under the inverse recovery actor. Retain the stop
+intent, classification and verified inverse. Use protected ownership status to
+confirm that recovery actor, next epoch, serving pair and stable readiness by
+readback alone.
+
+Mixed ledgers, a pending takeover or an unproved serving pair require protected
+reconciliation. The classifier uses the dispatch commit's embedded migrations.
+Later migrations that change the reviewed plan can make it refuse. Preserve the
+stop if the inverse outcome remains uncertain.
+Never rerun the forward apply or use ordinary Worker/image rollback to
+cross the schema boundary.
 
 After the production rollback script posts a Worker restore once,
 it checks the current deployment immediately. A valid but nonmatching serving

@@ -5,7 +5,7 @@ from pathlib import Path
 SOAK = "staging-soak.yml"
 PRODUCTION_RELEASE_GROUP = (
     "${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.run_attempt == 1 "
-    "&& inputs.release_plan_run_id != '' && 'deploy-production' || "
+    "&& (inputs.release_plan_run_id != '' || inputs.release_recovery_run_id != '') && 'deploy-production' || "
     "format('deploy-production-run-{0}-{1}', github.run_id, github.run_attempt) }}"
 )
 PRODUCTION_GROUP = (

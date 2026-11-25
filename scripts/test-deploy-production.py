@@ -50,6 +50,7 @@ IMAGE = "registry.cloudflare.com/acct/two-bot-next-twobotcontainer-production@sh
 WRANGLER_ACTION = "cloudflare/wrangler-action@"
 RECOVERY_WORKFLOWS = {
     "release-recover": "./.github/workflows/deploy-production-recovery.yml",
+    "release-reconcile": "./.github/workflows/deploy-production-interrupted.yml",
 }
 # R1 short-SHA fixtures (TOG-28737 acceptance; builder TOG-28741 must not edit
 # these). SHORT_UNAMBIGUOUS is a 12-char prefix of SHA that resolves uniquely;
@@ -346,7 +347,7 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual(value(unstaged["default"]), "false")
         # Unknown inputs are rejected by GitHub before a production run.
         self.assertEqual(set(inputs), {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold",
-                                       "release_plan_run_id", "release_pins"})
+                                       "release_plan_run_id", "release_pins", "release_recovery_run_id"})
         self.assertNotIn("inject_error_rate_spike", "\n".join(LINES))
         self.assertNotIn("INJECT_ERROR_RATE_SPIKE", "\n".join(LINES))
         self.assertNotIn("inject_gateway_failure", "\n".join(LINES))
@@ -372,6 +373,7 @@ class StaticGuardTests(unittest.TestCase):
                 "&& needs.guard.outputs.skip == ''\"")
         production_if = value(children(JOBS["production"][1:], 4)["if"])
         self.assertIn("needs.guard.outputs.mode == 'rollback'", production_if)
+        self.assertIn("needs.guard.outputs.mode != 'interrupted-recovery'", production_if)
         self.assertIn("needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'", production_if)
         guard = children(JOBS["guard"][1:], 4)
         self.assertNotIn("environment", guard)
@@ -390,7 +392,7 @@ class StaticGuardTests(unittest.TestCase):
         global_lane = children(TOP["concurrency"][1:], 2)
         self.assertEqual(value(global_lane["group"]),
             "${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
-            "&& github.run_attempt == 1 && inputs.release_plan_run_id != '' "
+            "&& github.run_attempt == 1 && (inputs.release_plan_run_id != '' || inputs.release_recovery_run_id != '') "
             "&& 'deploy-production' || format('deploy-production-run-{0}-{1}', github.run_id, github.run_attempt) }}")
         self.assertEqual(value(global_lane["cancel-in-progress"]), "false")
         self.assertEqual(value(global_lane["queue"]), "max")
@@ -414,7 +416,7 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "soak",
                                       "staging-soak-evidence", "recheck",
                                       "promotion-skipped", "release-plan", "release-prepare", "release-apply",
-                                      "production", "release-recover"])
+                                      "production", "release-recover", "release-reconcile"])
         for name, job in JOBS.items():
             fields = children(job[1:], 4)
             if name in RECOVERY_WORKFLOWS:
@@ -1185,12 +1187,11 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("::error::Refusing production", stdout)
         self.assertIn(reason, stdout)
 
-    def test_dormant_protected_dispatch_refuses_before_provider_access(self):
+    def test_malformed_protected_dispatch_refuses_before_provider_access(self):
         for plan, attempt, reason in (
             ("", "1", "requires a fresh manual exact-SHA"),
             ("001", "1", "requires a fresh manual exact-SHA"),
             ("123", "2", "requires a fresh manual exact-SHA"),
-            ("123", "1", "requires the activation follow-up"),
         ):
             with self.subTest(plan=plan, attempt=attempt):
                 result = self.guard(takeover="true", cutover_hold="false", auto_disabled="true",

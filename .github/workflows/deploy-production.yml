@@ -107,6 +107,10 @@ on:
         description: "Protected attendance release only: exact archive, image, prior pair and restore proof digest as JSON"
         type: string
         default: ""
+      release_recovery_run_id:
+        description: "Interrupted attendance apply only: terminal originating attempt-one run ID"
+        type: string
+        default: ""
 
 permissions: {}
 
@@ -121,7 +125,7 @@ permissions: {}
 # covered by the in-lane recheck.
 
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.run_attempt == 1 && inputs.release_plan_run_id != '' && 'deploy-production' || format('deploy-production-run-{0}-{1}', github.run_id, github.run_attempt) }}
+  group: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.run_attempt == 1 && (inputs.release_plan_run_id != '' || inputs.release_recovery_run_id != '') && 'deploy-production' || format('deploy-production-run-{0}-{1}', github.run_id, github.run_attempt) }}
   cancel-in-progress: false
   queue: max
 
@@ -161,6 +165,7 @@ jobs:
           SHA: ${{ inputs.sha }}
           RELEASE_PLAN_ID: ${{ inputs.release_plan_run_id }}
           RELEASE_PINS: ${{ inputs.release_pins }}
+          RELEASE_RECOVERY_RUN_ID: ${{ inputs.release_recovery_run_id }}
           ROLLBACK: ${{ inputs.rollback }}
           IMAGE: ${{ inputs.image }}
           ALLOW_UNSTAGED: ${{ inputs.allow_unstaged }}
@@ -274,6 +279,45 @@ jobs:
 
           release_plan = os.environ.get("RELEASE_PLAN_ID", "")
           release_pins = os.environ.get("RELEASE_PINS", "")
+          def api(path, what, **query):
+              args = ["gh", "api", "--method", "GET", path]
+              for key, value in query.items():
+                  args += ["-f", f"{key}={value}"]
+              try:
+                  return json.loads(subprocess.check_output(args, text=True))
+              except (subprocess.CalledProcessError, ValueError):
+                  refuse(f"could not read {what} from the GitHub API; failing closed")
+
+          recovery = os.environ.get("RELEASE_RECOVERY_RUN_ID", "")
+          if recovery:
+              if (event != "workflow_dispatch" or os.environ.get("GITHUB_RUN_ATTEMPT") != "1"
+                      or repo != "TogetherWeOwn/two-bot-next" or os.environ.get("GITHUB_REPOSITORY_ID") != "1396224242"
+                      or os.environ.get("GITHUB_REF") != "refs/heads/main"
+                      or os.environ.get("GITHUB_REF_PROTECTED") != "true"
+                      or not re.fullmatch(r"[1-9][0-9]{0,19}", recovery)
+                      or recovery == os.environ.get("GITHUB_RUN_ID")
+                      or release_plan or release_pins or any(os.environ.get(key) for key in ("SHA", "ROLLBACK", "IMAGE"))
+                      or takeover != "true" or allow_unstaged != "false" or cutover_hold != "false"
+                      or os.environ.get("AUTO_DISABLED") != "true"):
+                  refuse("interrupted recovery requires a fresh protected main dispatch with only the original run ID")
+              settings = api(f"repos/{repo}/environments/production", "the production Environment")
+              policy = settings.get("deployment_branch_policy") or {}
+              rules = settings.get("protection_rules") or []
+              branches = api(f"repos/{repo}/environments/production/deployment-branch-policies",
+                             "the production deployment branch policies")
+              if (settings.get("name") != "production" or policy.get("custom_branch_policies") is not True
+                      or policy.get("protected_branches") is not False
+                      or sum(rule.get("type") == "branch_policy" for rule in rules) != 1
+                      or branches.get("total_count") != 1
+                      or [(row.get("type", "branch"), row.get("name"))
+                          for row in branches.get("branch_policies", [])] != [("branch", "main")]
+                      or not (any(rule.get("type") == "required_reviewers" and rule.get("reviewers")
+                                  for rule in rules) or auto_approve)):
+                  refuse("interrupted recovery requires the protected production Environment")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write("mode=interrupted-recovery\n")
+              sys.exit(0)
+
           if release_plan or release_pins:
               if (event != "workflow_dispatch" or os.environ.get("GITHUB_RUN_ATTEMPT") != "1"
                       or not re.fullmatch(r"[1-9][0-9]{0,19}", release_plan)
@@ -284,16 +328,6 @@ jobs:
                   refuse("protected release requires a fresh manual exact-SHA staged takeover with both release inputs")
               if os.environ.get("AUTO_DISABLED") != "true":
                   refuse("protected release requires automatic production promotion to be disabled")
-              refuse("protected release requires the activation follow-up")
-
-          def api(path, what, **query):
-              args = ["gh", "api", "--method", "GET", path]
-              for key, value in query.items():
-                  args += ["-f", f"{key}={value}"]
-              try:
-                  return json.loads(subprocess.check_output(args, text=True))
-              except (subprocess.CalledProcessError, ValueError):
-                  refuse(f"could not read {what} from the GitHub API; failing closed")
 
           def staged_source(run):
               title = run.get("display_title")
@@ -1618,7 +1652,7 @@ jobs:
     # must have succeeded or been skipped (a failed soak fails closed: no bake,
     # no deploy), and a skipped recheck counts only for manual runs — an
     # automatic run always needs a fresh recheck pass with no skip.
-    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
+    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.mode != 'interrupted-recovery' && needs.guard.outputs.skip == '' && (needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
     # The protected status read shares the deploy-production lane. A
     # protected release already holds it at workflow level. Ordinary
     # automatic runs yield to an active operator dispatch before lane entry.
@@ -2466,3 +2500,12 @@ jobs:
       forward-artifact-id: ${{ needs.release-apply.outputs.artifact-id }}
       forward-archive-sha256: ${{ needs.release-apply.outputs.archive-sha256 }}
       candidate-worker: ${{ needs.production.outputs.release-worker }}
+
+  release-reconcile:
+    name: Production release / Reconcile interrupted apply
+    needs: guard
+    if: needs.guard.outputs.mode == 'interrupted-recovery'
+    permissions: *release-permissions
+    uses: ./.github/workflows/deploy-production-interrupted.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    with:
+      origin-run-id: ${{ inputs.release_recovery_run_id }}
