@@ -8,7 +8,8 @@ import json
 from pathlib import Path
 import sys
 
-from production_recovery_takeover import HEX, UUID, RecoveryPin, observed_phase, verify_inverse
+from production_ownership_status import CI_ACTOR, NAMESPACE, RELEASE_FENCE_ACTOR, matches
+from production_recovery_takeover import HEX, SHA, UUID, RecoveryPin, observed_phase, verify_inverse
 from script_intake import decode_json, read_with_overflow
 from staging_rollout import GateError, mapping
 from worker_container_rollback import STABLE_PASSES
@@ -40,9 +41,31 @@ def scope(state):
 def deployment(state):
     worker, container = state["worker"], state["container"]
     ids = worker["deployment_id"], container["rollout_id"]
-    if not all(isinstance(value, str) and UUID.fullmatch(value) for value in ids):
+    if not all(matches(UUID, value) for value in ids):
         raise ValueError
     return ids
+
+
+def validate_status(state):
+    """Check the protected status projection before it can classify any receipt."""
+    at = observation_time(state)
+    worker = mapping(state["worker"])
+    container = mapping(state["container"])
+    owner = mapping(state["ownership"])
+    deployment(state)
+    digest = container["image_digest"]
+    if (not matches(UUID, worker["version_id"]) or not matches(SHA, worker["sha"])
+            or type(worker["traffic_percent"]) is not int or worker["traffic_percent"] != 100
+            or not matches(UUID, container["application_id"]) or not matches(NAMESPACE, container["namespace_id"])
+            or container["rollout_status"] != "completed" or not isinstance(digest, str)
+            or not digest.startswith("sha256:") or not matches(HEX, digest[7:])):
+        raise ValueError
+    epoch, actor, running, phase = (owner[key] for key in ("epoch", "owner_actor", "running", "phase"))
+    if (type(epoch) is not int or not 0 < epoch < 2**53 or type(running) is not bool
+            or not (phase == "active" or (phase == "fenced" and not running))
+            or not (actor == "redacted" or matches(CI_ACTOR, actor) or matches(RELEASE_FENCE_ACTOR, actor))):
+        raise ValueError
+    return at
 
 
 def classify(receipt, current, as_of):
@@ -88,13 +111,7 @@ def main(argv=None):
         parser.error(f"at most {MAX_RECEIPTS} receipts are supported")
     try:
         current = read_object(args.status)
-        as_of = observation_time(current)
-        deployment(current)
-        owner = mapping(current["ownership"])
-        epoch = owner["epoch"]
-        if (type(epoch) is not int or not 0 < epoch < 2**53 or type(owner["running"]) is not bool
-                or not (owner["phase"] == "active" or (owner["phase"] == "fenced" and not owner["running"]))):
-            raise ValueError
+        as_of = validate_status(current)
     except (GateError, KeyError, OSError, RecursionError, TypeError, ValueError):
         print("recovery report refused: missing or invalid ownership observation", file=sys.stderr)
         return 2

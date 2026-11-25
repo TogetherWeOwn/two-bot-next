@@ -529,7 +529,7 @@ or foreign owner leaves the handoff open without another takeover.
 
 ### Offline recovery report
 
-Use `scripts/production_recovery_report.py` to summarize saved
+Use Python 3.11 or later to run `scripts/production_recovery_report.py` on saved
 `production-release-restored.json` receipts against one independent,
 bracketed `production-ownership-status` observation. Use the latest verified
 observation from the protected status path. For each receipt, preserve its

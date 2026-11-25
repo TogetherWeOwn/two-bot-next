@@ -94,7 +94,7 @@ class ProductionRecoveryReportTests(unittest.TestCase):
         self.assert_rows(self.current["provider"], [self.current], ["unverified"])
         for group, field, changed in (
             ("ownership", "epoch", 20),
-            ("ownership", "owner_actor", self.old["provider"]["ownership"]["owner_actor"] + "0"),
+            ("ownership", "owner_actor", f"github-actions:999:{self.admission['pin']['rollback_sha']}"),
             ("ownership", "running", False),
             ("container", "namespace_id", "0" * 32),
             ("container", "rollout_id", "66666666-6666-4666-8666-666666666666"),
@@ -107,6 +107,29 @@ class ProductionRecoveryReportTests(unittest.TestCase):
         unrelated = deepcopy(self.latest)
         unrelated["container"]["application_id"] = "99999999-9999-4999-8999-999999999999"
         self.assert_rows(unrelated, [self.old, self.current], ["unverified", "unverified"])
+
+    def test_refuses_incomplete_shared_status_before_classifying_any_receipt(self):
+        # The old receipt would otherwise be superseded by this later epoch.
+        for group in ("worker", "container", "ownership"):
+            for field in self.latest[group]:
+                with self.subTest(group=group, missing=field):
+                    incomplete = deepcopy(self.latest)
+                    del incomplete[group][field]
+                    result, _ = self.invoke(incomplete, self.old, self.current)
+                    self.assertEqual((result.returncode, result.stdout), (2, b""))
+
+        for group, field, value in (
+            ("worker", "sha", "bad-sha"),
+            ("worker", "traffic_percent", 100.0),
+            ("container", "image_digest", "sha256:short"),
+            ("container", "rollout_status", "progressing"),
+            ("ownership", "owner_actor", []),
+        ):
+            with self.subTest(group=group, invalid=field):
+                invalid = deepcopy(self.latest)
+                invalid[group][field] = value
+                result, _ = self.invoke(invalid, self.old, self.current)
+                self.assertEqual((result.returncode, result.stdout), (2, b""))
 
     def test_invalid_inputs_cannot_suppress_current_sibling_or_leak_payload(self):
         wrong_digest = "0" * 64, json.dumps(self.current).encode()
