@@ -934,6 +934,17 @@ class ProvenanceReceiptTests(unittest.TestCase):
 
 
 class MainProvenanceTests(unittest.TestCase):
+    def test_ordinary_production_rollback_refuses_schema_crossing_or_reserved_fence(self):
+        older, expanded = "a" * 40, "b" * 40
+        active = {"owner": {"phase": "active", "actor": "fixture-actor"}}
+        held = {"owner": {"phase": "fenced", "actor": f"production-schema-release:123:{expanded}"}}
+        has_schema = lambda sha: sha == expanded
+        with self.assertRaisesRegex(base.GateError, "production_rollback_requires_protected_inverse"):
+            rollback.require_ordinary_production_rollback(expanded, older, active, has_schema=has_schema)
+        with self.assertRaisesRegex(base.GateError, "production_rollback_fence_reserved"):
+            rollback.require_ordinary_production_rollback(expanded, expanded, held, has_schema=has_schema)
+        rollback.require_ordinary_production_rollback(expanded, expanded, active, has_schema=has_schema)
+
     """Manual and snapshot rollbacks refuse a bad receipt before any POST."""
 
     URL = "https://two-bot-next-staging.acct.workers.dev"
