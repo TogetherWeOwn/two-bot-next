@@ -208,6 +208,12 @@ STAGING_SETUP_NODE_USES = "actions/setup-node@949feb2413d6458794dcd2491c4babbbce
 STAGING_USE_RECEIPT = "${{ runner.temp }}/staging-use.jsonl"
 STAGING_USE_RELEASE_RECEIPT = "${{ runner.temp }}/staging-use-release.jsonl"
 STAGING_UPLOAD_USES = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+STAGING_TOOLING_STEPS = [
+    {"uses": STAGING_CHECKOUT_USES,
+     "with": {"ref": "${{ github.sha }}", "persist-credentials": "false", "fetch-depth": "1"}},
+    {"uses": STAGING_SETUP_NODE_USES,
+     "with": {"node-version": "22", "package-manager-cache": "false"}},
+]
 
 
 def staging_receipt_upload(kind, phase, receipt):
@@ -1066,21 +1072,24 @@ def staging_full_window_errors(workflow, name="deploy-staging.yml"):
         errors.append(f"{name}:staging-use-release: must always clean up an issued deploy window")
     if release.get("environment") != "staging" or release.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:staging-use-release: must read only the staging Environment with contents:read")
-    if "defaults" in release or "defaults" in workflow:
-        errors.append(f"{name}:staging-use-release: must run from the checkout with the default shell")
-    if "continue-on-error" in release or any("continue-on-error" in step for step in release.get("steps") or []):
+    if {"defaults", "env"} & workflow.keys() or {"defaults", "env", "container", "services"} & release.keys():
+        errors.append(f"{name}:staging-use-release: must use the checkout and default runner environment")
+    if "continue-on-error" in release:
         errors.append(f"{name}:staging-use-release: a failed stop must fail the run")
     if not runner_allowed("staging-use-release", release.get("runs-on")):
         errors.append(f"{name}:staging-use-release: must use the explicit ubuntu-latest runner for job "
                       "'staging-use-release'")
-    commands = [step for step in release.get("steps") or [] if "run" in step]
-    if len(commands) != 1 or {key: value for key, value in commands[0].items() if key != "name"} != {
-        "run": "node wrangler/scripts/staging-use-pipeline.mjs finish",
-        "env": {**STAGING_CONTROL_ENV,
-                "STAGING_USE_EXPIRES_AT": f"${{{{ {expiry} }}}}",
-                "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-use-release.jsonl"},
-    }:
-        errors.append(f"{name}:staging-use-release: must finish only the exact issued deploy window")
+    steps = [{key: value for key, value in step.items() if key != "name"}
+             for step in release.get("steps") or []]
+    if steps != [
+        *STAGING_TOOLING_STEPS,
+        {"run": "node wrangler/scripts/staging-use-pipeline.mjs finish",
+         "env": {**STAGING_CONTROL_ENV,
+                 "STAGING_USE_EXPIRES_AT": f"${{{{ {expiry} }}}}",
+                 "STAGING_USE_RECEIPT": STAGING_USE_RELEASE_RECEIPT}},
+        staging_receipt_upload("deploy", "stop", STAGING_USE_RELEASE_RECEIPT),
+    ]:
+        errors.append(f"{name}:staging-use-release: must use pinned tooling, finish the exact window and retain its receipt")
     return errors
 
 
@@ -1222,31 +1231,32 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
     if not runner_allowed("user-flow-synthetic", job.get("runs-on")):
         errors.append(f"{name}:user-flow-synthetic: must use the explicit ubuntu-latest runner "
                       "for job 'user-flow-synthetic'")
-    if "defaults" in job or "defaults" in workflow:
-        errors.append(f"{name}:user-flow-synthetic: must run from the checkout with the default shell")
+    if "defaults" in job or {"defaults", "env"} & workflow.keys():
+        errors.append(f"{name}:user-flow-synthetic: must use the checkout and default runner environment")
     for key in ("if", "uses", "services", "container",
                 "continue-on-error", "strategy", "concurrency"):
         if key in job:
             errors.append(f"{name}:user-flow-synthetic: must not set {key}")
     errors.extend(staging_qualification_assert_errors(job, "user-flow-synthetic",
                   "staging_health_contract_probe.py", "staging-use-user-flow.jsonl", "staging-use-user-flow"))
-    steps = job.get("steps") or []
-    probes = [step for step in steps
-              if "staging_health_contract_probe.py" in str(step.get("run", ""))]
-    if len(probes) != 1 or any(key in probes[0] for key in ("if", "continue-on-error")):
-        errors.append(f"{name}:user-flow-synthetic: must run the probe in exactly one unconditional step")
+    steps = [{key: value for key, value in step.items() if key != "name"}
+             for step in job.get("steps") or []]
+    if (len(steps) != 6 or steps[:2] != STAGING_TOOLING_STEPS
+            or steps[2].get("run") != "node wrangler/scripts/staging-use.mjs ready"
+            or (steps[3].get("with") or {}).get("path") != "${{ runner.temp }}/staging-use-user-flow.jsonl"
+            or steps[5] != {"if": "always()", "uses": STAGING_UPLOAD_USES,
+                            "with": {"name": "staging-user-flow-synthetic",
+                                     "path": "${{ runner.temp }}/staging-user-flow-synthetic.json",
+                                     "if-no-files-found": "ignore", "retention-days": "14"}}):
+        errors.append(f"{name}:user-flow-synthetic: must use pinned tooling, readiness, probe and evidence steps in order")
     else:
-        probe = probes[0]
+        probe = steps[4]
         if probe.get("env") != USER_FLOW_PROBE_ENV:
             errors.append(f"{name}:user-flow-synthetic: preserve the exact origin, SHA and preview authority")
-        if str(probe.get("run", "")).strip() != USER_FLOW_PROBE_RUN or "shell" in probe or "working-directory" in probe:
+        if set(probe) != {"run", "env"} or str(probe["run"]).strip() != USER_FLOW_PROBE_RUN:
             errors.append(f"{name}:user-flow-synthetic: preview authority must run only the exact readback probe")
     if str(workflow).count("inputs.verify_automod_preview") != 1 or "DISCORD_STAGING_BOT_TOKEN" in str(workflow):
         errors.append(f"{name}:user-flow-synthetic: keep preview opt-in and its credential in the pinned probe")
-    checkouts = [step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")]
-    if len(checkouts) != 1 or (checkouts[0].get("with") or {}).get("ref") != "${{ github.sha }}" \
-            or (checkouts[0].get("with") or {}).get("persist-credentials") != "false":
-        errors.append(f"{name}:user-flow-synthetic: must check out the reviewed workflow head without credentials")
     certify = jobs.get("certify-promotion") or {}
     if "user-flow-synthetic" not in (certify.get("needs") or []):
         errors.append(f"{name}:certify-promotion: must need the user-flow synthetic")
@@ -7625,6 +7635,15 @@ class WorkflowTests(unittest.TestCase):
                 {"defaults": {"run": {"working-directory": "wrangler"}}}),
             "release inherits a different working directory": lambda w: w.update(
                 {"defaults": {"run": {"working-directory": "wrangler"}}}),
+            "release job adds shared environment": lambda w: job(w, "staging-use-release").update(
+                {"env": {"FIXTURE_FLAG": "1"}}),
+            "release inherits workflow environment": lambda w: w.update({"env": {"FIXTURE_FLAG": "1"}}),
+            "release changes runtime image": lambda w: job(w, "staging-use-release").update(
+                {"container": "fixture.invalid/staging:fixture"}),
+            "release adds a service": lambda w: job(w, "staging-use-release").update(
+                {"services": {"fixture": {"image": "fixture.invalid/staging:fixture"}}}),
+            "release adds an action before cleanup": lambda w: job(w, "staging-use-release")["steps"].insert(
+                2, {"uses": "fixture/extra-action@" + "a" * 40}),
             "release tolerated": lambda w: job(w, "staging-use-release").update({"continue-on-error": "true"}),
             "release no client": lambda w: next(step for step in job(w, "staging-use-release")["steps"]
                                                 if step.get("run") == "node wrangler/scripts/staging-use-pipeline.mjs finish").update({"run": "true"}),
@@ -8320,6 +8339,9 @@ class WorkflowTests(unittest.TestCase):
                 {"defaults": {"run": {"working-directory": "wrangler"}}}),
             "probe inherits a different working directory": lambda w: w.update(
                 {"defaults": {"run": {"working-directory": "wrangler"}}}),
+            "probe inherits workflow environment": lambda w: w.update({"env": {"FIXTURE_FLAG": "1"}}),
+            "probe adds an action before readiness": lambda w: w["jobs"]["user-flow-synthetic"]["steps"].insert(
+                2, {"uses": "fixture/extra-action@" + "a" * 40}),
             "no sha pin": lambda w: probe(w).__setitem__(
                 "run", probe(w)["run"].replace('--expected-sha "$EXPECTED_SHA" ', "")),
             "empty origin passes": lambda w: probe(w).__setitem__(
