@@ -684,6 +684,16 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
             .await
             .is_err()
     );
+    admin.execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at DROP DEFAULT").await?;
+    let refused = recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await;
+    assert_eq!(
+        refused.unwrap_err().to_string(),
+        "failed: release inverse readback refused"
+    );
+    admin
+        .execute("SELECT 1 FROM public.live_sequence_watermarks LIMIT 0")
+        .await?;
+    admin.execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at SET DEFAULT CURRENT_TIMESTAMP").await?;
     let (restored_cutover, restored_store) =
         recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await?;
     assert_eq!(
