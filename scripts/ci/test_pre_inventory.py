@@ -82,17 +82,24 @@ class PreInventoryTests(unittest.TestCase):
             ("applications", [APP, APP | {"id": OTHER_ID}]),
             ("applications", [APP, APP | {"name": "other-app"}]),
             ("applications", [{"id": APP_ID}]),
-            ("applications", [APP | {"id": "not-an-app-uuid"}]),
         ):
             with self.subTest(listing=key, rows=rows), self.assertRaises(TargetError):
                 self.project(**{key: listing(*rows)})
+
+    def test_invalid_listing_uuid_and_pin_fail_independently(self):
+        invalid_id = "not-an-app-uuid"
+        unrelated = {"name": "unrelated-app", "id": invalid_id}
+        with self.assertRaisesRegex(TargetError, "invalid_pre_app_id"):
+            self.project(applications=listing(unrelated))
+        with self.assertRaisesRegex(TargetError, "invalid_pre_app_pin"):
+            self.project(pinned_app_id=invalid_id)
 
     def test_cross_target_snapshots_and_app_identity_drift_fail_closed(self):
         for foreign in (replace(TARGET, scope="pre-fixture-foreign"), replace(TARGET, shape="0475/0465"),
                         replace(TARGET, run_id=43)):
             with self.subTest(source=foreign), self.assertRaisesRegex(TargetError, "wrong_pre_inventory_target"):
                 self.project(source_target=foreign)
-        for pin in (None, OTHER_ID, "not-an-app-uuid"):
+        for pin in (None, OTHER_ID):
             with self.subTest(pin=pin), self.assertRaises(TargetError):
                 self.project(applications=listing(APP), pinned_app_id=pin, app_detail=detail(0, 0))
         for mismatch in ({"id": OTHER_ID}, {"name": TARGET.container_name + "-shadow"}):
