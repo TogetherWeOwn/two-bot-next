@@ -546,6 +546,11 @@ for the full ledgers and retained timestamp.
 
 ### Check the shared rollback SHA
 
+Dispatch `build-predecessor` from protected main to build the reviewed export.
+It emits the Worker modules, OCI image and their recorded identities. This
+receipt covers packaging. Staging qualification at either PRE endpoint requires
+a compatible isolated target that stops the exact runtime when its use window expires.
+
 1. For the reviewed rollback predecessor, record its Worker source SHA and
    module digests, container image digest and expected runtime
    `build_revision`, `build_id` and `deploy_id`. The forward candidate has

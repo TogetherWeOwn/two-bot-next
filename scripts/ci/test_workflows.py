@@ -41,6 +41,7 @@ JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
 PROBE_STEPS = _HISTORY_MODULE.PROBE_STEPS
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
+    "build-predecessor.yml": {"build"},
     # The nextest branch adds its required lane; main adds the production schema gate.
     # The inventory pin must retain both changes.
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
@@ -4964,6 +4965,11 @@ def workflow_policy_errors(workflows):
             contract = Path(__file__).parent / "fixtures/staging_automod_preview_workflow.json"
             if workflow != json.loads(contract.read_text()):
                 errors.append(f"{name}: expected the disabled, synthetic-only staging job")
+            continue
+        if name == "build-predecessor.yml":
+            contract = Path(__file__).parent / "fixtures/build_predecessor_workflow.json"
+            if workflow != json.loads(contract.read_text()):
+                errors.append(f"{name}: expected the pinned protected workflow")
             continue
         if name == "gradual-promote-proof.yml":
             # Manual gradual-promote proof caller (passive until the fixture
@@ -11326,6 +11332,9 @@ class WorkflowTests(unittest.TestCase):
                         expected.update({"actions": "read", "checks": "read"})
                         if job_id == "authorize":
                             expected["pull-requests"] = "read"
+                    elif (name, job_id) == ("build-predecessor.yml", "build"):
+                        # Verify the pinned source's Actions attempts and check runs.
+                        expected.update({"actions": "read", "checks": "read"})
                     elif (name, job_id) == ("check.yml", "ci-evidence"):
                         expected["actions"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):

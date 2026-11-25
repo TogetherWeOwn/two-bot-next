@@ -1,0 +1,68 @@
+{
+  "name": "build-predecessor",
+  "on": {
+    "workflow_dispatch": ""
+  },
+  "permissions": {},
+  "concurrency": {
+    "group": "build-predecessor",
+    "cancel-in-progress": "false"
+  },
+  "jobs": {
+    "build": {
+      "if": "github.repository_id == '1396224242' && github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1",
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": "50",
+      "permissions": {
+        "actions": "read",
+        "checks": "read",
+        "contents": "read"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": "false",
+            "fetch-depth": "0"
+          }
+        },
+        {
+          "uses": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+          "with": {
+            "node-version": "22",
+            "package-manager-cache": "false"
+          }
+        },
+        {
+          "uses": "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
+        },
+        {
+          "name": "Verify the protected input and export the reviewed tree",
+          "env": {
+            "GH_TOKEN": "${{ github.token }}"
+          },
+          "run": "python3 scripts/build_predecessor.py prepare"
+        },
+        {
+          "name": "Install the archived locked Worker dependencies",
+          "working-directory": "${{ runner.temp }}/predecessor/source/wrangler",
+          "run": "npm ci"
+        },
+        {
+          "name": "Build and stamp the archived Worker and image",
+          "run": "python3 scripts/build_predecessor.py build"
+        },
+        {
+          "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "with": {
+            "name": "attendance-predecessor-build-${{ github.run_id }}-1",
+            "path": "${{ runner.temp }}/predecessor/artifact",
+            "if-no-files-found": "error",
+            "retention-days": "14"
+          }
+        }
+      ]
+    }
+  }
+}
