@@ -188,15 +188,17 @@ See the [protected staging readback](automod-preview-spec.md#protected-staging-r
   (`environment=staging`, `purpose=automod-preview`, `phase=active`, `runId`,
   `runAttempt`, `deploymentId`, `sha`, `epoch`, `acquiredAt`, `expiresAt`).
   Each approval must bind its own action (`start` or `recover`) to that tuple.
+  A missing or invalid approval denies its own action. An independently valid
+  `recover` approval remains usable if `start` approval is unavailable.
 - [ ] **Record both outcomes.** Check each bounded `two-bot-staging-automod-job.v1`
   receipt for staging, the expected action, the exact original lease and a
-  canonical UTC `observedAt` at or after `acquiredAt`. Only a matching
-  `verdict=passed` confirms that action. Record a returned failure verdict
-  with its code. Mark missing, unreadable or mismatched evidence unconfirmed.
-  HTTP success alone cannot confirm either action. Retain metadata only,
-  with credentials and member data excluded. The protected runner attempts
-  `recover` after every startup attempt, even if startup fails or its reply is
-  lost.
+  canonical UTC `observedAt` at or after `acquiredAt`. Confirmation requires
+  HTTP 2xx and a matching `verdict=passed`. Record the runner's action results.
+  A receipt failure code, if available, is diagnostic. A refusal before
+  admission has no action or lease. Mark missing, unreadable or mismatched
+  evidence unconfirmed. Retain metadata only, with credentials and member
+  data excluded. The protected runner attempts `recover` after every startup
+  attempt, even if startup fails or its reply is lost.
 - [ ] **Stop safely after an unconfirmed startup.** Keep the original lease
   and journal hold, even after expiry. The protected runner uses separate
   recovery approval and fresh same-lease cleanup authority or durable
