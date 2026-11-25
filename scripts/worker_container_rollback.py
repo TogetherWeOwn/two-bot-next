@@ -355,8 +355,11 @@ def require_ordinary_production_rollback(current_sha, target_sha, state, *, has_
     actor = owner.get("actor")
     require(owner.get("phase") in ("active", "fenced") and isinstance(actor, str),
             "production_rollback_ownership_unproved")
-    require(not actor.startswith("production-schema-release:"), "production_rollback_fence_reserved")
-    require(has_schema(current_sha) == has_schema(target_sha), "production_rollback_requires_protected_inverse")
+    release_owned = actor.startswith("production-schema-release:")
+    require(not release_owned or owner["phase"] == "active", "production_rollback_fence_reserved")
+    current_expanded = has_schema(current_sha)
+    require(not release_owned or current_expanded, "production_rollback_fence_reserved")
+    require(current_expanded == has_schema(target_sha), "production_rollback_requires_protected_inverse")
 
 
 def replaced_converged(row):
