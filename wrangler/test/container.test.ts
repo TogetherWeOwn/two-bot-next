@@ -645,7 +645,7 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   await assert.rejects(run("start", { ...issued, deploymentId: "other-worker" }), refused);
   await assert.rejects(run("start", { ...issued, sha: "c".repeat(40) }), refused);
   const wrongVersion = "other-worker";
-  const invoke = TwoBotContainer.bindProtectedAutomodInvoker(h.bot, readServing, { ...effects, enabled: true });
+  let invoke = TwoBotContainer.bindProtectedAutomodInvoker(h.bot, readServing, { ...effects, enabled: true });
   const readInventory = t.mock.fn<Parameters<typeof bindStagingAutomodDeploymentTransport>[1]>(async () => ({
     schema_version: 1, observed_at: new Date(Date.now()).toISOString(),
     worker: { deployment_id: pin.workerDeploymentId, version_id: version, source_sha: issued.sha,
@@ -654,7 +654,8 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
       rollout_status: "completed", image_digest: pin.imageDigest },
     ownership: { phase: "active", epoch: issued.epoch },
   }));
-  const transport = bindStagingAutomodDeploymentTransport({ env: stageEnv, controlBearer: CONTROL_TOKEN }, readInventory, invoke);
+  const transport = bindStagingAutomodDeploymentTransport({ env: stageEnv, controlBearer: CONTROL_TOKEN }, readInventory,
+    (pin, call, signal) => invoke(pin, call, signal));
   const request = async (action: "start" | "recover") => {
     const call = { action, issuedLease: issued };
     const response = await transport(call, { ...call, target: STAGING_AUTOMOD_TARGET }, new AbortController().signal);
@@ -708,6 +709,8 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   assert.equal(calls.filter(call => call === "start").length, 1);
   await assert.rejects(run("start"), refused);
 
+  // Disable startup while keeping the transport's original serving pin.
+  invoke = TwoBotContainer.bindProtectedAutomodInvoker(h.bot, readServing, { ...effects, enabled: false });
   t.mock.timers.tick(issued.expiresAt - Date.now());
   values.set(STAGING_USE_KEY, { ...issued, phase: "released" });
   await assert.rejects(h.bot.start(), /staging_use_conflict/);
