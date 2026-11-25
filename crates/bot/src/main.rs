@@ -197,10 +197,7 @@ async fn main() {
     if cli_args.first().is_some_and(|arg| arg == "moderation") {
         std::process::exit(moderation_cli::dispatch(&cli_args[1..]).await);
     }
-    if cli_args
-        .first()
-        .is_some_and(|arg| arg == "rehearse-internal-actions")
-    {
+    if cli_args.first().map(String::as_str) == Some("rehearse-internal-actions") {
         logging::init();
         if let Err(error_class) = internal_action_rehearsal::serve(&cli_args[1..]).await {
             tracing::error!(error_class, "internal-action startup refused");

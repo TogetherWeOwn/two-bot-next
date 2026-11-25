@@ -229,6 +229,11 @@ request. Web must keep ambiguous work held in both cases.
 
 The runner uses the current artifact's schema for both positions. The same
 image may back both positions when the serving and retained receipts agree.
-The announcement control invokes `rehearse-internal-actions` and checks the
-receipt, same-key replay and TLS refusals. For source proof use `--candidate`
-with an exact local release image ID labeled with the tested commit.
+The full verdict requires both positive controls. A retained announcement
+transport using compiled WebPKI roots rejects the synthetic CA before the
+request reaches the recorder. Its announcement control remains incomplete
+until both admitted images can use the disposable trust root at the same
+Discord origin.
+
+The announcement control invokes `rehearse-internal-actions`. For source proof
+pass the exact local release image ID labeled with the tested commit to `--candidate`.
