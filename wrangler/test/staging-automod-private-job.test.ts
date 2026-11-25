@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { runStagingAutomodPrivateJob } from "../scripts/staging-automod-private-job.ts";
-import { runProtectedAutomodJob } from "../src/staging-automod-job.ts";
+import { invokeProtectedAutomodJob } from "../src/staging-automod-entry.ts";
 import { STAGING_AUTOMOD_TARGET as target } from "../src/staging-automod-recovery.ts";
 import { AUTOMOD_STAGING_PURPOSE } from "../src/staging-lifecycle.ts";
 import { lease, now } from "./fixtures/staging-automod-recovery.ts";
 
 type Transport = Parameters<typeof runStagingAutomodPrivateJob>[3];
-type Invoke = Parameters<typeof runProtectedAutomodJob>[2];
-type Receipt = Awaited<ReturnType<typeof runProtectedAutomodJob>>;
+type Invoke = Parameters<typeof invokeProtectedAutomodJob>[3];
+type Receipt = Awaited<ReturnType<typeof invokeProtectedAutomodJob>>;
 const issuedLease = { ...lease, purpose: AUTOMOD_STAGING_PURPOSE, runAttempt: 1 } as const;
 const { runId, runAttempt, sha } = issuedLease;
 const job = { runId, runAttempt, sha };
@@ -21,9 +21,15 @@ const passed = { verdict: "passed", start: true, recover: true };
 function syntheticTransport(invoke: Invoke,
   reply: (receipt: Receipt) => Response = receipt => Response.json(receipt),
 ): Transport {
+  const token = "synthetic-automod-private-job-token";
+  const env = { TWO_DEPLOY_ENV: "staging", STAGING_RUNTIME_POLICY: "bounded",
+    DISCORD_APPLICATION_ID: target.applicationId, GUILD_ID: target.guildId,
+    OWNERSHIP_CONTROL_TOKEN: token, CF_VERSION_METADATA: { id: lease.deploymentId }, CONTAINER_RELEASE: sha };
   return async (call, approval, signal) => {
-    signal.throwIfAborted();
-    return reply(await runProtectedAutomodJob(call, approval, invoke));
+    const request = new Request("https://worker.invalid", {
+      method: "POST", headers: { authorization: `Bearer ${token}` }, body: JSON.stringify(call), signal,
+    });
+    return reply(await invokeProtectedAutomodJob(request, env, approval, invoke));
   };
 }
 
@@ -78,6 +84,30 @@ test("private job recovers the original lease after failed startup and expiry", 
     { verdict: "failed", start: false, recover: true });
   assert.deepEqual(invoke.mock.calls.map(call => call.arguments[0]),
     [{ action: "start", issuedLease }, { action: "recover", issuedLease }]);
+});
+
+test("startup timeout aborts the private transport and still reaches original-lease recovery", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: now() });
+  const startup = Promise.withResolvers<AbortSignal>();
+  const invoke = t.mock.fn<Invoke>(async () => {});
+  const boundary = syntheticTransport(invoke);
+  const transport: Transport = (call, approval, signal) => {
+    if (call.action === "start") {
+      startup.resolve(signal);
+      return new Promise(() => {});
+    }
+    return boundary(call, approval, signal);
+  };
+
+  const run = runStagingAutomodPrivateJob(job, issuedLease, approvals, transport);
+  const signal = await startup.promise;
+  const aborted = t.mock.fn();
+  signal.addEventListener("abort", aborted, { once: true });
+  assert.equal(signal.aborted, false);
+  t.mock.timers.tick(15_000);
+  assert.deepEqual(await run, { verdict: "failed", start: false, recover: true });
+  assert.equal(aborted.mock.callCount(), 1);
+  assert.deepEqual(invoke.mock.calls.map(call => call.arguments[0]), [{ action: "recover", issuedLease }]);
 });
 
 test("private job requires bounded same-scope receipts for both actions", async t => {

@@ -778,9 +778,9 @@ authenticated binding from the protected job to the private Worker entry and
 a trusted source of the issued lease and separate start and recovery approvals.
 That binding must deliver the approval independently of the request body and
 return the Worker entry's receipt for the runner to validate. The reusable
-workflow holds the staging lifecycle queue across both actions. Worker cleanup
-owns durable retirement and retry for an interrupted runner or unconfirmed
-recovery.
+workflow holds the `staging-lifecycle` queue across both actions. A future
+caller must leave that queue to the reusable workflow. Worker cleanup owns
+durable retirement and retry for an interrupted runner or unconfirmed recovery.
 
 ## 10. Spec self-check (doctest)
 

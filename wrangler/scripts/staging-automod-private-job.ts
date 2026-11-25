@@ -1,8 +1,7 @@
-import type { runProtectedAutomodJob } from "../src/staging-automod-job.ts";
+import type { invokeProtectedAutomodJob } from "../src/staging-automod-entry.ts";
 import { runStagingAutomodDryRun } from "./staging-automod-workflow.ts";
 
-// The private Worker entry takes the job adapter's approval type.
-type Approval = NonNullable<Parameters<typeof runProtectedAutomodJob>[1]>;
+type Approval = NonNullable<Parameters<typeof invokeProtectedAutomodJob>[2]>;
 type Runner = Parameters<typeof runStagingAutomodDryRun>;
 type Call = Parameters<Runner[2]>[0];
 type Transport = (call: Call, approval: Approval, signal: AbortSignal) => Promise<Response>;
