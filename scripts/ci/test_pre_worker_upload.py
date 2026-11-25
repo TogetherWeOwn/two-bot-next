@@ -13,7 +13,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bot_promotion import MAX_MEMBER_BYTES, MAX_TOTAL_BYTES
 from pre_target import Target, TargetError, make_config
-from pre_worker_upload import assemble_worker_upload
+from pre_worker_upload import DatabaseEndpoint, assemble_worker_upload
 from script_intake import decode_json
 
 
@@ -25,6 +25,14 @@ MODULES = {
     "lib/message.txt": ("text/plain", b"fixture\r\n"),
     "lib/data.bin": ("application/octet-stream", bytes([0, 128, 255, 10, 13])),
 }
+
+
+def database_fixture(target):
+    endpoint = DatabaseEndpoint(target=target, service=target.service_name,
+                                host=f"{target.service_name}.{target.scope}.db.invalid", port=5432,
+                                database="pre", user="pre_fixture", disposable=True)
+    url = f"postgresql://{endpoint.user}:fixture%40password@{endpoint.host}:5432/pre?sslmode=verify-full"
+    return {"database_endpoint": endpoint, "database_url": url}
 
 
 def receive_multipart(content_type, body):
@@ -64,7 +72,7 @@ class PreWorkerUploadTests(unittest.TestCase):
     def assemble(self, **overrides):
         return assemble_worker_upload(**{
             "target": self.target, "now": self.target.started_at, "receipt": self.receipt,
-            "material_root": self.root, "config": self.config, **overrides,
+            "material_root": self.root, "config": self.config, **database_fixture(self.target), **overrides,
         })
 
     def test_multipart_preserves_module_names_types_bytes_and_version_metadata(self):
@@ -80,7 +88,7 @@ class PreWorkerUploadTests(unittest.TestCase):
             "bindings": [
                 {"name": "BOT_PORT", "type": "plain_text", "text": "8080"},
                 {"name": "CONTAINER_RELEASE", "type": "plain_text", "text": self.revision},
-                {"name": "DATABASE_URL", "type": "plain_text", "text": self.config["vars"]["DATABASE_URL"]},
+                {"name": "DATABASE_URL", "type": "secret_text", "text": database_fixture(self.target)["database_url"]},
                 {"name": "TWO_BOT", "type": "durable_object_namespace", "class_name": "TwoBotContainer"},
                 {"name": "CF_VERSION_METADATA", "type": "version_metadata"},
             ],
@@ -169,7 +177,8 @@ class PreWorkerUploadTests(unittest.TestCase):
                 self.assertEqual(other.worker_name, self.target.worker_name)
                 with self.assertRaisesRegex(TargetError, "^wrong_pre_worker_config$"):
                     self.assemble(target=other)
-                self.assertEqual(self.assemble(target=other, config=self.make_config(other)).target, other)
+                self.assertEqual(self.assemble(target=other, config=self.make_config(other),
+                                               **database_fixture(other)).target, other)
         with self.assertRaisesRegex(TargetError, "^pre_admission_expired$"):
             self.assemble(now=self.target.expires_at)
 

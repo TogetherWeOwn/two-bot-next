@@ -21,6 +21,43 @@ MODULE_TYPES = {
     ".bin": "application/octet-stream",
 }
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
+DNS_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+DATABASE_NAME = r"[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,62}"
+# SQLx accepts query overrides for the destination and user. Admit only the
+# TLS options used by the archived runtime and require explicit TCP identity.
+DATABASE_URL = re.compile(
+    rf"postgres(?:ql)?://(?P<user>{DATABASE_NAME}):(?:[a-zA-Z0-9._~-]|%[0-9a-fA-F]{{2}})+@"
+    rf"(?P<host>(?:{DNS_LABEL}\.)+[a-z](?:[a-z0-9-]{{0,61}}[a-z0-9])?)"
+    rf":(?P<port>[1-9][0-9]{{0,4}})/(?P<database>{DATABASE_NAME})"
+    r"\?sslmode=(?:require|verify-ca|verify-full)(?:&channel_binding=require)?"
+)
+
+
+@dataclass(frozen=True)
+class DatabaseEndpoint:
+    """Non-secret endpoint pin from authenticated provisioning for a Target."""
+
+    target: Target
+    service: str
+    host: str
+    port: int
+    database: str
+    user: str
+    disposable: bool
+
+
+def _database_binding(target, endpoint, url):
+    require(type(endpoint) is DatabaseEndpoint and type(endpoint.target) is Target
+            and endpoint.target == target and type(endpoint.service) is str and endpoint.service == target.service_name
+            and endpoint.disposable is True, "wrong_pre_database_target")
+    require(type(url) is str and 0 < len(url) <= 2048, "invalid_pre_database_url")
+    match = DATABASE_URL.fullmatch(url)
+    require(match is not None and len(match["host"]) <= 253 and int(match["port"]) <= 65535,
+            "invalid_pre_database_url")
+    require(type(endpoint.port) is int and endpoint.port == int(match["port"])
+            and all(type(getattr(endpoint, key)) is str and getattr(endpoint, key) == match[key]
+                    for key in ("host", "database", "user")), "pre_database_endpoint_mismatch")
+    return {"name": "DATABASE_URL", "type": "secret_text", "text": url}
 
 
 @dataclass(frozen=True)
@@ -70,13 +107,18 @@ def _read_modules(root, hashes):
     return modules
 
 
-def assemble_worker_upload(target, *, now, receipt, material_root, config):
+def assemble_worker_upload(target, *, now, receipt, material_root, config, database_endpoint=None, database_url=None):
     """Build a raw script upload body for exactly one reserved disposable target.
 
     Use the authenticated Target, verified build receipt and stable private
     material directory from the same predecessor verification, with the config
-    emitted by pre_target.make_config. The caller holds exclusive access until
-    assembly returns. Keep the result paired with its full Target.
+    emitted by pre_target.make_config. The protected caller authenticates the
+    disposable database pin independently of the supplied URL. The URL uses
+    a canonical DNS name and explicit TCP port, database, user, password and
+    TLS mode. Its only optional query setting is channel_binding=require.
+    Keep the result private and paired with its full Target. Hold exclusive
+    access to material until assembly returns, and use the returned body
+    directly at the upload boundary.
 
     The body matches Wrangler's script PUT module and metadata layout. The
     protected caller owns account selection, collision checks, ingress settings,
@@ -90,13 +132,16 @@ def assemble_worker_upload(target, *, now, receipt, material_root, config):
     require(config.get("main") == expected["main"], "wrong_pre_worker_entrypoint")
     require(config.get("workers_dev") is False and config.get("preview_urls") is False
             and config == expected, "wrong_pre_worker_config")
+    database_binding = _database_binding(target, database_endpoint, database_url)
     hashes = receipt.get("worker_modules_sha256")
     try:
         modules = _read_modules(root / "worker", hashes)
     except OSError:
         raise TargetError("unreadable_pre_worker_material") from None
 
-    bindings = [{"name": name, "type": "plain_text", "text": text} for name, text in expected["vars"].items()]
+    bindings = [{"name": name, "type": "plain_text", "text": text}
+                for name, text in expected["vars"].items() if name != "DATABASE_URL"]
+    bindings.append(database_binding)
     bindings.extend({"type": "durable_object_namespace", **binding}
                     for binding in expected["durable_objects"]["bindings"])
     bindings.append({"name": expected["version_metadata"]["binding"], "type": "version_metadata"})
