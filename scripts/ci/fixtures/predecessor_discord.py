@@ -21,6 +21,7 @@ COMMANDS = f"/api/v10/applications/{APP}/guilds/{GUILD}/commands"
 GATEWAY = "ws://127.0.0.1:8081"
 RELEASE = Event()
 READY_SENT = Event()
+REST_SYNCED = Event()
 # Decode byte-capped inputs with the standard decoder's nesting limit.
 decode_json = partial(decode_legacy_json, object_pairs_hook=unique_object, parse_constant=int)
 
@@ -42,7 +43,7 @@ class Discord(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/fixture":
-            self.reply({"ready_sent": READY_SENT.is_set()})
+            self.reply({"ready_sent": READY_SENT.is_set(), "rest_synced": REST_SYNCED.is_set()})
         elif self.path == "/release":
             RELEASE.set()
             self.reply({})
@@ -82,6 +83,7 @@ class Discord(BaseHTTPRequestHandler):
             if not isinstance(commands, list) or any(not isinstance(item, dict) for item in commands):
                 raise ValueError
             self.reply(commands)
+            REST_SYNCED.set()
         except (ValueError, RecursionError):
             self.reply({}, 400)
         except OSError:
@@ -148,10 +150,14 @@ def request(target, path):
         connection.close()
 
 
+def serve():
+    if {name for _, name in socket.if_nameindex()} != {"lo"}:
+        sys.exit("Discord fixture requires a loopback-only network namespace")
+    ThreadingHTTPServer(("127.0.0.1", 8081), Discord).serve_forever()
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 1:
-        if {name for _, name in socket.if_nameindex()} != {"lo"}:
-            sys.exit("Discord fixture requires a loopback-only network namespace")
-        ThreadingHTTPServer(("127.0.0.1", 8081), Discord).serve_forever()
+        serve()
     else:
         print(json.dumps(request(*sys.argv[1:])))
