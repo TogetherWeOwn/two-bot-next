@@ -198,6 +198,38 @@ test("protected voice adapter stops on an inconsistent denial and still finishes
   assert.deepEqual(result.cleanup, { memberDisconnected: null, off: true, stopped: true });
 });
 
+test("protected voice adapter credits only observations completed before their deadline", async (t) => {
+  const nearRelayCutoff = 15 * 60_000 - 1010;
+  for (const { elapsedMs, duration, code } of [
+    { elapsedMs: undefined, duration: 19_999, code: undefined },
+    { elapsedMs: undefined, duration: 20_000, code: "probe_timeout" },
+    { elapsedMs: undefined, duration: 20_001, code: "probe_timeout" },
+    { elapsedMs: nearRelayCutoff, duration: 9, code: undefined },
+    { elapsedMs: nearRelayCutoff, duration: 10, code: "lease_elapsed" },
+    { elapsedMs: nearRelayCutoff, duration: 11, code: "lease_elapsed" },
+  ]) {
+    await t.test(`${duration} ms observation with a ${elapsedMs === undefined ? "probe" : "relay"} deadline`, async () => {
+      const { input, calls } = protectedWindow(elapsedMs);
+      let at = input.now();
+      const result = await runProtectedVoiceMoveAcceptance({
+        ...input, now: () => at,
+        async observe(request) {
+          const state = await input.observe(request);
+          // Resolve in the same turn, with no chance for the timeout callback to run.
+          if (request.checkpoint === "after:not_connected") at += duration;
+          return state;
+        },
+      });
+      assert.equal(result.code, code);
+      assert.equal(result.verdict, code ? "failed" : "passed");
+      assert.deepEqual(result.cases.map(({ outcome }) => outcome),
+        code ? ["moved", "not_permitted"] : ["moved", "not_permitted", "not_connected"]);
+      assert.deepEqual(calls, ["assert", "assert", "assert", "status", "release", "status"]);
+      assert.deepEqual(result.cleanup, { memberDisconnected: code ? null : true, off: true, stopped: true });
+    });
+  }
+});
+
 test("protected voice adapter fails when final status cannot affirm OFF and stopped", async () => {
   for (const field of ["voiceMoveEnabled", "running"]) {
     const { input, calls } = protectedWindow();
