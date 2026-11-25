@@ -18,6 +18,23 @@ SPEC.loader.exec_module(recorder)
 
 
 class EventWriteCutoffTest(unittest.TestCase):
+    def test_request_count_includes_reads_without_a_mutation_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            handler = recorder.Handler.__new__(recorder.Handler)
+            handler.server = SimpleNamespace(state=root, token="Bot synthetic", lock=threading.Lock())
+            handler.command = "GET"
+            handler.path = f"/api/v10/guilds/{recorder.GUILD}/scheduled-events"
+            handler.headers = {"Authorization": "Bot synthetic"}
+            handler.rfile = io.BytesIO()
+            handler.reply = Mock()
+
+            handler.do_GET()
+
+            handler.reply.assert_called_once_with(200, [])
+            self.assertEqual((root / "request-count").stat().st_size, 1)
+            self.assertFalse((root / "journal.jsonl").exists())
+
     def test_channel_event_approval_changes_without_opening_the_guild(self):
         earlier = recorder.EVENT_CHANNEL
         replacement = recorder.REPLACEMENT_EVENT_CHANNEL

@@ -72,6 +72,9 @@ class Handler(BaseHTTPRequestHandler):
         raise TimeoutError("fixture barrier deadline")
 
     def dispatch(self):
+        # Count observations separately so reads do not change the mutation journal.
+        with self.server.lock, (self.server.state / "request-count").open("ab") as count:
+            count.write(b"\n")
         if not hmac.compare_digest(self.headers.get("Authorization", ""), self.server.token):
             self.reply(401, {"code": 0, "message": "Synthetic token required"})
             return

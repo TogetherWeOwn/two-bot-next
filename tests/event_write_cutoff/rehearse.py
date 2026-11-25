@@ -277,7 +277,7 @@ class Rehearsal:
         prior_key = "current-channel-edit"
         self.write("channel-event-approval", f"{GUILD}:{EVENT_CHANNEL}")
         answer = self.request("current", prior_key, scoped_edit)
-        require(answer["status"] == 200 and answer["outcome"] == "updated"
+        require(answer["status"] == 200 and answer["outcome"] == "updated" and answer["event_id"] == EVENT
                 and not answer["replay"] and self.claim(prior_key) == "completed",
                 "Current channel edit did not produce a durable receipt")
 
@@ -291,9 +291,11 @@ class Rehearsal:
                 "Recorder restart did not retain the replacement channel scope")
         self.start_bot("retained")
         before_replay = self.journal()
+        request_count = self.work / "request-count"
+        requests_before_replay = request_count.stat().st_size
         replay = self.request("retained", prior_key, scoped_edit)
         require(replay == {**answer, "replay": True} and self.claim(prior_key) == "completed"
-                and self.journal() == before_replay,
+                and request_count.stat().st_size == requests_before_replay,
                 "Retained replay did not preserve the original receipt without a wire attempt")
         rejected = self.request("retained", "retained-old-channel-edit", scoped_edit)
         require(rejected["code"] == "discord_rejected" and not rejected["replay"]
@@ -301,7 +303,8 @@ class Rehearsal:
                 "Fresh retained key did not encounter the changed channel approval")
         replacement = self.request("retained", "retained-replacement-channel-edit",
                                    {**scoped_edit, "channel_key": "replacement"})
-        require(replacement["status"] == 200 and replacement["outcome"] == "updated" and not replacement["replay"],
+        require(replacement["status"] == 200 and replacement["outcome"] == "updated"
+                and replacement["event_id"] == EVENT and not replacement["replay"],
                 "Replacement channel did not retain scoped authority")
 
         answer = self.request("retained", "rollback-create", create)
