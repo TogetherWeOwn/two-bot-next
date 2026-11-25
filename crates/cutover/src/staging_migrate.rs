@@ -42,8 +42,8 @@ use crate::intake_cap::{read_bytes_capped, IntakeReadError, INTAKE_CAP_LABEL};
 #[path = "release_schema_transaction.rs"]
 mod release_schema_transaction;
 pub use release_schema_transaction::{
-    apply_release_schema, classify_interrupted_release, confirm_release_pre, recover_release_schema,
-    undo_release_schema, AppliedRelease, InterruptedRelease,
+    apply_release_schema, classify_interrupted_release, confirm_release_pre,
+    recover_release_schema, undo_release_schema, AppliedRelease, InterruptedRelease,
 };
 
 /// Fixed binding names; each value is a secret and is never echoed.
@@ -1697,7 +1697,7 @@ async fn run_on_pool(
             store_applied = count;
         }
     }
-    let mut manifest = json!({
+    let manifest = json!({
         "runner_version": RUNNER_VERSION,
         "tool": {"name": "two-bot-cutover staging_migrate", "crate_version": env!("CARGO_PKG_VERSION"),
                  "sqlx": SQLX_VERSION, "invocation": "staging-migrate --target staging|production --plan|--apply"},
@@ -1734,10 +1734,14 @@ async fn run_on_pool(
         // transaction. Not part of either plan hash.
         "audit": audit,
     });
-    if let Some(fence) = release_fence {
+    Ok(with_attendance_fence(manifest, release_fence))
+}
+
+fn with_attendance_fence(mut manifest: Value, fence: Option<String>) -> Value {
+    if let Some(fence) = fence {
         manifest["attendance_fence_sha256"] = json!(fence);
     }
-    Ok(manifest)
+    manifest
 }
 
 #[cfg(test)]
@@ -1754,6 +1758,21 @@ mod tests {
                 checksum_hex: hex::encode(&m.checksum),
             })
             .collect()
+    }
+
+    #[test]
+    fn forward_manifest_carries_the_committed_attendance_fence() {
+        let manifest = json!({"mode": "apply", "plan_provenance_verified": true});
+        let fence = "a".repeat(64);
+        assert_eq!(with_attendance_fence(manifest.clone(), None), manifest);
+        assert_eq!(
+            with_attendance_fence(manifest, Some(fence.clone())),
+            json!({
+                "mode": "apply",
+                "plan_provenance_verified": true,
+                "attendance_fence_sha256": fence,
+            })
+        );
     }
 
     #[test]
