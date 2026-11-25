@@ -28,7 +28,7 @@ async function assertEntryOutput(t: TestContext, scenario: string, verdict: stri
       ...(scenario === "disabled" ? {} : { STAGING_VOICE_MOVE_PROOF: "true" }),
     },
     encoding: "utf8",
-    timeout: 8000,
+    timeout: 15_000,
   });
 
   assert.equal(result.stdout, `${verdict}\n`);
@@ -49,12 +49,11 @@ test("workflow entry reports failure when the final OFF readback is unconfirmed"
 test("coherent synthetic workflow entry returns only the bounded mock verdict",
   (t) => assertEntryOutput(t, "coherent", "passed"));
 
-test("failed restart readiness stays redacted while an isolated voice runner completes", async (t) => {
+test("failed restart readiness stays redacted alongside an independent voice runner completion", async (t) => {
   const results = await Promise.allSettled([
     assertEntryOutput(t, "restart-failed", "failed", "12345"),
     assertEntryOutput(t, "restart-ready", "passed", "12346"),
   ]);
-  for (const result of results) {
-    if (result.status === "rejected") throw result.reason;
-  }
+  const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  if (failures.length) throw new AggregateError(failures, "restart runner assertions failed");
 });

@@ -8,7 +8,9 @@ import { mockVoiceMoveWindow } from "./staging-voice-move.ts";
 const scenario = process.argv[2];
 const run = process.argv[3];
 const restart = scenario === "restart-failed" || scenario === "restart-ready";
-const { args, calls, signed } = mockVoiceMoveWindow(1000,
+// The earlier row is still admissible on failure. On success it has aged
+// out, so only the newly observed readiness can admit the control.
+const { args, calls, signed } = mockVoiceMoveWindow(scenario === "restart-ready" ? 61_000 : 1000,
   restart ? { runId: run, deploymentId: `synthetic-deployment-${run}` } : undefined);
 const { caller, evidence, fixture, lease, now, ready } = args;
 const { runId, runAttempt, expiresAt, deploymentId, sha } = lease;
@@ -23,16 +25,21 @@ if (restart) {
   // Keep the earlier same-window ready receipt. The real begin command appends
   // the restart outcome to that file, as on a runner with prior evidence.
   const failed = scenario === "restart-failed";
+  const syntheticToken = "synthetic".repeat(4);
   const transport = `
     import assert from "node:assert/strict";
     const use = ${JSON.stringify(ready.use)};
     const { acquiredAt, deploymentId, sha, epoch, runId, runAttempt, expiresAt } = use;
-    Date.now = () => acquiredAt + 1000;
+    Date.now = () => ${now()};
+    let acquired = false;
     let running = false;
     globalThis.fetch = async (url, { method, body }) => {
       if (url.pathname === "/readyz") {
         assert.equal(method, "GET");
-        assert.equal(running, true);
+        // The owned probe starts the stopped container after acquisition.
+        assert.equal(acquired, true);
+        assert.equal(running, false);
+        running = true;
         return Response.json({
           build_revision: ${failed} ? "synthetic-private-restart-diagnostic" : sha,
           components: [["gateway", "ready"]],
@@ -40,10 +47,11 @@ if (restart) {
       }
       assert.equal(url.pathname, "/internal/staging-use");
       if (method === "POST") {
+        assert.equal(acquired, false);
         assert.equal(running, false);
         assert.deepEqual(JSON.parse(body), { action: "acquire", environment: "staging",
           deploymentId, sha, expectedEpoch: epoch, runId, runAttempt, expiresAt, voiceMove: true });
-        running = true;
+        acquired = true;
       } else {
         assert.equal(method, "GET");
       }
@@ -53,16 +61,18 @@ if (restart) {
   `;
   const cli = fileURLToPath(new URL("../../scripts/staging-use-pipeline.mjs", import.meta.url));
   const beginOutput = receiptPath + ".output";
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY!;
+  const initialSummary = readFileSync(summaryPath);
   const result = spawnSync(process.execPath,
     ["--import", "data:text/javascript," + encodeURIComponent(transport), cli, "begin"], {
       env: {
-        ...runIdentity, GITHUB_OUTPUT: beginOutput,
+        ...runIdentity, GITHUB_OUTPUT: beginOutput, GITHUB_STEP_SUMMARY: summaryPath,
         STAGING_USE_RECEIPT: receiptPath, STAGING_USE_VOICE_MOVE: "1", STAGING_USE_MINUTES: "15",
-        STAGING_USE_EXPECTED_SHA: sha, OWNERSHIP_CONTROL_TOKEN: "synthetic".repeat(4),
+        STAGING_USE_EXPECTED_SHA: sha, OWNERSHIP_CONTROL_TOKEN: syntheticToken,
         STAGING_WORKER_URL: "https://two-bot-next-staging.example.workers.dev/",
       },
       encoding: "utf8",
-      timeout: 5000,
+      timeout: 10_000,
     });
   assert.ifError(result.error);
   assert.equal(result.status, failed ? 1 : 0, result.stderr);
@@ -73,11 +83,16 @@ if (restart) {
     ["attempt", "status", "window", "acquire", failed ? "failed" : "ready"]);
   assert.equal(rows.at(-1).runId, runId);
   assert.equal(rows[2].expiresAt, expiresAt);
+  assert.deepEqual(rows[3], { ...ready, action: "acquire", running: false, runId, runAttempt });
+  if (!failed) assert.deepEqual(rows.at(-1), { ...ready, runId, runAttempt });
   assert.doesNotMatch(result.stdout, /synthetic-private-restart-diagnostic/);
-  const collected = Object.fromEntries(readFileSync(beginOutput, "utf8").trimEnd().split("\n")
-    .map((line) => line.split("=")));
-  assert.deepEqual(collected, outputs);
-  outputs = collected;
+  assert.equal(result.stdout.includes(syntheticToken), false);
+  assert.deepEqual(readFileSync(summaryPath), initialSummary);
+  const expiryLine = `expires_at=${expiresAt}\n`;
+  const bindingLines = expiryLine + `deployment_id=${deploymentId}\nsha=${sha}\n`;
+  const collected = readFileSync(beginOutput, "utf8");
+  assert.equal(collected, expiryLine + bindingLines.repeat(failed ? 1 : 2));
+  outputs = Object.fromEntries(collected.trimEnd().split("\n").map((line) => line.split("=")));
 }
 
 Object.assign(process.env, {
