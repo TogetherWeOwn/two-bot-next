@@ -642,6 +642,21 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
         recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await?,
         (restored_cutover.clone(), restored_store.clone())
     );
+    // The retained ledger and original stamp alone cannot authenticate an
+    // inverse once the restored contract drifts.
+    admin
+        .execute("UPDATE public.web_contract_meta SET contract_version = '1.1' WHERE singleton")
+        .await?;
+    assert_eq!(
+        recover_release_schema(&pool, &cutover, &store, Some(&expected_fence))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "failed: release restored state refused"
+    );
+    admin
+        .execute("UPDATE public.web_contract_meta SET contract_version = '1.0' WHERE singleton")
+        .await?;
     expected[0].push(cutover.into_iter().find(|row| row.version == 475).unwrap());
     assert_eq!(restored_cutover, expected[0]);
     assert_eq!(restored_store, expected[1]);

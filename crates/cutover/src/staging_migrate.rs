@@ -2201,6 +2201,50 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn release_inverse_checks_both_plan_projections_before_using_binding() {
+        let sha = "a".repeat(40);
+        let fence = "b".repeat(64);
+        let store = Chain::Store.migrator().unwrap();
+        let mut req = bound_production_apply(&[475, 479, 480, 481, 482], &sha);
+        req.expected_store_pending = Some("478".to_owned());
+        req.store_plan_manifest_sha256 = Some(manifest_hash(&sha, &[478], &store));
+        // Use a binding that cannot connect under either TLS policy. With
+        // intact projections, the runner must reach the binding refusal.
+        req.url = Some("not-a-postgres-url".to_owned());
+        let plan = json!({
+            "plan_manifest_sha256": req.plan_manifest_sha256,
+            "store_plan_manifest_sha256": req.store_plan_manifest_sha256,
+            "source_migrations": source_manifest(&MIGRATOR),
+            "source_store_migrations": source_manifest(&store),
+        });
+        let mut invalid_cutover = plan.clone();
+        invalid_cutover["source_migrations"][0]["description"] = Value::Null;
+        let mut invalid_store = plan.clone();
+        invalid_store["source_store_migrations"] = Value::Null;
+        let invalid_projection = "refused: release inverse ledger projection invalid";
+        for (plan, stamp, refusal) in [
+            (&invalid_cutover, &fence, invalid_projection),
+            (&invalid_store, &fence, invalid_projection),
+            (
+                &plan,
+                &fence,
+                "refused: TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL value is not a Postgres URL",
+            ),
+            (
+                &plan,
+                &"A".repeat(64),
+                "refused: release inverse requires the production apply binding and attendance fence",
+            ),
+        ] {
+            let path = temp_manifest(&plan.to_string());
+            req.plan_manifest_path = Some(path.to_str().unwrap().to_owned());
+            let result = run_release_inverse(&req, stamp).await;
+            std::fs::remove_file(path).unwrap();
+            assert_eq!(result.unwrap_err().to_string(), refusal);
+        }
+    }
+
     #[test]
     fn plan_binding_accepts_the_matching_hash() {
         let sha = "a".repeat(40);
