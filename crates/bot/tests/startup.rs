@@ -47,6 +47,44 @@ fn rehearsal_command_refuses_an_unprepared_process() {
     }
 }
 
+#[tokio::test]
+async fn attendance_read_cannot_bypass_receiver_startup_checks() {
+    for (bind, expected) in [
+        ("0.0.0.0:8091", "receiver_config_invalid"),
+        ("127.0.0.1:8091", "receiver_prerequisites_invalid"),
+    ] {
+        // A wildcard lacks the container marker. A private bind still
+        // requires the receiver's guild, regardless of the read flag.
+        let mut bot = tokio::process::Command::from(command("invalid-health-bind"));
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            bot.env("TWO_INTERNAL_ACTIONS", "1")
+                .env("TWO_INTERNAL_ALLOW_ATTENDANCE_READ", "1")
+                .env("TWO_INTERNAL_BIND", bind)
+                .env("TWO_INTERNAL_KEYS", format!("fixture:{}", "f".repeat(64)))
+                .env("TWO_INTERNAL_CALLERS", "fixture:synthetic-web")
+                .env("TWO_INTERNAL_CHANNEL_KEYS", "fixture:400000000000000001")
+                .env("GUILD_ID", "222200000000000001")
+                .env("DISCORD_TOKEN", "synthetic-token")
+                .env("DATABASE_URL", "invalid-database-url")
+                .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|file| ("LLVM_PROFILE_FILE", file)))
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("startup refusal deadline")
+        .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let logs = String::from_utf8(output.stdout).unwrap();
+        assert!(logs.contains(expected), "startup logs: {logs}");
+        assert!(
+            !logs.contains("listener_bind_failed"),
+            "boot reached the health bind"
+        );
+    }
+}
+
 fn get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
     let timeout = Duration::from_millis(250);
     let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
