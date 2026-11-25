@@ -4012,7 +4012,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: .github/scripts
+          # Publish needs only the script. Include Git's root metadata in the
+          # same blob fetch to avoid separate lazy fetches during checkout.
+          sparse-checkout: |
+            /.gitattributes
+            /.gitignore
+            /.github/scripts/pr_evidence.py
+          sparse-checkout-cone-mode: false
           persist-credentials: false
       - env:
           GH_TOKEN: ${{ github.token }}
