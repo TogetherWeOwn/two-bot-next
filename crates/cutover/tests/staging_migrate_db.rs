@@ -33,6 +33,54 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+#[test]
+fn production_inverse_cli_dispatches_before_connecting() -> TestResult {
+    let hash = "a".repeat(64);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_staging-migrate"))
+        .env_clear()
+        .env(
+            "TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL",
+            "not-a-postgres-url",
+        )
+        .args([
+            "--target",
+            "production",
+            "--apply",
+            "--source-sha",
+            SHA,
+            "--production-host",
+            "production.example.invalid",
+            "--production-database",
+            "fixture",
+            "--recovery-evidence-ref",
+            "recovery-fixture",
+            "--acl-plan-ref",
+            "acl-fixture",
+            "--expected-pending",
+            "475,479,480,481,482",
+            "--expected-store-pending",
+            "478",
+            "--plan-manifest-sha256",
+            &hash,
+            "--store-plan-manifest-sha256",
+            &hash,
+            "--plan-run-id",
+            "100",
+            "--plan-manifest-path",
+            "unused-manifest.json",
+            "--inverse-attendance-fence-sha256",
+            "invalid",
+        ])
+        .output()?;
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(output.stderr)?.trim(),
+        "staging-migrate refused: release inverse requires the production apply binding and attendance fence"
+    );
+    assert!(output.stdout.is_empty());
+    Ok(())
+}
+
 /// Exact staging ledger versions at the base SHA (29 rows, max 390).
 const SEED_VERSIONS: [i64; 29] = [
     1, 2, 120, 121, 122, 123, 140, 141, 150, 160, 170, 180, 190, 200, 210, 300, 310, 311, 320, 330,
@@ -502,7 +550,7 @@ async fn warning_history_recovers_on_retained_schema() -> TestResult {
 async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> TestResult {
     use two_bot_core::database_roles::{plan_for_phase, Phase};
     use two_bot_cutover::staging_migrate::{
-        apply_release_schema, undo_release_schema, Chain, LedgerRow,
+        apply_release_schema, recover_release_schema, undo_release_schema, Chain, LedgerRow,
     };
 
     let fx = Fixture::new().await?;
@@ -626,7 +674,57 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     admin
         .execute("DELETE FROM live_sequence_watermarks WHERE guild_id = '1'")
         .await?;
-    let (restored_cutover, restored_store) = undo_release_schema(&pool, &cutover, &store).await?;
+    let expected_fence: String = sqlx::query_scalar(
+        "SELECT encode(sha256(timestamptz_send(installed_on)), 'hex') FROM _sqlx_migrations WHERE version = 475",
+    )
+    .fetch_one(&mut admin)
+    .await?;
+    assert!(
+        recover_release_schema(&pool, &cutover, &store, Some(&"0".repeat(64)))
+            .await
+            .is_err()
+    );
+    admin.execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at DROP DEFAULT").await?;
+    let refused = recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await;
+    assert_eq!(
+        refused.unwrap_err().to_string(),
+        "failed: release inverse readback refused"
+    );
+    admin
+        .execute("SELECT 1 FROM public.live_sequence_watermarks LIMIT 0")
+        .await?;
+    admin.execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at SET DEFAULT CURRENT_TIMESTAMP").await?;
+    let (restored_cutover, restored_store) =
+        recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await?;
+    assert_eq!(
+        recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await?,
+        (restored_cutover.clone(), restored_store.clone())
+    );
+    // The retained ledger and original stamp alone cannot authenticate an
+    // inverse once the restored contract drifts.
+    admin
+        .execute("UPDATE public.web_contract_meta SET contract_version = '1.1' WHERE singleton")
+        .await?;
+    assert_eq!(
+        recover_release_schema(&pool, &cutover, &store, Some(&expected_fence))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "failed: release restored state refused"
+    );
+    admin
+        .execute("UPDATE public.web_contract_meta SET contract_version = '1.0' WHERE singleton")
+        .await?;
+    admin
+        .execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at DROP DEFAULT")
+        .await?;
+    assert_eq!(
+        recover_release_schema(&pool, &cutover, &store, Some(&expected_fence))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "failed: release restored state refused"
+    );
     expected[0].push(cutover.into_iter().find(|row| row.version == 475).unwrap());
     assert_eq!(restored_cutover, expected[0]);
     assert_eq!(restored_store, expected[1]);
