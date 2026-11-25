@@ -463,13 +463,14 @@ pinned release plan, full candidate SHA and artifact identity, rollback plan,
 and original receipt links with producer run, attempt, digest and expiry where
 applicable. Keep credentials, raw responses and member data out of the record.
 
-- **Carry forward exact-candidate evidence.** Keep the CI and review evidence,
+- **Carry forward exact-candidate evidence.** Keep CI and PR review evidence,
   staging deploy and smoke results, and immutable artifact receipts while the
   selected workflow still admits them for the same candidate. For Bot, verify
   the current qualifying staging attempt and its
-  [promotion certificate](#build-identity-and-the-readyz-gate). A reviewed
-  migration plan remains usable only if the protected workflow can retrieve
-  the original artifact and verify the fresh plan matches. For Web, recheck the
+  [promotion certificate](#build-identity-and-the-readyz-gate). The protected
+  Bot migration workflow checks the original plan artifact, a matching fresh
+  plan and a still-valid approval check. A production migration apply job
+  that started after the plan was produced supersedes it. For Web, recheck the
   candidate's staging deploy and E2E evidence against the serving version and
   soak. Where applicable, revalidate the exact
   [Kit cutover packet and proof](https://github.com/TogetherWeOwn/two-web-next/blob/main/docs/kit-cutover-release.md#protected-release-and-recovery).
@@ -483,9 +484,11 @@ applicable. Keep credentials, raw responses and member data out of the record.
   required and Web's attempt-bound staging sample and production baseline.
   Before data or schema changes, take and verify a fresh provider backup and
   bind any required [restore rehearsal](#restore-evidence-for-release-approval)
-  to that backup and its new copy. Use the existing release gate for the
-  current plan and evidence. After dispatch, use that rollout's smoke and
-  [watch results](#post-deploy-watch) before returning custody.
+  to that backup and its new copy. Follow the
+  [production release gate](../CONTRIBUTING.md#production-release-gate) for
+  approval bound to the current plan and evidence. After dispatch, use that
+  rollout's smoke and [watch results](#post-deploy-watch) before returning
+  custody.
 
 ## Interrupted protected release
 
