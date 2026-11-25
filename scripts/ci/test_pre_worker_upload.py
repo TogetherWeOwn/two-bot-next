@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bot_promotion import MAX_MEMBER_BYTES, MAX_TOTAL_BYTES
 from pre_target import Target, TargetError, make_config
 from pre_worker_upload import assemble_worker_upload
 from script_intake import decode_json
@@ -134,7 +135,20 @@ class PreWorkerUploadTests(unittest.TestCase):
             self.assemble()
         del self.receipt["worker_modules_sha256"]["../substitute.bin"]
         with member.open("wb") as handle:
-            handle.truncate(8 * 1024 * 1024 + 1)
+            handle.truncate(MAX_MEMBER_BYTES + 1)
+        with self.assertRaisesRegex(TargetError, "^pre_worker_size_limit$"):
+            self.assemble()
+
+    def test_refuses_combined_module_limit(self):
+        modules = {name: data for name, (_, data) in MODULES.items()}
+        small_bytes = sum(len(data) for name, data in modules.items() if name != "lib/data.bin")
+        modules["lib/data.bin"] = b"\0" * MAX_MEMBER_BYTES
+        modules["lib/extra.bin"] = b"\0" * (MAX_TOTAL_BYTES - MAX_MEMBER_BYTES - small_bytes + 1)
+        self.assertEqual(sum(map(len, modules.values())), MAX_TOTAL_BYTES + 1)
+        self.assertLessEqual(max(map(len, modules.values())), MAX_MEMBER_BYTES)
+        for name, data in modules.items():
+            (self.worker / name).write_bytes(data)
+        self.receipt["worker_modules_sha256"] = {name: sha256(data).hexdigest() for name, data in modules.items()}
         with self.assertRaisesRegex(TargetError, "^pre_worker_size_limit$"):
             self.assemble()
 
