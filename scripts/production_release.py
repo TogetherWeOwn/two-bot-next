@@ -201,12 +201,13 @@ def main(argv, env):
 
         actor = release_actor(str(run["id"]), pin.candidate_sha)
         url = check_url("production", env["PRODUCTION_WORKER_URL"])
-        control = control_client("production", env["OWNERSHIP_CONTROL_TOKEN"], url, "", actor)
+        make_control = partial(control_client, "production", env["OWNERSHIP_CONTROL_TOKEN"], url, "", actor)
         if argv == ["prepare"]:
             fresh = mapping(decode((directory / "fresh-plan.json").read_bytes()))
             validate_attendance_plan(plan)
             validate_attendance_plan(fresh)
-            epoch = verify_preflight(pin, plan["target"], plan, fresh, lambda: read_status(env), control)
+            require_unused_attendance_plan(github, artifact, run)
+            epoch = verify_preflight(pin, plan["target"], plan, fresh, lambda: read_status(env), make_control())
             account = env["CLOUDFLARE_ACCOUNT_ID"]
             client = RollbackClient(account, env["CLOUDFLARE_API_TOKEN"])
             app = APPLICATIONS["production"]
@@ -223,7 +224,7 @@ def main(argv, env):
                     and proof["run_id"] == str(run["id"]) and proof["plan_run_id"] == plan_id,
                     "production_release_preflight_plan_changed")
             require_unused_attendance_plan(github, artifact, run)
-            ack = stop_prior_pair(pin, str(run["id"]), proof["epoch"], lambda: read_status(env), control)
+            ack = stop_prior_pair(pin, str(run["id"]), proof["epoch"], lambda: read_status(env), make_control())
             write_json(directory / "stopped.json", ack)
             output(env, ack=json.dumps(ack, separators=(",", ":")))
         elif argv in (["authorize-deploy"], ["takeover"]):
