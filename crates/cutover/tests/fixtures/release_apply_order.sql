@@ -11,9 +11,9 @@ CREATE TABLE fixture_release_order.writer_advisory_key AS
     WHERE pid = pg_backend_pid() AND granted AND locktype = 'advisory' AND mode = 'ExclusiveLock';
 GRANT USAGE ON SCHEMA fixture_release_order TO two_bot_migrator;
 GRANT SELECT ON fixture_release_order.writer_advisory_key TO two_bot_migrator;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA fixture_release_order TO two_bot_migrator;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA fixture_release_order TO two_bot_migrator;
 
-CREATE FUNCTION fixture_release_order.read_ledger(marker regclass) RETURNS boolean
+CREATE FUNCTION fixture_release_order.read_ledger(marker text) RETURNS boolean
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
     IF current_user <> 'two_bot_migrator' OR NOT EXISTS (
@@ -30,7 +30,10 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'release ledger read without migrator writer locks';
     END IF;
-    PERFORM nextval(marker);
+    PERFORM nextval(marker::regclass);
+    -- Separately bind the observation to this transaction. The sequence is
+    -- only for the test's post-rollback assertions.
+    PERFORM set_config(marker, 'seen', true);
     RETURN true;
 END;
 $$;
@@ -55,9 +58,9 @@ BEGIN
     IF current_user = 'two_bot_migrator' THEN
         PERFORM nextval(CASE WHEN TG_TAG = 'GRANT' THEN 'fixture_release_order.grant_attempt'::regclass
                              ELSE 'fixture_release_order.ddl_attempt'::regclass END);
-        IF NOT ((SELECT is_called FROM fixture_release_order.cutover_read)
-                AND (SELECT is_called FROM fixture_release_order.store_read)) THEN
-            RAISE EXCEPTION 'release mutation before both locked ledger reads';
+        IF current_setting('fixture_release_order.cutover_read', true) IS DISTINCT FROM 'seen'
+           OR current_setting('fixture_release_order.store_read', true) IS DISTINCT FROM 'seen' THEN
+            RAISE EXCEPTION 'release mutation before both locked ledger reads in this transaction';
         END IF;
     END IF;
 END;
