@@ -122,9 +122,10 @@ test("recovery at lease expiry refuses a record if the issued identity rolls dur
     h.records.set(STAGING_USE_KEY, replacement);
     return h.approvals[action];
   });
-  assert.deepEqual(await rolled.inputs(), { context, issuedLease: h.issued, approvals: {} });
+  const bounded = boundStagingAutomodAuthority(rolled.provider);
+  assert.equal(await bounded.readApproval("recover", h.issued), undefined);
   assert.deepEqual(rolled.approve.mock.calls.map(({ arguments: [action, issued] }) => [action, issued]), [["recover", h.issued]]);
-  assert.deepEqual(await Promise.all(h.readLease.mock.calls.map(({ result }) => result)), [h.issued, h.issued, replacement]);
+  assert.deepEqual(await Promise.all(h.readLease.mock.calls.map(({ result }) => result)), [h.issued, replacement]);
 });
 
 test("Container authority reads under the gate and refuses a fenced owner", async t => {
