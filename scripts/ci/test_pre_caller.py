@@ -212,23 +212,34 @@ class PreCallerTests(unittest.TestCase):
         self.assertIs(fixture.finalize(), RegistryDisposition.ALREADY_ABSENT)
 
     def test_lost_final_readback_withholds_registry_handback_until_retry(self):
-        fixture = Fixture()
-        fixture.caller(Operation.START).start(Upload(fixture.target))
-        self.assertTrue(fixture.caller(Operation.STOP).stop())
-        fixture.status = "terminal"
-        inventory = fixture.inventory
+        for failed_read, error in (
+            (1, "PRE cleanup readback could not be verified"),
+            (2, "PRE registry handback could not be verified"),
+        ):
+            with self.subTest(failed_read=failed_read):
+                fixture = Fixture()
+                fixture.caller(Operation.START).start(Upload(fixture.target))
+                self.assertTrue(fixture.caller(Operation.STOP).stop())
+                fixture.status = "terminal"
+                inventory = fixture.inventory
+                reads_after_delete = 0
 
-        def lose_final_readback(target):
-            if fixture.snapshot.container is None:
-                raise TimeoutError("synthetic lost final readback")
-            return inventory(target)
+                def lose_final_readback(target):
+                    nonlocal reads_after_delete
+                    if fixture.snapshot.container is None:
+                        reads_after_delete += 1
+                        if reads_after_delete == failed_read:
+                            raise TimeoutError("synthetic lost final readback")
+                    return inventory(target)
 
-        with patch.object(fixture, "inventory", side_effect=lose_final_readback):
-            with self.assertRaisesRegex(SweepError, "^PRE cleanup readback could not be verified$"):
-                fixture.finalize()
-        self.assertNotIn("registry", fixture.steps())
-        self.assertIs(fixture.finalize(), RegistryDisposition.ALREADY_ABSENT)
-        self.assertEqual(fixture.steps().count("delete_container"), 1)
+                with patch.object(fixture, "inventory", side_effect=lose_final_readback):
+                    with self.assertRaisesRegex(SweepError, f"^{error}$"):
+                        fixture.finalize()
+                self.assertEqual(reads_after_delete, failed_read)
+                self.assertNotIn("registry_reservation", fixture.steps())
+                self.assertNotIn("registry", fixture.steps())
+                self.assertIs(fixture.finalize(), RegistryDisposition.ALREADY_ABSENT)
+                self.assertEqual(fixture.steps().count("delete_container"), 1)
 
     def test_readiness_requires_reviewed_runtime_and_ready_gateway(self):
         fixture = Fixture()
