@@ -67,7 +67,7 @@ def _verify_lock(repo, lock_blob, fence_sql):
         checksum = entry["sha256"]
     except (KeyError, TypeError, ValueError, RecursionError):
         raise Refused("retained_catalog_lock_mismatch") from None
-    if FENCE_PATH in entries or checksum != sha256(fence_sql).hexdigest():
+    if not isinstance(entries, dict) or FENCE_PATH in entries or checksum != sha256(fence_sql).hexdigest():
         raise Refused("retained_catalog_lock_mismatch")
     entries[FENCE_PATH] = entry
     expected = (json.dumps(original, indent=2) + "\n").encode()

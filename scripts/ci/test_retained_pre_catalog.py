@@ -1,14 +1,17 @@
 """Reconstruct catalog candidates in disposable repositories without a database."""
 
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from ci.staging_rollback_compatibility import MIGRATION_PATHS, Refused, git
-from retained_pre_catalog import verify_retained_catalog
+from ci.staging_rollback_compatibility import MIGRATION_PATHS, Refused, git, git_environment
+import retained_pre_catalog as catalog
 from script_intake import decode_json
 sys.path.pop(0)
 
@@ -44,9 +47,13 @@ class RetainedPreCatalogTests(unittest.TestCase):
         self.reconstruction = self.commit()
 
     def git(self, *args):
-        return git(self.repo, "-c", "core.hooksPath=/dev/null", "-c", "core.autocrlf=false",
-                   "-c", "core.fileMode=true", "-c", "user.name=Catalog Fixture",
-                   "-c", "user.email=catalog@example.invalid", *args)
+        return subprocess.run(
+            ["git", "--no-replace-objects", "-C", self.repo, "-c", "core.hooksPath=/dev/null",
+             "-c", "core.autocrlf=false", "-c", "core.fileMode=true", "-c", "core.excludesFile=/dev/null",
+             "-c", "user.name=Catalog Fixture", "-c", "user.email=catalog@example.invalid", *args],
+            env={**git_environment(), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
+            check=True, capture_output=True, timeout=10,
+        ).stdout
 
     def commit(self):
         self.git("add", "--all")
@@ -55,14 +62,14 @@ class RetainedPreCatalogTests(unittest.TestCase):
 
     def assert_refused(self, sha, reason):
         with self.assertRaisesRegex(Refused, f"^{reason}$"):
-            verify_retained_catalog(self.repo, sha)
+            catalog.verify_retained_catalog(self.repo, sha)
 
     def test_proves_exact_historical_catalog_from_distinct_commits(self):
         (self.repo / "unrelated.txt").write_text("Independent source identity\n")
         second = self.commit()
         for sha in (self.reconstruction, second):
             with self.subTest(sha=sha):
-                self.assertEqual(verify_retained_catalog(self.repo, sha), {
+                self.assertEqual(catalog.verify_retained_catalog(self.repo, sha), {
                     "source_sha": "058141c29cf135304b060d8fd89aa6e21e44a0c6",
                     "reconstruction_sha": sha,
                     "cutover_tree": "8be4d2baba589a053bacc2523cbdcb760fca4d90",
@@ -112,6 +119,22 @@ class RetainedPreCatalogTests(unittest.TestCase):
         self.git("replace", self.original, self.reconstruction)
         self.assert_refused(self.original, "retained_catalog_tree_mismatch")
         self.assert_refused("HEAD", "invalid_source_sha")
+
+    def test_refuses_wrong_cutover_derivation_even_with_a_matching_tree_pin(self):
+        self.fence.write_bytes(self.sql + b"\n")
+        candidate = self.commit()
+        candidate_tree = self.git("rev-parse", f"{candidate}:{MIGRATION_PATHS[0]}").strip()
+        with patch.object(catalog, "RETAINED_CUTOVER_TREE", candidate_tree):
+            self.assert_refused(candidate, "retained_catalog_tree_mismatch")
+
+    def test_refuses_wrong_lock_derivation_even_with_a_matching_blob_pin(self):
+        modified = decode_json(self.lock_bytes)
+        modified["migrations"][FENCE]["justification"] = "Different lock entry"
+        self.lock.write_text(json.dumps(modified, indent=2) + "\n")
+        candidate = self.commit()
+        candidate_blob = self.git("rev-parse", f"{candidate}:{LOCK}").strip()
+        with patch.object(catalog, "RETAINED_LOCK_BLOB", candidate_blob):
+            self.assert_refused(candidate, "retained_catalog_lock_mismatch")
 
 
 if __name__ == "__main__":
