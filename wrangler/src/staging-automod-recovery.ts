@@ -136,6 +136,11 @@ export class StagingAutomodRecovery {
     return journal?.phase === "complete" ? undefined : journal?.intent;
   }
 
+  async completedFor(lease: Lease): Promise<boolean> {
+    const journal = await this.read();
+    return journal?.phase === "complete" && sameLease(journal.intent.lease, lease);
+  }
+
   /** The publication adapter supplies a digest from its fresh absent registry
    * read under current admission. Success permits a single POST, subject to
    * the adapter's own send-boundary checks. A repeat must go to recovery. */

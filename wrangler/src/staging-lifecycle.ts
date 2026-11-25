@@ -128,7 +128,14 @@ export class StagingLifecycle {
       || expected.phase !== "active" || "voiceMove" in expected || !sameWindow(use, expected)
       || expected.deploymentId !== use.deploymentId || expected.sha !== use.sha || expected.epoch !== use.epoch
       || expected.acquiredAt !== use.acquiredAt) throw new OwnershipRefused("staging_use_conflict");
-    return { lease: Object.freeze({ ...use, phase: "active" as const }), active: activeFor(use, identity, now) };
+    return { lease: Object.freeze({ ...use, phase: "active" as const }), active: activeFor(use, identity, now),
+      released: use.phase === "released" };
+  }
+
+  /** The protected caller checks completed cleanup under the same gate first. */
+  async releaseAutomod(expected: Readonly<StagingUse>, identity: StagingIdentity, now: number): Promise<void> {
+    const { lease, released } = await this.automodBinding(expected, identity, now);
+    if (!released) await this.write({ ...lease, phase: "released" });
   }
 
   async acquire(change: StagingUseChange, identity: StagingIdentity,

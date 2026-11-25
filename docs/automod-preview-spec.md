@@ -724,8 +724,9 @@ The refusal leaves lease and owner records intact until a later verified retry.
 Protected cleanup continues to require fresh remote drain and stopped
 readbacks before releasing the lease.
 
-The dependent private caller needs to use the stored scope for startup and
-release on same-lease cleanup completion. Live qualification still needs the
+The dormant private caller uses the stored scope for startup and releases
+the lease on durable same-lease cleanup completion. Live qualification still
+needs the
 authenticated workflow entry, native expiry and restart recovery, a way to
 retire an unused reservation before intent, an isolated runtime adapter and
 authoritative remote drain and stopped readbacks. A lost receipt with a command
