@@ -478,15 +478,27 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   assert.ok(await journal.pending());
 
   reportedRunning = undefined;
-  // An expired original lease also recovers and persists the release.
+  // The journal can finish before the lease retirement write succeeds.
   values.set(STAGING_USE_KEY, issued);
-  await run("recover", issued, false);
+  const put = h.ctx.storage.put;
+  const failRelease = t.mock.method(h.ctx.storage, "put", async (...args: Parameters<typeof put>) => {
+    const [key] = args;
+    if (typeof key !== "string" && Object.hasOwn(key, STAGING_USE_KEY)) throw new Error("synthetic lease write failure");
+    await put(...args);
+  });
+  await assert.rejects(run("recover", issued, false), /staging_storage_unavailable/);
+  failRelease.mock.restore();
   assert.deepEqual(calls.filter(call => ["start", "drain", "stop", "delete"].includes(call)),
     ["start", "drain", "stop", "delete"]);
   assert.equal(await journal.completedFor(issued), true);
+  assert.deepEqual(values.get(STAGING_USE_KEY), issued);
+  await assert.rejects(h.bot.start(), /staging_use_conflict/);
+
+  const afterCleanup = calls.length;
+  await run("recover", issued, false);
   assert.deepEqual(values.get(STAGING_USE_KEY), { ...issued, phase: "released" });
   await run("recover", issued, false);
-  assert.equal(calls.filter(call => call === "stop").length, 1);
+  assert.equal(calls.length, afterCleanup);
   assert.equal(h.runtime.running, false);
 });
 
