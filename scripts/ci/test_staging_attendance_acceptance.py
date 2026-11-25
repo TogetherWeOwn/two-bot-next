@@ -6,6 +6,7 @@ from io import BytesIO, StringIO
 import json
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -141,6 +142,66 @@ class AcceptanceTests(unittest.TestCase):
         check.reset_mock()
         self.assertEqual(run(boundary), (1, "FAIL: staging lease did not cover the probe\n"))
         check.assert_not_called()
+
+    def test_acceptance_sequence_uses_one_pinned_rollout(self):
+        env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
+               "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
+        other_rollout = {**ROLLOUT, "worker_version": "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+                         "revision": "b" * 40, "build_id": "1234-2", "deploy_id": "2026.11.24.2+bbbbbbb"}
+        no_traffic = Mock(side_effect=AssertionError("unexpected staging request"))
+
+        with (TemporaryDirectory() as directory,
+              patch.object(acceptance.time, "time") as clock,
+              patch.object(acceptance.time, "monotonic", return_value=0)):
+            rollout_path = Path(directory) / "rollout.json"
+            observed_path = Path(directory) / "observed.json"
+            rollout_path.write_text(json.dumps(ROLLOUT), encoding="utf-8")
+
+            def run(phase, observed, check):
+                observed_path.write_text(json.dumps(observed), encoding="utf-8")
+                args = [phase, "--rollout", str(rollout_path), "--observed", str(observed_path)]
+                if phase != "cleanup":
+                    args.extend(["--execute", "--fixture-start", START.strftime("%Y-%m-%dT%H:%M:%SZ")])
+                with (patch("sys.stdout", new_callable=StringIO) as stdout,
+                      patch("sys.stderr", new_callable=StringIO) as stderr):
+                    status = acceptance.main(args, env=env if phase != "cleanup" else {}, check=check)
+                return status, stdout.getvalue(), stderr.getvalue()
+
+            phases = [("pending", 10, [EVENT]), ("finalized", 46, [EVENT, EVENT + ":foreign"]),
+                      ("off", 47, [EVENT]), ("cleanup", 48, [])]
+            for phase, minutes_after_start, expected_reads in phases:
+                with self.subTest(phase=phase):
+                    clock.return_value = START.timestamp() + 60 * minutes_after_start
+                    observed = deepcopy(FIXTURE["observed"])
+                    observed.update(attendance_read=phase in ("pending", "finalized"),
+                                    primary_fixture="pending" if phase == "pending" else "finalized")
+                    lifecycle = observed["lifecycle"]
+                    lifecycle["use"]["expiresAt"] = int((START.timestamp() + 7200) * 1000)
+                    if phase == "cleanup":
+                        lifecycle.update(action="release", running=False)
+                        lifecycle["use"]["phase"] = "released"
+                        del observed["primary_fixture"], observed["foreign_fixture"]
+                        observed["fixture_rows"] = 0
+
+                    if phase in ("finalized", "cleanup"):
+                        other_observed = deepcopy(observed)
+                        other_observed.update(worker_version=other_rollout["worker_version"],
+                                              build_revision=other_rollout["revision"], build_id=other_rollout["build_id"],
+                                              deploy_id=other_rollout["deploy_id"])
+                        other_lifecycle = other_observed["lifecycle"]
+                        for record in (other_lifecycle, other_lifecycle["use"]):
+                            record.update(deploymentId=other_rollout["worker_version"], sha=other_rollout["revision"])
+                        # The substitute is internally valid under its own receipt.
+                        acceptance.validate_configuration(phase, ORIGIN, other_rollout, other_observed)
+                        self.assertEqual(run(phase, other_observed, no_traffic),
+                                         (1, "", "FAIL: configuration is for a different staging build\n"))
+
+                    check, reads, readies = self.signed_peer(phase) if expected_reads else (no_traffic, [], [])
+                    self.assertEqual(run(phase, observed, check), (0, f"PASS: attendance {phase}\n", ""))
+                    self.assertEqual(reads, expected_reads)
+                    self.assertEqual(len(readies), len(expected_reads) + 1 if expected_reads else 0)
+
+        no_traffic.assert_not_called()
 
     def test_signature_matches_shared_wire_vectors(self):
         path = Path(__file__).resolve().parents[2] / "crates/core/tests/fixtures/internal-action-signing.json"
