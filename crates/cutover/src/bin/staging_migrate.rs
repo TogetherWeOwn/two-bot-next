@@ -44,8 +44,8 @@
 #![allow(clippy::print_stdout)]
 
 use two_bot_cutover::staging_migrate::{
-    run, run_release_inverse, Request, RunError, Target, PLAN_URL_ENV, PROD_PLAN_URL_ENV,
-    PROD_URL_ENV, URL_ENV,
+    run, run_release_classification, run_release_inverse, Request, RunError, Target, PLAN_URL_ENV,
+    PROD_PLAN_URL_ENV, PROD_URL_ENV, URL_ENV,
 };
 
 fn main() {
@@ -55,12 +55,14 @@ fn main() {
 fn real_main() -> i32 {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut apply = None;
+    let mut classify = false;
     let mut values = std::collections::HashMap::new();
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--plan" => apply = Some(false),
             "--apply" => apply = Some(true),
+            "--classify-interrupted-release" => classify = true,
             "--target"
             | "--source-sha"
             | "--staging-host"
@@ -89,6 +91,9 @@ fn real_main() -> i32 {
     let Some(apply) = apply else {
         return refused("choose exactly --plan or --apply");
     };
+    if classify && (!apply || values.contains_key("--inverse-attendance-fence-sha256")) {
+        return refused("classification requires --apply binding and excludes the inverse");
+    }
     let target = match values.get("--target").map(String::as_str) {
         Some(raw) => match Target::parse(raw) {
             Some(target) => target,
@@ -165,9 +170,10 @@ fn real_main() -> i32 {
         Err(_) => return refused("runtime init failed"),
     };
     match runtime.block_on(async {
-        match values.get("--inverse-attendance-fence-sha256") {
-            Some(fence) => run_release_inverse(&req, fence).await,
-            None => run(&req).await,
+        match (classify, values.get("--inverse-attendance-fence-sha256")) {
+            (true, _) => run_release_classification(&req).await,
+            (false, Some(fence)) => run_release_inverse(&req, fence).await,
+            (false, None) => run(&req).await,
         }
     }) {
         Ok(manifest) => {

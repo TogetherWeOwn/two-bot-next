@@ -42,7 +42,8 @@ use crate::intake_cap::{read_bytes_capped, IntakeReadError, INTAKE_CAP_LABEL};
 #[path = "release_schema_transaction.rs"]
 mod release_schema_transaction;
 pub use release_schema_transaction::{
-    apply_release_schema, recover_release_schema, undo_release_schema,
+    apply_release_schema, classify_interrupted_release, confirm_release_pre,
+    recover_release_schema, undo_release_schema, InterruptedRelease,
 };
 
 /// Fixed binding names; each value is a secret and is never echoed.
@@ -1452,15 +1453,34 @@ fn project_release_ledger(
 /// before calling this entry point with the existing production binding.
 #[doc(hidden)]
 pub async fn run_release_inverse(req: &Request, fence_sha256: &str) -> Result<Value, RunError> {
+    run_release_recovery(req, Some(fence_sha256)).await
+}
+
+/// Classify under the production apply binding. The caller authenticates
+/// the producing plan artifact and fences writers before relying on this result.
+#[doc(hidden)]
+pub async fn run_release_classification(req: &Request) -> Result<Value, RunError> {
+    if req.target != Target::Production || !req.apply {
+        return refuse("release classification requires the production apply binding");
+    }
+    run_release_recovery(req, None).await
+}
+
+async fn run_release_recovery(
+    req: &Request,
+    fence_sha256: Option<&str>,
+) -> Result<Value, RunError> {
     const CUTOVER: &[i64] = &[475, 479, 480, 481, 482];
     const STORE: &[i64] = &[478];
     validate_request(req)?;
     if req.target != Target::Production
         || !req.apply
-        || fence_sha256.len() != 64
-        || !fence_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || fence_sha256.is_some_and(|fence| {
+            fence.len() != 64
+                || !fence
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
     {
         return refuse(
             "release inverse requires the production apply binding and attendance fence",
@@ -1486,20 +1506,21 @@ pub async fn run_release_inverse(req: &Request, fence_sha256: &str) -> Result<Va
     );
     let options = verify_target(req, tls_policy_from_env()?)?;
     let pool = connect(options, MIGRATOR_ROLE, Arc::new(AtomicUsize::new(0))).await?;
-    let result = release_schema_transaction::recover_release_schema(
-        &pool,
-        &expected.0,
-        &expected.1,
-        Some(fence_sha256),
-    )
-    .await;
+    let result = if let Some(fence) = fence_sha256 {
+        recover_release_schema(&pool, &expected.0, &expected.1, Some(fence))
+            .await
+            .map(|after| {
+                json!({"state": "restored", "attendance_fence_sha256": fence,
+                "expanded": [ledger_json(&expected.0), ledger_json(&expected.1)],
+                "restored": [ledger_json(&after.0), ledger_json(&after.1)]})
+            })
+    } else {
+        classify_interrupted_release(&pool, &expected.0, &expected.1)
+            .await
+            .map(|state| json!(state))
+    };
     pool.close().await;
-    let after = result?;
-    Ok(
-        json!({"state": "restored", "attendance_fence_sha256": fence_sha256,
-        "expanded": [ledger_json(&expected.0), ledger_json(&expected.1)],
-        "restored": [ledger_json(&after.0), ledger_json(&after.1)]}),
-    )
+    result
 }
 
 /// Apply one chain's pending migrations and verify its ledger. Runs only
@@ -2273,6 +2294,10 @@ mod tests {
             let path = temp_manifest(&plan.to_string());
             req.plan_manifest_path = Some(path.to_str().unwrap().to_owned());
             let result = run_release_inverse(&req, stamp).await;
+            if stamp == &fence {
+                let classification = run_release_classification(&req).await;
+                assert_eq!(classification.unwrap_err().to_string(), refusal);
+            }
             std::fs::remove_file(path).unwrap();
             assert_eq!(result.unwrap_err().to_string(), refusal);
         }

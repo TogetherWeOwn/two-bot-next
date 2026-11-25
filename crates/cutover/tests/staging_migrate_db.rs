@@ -19,7 +19,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::{
     migrate::Migrator,
     postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
@@ -32,6 +32,33 @@ mod warning_history_recovery;
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+#[test]
+fn classification_cli_requires_production_apply_and_excludes_inverse() -> TestResult {
+    let invalid_flags = "classification requires --apply binding and excludes the inverse";
+    let invalid_target = "release classification requires the production apply binding";
+    for (args, refusal) in [
+        (&["--plan"][..], invalid_flags),
+        (
+            &["--apply", "--inverse-attendance-fence-sha256", "invalid"],
+            invalid_flags,
+        ),
+        (&["--apply"], invalid_target),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_staging-migrate"))
+            .env_clear()
+            .args(["--target", "staging", "--classify-interrupted-release"])
+            .args(args)
+            .output()?;
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            String::from_utf8(output.stderr)?.trim(),
+            format!("staging-migrate refused: {refusal}")
+        );
+        assert!(output.stdout.is_empty());
+    }
+    Ok(())
+}
 
 #[test]
 fn production_inverse_cli_dispatches_before_connecting() -> TestResult {
@@ -550,15 +577,28 @@ async fn warning_history_recovers_on_retained_schema() -> TestResult {
 async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> TestResult {
     use two_bot_core::database_roles::{plan_for_phase, Phase};
     use two_bot_cutover::staging_migrate::{
-        apply_release_schema, recover_release_schema, undo_release_schema, Chain, LedgerRow,
+        apply_release_schema, classify_interrupted_release, confirm_release_pre,
+        recover_release_schema, undo_release_schema, Chain, LedgerRow,
     };
 
     let fx = Fixture::new().await?;
     let mut admin = fx.scratch().await?;
     let pool = fx.migrator_pool().await?;
     let mut expected = Vec::new();
+    let mut expanded = Vec::new();
     for (chain, limit) in [(Chain::Cutover, 473), (Chain::Store, 465)] {
         let source = chain.migrator()?;
+        expanded.push(
+            source
+                .iter()
+                .map(|m| LedgerRow {
+                    version: m.version,
+                    description: m.description.to_string(),
+                    success: true,
+                    checksum_hex: hex::encode(&m.checksum),
+                })
+                .collect::<Vec<_>>(),
+        );
         let mut seed = Migrator::with_migrations(
             source
                 .iter()
@@ -596,15 +636,24 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     sqlx::raw_sql(sqlx::AssertSqlSafe(plan_for_phase(Phase::Bootstrap)))
         .execute(&mut admin)
         .await?;
+    let confirm_pre = || confirm_release_pre(&pool, &expected[0], &expected[1]);
+    let classify = || classify_interrupted_release(&pool, &expanded[0], &expanded[1]);
+    confirm_pre().await?;
+    assert_eq!(json!(classify().await?), json!({"state": "pre"}));
 
     sqlx::raw_sql("BEGIN; LOCK TABLE public.web_contract_meta IN SHARE ROW EXCLUSIVE MODE")
         .execute(&mut admin)
         .await?;
     let busy = apply_release_schema(&pool, &expected[0], &expected[1]).await;
+    let classified = classify().await;
     admin.execute("ROLLBACK").await?;
     assert_eq!(
         busy.unwrap_err().to_string(),
         "failed: release schema tables busy or unavailable"
+    );
+    assert_eq!(
+        classified.unwrap_err().to_string(),
+        "failed: release inverse ledgers busy or unavailable"
     );
 
     // Fail the final canonical privilege readback, after the uncommitted
@@ -620,6 +669,7 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
         two_bot_cutover::staging_migrate::RunError::Failed(message, _)
             if message == "release schema or role readback refused"
     ));
+    assert!(confirm_pre().await.is_err());
     let pre: (i64, i64, String, bool) = sqlx::query_as(
         "SELECT (SELECT max(version) FROM _sqlx_migrations),
                 (SELECT max(version) FROM _two_bot_migrations),
@@ -679,12 +729,35 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     )
     .fetch_one(&mut admin)
     .await?;
+    assert_eq!(
+        json!(classify().await?),
+        json!({"state": "post", "attendance_fence_sha256": expected_fence})
+    );
+    let receipt: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+         WHERE conrelid = 'public.internal_action_log'::regclass AND conname = 'internal_action_log_receipt_check'",
+    )
+    .fetch_one(&mut admin)
+    .await?;
+    let unenforced = format!("{} NOT ENFORCED", receipt.trim_end_matches(" NOT VALID"));
+    for definition in ["CHECK (true) NOT VALID", &unenforced, &receipt] {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE public.internal_action_log DROP CONSTRAINT internal_action_log_receipt_check,
+             ADD CONSTRAINT internal_action_log_receipt_check {definition}"
+        )))
+        .execute(&mut admin)
+        .await?;
+        if definition != receipt {
+            assert!(classify().await.is_err());
+        }
+    }
     assert!(
         recover_release_schema(&pool, &cutover, &store, Some(&"0".repeat(64)))
             .await
             .is_err()
     );
     admin.execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at DROP DEFAULT").await?;
+    assert!(classify().await.is_err());
     let refused = recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await;
     assert_eq!(
         refused.unwrap_err().to_string(),
@@ -696,6 +769,8 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     admin.execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at SET DEFAULT CURRENT_TIMESTAMP").await?;
     let (restored_cutover, restored_store) =
         recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await?;
+    assert!(confirm_pre().await.is_err());
+    assert!(classify().await.is_err());
     assert_eq!(
         recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await?,
         (restored_cutover.clone(), restored_store.clone())
