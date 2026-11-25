@@ -71,15 +71,18 @@ class PredecessorBuildSourceTests(unittest.TestCase):
                 with source.extractfile("crates/bot/src/server.rs") as archived:
                     self.assertIn(b'build_revision: option_env!("BOT_BUILD_REVISION")', archived.read())
 
-    def test_refuses_changed_or_missing_archive_bytes(self):
+    def test_refuses_changed_or_missing_archive_inputs(self):
         tree = self.git("rev-parse", f"{BASE}^{{tree}}").decode().strip()
         original = self.git("show", f"{BASE}:Dockerfile")
-        for content, reason in ((original + b"\n", "archive bytes or file mode differ"),
-                                (original, "archive is missing files")):
-            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as scratch:
+        mismatch = "archive bytes or file mode differ"
+        for content, mode, reason in ((original + b"\n", 0o644, mismatch),
+                                      (original, 0o755, mismatch),
+                                      (original, 0o644, "archive is missing files")):
+            with self.subTest(mode=oct(mode), reason=reason), tempfile.TemporaryDirectory() as scratch:
                 archive = Path(scratch) / "source.tar"
                 with tarfile.open(archive, "w:") as output:
                     info = tarfile.TarInfo("Dockerfile")
+                    info.mode = mode
                     info.size = len(content)
                     output.addfile(info, BytesIO(content))
                 with self.assertRaisesRegex(ValueError, reason):
