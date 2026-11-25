@@ -60,7 +60,7 @@ JOB_INVENTORY = {
                   "nextest", "db-compatibility"},
     STAGING_SOAK: {"begin", "voice", "finish"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
-                              "promotion-skipped", "production", "release-plan", "release-prepare", "release-apply", "release-recover"},
+                              "promotion-skipped", "production", "release-plan", "release-prepare", "release-apply"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "help-embed-synthetic",
                            "user-flow-synthetic", "pinned-history-guard", "certify-promotion",
                            "staging-use-release"},
@@ -158,7 +158,6 @@ JOB_INVENTORY = {
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
 REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
                    ("deploy-production.yml", "soak"): "$/.github/workflows/staging-soak.yml",
-                   ("deploy-production.yml", "release-recover"): "./.github/workflows/deploy-production-recovery.yml",
                    (STAGING_SOAK, "voice"): "$/.github/workflows/voice-synthetic.yml",
                    ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
                    ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
@@ -765,8 +764,7 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
                 < steps.index(step) < steps.index(rollback)):
             errors.append(f"{name}: snapshot must precede deploy and both gates must precede rollback")
     if rollback.get("if") != ("failure() && env.MODE == 'deploy' && env.TAKEOVER == 'true' "
-                              "&& steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success' "
-                              "&& inputs.release_plan_run_id == ''"):
+                              "&& steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success'"):
         errors.append(f"{name}: auto_rollback must retain the failure/deploy/takeover/snapshot chain")
     restore = str(rollback.get("run") or "")
     for required in ("../tooling/scripts/worker_container_rollback.py rollback",
@@ -8986,7 +8984,6 @@ class WorkflowTests(unittest.TestCase):
                                           ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                                           ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                                           ("deploy-production.yml", "soak"): "$/.github/workflows/staging-soak.yml",
-                                          ("deploy-production.yml", "release-recover"): "./.github/workflows/deploy-production-recovery.yml",
                                           (STAGING_SOAK, "voice"): "$/.github/workflows/voice-synthetic.yml",
                                           ("voice-rest-measurement.yml", "voice-first"): "./.github/workflows/voice-synthetic.yml",
                                           ("voice-rest-measurement.yml", "voice-second"): "./.github/workflows/voice-synthetic.yml",
@@ -11381,7 +11378,7 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("deploy-production.yml", "production"):
                         # Reads immutable staging artifacts, then records this
                         # independent production Deployment event.
-                        expected = {"contents": "read", "actions": "read", "checks": "read", "deployments": "write"}
+                        expected = {"contents": "read", "actions": "read", "deployments": "write"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif name == "production-ownership-status.yml" or (name, job_id) == (
