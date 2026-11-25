@@ -85,72 +85,74 @@ export function bindStagingVoiceSession(inputs = {}) {
   const orderedChannels = [channelIds[0], channelIds[1]];
   const requestBody = JSON.stringify({ discord_id: discordId, channel_ids: orderedChannels });
   const request = session.request.bind(session);
-  async function read(status, signal, parse) {
-    let response;
-    let reader;
-    let onAbort;
-    const cancelBody = () => {
-      if (!response) return;
-      try {
-        void (reader ? reader.cancel() : response.body?.cancel())?.catch(() => {});
-      } catch {
-        // Cleanup failures must not escape the refusal or hold up the runner.
-      } finally {
-        response = undefined;
-      }
-    };
-    try {
-      signal.throwIfAborted();
-      const aborted = new Promise((_, reject) => {
-        onAbort = () => {
-          reject(unconfirmed());
-          cancelBody();
-        };
-        signal.addEventListener("abort", onAbort, { once: true });
-      });
-      const observe = async () => {
-        response = await request(RECEIPT_URL, {
-          method: "POST",
-          headers: { origin: STAGING_ORIGIN, accept: "application/json", "content-type": "application/json" },
-          body: requestBody,
-          redirect: "error",
-          cache: "no-store",
-          signal,
-        });
+  const companion = {
+    async read(status, signal, parse) {
+      let response;
+      let reader;
+      let onAbort;
+      const cancelBody = () => {
+        if (!response) return;
         try {
-          signal.throwIfAborted();
-          if (!acceptedResponse(response, status)) throw unconfirmed();
-          reader = response.body?.getReader();
-          if (!reader) throw unconfirmed();
-          const receipt = await readReceipt(reader, signal);
-          signal.throwIfAborted();
-          return parse(receipt);
+          void (reader ? reader.cancel() : response.body?.cancel())?.catch(() => {});
+        } catch {
+          // Cleanup failures must not escape the refusal or hold up the runner.
         } finally {
-          cancelBody();
-          reader?.releaseLock();
+          response = undefined;
         }
       };
-      return await Promise.race([aborted, observe()]);
-    } catch {
-      // Transport, parsing and cancellation errors can include private input.
-      throw unconfirmed();
-    } finally {
-      if (onAbort) signal.removeEventListener("abort", onAbort);
-    }
-  }
+      try {
+        signal.throwIfAborted();
+        const aborted = new Promise((_, reject) => {
+          onAbort = () => {
+            reject(unconfirmed());
+            cancelBody();
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+        });
+        const observe = async () => {
+          response = await request(RECEIPT_URL, {
+            method: "POST",
+            headers: { origin: STAGING_ORIGIN, accept: "application/json", "content-type": "application/json" },
+            body: requestBody,
+            redirect: "error",
+            cache: "no-store",
+            signal,
+          });
+          try {
+            signal.throwIfAborted();
+            if (!acceptedResponse(response, status)) throw unconfirmed();
+            reader = response.body?.getReader();
+            if (!reader) throw unconfirmed();
+            const receipt = await readReceipt(reader, signal);
+            signal.throwIfAborted();
+            return parse(receipt);
+          } finally {
+            cancelBody();
+            reader?.releaseLock();
+          }
+        };
+        return await Promise.race([aborted, observe()]);
+      } catch {
+        // Transport, parsing and cancellation errors can include private input.
+        throw unconfirmed();
+      } finally {
+        if (onAbort) signal.removeEventListener("abort", onAbort);
+      }
+    },
+  };
   return Object.freeze({
     environment: "staging",
     discordId,
     move: session.move.bind(session),
     async readCurrent({ signal } = {}) {
-      const observedAt = await read(200, signal, (receipt) => currentObservation(receipt, versionId, commit));
+      const observedAt = await companion.read(200, signal, (receipt) => currentObservation(receipt, versionId, commit));
       return {
         environment: "staging", authenticated: true, action: "voice.move_member",
         discordId, channelIds: [...orderedChannels], observedAt,
       };
     },
     async readDisabled({ signal } = {}) {
-      await read(404, signal, requireDisabledRefusal);
+      await companion.read(404, signal, requireDisabledRefusal);
     },
   });
 }
