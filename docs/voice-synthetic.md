@@ -209,6 +209,45 @@ instead of being renamed over. Restore runs whenever a rename was attempted
 and the live name differs from the original, so a rename Discord applied but
 whose response was lost is still restored.
 
+## Offline occupied and empty room naming receipt
+
+The ordinary synthetic reads a template name on the created room and verifies
+empty-room deletion. Its optional `rename` check acts on the creator. For name
+changes on the same temporary room, use the local readback mode of
+`staging_voice_smoke.py`. It takes observations from a disposable fixture and
+uses no credentials or network. The receipt reports the observed transitions
+in the input. Release qualification and the live synthetic use their existing
+checks.
+
+Save the fixture as `observations.json`. Record the distinct expected names
+from the fixture template, followed by three readback slots in order: occupied,
+empty before cleanup, and occupied again. Each slot binds the room's read-back
+name and observed human count to the same room ID and a strictly increasing
+Unix timestamp in milliseconds. Use `null` for a slot you could not observe.
+
+```json
+{
+  "occupied_name": "Fixture owner",
+  "empty_name": "Open seat",
+  "readbacks": [
+    {"room_id": "3000000000000000001", "observed_at_ms": 1000, "humans": 2, "name": "Fixture owner"},
+    {"room_id": "3000000000000000001", "observed_at_ms": 2000, "humans": 0, "name": "Open seat"},
+    {"room_id": "3000000000000000001", "observed_at_ms": 3000, "humans": 1, "name": "Fixture owner"}
+  ]
+}
+```
+
+```sh
+python3 scripts/staging_voice_smoke.py --naming-observations observations.json \
+  --evidence staging-voice-naming-evidence.json
+```
+
+`empty-room-rename` checks the first two slots. `occupied-room-return` checks
+the last two. Exit 0 requires both transitions to pass. A missing slot skips
+its transition and produces an `incomplete` receipt and exit 3 if there are no
+failures. An observed mismatch or invalid input fails with exit 1. The receipt
+uses fixed diagnostics and omits names, room IDs and the source observations.
+
 ## Owner-command checks (limit, privacy, name panel)
 
 While the test bot owns its room, the synthetic exercises the same Discord
