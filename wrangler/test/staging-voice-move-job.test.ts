@@ -62,7 +62,7 @@ function beginFixture(ready: ReturnType<typeof mockVoiceMoveWindow>["args"]["rea
 function jobInputs(t: TestContext) {
   const dir = mkdtempSync(join(tmpdir(), "staging-voice-move-job-"));
   t.after(() => rmSync(dir, { recursive: true }));
-  const { args, calls, signed, moves } = mockVoiceMoveWindow();
+  const { args, calls, signed, moves, restoreSource } = mockVoiceMoveWindow();
   const { ready, fixture, caller, evidence, now } = args;
   const env = { ...beginFixture(ready, dir), STAGING_VOICE_MOVE_PROOF: "true" };
   const expectedRevision = { version_id: "11111111-2222-3333-4444-555555555555", commit: "b".repeat(40) };
@@ -112,7 +112,7 @@ function jobInputs(t: TestContext) {
     }, args.control, now);
     assertOff(off);
   }
-  return { env, inputs, signed, moves, calls, reads, assertOff, finish };
+  return { env, inputs, signed, moves, calls, reads, restoreSource, assertOff, finish };
 }
 
 test("job defaults off before reading proof inputs", async (t) => {
@@ -243,13 +243,13 @@ test("selected synthetic entry finishes the exact lease after either proof outco
 });
 
 test("protected entry finishes a cancelled pending move and refuses the same attempt", { timeout: 5000 }, async (t) => {
-  const { env, inputs, signed, moves, calls, reads, assertOff, finish } = jobInputs(t);
+  const { env, inputs, signed, moves, calls, reads, restoreSource, assertOff, finish } = jobInputs(t);
   const { now, ...dependencies } = inputs;
   t.mock.method(Date, "now", now);
   const { webSession, observer, control } = dependencies;
   const { request, move } = webSession;
   const checkpoints: string[] = [];
-  const statuses: Awaited<ReturnType<typeof control>>[] = [];
+  const controlReadbacks: Awaited<ReturnType<typeof control>>[] = [];
   const admitted = Promise.withResolvers<Awaited<ReturnType<typeof move>>>();
   const lateReply = Promise.withResolvers<Awaited<ReturnType<typeof move>>>();
   const web = new AbortController();
@@ -258,16 +258,16 @@ test("protected entry finishes a cancelled pending move and refuses the same att
     assert.equal(this, webSession);
     return request.apply(this, args);
   };
-  webSession.move = async function (args) {
+  const moveCall = t.mock.method(webSession, "move", async function (this: typeof webSession, args: Parameters<typeof move>[0]) {
     assert.equal(this, webSession);
     const response = await move.call(this, args);
-    // The synthetic move took effect. Its valid result is still pending at the Web handoff.
+    // Model Web cancelling its own pending reply after the synthetic move took effect.
     const cancelled = new Promise<never>((_, reject) => {
       web.signal.addEventListener("abort", () => reject(web.signal.reason), { once: true });
     });
     admitted.resolve(response);
     return Promise.race([lateReply.promise, cancelled]);
-  };
+  });
   const provider = bindStagingVoiceMoveProvider({
     ...dependencies,
     observer: { ...observer, observe(check) {
@@ -283,7 +283,7 @@ test("protected entry finishes a cancelled pending move and refuses the same att
         });
       }
       const state = await control(args);
-      if (args.action === "status") statuses.push(state);
+      if (args.action === "assert" || args.action === "status") controlReadbacks.push(state);
       return state;
     },
   });
@@ -294,19 +294,30 @@ test("protected entry finishes a cancelled pending move and refuses the same att
       assert.fail(`Proof returned ${verdict} before move admission`);
     })]);
     const destination = inputs.fixture.channelIds[1];
+    const expectedMoves = [{ discordId: inputs.fixture.discordId, channelId: destination }];
+    const finishCalls = ["assert", "status", "release", "status"];
     assert.deepEqual(reads, ["session", "channels"]);
-    assert.deepEqual(moves, [{ discordId: inputs.fixture.discordId, channelId: destination }]);
+    assert.deepEqual(moves, expectedMoves);
     assert.deepEqual(calls, ["assert"]);
 
     web.abort();
     assert.equal(await proof, "failed");
     assert.deepEqual(checkpoints, ["before:moved"]);
-    assert.deepEqual(calls, ["assert", "status", "release", "status"]);
-    assertOff(statuses.at(-1)!);
+    assert.deepEqual(calls, finishCalls);
+    assertOff(controlReadbacks.at(-1)!);
 
     lateReply.resolve(response);
+    // Isolate the released-window guard from the first move's occupancy change.
+    restoreSource();
     assert.equal(await runStagingVoiceMoveEntry(env, provider), "failed");
+    assert.deepEqual(reads, ["session", "channels", "session", "channels"]);
+    assert.deepEqual(checkpoints, ["before:moved", "before:moved"]);
+    assert.deepEqual(calls, [...finishCalls, ...finishCalls]);
+    assert.equal(controlReadbacks.findLast(({ action }) => action === "assert")?.use.phase, "released");
+    assertOff(controlReadbacks.at(-1)!);
+    assert.equal(moveCall.mock.callCount(), 1);
     assert.deepEqual(signed.map(({ channel_id }) => channel_id), [destination]);
+    assert.deepEqual(moves, expectedMoves);
     await assert.rejects(pipelineUse({ action: "begin", voiceMove: true, minutes: 15,
       runId: env.GITHUB_RUN_ID, runAttempt: Number(env.GITHUB_RUN_ATTEMPT),
     }, control, now), { code: "staging_use_ended" });
