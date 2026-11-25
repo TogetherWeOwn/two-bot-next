@@ -1,4 +1,5 @@
 import ast
+from dataclasses import dataclass
 import hashlib
 import html
 import os
@@ -9,6 +10,7 @@ import sys
 
 SHA = re.compile(r"[0-9a-f]{40}")
 NUMBER = re.compile(r"[1-9][0-9]*")
+REPOSITORY = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+")
 RUN_LINK = re.compile(r"\bgithub\.com/[^/\s]+/[^/\s]+/actions/runs/", re.I)
 CUBIC_FOOTER = re.compile(
     r'\n<!-- This is an auto-generated description by cubic\. -->\n'
@@ -18,6 +20,26 @@ MAX_SOURCE = 2 * 1024 * 1024
 
 class EvidenceError(ValueError):
     """A refusal safe to expose in Actions."""
+
+
+@dataclass(frozen=True)
+class EvidenceVerdict:
+    """A passing validation for one PR snapshot, issued by a trusted verifier."""
+
+    repo: str
+    number: int
+    base: str
+    head: str
+    description_sha256: str
+
+    def matches_current(self, reader, number, repo, base, head):
+        """Compare a trusted verdict with a fresh read of the intended PR."""
+        try:
+            current, _ = current_snapshot(reader, number, repo, base, head)
+        except EvidenceError:
+            return False
+        return self == current
+
 
 def command(*args):
     return subprocess.check_output(args, stderr=subprocess.DEVNULL, timeout=30).decode()
@@ -165,6 +187,45 @@ def validate(policy, body, files, read):
             names = [name.rsplit(separator, 1)[-1] for name in names]
         if names.count(selector) != 1:
             raise EvidenceError(f"Attestation test entry {index} has no unique matching test on this head.")
+
+
+def current_snapshot(reader, number, repo, base, head):
+    if (type(number) is not int or number < 1
+            or not isinstance(repo, str) or not REPOSITORY.fullmatch(repo)
+            or not all(isinstance(sha, str) and SHA.fullmatch(sha) for sha in (base, head))):
+        raise EvidenceError("Invalid PR identity.")
+    try:
+        pr = reader.get(f"pulls/{number}")
+        identity = (pr["number"], pr["state"], pr["base"]["repo"]["full_name"],
+                    pr["base"]["sha"], pr["head"]["sha"])
+        body = pr["body"]
+    except Exception:
+        raise EvidenceError("Could not read current PR metadata.") from None
+    if type(pr["number"]) is not int or identity != (number, "open", repo, base, head):
+        raise EvidenceError("PR identity moved or does not match this run.")
+    if body is None:
+        body = ""
+    if not isinstance(body, str):
+        raise EvidenceError("Invalid PR description.")
+    try:
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    except UnicodeError:
+        raise EvidenceError("Invalid PR description.") from None
+    return EvidenceVerdict(repo, number, base, head, digest), body
+
+
+def evaluate_current(policy, reader, number, repo, base, head):
+    """Validate the current description and issue a verdict for the observed pair."""
+    verdict, body = current_snapshot(reader, number, repo, base, head)
+    try:
+        validate(policy, body, sources(base, head), lambda path: source_blob(head, path))
+    except EvidenceError:
+        raise
+    except Exception:
+        raise EvidenceError("Could not validate the PR evidence or attested source.") from None
+    if not verdict.matches_current(reader, number, repo, base, head):
+        raise EvidenceError("Could not confirm the PR evidence is still current.")
+    return verdict
 
 
 def check(policy, reader, number, repo, base, head):
