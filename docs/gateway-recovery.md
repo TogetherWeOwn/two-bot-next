@@ -165,9 +165,12 @@ from other reasons for IDENTIFY. Keep that observation unverified unless
 explicit passive evidence is available and cite #2075 for the hosted checkpoint
 coverage.
 
-Mixed builds, a foreign or unstamped build, a stale window or event, and a
-possibly truncated page return nonzero without signal counts. This optional
-summary has no release-gate wiring.
+Mixed builds, a foreign build, an unstamped signal event, and a stale window
+or event return nonzero without signal counts. Filtered and possibly truncated
+pages are also refused. Use shorter subwindows within the verified serving
+interval when the readback fills a page. `no_build_events` means the packet
+contains no stamped record for the verified build. This optional summary has
+no release-gate wiring.
 
 ## Verification (test containers only)
 

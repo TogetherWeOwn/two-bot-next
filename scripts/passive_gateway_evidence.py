@@ -40,6 +40,10 @@ def summarize(packet, *, service, sha, start, end):
         return {"verdict": "invalid_packet"}
     if packet.get("service") != service:
         return {"verdict": "service_mismatch"}
+    if packet.get("contains") is True:
+        return {"verdict": "filtered_window"}
+    if packet.get("contains") is not False:
+        return {"verdict": "invalid_packet"}
     window, events, limit = (packet.get(key) for key in ("window", "events", "limit"))
     count, truncated = packet.get("event_count"), packet.get("possibly_truncated")
     if (not isinstance(window, dict) or not isinstance(events, list)
@@ -75,6 +79,8 @@ def summarize(packet, *, service, sha, start, end):
                 return {"verdict": "invalid_packet"}
             name = "resume_planned" if resume else "identify_planned"
         signals[name] += 1
+    if not builds:
+        return {"verdict": "no_build_events"}
     verdict = "observed" if any(signals.values()) else "not_observed"
     return {"verdict": verdict, "build_sha": sha, "signals": signals}
 

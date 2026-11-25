@@ -214,10 +214,10 @@ class PassiveGatewayEvidenceTests(unittest.TestCase):
         return hostile_event("[redacted]", msg=msg, target=target,
                              **{"build_sha": self.SHA, **fields})
 
-    def packet(self, *events):
+    def packet(self, *events, **overrides):
         answer = fixture_response()
         answer["result"]["events"]["events"] = list(events)
-        return read_with(FakeTransport(answer))
+        return read_with(FakeTransport(answer), **overrides)
 
     def summarize(self, packet):
         out = io.StringIO()
@@ -254,16 +254,26 @@ class PassiveGatewayEvidenceTests(unittest.TestCase):
         }))
 
     def test_quiet_window_does_not_infer_unseen_paths(self):
-        for packet in (self.packet(), self.packet(self.event("ready", "other::target"))):
-            with self.subTest(event_count=packet["event_count"]):
-                code, result = self.summarize(packet)
-                self.assertEqual((code, result["verdict"]), (0, "not_observed"))
-                self.assertEqual(set(result["signals"].values()), {0})
+        packet = self.packet(self.event("ready", "other::target"))
+        code, result = self.summarize(packet)
+        self.assertEqual((code, result["verdict"]), (0, "not_observed"))
+        self.assertEqual(set(result["signals"].values()), {0})
         packet = self.packet(self.event("ready", "two_bot::gateway"))
         _, result = self.summarize(packet)
         self.assertEqual(result["signals"], {"ready": 1, "gateway_resumed": 0, "shard_closed": 0,
                                             "gateway_reconnect_failed": 0, "identify_planned": 0,
                                             "resume_planned": 0})
+
+    def test_empty_or_filtered_window_cannot_claim_build_coverage(self):
+        unstamped = self.event("http_listening", "two_bot", build_sha="[redacted]")
+        for packet in (self.packet(), self.packet(unstamped)):
+            self.assertEqual(self.summarize(packet), (1, {"verdict": "no_build_events"}))
+        ready = self.event("ready", "two_bot::gateway")
+        filtered = self.packet(ready, contains="[redacted]")
+        self.assertIs(filtered["contains"], True)
+        self.assertEqual(self.summarize(filtered), (1, {"verdict": "filtered_window"}))
+        del filtered["contains"]
+        self.assertEqual(self.summarize(filtered), (1, {"verdict": "invalid_packet"}))
 
     def test_mixed_and_wrong_builds_refuse_partial_credit(self):
         ready = self.event("ready", "two_bot::gateway")
