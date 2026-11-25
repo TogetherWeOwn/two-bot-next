@@ -115,10 +115,11 @@ offline configuration and validates cleanup evidence.
 1. Pin the protected [build-predecessor](../.github/workflows/build-predecessor.yml)
    workflow SHA, first-attempt run ID, artifact ID and ZIP SHA-256. Use the
    verified `build.json`, Worker modules and `image.oci.tar` from that same
-   private artifact. Bind the authenticated first-attempt reservation to one
-   disposable scope (for example `pre-fixture-test`), rehearsal run ID, original
-   start time, and PRE shape (`0473/0465` or retained `0475/0465`). Pin the
-   approved synthetic database and gateway fixture to that reservation.
+   Actions artifact. Keep the verified local copy private and unchanged.
+   Bind the authenticated first-attempt reservation to one disposable scope
+   (for example `pre-fixture-test`), rehearsal run ID, original start time, and
+   PRE shape (`0473/0465` or retained `0475/0465`). Pin the approved synthetic
+   database and gateway fixture to that reservation.
 2. Admit one rehearsal at a time on its own Worker, Container app and synthetic
    database. Keep ingress private from first create, with no shared staging app,
    production routes, public preview, or access to shared writers. Arm the

@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from pre_target import ADMISSION_SECONDS
+
 ROOT = Path(__file__).resolve().parents[1]
 CUTOVER_DOCS = sorted((ROOT / "docs").glob("cutover*.md"))
 AUTOMOD_DOCS = [ROOT / "docs" / "automod-runtime.md"]
@@ -133,6 +135,17 @@ class CutoverDocLinks(unittest.TestCase):
         for doc in CUTOVER_DOCS:
             problems += _problems(doc, doc.read_text(encoding="utf-8"))
         self.assertEqual(problems, [])
+
+    def test_disposable_pre_rehearsal_links_and_cutoff_match_source(self):
+        doc = ROOT / "docs" / "staging-rollout-gate.md"
+        _, heading, rest = doc.read_text(encoding="utf-8").partition(
+            "#### Disposable exact PRE rehearsal\n"
+        )
+        self.assertTrue(heading)
+        section = rest.split("\n### ", 1)[0]
+        self.assertIn("../scripts/pre_target.py", LINK.findall(section))
+        self.assertIn(f"expires {ADMISSION_SECONDS / 60:g} minutes", section)
+        self.assertEqual(_problems(doc, section), [])
 
     def test_automod_runtime_doc_is_found(self):
         self.assertIn(ROOT / "docs" / "automod-runtime.md", AUTOMOD_DOCS)
