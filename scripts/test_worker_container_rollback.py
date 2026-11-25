@@ -1158,9 +1158,9 @@ class MainProvenanceTests(unittest.TestCase):
         state = {"has_previous": True, "worker": WORKER, "application": APPLICATION,
                  "application_id": APP_ID, "namespace_id": NAMESPACE,
                  "serving_version": GOOD_VERSION, "serving_sha": SHA,
-                 "provenance_complete": True, "serving_rollout_id": "r-prev",
-                 "serving_image": good_image(), "recorded_at": 1.0}
+                 "serving_rollout_id": "r-prev", "serving_image": good_image(), "recorded_at": 1.0}
         state.update(overrides)
+        state.setdefault("provenance_complete", state["serving_sha"] is not None)
         path = Path(tmp) / "snapshot.json"
         path.write_text(json.dumps(state))
         return path
