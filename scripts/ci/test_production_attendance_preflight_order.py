@@ -22,6 +22,7 @@ import production_release_preflight as preflight
 from production_migrate_approval import stable_plan
 from production_release_ledgers import CUTOVER, STORE
 from staging_migrate_reviewed import APP_ID
+from staging_rollout import GateError
 
 
 REPO = {"full_name": "TogetherWeOwn/two-bot-next", "id": 1396224242}
@@ -93,8 +94,6 @@ class SyntheticSource:
             return self.archive
         if binary:
             raise AssertionError(f"unexpected binary fixture API route {path}")
-        if path == HISTORY:
-            self.events.append("approval history")
         if path == check_path:
             self.events.append("bound approval")
         return deepcopy({
@@ -171,6 +170,7 @@ class AttendancePreflightOrderTests(unittest.TestCase):
         self.fresh = deepcopy(self.plan)
         self.fresh["role_verified_connections"] = 2
         self.events = []
+        self.refusals = []
         self.provider = ProviderEffects(self.pin, self.events)
         self.temp = Path(self.enterContext(TemporaryDirectory()))
         self.directory = self.temp / "production-release"
@@ -197,16 +197,26 @@ class AttendancePreflightOrderTests(unittest.TestCase):
         }
         effect = self.provider.effect
         validate = release.validate_attendance_plan
+        require_unused = release.require_unused_attendance_plan
+
+        def record_gate(label, gate, *args):
+            try:
+                result = gate(*args)
+            except GateError as error:
+                self.refusals.append((label, str(error)))
+                raise
+            self.events.append(label)
+            return result
 
         def record_validation(plan):
             label = {1: "producer plan", 2: "fresh plan"}[plan["role_verified_connections"]]
-            self.events.append(label)
-            return validate(plan)
+            return record_gate(label, validate, plan)
 
         with (
             patch.object(release, "release_context", partial(release.release_context, api=source.api)),
             patch.object(release, "github", source.api),
             patch.object(release, "validate_attendance_plan", record_validation),
+            patch.object(release, "require_unused_attendance_plan", partial(record_gate, "approval history", require_unused)),
             patch.object(preflight, "datetime", wraps=datetime) as clock,
             patch.multiple(release, RollbackClient=effect("provider client"),
                            validate_receipt_against_live=effect("provenance"),
@@ -216,6 +226,7 @@ class AttendancePreflightOrderTests(unittest.TestCase):
                            apply_under_prepared_fence=effect("apply", forbidden=True)),
             patch("subprocess.Popen", side_effect=effect("process", forbidden=True)),
             patch("socket.socket", side_effect=effect("socket", forbidden=True)),
+            patch("socket.getaddrinfo", side_effect=effect("DNS", forbidden=True)),
             redirect_stderr(StringIO()),
         ):
             clock.now.return_value = NOW
@@ -223,10 +234,11 @@ class AttendancePreflightOrderTests(unittest.TestCase):
         self.assertEqual(fresh_path.read_text(encoding="utf-8"), original)
         return status
 
-    def assert_refused_without_effects(self, source):
+    def assert_refused_without_effects(self, source, gate, code):
         status = self.prepare(source)
         self.assertEqual(self.provider.calls, [])
         self.assertEqual(status, 1)
+        self.assertEqual(self.refusals, [(gate, code)])
         self.assertFalse(self.output.exists())
         self.assertEqual([path.name for path in self.directory.iterdir()], ["fresh-plan.json"])
 
@@ -234,27 +246,26 @@ class AttendancePreflightOrderTests(unittest.TestCase):
         # Projection equality alone cannot distinguish False from zero.
         self.plan["applied_count"] = False
         self.assertEqual(stable_plan(self.plan), stable_plan(self.fresh))
-        self.assert_refused_without_effects(SyntheticSource(self.pin, self.plan, self.events))
-        self.assertIn("producer plan", self.events)
+        self.assert_refused_without_effects(SyntheticSource(self.pin, self.plan, self.events),
+                                            "producer plan", "production_attendance_plan_invalid")
 
     def test_bad_fresh_plan_refuses_before_provider_access(self):
         self.fresh["applied_store_count"] = False
         self.assertEqual(stable_plan(self.plan), stable_plan(self.fresh))
-        self.assert_refused_without_effects(SyntheticSource(self.pin, self.plan, self.events))
-        self.assertIn("fresh plan", self.events)
+        self.assert_refused_without_effects(SyntheticSource(self.pin, self.plan, self.events),
+                                            "fresh plan", "production_attendance_plan_invalid")
 
     def test_reused_approval_refuses_before_provider_access(self):
         source = SyntheticSource(self.pin, self.plan, self.events)
         prior = run_record(204, self.pin.workflow_sha, "2026-10-01T00:07:00Z", status="completed", conclusion="failure")
         source.history = {"total_count": 2, "workflow_runs": [source.current, prior]}
-        self.assert_refused_without_effects(source)
-        self.assertIn("approval history", self.events)
+        self.assert_refused_without_effects(source, "approval history",
+                                            "production_attendance_plan_superseded_by_release_attempt")
 
     def test_ambiguous_approval_refuses_before_provider_access(self):
         source = SyntheticSource(self.pin, self.plan, self.events)
         source.history["total_count"] = 2
-        self.assert_refused_without_effects(source)
-        self.assertIn("approval history", self.events)
+        self.assert_refused_without_effects(source, "approval history", "production_attendance_history_incomplete")
 
     def test_valid_prepare_checks_approval_before_reading_the_retained_pair(self):
         source = SyntheticSource(self.pin, self.plan, self.events)
