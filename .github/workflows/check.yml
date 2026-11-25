@@ -3211,8 +3211,6 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_dry_run_acceptance.py' -v
       - name: Offline JSON-log smoke parser regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-logging-container.py --self-test
-      - name: Rehearse a finite synthetic predecessor writer (no network)
-        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_predecessor_execution_boundary.py -v
       # A skipped build still reports success: the offline tests above ran,
       # and container smoke is not a required check, so the check stays
       # green without hiding anything the branch protection demands.
@@ -3273,6 +3271,9 @@ jobs:
           if docker image inspect "$IMAGE" > /dev/null 2>&1; then
             docker image rm "$IMAGE"
           fi
+      - name: Rehearse a finite synthetic predecessor writer (no network)
+        if: ${{ !cancelled() }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_predecessor_execution_boundary.py -v
 
   community-db:
     name: community db
