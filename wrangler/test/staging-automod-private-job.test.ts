@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { runStagingAutomodPrivateJob } from "../scripts/staging-automod-private-job.ts";
+import { runStagingAutomodBoundJob, runStagingAutomodPrivateJob } from "../scripts/staging-automod-private-job.ts";
 import { invokeProtectedAutomodJob } from "../src/staging-automod-entry.ts";
 import { STAGING_AUTOMOD_TARGET as target } from "../src/staging-automod-recovery.ts";
 import { AUTOMOD_STAGING_PURPOSE } from "../src/staging-lifecycle.ts";
@@ -12,26 +12,70 @@ type Receipt = Awaited<ReturnType<typeof invokeProtectedAutomodJob>>;
 const issuedLease = { ...lease, purpose: AUTOMOD_STAGING_PURPOSE, runAttempt: 1 } as const;
 const { runId, runAttempt, sha } = issuedLease;
 const job = { runId, runAttempt, sha };
+const context = { ...job, environment: "staging", target, deploymentId: issuedLease.deploymentId };
 const approvals = {
   start: { action: "start", target, issuedLease },
   recover: { action: "recover", target, issuedLease },
 } as const;
 const passed = { verdict: "passed", start: true, recover: true };
+const controlBearer = "synthetic-automod-private-job-token";
+const env = { TWO_DEPLOY_ENV: "staging", STAGING_RUNTIME_POLICY: "bounded",
+  DISCORD_APPLICATION_ID: target.applicationId, GUILD_ID: target.guildId,
+  OWNERSHIP_CONTROL_TOKEN: controlBearer, CF_VERSION_METADATA: { id: lease.deploymentId }, CONTAINER_RELEASE: sha };
 
 function syntheticTransport(invoke: Invoke,
   reply: (receipt: Receipt) => Response = receipt => Response.json(receipt),
 ): Transport {
-  const token = "synthetic-automod-private-job-token";
-  const env = { TWO_DEPLOY_ENV: "staging", STAGING_RUNTIME_POLICY: "bounded",
-    DISCORD_APPLICATION_ID: target.applicationId, GUILD_ID: target.guildId,
-    OWNERSHIP_CONTROL_TOKEN: token, CF_VERSION_METADATA: { id: lease.deploymentId }, CONTAINER_RELEASE: sha };
   return async (call, approval, signal) => {
     const request = new Request("https://worker.invalid", {
-      method: "POST", headers: { authorization: `Bearer ${token}` }, body: JSON.stringify(call), signal,
+      method: "POST", headers: { authorization: `Bearer ${controlBearer}` }, body: JSON.stringify(call), signal,
     });
     return reply(await invokeProtectedAutomodJob(request, env, approval, invoke));
   };
 }
+
+test("bound job uses the private Worker entry and confirms both scoped receipts", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: now() });
+  const invoke = t.mock.fn<Invoke>(async () => {});
+  const worker = { env, controlBearer, invoke };
+
+  assert.deepEqual(await runStagingAutomodBoundJob(context, issuedLease, approvals, worker), passed);
+  assert.deepEqual(invoke.mock.calls.map(call => call.arguments[0]),
+    [{ action: "start", issuedLease }, { action: "recover", issuedLease }]);
+
+  invoke.mock.resetCalls();
+  for (const unboundWorker of [{ ...worker, controlBearer: "wrong-synthetic-ownership-control-token" },
+    { ...worker, env: { ...env, CF_VERSION_METADATA: { id: "other" } } },
+    { ...worker, env: { ...env, CONTAINER_RELEASE: "b".repeat(40) } }]) {
+    assert.deepEqual(await runStagingAutomodBoundJob(context, issuedLease, approvals, unboundWorker),
+      { verdict: "failed", start: false, recover: false });
+  }
+  assert.equal(invoke.mock.callCount(), 0);
+});
+
+test("bound job refuses mismatched context before entering the private transport", async t => {
+  const workerEnv = t.mock.fn(() => env);
+  const invoke = t.mock.fn<Invoke>(async () => {});
+  const worker = { get env() { return workerEnv(); }, controlBearer, invoke };
+  const mismatches = [undefined, { ...context, environment: "production" }, { ...context, runId: "98765" },
+    { ...context, runAttempt: 2 }, { ...context, deploymentId: "other" }, { ...context, sha: "b".repeat(40) },
+    { ...context, target: { ...target, applicationId: "other" } },
+    { ...context, target: { ...target, guildId: "other" } }];
+
+  for (const wrong of mismatches) {
+    assert.deepEqual(await runStagingAutomodBoundJob(wrong, issuedLease, approvals, worker),
+      { verdict: "failed", code: "lease_unconfirmed" });
+  }
+  assert.deepEqual(await runStagingAutomodBoundJob(context, undefined, approvals, worker),
+    { verdict: "failed", code: "lease_unconfirmed" });
+  assert.deepEqual(await runStagingAutomodBoundJob(context, issuedLease, undefined, worker),
+    { verdict: "failed", start: false, recover: false });
+  assert.deepEqual(await runStagingAutomodBoundJob(context, issuedLease,
+    { start: approvals.recover, recover: approvals.start }, worker),
+    { verdict: "failed", start: false, recover: false });
+  assert.equal(workerEnv.mock.callCount(), 0);
+  assert.equal(invoke.mock.callCount(), 0);
+});
 
 test("private job forwards the issued scope and each independent approval", async t => {
   t.mock.timers.enable({ apis: ["Date"], now: now() });
@@ -51,17 +95,20 @@ test("private job forwards the issued scope and each independent approval", asyn
   assert.equal(transport.mock.calls[1]?.arguments[1], approvals.recover);
 });
 
-test("private job cannot pass with missing or mismatched approval", async t => {
+test("private job refuses missing or mismatched approval before transport", async t => {
   t.mock.timers.enable({ apis: ["Date"], now: now() });
   for (const action of ["start", "recover"] as const) {
     const other = action === "start" ? "recover" : "start";
     const approval = approvals[action];
     for (const wrong of [approvals[other], { ...approval, target: { ...target, guildId: "other" } },
       ...[{ runId: "98765" }, { runAttempt: 2 }, { deploymentId: "other" }, { sha: "b".repeat(40) },
-        { epoch: lease.epoch + 1 }].map(scope => ({ ...approval, issuedLease: { ...issuedLease, ...scope } }))]) {
+        { epoch: lease.epoch + 1 }, { acquiredAt: lease.acquiredAt + 1 }, { expiresAt: lease.expiresAt + 1 },
+      ].map(scope => ({ ...approval, issuedLease: { ...issuedLease, ...scope } }))]) {
       const invoke = t.mock.fn<Invoke>(async () => {});
+      const transport = t.mock.fn(syntheticTransport(invoke));
       assert.deepEqual(await runStagingAutomodPrivateJob(job, issuedLease,
-        { ...approvals, [action]: wrong }, syntheticTransport(invoke)), { ...passed, verdict: "failed", [action]: false });
+        { ...approvals, [action]: wrong }, transport), { ...passed, verdict: "failed", [action]: false });
+      assert.deepEqual(transport.mock.calls.map(call => call.arguments[0]), [{ action: other, issuedLease }]);
       assert.deepEqual(invoke.mock.calls.map(call => call.arguments[0]), [{ action: other, issuedLease }]);
     }
 
@@ -72,7 +119,7 @@ test("private job cannot pass with missing or mismatched approval", async t => {
   }
 });
 
-test("private job recovers the original lease after failed startup and expiry", async t => {
+test("bound job confirms recovery on the original lease after a failed startup receipt", async t => {
   t.mock.timers.enable({ apis: ["Date"], now: now() });
   const invoke = t.mock.fn<Invoke>(async call => {
     if (call.action === "start") {
@@ -80,10 +127,33 @@ test("private job recovers the original lease after failed startup and expiry", 
       throw new Error("synthetic startup failure after taking effect");
     }
   });
-  assert.deepEqual(await runStagingAutomodPrivateJob(job, issuedLease, approvals, syntheticTransport(invoke)),
+  assert.deepEqual(await runStagingAutomodBoundJob(context, issuedLease, approvals, { env, controlBearer, invoke }),
     { verdict: "failed", start: false, recover: true });
   assert.deepEqual(invoke.mock.calls.map(call => call.arguments[0]),
     [{ action: "start", issuedLease }, { action: "recover", issuedLease }]);
+});
+
+test("bound job requests original-lease recovery while Worker startup is pending", async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: now() });
+  const entered = Promise.withResolvers<boolean>();
+  const startup = Promise.withResolvers<void>();
+  const invoke = t.mock.fn<Invoke>(async call => {
+    if (call.action === "start") {
+      entered.resolve(true);
+      await startup.promise;
+    }
+  });
+
+  const run = runStagingAutomodBoundJob(context, issuedLease, approvals, { env, controlBearer, invoke });
+  try {
+    assert.equal(await Promise.race([entered.promise, run.then(() => false)]), true);
+    t.mock.timers.tick(15_000);
+    assert.deepEqual(await run, { verdict: "failed", start: false, recover: true });
+    assert.deepEqual(invoke.mock.calls.map(call => call.arguments[0]),
+      [{ action: "start", issuedLease }, { action: "recover", issuedLease }]);
+  } finally {
+    startup.resolve();
+  }
 });
 
 test("startup timeout aborts the private transport and still reaches original-lease recovery", async t => {

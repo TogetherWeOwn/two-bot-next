@@ -754,13 +754,11 @@ metadata before passing the body and independent approval to the job adapter.
 Any refusal before admission returns the same unscoped failure receipt and
 leaves the private caller untouched.
 
-Only synthetic tests invoke the entry today. Live integration must supply
-approval from authenticated protected GitHub `staging` job context, independent
-of the request body. Bind the approved action to the job run and attempt and
-supply the fixed staging target and original issued lease from protected
-authority. Resolve the private Container invocation for that deployment only
-after admission. The receipt supports job evidence, while the protected context
-and Worker checks supply authority.
+Only synthetic tests invoke the entry today. Live integration must supply an
+already authenticated protected GitHub `staging` job context and resolve the
+private Container invocation for the pinned deployment only after admission.
+The receipt supports job evidence. The protected context and Worker checks
+supply authority.
 
 Live qualification also needs native expiry and restart recovery, an isolated
 runtime adapter and authoritative remote drain and stopped readbacks. A lost
@@ -782,15 +780,17 @@ fails or its reply is lost. Both actions must return a bounded v1 receipt
 confirming the exact scope. The job preserves a startup failure even if
 recovery passes.
 
-The offline job adapter passes each scoped call and its separately supplied
-approval to an injected private transport. The runner still checks both
-receipts and uses the original lease for recovery. Live use needs an
-authenticated binding from the protected job to the private Worker entry and
-a trusted source of the issued lease and separate start and recovery approvals.
-That binding must deliver the approval independently of the request body and
-return the Worker entry's receipt for the runner to validate. The reusable
-workflow holds the `staging-lifecycle` queue across both actions. A future
-caller must leave that queue to the reusable workflow. Worker cleanup owns
+The dormant `runStagingAutomodBoundJob` accepts the protected run, attempt,
+staging target, build and deployment, plus the original issued AutoMod lease
+and separate start and recovery approvals. The job adapter refuses out-of-scope
+actions before transport. The binding sends the existing ownership control
+bearer in the in-process request header and supplies approval separately from
+the serialized action and lease. The runner checks the private Worker entry's
+v1 receipts for both actions and uses the original lease for recovery.
+Live use still needs the protected context and authority provider and the
+deployment-bound private Container invoker. The reusable workflow holds the
+`staging-lifecycle` queue across both actions. A future caller must leave that
+queue to the reusable workflow. Worker cleanup owns
 durable retirement and retry for an interrupted runner or unconfirmed recovery.
 
 The dormant `readStagingAutomodJobInputs` adapter takes authenticated staging
