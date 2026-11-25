@@ -194,14 +194,17 @@ checks the fixture before the acceptance runner can dispatch a move. Its
   `connectedChannelId`, `canConnect` and `observedAt`. The member starts in the
   source. Effective Connect is denied there and allowed in the destination.
 - `evidence.previousReady` and `evidence.previousOff` are the ready and final
-  status receipts from an earlier protected lease verification on the same
-  SHA, deployment and epoch. That exact earlier lease must be released or
-  expired, OFF and stopped within 15 minutes before the current acquisition.
+  status receipts from `verify_lease` on the same SHA, deployment and epoch.
+  The workflow uploads them after cleanup. Use those receipts for the prior
+  lease and get `ready` from the separate active window that owns the moves.
+  The earlier lease must be released or expired, OFF and stopped within 15
+  minutes before the current acquisition.
 
 Use UTC ISO timestamps with milliseconds for `observedAt`. Current ready,
 session and Discord readbacks must be at most 60 seconds old and belong to
-the current lease window. Keep fixture IDs and readbacks in the protected
-operator context. Supply only projected facts. The preflight checks the
+the current lease window. Start the runner promptly after ready and feed it
+projections directly from the protected Web, Discord and staging readers.
+Keep fixture IDs and readbacks in the protected context. The preflight checks the
 consistency of trusted readbacks offline and returns a verdict with a fixed
 failure code on refusal. The protected Web caller verifies the signed session
 at dispatch. The runner rechecks lease and Discord observations for each case

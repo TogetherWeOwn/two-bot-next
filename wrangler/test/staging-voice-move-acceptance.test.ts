@@ -133,22 +133,23 @@ test("voice fixture recognizes the occupied source before the Connect denial", a
 });
 
 test("voice acceptance refuses mismatched fixture, caller or ready proof before dispatch", async () => {
-  const changes = [
-    (args) => ({ fixture: { ...args.fixture, channelIds: ["300", "300"] } }),
-    (args) => ({ fixture: { ...args.fixture, channelIds: ["300", "400", "500"] } }),
-    (args) => ({ fixture: { ...args.fixture, channelIds: ["300", "18446744073709551616"] } }),
-    (args) => ({ fixture: { ...args.fixture, environment: "production" } }),
-    (args) => ({ caller: { ...args.caller, environment: "production" } }),
-    (args) => ({ caller: { ...args.caller, discordId: undefined } }),
-    (args) => ({ caller: { ...args.caller, discordId: "999" } }),
-    (args) => ({ ready: { ...args.ready, voiceMoveEnabled: undefined } }),
-    (args) => ({ ready: { ...args.ready, use: { ...args.ready.use, runAttempt: 2 } } }),
+  const cases = [
+    [(args) => ({ fixture: { ...args.fixture, channelIds: Array(2).fill(args.fixture.channelIds[0]) } }), "fixture_invalid"],
+    [(args) => ({ fixture: { ...args.fixture, channelIds: [...args.fixture.channelIds, "100000000000000099"] } }), "fixture_invalid"],
+    [(args) => ({ fixture: { ...args.fixture, channelIds: [args.fixture.channelIds[0], "18446744073709551616"] } }), "fixture_invalid"],
+    [(args) => ({ fixture: { ...args.fixture, channelIds: [args.fixture.channelIds[0], "300"] } }), "fixture_invalid"],
+    [(args) => ({ fixture: { ...args.fixture, environment: "production" } }), "fixture_invalid"],
+    [(args) => ({ caller: { ...args.caller, environment: "production" } }), "caller_unconfirmed"],
+    [(args) => ({ caller: { ...args.caller, discordId: undefined } }), "caller_unconfirmed"],
+    [(args) => ({ caller: { ...args.caller, discordId: "100000000000000099" } }), "caller_unconfirmed"],
+    [(args) => ({ ready: { ...args.ready, voiceMoveEnabled: undefined } }), "lease_unconfirmed"],
+    [(args) => ({ ready: { ...args.ready, use: { ...args.ready.use, runAttempt: 2 } } }), "lease_unconfirmed"],
   ];
-  for (const change of changes) {
+  for (const [change, code] of cases) {
     const { args, calls, signed } = mockVoiceMoveWindow();
     const receipt = await runVoiceMoveAcceptance({ ...args, ...change(args) });
     assert.equal(receipt.verdict, "failed");
-    assert.ok(receipt.code);
+    assert.equal(receipt.code, code);
     assert.deepEqual(signed, []);
     assert.deepEqual(calls, ["status", "release", "status"]);
     assert.deepEqual(receipt.cleanup, { memberDisconnected: null, off: true, stopped: true });
