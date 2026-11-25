@@ -13,6 +13,10 @@ const input = {
   lease, origin: "https://two-bot-next-staging.example.workers.dev", purposes: ["automod-preview"],
   verifiedRecoveryPair: true, verifiedRuntimeDatabase: true, verifiedGatewayIntents: true, cleanupReserveMs: 5_000,
 };
+const dryRunPolicy = {
+  memberIntake: false, enforcement: false, resume: false, registrySync: false, interactionDispatch: false,
+  dedicatedIntents: true,
+};
 
 test("AutoMod recovery holds after a lost stop acknowledgement and rechecks absence after restart", async () => {
   const storage = new Storage();
@@ -32,7 +36,18 @@ test("AutoMod recovery holds after a lost stop acknowledgement and rechecks abse
       assert.equal(url, guild);
       return rows();
     },
-    observe: async () => ({ lease, purpose: "automod-preview", active: true, running, cleanupBefore }),
+    observe: async () => ({ lease, purpose: "automod-preview", active: true, running, cleanupBefore, policy: dryRunPolicy }),
+    dryRun: {
+      policy: dryRunPolicy,
+      start: async (bound, policy, before) => {
+        assert.deepEqual(bound, lease);
+        assert.deepEqual(policy, dryRunPolicy);
+        assert.equal(before, lease.expiresAt - input.cleanupReserveMs);
+        assert.deepEqual(storage.value, { ...ready, phase: "starting" });
+        calls.push("start");
+        running = true;
+      },
+    },
     fenceAndDrain: async (bound, before) => {
       assert.deepEqual(bound, lease);
       assert.equal(before, cleanupBefore);
@@ -85,7 +100,8 @@ test("AutoMod recovery holds after a lost stop acknowledgement and rechecks abse
     },
   });
 
-  const { intent, id, version } = await start(true).publish(input);
+  const active = start(true);
+  const { intent, id, version } = await active.publish(input);
   assert.deepEqual({ id, version }, { id: preview.id, version: preview.version });
   assert.deepEqual(calls.splice(0), ["bot", "list", "list", "create", "list", "detail"]);
   const ready = { intent, created: { id, version }, phase: "ready" };
@@ -98,8 +114,8 @@ test("AutoMod recovery holds after a lost stop acknowledgement and rechecks abse
     assert.deepEqual(calls, []);
   };
 
-  // The isolated dry run is already running when recovery begins.
-  running = true;
+  await active.startDryRun(lease);
+  assert.deepEqual(calls.splice(0), ["start"]);
   await assert.rejects(start().recover(lease), /staging_automod_cleanup_unverified/);
   assert.equal(running, false);
   assert.deepEqual(command, preview);
