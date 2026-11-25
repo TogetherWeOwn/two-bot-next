@@ -564,7 +564,7 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
     ...window, deploymentId: ID, sha: stageEnv.CONTAINER_RELEASE, epoch: ACTIVE_OWNER.epoch,
     acquiredAt: Date.now(), phase: "active",
   };
-  const issued = { ...ordinary, purpose: AUTOMOD_STAGING_PURPOSE };
+  const issued: Readonly<StagingUse> = { ...ordinary, purpose: AUTOMOD_STAGING_PURPOSE };
   const values = new Map<string, unknown>([[OWNER_KEY, ACTIVE_OWNER], [STAGING_USE_KEY, issued]]);
   const h = await harness(t, stageEnv, values);
   const storage = h.ctx.storage as unknown as DurableObjectStorage;
@@ -626,12 +626,49 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
       return commandPresent ? Response.json(preview) : Response.json({ code: 10063 }, { status: 404 });
     },
   };
+  const pin = { workerDeploymentId: "fixture-worker-deployment", workerVersionId: ID, sourceSha: issued.sha,
+    applicationId: "fixture-container-app", namespaceId: "fixture-namespace", rolloutId: "fixture-rollout",
+    imageDigest: `sha256:${"b".repeat(64)}` };
+  let observed: typeof pin | undefined = pin;
+  const readServing = t.mock.fn(async () => observed);
   const run = (action: "start" | "recover", issuedLease = issued, enabled = true) => {
     // A loosely typed adapter may carry extra properties. Only the Worker clock is authoritative.
     const adapter = { ...effects, enabled, now: () => 0 };
-    return TwoBotContainer.runProtectedAutomod(h.bot, { action, issuedLease }, adapter);
+    const invoke = TwoBotContainer.bindProtectedAutomodInvoker(h.bot, readServing, adapter);
+    return invoke(pin, { action, issuedLease }, new AbortController().signal);
   };
   const refused = /staging_(automod_|use_conflict)/;
+  await assert.rejects(run("start", { ...issued, deploymentId: "other-worker" }), refused);
+  await assert.rejects(run("start", { ...issued, sha: "c".repeat(40) }), refused);
+  const wrongVersion = "other-worker";
+  const invoke = TwoBotContainer.bindProtectedAutomodInvoker(h.bot, readServing, { ...effects, enabled: true });
+  assert.equal("bindProtectedAutomodInvoker" in h.bot, false);
+  await assert.rejects(invoke({ ...pin, workerVersionId: wrongVersion }, {
+    action: "start", issuedLease: { ...issued, deploymentId: wrongVersion },
+  }, new AbortController().signal), refused);
+  assert.equal(readServing.mock.callCount(), 0);
+  for (const key of Object.keys(pin)) {
+    observed = { ...pin, [key]: "different-pin" };
+    await assert.rejects(run("start"), refused, key);
+  }
+  observed = undefined;
+  await assert.rejects(run("recover"), refused);
+  assert.equal(readServing.mock.callCount(), Object.keys(pin).length + 1);
+
+  const deadline = new AbortController();
+  const delayed = Promise.withResolvers<typeof pin>();
+  const lateInvoker = TwoBotContainer.bindProtectedAutomodInvoker(h.bot, signal => {
+    assert.equal(signal, deadline.signal);
+    return delayed.promise;
+  }, { ...effects, enabled: true });
+  const result = lateInvoker(pin, { action: "start", issuedLease: issued }, deadline.signal);
+  deadline.abort();
+  await assert.rejects(result, /deadline exceeded/);
+  delayed.resolve(pin);
+  await setImmediate();
+  assert.deepEqual(calls, []);
+
+  observed = pin;
   await assert.rejects(run("start", issued, false), refused);
   await assert.rejects(run("recover"), refused);
   assert.deepEqual(calls, []);
@@ -655,6 +692,12 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   await assert.rejects(h.bot.start(), /staging_use_conflict/);
   await h.bot.stagingExpiry();
   assert.equal(h.runtime.running, true);
+  observed = { ...pin, rolloutId: "different-rollout" };
+  const beforeDrift = [...calls];
+  await assert.rejects(run("recover"), refused);
+  assert.deepEqual(calls, beforeDrift);
+  assert.equal(h.runtime.running, true);
+  observed = pin;
   await assert.rejects(run("recover", { ...issued, expiresAt: issued.expiresAt + 1 }), refused);
   cleanupLease = { ...issued, epoch: issued.epoch + 1 };
   await assert.rejects(run("recover", issued, false), refused);

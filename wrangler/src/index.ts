@@ -21,6 +21,7 @@
  */
 
 import { Container } from "@cloudflare/containers";
+import type { bindStagingAutomodDeploymentTransport } from "../scripts/staging-automod-deployment-transport.ts";
 // SDK 0.3.7 reattaches outbound callbacks even for an already-running process.
 // https://developers.cloudflare.com/containers/container-package/
 export { ContainerProxy } from "@cloudflare/containers";
@@ -29,11 +30,11 @@ import {
   authenticated, deploymentId, readChange, readControlBody, refused,
 } from "./ownership.ts";
 import {
-  StagingLifecycle, STAGING_USE_PATH, VOICE_MOVE_LEASE_HEADER, hasAutomodReservation, parseStagingUseChange,
+  AUTOMOD_STAGING_PURPOSE, StagingLifecycle, STAGING_USE_PATH, VOICE_MOVE_LEASE_HEADER, hasAutomodReservation, parseStagingUseChange,
   voiceMoveAllowed, type StagingUse,
 } from "./staging-lifecycle.ts";
 import { runProtectedAutomod, type ProtectedAutomodCall, type ProtectedAutomodEffects } from "./staging-automod-caller.ts";
-import { StagingAutomodRecovery } from "./staging-automod-recovery.ts";
+import { STAGING_AUTOMOD_TARGET, StagingAutomodRecovery } from "./staging-automod-recovery.ts";
 import { stagingDatabaseEvidence } from "./staging-database-fingerprint.ts";
 import { PREVIEW_HEADER, parseRegistryJson, previewRefusal, readPreview, readPreviewAbsent } from "./staging-preview.ts";
 import {
@@ -69,6 +70,7 @@ import {
   REQUEST_TIMEOUT_MS,
   SIGNING_HEADERS,
   allowlistedHeaders,
+  boundRead,
   envelope,
   forwardRequest,
   handleActionsIngress,
@@ -156,6 +158,9 @@ import {
  * Plus the optional reviewed TWO_* flags in container-env.ts (TOG-12020) and
  * the optional reviewed DISCORD_* snowflake IDs there (TOG-19025, M3.6).
  */
+type ProtectedAutomodInvoker = Parameters<typeof bindStagingAutomodDeploymentTransport>[2];
+type AutomodServingPin = Parameters<ProtectedAutomodInvoker>[0];
+
 export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_BOT: DurableObjectNamespace<TwoBotContainer>;
   /** Cloudflare version identity, never a client-supplied owner name. */
@@ -1013,6 +1018,36 @@ export class TwoBotContainer extends Container<Env> {
         return runtime?.running === bot.ctx.container?.running ? runtime : undefined;
       },
     });
+  }
+
+  /** Bind an in-process instance for the authenticated AutoMod transport. The
+   * protected caller independently reads the current serving deployment and
+   * rollout for this instance. Each action compares that evidence to the
+   * original pin before entering the existing DO gate.
+   */
+  static bindProtectedAutomodInvoker(bot: TwoBotContainer,
+    readServing: (signal: AbortSignal) => Promise<AutomodServingPin | undefined>,
+    effects: ProtectedAutomodEffects,
+  ): ProtectedAutomodInvoker {
+    return async (pin, call, signal) => {
+      signal.throwIfAborted();
+      const { issuedLease } = call;
+      if (!bot.boundedStaging() || bot.env.DISCORD_APPLICATION_ID !== STAGING_AUTOMOD_TARGET.applicationId
+        || bot.env.GUILD_ID !== STAGING_AUTOMOD_TARGET.guildId || issuedLease.purpose !== AUTOMOD_STAGING_PURPOSE
+        || pin.workerVersionId !== bot.id() || pin.sourceSha !== bot.env.CONTAINER_RELEASE
+        || issuedLease.deploymentId !== pin.workerVersionId || issuedLease.sha !== pin.sourceSha) {
+        throw new OwnershipRefused("staging_use_conflict");
+      }
+      const observed = await boundRead(readServing(signal), signal);
+      if (!observed || observed.workerDeploymentId !== pin.workerDeploymentId
+        || observed.workerVersionId !== pin.workerVersionId || observed.sourceSha !== pin.sourceSha
+        || observed.applicationId !== pin.applicationId || observed.namespaceId !== pin.namespaceId
+        || observed.rolloutId !== pin.rolloutId || observed.imageDigest !== pin.imageDigest) {
+        throw new OwnershipRefused("staging_use_conflict");
+      }
+      signal.throwIfAborted();
+      return TwoBotContainer.runProtectedAutomod(bot, call, effects);
+    };
   }
 
   /** Snapshot composition. Static so the DO instance exposes no snapshot RPC. */
