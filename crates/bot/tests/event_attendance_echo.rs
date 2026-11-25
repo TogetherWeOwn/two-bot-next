@@ -58,6 +58,14 @@ struct SignedEcho<'a> {
     now: u64,
 }
 
+struct SignedEchoRequest<'a> {
+    body: &'a [u8],
+    key_id: &'a str,
+    timestamp: String,
+    nonce: &'a str,
+    signature: String,
+}
+
 impl<'a> SignedEcho<'a> {
     fn new(store: &'a InternalActionStore, now: u64) -> Self {
         let key = SigningKey {
@@ -79,17 +87,41 @@ impl<'a> SignedEcho<'a> {
         sent_at: u64,
         nonce: &str,
     ) -> Result<AttendanceReadRequest, ErrorCode> {
+        self.authorize(flags, &self.issue(body, sent_at, nonce))
+            .await
+    }
+
+    fn issue<'request>(
+        &'request self,
+        body: &'request [u8],
+        sent_at: u64,
+        nonce: &'request str,
+    ) -> SignedEchoRequest<'request> {
         let timestamp = sent_at.to_string();
         let signature = sign(self.key.secret.expose(), &timestamp, nonce, body);
-        let headers = AuthHeaders {
+        SignedEchoRequest {
+            body,
             key_id: &self.key.id,
-            timestamp: &timestamp,
+            timestamp,
             nonce,
-            signature: &signature,
+            signature,
+        }
+    }
+
+    async fn authorize(
+        &self,
+        flags: &InternalFlags,
+        request: &SignedEchoRequest<'_>,
+    ) -> Result<AttendanceReadRequest, ErrorCode> {
+        let headers = AuthHeaders {
+            key_id: request.key_id,
+            timestamp: &request.timestamp,
+            nonce: request.nonce,
+            signature: &request.signature,
         };
         let verified = AuthenticatedRequest::verify(
             &headers,
-            body,
+            request.body,
             &self.keys,
             SKEW_SECONDS,
             self.now * 1_000,
@@ -190,17 +222,20 @@ async fn exercise_echo(pool: PgPool) {
     let enabled = InternalFlags::from_map(
         &[("TWO_INTERNAL_ALLOW_ATTENDANCE_READ".into(), "1".into())].into(),
     );
-    let echo = async |body: &[u8], nonce: &str| {
-        let request = signed
-            .request(&enabled, body, now_secs, nonce)
-            .await
-            .unwrap();
+    let read_echo = async |request: AttendanceReadRequest| {
         read(request, pool, |scope| {
             assert_eq!(scope, guild_id);
             // This fixture holds a stable read epoch for the duration of each lookup.
             Some(|| true)
         })
         .await
+    };
+    let echo = async |body: &[u8], nonce: &str| {
+        let request = signed
+            .request(&enabled, body, now_secs, nonce)
+            .await
+            .unwrap();
+        read_echo(request).await
     };
     assert_eq!(
         echo(READ_BODY, &random_nonce()).await,
@@ -240,9 +275,17 @@ async fn exercise_echo(pool: PgPool) {
     let ends_at = joined_at - Duration::minutes(15) + Duration::seconds(10);
     event.ends_at = Some(iso(ends_at));
     upsert_event(pool, guild, &iso(now), &event).await.unwrap();
+    let pull_signed = async |flags: &InternalFlags, request: &SignedEchoRequest<'_>| {
+        let authorized = signed
+            .authorize(flags, request)
+            .await
+            .map_err(PullRefusal::Request)?;
+        read_echo(authorized).await.map_err(PullRefusal::Read)
+    };
     let final_nonce = random_nonce();
+    let successful = signed.issue(READ_BODY, now_secs, &final_nonce);
     // Web Echo can freeze this v1 result. A real but short visit has zero whole minutes.
-    let finalized = echo(READ_BODY, &final_nonce).await.unwrap();
+    let finalized = pull_signed(&enabled, &successful).await.unwrap();
     assert_eq!(
         finalized,
         json!({
@@ -267,13 +310,44 @@ async fn exercise_echo(pool: PgPool) {
         "the signed key for the pre-enable event has no attendance record"
     );
     assert_eq!(
-        signed
-            .request(&enabled, READ_BODY, now_secs, &final_nonce)
-            .await
-            .err(),
-        Some(ErrorCode::Replayed),
+        pull_signed(&enabled, &successful).await,
+        Err(PullRefusal::Request(ErrorCode::Replayed)),
         "the same signed request cannot reach the finalized reader again"
     );
+
+    // A request signed while enabled can arrive for the first time after rollback.
+    let delayed_nonce = random_nonce();
+    let delayed = signed.issue(READ_BODY, now_secs, &delayed_nonce);
+    let disabled = InternalFlags::from_map(&Default::default());
+    assert_eq!(
+        pull_signed(&disabled, &delayed).await,
+        Err(PullRefusal::Request(ErrorCode::ActionNotAllowed)),
+        "the disabled reader must refuse a valid first delivery before returning attendance"
+    );
+    assert_eq!(
+        pull_signed(&disabled, &successful).await,
+        Err(PullRefusal::Request(ErrorCode::Replayed)),
+        "rollback must not replay an earlier successful response"
+    );
+
+    let reenabled = InternalFlags::from_map(
+        &[("TWO_INTERNAL_ALLOW_ATTENDANCE_READ".into(), "1".into())].into(),
+    );
+    for issued in [&successful, &delayed] {
+        assert_eq!(
+            pull_signed(&reenabled, issued).await,
+            Err(PullRefusal::Request(ErrorCode::Replayed)),
+            "re-enabling must not revive a nonce used before or during rollback"
+        );
+    }
+    let fresh_nonce = random_nonce();
+    let fresh = signed.issue(READ_BODY, now_secs, &fresh_nonce);
+    assert_eq!(
+        pull_signed(&reenabled, &fresh).await.unwrap(),
+        finalized,
+        "a fresh signed read after re-enabling returns the same finalized v1 record"
+    );
+
     staged_echo_enablement_and_rollback(pool, &signed, &enabled, &finalized).await;
 
     let mark_ambiguous = async |ambiguous| {
