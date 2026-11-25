@@ -1,4 +1,4 @@
-"""Exercise the event-denied fallback against two locally present immutable images."""
+"""Rehearse the event-denied fallback and announcement transport on immutable Bot images."""
 
 import argparse
 import contextlib
@@ -12,14 +12,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from recorder import CHANNEL, EVENT, GUILD, MEMBER, ROLE
+from recorder import CHANNEL, EVENT, GUILD, MEMBER, MESSAGE, MESSAGE_PATH, ROLE
 
 HERE = Path(__file__).resolve().parent
 BOT_PORTS = {"current": 8091, "retained": 8092}
 REVISION = "org.opencontainers.image.revision"
 DIGEST = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}")
+IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 DB_IMAGE = "postgres@sha256:372621a978f4513b082d946d6320e2b11a3b359648b81fba8a2ba0df33958f62"
 RECORDER_IMAGE = "node@sha256:e7add2a490bb17d97b485b8641bd88455fff7839ade0f5eba493c3508124d413"
+ANNOUNCEMENT = {"action": "announcement.post", "channel_key": "ann", "body": "Synthetic announcement"}
 
 
 def run(*argv, data=None, timeout=30):
@@ -55,8 +57,9 @@ class Rehearsal:
         self.pg = self.prefix + "-pg"
         self.recorder = self.prefix + "-recorder"
         self.token = "synthetic-" + secrets.token_hex(24)
-        self.key = secrets.token_hex(32)
-        self.password = secrets.token_hex(24)
+        self.key = "synthetic-" + secrets.token_hex(32)
+        self.password = "synthetic-" + secrets.token_hex(24)
+        self.containers = {}
         self.database = "event_cutoff"
         self.generation = 0
         self.write("barrier", "none")
@@ -80,22 +83,36 @@ class Rehearsal:
             argv.extend(["-e", f"{key}={value}"])
         container_id = run(*argv, *args).decode().strip()
         self.cleanup.callback(run, "docker", "container", "rm", "--force", "--volumes", container_id)
+        self.containers[name] = container_id
+        info = json.loads(run("docker", "inspect", container_id))[0]["HostConfig"]
+        expected = ("container:" + namespace, "container:" + self.containers[namespace]) if namespace else ("none",)
+        require(info["NetworkMode"] in expected and not info["PortBindings"] and not info["PublishAllPorts"],
+                "Fixture container has an unexpected network or published port")
         run("docker", "start", container_id)
 
     def sql(self, sql, db=None):
         return run("docker", "exec", "-i", self.pg, "psql", "-XAtq", "-v", "ON_ERROR_STOP=1", "-U",
                    "postgres", "-d", db or self.database, data=sql.encode(), timeout=60).decode().strip()
 
-    def start(self, schema_revision):
+    def start(self, schema_revision, *, wrong_ca=False, wrong_san=False):
         run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
             "-subj", "/CN=Discord Recorder CA", "-keyout", str(self.work / "ca.key"),
             "-out", str(self.work / "ca.crt"))
         run("openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=discord.com",
             "-keyout", str(self.work / "server.key"), "-out", str(self.work / "server.csr"))
-        (self.work / "server.ext").write_text("subjectAltName=DNS:discord.com\nextendedKeyUsage=serverAuth\n")
+        san = "wrong.example" if wrong_san else "discord.com"
+        (self.work / "server.ext").write_text(f"subjectAltName=DNS:{san}\nextendedKeyUsage=serverAuth\n")
         run("openssl", "x509", "-req", "-days", "1", "-in", str(self.work / "server.csr"), "-CA",
             str(self.work / "ca.crt"), "-CAkey", str(self.work / "ca.key"), "-CAcreateserial",
             "-extfile", str(self.work / "server.ext"), "-out", str(self.work / "server.crt"))
+        announcement_root = self.work / "ca.crt"
+        if wrong_ca:
+            announcement_root = self.work / "other-ca.crt"
+            run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                "-subj", "/CN=Other Discord Recorder CA", "-keyout", str(self.work / "other-ca.key"),
+                "-out", str(announcement_root))
+        run("openssl", "x509", "-in", str(announcement_root), "-outform", "DER",
+            "-out", str(self.work / "announcement-ca.der"))
         self.docker_run(self.pg, "--add-host", "discord.com:127.0.0.1", DB_IMAGE, "postgres",
                         "-c", "listen_addresses=127.0.0.1", env={"POSTGRES_PASSWORD": self.password,
                                                                   "POSTGRES_DB": self.database})
@@ -135,27 +152,36 @@ class Rehearsal:
         return subprocess.run(["docker", "inspect", name], check=False,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode == 0
 
-    def start_bot(self, which):
+    def create_bot(self, which, name, *, ordinary=False, restricted=True, overrides=None):
+        port = BOT_PORTS[which]
+        env = {
+            "LISTEN_ADDR": f"127.0.0.1:{port + 100}", "DISCORD_TOKEN": self.token, "GUILD_ID": GUILD,
+            "DATABASE_URL": (f"postgres://postgres:{self.password}@127.0.0.1:5432/"
+                             f"{self.database}?sslmode=disable"),
+            "TWO_DATABASE_TLS": "local-only", "DISCORD_GATEWAY_URL": "ws://127.0.0.1:9999",
+            "DISCORD_API_BASE": "invalid fixture background origin",
+            "TWO_INTERNAL_ACTIONS": "1", "TWO_INTERNAL_BIND": f"127.0.0.1:{port}",
+            "TWO_INTERNAL_KEYS": f"rehearsal:{self.key}", "TWO_INTERNAL_CALLERS": "rehearsal:fixture",
+            "TWO_INTERNAL_CHANNEL_KEYS": f"ann:{CHANNEL}", "TWO_INTERNAL_ROLE_KEYS": f"member:{ROLE}",
+            "TWO_INTERNAL_ALLOW_EVENT_CANCEL": "1",
+        }
+        env.update(overrides or {})
+        options = ("--cap-drop", "ALL", "--security-opt", "no-new-privileges") if restricted else ()
+        command = () if ordinary else ("rehearse-internal-actions",)
+        self.docker_run(
+            name, *options, "--no-healthcheck",
+            "--mount", f"type=bind,src={self.work / 'ca.crt'},dst=/etc/ssl/certs/ca-certificates.crt,readonly",
+            "--mount", f"type=bind,src={self.work / 'announcement-ca.der'},dst=/fixture/announcement-ca.der,readonly",
+            self.images[which], *command, namespace=self.pg, env=env,
+        )
+
+    def start_bot(self, which, *, ordinary=False):
         name = self.bot_name(which)
         port = BOT_PORTS[which]
         if self.was_started(name):
             run("docker", "start", name)
         else:
-            self.docker_run(
-                name, "--mount", f"type=bind,src={self.work / 'ca.crt'},dst=/etc/ssl/certs/ca-certificates.crt,readonly",
-                self.images[which], namespace=self.pg, env={
-                    "LISTEN_ADDR": f"127.0.0.1:{port + 100}", "DISCORD_TOKEN": self.token,
-                    "GUILD_ID": GUILD, "DATABASE_URL": f"postgres://postgres:{self.password}@127.0.0.1/{self.database}",
-                    "TWO_DATABASE_TLS": "local-only", "DISCORD_GATEWAY_URL": "ws://127.0.0.1:9999",
-                    # Park background REST clients. The shipping internal receiver
-                    # ignores this override and uses its actual Discord TLS path.
-                    "DISCORD_API_BASE": "invalid fixture background origin",
-                    "TWO_INTERNAL_ACTIONS": "1", "TWO_INTERNAL_BIND": f"127.0.0.1:{port}",
-                    "TWO_INTERNAL_KEYS": f"rehearsal:{self.key}", "TWO_INTERNAL_CALLERS": "rehearsal:fixture",
-                    "TWO_INTERNAL_CHANNEL_KEYS": f"ann:{CHANNEL}", "TWO_INTERNAL_ROLE_KEYS": f"member:{ROLE}",
-                    "TWO_INTERNAL_ALLOW_EVENT_CANCEL": "1",
-                },
-            )
+            self.create_bot(which, name, ordinary=ordinary)
         try:
             wait_for(lambda remaining: subprocess.run(
                 ["docker", "exec", self.recorder, "python3", "-c",
@@ -165,11 +191,6 @@ class Rehearsal:
         except RuntimeError:
             print(run("docker", "logs", name).decode()[-4000:], flush=True)
             raise
-        info = json.loads(run("docker", "inspect", name))[0]
-        network_mode = info["HostConfig"]["NetworkMode"]
-        anchor_id = run("docker", "inspect", "--format", "{{.Id}}", self.pg).decode().strip()
-        require(network_mode in ("container:" + self.pg, "container:" + anchor_id)
-                and not info["HostConfig"]["PortBindings"], "Bot namespace changed")
         print(f"started={which}", flush=True)
 
     def bot_name(self, which):
@@ -291,6 +312,9 @@ class Rehearsal:
         require(applied == ["role", "role", "create"], "Expected two role writes and one pre-cutoff event effect")
         require(all(row[3] != "unexpected" for row in entries), "Unexpected fixture mutation route")
         print(json.dumps({"recorder": entries, "event_and_role_verdict": "passed"}), flush=True)
+        self.start_bot("current")
+        for which in BOT_PORTS:
+            self.announcement_control(which)
 
     def restart_recorder_with_cutoff(self):
         run("docker", "stop", "-t", "1", self.recorder)
@@ -298,55 +322,85 @@ class Rehearsal:
         require((self.work / "policy").read_text() == "closed\n", "Restore or restart reopened event authority")
 
     def announcement_control(self, which):
+        key = f"{which}-announcement"
+        since = len(self.journal())
+        answer = self.request(which, key, ANNOUNCEMENT)
+        replay = self.request(which, key, ANNOUNCEMENT)
+        require(answer["status"] == 200 and answer["message_id"] == MESSAGE and not answer["replay"]
+                and replay["status"] == 200 and replay["message_id"] == MESSAGE and replay["replay"]
+                and self.claim(key) == "completed", "Announcement did not settle and replay its original receipt")
+        require(self.journal()[since:] == [("POST", MESSAGE_PATH, "announcement", "applied")],
+                "Expected one announcement request and no replayed effect")
+        print(json.dumps({"runtime": which, "announcement_recorder_writes": 1}), flush=True)
+
+    def announcement_refusal(self, case):
         self.set_policy("closed")
-        self.start_bot(which)
-        body = {"action": "announcement.post", "channel_key": "ann", "body": "Synthetic announcement"}
-        answer = self.request(which, f"{which}-announcement", body)
-        writes = sum(operation == "announcement" and outcome == "applied"
-                     for _, _, operation, outcome in self.journal())
-        print(json.dumps({"runtime": which, "announcement_recorder_writes": writes}), flush=True)
-        return answer["status"] == 200 and writes == 1
+        self.start_bot("current", ordinary=case == "off")
+        answer = self.request("current", case, ANNOUNCEMENT)
+        require(answer["status"] != 200 and answer["code"] == "needs_reconciliation"
+                and self.claim(case) == "unknown" and not self.journal(),
+                f"{case}: announcement reached HTTP or was not held unknown")
+        print(json.dumps({"case": case, "announcement_recorder_writes": 0, "verdict": "passed"}), flush=True)
+
+    def startup_refusal(self, case, error_class, *, restricted=True, **overrides):
+        name = f"{self.prefix}-{case}"
+        self.create_bot("current", name, restricted=restricted, overrides=overrides)
+        code = run("docker", "wait", name, timeout=15).decode().strip()
+        log = run("docker", "logs", name).decode()
+        require(code == "1" and error_class in log and not self.journal(),
+                f"{case}: expected a closed startup refusal with {error_class}")
+        print(json.dumps({"case": case, "startup_refusal": error_class, "verdict": "passed"}), flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for which in BOT_PORTS:
-        parser.add_argument(f"--{which}", required=True, help=" locally present registry image@sha256:…")
+        parser.add_argument(f"--{which}", help="locally present registry image@sha256:…")
+    parser.add_argument("--candidate", help="source-only proof against one locally built image ID (sha256:…)")
     args = parser.parse_args()
-    images = vars(args)
+    candidate = args.candidate is not None
+    if candidate:
+        require(not args.current and not args.retained, "Use a candidate or two admitted image references")
+        images = dict.fromkeys(BOT_PORTS, args.candidate)
+    else:
+        require(args.current and args.retained, "Both admitted image references are required")
+        images = {"current": args.current, "retained": args.retained}
     revisions = {}
     for which, image in images.items():
-        require(DIGEST.fullmatch(image), "Bot image must be digest pinned")
+        require((IMAGE_ID if candidate else DIGEST).fullmatch(image), "Bot image must be digest pinned")
         info = json.loads(run("docker", "image", "inspect", image))[0]
-        require(image in info["RepoDigests"], "Exact registry digest is absent")
+        require(image == info["Id"] if candidate else image in info["RepoDigests"], "Exact image identity is absent")
         source = info["Config"]["Labels"].get(REVISION, "")
         require(re.fullmatch(r"[0-9a-f]{40}", source), "Missing exact source revision")
         revisions[which] = source
     run("git", "cat-file", "-e", f"{revisions['current']}:sql/web_v1.sql")
     print(json.dumps({
-        "images": images, "source_revisions": revisions, "postgres": DB_IMAGE, "recorder_image": RECORDER_IMAGE,
+        "images": images, "source_revisions": revisions, "source_only_candidate": candidate,
+        "postgres": DB_IMAGE, "recorder_image": RECORDER_IMAGE,
         "recorder_sha256": hashlib.sha256((HERE / "recorder.py").read_bytes()).hexdigest(),
         "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
     }), flush=True)
     with tempfile.TemporaryDirectory(prefix="two-bot-event-cutoff-") as directory, contextlib.ExitStack() as cleanup:
         rehearsal = Rehearsal(Path(directory), cleanup, images)
         rehearsal.start(revisions["current"])
+        for case, error_class, overrides in (
+            ("wrong-bind", "rehearsal_receiver_not_loopback",
+             {"TWO_INTERNAL_CONTAINER": "1", "TWO_INTERNAL_BIND": "0.0.0.0:8091"}),
+            ("wrong-db", "rehearsal_database_invalid", {"DATABASE_URL": "postgres://postgres@192.0.2.1/db"}),
+            ("ordinary-token", "rehearsal_token_not_synthetic", {"DISCORD_TOKEN": "ordinary.fixture.credential"}),
+            ("receiver-off", "rehearsal_receiver_invalid", {"TWO_INTERNAL_ACTIONS": "0"}),
+        ):
+            rehearsal.startup_refusal(case, error_class, **overrides)
+        rehearsal.startup_refusal("privileged", "rehearsal_network_unisolated", restricted=False)
         rehearsal.exercise()
 
-    # An ambiguous announcement can hold the token-wide lane. Give each
-    # distinct image its own isolated probe so a refusal cannot mask the other.
-    seen = set()
-    announcements_passed = True
-    for which, image in images.items():
-        if image in seen:
-            continue
-        seen.add(image)
+    # An ambiguous send retains the token permit. Give each refusal its own
+    # database and credential so it cannot mask any of the other cases.
+    for case in ("off", "wrong-ca", "wrong-san"):
         with tempfile.TemporaryDirectory(prefix="two-bot-event-cutoff-") as directory, contextlib.ExitStack() as cleanup:
             rehearsal = Rehearsal(Path(directory), cleanup, images)
-            rehearsal.start(revisions["current"])
-            passed = rehearsal.announcement_control(which)
-            announcements_passed = announcements_passed and passed
-    require(announcements_passed, "Announcement positive control did not reach and settle at the recorder")
+            rehearsal.start(revisions["current"], wrong_ca=case == "wrong-ca", wrong_san=case == "wrong-san")
+            rehearsal.announcement_refusal(case)
     print(json.dumps({"verdict": "passed"}), flush=True)
 
 

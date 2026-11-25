@@ -84,6 +84,7 @@ use two_bot_cutover::{internal_settings::execute_settings, settings::SettingsSto
 use two_bot_discord::executor::member::MemberOutcome;
 use two_bot_discord::internal_actions::{
     supports_event_mutation, AnnouncementExecutor, ExecutionOutcome, Refusal,
+    RehearsalAnnouncementConnector,
 };
 use two_bot_discord::internal_channel_moderation::{
     InternalChannelConfig, InternalChannelExecutor, InternalChannelRequest, InternalChannelResult,
@@ -1265,14 +1266,19 @@ pub struct BoundReceiver {
     state: Arc<ReceiverState>,
 }
 
-pub async fn bind(
+pub(crate) enum ReceiverMode {
+    Standard(Option<live_snapshot::LiveSnapshotEndpoint>),
+    Rehearsal(RehearsalAnnouncementConnector),
+}
+
+pub(crate) async fn bind(
     config: InternalActionConfig,
     pool: sqlx::PgPool,
     token: &str,
     voice_cache: Arc<two_bot_discord::SharedCache>,
     voice_clock: Arc<VoiceOccupancyClock>,
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
-    live_snapshot: Option<live_snapshot::LiveSnapshotEndpoint>,
+    mode: ReceiverMode,
 ) -> std::io::Result<BoundReceiver> {
     use two_bot_core::send_admission::{PgSendAdmission, SendAdmission};
     use two_bot_discord::internal_actions::CooldownGovernor;
@@ -1292,6 +1298,15 @@ pub async fn bind(
         Arc::clone(&admission),
     )
     .map_err(|_| std::io::Error::other("internal-action executor configuration invalid"))?;
+    let (executor, live_snapshot) = match mode {
+        ReceiverMode::Standard(snapshot) => (executor, snapshot),
+        ReceiverMode::Rehearsal(connector) => (
+            executor.with_rehearsal_connector(connector).map_err(|_| {
+                std::io::Error::other("internal-action rehearsal configuration invalid")
+            })?,
+            None,
+        ),
+    };
     let events = ActionExecutor::with_admission(token.to_owned(), None, Arc::clone(&admission))
         .map_err(|_| {
             std::io::Error::other("internal-action event executor configuration invalid")

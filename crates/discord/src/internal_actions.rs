@@ -31,7 +31,9 @@ use two_bot_core::send_admission::{
 };
 
 mod governor;
+mod rehearsal;
 pub use governor::{Clock, CooldownGovernor, MAX_CHANNEL_HOLDS};
+pub use rehearsal::RehearsalAnnouncementConnector;
 
 /// Every verb the receiver will run: the Discord send, the two event verbs
 /// (executed through [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event)
@@ -62,7 +64,26 @@ const BOT_USER_AGENT: &str = concat!(
     ")"
 );
 
+const DISCORD_ORIGIN: &str = "https://discord.com";
 type HttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+
+#[derive(Clone)]
+enum AnnouncementHttp {
+    Discord(HttpClient),
+    Rehearsal(RehearsalAnnouncementConnector),
+}
+
+impl AnnouncementHttp {
+    async fn request(
+        &self,
+        request: http::Request<Full<Bytes>>,
+    ) -> Result<http::Response<hyper::body::Incoming>, hyper_util::client::legacy::Error> {
+        match self {
+            Self::Discord(client) => client.request(request).await,
+            Self::Rehearsal(connector) => connector.request(request).await,
+        }
+    }
+}
 
 /// No free-text provider errors or request values may enter this contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -247,7 +268,7 @@ pub fn announcement_embed(body: &str) -> Embed {
 #[derive(Clone)]
 pub struct AnnouncementExecutor {
     twilight: Arc<TwilightClient>,
-    http: HttpClient,
+    http: AnnouncementHttp,
     channel_keys: HashMap<String, String>,
     timeout: Duration,
     api_origin: String,
@@ -274,10 +295,10 @@ impl AnnouncementExecutor {
             .build(https);
         Self {
             twilight,
-            http,
+            http: AnnouncementHttp::Discord(http),
             channel_keys,
             timeout: Duration::from_secs(10),
-            api_origin: "https://discord.com".to_owned(),
+            api_origin: DISCORD_ORIGIN.to_owned(),
             #[cfg(test)]
             response_received: None,
             admission: None,
@@ -300,6 +321,25 @@ impl AnnouncementExecutor {
         let mut executor = Self::new(twilight, channel_keys, governor);
         executor.admission = Some(admission);
         Ok(executor)
+    }
+
+    /// Install the local-only connector on an already admitted synthetic lane.
+    pub fn with_rehearsal_connector(
+        mut self,
+        connector: RehearsalAnnouncementConnector,
+    ) -> Result<Self, AdmissionError> {
+        if self.admission.is_none()
+            || self.api_origin != DISCORD_ORIGIN
+            || !self
+                .twilight
+                .token()
+                .and_then(|token| token.strip_prefix("Bot "))
+                .is_some_and(RehearsalAnnouncementConnector::is_synthetic_token)
+        {
+            return Err(AdmissionError::Configuration);
+        }
+        self.http = AnnouncementHttp::Rehearsal(connector);
+        Ok(self)
     }
 
     /// Downstream tests exercise the real transport without live Discord or a

@@ -203,6 +203,16 @@ to the local recorder. It uses the shipping receiver's compile-time guild
 fence as an inert fixture identifier. It does not use a live guild or the
 Worker ingress.
 
+The runner starts the release binary with `rehearse-internal-actions`. This
+command serves the signed-action receiver only. It requires a loopback bind,
+the fixture Postgres URL and synthetic credentials, and a loopback-only
+namespace with all capabilities dropped and new privileges disabled. The
+announcement client trusts the single fixture root mounted at
+`/fixture/announcement-ca.der`. It connects directly to the recorder on
+loopback port 443 and verifies the certificate for `discord.com`, which is
+also the HTTPS authority, Host and SNI. A standard launch keeps the compiled
+WebPKI trust and fixed Discord origin.
+
 The runner reads the schema from the current image's
 `org.opencontainers.image.revision` commit. If that revision is missing from
 the checkout, fetch it from `origin` before starting.
@@ -229,8 +239,16 @@ request. Web must keep ambiguous work held in both cases.
 
 The runner uses the current artifact's schema for both positions. The same
 image may back both positions when the serving and retained receipts agree.
-The full verdict requires both positive controls. A retained announcement
-transport using compiled WebPKI roots rejects the synthetic CA before the
-request reaches the recorder. Its announcement control remains incomplete
-until both admitted images can use the disposable trust root at the same
-Discord origin.
+The full verdict requires the event cutoff and role write cases plus an
+announcement receipt on each position. Replaying each signed announcement
+under its original key must return the same receipt and produce one recorded
+write in total. Separate runs check that the standard launch and the wrong
+CA and SAN produce no announcement request and hold the claim unknown.
+Startup refusals cover a disabled or non-loopback receiver, a database
+outside the fixture, an ordinary token and a launch with capabilities.
+
+For a source-only PR proof, build a local release image with
+`BOT_BUILD_REVISION` set to the tested source commit and pass its exact local
+image ID as `--candidate`. The runner starts two instances of that image.
+Admitted-position qualification uses the two registry digest inputs and
+the corresponding Worker and rollout evidence.

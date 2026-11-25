@@ -80,6 +80,7 @@ mod interaction_admission;
 mod interaction_composition_tests;
 mod internal_action_http;
 pub use internal_action_http::live_snapshot::LiveSnapshotEndpoint;
+mod internal_action_rehearsal;
 #[cfg(test)]
 mod job_emission_conformance_tests;
 mod jobs;
@@ -195,6 +196,13 @@ async fn main() {
     }
     if cli_args.first().is_some_and(|arg| arg == "moderation") {
         std::process::exit(moderation_cli::dispatch(&cli_args[1..]).await);
+    }
+    if cli_args
+        .first()
+        .is_some_and(|arg| arg == "rehearse-internal-actions")
+    {
+        logging::init();
+        std::process::exit(internal_action_rehearsal::dispatch(&cli_args[1..]).await);
     }
     // Docker HEALTHCHECK probe: GET /health on the configured port and exit
     // 0/1. Kept dependency-free (std + tokio only) so the check path cannot
@@ -482,7 +490,7 @@ async fn run(cli_args: &[String]) {
                     Arc::clone(&voice_cache),
                     Arc::clone(&voice_clock),
                     Arc::clone(&gateway),
-                    snapshot,
+                    internal_action_http::ReceiverMode::Standard(snapshot),
                 )
                 .await
                 .unwrap_or_else(|_| {

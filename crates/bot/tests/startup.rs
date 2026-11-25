@@ -32,6 +32,17 @@ fn command(listen_addr: &str) -> Command {
     command
 }
 
+#[test]
+fn rehearsal_command_refuses_unexpected_arguments() {
+    let output = Command::new(env!("CARGO_BIN_EXE_two-bot"))
+        .env_clear()
+        .args(["rehearse-internal-actions", "unexpected"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("rehearsal_arguments_invalid"));
+}
+
 fn get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
     let timeout = Duration::from_millis(250);
     let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
