@@ -25,12 +25,13 @@ class ReviewedStagingTests(unittest.TestCase):
             stderr=subprocess.DEVNULL, text=True, timeout=10,
         ).strip()
 
-    def commit(self, name):
-        path = self.repo / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.git("rev-parse", "--short", "HEAD") if path.is_file() else name)
-        self.git("add", name)
-        self.git("commit", "-qm", name)
+    def commit(self, *names):
+        for name in names:
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(self.git("rev-parse", "--short", "HEAD") if path.is_file() else name)
+        self.git("add", *names)
+        self.git("commit", "-qm", names[0])
         return self.git("rev-parse", "HEAD")
 
     def setUp(self):
@@ -41,7 +42,9 @@ class ReviewedStagingTests(unittest.TestCase):
         self.prior = self.commit(".github/workflows/deploy-staging.yml")
         self.source = self.commit("candidate.rs")
         self.workflow = self.commit("unrelated.rs")
-        self.tip = self.commit("other.rs")
+        self.tip = self.commit("wrangler/scripts/staging-voice-move-acceptance.mjs",
+                               "wrangler/test/fixtures/staging-voice-move.ts",
+                               "wrangler/test/staging-voice-move-acceptance.test.ts")
         self.git("switch", "-qc", "outside", self.prior)
         self.off_main = self.commit("outside.rs")
         self.git("switch", "--detach", self.source)
@@ -127,7 +130,9 @@ class ReviewedStagingTests(unittest.TestCase):
         self.assertEqual(proof["checks"]["check.yml"], {"run_id": 51, "attempt": 1})
 
     def test_refuses_changed_workflow_off_main_source_or_newer_staging(self):
-        for number, path in enumerate(("wrangler/src/alert-rules.ts", ".github/workflows/deploy-staging.yml")):
+        gates = ("wrangler/scripts/ownership-control.mjs", "wrangler/src/alert-rules.ts",
+                 ".github/workflows/deploy-staging.yml")
+        for number, path in enumerate(gates):
             self.git("switch", "-qc", f"gate-change-{number}", self.tip)
             self.env["FETCHED_MAIN_SHA"] = self.commit(path)
             self.workdir.mkdir(exist_ok=True)

@@ -546,8 +546,8 @@ deploy-called voice and help synthetics refuse every rerun, and a partial rerun
 can also reuse earlier deploy evidence. Subject to existing holds and
 authorization, follow the
 [staging qualification and recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
-for the intended exact `main` SHA. An older pin cannot certify a different
-workflow head. Wait for all qualifying jobs and release, and retain the fresh
+for the intended exact `main` SHA. A reviewed run certifies its serving SHA.
+Verify its workflow SHA separately. Wait for all qualifying jobs and release, and retain the fresh
 receipts.
 
 The certificate contains only a closed version-1 receipt and `modules/`: source

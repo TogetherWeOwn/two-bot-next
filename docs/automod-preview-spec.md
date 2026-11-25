@@ -696,14 +696,27 @@ verifies absence in both the list and detail. With a lost receipt, the full
 registry must match the absent baseline. A present command without a durable
 receipt leaves the hold in place.
 
+The dormant protected startup entry uses the same gate and requires an
+explicitly enabled staging runtime adapter. Full publication verification
+precedes a durable, single-use startup claim bound to the exact active lease and
+cutoff. The launch policy requires a fresh session with dedicated intents and
+member intake, enforcement, registry sync and interaction dispatch off. The
+entry refuses an unsafe planned policy and requires independent runtime
+readback of the same policy. The cutoff bounds the wait for the startup reply
+and readback. A lost response or a failed readback keeps the hold for recovery.
+Recovery requires same-lease remote drain of both publication and startup,
+followed by confirmed stop and a separate registry absence read.
+
 The protected caller still has to bind the same gate to staging ownership,
 lease acquisition and release, expiry, startup and all registry writers.
 It needs authoritative same-lease purpose and cleanup authority after expiry,
-remote drain evidence after an interrupted write, and affirmative container
-stop readback. A lost receipt with a command still present needs separately
-proven attribution or independently verified absence. Wire the isolated
-dry-run boot separately with member intake suppressed. Live qualification
-requires those reviewed bindings and the sole staging writer's exclusive window.
+remote drain evidence after an interrupted write or boot, and affirmative
+container stop and isolated boot readbacks. A lost receipt with a command
+still present needs separately proven attribution or independently verified
+absence. Older Workers refuse journal entries with the new startup phases.
+Before a future rollback to one of those builds, finish recovery with a
+Worker that understands both phases. Live qualification requires the reviewed
+bindings and the sole staging writer's exclusive window.
 
 ## 10. Spec self-check (doctest)
 

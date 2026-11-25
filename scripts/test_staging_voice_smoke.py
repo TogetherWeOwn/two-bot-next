@@ -90,6 +90,125 @@ class VoiceSmokeTests(unittest.TestCase):
         with open(self.evidence, encoding="utf-8") as handle:
             return json.load(handle)
 
+    def naming_fixture(self):
+        occupied = "Fixture owner"
+        empty = "Open seat"
+        return {"occupied_name": occupied, "empty_name": empty, "readbacks": [
+            {"room_id": "3000000000000000001", "observed_at_ms": 1000,
+             "humans": 2, "name": occupied},
+            {"room_id": "3000000000000000001", "observed_at_ms": 2000,
+             "humans": 0, "name": empty},
+            {"room_id": "3000000000000000001", "observed_at_ms": 3000,
+             "humans": 1, "name": occupied},
+        ]}
+
+    def run_naming(self, raw):
+        source = Path(self.evidence).with_name("observations.json")
+        source.write_bytes(raw)
+        worker = mock.Mock(side_effect=AssertionError("unexpected Worker request"))
+        code, out = self.run_main(["--naming-observations", str(source),
+                                   "--staging-url", WORKER_URL], {}, worker_fetch=worker)
+        worker.assert_not_called()
+        self.assertEqual(self.requested, [])
+        return code, out, self.read_evidence()
+
+    def assert_naming_verdicts(self, evidence, result, empty, occupied):
+        self.assertEqual(evidence["result"], result)
+        self.assertEqual({row["check"]: row["verdict"] for row in evidence["checks"]}, {
+            "empty-room-rename": empty, "occupied-room-return": occupied,
+        })
+
+    def test_naming_receipt_passes_for_two_verified_transitions(self):
+        fixture = self.naming_fixture()
+        code, out, evidence = self.run_naming(json.dumps(fixture).encode())
+        self.assertEqual(code, 0)
+        self.assertEqual(evidence["transport"], "offline-naming-observations")
+        self.assert_naming_verdicts(evidence, "pass", "pass", "pass")
+        self.assertIn("PASS empty-room-rename:", out)
+        self.assertIn("PASS occupied-room-return:", out)
+        for private in (fixture["occupied_name"], fixture["empty_name"],
+                        fixture["readbacks"][0]["room_id"], TOKEN, WORKER_URL):
+            self.assertNotIn(private, out)
+            self.assertNotIn(private, Path(self.evidence).read_text())
+
+    def test_naming_receipt_skips_missing_readbacks(self):
+        for index, verdicts in enumerate((("skip", "pass"), ("skip", "skip"), ("pass", "skip"))):
+            with self.subTest(index=index):
+                fixture = self.naming_fixture()
+                fixture["readbacks"][index] = None
+                code, _, evidence = self.run_naming(json.dumps(fixture).encode())
+                self.assertEqual(code, 3)
+                self.assert_naming_verdicts(evidence, "incomplete", *verdicts)
+
+    def test_naming_receipt_fails_stale_name_or_wrong_occupancy(self):
+        for index, field, value, verdicts in (
+                (1, "name", "Fixture owner", ("fail", "fail")),
+                (2, "name", "Open seat", ("pass", "fail")),
+                (1, "humans", 1, ("fail", "fail")),
+                (2, "humans", 0, ("pass", "fail"))):
+            with self.subTest(index=index, field=field):
+                fixture = self.naming_fixture()
+                fixture["readbacks"][index][field] = value
+                code, _, evidence = self.run_naming(json.dumps(fixture).encode())
+                self.assertEqual(code, 1)
+                self.assert_naming_verdicts(evidence, "fail", *verdicts)
+
+    def test_naming_receipt_does_not_skip_an_observed_mismatch(self):
+        fixture = self.naming_fixture()
+        fixture["readbacks"][0] = None
+        fixture["readbacks"][1]["name"] = fixture["occupied_name"]
+        fixture["readbacks"][2] = None
+        code, _, evidence = self.run_naming(json.dumps(fixture).encode())
+        self.assertEqual(code, 1)
+        self.assert_naming_verdicts(evidence, "fail", "fail", "fail")
+
+    def test_naming_receipt_refuses_mixed_rooms_and_stale_readbacks(self):
+        for field, value in (("room_id", "3000000000000000002"), ("observed_at_ms", 1000)):
+            with self.subTest(field=field):
+                fixture = self.naming_fixture()
+                fixture["readbacks"][1][field] = value
+                code, out, evidence = self.run_naming(json.dumps(fixture).encode())
+                self.assertEqual(code, 1)
+                self.assertIn("FAIL room-naming-input:", out)
+                self.assertEqual(evidence["result"], "fail")
+
+    def test_naming_receipt_refuses_invalid_input_without_echoing_it(self):
+        fixture = self.naming_fixture()
+        duplicate = b'{"occupied_name":"ignored",' + json.dumps(fixture).encode()[1:]
+        identical = {**fixture, "empty_name": fixture["occupied_name"]}
+        invalid_id = {**fixture, "readbacks": [dict(row, room_id="030") for row in fixture["readbacks"]]}
+        for raw, reason in (
+                (json.dumps(identical).encode(), "expected two distinct room names"),
+                (duplicate, "invalid naming observations JSON"),
+                (json.dumps(invalid_id).encode(), "invalid room readback"),
+                (b" " * (smoke.BODY_CAP + 1), "naming observations exceed the body cap"),
+                (b"raw-body-sentinel", "invalid naming observations JSON")):
+            with self.subTest(reason=reason):
+                code, out, evidence = self.run_naming(raw)
+                self.assertEqual(code, 1)
+                self.assertEqual(evidence["result"], "fail")
+                self.assertIn(reason, out)
+                self.assertNotIn("raw-body-sentinel", out + Path(self.evidence).read_text())
+                self.assertNotIn("Traceback", out)
+
+    def test_naming_receipt_cannot_overwrite_its_source(self):
+        source = Path(self.evidence).with_name("observations.json")
+        original = json.dumps(self.naming_fixture())
+        source.write_text(original, encoding="utf-8")
+        os.link(source, self.evidence)
+        code, out = self.run_main(["--naming-observations", str(source)], {})
+        self.assertEqual(code, 1)
+        self.assertIn("observation and receipt paths must differ", out)
+        self.assertEqual(source.read_text(encoding="utf-8"), original)
+
+    def test_naming_receipt_cannot_create_a_missing_source_at_an_aliased_path(self):
+        source = Path(self.evidence).parent / "alias.json"
+        source.symlink_to(self.evidence)
+        code, out = self.run_main(["--naming-observations", str(source)], {})
+        self.assertEqual(code, 1)
+        self.assertIn("observation and receipt paths must differ", out)
+        self.assertFalse(Path(self.evidence).exists())
+
     def test_live_guild_refuses_before_any_request(self):
         code, out = self.run_main(["--guild-id", LIVE_GUILD, "--staging-url", ""],
                                   self.routes(command_list(FULL_NAMES)))

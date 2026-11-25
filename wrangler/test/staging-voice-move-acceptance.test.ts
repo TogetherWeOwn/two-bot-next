@@ -1,7 +1,110 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { runVoiceMoveAcceptance } from "../scripts/staging-voice-move-acceptance.mjs";
+import { preflightVoiceMoveAcceptance, runVoiceMoveAcceptance } from "../scripts/staging-voice-move-acceptance.mjs";
 import { mockVoiceMoveWindow } from "./fixtures/staging-voice-move.ts";
+
+test("voice preflight defaults off and returns only a verdict for complete evidence", () => {
+  const { args, calls, signed } = mockVoiceMoveWindow();
+  assert.deepEqual(preflightVoiceMoveAcceptance(), { verdict: "disabled" });
+  assert.deepEqual(preflightVoiceMoveAcceptance({ ...args, enabled: "true" }), { verdict: "disabled" });
+  assert.deepEqual(preflightVoiceMoveAcceptance(args), { verdict: "passed" });
+  assert.deepEqual(calls, []);
+  assert.deepEqual(signed, []);
+});
+
+test("voice preflight refuses swapped channels and mismatched actors", () => {
+  const { args } = mockVoiceMoveWindow();
+  const { session, readback } = args.evidence;
+  const cases = [
+    [{ session: { ...session, channelIds: [...session.channelIds].reverse() } }, "session_unconfirmed"],
+    [{ session: { ...session, discordId: "100000000000000099" } }, "session_unconfirmed"],
+    [{ session: { ...session, authenticated: false } }, "session_unconfirmed"],
+    [{ readback: { source: readback.destination, destination: readback.source } }, "discord_unconfirmed"],
+    [{ readback: { ...readback, source: { ...readback.source, discordId: "100000000000000099" } } }, "discord_unconfirmed"],
+    [{ readback: { ...readback, source: { ...readback.source, channelType: 0 } } }, "discord_unconfirmed"],
+    [{ readback: { ...readback, source: { ...readback.source, canConnect: true } } }, "discord_unconfirmed"],
+    [{ readback: { ...readback, destination: { ...readback.destination, canConnect: false } } }, "discord_unconfirmed"],
+    [{ readback: { ...readback, destination: { ...readback.destination, connectedChannelId: null } } }, "discord_unconfirmed"],
+  ];
+  for (const [change, code] of cases) {
+    assert.deepEqual(preflightVoiceMoveAcceptance({ ...args, evidence: { ...args.evidence, ...change } }),
+      { verdict: "failed", code });
+  }
+});
+
+test("voice preflight refuses missing, stale, future or expired evidence", () => {
+  const { args } = mockVoiceMoveWindow(70_000);
+  const { evidence, ready } = args;
+  const observedAt = new Date(args.now() - 60_001).toISOString();
+  const cases = [
+    [{ lease: undefined }, "lease_invalid"],
+    [{ ready: undefined }, "lease_unconfirmed"],
+    [{ ready: { ...ready, observedAt } }, "lease_unconfirmed"],
+    [{ ready: { ...ready, observedAt: new Date(args.now() + 1).toISOString() } }, "lease_unconfirmed"],
+    [{ evidence: undefined }, "session_unconfirmed"],
+    [{ evidence: { ...evidence, session: { ...evidence.session, observedAt } } }, "session_unconfirmed"],
+    [{ evidence: { ...evidence, readback: { ...evidence.readback, source: undefined } } }, "discord_unconfirmed"],
+    [{ evidence: { ...evidence, readback: { ...evidence.readback,
+      destination: { ...evidence.readback.destination, observedAt } } } }, "discord_unconfirmed"],
+  ];
+  for (const [change, code] of cases) {
+    assert.deepEqual(preflightVoiceMoveAcceptance({ ...args, ...change }), { verdict: "failed", code });
+  }
+  const lastSecond = mockVoiceMoveWindow(15 * 60_000 - 1000);
+  assert.deepEqual(preflightVoiceMoveAcceptance(lastSecond.args), { verdict: "failed", code: "lease_unconfirmed" });
+});
+
+test("voice preflight requires OFF and stopped evidence for the exact prior lease", () => {
+  const { args } = mockVoiceMoveWindow();
+  const { evidence } = args;
+  const { previousReady, previousOff } = evidence;
+  const cases = [
+    { previousReady: undefined },
+    { previousReady: { ...previousReady, voiceMoveEnabled: false } },
+    { previousOff: undefined },
+    { previousOff: { ...previousOff, running: undefined } },
+    { previousOff: { ...previousOff, voiceMoveEnabled: true } },
+    { previousOff: { ...previousOff, use: { ...previousOff.use, runAttempt: 2 } } },
+    { previousOff: { ...previousOff, use: { ...previousOff.use, acquiredAt: previousOff.use.acquiredAt + 1 } } },
+    { previousOff: { ...previousOff, use: { ...previousOff.use, phase: "active" } } },
+    { previousOff: { ...previousOff, observedAt: args.ready.observedAt } },
+  ];
+  for (const pin of [{ runId: args.lease.runId }, { sha: "b".repeat(40) }, { deploymentId: "other" }, { epoch: 3 }]) {
+    cases.push({
+      previousReady: { ...previousReady, ...pin, use: { ...previousReady.use, ...pin } },
+      previousOff: { ...previousOff, ...pin, use: { ...previousOff.use, ...pin } },
+    });
+  }
+  for (const change of cases) {
+    assert.deepEqual(preflightVoiceMoveAcceptance({ ...args, evidence: { ...evidence, ...change } }),
+      { verdict: "failed", code: "prior_cleanup_unconfirmed" });
+  }
+  const earlier = (time: number) => time - 15 * 60_000;
+  const stale = (receipt: typeof previousReady) => ({
+    ...receipt,
+    observedAt: new Date(earlier(Date.parse(receipt.observedAt))).toISOString(),
+    use: { ...receipt.use, acquiredAt: earlier(receipt.use.acquiredAt), expiresAt: earlier(receipt.use.expiresAt) },
+  });
+  assert.deepEqual(preflightVoiceMoveAcceptance({
+    ...args, evidence: { ...evidence, previousReady: stale(previousReady), previousOff: stale(previousOff) },
+  }), { verdict: "failed", code: "prior_cleanup_unconfirmed" });
+  const expiredOff = {
+    ...previousOff, use: { ...previousOff.use, phase: "active" },
+    observedAt: new Date(previousOff.use.expiresAt).toISOString(),
+  };
+  assert.deepEqual(preflightVoiceMoveAcceptance({ ...args, evidence: { ...evidence, previousOff: expiredOff } }),
+    { verdict: "passed" });
+});
+
+test("voice acceptance refuses missing preflight input before any move", async () => {
+  const { args, calls, signed } = mockVoiceMoveWindow();
+  const receipt = await runVoiceMoveAcceptance({ ...args, evidence: undefined });
+  assert.equal(receipt.code, "session_unconfirmed");
+  assert.equal(receipt.verdict, "failed");
+  assert.deepEqual(signed, []);
+  assert.deepEqual(calls, ["status", "release", "status"]);
+  assert.equal(receipt.cleanup.off, true);
+});
 
 test("voice acceptance defaults off and does not touch the lease or caller", async () => {
   const { args, calls, signed } = mockVoiceMoveWindow();
@@ -42,22 +145,23 @@ test("voice fixture recognizes the occupied source before the Connect denial", a
 });
 
 test("voice acceptance refuses mismatched fixture, caller or ready proof before dispatch", async () => {
-  const changes = [
-    (args) => ({ fixture: { ...args.fixture, channelIds: ["300", "300"] } }),
-    (args) => ({ fixture: { ...args.fixture, channelIds: ["300", "400", "500"] } }),
-    (args) => ({ fixture: { ...args.fixture, channelIds: ["300", "18446744073709551616"] } }),
-    (args) => ({ fixture: { ...args.fixture, environment: "production" } }),
-    (args) => ({ caller: { ...args.caller, environment: "production" } }),
-    (args) => ({ caller: { ...args.caller, discordId: undefined } }),
-    (args) => ({ caller: { ...args.caller, discordId: "999" } }),
-    (args) => ({ ready: { ...args.ready, voiceMoveEnabled: undefined } }),
-    (args) => ({ ready: { ...args.ready, use: { ...args.ready.use, runAttempt: 2 } } }),
+  const cases = [
+    [(args) => ({ fixture: { ...args.fixture, channelIds: Array(2).fill(args.fixture.channelIds[0]) } }), "fixture_invalid"],
+    [(args) => ({ fixture: { ...args.fixture, channelIds: [...args.fixture.channelIds, "100000000000000099"] } }), "fixture_invalid"],
+    [(args) => ({ fixture: { ...args.fixture, channelIds: [args.fixture.channelIds[0], "18446744073709551616"] } }), "fixture_invalid"],
+    [(args) => ({ fixture: { ...args.fixture, channelIds: [args.fixture.channelIds[0], "300"] } }), "fixture_invalid"],
+    [(args) => ({ fixture: { ...args.fixture, environment: "production" } }), "fixture_invalid"],
+    [(args) => ({ caller: { ...args.caller, environment: "production" } }), "caller_unconfirmed"],
+    [(args) => ({ caller: { ...args.caller, discordId: undefined } }), "caller_unconfirmed"],
+    [(args) => ({ caller: { ...args.caller, discordId: "100000000000000099" } }), "caller_unconfirmed"],
+    [(args) => ({ ready: { ...args.ready, voiceMoveEnabled: undefined } }), "lease_unconfirmed"],
+    [(args) => ({ ready: { ...args.ready, use: { ...args.ready.use, runAttempt: 2 } } }), "lease_unconfirmed"],
   ];
-  for (const change of changes) {
+  for (const [change, code] of cases) {
     const { args, calls, signed } = mockVoiceMoveWindow();
     const receipt = await runVoiceMoveAcceptance({ ...args, ...change(args) });
     assert.equal(receipt.verdict, "failed");
-    assert.ok(receipt.code);
+    assert.equal(receipt.code, code);
     assert.deepEqual(signed, []);
     assert.deepEqual(calls, ["status", "release", "status"]);
     assert.deepEqual(receipt.cleanup, { memberDisconnected: null, off: true, stopped: true });
@@ -185,10 +289,10 @@ test("voice acceptance stops probing at the lease deadline and still invokes fin
 });
 
 test("voice acceptance aborts a stalled probe and still invokes finish", async () => {
-  const { args, calls, signed } = mockVoiceMoveWindow();
+  const { args, calls, signed } = mockVoiceMoveWindow(15 * 60_000 - 1005);
   let aborted = false;
   const receipt = await runVoiceMoveAcceptance({
-    ...args, now: () => args.lease.expiresAt - 1005,
+    ...args,
     observe({ signal }) {
       signal.addEventListener("abort", () => { aborted = true; }, { once: true });
       return new Promise(() => {});

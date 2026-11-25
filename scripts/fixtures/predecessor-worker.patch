@@ -1,0 +1,91 @@
+diff --git a/wrangler/src/index.ts b/wrangler/src/index.ts
+index 389f09a987b3491ca14cd5ef7580e7e84ac01754..1aeaf2d674a51f62b8d971bada89c1813887748b 100644
+--- a/wrangler/src/index.ts
++++ b/wrangler/src/index.ts
+@@ -1264 +1264 @@ export class TwoBotContainer extends Container<Env> {
+-            headers: withSecurityHeaders({ "cache-control": "no-store" }),
++            headers: withSecurityHeaders({ "cache-control": "no-store", "x-two-bot-exact-takeover": "1" }),
+diff --git a/wrangler/src/ownership.ts b/wrangler/src/ownership.ts
+index 682643cebff6ba0f1dd7c1214b17c51ee5417bd4..315d148400fb3d2d24ba26baa13d6d01f588a280 100644
+--- a/wrangler/src/ownership.ts
++++ b/wrangler/src/ownership.ts
+@@ -22,0 +23 @@ export interface OwnershipChange {
++  expectedDeploymentId?: string;
+@@ -46 +47 @@ export function parseChange(value: unknown): OwnershipChange | null {
+-  if (v.action !== "takeover" && v.action !== "fence") return null;
++  if (v.action !== "takeover" && v.action !== "fence" && v.action !== "takeover-exact" && v.action !== "fence-exact") return null;
+@@ -49,0 +51,6 @@ export function parseChange(value: unknown): OwnershipChange | null {
++  if (v.action === "takeover-exact" || v.action === "fence-exact") {
++    if (!validId(v.expectedDeploymentId)) return null;
++    return { action: v.action === "takeover-exact" ? "takeover" : "fence",
++      expectedEpoch: v.expectedEpoch as number, actor: v.actor,
++      expectedDeploymentId: v.expectedDeploymentId };
++  }
+@@ -102,0 +110,3 @@ export class OwnershipFence {
++    if (change.expectedDeploymentId !== undefined && change.expectedDeploymentId !== id) {
++      throw new OwnershipRefused("deployment_mismatch");
++    }
+@@ -106,0 +117,5 @@ export class OwnershipFence {
++    if (change.expectedDeploymentId !== undefined) {
++      const stopped = old?.phase === "fenced" && old.deploymentId === null;
++      const active = old?.phase === "active" && old.deploymentId === id;
++      if (!stopped && !(change.action === "fence" && active)) throw new OwnershipRefused("epoch_conflict");
++    }
+diff --git a/wrangler/test/container.test.ts b/wrangler/test/container.test.ts
+index f3ffe26f352b13a14352fabb7cdeba3ec10a4416..7cbb73d55bc3fd7a8157f0c5d4d49f8e3d1c51c3 100644
+--- a/wrangler/test/container.test.ts
++++ b/wrangler/test/container.test.ts
+@@ -1183,0 +1184,53 @@ function controlRequest(body?: object, token = CONTROL_TOKEN): Request {
++test("exact takeover refuses a routed version mismatch before changing ownership", async (t) => {
++  const h = await harness(t);
++  const status = await h.bot.fetch(controlRequest());
++  assert.equal(status.headers.get("x-two-bot-exact-takeover"), "1");
++  const actor = `production-schema-release:123:${"a".repeat(40)}`;
++  const fence = await h.bot.fetch(controlRequest({ action: "fence-exact", expectedEpoch: 1,
++    actor, expectedDeploymentId: ID }));
++  assert.equal(fence.status, 200);
++  const before = h.values.get(OWNER_KEY);
++  assert.partialDeepStrictEqual(await fence.json(), { running: false,
++    owner: { deploymentId: null, epoch: 2, phase: "fenced", actor } });
++  const change = { action: "takeover-exact", expectedEpoch: 2, actor: "fixture-recovery" };
++  const wrong = await h.bot.fetch(controlRequest({ ...change, expectedDeploymentId: "deployment-other" }));
++  assert.equal(wrong.status, 503);
++  assert.equal((await wrong.json()).reason, "deployment_mismatch");
++  assert.deepEqual(h.values.get(OWNER_KEY), before);
++  const matched = await h.bot.fetch(controlRequest({ ...change, expectedDeploymentId: ID }));
++  assert.equal(matched.status, 200);
++  const state = await matched.json();
++  assert.equal(state.owner.deploymentId, ID);
++  assert.equal(state.owner.epoch, 3);
++  assert.equal(state.running, false);
++  assert.equal(h.starts.length, 0);
++});
++
++test("exact takeover refuses a pending fence without changing ownership", async (t) => {
++  const pending = { ...ACTIVE_OWNER, phase: "fenced", epoch: 2, oldEpoch: 1 };
++  const h = await harness(t, WORKER_ENV, { owner: pending });
++  const response = await h.bot.fetch(controlRequest({
++    action: "takeover-exact", expectedDeploymentId: ID, expectedEpoch: pending.epoch, actor: "fixture-recovery",
++  }));
++  assert.equal(response.status, 409);
++  assert.equal((await response.json()).reason, "epoch_conflict");
++  assert.deepEqual(h.values.get(OWNER_KEY), pending);
++  assert.equal(h.values.has(`${AUDIT_PREFIX}3:fenced`), false);
++  assert.equal(h.values.has(`${AUDIT_PREFIX}3:active`), false);
++  assert.equal(h.starts.length, 0);
++});
++
++test("exact schema fence refuses a routed version mismatch and confirms a matching stop", async (t) => {
++  const h = await harness(t);
++  const before = h.values.get(OWNER_KEY);
++  const change = { action: "fence-exact", expectedEpoch: 1, actor: "fixture-release" };
++  const wrong = await h.bot.fetch(controlRequest({ ...change, expectedDeploymentId: "deployment-other" }));
++  assert.equal(wrong.status, 503);
++  assert.equal((await wrong.json()).reason, "deployment_mismatch");
++  assert.deepEqual(h.values.get(OWNER_KEY), before);
++  const matched = await h.bot.fetch(controlRequest({ ...change, expectedDeploymentId: ID }));
++  assert.equal(matched.status, 200);
++  const state = await matched.json();
++  assert.partialDeepStrictEqual(state, { owner: { deploymentId: null, epoch: 2 }, running: false });
++});
++
