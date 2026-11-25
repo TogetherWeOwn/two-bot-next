@@ -703,11 +703,12 @@ def _admit(args, github, copy_image):
     if (_staging_image_pattern(args.account_id).fullmatch(staging_image) is None):
         raise PromotionError("staging image mismatch")
     digest = receipt["container"]["digest"]
+    pins = args.approved_archive, args.approved_image
+    if (args.verify_only or pins != (None, None)) and not all(map(_is_digest, pins)):
+        raise PromotionError("protected admission needs both approved digests")
     if args.approved_image is not None and digest != args.approved_image:
         raise PromotionError("approved staging image mismatch")
     if args.verify_only:
-        if not (_is_digest(args.approved_archive) and _is_digest(args.approved_image)):
-            raise PromotionError("verification needs both approved digests")
         return 0
     repository = f"{REGISTRY_HOST}/{args.account_id}/{PRODUCTION_APP}"
     expected = repository + "@" + digest

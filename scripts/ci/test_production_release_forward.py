@@ -180,7 +180,7 @@ class ReleaseForwardTests(unittest.TestCase):
         actor = release.release_actor("456", pin.candidate_sha)
         state = {"worker": {"version_id": pin.rollback_worker, "sha": pin.candidate_sha, "traffic_percent": 100},
                  "container": {"image_digest": pin.candidate_image, "application_id": pin.application_id,
-                               "namespace_id": pin.namespace_id},
+                               "namespace_id": pin.namespace_id, "rollout_status": "completed"},
                  "ownership": {"phase": "fenced", "epoch": 18, "running": False, "owner_actor": actor}}
         observe = Mock(return_value=state)
         control = Mock(side_effect=GateError("lost_ack"))
@@ -191,9 +191,11 @@ class ReleaseForwardTests(unittest.TestCase):
         prior["worker"]["sha"] = pin.rollback_sha
         prior["container"]["image_digest"] = pin.rollback_image
         state["worker"]["version_id"] = version
-        observe.side_effect = [prior, state]
+        progressing = deepcopy(state)
+        progressing["container"]["rollout_status"] = "progressing"
+        observe.side_effect = [prior, progressing, state]
         pause = Mock()
         with self.assertRaisesRegex(GateError, "lost_ack"):
             release.take_over(pin, recovery, version, observe, control, pause=pause)
         control.assert_called_once_with("takeover-fenced", 18, expected_deployment=version)
-        pause.assert_called_once_with(release.WORKER_RESTORE_POLL_SECONDS)
+        self.assertEqual(pause.call_count, 2)
