@@ -5,19 +5,26 @@ import json
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from ci.pre_operator_acceptance_fixture import (
-        AcceptedRow, Build, Probe, Reservation, SchemaEvidence, SchemaState,
+        AcceptedRow, Build, IngressReadback, Probe, SchemaEvidence, SchemaState,
         ServingEvidence, SweepEvidence, WorkerEvidence, accept,
     )
+    from ci.test_pre_admission import Store
+    from ci.test_pre_start_stop import START, PreFixture
+    from ci.test_staging_pre_reaper_fixture import SyntheticStaging
+    from pre_admission import SettlementEvidence, SettlementSource, StartupAdmission
+    from pre_start_stop import ProtectedPre
+    from pre_sweep import SweepError, sweep_target
+    from pre_target import ProtectedRouteReadback, Resource, Target
     from rollback_proof import ProofError
 
 
 class PreOperatorAcceptanceTests(unittest.TestCase):
     def setUp(self):
-        self.target = Reservation("pre-fixture-operator", 42, 1_800_000_000, "0473/0465")
+        self.target = Target("pre-fixture-operator", 42, 1_800_000_000, "0473/0465")
         self.build = Build(17, "a" * 40, "2026.11.25.1+aaaaaaa", "sha256:" + "b" * 64)
         self.original = SchemaState((115, 473), (20, 465), False, None)
         self.restored = SchemaState((116, 475), (20, 465), True, 1_800_000_001)
@@ -25,7 +32,8 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
         self.report = {"build_revision": "a" * 40, "build_id": "17-1", "deploy_id": "2026.11.25.1+aaaaaaa",
                        "components": [["process", "ready"], ["database", "ready"], ["gateway", "ready"]]}
 
-    def evidence(self, target, state):
+    def evidence(self, target, state, *, app_id="12345678-1234-4234-8234-123456789abc"):
+        route = ProtectedRouteReadback(target, target.worker_name, Resource(target.container_name, app_id))
         return {
             "receipt": {"source_sha": "a" * 40, "worker_message": "a" * 40, "BOT_BUILD_REVISION": "a" * 40,
                         "BOT_BUILD_ID": "17-1", "BOT_DEPLOY_ID": "2026.11.25.1+aaaaaaa",
@@ -35,6 +43,9 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
             "worker": WorkerEvidence(target, Probe(200, self.version),
                                      Probe(200, self.version, json.dumps(self.report).encode())),
             "sweep": SweepEvidence(target, "cleared"),
+            "pinned_route": route,
+            "pinned_app_id": app_id,
+            "read_ingress": lambda _: IngressReadback(route, False),
         }
 
     def refuse(self, evidence, reason):
@@ -144,6 +155,7 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
 
     def test_cleanup_must_be_cleared_for_the_exact_reservation(self):
         evidence = self.evidence(self.target, self.original)
+        read_ingress = evidence["read_ingress"] = Mock()
         for outcome in ("spared", None):
             with self.subTest(outcome=outcome):
                 self.refuse(evidence | {"sweep": SweepEvidence(self.target, outcome)}, "pre_cleanup_unproved")
@@ -152,3 +164,70 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
         for foreign in self.foreign_reservations():
             with self.subTest(foreign=foreign):
                 self.refuse(evidence | {"sweep": SweepEvidence(foreign, "cleared")}, "pre_cleanup_reservation_mismatch")
+        read_ingress.assert_not_called()
+
+    def test_stop_success_keeps_custody_until_fresh_ingress_worker_and_app_absence(self):
+        target = self.target
+        runtime = PreFixture(target)
+        store = Store()
+        admission = StartupAdmission(
+            store, lambda closed: SettlementEvidence(closed, SettlementSource.PROVIDER, True, True),
+        )
+        controller = ProtectedPre(target, authorize=runtime.authorize, admission=admission,
+                                  runtime=runtime, external_stop=runtime)
+        with patch("pre_admission.uuid4", return_value=START):
+            deployment = controller.start(runtime.upload)
+        self.version = str(deployment.worker_version)
+        evidence = self.evidence(target, self.original, app_id=str(deployment.container_id))
+        route = evidence["pinned_route"]
+        staging = SyntheticStaging(target)
+        self.assertIs(controller.stop(), True)
+        staging.snapshot = replace(staging.snapshot, container=route.app,
+                                   startup_settled=admission.startup_settled(target))
+
+        read_ingress = evidence["read_ingress"] = Mock(return_value=IngressReadback(route, True))
+
+        def handoff():
+            outcome = sweep_target(target, staging, now=store.now)
+            return accept(target, self.build, **(evidence | {"sweep": SweepEvidence(target, outcome)}))
+
+        worker = staging.snapshot.worker
+        with self.assertRaisesRegex(ProofError, "^pre_ingress_unproved$"):
+            handoff()
+        read_ingress.assert_called_once_with(route)
+        cleared = staging.snapshot
+        self.assertIsNone(cleared.worker)
+        self.assertIsNone(cleared.container)
+
+        read_ingress.return_value = IngressReadback(route, False)
+        for lingering in (replace(cleared, worker=worker), replace(cleared, container=route.app)):
+            with self.subTest(lingering=lingering), patch.object(
+                staging, "inventory", side_effect=[cleared, lingering]
+            ) as inventory:
+                with self.assertRaisesRegex(SweepError, "^PRE cleanup readback could not be verified$"):
+                    handoff()
+                self.assertEqual(inventory.call_args_list, [call(target), call(target)])
+        read_ingress.assert_called_once_with(route)
+
+        self.assertEqual(handoff(), AcceptedRow(target, self.build, self.original, self.version, "cleared"))
+        self.assertEqual(read_ingress.call_args_list, [call(route), call(route)])
+
+    def test_private_ingress_absence_requires_the_independently_pinned_scope(self):
+        evidence = self.evidence(self.target, self.original)
+        route = evidence["pinned_route"]
+        read_ingress = evidence["read_ingress"] = Mock()
+        wrong_app = replace(route, app=replace(route.app, id="12345678-1234-4234-8234-123456789def"))
+        self.refuse(evidence | {"pinned_route": wrong_app}, "pre_ingress_unproved")
+        read_ingress.assert_not_called()
+
+        for observed in (replace(route, target=replace(self.target, shape="0475/0465")),
+                         replace(route, worker_id="sibling-worker"), wrong_app):
+            with self.subTest(observed=observed):
+                read_ingress.return_value = IngressReadback(observed, False)
+                self.refuse(evidence, "pre_ingress_unproved")
+        for present in (None, 0):
+            with self.subTest(present=present):
+                read_ingress.return_value = IngressReadback(route, present)
+                self.refuse(evidence, "pre_ingress_unproved")
+        read_ingress.side_effect = TimeoutError("synthetic private detail")
+        self.refuse(evidence, "pre_ingress_unproved")

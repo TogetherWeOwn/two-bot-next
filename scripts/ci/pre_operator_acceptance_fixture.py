@@ -3,19 +3,10 @@
 from dataclasses import dataclass
 
 from build_identity import is_build_revision_shape, is_deploy_id_shape
+from pre_target import ProtectedRouteReadback, Target, confirm_protected_route
 from rollback_proof import DIGEST, ProofError, VERSION, require
 from staging_rollout import GateError, decode, runtime_ready
 from worker_container_rollback import gateway_state
-
-
-@dataclass(frozen=True)
-class Reservation:
-    # The immutable Target fields published in #2564. The cutoff is derived
-    # from started_at, and this run ID belongs to staging, not to the build.
-    scope: str
-    run_id: int
-    started_at: int
-    shape: str
 
 
 @dataclass(frozen=True)
@@ -53,13 +44,13 @@ PRE_STATES = {
 
 @dataclass(frozen=True)
 class SchemaEvidence:
-    reservation: Reservation
+    reservation: Target
     state: SchemaState
 
 
 @dataclass(frozen=True)
 class ServingEvidence:
-    reservation: Reservation
+    reservation: Target
     worker_version: str
     worker_message: str
     image_digest: str
@@ -74,7 +65,7 @@ class Probe:
 
 @dataclass(frozen=True)
 class WorkerEvidence:
-    reservation: Reservation
+    reservation: Target
     health: Probe | None
     readyz: Probe | None
 
@@ -84,25 +75,40 @@ class SweepEvidence:
     # Record the reservation passed to #2563's sweep_target with its outcome.
     # An exception or lost response has no outcome. Only 'cleared' signifies
     # completion of the independent stop and final readback checks.
-    reservation: Reservation
+    reservation: Target
     outcome: str | None
 
 
 @dataclass(frozen=True)
+class IngressReadback:
+    """Scope of a fresh authenticated lookup, with None for unknown presence.
+
+    The scope identifies the lookup even when the route itself is absent.
+    It comes from the reader's authenticated context, never from the request.
+    """
+
+    scope: ProtectedRouteReadback
+    present: bool | None
+
+
+@dataclass(frozen=True)
 class AcceptedRow:
-    reservation: Reservation
+    reservation: Target
     build: Build
     schema: SchemaState
     worker_version: str
     cleanup: str
 
 
-def accept(reservation, build, *, receipt, schema, serving, worker, sweep):
+def accept(reservation, build, *, receipt, schema, serving, worker, sweep,
+           pinned_route, pinned_app_id, read_ingress):
     """Compose a stubbed verified build receipt and scoped observations.
 
     The operator pins come from outside the observations. `receipt` stands in
     for #2558's verified #2556 build.json. Schema, serving, probes and sweep
     stand in for evidence captured against each independently observed target.
+    The sweep outcome comes from the current cleanup attempt. After it clears,
+    read private ingress independently using the original route and app pins.
     """
     require(type(build.run_id) is int and 0 < build.run_id < 10**20
             and is_build_revision_shape(build.revision) and is_deploy_id_shape(build.deploy_id)
@@ -141,4 +147,11 @@ def accept(reservation, build, *, receipt, schema, serving, worker, sweep):
     require(sweep is not None, "pre_cleanup_unproved")
     require(sweep.reservation == reservation, "pre_cleanup_reservation_mismatch")
     require(sweep.outcome == "cleared", "pre_cleanup_unproved")
+    try:
+        confirm_protected_route(reservation, pinned_app_id=pinned_app_id, readback=pinned_route)
+        ingress = read_ingress(pinned_route)
+        require(type(ingress) is IngressReadback and ingress.present is False, "pre_ingress_unproved")
+        confirm_protected_route(reservation, pinned_app_id=pinned_app_id, readback=ingress.scope)
+    except Exception:
+        raise ProofError("pre_ingress_unproved") from None
     return AcceptedRow(reservation, build, schema.state, serving.worker_version, sweep.outcome)
