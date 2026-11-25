@@ -1,17 +1,19 @@
 # Hosting decision for the archived attendance predecessor
 
 Keep live PRE qualification closed for [#2614](https://github.com/TogetherWeOwn/two-bot-next/issues/2614).
-Keep the protected caller dormant and the existing selectors off. Use the
-existing isolated Docker fixture for synthetic Container evidence. Cloudflare
+Keep hosted caller wiring and the existing selectors off. Use the isolated
+Docker fixture for synthetic Container evidence. Cloudflare
 Workers and Containers is the candidate for the exact hosted pair when an
 already-approved isolated account can prove private creation and enforce the
 Container launch policy independently of the archived Worker. The available
-evidence leaves both controls open. [Hosted transport preflight (#2654)](https://github.com/TogetherWeOwn/two-bot-next/pull/2654) ·
-[Dormant caller (#2650)](https://github.com/TogetherWeOwn/two-bot-next/pull/2650)
+evidence leaves both controls open. Separate source PRs track the
+[archived upload guard (#2622)](https://github.com/TogetherWeOwn/two-bot-next/pull/2622),
+[hosted transport preflight (#2654)](https://github.com/TogetherWeOwn/two-bot-next/pull/2654)
+and [dormant caller (#2650)](https://github.com/TogetherWeOwn/two-bot-next/pull/2650).
 
 ## Archived pair
 
-The rank 11 packet pins first-attempt build `45640646722/1`, artifact `15036560345`,
+The protected rehearsal packet pins first-attempt build `45640646722/1`, artifact `15036560345`,
 and source revision `b689bc3545777c801b8758bcb7160e72a0321724`. The archived
 `index.js` SHA-256 is `709eaf3242b28d645cf163a3e28333b106f9dd35ab2426d0eef023a431326453`.
 The Linux amd64 OCI manifest is `sha256:c2a855f56ac103323ec1055618e68e5716ad0432f9e0faf158594b8166766c1c`
@@ -37,7 +39,7 @@ again after the initiating runner exits. [Archived Worker source](https://github
 | --- | --- | --- |
 | Existing Cloudflare Workers and Containers | Same-account HTTP Service Bindings call the named Worker and environment without a public URL. Prior read-only staging inventory joined the Worker's `TWO_BOT` binding, the exact worker/class namespace, and the Container app detail by Durable Object namespace ID. The upload and route fixtures check artifact identity and complete ingress readback. | The script upload and per-script subdomain APIs are separate. The provider documents `workers.dev` route assignment on creation. A later read with `workers.dev` and Version URLs disabled leaves first-create privacy unproved. A service binding names a service, so the caller must independently verify the serving version and app. Staging inventory covers identity correlation only. There is no evidenced isolated account default or provider-supported atomic create with every public ingress surface disabled. [Worker upload](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/methods/update/) · [Subdomain API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/subdomain/methods/create/) · [workers.dev](https://developers.cloudflare.com/workers/configuration/routing/workers-dev/) · [Version URLs](https://developers.cloudflare.com/workers/configuration/previews/) · [Service Bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/) · [Container detail](https://developers.cloudflare.com/api/resources/containers/subresources/applications/methods/get/) |
 | Cloudflare Container launch controls | The scheduler-backed application API exposes `configuration.environment_variables` and command/entrypoint settings. The separate Durable Object-managed application form delegates instance lifecycle to the Durable Object and exposes neither an application environment override nor a command override. The start API takes process `env`, `entrypoint` and `enableInternet`. | The scheduler-backed schema supplies no guarantee that application defaults win over the archived Worker's actual start configuration or that mocks can be installed in the process network namespace before each start. The documented egress controls require control of start options or Worker-side intercepts. HTTP(S) intercepts alone supply neither a loopback listener nor a private PostgreSQL transport. No documented control in this path enforces the required settings and default-deny policy across legacy restarts without changing the pair. [Application Create API](https://developers.cloudflare.com/api/resources/containers/subresources/applications/methods/create/) · [Container start](https://developers.cloudflare.com/containers/api/durable-object-container/#start) · [Outbound traffic](https://developers.cloudflare.com/containers/configuration/outbound-traffic/) |
-| Existing disposable Docker fixture | A `--network=none` namespace is loopback-only. The disposable PostgreSQL, mock and bot share that namespace, and the Docker launch supplies both settings to the exact bot image. The retained receipt covers both PRE shapes, with readiness 503 then 200, a gateway checkpoint, nonempty REST command sync and cleanup. The fixture uses synthetic data and already available capacity. | Scope is `direct-container-only`. There is no Worker service binding, Durable Object launch, hosted app UUID or proof against a legacy keepalive restart. [Docker none driver](https://docs.docker.com/engine/network/drivers/none/) · [Docker run](https://docs.docker.com/engine/containers/run/) · [Exact image fixture follow-up (#2635)](https://github.com/TogetherWeOwn/two-bot-next/pull/2635) |
+| Disposable Docker fixture | A `--network=none` namespace is loopback-only. The disposable PostgreSQL, mock and bot share that namespace, and the Docker launch supplies both settings to the exact bot image. The retained replay used the exact image fixture changes from #2635 and the REST sync check from #2654. Both PRE shapes showed readiness 503 then 200, a gateway checkpoint, nonempty REST command sync and cleanup on synthetic data with existing capacity. | Scope is `direct-container-only`. There is no Worker service binding, Durable Object launch, hosted app UUID or proof against a legacy keepalive restart. [Docker none driver](https://docs.docker.com/engine/network/drivers/none/) · [Docker run](https://docs.docker.com/engine/containers/run/) · [Exact image fixture (#2635)](https://github.com/TogetherWeOwn/two-bot-next/pull/2635) · [REST sync verification (#2654)](https://github.com/TogetherWeOwn/two-bot-next/pull/2654) |
 | Existing GitHub-hosted fixture lanes and Cloudflare local development | The existing Actions reaper exercises synthetic contracts. Cloudflare documents local Worker-driven Container launches using a Docker-compatible engine. This is a candidate for additional local paired evidence if its launch boundary can be enforced on already-approved isolated capacity. | Local dev alone leaves the archived launch options in control. The reviewed configuration surfaces provide no supported pre-start environment and shared-loopback listener injection with egress denial for this exact archived pair. Local evidence also cannot establish Cloudflare account ingress, hosted version/app identity or stop after runner loss. [Synthetic reaper](../.github/workflows/staging-pre-reaper.yml) · [Cloudflare local development](https://developers.cloudflare.com/containers/local-dev/) |
 
 The direct-container fixture is the qualified zero-new-spend route for its
@@ -45,7 +47,7 @@ synthetic scope. Cloudflare's included usage is metered. The packet contains
 no applicable allowance readback for an isolated hosted run. Keep hosted work
 at the decision and evidence stage. [Cloudflare Container pricing](https://developers.cloudflare.com/containers/platform/pricing/)
 
-## Acceptance evidence for rank 11
+## Acceptance evidence
 
 The missing provider predicate is a supported, reservation-scoped pre-start
 boundary outside the archived Worker. It must apply both effective process
@@ -90,6 +92,7 @@ exact reserved pair at a time.
    [Existing rollout and cleanup contract](staging-rollout-gate.md#disposable-exact-pre-rehearsal)
 
 Adopt a provider path only when its supported controls and authenticated
-evidence cover the full sequence. Keep the #2654 hosted refusal and the archived
-upload guard in force while it is unavailable. The two synthetic PRE receipts
-support the direct-container fallback and leave the hosted qualification open.
+evidence cover the full sequence. Any future caller integration requires the
+reviewed upload guard and hosted preflight on protected source. Until the
+provider boundary is proved, keep live admission closed. The two synthetic PRE
+receipts support the direct-container fallback and leave hosted qualification open.
