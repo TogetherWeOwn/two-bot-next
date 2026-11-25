@@ -172,7 +172,9 @@ export async function readChange(request: Request): Promise<OwnershipChange | nu
 }
 
 /** Bound control input independently of the untrusted Content-Length header. */
-export async function readControlBody(request: Request): Promise<unknown> {
+export async function readControlBody(request: Request,
+  decode = (bytes: Uint8Array): unknown => JSON.parse(new TextDecoder().decode(bytes)),
+): Promise<unknown> {
   const reader = request.body?.getReader();
   if (!reader) return null;
   const chunks: Uint8Array[] = [];
@@ -199,7 +201,7 @@ export async function readControlBody(request: Request): Promise<unknown> {
     const bytes = new Uint8Array(size);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-    return JSON.parse(new TextDecoder().decode(bytes));
+    return decode(bytes);
   } catch {
     return null;
   } finally {

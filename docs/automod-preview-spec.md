@@ -735,15 +735,20 @@ durable completion. The versioned job receipt carries a timestamp, verdict and
 scoped lease metadata for admitted requests. The job must treat a failed verdict
 as failure. A recovery pass means cleanup and lease retirement were confirmed.
 
-The remaining authentication boundary lies between the protected GitHub
-`staging` job and the private in-process Container caller. The future transport
-must authenticate the protected job and derive approval independently of the
-request body. Bind the allowed action to the job run and attempt, the approved
-staging application and guild, and the exact issued deployment, build and owner
-epoch. Supply the original issued lease from the protected authority and bind
-the invocation to that Container. The receipt is evidence for the job summary
-or artifact. Authority stays with the protected job and Worker checks. Only the
-synthetic test invokes the adapter today.
+The private in-process Worker entry requires the existing staging ownership
+control bearer and checks the configured staging application and guild. It
+accepts bounded POST JSON and checks the deployment and build against Worker
+metadata before passing the body and independent approval to the job adapter.
+Any refusal before admission returns the same unscoped failure receipt and
+leaves the private caller untouched.
+
+Only synthetic tests invoke the entry today. Live integration must supply
+approval from authenticated protected GitHub `staging` job context, independent
+of the request body. Bind the approved action to the job run and attempt and
+supply the fixed staging target and original issued lease from protected
+authority. Resolve the private Container invocation for that deployment only
+after admission. The receipt supports job evidence, while the protected context
+and Worker checks supply authority.
 
 Live qualification also needs native expiry and restart recovery, a way to
 retire an unused reservation before intent, an isolated runtime adapter and
