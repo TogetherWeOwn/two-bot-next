@@ -124,6 +124,7 @@ test("Container authority reads under the gate and refuses a fenced owner", asyn
       put: async (key: string, value: unknown) => { h.records.set(key, structuredClone(value)); },
       kv: { get: () => undefined },
       sql: { exec: () => [] },
+      setAlarm: async () => {},
       deleteAlarm: async () => {},
       sync: async () => {},
     },
