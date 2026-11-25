@@ -437,8 +437,11 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
       return commandPresent ? Response.json(preview) : Response.json({ code: 10063 }, { status: 404 });
     },
   };
-  const run = (action: "start" | "recover", issuedLease = issued, enabled = true) =>
-    TwoBotContainer.runProtectedAutomod(h.bot, { action, issuedLease }, { ...effects, enabled });
+  const run = (action: "start" | "recover", issuedLease = issued, enabled = true) => {
+    // A loosely typed adapter may carry extra properties. Only the Worker clock is authoritative.
+    const adapter = { ...effects, enabled, now: () => 0 };
+    return TwoBotContainer.runProtectedAutomod(h.bot, { action, issuedLease }, adapter);
+  };
   const refused = /staging_(automod_|use_conflict)/;
   await assert.rejects(run("start", issued, false), refused);
   await assert.rejects(run("recover"), refused);

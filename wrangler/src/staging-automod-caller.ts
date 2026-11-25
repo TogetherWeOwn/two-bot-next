@@ -13,7 +13,7 @@ export type ProtectedAutomodCall = Readonly<{ action: "start" | "recover"; issue
 
 /** Trusted adapters supplied by the eventual protected workflow caller.
  * Runtime and cleanup readbacks each identify their own issued lease. */
-export type ProtectedAutomodEffects = Omit<Lifecycle, "storage" | "env" | "exclusive" | "observe" | "get" | "now"> & {
+export type ProtectedAutomodEffects = Pick<Lifecycle, "enabled" | "dryRun" | "fenceAndDrain" | "stop" | "request"> & {
   readRuntime(lease: Lease): Promise<{ lease: Lease; running: boolean; policy?: RuntimePolicy } | undefined>;
   readCleanupGrant(lease: Lease): Promise<{ lease: Lease; before: number } | undefined>;
 };
@@ -36,9 +36,10 @@ export async function runProtectedAutomod(call: ProtectedAutomodCall, authority:
   const { storage, env, staging } = authority;
   const { action } = call;
   const { dryRun } = effects;
+  const enabled = effects.enabled === true;
   if (env.TWO_DEPLOY_ENV !== "staging" || env.STAGING_RUNTIME_POLICY !== "bounded"
     || (action !== "start" && action !== "recover")
-    || (action === "start" && effects.enabled !== true)) throw refused();
+    || (action === "start" && !enabled)) throw refused();
 
   const issued = Object.freeze({ ...call.issuedLease });
   const journal = new StagingAutomodRecovery(storage);
@@ -48,7 +49,7 @@ export async function runProtectedAutomod(call: ProtectedAutomodCall, authority:
     return bound;
   };
   const lifecycle = new StagingAutomodLifecycle({
-    ...effects, storage, env,
+    storage, env, enabled,
     ...(dryRun === undefined ? {} : { dryRun: {
       policy: dryRun.policy,
       start: async (expected, policy, before) => {
