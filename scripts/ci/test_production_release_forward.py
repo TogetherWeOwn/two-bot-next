@@ -1,12 +1,15 @@
 """Synthetic evidence for the forward database release and inverse boundary."""
 
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from production_release_forward import CUTOVER, STORE, forward_receipt
+from production_release_preflight import ReleasePreflight, verify_preflight
 from ci.production_migrate_claim import projection_hash, store_projection_hash
 from staging_migrate_approval import digest_json
 from staging_rollout import GateError
@@ -57,3 +60,33 @@ class ReleaseForwardTests(unittest.TestCase):
         bad_source["source_migrations"][0]["sha384_recomputed"] = "c" * 96
         with self.assertRaisesRegex(GateError, "production_release_plan_checksum_invalid"):
             forward_receipt("123", bad_source, self.outcome)
+
+    def test_preflight_binds_immutable_candidate_and_live_rollback_capability(self):
+        pin = ReleasePreflight("d" * 40, self.plan["source_sha"], "sha256:" + "1" * 64,
+                               "sha256:" + "2" * 64, "e" * 40,
+                               "12345678-1234-4567-8123-123456789abc", "sha256:" + "3" * 64,
+                               "12345678-1234-4567-8123-123456789def", "4" * 32, "5" * 64)
+        plan = {**self.plan, "mode": "plan", "role": "two_bot_migrator_ro", "migration_target": "production",
+                "role_verified_connections": 1, "audit": {"verify_findings": []},
+                "recovery_evidence_ref": pin.recovery_reference()}
+        state = {"worker": {"version_id": pin.rollback_worker, "sha": pin.rollback_sha, "traffic_percent": 100},
+                 "container": {"image_digest": pin.rollback_image, "application_id": pin.application_id,
+                               "namespace_id": pin.namespace_id, "rollout_status": "completed"},
+                 "ownership": {"phase": "active", "running": True, "epoch": 17}}
+        observe = Mock(side_effect=lambda: deepcopy(state))
+        control = Mock(return_value={"deploymentId": pin.rollback_worker, "exactTakeover": True})
+        self.assertEqual(verify_preflight(pin, plan["target"], plan, deepcopy(plan), observe, control), 17)
+        control.assert_called_once_with("takeover-capability", expected_deployment=pin.rollback_worker)
+        control.reset_mock()
+        with self.assertRaisesRegex(GateError, "production_release_preflight_plan_changed"):
+            verify_preflight(replace(pin, candidate_archive="sha256:" + "6" * 64), plan["target"], plan, plan,
+                             observe, control)
+        control.assert_not_called()
+        control.return_value = {"deploymentId": pin.rollback_worker, "exactTakeover": False}
+        with self.assertRaisesRegex(GateError, "production_release_retained_takeover_unproved"):
+            verify_preflight(pin, plan["target"], plan, plan, observe, control)
+        control.return_value["exactTakeover"] = True
+        shifted = deepcopy(state)
+        shifted["ownership"]["epoch"] += 1
+        with self.assertRaisesRegex(GateError, "production_release_retained_pair_changed"):
+            verify_preflight(pin, plan["target"], plan, plan, Mock(side_effect=[state, shifted]), control)
