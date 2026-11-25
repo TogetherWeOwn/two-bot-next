@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
 import { Container } from "@cloudflare/containers";
+import { bindStagingAutomodDeploymentTransport } from "../scripts/staging-automod-deployment-transport.ts";
 import detail from "./fixtures/staging-automod-preview.json" with { type: "json" };
 import databaseTargets from "./fixtures/staging-database-fingerprint.json" with { type: "json" };
 import automodPublication from "./fixtures/staging-automod-publication.json" with { type: "json" };
@@ -558,15 +559,17 @@ test("protected AutoMod publication intent spends unused reservation evidence be
 test("protected AutoMod scopes startup and cleanup to the exact exclusive staging purpose", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
   const { env, replies: { preview } } = automodPublication;
-  const stageEnv = { ...BOUNDED_STAGING_ENV, ...env };
+  const version = "11111111-1111-1111-1111-111111111111";
+  const stageEnv = { ...BOUNDED_STAGING_ENV, ...env, CF_VERSION_METADATA: { id: version } };
+  const owner = { ...ACTIVE_OWNER, deploymentId: version };
   const window = stagingWindow();
   const ordinary: StagingUse = {
-    ...window, deploymentId: ID, sha: stageEnv.CONTAINER_RELEASE, epoch: ACTIVE_OWNER.epoch,
+    ...window, deploymentId: version, sha: stageEnv.CONTAINER_RELEASE, epoch: owner.epoch,
     acquiredAt: Date.now(), phase: "active",
   };
   const issued: Readonly<StagingUse> = { ...ordinary, purpose: AUTOMOD_STAGING_PURPOSE };
-  const values = new Map<string, unknown>([[OWNER_KEY, ACTIVE_OWNER], [STAGING_USE_KEY, issued]]);
-  const h = await harness(t, stageEnv, values);
+  const values = new Map<string, unknown>([[OWNER_KEY, owner], [STAGING_USE_KEY, issued]]);
+  const h = await harness(t, stageEnv, { values, owner });
   const storage = h.ctx.storage as unknown as DurableObjectStorage;
   const options = { memberIntake: false, enforcement: false, resume: false, registrySync: false,
     interactionDispatch: false, dedicatedIntents: true };
@@ -626,8 +629,9 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
       return commandPresent ? Response.json(preview) : Response.json({ code: 10063 }, { status: 404 });
     },
   };
-  const pin = { workerDeploymentId: "fixture-worker-deployment", workerVersionId: ID, sourceSha: issued.sha,
-    applicationId: "fixture-container-app", namespaceId: "fixture-namespace", rolloutId: "fixture-rollout",
+  const pin = { workerDeploymentId: "22222222-2222-2222-2222-222222222222", workerVersionId: version, sourceSha: issued.sha,
+    applicationId: "33333333-3333-3333-3333-333333333333", namespaceId: "a".repeat(32),
+    rolloutId: "44444444-4444-4444-4444-444444444444",
     imageDigest: `sha256:${"b".repeat(64)}` };
   let observed: typeof pin | undefined = pin;
   const readServing = t.mock.fn(async () => observed);
@@ -642,6 +646,21 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   await assert.rejects(run("start", { ...issued, sha: "c".repeat(40) }), refused);
   const wrongVersion = "other-worker";
   const invoke = TwoBotContainer.bindProtectedAutomodInvoker(h.bot, readServing, { ...effects, enabled: true });
+  const readInventory = t.mock.fn<Parameters<typeof bindStagingAutomodDeploymentTransport>[1]>(async () => ({
+    schema_version: 1, observed_at: new Date(Date.now()).toISOString(),
+    worker: { deployment_id: pin.workerDeploymentId, version_id: version, source_sha: issued.sha,
+      traffic_percent: 100, runtime_policy: "bounded" },
+    container: { application_id: pin.applicationId, namespace_id: pin.namespaceId, rollout_id: pin.rolloutId,
+      rollout_status: "completed", image_digest: pin.imageDigest },
+    ownership: { phase: "active", epoch: issued.epoch },
+  }));
+  const transport = bindStagingAutomodDeploymentTransport({ env: stageEnv, controlBearer: CONTROL_TOKEN }, readInventory, invoke);
+  const request = async (action: "start" | "recover") => {
+    const call = { action, issuedLease: issued };
+    const response = await transport(call, { ...call, target: STAGING_AUTOMOD_TARGET }, new AbortController().signal);
+    assert.equal(response.status, 200);
+    return await response.json();
+  };
   assert.equal("bindProtectedAutomodInvoker" in h.bot, false);
   await assert.rejects(invoke({ ...pin, workerVersionId: wrongVersion }, {
     action: "start", issuedLease: { ...issued, deploymentId: wrongVersion },
@@ -682,7 +701,8 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   const receipt = { intent, id: preview.id, version: preview.version };
   await journal.recordCreated(receipt);
   await journal.confirmPublication(receipt);
-  await run("start");
+  assert.deepEqual(await request("start"), { schema: "two-bot-staging-automod-job.v1", environment: "staging",
+    observedAt: new Date(Date.now()).toISOString(), action: "start", lease: issued, verdict: "passed" });
   assert.equal(h.runtime.running, true);
   assert.equal(calls.filter(call => call === "start").length, 1);
   await assert.rejects(run("start"), refused);
@@ -694,7 +714,9 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   assert.equal(h.runtime.running, true);
   observed = { ...pin, rolloutId: "different-rollout" };
   const beforeDrift = [...calls];
-  await assert.rejects(run("recover"), refused);
+  assert.deepEqual(await request("recover"), { schema: "two-bot-staging-automod-job.v1", environment: "staging",
+    observedAt: new Date(Date.now()).toISOString(), action: "recover", lease: issued, verdict: "failed",
+    code: "operation_unconfirmed" });
   assert.deepEqual(calls, beforeDrift);
   assert.equal(h.runtime.running, true);
   observed = pin;
@@ -729,7 +751,9 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   await assert.rejects(h.bot.start(), /staging_use_conflict/);
 
   const afterCleanup = calls.length;
-  await run("recover", issued, false);
+  assert.deepEqual(await request("recover"), { schema: "two-bot-staging-automod-job.v1", environment: "staging",
+    observedAt: new Date(Date.now()).toISOString(), action: "recover", lease: issued, verdict: "passed" });
+  assert.equal(readInventory.mock.callCount(), 1);
   assert.deepEqual(values.get(STAGING_USE_KEY), { ...issued, phase: "released" });
   await run("recover", issued, false);
   assert.deepEqual(calls.slice(afterCleanup), [], "completed-journal retries must perform no external calls");
