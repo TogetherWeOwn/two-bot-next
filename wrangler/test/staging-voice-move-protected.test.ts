@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { runProtectedVoiceMoveAcceptance } from "../scripts/staging-voice-move-acceptance.mjs";
+import { runProtectedVoiceMoveAcceptance, runVoiceMoveAcceptance } from "../scripts/staging-voice-move-acceptance.mjs";
 import { mockVoiceMoveWindow } from "./fixtures/staging-voice-move.ts";
 
 function protectedWindow(elapsedMs?: number) {
@@ -70,6 +70,35 @@ test("protected voice adapter refuses an unrelated ready receipt and cleans up o
   assert.equal(result.verdict, "failed");
   assert.equal(result.code, "lease_unconfirmed");
   assert.deepEqual({ reads, signed }, { reads: [], signed: [] });
+  assert.deepEqual(calls, ["status", "release", "status"]);
+  assert.deepEqual(result.cleanup, { memberDisconnected: null, off: true, stopped: true });
+});
+
+test("protected voice adapter rejects an invalid fixture before collecting readbacks", async () => {
+  const { input, reads, calls, signed } = protectedWindow();
+  const fixture = { ...input.fixture, channelIds: [input.fixture.channelIds[0], input.fixture.channelIds[0]] };
+  const result = await runProtectedVoiceMoveAcceptance({ ...input, fixture });
+  assert.equal(result.verdict, "failed");
+  assert.equal(result.code, "fixture_invalid");
+  assert.deepEqual({ reads, signed }, { reads: [], signed: [] });
+  assert.deepEqual(calls, ["status", "release", "status"]);
+  assert.deepEqual(result.cleanup, { memberDisconnected: null, off: true, stopped: true });
+});
+
+test("public voice runner ignores an extra evidence collector argument", async () => {
+  const { args, calls, signed } = mockVoiceMoveWindow();
+  let collected = false;
+  const result = await Reflect.apply(runVoiceMoveAcceptance, undefined, [
+    { ...args, evidence: undefined },
+    async () => {
+      collected = true;
+      return args.evidence;
+    },
+  ]);
+  assert.equal(result.verdict, "failed");
+  assert.equal(result.code, "session_unconfirmed");
+  assert.equal(collected, false);
+  assert.deepEqual(signed, []);
   assert.deepEqual(calls, ["status", "release", "status"]);
   assert.deepEqual(result.cleanup, { memberDisconnected: null, off: true, stopped: true });
 });
