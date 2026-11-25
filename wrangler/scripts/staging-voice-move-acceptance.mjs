@@ -124,7 +124,9 @@ export function preflightVoiceMoveAcceptance({ enabled = false, lease, ready, fi
 
 async function withinLease(lease, now, operation) {
   // The relay stops forwarding in the final second of the lease.
-  const budget = Math.min(CHECK_MS, lease.expiresAt - now() - 1000);
+  const leaseDeadline = lease.expiresAt - 1000;
+  const startedAt = now();
+  const budget = Math.min(CHECK_MS, leaseDeadline - startedAt);
   require(budget > 0, "lease_elapsed");
   const controller = new AbortController();
   let timer;
@@ -138,7 +140,10 @@ async function withinLease(lease, now, operation) {
       }),
       operation(controller.signal),
     ]);
-    require(now() < lease.expiresAt, "lease_elapsed");
+    // The operation can resolve before an elapsed timer's callback runs.
+    const completedAt = now();
+    require(completedAt < leaseDeadline, "lease_elapsed");
+    require(completedAt < startedAt + budget, "probe_timeout");
     return result;
   } finally {
     clearTimeout(timer);
