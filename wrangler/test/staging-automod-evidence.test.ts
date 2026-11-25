@@ -29,6 +29,25 @@ test("assembles a complete successful result without copying underlying evidence
   assert.equal(run.stderr, "");
 });
 
+test("CLI refuses a receipt in place of an action confirmation and omits extra receipts", () => {
+  const startReceipt = {
+    schema: "two-bot-staging-automod-job.v1", environment: "staging", action: "start",
+    lease: expectedLease, observedAt: new Date(expectedLease.acquiredAt).toISOString(), verdict: "passed",
+    details: "synthetic receipt payload",
+  };
+  const confirmedRecovery = { verdict: "failed", start: false, recover: true };
+  for (const { result, expected } of [
+    { result: { ...passed, start: startReceipt, startReceipt }, expected: unconfirmedActions },
+    { result: { ...confirmedRecovery, startReceipt }, expected: confirmedRecovery },
+  ]) {
+    const input = { expectedLease, attempt: { lease: expectedLease, result } };
+    const run = spawnSync(process.execPath, [cli], { input: JSON.stringify(input), encoding: "utf8" });
+    assert.equal(run.status, 1);
+    assert.equal(run.stdout, JSON.stringify(expected) + "\n");
+    assert.equal(run.stderr, "");
+  }
+});
+
 test("cannot confirm either action for a different or missing lease", () => {
   for (const mismatch of [
     { environment: "production" }, { purpose: "voice-move" }, { phase: "released" }, { runAttempt: 2 },
