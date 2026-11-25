@@ -66,6 +66,25 @@ async fn attendance_fence(conn: &mut PgConnection) -> Result<Vec<u8>, RunError> 
     .map_err(|_| failure("release attendance fence readback failed"))
 }
 
+async fn retained_attendance_schema(conn: &mut PgConnection) -> Result<bool, RunError> {
+    // Match the post-0475 catalog contract in attendance_0475_readback.sql.
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT FROM pg_class c
+            JOIN pg_attribute a ON a.attrelid = c.oid AND NOT a.attisdropped
+                               AND a.attname = 'attendance_recovered_at'
+            JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+            WHERE c.oid = to_regclass('public.event_instance_windows')
+              AND c.relkind = 'r' AND NOT c.relrowsecurity AND NOT c.relhassubclass
+              AND a.atttypid = 'timestamptz'::regtype AND NOT a.attnotnull
+              AND pg_get_expr(d.adbin, d.adrelid) = 'CURRENT_TIMESTAMP'
+        )",
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(|_| failure("release attendance schema readback failed"))
+}
+
 /// Reverse the exact release bundle on the already verified target. This is
 /// the database operation only: the protected caller must authenticate the
 /// complete post-apply ledgers, target, and stopped writer's fence epoch.
@@ -148,6 +167,10 @@ pub async fn recover_release_schema(
         && before_cutover == expected_restored.0
         && before_store == expected_restored.1
     {
+        sqlx::raw_sql("LOCK TABLE ONLY public.event_instance_windows IN ACCESS SHARE MODE NOWAIT")
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| failure("release restored attendance table busy or unavailable"))?;
         let restored: bool = sqlx::query_scalar(
             "SELECT COALESCE((SELECT contract_version FROM public.web_contract_meta WHERE singleton) = '1.0', false)
                 AND to_regclass('web_v1.voice_heat') IS NULL
@@ -169,7 +192,10 @@ pub async fn recover_release_schema(
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| failure("release restored schema read failed"))?;
-        if restored && release_roles_clean(&mut tx, legacy_verifier()).await? {
+        if restored
+            && retained_attendance_schema(&mut tx).await?
+            && release_roles_clean(&mut tx, legacy_verifier()).await?
+        {
             tx.rollback()
                 .await
                 .map_err(|_| failure("release restored readback failed"))?;
@@ -193,6 +219,7 @@ pub async fn recover_release_schema(
     let after = ledgers(&mut tx).await?;
     if after != expected_restored
         || attendance_fence(&mut tx).await? != fence
+        || !retained_attendance_schema(&mut tx).await?
         || !release_roles_clean(&mut tx, legacy_verifier()).await?
     {
         return Err(failure("release inverse readback refused"));
