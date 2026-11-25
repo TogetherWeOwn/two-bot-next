@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use serde::Serialize;
 use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_model::{
-    channel::{permission_overwrite::PermissionOverwriteType, ChannelType},
+    channel::{permission_overwrite::PermissionOverwriteType, ChannelFlags, ChannelType},
     guild::Permissions,
     id::{
         marker::{GuildMarker, UserMarker},
@@ -28,7 +28,9 @@ pub struct EventPermissionEvidence {
 
 impl SharedCache {
     /// Read one complete snapshot for the expected gateway bot. The caller
-    /// must also fence its gateway connection state across this read.
+    /// must also fence its gateway connection state across this read. A role
+    /// deletion can leave a dangling member role until the gateway refreshes
+    /// that member; the intervening evidence is incomplete.
     pub fn event_permission_evidence(
         &self,
         guild_id: Id<GuildMarker>,
@@ -96,13 +98,16 @@ fn read_permissions(
     let mut voice = ChannelCounts::default();
     let mut stage = ChannelCounts::default();
     let channels = cache.guild_channels(guild_id)?;
-    // Discord's guild channel limit plus active threads, which the cache also indexes.
-    if channels.len() > 2048 {
+    // The index can retain archived threads. Bound the cache scan separately
+    // from the number of guild channels on which we resolve event permissions.
+    if channels.len() > 32_768 {
         return None;
     }
     for id in channels.iter() {
         let channel = cache.channel(*id)?;
-        if channel.guild_id != Some(guild_id) || !channel.kind.is_guild() {
+        if channel.guild_id != Some(guild_id)
+            || !(channel.kind.is_guild() || channel.kind == ChannelType::GuildForum)
+        {
             return None;
         }
         let counts = match channel.kind {
@@ -110,6 +115,14 @@ fn read_permissions(
             ChannelType::GuildStageVoice => &mut stage,
             _ => continue,
         };
+        // The Gateway replaces obfuscated overwrites with a View Channel
+        // denial. That placeholder cannot establish the effective event bits.
+        if channel
+            .flags
+            .is_some_and(|flags| flags.contains(ChannelFlags::CHANNEL_OBFUSCATED))
+        {
+            return None;
+        }
         let overwrites = channel.permission_overwrites.as_deref()?;
         let mut seen = HashSet::new();
         if overwrites.len() > 1024
@@ -128,6 +141,9 @@ fn read_permissions(
         counts.manage_events += usize::from(bits.contains(Permissions::MANAGE_EVENTS));
         counts.either_event_permission +=
             usize::from(bits.intersects(Permissions::CREATE_EVENTS | Permissions::MANAGE_EVENTS));
+        if voice.channels + stage.channels > 500 {
+            return None;
+        }
     }
     Some(EventPermissionEvidence {
         owner_or_admin: base.contains(Permissions::ADMINISTRATOR),
