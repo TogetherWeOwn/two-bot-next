@@ -15,10 +15,7 @@ export function bindStagingVoiceMoveProvider(dependencies) {
 /** Bind a completed protected Web handoff at the existing provider boundary. */
 export function bindStagingVoiceMoveHandoffProvider(dependencies, evidence) {
   const provide = bindStagingVoiceMoveProvider(dependencies);
-  return () => {
-    const { qualification, webHandoff } = evidence ?? {};
-    return stagingVoiceWebHandoffInputs(provide(), qualification, webHandoff);
-  };
+  return () => stagingVoiceWebHandoffInputs(provide(), evidence);
 }
 
 /** The trusted caller supplies a provider for the prepared, in-process proof

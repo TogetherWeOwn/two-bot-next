@@ -290,13 +290,20 @@ test("bound provider skips disabled selection and refuses incomplete dependencie
 function mockWebHandoff(inputs: ReturnType<typeof jobInputs>["inputs"]) {
   const { now, ...dependencies } = inputs;
   const { commit, version_id: workerVersion } = dependencies.expectedRevision;
-  const qualification = {
-    schema: "staging-soak/1", verdict: "qualified", status: "sampled", sha: commit, workerVersion,
-    sample: { workerVersion, observedAt: new Date(now() - 60_000).toISOString(), requests: 50, errors: 0 },
+  const sampledAt = now() - 60_000;
+  // The Web producer retains this shape. Web Operations issues its separate decision after validation.
+  const soakReceipt = {
+    schema: "staging-soak/1", status: "sampled", sha: commit, workerVersion,
+    deployedAt: new Date(sampledAt - 31 * 60_000).toISOString(), deployRunId: 100, deployAttempt: 1,
+    e2eRunId: 200, e2eAttempt: 1, e2eCompletedAt: new Date(sampledAt - 30 * 60_000).toISOString(),
+    floorAt: new Date(sampledAt).toISOString(),
+    sample: { workerVersion, observedAt: new Date(sampledAt).toISOString(), requests: 50, errors: 0 },
   };
-  const reply = { status: 200, body: {
+  const qualification = { ...structuredClone(soakReceipt), verdict: "qualified" };
+  const match = {
     matched: true, observed_at: new Date(now()).toISOString(), revision: dependencies.expectedRevision,
-  } as object };
+  };
+  const reply = { status: 200, body: match as object };
   let reads = 0;
   const webSession = {
     ...dependencies.webSession,
@@ -318,15 +325,15 @@ function mockWebHandoff(inputs: ReturnType<typeof jobInputs>["inputs"]) {
   const readReady = (signal: AbortSignal) => readStagingVoiceWebReady(scopedInputs, { signal });
   async function complete(signal: AbortSignal) {
     const ready = await readReady(signal);
-    const match = reply.body;
     reply.status = 404;
     reply.body = { error: "not_found", request_id: "0".repeat(26) };
-    const handoff = await ready.confirmDisabled({ signal });
+    return ready.confirmDisabled({ signal });
+  }
+  function enableCompanion() {
     reply.status = 200;
     reply.body = match;
-    return handoff;
   }
-  return { scopedInputs, qualification, reply, readReady, complete, readCount: () => reads };
+  return { scopedInputs, qualification, soakReceipt, reply, readReady, complete, enableCompanion, readCount: () => reads };
 }
 
 test("qualified Web handoff reaches the existing mock proof with a fresh preflight", async (t) => {
@@ -337,13 +344,34 @@ test("qualified Web handoff reaches the existing mock proof with a fresh preflig
     const webHandoff = await web.complete(t.signal);
     assert.equal(web.readCount(), 2);
     assert.equal(signed.length, 0);
-    const provider = bindStagingVoiceMoveHandoffProvider(web.scopedInputs, { qualification: web.qualification, webHandoff });
+    const provider = bindStagingVoiceMoveHandoffProvider(web.scopedInputs, {
+      qualification: web.qualification, soakReceipt: web.soakReceipt, webHandoff,
+    });
     assert.equal(await runStagingVoiceMoveEntry({}, provider), "disabled");
     assert.equal(web.readCount(), 2);
+    web.enableCompanion();
     assert.equal(await runStagingVoiceMoveEntry(env, provider), "passed");
     assert.equal(web.readCount(), 3, "the proof reads its own current session");
     assert.equal(signed.length, 3);
     assert.deepEqual(calls, ["assert", "assert", "assert", "status", "release", "status"]);
+  } finally {
+    await finish();
+  }
+});
+
+test("completed Web handoff cannot replace the enabled companion at proof preflight", async (t) => {
+  const { env, inputs, signed, calls, finish } = jobInputs(t);
+  t.mock.method(Date, "now", inputs.now);
+  const web = mockWebHandoff(inputs);
+  try {
+    const webHandoff = await web.complete(t.signal);
+    const provider = bindStagingVoiceMoveHandoffProvider(web.scopedInputs, {
+      qualification: web.qualification, soakReceipt: web.soakReceipt, webHandoff,
+    });
+    assert.equal(await runStagingVoiceMoveEntry(env, provider), "failed");
+    assert.equal(web.readCount(), 3, "the runner attempted its own current-session read");
+    assert.equal(signed.length, 0);
+    assert.deepEqual(calls, ["status", "release", "status"]);
   } finally {
     await finish();
   }
@@ -355,24 +383,30 @@ test("Web handoff refuses stale qualification and cross-session or unconfirmed e
   const web = mockWebHandoff(inputs);
   try {
     const webHandoff = await web.complete(t.signal);
-    const { qualification, scopedInputs } = web;
-    for (const [label, outcome] of Object.entries({
-      "stale Web SHA": { ...qualification, sha: "d".repeat(40) },
-      "different Worker": { ...qualification, workerVersion: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" },
-      "superseded soak": { ...qualification, status: "superseded" },
-      "unqualified soak": { ...qualification, verdict: "pending" },
-      "future soak sample": { ...qualification, sample: { ...qualification.sample, observedAt: new Date(inputs.now() + 1).toISOString() } },
+    const { qualification, soakReceipt, scopedInputs } = web;
+    const evidence = { qualification, soakReceipt, webHandoff };
+    const futureSample = { ...soakReceipt, sample: { ...soakReceipt.sample, observedAt: new Date(inputs.now() + 1).toISOString() } };
+    for (const [label, change] of Object.entries({
+      "missing soak receipt": { soakReceipt: undefined },
+      "soak receipt without a terminal decision": { qualification: soakReceipt },
+      "stale Web SHA": { soakReceipt: { ...soakReceipt, sha: "d".repeat(40) } },
+      "different Worker": { soakReceipt: { ...soakReceipt, workerVersion: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" } },
+      "superseded soak": { soakReceipt: { ...soakReceipt, status: "superseded" } },
+      "different E2E run": { soakReceipt: { ...soakReceipt, e2eRunId: soakReceipt.e2eRunId + 1 } },
+      "different sample": { soakReceipt: { ...soakReceipt, sample: { ...soakReceipt.sample, requests: 51 } } },
+      "unqualified soak": { qualification: { ...qualification, verdict: "pending" } },
+      "future soak sample": { soakReceipt: futureSample, qualification: { ...futureSample, verdict: "qualified" } },
     })) {
-      const provider = bindStagingVoiceMoveHandoffProvider(scopedInputs, { qualification: outcome, webHandoff });
+      const provider = bindStagingVoiceMoveHandoffProvider(scopedInputs, { ...evidence, ...change });
       assert.equal(await runStagingVoiceMoveEntry(env, provider), "failed", label);
     }
-    const crossSession = bindStagingVoiceMoveHandoffProvider({ ...scopedInputs, webSession: { ...scopedInputs.webSession } },
-      { qualification, webHandoff });
+    const crossSession = bindStagingVoiceMoveHandoffProvider({ ...scopedInputs, webSession: { ...scopedInputs.webSession } }, evidence);
     assert.equal(await runStagingVoiceMoveEntry(env, crossSession), "failed", "another session with identical metadata");
 
+    web.enableCompanion();
     const readyOnly = await web.readReady(t.signal);
     for (const incomplete of [undefined, readyOnly, { ...webHandoff }]) {
-      const provider = bindStagingVoiceMoveHandoffProvider(scopedInputs, { qualification, webHandoff: incomplete });
+      const provider = bindStagingVoiceMoveHandoffProvider(scopedInputs, { ...evidence, webHandoff: incomplete });
       assert.equal(await runStagingVoiceMoveEntry(env, provider), "failed", "refusal was not confirmed by this handoff");
     }
     assert.equal(web.readCount(), 3);

@@ -3,6 +3,9 @@ import { bindStagingVoiceSession, stagingVoiceSessionScopeMatches } from "./stag
 
 const completedHandoffs = new WeakMap();
 const unconfirmed = () => new Error("staging_voice_web_handoff_unconfirmed");
+const SOAK_FIELDS = ["schema", "status", "sha", "workerVersion", "deployedAt", "deployRunId", "deployAttempt",
+  "e2eRunId", "e2eAttempt", "e2eCompletedAt", "floorAt"];
+const SAMPLE_FIELDS = ["observedAt", "workerVersion", "requests", "errors"];
 
 function sameTransport(scope, webSession) {
   return scope.webSession === webSession && scope.request === webSession.request && scope.move === webSession.move;
@@ -41,7 +44,7 @@ export async function readStagingVoiceWebReady(inputs, options) {
           await session.readDisabled({ signal });
           if (!sameTransport(scope, webSession)) throw unconfirmed();
           const handoff = Object.freeze({});
-          completedHandoffs.set(handoff, { ...scope, readyAt });
+          completedHandoffs.set(handoff, scope);
           return handoff;
         } catch {
           throw unconfirmed();
@@ -54,13 +57,14 @@ export async function readStagingVoiceWebReady(inputs, options) {
 }
 
 /**
- * The protected Web producer validates smoke, E2E and soak before issuing the
- * qualified staging-soak/1 outcome. Bind that terminal result to the separately
- * approved revision and to the in-process session that observed both replies.
+ * Web Operations validates smoke, E2E and soak before issuing the protected
+ * qualification decision. Match its rollout and sample to the unmodified Web
+ * soak receipt, then bind both to the approved revision and session.
  */
-export function stagingVoiceWebHandoffInputs(inputs, qualification, handoff) {
+export function stagingVoiceWebHandoffInputs(inputs, evidence) {
+  const { qualification, soakReceipt, webHandoff } = evidence ?? {};
   const { fixture, expectedRevision, webSession } = inputs;
-  const scope = completedHandoffs.get(handoff);
+  const scope = completedHandoffs.get(webHandoff);
   if (!scope || !sameTransport(scope, webSession)
     || !stagingVoiceSessionScopeMatches({ session: webSession, fixture, expectedRevision })) throw unconfirmed();
   const { commit, version_id: versionId } = scope.revision;
@@ -69,11 +73,14 @@ export function stagingVoiceWebHandoffInputs(inputs, qualification, handoff) {
     || fixture.guildId !== pin.guildId || fixture.discordId !== pin.discordId
     || fixture.channelIds[0] !== pin.channelIds[0] || fixture.channelIds[1] !== pin.channelIds[1]) throw unconfirmed();
 
-  if (qualification?.schema !== "staging-soak/1" || qualification.verdict !== "qualified"
-    || qualification.status !== "sampled" || qualification.sha !== commit
-    || qualification.workerVersion !== versionId || qualification.sample?.workerVersion !== versionId) throw unconfirmed();
-  const { observedAt } = qualification.sample;
+  if (qualification?.verdict !== "qualified" || soakReceipt?.schema !== "staging-soak/1"
+    || soakReceipt.status !== "sampled" || soakReceipt.sha !== commit
+    || soakReceipt.workerVersion !== versionId || soakReceipt.sample?.workerVersion !== versionId
+    || !SOAK_FIELDS.every((field) => Object.hasOwn(soakReceipt, field) && qualification[field] === soakReceipt[field])
+    || !SAMPLE_FIELDS.every((field) => Object.hasOwn(soakReceipt.sample, field)
+      && qualification.sample?.[field] === soakReceipt.sample[field])) throw unconfirmed();
+  const { observedAt } = soakReceipt.sample;
   const sampledAt = typeof observedAt === "string" ? Date.parse(observedAt) : NaN;
-  if (!(sampledAt > 0 && sampledAt <= scope.readyAt && new Date(sampledAt).toISOString() === observedAt)) throw unconfirmed();
+  if (!(sampledAt > 0 && sampledAt <= Date.now() && new Date(sampledAt).toISOString() === observedAt)) throw unconfirmed();
   return { ...inputs, fixture: pin, expectedRevision: scope.revision, webSession: scope.transport };
 }
