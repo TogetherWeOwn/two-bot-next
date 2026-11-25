@@ -254,6 +254,8 @@ def main():
     if not SHA.fullmatch(head) or not all(map(NUMBER.fullmatch, (run, attempt))):
         raise EvidenceError("Invalid Actions identity.")
     mode = sys.argv[1]
+    if mode == "verify" and event == "merge_group":
+        raise EvidenceError("Cannot verify merge-group evidence without authoritative PR membership.")
     workflow = {"verify": "pr-evidence.yml", "publish": "check.yml"}[mode]
     with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
         output.write(publish(repo, event, head, run, attempt, workflow))
