@@ -1,16 +1,19 @@
 """Compare a protected stopped inventory with a same-source rollback rehearsal."""
 
 from copy import deepcopy
+from pathlib import Path
+import sys
 import unittest
 
-from test_staging_recovery_status import (
-    APP, ENV, IMAGE, ROLLOUT, SOURCE, VERSION, github_fixture, provider_fixture,
-)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import bot_promotion
 import rollback_proof
 import staging_recovery_status
-from test_rollback_proof import files, run, stop_files
+from test_staging_recovery_status import (
+    APP, ENV, IMAGE, ROLLOUT, SOURCE, VERSION, github_fixture, provider_fixture,
+)
+from test_rollback_proof import NOW, files, run, stop_files
 
 
 DIGEST = IMAGE.split("@", 1)[1]
@@ -73,12 +76,15 @@ def drill(run_id=DRILL_RUN, *, restored_version=VERSION, restored_image=IMAGE, r
     rollout["auto-rollback-evidence.json"].update(
         restored_version=restored_version, restored_image_digest=restored_image.split("@", 1)[1])
     rollout["evidence.json"]["revision"] = SOURCE
-    rollout["staging-use.jsonl"][0].update(runId=str(run_id), sha=SOURCE)
+    acquired_at = int(NOW.timestamp()) * 1000
+    expires_at = acquired_at + 40 * 60 * 1000
+    rollout["staging-use.jsonl"][0].update(runId=str(run_id), sha=SOURCE, expiresAt=expires_at)
     for row in shutdown["staging-use-release.jsonl"]:
         row["runId"] = str(run_id)
         if "use" in row:
             row.update(deploymentId=release_version, sha=SOURCE, epoch=9)
-            row["use"].update(runId=str(run_id), deploymentId=release_version, sha=SOURCE, epoch=9)
+            row["use"].update(runId=str(run_id), deploymentId=release_version, sha=SOURCE, epoch=9,
+                              acquiredAt=acquired_at, expiresAt=expires_at)
     return child, rollout, shutdown
 
 
@@ -122,9 +128,10 @@ class StagingRecoveryHandoffTests(unittest.TestCase):
         pair = (worker["version_id"], container["image_digest"])
         self.assertEqual((qualified["staging"]["worker_version"], qualified["container"]["digest"]), pair)
         self.assertEqual((restored["restored_version"], restored["restored_image_digest"]), pair, "restored pair")
-        release = shutdown["staging-use-release.jsonl"][-1]
+        _, before_release, release = shutdown["staging-use-release.jsonl"]
         self.assertEqual((release["deploymentId"], release["sha"]), (pair[0], SOURCE), "released build")
         use = release["use"]
+        self.assertEqual(release["epoch"], before_release["epoch"], "owner epoch before release")
         self.assertEqual((use["deploymentId"], use["sha"], use["epoch"]),
                          (pair[0], SOURCE, release["epoch"]), "released lease binding")
 
@@ -136,6 +143,9 @@ class StagingRecoveryHandoffTests(unittest.TestCase):
         alternate_image = IMAGE.split("@", 1)[0] + "@sha256:" + "f" * 64
         other_lease = drill()
         other_lease[2]["staging-use-release.jsonl"][-1]["use"]["epoch"] = 8
+        other_owner = drill()
+        release = other_owner[2]["staging-use-release.jsonl"][-1]
+        release["epoch"] = release["use"]["epoch"] = 10
         cases = (
             ("worker version", "restored pair", self.inventory, self.qualified, drill(restored_version=OTHER_VERSION)),
             ("image digest", "restored pair", self.inventory, self.qualified, drill(restored_image=alternate_image)),
@@ -148,6 +158,8 @@ class StagingRecoveryHandoffTests(unittest.TestCase):
             ("release for another worker", "released build", self.inventory, self.qualified,
              drill(release_version=OTHER_VERSION)),
             ("release for another epoch", "released lease binding", self.inventory, self.qualified, other_lease),
+            ("release and lease from another owner epoch", "owner epoch before release",
+             self.inventory, self.qualified, other_owner),
         )
         for case, finding, inventory, qualified, child in cases:
             with self.subTest(case=case):
