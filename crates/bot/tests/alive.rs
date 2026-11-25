@@ -979,13 +979,18 @@ async fn lifecycle(
             // listener. Jitter is bounded by min(cadence, 5s); STEP covers it.
             let ticked = timeout(STEP, async {
                 loop {
-                    if discord
+                    if let Some(request) = discord
                         .rest_requests
                         .lock()
                         .await
                         .iter()
-                        .any(|request| request.path.contains("scheduled-events"))
+                        .find(|request| request.path.contains("scheduled-events"))
                     {
+                        assert!(
+                            request.method == "GET"
+                                && request.header("authorization") == Some(authorization.as_str()),
+                            "events job must use the fixture's synthetic identity"
+                        );
                         break;
                     }
                     // Bounded 10 ms backoff under the outer STEP deadline:
