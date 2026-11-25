@@ -33,10 +33,7 @@ test("the dormant inventory reader returns the typed v1 readback for the approve
     assert.equal(receivedSignal, signal);
     return JSON.stringify(inventory) + "\n";
   });
-  const result = await read(source, signal);
-  assert.deepEqual(result, inventory);
-  const schema: 1 | undefined = result?.schema_version;
-  assert.equal(schema, 1);
+  assert.deepEqual(await read(source, signal), inventory);
   for (const observed_at of ["2026-11-25T12:00:00+00:00", "2026-11-25T12:00:00Z"]) {
     const value = { ...inventory, observed_at };
     const readAlternate = bindStagingAutomodInventoryReader(async () => JSON.stringify(value));

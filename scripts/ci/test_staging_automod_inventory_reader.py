@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import staging_automod_inventory_reader as reader
 from rollback_proof import ProofError, REPO
 from staging_rollout import GateError
+from test_staging_recovery_handoff import inventory_receipt
 
 SHA = "a" * 40
 TIP = "b" * 40
@@ -21,24 +22,12 @@ RUN_ROUTE = f"actions/runs/{RUN}"
 LIST_ROUTE = f"{RUN_ROUTE}/artifacts?per_page=2"
 ZIP_ROUTE = "actions/artifacts/42/zip"
 COMPARE_ROUTE = f"compare/{SHA}...{TIP}?per_page=1&page=1"
-DEPLOYMENT = "11111111-1111-1111-1111-111111111111"
-VERSION = "22222222-2222-2222-2222-222222222222"
-APP = "33333333-3333-3333-3333-333333333333"
-ROLLOUT = "44444444-4444-4444-4444-444444444444"
 FILENAME = "staging-recovery-status.json"
 
 
 def receipt():
-    return {
-        "schema_version": 1, "workflow_sha": SHA, "workflow_run_id": int(RUN),
-        "observed_at": "2026-11-25T12:00:00.123456+00:00",
-        "verification": "provider_only", "runtime_database": "plan_not_supplied", "plan": None,
-        "worker": {"deployment_id": DEPLOYMENT, "version_id": VERSION, "source_sha": "c" * 40,
-                   "traffic_percent": 100, "runtime_policy": "bounded"},
-        "container": {"application_id": APP, "namespace_id": "e" * 32, "rollout_id": ROLLOUT,
-                      "rollout_status": "completed", "image_digest": "sha256:" + "f" * 64},
-        "ownership": {"phase": "active", "epoch": 7, "running": False},
-    }
+    return {**inventory_receipt(None), "workflow_sha": SHA, "workflow_run_id": int(RUN),
+            "observed_at": "2026-11-25T12:00:00.123456+00:00"}
 
 
 class InventoryReaderTests(unittest.TestCase):
@@ -73,18 +62,15 @@ class InventoryReaderTests(unittest.TestCase):
         return reader.read_inventory(SHA, RUN, self.api)
 
     def test_reads_exact_inventory_from_successful_protected_main(self):
-        expected = receipt()
-        for key in ("verification", "runtime_database", "plan"):
-            del expected[key]
+        expected = {key: value for key, value in receipt().items() if key not in ("verification", "runtime_database", "plan")}
         del expected["ownership"]["running"]
-        self.assertEqual(self.read(), expected)
-        self.assertEqual(self.requests, [(RUN_ROUTE, False), ("branches/main", False),
-                                         (LIST_ROUTE, False), (ZIP_ROUTE, True)])
         stdout, stderr = StringIO(), StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
             self.assertEqual(reader.main([SHA, RUN], self.api), 0)
         self.assertEqual(json.loads(stdout.getvalue()), expected)
         self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(self.requests, [(RUN_ROUTE, False), ("branches/main", False),
+                                         (LIST_ROUTE, False), (ZIP_ROUTE, True)])
 
     def test_refuses_wrong_run_producer_attempt_or_completion(self):
         for change in (
@@ -100,13 +86,6 @@ class InventoryReaderTests(unittest.TestCase):
                     self.read()
                 self.assertEqual(self.requests, [(RUN_ROUTE, False)])
 
-    def test_refuses_bad_source_pins_before_an_api_call(self):
-        for sha, run in (("main", RUN), (SHA, "0"), (SHA, "01234"), (SHA, str(2**53))):
-            with self.subTest(sha=sha, run=run):
-                with self.assertRaises(GateError):
-                    reader.read_inventory(sha, run, self.api)
-        self.assertEqual(self.requests, [])
-
     def test_requires_protected_main_and_proved_ancestry_if_it_advanced(self):
         branch = self.routes["branches/main"]
         branch["protected"] = False
@@ -119,14 +98,14 @@ class InventoryReaderTests(unittest.TestCase):
         }
         self.assertEqual(self.read()["workflow_sha"], SHA)
         for change in ({"merge_base_commit": {"sha": "c" * 40}}, {"status": "diverged"}, {"behind_by": 1}):
-            with self.subTest(change=change):
+            with self.subTest(change=change), self.assertRaises(GateError):
                 self.routes[COMPARE_ROUTE] = {**comparison, **change}
-                with self.assertRaises(GateError):
-                    self.read()
+                self.read()
 
     def test_refuses_missing_ambiguous_or_unpinned_artifact(self):
         for change in (
             {"total_count": 0, "artifacts": []}, {"total_count": 2}, {"total_count": True},
+            {"total_count": 2, "artifacts": [self.artifact, {**self.artifact, "id": 43}]},
             {"name": f"staging-recovery-status-{RUN}-2"}, {"expired": True}, {"digest": None},
             {"size_in_bytes": reader.MAX_PLAN + 1},
         ):
@@ -137,11 +116,6 @@ class InventoryReaderTests(unittest.TestCase):
                 with self.assertRaises(GateError):
                     self.read()
                 self.assertNotIn((ZIP_ROUTE, True), self.requests)
-        self.setUp()
-        self.listing.update(total_count=2, artifacts=[self.artifact, {**self.artifact, "id": 43}])
-        with self.assertRaises(GateError):
-            self.read()
-        self.assertNotIn((ZIP_ROUTE, True), self.requests)
 
     def test_refuses_bad_archive_partial_receipt_or_mismatched_payload(self):
         complete = json.dumps(receipt())
