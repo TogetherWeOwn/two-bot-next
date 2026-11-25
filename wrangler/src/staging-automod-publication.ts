@@ -1,5 +1,6 @@
 import { isSnowflake } from "./container-env.ts";
 import { boundRead, readReceiverBytes, releaseUpstream } from "./internal-actions.ts";
+import type { CommandRevision } from "./staging-automod-recovery.ts";
 import type { admitStagingAutomod } from "./staging-automod.ts";
 import { MAX_STAGING_USE_MS, parseStagingUseChange, type StagingUse } from "./staging-lifecycle.ts";
 import { parseRegistryJson, type PreviewEnv } from "./staging-preview.ts";
@@ -251,6 +252,28 @@ export async function publishStagingAutomod(admission: StagingAutomodAdmission |
   } catch {
     throw intentAttempted ? uncertain() : refused();
   }
+}
+
+/** Independent scoped read after the protected caller has fenced, drained and
+ * stopped the window. A lost receipt can prove absence against the baseline. */
+export async function inspectStagingAutomod(intent: StagingAutomodPublicationIntent,
+  command: CommandRevision | null, deps: DiscordTransport, readBefore: number,
+  now = Date.now): Promise<"absent" | "owned"> {
+  const owned = command && { intent, ...command };
+  if (owned && !validOwned(owned)) throw refused();
+  const discord = transport(deps, readBefore, now);
+  await discord.bot();
+  const rows = await discord.list();
+  if (rows.some(row => row.name === target.name || row.id === owned?.id)) {
+    if (!owned) throw refused();
+    matching(rows, owned);
+    if (!sameCommand(record(await discord.json("GET", `${commands}/${owned.id}`, 200)), owned)) throw refused();
+    return "owned";
+  }
+  if (owned) {
+    if (record(await discord.json("GET", `${commands}/${owned.id}`, 404))?.code !== 10063) throw refused();
+  } else if (await discord.settle(fingerprint(rows)) !== intent.baseline) throw refused();
+  return "absent";
 }
 
 /** Delete the exact durable owned record. Recovery owns state and affirmative stop. */
