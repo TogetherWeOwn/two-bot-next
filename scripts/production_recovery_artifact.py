@@ -11,6 +11,9 @@ from staging_rollout import mapping, require, sequence
 WORKFLOW = ".github/workflows/deploy-production.yml"
 REPO_ID = 1396224242
 ARTIFACT = "production-release-inverse"
+FORWARD_ARTIFACT = "production-release-forward"
+FORWARD_JOB = "Production release / Apply the approved schema"
+FORWARD_STEPS = ("Apply the protected forward transaction", "Upload the verified forward result")
 JOB = "Production release / Recover production schema / Apply or reconcile the protected inverse"
 FENCE_JOB = "Production release / Recover production schema / Confirm the protected production writer stopped"
 FENCE_STEP = "Fence the exact serving pair at the pinned epoch"
@@ -58,17 +61,14 @@ def protected_job(run, api, name, expected_steps):
             "production_inverse_step_invalid")
 
 
-def authenticated_inverse(pin, approval, artifact_id, archive_sha, env, api=github):
-    run = current_run(env, api)
+def authentic_document(run, artifact, artifact_id, archive_sha, api):
     archive_sha = archive_sha.removeprefix("sha256:")
-    require(str(run["id"]) == pin.run_id and pin.run_attempt == 1
-            and RUN_ID.fullmatch(artifact_id) and HEX.fullmatch(archive_sha),
+    require(RUN_ID.fullmatch(artifact_id) and HEX.fullmatch(archive_sha),
             "production_inverse_artifact_pin_invalid")
-    protected_job(run, api, JOB, (WRITE_STEP, UPLOAD_STEP))
     listing = mapping(api(f"actions/runs/{run['id']}/artifacts?per_page=30"))
     rows = sequence(listing.get("artifacts"))
     require(listing.get("total_count") == len(rows) <= 30, "production_inverse_artifact_inventory_invalid")
-    name, digest = f"{ARTIFACT}-{pin.run_id}-1", f"sha256:{archive_sha}"
+    name, digest = f"{artifact}-{run['id']}-1", f"sha256:{archive_sha}"
     candidates = [row for row in rows if mapping(row).get("name") == name or row.get("id") == int(artifact_id)]
     require(len(candidates) == 1, "production_inverse_artifact_missing_or_ambiguous")
     entry = candidates[0]
@@ -86,7 +86,14 @@ def authenticated_inverse(pin, approval, artifact_id, archive_sha, env, api=gith
     raw = api(f"actions/artifacts/{artifact_id}/zip", binary=True)
     require(isinstance(raw, bytes) and len(raw) == meta["size_in_bytes"]
             and sha256(raw).hexdigest() == archive_sha, "production_inverse_archive_invalid")
-    document = plan_manifest(raw, digest, ARTIFACT)
+    return plan_manifest(raw, digest, artifact)
+
+
+def authenticated_inverse(pin, approval, artifact_id, archive_sha, env, api=github):
+    run = current_run(env, api)
+    require(str(run["id"]) == pin.run_id and pin.run_attempt == 1, "production_inverse_artifact_pin_invalid")
+    protected_job(run, api, JOB, (WRITE_STEP, UPLOAD_STEP))
+    document = authentic_document(run, ARTIFACT, artifact_id, archive_sha, api)
     require(set(document) == {"operation", "approval", "result"}
             and document["operation"] == "undo-0480" and document["approval"] == approval,
             "production_inverse_operation_mismatch")

@@ -11,10 +11,9 @@ from t0_acceptance_report import (
     MAX_BYTES,
     PRODUCTION_WATCH_SCHEMA,
     WATCH_OBSERVATIONS,
-    WINDOW_FIELDS,
     production_watch_observation,
+    production_watch_window,
     read_object,
-    serving_window,
 )
 
 HEADER = "utc\tsignal\tobservation\tdisposition"
@@ -29,11 +28,7 @@ def assemble(signal, rows_path, window_path):
     if signal not in WATCH_OBSERVATIONS:
         raise ValueError
     window, _ = read_object(window_path)
-    if window.keys() != set(WINDOW_FIELDS):
-        raise ValueError
-    window = serving_window(window)
-    if window["environment"] != "production":
-        raise ValueError
+    window = production_watch_window(window)
 
     with rows_path.open("rb") as stream:
         raw = read_with_overflow(stream, MAX_BYTES)
@@ -50,7 +45,7 @@ def assemble(signal, rows_path, window_path):
         if row_signal != signal:
             raise ValueError
         rows.append({"utc": utc, "observation": observation, "disposition": disposition})
-    report = {"schema": PRODUCTION_WATCH_SCHEMA, "signal": signal, "rows": rows}
+    report = {"schema": PRODUCTION_WATCH_SCHEMA, "signal": signal, "window": window, "rows": rows}
     if production_watch_observation(signal, report, window) is None:
         raise ValueError
     output = json.dumps(report, separators=(",", ":")) + "\n"

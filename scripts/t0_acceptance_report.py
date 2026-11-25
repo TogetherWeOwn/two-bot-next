@@ -23,7 +23,7 @@ SIGNALS = ("ready", "gateway_resumed", "shard_closed", "gateway_reconnect_failed
            "identify_planned", "resume_planned")
 GATEWAY_MISMATCHES = ("service_mismatch", "stale_evidence", "mixed_build", "build_mismatch")
 TRANSITIONS = ("empty-room-rename", "occupied-room-return")
-PRODUCTION_WATCH_SCHEMA = "production_watch.v1"
+PRODUCTION_WATCH_SCHEMA = "production_watch.v2"
 WATCH_OBSERVATIONS = {"help": ("branding-readbacks-and-deletions",), "naming": TRANSITIONS}
 NEEDED = {
     "help": "Record Help branding, readbacks and deletions during the intended serving window.",
@@ -114,11 +114,20 @@ def naming_observation(report):
     return {"result": "not_observed" if missing else "transitions_recorded", "missing_transitions": missing}
 
 
+def production_watch_window(value):
+    if not isinstance(value, dict) or value.keys() != set(WINDOW_FIELDS):
+        raise ValueError
+    window = serving_window(value)
+    if window["environment"] != "production":
+        raise ValueError
+    return window
+
+
 def production_watch_observation(kind, report, window):
     """Read the fixed fields projected from authorized execution-card rows."""
     rows = report.get("rows")
     checks = WATCH_OBSERVATIONS[kind]
-    if (report.keys() != {"schema", "signal", "rows"} or report["signal"] != kind
+    if (report.keys() != {"schema", "signal", "window", "rows"} or report["signal"] != kind
             or not isinstance(rows, list) or not 1 <= len(rows) <= len(checks)):
         raise ValueError
 
@@ -196,11 +205,18 @@ def observation(kind, parse, path, binding, expected):
                    fields=differing, window=recorded)
     try:
         if expected["environment"] == "production" and kind in WATCH_OBSERVATIONS:
+            if report.get("schema") == "production_watch.v1":
+                return gap("unverified", "legacy production watch lacks the assembler serving window")
             if report.get("schema") != PRODUCTION_WATCH_SCHEMA:
                 return gap("unverified", "this probe format lacks production observations")
-            outcome = production_watch_observation(kind, report, recorded)
+            watch_window = production_watch_window(report.get("window"))
+            outcome = production_watch_observation(kind, report, watch_window)
             if outcome is None:
                 return gap("mismatched", "production watch row falls outside the serving window")
+            differing = [key for key in WINDOW_FIELDS if watch_window[key] != recorded[key]]
+            if differing:
+                return gap("mismatched", "production watch assembler window differs from the serving window",
+                           fields=differing)
         else:
             outcome = parse(report)
     except ValueError:

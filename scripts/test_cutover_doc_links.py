@@ -134,6 +134,20 @@ class CutoverDocLinks(unittest.TestCase):
             problems += _problems(doc, doc.read_text(encoding="utf-8"))
         self.assertEqual(problems, [])
 
+    def test_disposable_pre_rehearsal_links_and_cutoff_match_source(self):
+        doc = ROOT / "docs" / "staging-rollout-gate.md"
+        _, heading, rest = doc.read_text(encoding="utf-8").partition(
+            "#### Disposable exact PRE rehearsal\n"
+        )
+        self.assertTrue(heading)
+        section = rest.split("\n### ", 1)[0]
+        self.assertIn("../scripts/pre_target.py", LINK.findall(section))
+        source = (ROOT / "scripts" / "pre_target.py").read_text(encoding="utf-8")
+        cutoff = re.search(r"^ADMISSION_SECONDS = ([0-9]+)$", source, re.MULTILINE)
+        self.assertIsNotNone(cutoff, "PRE admission cutoff must be a literal in pre_target.py")
+        self.assertIn(f"expires {int(cutoff[1]) / 60:g} minutes", section)
+        self.assertEqual(_problems(doc, section), [])
+
     def test_automod_runtime_doc_is_found(self):
         self.assertIn(ROOT / "docs" / "automod-runtime.md", AUTOMOD_DOCS)
 

@@ -35,8 +35,8 @@ function admitted(context: Context | undefined): context is Context {
 
 /** Dormant entry for the authenticated protected staging job. Supply options
  * from trusted job state and use readWorker only to obtain local bindings.
- * Authenticate the inventory against the job's workflow SHA and run ID in
- * readInventory. Invoke the exact private instance identified by the transport.
+ * Authenticate the inventory against its producer's workflow SHA and run ID
+ * in readInventory. Invoke the exact private instance identified by the transport.
  */
 export async function runStagingAutomodRehearsal(
   options: Readonly<{ enabled?: boolean; context?: Context }>, providers: Providers,
