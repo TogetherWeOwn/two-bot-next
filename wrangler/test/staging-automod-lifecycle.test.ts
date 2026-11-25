@@ -227,23 +227,38 @@ test("AutoMod startup timeout lets recovery check remote drain", async t => {
   for (const stall of ["boot", "readback"] as const) {
     const f = fixture();
     await f.start(true).publish(input);
+    const startedAt = f.state.at;
+    const cutoff = lease.expiresAt - input.cleanupReserveMs;
     const deadline = new AbortController();
     const timeout = t.mock.method(AbortSignal, "timeout", () => deadline.signal);
-    const entered = Promise.withResolvers<void>();
-    f.state[stall] = () => {
-      entered.resolve();
+    const launchEntered = Promise.withResolvers<void>();
+    const launchReply = Promise.withResolvers<void>();
+    const readbackEntered = Promise.withResolvers<void>();
+    f.state.boot = () => {
+      launchEntered.resolve();
+      return launchReply.promise;
+    };
+    f.state.readback = () => {
+      readbackEntered.resolve();
       return new Promise<void>(() => {});
     };
     const starting = assert.rejects(f.start(true).startDryRun(lease), refusal);
-    await entered.promise;
-    assert.deepEqual(timeout.mock.calls[0]?.arguments, [lease.expiresAt - input.cleanupReserveMs - f.state.at]);
-    f.state.at = lease.expiresAt - input.cleanupReserveMs;
+    await launchEntered.promise;
+    if (stall === "readback") {
+      f.state.at = cutoff - 1;
+      launchReply.resolve();
+      await readbackEntered.promise;
+    }
+    f.state.at = cutoff;
     f.state.readback = async () => {};
     f.state.startupDrained = false;
     const recovering = assert.rejects(f.start().recover(lease), refusal);
     deadline.abort();
     timeout.mock.restore();
     await Promise.all([starting, recovering]);
+    // The mock returns the original signal even if readback requests a fresh budget.
+    assert.deepEqual(timeout.mock.calls.map(call => call.arguments), [[cutoff - startedAt]],
+      `${stall} must use the original startup timeout`);
     assert.equal(f.journal()?.phase, "cleanup");
     assert.equal(f.events.includes("stop"), false);
     await assert.rejects(f.start().otherUse(f.other), refusal);
