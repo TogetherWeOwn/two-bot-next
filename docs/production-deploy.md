@@ -422,10 +422,13 @@ actual start and expected end when the run is admitted under the existing
   released. Keep custody while recovery or cleanup remains unresolved.
 
 Before admitting its run, the receiving team reads back the current custody
-agreement and both teams' production run status. Confirm there is no
-conflicting queued, approval-pending or active run, watch, recovery or
-cleanup. If the readback is unclear, keep production changes on hold and
-reconcile with the other team. A later attempt uses fresh coordination.
+agreement and both teams' production run status. Verify that automatic
+promotion for the team standing down is held. When Web takes custody, read
+back Bot's existing [automatic promotion disable](#automatic-promotion).
+Confirm there is no conflicting queued, approval-pending or active run,
+watch, recovery or cleanup. If the readback is unclear, keep production
+changes on hold and reconcile with the other team. A later attempt uses
+fresh coordination.
 
 ## Interrupted protected release
 
