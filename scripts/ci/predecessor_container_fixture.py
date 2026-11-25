@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 from script_intake import decode_legacy_json, unique_object
 
-from fixtures.predecessor_discord import APP, GATEWAY, TOKEN
+from fixtures.predecessor_discord import API_BASE, APP, GATEWAY, TOKEN
 from fixtures.predecessor_snapshots import GUILD, schema_check, snapshot_sql
 
 
@@ -136,7 +136,7 @@ def run_endpoint(docker, image, postgres, mock_image, stamps, tip):
         wait_for(lambda: probe("mock", "/fixture"), "mock did not start")
         env = {
             "DISCORD_GATEWAY_URL": GATEWAY,
-            "DISCORD_API_BASE": "http://127.0.0.1:8081",
+            "DISCORD_API_BASE": API_BASE,
             "LISTEN_ADDR": "127.0.0.1:8080",
             "DISCORD_TOKEN": TOKEN,
             "DISCORD_APPLICATION_ID": APP,

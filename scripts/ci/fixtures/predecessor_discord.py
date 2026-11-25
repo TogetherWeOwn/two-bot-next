@@ -18,7 +18,9 @@ GUILD = "222200000000000001"
 APP = "1111"
 TOKEN = "offline-predecessor-fixture"
 COMMANDS = f"/api/v10/applications/{APP}/guilds/{GUILD}/commands"
-GATEWAY = "ws://127.0.0.1:8081"
+PORT = 8081
+GATEWAY = f"ws://127.0.0.1:{PORT}"
+API_BASE = f"http://127.0.0.1:{PORT}"
 RELEASE = Event()
 READY_SENT = Event()
 REST_SYNCED = Event()
@@ -83,7 +85,8 @@ class Discord(BaseHTTPRequestHandler):
             if not isinstance(commands, list) or any(not isinstance(item, dict) for item in commands):
                 raise ValueError
             self.reply(commands)
-            REST_SYNCED.set()
+            if commands:
+                REST_SYNCED.set()
         except (ValueError, RecursionError):
             self.reply({}, 400)
         except OSError:
@@ -135,7 +138,7 @@ class Discord(BaseHTTPRequestHandler):
 
 
 def request(target, path):
-    port = {"mock": 8081, "bot": 8080}[target]
+    port = {"mock": PORT, "bot": 8080}[target]
     connection = HTTPConnection("127.0.0.1", port, timeout=3)
     try:
         connection.request("GET", path)
@@ -153,7 +156,7 @@ def request(target, path):
 def serve():
     if {name for _, name in socket.if_nameindex()} != {"lo"}:
         sys.exit("Discord fixture requires a loopback-only network namespace")
-    ThreadingHTTPServer(("127.0.0.1", 8081), Discord).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", PORT), Discord).serve_forever()
 
 
 if __name__ == "__main__":

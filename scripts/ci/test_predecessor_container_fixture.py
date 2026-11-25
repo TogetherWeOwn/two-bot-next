@@ -20,6 +20,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
     def test_mock_command_publication(self):
         self.addCleanup(predecessor_discord.REST_SYNCED.clear)
         for token, body, status in [(fixture.TOKEN, b'[{"name":"help"}]', b"200"),
+                                    (fixture.TOKEN, b"[]", b"200"),
                                     ("foreign", b"[]", b"401"), (fixture.TOKEN, b"{}", b"400"),
                                     (fixture.TOKEN, b'[{"k":1,"k":2}]', b"400"),
                                     (fixture.TOKEN, b'[{"k":NaN}]', b"400"),
@@ -33,7 +34,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                 Discord(server, None, None)
                 response = client.recv(4096)
                 self.assertEqual(response.split(b" ", 2)[1], status)
-                self.assertEqual(predecessor_discord.REST_SYNCED.is_set(), status == b"200")
+                self.assertEqual(predecessor_discord.REST_SYNCED.is_set(), status == b"200" and body != b"[]")
                 if status == b"200":
                     self.assertEqual(json.loads(response.split(b"\r\n\r\n")[1]), json.loads(body))
 
