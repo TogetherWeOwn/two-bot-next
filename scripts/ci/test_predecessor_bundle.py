@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from zipfile import ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from predecessor_bundle import (BUILD, IMAGE, INPUT_TREE, REPOSITORY_ID, SOURCE, WORKFLOW, GateError,
@@ -37,9 +37,9 @@ def fixture(scratch, run_id, worker_byte):
     return members, receipt
 
 
-def pack(members, receipt):
+def pack(members, receipt, *, compression=ZIP_STORED):
     archive = BytesIO()
-    with ZipFile(archive, "w") as bundle:
+    with ZipFile(archive, "w", compression=compression) as bundle:
         bundle.writestr(BUILD, json.dumps(receipt))
         for name, data in members.items():
             bundle.writestr(name, data)
@@ -65,7 +65,8 @@ class PredecessorBundleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             self.a = fixture(Path(scratch), 123, b"a")
             self.b = fixture(Path(scratch), 124, b"b")
-        self.zip_a, self.zip_b = pack(*self.a), pack(*self.b)
+        self.zip_a = pack(*self.a)
+        self.zip_b = pack(*self.b, compression=ZIP_DEFLATED)
         self.pin_a = metadata(self.zip_a, 123, 457)
         self.pin_b = metadata(self.zip_b, 124, 458)
 

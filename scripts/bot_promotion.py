@@ -413,7 +413,7 @@ def validate_artifact_run(meta, *, run_id, repo_id, head_sha):
             or type(workflow_run.get("repository_id")) is not int
             or workflow_run.get("head_repository_id") != repo_id
             or type(workflow_run.get("head_repository_id")) is not int
-            or workflow_run.get("head_branch") != "main"
+            or workflow_run.get("head_branch") != STAGING_BRANCH
             or workflow_run.get("head_sha") != head_sha):
         raise PromotionError("artifact run binding mismatch")
 

@@ -1,6 +1,7 @@
 """Verify the protected attendance predecessor artifact from a local ZIP."""
 
 from hashlib import file_digest
+from struct import error as StructError
 import tarfile
 from zipfile import BadZipFile, ZipFile
 from zlib import error as CompressionError
@@ -65,7 +66,8 @@ def verify_predecessor_bundle(archive, *, run_id, workflow_sha, artifact_id, arc
                 "predecessor_archive_digest_mismatch")
         with ZipFile(archive) as bundle:
             return _verify_build(bundle, build_id)
-    except (BadZipFile, CompressionError, OSError, RuntimeError, ValueError, tarfile.TarError, KeyError):
+    except (BadZipFile, CompressionError, EOFError, KeyError, OSError, RuntimeError, StructError,
+            ValueError, tarfile.TarError):
         raise GateError("invalid_predecessor_archive") from None
 
 
