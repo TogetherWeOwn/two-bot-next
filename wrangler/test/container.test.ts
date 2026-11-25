@@ -431,7 +431,11 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
         return new Response(null, { status: 204 });
       }
       assert.equal(init.method, "GET");
-      if (url === "https://discord.com/api/v10/users/@me") return Response.json(automodPublication.identity);
+      if (url === "https://discord.com/api/v10/users/@me") {
+        calls.push("identity");
+        return Response.json(automodPublication.identity);
+      }
+      calls.push("registry-get");
       if (url === `${guild}?with_localizations=true`) return Response.json(commandPresent ? [preview] : []);
       assert.equal(url, `${guild}/${preview.id}`);
       return commandPresent ? Response.json(preview) : Response.json({ code: 10063 }, { status: 404 });
@@ -475,6 +479,7 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   await assert.rejects(run("recover", issued, false), refused);
   assert.equal(h.runtime.running, true);
   assert.equal(calls.includes("drain"), false);
+  assert.equal(calls.includes("registry-get"), false);
   assert.ok(await journal.pending());
 
   reportedRunning = undefined;
@@ -490,6 +495,7 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   failRelease.mock.restore();
   assert.deepEqual(calls.filter(call => ["start", "drain", "stop", "delete"].includes(call)),
     ["start", "drain", "stop", "delete"]);
+  assert.equal(calls.filter(call => call === "registry-get").length, 8);
   assert.equal(await journal.completedFor(issued), true);
   assert.deepEqual(values.get(STAGING_USE_KEY), issued);
   await assert.rejects(h.bot.start(), /staging_use_conflict/);
@@ -498,7 +504,7 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   await run("recover", issued, false);
   assert.deepEqual(values.get(STAGING_USE_KEY), { ...issued, phase: "released" });
   await run("recover", issued, false);
-  assert.equal(calls.length, afterCleanup);
+  assert.deepEqual(calls.slice(afterCleanup), [], "completed-journal retries must perform no external calls");
   assert.equal(h.runtime.running, false);
 });
 
