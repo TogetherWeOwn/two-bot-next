@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,7 +14,6 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import check_staging_help_evidence as evidence_check
 import staging_help_embed_smoke as smoke
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -252,7 +252,13 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         start_path = self.dir / "staging-use.jsonl"
         certify_path = self.dir / "staging-use-certify.jsonl"
         self.evidence = str(self.dir / f"help-embed-synthetic-{run}-2.json")
+        before_ms, after_ms = 1795600801000, 1795600861000
+
+        def snowflake(created_ms, sequence=0):
+            return ((created_ms - 1_420_070_400_000) << 22) | sequence
+
         fake = FakeDiscord()
+        fake.next_id = snowflake(before_ms + 1)
         code, _ = self.run_main(fake)
         self.assertEqual(0, code)
         self.assertEqual({}, fake.messages)
@@ -266,12 +272,13 @@ class HelpEmbedSmokeTests(unittest.TestCase):
             start_path.write_text("".join(json.dumps(line) + "\n" for line in window))
             certify_path.write_text("".join(json.dumps(line) + "\n" for line in finish))
             report_path.write_text(json.dumps(rows))
-            out = io.StringIO()
-            with redirect_stdout(out), redirect_stderr(out):
-                code = evidence_check.main(["--rollout", str(rollout_path), "--run-metadata", str(run_path),
-                                            "--start", str(start_path), "--certify", str(certify_path),
-                                            "--report", str(report_path)])
-            return code, out.getvalue()
+            result = subprocess.run(
+                [sys.executable, "-B", str(ROOT / "scripts/check_staging_help_evidence.py"),
+                 "--rollout", str(rollout_path), "--run-metadata", str(run_path),
+                 "--start", str(start_path), "--certify", str(certify_path),
+                 "--report", str(report_path)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5, check=False)
+            return result.returncode, result.stdout
 
         code, out = check()
         self.assertEqual(0, code)
@@ -285,6 +292,23 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         failed_cleanup["rows"][0]["cleanup_failed"] = True
         repeated_id = copy.deepcopy(report)
         repeated_id["rows"][1]["message_id"] = repeated_id["rows"][0]["message_id"]
+
+        on_bounds = copy.deepcopy(report)
+        on_bounds["rows"][0]["message_id"] = str(snowflake(before_ms))
+        on_bounds["rows"][-1]["message_id"] = str(snowflake(after_ms, 1))
+        code, out = check(rows=on_bounds)
+        self.assertEqual(0, code, out)
+
+        too_early = copy.deepcopy(report)
+        too_early["rows"][0]["message_id"] = str(snowflake(before_ms - 1))
+        too_late = copy.deepcopy(report)
+        too_late["rows"][-1]["message_id"] = str(snowflake(after_ms + 1))
+        for edge, invalid_report in (("early", too_early), ("late", too_late)):
+            with self.subTest(edge=edge):
+                code, out = check(rows=invalid_report)
+                self.assertEqual(1, code, out)
+                self.assertIn("message creation is outside the readiness bounds", out)
+                self.assertNotIn("PASS", out)
 
         for inputs, reason in (
             ({"report_path": self.dir / f"help-embed-synthetic-{old_run}-2.json"}, "different run"),
