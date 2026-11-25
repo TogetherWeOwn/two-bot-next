@@ -9,6 +9,7 @@ on:
       candidate-sha: {type: string, required: true}
       pins: {type: string, required: true}
       plan-run-id: {type: string, required: true}
+      preflight-epoch: {type: string, required: true}
       database-host: {type: string, required: true}
       database-name: {type: string, required: true}
       database-branch-id: {type: string, required: true}
@@ -23,6 +24,7 @@ env:
   RELEASE_SHA: ${{ inputs.candidate-sha }}
   RELEASE_PINS: ${{ inputs.pins }}
   RELEASE_PLAN_ID: ${{ inputs.plan-run-id }}
+  RELEASE_PREFLIGHT_EPOCH: ${{ inputs.preflight-epoch }}
   RELEASE_STOPPED: ${{ inputs.stopped }}
   FORWARD_ARTIFACT_ID: ${{ inputs.forward-artifact-id }}
   FORWARD_ARCHIVE_SHA256: ${{ inputs.forward-archive-sha256 }}

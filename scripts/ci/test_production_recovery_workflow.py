@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import asdict, replace
+import json
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -75,13 +76,22 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.control.assert_called_once_with("fence-exact", 20, expected_deployment=self.candidate[0])
 
     def test_cli_requires_authenticated_forward_apply(self):
-        release, run, plan_id, plan, artifact = object(), {}, "321", {}, {}
-        env = {"FORWARD_ARTIFACT_ID": "789", "PRODUCTION_WORKER_URL": "https://fixture.invalid"}
-        with (patch.object(recovery, "release_context", return_value=(release, run, plan_id, plan, artifact)),
-              patch.object(recovery, "forward_document", side_effect=GateError("unproved")) as authenticate,
+        release = Mock(workflow_sha="d" * 40, candidate_sha=self.pin.candidate_sha,
+                       rollback_worker=self.pin.worker_version)
+        run = {"id": 123, "head_sha": release.workflow_sha, "run_attempt": 1}
+        env = {"RELEASE_STOPPED": json.dumps({**self.ack, "deploymentId": self.pin.worker_version}),
+               "RELEASE_PREFLIGHT_EPOCH": "20", "FORWARD_ARTIFACT_ID": "789",
+               "FORWARD_ARCHIVE_SHA256": "8" * 64, "PRODUCTION_WORKER_URL": "https://fixture.invalid"}
+        with (patch.object(recovery, "release_context", return_value=(release, run, "321", {}, {})),
+              patch.object(artifacts, "protected_job") as producer,
+              patch.object(artifacts, "authentic_document", side_effect=GateError("unproved")) as authenticate,
               patch.object(recovery, "check_url") as provider_url):
+            self.assertEqual(recovery.main(["fence"], {**env, "RELEASE_PREFLIGHT_EPOCH": "19"}), 1)
+            producer.assert_not_called()
+            authenticate.assert_not_called()
             self.assertEqual(recovery.main(["fence"], env), 1)
-        authenticate.assert_called_once_with(env, release, run, plan_id, plan, artifact)
+        producer.assert_called_once_with(run, recovery.github, artifacts.FORWARD_JOB, artifacts.FORWARD_STEPS)
+        authenticate.assert_called_once_with(run, artifacts.FORWARD_ARTIFACT, "789", "8" * 64, recovery.github)
         provider_url.assert_not_called()
 
     def test_inverse_refuses_incomplete_database_readback(self):
