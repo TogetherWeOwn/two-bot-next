@@ -869,7 +869,7 @@ class StaticGuardTests(unittest.TestCase):
         for needle in ("set -euo pipefail", '--expected-sha "$SHA"', 'if [ "$probe" -gt 1 ]',
                        "wrangler/scripts/rest-5xx-counters.mjs",
                        "deploy-staging.yml/runs", "--method GET", "-f branch=main",
-                       "-q '[.workflow_runs[] | {head_sha, head_branch, status, conclusion}]'",
+                       "-q '[.workflow_runs[] | {head_sha, head_branch, display_title, event, status, conclusion}]'",
                        'promotion_regression_gate.py staging', '--auto "$AUTO"',
                        '--run-id "$RUN_ID"', '--attempt "$RUN_ATTEMPT"',
                        '--staging-runs "$RUNNER_TEMP/staging-runs.json"',
