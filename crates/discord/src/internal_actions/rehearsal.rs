@@ -1,7 +1,6 @@
-use std::{io, net::Ipv4Addr};
+use std::{future::Future, io, net::Ipv4Addr, pin::Pin};
 
 use super::{Bytes, Client, Full, HttpsConnector, HttpsConnectorBuilder, TokioExecutor};
-use futures_util::future::BoxFuture;
 use http::Uri;
 use hyper_util::rt::TokioIo;
 use rustls::{pki_types::CertificateDer, ClientConfig, RootCertStore};
@@ -9,7 +8,7 @@ use tokio::net::TcpStream;
 use tower::{service_fn, util::ServiceFn};
 use two_bot_core::send_admission::AdmissionError;
 
-type RecorderDial = BoxFuture<'static, io::Result<TokioIo<TcpStream>>>;
+type RecorderDial = Pin<Box<dyn Future<Output = io::Result<TokioIo<TcpStream>>> + Send>>;
 type RecorderTcp = ServiceFn<fn(Uri) -> RecorderDial>;
 
 /// Isolated transport with one fixture root and standard rustls verification.
