@@ -1,5 +1,6 @@
 """Replay synthetic Help, naming and gateway evidence through one execution card."""
 
+from copy import deepcopy
 from dataclasses import asdict
 import hashlib
 import json
@@ -15,7 +16,7 @@ from test_t0_acceptance_report import PRODUCTION, SCRIPTS, WATCH_EMPTY, WATCH_HE
 sys.path.insert(0, str(SCRIPTS))
 from production_recovery_artifact import FORWARD_JOB, FORWARD_STEPS, protected_job
 from production_recovery_takeover import RecoveryPin
-from production_recovery_workflow import restore_under_fence
+from production_recovery_workflow import fence_actor, restore_under_fence
 from staging_rollout import GateError
 
 
@@ -70,48 +71,57 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
         self.assertEqual(report["expected"], expected)
         return report["observations"]
 
+    def recover_predecessor(self, pin, candidate, before):
+        inverse = {"state": "restored", **asdict(pin)}
+        version, sha, digest = before
+        serving = {
+            "worker": {"version_id": version, "sha": sha, "traffic_percent": 100},
+            "container": {"application_id": pin.application_id, "namespace_id": pin.namespace_id,
+                          "image_digest": digest, "rollout_status": "completed"},
+            "ownership": {"phase": "fenced", "running": False, "epoch": pin.fence_epoch,
+                          "owner_actor": fence_actor(pin)},
+        }
+
+        def takeover(_operation, _epoch, *, expected_deployment):
+            self.assertEqual(serving["worker"]["version_id"], expected_deployment)
+            self.assertEqual(serving["container"]["image_digest"], pin.image_digest)
+            serving["ownership"].update(phase="active", running=True, epoch=pin.fence_epoch + 1,
+                                        owner_actor=pin.actor)
+
+        def wait_stable(version, _started):
+            self.assertEqual(serving["worker"]["version_id"], version)
+            self.assertEqual(serving["ownership"]["phase"], "active")
+            self.assertIs(serving["ownership"]["running"], True)
+
+        rollback, control = Mock(), Mock(side_effect=takeover)
+        rollback.post_worker_restore.side_effect = lambda version: serving["worker"].update(
+            version_id=version, sha=pin.rollback_sha,
+        )
+        rollback.restore_image.side_effect = lambda _image: serving["container"].update(image_digest=pin.image_digest)
+        rollback.wait_stable.side_effect = wait_stable
+        observe = Mock(side_effect=lambda: deepcopy(serving))
+        restore_under_fence(pin, inverse, observe, control, rollback, "fixture-image", candidate)
+        if before == candidate:
+            rollback.post_worker_restore.assert_called_once_with(pin.worker_version)
+            rollback.restore_image.assert_called_once_with("fixture-image")
+        else:
+            rollback.post_worker_restore.assert_not_called()
+            rollback.restore_image.assert_not_called()
+        control.assert_called_once_with("takeover-fenced", pin.fence_epoch, expected_deployment=pin.worker_version)
+        rollback.wait_stable.assert_called_once_with(pin.worker_version, rollback.now.return_value)
+        return serving
+
     def test_recovery_readiness_cannot_certify_the_forward_candidate(self):
         fixture = Path(__file__).with_name("fixtures") / "production_inverse_admission.json"
         case = json.loads(fixture.read_text(encoding="utf-8"))
         admission = case["admission"]
         pin = RecoveryPin(**admission["pin"])
         candidate = (admission["candidate_worker"], pin.candidate_sha, admission["candidate_image"])
-        inverse = {"state": "restored", **asdict(pin)}
-        # Read back the exact predecessor after takeover and replay the stable recovery check.
-        serving = {
-            "worker": {"version_id": pin.worker_version, "sha": pin.rollback_sha, "traffic_percent": 100},
-            "container": {"application_id": pin.application_id, "namespace_id": pin.namespace_id,
-                          "image_digest": pin.image_digest, "rollout_status": "completed"},
-            "ownership": {"phase": "active", "running": True, "epoch": pin.fence_epoch + 1,
-                          "owner_actor": pin.actor},
-        }
-        rollback, control = Mock(), Mock()
-        restore_under_fence(pin, inverse, Mock(return_value=serving), control, rollback, "fixture-image", candidate)
-        control.assert_not_called()
-        rollback.wait_stable.assert_called_once_with(pin.worker_version, rollback.now.return_value)
-
-        restored = dict(
-            PRODUCTION, build_revision=serving["worker"]["sha"], build_id="899-1",
-            deploy_id="2026.11.24.1+bbbbbbb", image_digest=serving["container"]["image_digest"],
-            worker_version=serving["worker"]["version_id"], application_id=serving["container"]["application_id"],
-        )
+        predecessor = (pin.worker_version, pin.rollback_sha, pin.image_digest)
         intended = dict(PRODUCTION, worker_version=candidate[0], build_revision=candidate[1],
                         image_digest=candidate[2], application_id=pin.application_id)
-        window_path = self.root / "recovered-window.json"
-        window_path.write_text(json.dumps(restored), encoding="utf-8")
-        help_report = self.assemble_watch("help", WATCH_HELP, window_path)
-        gateway = self.summarize_gateway(
-            restored, "gateway_resumed", "2026-11-25T02:01:00.000Z", "recovered-gateway.json",
-        )
-        reports = {"help": (help_report, restored), "gateway": (gateway, restored)}
-        recovered = self.replay(restored, reports)
-        self.assertEqual((recovered["help"]["status"], recovered["help"]["result"]),
-                         ("attributed", "readbacks_and_deletions_recorded"))
-        self.assertEqual((recovered["gateway"]["status"], recovered["gateway"]["readiness"]),
-                         ("attributed", "observed"))
-
         origin = dict(case["run"], id=456)
-        for conclusion in ("cancelled", "success"):
+        for conclusion, before in (("cancelled", predecessor), ("success", candidate)):
             with self.subTest(forward_job=conclusion):
                 # Applying the schema can finish before the run is interrupted at receipt upload.
                 steps = [{"name": name, "status": "completed", "conclusion": result}
@@ -124,6 +134,25 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
                         protected_job(origin, api, FORWARD_JOB, FORWARD_STEPS)
                 else:
                     protected_job(origin, api, FORWARD_JOB, FORWARD_STEPS)
+
+                serving = self.recover_predecessor(pin, candidate, before)
+                restored = dict(
+                    PRODUCTION, build_revision=serving["worker"]["sha"], build_id="899-1",
+                    deploy_id="2026.11.24.1+bbbbbbb", image_digest=serving["container"]["image_digest"],
+                    worker_version=serving["worker"]["version_id"], application_id=serving["container"]["application_id"],
+                )
+                window_path = self.root / "recovered-window.json"
+                window_path.write_text(json.dumps(restored), encoding="utf-8")
+                help_report = self.assemble_watch("help", WATCH_HELP, window_path)
+                gateway = self.summarize_gateway(
+                    restored, "gateway_resumed", "2026-11-25T02:01:00.000Z", "recovered-gateway.json",
+                )
+                reports = {"help": (help_report, restored), "gateway": (gateway, restored)}
+                recovered = self.replay(restored, reports)
+                self.assertEqual((recovered["help"]["status"], recovered["help"]["result"]),
+                                 ("attributed", "readbacks_and_deletions_recorded"))
+                self.assertEqual((recovered["gateway"]["status"], recovered["gateway"]["readiness"]),
+                                 ("attributed", "observed"))
 
                 refused = self.replay(intended, reports)
                 self.assertEqual(refused["help"]["fields"],
