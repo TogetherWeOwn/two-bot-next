@@ -1246,10 +1246,11 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     steps:
+      # Build and measure the event tree with a single-commit fetch.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Job-container prerequisites (loopback forward to agent-testdb)
         shell: bash

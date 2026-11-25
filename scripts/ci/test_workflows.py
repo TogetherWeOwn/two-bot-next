@@ -7485,6 +7485,14 @@ class WorkflowTests(unittest.TestCase):
             [shlex.split(invite["command"])],
         )
 
+    def test_coverage_shard_shallow_checkout_uses_the_event_revision(self):
+        checkout = self.workflows["check.yml"]["jobs"]["coverage-shard"]["steps"][0]
+        self.assertEqual(checkout, {
+            "uses": STAGING_CHECKOUT_USES,
+            # The pinned action defaults to the event ref and SHA when ref is absent.
+            "with": {"persist-credentials": "false", "fetch-depth": "1"},
+        })
+
     def test_coverage_shard_caches_the_instrumented_build(self):
         # Each shard restores its own rust-cache entry and reports sccache
         # stats for the hit rate; the GitHub cache backend is ref-scoped by
