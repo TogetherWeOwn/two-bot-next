@@ -5017,7 +5017,7 @@ def workflow_policy_errors(workflows):
         if name == "staging-automod-preview.yml":
             contract = Path(__file__).parent / "fixtures/staging_automod_preview_workflow.json"
             if workflow != json.loads(contract.read_text()):
-                errors.append(f"{name}: expected the disabled, synthetic-only staging job")
+                errors.append(f"{name}: expected the default-off protected staging dispatch")
             continue
         if name == "build-predecessor.yml":
             contract = Path(__file__).parent / "fixtures/build_predecessor_workflow.json"
@@ -7685,11 +7685,12 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(file=file_name, mutation=label):
                     self.assertNotEqual(check(changed), [])
 
-    def test_staging_automod_preview_is_dormant(self):
+    def test_staging_automod_preview_requires_protected_opt_in(self):
         name = "staging-automod-preview.yml"
         self.assertEqual(workflow_policy_errors(self.workflows), [])
         for keys, change in (
-                (("on",), {"workflow_dispatch": {}}),
+                (("on",), {"workflow_call": ""}),
+                (("on", "workflow_dispatch", "inputs", "rehearse"), {"default": "true"}),
                 (("concurrency",), {"group": "automod-only"}),
                 (("jobs", "dry-run"), {"if": "true"}),
                 (("jobs", "dry-run", "permissions"), {"id-token": "write"}),
@@ -7697,14 +7698,17 @@ class WorkflowTests(unittest.TestCase):
                 (("jobs", "dry-run", "steps", 3), {
                     "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
                 (("jobs", "dry-run", "steps", 4), {
-                    "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}})):
+                    "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
+                (("jobs", "dry-run", "steps", 5), {"env": {"STAGING_AUTOMOD_REHEARSAL": "true"}}),
+                (("jobs", "dry-run", "steps", 5, "env"), {
+                    "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"})):
             with self.subTest(keys=keys, change=change):
                 workflows = deepcopy(self.workflows)
                 node = workflows[name]
                 for key in keys:
                     node = node[key]
                 node.update(change)
-                self.assertIn(f"{name}: expected the disabled, synthetic-only staging job",
+                self.assertIn(f"{name}: expected the default-off protected staging dispatch",
                               workflow_policy_errors(workflows))
         workflows = deepcopy(self.workflows)
         workflows["check.yml"]["jobs"]["worker"] = {"uses": f"./.github/workflows/{name}"}
