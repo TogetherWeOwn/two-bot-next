@@ -60,6 +60,9 @@ Usage (live, read-only GETs):
 
 Usage (offline fixtures, no network, no token):
   python3 scripts/staging_voice_smoke.py --mock [--evidence FILE]
+
+Usage (offline room naming readbacks, no network, no token):
+  python3 scripts/staging_voice_smoke.py --naming-observations FILE [--evidence FILE]
 """
 
 import argparse
@@ -75,6 +78,7 @@ import urllib.request
 from urllib.parse import urlsplit
 
 from script_intake import (
+    decode_json,
     decode_legacy_json,
     no_redirect_opener,
     read_with_overflow,
@@ -636,6 +640,99 @@ def evidence_shape(results):
              "command_id": r.command_id, "version": r.version} for r in results]
 
 
+def valid_room_name(value):
+    return isinstance(value, str) and 0 < len(value) <= 100 and bool(value.strip())
+
+
+def read_naming_observations(path):
+    try:
+        with open(path, "rb") as source:
+            raw = read_with_overflow(source, BODY_CAP)
+    except OSError:
+        raise SmokeError("could not read naming observations") from None
+    if len(raw) > BODY_CAP:
+        raise SmokeError("naming observations exceed the body cap")
+    try:
+        report = decode_json(raw)
+    except (ValueError, RecursionError):
+        raise SmokeError("invalid naming observations JSON") from None
+
+    if not isinstance(report, dict) or report.keys() != {"occupied_name", "empty_name", "readbacks"}:
+        raise SmokeError("expected occupied and empty names and ordered readbacks")
+    occupied, empty, readbacks = report["occupied_name"], report["empty_name"], report["readbacks"]
+    if not valid_room_name(occupied) or not valid_room_name(empty) or occupied == empty:
+        raise SmokeError("expected two distinct room names")
+    if not isinstance(readbacks, list) or len(readbacks) != 3:
+        raise SmokeError("expected three readback slots")
+
+    room_id = None
+    previous_time = 0
+    for row in readbacks:
+        if row is None:
+            continue
+        if (not isinstance(row, dict) or row.keys() != {"room_id", "observed_at_ms", "humans", "name"}
+                or not is_snowflake(row["room_id"]) or not valid_room_name(row["name"])
+                or type(row["humans"]) is not int or row["humans"] < 0
+                or type(row["observed_at_ms"]) is not int or row["observed_at_ms"] <= 0):
+            raise SmokeError("invalid room readback")
+        if room_id is not None and row["room_id"] != room_id:
+            raise SmokeError("readbacks name different rooms")
+        if row["observed_at_ms"] <= previous_time:
+            raise SmokeError("readback times do not increase")
+        room_id = row["room_id"]
+        previous_time = row["observed_at_ms"]
+    return occupied, empty, readbacks
+
+
+def naming_transition(check, before, after):
+    if False in (before, after):
+        return Result(check, "fail", "readback disagrees with expected occupancy or name")
+    if None in (before, after):
+        return Result(check, "skip", "transition readback is incomplete")
+    return Result(check, "pass", "expected name change read back on the same room")
+
+
+def run_naming_observations(source, evidence):
+    # Keep the original observations when the requested receipt path aliases them.
+    try:
+        same_path = os.path.realpath(source) == os.path.realpath(evidence)
+        if not same_path:
+            try:
+                same_path = os.path.samefile(source, evidence)
+            except FileNotFoundError:
+                pass
+    except OSError:
+        print("FAIL room-naming-input: could not check observation and receipt paths")
+        return 1
+    if same_path:
+        print("FAIL room-naming-input: observation and receipt paths must differ")
+        return 1
+
+    try:
+        occupied, empty, readbacks = read_naming_observations(source)
+    except SmokeError as error:
+        results = [Result("room-naming-input", "fail", str(error))]
+    else:
+        before, vacant, after = [
+            None if row is None else (row["humans"] > 0) == has_humans and row["name"] == name
+            for row, has_humans, name in zip(readbacks, (True, False, True), (occupied, empty, occupied))
+        ]
+        results = [naming_transition("empty-room-rename", before, vacant),
+                   naming_transition("occupied-room-return", vacant, after)]
+    for result in results:
+        print(result.line())
+    verdicts = {result.verdict for result in results}
+    if "fail" in verdicts:
+        outcome, code = "fail", 1
+    elif "skip" in verdicts:
+        outcome, code = "incomplete", 3
+    else:
+        outcome, code = "pass", 0
+    receipt = {"transport": "offline-naming-observations", "checks": evidence_shape(results),
+               "result": outcome}
+    return write_evidence(evidence, receipt) or code
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--guild-id",
@@ -644,16 +741,35 @@ def parse_args(argv):
     parser.add_argument("--staging-url",
                         default=os.environ.get("STAGING_WORKER_URL"),
                         help="staging Worker origin (default: $STAGING_WORKER_URL; omit for registry-only)")
-    parser.add_argument("--mock", action="store_true",
-                        help="drive the endpoint shape against local fixtures "
-                             "(no network, no token; ignores --staging-url)")
-    parser.add_argument("--evidence", default="staging-voice-smoke-evidence.json",
-                        help="receipt path written when the fetch phase completes")
-    return parser.parse_args(argv)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--mock", action="store_true",
+                      help="drive the endpoint shape against local fixtures "
+                           "(no network, no token; ignores --staging-url)")
+    mode.add_argument("--naming-observations",
+                      help="check ordered room naming readbacks from a local JSON file (offline)")
+    parser.add_argument("--evidence", help="receipt path (defaults to a file for the selected mode)")
+    args = parser.parse_args(argv)
+    if args.evidence is None:
+        args.evidence = ("staging-voice-naming-evidence.json" if args.naming_observations is not None
+                         else "staging-voice-smoke-evidence.json")
+    return args
+
+
+def write_evidence(path, receipt):
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(receipt, handle, indent=2)
+            handle.write("\n")
+    except OSError as error:
+        print(f"staging voice smoke failed: evidence not written ({error.__class__.__name__})")
+        return 1
+    return 0
 
 
 def main(argv=None, fetch_fn=None, worker_fetch=None):
     args = parse_args(argv)
+    if args.naming_observations is not None:
+        return run_naming_observations(args.naming_observations, args.evidence)
     token = os.environ.get("DISCORD_STAGING_BOT_TOKEN", "")
     if args.mock:
         # Mock mode is fully offline: --staging-url is ignored so the
@@ -687,14 +803,7 @@ def main(argv=None, fetch_fn=None, worker_fetch=None):
                "worker_url": worker_url,
                "checks": evidence_shape(results),
                "result": "pass" if not failed else "fail"}
-    try:
-        with open(args.evidence, "w", encoding="utf-8") as handle:
-            json.dump(receipt, handle, indent=2)
-            handle.write("\n")
-    except OSError as error:
-        print(f"staging voice smoke failed: evidence not written ({error.__class__.__name__})")
-        return 1
-    return 0 if not failed else 1
+    return write_evidence(args.evidence, receipt) or int(bool(failed))
 
 
 if __name__ == "__main__":
