@@ -1,33 +1,10 @@
 """Verify the atomic forward transaction before allowing a production takeover."""
 
-from ci.production_migrate_claim import projection_hash, store_projection_hash
 from production_recovery_takeover import HEX, RUN_ID
+from production_release_ledgers import CUTOVER, STORE, ledger_endpoints
 from staging_migrate_approval import digest_json
 from staging_recovery_status import matches
 from staging_rollout import mapping, require
-
-CUTOVER = (475, 479, 480, 481, 482)
-STORE = (478,)
-
-
-def ledger_endpoints(plan):
-    """Derive the three permissible ledger states from the approved source."""
-    require(plan.get("pending_before") == list(CUTOVER)
-            and plan.get("pending_store_before") == list(STORE)
-            and plan.get("plan_manifest_sha256") == projection_hash(plan)
-            and plan.get("store_plan_manifest_sha256") == store_projection_hash(plan),
-            "production_release_plan_projection_invalid")
-    expanded = [[dict(row, success=True) for row in plan[key]]
-                for key in ("source_migrations", "source_store_migrations")]
-    before = [[row for row in rows if row["version"] not in pending]
-              for rows, pending in zip(expanded, (CUTOVER, STORE), strict=True)]
-    restored = [[row for row in rows if row["version"] not in removed]
-                for rows, removed in zip(expanded, (CUTOVER[1:], STORE), strict=True)]
-    require([plan.get("ledger_before"), plan.get("ledger_store_before")] == before
-            and [plan.get("ledger_after"), plan.get("ledger_store_after")] == before,
-            "production_release_plan_ledgers_invalid")
-    return before, expanded, restored
-
 
 def forward_receipt(plan_id, plan, outcome):
     """Bind both ledger readbacks and the committed 0475 stamp to this plan."""
