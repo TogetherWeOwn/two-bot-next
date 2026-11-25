@@ -6,8 +6,13 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { pipelineUse } from "../scripts/staging-use-pipeline.mjs";
-import { bindStagingVoiceMoveProvider, runStagingVoiceMoveEntry } from "../scripts/staging-voice-move-entry.mjs";
+import {
+  bindStagingVoiceMoveHandoffProvider,
+  bindStagingVoiceMoveProvider,
+  runStagingVoiceMoveEntry,
+} from "../scripts/staging-voice-move-entry.mjs";
 import { runStagingVoiceMoveJob } from "../scripts/staging-voice-move-job.mjs";
+import { readStagingVoiceWebReady } from "../scripts/staging-voice-web-handoff.mjs";
 import { mockVoiceMoveWindow } from "./fixtures/staging-voice-move.ts";
 
 function beginFixture(ready: ReturnType<typeof mockVoiceMoveWindow>["args"]["ready"], dir: string) {
@@ -277,6 +282,181 @@ test("bound provider skips disabled selection and refuses incomplete dependencie
     }
     assert.equal(clock.mock.callCount(), 0);
     assert.deepEqual({ signed, moves, calls, reads }, { signed: [], moves: [], calls: [], reads: [] });
+  } finally {
+    await finish();
+  }
+});
+
+function mockWebHandoff(inputs: ReturnType<typeof jobInputs>["inputs"]) {
+  const { now, ...dependencies } = inputs;
+  const { commit, version_id: workerVersion } = dependencies.expectedRevision;
+  const sampledAt = now() - 60_000;
+  // The Web producer retains this shape. Web Operations issues its separate decision after validation.
+  const soakReceipt = {
+    schema: "staging-soak/1", status: "sampled", sha: commit, workerVersion,
+    deployedAt: new Date(sampledAt - 31 * 60_000).toISOString(), deployRunId: 100, deployAttempt: 1,
+    e2eRunId: 200, e2eAttempt: 1, e2eCompletedAt: new Date(sampledAt - 30 * 60_000).toISOString(),
+    floorAt: new Date(sampledAt).toISOString(),
+    sample: { workerVersion, observedAt: new Date(sampledAt).toISOString(), requests: 50, errors: 0 },
+  };
+  const qualification = { ...structuredClone(soakReceipt), verdict: "qualified" };
+  const match = {
+    matched: true, observed_at: new Date(Date.now()).toISOString(), revision: dependencies.expectedRevision,
+  };
+  const reply = { status: 200, body: match as object };
+  let reads = 0;
+  const webSession = {
+    ...dependencies.webSession,
+    async request(url: string, init: RequestInit) {
+      init.signal?.throwIfAborted();
+      assert.equal(this === webSession, true, "calls use the same scoped adapter");
+      assert.equal(url === webSession.origin + "/__probe/voice-move/session", true, "companion endpoint only");
+      assert.equal(init.method, "POST");
+      assert.equal(init.body === JSON.stringify({
+        discord_id: dependencies.fixture.discordId, channel_ids: dependencies.fixture.channelIds,
+      }), true, "ordered fixture assertions");
+      reads += 1;
+      return Object.defineProperty(Response.json(reply.body, {
+        status: reply.status, headers: { "cache-control": "private, no-store" },
+      }), "url", { value: url });
+    },
+  };
+  const scopedInputs = { ...dependencies, webSession };
+  const readReady = (signal: AbortSignal) => readStagingVoiceWebReady(scopedInputs, { signal });
+  async function complete(signal: AbortSignal) {
+    const ready = await readReady(signal);
+    reply.status = 404;
+    reply.body = { error: "not_found", request_id: "0".repeat(26) };
+    return ready.confirmDisabled({ signal });
+  }
+  function enableCompanion() {
+    reply.status = 200;
+    reply.body = { ...match, observed_at: new Date(Date.now()).toISOString() };
+  }
+  return { scopedInputs, qualification, soakReceipt, reply, readReady, complete, enableCompanion, readCount: () => reads };
+}
+
+test("qualified Web handoff reaches the existing mock proof with a fresh preflight", async (t) => {
+  const { env, inputs, signed, calls, finish } = jobInputs(t);
+  // Earlier readbacks can be followed by a fresh qualification of the restored Worker.
+  let now = inputs.now() - 35 * 60_000;
+  t.mock.method(Date, "now", () => now);
+  const web = mockWebHandoff(inputs);
+  try {
+    const webHandoff = await web.complete(t.signal);
+    assert.equal(web.readCount(), 2);
+    assert.equal(signed.length, 0);
+    const provider = bindStagingVoiceMoveHandoffProvider(web.scopedInputs, {
+      qualification: web.qualification, soakReceipt: web.soakReceipt, webHandoff,
+    });
+    assert.equal(await runStagingVoiceMoveEntry({}, provider), "disabled");
+    assert.equal(web.readCount(), 2);
+    now = inputs.now();
+    web.enableCompanion();
+    assert.equal(await runStagingVoiceMoveEntry(env, provider), "passed");
+    assert.equal(web.readCount(), 3, "the proof reads its own current session");
+    assert.equal(signed.length, 3);
+    assert.deepEqual(calls, ["assert", "assert", "assert", "status", "release", "status"]);
+  } finally {
+    await finish();
+  }
+});
+
+test("completed Web handoff cannot replace the enabled companion at proof preflight", async (t) => {
+  const { env, inputs, signed, calls, finish } = jobInputs(t);
+  t.mock.method(Date, "now", inputs.now);
+  const web = mockWebHandoff(inputs);
+  try {
+    const webHandoff = await web.complete(t.signal);
+    const provider = bindStagingVoiceMoveHandoffProvider(web.scopedInputs, {
+      qualification: web.qualification, soakReceipt: web.soakReceipt, webHandoff,
+    });
+    assert.equal(await runStagingVoiceMoveEntry(env, provider), "failed");
+    assert.equal(web.readCount(), 3, "the runner attempted its own current-session read");
+    assert.equal(signed.length, 0);
+    assert.deepEqual(calls, ["status", "release", "status"]);
+  } finally {
+    await finish();
+  }
+});
+
+test("Web handoff refuses stale qualification and cross-session or unconfirmed evidence", async (t) => {
+  const { env, inputs, signed, calls, finish } = jobInputs(t);
+  t.mock.method(Date, "now", inputs.now);
+  const web = mockWebHandoff(inputs);
+  try {
+    const webHandoff = await web.complete(t.signal);
+    const { qualification, soakReceipt, scopedInputs } = web;
+    const evidence = { qualification, soakReceipt, webHandoff };
+    const futureSample = { ...soakReceipt, sample: { ...soakReceipt.sample, observedAt: new Date(inputs.now() + 1).toISOString() } };
+    const staleSha = { ...soakReceipt, sha: "d".repeat(40) };
+    const differentVersion = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const wrongSampleWorker = { ...soakReceipt, sample: { ...soakReceipt.sample, workerVersion: differentVersion } };
+    const wrongWorker = { ...soakReceipt, workerVersion: differentVersion };
+    for (const [label, change] of Object.entries({
+      "missing soak receipt": { soakReceipt: undefined },
+      "soak receipt without a terminal decision": { qualification: soakReceipt },
+      "stale Web SHA": { soakReceipt: staleSha, qualification: { ...staleSha, verdict: "qualified" } },
+      "different Worker": { soakReceipt: wrongWorker, qualification: { ...wrongWorker, verdict: "qualified" } },
+      "different sample Worker": { soakReceipt: wrongSampleWorker, qualification: { ...wrongSampleWorker, verdict: "qualified" } },
+      "superseded soak": { soakReceipt: { ...soakReceipt, status: "superseded" } },
+      "different E2E run": { soakReceipt: { ...soakReceipt, e2eRunId: soakReceipt.e2eRunId + 1 } },
+      "different sample": { soakReceipt: { ...soakReceipt, sample: { ...soakReceipt.sample, requests: 51 } } },
+      "unqualified soak": { qualification: { ...qualification, verdict: "pending" } },
+      "future soak sample": { soakReceipt: futureSample, qualification: { ...futureSample, verdict: "qualified" } },
+    })) {
+      const provider = bindStagingVoiceMoveHandoffProvider(scopedInputs, { ...evidence, ...change });
+      assert.equal(await runStagingVoiceMoveEntry(env, provider), "failed", label);
+    }
+    const crossSession = bindStagingVoiceMoveHandoffProvider({ ...scopedInputs, webSession: { ...scopedInputs.webSession } }, evidence);
+    assert.equal(await runStagingVoiceMoveEntry(env, crossSession), "failed", "another session with identical metadata");
+
+    web.enableCompanion();
+    const readyOnly = await web.readReady(t.signal);
+    for (const incomplete of [undefined, readyOnly, { ...webHandoff }]) {
+      const provider = bindStagingVoiceMoveHandoffProvider(scopedInputs, { ...evidence, webHandoff: incomplete });
+      assert.equal(await runStagingVoiceMoveEntry(env, provider), "failed", "refusal was not confirmed by this handoff");
+    }
+    assert.equal(web.readCount(), 3);
+    assert.equal(signed.length, 0);
+    assert.equal(calls.length, 0);
+  } finally {
+    await finish();
+  }
+});
+
+test("Web handoff refuses invalid readiness and disabled responses with a fixed error", async (t) => {
+  const { inputs, signed, calls, finish } = jobInputs(t);
+  t.mock.method(Date, "now", inputs.now);
+  const web = mockWebHandoff(inputs);
+  const refused = (error: unknown) => error instanceof Error
+    && error.message === "staging_voice_web_handoff_unconfirmed" && !("cause" in error);
+  try {
+    const valid = web.reply.body;
+    for (const invalid of [
+      { ...valid, observed_at: "2030-02-30T12:00:00.000Z" },
+      { ...valid, observed_at: new Date(inputs.now() - 60_001).toISOString() },
+      { ...valid, revision: { ...inputs.expectedRevision, commit: "e".repeat(40) } },
+      { ...valid, matched: false },
+    ]) {
+      web.reply.body = invalid;
+      await assert.rejects(web.readReady(t.signal), refused);
+    }
+    web.reply.body = valid;
+    const ready = await web.readReady(t.signal);
+    // An enabled match, a different refusal, or an identity-bearing extra field cannot complete the handoff.
+    await assert.rejects(ready.confirmDisabled({ signal: t.signal }), refused);
+    web.reply.status = 404;
+    for (const body of [{ error: "forbidden" }, { error: "not_found", member: "synthetic-only" }]) {
+      web.reply.body = body;
+      await assert.rejects(ready.confirmDisabled({ signal: t.signal }), refused);
+    }
+    web.reply.body = { error: "not_found" };
+    web.scopedInputs.webSession.request = async () => { throw new Error("synthetic replacement transport"); };
+    await assert.rejects(ready.confirmDisabled({ signal: t.signal }), refused);
+    assert.equal(web.readCount(), 8);
+    assert.equal(signed.length, 0);
+    assert.equal(calls.length, 0);
   } finally {
     await finish();
   }
