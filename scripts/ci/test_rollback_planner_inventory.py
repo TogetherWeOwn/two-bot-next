@@ -3,11 +3,13 @@
 from copy import deepcopy
 from dataclasses import asdict, replace
 from hashlib import sha256, sha384
+from io import BytesIO
 import json
 from pathlib import Path
 import unittest
+from zipfile import ZIP_DEFLATED, ZipFile
 
-from test_staging_recovery_status import archive_fixture, plan_fixture, status
+from test_staging_recovery_status import plan_fixture, status
 from ci.staging_rollback_compatibility import MIGRATION_PATHS, git
 from production_recovery_takeover import RecoveryPin
 from rollback_planner_inventory import PlanArtifact, verify_inventory
@@ -64,8 +66,12 @@ class RollbackPlannerInventoryTests(unittest.TestCase):
         )
         cls.inverse = {"state": "restored", **asdict(cls.inverse_pin)}
 
-    def verify(self, endpoint, plan, *, artifact_changes=None, archive_override=None, **overrides):
-        archive = archive_fixture(json.dumps(plan))
+    def verify(self, endpoint, plan, *, artifact_changes=None, archive_override=None,
+               archive_member="staging-migrate-manifest.json", **overrides):
+        buffer = BytesIO()
+        with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive_file:
+            archive_file.writestr(archive_member, json.dumps(plan))
+        archive = buffer.getvalue()
         run, artifact_id = ("11", "101") if plan["source_sha"] == ORIGINAL else ("12", "102")
         artifact = PlanArtifact("a" * 40, run, 1, artifact_id, "sha256:" + sha256(archive).hexdigest())
         pins = {"expected_artifact": artifact, "window_id": WINDOW, "migration_target": "staging",
@@ -93,6 +99,20 @@ class RollbackPlannerInventoryTests(unittest.TestCase):
         self.assertNotIn("attendance_fence_sha256", self.verify("original-pre", self.original))
         ordinary = status.plan_projection(plan_fixture())
         self.assertEqual((ordinary["cutover_version"], ordinary["store_version"]), (481, 478))
+
+    def test_archive_member_must_match_pinned_migration_target(self):
+        plan = {**self.retained, "migration_target": "production"}
+        proof = self.verify("retained-pre", plan, migration_target="production",
+                            archive_member="production-migrate-manifest.json")
+        self.assertEqual(proof["migration_target"], "production")
+        self.assertEqual(proof["attendance_fence_sha256"], FENCE)
+        with self.assertRaisesRegex(status.GateError, "^invalid_plan_archive$"):
+            self.verify("retained-pre", plan, migration_target="production")
+        with self.assertRaisesRegex(status.GateError, "^invalid_plan_archive$"):
+            self.verify("original-pre", self.original, archive_member="production-migrate-manifest.json")
+        with self.assertRaisesRegex(status.GateError, "^invalid_read_only_plan$"):
+            self.verify("retained-pre", self.retained, migration_target="production",
+                        archive_member="production-migrate-manifest.json")
 
     def test_refuse_swapped_or_unapproved_catalogs(self):
         for endpoint, plan in (("original-pre", self.retained), ("retained-pre", self.original)):

@@ -9,9 +9,10 @@ from dataclasses import asdict, dataclass
 import re
 
 from ci.staging_migrate_claim import Refused, projection_hash, store_projection_hash
+from production_migrate_approval import ARTIFACT as PRODUCTION_PLAN_ARTIFACT
 from production_recovery_takeover import verify_inverse
 from staging_migrate_approval import digest_json
-from staging_recovery_status import DIGEST, HEX64, RUN_ID, SHA, matches, plan_manifest
+from staging_recovery_status import DIGEST, HEX64, PLAN_ARTIFACT, RUN_ID, SHA, matches, plan_manifest
 from staging_rollout import GateError, mapping, number, require, sequence
 
 
@@ -40,6 +41,7 @@ CATALOGS = {
 }
 WINDOW = re.compile(r"[A-Za-z0-9_-]{1,64}")
 STORE_VERSION, STORE_COUNT = 465, 20
+PLAN_ARTIFACTS = {"staging": PLAN_ARTIFACT, "production": PRODUCTION_PLAN_ARTIFACT}
 
 
 @dataclass(frozen=True)
@@ -81,11 +83,13 @@ def verify_inventory(endpoint, archive, artifact, *, expected_artifact, window_i
                 and matches(DIGEST, pin.archive_digest), "rollback_artifact_invalid")
     require(artifact == expected_artifact, "rollback_artifact_mismatch")
     require(isinstance(archive, bytes), "invalid_plan_archive")
-    plan = plan_manifest(archive, expected_artifact.archive_digest)
+    require(isinstance(migration_target, str) and migration_target in PLAN_ARTIFACTS,
+            "rollback_migration_target_invalid")
+    plan = plan_manifest(archive, expected_artifact.archive_digest, PLAN_ARTIFACTS[migration_target])
     require(matches(WINDOW, window_id) and plan.get("recovery_evidence_ref") == window_id,
             "rollback_window_mismatch")
     require(plan.get("source_sha") == catalog.source_sha, "rollback_catalog_source_mismatch")
-    require(migration_target in ("staging", "production") and plan.get("migration_target") == migration_target
+    require(plan.get("migration_target") == migration_target
             and type(plan.get("runner_version")) is int and plan["runner_version"] == 1
             and plan.get("mode") == "plan" and plan.get("role") == "two_bot_migrator_ro"
             and number(plan.get("role_verified_connections")) > 0
