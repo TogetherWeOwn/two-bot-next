@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from production_release_forward import CUTOVER, STORE, forward_receipt
@@ -103,6 +103,7 @@ class ReleaseForwardTests(unittest.TestCase):
 
     def test_prepare_rejects_agreeing_invalid_pre_plans_before_reading_provider(self):
         pin, plan = self.preflight_fixture()
+        # The read-only shape is valid, but the required PRE audit findings are absent.
         plan.update(runner_version=1, plan_run_id="", plan_provenance_verified=False,
                     applied_count=0, applied_store_count=0)
         run = {"id": 456}
@@ -124,6 +125,41 @@ class ReleaseForwardTests(unittest.TestCase):
             control.assert_not_called()
             observe.assert_not_called()
             provider.assert_not_called()
+
+    def test_prepare_checks_single_use_before_provider_access(self):
+        pin, plan = self.preflight_fixture()
+        fresh = {**plan, "role_verified_connections": 2}
+        run = {"id": 456}
+        artifact = {"run_id": 123, "artifact_id": 789, "archive_digest": "sha256:" + "8" * 64}
+        provider_steps = ["control", "preflight", "provider", "provenance", "registry", "write_proof"]
+        spent = GateError("production_attendance_plan_superseded_by_release_attempt")
+        for refusal, expected_steps in ((spent, []), (None, provider_steps)):
+            with self.subTest(approved=refusal is None), TemporaryDirectory() as temp:
+                directory = Path(temp) / "production-release"
+                directory.mkdir()
+                (directory / "fresh-plan.json").write_text(json.dumps(fresh), encoding="utf-8")
+                output_path = Path(temp) / "output"
+                env = {"RUNNER_TEMP": temp, "PRODUCTION_WORKER_URL": "https://prod.invalid",
+                       "OWNERSHIP_CONTROL_TOKEN": "fixture", "CLOUDFLARE_ACCOUNT_ID": "fixture",
+                       "CLOUDFLARE_API_TOKEN": "fixture", "GITHUB_OUTPUT": str(output_path)}
+                calls = Mock()
+                calls.approval.side_effect = refusal
+                calls.preflight.return_value = 17
+                calls.write_proof.side_effect = release.write_json
+                with (patch.object(release, "release_context", return_value=(pin, run, "123", plan, artifact)),
+                      patch.object(release, "check_url"),
+                      patch.multiple(release, validate_attendance_plan=calls.validate,
+                                     require_unused_attendance_plan=calls.approval,
+                                     control_client=calls.control, verify_preflight=calls.preflight,
+                                     read_status=calls.observe, RollbackClient=calls.provider,
+                                     validate_receipt_against_live=calls.provenance,
+                                     image_in_registry=calls.registry, write_json=calls.write_proof)):
+                    self.assertEqual(release.main(["prepare"], env), int(refusal is not None))
+                self.assertEqual(calls.mock_calls[:3], [call.validate(plan), call.validate(fresh),
+                                                        call.approval(release.github, artifact, run)])
+                self.assertEqual([name for name, _, _ in calls.mock_calls[3:]], expected_steps)
+                self.assertEqual((directory / "preflight.json").exists(), refusal is None)
+                self.assertEqual(output_path.exists(), refusal is None)
 
     def test_stop_refuses_a_spent_attendance_plan_before_the_provider_call(self):
         pin, plan = self.preflight_fixture()
