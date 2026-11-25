@@ -107,6 +107,11 @@ class EventCutoffPermissionAttributionTest(unittest.TestCase):
         self.requests.pop(0)
         self.assertEqual(self.compare("current"), "attribution gap: signed request")
 
+    def test_case_changed_nonce_leaves_attribution_gap(self):
+        receipt = self.receipts["current"]
+        receipt["scope_nonce"] = receipt["scope_nonce"].upper()
+        self.assertEqual(self.compare("current"), "attribution gap: signed request")
+
     def test_reused_nonce_leaves_attribution_gap(self):
         self.requests[1]["nonce"] = self.requests[0]["nonce"].upper()
         self.assertEqual(self.compare("current"), "attribution gap: signed request")
