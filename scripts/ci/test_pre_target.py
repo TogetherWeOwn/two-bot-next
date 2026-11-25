@@ -67,8 +67,11 @@ class PreTargetTests(unittest.TestCase):
         earlier = replace(TARGET, run_id=TARGET.run_id - 1, started_at=TARGET.started_at - 60)
         earlier_app = Resource(earlier.container_name, "bcf0c525-7a87-4741-9bd7-cde8a22e4cb0")
         foreign_scope = replace(TARGET, scope="pre-fixture-other")
+        other_shape = replace(TARGET, shape="0475/0465")
         self.assertEqual(foreign_scope.worker_name, route.worker_id)
         self.assertEqual(foreign_scope.container_name, route.app.name)
+        self.assertEqual(other_shape.worker_name, route.worker_id)
+        self.assertEqual(other_shape.container_name, route.app.name)
         for readback, reason in (
             (replace(route, worker_id=WORKERS["staging"]), "wrong_pre_route_worker"),
             (replace(route, worker_id=WORKERS["production"]), "wrong_pre_route_worker"),
@@ -76,6 +79,7 @@ class PreTargetTests(unittest.TestCase):
             (replace(route, app=replace(route.app, name=PRODUCTION_APP)), "wrong_pre_route_app"),
             (ProtectedRouteReadback(earlier, earlier.worker_name, earlier_app), "wrong_pre_route_target"),
             (replace(route, target=foreign_scope), "wrong_pre_route_target"),
+            (replace(route, target=other_shape), "wrong_pre_route_target"),
             (replace(route, app=replace(route.app, id=earlier_app.id)), "wrong_pre_route_app"),
         ):
             with self.subTest(readback=readback), self.assertRaisesRegex(TargetError, f"^{reason}$"):
