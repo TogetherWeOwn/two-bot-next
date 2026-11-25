@@ -160,10 +160,8 @@ path. `shard_closed` and `gateway_reconnect_failed` record a close and a failed
 reconnect attempt, respectively. Record each signal separately. A count of zero
 or `not_observed` means the packet contains no matching observation. A cold
 resume can commit without emitting `gateway_resumed` if it needs a fresh READY
-to publish readiness. The existing logs do not distinguish endpoint rejection
-from other reasons for IDENTIFY. Keep that observation unverified unless
-explicit passive evidence is available and cite #2075 for the hosted checkpoint
-coverage.
+to publish readiness. Several recovery paths can lead to IDENTIFY. The existing
+logs leave the reason for that choice ambiguous.
 
 Mixed builds, a foreign build, an unstamped signal event, and a stale window
 or event return nonzero without signal counts. Filtered and possibly truncated
@@ -172,6 +170,23 @@ verified window because they lack the filter marker. Use shorter subwindows
 within that interval when the readback fills a page. `no_build_events` means
 the packet contains no stamped record for the verified build. This optional
 summary has no release-gate wiring.
+
+### Recording endpoint-policy evidence
+
+Use the `gateway` signal on the existing
+[execution card](production-deploy.md#watch-rows-one-per-finding-and-per-checkpoint).
+Reference the full reviewed revision and its verified serving identity (build ID,
+image digest, Container application and UTC window). The examples below are
+synthetic. Each row can be recorded as its evidence becomes available.
+
+| Evidence | Example observation and disposition |
+|---|---|
+| Gateway readiness | One planned IDENTIFY and one committed READY in the verified serving window. Record readiness as `observed` and deployed endpoint rejection as `unverified`. |
+| Endpoint policy coverage | The existing release reviewer confirmed passing hosted endpoint-policy regressions on the revision bound to this exact artifact. Record `verified in hosted tests` with the run/job and reviewer references. Cite [#2075](https://github.com/TogetherWeOwn/two-bot-next/pull/2075) for the original coverage. Deployed endpoint rejection remains `unverified`. |
+| Deployed endpoint rejection | If authorized passive evidence explicitly identifies a rejection on this exact serving build, record `observed` with the UTC observation time and redacted evidence reference. With absent, ambiguous or mismatched evidence, retain `unverified`. |
+
+Keep endpoint values, session IDs and raw logs out of the execution card. Use
+the existing release watch and reviewer process for these entries.
 
 ## Verification (test containers only)
 
