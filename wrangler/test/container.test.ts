@@ -2240,6 +2240,65 @@ test("different-deployment takeover at the fresh epoch still commits", async (t)
   assert.equal(h.runtime.destroys, 0);
 });
 
+test("PRE predecessor preserves readiness build fields through ordinary ownership and boot", async (t) => {
+  const outbound = t.mock.method(globalThis, "fetch", () => {
+    throw new Error("unexpected outbound fetch during the PRE boot fixture");
+  });
+  const manifest = {
+    workerVersion: "fixture-predecessor-version",
+    rustBuild: { build_revision: "a".repeat(40), build_id: "123-1" },
+  };
+  const env = { ...WORKER_ENV, CF_VERSION_METADATA: { id: manifest.workerVersion } };
+  const h = await harness(t, env);
+  const send = (request: Request) => worker.fetch(request, {
+    ...env, TWO_BOT: { getByName: () => h.bot },
+  } as unknown as Env, {} as ExecutionContext);
+  const readyz = () => send(new Request("https://worker.invalid/readyz"));
+
+  const capability = await send(controlRequest());
+  assert.equal(capability.status, 200);
+  assert.equal(capability.headers.get("x-two-bot-exact-takeover"), "1");
+  assert.deepEqual(await capability.json(), {
+    deploymentId: manifest.workerVersion, owner: ACTIVE_OWNER, running: false,
+  });
+  const parked = await readyz();
+  assert.equal(parked.status, 503);
+  assert.equal((await parked.json()).reason, "not_owner");
+  assert.equal(h.starts.length, 0);
+  assert.deepEqual(h.values.get(OWNER_KEY), ACTIVE_OWNER);
+
+  const takeover = await send(controlRequest({ action: "takeover", expectedEpoch: ACTIVE_OWNER.epoch,
+    actor: "fixture-ordinary-rollout" }));
+  assert.equal(takeover.status, 200);
+  const state = await takeover.json();
+  assert.equal(state.running, false);
+  assert.equal(state.owner.deploymentId, manifest.workerVersion);
+  assert.equal(state.owner.phase, "active");
+  assert.equal(state.owner.epoch, ACTIVE_OWNER.epoch + 1);
+  assert.equal(h.starts.length, 0);
+
+  const report = { ready: true, components: [["process", "ready"], ["gateway", "ready"], ["database", "ready"]],
+    jobs: {}, ...manifest.rustBuild };
+  h.setProbeStatus(200);
+  h.setProbeResponse((status) =>
+    Response.json(h.requests.at(-1)?.pathname === "/readyz" ? report : { status: "ok" }, { status }));
+  for (let probe = 0; probe < 2; probe++) {
+    const response = await readyz();
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-two-worker-version"), manifest.workerVersion);
+    assert.deepEqual(await response.json(), report);
+  }
+  assert.equal(h.requests.filter(({ pathname }) => pathname === "/readyz").length, 2);
+  assert.equal(h.starts.length, 1);
+  assert.deepEqual(h.starts[0]?.env, EXPECTED_ENV);
+  assert.equal(h.runtime.destroys, 0);
+  assert.deepEqual(h.values.get(OWNER_KEY), state.owner);
+  assert.deepEqual([...h.values.keys()].filter((key) => key.startsWith(AUDIT_PREFIX)).sort(), [
+    `${AUDIT_PREFIX}2:active`, `${AUDIT_PREFIX}2:fenced`,
+  ]);
+  assert.equal(outbound.mock.callCount(), 0);
+});
+
 test("shutdown failure retains durable revocation and refuses warm proxying", async (t) => {
   const h = await harness(t, WORKER_ENV, { stopError: true });
   await h.bot.fetch(probeRequest("https://worker.invalid/health"));
