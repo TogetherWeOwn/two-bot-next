@@ -17,9 +17,8 @@ from staging_rollout import mapping, require, sequence
 
 NAMESPACE = re.compile(r"[0-9a-f]{32}")
 PREPARE_JOB = "Production release / Prepare and stop the prior pair"
-PREPARE_STEPS = ("Verify forward release preflight", "Confirm the exact stopped writer")
 STOP_INTENT_STEP = "Retain the exact recovery stop intent"
-STOP_INTENT_STEPS = (PREPARE_STEPS[0], STOP_INTENT_STEP, PREPARE_STEPS[1])
+STOP_INTENT_STEPS = ("Verify forward release preflight", STOP_INTENT_STEP, "Confirm the exact stopped writer")
 
 
 @dataclass(frozen=True)
@@ -175,23 +174,12 @@ def interrupted_release_context(env, api=github):
     return pin, origin, plan_id, plan, artifact, epoch + 1
 
 
-def _apply_under_fence(pin, run, plan_id, stopped, apply_database, prepare_steps, authorize, api):
+def apply_under_bound_fence(pin, run, plan_id, target_fingerprint, stopped, apply_database, api=github):
+    """Apply only with the bound fingerprint, durable stop intent and fresh approval."""
     epoch = prepared_epoch(pin, run, plan_id, stopped)
     run_id = run["id"]
-    protected_job(run, api, PREPARE_JOB, prepare_steps)
-    plan, artifact = authorize()
+    protected_job(run, api, PREPARE_JOB, STOP_INTENT_STEPS)
+    plan, artifact = approved_bound_plan(pin, run, plan_id, target_fingerprint, api)
     receipt = forward_receipt(plan_id, plan, apply_database(plan_id, plan))
     return {**receipt, "run_id": str(run_id), "run_attempt": 1, "stopped_epoch": epoch,
             "plan_archive_sha256": artifact["archive_digest"], "release_reference": plan["recovery_evidence_ref"]}
-
-
-def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_database, api=github):
-    """Recheck the current attempt's stopped writer and approval before applying."""
-    return _apply_under_fence(pin, run, plan_id, stopped, apply_database, PREPARE_STEPS,
-                              lambda: approved_plan(pin, run, plan_id, target, api), api)
-
-
-def apply_under_bound_fence(pin, run, plan_id, target_fingerprint, stopped, apply_database, api=github):
-    """Use the fingerprint and the prepare job that retained the stop intent."""
-    return _apply_under_fence(pin, run, plan_id, stopped, apply_database, STOP_INTENT_STEPS,
-                              lambda: approved_bound_plan(pin, run, plan_id, target_fingerprint, api), api)
