@@ -4,12 +4,13 @@ import { runStagingAutomodDryRun } from "../scripts/staging-automod-workflow.ts"
 import { runProtectedAutomod } from "../src/staging-automod-caller.ts";
 import { runProtectedAutomodJob } from "../src/staging-automod-job.ts";
 import { StagingAutomodLifecycle } from "../src/staging-automod-lifecycle.ts";
-import { STAGING_AUTOMOD_TARGET as target, StagingAutomodRecovery } from "../src/staging-automod-recovery.ts";
-import { AUTOMOD_STAGING_PURPOSE, STAGING_USE_KEY, StagingLifecycle } from "../src/staging-lifecycle.ts";
+import { STAGING_AUTOMOD_TARGET as target } from "../src/staging-automod-recovery.ts";
+import { AUTOMOD_STAGING_PURPOSE, STAGING_USE_KEY, StagingLifecycle, type StagingUse } from "../src/staging-lifecycle.ts";
 import publication from "./fixtures/staging-automod-publication.json" with { type: "json" };
-import { lease, now } from "./fixtures/staging-automod-recovery.ts";
+import { lease, now, Storage } from "./fixtures/staging-automod-recovery.ts";
 
-const issuedLease = { ...lease, purpose: AUTOMOD_STAGING_PURPOSE, runAttempt: 1 } as const;
+const publicationLease = { ...lease, runAttempt: 1 } as const;
+const issuedLease = { ...publicationLease, purpose: AUTOMOD_STAGING_PURPOSE } as const;
 const { runId, runAttempt, sha } = issuedLease;
 const job = { runId, runAttempt, sha };
 const passed = { verdict: "passed", start: true, recover: true };
@@ -118,15 +119,15 @@ test("the pinned rehearsal passes only with published preview and verified clean
     await t.test(cleanupProven ? "independent absence confirmed" : "independent absence reply lost", async () => {
       const { definition, identity, replies: { help, preview } } = publication;
       const env = { ...publication.env, STAGING_RUNTIME_POLICY: "bounded", TWO_MODERATION: "1", TWO_OWEN_USER_ID: preview.id };
-      const values = new Map<string, unknown>([[STAGING_USE_KEY, issuedLease]]);
+      const journalStorage = new Storage();
+      let storedLease: StagingUse = issuedLease;
       const storage = {
-        get: async (key: string) => structuredClone(values.get(key)),
-        put: async (key: string | Record<string, unknown>, value?: unknown) => {
-          for (const [name, entry] of Object.entries(typeof key === "string" ? { [key]: value } : key)) {
-            values.set(name, structuredClone(entry));
-          }
+        get: async (key: string) => key === STAGING_USE_KEY ? structuredClone(storedLease) : journalStorage.get(key),
+        put: async (key: string | Record<typeof STAGING_USE_KEY, StagingUse>, value?: unknown) => {
+          if (typeof key === "string") await journalStorage.put(key, value);
+          else storedLease = structuredClone(key[STAGING_USE_KEY]);
         },
-        sync: async () => {},
+        sync: () => journalStorage.sync(),
       } as unknown as DurableObjectStorage;
       const staging = new StagingLifecycle(storage);
       const owner = { deploymentId: issuedLease.deploymentId, epoch: issuedLease.epoch, phase: "active" as const,
@@ -182,15 +183,18 @@ test("the pinned rehearsal passes only with published preview and verified clean
         },
       };
       const lifecycle = new StagingAutomodLifecycle({ ...authority, ...effects,
-        observe: async () => ({ lease: issuedLease, purpose: AUTOMOD_STAGING_PURPOSE, active: true, running }),
+        observe: async () => ({
+          ...await staging.automodBinding(issuedLease, await authority.identity(), Date.now()),
+          purpose: AUTOMOD_STAGING_PURPOSE, running,
+        }),
         get: async url => {
           if (url === `${api}/users/@me`) return identity;
           assert.equal(url, commands);
           return rows();
         },
       });
-      const { id, version } = await lifecycle.publish({
-        lease: issuedLease, origin: "https://two-bot-next-staging.example.workers.dev", purposes: [AUTOMOD_STAGING_PURPOSE],
+      const { intent, id, version } = await lifecycle.publish({
+        lease: publicationLease, origin: "https://two-bot-next-staging.example.workers.dev", purposes: [AUTOMOD_STAGING_PURPOSE],
         verifiedRecoveryPair: true, verifiedRuntimeDatabase: true, verifiedGatewayIntents: true, cleanupReserveMs: 5_000,
       });
       assert.deepEqual({ id, version }, { id: preview.id, version: preview.version });
@@ -218,7 +222,9 @@ test("the pinned rehearsal passes only with published preview and verified clean
       assert.equal(absenceReads, 2);
       assert.deepEqual(rows(), [help]);
       assert.equal(running, false);
-      assert.equal(await new StagingAutomodRecovery(storage).completedFor(issuedLease), cleanupProven);
+      // Read the committed value directly so the assertion cannot flush a staged write.
+      assert.deepEqual(journalStorage.value, { intent, created: { id, version }, phase: cleanupProven ? "complete" : "cleanup" });
+      assert.equal(journalStorage.staged, undefined);
       assert.deepEqual(await staging.read(), { ...issuedLease, phase: cleanupProven ? "released" : "active" });
     });
   }
