@@ -5,18 +5,15 @@ serving the signed verb in a protected staging window. Keep the same compiled
 revision, build ID, deploy ID and tenant. For each Worker version, use its
 verified [staging rollout receipt](staging-rollout-gate.md).
 
-Use an isolated synthetic store. Give `attendance-acceptance:<build_id>` to
-a pending event in TWO Staging. Use a recent UTC whole-minute start, end 30
-minutes later, and seed one closed 12-minute session starting one minute
-after the start. Use fabricated member `300000000000000001` and room
-`400000000000000001` with observed name `Synthetic attendance room`. Finalize
-after completion and 15 minutes of grace (start + 45 minutes). Seed the equivalent
-record at the `:foreign` suffix key only in a different synthetic tenant.
-Use the same finalized primary event for OFF. The wire request has no guild
-selector, so the foreign-only key tests the configured reader's tenant scope.
+In an isolated synthetic store, map `attendance-acceptance:<build_id>` to a
+pending TWO Staging event with a recent UTC whole-minute start and a 30-minute
+window. Seed a closed 12-minute session starting one minute in for fabricated
+member `300000000000000001` and room `400000000000000001` named `Synthetic attendance room`.
+Finalize after completion and 15 minutes of grace (start + 45 minutes). Use that
+event for OFF. Seed an equivalent finalized record at `:foreign` only in a
+different synthetic tenant to test the reader's tenant scope.
 
-Put trusted configuration and fixture readback from that window into `observed`
-JSON. The harness probes `/readyz` around each signed read.
+Put trusted configuration and fixture readback from that window into `observed` JSON.
 
 | Fields | Expected observation |
 | --- | --- |
@@ -25,11 +22,10 @@ JSON. The harness probes `/readyz` around each signed read.
 | `attendance_read` | Effective `TWO_INTERNAL_ALLOW_ATTENDANCE_READ`. JSON `true` for pending and finalized, `false` for OFF and cleanup |
 | `attendance_capture`, `signed_ingress` | Capture `false` throughout. Signed ingress `true` during the three wire phases |
 | `primary_fixture`, `foreign_fixture` | Primary `pending` or `finalized` per phase. For finalized, `foreign-only` after checking the key exists only in the foreign tenant |
-| `lifecycle`, `fixture_rows` | Successful `staging-use.mjs` JSONL `ready` record for wire phases. Stopped `release` record with lease `released` and `0` fixture rows across both tenants for cleanup |
+| `lifecycle`, `fixture_rows` | Successful `staging-use.mjs` JSONL `ready` record for wire phases. Cleanup requires a stopped `release` record with lease `released` in the matching owner epoch and `0` fixture rows across both tenants |
 
 Use Python 3.11+, the same fixture start (`YYYY-MM-DDTHH:MM:00Z`) and each phase's readback.
-Inject `STAGING_ATTENDANCE_KEY_ID` and `STAGING_ATTENDANCE_SIGNING_SECRET` for
-the dedicated staging caller. Pass the 64-character lowercase hex secret as ASCII.
+Inject `STAGING_ATTENDANCE_KEY_ID` and a dedicated `STAGING_ATTENDANCE_SIGNING_SECRET` of 64 lowercase hex characters as ASCII.
 
 ```sh
 python3 scripts/staging_attendance_acceptance.py "$phase" --rollout rollout.json \

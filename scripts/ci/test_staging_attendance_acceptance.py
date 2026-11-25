@@ -32,7 +32,7 @@ class AcceptanceTests(unittest.TestCase):
         check = acceptance.validate_configuration
         self.assertEqual(check("finalized", ORIGIN, ROLLOUT, observed), IDENTITY)
         mismatches = {"guild_id": "2", "origin": "https://other.example.test", "build_id": "1234-2",
-                      "attendance_read": 1, "attendance_capture": True, "foreign_fixture": "missing"}
+                      "attendance_read": 1, "attendance_capture": True, "signed_ingress": False, "foreign_fixture": "missing"}
         for field, bad in mismatches.items():
             with self.assertRaises((acceptance.Refused, acceptance.SmokeError)):
                 check("finalized", ORIGIN, ROLLOUT, {**observed, field: bad})
@@ -40,10 +40,12 @@ class AcceptanceTests(unittest.TestCase):
         with self.assertRaises(acceptance.Refused):
             check("finalized", ORIGIN, ROLLOUT, observed)
         observed.update(attendance_read=False, fixture_rows=0)
-        lifecycle.update(action="stop", running=False)
-        with self.assertRaises(acceptance.Refused):
-            check("cleanup", ORIGIN, ROLLOUT, observed)
-        lifecycle["action"], lease["phase"] = "release", "released"
+        lifecycle["running"] = False
+        for action in ("stop", "release"):
+            lifecycle["action"] = action
+            with self.assertRaises(acceptance.Refused):
+                check("cleanup", ORIGIN, ROLLOUT, observed)
+        lease["phase"] = "released"
         self.assertEqual(check("cleanup", ORIGIN, ROLLOUT, observed), IDENTITY)
         with self.assertRaises(acceptance.Refused):
             check("cleanup", ORIGIN, ROLLOUT, {**observed, "fixture_rows": 1})
@@ -106,3 +108,5 @@ class AcceptanceTests(unittest.TestCase):
         args = ["pending", "--rollout", "rollout", "--observed", "observed"]
         with patch.object(acceptance, "read_object"), patch.object(acceptance, "validate_configuration"):
             self.assertEqual(acceptance.main(args, env={}, check=lambda _: self.fail("network call")), 2)
+            args[0] = "cleanup"
+            self.assertEqual(acceptance.main([*args, "--fixture-start", "2026-11-24T16:00:00Z"]), 1)
