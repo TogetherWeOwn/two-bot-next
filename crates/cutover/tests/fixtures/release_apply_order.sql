@@ -5,15 +5,22 @@ CREATE SEQUENCE fixture_release_order.cutover_read;
 CREATE SEQUENCE fixture_release_order.store_read;
 CREATE SEQUENCE fixture_release_order.ddl_attempt;
 CREATE SEQUENCE fixture_release_order.grant_attempt;
+-- The setup session takes the real SQLx migration lock before loading this fixture.
+CREATE TABLE fixture_release_order.writer_advisory_key AS
+    SELECT classid, objid, objsubid FROM pg_locks
+    WHERE pid = pg_backend_pid() AND granted AND locktype = 'advisory' AND mode = 'ExclusiveLock';
 GRANT USAGE ON SCHEMA fixture_release_order TO two_bot_migrator;
+GRANT SELECT ON fixture_release_order.writer_advisory_key TO two_bot_migrator;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA fixture_release_order TO two_bot_migrator;
 
 CREATE FUNCTION fixture_release_order.read_ledger(marker regclass) RETURNS boolean
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
     IF current_user <> 'two_bot_migrator' OR NOT EXISTS (
-        SELECT FROM pg_locks WHERE pid = pg_backend_pid() AND granted
-          AND locktype = 'advisory' AND mode = 'ExclusiveLock'
+        SELECT FROM pg_locks l JOIN fixture_release_order.writer_advisory_key k
+            USING (classid, objid, objsubid)
+        WHERE l.pid = pg_backend_pid() AND l.granted
+          AND l.locktype = 'advisory' AND l.mode = 'ExclusiveLock'
     ) OR 3 <> (
         SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND granted
           AND locktype = 'relation' AND mode = 'ShareRowExclusiveLock'

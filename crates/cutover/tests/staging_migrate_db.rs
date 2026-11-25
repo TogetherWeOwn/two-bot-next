@@ -21,10 +21,11 @@ use std::{
 
 use serde_json::{json, Value};
 use sqlx::{
-    migrate::Migrator,
+    migrate::{Migrate, Migrator},
     postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
-    Connection, Executor, PgConnection, Row,
+    Connection, Executor, PgConnection, PgPool, Row,
 };
+use two_bot_cutover::staging_migrate::{Chain, LedgerRow};
 
 #[path = "support/warning_history_recovery.rs"]
 mod warning_history_recovery;
@@ -587,17 +588,21 @@ async fn release_apply_observations(
     .await
 }
 
-async fn check_locked_release_pre_ledgers(
-    admin: &mut PgConnection,
-    pool: &sqlx::PgPool,
-    cutover: &[two_bot_cutover::staging_migrate::LedgerRow],
-    store: &[two_bot_cutover::staging_migrate::LedgerRow],
-) -> TestResult {
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI service"]
+async fn locked_release_pre_ledger_drift_refuses_before_ddl_and_grants() -> TestResult {
     use two_bot_cutover::staging_migrate::apply_release_schema;
 
+    let fx = Fixture::new().await?;
+    let mut admin = fx.scratch().await?;
+    let pool = fx.migrator_pool().await?;
+    let ReleaseLedgers { pre, .. } = seed_release_pre(&mut admin, &pool).await?;
+    let [cutover, store] = [&pre[0][..], &pre[1][..]];
+    admin.lock().await?;
     sqlx::raw_sql(include_str!("fixtures/release_apply_order.sql"))
-        .execute(&mut *admin)
+        .execute(&mut admin)
         .await?;
+    admin.unlock().await?;
     for (table, approved) in [
         ("public._sqlx_migrations", cutover),
         ("public._two_bot_migrations", store),
@@ -614,11 +619,11 @@ async fn check_locked_release_pre_ledgers(
                 "UPDATE {table} SET {change} WHERE version = $1"
             )))
             .bind(row.version)
-            .execute(&mut *admin)
+            .execute(&mut admin)
             .await?;
             assert_eq!(changed.rows_affected(), 1, "{table}: {change}");
 
-            let error = apply_release_schema(pool, cutover, store)
+            let error = apply_release_schema(&pool, cutover, store)
                 .await
                 .expect_err("changed PRE ledger was applied");
             assert_eq!(
@@ -627,12 +632,12 @@ async fn check_locked_release_pre_ledgers(
                 "{table}: {change}"
             );
             assert_eq!(
-                release_apply_observations(admin).await?,
+                release_apply_observations(&mut admin).await?,
                 (true, true, false, false),
                 "{table}: {change}"
             );
 
-            sqlx::query(sqlx::AssertSqlSafe(format!(
+            let restored = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {table} SET version = $1, checksum = decode($2, 'hex'), description = $3
                  WHERE version = $4"
             )))
@@ -640,30 +645,40 @@ async fn check_locked_release_pre_ledgers(
             .bind(&row.checksum_hex)
             .bind(&row.description)
             .bind(changed_version)
-            .execute(&mut *admin)
+            .execute(&mut admin)
             .await?;
+            assert_eq!(restored.rows_affected(), 1, "restore {table}: {change}");
             sqlx::query(
                 "SELECT setval('fixture_release_order.cutover_read', 1, false),
                         setval('fixture_release_order.store_read', 1, false)",
             )
-            .execute(&mut *admin)
+            .execute(&mut admin)
             .await?;
         }
     }
-    Ok(())
+    apply_release_schema(&pool, cutover, store).await?;
+    assert_eq!(
+        release_apply_observations(&mut admin).await?,
+        (true, true, true, true),
+        "valid PRE ledgers must reach both DDL and grants after the locked reads"
+    );
+    pool.close().await;
+    admin.close().await?;
+    fx.finish().await
 }
 
-async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> TestResult {
-    use two_bot_core::database_roles::{plan_for_phase, Phase};
-    use two_bot_cutover::staging_migrate::{
-        apply_release_schema, classify_interrupted_release, confirm_release_pre,
-        recover_release_schema, undo_release_schema, Chain, LedgerRow,
-    };
+struct ReleaseLedgers {
+    pre: Vec<Vec<LedgerRow>>,
+    expanded: Vec<Vec<LedgerRow>>,
+}
 
-    let fx = Fixture::new().await?;
-    let mut admin = fx.scratch().await?;
-    let pool = fx.migrator_pool().await?;
-    let mut expected = Vec::new();
+async fn seed_release_pre(
+    admin: &mut PgConnection,
+    pool: &PgPool,
+) -> Result<ReleaseLedgers, Box<dyn std::error::Error + Send + Sync>> {
+    use two_bot_core::database_roles::{plan_for_phase, Phase};
+
+    let mut pre = Vec::new();
     let mut expanded = Vec::new();
     for (chain, limit) in [(Chain::Cutover, 473), (Chain::Store, 465)] {
         let source = chain.migrator()?;
@@ -686,8 +701,8 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
                 .collect(),
         );
         seed.dangerous_set_table_name(chain.table());
-        seed.run(&pool).await?;
-        expected.push(
+        seed.run(pool).await?;
+        pre.push(
             seed.iter()
                 .map(|m| LedgerRow {
                     version: m.version,
@@ -702,19 +717,35 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
         .split_once("-- Voice heat contract 1.1:")
         .unwrap();
     sqlx::raw_sql(sqlx::AssertSqlSafe(contract))
-        .execute(&mut admin)
+        .execute(&mut *admin)
         .await?;
     for group in ["two_bot_runtime", "two_web_reader"] {
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "DO $$ BEGIN CREATE ROLE {group} NOLOGIN;
              EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
         )))
-        .execute(&mut admin)
+        .execute(&mut *admin)
         .await?;
     }
     sqlx::raw_sql(sqlx::AssertSqlSafe(plan_for_phase(Phase::Bootstrap)))
-        .execute(&mut admin)
+        .execute(&mut *admin)
         .await?;
+    Ok(ReleaseLedgers { pre, expanded })
+}
+
+async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> TestResult {
+    use two_bot_cutover::staging_migrate::{
+        apply_release_schema, classify_interrupted_release, confirm_release_pre,
+        recover_release_schema, undo_release_schema,
+    };
+
+    let fx = Fixture::new().await?;
+    let mut admin = fx.scratch().await?;
+    let pool = fx.migrator_pool().await?;
+    let ReleaseLedgers {
+        pre: mut expected,
+        expanded,
+    } = seed_release_pre(&mut admin, &pool).await?;
     let confirm_pre = || confirm_release_pre(&pool, &expected[0], &expected[1]);
     let classify = || classify_interrupted_release(&pool, &expanded[0], &expanded[1]);
     confirm_pre().await?;
@@ -763,21 +794,7 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     admin
         .execute("REVOKE CREATE ON SCHEMA public FROM two_bot_runtime")
         .await?;
-    check_locked_release_pre_ledgers(&mut admin, &pool, &expected[0], &expected[1]).await?;
     let (cutover, store) = apply_release_schema(&pool, &expected[0], &expected[1]).await?;
-    assert_eq!(
-        release_apply_observations(&mut admin).await?,
-        (true, true, true, true),
-        "valid PRE ledgers must reach both DDL and grants after the locked reads"
-    );
-    sqlx::raw_sql(
-        "DROP EVENT TRIGGER fixture_release_mutation;
-         ALTER TABLE public._sqlx_migrations DISABLE ROW LEVEL SECURITY;
-         ALTER TABLE public._two_bot_migrations DISABLE ROW LEVEL SECURITY;
-         DROP SCHEMA fixture_release_order CASCADE;",
-    )
-    .execute(&mut admin)
-    .await?;
     assert_eq!(cutover.len(), expected[0].len() + 5);
     assert_eq!(store.len(), expected[1].len() + 1);
     let installed: bool = sqlx::query_scalar(
