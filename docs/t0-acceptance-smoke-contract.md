@@ -242,12 +242,25 @@ python3 scripts/assemble_production_watch.py --signal naming --rows naming.tsv \
   --window window.json > production-naming.json
 ```
 
-Each command writes a `production_watch.v1` JSON report on exit 0. A missing
-row, an invalid field or a timestamp outside the verified bounds gives exit 2
-with an empty stdout. For example, removing the occupied-room row or changing
-its timestamp to `2026-11-25T02:05:00.000000001Z` causes refusal. Use fresh
-output paths and bind only files from successful commands. Omit an unavailable
-report from the handoff.
+Each command writes a `production_watch.v2` JSON report on exit 0. It contains
+the signal, the validated serving identity and bounds from `window.json`, and
+the projected rows. The report compares that embedded window with the
+independent handoff at full timestamp precision. Differing identity or bounds
+give `mismatched` even when every row timestamp fits both windows. The
+independent handoff still establishes the serving window and ties the file's
+exact hash to it.
+
+A missing row, an invalid field or a timestamp outside the verified bounds
+gives exit 2 with an empty stdout. For example, removing the occupied-room row
+or changing its timestamp to `2026-11-25T02:05:00.000000001Z` causes refusal.
+Use fresh output paths and bind only files from successful commands.
+
+Legacy `production_watch.v1` receipts lack the assembler window and receive
+`unverified` when their outer binding checks match. Keep them as historical
+records. To use the original evidence, assemble a new receipt from the retained
+approved TSV and its original independently verified serving window, then
+independently bind the new file's exact hash. Omit the report if that provenance
+is unavailable.
 
 1. In `handoff.json`, use `environment: production` in the independently
    verified `expected` window. When the approved card evidence independently
