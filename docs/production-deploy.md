@@ -550,8 +550,9 @@ Dispatch `build-predecessor` from protected main to build the reviewed export.
 It emits the Worker modules, OCI image and their recorded identities. This
 receipt covers packaging. Staging qualification at either PRE endpoint requires
 a compatible isolated target that stops the exact runtime when its use window expires.
-If the isolated predecessor refuses startup, follow the staging release
-operator's [startup refusal handoff](staging-rollout-gate.md#startup-refusal-handoff).
+The staging release operator's
+[startup refusal handoff](staging-rollout-gate.md#startup-refusal-handoff)
+applies once the protected rehearsal caller and provider adapter are available.
 
 Before handing the bundle to a staging caller, use
 [`verify_predecessor_bundle`](../scripts/predecessor_bundle.py) with the reviewed

@@ -151,6 +151,12 @@ verification passes.
 
 ##### Startup refusal handoff
 
+This handoff describes the dormant PRE contract. Keep rehearsal admission and
+qualification pending until the protected workflow caller and provider adapter
+are available under the existing gates. If protected stop is unavailable for
+an existing reservation, record cleanup as unresolved and track it as a staging
+incident with the staging release operator.
+
 When the protected caller refuses startup or loses the create reply, keep
 qualification pending. In the private release task record, retain the rehearsal
 run and attempt, pinned predecessor artifact, full reservation (scope, run ID,
