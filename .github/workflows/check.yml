@@ -3295,10 +3295,12 @@ jobs:
         image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
         env:
           POSTGRES_USER: agent_test
-          POSTGRES_DB: postgres
+          POSTGRES_DB: two_bot_test_ci
           POSTGRES_HOST_AUTH_METHOD: trust
+        # The entrypoint creates the guarded bootstrap before starting TCP.
+        # Connect to that database so both readiness and existence are checked.
         options: >-
-          --health-cmd "pg_isready -U agent_test -d postgres"
+          --health-cmd "psql -X -w -h 127.0.0.1 -U agent_test -d two_bot_test_ci -Atqc 'SELECT 1'"
           --health-interval 10s --health-timeout 5s --health-retries 5
     env:
       TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
@@ -3341,19 +3343,6 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
-      # The presence fixtures now route through the shared disposable-database
-      # guard, which accepts only the explicit-empty-password bootstrap URL
-      # naming a two_bot_test_* database. Create that bootstrap here; the
-      # legacy bespoke helpers in the sibling stores accept the same URL
-      # (they check host and principal only), so one URL serves all four
-      # suites below. The rust:bookworm job container ships no PostgreSQL
-      # client, so install it first like the other DB jobs do.
-      - name: Prepare isolated test database
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
-          rm -rf /var/lib/apt/lists/*
-          createdb -h agent-testdb -U agent_test two_bot_test_ci
       - name: Check feature-gated community stores
         run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - name: Test presence, scorecard and inactivity ledgers on ephemeral Postgres
