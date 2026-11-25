@@ -5533,6 +5533,21 @@ class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflows = load_workflows()
 
+    def test_container_checkout_is_sparse_only_when_the_selector_skips_the_build(self):
+        job = self.workflows["check.yml"]["jobs"]["container"]
+        checkouts = [step for step in job["steps"]
+                     if step.get("uses", "").startswith("actions/checkout@")]
+        self.assertEqual(len(checkouts), 2)
+        full, sparse = checkouts
+        self.assertEqual(full["if"], "needs.container-inputs.outputs.build != 'false'")
+        self.assertEqual(sparse["if"], "needs.container-inputs.outputs.build == 'false'")
+        self.assertEqual(sparse["uses"], full["uses"])
+        full_inputs = {"fetch-depth": "1", "persist-credentials": "false"}
+        self.assertEqual(full["with"], full_inputs)
+        self.assertEqual(sparse["with"], {
+            **full_inputs, "sparse-checkout": "scripts\n.github/workflows\n",
+        })
+
     def assert_bookworm_image(self, workflows, workflow, job):
         actual = workflows[workflow]["jobs"].get(job, {}).get("container", {})
         self.assertIsInstance(actual, dict, f"{workflow}:{job} requires a container")
