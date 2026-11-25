@@ -239,7 +239,6 @@ test("AutoMod startup timeout lets recovery check remote drain", async t => {
       return launchReply.promise;
     };
     f.state.readback = () => {
-      AbortSignal.timeout(cutoff - startedAt); // Temporary negative control: allocate a fresh readback budget.
       readbackEntered.resolve();
       return new Promise<void>(() => {});
     };
