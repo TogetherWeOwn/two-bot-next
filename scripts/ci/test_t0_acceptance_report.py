@@ -109,6 +109,7 @@ class T0AcceptanceReportTests(unittest.TestCase):
     def test_watch_assembly_refuses_late_incomplete_or_unapproved_input_without_echo(self):
         late = WATCH_RETURN.replace(b"02:03:00.125+00:00", b"02:05:00.000000001Z")
         sentinel = b"synthetic private value"
+        duplicate_key = b'{"environment":"' + sentinel + b'",' + json.dumps(PRODUCTION).encode()[1:]
         for index, (signal, source, window) in enumerate((
             ("naming", WATCH_EMPTY + late, PRODUCTION),
             ("naming", WATCH_EMPTY, PRODUCTION),
@@ -123,7 +124,7 @@ class T0AcceptanceReportTests(unittest.TestCase):
             ("help", WATCH_HELP, WINDOW),
             ("help", WATCH_HELP, dict(PRODUCTION, end=None)),
             ("help", WATCH_HELP, dict(PRODUCTION, note=sentinel.decode())),
-            ("help", WATCH_HELP, b'{"environment":"production","environment":"' + sentinel + b'"}'),
+            ("help", WATCH_HELP, duplicate_key),
             (sentinel.decode(), WATCH_HELP, PRODUCTION),
         )):
             with self.subTest(case=index):
