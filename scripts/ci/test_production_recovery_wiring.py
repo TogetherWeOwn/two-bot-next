@@ -27,13 +27,17 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertEqual(plan["outputs"]["runner-artifact-id"], "${{ steps.release-runner.outputs.artifact-id }}")
         self.assertEqual(plan["outputs"]["runner-sha256"], "${{ steps.build.outputs.sha256 }}")
         self.assertIn("cargo build", next(step["run"] for step in plan["steps"] if step.get("id") == "build"))
+        upload = next(step for step in plan["steps"] if step.get("id") == "release-runner")
+        self.assertEqual(upload["with"]["retention-days"], 14)
         steps = jobs["release-apply"]["steps"]
         self.assertFalse(any("cargo build" in step.get("run", "") for step in steps))
+        pins = next(step for step in steps if step.get("name") == "Validate the protected forward runner pins")
         download = next(step for step in steps if step.get("name") == "Download the prebuilt protected forward runner")
         self.assertEqual(download["with"]["artifact-ids"], "${{ needs.release-plan.outputs.runner-artifact-id }}")
         self.assertEqual(download["with"]["path"], "${{ runner.temp }}/production-release-runner")
         verify = next(step for step in steps if step.get("name") == "Verify the prebuilt forward runner checksum")
         apply = next(step for step in steps if step.get("name") == "Apply the protected forward transaction")
+        self.assertLess(steps.index(pins), steps.index(download))
         self.assertLess(steps.index(download), steps.index(verify))
         self.assertLess(steps.index(verify), steps.index(apply))
         self.assertEqual(apply["env"]["RELEASE_RUNNER"], "${{ runner.temp }}/production-release-runner/staging-migrate")
@@ -42,6 +46,19 @@ class RecoveryWiringTests(unittest.TestCase):
             runner.parent.mkdir()
             original = b"offline binary fixture"
             checksum = sha256(original).hexdigest()
+            for artifact, digest, expected in (("123", checksum, 0), ("invalid", checksum, 1), ("123", "f" * 63, 1)):
+                with self.subTest(artifact=artifact, digest=digest):
+                    result = subprocess.run(["bash", "-c", pins["run"]], capture_output=True, timeout=3, check=False,
+                                            env={"ARTIFACT_ID": artifact, "RUNNER_SHA256": digest})
+                    self.assertEqual(result.returncode, expected, result.stderr)
+            target = runner.with_name("other-binary")
+            target.write_bytes(original)
+            runner.symlink_to(target)
+            result = subprocess.run(["bash", "-c", verify["run"]], capture_output=True, timeout=3, check=False,
+                                    env={"RUNNER_TEMP": temp, "RUNNER_SHA256": checksum})
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertFalse(target.stat().st_mode & 0o100)
+            runner.unlink()
             for body, expected in ((b"changed fixture", 1), (original, 0)):
                 with self.subTest(expected=expected):
                     runner.write_bytes(body)
