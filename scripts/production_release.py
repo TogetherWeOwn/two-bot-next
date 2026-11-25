@@ -12,14 +12,14 @@ from time import sleep
 
 import production_recovery_artifact as artifacts
 from production_ownership_status import read_status
-from production_recovery_takeover import UUID, RecoveryPin, verify_inverse
+from production_recovery_takeover import HEX, UUID, RecoveryPin
 from production_release_ledgers import CUTOVER, STORE, ledger_endpoints
 from production_release_preflight import ReleasePreflight, approved_plan, apply_under_prepared_fence, prepared_epoch
 from production_release_preflight import verify_preflight
 from rollback_proof import ProofError
 from rollback_target_preflight import command, image_in_registry
 from staging_migrate_approval import digest_json
-from staging_recovery_status import github
+from staging_recovery_status import github, matches
 from staging_rollout import GateError, decode, mapping, require
 from worker_container_rollback import APPLICATIONS, WORKERS, ProvenanceReceipt, RollbackClient
 from worker_container_rollback import WORKER_RESTORE_POLL_SECONDS, WORKER_RESTORE_READS
@@ -53,14 +53,13 @@ def forward_document(env, pin, run, plan_id, plan, artifact, api=github):
                 "stopped_epoch": epoch, "plan_archive_sha256": artifact["archive_digest"],
                 "release_reference": pin.recovery_reference()}
     require(set(document) == set(expected) | {"attendance_fence_sha256"}
+            and matches(HEX, document["attendance_fence_sha256"])
             and all(type(document[key]) is type(value) and document[key] == value for key, value in expected.items()),
             "production_forward_artifact_mismatch")
-    recovery = RecoveryPin(str(run["id"]), 1, pin.candidate_sha, pin.rollback_sha, pin.rollback_worker,
-                           pin.rollback_image, pin.application_id, pin.namespace_id, document["database_fingerprint"],
-                           document["expanded_ledgers_sha256"], document["restored_ledgers_sha256"],
-                           document["attendance_fence_sha256"], epoch)
-    verify_inverse(recovery, {"state": "restored", **asdict(recovery)})
-    return recovery
+    return RecoveryPin(str(run["id"]), 1, pin.candidate_sha, pin.rollback_sha, pin.rollback_worker,
+                       pin.rollback_image, pin.application_id, pin.namespace_id, document["database_fingerprint"],
+                       document["expanded_ledgers_sha256"], document["restored_ledgers_sha256"],
+                       document["attendance_fence_sha256"], epoch)
 
 
 def release_actor(run_id, candidate_sha):
@@ -85,11 +84,12 @@ def is_stopped(state, epoch, actor):
             and type(owner.get("epoch")) is int and owner["epoch"] == epoch and owner.get("owner_actor") == actor)
 
 
-def matches_pair(state, pin, version, sha, digest):
+def matches_pair(state, pin, version, sha, digest, *, completed=False):
     worker, image = mapping(state.get("worker")), mapping(state.get("container"))
     return (worker.get("version_id") == version and worker.get("sha") == sha
             and worker.get("traffic_percent") == 100 and image.get("image_digest") == digest
-            and image.get("application_id") == pin.application_id and image.get("namespace_id") == pin.namespace_id)
+            and image.get("application_id") == pin.application_id and image.get("namespace_id") == pin.namespace_id
+            and (not completed or image.get("rollout_status") == "completed"))
 
 
 def stop_prior_pair(pin, run_id, epoch, observe, control):
@@ -123,7 +123,7 @@ def take_over(pin, recovery, version, observe, control, *, pause=sleep):
             pause(WORKER_RESTORE_POLL_SECONDS)
         state = observe()
         require(is_stopped(state, recovery.fence_epoch, actor), "production_stopped_fence_unproved")
-        if matches_pair(state, pin, version, pin.candidate_sha, pin.candidate_image):
+        if matches_pair(state, pin, version, pin.candidate_sha, pin.candidate_image, completed=True):
             break
         require(any(matches_pair(state, pin, worker, sha, digest)
                     for worker, sha in ((pin.rollback_worker, pin.rollback_sha), (version, pin.candidate_sha))
@@ -134,7 +134,7 @@ def take_over(pin, recovery, version, observe, control, *, pause=sleep):
     control("takeover-fenced", recovery.fence_epoch, expected_deployment=version)
     state = observe()
     owner = mapping(state.get("ownership"))
-    require(matches_pair(state, pin, version, pin.candidate_sha, pin.candidate_image)
+    require(matches_pair(state, pin, version, pin.candidate_sha, pin.candidate_image, completed=True)
             and owner.get("phase") == "active" and owner.get("epoch") == recovery.fence_epoch + 1
             and owner.get("owner_actor") == actor and owner.get("running") is False,
             "production_release_takeover_unconfirmed")
@@ -170,8 +170,7 @@ def write_json(path, value):
 
 def output(env, **fields):
     with Path(env["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
-        for key, value in fields.items():
-            print(f"{key}={value}", file=handle)
+        handle.writelines(f"{key}={value}\n" for key, value in fields.items())
 
 
 def main(argv, env):
@@ -195,8 +194,7 @@ def main(argv, env):
 
         pin, run, plan_id, plan, artifact = release_context(env)
         if argv == ["plan"]:
-            fresh = database(env["RELEASE_RUNNER"], directory, plan, env)
-            write_json(directory / "fresh-plan.json", fresh)
+            write_json(directory / "fresh-plan.json", database(env["RELEASE_RUNNER"], directory, plan, env))
             return 0
 
         actor = release_actor(str(run["id"]), pin.candidate_sha)

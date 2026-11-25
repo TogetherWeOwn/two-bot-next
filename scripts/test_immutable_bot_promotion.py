@@ -286,11 +286,11 @@ class ImmutablePromotionIntakeTests(PromotionFixture):
         archive = self.github.artifact["digest"]
         image = receipt()["container"]["digest"]
         wrong = "sha256:" + "7" * 64
-        for archive_pin, image_pin in ((wrong, image), (archive, wrong)):
-            with self.subTest(archive=archive_pin, image=image_pin):
-                self.assertNotEqual(self.command(args + ["--approved-archive", archive_pin,
-                                                         "--approved-image", image_pin]), 0)
-                self.assertEqual(self.mutations, [])
+        for invalid in (["--approved-archive", archive], ["--approved-image", image],
+                        ["--approved-archive", wrong, "--approved-image", image],
+                        ["--approved-archive", archive, "--approved-image", wrong]):
+            self.assertNotEqual(self.command(args + invalid), 0)
+            self.assertEqual(self.mutations, [])
         approved = args + ["--approved-archive", archive, "--approved-image", image]
         self.assertEqual(self.command(approved + ["--verify-only"]), 0)
         self.assertEqual(self.mutations, [])

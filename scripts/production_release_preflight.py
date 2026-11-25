@@ -105,7 +105,7 @@ def approved_plan(pin, run, plan_id, target, api=github):
     verify_environment(api)
     _, approved_at = verify_check(api, run, f"production-apply:{plan_id}:{artifact['archive_digest'].removeprefix('sha256:')}",
                                   datetime.now(timezone.utc))
-    require(moment(api(f"actions/runs/{plan_id}").get("created_at")) <= approved_at,
+    require(moment(mapping(api(f"actions/runs/{plan_id}")).get("created_at")) <= approved_at,
             "independent_production_approval_stale")
     return plan, artifact
 
