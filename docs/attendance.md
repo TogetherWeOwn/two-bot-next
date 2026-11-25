@@ -67,16 +67,17 @@ runtime and keep only sanitized outcomes in the evidence.
   recipe above with capture OFF to prove the serving receiver dispatches
   `event.attendance.read`. Pending and foreign keys return `404 not_found`,
   and the finalized key returns the exact event-bound v1 `final: true` result.
-  After rollback, read back the reader OFF while signed ingress remains active
-  for the check. A valid signed read of the same retained finalized key must
-  return `403 action_not_allowed` without a result. Then verify the separate
-  stopped, released and fixture-removal cleanup receipt.
+  After rollback, read back the reader OFF on the same serving receiver build
+  and tenant that passed the finalized read, with signed ingress still active.
+  A valid signed read of the same retained finalized key must return
+  `403 action_not_allowed` without a result. Then verify the separate stopped,
+  released and fixture-removal cleanup receipt.
 
 The Web caller has its own pull control. When rolling it back, verify its
-effective OFF state separately and confirm that it stops issuing new pulls.
-Keep the already-frozen Echo. If either Bot OFF check lacks its positive
-control (a processed eligible observation or the previously successful
-signed read of the retained fixture), leave that rollback verdict unverified.
+effective OFF state separately. Confirm it issues no new pulls during an
+eligible synthetic polling opportunity while Bot can still serve the finalized
+result. Preserve any already-frozen Echo. If a rollback check lacks its
+behavioral evidence, leave that control's OFF verdict unverified.
 
 Apply the [no-backfill contract](bot-site-contract.md#9-echoes--attendance-record-v1-4-carried-two-additions).
 A completed pre-enable window stays a Web sign-up record. A delayed
