@@ -213,7 +213,8 @@ and still requires OFF and stopped for its own window.
 The same module exports `runProtectedVoiceMoveAcceptance` for the job holding
 the active lease. It defaults off. Pass the current lease and ready receipt,
 the prior ready and OFF receipts, and the protected fixture pin. The bound Web
-session supplies `readCurrent({ signal })` and the destination-only `move`.
+session exposes `environment: "staging"` and `discordId` matching the fixture
+member. It supplies `readCurrent({ signal })` and the destination-only `move`.
 An independent fixture reader supplies `readChannels({ signal })` and the
 per-case `observe` callback. The control callback uses the existing staging-use
 client. Pass those readbacks directly without rewriting their timestamps or
