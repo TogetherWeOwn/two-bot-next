@@ -134,15 +134,14 @@ class CurrentEvidenceTests(unittest.TestCase):
         edited = dict(PR, body=BODY.replace("proof=fixture", "proof=updated synthetic evidence"))
 
         for case, reads in (
-                ("edit before validation", [edited, edited, edited]),
-                ("edit during validation", [PR, edited, edited]),
+                ("edit before validation", [edited, edited]),
+                ("edit during validation", [PR, edited]),
                 ("edit after validation", [PR, PR, edited])):
-            with self.subTest(case=case):
-                self.reader.get.side_effect = reads
+            with self.subTest(case=case), patch.object(self.reader, "get", side_effect=reads) as get:
                 attempt_merge(prior)
+                self.assertEqual(get.call_count, len(reads))
                 accept_merge.assert_not_called()
 
-        self.reader.get.side_effect = None
         self.reader.get.return_value = edited
         fresh = evidence.evaluate_current(policy, self.reader, *self.identity)
         self.assertEqual(prior.head, fresh.head)
