@@ -15,7 +15,7 @@ from build_predecessor import GateError, image_manifest, package_worker
 LABELS = {"org.opencontainers.image.revision": "a" * 40, "com.togetherweown.build-id": "123-1"}
 
 
-def oci_fixture(path, *, bad_config_digest=False):
+def oci_fixture(path, *, labels=LABELS, bad_config_digest=False):
     def add(archive, name, raw):
         member = tarfile.TarInfo(name)
         member.size = len(raw)
@@ -28,7 +28,7 @@ def oci_fixture(path, *, bad_config_digest=False):
         return {"digest": f"sha256:{digest}", "size": len(raw), "mediaType": f"application/vnd.oci.image.{subtype}.v1+json"}
 
     with tarfile.open(path, "w") as archive:
-        config = blob(archive, "config", {"os": "linux", "architecture": "amd64", "config": {"Labels": LABELS}},
+        config = blob(archive, "config", {"os": "linux", "architecture": "amd64", "config": {"Labels": labels}},
                       invalid=bad_config_digest)
         manifest = blob(archive, "manifest", {"config": config})
         add(archive, "index.json", json.dumps({"manifests": [manifest]}).encode())

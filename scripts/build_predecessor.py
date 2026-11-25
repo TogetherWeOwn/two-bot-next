@@ -73,8 +73,8 @@ def read_descriptor(archive, descriptor, media_type):
     return archive_json(archive, f"blobs/sha256/{address[7:]}", descriptor)
 
 
-def image_manifest(path, labels):
-    with tarfile.open(path, "r:") as archive:
+def image_manifest(path, labels, *, fileobj=None):
+    with tarfile.open(path, "r:", fileobj=fileobj) as archive:
         manifests = archive_json(archive, "index.json").get("manifests")
         require(isinstance(manifests, list) and len(manifests) == 1, "image_manifest_ambiguous")
         manifest = read_descriptor(archive, manifests[0], "application/vnd.oci.image.manifest.v1+json")
