@@ -174,7 +174,7 @@ class ReleaseForwardTests(unittest.TestCase):
         state = {**provider_sample(client, account), "ownership": takeover["fenced_owner"]}
         output = takeover["upload_output"]
         version = release.produced_version(output)
-        for invalid in ("", output + output, "Current Version ID: not-a-uuid\n"):
+        for invalid in ("", output + output, "Current Version ID: abcd-1234\n", "Current Version ID: not-a-uuid\n"):
             with self.subTest(invalid=invalid), self.assertRaises(GateError):
                 release.produced_version(invalid)
         recovery = Mock(run_id="456", fence_epoch=18)
