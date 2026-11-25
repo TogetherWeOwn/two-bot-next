@@ -274,6 +274,25 @@ class ProductionApprovalTests(unittest.TestCase):
         with self.assertRaisesRegex(GateError, "production_migration_environment_unprotected"):
             self.authorize()
 
+    def test_runbook_readback_matches_environment_guard(self):
+        runbook = (ROOT / "docs/runbook.md").read_text(encoding="utf-8")
+        _, heading, section = runbook.partition("#### Disable administrator bypass for migration apply")
+        self.assertTrue(heading, "Missing production migration environment remedy")
+        section = section.split("\n###", 1)[0]
+        refusal = "production_migration_environment_unprotected"
+        self.assertIn(f"`{refusal}`", section)
+        settings, policy = (json.loads(block.split("\n```", 1)[0])
+                            for block in section.split("```json\n")[1:])
+        responses = {
+            approval.POLICY: settings,
+            f"{approval.POLICY}/deployment-branch-policies?per_page=2": policy,
+        }
+        approval.verify_environment(responses.__getitem__)
+        for row, drift in ((settings, {"can_admins_bypass": True}),
+                           (policy["branch_policies"][0], {"type": "tag"})):
+            with patch.dict(row, drift), self.assertRaisesRegex(GateError, refusal):
+                approval.verify_environment(responses.__getitem__)
+
     def test_refuses_reuse_after_an_apply_attempt(self):
         self.history["workflow_runs"].append({"id": 456})
         self.history["total_count"] += 1
