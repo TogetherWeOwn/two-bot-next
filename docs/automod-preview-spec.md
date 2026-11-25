@@ -755,6 +755,22 @@ with the new startup phases. Before rollback to one of those builds, finish
 recovery and retire the AutoMod lease with a Worker that understands both.
 Live qualification uses the sole staging writer's exclusive window.
 
+### Dormant staging workflow
+
+The reusable AutoMod preview workflow has no caller and its staging job is
+disabled. Its offline fixture passes the issued AutoMod lease and pinned run,
+attempt and build to the job runner. Once startup is attempted, the runner
+asks for recovery on the original lease even if startup fails or its reply
+is lost. Both actions must return a bounded v1 receipt confirming the exact
+scope. The job preserves a startup failure even if recovery passes.
+
+The live handoff needs the authenticated private invoker and a trusted source
+of the issued AutoMod lease and separate start and recovery approvals. The
+reusable workflow holds the staging lifecycle queue across both actions. A
+future caller must leave that queue to the reusable workflow. Worker cleanup
+owns durable retirement and retry for an interrupted runner or unconfirmed
+recovery.
+
 ## 10. Spec self-check (doctest)
 
 The numbers asserted above, verified against themselves. This checks the
