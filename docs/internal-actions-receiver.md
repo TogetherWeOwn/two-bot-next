@@ -225,6 +225,15 @@ the protected context.
    `observedAt`. Ready, session and Discord preflight observations must be
    from the active window, at most 60 seconds old and never in the future.
    Preserve the producers' UTC timestamps with milliseconds.
+
+   The dormant [Web handoff reader](../wrangler/scripts/staging-voice-web-handoff.mjs)
+   binds a fresh authenticated companion match to the same scoped session's
+   later private `404 not_found` companion refusal. Call `readStagingVoiceWebReady`
+   with the approved fixture, session and revision. After Web Operations
+   restores and independently verifies the disabled settings, call its
+   `confirmDisabled` on the same installed session. Give each read a deadline.
+   Both reads use the companion route, which does not submit a signed move.
+   Keep the completion handle in process.
 3. **Bot Operations.** Coordinate fresh exclusive admission under the existing
    `staging-lifecycle` lock. Use `verify_lease=true` in the
    [manual workflow](../.github/workflows/staging-voice-move.yml) from protected
@@ -250,6 +259,12 @@ the protected context.
    in-process caller supplies those dependencies to
    [`bindStagingVoiceMoveProvider(dependencies)`](../wrangler/scripts/staging-voice-move-entry.mjs)
    and passes the returned provider to `runStagingVoiceMoveEntry(env, provider)`.
+   The dormant `bindStagingVoiceMoveHandoffProvider(dependencies, { qualification, webHandoff })`
+   also requires the completed Web handoff and the protected Web Operations
+   `staging-soak/1` outcome that qualified smoke, E2E and soak for the independently
+   pinned Web commit and Worker version. It admits only the original session
+   and ordered fixture. The runner still obtains current Web preflight and
+   the eventual live run still needs its own cleanup readbacks.
    The entry uses the current job's lease, and the bound provider uses the
    job's clock. The workflow keeps the proof selector off and its CLI has
    no live input provider. The in-process job returns `disabled`, `failed`

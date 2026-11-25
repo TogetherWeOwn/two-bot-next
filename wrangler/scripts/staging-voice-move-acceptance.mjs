@@ -3,7 +3,7 @@ import { isRequestId } from "../src/request-id.ts";
 
 const LEASE_MS = 15 * 60_000; // The protected voice-move workflow's finite window.
 const CHECK_MS = 20_000;
-const READBACK_MAX_AGE_MS = 60_000;
+export const READBACK_MAX_AGE_MS = 60_000;
 const GUILD_VOICE = 2;
 const positive = (value) => Number.isSafeInteger(value) && value > 0;
 const matches = (value, pattern) => typeof value === "string" && pattern.test(value);

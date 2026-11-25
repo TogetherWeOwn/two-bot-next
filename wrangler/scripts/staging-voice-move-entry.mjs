@@ -1,5 +1,6 @@
 import { isDirectInvocation } from "./is-direct-invocation.mjs";
 import { runStagingVoiceMoveJob } from "./staging-voice-move-job.mjs";
+import { stagingVoiceWebHandoffInputs } from "./staging-voice-web-handoff.mjs";
 
 /** Bind dependencies already held by the protected caller. The job supplies
  * the active lease and clock. Its existing admission checks validate the inputs.
@@ -8,6 +9,15 @@ export function bindStagingVoiceMoveProvider(dependencies) {
   return () => {
     const { fixture, expectedRevision, webSession, observer, previousReady, previousOff, control } = dependencies ?? {};
     return { fixture, expectedRevision, webSession, observer, previousReady, previousOff, control };
+  };
+}
+
+/** Bind a completed protected Web handoff at the existing provider boundary. */
+export function bindStagingVoiceMoveHandoffProvider(dependencies, evidence) {
+  const provide = bindStagingVoiceMoveProvider(dependencies);
+  return () => {
+    const { qualification, webHandoff } = evidence ?? {};
+    return stagingVoiceWebHandoffInputs(provide(), qualification, webHandoff);
   };
 }
 

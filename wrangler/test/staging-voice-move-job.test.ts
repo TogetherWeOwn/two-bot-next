@@ -6,8 +6,13 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { pipelineUse } from "../scripts/staging-use-pipeline.mjs";
-import { bindStagingVoiceMoveProvider, runStagingVoiceMoveEntry } from "../scripts/staging-voice-move-entry.mjs";
+import {
+  bindStagingVoiceMoveHandoffProvider,
+  bindStagingVoiceMoveProvider,
+  runStagingVoiceMoveEntry,
+} from "../scripts/staging-voice-move-entry.mjs";
 import { runStagingVoiceMoveJob } from "../scripts/staging-voice-move-job.mjs";
+import { readStagingVoiceWebReady } from "../scripts/staging-voice-web-handoff.mjs";
 import { mockVoiceMoveWindow } from "./fixtures/staging-voice-move.ts";
 
 function beginFixture(ready: ReturnType<typeof mockVoiceMoveWindow>["args"]["ready"], dir: string) {
@@ -277,6 +282,139 @@ test("bound provider skips disabled selection and refuses incomplete dependencie
     }
     assert.equal(clock.mock.callCount(), 0);
     assert.deepEqual({ signed, moves, calls, reads }, { signed: [], moves: [], calls: [], reads: [] });
+  } finally {
+    await finish();
+  }
+});
+
+function mockWebHandoff(inputs: ReturnType<typeof jobInputs>["inputs"]) {
+  const { now, ...dependencies } = inputs;
+  const { commit, version_id: workerVersion } = dependencies.expectedRevision;
+  const qualification = {
+    schema: "staging-soak/1", verdict: "qualified", status: "sampled", sha: commit, workerVersion,
+    sample: { workerVersion, observedAt: new Date(now() - 60_000).toISOString(), requests: 50, errors: 0 },
+  };
+  const reply = { status: 200, body: {
+    matched: true, observed_at: new Date(now()).toISOString(), revision: dependencies.expectedRevision,
+  } as object };
+  let reads = 0;
+  const webSession = {
+    ...dependencies.webSession,
+    async request(url: string, init: RequestInit) {
+      init.signal?.throwIfAborted();
+      assert.equal(this === webSession, true, "calls use the same scoped adapter");
+      assert.equal(url === webSession.origin + "/__probe/voice-move/session", true, "companion endpoint only");
+      assert.equal(init.method, "POST");
+      assert.equal(init.body === JSON.stringify({
+        discord_id: dependencies.fixture.discordId, channel_ids: dependencies.fixture.channelIds,
+      }), true, "ordered fixture assertions");
+      reads += 1;
+      return Object.defineProperty(Response.json(reply.body, {
+        status: reply.status, headers: { "cache-control": "private, no-store" },
+      }), "url", { value: url });
+    },
+  };
+  const scopedInputs = { ...dependencies, webSession };
+  const readReady = (signal: AbortSignal) => readStagingVoiceWebReady(scopedInputs, { signal });
+  async function complete(signal: AbortSignal) {
+    const ready = await readReady(signal);
+    const match = reply.body;
+    reply.status = 404;
+    reply.body = { error: "not_found", request_id: "0".repeat(26) };
+    const handoff = await ready.confirmDisabled({ signal });
+    reply.status = 200;
+    reply.body = match;
+    return handoff;
+  }
+  return { scopedInputs, qualification, reply, readReady, complete, readCount: () => reads };
+}
+
+test("qualified Web handoff reaches the existing mock proof with a fresh preflight", async (t) => {
+  const { env, inputs, signed, calls, finish } = jobInputs(t);
+  t.mock.method(Date, "now", inputs.now);
+  const web = mockWebHandoff(inputs);
+  try {
+    const webHandoff = await web.complete(t.signal);
+    assert.equal(web.readCount(), 2);
+    assert.equal(signed.length, 0);
+    const provider = bindStagingVoiceMoveHandoffProvider(web.scopedInputs, { qualification: web.qualification, webHandoff });
+    assert.equal(await runStagingVoiceMoveEntry({}, provider), "disabled");
+    assert.equal(web.readCount(), 2);
+    assert.equal(await runStagingVoiceMoveEntry(env, provider), "passed");
+    assert.equal(web.readCount(), 3, "the proof reads its own current session");
+    assert.equal(signed.length, 3);
+    assert.deepEqual(calls, ["assert", "assert", "assert", "status", "release", "status"]);
+  } finally {
+    await finish();
+  }
+});
+
+test("Web handoff refuses stale qualification and cross-session or unconfirmed evidence", async (t) => {
+  const { env, inputs, signed, calls, finish } = jobInputs(t);
+  t.mock.method(Date, "now", inputs.now);
+  const web = mockWebHandoff(inputs);
+  try {
+    const webHandoff = await web.complete(t.signal);
+    const { qualification, scopedInputs } = web;
+    for (const [label, outcome] of Object.entries({
+      "stale Web SHA": { ...qualification, sha: "d".repeat(40) },
+      "different Worker": { ...qualification, workerVersion: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" },
+      "superseded soak": { ...qualification, status: "superseded" },
+      "unqualified soak": { ...qualification, verdict: "pending" },
+      "future soak sample": { ...qualification, sample: { ...qualification.sample, observedAt: new Date(inputs.now() + 1).toISOString() } },
+    })) {
+      const provider = bindStagingVoiceMoveHandoffProvider(scopedInputs, { qualification: outcome, webHandoff });
+      assert.equal(await runStagingVoiceMoveEntry(env, provider), "failed", label);
+    }
+    const crossSession = bindStagingVoiceMoveHandoffProvider({ ...scopedInputs, webSession: { ...scopedInputs.webSession } },
+      { qualification, webHandoff });
+    assert.equal(await runStagingVoiceMoveEntry(env, crossSession), "failed", "another session with identical metadata");
+
+    const readyOnly = await web.readReady(t.signal);
+    for (const incomplete of [undefined, readyOnly, { ...webHandoff }]) {
+      const provider = bindStagingVoiceMoveHandoffProvider(scopedInputs, { qualification, webHandoff: incomplete });
+      assert.equal(await runStagingVoiceMoveEntry(env, provider), "failed", "refusal was not confirmed by this handoff");
+    }
+    assert.equal(web.readCount(), 3);
+    assert.equal(signed.length, 0);
+    assert.equal(calls.length, 0);
+  } finally {
+    await finish();
+  }
+});
+
+test("Web handoff refuses invalid readiness and disabled responses with a fixed error", async (t) => {
+  const { inputs, signed, calls, finish } = jobInputs(t);
+  t.mock.method(Date, "now", inputs.now);
+  const web = mockWebHandoff(inputs);
+  const refused = (error: unknown) => error instanceof Error
+    && error.message === "staging_voice_web_handoff_unconfirmed" && !("cause" in error);
+  try {
+    const valid = web.reply.body;
+    for (const invalid of [
+      { ...valid, observed_at: "2030-02-30T12:00:00.000Z" },
+      { ...valid, observed_at: new Date(inputs.now() - 60_001).toISOString() },
+      { ...valid, revision: { ...inputs.expectedRevision, commit: "e".repeat(40) } },
+      { ...valid, matched: false },
+    ]) {
+      web.reply.body = invalid;
+      await assert.rejects(web.readReady(t.signal), refused);
+    }
+    web.reply.body = valid;
+    const ready = await web.readReady(t.signal);
+    // An enabled match, a different refusal, or an identity-bearing extra field cannot complete the handoff.
+    await assert.rejects(ready.confirmDisabled({ signal: t.signal }), refused);
+    web.reply.status = 404;
+    for (const body of [{ error: "forbidden" }, { error: "not_found", member: "synthetic-only" }]) {
+      web.reply.body = body;
+      await assert.rejects(ready.confirmDisabled({ signal: t.signal }), refused);
+    }
+    web.reply.body = { error: "not_found" };
+    web.scopedInputs.webSession.request = async () => { throw new Error("synthetic replacement transport"); };
+    await assert.rejects(ready.confirmDisabled({ signal: t.signal }), refused);
+    assert.equal(web.readCount(), 8);
+    assert.equal(signed.length, 0);
+    assert.equal(calls.length, 0);
   } finally {
     await finish();
   }
