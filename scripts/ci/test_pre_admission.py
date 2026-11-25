@@ -97,6 +97,20 @@ class StartupAdmissionTests(unittest.TestCase):
         self.assertIsInstance(self.store.read(TARGET).start_id, UUID)
         self.assertFalse(restarted.settle(TARGET))
 
+    def test_cancellation_after_commit_leaves_the_original_start_unresolved(self):
+        self.store.lost_reply = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            self.authority.admit_start(TARGET)
+        pending = self.store.read(TARGET)
+        self.assertIsInstance(pending.start_id, UUID)
+        self.assertTrue(self.authority.close(TARGET))
+        self.observe.side_effect = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            self.authority.settle(TARGET)
+        self.assertEqual(self.store.read(TARGET), replace(pending, closed=True))
+        self.assertIsNone(self.authority.admit_start(TARGET))
+        self.assertFalse(self.authority.startup_settled(TARGET))
+
     def test_cancelled_or_lost_provider_start_stays_unsettled(self):
         for offset, error in enumerate((asyncio.CancelledError(), TimeoutError())):
             with self.subTest(error=type(error)):

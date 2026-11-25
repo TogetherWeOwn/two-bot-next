@@ -1,7 +1,9 @@
 """Dormant admission and startup settlement for one authenticated PRE reservation.
 
-The protected controller authenticates the full Target before using this module.
-Only its independent settlement adapter can interpret provider or runtime proof.
+The protected controller authenticates the full Target before using this module
+and must bind each provider resource name to only one reservation. The planner's
+Worker and Container names can coincide across scopes or shapes. Only the
+independent settlement adapter can interpret provider or runtime proof.
 There is no dispatch, provider transport, lease binding, or stop operation here.
 """
 
@@ -121,7 +123,11 @@ class StartupAdmission:
         return self._swap(target, current, closed)
 
     def settle(self, target: Target) -> bool:
-        """Persist affirmative proof against the exact closed record observed."""
+        """Persist affirmative proof against the exact closed record observed.
+
+        A competing CAS can make this call return False even after settlement.
+        Use startup_settled for the durable verdict.
+        """
         current = self._read(target)
         if current is None or not current.closed:
             return False
