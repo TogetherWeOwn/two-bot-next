@@ -1,12 +1,14 @@
 """Disposable provider, ownership and dispatch evidence for the protected inventory."""
 
+from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 from hashlib import sha256
-from io import BytesIO
+from io import BytesIO, StringIO
 import json
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 from zipfile import ZIP_DEFLATED, ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -17,6 +19,15 @@ ACCOUNT = "b" * 32
 CLOUDFLARE = {"CLOUDFLARE_ACCOUNT_ID": ACCOUNT, "CLOUDFLARE_API_TOKEN": "provider-fixture"}
 CONTROL = {"STAGING_WORKER_URL": status.ORIGIN, "OWNERSHIP_CONTROL_TOKEN": "synthetic-ownership-token-of-valid-length"}
 ENV = {**CLOUDFLARE, **CONTROL, "GITHUB_SHA": SOURCE, "GITHUB_RUN_ID": "19"}
+WORKFLOW_SHA = "c" * 40
+MAIN_TIP = "e" * 40
+DISPATCH = {**ENV, "GITHUB_REPOSITORY": status.REPO, "GITHUB_REPOSITORY_ID": "1396224242",
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_REF": "refs/heads/main", "GITHUB_REF_PROTECTED": "true",
+            "GITHUB_SHA": WORKFLOW_SHA, "GITHUB_WORKFLOW_SHA": WORKFLOW_SHA,
+            "GITHUB_WORKFLOW_REF": f"{status.REPO}/{status.WORKFLOW}@refs/heads/main"}
+DISPATCH_ROUTE = "actions/runs/19"
+COMPARE_ROUTE = f"compare/{WORKFLOW_SHA}...{MAIN_TIP}?per_page=1&page=1"
 VERSION = "11111111-1111-1111-1111-111111111111"
 DEPLOYMENT = "22222222-2222-2222-2222-222222222222"
 APP = "33333333-3333-3333-3333-333333333333"
@@ -66,6 +77,22 @@ def github_fixture():
     }
 
 
+def dispatch_fixture():
+    repo = {"id": 1396224242, "full_name": status.REPO}
+    return {
+        DISPATCH_ROUTE: {"id": 19, "run_attempt": 1, "head_sha": WORKFLOW_SHA, "head_branch": "main",
+                         "event": "workflow_dispatch", "path": f"{status.WORKFLOW}@main",
+                         "repository": repo.copy(), "head_repository": repo.copy()},
+        "branches/main": {"protected": True, "commit": {"sha": MAIN_TIP}},
+        COMPARE_ROUTE: {"status": "ahead", "behind_by": 0, "ahead_by": 1,
+                        "base_commit": {"sha": WORKFLOW_SHA}, "merge_base_commit": {"sha": WORKFLOW_SHA},
+                        "files": [{"status": "added", "filename": "wrangler/test/staging-stop.test.ts"},
+                                  {"status": "modified", "filename": "scripts/ci/test_workflows.py"},
+                                  {"status": "modified", "filename":
+                                   "scripts/ci/fixtures/production_ownership_status_provider.json"}]},
+    }
+
+
 def provider_fixture():
     path = Path(__file__).with_name("fixtures") / "staging_recovery_status_provider.json"
     return json.loads(path.read_text())
@@ -80,7 +107,7 @@ class StagingRecoveryStatusTests(unittest.TestCase):
             "owner": {"phase": "active", "deploymentId": VERSION, "epoch": 7, "actor": SECRET_SENTINEL},
         }
 
-    def observe(self, update=lambda: None):
+    def observe(self, update=lambda: None, *, env=ENV):
         reads = []
         routes = self.routes
 
@@ -96,7 +123,7 @@ class StagingRecoveryStatusTests(unittest.TestCase):
             update()
             return self.state
 
-        return status.read_status(ENV, self.plan, client_factory=lambda *args, **kwargs: Provider(), read=ownership)
+        return status.read_status(env, self.plan, client_factory=lambda *args, **kwargs: Provider(), read=ownership)
 
     def test_bracket_projects_only_provider_and_ownership_evidence(self):
         self.plan = None
@@ -206,13 +233,86 @@ class StagingRecoveryStatusTests(unittest.TestCase):
             with self.subTest(code=code), self.assertRaisesRegex(status.GateError, f"^{code}$"):
                 status.plan_manifest(raw, f"sha256:{digest}")
 
-    def test_dispatch_must_be_attempt_one_from_the_current_protected_workflow_head(self):
-        context = {**ENV, "GITHUB_REPOSITORY": status.REPO, "GITHUB_REPOSITORY_ID": "1396224242",
-                   "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_RUN_ATTEMPT": "1",
-                   "GITHUB_REF": "refs/heads/main", "GITHUB_REF_PROTECTED": "true", "GITHUB_WORKFLOW_SHA": SOURCE,
-                   "GITHUB_WORKFLOW_REF": f"{status.REPO}/{status.WORKFLOW}@refs/heads/main"}
-        status.verify_main(context, lambda path: {"protected": True, "commit": {"sha": SOURCE}})
-        with self.assertRaisesRegex(status.GateError, "^dispatch_is_not_current_main$"):
-            status.verify_main(context, lambda path: {"protected": True, "commit": {"sha": "b" * 40}})
-        with self.assertRaisesRegex(status.GateError, "^untrusted_status_dispatch$"):
-            status.verify_main(dict(context, GITHUB_RUN_ATTEMPT="2"), lambda path: self.fail("unexpected API call"))
+    def test_queued_dispatch_authenticates_plan_and_keeps_serving_identity_separate(self):
+        routes = {**dispatch_fixture(), **github_fixture()}
+        calls = []
+
+        def github_get(path, *, binary):
+            self.assertTrue(path.startswith(f"repos/{status.REPO}/"))
+            path = path.removeprefix(f"repos/{status.REPO}/")
+            self.assertEqual(binary, path.endswith("/zip"))
+            calls.append(path)
+            return routes[path]
+
+        with patch.object(status, "gh", github_get), redirect_stderr(StringIO()) as errors:
+            with redirect_stdout(StringIO()) as output:
+                self.assertEqual(status.main(["plan"], dict(DISPATCH, PLAN_RUN_ID="13")), 0, errors.getvalue())
+            self.plan = status.checked_plan_summary(json.loads(output.getvalue()))
+            self.state["runtimeDatabaseFingerprint"] = FINGERPRINT
+            receipt = self.observe(env=DISPATCH)
+            self.assertEqual(receipt["workflow_sha"], WORKFLOW_SHA)
+            self.assertEqual(receipt["worker"]["source_sha"], SOURCE)
+            self.assertEqual(receipt["plan"]["source_sha"], SOURCE)
+            self.assertEqual(receipt["plan"]["artifact_id"], 17)
+            self.assertIs(receipt["ownership"]["running"], False)
+            self.assertEqual(receipt["verification"], "full_tuple")
+
+            self.assertEqual(status.main(["verify-dispatch"], DISPATCH), 0, errors.getvalue())
+            admission = [DISPATCH_ROUTE, "branches/main", COMPARE_ROUTE]
+            self.assertEqual(calls, admission + list(github_fixture()) + admission)
+
+            new_tip = "f" * 40
+            routes["branches/main"]["commit"]["sha"] = new_tip
+            final_compare = COMPARE_ROUTE.replace(MAIN_TIP, new_tip)
+            routes[final_compare] = dict(routes[COMPARE_ROUTE], ahead_by=2, files=[
+                {"status": "modified", "filename": status.WORKFLOW},
+            ])
+            self.assertEqual(status.main(["verify-dispatch"], DISPATCH), 1)
+            self.assertEqual(calls[-3:], [DISPATCH_ROUTE, "branches/main", final_compare])
+            self.assertIn("status_dispatch_superseded", errors.getvalue())
+
+    def test_dispatch_refuses_invalid_context_and_actions_provenance(self):
+        routes = dispatch_fixture()
+        del routes[COMPARE_ROUTE]
+        routes["branches/main"]["commit"]["sha"] = WORKFLOW_SHA
+        for suffix in ("", "@main", "@refs/heads/main"):
+            with self.subTest(path_suffix=suffix):
+                routes[DISPATCH_ROUTE]["path"] = status.WORKFLOW + suffix
+                status.verify_dispatch(DISPATCH, routes.__getitem__)
+
+        for key, value in (("GITHUB_RUN_ATTEMPT", "2"), ("GITHUB_REF_PROTECTED", "false"),
+                           ("GITHUB_WORKFLOW_SHA", SOURCE), ("GITHUB_RUN_ID", "19/attempts/2")):
+            with self.subTest(context=key), self.assertRaisesRegex(status.GateError, "^untrusted_status_dispatch$"):
+                status.verify_dispatch(dict(DISPATCH, **{key: value}), lambda path: self.fail("unexpected API call"))
+
+        for key, value in (("run_attempt", 2), ("id", 20), ("path", status.PLAN_WORKFLOW), ("head_sha", SOURCE),
+                           ("path", f"{status.WORKFLOW}@refs/heads/feature"),
+                           ("head_repository", {"id": 1, "full_name": status.REPO}),
+                           ("head_branch", "other"), ("event", "push")):
+            with self.subTest(run=key), self.assertRaises((status.GateError, status.ProofError)):
+                run = dict(routes[DISPATCH_ROUTE], **{key: value})
+                status.verify_dispatch(DISPATCH, {DISPATCH_ROUTE: run}.__getitem__)
+
+    def test_advanced_main_refuses_unproved_ancestry_or_control_changes(self):
+        routes = dispatch_fixture()
+        routes["branches/main"]["protected"] = False
+        with self.assertRaisesRegex(status.GateError, "^status_main_unproved$"):
+            status.verify_dispatch(DISPATCH, routes.__getitem__)
+
+        for override in ({"status": "diverged"}, {"merge_base_commit": {"sha": SOURCE}},
+                         {"behind_by": 1}, {"ahead_by": 0}, {"base_commit": {"sha": SOURCE}},
+                         {"files": None}, {"files": [{"status": "renamed", "filename": "docs/new.md"}]},
+                         {"files": [{"status": "modified", "filename": "docs/staging.md"}] * 300}):
+            with self.subTest(override=next(iter(override))), self.assertRaises(status.GateError):
+                routes = dispatch_fixture()
+                routes[COMPARE_ROUTE].update(override)
+                status.verify_dispatch(DISPATCH, routes.__getitem__)
+
+        for entry in ({"status": "modified", "filename": status.WORKFLOW},
+                      {"status": "modified", "filename": status.PLAN_WORKFLOW},
+                      {"status": "renamed", "filename": "docs/tool.md", "previous_filename": "scripts/script_intake.py"},
+                      {"status": "added", "filename": "scripts/json.py"}):
+            with self.subTest(entry=entry), self.assertRaisesRegex(status.GateError, "^status_dispatch_superseded$"):
+                routes = dispatch_fixture()
+                routes[COMPARE_ROUTE]["files"].append(entry)
+                status.verify_dispatch(DISPATCH, routes.__getitem__)

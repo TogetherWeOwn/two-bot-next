@@ -688,8 +688,25 @@ saved as artifacts. Temporary baseline/config/NDJSON files stay in runner scratc
 
 ## Read-only recovery inventory
 
-Freshly dispatch `staging-ownership-status.yml` on protected current `main`
-with `inventory=true` for each receipt. The staging job brackets an authenticated
+The staging owner dispatches `staging-ownership-status.yml` on protected `main`
+with `inventory=true` for each receipt. To include an existing authenticated plan,
+substitute its run ID for `PLAN_RUN_ID` below.
+
+```sh
+gh workflow run staging-ownership-status.yml -R TogetherWeOwn/two-bot-next \
+  --ref main -f inventory=true -f plan_run_id="$PLAN_RUN_ID"
+```
+
+The inventory checks its first-attempt Actions run against the pinned workflow
+SHA before reading and again before publishing. If `main` advances, the dispatch
+must still be a protected-main ancestor. The inventory also requires a complete
+comparison showing no changes to the inventory or plan workflow or executable
+inventory tooling. An oversized comparison or one that reaches GitHub's
+300-file limit cannot prove this. If GitHub cannot prove it or reports
+`status_dispatch_superseded`, use a new dispatch from `main` after reviewing the
+current controls. Reruns are refused.
+
+The staging job brackets an authenticated
 no-start ownership GET with two provider reads. Both samples must agree on the
 100% serving Worker version, bounded policy, Durable Object namespace, and
 newest completed rollout with a digest matching the application's configured
@@ -700,7 +717,14 @@ Supply `plan_run_id` to authenticate the plan and both clean ledgers through
 cutover 0481 and store 0478 or later. The Worker fingerprints the host,
 database and exact branch pin of its direct `*.pg.psdb.cloud` binding
 without connecting. Only `sslmode` and `channel_binding` options are
-supported. A match yields `full_tuple`.
+supported. A match yields `full_tuple`. Authenticate the
+`staging-recovery-status-<run_id>-1` artifact from that successful inventory run.
+Match `workflow_sha` and `workflow_run_id` to the Actions run. Verify the serving
+SHA and Worker/image pair independently against the intended candidate, verify
+the exact plan run/artifact/digest, and require `ownership.running` to be `false`
+for a stopped receipt. The plan and serving SHA can precede the workflow SHA.
+The receipt describes the observation window. Any staging write still needs its
+own exclusive admission and live checks.
 
 `provider_only` attests provider and owner data when the Worker lacks
 fingerprint support or the plan is omitted. A supporting Worker refuses

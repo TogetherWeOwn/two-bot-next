@@ -146,11 +146,14 @@ class StagingRecoveryHandoffTests(unittest.TestCase):
         other_owner = drill()
         release = other_owner[2]["staging-use-release.jsonl"][-1]
         release["epoch"] = release["use"]["epoch"] = 10
+        other_candidate = deepcopy(self.inventory)
+        other_candidate["worker"]["source_sha"] = "b" * 40
         cases = (
             ("worker version", "restored pair", self.inventory, self.qualified, drill(restored_version=OTHER_VERSION)),
             ("image digest", "restored pair", self.inventory, self.qualified, drill(restored_image=alternate_image)),
             ("plan run", "protected plan identity", inventory_receipt(authenticated_plan("14")),
              self.qualified, self.child),
+            ("serving source", "same source", other_candidate, self.qualified, self.child),
             ("certification rerun", "qualification attempt", self.inventory, certification(attempt=2), self.child),
             ("drill run", "drill attempt", self.inventory, self.qualified, drill(run_id=124)),
             ("running inventory", "baseline still running", inventory_receipt(self.plan, running=True),
