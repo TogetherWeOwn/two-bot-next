@@ -424,17 +424,22 @@ and any authorized manual Actions run also stay on GitHub.
 ### Exact-head CI evidence
 
 Before opening a PR or editing its description, preflight the draft from the
-repository root with the proposed source and tests committed to `HEAD`.
+repository root on the PR branch with the proposed source and tests committed
+to `HEAD`.
 
 ```sh
 python3 scripts/ci/pr_verification_preflight.py \
   --title 'fix(scope): describe the change' --body-file /path/to/pr.md
 ```
 
-Use `--base` for a local target ref other than `origin/main` and `--pr-number`
-when editing an existing PR. The command runs offline. For setup, install
-the [evidence requirements](.github/scripts/pr-evidence-requirements.txt)
-in a Python 3.12 virtual environment with
+The command runs offline and loads the standards checker from the local target
+commit. Use `--base` to select a trusted local ref other than `origin/main` and
+`--pr-number` when editing an existing PR. The evidence and squash checks use
+the parsers in your checkout.
+
+For setup on x86-64 Linux, install the
+[pinned evidence wheels](.github/scripts/pr-evidence-requirements.txt) in a
+CPython 3.12 virtual environment with
 `python3 -m pip --isolated install --no-deps --only-binary=:all: --require-hashes -r .github/scripts/pr-evidence-requirements.txt`.
 Set `PYTHONPATH` to the `.github/scripts` directory from the `TogetherWeOwn/.github`
 revision pinned in the [evidence workflow](.github/workflows/pr-evidence.yml).

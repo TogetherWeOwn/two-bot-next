@@ -3,6 +3,7 @@
 import argparse
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -11,7 +12,18 @@ from tempfile import TemporaryDirectory
 SCRIPTS = Path(__file__).resolve().parents[2] / ".github/scripts"
 sys.path.insert(0, str(SCRIPTS))
 import pr_evidence
-import pr_standards
+
+
+def check_standards(base, env):
+    try:
+        source = pr_evidence.source_blob(base, ".github/scripts/pr_standards.py")
+        with TemporaryDirectory(prefix="pr-standards-") as directory:
+            policy = Path(directory) / "pr_standards.py"
+            policy.write_bytes(source.encode("utf-8"))
+            return runpy.run_path(str(policy))["main"](env)
+    except (OSError, SyntaxError, ValueError, KeyError, subprocess.SubprocessError):
+        print("Could not load or run the standards checker from --base.", file=sys.stderr)
+        return 1
 
 
 def check_evidence(body, files, head):
@@ -72,7 +84,7 @@ def main(argv=None):
         parser.error("could not read the committed PR diff from --base to HEAD")
 
     # Hosted standards normalizes line endings when it reads the body file.
-    standards = pr_standards.main({
+    standards = check_standards(base, {
         "EVENT": "pull_request", "TITLE": args.title, "HEAD_REF": head_ref,
         "BODY": body.replace("\r\n", "\n").replace("\r", "\n"), "REPO_PRIVATE": "false",
         "CHANGED_FILES": "\n".join(file["filename"] for file in files),
