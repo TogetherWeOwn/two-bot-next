@@ -342,17 +342,17 @@ async fn exercise_transition(pool: &PgPool, name: &str) {
     install_roles(&mut grants, name, Phase::Full).await.unwrap();
     grants.commit().await.unwrap();
     assert_eq!(recovery_fence(&runtime).await, fence);
-    // Sequence advances survive rollback. Exercise this condition after the
-    // positive undo, before the existing fixture inserts attendance rows.
+    // Sequence advances survive rollback. Check the called flag first, while
+    // the value is still 1, then check an advanced value with the flag unset.
     assert_undo_refused(
         &migrator,
-        "SELECT setval('public.event_voice_sessions_id_seq', 2, false)",
+        "SELECT nextval('public.event_voice_sessions_id_seq')",
         "new schema contains evidence",
     )
     .await;
     assert_undo_refused(
         &migrator,
-        "SELECT nextval('public.event_voice_sessions_id_seq')",
+        "SELECT setval('public.event_voice_sessions_id_seq', 2, false)",
         "new schema contains evidence",
     )
     .await;
