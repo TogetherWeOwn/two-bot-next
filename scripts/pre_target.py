@@ -10,9 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 
-from bot_promotion import PromotionError, configure_bundle
-
-
 ADMISSION_SECONDS = 3600
 LAST_UNIX_SECOND = 9_999_999_999
 SCOPE = re.compile(r"pre-fixture-[a-z0-9]{1,32}")
@@ -62,6 +59,11 @@ class Target:
     def service_name(self):
         return f"{self.worker_name}-{self.shape.replace('/', '-')}"
 
+    @property
+    def synthetic_database_url(self):
+        """The canonical binding written to this reservation's Worker config."""
+        return f"postgresql://pre_fixture@{self.service_name}.{self.scope}.invalid/pre"
+
 
 def check_clock(target, now):
     require(type(now) is int and target.started_at <= now <= LAST_UNIX_SECOND, "invalid_pre_clock")
@@ -105,8 +107,11 @@ def make_config(target, *, now, receipt, material_root, synthetic_service):
             "max_instances": 1,
         }],
         "vars": {"BOT_PORT": "8080", "CONTAINER_RELEASE": revision,
-                 "DATABASE_URL": f"postgresql://pre_fixture@{synthetic_service}.{target.scope}.invalid/pre"},
+                 "DATABASE_URL": target.synthetic_database_url},
     }
+    # Bundle configuration needs tomllib. Reservation and readback checks do not.
+    from bot_promotion import PromotionError, configure_bundle
+
     try:
         return configure_bundle(config, modules, "index.js")
     except (PromotionError, OSError):

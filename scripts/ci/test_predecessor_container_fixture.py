@@ -3,6 +3,8 @@
 from dataclasses import replace
 import json
 import socket
+import subprocess
+import sys
 import unittest
 from unittest.mock import Mock
 
@@ -18,14 +20,25 @@ APP_ID = "5cb771af-3421-4223-8a06-39e061f06400"
 OTHER_APP_ID = "bcf0c525-7a87-4741-9bd7-cde8a22e4cb0"
 
 
-def admission(tip):
-    target = Target("pre-fixture-test", 123, 1_800_000_000, f"{tip:04}/0465")
+def admission(tip, scope="pre-fixture-test"):
+    target = Target(scope, 123, 1_800_000_000, f"{tip:04}/0465")
     inventory = Inventory(target, None, Resource(target.container_name, APP_ID), 0, False, True)
-    url = f"postgresql://pre_fixture@two-bot-next-pre-123-1800003600-{tip:04}-0465.pre-fixture-test.invalid/pre"
+    url = f"postgresql://pre_fixture@two-bot-next-pre-123-1800003600-{tip:04}-0465.{scope}.invalid/pre"
     return target, fixture.AppDatabaseReadback(inventory, url)
 
 
 class PredecessorContainerFixtureTests(unittest.TestCase):
+    def test_cli_help_without_tomllib(self):
+        result = subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import runpy, sys; sys.modules['tomllib'] = None; "
+             "sys.argv = ['predecessor_container_fixture.py', '--help']; "
+             "runpy.run_path(sys.argv[0], run_name='__main__')"],
+            cwd=fixture.ROOT / "scripts/ci", capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Opt-in direct-container rehearsal", result.stdout)
+
     def test_mock_command_publication(self):
         for token, body, status in [(fixture.TOKEN, b'[{"name":"help"}]', b"200"),
                                     ("foreign", b"[]", b"401"), (fixture.TOKEN, b"{}", b"400"),
@@ -81,7 +94,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
              "database identity mismatch"),
             ("other database", replace(readback, database_url=url + "_other"), "database identity mismatch"),
             ("URL override", replace(readback, database_url=url + "?host=shared-staging.invalid"),
-             "invalid synthetic PRE database binding"),
+             "database identity mismatch"),
             ("missing readback", None, "missing isolated PRE admission or readback"),
         ):
             with self.subTest(case=case):
@@ -93,9 +106,10 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
 
     def test_endpoints_and_failure_cleanup(self):
         prefixes = set()
-        for tip, failure in [(473, None), (475, None), (473, "stamp"), (475, "checkpoint"),
-                             (473, "setup"),
-                             (475, "premature"), (473, "cancel")]:
+        for tip, failure, scope in [(473, None, "pre-fixture-prodcheck"), (475, None, "pre-fixture-pooler"),
+                                    (473, "stamp", "pre-fixture-test"), (475, "checkpoint", "pre-fixture-test"),
+                                    (473, "setup", "pre-fixture-test"), (475, "premature", "pre-fixture-test"),
+                                    (473, "cancel", "pre-fixture-test")]:
             containers, released = {}, False
 
             def docker(*args, input_data=None, **_):
@@ -153,8 +167,8 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                     }[path]
                     return json.dumps([status, body])
 
-            with self.subTest(tip=tip, failure=failure):
-                target, readback = admission(tip)
+            with self.subTest(tip=tip, failure=failure, scope=scope):
+                target, readback = admission(tip, scope)
 
                 def rehearse():
                     return fixture.run_bound_endpoint(docker, IMAGE, IMAGE, IMAGE, STAMPS, target=target,

@@ -22,7 +22,6 @@ from pre_target import Inventory, Target, TargetError, check_inventory
 from script_intake import decode_legacy_json, unique_object
 
 from fixtures.predecessor_snapshots import GUILD, schema_check, snapshot_sql
-from staging_schema_gate import Refused as BindingRefused, verify_binding
 
 
 MOCK = Path(__file__).with_name("fixtures") / "predecessor_discord.py"
@@ -36,7 +35,6 @@ STAMPS = dict(zip(
      "com.togetherweown.deploy-id"),
 ))
 TOKEN = "offline-predecessor-fixture"
-PRE_DSN = re.compile(r"postgresql://pre_fixture@[a-z0-9.-]{1,253}/[a-z0-9_]{1,63}")
 
 
 class Refused(Exception):
@@ -74,11 +72,8 @@ def run_bound_endpoint(docker, image, postgres, mock_image, stamps, *, target, e
     require(app is not None and type(expected_app_id) is str and app.id == expected_app_id,
             "isolated PRE app identity mismatch")
     url = readback.database_url
-    require(isinstance(url, str) and PRE_DSN.fullmatch(url), "invalid synthetic PRE database binding")
-    try:
-        verify_binding(url, f"{target.service_name}.{target.scope}.invalid", "pre", "")
-    except BindingRefused:
-        raise Refused("isolated PRE database identity mismatch") from None
+    require(type(url) is str and url == target.synthetic_database_url,
+            "isolated PRE database identity mismatch")
     return run_endpoint(docker, image, postgres, mock_image, stamps, int(target.shape.split("/")[0]))
 
 
