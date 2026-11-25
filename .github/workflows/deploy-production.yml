@@ -263,6 +263,20 @@ jobs:
               except (subprocess.CalledProcessError, ValueError):
                   refuse(f"could not read {what} from the GitHub API; failing closed")
 
+          def staged_source(run):
+              title = run.get("display_title")
+              if isinstance(title, str) and title.startswith("reviewed staging source "):
+                  source = title.removeprefix("reviewed staging source ")
+                  if (re.fullmatch(r"[0-9a-f]{40}", source)
+                          and run.get("event") == "workflow_dispatch"
+                          and str(run.get("path") or "").split("@", 1)[0] == ".github/workflows/deploy-staging.yml"
+                          and run.get("head_branch") == "main"
+                          and (run.get("repository") or {}).get("full_name") == repo
+                          and (run.get("head_repository") or {}).get("full_name") == repo):
+                      return source
+                  return None
+              return run.get("head_sha")
+
           def probe_readyz(worker_url):
               """One live (status, body) read of a Worker's /readyz endpoint.
 
@@ -293,9 +307,10 @@ jobs:
                   f"repos/{repo}/actions/workflows/deploy-staging.yml/runs", "the latest staging deploy",
                   branch="main", status="success", per_page="1",
               ).get("workflow_runs") or []
-              if not staged or not isinstance(staged[0].get("head_sha"), str):
+              selected_source = staged_source(staged[0]) if staged else None
+              if not isinstance(selected_source, str):
                   refuse("no successful deploy-staging run on main to promote")
-              sha = staged[0]["head_sha"].strip().lower()
+              sha = selected_source.strip().lower()
               print(f"Promoting the latest successful staging deploy: {sha}")
               if ci_trigger_sha and sha != ci_trigger_sha:
                   # CI finished before staging did (or for a commit staging
@@ -511,27 +526,39 @@ jobs:
           # checks. A live-SHA takeover redeploy waives it the same way when
           # the operator confirms the SHA is live.
           needs_staging = mode == "deploy" and allow_unstaged != "true"
-          if needs_staging:
-              staged = api(
-                  f"repos/{repo}/actions/workflows/deploy-staging.yml/runs", "deploy-staging runs",
-                  head_sha=sha, branch="main", status="success", per_page="1",
-              )
-              if not staged.get("total_count"):
-                  refuse(f"deploy-staging has no successful run on {sha}")
           staging_run = None
           if needs_staging:
               # Immutable promotion needs the LATEST staging deploy of this SHA to be
               # green: an older success cannot hide a newer failed or running deploy.
-              staging_runs = collection(
-                  f"repos/{repo}/actions/workflows/deploy-staging.yml/runs", "deploy-staging runs on the SHA",
+              staging_path = f"repos/{repo}/actions/workflows/deploy-staging.yml/runs"
+              head_runs = collection(
+                  staging_path, "deploy-staging runs on the SHA",
                   "workflow_runs", head_sha=sha, branch="main",
               )
-              if not staging_runs or any(
+              if any(
                   run.get("head_sha") != sha or any(
                       type(run.get(key)) is not int or run[key] <= 0 for key in ("id", "run_number")
-                  ) for run in staging_runs
+                  ) for run in head_runs
               ):
                   refuse(f"deploy-staging has no verifiable latest run on {sha}")
+              # Reviewed-source runs carry a different GitHub head SHA. Search
+              # past the 14-day artifact retention and GitHub's 35-day run
+              # limit (including wait/approval), since created_at precedes upload.
+              since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=50)).strftime("%Y-%m-%dT%H:%M:%SZ")
+              recent = collection(staging_path, "recent deploy-staging dispatches", "workflow_runs",
+                                  branch="main", event="workflow_dispatch", created=f">={since}")
+              reviewed_runs = [
+                  run for run in recent if staged_source(run) == sha
+                  and str(run.get("display_title") or "").startswith("reviewed staging source ")
+              ]
+              if any(not re.fullmatch(r"[0-9a-f]{40}", str(run.get("head_sha") or ""))
+                     or any(type(run.get(key)) is not int or run[key] <= 0 for key in ("id", "run_number"))
+                     for run in reviewed_runs):
+                  refuse(f"deploy-staging has no verifiable latest run on {sha}")
+              staging_runs = {run["id"]: run for run in head_runs if staged_source(run) == sha}
+              staging_runs.update({run["id"]: run for run in reviewed_runs})
+              if not staging_runs:
+                  refuse(f"deploy-staging has no successful run on {sha}")
               def verified_proof(row):
                   # A name alone cannot excuse red history. Only this workflow's
                   # dispatch-only proof identity, exact attempt, and complete
@@ -579,7 +606,7 @@ jobs:
                           return False
                   return True
 
-              staging_runs = [run for run in staging_runs if not verified_proof(run)]
+              staging_runs = [run for run in staging_runs.values() if not verified_proof(run)]
               if not staging_runs:
                   refuse(f"deploy-staging has no certification run on {sha}; proofs never certify a build")
               staging_run = max(staging_runs, key=lambda run: (run["run_number"], run["id"]))
@@ -589,7 +616,8 @@ jobs:
               # not only a scheduled check: a green run whose synthetic job
               # was skipped, renamed or ran in another attempt certifies nothing.
               staging_attempt = staging_run.get("run_attempt")
-              if type(staging_attempt) is not int or staging_attempt <= 0:
+              reviewed = str(staging_run.get("display_title") or "").startswith("reviewed staging source ")
+              if type(staging_attempt) is not int or staging_attempt <= 0 or (reviewed and staging_attempt != 1):
                   refuse(f"the latest deploy-staging run on {sha} carries no verifiable attempt")
               staging_jobs = collection(
                   f"repos/{repo}/actions/runs/{staging_run['id']}/attempts/{staging_attempt}/jobs",
@@ -599,7 +627,7 @@ jobs:
                            if job.get("name") == "staging user-flow synthetic (exact SHA)"]
               if len(synthetic) != 1 or any(
                   job.get("run_id") != staging_run["id"] or job.get("run_attempt") != staging_attempt
-                  or job.get("head_sha") != sha
+                  or job.get("head_sha") != staging_run["head_sha"]
                   or job.get("status") != "completed" or job.get("conclusion") != "success"
                   for job in synthetic
               ):
@@ -794,11 +822,7 @@ jobs:
               None when no timestamp is readable: the caller then soaks the
               full window instead of skipping it.
               """
-              runs = api(
-                  f"repos/{repo}/actions/workflows/deploy-staging.yml/runs", "the green staging deploy time",
-                  head_sha=sha, branch="main", status="success", per_page="1",
-              ).get("workflow_runs") or []
-              raw = runs[0].get("updated_at") if runs and isinstance(runs[0], dict) else None
+              raw = staging_run.get("updated_at") if staging_run else None
               if not isinstance(raw, str) or not raw:
                   return None
               try:

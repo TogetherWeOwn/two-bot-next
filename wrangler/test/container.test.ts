@@ -1924,6 +1924,41 @@ function controlRequest(body?: object, token = CONTROL_TOKEN): Request {
   });
 }
 
+test("exact takeover refuses a routed version mismatch before changing ownership", async (t) => {
+  const h = await harness(t);
+  const status = await h.bot.fetch(controlRequest());
+  assert.equal(status.headers.get("x-two-bot-exact-takeover"), "1");
+  const fence = await h.bot.fetch(controlRequest({ action: "fence", expectedEpoch: 1, actor: "fixture-operator" }));
+  assert.equal(fence.status, 200);
+  const before = h.values.get(OWNER_KEY);
+  const change = { action: "takeover-exact", expectedEpoch: 2, actor: "fixture-recovery" };
+  const wrong = await h.bot.fetch(controlRequest({ ...change, expectedDeploymentId: "deployment-other" }));
+  assert.equal(wrong.status, 503);
+  assert.equal((await wrong.json()).reason, "deployment_mismatch");
+  assert.deepEqual(h.values.get(OWNER_KEY), before);
+  const matched = await h.bot.fetch(controlRequest({ ...change, expectedDeploymentId: ID }));
+  assert.equal(matched.status, 200);
+  const state = await matched.json();
+  assert.equal(state.owner.deploymentId, ID);
+  assert.equal(state.owner.epoch, 3);
+  assert.equal(state.running, false);
+  assert.equal(h.starts.length, 0);
+});
+
+test("exact takeover refuses a pending fence without changing ownership", async (t) => {
+  const pending = { ...ACTIVE_OWNER, phase: "fenced", epoch: 2, oldEpoch: 1 };
+  const h = await harness(t, WORKER_ENV, { owner: pending });
+  const response = await h.bot.fetch(controlRequest({
+    action: "takeover-exact", expectedDeploymentId: ID, expectedEpoch: pending.epoch, actor: "fixture-recovery",
+  }));
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).reason, "epoch_conflict");
+  assert.deepEqual(h.values.get(OWNER_KEY), pending);
+  assert.equal(h.values.has(`${AUDIT_PREFIX}3:fenced`), false);
+  assert.equal(h.values.has(`${AUDIT_PREFIX}3:active`), false);
+  assert.equal(h.starts.length, 0);
+});
+
 test("authenticated takeover is CAS audited, tears down first and never auto-starts", async (t) => {
   // A same-owner exact-epoch repeat is a no-op, so the commit path is
   // exercised by a fresh deployment at the fresh epoch.

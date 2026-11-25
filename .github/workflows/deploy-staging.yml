@@ -1,7 +1,7 @@
 name: deploy-staging
 # Expected-red rehearsals are not staging certification runs. Production excludes
 # this identity only after independently verifying the failure/restore step chain.
-run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'staging rollback proof' || github.workflow }}
+run-name: ${{ inputs.reviewed_plan && format('reviewed staging source {0}', inputs.sha) || (github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'staging rollback proof') || github.workflow }}
 
 # Staging only. Accept the intended new rollout + serving image, never an old
 # healthy singleton. Production promotion remains subject to its separate gates.
@@ -20,7 +20,7 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_ra
 # a dispatch-only string, empty by default (empty deploys the workflow head).
 # Every job checks out that ref and refuses anything that is not a full
 # 40-hex ancestor of origin/main. After the queue, the deploy job requires a
-# current workflow head; recover_prior_sha allows a deliberate older pin.
+# current workflow head by default. A bound reviewed_plan can qualify an ancestor.
 #
 # A merge is not a deploy or qualification. Authorized dispatch and all
 # existing staging and production gates remain required.
@@ -69,6 +69,11 @@ on:
         description: Require a GET-only AutoMod preview receipt on a clean current-main rollout
         type: boolean
         default: false
+      reviewed_plan:
+        description: "Qualify the exact reviewed sha with verified recovery. Enter the protected plan run ID@sha256:archive-digest to opt in"
+        required: false
+        type: string
+        default: ""
 
 permissions: {}
 
@@ -144,6 +149,7 @@ jobs:
     needs: soak-hold
     outputs:
       recovery_fingerprint: ${{ steps.recovery-plan.outputs.fingerprint }}
+      recovery_plan: ${{ steps.recovery-plan.outputs.plan }}
     environment: staging-migrate-plan
     # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
     # note on `check` in check.yml.
@@ -193,10 +199,21 @@ jobs:
           set -o pipefail
           python3 scripts/ci/staging_schema_gate.py \
             --binary ./target/debug/staging-migrate --source-sha "$SOURCE_SHA"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ inputs.reviewed_plan != '' }}
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+          fetch-depth: 1
       - name: Verify the recovery plan and both ledgers
         id: recovery-plan
         if: ${{ inputs.recovery_mode != 'standard' }}
-        run: python3 scripts/staging_bootstrap.py plan
+        env:
+          RECOVERY_PLAN_SOURCE: ${{ inputs.sha }}
+          REVIEWED_PLAN: ${{ inputs.reviewed_plan }}
+          PLAN_TOOLING: ${{ inputs.reviewed_plan && 'tooling' || '.' }}
+        run: python3 "$PLAN_TOOLING/scripts/staging_bootstrap.py" plan
   # Pre-deploy role-drift gate: a database whose grants lag the migrations
   # fails this job (and, through `needs`, the deploy below) instead of
   # crash-looping the new build at gateway startup with SQLSTATE 42501.
@@ -271,12 +288,15 @@ jobs:
     needs: [schema-gate, roles-gate]
     outputs:
       promotion_clean: ${{ steps.prepare.outputs.promotion_clean }}
+      reviewed_source: ${{ steps.reviewed-source.outputs.source_sha }}
       staging_use_expires_at: ${{ steps.use.outputs.expires_at }}
       staging_use_sha: ${{ steps.use.outputs.sha }}
       staging_use_deployment: ${{ steps.use.outputs.deployment_id }}
     permissions:
       contents: read # checkout only; the deploy authenticates with `staging` environment secrets
       deployments: write # derive the deploy ID from today's staging Deployments, then record this one
+      actions: read # authenticate exact-source workflow runs, jobs and read-only plan artifact
+      checks: read # bind the exact-source check runs to their workflow attempts
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ubuntu-latest
     # TOG-11143: STAGING_OWNERSHIP_CONTROL_TOKEN is a `staging` environment
@@ -285,6 +305,7 @@ jobs:
     env:
       RECOVERY_MODE: ${{ inputs.recovery_mode }}
       RECOVERY_FINGERPRINT: ${{ needs.schema-gate.outputs.recovery_fingerprint }}
+      STAGING_GATE_ROOT: ${{ inputs.reviewed_plan != '' && '../tooling' || '..' }}
     # Sized for the worst case: the deploy, a failing verify and the
     # auto-rollback budget (600 s image + 900 s gate). A 30 min cap can
     # cancel the run mid-rollback and leave staging fenced.
@@ -300,11 +321,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Reviewed tooling runs from the workflow's own commit: a pinned
-          # drill deploys an older SHA whose checkout predates deploy_id.py,
-          # so the compute and record steps below run from here, never from
-          # the deployed commit. The prepare/verify gate scripts stay on the
-          # deployed checkout: they judge that commit's own identity.
+          # Reviewed deploy gates plus shared recovery and deploy-ID tooling.
           ref: ${{ github.sha }}
           path: tooling
           persist-credentials: false
@@ -314,6 +331,7 @@ jobs:
           SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
           WORKFLOW_REF: ${{ github.ref }}
           RECOVER_PRIOR_SHA: ${{ inputs.recover_prior_sha }}
+          REVIEWED_PLAN: ${{ inputs.reviewed_plan }}
         run: |
           [ "$WORKFLOW_REF" = "refs/heads/main" ] || { echo "::error::This job must run from main (workflow ref: $WORKFLOW_REF)" >&2; exit 1; }
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -326,10 +344,12 @@ jobs:
           git merge-base --is-ancestor "$SOURCE_SHA" origin/main || { echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 1; }
           # Check the fetched tip after acquiring the lock; dispatch and queue
           # admission are not freshness checks. Refuse before staging writes.
-          test "$GITHUB_SHA" = "$(git rev-parse FETCH_HEAD)" || { echo "::error::Staging dispatch superseded by main; start a fresh dispatch" >&2; exit 1; }
-          if [ "$SOURCE_SHA" != "$GITHUB_SHA" ] && [ "$RECOVER_PRIOR_SHA" != true ]; then
-            echo "::error::Prior-main pins require recover_prior_sha; do not set it for qualification" >&2
-            exit 1
+          if [ -z "${REVIEWED_PLAN:-}" ]; then
+            test "$GITHUB_SHA" = "$(git rev-parse FETCH_HEAD)" || { echo "::error::Staging dispatch superseded by main; start a fresh dispatch" >&2; exit 1; }
+            if [ "$SOURCE_SHA" != "$GITHUB_SHA" ] && [ "$RECOVER_PRIOR_SHA" != true ]; then
+              echo "::error::Prior-main pins require recover_prior_sha or reviewed_plan" >&2
+              exit 1
+            fi
           fi
           # Export the validated dispatch-or-head SHA: every build-identity
           # and provenance consumer below stamps this, never the workflow
@@ -344,6 +364,21 @@ jobs:
           rollout_dir="$RUNNER_TEMP/two-bot-staging-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           echo "ROLLOUT_DIR=$rollout_dir" >> "$GITHUB_ENV"
           echo "WRANGLER_OUTPUT_FILE_PATH=$rollout_dir/wrangler-output.ndjson" >> "$GITHUB_ENV"
+      - name: Authorize the reviewed source before staging writes
+        id: reviewed-source
+        if: ${{ inputs.reviewed_plan != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ env.DEPLOY_SHA }}
+          REVIEWED_PLAN: ${{ inputs.reviewed_plan }}
+          RECOVERY_PAIR: ${{ inputs.recovery_pair }}
+          FRESH_PLAN: ${{ needs.schema-gate.outputs.recovery_plan }}
+          VOICE_SYNTHETIC_REQUIRED: ${{ vars.VOICE_SYNTHETIC_REQUIRED }}
+        run: |
+          set -euo pipefail
+          export FETCHED_MAIN_SHA="$(git rev-parse FETCH_HEAD)"
+          mkdir -p "$ROLLOUT_DIR"
+          python3 ../tooling/scripts/staging_qualification.py
       # The deploy ID (`YYYY.MM.DD.N+sha7`, scripts/deploy_id.py) is derived
       # here, inside the serialized staging lane: N is one plus the count of
       # today's staging Deployments, so a queued lane entry cannot mint a
@@ -373,7 +408,7 @@ jobs:
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
-        run: node scripts/ownership-control.mjs preflight
+        run: node "${STAGING_GATE_ROOT:-..}"/wrangler/scripts/ownership-control.mjs preflight
       - name: Snapshot staging identity and generate per-deploy image provenance
         id: prepare
         env:
@@ -404,7 +439,7 @@ jobs:
           if [ "$INJECT_UNPAIRED_DISCONNECT" = "true" ]; then
             inject+=(--inject-unpaired-disconnect)
           fi
-          python3 ../scripts/staging_rollout.py prepare \
+          python3 "${STAGING_GATE_ROOT:-..}"/scripts/staging_rollout.py prepare \
             --receipt "$ROLLOUT_DIR/baseline.json" \
             --output "$WRANGLER_OUTPUT_FILE_PATH" \
             --deploy-config "$ROLLOUT_DIR/staging-deploy.json" "${inject[@]}"
@@ -443,7 +478,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          python3 ../scripts/worker_container_rollback.py snapshot \
+          python3 "${STAGING_GATE_ROOT:-..}"/scripts/worker_container_rollback.py snapshot \
             --variant staging \
             --out "$ROLLOUT_DIR/staging-rollback-snapshot.json"
           python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["ROLLOUT_DIR"] + "/staging-rollback-snapshot.json")), sort_keys=True))'
@@ -459,6 +494,7 @@ jobs:
         if: ${{ inputs.recovery_mode != 'standard' }}
         env:
           RECOVERY_PAIR: ${{ inputs.recovery_pair }}
+          REVIEWED_SOURCE: ${{ steps.reviewed-source.outputs.source_sha }}
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -472,8 +508,8 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           environment: staging
-          # A pinned drill uses its deploy checkout's CLI and receipt guard,
-          # not the version belonging to this workflow's newer main commit.
+          # Use the exact CLI from the source lockfile. Reviewed qualification
+          # already checked compatibility with the workflow's receipt guard.
           wranglerVersion: ${{ steps.wrangler.outputs.version }}
           # --message stamps the version's immutable workers/message
           # annotation with the deployed commit, the SHA member of the
@@ -492,13 +528,14 @@ jobs:
       - name: Validate Wrangler deploy receipt before ownership transfer
         run: |
           set -euo pipefail
-          python3 ../scripts/staging_rollout.py receipt \
+          python3 "${STAGING_GATE_ROOT:-..}"/scripts/staging_rollout.py receipt \
             --receipt "$ROLLOUT_DIR/baseline.json" \
             --output "$WRANGLER_OUTPUT_FILE_PATH" \
             --evidence "$ROLLOUT_DIR/receipt.json"
       - name: Prove the serving Worker database before ownership or startup
         if: ${{ inputs.recovery_mode != 'standard' }}
         env:
+          REVIEWED_SOURCE: ${{ steps.reviewed-source.outputs.source_sha }}
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -528,7 +565,7 @@ jobs:
           if output="$(
             timeout --signal=TERM --kill-after=10s 390s \
               env OWNERSHIP_EXPECTED_DEPLOYMENT="$(python3 -c 'import json,os;print(json.load(open(os.environ["ROLLOUT_DIR"]+"/receipt.json"))["worker_version"])')" \
-              node scripts/ownership-control.mjs deployment-takeover 2>&1
+              node "${STAGING_GATE_ROOT:-..}"/wrangler/scripts/ownership-control.mjs deployment-takeover 2>&1
           )"; then
             printf '%s\n' "$output"
           else
@@ -572,7 +609,7 @@ jobs:
           STAGING_USE_RECEIPT: ${{ env.ROLLOUT_DIR }}/staging-use.jsonl
         run: |
           set -euo pipefail
-          python3 ../scripts/staging_rollout.py verify \
+          python3 "${STAGING_GATE_ROOT:-..}"/scripts/staging_rollout.py verify \
             --receipt "$ROLLOUT_DIR/baseline.json" \
             --output "$WRANGLER_OUTPUT_FILE_PATH" \
             --evidence "$ROLLOUT_DIR/evidence.json"
@@ -603,7 +640,7 @@ jobs:
           if [ "$INJECT_ERROR_RATE_SPIKE" = "true" ]; then
             rehearsal=(--rehearsal-firing '["rest_5xx_rate"]')
           fi
-          node scripts/promotion-error-gate.mjs \
+          node "${STAGING_GATE_ROOT:-..}"/wrangler/scripts/promotion-error-gate.mjs \
             --metrics-url "$STAGING_URL" \
             --evidence "$ROLLOUT_DIR/error-rate-gate.json" \
             --sha "$SHA" "${rehearsal[@]}"
@@ -791,7 +828,8 @@ jobs:
 
   # Pinned-drill history guard: the production guard keys staging runs by head
   # SHA, so a dispatch that deploys a pinned SHA below the workflow head must
-  # not read as staging history for the head. This job runs after the voice
+  # not read as staging history for the head. A reviewed run names its serving SHA.
+  # This job runs after the voice
   # synthetic (a deploy-job verdict step cannot judge: its failure would
   # auto-roll back the drill build) and fails the run red with the reason when
   # the pin differs from the head. An empty pin, or a pin equal to the head,
@@ -800,7 +838,7 @@ jobs:
   # rollback drill's intentionally-red run.
   pinned-history-guard:
     name: pinned drill deploys stay red (not staging history)
-    needs: voice-synthetic
+    needs: [deploy, voice-synthetic]
     permissions:
       contents: read # the minimal-grants test requires an explicit grant; the job uses no token
     # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
@@ -812,9 +850,10 @@ jobs:
         env:
           PINNED_SHA: ${{ inputs.sha }}
           HEAD_SHA: ${{ github.sha }}
+          REVIEWED_SOURCE: ${{ needs.deploy.outputs.reviewed_source }}
         run: |
           set -euo pipefail
-          if [ -z "$PINNED_SHA" ] || [ "$PINNED_SHA" = "$HEAD_SHA" ]; then
+          if [ -z "$PINNED_SHA" ] || [ "$PINNED_SHA" = "$HEAD_SHA" ] || [ "$PINNED_SHA" = "${REVIEWED_SOURCE:-}" ]; then
             exit 0
           fi
           echo "::error::Pinned drill deploy of $PINNED_SHA (workflow head $HEAD_SHA): staging serves the pin, so this run stays red and is not staging history for production."
@@ -842,6 +881,13 @@ jobs:
         with:
           name: staging-rollout-evidence
           path: ${{ runner.temp }}/promotion-source
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ needs.deploy.outputs.reviewed_source != '' }}
+        with:
+          ref: ${{ needs.deploy.outputs.reviewed_source }}
+          path: reviewed-source
+          persist-credentials: false
+          fetch-depth: 1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
@@ -866,14 +912,20 @@ jobs:
       - name: Certify the served module bytes and verified rollout
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ needs.deploy.outputs.reviewed_source || github.sha }}
+          REVIEWED_SOURCE: ${{ needs.deploy.outputs.reviewed_source }}
         run: |
           set -euo pipefail
           source="$RUNNER_TEMP/promotion-source"
+          config=wrangler/wrangler.toml
+          if [ -n "${REVIEWED_SOURCE:-}" ]; then
+            test "$(git -C reviewed-source rev-parse HEAD)" = "$SOURCE_SHA"
+            config="reviewed-source/$config"
+          fi
           stamp="$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/promotion-source/evidence.json"))["deploy_id"])')"
           python3 scripts/bot_promotion.py certify \
             --modules "$source/worker-modules" --entrypoint index.js \
-            --evidence "$source/evidence.json" --config wrangler/wrangler.toml \
+            --evidence "$source/evidence.json" --config "$config" \
             --sha "$SOURCE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
             --deploy-id "$stamp" --readiness-result success --synthetic-result success \
             --fault-mode none --out "$RUNNER_TEMP/promotion.zip"

@@ -20,6 +20,7 @@ export interface OwnershipChange {
   action: "takeover" | "fence";
   expectedEpoch: number;
   actor: string;
+  expectedDeploymentId?: string;
 }
 
 export class OwnershipRefused extends Error {
@@ -43,10 +44,15 @@ export function deploymentId(id: unknown): string {
 export function parseChange(value: unknown): OwnershipChange | null {
   if (!value || typeof value !== "object") return null;
   const v = value as Record<string, unknown>;
-  if (v.action !== "takeover" && v.action !== "fence") return null;
+  if (v.action !== "takeover" && v.action !== "fence" && v.action !== "takeover-exact") return null;
   if (!Number.isSafeInteger(v.expectedEpoch) || (v.expectedEpoch as number) < 0) return null;
   // Actor is the caller's audit label; authentication is the control token, not this label.
   if (typeof v.actor !== "string" || !/^[a-zA-Z0-9_.:@/-]{1,128}$/.test(v.actor)) return null;
+  if (v.action === "takeover-exact") {
+    if (!validId(v.expectedDeploymentId)) return null;
+    return { action: "takeover", expectedEpoch: v.expectedEpoch as number, actor: v.actor,
+      expectedDeploymentId: v.expectedDeploymentId };
+  }
   return { action: v.action, expectedEpoch: v.expectedEpoch as number, actor: v.actor };
 }
 
@@ -100,10 +106,16 @@ export class OwnershipFence {
    */
   async change(id: string, change: OwnershipChange, destroy: () => Promise<void>, opts?: { force?: boolean }): Promise<OwnerRecord> {
     deploymentId(id);
+    if (change.expectedDeploymentId !== undefined && change.expectedDeploymentId !== id) {
+      throw new OwnershipRefused("deployment_mismatch");
+    }
     const old = await this.read();
     const oldEpoch = old?.epoch ?? 0;
     if (oldEpoch !== change.expectedEpoch) throw new OwnershipRefused("epoch_conflict");
     if (oldEpoch === Number.MAX_SAFE_INTEGER) throw new OwnershipRefused("epoch_exhausted");
+    if (change.expectedDeploymentId !== undefined && (old?.phase !== "fenced" || old.deploymentId !== null)) {
+      throw new OwnershipRefused("epoch_conflict");
+    }
     // Idempotent repeat: the deployment that already owns the active singleton,
     // re-posting at its own epoch, gets the stored record back unchanged: no
     // write, no audit row, no destroy. A fenced (crash-recovery) record and an

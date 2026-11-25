@@ -14,6 +14,8 @@ pub mod automod_activation;
 pub mod automod_preview_handler;
 pub mod brand;
 pub mod channel_access;
+mod event_permission_readback;
+pub use event_permission_readback::EventPermissionEvidence;
 #[cfg(feature = "db")]
 pub mod channel_moderation;
 pub mod command_identity;

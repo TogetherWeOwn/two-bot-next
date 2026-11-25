@@ -16,7 +16,9 @@ function sender(owner: object | null, deploymentId = "B", running = false) {
     calls,
     send: async (_url: URL, init: RequestInit) => {
       calls.push(init);
-      if (init.method === "GET") return Response.json({ deploymentId, owner, running });
+      if (init.method === "GET") {
+        return Response.json({ deploymentId, owner, running }, { headers: { "x-two-bot-exact-takeover": "1" } });
+      }
       const change = JSON.parse(String(init.body));
       return Response.json({ deploymentId, running: false, owner: {
         deploymentId: change.action === "fence" ? null : deploymentId, epoch: change.expectedEpoch + 1,
@@ -77,6 +79,59 @@ test("takeover posts exactly the read epoch and confirms the transition", async 
   assert.equal(result.owner.phase, "active");
   assert.equal(s.calls.length, 2);
   assert.deepEqual(JSON.parse(String(s.calls[1]!.body)), { action: "takeover", actor: args.actor, expectedEpoch: 3 });
+});
+
+test("fenced recovery requires a stopped matching epoch before takeover", async () => {
+  const recovery = { ...args, action: "takeover-fenced", releaseFence: true, expectedEpoch: 3 };
+  for (const s of [
+    sender({ epoch: 4, deploymentId: null, phase: "fenced" }),
+    sender({ epoch: 3, deploymentId: "B", phase: "fenced" }),
+    sender({ epoch: 3, deploymentId: "B", phase: "active" }),
+    sender({ epoch: 3, deploymentId: null, phase: "fenced" }, "B", true),
+    sender({ epoch: 3, deploymentId: null, phase: "fenced" }, "C"),
+  ]) {
+    await assert.rejects(control(recovery, s.send));
+    assert.deepEqual(s.calls.map((call) => call.method), ["GET"]);
+  }
+});
+
+test("the exact takeover capability requires a pinned Worker with authenticated support", async () => {
+  const current = sender({ epoch: 3, deploymentId: "B", phase: "active" }, "B", true);
+  assert.deepEqual(await control({ ...args, action: "takeover-capability" }, current.send),
+    { deploymentId: "B", exactTakeover: true });
+  assert.deepEqual(current.calls.map((call) => call.method), ["GET"]);
+  const methods: string[] = [];
+  await assert.rejects(control({ ...args, action: "takeover-fenced", releaseFence: true }, async (_url, init) => {
+    methods.push(String(init.method));
+    return Response.json({ deploymentId: "B", owner: { phase: "fenced", deploymentId: null, epoch: 1 }, running: false });
+  }), /does not support exact takeover/);
+  assert.deepEqual(methods, ["GET"]);
+});
+
+test("fenced recovery never retries an interrupted takeover at a new epoch", async () => {
+  const recovery = { ...args, action: "takeover-fenced", releaseFence: true, expectedEpoch: 3 };
+  for (const interrupt of [true, false]) {
+    const calls: string[] = [];
+    const operation = control(recovery, async (_url: URL, init: RequestInit) => {
+      calls.push(String(init.method));
+      if (init.method === "GET") {
+        return Response.json({ deploymentId: "B", running: false,
+          owner: { epoch: 3, deploymentId: null, phase: "fenced" } }, { headers: { "x-two-bot-exact-takeover": "1" } });
+      }
+      assert.deepEqual(JSON.parse(String(init.body)), {
+        action: "takeover-exact", actor: args.actor, expectedEpoch: 3, expectedDeploymentId: "B",
+      });
+      if (interrupt) throw new Error("fixture lost the acknowledgement");
+      return Response.json({ deploymentId: "B", running: false,
+        owner: { epoch: 4, deploymentId: "B", phase: "active", actor: args.actor } });
+    }, async () => { assert.fail("fenced takeover must never retry"); });
+    if (interrupt) {
+      await assert.rejects(operation, /Ownership control request failed/);
+    } else {
+      assert.equal((await operation).owner.epoch, 4);
+    }
+    assert.deepEqual(calls, ["GET", "POST"]);
+  }
 });
 
 test("routine takeover refuses to unpark a fenced/pristine singleton", async () => {

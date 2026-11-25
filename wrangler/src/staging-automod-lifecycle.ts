@@ -1,3 +1,4 @@
+import { boundRead } from "./internal-actions.ts";
 import { admitStagingAutomod } from "./staging-automod.ts";
 import {
   inspectStagingAutomod, publishStagingAutomod, removeOwnedStagingAutomod,
@@ -5,13 +6,21 @@ import {
 import { sameLease, StagingAutomodRecovery, type AutomodIntent } from "./staging-automod-recovery.ts";
 
 type Lease = AutomodIntent["lease"];
+const DRY_RUN_POLICY = Object.freeze({
+  memberIntake: false, enforcement: false, resume: false, registrySync: false, interactionDispatch: false,
+  dedicatedIntents: true,
+});
+type RuntimePolicy = { readonly [K in keyof typeof DRY_RUN_POLICY]: boolean };
 type Observation = {
   lease: Lease;
   purpose: "automod-preview";
+  active: boolean;
   running: boolean;
+  policy?: RuntimePolicy;
   // Separate bounded authority for cleanup, including after lease expiry.
   cleanupBefore?: number;
 };
+type DrainEvidence = { lease: Lease; publicationDrained: boolean; startupDrained: boolean };
 
 interface Dependencies {
   enabled?: boolean;
@@ -22,17 +31,29 @@ interface Dependencies {
   // One shared gate across all callers and registry/runtime writers. Every
   // competing use enters through otherUse, including on a fresh instance.
   exclusive<T>(operation: () => Promise<T>): Promise<T>;
-  // Read authoritative ownership and sole purpose for the exact original
-  // lease. Recovery can return that binding after expiry, but never rebind it.
+  // Read current ownership, active status and sole purpose for the exact lease.
+  // Recovery can return its original binding after expiry or release.
   observe(lease: Lease): Promise<Observation | undefined>;
-  // Affirm that earlier remote publication cannot land after this returns.
+  // Fence both kinds of work on this lease and prove earlier remote effects cannot land.
   // Client abort, timeout and local task completion alone cannot prove this.
-  fenceAndDrain(lease: Lease): Promise<boolean>;
-  stop(lease: Lease): Promise<boolean>;
+  fenceAndDrain(lease: Lease, before: number): Promise<DrainEvidence | undefined>;
+  stop(lease: Lease, before: number): Promise<boolean>;
+  dryRun?: {
+    // Effective launch configuration derived by the protected runtime adapter.
+    policy: RuntimePolicy;
+    // Enforce this policy at launch and refuse after the deadline. An uncertain
+    // remote start must remain fenced by recovery even after caller restart.
+    start(lease: Lease, policy: typeof DRY_RUN_POLICY, before: number): Promise<void>;
+  };
   now?: () => number;
 }
 
 const refused = () => new Error("staging_automod_lifecycle_refused");
+
+function isolated(policy: RuntimePolicy | undefined): boolean {
+  return policy?.memberIntake === false && policy.enforcement === false && policy.resume === false
+    && policy.registrySync === false && policy.interactionDispatch === false && policy.dedicatedIntents === true;
+}
 
 /** Dormant coordinator. With the gate held, all work before the journal
  * intent is read-only. Thereafter the durable intent excludes competing use
@@ -60,12 +81,12 @@ export class StagingAutomodLifecycle {
       if (this.deps.enabled !== true || signal?.aborted) throw refused();
       await this.requireIdle();
       const admission = await admitStagingAutomod(input, this.deps.env,
-        () => this.observe(input.lease), this.deps.get, this.now);
+        () => this.observe(input.lease, true), this.deps.get, this.now);
       const currentAdmission = async () => {
-        const observed = await this.observe(admission.lease);
+        const observed = await this.observe(admission.lease, true);
         return observed.running === false && !signal?.aborted ? admission : undefined;
       };
-      return publishStagingAutomod(admission, {
+      const command = await publishStagingAutomod(admission, {
         env: this.deps.env,
         request: (url, init) => {
           if (signal?.aborted) throw refused();
@@ -75,6 +96,35 @@ export class StagingAutomodLifecycle {
         persistIntent: intent => this.journal.persistIntent(intent, currentAdmission, this.now),
         recordCreated: owned => this.journal.recordCreated(owned),
       }, this.now);
+      await this.journal.confirmPublication(command);
+      return command;
+    });
+  }
+
+  /** Protected entry within the held window. The ordinary startup path checks
+   * otherUse and stays barred until recovery completes. */
+  startDryRun(expected: Lease): Promise<void> {
+    return this.deps.exclusive(async () => {
+      const { dryRun, enabled, env } = this.deps;
+      if (enabled !== true || !dryRun || env.TWO_DEPLOY_ENV !== "staging"
+        || env.STAGING_RUNTIME_POLICY !== "bounded" || !isolated(dryRun.policy)) throw refused();
+
+      const requireRuntime = async ({ lease, publishBefore }: AutomodIntent, running: boolean) => {
+        const observed = await this.observe(lease, true);
+        const at = this.now();
+        if (!Number.isSafeInteger(at) || at < lease.acquiredAt || at >= publishBefore || observed.running !== running
+          || !isolated(running ? observed.policy : dryRun.policy)) throw refused();
+        return at;
+      };
+      const intent = await this.journal.claimStartup(expected, async intent => { await requireRuntime(intent, false); });
+      const at = await requireRuntime(intent, false);
+      const deadline = AbortSignal.timeout(intent.publishBefore - at);
+      // A lost response cannot retain the gate past the cutoff. The durable
+      // claim stays pending and recovery still requires authoritative drain.
+      try {
+        await boundRead(dryRun.start(intent.lease, DRY_RUN_POLICY, intent.publishBefore), deadline);
+        await boundRead(requireRuntime(intent, true), deadline);
+      } catch { throw refused(); }
     });
   }
 
@@ -85,18 +135,20 @@ export class StagingAutomodLifecycle {
       const pending = await this.journal.pending();
       if (!pending) return;
       const { lease } = pending;
-      if (expected && !sameLease(lease, expected)) throw refused();
-      let prepared = false;
+      if (expected !== undefined && !sameLease(lease, expected)) throw refused();
+      let prepared: number | undefined;
       await this.journal.recover(lease, {
         inspect: async (intent, command) => {
-          if (!prepared) {
-            await this.cleanupDeadline(lease);
-            if (await this.deps.fenceAndDrain(lease) !== true) throw refused();
-            await this.cleanupDeadline(lease);
-            if (await this.deps.stop(lease) !== true) throw refused();
-            prepared = true;
+          if (prepared === undefined) {
+            const deadline = await this.cleanupDeadline(lease);
+            const drained = await this.deps.fenceAndDrain(lease, deadline).catch(() => { throw refused(); });
+            if (drained?.publicationDrained !== true || drained.startupDrained !== true
+              || !sameLease(lease, drained.lease) || await this.cleanupDeadline(lease) !== deadline) throw refused();
+            if (await this.deps.stop(lease, deadline).catch(() => { throw refused(); }) !== true) throw refused();
+            prepared = deadline;
           }
           const deadline = await this.cleanupDeadline(lease, true);
+          if (deadline !== prepared) throw refused();
           const registry = await inspectStagingAutomod(intent, command, this.deps, deadline, this.now);
           if (await this.cleanupDeadline(lease, true) !== deadline) throw refused();
           const proof = { intent, authorized: true, stopped: true, publicationDrained: true } as const;
@@ -106,6 +158,7 @@ export class StagingAutomodLifecycle {
         },
         removeOwned: async owned => {
           const removeBefore = await this.cleanupDeadline(lease, true);
+          if (removeBefore !== prepared) throw refused();
           const grant = { owned, removeBefore };
           await removeOwnedStagingAutomod(grant, {
             env: this.deps.env, request: (url, init) => this.deps.request(url, init),
@@ -120,9 +173,10 @@ export class StagingAutomodLifecycle {
     if (await this.journal.pending()) throw refused();
   }
 
-  private async observe(lease: Lease): Promise<Observation> {
+  private async observe(lease: Lease, requireActive = false): Promise<Observation> {
     const observed = await this.deps.observe(lease).catch(() => { throw refused(); });
-    if (observed?.purpose !== "automod-preview" || !sameLease(lease, observed.lease)) throw refused();
+    if (observed?.purpose !== "automod-preview" || !sameLease(lease, observed.lease)
+      || (requireActive && observed.active !== true)) throw refused();
     return observed;
   }
 

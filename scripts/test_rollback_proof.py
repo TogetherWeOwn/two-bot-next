@@ -5,6 +5,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import importlib.util
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from functools import partial
 import io
 import json
 import os
@@ -16,7 +17,7 @@ import tempfile
 import textwrap
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import zipfile
 
 import incident_issue
@@ -304,8 +305,10 @@ class RollbackProofTests(unittest.TestCase):
     def test_first_exact_child_reads_can_recover_and_prove_restore_and_shutdown(self):
         responses = [gh_output({"workflow_run_id": 123}), gh_output({}, status=404),
                      gh_output({}, status=502), gh_output(run(), status=200), gh_output(jobs())]
+        # Inject the wrapper wait so subprocess.wait keeps its real backoff.
+        pause = Mock()
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, ENV), \
-                local_gh(responses) as (gh, _), patch.object(proof.time, "sleep") as pause, \
+                local_gh(responses) as (gh, _), patch.object(proof, "prove", partial(proof.prove, sleep=pause)), \
                 patch.object(proof, "artifact_files", side_effect=[files(), stop_files()]) as artifacts, \
                 redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             path = Path(directory) / "proof.json"
@@ -332,9 +335,11 @@ class RollbackProofTests(unittest.TestCase):
         for statuses, code in scenarios:
             responses = [gh_output({"workflow_run_id": 123})]
             responses.extend(gh_output({"message": "private-body"}, status=status) for status in statuses)
+            pause = Mock()
             with self.subTest(statuses=statuses), tempfile.TemporaryDirectory() as directory, \
                     patch.dict(os.environ, ENV), local_gh(responses) as (gh, _), \
-                    patch.object(proof.time, "sleep") as pause, patch.object(proof, "artifact_files") as artifacts, \
+                    patch.object(proof, "prove", partial(proof.prove, sleep=pause)), \
+                    patch.object(proof, "artifact_files") as artifacts, \
                     redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
                 path = Path(directory) / "proof.json"
                 self.assertEqual(proof.main(["run", "--sha", "a" * 40, "--evidence", str(path)]), 1)

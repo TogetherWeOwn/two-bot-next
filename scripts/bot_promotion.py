@@ -218,7 +218,7 @@ def _check_run_identity(run, sha, run_id, attempt):
         raise PromotionError("source run sha mismatch")
     if run.get("head_branch") != STAGING_BRANCH:
         raise PromotionError("source run branch mismatch")
-    if (run.get("path") != STAGING_WORKFLOW
+    if (str(run.get("path") or "").split("@", 1)[0] != STAGING_WORKFLOW
             or run.get("event") not in ("push", "workflow_dispatch")):
         raise PromotionError("source run workflow mismatch")
     repository = run.get("repository")
