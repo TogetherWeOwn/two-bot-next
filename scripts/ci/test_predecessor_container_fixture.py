@@ -1,21 +1,57 @@
 """Test the dormant rehearsal without a Docker daemon or a predecessor image."""
 
+from contextlib import closing
 from dataclasses import replace
 import json
 import socket
+import sqlite3
 import unittest
 from unittest.mock import Mock
 
 import predecessor_container_fixture as fixture
 from fixtures.predecessor_discord import COMMANDS, Discord
-from fixtures.predecessor_snapshots import schema_check
-from pre_start_stop import Endpoint, ProbeReply
-from test_pre_start_stop import PreFixture, TARGET
+from fixtures.predecessor_snapshots import GUILD, PROJECTIONS
+from test_pre_start_stop import Endpoint, PreFixture, ProbeReply, TARGET
 
 
 STAMPS = {"build_revision": fixture.SOURCE, "build_id": "test-1", "deploy_id": "test.1"}
 IMAGE = "sha256:" + "a" * 64
 PIN = {"image_id": IMAGE, "manifest_digest": "sha256:" + "b" * 64, **STAMPS}
+POSTGRES_IMAGE = "sha256:" + "c" * 64
+MOCK_IMAGE = "sha256:" + "d" * 64
+
+
+def query_ledger(query, tip):
+    """Evaluate the fixture's check against an in-memory PRE projection."""
+    with closing(sqlite3.connect(":memory:")) as db:
+        db.executescript("""
+            CREATE TABLE _sqlx_migrations (version INT, success INT, installed_on INT);
+            CREATE TABLE _two_bot_migrations (version INT, success INT);
+            CREATE TABLE event_instance_windows (guild_id TEXT);
+            ATTACH ':memory:' AS information_schema;
+            CREATE TABLE information_schema.columns (table_schema TEXT, table_name TEXT, column_name TEXT);
+            ATTACH ':memory:' AS web_v1;
+            CREATE TABLE web_v1.contract_meta (contract_version TEXT);
+            INSERT INTO web_v1.contract_meta VALUES ('1.0');
+        """)
+        for table, endpoint in (("_sqlx_migrations", tip), ("_two_bot_migrations", 465)):
+            count, _ = PROJECTIONS[endpoint]
+            versions = range(endpoint - count + 1, endpoint + 1)
+            db.executemany(f"INSERT INTO {table} (version, success) VALUES (?, 1)",
+                           ((version,) for version in versions))
+        db.execute("INSERT INTO event_instance_windows (guild_id) VALUES (?)", (GUILD,))
+        if tip == 475:
+            db.executescript("""
+                ALTER TABLE event_instance_windows ADD COLUMN attendance_recovered_at INT;
+                UPDATE _sqlx_migrations SET installed_on = 1800000001 WHERE version = 475;
+                UPDATE event_instance_windows SET attendance_recovered_at = 1800000001;
+                INSERT INTO information_schema.columns VALUES
+                    ('public', 'event_instance_windows', 'attendance_recovered_at');
+            """)
+        # SQLite needs a SELECT list. MIN implements bool_and over these non-null booleans.
+        query = query.replace("SELECT FROM information_schema", "SELECT 1 FROM information_schema")
+        result, = db.execute(query.replace("bool_and(", "min(")).fetchone()
+        return {1: "t", 0: "f", None: ""}[result]
 
 
 class PredecessorContainerFixtureTests(unittest.TestCase):
@@ -51,7 +87,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
         prefixes = set()
         for tip, post_start_tip, failure in [
             (473, 473, None), (475, 475, None),
-            (473, 475, "ledger"), (475, 473, "ledger"),
+            (473, 475, "ledger"), (475, 473, "ledger_query"),
             (473, 473, "stamp"), (475, 475, "checkpoint"),
             (473, 473, "setup"), (475, 475, "premature"), (473, 473, "cancel"),
         ]:
@@ -70,6 +106,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                     self.assertIn("--pull=never", args)
                     self.assertNotIn("-p", args)
                     if name.endswith("-db"):
+                        self.assertEqual(args[args.index("--entrypoint") + 2], POSTGRES_IMAGE)
                         self.assertNotIn(name, prefixes)
                         prefixes.add(name)
                         self.assertIn("--network=none", args)
@@ -79,6 +116,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                         self.assertIn(anchor, containers)
                         self.assertEqual(args.count(f"container:{anchor}"), 2)
                     if name.endswith("-mock"):
+                        self.assertEqual(args[args.index("--entrypoint") + 2], MOCK_IMAGE)
                         decoder = fixture.ROOT / "scripts/script_intake.py"
                         self.assertIn(f"type=bind,src={decoder},dst=/script_intake.py,readonly", args)
                     if name.endswith("-bot"):
@@ -109,7 +147,13 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                         return "t"
                     trace.append(("ledger", deployment, input_data))
                     observed_tip = tip if deployment is None else post_start_tip
-                    return "t" if failure != "setup" and input_data == schema_check(observed_tip) else "f"
+                    if failure == "setup":
+                        return "f"
+                    try:
+                        return query_ledger(input_data, observed_tip)
+                    except sqlite3.OperationalError as error:
+                        self.assertEqual(str(error), "no such column: attendance_recovered_at")
+                        raise fixture.Refused("Docker exec failed") from None
                 else:
                     path = args[-1]
                     if path == "/release":
@@ -134,13 +178,14 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
 
             with self.subTest(tip=tip, post_start_tip=post_start_tip, failure=failure):
                 def rehearse():
-                    return fixture.run_endpoint(docker, IMAGE, IMAGE, IMAGE, STAMPS, tip)
+                    return fixture.run_endpoint(docker, IMAGE, POSTGRES_IMAGE, MOCK_IMAGE, STAMPS, tip)
 
                 if failure == "cancel":
                     with self.assertRaises(KeyboardInterrupt):
                         rehearse()
                 elif failure:
                     expected = {"ledger": "^PRE snapshot changed during startup$",
+                                "ledger_query": "^Docker exec failed$",
                                 "stamp": "stamp mismatch", "checkpoint": "checkpoint missing",
                                 "premature": "pre-READY state invalid", "setup": "snapshot readback failed"}
                     with self.assertRaisesRegex(fixture.Refused, expected[failure]):
@@ -149,7 +194,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                     self.assertEqual(rehearse(), {"cutover": tip, "store": 465, "process": "live",
                                                 "database": "ready", "mock_gateway": "checkpointed",
                                                 "pre_ready_status": 503, "ready_status": 200})
-                if failure in (None, "ledger"):
+                if failure in (None, "ledger", "ledger_query"):
                     self.assertEqual([(event, app) for event, app, *_ in trace],
                                      [("ledger", None), ("started", deployment), (Endpoint.HEALTH, deployment),
                                       (Endpoint.READINESS, deployment), (Endpoint.READINESS, deployment),
