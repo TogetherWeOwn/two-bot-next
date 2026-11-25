@@ -139,10 +139,14 @@ offline configuration and validates cleanup evidence.
 
    With the inputs already local, these preparation steps need no cloud
    credentials. Run the same sequence against synthetic inputs from the repo
-   root with an empty environment.
+   root with an empty environment. Use the absolute path to an installed
+   Python 3.11 or newer. This example resolves Python 3.12 before clearing
+   the environment.
 
    ```sh
-   env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p test_pre_operator_inputs.py -v
+   pre_python=$(command -v python3.12) &&
+     env -i PYTHONDONTWRITEBYTECODE=1 "$pre_python" -m unittest discover \
+       -s scripts/ci -p test_pre_operator_inputs.py -v
    ```
 
 2. Admit one rehearsal at a time on its own Worker, Container app and synthetic
