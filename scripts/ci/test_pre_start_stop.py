@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 from threading import Barrier
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import MagicMock, Mock, call, patch
 from uuid import UUID
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
@@ -108,6 +108,16 @@ class ProtectedPreTests(unittest.TestCase):
         self.fixture.now = TARGET.expires_at
         self.assert_refuses("pre_external_stop_unarmed", self.controller.start, self.fixture.upload)
         self.assertEqual(self.fixture.effects.mock_calls, [call.admission.admit_start(TARGET), call.arm(TARGET, START)])
+
+    def test_claim_lookup_and_insert_share_one_critical_section(self):
+        authority = self.fixture.external_stop
+        events = Mock(lock=MagicMock(), claims=MagicMock(spec_set=dict))
+        events.claims.get.return_value = None
+        with patch.object(authority, "_lock", events.lock), patch.object(authority, "_claims", events.claims):
+            self.assertTrue(authority.arm(TARGET, START))
+        self.assertEqual(events.mock_calls, [call.lock.__enter__(), call.claims.get(TARGET.provider_names),
+                         call.claims.__setitem__(TARGET.provider_names, (TARGET, START)),
+                         call.lock.__exit__(None, None, None)])
 
     def test_colliding_scope_or_shape_cannot_create_fence_or_release_the_winner(self):
         neighbors = (replace(TARGET, scope="pre-fixture-neighbor"), replace(TARGET, shape=PRE_SHAPES[1]))
