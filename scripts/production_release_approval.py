@@ -53,8 +53,9 @@ def require_legacy_non_attempt(api, run):
     seen = set()
     for job in map(mapping, jobs):
         job_id, name, result = job.get("id"), job.get("name"), job.get("conclusion")
+        # The attempt-qualified endpoint binds jobs when this optional field is absent.
         require(identifier(job_id) and job_id not in seen and number(job.get("run_id")) == run["id"]
-                and number(job.get("run_attempt")) == 1
+                and number(job.get("run_attempt", 1)) == 1
                 and job.get("head_sha") == run["head_sha"] and job.get("status") == "completed"
                 and isinstance(name, str) and bool(name) and isinstance(result, str) and bool(result), INVALID)
         seen.add(job_id)

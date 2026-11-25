@@ -101,6 +101,18 @@ class AttendanceApprovalHistoryTests(unittest.TestCase):
                 self.api_rows[JOBS] = {"total_count": total, "jobs": jobs}
                 self.verify()
 
+    def test_legacy_job_attempt_is_optional_but_must_match_if_present(self):
+        self.history(self.current, run(202, 5, display_title="deploy-production", status="completed"))
+        row = job(501, "Production release / Prepare and stop the prior pair", "skipped")
+        del row["run_attempt"]
+        self.api_rows[JOBS] = {"total_count": 1, "jobs": [row]}
+        self.assertIsNone(self.verify())
+
+        for attempt in (2, True, "1", None):
+            with self.subTest(attempt=attempt), self.assertRaises(GateError):
+                row["run_attempt"] = attempt
+                self.verify()
+
     def test_refuses_wrong_producer_or_current_attempt(self):
         for fields in ({"artifact_id": True}, {"archive_digest": "a" * 64}, {"run_id": False}):
             with self.subTest(producer=fields), self.assertRaises(GateError):
