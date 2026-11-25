@@ -1061,19 +1061,26 @@ def staging_full_window_errors(workflow, name="deploy-staging.yml"):
     needs = release.get("needs")
     if not isinstance(needs, list) or len(needs) != len(wanted) or set(needs) != wanted:
         errors.append(f"{name}:staging-use-release: must need every window job")
-    if "always()" not in str(release.get("if") or "").split(" && ") or "||" in str(release.get("if") or ""):
-        errors.append(f"{name}:staging-use-release: must run with always() as a conjunct")
+    expiry = "needs.deploy.outputs.staging_use_expires_at"
+    if release.get("if") != f"always() && {expiry} != ''":
+        errors.append(f"{name}:staging-use-release: must always clean up an issued deploy window")
     if release.get("environment") != "staging" or release.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:staging-use-release: must read only the staging Environment with contents:read")
+    if "defaults" in release or "defaults" in workflow:
+        errors.append(f"{name}:staging-use-release: must run from the checkout with the default shell")
     if "continue-on-error" in release or any("continue-on-error" in step for step in release.get("steps") or []):
         errors.append(f"{name}:staging-use-release: a failed stop must fail the run")
     if not runner_allowed("staging-use-release", release.get("runs-on")):
         errors.append(f"{name}:staging-use-release: must use the explicit ubuntu-latest runner for job "
                       "'staging-use-release'")
-    commands = [str(step.get("run") or "") for step in release.get("steps") or []]
-    if not any(command in ("node wrangler/scripts/staging-use-pipeline.mjs finish",
-                           "node wrangler/scripts/staging-use.mjs release") for command in commands):
-        errors.append(f"{name}:staging-use-release: must stop the window through the reviewed client")
+    commands = [step for step in release.get("steps") or [] if "run" in step]
+    if len(commands) != 1 or {key: value for key, value in commands[0].items() if key != "name"} != {
+        "run": "node wrangler/scripts/staging-use-pipeline.mjs finish",
+        "env": {**STAGING_CONTROL_ENV,
+                "STAGING_USE_EXPIRES_AT": f"${{{{ {expiry} }}}}",
+                "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-use-release.jsonl"},
+    }:
+        errors.append(f"{name}:staging-use-release: must finish only the exact issued deploy window")
     return errors
 
 
@@ -1142,6 +1149,13 @@ USER_FLOW_PROBE_ENV = {
     "STAGING_USE_EXPIRES_AT": "${{ needs.deploy.outputs.staging_use_expires_at }}",
     "STAGING_USE_DEPLOYMENT": "${{ needs.deploy.outputs.staging_use_deployment }}",
 }
+USER_FLOW_PROBE_RUN = r'''set -euo pipefail
+if [ -z "$STAGING_WORKER_URL" ]; then
+  echo "::error::STAGING_WORKER_URL is unset; the user-flow synthetic has zero samples, refusing to certify"
+  exit 1
+fi
+python3 scripts/staging_health_contract_probe.py --expected-sha "$EXPECTED_SHA" \
+  --evidence "$RUNNER_TEMP/staging-user-flow-synthetic.json"'''
 
 def staging_qualification_assert_errors(job, job_id, entry, receipt, artifact):
     label = f"deploy-staging.yml:{job_id}"
@@ -1208,6 +1222,8 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
     if not runner_allowed("user-flow-synthetic", job.get("runs-on")):
         errors.append(f"{name}:user-flow-synthetic: must use the explicit ubuntu-latest runner "
                       "for job 'user-flow-synthetic'")
+    if "defaults" in job or "defaults" in workflow:
+        errors.append(f"{name}:user-flow-synthetic: must run from the checkout with the default shell")
     for key in ("if", "uses", "services", "container",
                 "continue-on-error", "strategy", "concurrency"):
         if key in job:
@@ -1221,13 +1237,10 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
         errors.append(f"{name}:user-flow-synthetic: must run the probe in exactly one unconditional step")
     else:
         probe = probes[0]
-        run = str(probe.get("run", ""))
-        if probe.get("env") != USER_FLOW_PROBE_ENV or re.search(r"\b(?:env|STAGING_PREVIEW_AUTHORIZATION)\b", run):
+        if probe.get("env") != USER_FLOW_PROBE_ENV:
             errors.append(f"{name}:user-flow-synthetic: preserve the exact origin, SHA and preview authority")
-        if '--expected-sha "$EXPECTED_SHA"' not in run or "set -euo pipefail" not in run:
-            errors.append(f"{name}:user-flow-synthetic: probe must enforce the exact deployed SHA")
-        if '[ -z "$STAGING_WORKER_URL" ]' not in run or "exit 1" not in run:
-            errors.append(f"{name}:user-flow-synthetic: an unset staging origin must fail, never pass empty")
+        if str(probe.get("run", "")).strip() != USER_FLOW_PROBE_RUN or "shell" in probe or "working-directory" in probe:
+            errors.append(f"{name}:user-flow-synthetic: preview authority must run only the exact readback probe")
     if str(workflow).count("inputs.verify_automod_preview") != 1 or "DISCORD_STAGING_BOT_TOKEN" in str(workflow):
         errors.append(f"{name}:user-flow-synthetic: keep preview opt-in and its credential in the pinned probe")
     checkouts = [step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")]
@@ -7598,6 +7611,7 @@ class WorkflowTests(unittest.TestCase):
             "release dropped": lambda w: w["jobs"].pop("staging-use-release"),
             "release not always": lambda w: job(w, "staging-use-release").update({"if": "success()"}),
             "release or-always": lambda w: job(w, "staging-use-release").update({"if": "always() || true"}),
+            "release accepts empty expiry": lambda w: job(w, "staging-use-release").update({"if": "always()"}),
             "release skips certify": lambda w: job(w, "staging-use-release").update(
                 {"needs": [n for n in job(w, "staging-use-release")["needs"] if n != "certify-promotion"]}),
             "release skips a consumer": lambda w: job(w, "staging-use-release").update(
@@ -7607,9 +7621,16 @@ class WorkflowTests(unittest.TestCase):
             "release skips history guard": lambda w: job(w, "staging-use-release").update(
                 {"needs": [n for n in job(w, "staging-use-release")["needs"] if n != "pinned-history-guard"]}),
             "release wrong environment": lambda w: job(w, "staging-use-release").update({"environment": "production"}),
+            "release job changes working directory": lambda w: job(w, "staging-use-release").update(
+                {"defaults": {"run": {"working-directory": "wrangler"}}}),
+            "release inherits a different working directory": lambda w: w.update(
+                {"defaults": {"run": {"working-directory": "wrangler"}}}),
             "release tolerated": lambda w: job(w, "staging-use-release").update({"continue-on-error": "true"}),
             "release no client": lambda w: next(step for step in job(w, "staging-use-release")["steps"]
                                                 if step.get("run") == "node wrangler/scripts/staging-use-pipeline.mjs finish").update({"run": "true"}),
+            "release uses a foreign expiry": lambda w: next(step for step in job(w, "staging-use-release")["steps"]
+                if step.get("run") == "node wrangler/scripts/staging-use-pipeline.mjs finish")["env"].update(
+                    {"STAGING_USE_EXPIRES_AT": "${{ inputs.staging_use_expires_at }}"}),
         }
         for label, mutate in mutations.items():
             changed = copy.deepcopy(staging)
@@ -8295,6 +8316,10 @@ class WorkflowTests(unittest.TestCase):
             "conditional": lambda w: w["jobs"]["user-flow-synthetic"].__setitem__("if", "false"),
             "tolerated": lambda w: probe(w).__setitem__("continue-on-error", "true"),
             "head sha only": lambda w: probe(w)["env"].__setitem__("EXPECTED_SHA", "${{ github.sha }}"),
+            "probe job changes working directory": lambda w: w["jobs"]["user-flow-synthetic"].update(
+                {"defaults": {"run": {"working-directory": "wrangler"}}}),
+            "probe inherits a different working directory": lambda w: w.update(
+                {"defaults": {"run": {"working-directory": "wrangler"}}}),
             "no sha pin": lambda w: probe(w).__setitem__(
                 "run", probe(w)["run"].replace('--expected-sha "$EXPECTED_SHA" ', "")),
             "empty origin passes": lambda w: probe(w).__setitem__(
@@ -8306,6 +8331,10 @@ class WorkflowTests(unittest.TestCase):
                 "permissions", {"contents": "write"}),
             "preview token unconditional": lambda w: probe(w)["env"].update({
                 "STAGING_PREVIEW_AUTHORIZATION": STAGING_CONTROL_ENV["OWNERSHIP_CONTROL_TOKEN"]}),
+            "append voice lane to the receipt step": lambda w: probe(w).update({
+                "run": probe(w)["run"] + "\npython3 scripts/staging_voice_synthetic.py"}),
+            "append lease acquisition to the receipt step": lambda w: probe(w).update({
+                "run": probe(w)["run"] + '\nnode wrangler/scripts/staging-use-"pipeline.mjs" begin'}),
             "certify ignores it": lambda w: w["jobs"]["certify-promotion"].__setitem__(
                 "needs", ["deploy", "voice-synthetic", "pinned-history-guard"]),
         }
