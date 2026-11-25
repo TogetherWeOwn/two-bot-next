@@ -33,12 +33,12 @@ test("CLI refuses a receipt in place of an action confirmation and omits extra r
   const startReceipt = {
     schema: "two-bot-staging-automod-job.v1", environment: "staging", action: "start",
     lease: expectedLease, observedAt: new Date(expectedLease.acquiredAt).toISOString(), verdict: "passed",
-    details: "synthetic receipt payload",
   };
+  const extraReceipt = { ...startReceipt, details: "synthetic receipt payload" };
   const confirmedRecovery = { verdict: "failed", start: false, recover: true };
   for (const { result, expected } of [
-    { result: { ...passed, start: startReceipt, startReceipt }, expected: unconfirmedActions },
-    { result: { ...confirmedRecovery, startReceipt }, expected: confirmedRecovery },
+    { result: { ...passed, start: startReceipt, startReceipt: extraReceipt }, expected: unconfirmedActions },
+    { result: { ...confirmedRecovery, startReceipt: extraReceipt }, expected: confirmedRecovery },
   ]) {
     const input = { expectedLease, attempt: { lease: expectedLease, result } };
     const run = spawnSync(process.execPath, [cli], { input: JSON.stringify(input), encoding: "utf8" });
