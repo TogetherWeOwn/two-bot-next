@@ -116,3 +116,78 @@ it on its ephemeral `agent-testdb` service; production/staging are forbidden.
 A missing/refused controller pool is not permission to build directly or use an
 external target. Hosted CI keeps its existing compiling commands on ephemeral
 runners, as required by the build-cache runbook.
+
+## Event write cutoff and rollback
+
+Keep Web event dispatch closed unless Bot Operations has qualified the current
+and every retained runtime against a verified independent control. This
+procedure describes a fallback for holding event writes closed. It carries
+no authority to change guild permissions or enable the receiver.
+
+### Enforcement
+
+The rollback-independent fallback is the Discord guild permission check at
+mutation time. The guild administrator owns the policy. Bot Operations is
+accountable for verifying the policy against the admitted runtime and rollback
+identities and recording the policy revision. Worker ownership and an ingress
+flag can block new work while leaving a sender with a committed claim on its
+way to Discord. Both the runtime and its retained rollback use Discord's API
+directly. A Worker outbound handler added to a newer revision would leave the
+retained Worker without that handler.
+
+| Signed action | Discord request |
+| --- | --- |
+| `event.upsert` create | `POST /guilds/{guild}/scheduled-events` |
+| `event.upsert` edit | `PATCH /guilds/{guild}/scheduled-events/{event}` |
+| `event.cancel` | The same `PATCH` with status 4 |
+| Alternate deletion | `DELETE /guilds/{guild}/scheduled-events/{event}` |
+| `role.assign` write | `PUT /guilds/{guild}/members/{member}/roles/{role}` |
+| `announcement.post` write | `POST /channels/{channel}/messages` |
+
+For each current and rollback credential, identify its Discord bot member and
+every guild and destination the affected routes can use. Remove effective
+`CREATE_EVENTS` and `MANAGE_EVENTS` at guild level for external events and on
+every eligible voice and stage channel for channel events. Check the bot's
+membership, all held roles including `@everyone`, channel overwrites including
+member-specific overrides, and guild ownership or `ADMINISTRATOR` bypass.
+Existing events the bot created can still be edited or deleted with
+`CREATE_EVENTS` alone. Verify that the bot cannot regain either permission
+through a role it can assign, through an overwrite it can change, or through
+an alternate credential. A role assignment must still have `MANAGE_ROLES` and
+an eligible role below the bot's highest role. Announcement channels must
+still allow the bot to view and send there, including any content permissions
+the configured messages require. Verify those positive controls separately for
+each identity. The scope is all scheduled-event writes by the affected identity
+in the covered guilds, including native bot writers. [Discord event permissions](https://docs.discord.com/developers/resources/guild-scheduled-event#guild-scheduled-event-permissions-requirements) · [Discord guild permissions](https://docs.discord.com/developers/topics/permissions#permission-overwrites)
+
+### Activation and recovery
+
+1. Close the Web dispatcher, pin current and retained Worker/OCI identities,
+   and identify the distinct Discord identities they use.
+2. In a separately authorized operation, the guild administrator applies the
+   event-denied policy. Record the guild and credential identities, protected
+   change or audit references, and an authenticated readback of effective roles,
+   hierarchy and overwrites. A missing, stale or incomplete readback keeps
+   dispatch closed. Readback identifies policy state and scope. It supplies
+   no per-attempt acknowledgement.
+3. Keep Discord permissions in place throughout process restart, database
+   restore, old/new overlap and Worker rollback. A Bot or database rollback
+   cannot restore Discord permissions. If a separate guild configuration restore
+   can change those permissions, require the effective policy to be read back
+   and held before that restore can be treated as covered.
+4. Reopening event permission is a separate administrator change, with Web
+   held closed. The event-denied fallback has no generation or per-attempt
+   permit that could authorize dispatch. An open policy by itself provides no
+   dispatch contract.
+
+A request evaluated by Discord before the policy change may already have
+affected an event. A permission rejection only establishes refusal of that
+specific Discord request. The current Bot relay returns a generic
+`discord_rejected` and gives Web no authenticated cutoff receipt linked to
+its original idempotency key, action and payload. Web must preserve the
+original key and keep ambiguous work held. An authenticated durable
+non-admission receipt would need to bind the original caller and key, action
+and payload, and attest no wire attempt was admitted on any covered path.
+An authenticated outcome proven against the original attempt may settle that
+attempt. A lost response, timeout, stale owner, revoked permit, permission
+readback, or elapsed time cannot settle it. Never dispatch under a second key.
