@@ -2377,6 +2377,32 @@ mod tests {
     }
 
     #[test]
+    fn release_ledger_json_matches_the_recovery_projection_fixture() {
+        let row = |version, description: &str| LedgerRow {
+            version,
+            description: description.to_owned(),
+            success: true,
+            checksum_hex: format!("{version:096x}"),
+        };
+        let cutover = [
+            row(474, "original cutover description"),
+            row(475, "migration 475"),
+        ];
+        let store = [
+            row(477, "original store description"),
+            row(478, "migration 478"),
+        ];
+        let expected: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/production_release_ledger_readback.json"
+        ))
+        .expect("valid shared recovery ledger fixture");
+        assert_eq!(
+            json!([ledger_json(&cutover), ledger_json(&store)]),
+            expected
+        );
+    }
+
+    #[test]
     fn release_ledgers_match_both_producing_plan_ledgers() {
         let [cutover, store] = [1, 2].map(|version| {
             [LedgerRow {
