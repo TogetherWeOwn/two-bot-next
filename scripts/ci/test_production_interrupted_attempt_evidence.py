@@ -125,6 +125,7 @@ class InterruptedAttemptEvidenceTests(unittest.TestCase):
 
         self.takeover.side_effect = commit_then_lose_reply
         for _ in range(2):
+            self.receipt.unlink(missing_ok=True)
             self.assertEqual(interrupted.main(["restart"], self.env, self.api), 0)
             result = json.loads(self.receipt.read_bytes())
             self.assertEqual(result["outcome"], {"state": "pre", "worker": self.pin.rollback_worker,
