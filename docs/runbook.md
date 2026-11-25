@@ -2804,6 +2804,58 @@ and both secrets must exist before dispatch; the host provisions them after
 this change merges. The cutover itself does not need this path: the fresh
 `two_bot` bootstrap uses the tested provisioner flow.
 
+#### Disable administrator bypass for migration apply
+
+1. Follow GitHub's documented Settings procedure. Sign in as a repository
+   administrator and open the existing environment under **Settings →
+   Environments → production-migrate-apply**. [GitHub environment settings](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments#creating-an-environment)
+2. Immediately before the save, read these GitHub REST endpoints using the
+   target repository in place of `OWNER/REPO`.
+
+   - `GET /repos/OWNER/REPO/environments/production-migrate-apply` for the
+     environment identity, `can_admins_bypass`, branch policy mode, and
+     built-in rules such as reviewers and wait timers. [Get an environment](https://docs.github.com/en/rest/deployments/environments#get-an-environment)
+   - `GET /repos/OWNER/REPO/environments/production-migrate-apply/deployment-branch-policies?per_page=2`
+     for the count and typed branch policy. [List deployment branch policies](https://docs.github.com/en/rest/deployments/branch-policies#list-deployment-branch-policies)
+   - `GET /repos/OWNER/REPO/environments/production-migrate-apply/deployment_protection_rules`
+     for enabled custom protection rules. [List enabled custom protection rules](https://docs.github.com/en/rest/deployments/protection-rules#get-all-deployment-protection-rules-for-an-environment)
+
+   Compare the controls with the approved setup baseline. The expected branch mode
+   is custom policies with one `branch_policy` rule and one typed entry for
+   branch `main`. If readback is incomplete, any other control has drifted,
+   or the setting is unavailable, stop and keep apply on hold for review.
+   If `can_admins_bypass` is already `false` and the controls match, record
+   that no save was needed.
+3. If bypass is `true`, deselect only **Allow administrators to bypass configured
+   protection rules** and click **Save protection rules** once. Repeat the
+   same reads immediately. Verify `can_admins_bypass` is `false` and compare
+   the environment identity and all other controls with the pre-save readback.
+   Stop and keep apply on hold if the readback fails or anything else changed.
+
+These synthetic, redacted response excerpts show the expected environment and
+typed policy after a successful save. In this example, the environment excerpt
+before the save differs only in `can_admins_bypass` (`true`).
+
+```json
+{
+  "name": "production-migrate-apply",
+  "can_admins_bypass": false,
+  "deployment_branch_policy": {"custom_branch_policies": true, "protected_branches": false},
+  "protection_rules": [{"type": "branch_policy"}]
+}
+```
+
+```json
+{"total_count": 1, "branch_policies": [{"type": "branch", "name": "main"}]}
+```
+
+If the existing guard reports `production_migration_environment_unprotected`,
+keep apply on hold. Report the exact refusal code, UTC check times, and a
+redacted before/after summary or the missing check to the release operator.
+Keep raw responses, screenshots, IDs, and credentials out of the report.
+
+#### Approve the reviewed plan
+
 After the independent release review, the designated App operator publishes
 a successful `production-migration-approval` check on the protected apply
 workflow SHA with external ID `production-apply:<plan run ID>:<archive SHA-256 without prefix>`.
