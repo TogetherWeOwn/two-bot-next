@@ -469,8 +469,9 @@ applicable. Keep credentials, raw responses and member data out of the record.
   the current qualifying staging attempt and its
   [promotion certificate](#build-identity-and-the-readyz-gate). The protected
   Bot migration workflow checks the original plan artifact, a matching fresh
-  plan and a still-valid approval check. A production migration apply job
-  that started after the plan was produced supersedes it. For Web, recheck the
+  plan and a still-valid approval check. A prior production migration dispatch
+  supersedes the plan if GitHub created it at or after the plan run's creation
+  time and its first attempt started a non-skipped apply job. For Web, recheck the
   candidate's staging deploy and E2E evidence against the serving version and
   soak. Where applicable, revalidate the exact
   [Kit cutover packet and proof](https://github.com/TogetherWeOwn/two-web-next/blob/main/docs/kit-cutover-release.md#protected-release-and-recovery).
@@ -486,9 +487,9 @@ applicable. Keep credentials, raw responses and member data out of the record.
   bind any required [restore rehearsal](#restore-evidence-for-release-approval)
   to that backup and its new copy. Follow the
   [production release gate](../CONTRIBUTING.md#production-release-gate) for
-  approval bound to the current plan and evidence. After dispatch, use that
-  rollout's smoke and [watch results](#post-deploy-watch) before returning
-  custody.
+  approval bound to the current plan and evidence. Use a fresh protected
+  dispatch for an authorized staged Bot promotion. After dispatch, use that
+  rollout's smoke and [watch results](#post-deploy-watch) before returning custody.
 
 ## Interrupted protected release
 
