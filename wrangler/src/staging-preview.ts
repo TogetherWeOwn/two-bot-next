@@ -1,6 +1,7 @@
 import { authenticated } from "./ownership.ts";
 import { withSecurityHeaders } from "./security-headers.ts";
 import { isSnowflake } from "./container-env.ts";
+export { parseUniqueJson as parseRegistryJson } from "./unique-json.ts";
 
 export const PREVIEW_HEADER = "x-two-staging-preview";
 // Match the pinned staging application and guild in the bot command registry.
@@ -46,26 +47,6 @@ async function registry(env: PreviewEnv, get: DiscordGet) {
   const list = await get(COMMANDS, token);
   if (!Array.isArray(list)) throw refuse();
   return { token, list };
-}
-
-/** JSON.parse validates the grammar first. Reject ambiguous object members
- * before an overwritten name or principal can be mistaken for absence. */
-export function parseRegistryJson(text: string): unknown {
-  const value: unknown = JSON.parse(text);
-  const scopes: (Set<string> | null)[] = [];
-  for (const match of text.matchAll(/"(?:[^"\\]|\\.)*"\s*:?|[{}\[\]]/g)) {
-    const token = match[0];
-    if (token === "{") scopes.push(new Set());
-    else if (token === "[") scopes.push(null);
-    else if (token === "}" || token === "]") scopes.pop();
-    else if (token.endsWith(":")) {
-      const keys = scopes.at(-1);
-      const key: string = JSON.parse(token.slice(0, -1));
-      if (!keys || keys.has(key)) throw refuse();
-      keys.add(key);
-    }
-  }
-  return value;
 }
 
 export async function readPreviewAbsent(env: PreviewEnv, get: DiscordGet): Promise<number> {
