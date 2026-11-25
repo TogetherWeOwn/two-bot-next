@@ -6,6 +6,7 @@ import re
 
 from ci.production_migrate_claim import WORKFLOW_PATH
 from production_migrate_approval import ARTIFACT, stable_plan, verify_check, verify_environment
+from rollback_proof import moment
 from production_recovery_artifact import protected_job
 from production_recovery_takeover import HEX, RUN_ID, SHA, UUID
 from production_release_forward import forward_receipt, ledger_endpoints
@@ -60,7 +61,7 @@ def verify_preflight(pin, target, plan, fresh, observe, control):
             and worker.get("traffic_percent") == 100 and image.get("image_digest") == pin.rollback_image
             and image.get("application_id") == pin.application_id and image.get("namespace_id") == pin.namespace_id
             and image.get("rollout_status") == "completed" and owner.get("phase") == "active"
-            and owner.get("running") is True and type(owner.get("epoch")) is int and 0 < owner["epoch"] < 2**53 - 2,
+            and owner.get("running") is True and type(owner.get("epoch")) is int and 0 < owner["epoch"] < 2**53 - 4,
             "production_release_retained_pair_changed")
     capability = control("takeover-capability", expected_deployment=pin.rollback_worker)
     require(capability == {"deploymentId": pin.rollback_worker, "exactTakeover": True}
@@ -71,8 +72,7 @@ def verify_preflight(pin, target, plan, fresh, observe, control):
     return owner["epoch"]
 
 
-def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_database, api=github):
-    """Recheck the current attempt's stopped writer and approval before applying."""
+def prepared_epoch(pin, run, plan_id, stopped):
     run_id = run.get("id")
     owner = mapping(stopped.get("owner"))
     epoch = owner.get("epoch")
@@ -84,7 +84,11 @@ def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_databas
             and owner.get("actor") == actor and type(epoch) is int and 1 < epoch < 2**53 - 1
             and type(owner.get("oldEpoch")) is int and owner["oldEpoch"] == epoch - 1,
             "production_forward_stopped_fence_unproved")
-    protected_job(run, api, PREPARE_JOB, PREPARE_STEPS)
+    return epoch
+
+
+def approved_plan(pin, run, plan_id, target, api=github):
+    require(matches(RUN_ID, plan_id) and plan_id != str(run["id"]), "production_forward_plan_changed")
     plan, artifact = authenticated_plan(plan_id, api, workflow=WORKFLOW_PATH, artifact_name=ARTIFACT)
     require(plan.get("mode") == "plan" and plan.get("migration_target") == "production"
             and plan.get("role") == "two_bot_migrator_ro" and plan.get("target") == target
@@ -93,8 +97,21 @@ def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_databas
             "production_forward_plan_changed")
     ledger_endpoints(plan)
     verify_environment(api)
-    verify_check(api, run, f"production-apply:{plan_id}:{artifact['archive_digest'].removeprefix('sha256:')}",
-                 datetime.now(timezone.utc))
+    _, approved_at = verify_check(
+        api, run, f"production-apply:{plan_id}:{artifact['archive_digest'].removeprefix('sha256:')}",
+        datetime.now(timezone.utc),
+    )
+    require(moment(api(f"actions/runs/{plan_id}").get("created_at")) <= approved_at,
+            "independent_production_approval_stale")
+    return plan, artifact
+
+
+def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_database, api=github):
+    """Recheck the current attempt's stopped writer and approval before applying."""
+    epoch = prepared_epoch(pin, run, plan_id, stopped)
+    run_id = run["id"]
+    protected_job(run, api, PREPARE_JOB, PREPARE_STEPS)
+    plan, artifact = approved_plan(pin, run, plan_id, target, api)
     receipt = forward_receipt(plan_id, plan, apply_database(plan_id, plan))
     return {**receipt, "run_id": str(run_id), "run_attempt": 1, "stopped_epoch": epoch,
             "plan_archive_sha256": artifact["archive_digest"], "release_reference": plan["recovery_evidence_ref"]}

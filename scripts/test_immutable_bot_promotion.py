@@ -280,6 +280,24 @@ class ImmutablePromotionIntakeTests(PromotionFixture):
             self.assertEqual(self.mutations, [(STAGE_IMAGE, PROD_REPO)])
             self.assertEqual(json.loads((self.out / "admitted.json").read_text())["receipt"]["source"]["sha"], SHA)
 
+    def test_protected_admission_checks_the_approved_archive_and_image_before_copy(self):
+        args = ["admit", "--sha", SHA, "--run-id", str(STAGE_RUN), "--attempt", str(ATTEMPT),
+                "--account-id", "acct", "--out", str(self.out)]
+        archive = self.github.artifact["digest"]
+        image = receipt()["container"]["digest"]
+        wrong = "sha256:" + "7" * 64
+        for archive_pin, image_pin in ((wrong, image), (archive, wrong)):
+            with self.subTest(archive=archive_pin, image=image_pin):
+                self.assertNotEqual(self.command(args + ["--approved-archive", archive_pin,
+                                                         "--approved-image", image_pin]), 0)
+                self.assertEqual(self.mutations, [])
+        approved = args + ["--approved-archive", archive, "--approved-image", image]
+        self.assertEqual(self.command(approved + ["--verify-only"]), 0)
+        self.assertEqual(self.mutations, [])
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.command(approved), 0)
+        self.assertEqual(self.mutations, [(STAGE_IMAGE, PROD_REPO)])
+
     def test_exact_staged_bytes_and_digest_reach_real_production_render_without_build(self):
         self.assertEqual(self.certify(), 0)
         self.github = GitHubFixture(self.output_zip.read_bytes())

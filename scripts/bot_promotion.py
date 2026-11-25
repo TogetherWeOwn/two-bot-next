@@ -663,7 +663,10 @@ def _admit(args, github, copy_image):
             or workflow_run.get("head_branch") != STAGING_BRANCH
             or workflow_run.get("head_sha") != run["head_sha"]):
         raise PromotionError("artifact run binding mismatch")
-    if not _is_digest(meta.get("digest")):
+    approved_archive = getattr(args, "approved_archive", None)
+    approved_image = getattr(args, "approved_image", None)
+    if (not _is_digest(meta.get("digest"))
+            or approved_archive is not None and meta["digest"] != approved_archive):
         raise PromotionError("artifact digest mismatch")
 
     # 4. The archive bytes, digest-bound before anything is unpacked.
@@ -692,6 +695,13 @@ def _admit(args, github, copy_image):
     if (_staging_image_pattern(args.account_id).fullmatch(staging_image) is None):
         raise PromotionError("staging image mismatch")
     digest = receipt["container"]["digest"]
+    if approved_image is not None and digest != approved_image:
+        raise PromotionError("approved staging image mismatch")
+    if getattr(args, "verify_only", False):
+        if not (_is_digest(approved_archive) and _is_digest(approved_image)):
+            raise PromotionError("verification needs both approved digests")
+        print("approved staging archive and image verified")
+        return 0
     repository = f"{REGISTRY_HOST}/{args.account_id}/{PRODUCTION_APP}"
     expected = repository + "@" + digest
 
@@ -747,6 +757,9 @@ def _parse_cli_args(argv):
     admit.add_argument("--attempt", required=True)
     admit.add_argument("--account-id", required=True)
     admit.add_argument("--out", required=True)
+    admit.add_argument("--approved-archive")
+    admit.add_argument("--approved-image")
+    admit.add_argument("--verify-only", action="store_true")
     return parser.parse_args(argv)
 
 
