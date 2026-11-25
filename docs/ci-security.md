@@ -46,19 +46,23 @@ are rebuilt. The REST commit-to-PR endpoint promises commit associations,
 and `GET /pulls/{number}` can refresh an already identified PR. Neither
 supplies that mapping. For example, the archived run below has an empty
 `pull_requests` array in the workflow-run API, while the commit-to-PR
-lookup for its group SHA returned #1861. Those responses provide no proof
-of the full group membership.
+lookup for its group SHA returned #1861. That PR's recorded merge commit
+equals the group SHA. Those responses provide no proof of the full group
+membership at check time.
 [GraphQL queue entries][queue-entry] · [Commit associations][commit-pulls] ·
 [PR details][pr-details] · [Archived run][archived-group] ·
-[Run API response][archived-run-api] · [Commit lookup][archived-commit-pulls]
+[Run API response][archived-run-api] · [Commit lookup][archived-commit-pulls] ·
+[Merged PR metadata][archived-pr]
 
-The verifier refuses `merge_group` in verify mode before publishing
+The advisory `pr-evidence` workflow subscribes to PR events and pushes to
+`main`. Its verifier refuses `merge_group` in verify mode before publishing
 evidence. A future adapter needs a supported source that binds the exact
-group to every member, then must validate each member with its own current
-repository, PR number, base SHA and head SHA. Missing or ambiguous
-membership, or a changed member snapshot at the final read, must refuse
-the whole group. Even with that mapping, a PR description can change
-after the last read without changing a commit SHA. The documented merge
+group to every member. Use each member's own repository, PR number, base
+SHA and head SHA with `evaluate_current` and check each verdict with
+`matches_current` before use. Missing or ambiguous membership, or a changed
+member snapshot at the final read, must refuse the whole group. Even with
+that mapping, a PR description can change after the last read without
+changing a commit SHA. The documented merge
 API precondition pins the PR head SHA, and GitHub documents no group
 invalidation on same-head description edits. Keep the advisory edit
 procedure in force.
@@ -66,20 +70,24 @@ procedure in force.
 
 #### Validate in a disposable queue
 
-1. Use an already-provisioned disposable repository with an isolated merge
-   queue that can build two groups concurrently. Use an existing required
-   check that permits the synthetic PR heads to enter the queue and stays
-   pending on group SHAs so the fixture cannot merge. Use two drafts with
-   harmless, independent changes and synthetic descriptions. Mark them
-   ready only in the fixture, then queue them in order. Drafts cannot be
-   merged. Leave the pending check untouched.
+1. Use an already-provisioned disposable repository with no deploy or
+   release workflows and an isolated queue that can build two groups
+   concurrently. Start with two drafts with synthetic descriptions that
+   each add a distinct marker file. Confirm both markers are absent
+   from the fixture target branch. GitHub blocks draft merges, so mark
+   the PRs ready before queueing them in order. Use an existing required
+   check that passes on the PR heads and stays pending on group SHAs
+   to prevent merging once the PRs are ready. Leave that check pending and
+   collect the observations before the queue's status-check timeout.
    [Draft PR behavior][draft-prs]
 2. From a trusted recorder, capture the group base and head refs and SHAs
    for each `checks_requested` delivery. The group for the second PR
    should contain both fixture PRs while the first remains ahead of it.
-   Compare that set to the candidate API's result for the exact SHA.
-   Read all queue-entry pages and collect the
-   entry position, entry base and head OIDs, PR number and PR head OID.
+   Inspect the commit tree at that group's exact head SHA and confirm
+   both marker files have their expected contents before interpreting
+   the API results. Compare both fixture PRs to the candidate API's
+   result for that SHA. Read all queue-entry pages and collect each
+   entry's position, base and head OIDs, PR number and PR head OID.
    Also read the REST workflow-run associations, commit-to-PR associations
    and current metadata for each known fixture PR. Record the response
    status, identity fields and description digest. Keep the raw bodies,
@@ -101,6 +109,7 @@ procedure in force.
 [archived-group]: https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40761465005
 [archived-run-api]: https://api.github.com/repos/TogetherWeOwn/two-bot-next/actions/runs/40761465005
 [archived-commit-pulls]: https://api.github.com/repos/TogetherWeOwn/two-bot-next/commits/76b048e3b39c757742e0f7d0af9ce2c425354dfb/pulls
+[archived-pr]: https://api.github.com/repos/TogetherWeOwn/two-bot-next/pulls/1861
 [merge-api]: https://docs.github.com/en/rest/pulls/pulls?apiVersion=2022-11-28#merge-a-pull-request
 [draft-prs]: https://docs.github.com/en/pull-requests/reference/pull-requests#draft-pull-requests
 
