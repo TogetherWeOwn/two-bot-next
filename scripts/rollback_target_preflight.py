@@ -355,9 +355,9 @@ def validate_live(client, snapshot, receipt):
     wcr.validate_receipt_against_live(client, receipt)
 
 
-def command(argv, env=None, input_bytes=None):
+def command(argv, env=None, input_bytes=None, *, cwd=None):
     try:
-        result = subprocess.run(argv, check=True, capture_output=True, env=env, input=input_bytes,
+        result = subprocess.run(argv, check=True, capture_output=True, env=env, input=input_bytes, cwd=cwd,
                                 timeout=COMMAND_TIMEOUT_SECONDS)
     except (OSError, subprocess.SubprocessError):
         raise GateError("registry_command_failed") from None

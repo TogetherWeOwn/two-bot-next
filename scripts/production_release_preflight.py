@@ -6,6 +6,7 @@ import re
 
 from ci.production_migrate_claim import WORKFLOW_PATH
 from production_migrate_approval import ARTIFACT, stable_plan, verify_check, verify_environment
+from rollback_proof import moment
 from production_recovery_artifact import protected_job
 from production_recovery_takeover import HEX, RUN_ID, SHA, UUID
 from production_release_forward import forward_receipt
@@ -61,7 +62,7 @@ def verify_preflight(pin, target, plan, fresh, observe, control):
             and worker.get("traffic_percent") == 100 and image.get("image_digest") == pin.rollback_image
             and image.get("application_id") == pin.application_id and image.get("namespace_id") == pin.namespace_id
             and image.get("rollout_status") == "completed" and owner.get("phase") == "active"
-            and owner.get("running") is True and type(owner.get("epoch")) is int and 0 < owner["epoch"] < 2**53 - 2,
+            and owner.get("running") is True and type(owner.get("epoch")) is int and 0 < owner["epoch"] < 2**53 - 4,
             "production_release_retained_pair_changed")
     capability = control("takeover-capability", expected_deployment=pin.rollback_worker)
     require(capability == {"deploymentId": pin.rollback_worker, "exactTakeover": True}
@@ -102,8 +103,10 @@ def approved_plan(pin, run, plan_id, target, api=github):
             "production_forward_plan_changed")
     ledger_endpoints(plan)
     verify_environment(api)
-    verify_check(api, run, f"production-apply:{plan_id}:{artifact['archive_digest'].removeprefix('sha256:')}",
-                 datetime.now(timezone.utc))
+    _, approved_at = verify_check(api, run, f"production-apply:{plan_id}:{artifact['archive_digest'].removeprefix('sha256:')}",
+                                  datetime.now(timezone.utc))
+    require(moment(mapping(api(f"actions/runs/{plan_id}")).get("created_at")) <= approved_at,
+            "independent_production_approval_stale")
     return plan, artifact
 
 
