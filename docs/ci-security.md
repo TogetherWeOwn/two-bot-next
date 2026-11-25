@@ -57,15 +57,17 @@ membership at check time.
 The advisory `pr-evidence` workflow subscribes to PR events and pushes to
 `main`. Its verifier refuses `merge_group` in verify mode before publishing
 evidence. A future adapter needs a supported source that binds the exact
-group to every member. Use each member's own repository, PR number, base
-SHA and head SHA with `evaluate_current` and check each verdict with
-`matches_current` before use. Missing or ambiguous membership, or a changed
-member snapshot at the final read, must refuse the whole group. Even with
-that mapping, a PR description can change after the last read without
-changing a commit SHA. The documented merge
-API precondition pins the PR head SHA, and GitHub documents no group
-invalidation on same-head description edits. Keep the advisory edit
-procedure in force.
+group to every PR number and queued PR head SHA. Confirm each PR's
+current base ref matches the protected target. Pass the target repository
+(`base.repo.full_name`, including for fork PRs), PR number, current PR base
+SHA and group-bound PR head SHA to `evaluate_current`. Before use, recheck
+membership and each target ref and call `matches_current` for every verdict.
+Missing or ambiguous membership, or a changed member snapshot at the final
+read, must refuse the whole group. Even with that mapping, a PR description
+can change after the last read without changing a commit SHA. The
+documented merge API precondition pins the PR head SHA, and GitHub documents
+no group invalidation on same-head description edits. Keep the advisory
+edit procedure in force.
 [PR merge API][merge-api] · [Exact-head CI evidence](../CONTRIBUTING.md#exact-head-ci-evidence)
 
 #### Validate in a disposable queue
