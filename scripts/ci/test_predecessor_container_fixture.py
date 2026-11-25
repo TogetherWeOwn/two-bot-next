@@ -21,7 +21,7 @@ POSTGRES_IMAGE = "sha256:" + "c" * 64
 MOCK_IMAGE = "sha256:" + "d" * 64
 
 
-def query_ledger(query, tip):
+def query_ledger(query, tip, *, recovery_timestamp):
     """Evaluate the fixture's check against an in-memory PRE projection."""
     with closing(sqlite3.connect(":memory:")) as db:
         db.executescript("""
@@ -44,10 +44,10 @@ def query_ledger(query, tip):
             db.executescript("""
                 ALTER TABLE event_instance_windows ADD COLUMN attendance_recovered_at INT;
                 UPDATE _sqlx_migrations SET installed_on = 1800000001 WHERE version = 475;
-                UPDATE event_instance_windows SET attendance_recovered_at = 1800000001;
                 INSERT INTO information_schema.columns VALUES
                     ('public', 'event_instance_windows', 'attendance_recovered_at');
             """)
+            db.execute("UPDATE event_instance_windows SET attendance_recovered_at = ?", (recovery_timestamp,))
         # SQLite needs a SELECT list. MIN implements bool_and over these non-null booleans.
         query = query.replace("SELECT FROM information_schema", "SELECT 1 FROM information_schema")
         result, = db.execute(query.replace("bool_and(", "min(")).fetchone()
@@ -88,6 +88,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
         for tip, post_start_tip, failure in [
             (473, 473, None), (475, 475, None),
             (473, 475, "ledger"), (475, 473, "ledger_query"),
+            (475, 475, "retained_timestamp"),
             (473, 473, "stamp"), (475, 475, "checkpoint"),
             (473, 473, "setup"), (475, 475, "premature"), (473, 473, "cancel"),
         ]:
@@ -149,8 +150,11 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                     observed_tip = tip if deployment is None else post_start_tip
                     if failure == "setup":
                         return "f"
+                    recovery_timestamp = 1_800_000_001
+                    if deployment is not None and failure == "retained_timestamp":
+                        recovery_timestamp += 1
                     try:
-                        return query_ledger(input_data, observed_tip)
+                        return query_ledger(input_data, observed_tip, recovery_timestamp=recovery_timestamp)
                     except sqlite3.OperationalError as error:
                         self.assertEqual(str(error), "no such column: attendance_recovered_at")
                         raise fixture.Refused("Docker exec failed") from None
@@ -186,6 +190,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                 elif failure:
                     expected = {"ledger": "^PRE snapshot changed during startup$",
                                 "ledger_query": "^Docker exec failed$",
+                                "retained_timestamp": "^PRE snapshot changed during startup$",
                                 "stamp": "stamp mismatch", "checkpoint": "checkpoint missing",
                                 "premature": "pre-READY state invalid", "setup": "snapshot readback failed"}
                     with self.assertRaisesRegex(fixture.Refused, expected[failure]):
@@ -194,7 +199,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                     self.assertEqual(rehearse(), {"cutover": tip, "store": 465, "process": "live",
                                                 "database": "ready", "mock_gateway": "checkpointed",
                                                 "pre_ready_status": 503, "ready_status": 200})
-                if failure in (None, "ledger", "ledger_query"):
+                if failure in (None, "ledger", "ledger_query", "retained_timestamp"):
                     self.assertEqual([(event, app) for event, app, *_ in trace],
                                      [("ledger", None), ("started", deployment), (Endpoint.HEALTH, deployment),
                                       (Endpoint.READINESS, deployment), (Endpoint.READINESS, deployment),
