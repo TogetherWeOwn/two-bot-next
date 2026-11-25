@@ -2064,7 +2064,7 @@ test("different-deployment takeover at the fresh epoch still commits", async (t)
   assert.equal(h.runtime.destroys, 0);
 });
 
-test("PRE predecessor keeps ordinary ownership and the retained Rust build on boot", async (t) => {
+test("PRE predecessor preserves readiness build fields through ordinary ownership and boot", async (t) => {
   const outbound = t.mock.method(globalThis, "fetch", () => {
     throw new Error("unexpected outbound fetch during the PRE boot fixture");
   });
@@ -2104,13 +2104,15 @@ test("PRE predecessor keeps ordinary ownership and the retained Rust build on bo
   const report = { ready: true, components: [["process", "ready"], ["gateway", "ready"], ["database", "ready"]],
     jobs: {}, ...manifest.rustBuild };
   h.setProbeStatus(200);
-  h.setProbeResponse((status) => Response.json(report, { status }));
+  h.setProbeResponse((status) =>
+    Response.json(h.requests.at(-1)?.pathname === "/readyz" ? report : { status: "ok" }, { status }));
   for (let probe = 0; probe < 2; probe++) {
     const response = await readyz();
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("x-two-worker-version"), manifest.workerVersion);
     assert.deepEqual(await response.json(), report);
   }
+  assert.equal(h.requests.filter(({ pathname }) => pathname === "/readyz").length, 2);
   assert.equal(h.starts.length, 1);
   assert.deepEqual(h.starts[0]?.env, EXPECTED_ENV);
   assert.equal(h.runtime.destroys, 0);
