@@ -63,8 +63,8 @@ export async function runProtectedAutomod(call: ProtectedAutomodCall, authority:
       if (action === "start" && !bound.active) throw refused();
       const result = await operation();
       if (action === "recover") {
-        // A missing journal is not successful cleanup. The same-lease
-        // completion receipt also covers retry after an interrupted release.
+        // Require durable same-lease completion for both publication cleanup
+        // and unused retirement, including retry after an interrupted release.
         if (!await journal.completedFor(issued)) throw refused();
         await staging.releaseAutomod(issued, await authority.identity());
       }

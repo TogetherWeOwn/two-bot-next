@@ -1,8 +1,10 @@
 import { isSnowflake } from "./container-env.ts";
 import type { admitStagingAutomod } from "./staging-automod.ts";
-import { MAX_STAGING_USE_MS, type StagingUse } from "./staging-lifecycle.ts";
+import type { StagingUse } from "./staging-lifecycle.ts";
+import { AUTOMOD_STAGING_PURPOSE, MAX_STAGING_USE_MS } from "./staging-use-window.ts";
 
 const KEY = "two-bot:staging-automod-recovery:v1";
+const RESERVATION_KEY = "two-bot:staging-automod-reservation:v1";
 // Same fixed guild slash identity as the protected staging preview reader.
 export const STAGING_AUTOMOD_TARGET = Object.freeze({
   applicationId: "1469137636663758888", guildId: "1545644954272137297",
@@ -20,15 +22,20 @@ export type AutomodIntent = Readonly<{
 }>;
 export type AutomodOwnedCommand = CommandRevision & Readonly<{ intent: AutomodIntent }>;
 
-type Journal = Readonly<{
+type IntentJournal = Readonly<{
   intent: AutomodIntent;
   phase: "publishing" | "ready" | "starting" | "cleanup" | "complete";
   created: CommandRevision | null;
 }>;
 
+type Reservation<Phase extends "reserved" | "retired"> = Readonly<{ lease: Lease; phase: Phase }>;
+type ReservationJournal = Reservation<"reserved"> | Reservation<"retired">;
+type Journal = IntentJournal | ReservationJournal;
+
 interface JournalStorage {
   get(key: string): Promise<unknown>;
   put(key: string, journal: Journal): Promise<void>;
+  put(entries: Record<string, Journal | null>): Promise<void>;
   sync(): Promise<void>;
 }
 
@@ -89,12 +96,16 @@ function validIntent(value: unknown): value is AutomodIntent {
     && typeof baseline === "string" && /^[0-9a-f]{64}$/.test(baseline);
 }
 
-function copyIntent(intent: AutomodIntent): AutomodIntent {
-  const { deploymentId, sha, epoch, runId, runAttempt, acquiredAt, expiresAt } = intent.lease;
+function copyLease(lease: Lease): Lease {
+  const { deploymentId, sha, epoch, runId, runAttempt, acquiredAt, expiresAt } = lease;
   return Object.freeze({
-    lease: Object.freeze({
-      environment: "staging", phase: "active", deploymentId, sha, epoch, runId, runAttempt, acquiredAt, expiresAt,
-    }),
+    environment: "staging", phase: "active", deploymentId, sha, epoch, runId, runAttempt, acquiredAt, expiresAt,
+  });
+}
+
+function copyIntent(intent: AutomodIntent): AutomodIntent {
+  return Object.freeze({
+    lease: copyLease(intent.lease),
     target: STAGING_AUTOMOD_TARGET,
     publishBefore: intent.publishBefore,
     baseline: intent.baseline,
@@ -118,6 +129,10 @@ function sameRevision(expected: CommandRevision, actual: CommandRevision): boole
   return expected.id === actual.id && expected.version === actual.version;
 }
 
+function canReplaceIntent(journal: IntentJournal | undefined, lease: Lease): boolean {
+  return !journal || (journal.phase === "complete" && !sameLease(journal.intent.lease, lease));
+}
+
 /** Dormant DO journal. The existing ownership gate must serialize each whole
  * operation with publication, cleanup, lifecycle and other registry writers.
  * The active hold must bar competing uses across restart. This class supplies
@@ -130,15 +145,41 @@ export class StagingAutomodRecovery {
     this.storage = storage;
   }
 
-  /** Resume using the original intent, even if the live lease expired or was released. */
-  async pending(): Promise<AutomodIntent | undefined> {
-    const journal = await this.read();
-    return journal?.phase === "complete" ? undefined : journal?.intent;
+  /** Use the original tuple even after expiry. An unused reservation also holds the gate. */
+  async pending(): Promise<AutomodIntent | Reservation<"reserved"> | undefined> {
+    const intent = await this.readIntent();
+    if (intent && intent.phase !== "complete") return intent.intent;
+    const reservation = await this.readReservation();
+    if (reservation?.phase === "reserved" && canReplaceIntent(intent, reservation.lease)) return reservation;
   }
 
   async completedFor(lease: Lease): Promise<boolean> {
-    const journal = await this.read();
-    return journal?.phase === "complete" && sameLease(journal.intent.lease, lease);
+    const intent = await this.readIntent();
+    if (intent?.phase === "complete" && sameLease(intent.intent.lease, lease)) return true;
+    if (lease.purpose !== AUTOMOD_STAGING_PURPOSE || !canReplaceIntent(intent, lease)) return false;
+    const reservation = await this.readReservation();
+    return reservation?.phase === "retired" && sameLease(reservation.lease, lease);
+  }
+
+  /** Include this record in the same storage write as the new active lease. */
+  async reservation(lease: Lease): Promise<Record<typeof RESERVATION_KEY, Reservation<"reserved">>> {
+    if (!validLease(lease) || lease.purpose !== AUTOMOD_STAGING_PURPOSE) {
+      throw new Error("staging_automod_intent_invalid");
+    }
+    const old = await this.readReservation();
+    if ((old && (old.phase === "reserved" || sameLease(old.lease, lease))) || !canReplaceIntent(await this.readIntent(), lease)) {
+      throw new Error("staging_automod_intent_held");
+    }
+    return { [RESERVATION_KEY]: { lease: { ...copyLease(lease), purpose: AUTOMOD_STAGING_PURPOSE }, phase: "reserved" } };
+  }
+
+  async retireReservation(lease: Lease, confirmStop: () => Promise<void>): Promise<void> {
+    const journal = await this.pending();
+    if (!journal || !("phase" in journal) || lease.purpose !== AUTOMOD_STAGING_PURPOSE || !sameLease(journal.lease, lease)) {
+      throw new Error("staging_automod_recovery_mismatch");
+    }
+    await confirmStop();
+    await this.write({ ...journal, phase: "retired" });
   }
 
   /** The publication adapter supplies a digest from its fresh absent registry
@@ -149,8 +190,9 @@ export class StagingAutomodRecovery {
     if (!validIntent(intent)) throw new Error("staging_automod_intent_invalid");
     const saved = copyIntent(intent);
     const { lease, publishBefore } = saved;
-    const old = await this.read();
-    if (old && (old.phase !== "complete" || sameLease(old.intent.lease, lease))) {
+    const old = await this.readReservation();
+    const canPublish = old?.phase === "reserved" ? sameLease(old.lease, lease) : !old || !sameLease(old.lease, lease);
+    if (!canPublish || !canReplaceIntent(await this.readIntent(), lease)) {
       throw new Error("staging_automod_intent_held");
     }
     const requireActive = async () => {
@@ -164,7 +206,7 @@ export class StagingAutomodRecovery {
       }
     };
     await requireActive();
-    await this.write({ intent: saved, phase: "publishing", created: null });
+    await this.write({ intent: saved, phase: "publishing", created: null }, old !== undefined);
     await requireActive();
     return true;
   }
@@ -172,7 +214,7 @@ export class StagingAutomodRecovery {
   /** Record only a validated fresh-create receipt. The adapter still owes
    * the positive detail and full-registry delta before it reports success. */
   async recordCreated(command: AutomodOwnedCommand): Promise<true> {
-    const journal = await this.read();
+    const journal = await this.readIntent();
     if (!journal || journal.phase !== "publishing" || !validRevision(command) || !sameIntent(journal.intent, command.intent)
       || (journal.created !== null && !sameRevision(journal.created, command))) {
       throw new Error("staging_automod_receipt_mismatch");
@@ -186,7 +228,7 @@ export class StagingAutomodRecovery {
   /** A create receipt alone does not authorize boot. Call after the full
    * registry delta and scoped detail match have been verified. */
   async confirmPublication(command: AutomodOwnedCommand): Promise<void> {
-    const journal = await this.read();
+    const journal = await this.readIntent();
     if (!journal || journal.phase !== "publishing" || !journal.created
       || !sameIntent(journal.intent, command.intent) || !sameRevision(journal.created, command)) {
       throw new Error("staging_automod_receipt_mismatch");
@@ -197,7 +239,7 @@ export class StagingAutomodRecovery {
   /** Spend the startup grant before invoking the runtime. A lost response
    * leaves recovery as the only allowed operation on this intent. */
   async claimStartup(expected: Lease, check: (intent: AutomodIntent) => Promise<void>): Promise<AutomodIntent> {
-    const journal = await this.read();
+    const journal = await this.readIntent();
     if (!journal || journal.phase !== "ready" || !sameLease(journal.intent.lease, expected)) {
       throw new Error("staging_automod_startup_refused");
     }
@@ -209,7 +251,7 @@ export class StagingAutomodRecovery {
   /** Fence new publication before inspection. Finish only on affirmative
    * absence and confirmed stop under the existing cleanup authority. */
   async recover(lease: Lease, adapter: AutomodCleanup): Promise<void> {
-    let journal = await this.read();
+    let journal = await this.readIntent();
     if (!journal || !sameLease(journal.intent.lease, lease)) {
       throw new Error("staging_automod_recovery_mismatch");
     }
@@ -252,14 +294,17 @@ export class StagingAutomodRecovery {
     return command === null ? null : Object.freeze(command);
   }
 
-  private async read(): Promise<Journal | undefined> {
-    let value: unknown;
+  private async readValue(key: string): Promise<unknown> {
     try {
       // An earlier failed flush can leave a speculative record in the DO cache.
       await this.storage.sync();
-      value = await this.storage.get(KEY);
+      return await this.storage.get(key);
     }
     catch { throw new Error("staging_automod_storage_unavailable"); }
+  }
+
+  private async readIntent(): Promise<IntentJournal | undefined> {
+    const value = await this.readValue(KEY);
     if (value === undefined) return undefined;
     if (!record(value) || !validIntent(value.intent)
       || (value.phase !== "publishing" && value.phase !== "ready" && value.phase !== "starting"
@@ -272,9 +317,26 @@ export class StagingAutomodRecovery {
     return { intent: copyIntent(value.intent), phase: value.phase, created };
   }
 
-  private async write(journal: Journal): Promise<void> {
+  private async readReservation(): Promise<ReservationJournal | undefined> {
+    const value = await this.readValue(RESERVATION_KEY);
+    if (value === undefined || value === null) return undefined;
+    if (!record(value) || Object.keys(value).length !== 2 || (value.phase !== "reserved" && value.phase !== "retired")
+      || !validLease(value.lease) || value.lease.purpose !== AUTOMOD_STAGING_PURPOSE) {
+      throw new Error("staging_automod_storage_invalid");
+    }
+    const lease = Object.freeze({ ...copyLease(value.lease), purpose: AUTOMOD_STAGING_PURPOSE });
+    if (Object.keys(value.lease).length !== Object.keys(lease).length) throw new Error("staging_automod_storage_invalid");
+    return value.phase === "reserved" ? { lease, phase: "reserved" } : { lease, phase: "retired" };
+  }
+
+  private async write(journal: Journal, consumeReservation = false): Promise<void> {
     try {
-      await this.storage.put(KEY, journal);
+      if (consumeReservation) {
+        // Use one write so a lost intent can never expose stale unused evidence.
+        await this.storage.put({ [KEY]: journal, [RESERVATION_KEY]: null });
+      } else {
+        await this.storage.put("intent" in journal ? KEY : RESERVATION_KEY, journal);
+      }
       await this.storage.sync();
     } catch { throw new Error("staging_automod_storage_unavailable"); }
   }
