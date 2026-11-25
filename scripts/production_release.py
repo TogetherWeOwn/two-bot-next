@@ -168,20 +168,16 @@ def write_json(path, value):
     path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
-def output(env, key, value):
+def output(env, **fields):
     with Path(env["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
-        print(f"{key}={value}", file=handle)
-
-
-def artifact_outputs(env, pin):
-    output(env, "archive", pin.candidate_archive)
-    output(env, "image", pin.candidate_image)
+        for key, value in fields.items():
+            print(f"{key}={value}", file=handle)
 
 
 def main(argv, env):
     try:
         if argv == ["version"]:
-            output(env, "worker", produced_version(env["WRANGLER_DEPLOY_OUTPUT"]))
+            output(env, worker=produced_version(env["WRANGLER_DEPLOY_OUTPUT"]))
             return 0
         directory = Path(env["RUNNER_TEMP"]) / "production-release"
         directory.mkdir(mode=0o700, exist_ok=True)
@@ -218,8 +214,7 @@ def main(argv, env):
             epoch = verify_preflight(pin, plan["target"], plan, fresh, lambda: read_status(env), control)
             write_json(directory / "preflight.json", {"pin": asdict(pin), "epoch": epoch,
                        "run_id": str(run["id"]), "plan_run_id": plan_id, "plan_archive_sha256": artifact["archive_digest"]})
-            output(env, "epoch", epoch)
-            artifact_outputs(env, pin)
+            output(env, epoch=epoch, archive=pin.candidate_archive, image=pin.candidate_image)
         elif argv == ["stop"]:
             proof = mapping(decode((directory / "preflight.json").read_bytes()))
             require(proof["pin"] == asdict(pin) and proof["plan_archive_sha256"] == artifact["archive_digest"]
@@ -227,14 +222,14 @@ def main(argv, env):
                     "production_release_preflight_plan_changed")
             ack = stop_prior_pair(pin, str(run["id"]), proof["epoch"], lambda: read_status(env), control)
             write_json(directory / "stopped.json", ack)
-            output(env, "ack", json.dumps(ack, separators=(",", ":")))
+            output(env, ack=json.dumps(ack, separators=(",", ":")))
         elif argv in (["authorize-deploy"], ["takeover"]):
             recovery = forward_document(env, pin, run, plan_id, plan, artifact)
             if argv == ["authorize-deploy"]:
                 state = read_status(env)
                 require(matches_pair(state, pin, pin.rollback_worker, pin.rollback_sha, pin.rollback_image)
                         and is_stopped(state, recovery.fence_epoch, actor), "production_stopped_fence_unproved")
-                artifact_outputs(env, pin)
+                output(env, archive=pin.candidate_archive, image=pin.candidate_image)
             else:
                 take_over(pin, recovery, env["NEW_VERSION"],
                           lambda: read_status(env, allow_rollout=True), control)

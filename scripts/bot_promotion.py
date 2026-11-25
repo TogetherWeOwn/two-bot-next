@@ -673,10 +673,8 @@ def _admit(args, github, copy_image):
             or meta.get("digest") != entry.get("digest")):
         raise PromotionError("artifact record mismatch")
     validate_artifact_run(meta, run_id=run_id, repo_id=repo_id, head_sha=run["head_sha"])
-    approved_archive = getattr(args, "approved_archive", None)
-    approved_image = getattr(args, "approved_image", None)
     if (not _is_digest(meta.get("digest"))
-            or approved_archive is not None and meta["digest"] != approved_archive):
+            or args.approved_archive is not None and meta["digest"] != args.approved_archive):
         raise PromotionError("artifact digest mismatch")
 
     # 4. The archive bytes, digest-bound before anything is unpacked.
@@ -705,12 +703,11 @@ def _admit(args, github, copy_image):
     if (_staging_image_pattern(args.account_id).fullmatch(staging_image) is None):
         raise PromotionError("staging image mismatch")
     digest = receipt["container"]["digest"]
-    if approved_image is not None and digest != approved_image:
+    if args.approved_image is not None and digest != args.approved_image:
         raise PromotionError("approved staging image mismatch")
-    if getattr(args, "verify_only", False):
-        if not (_is_digest(approved_archive) and _is_digest(approved_image)):
+    if args.verify_only:
+        if not (_is_digest(args.approved_archive) and _is_digest(args.approved_image)):
             raise PromotionError("verification needs both approved digests")
-        print("approved staging archive and image verified")
         return 0
     repository = f"{REGISTRY_HOST}/{args.account_id}/{PRODUCTION_APP}"
     expected = repository + "@" + digest
