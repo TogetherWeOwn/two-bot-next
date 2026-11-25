@@ -271,6 +271,29 @@ risk_tier: T0
 class AttestationFloor(unittest.TestCase):
     T0_FILES = ".github/workflows/deploy-production.yml"
 
+    def test_organization_app_author_follows_maintainer_standards(self):
+        body = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #123")
+        valid = env(BODY=body + FULL_ATTESTATION, CHANGED_FILES=self.T0_FILES,
+                    AUTHOR="maintainer", REPO_PRIVATE="false", REQUIRE_CARD_REF="false",
+                    PR_STANDARDS_MODE="warn")
+        cases = (
+            ({}, []),
+            ({"TITLE": "Refresh the signing key"}, [("error", "PR title")]),
+            ({"BODY": ""}, [("error", "Attestation"), ("error", "PR body")]),
+            ({"BODY": body}, [("error", "Attestation")]),
+            ({"BODY": valid["BODY"].replace("## Verification", "## Notes")},
+             [("warning", "PR template")]),
+            ({"BODY": valid["BODY"].replace("Fixes #123", "Refs: TOG-1234")},
+             [("error", "Internal reference")]),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=tuple(overrides), expected=expected):
+                inputs = dict(valid, **overrides)
+                maintainer = ps.evaluate(inputs)
+                app = ps.evaluate(dict(inputs, AUTHOR="togetherweown[bot]"))
+                self.assertEqual(expected, levels(maintainer))
+                self.assertEqual(maintainer, app)
+
     def test_t0_path_without_attestation_fails(self):
         f = ps.evaluate(env(BODY=GOOD_BODY, CHANGED_FILES=self.T0_FILES))
         self.assertIn(("error", "Attestation"), levels(f))
