@@ -321,7 +321,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Reviewed deploy gates plus shared recovery and deploy-ID tooling.
+          # Reviewed deploy gates, rollback rehearsal prepare and shared recovery tooling.
           ref: ${{ github.sha }}
           path: tooling
           persist-credentials: false
@@ -418,6 +418,7 @@ jobs:
           # GITHUB_SHA identifies the workflow checkout. Stamp the validated
           # serving SHA in the build, deployment config and baseline receipt.
           STAGING_SOURCE_SHA: ${{ env.DEPLOY_SHA }}
+          ROLLBACK_REHEARSAL_PREPARE: ${{ github.event_name == 'workflow_dispatch' && inputs.recover_prior_sha && inputs.inject_error_rate_spike }}
           # Opt-in drill switches. test_workflows.py pins the explicit
           # workflow_dispatch guards as defense in depth.
           INJECT_GATEWAY_FAILURE: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_gateway_failure && 'true' || 'false' }}
@@ -425,6 +426,16 @@ jobs:
           INJECT_UNPAIRED_DISCONNECT: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_unpaired_disconnect && 'true' || 'false' }}
         run: |
           set -euo pipefail
+          source_sha=$(git rev-parse HEAD)
+          test "${STAGING_SOURCE_SHA:?Missing validated staging SHA}" = "$source_sha" || { echo "::error::Staging prepare source checkout mismatch" >&2; exit 1; }
+          prepare_root="${STAGING_GATE_ROOT:-..}"
+          if [ "$ROLLBACK_REHEARSAL_PREPARE" = "true" ]; then
+            prepare_root=../tooling
+          fi
+          if [ "$prepare_root" = ../tooling ]; then
+            tooling_sha=$(git -C ../tooling rev-parse HEAD)
+            test "${GITHUB_SHA:?Missing workflow SHA}" = "$tooling_sha" || { echo "::error::Staging prepare workflow checkout mismatch" >&2; exit 1; }
+          fi
           mkdir -p "$ROLLOUT_DIR"
           inject=()
           if [ "$INJECT_GATEWAY_FAILURE" = "true" ]; then
@@ -436,7 +447,8 @@ jobs:
           if [ "$INJECT_UNPAIRED_DISCONNECT" = "true" ]; then
             inject+=(--inject-unpaired-disconnect)
           fi
-          python3 "${STAGING_GATE_ROOT:-..}"/scripts/staging_rollout.py prepare \
+          python3 "$prepare_root"/scripts/staging_rollout.py prepare \
+            --config wrangler.toml \
             --receipt "$ROLLOUT_DIR/baseline.json" \
             --output "$WRANGLER_OUTPUT_FILE_PATH" \
             --deploy-config "$ROLLOUT_DIR/staging-deploy.json" "${inject[@]}"
