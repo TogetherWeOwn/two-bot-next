@@ -1,4 +1,5 @@
 import type { TwoBotContainer } from "../src/index.ts";
+import { boundRead } from "../src/internal-actions.ts";
 import { parseStagingUseChange } from "../src/staging-lifecycle.ts";
 import { runStagingAutomodProtectedHost } from "./staging-automod-protected-host.ts";
 
@@ -6,6 +7,7 @@ type ProtectedHost = Parameters<typeof runStagingAutomodProtectedHost>;
 type Host = NonNullable<ProtectedHost[1]>;
 type Instance = ReturnType<typeof TwoBotContainer.bindProtectedAutomodInstance>;
 type Acquire = Parameters<Instance["acquireLease"]>;
+type LeaseContext = Parameters<Instance["authority"]["readIssuedLease"]>[0];
 type Wiring = Pick<Host, "readRun" | "readWorker" | "readAuthenticatedInventory"> & Readonly<{
   instance: Instance;
   reservation: Readonly<{ pin: Acquire[0]; change: Readonly<Acquire[1]> }>;
@@ -33,8 +35,19 @@ export async function runStagingAutomodInstanceHost(options: ProtectedHost[0] = 
     return { verdict: "failed", code: "context_unconfirmed" } as const;
   }
 
+  const matchesRun = (context: LeaseContext) => context.environment === change.environment
+    && context.runId === change.runId && context.runAttempt === change.runAttempt
+    && context.deploymentId === change.deploymentId && context.sha === change.sha;
+
   return runStagingAutomodProtectedHost(options, {
     readRun: (id, signal) => wiring.readRun(id, signal),
+    prepareLease: async context => {
+      if (!matchesRun(context)) return;
+      const signal = AbortSignal.timeout(2_000);
+      const existing = await boundRead(instance.authority.readIssuedLease(context, signal), signal);
+      signal.throwIfAborted();
+      if (!existing) await instance.acquireLease(pin, change, AbortSignal.timeout(2_000));
+    },
     readWorker: () => wiring.readWorker(),
     readAuthenticatedInventory: (source, signal) => wiring.readAuthenticatedInventory(source, signal),
     invokePrivate: (serving, call, signal) => {
@@ -48,21 +61,9 @@ export async function runStagingAutomodInstanceHost(options: ProtectedHost[0] = 
     authority: {
       readApproval: (action, lease, signal) => instance.authority.readApproval(action, lease, signal),
       readIssuedLease: async (context, signal) => {
-        if (context.environment !== change.environment || context.runId !== change.runId
-          || context.runAttempt !== change.runAttempt || context.deploymentId !== change.deploymentId
-          || context.sha !== change.sha) return;
-
-        // The operator authenticates the job before this read. A held lease
-        // can outlive its window, so recovery must not try to acquire again.
-        signal.throwIfAborted();
-        const existing = await instance.authority.readIssuedLease(context, signal);
-        if (existing) {
-          if (existing.epoch === change.expectedEpoch && existing.expiresAt === change.expiresAt) return existing;
-          return;
-        }
-        signal.throwIfAborted();
-        await instance.acquireLease(pin, change, signal);
-        return instance.authority.readIssuedLease(context, signal);
+        if (!matchesRun(context)) return;
+        const issued = await instance.authority.readIssuedLease(context, signal);
+        if (issued?.epoch === change.expectedEpoch && issued.expiresAt === change.expiresAt) return issued;
       },
     },
   });

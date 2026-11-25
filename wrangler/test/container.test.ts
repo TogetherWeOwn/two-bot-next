@@ -593,6 +593,7 @@ test("the AutoMod instance host acquires exactly once and runs both approved act
   const steps: string[] = [];
   let command: typeof preview | undefined;
   let inventoryRollout = "55555555-5555-5555-5555-555555555555";
+  let recoveryReachable = false;
   const instance = TwoBotContainer.bindProtectedAutomodInstance(h.bot, control, {
     readReservation: async () => { steps.push("acquire"); return { change, pin, target }; },
     readServing: async () => pin,
@@ -641,7 +642,7 @@ test("the AutoMod instance host acquires exactly once and runs both approved act
       assert.equal(signal.aborted, false);
       steps.push("inventory");
       return JSON.stringify({ schema_version: 1, workflow_sha: sha, workflow_run_id: Number(id),
-        observed_at: new Date(now).toISOString(),
+        observed_at: new Date(Date.now()).toISOString(),
         worker: { deployment_id: pin.workerDeploymentId, version_id: version, source_sha: serving.sha,
           traffic_percent: 100, runtime_policy: "bounded" },
         container: { application_id: pin.applicationId, namespace_id: pin.namespaceId, rollout_id: inventoryRollout,
@@ -651,10 +652,16 @@ test("the AutoMod instance host acquires exactly once and runs both approved act
     instance: {
       ...instance,
       authority: { ...instance.authority, readIssuedLease },
+      acquireLease: async (...scope) => {
+        await instance.acquireLease(...scope);
+        steps.push("lost-acquire-reply");
+        throw new Error("synthetic acquisition response lost after issuance");
+      },
       invokePrivate: async (attested, call, signal) => {
         steps.push(`invoke:${call.action}`);
         assert.deepEqual(attested, pin);
         assert.deepEqual(call.issuedLease, issued);
+        if (call.action === "recover" && !recoveryReachable) throw new Error("synthetic recovery unavailable");
         if (call.action === "start") {
           // Seed the independently confirmed publication receipt locally. The
           // private startup caller consumes it and performs no publication.
@@ -691,18 +698,26 @@ test("the AutoMod instance host acquires exactly once and runs both approved act
   assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), { verdict: "failed", start: false, recover: false });
   assert.deepEqual(h.values.get(STAGING_USE_KEY), issued);
   assert.deepEqual(await journal.pending(), { lease: issued, phase: "reserved" });
-  assert.deepEqual(steps.slice(1, 3), ["run", "acquire"]);
-  assert.deepEqual(steps.slice(3, 5).sort(), ["approve:recover", "approve:start"]);
-  assert.deepEqual(steps.slice(5), ["inventory"]);
+  assert.deepEqual(steps.slice(1, 4), ["run", "acquire", "lost-acquire-reply"]);
+  assert.deepEqual(steps.slice(4, 6).sort(), ["approve:recover", "approve:start"]);
+  assert.deepEqual(steps.slice(6), ["inventory"]);
 
   // Continue the same synthetic run with the original rollout. The host must
   // use the held tuple without acquiring a replacement or repeating acquisition.
   inventoryRollout = pin.rolloutId;
   steps.length = 0;
-  assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), { verdict: "passed", start: true, recover: true });
+  assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), { verdict: "failed", start: true, recover: false });
   assert.equal(steps[0], "run");
   assert.deepEqual(steps.slice(1, 3).sort(), ["approve:recover", "approve:start"]);
-  assert.deepEqual(steps.slice(3), ["inventory", "invoke:start", "start", "invoke:recover", "drain", "stop", "delete"]);
+  assert.deepEqual(steps.slice(3), ["inventory", "invoke:start", "start", "invoke:recover"]);
+  assert.equal(Date.now(), issued.expiresAt + 1);
+  assert.deepEqual(h.values.get(STAGING_USE_KEY), issued);
+  assert.ok(await journal.pending());
+
+  recoveryReachable = true;
+  steps.length = 0;
+  assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), { verdict: "failed", start: false, recover: true });
+  assert.deepEqual(steps, ["run", "approve:recover", "inventory", "invoke:recover", "drain", "stop", "delete"]);
   assert.equal(h.runtime.running, false);
   assert.equal(command, undefined);
   assert.equal(await journal.completedFor(issued), true);
