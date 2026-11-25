@@ -103,10 +103,49 @@ The `container smoke` CI job rehearses an isolated Docker boundary with a
 synthetic writer. A watchdog inside the container's PID namespace stops the
 writer if the startup client disappears or startup stalls. The job also
 verifies explicit stop and empty runtime state. The fixture has no network or
-host file mounts. The staging release operator still needs a supported isolated
-target that runs the exact Worker bundle and image against approved PRE
-fixtures, fences access to shared writers, and verifies independent expiry and
-normal stop. The Docker rehearsal covers only the synthetic process lifetime.
+host file mounts.
+
+#### Disposable exact PRE rehearsal
+
+Keep qualification pending until a protected caller can enforce private
+creation and stop the exact runtime independently of the runner and the
+historical Worker. The [target helper](../scripts/pre_target.py) only prepares
+offline configuration and validates cleanup evidence.
+
+1. Pin the protected [build-predecessor](../.github/workflows/build-predecessor.yml)
+   workflow SHA, first-attempt run ID, artifact ID and ZIP SHA-256. Use the
+   verified `build.json`, Worker modules and `image.oci.tar` from that same
+   private artifact. Bind the authenticated first-attempt reservation to one
+   disposable scope (for example `pre-fixture-test`), rehearsal run ID, original
+   start time, and PRE shape (`0473/0465` or retained `0475/0465`). Pin the
+   approved synthetic database and gateway fixture to that reservation.
+2. Admit one rehearsal at a time on its own Worker, Container app and synthetic
+   database. Keep ingress private from first create, with no shared staging app,
+   production routes, public preview, or access to shared writers. Arm the
+   independent stop fence before startup. The reservation expires 60 minutes
+   after its original start, including on retry. The fence must stop the runtime
+   and block delayed creates and keepalives even if the workflow disappears.
+3. For each PRE shape, record the exact Worker version UUID and annotation,
+   Container app ID and running image digest, and health and readiness with
+   the matching runtime stamps. Read back the exact app's effective synthetic
+   database binding and verify the endpoint ledger and schema, including the
+   approved retained `0475` timestamp where applicable. See the
+   [identity and ledger checks](production-deploy.md#attendance-predecessor-identity-at-both-pre-endpoints)
+   and the [direct-container fixture](../scripts/ci/predecessor_container_fixture.py).
+4. Explicitly stop at completion or failure. Close admission, settle pending
+   starts, revoke synthetic write access and remove the exact Worker. Before
+   deleting the app, read back zero active and zero assigned instances while
+   that app ID is still readable. If startup never created an app, require
+   affirmative evidence of that outcome. Verify cleanup with a fresh, complete
+   readback showing settled startup, no write access, no Worker or app, and
+   both counts proved zero. Workflow status and resource disappearance alone
+   leave stop unverified. See the [cleanup fixtures](../scripts/ci/test_pre_target.py).
+
+The proposed [scheduled sweep](https://github.com/TogetherWeOwn/two-bot-next/pull/2563)
+is a cleanup fallback that can run late or be dropped. The staging release
+operator owns an unverified stop or cleanup as a staging incident. Keep
+admission closed and qualification pending, reconcile the exact reservation,
+and repeat cleanup with fresh inventory until verification passes.
 
 ### Trusted client and receipt contract (partial wiring, not activated)
 
