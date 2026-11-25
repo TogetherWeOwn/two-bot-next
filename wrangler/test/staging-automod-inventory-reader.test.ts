@@ -112,15 +112,20 @@ test("the verifier invokes the checked-in script with the exact pins and accepts
 test("the verifier refuses nonzero exit and excess stdout even after a complete receipt", async () => {
   const { signal } = new AbortController();
   const multibyteOutput = receipt + "é".repeat(2_048);
-  for (const program of [
-    `${writeCappedReceipt} process.exitCode = 7;`,
-    `${writeCappedReceipt} process.stdout.write(" ");`,
-    `process.stdout.write(${JSON.stringify(multibyteOutput)});`,
-  ]) {
+  for (const [program, expectedErrorCode] of [
+    [`${writeCappedReceipt} process.exitCode = 7;`, 7],
+    [`${writeCappedReceipt} process.stdout.write(" ");`, "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"],
+    [`process.stdout.write(${JSON.stringify(multibyteOutput)});`, "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"],
+  ] as const) {
+    let errorCode: number | string | undefined;
     const run = bindStagingAutomodInventoryVerifier((_, __, options, callback) => {
-      execFile(process.execPath, ["-e", program], options, callback);
+      execFile(process.execPath, ["-e", program], options, (error, stdout) => {
+        errorCode = error?.code;
+        callback(error, stdout);
+      });
     });
     await assert.rejects(run(source.workflowSha, String(source.runId), signal), { message: "Staging inventory verifier failed" });
+    assert.equal(errorCode, expectedErrorCode);
   }
 });
 
