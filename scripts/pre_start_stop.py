@@ -52,6 +52,10 @@ class WorkerUpload(Protocol):
     def content_type(self) -> str: ...
     @property
     def body(self) -> bytes: ...
+    @property
+    def supports_discord_fixture_overrides(self) -> bool:
+        """Whether the verified Worker can forward both synthetic endpoints."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -77,6 +81,8 @@ class PrivateRuntime(Protocol):
     Return a deployment only after verifying the exact artifact and isolated
     app identity, private ingress from first create, current unrouted readback
     and an authenticated service binding restricted to this exact Worker.
+    Before starting any process, require the effective synthetic Discord
+    gateway and REST settings and enforce a block on public egress.
     Resolve and compare the deployment against the authoritative identity for
     the full reservation on each bounded GET without following redirects.
     Controller instances can span different runners, so retain that identity
@@ -148,6 +154,8 @@ class ProtectedPre:
         target = self._target
         upload_target = getattr(upload, "target", None)
         require(type(upload_target) is Target and upload_target == target, "wrong_pre_upload_target")
+        require(getattr(upload, "supports_discord_fixture_overrides", None) is True,
+                "pre_discord_fixture_overrides_unavailable")
         start_id = _call(self._admission.admit_start, target, failure="pre_start_unconfirmed")
         require(type(start_id) is UUID and start_id.int, "pre_start_not_admitted")
         armed = _call(self._external_stop.arm, target, start_id, failure="pre_external_stop_unarmed")

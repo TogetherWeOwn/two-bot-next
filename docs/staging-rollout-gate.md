@@ -112,6 +112,13 @@ creation and stop the exact runtime independently of the runner and the
 historical Worker. The [target helper](../scripts/pre_target.py) only prepares
 offline configuration and validates cleanup evidence.
 
+The archived Worker omits `DISCORD_GATEWAY_URL` and `DISCORD_API_BASE` from
+its Container startup environment. The direct-container fixture injects both
+values into a shared loopback namespace. The [protected startup controller](../scripts/pre_start_stop.py)
+refuses the archived upload before consuming the reservation. Private ingress
+readback covers inbound access. Startup also requires independent proof that
+the process receives both synthetic endpoints and that public egress is blocked.
+
 1. Pin the protected [build-predecessor](../.github/workflows/build-predecessor.yml)
    workflow SHA, first-attempt run ID, artifact ID and ZIP SHA-256. Use the
    verified `build.json`, Worker modules and `image.oci.tar` from that same
