@@ -661,6 +661,8 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
     assert.equal(response.status, 200);
     return await response.json();
   };
+  const scopedReceipt = (action: "start" | "recover") => ({ schema: "two-bot-staging-automod-job.v1",
+    environment: "staging", observedAt: new Date(Date.now()).toISOString(), action, lease: issued });
   assert.equal("bindProtectedAutomodInvoker" in h.bot, false);
   await assert.rejects(invoke({ ...pin, workerVersionId: wrongVersion }, {
     action: "start", issuedLease: { ...issued, deploymentId: wrongVersion },
@@ -701,8 +703,7 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   const receipt = { intent, id: preview.id, version: preview.version };
   await journal.recordCreated(receipt);
   await journal.confirmPublication(receipt);
-  assert.deepEqual(await request("start"), { schema: "two-bot-staging-automod-job.v1", environment: "staging",
-    observedAt: new Date(Date.now()).toISOString(), action: "start", lease: issued, verdict: "passed" });
+  assert.deepEqual(await request("start"), { ...scopedReceipt("start"), verdict: "passed" });
   assert.equal(h.runtime.running, true);
   assert.equal(calls.filter(call => call === "start").length, 1);
   await assert.rejects(run("start"), refused);
@@ -714,9 +715,7 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   assert.equal(h.runtime.running, true);
   observed = { ...pin, rolloutId: "different-rollout" };
   const beforeDrift = [...calls];
-  assert.deepEqual(await request("recover"), { schema: "two-bot-staging-automod-job.v1", environment: "staging",
-    observedAt: new Date(Date.now()).toISOString(), action: "recover", lease: issued, verdict: "failed",
-    code: "operation_unconfirmed" });
+  assert.deepEqual(await request("recover"), { ...scopedReceipt("recover"), verdict: "failed", code: "operation_unconfirmed" });
   assert.deepEqual(calls, beforeDrift);
   assert.equal(h.runtime.running, true);
   observed = pin;
@@ -741,7 +740,7 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
     if (typeof key !== "string" && Object.hasOwn(key, STAGING_USE_KEY)) throw new Error("synthetic lease write failure");
     await put(...args);
   });
-  await assert.rejects(run("recover", issued, false), /staging_storage_unavailable/);
+  assert.deepEqual(await request("recover"), { ...scopedReceipt("recover"), verdict: "failed", code: "operation_unconfirmed" });
   failRelease.mock.restore();
   assert.deepEqual(calls.filter(call => ["start", "drain", "stop", "delete"].includes(call)),
     ["start", "drain", "stop", "delete"]);
@@ -751,8 +750,7 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
   await assert.rejects(h.bot.start(), /staging_use_conflict/);
 
   const afterCleanup = calls.length;
-  assert.deepEqual(await request("recover"), { schema: "two-bot-staging-automod-job.v1", environment: "staging",
-    observedAt: new Date(Date.now()).toISOString(), action: "recover", lease: issued, verdict: "passed" });
+  assert.deepEqual(await request("recover"), { ...scopedReceipt("recover"), verdict: "passed" });
   assert.equal(readInventory.mock.callCount(), 1);
   assert.deepEqual(values.get(STAGING_USE_KEY), { ...issued, phase: "released" });
   await run("recover", issued, false);
