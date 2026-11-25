@@ -236,7 +236,7 @@ def main(argv, env):
                 output(env, archive=pin.candidate_archive, image=pin.candidate_image)
             else:
                 take_over(pin, recovery, env["NEW_VERSION"],
-                          lambda: read_status(env, allow_rollout=True), control)
+                          lambda: read_status(env, allow_rollout=True), make_control())
         else:
             raise GateError("production_release_operation_invalid")
     except (GateError, ProofError, KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError):
