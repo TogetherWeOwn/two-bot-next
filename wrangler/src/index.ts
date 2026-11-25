@@ -901,6 +901,11 @@ export class TwoBotContainer extends Container<Env> {
         if (this.boundedStaging() && await this.deferStagingTeardown(await this.stagingUse.read())) return;
         const owner = await this.ownership.require(this.id());
         if (this.boundedStaging()) {
+          const [pending] = await this.listSchedules<boolean>("stagingExpiry");
+          if (pending?.payload === true) {
+            this.recoveryFailed = true;
+            return;
+          }
           await this.requireRecoveryDatabase();
           const use = await this.stagingUse.require({ deploymentId: this.id(), sha: this.env.CONTAINER_RELEASE ?? "", owner });
           await this.scheduleStagingExpiry(use.expiresAt);
@@ -914,7 +919,7 @@ export class TwoBotContainer extends Container<Env> {
         try { await this.destroyInactive(); }
         catch {
           this.recoveryFailed = true;
-          if (this.boundedStaging()) await this.scheduleStagingExpiry(Date.now() + 15_000);
+          if (this.boundedStaging()) await this.scheduleStagingExpiry(Date.now() + 15_000, true);
         }
       }
     });
@@ -1035,20 +1040,20 @@ export class TwoBotContainer extends Container<Env> {
       try { await this.destroyInactive(); }
       catch {
         this.recoveryFailed = true;
-        await this.scheduleStagingExpiry(Date.now() + 15_000);
+        await this.scheduleStagingExpiry(Date.now() + 15_000, true);
       }
       throw error;
     }
   }
 
-  private async scheduleStagingExpiry(expiresAt: number): Promise<void> {
-    const [pending] = await this.listSchedules("stagingExpiry");
+  private async scheduleStagingExpiry(expiresAt: number, stopOnly = false): Promise<void> {
+    const [pending] = await this.listSchedules<boolean>("stagingExpiry");
     // The pinned SDK persists schedule times in whole seconds. Ceil, never
     // floor an expiry: an early callback must not discard the only deadline.
     const when = Math.ceil(expiresAt / 1000);
-    if (pending?.time === when) return;
+    if (pending?.time === when && (pending.payload === true) === stopOnly) return;
     this.deleteSchedules("stagingExpiry");
-    await this.schedule(new Date(when * 1000), "stagingExpiry", null);
+    await this.schedule(new Date(when * 1000), "stagingExpiry", stopOnly ? true : null);
   }
 
   private async stopStagingUse(): Promise<void> {
@@ -1058,7 +1063,7 @@ export class TwoBotContainer extends Container<Env> {
       // persisted released denial. Neither may wait for the original deadline
       // after an unconfirmed stop. This successor can only retry teardown.
       this.recoveryFailed = true;
-      await this.scheduleStagingExpiry(Date.now() + 15_000);
+      await this.scheduleStagingExpiry(Date.now() + 15_000, true);
       throw error;
     }
   }
@@ -1106,7 +1111,7 @@ export class TwoBotContainer extends Container<Env> {
           // SDK 0.3.7 consumes a scheduled row even when its callback throws.
           // Persist a successor before returning; never revive the gateway.
           this.recoveryFailed = true;
-          await this.scheduleStagingExpiry(Date.now() + 15_000);
+          await this.scheduleStagingExpiry(Date.now() + 15_000, true);
           console.error(JSON.stringify({ event: "staging_stop_unconfirmed" }));
           this.stagingReceipt("expiry", use, "stop_unconfirmed");
         }
@@ -1630,6 +1635,7 @@ export class TwoBotContainer extends Container<Env> {
         let use = await this.stagingUse.read();
         if (checkAbsence) await this.previewAbsent(request);
         if (change) {
+          if (change.action !== "release" && this.recoveryFailed) throw new OwnershipRefused("shutdown_unconfirmed");
           if (change.action === "acquire") {
             if (change.voiceMove && !this.voiceMoveConfigured()) {
               throw new OwnershipRefused("staging_use_required");
@@ -1639,7 +1645,6 @@ export class TwoBotContainer extends Container<Env> {
               () => this.stopStagingUse(), (expiry) => this.scheduleStagingExpiry(expiry));
             this.recoveryFailed = false;
           } else if (change.action === "stop") {
-            if (this.recoveryFailed) throw new OwnershipRefused("shutdown_unconfirmed");
             // Keep the grant and its expiry schedule intact even if shutdown fails.
             use = await this.stagingUse.stop(change, identity, () => this.destroyInactive());
           } else {

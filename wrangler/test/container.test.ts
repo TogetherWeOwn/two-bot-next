@@ -963,6 +963,14 @@ test("bounded staging: uncertain reservation permits only scoped emergency stop"
   assert.equal((await h.bot.fetch(stagingUseRequest("release", window))).status, 503);
   const [retry] = await h.bot.listSchedules("stagingExpiry");
   assert.equal(retry?.time, Math.ceil((Date.now() + 15_000) / 1000));
+  const rebuilt = await harness(t, BOUNDED_STAGING_ENV, { values: h.values, running: true }, h.database);
+  const [retained] = await rebuilt.bot.listSchedules("stagingExpiry");
+  assert.equal(retained?.time, retry?.time, "reconstruction must preserve the prompt stop retry");
+  await assert.rejects(rebuilt.bot.start(), /shutdown_unconfirmed/);
+  assert.equal((await rebuilt.bot.fetch(stagingUseRequest("acquire", window))).status, 503);
+  t.mock.timers.tick(15_000);
+  await rebuilt.bot.stagingExpiry();
+  assert.equal(rebuilt.runtime.running, false);
 });
 
 test("bounded staging: failed control teardown persists a prompt stop-only retry", async (t) => {
