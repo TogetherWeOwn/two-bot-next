@@ -116,3 +116,47 @@ enablement and rollback orders with a synthetic Web peer and verifies that a
 fresh signed read after re-enablement resolves the same finalized record.
 [#2491](https://github.com/TogetherWeOwn/two-bot-next/pull/2491) covers the
 pre-enable window. Use protected runtime evidence for deployed readiness.
+
+## Recover the capture-only handoff
+
+Use this evidence handoff when a separately qualified capture-only state
+precedes the protected signed-reader rehearsal. Use the existing protected release and
+[staging recovery](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
+paths for any runtime action.
+
+The merged source trail covers the retained `0475` recovery fence, the
+conservative observation floor and the dormant mapped writer.
+[#2158](https://github.com/TogetherWeOwn/two-bot-next/commit/28990125adbc3a636c6a70e9a99d8dbd9f77fbcd)
+· [#2306](https://github.com/TogetherWeOwn/two-bot-next/commit/8374f89465bb27e9caee57577b2e966e709a1427)
+· [#2338](https://github.com/TogetherWeOwn/two-bot-next/commit/6dad6cddabca0ce882dee5863789f69d813882ad).
+
+1. Before the reader window, pin the prior capture-only rollout and its
+   effective capture ON, reader OFF and ingress state. Attach its qualified
+   artifact, runtime and tenant identifiers and the synthetic capture evidence
+   described above. Record the reader candidate's verified rollout and link its
+   protected run, original lease, acceptance tool source SHA and synthetic
+   fixture scope to that baseline. Keep prior capture evidence outside the
+   reader fixture cleanup scope. The signed-reader rehearsal begins with
+   effective capture OFF and uses the acceptance and offline comparison above.
+2. If a reader probe fails or cleanup is invalid, keep the transition
+   unqualified. Preserve the failed or missing verdict in the protected run
+   record and use the existing recovery path. When the original reader window
+   still permits the OFF check, keep its finalized fixture through the fresh
+   signed refusal check. Leave that verdict unverified if the check or its
+   original fixture is unavailable.
+3. Retain two affirmative receipts in the protected run evidence. Bind the
+   reader cleanup to the original lease and reader fixture scope using the
+   stopped release and zero-row readback above. Bind capture-only restoration
+   to the pinned prior artifact and tenant with a verified serving rollout,
+   effective capture ON, reader OFF and the prior ingress state. Use the
+   capture ON behavior above to confirm a fresh eligible synthetic observation
+   under the authorized restoration window. Its fixtures follow that window's
+   cleanup. Use the staging lifecycle's recovery for any unconfirmed stop
+   before opening another window.
+
+The protected run record carries the sanitized baseline, phase evidence,
+failure and receipts through closeout. If recovery continues in another
+protected run, cross-link both records and retain the original lease and
+fixture scope on its cleanup evidence. A later run's own release or zero-row
+readback cannot close the original window. Record restoration and cleanup
+verdicts independently. A missing receipt leaves its verdict unverified.
