@@ -111,6 +111,10 @@ class Handler(BaseHTTPRequestHandler):
             self.record("role", "applied")
             self.reply(204)
         elif self.command == "POST" and path == MESSAGE_PATH:
+            if self.headers.get("Host") != "discord.com":
+                self.record("announcement", "unexpected")
+                self.reply(400)
+                return
             self.record("announcement", "applied")
             self.reply(200, {"id": MESSAGE, "channel_id": CHANNEL})
         elif self.command == "GET":
@@ -148,6 +152,9 @@ def main():
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.minimum_version = ssl.TLSVersion.TLSv1_2
         tls.load_cert_chain(state / "server.crt", state / "server.key")
+        tls.sni_callback = lambda _sock, name, _ctx: (
+            (state / "discord-sni").touch() if name == "discord.com" else ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+        )
         server.socket = tls.wrap_socket(server.socket, server_side=True)
         (state / "recorder-ready").touch()
         server.serve_forever()

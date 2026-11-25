@@ -234,3 +234,5 @@ transport using compiled WebPKI roots rejects the synthetic CA before the
 request reaches the recorder. Its announcement control remains incomplete
 until both admitted images can use the disposable trust root at the same
 Discord origin.
+
+The announcement control invokes `rehearse-internal-actions`. For source proof, pass the commit-labeled release image ID to `--candidate`.
