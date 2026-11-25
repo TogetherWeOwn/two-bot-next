@@ -4862,7 +4862,7 @@ def staging_pre_reaper_errors(workflows):
                 continue
             lock = node["concurrency"]
             group = lock.get("group", "") if isinstance(lock, dict) else lock
-            prefix, expression, _ = group.casefold().partition("${{")
+            prefix, expression, _ = group.casefold().strip().partition("${{")
             if not expression:
                 may_collide = prefix == PRE_REAPER_QUEUE
             elif not PRE_REAPER_QUEUE.startswith(prefix):
@@ -7737,6 +7737,7 @@ class WorkflowTests(unittest.TestCase):
         workflows = deepcopy(self.workflows)
         for group in (
             "STAGING-PRE-REAPER",
+            " staging-pre-reaper ",
             "${{ format('staging-{0}-reaper', 'pre') }}",
             "staging-pre-${{ vars.CLEANUP_SUFFIX }}",
         ):
