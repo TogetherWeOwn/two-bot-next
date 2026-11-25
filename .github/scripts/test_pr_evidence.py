@@ -119,6 +119,36 @@ class CurrentEvidenceTests(unittest.TestCase):
         self.assertNotIn(updated, repr(fresh))
         self.reader.get.assert_called_with("pulls/1")
 
+    def test_merge_attempt_requires_current_verdict(self):
+        accept_merge = Mock()
+
+        def attempt_merge(recorded):
+            try:
+                current = evidence.evaluate_current(policy, self.reader, *self.identity)
+            except evidence.EvidenceError:
+                return
+            if recorded == current and recorded.matches_current(self.reader, *self.identity):
+                accept_merge(recorded.head)
+
+        prior = evidence.evaluate_current(policy, self.reader, *self.identity)
+        edited = dict(PR, body=BODY.replace("proof=fixture", "proof=updated synthetic evidence"))
+
+        for case, reads in (
+                ("edit before validation", [edited, edited, edited]),
+                ("edit during validation", [PR, edited, edited]),
+                ("edit after validation", [PR, PR, edited])):
+            with self.subTest(case=case):
+                self.reader.get.side_effect = reads
+                attempt_merge(prior)
+                accept_merge.assert_not_called()
+
+        self.reader.get.side_effect = None
+        self.reader.get.return_value = edited
+        fresh = evidence.evaluate_current(policy, self.reader, *self.identity)
+        self.assertEqual(prior.head, fresh.head)
+        attempt_merge(fresh)
+        accept_merge.assert_called_once_with(HEAD)
+
     def test_formatting_and_identity_changes_invalidate_verdict(self):
         prior = evidence.evaluate_current(policy, self.reader, *self.identity)
         for body in (BODY + "\n", BODY.replace("\n", "\r\n"), BODY + "\n<!-- updated -->"):

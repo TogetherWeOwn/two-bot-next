@@ -460,11 +460,19 @@ Keep `pr-evidence` advisory until a supported registration path binds the requir
 verdict to the protected workflow, exact head and current PR description. It must
 invalidate the previous verdict and re-evaluate after a same-head description
 edit. The pinned ruleset route does not support the `edited` activity and left
-its required verdict green in the hosted qualification above. The synthetic
-fixture exercises the comparison in source. Required registration needs a
-route that enforces the comparison when merging. Any future registration also needs
-merge-queue verification and green runs on `main` and two later PRs, with the SHAs
-and run and job URLs recorded.
+its required verdict green in the hosted qualification above. The offline
+merge-attempt fixture refuses the old verdict after an edit at the same head,
+including edits during validation and before the final comparison. A fresh
+verdict for the stable edited description reaches the fixture's acceptance step.
+
+A [protected merge-queue workflow](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#supported-event-triggers)
+could recheck each queued PR on `merge_group.checks_requested`. That check still
+leaves a window for an edit between the last metadata read and the merge.
+The documented [merge APIs](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
+can require an expected head SHA and provide no description precondition.
+Required registration needs a route that enforces the comparison when merging.
+Any future registration also needs merge-queue verification and green runs on
+`main` and two later PRs, with the SHAs and run and job URLs recorded.
 
 The toolchain remains pinned in `rust-toolchain.toml`. CI runs
 `python3 scripts/generate_command_reference.py` to generate ignored
