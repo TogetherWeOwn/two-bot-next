@@ -70,6 +70,9 @@ export function mockVoiceMoveWindow(elapsedMs = 1000) {
   });
   return {
     signed, moves, calls,
+    restoreSource() {
+      connectedChannelId = source;
+    },
     args: {
       enabled: true,
       fixture,

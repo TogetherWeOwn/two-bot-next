@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import json
 import tempfile
 import threading
 import unittest
@@ -17,6 +18,70 @@ SPEC.loader.exec_module(recorder)
 
 
 class EventWriteCutoffTest(unittest.TestCase):
+    def test_request_count_includes_reads_without_a_mutation_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            handler = recorder.Handler.__new__(recorder.Handler)
+            handler.server = SimpleNamespace(state=root, token="Bot synthetic", lock=threading.Lock())
+            handler.command = "GET"
+            handler.path = f"/api/v10/guilds/{recorder.GUILD}/scheduled-events"
+            handler.headers = {"Authorization": "Bot synthetic"}
+            handler.rfile = io.BytesIO()
+            handler.reply = Mock()
+
+            handler.do_GET()
+
+            handler.reply.assert_called_once_with(200, [])
+            self.assertEqual((root / "request-count").stat().st_size, 1)
+            self.assertFalse((root / "journal.jsonl").exists())
+
+    def test_channel_event_approval_changes_without_opening_the_guild(self):
+        earlier = recorder.EVENT_CHANNEL
+        replacement = recorder.REPLACEMENT_EVENT_CHANNEL
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "barrier").write_text("none\n")
+            approval = root / "channel-event-approval"
+            handler = recorder.Handler.__new__(recorder.Handler)
+            handler.server = SimpleNamespace(state=root, token="Bot synthetic", lock=threading.Lock())
+            handler.command = "PATCH"
+            handler.path = f"/api/v10/guilds/{recorder.GUILD}/scheduled-events/{recorder.EVENT}"
+            handler.reply = Mock()
+
+            for policy, approved_scope, requested, status in (
+                ("closed", None, earlier, 403),
+                ("closed", f"{recorder.GUILD}:{earlier}", earlier, 200),
+                ("closed", f"{recorder.GUILD}:{replacement}", earlier, 403),
+                ("closed", f"{recorder.GUILD}:{replacement}", replacement, 200),
+                ("closed", f"{recorder.GUILD}:{replacement}", None, 403),
+                ("closed", f"{recorder.GUILD}0:{earlier}", earlier, 403),
+                ("open", f"{recorder.GUILD}:{replacement}", earlier, 403),
+            ):
+                with self.subTest(policy=policy, approved_scope=approved_scope, requested=requested):
+                    (root / "policy").write_text(f"{policy}\n")
+                    if approved_scope is not None:
+                        approval.write_text(f"{approved_scope}\n")
+                    body = json.dumps({"entity_type": 2 if requested else 3, "channel_id": requested}).encode()
+                    handler.headers = {"Authorization": "Bot synthetic", "Content-Length": str(len(body))}
+                    handler.rfile = io.BytesIO(body)
+                    handler.reply.reset_mock()
+                    handler.do_PATCH()
+                    self.assertEqual(handler.reply.call_count, 1)
+                    self.assertEqual(handler.reply.call_args.args[0], status)
+                    if status == 200:
+                        self.assertEqual(handler.reply.call_args.args[1]["channel_id"], requested)
+
+            entries = [json.loads(line) for line in (root / "journal.jsonl").read_text().splitlines()]
+            self.assertEqual(entries, [
+                ["PATCH", handler.path, f"channel-edit:{earlier}", "denied"],
+                ["PATCH", handler.path, f"channel-edit:{earlier}", "applied"],
+                ["PATCH", handler.path, f"channel-edit:{earlier}", "denied"],
+                ["PATCH", handler.path, f"channel-edit:{replacement}", "applied"],
+                ["PATCH", handler.path, "edit", "denied"],
+                ["PATCH", handler.path, f"channel-edit:{earlier}", "denied"],
+                ["PATCH", handler.path, f"channel-edit:{earlier}", "denied"],
+            ])
+
     def test_provider_requires_both_event_permissions_removed(self):
         self.assertTrue(recorder.permits_event("POST", recorder.CREATE_EVENTS, False))
         self.assertFalse(recorder.permits_event("POST", recorder.MANAGE_EVENTS, False))
