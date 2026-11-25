@@ -10,10 +10,13 @@ import struct
 from threading import Event
 import sys
 
+from script_intake import decode_json
+
 
 GUILD = "222200000000000001"
 APP = "1111"
 TOKEN = "offline-predecessor-fixture"
+COMMANDS = f"/api/v10/applications/{APP}/guilds/{GUILD}/commands"
 GATEWAY = "ws://127.0.0.1:8081"
 RELEASE = Event()
 READY_SENT = Event()
@@ -21,6 +24,7 @@ READY_SENT = Event()
 
 class Discord(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 5
 
     def log_message(self, *_):
         pass
@@ -47,6 +51,7 @@ class Discord(BaseHTTPRequestHandler):
                 "/api/v10/applications/@me": {"id": APP},
                 f"/api/v10/guilds/{GUILD}": {"id": GUILD, "name": "Offline fixture"},
                 f"/api/v10/guilds/{GUILD}/scheduled-events": [],
+                COMMANDS: [],
             }
             if self.headers.get("Authorization") != f"Bot {TOKEN}":
                 self.reply({}, 401)
@@ -54,6 +59,29 @@ class Discord(BaseHTTPRequestHandler):
                 self.reply(routes[self.path.split("?", 1)[0]])
             else:
                 self.reply({}, 404)
+
+    def do_PUT(self):
+        self.close_connection = True
+        if self.path != COMMANDS:
+            self.reply({}, 404)
+            return
+        if self.headers.get("Authorization") != f"Bot {TOKEN}":
+            self.reply({}, 401)
+            return
+        try:
+            size = int(self.headers.get("Content-Length", 0))
+            if not 0 < size <= 65536:
+                raise ValueError
+            body = self.rfile.read(size)
+            if len(body) != size:
+                raise ValueError
+            commands = decode_json(body)
+            if not isinstance(commands, list) or any(not isinstance(item, dict) for item in commands):
+                raise ValueError
+        except (OSError, ValueError, RecursionError):
+            self.reply({}, 400)
+            return
+        self.reply(commands)
 
     def send_frame(self, packet):
         body = json.dumps(packet).encode()
@@ -83,7 +111,7 @@ class Discord(BaseHTTPRequestHandler):
                     return
                 size = struct.unpack("!H", self.rfile.read(2))[0] if size == 0xfe else size & 0x7f
                 mask = self.rfile.read(4)
-                data = json.loads(bytes(byte ^ mask[i % 4] for i, byte in enumerate(self.rfile.read(size))))
+                data = decode_json(bytes(byte ^ mask[i % 4] for i, byte in enumerate(self.rfile.read(size))))
                 if data["op"] == 1:
                     self.send_frame({"op": 11, "d": None})
                 elif data["op"] == 2 and data["d"]["token"] == TOKEN and RELEASE.wait(35):
@@ -96,7 +124,7 @@ class Discord(BaseHTTPRequestHandler):
                     READY_SENT.set()
                 else:
                     return
-        except (OSError, ValueError, KeyError, IndexError, TypeError, struct.error):
+        except (OSError, ValueError, KeyError, IndexError, TypeError, RecursionError, struct.error):
             return
 
 
@@ -106,7 +134,10 @@ def request(target, path):
     try:
         connection.request("GET", path)
         response = connection.getresponse()
-        return response.status, json.loads(response.read(65536))
+        body = response.read(65537)
+        if len(body) > 65536:
+            raise ValueError("fixture response exceeds the body limit")
+        return response.status, decode_json(body)
     except (ConnectionError, RemoteDisconnected, TimeoutError):
         return None
     finally:

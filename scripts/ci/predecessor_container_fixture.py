@@ -2,19 +2,25 @@
 
 import argparse
 import contextlib
-import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+from script_intake import decode_json
+
+from fixtures.predecessor_snapshots import GUILD, schema_check, snapshot_sql
+
+
 MOCK = Path(__file__).with_name("fixtures") / "predecessor_discord.py"
 SOURCE = "b689bc3545777c801b8758bcb7160e72a0321724"
 DIGEST = r"sha256:[a-f0-9]{64}"
@@ -23,20 +29,7 @@ STAMPS = dict(zip(
     ("org.opencontainers.image.revision", "com.togetherweown.build-id",
      "com.togetherweown.deploy-id"),
 ))
-# Same SQLx projections and row counts as the landed predecessor_plan.rs.
-PROJECTIONS = {
-    473: (115, "186ebda9ebbc1beab29be4c9e7298fb05e83c9f84460c514707ddaa2f1ad4724"),
-    475: (116, "bd463cd55505f968149f2dd65a845fbba3ebd2efbaecabf9aa4d4b9ea2b34754"),
-    465: (20, "746e2a68cf83ccd51945aa8b3e1d7b06d96bf423ba027113a23db2e8888fb7b7"),
-}
-GUILD = "222200000000000001"
 TOKEN = "offline-predecessor-fixture"
-SEED = """INSERT INTO event_instance_windows
-(guild_id,event_id,instance_starts_at,starts_at,status,observed_at)
-VALUES ('222200000000000001','200000000000000001','2000-01-01','2000-01-01',
-        'completed','2000-01-01T00:00:00Z');
-"""
-
 
 class Refused(Exception):
     pass
@@ -55,7 +48,7 @@ def verify_image(docker, pin, synthetic):
             and (synthetic or stamps["build_revision"] == SOURCE)
             and all(re.fullmatch(r"[A-Za-z0-9.+_-]{1,128}", value) and value != "unknown"
                     for value in stamps.values()), "invalid predecessor stamp pin")
-    image, = json.loads(docker("image", "inspect", pin["image_id"]))
+    image, = decode_json(docker("image", "inspect", pin["image_id"]))
     config = image["Config"]
     labels = config.get("Labels") or {}
     require(image["Id"] == pin["image_id"] and image["Os"] == "linux"
@@ -67,65 +60,11 @@ def verify_image(docker, pin, synthetic):
 
 
 def verify_support(docker, postgres, mock):
-    db, server = json.loads(docker("image", "inspect", postgres, mock))
+    db, server = decode_json(docker("image", "inspect", postgres, mock))
     require(db["Id"] == postgres and server["Id"] == mock
             and "PG_MAJOR=17" in db["Config"]["Env"]
             and set(db["Config"]["Volumes"]) == {"/var/lib/postgresql/data"}
             and not server["Config"].get("Volumes"), "unexpected fixture support image config")
-
-
-def chain_sql(chain, table, tip):
-    count, projection = PROJECTIONS[tip]
-    names = sorted((ROOT / "crates" / chain / "migrations").glob("*.sql"))
-    rows, commands = [], []
-    for path in names:
-        version, name = path.stem.split("_", 1)
-        if int(version) > tip:
-            continue
-        sql = path.read_bytes()
-        checksum = hashlib.sha384(sql).hexdigest()
-        description = name.replace("_", " ")
-        rows.append(f"{int(version)}:{description}:{checksum}\n")
-        if int(version) == 475:
-            commands.append(SEED)
-        commands.append(f"BEGIN;\n{sql.decode()}\n"
-                        f"INSERT INTO {table} VALUES ({int(version)}, '{description}', "
-                        f"now(), true, decode('{checksum}', 'hex'), 0);\nCOMMIT;\n")
-    require(len(rows) == count and rows[-1].startswith(f"{tip}:")
-            and hashlib.sha256(("synthetic-pre-inventory\n" + "".join(rows)).encode()).hexdigest()
-            == projection, f"PRE migration projection mismatch at {tip}")
-    return (f"CREATE TABLE {table} (version bigint PRIMARY KEY, description text NOT NULL, "
-            "installed_on timestamptz NOT NULL, success bool NOT NULL, checksum bytea NOT NULL, "
-            "execution_time bigint NOT NULL);\n" + "".join(commands))
-
-
-def snapshot_sql(tip):
-    contract, marker, _ = (ROOT / "sql/web_v1.sql").read_text().partition("-- Voice heat contract 1.1:")
-    require(marker, "missing Web contract 1.0 boundary")
-    return (chain_sql("cutover", "_sqlx_migrations", tip)
-            + (SEED if tip == 473 else "")
-            + chain_sql("store", "_two_bot_migrations", 465) + contract + """
-CREATE ROLE offline_bot LOGIN PASSWORD 'offline-fixture';
-GRANT USAGE ON SCHEMA public, web_v1 TO offline_bot;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO offline_bot;
-GRANT SELECT ON ALL TABLES IN SCHEMA web_v1 TO offline_bot;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO offline_bot;
-REVOKE INSERT, UPDATE, DELETE ON _sqlx_migrations, _two_bot_migrations FROM offline_bot;
-""")
-
-
-def schema_check(tip):
-    fence = ("attendance_recovered_at = (SELECT installed_on FROM _sqlx_migrations "
-             "WHERE version = 475)" if tip == 475 else "NOT EXISTS (SELECT FROM "
-             "information_schema.columns WHERE table_schema = 'public' "
-             "AND table_name = 'event_instance_windows' AND column_name = 'attendance_recovered_at')")
-    return f"""SELECT
-        (SELECT count(*) = {PROJECTIONS[tip][0]} AND max(version) = {tip} AND bool_and(success)
-           FROM _sqlx_migrations)
-        AND (SELECT count(*) = 20 AND max(version) = 465 AND bool_and(success)
-           FROM _two_bot_migrations)
-        AND (SELECT contract_version = '1.0' FROM web_v1.contract_meta)
-        AND (SELECT {fence} FROM event_instance_windows WHERE guild_id = '{GUILD}');"""
 
 
 def wait_for(probe, message, seconds=35):
@@ -184,10 +123,11 @@ def run_endpoint(docker, image, postgres, mock_image, stamps, tip):
                 "new PRE snapshot already has a gateway checkpoint")
         docker(*common, *joined, "--name", mock, "--user=1000:1000",
                "--mount", f"type=bind,src={MOCK},dst=/fixture.py,readonly",
-               "--entrypoint", "python3", mock_image, "/fixture.py")
+               "--mount", f"type=bind,src={ROOT / 'scripts/script_intake.py'},dst=/script_intake.py,readonly",
+               "--entrypoint", "python3", mock_image, "-B", "/fixture.py")
 
         def probe(target, path):
-            return json.loads(docker("exec", mock, "python3", "/fixture.py", target, path) or "null")
+            return decode_json(docker("exec", mock, "python3", "-B", "/fixture.py", target, path) or "null")
 
         wait_for(lambda: probe("mock", "/fixture"), "mock did not start")
         env = {
@@ -212,7 +152,8 @@ def run_endpoint(docker, image, postgres, mock_image, stamps, tip):
             if response is None:
                 return None
             status, body = response
-            require(all(body.get(key) == value for key, value in stamps.items()), "readiness stamp mismatch")
+            require(isinstance(body, dict) and all(body.get(key) == value for key, value in stamps.items()),
+                    "readiness stamp mismatch")
             pairs = body["components"]
             components = dict(pairs)
             require(len(pairs) == len(components) and components.get("process") == "ready",
@@ -263,7 +204,7 @@ def main():
         with args.pin.open("rb") as stream:
             raw = stream.read(4097)
         require(len(raw) <= 4096, "private image pin exceeds the fixture limit")
-        pin = json.loads(raw)
+        pin = decode_json(raw)
         with tempfile.TemporaryDirectory(prefix="offline-pre-docker-") as config:
             def docker(*command, input_data=None, timeout=10, missing_ok=False):
                 result = subprocess.run(
@@ -290,7 +231,7 @@ def main():
         parser.exit(1, f"Fixture refused: {error}\n")
     except KeyboardInterrupt:
         parser.exit(130, "Fixture cancelled\n")
-    except (KeyError, ValueError, TypeError, OSError, subprocess.SubprocessError):
+    except (KeyError, ValueError, TypeError, OSError, RecursionError, subprocess.SubprocessError):
         parser.exit(1, "Fixture refused: malformed input or local command failed\n")
 
 

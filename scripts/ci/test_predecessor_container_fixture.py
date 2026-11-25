@@ -1,10 +1,12 @@
 """Test the dormant rehearsal without a Docker daemon or a predecessor image."""
 
 import json
+import socket
 import unittest
 from unittest.mock import Mock
 
 import predecessor_container_fixture as fixture
+from fixtures.predecessor_discord import COMMANDS, Discord
 
 
 STAMPS = {"build_revision": fixture.SOURCE, "build_id": "test-1", "deploy_id": "test.1"}
@@ -13,6 +15,20 @@ PIN = {"image_id": IMAGE, "manifest_digest": "sha256:" + "b" * 64, **STAMPS}
 
 
 class PredecessorContainerFixtureTests(unittest.TestCase):
+    def test_mock_command_publication(self):
+        for token, body, status in [(fixture.TOKEN, b'[{"name":"help"}]', b"200"),
+                                    ("foreign", b"[]", b"401"), (fixture.TOKEN, b"{}", b"400")]:
+            client, server = socket.socketpair()
+            with self.subTest(status=status), client, server:
+                request = (f"PUT {COMMANDS} HTTP/1.1\r\nConnection: close\r\n"
+                           f"Authorization: Bot {token}\r\nContent-Length: {len(body)}\r\n\r\n").encode()
+                client.sendall(request + body)
+                Discord(server, None, None)
+                response = client.recv(4096)
+                self.assertEqual(response.split(b" ", 2)[1], status)
+                if status == b"200":
+                    self.assertEqual(json.loads(response.split(b"\r\n\r\n")[1]), json.loads(body))
+
     def test_refuses_absent_or_mismatched_image_stamps(self):
         config = {"Entrypoint": ["/home/nonroot/two-bot"],
                   "Labels": {label: STAMPS[key] for key, label in fixture.STAMPS.items()}}
