@@ -3,6 +3,7 @@ import { OwnershipRefused, type OwnerRecord } from "./ownership.ts";
 export const STAGING_USE_PATH = "/internal/staging-use";
 export const STAGING_USE_KEY = "two-bot:staging-use:v1";
 export const VOICE_MOVE_LEASE_HEADER = "x-two-voice-move-until";
+export const AUTOMOD_STAGING_PURPOSE = "automod-preview";
 const USED_PREFIX = "two-bot:staging-use-ended:v1:";
 // Allows an explicitly authorized four-ACTIVE-hour soak plus startup/cleanup;
 // routine synthetics and deployment callers must request much shorter windows.
@@ -22,6 +23,7 @@ export interface StagingUse extends StagingWindow {
   acquiredAt: number;
   phase: "preparing" | "active" | "released";
   voiceMove?: true;
+  purpose?: typeof AUTOMOD_STAGING_PURPOSE;
 }
 
 export interface StagingIdentity {
@@ -61,6 +63,7 @@ export function parseStagingUseChange(value: unknown): StagingUseChange | null {
   const v = value as StagingUseChange;
   if ((v.action !== "acquire" && v.action !== "release" && v.action !== "stop")
     || !validIdentity({ ...v, epoch: v.expectedEpoch })
+    || "purpose" in v
     || ("voiceMove" in v && !(v.action === "acquire" && v.voiceMove === true))) return null;
   return {
     environment: "staging", action: v.action, runId: v.runId, runAttempt: v.runAttempt,
@@ -69,15 +72,22 @@ export function parseStagingUseChange(value: unknown): StagingUseChange | null {
   };
 }
 
-function activeFor(use: StagingUse, identity: StagingIdentity, now: number): boolean {
-  return use.phase === "active" && use.acquiredAt <= now && now < use.expiresAt
-    && use.deploymentId === identity.deploymentId && use.sha === identity.sha
+function ownedBy(use: StagingUse, identity: StagingIdentity): boolean {
+  return use.deploymentId === identity.deploymentId && use.sha === identity.sha
     && use.epoch === identity.owner.epoch && identity.owner.phase === "active"
     && identity.owner.deploymentId === identity.deploymentId;
 }
 
+function activeFor(use: StagingUse, identity: StagingIdentity, now: number): boolean {
+  return use.phase === "active" && use.acquiredAt <= now && now < use.expiresAt && ownedBy(use, identity);
+}
+
 export function voiceMoveAllowed(use: StagingUse | undefined, identity: StagingIdentity, now = Date.now()): boolean {
-  return use?.voiceMove === true && activeFor(use, identity, now);
+  return use?.voiceMove === true && use.purpose === undefined && activeFor(use, identity, now);
+}
+
+export function hasAutomodReservation(use: StagingUse | undefined): boolean {
+  return use?.purpose === AUTOMOD_STAGING_PURPOSE && use.phase !== "released";
 }
 
 /** All calls, including native scheduling and teardown, stay in the DO gate. */
@@ -94,6 +104,7 @@ export class StagingLifecycle {
       || !Number.isSafeInteger(value.acquiredAt) || value.acquiredAt < 0
       || value.expiresAt <= value.acquiredAt || value.expiresAt - value.acquiredAt > MAX_STAGING_USE_MS
       || ("voiceMove" in value && value.voiceMove !== true)
+      || ("purpose" in value && (value.purpose !== AUTOMOD_STAGING_PURPOSE || "voiceMove" in value))
       || !["preparing", "active", "released"].includes(value.phase))) {
       throw new OwnershipRefused("staging_storage_invalid");
     }
@@ -102,25 +113,46 @@ export class StagingLifecycle {
 
   async require(identity: StagingIdentity, now = Date.now()): Promise<StagingUse> {
     const use = await this.read();
-    if (!use || !activeFor(use, identity, now)) {
+    if (!use || use.purpose !== undefined || !activeFor(use, identity, now)) {
       throw new OwnershipRefused("staging_use_required");
     }
     return use;
   }
 
+  /** Retain the original issued tuple for recovery after release or expiry.
+   * Ownership remains fenced to the same deployment, build and epoch. */
+  async automodBinding(expected: Readonly<StagingUse>, identity: StagingIdentity, now: number) {
+    const use = await this.read();
+    if (use?.purpose !== AUTOMOD_STAGING_PURPOSE || use.phase === "preparing" || !ownedBy(use, identity)
+      || expected?.purpose !== AUTOMOD_STAGING_PURPOSE || expected.environment !== use.environment
+      || expected.phase !== "active" || "voiceMove" in expected || !sameWindow(use, expected)
+      || expected.deploymentId !== use.deploymentId || expected.sha !== use.sha || expected.epoch !== use.epoch
+      || expected.acquiredAt !== use.acquiredAt) throw new OwnershipRefused("staging_use_conflict");
+    return { lease: Object.freeze({ ...use, phase: "active" as const }), active: activeFor(use, identity, now) };
+  }
+
   async acquire(change: StagingUseChange, identity: StagingIdentity,
-    stop: () => Promise<void>, scheduleExpiry: (expiresAt: number) => Promise<void>, now = Date.now()): Promise<StagingUse> {
+    stop: () => Promise<void>, scheduleExpiry: (expiresAt: number) => Promise<void>, now = Date.now(),
+    purpose?: typeof AUTOMOD_STAGING_PURPOSE): Promise<StagingUse> {
     this.checkIdentity(change, identity);
+    if (purpose !== undefined && (purpose !== AUTOMOD_STAGING_PURPOSE || "voiceMove" in change)) {
+      throw new OwnershipRefused("staging_use_conflict");
+    }
     if (change.expiresAt <= now || change.expiresAt - now > MAX_STAGING_USE_MS) {
       throw new OwnershipRefused("staging_expiry_invalid");
     }
     const old = await this.read();
+    if (old?.purpose === AUTOMOD_STAGING_PURPOSE && old.phase !== "released"
+      && (purpose !== old.purpose || old.expiresAt <= now)) throw new OwnershipRefused("staging_use_conflict");
     if (old && old.phase !== "released" && old.expiresAt > now) {
       // A single workflow may rebind after a deployment or rollback, but may
       // never extend its original finite window or steal another consumer's.
       if (!sameWindow(old, change)) throw new OwnershipRefused("staging_use_conflict");
       const sameBuild = old.deploymentId === identity.deploymentId && old.epoch === identity.owner.epoch
         && old.sha === identity.sha;
+      if (old.purpose !== purpose || (purpose !== undefined && !sameBuild)) {
+        throw new OwnershipRefused("staging_use_conflict");
+      }
       // An exact retry keeps its selection. A rebind may clear the capability
       // for recovery but may never arm it on a different owner/build.
       if (sameBuild ? old.voiceMove !== change.voiceMove : change.voiceMove === true) {
@@ -141,6 +173,7 @@ export class StagingLifecycle {
       deploymentId: identity.deploymentId, sha: identity.sha, epoch: identity.owner.epoch,
       acquiredAt: old && sameWindow(old, change) ? old.acquiredAt : now, phase: "preparing",
       ...(change.voiceMove === true ? { voiceMove: true } : {}),
+      ...(purpose === undefined ? {} : { purpose }),
     };
     // Durable denial precedes both teardown and scheduling. A crash cannot
     // publish an active grant lacking its expiry alarm. End markers prevent a
@@ -166,7 +199,7 @@ export class StagingLifecycle {
   async release(change: StagingUseChange, identity: StagingIdentity, stop: () => Promise<void>): Promise<StagingUse> {
     this.checkIdentity(change, identity);
     const use = await this.read();
-    if (!use || !sameWindow(use, change)) throw new OwnershipRefused("staging_use_conflict");
+    if (!use || use.purpose !== undefined || !sameWindow(use, change)) throw new OwnershipRefused("staging_use_conflict");
     const { voiceMove: _voiceMove, ...ended } = use;
     const released = { ...ended, phase: "released" as const };
     // Keep the tombstone even after a confirmed stop. Repeat cleanup is safe;

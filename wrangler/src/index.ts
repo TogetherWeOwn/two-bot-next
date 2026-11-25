@@ -29,9 +29,10 @@ import {
   authenticated, deploymentId, readChange, readControlBody, refused,
 } from "./ownership.ts";
 import {
-  StagingLifecycle, STAGING_USE_PATH, VOICE_MOVE_LEASE_HEADER, parseStagingUseChange,
+  StagingLifecycle, STAGING_USE_PATH, VOICE_MOVE_LEASE_HEADER, hasAutomodReservation, parseStagingUseChange,
   voiceMoveAllowed, type StagingUse,
 } from "./staging-lifecycle.ts";
+import { StagingAutomodRecovery } from "./staging-automod-recovery.ts";
 import { stagingDatabaseEvidence } from "./staging-database-fingerprint.ts";
 import { PREVIEW_HEADER, parseRegistryJson, previewRefusal, readPreview, readPreviewAbsent } from "./staging-preview.ts";
 import {
@@ -875,6 +876,7 @@ export class TwoBotContainer extends Container<Env> {
 
   private readonly ownership = new OwnershipFence(this.ctx.storage);
   private readonly stagingUse = new StagingLifecycle(this.ctx.storage);
+  private readonly automodRecovery = new StagingAutomodRecovery(this.ctx.storage);
   private readonly initialization: Promise<void>;
   private recoveryFailed = false;
   // Last container git SHA seen on /readyz this tick. Tags the keepalive
@@ -896,6 +898,7 @@ export class TwoBotContainer extends Container<Env> {
     // ingress or alarms are delivered, not just before the next cold start.
     this.initialization = ctx.blockConcurrencyWhile(async () => {
       try {
+        if (this.boundedStaging() && await this.automodReserved()) return;
         const owner = await this.ownership.require(this.id());
         if (this.boundedStaging()) {
           await this.requireRecoveryDatabase();
@@ -904,6 +907,10 @@ export class TwoBotContainer extends Container<Env> {
         }
       } catch (error) {
         refused(error);
+        if (this.boundedStaging() && await this.confirmedAutomodReservation()) {
+          this.recoveryFailed = true;
+          return;
+        }
         try { await this.destroyInactive(); }
         catch {
           this.recoveryFailed = true;
@@ -932,6 +939,7 @@ export class TwoBotContainer extends Container<Env> {
 
   private async owned<T>(operation: (use?: StagingUse) => Promise<T>): Promise<T> {
     return this.gated(async () => {
+      await this.requireCompetingStagingUse();
       if (this.recoveryFailed) throw new OwnershipRefused("shutdown_unconfirmed");
       await this.ownership.require(this.id());
       if (!this.boundedStaging()) return operation();
@@ -943,6 +951,23 @@ export class TwoBotContainer extends Container<Env> {
 
   private voiceMoveConfigured(): boolean {
     return this.boundedStaging() && ingressEnabled(this.env) && this.env.TWO_INTERNAL_ALLOW_VOICE_MOVE === "1";
+  }
+
+  private async requireCompetingStagingUse(): Promise<void> {
+    if (this.boundedStaging() && await this.automodReserved()) {
+      throw new OwnershipRefused("staging_automod_reserved");
+    }
+  }
+
+  private async automodReserved(): Promise<boolean> {
+    return hasAutomodReservation(await this.stagingUse.read()) || !!await this.automodRecovery.pending();
+  }
+
+  /** Emergency teardown still stops unverified ordinary staging. Either
+   * readable record can affirm an AutoMod reservation and defer to recovery. */
+  private async confirmedAutomodReservation(): Promise<boolean> {
+    const use = await this.stagingUse.read().catch(() => undefined);
+    return hasAutomodReservation(use) || await this.automodRecovery.pending().then(Boolean, () => false);
   }
 
   /** Snapshot composition. Static so the DO instance exposes no snapshot RPC. */
@@ -1048,6 +1073,7 @@ export class TwoBotContainer extends Container<Env> {
       let use: StagingUse | undefined;
       try {
         use = await this.stagingUse.read();
+        if (hasAutomodReservation(use) || await this.automodRecovery.pending()) return;
         if (use?.phase === "active" && use.expiresAt > Date.now() && !this.recoveryFailed) {
           await this.scheduleStagingExpiry(use.expiresAt);
           return;
@@ -1059,6 +1085,7 @@ export class TwoBotContainer extends Container<Env> {
       } catch {
         // A storage failure is denial too. Do not keep a healthy gateway or
         // an idle retry loop alive just because authority could not be read.
+        if (await this.confirmedAutomodReservation()) return;
         try {
           if (this.ctx.container?.running) await super.destroy();
           if (this.ctx.container?.running) throw new OwnershipRefused("shutdown_unconfirmed");
@@ -1081,7 +1108,9 @@ export class TwoBotContainer extends Container<Env> {
   override async onActivityExpired(): Promise<void> {
     if (!this.boundedStaging()) return super.onActivityExpired();
     // Native inactivity is a second stop path, never a staging restart path.
-    await this.gated(() => this.destroyInactive());
+    await this.gated(async () => {
+      if (!await this.confirmedAutomodReservation()) await this.stopStagingUse();
+    });
   }
 
   private async destroyInactive(): Promise<void> {
@@ -1244,6 +1273,7 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   private async previewUse(request: Request): Promise<StagingUse> {
+    await this.requireCompetingStagingUse();
     const id = this.id();
     const owner = await this.ownership.require(id, request.headers.get(DEPLOYMENT_HEADER) ?? "");
     const use = await this.stagingUse.require({ deploymentId: id, sha: this.env.CONTAINER_RELEASE ?? "", owner });
@@ -1583,6 +1613,7 @@ export class TwoBotContainer extends Container<Env> {
         if (request.headers.get(DEPLOYMENT_HEADER) !== id) throw new OwnershipRefused("deployment_mismatch");
         const owner = await this.ownership.require(id);
         const identity = { deploymentId: id, sha: this.env.CONTAINER_RELEASE ?? "", owner };
+        if (checkAbsence || change) await this.requireCompetingStagingUse();
         let use = await this.stagingUse.read();
         if (checkAbsence) await this.previewAbsent(request);
         if (change) {
@@ -1651,6 +1682,7 @@ export class TwoBotContainer extends Container<Env> {
         // repeat (force), and only a commit clears the flag. A no-op repeat
         // returns the stored record at the posted epoch while every commit
         // lands exactly one epoch higher, so equality is the no-op signal.
+        await this.requireCompetingStagingUse();
         const owner = await this.ownership.change(id, change, () => this.destroyInactive(), { force: this.recoveryFailed });
         if (change.action === "takeover" && owner.epoch === change.expectedEpoch) {
           console.log(`two-bot ownership takeover already applied at epoch ${owner.epoch}`);
@@ -1710,6 +1742,7 @@ export class TwoBotContainer extends Container<Env> {
       return await this.gated(async () => {
         const id = this.id();
         if (request.headers.get(DEPLOYMENT_HEADER) !== id) throw new OwnershipRefused("deployment_mismatch");
+        if (request.method !== "GET") await this.requireCompetingStagingUse();
         const ops = new OpsControl(this.ctx.storage, this.env as unknown as Record<string, unknown>);
         if (isConfig && request.method === "GET") {
           const config = await ops.readConfig();
@@ -1783,6 +1816,22 @@ export class TwoBotContainer extends Container<Env> {
 
   override async containerFetch(...args: Parameters<Container<Env>["containerFetch"]>): Promise<Response> {
     return this.owned(() => super.containerFetch(...args));
+  }
+
+  override async stop(...args: Parameters<Container<Env>["stop"]>): Promise<void> {
+    if (!this.boundedStaging()) return super.stop(...args);
+    return this.gated(async () => {
+      await this.requireCompetingStagingUse();
+      await super.stop(...args);
+    });
+  }
+
+  override async destroy(): Promise<void> {
+    if (!this.boundedStaging()) return super.destroy();
+    return this.gated(async () => {
+      await this.requireCompetingStagingUse();
+      await super.destroy();
+    });
   }
 
   private keepaliveArming: Promise<void> | undefined;
@@ -2271,7 +2320,10 @@ export class TwoBotContainer extends Container<Env> {
     } catch (error) {
       // A read/write failure after native startup cannot leave an unconfirmed
       // gateway running just because the HTTP request will fail closed.
-      try { await this.destroyInactive(); }
+      try {
+        if (this.boundedStaging()) await this.onActivityExpired();
+        else await this.destroyInactive();
+      }
       catch { this.recoveryFailed = true; }
       throw error;
     }

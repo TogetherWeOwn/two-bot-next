@@ -19,7 +19,10 @@ import detail from "./fixtures/staging-automod-preview.json" with { type: "json"
 import databaseTargets from "./fixtures/staging-database-fingerprint.json" with { type: "json" };
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
 import { PREVIEW_HEADER } from "../src/staging-preview.ts";
-import { STAGING_USE_PATH, STAGING_USE_KEY, VOICE_MOVE_LEASE_HEADER, type StagingWindow } from "../src/staging-lifecycle.ts";
+import {
+  AUTOMOD_STAGING_PURPOSE, StagingLifecycle, STAGING_USE_PATH, STAGING_USE_KEY, VOICE_MOVE_LEASE_HEADER,
+  voiceMoveAllowed, type StagingUse, type StagingWindow,
+} from "../src/staging-lifecycle.ts";
 import { EMPTY_STATE, LOG_QUERY_URL, type MetricsAlertState } from "../src/alert-rules.ts";
 import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
 
@@ -105,7 +108,8 @@ type StartConfig = {
 };
 
 async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: {
-  owner?: unknown; readError?: boolean; stopError?: boolean; running?: boolean; values?: Map<string, unknown>;
+  owner?: unknown; readError?: boolean; stopError?: boolean; unreadableKey?: string; running?: boolean;
+  values?: Map<string, unknown>;
 } | Map<string, unknown> = {}, sqlStore?: DatabaseSync) {
   const database = sqlStore ?? new DatabaseSync(":memory:");
   if (!sqlStore) t.after(() => database.close());
@@ -170,7 +174,9 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
     container: runtime,
     storage: {
       get: async (key: string) => {
-        if (key === OWNER_KEY && flags.readError) throw new Error("synthetic storage error");
+        if ((key === OWNER_KEY && flags.readError) || key === flags.unreadableKey) {
+          throw new Error("synthetic storage error");
+        }
         return values.get(key);
       },
       put: async (key: string | Record<string, unknown>, value?: unknown) => {
@@ -312,6 +318,53 @@ test("protected staging admits only the checked startup environment", async (t) 
   assert.equal(stage.starts.length, 1);
   assert.equal(stage.starts[0]?.env?.DATABASE_URL, database);
   assert.equal(stage.starts[0]?.env?.STAGING_RECOVERY_DB_FINGERPRINT, undefined);
+});
+
+test("protected AutoMod purpose excludes ordinary and voice staging callers", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const window = stagingWindow(), sha = BOUNDED_STAGING_ENV.CONTAINER_RELEASE;
+  const identity = { deploymentId: ID, sha, owner: { ...ACTIVE_OWNER, phase: "active" as const } };
+  const ordinary: StagingUse = { ...window, deploymentId: ID, sha, epoch: ACTIVE_OWNER.epoch,
+    acquiredAt: Date.now(), phase: "active" };
+  const issued = { ...ordinary, purpose: AUTOMOD_STAGING_PURPOSE };
+  const values = new Map<string, unknown>([[OWNER_KEY, ACTIVE_OWNER]]);
+  const h = await harness(t, BOUNDED_STAGING_ENV, values);
+  const staging = new StagingLifecycle(h.ctx.storage as unknown as DurableObjectStorage);
+  for (const use of [ordinary, { ...ordinary, voiceMove: true as const }]) {
+    values.set(STAGING_USE_KEY, use);
+    assert.deepEqual(await staging.require(identity), use);
+    assert.equal(voiceMoveAllowed(use, identity), use.voiceMove === true);
+    await assert.rejects(staging.automodBinding(issued, identity, Date.now()), /staging_use_conflict/);
+  }
+
+  // Exercise purpose persistence solely in the isolated mock store.
+  values.delete(STAGING_USE_KEY);
+  const change = { ...window, action: "acquire" as const, deploymentId: ID, sha, expectedEpoch: issued.epoch };
+  const publicSelection = probeRequest(`https://worker.invalid${STAGING_USE_PATH}`, { method: "POST",
+    headers: { authorization: `Bearer ${CONTROL_TOKEN}` }, body: JSON.stringify({ ...change, purpose: AUTOMOD_STAGING_PURPOSE }) });
+  assert.equal((await h.bot.fetch(publicSelection)).status, 400);
+  assert.equal(values.has(STAGING_USE_KEY), false);
+  assert.deepEqual(await staging.acquire(change, identity, async () => {
+    assert.deepEqual(values.get(STAGING_USE_KEY), { ...issued, phase: "preparing" });
+  }, async () => {}, Date.now(), AUTOMOD_STAGING_PURPOSE), issued);
+  assert.deepEqual(await staging.automodBinding(issued, identity, Date.now()), { lease: issued, active: true });
+  await assert.rejects(h.bot.start(), /staging_automod_reserved/);
+  await assert.rejects(h.bot.containerFetch("http://c/readyz"), /staging_automod_reserved/);
+  await assert.rejects(h.bot.destroy(), /staging_automod_reserved/);
+  for (const action of ["acquire", "release"] as const) {
+    assert.equal((await h.bot.fetch(stagingUseRequest(action, window))).status, 503);
+  }
+  const previewBinding = [ID, sha, issued.runId, issued.runAttempt, issued.expiresAt].join(":");
+  assert.equal((await h.bot.fetch(probeRequest("https://worker.invalid/readyz", { headers: {
+    authorization: `Bearer ${CONTROL_TOKEN}`, [PREVIEW_HEADER]: previewBinding,
+  } }))).status, 503);
+  assert.equal(voiceMoveAllowed({ ...issued, voiceMove: true }, identity), false);
+  assert.deepEqual([h.starts.length, h.requests.length, h.runtime.destroys], [0, 0, 0]);
+
+  t.mock.timers.tick(issued.expiresAt - Date.now());
+  assert.deepEqual(await staging.automodBinding(issued, identity, Date.now()), { lease: issued, active: false });
+  await assert.rejects(staging.automodBinding({ ...issued, expiresAt: issued.expiresAt + 1 }, identity, Date.now()),
+    /staging_use_conflict/);
 });
 
 test("staging preview extends readiness without extra cold lifecycle activity", async (t) => {
@@ -809,6 +862,46 @@ test("bounded staging: unreadable authority in expiry stops rather than sustaini
   assert.equal(h.runtime.running, false);
   assert.equal(h.pending().length, 0);
   assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 0);
+});
+
+test("bounded staging: unreadable AutoMod journal preserves native stop and retry", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const journalKey = "two-bot:staging-automod-recovery:v1";
+  const reconstructed = await harness(t, BOUNDED_STAGING_ENV, { running: true, unreadableKey: journalKey });
+  assert.equal(reconstructed.runtime.running, false, "reconstruction must stop an unconfirmed process");
+
+  const h = await harness(t, BOUNDED_STAGING_ENV);
+  const window = stagingWindow();
+  assert.equal((await h.bot.fetch(stagingUseRequest("acquire", window))).status, 200);
+  const get = h.ctx.storage.get;
+  t.mock.method(h.ctx.storage, "get", async (key: string) => {
+    if (key === journalKey) throw new Error("synthetic journal read failure");
+    return get(key);
+  });
+  h.runtime.running = true;
+  await h.bot.onActivityExpired();
+  assert.equal(h.runtime.running, false, "native inactivity still stops without storage");
+
+  h.runtime.running = true;
+  await assert.rejects(h.bot.onStart(), /staging_automod_storage_unavailable/);
+  assert.equal(h.runtime.running, false, "failed startup still stops without storage");
+
+  const destroy = h.runtime.destroy.bind(h.runtime);
+  let failStop = true;
+  t.mock.method(h.runtime, "destroy", async () => {
+    if (failStop) throw new Error("synthetic native stop failure");
+    await destroy();
+  });
+  h.runtime.running = true;
+  t.mock.timers.tick(window.expiresAt - Date.now());
+  await h.bot.stagingExpiry();
+  const [retry] = await h.bot.listSchedules("stagingExpiry");
+  assert.equal(retry?.time, Math.ceil((Date.now() + 15_000) / 1000));
+  assert.equal(h.runtime.running, true);
+  failStop = false;
+  await h.bot.stagingExpiry();
+  assert.equal(h.runtime.running, false);
+  assert.deepEqual(await h.bot.listSchedules("stagingExpiry"), []);
 });
 
 test("bounded staging: failed control teardown persists a prompt stop-only retry", async (t) => {
