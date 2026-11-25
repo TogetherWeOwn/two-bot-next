@@ -239,7 +239,7 @@ DEPLOY_MARKERS = (
 )
 # Canonical parsed graph for the protected recovery callee. This pins the
 # caller guard, Environment split, exact commands, permissions, and handoffs.
-PRODUCTION_RECOVERY_GRAPH = "581651c0eb95b463adaf47dfbb9465ff8d886a829911bce50e34aede33bf907d"
+PRODUCTION_RECOVERY_GRAPH = "03842025e5a6d800fa46885f9373533a7aa1cacbf9b6850aae7f8b6a8fafc38a"
 
 
 class UniqueKeyLoader(yaml.BaseLoader):
@@ -1689,8 +1689,11 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
             errors.append(f"{name}: must preserve all pending staging migration requests")
         errors.extend(staging_claim_errors(claim))
     else:
-        if workflow.get("concurrency") != {"group": "production-migrate", "cancel-in-progress": "false"}:
-            errors.append(f"{name}: must serialize production plan and apply runs")
+        if workflow.get("concurrency") != {
+            "group": "${{ inputs.mode == 'apply' && 'deploy-production' || 'production-migrate-plan' }}",
+            "cancel-in-progress": "false", "queue": "max",
+        }:
+            errors.append(f"{name}: apply must share the production deploy and recovery lane")
         errors.extend(production_claim_errors(claim))
     if plan.get("environment") != plan_env:
         errors.append(f"{name}:plan: must read the {plan_env} Environment binding")

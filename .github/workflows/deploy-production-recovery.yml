@@ -6,17 +6,27 @@ name: deploy-production-recovery
 on:
   workflow_call:
     inputs:
-      admission: {type: string, required: true}
-      database-host: {type: string, required: true}
-      database-name: {type: string, required: true}
-      database-branch-id: {type: string, required: true}
+      candidate-sha: {type: string, required: true}
+      pins: {type: string, required: true}
+      plan-run-id: {type: string, required: true}
+      stopped: {type: string, required: true}
+      forward-artifact-id: {type: string, required: true}
+      forward-archive-sha256: {type: string, required: true}
+      candidate-worker: {type: string, required: true}
 
 permissions: {}
 
 env:
-  PRODUCTION_HOST: ${{ inputs.database-host }}
-  PRODUCTION_DATABASE: ${{ inputs.database-name }}
-  PRODUCTION_BRANCH_ID: ${{ inputs.database-branch-id }}
+  RELEASE_SHA: ${{ inputs.candidate-sha }}
+  RELEASE_PINS: ${{ inputs.pins }}
+  RELEASE_PLAN_ID: ${{ inputs.plan-run-id }}
+  RELEASE_STOPPED: ${{ inputs.stopped }}
+  FORWARD_ARTIFACT_ID: ${{ inputs.forward-artifact-id }}
+  FORWARD_ARCHIVE_SHA256: ${{ inputs.forward-archive-sha256 }}
+  CANDIDATE_WORKER: ${{ inputs.candidate-worker }}
+  PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
+  PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
+  PRODUCTION_BRANCH_ID: ${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}
 
 jobs:
   fence:
@@ -42,12 +52,18 @@ jobs:
         id: stop
         env:
           GH_TOKEN: ${{ github.token }}
-          RECOVERY_ADMISSION: ${{ inputs.admission }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
         run: python3 scripts/production_recovery_workflow.py fence
+      - name: Retain the authenticated recovery stop
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-release-recovery-stop-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-release-recovery-stop.json
+          if-no-files-found: error
+          retention-days: 14
 
   inverse:
     name: Apply or reconcile the protected inverse
@@ -66,7 +82,6 @@ jobs:
       - name: Verify the stopped fence and run the inverse
         env:
           GH_TOKEN: ${{ github.token }}
-          RECOVERY_ADMISSION: ${{ inputs.admission }}
           STOPPED_FENCE_ACK: ${{ needs.fence.outputs.stopped }}
           TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}
         run: python3 scripts/production_recovery_workflow.py inverse "$GITHUB_WORKSPACE/target/debug/staging-migrate" "$RUNNER_TEMP/production-inverse"
@@ -93,7 +108,6 @@ jobs:
       - name: Authenticate the protected result and restore the exact pair
         env:
           GH_TOKEN: ${{ github.token }}
-          RECOVERY_ADMISSION: ${{ inputs.admission }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
@@ -102,3 +116,10 @@ jobs:
           ARTIFACT_ID: ${{ needs.inverse.outputs.artifact_id }}
           ARCHIVE_SHA256: ${{ needs.inverse.outputs.archive_sha256 }}
         run: python3 scripts/production_recovery_workflow.py restore
+      - name: Retain the exact restored pair and stable readiness
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-release-restored-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-release-restored.json
+          if-no-files-found: error
+          retention-days: 14

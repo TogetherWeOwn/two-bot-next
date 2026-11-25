@@ -1,7 +1,7 @@
 """Synthetic checks for the production recovery handoffs and failure ordering."""
 
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -67,10 +67,11 @@ class RecoveryWorkflowTests(unittest.TestCase):
         before = deepcopy(self.state)
         before["ownership"].update(epoch=20, running=True, phase="active")
         after = deepcopy(self.state)
-        after["container"]["namespace_id"] = "9" * 32
+        after["worker"]["deployment_id"] = "changed"
         self.control.return_value = self.ack
         with self.assertRaisesRegex(GateError, "production_inverse_serving_pair_changed"):
-            recovery.establish_fence(self.pin, self.candidate, Mock(side_effect=[before, after]), self.control)
+            recovery.establish_fence(replace(self.pin, fence_epoch=19), self.candidate,
+                                     Mock(side_effect=[before, after]), self.control)
         self.control.assert_called_once_with("fence-exact", 20, expected_deployment=self.candidate[0])
 
     def test_cli_requires_reviewed_plan_approval(self):
@@ -112,6 +113,36 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.control.assert_not_called()
         self.rollback.wait_stable.assert_not_called()
 
+    def test_post_commit_recovery_reuses_the_forward_stop_and_refuses_an_unknown_worker(self):
+        self.assertEqual(recovery.establish_fence(self.pin, self.candidate, self.observe, self.control),
+                         (self.pin, None))
+        self.control.assert_not_called()
+        with self.assertRaisesRegex(GateError, "production_inverse_serving_pair_changed"):
+            recovery.establish_fence(self.pin, ("", *self.candidate[1:]), self.observe, self.control)
+        self.control.assert_not_called()
+        self.state["worker"].update(version_id=self.pin.worker_version, sha=self.pin.rollback_sha)
+        self.assertEqual(recovery.establish_fence(self.pin, ("", *self.candidate[1:]), self.observe, self.control),
+                         (self.pin, None))
+        self.control.assert_not_called()
+
+    def test_watch_breach_refences_only_the_exact_active_candidate_at_the_next_epoch(self):
+        initial = replace(self.pin, fence_epoch=19)
+        self.state["ownership"].update(epoch=20, phase="active", running=True)
+
+        def fence(*_args, **_kwargs):
+            self.state["ownership"].update(epoch=21, phase="fenced", running=False)
+            return self.ack
+
+        self.control.side_effect = fence
+        self.assertEqual(recovery.establish_fence(initial, self.candidate, self.observe, self.control),
+                         (self.pin, self.ack))
+        self.control.assert_called_once_with("fence-exact", 20, expected_deployment=self.candidate[0])
+        self.control.reset_mock()
+        self.state["ownership"].update(epoch=20, phase="fenced")
+        with self.assertRaisesRegex(GateError, "production_inverse_fence_epoch_changed"):
+            recovery.establish_fence(initial, self.candidate, self.observe, self.control)
+        self.control.assert_not_called()
+
     def test_one_time_takeover_reconciles_lost_reply_before_readiness(self):
         def worker(version):
             self.state["worker"].update(version_id=version, sha=self.pin.rollback_sha)
@@ -141,5 +172,9 @@ class RecoveryWorkflowTests(unittest.TestCase):
         owner["owner"].update(phase="fenced", actor=recovery.fence_actor(self.pin))
         with self.assertRaisesRegex(GateError, "production_rollback_fence_reserved"):
             require_ordinary_production_rollback(self.pin.rollback_sha, self.pin.rollback_sha, owner, has_schema=has_schema)
+        owner["owner"].update(phase="active")
+        with self.assertRaisesRegex(GateError, "production_rollback_requires_protected_inverse"):
+            require_ordinary_production_rollback(self.pin.candidate_sha, self.pin.rollback_sha, owner, has_schema=has_schema)
+        require_ordinary_production_rollback(self.pin.candidate_sha, self.pin.candidate_sha, owner, has_schema=has_schema)
         with self.assertRaisesRegex(GateError, "production_rollback_source_unproved"):
             source_has_attendance_schema(None)

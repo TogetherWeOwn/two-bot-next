@@ -63,8 +63,9 @@ on:
 permissions: {}
 
 concurrency:
-  group: production-migrate
+  group: ${{ inputs.mode == 'apply' && 'deploy-production' || 'production-migrate-plan' }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   plan:
