@@ -1,5 +1,5 @@
 //! Offline reconciliation for the two PRE ledger endpoints. Set
-//! TWO_BOT_PREDECESSOR_PLAN_SOURCE to the source root of the proposed
+//! PREDECESSOR_PLAN_SOURCE to the source root of the proposed
 //! qualification planner and run the case for the intended PRE endpoint.
 
 use std::{env, path::PathBuf};
@@ -55,24 +55,23 @@ async fn assert_pre(cutover_tip: i64, cutover_count: usize, cutover_projection: 
         reconcile(&cutover_ledger, &through(&cutover, 470)),
         Err("ledger version 472 is unknown to this source".to_owned()),
     );
-    let (plan_cutover, plan_store) =
-        if let Some(root) = env::var_os("TWO_BOT_PREDECESSOR_PLAN_SOURCE") {
-            let root = PathBuf::from(root);
-            (
-                Migrator::new(root.join("crates/cutover/migrations"))
-                    .await
-                    .expect("candidate Cutover inventory"),
-                Migrator::new(root.join("crates/store/migrations"))
-                    .await
-                    .expect("candidate Store inventory"),
-            )
-        } else {
-            // CI exercises the PRE prefixes. The full main inventory also
-            // contains later migrations and cannot produce a clean PRE plan.
-            assert!(reconcile(&cutover_ledger, &cutover).unwrap().contains(&480));
-            assert!(reconcile(&store_ledger, &store).unwrap().contains(&478));
-            (pre_cutover, pre_store)
-        };
+    let (plan_cutover, plan_store) = if let Some(root) = env::var_os("PREDECESSOR_PLAN_SOURCE") {
+        let root = PathBuf::from(root);
+        (
+            Migrator::new(root.join("crates/cutover/migrations"))
+                .await
+                .expect("candidate Cutover inventory"),
+            Migrator::new(root.join("crates/store/migrations"))
+                .await
+                .expect("candidate Store inventory"),
+        )
+    } else {
+        // CI exercises the PRE prefixes. The full main inventory also
+        // contains later migrations and cannot produce a clean PRE plan.
+        assert!(reconcile(&cutover_ledger, &cutover).unwrap().contains(&480));
+        assert!(reconcile(&store_ledger, &store).unwrap().contains(&478));
+        (pre_cutover, pre_store)
+    };
 
     assert_eq!(reconcile(&cutover_ledger, &plan_cutover), Ok(vec![]));
     assert_eq!(reconcile(&store_ledger, &plan_store), Ok(vec![]));
