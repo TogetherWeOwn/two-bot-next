@@ -589,6 +589,17 @@ identity check and the later SHA fails readiness. Record the two actual
 revisions and the image digest as a release integration dependency and keep
 qualification pending at both endpoints. Preserve truthful source stamps.
 
+For an interrupted or expired isolated rehearsal, keep the planned immutable
+registry reference with the protected reservation before the copy starts. After
+publication has settled and the exact staging target passes cleanup readback,
+record the [registry disposition](../scripts/pre_registry_cleanup.py) from a
+fresh authenticated lookup of that reference. `already_absent` records confirmed
+absence in that repository. A present digest yields `unresolved_digest_reference`
+and leaves registry cleanup open. The publication plan creates no reservation
+tag, and the documented Cloudflare image removal can affect rollback images.
+Preserve shared or retained content and keep the existing protected cleanup
+approval in force. [Cloudflare image management](https://developers.cloudflare.com/containers/guides/image-management/#registry-limits)
+
 Hosted source-level CI runs the
 [synthetic refusal case](../scripts/ci/test_predecessor_serving_identity.py)
 for both choices of `rollback_sha`.
