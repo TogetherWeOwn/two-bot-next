@@ -123,19 +123,22 @@ class Resource:
 class Inventory:
     """A fresh, complete exact-target observation from the caller's adapter.
 
-    None for a resource means confirmed absence. An incomplete or uncertain
-    observation must never be normalized to absence or zero. `startup_settled`
-    requires independent proof that admission is closed and no earlier request
-    can still create resources. Time and workflow status do not prove this.
+    None for a resource means confirmed absence. The active and assigned counts
+    must come from direct proof while the exact app is readable, or affirmative
+    evidence that it was never created. App deletion alone cannot supply them.
+    `startup_settled` requires independent proof that admission is closed and
+    no in-flight operation or keepalive can create or restart resources. Time
+    and workflow status do not prove this.
     """
 
     target: Target
     worker: Resource | None
     container: Resource | None
-    instance_count: int
+    instance_count: int | None
     write_access: bool
     complete: bool
     startup_settled: bool = False
+    assigned_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -147,11 +150,14 @@ class Action:
 
 def check_inventory(target, inventory):
     require(type(inventory) is Inventory and inventory.target == target, "wrong_pre_inventory_target")
-    require(inventory.complete is True and type(inventory.instance_count) is int
-            and inventory.instance_count >= 0 and type(inventory.write_access) is bool,
+    counts = (inventory.instance_count, inventory.assigned_count)
+    require(inventory.complete is True
+            and all(count is None or (type(count) is int and count >= 0) for count in counts)
+            and type(inventory.write_access) is bool,
             "unconfirmed_pre_inventory")
     if inventory.worker is not None:
-        require(inventory.worker == Resource(target.worker_name, target.worker_name), "wrong_pre_worker")
+        require(type(inventory.worker) is Resource
+                and inventory.worker == Resource(target.worker_name, target.worker_name), "wrong_pre_worker")
     if inventory.container is not None:
         app = inventory.container
         require(type(app) is Resource and app.name == target.container_name
@@ -162,8 +168,9 @@ def plan_cleanup(target, inventory, *, now, run_status):
     """Return ordered actions in this target's scope, or None to spare a run.
 
     Use authoritative run status. Apply the plan in order and stop on an
-    unconfirmed operation. Re-observe for each sweep, including after a lost
-    deploy reply. Plans and empty snapshots do not attest teardown.
+    unconfirmed operation. Guard app deletion with `confirm_container_stopped`.
+    Re-observe for each sweep, including after a lost deploy reply. Plans and
+    empty snapshots do not attest teardown.
     """
     check_clock(target, now)
     require(run_status in ("active", "terminal"), "unconfirmed_pre_run_status")
@@ -180,9 +187,19 @@ def plan_cleanup(target, inventory, *, now, run_status):
     return tuple(actions)
 
 
+def confirm_container_stopped(target, action, inventory):
+    """Guard app deletion using fresh direct health for the pinned app ID."""
+    check_inventory(target, inventory)
+    require(inventory.container is not None
+            and action == Action("delete_container", target.container_name, inventory.container.id),
+            "wrong_pre_container_delete")
+    require(inventory.startup_settled is True and not inventory.write_access and inventory.worker is None
+            and inventory.instance_count == inventory.assigned_count == 0, "pre_container_stop_unconfirmed")
+
+
 def verify_cleanup(target, inventory):
     """Require independently settled startup and fresh post-cleanup readback."""
     check_inventory(target, inventory)
     require(inventory.startup_settled is True, "pre_startup_unsettled")
     require(not inventory.write_access and inventory.worker is None and inventory.container is None
-            and inventory.instance_count == 0, "pre_cleanup_unconfirmed")
+            and inventory.instance_count == inventory.assigned_count == 0, "pre_cleanup_unconfirmed")

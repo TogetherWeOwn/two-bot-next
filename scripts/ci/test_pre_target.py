@@ -9,14 +9,15 @@ import unittest
 from unittest.mock import patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
-    from pre_target import Action, Inventory, Resource, Target, TargetError, make_config, plan_cleanup, verify_cleanup
+    from pre_target import (Action, Inventory, Resource, Target, TargetError, confirm_container_stopped,
+                            make_config, plan_cleanup, verify_cleanup)
 
 
 TARGET = Target("pre-fixture-test", 123, 1_800_000_000, "0473/0465")
 APP_ID = "5cb771af-3421-4223-8a06-39e061f06400"
 WORKER = Resource(TARGET.worker_name, TARGET.worker_name)
 CONTAINER = Resource(TARGET.container_name, APP_ID)
-ABSENT = Inventory(TARGET, None, None, 0, False, True, startup_settled=True)
+ABSENT = Inventory(TARGET, None, None, 0, False, True, startup_settled=True, assigned_count=0)
 
 
 class FakeTransport:
@@ -35,8 +36,8 @@ class FakeTransport:
             assert snapshot.write_access is False
             updated = replace(snapshot, worker=None)
         elif snapshot.container and action == Action("delete_container", snapshot.container.name, snapshot.container.id):
-            assert snapshot.write_access is False and snapshot.worker is None
-            updated = replace(snapshot, container=None, instance_count=0)
+            confirm_container_stopped(target, action, self.inventory(target))
+            updated = replace(snapshot, container=None)
         else:
             raise AssertionError("unexpected cleanup action")
         self.calls.append(action.operation)
@@ -87,8 +88,9 @@ class PreTargetTests(unittest.TestCase):
         active_target = replace(TARGET, run_id=124, started_at=TARGET.started_at + 60, shape="0475/0465")
         active = Inventory(active_target, Resource(active_target.worker_name, active_target.worker_name),
                            Resource(active_target.container_name, "bcf0c525-7a87-4741-9bd7-cde8a22e4cb0"),
-                           1, True, True)
-        fake = FakeTransport(replace(ABSENT, write_access=True, startup_settled=False), active)
+                           1, True, True, assigned_count=1)
+        fake = FakeTransport(replace(ABSENT, write_access=True, startup_settled=False,
+                                     instance_count=None, assigned_count=None), active)
 
         def sweep(target, *, status="active"):
             plan = plan_cleanup(target, fake.inventory(target), now=TARGET.expires_at, run_status=status)
@@ -104,7 +106,14 @@ class PreTargetTests(unittest.TestCase):
         # The lost deploy reply had carried no IDs. Exact scoped inventory now
         # finds the late resources, with their synthetic write access revoked.
         fake.snapshots[TARGET] = replace(fake.inventory(TARGET), worker=WORKER, container=CONTAINER,
-                                         instance_count=1, startup_settled=True)
+                                         instance_count=1, assigned_count=1)
+        with self.assertRaisesRegex(TargetError, "pre_container_stop_unconfirmed"):
+            sweep(TARGET)
+        self.assertEqual(fake.calls, ["revoke_write_access", "delete_worker"])
+        # An independent authority stops the instance and confirms zero counts
+        # while the exact app is still readable. Deletion preserves that proof.
+        fake.snapshots[TARGET] = replace(fake.inventory(TARGET), instance_count=0, assigned_count=0,
+                                         startup_settled=True)
         sweep(TARGET)
         sweep(TARGET)
         self.assertEqual(fake.calls, ["revoke_write_access", "delete_worker", "delete_container"])
@@ -129,11 +138,13 @@ class PreTargetTests(unittest.TestCase):
         self.assertIsNone(verify_cleanup(TARGET, ABSENT))
         for snapshot, reason in (
             (replace(ABSENT, complete=False), "unconfirmed_pre_inventory"),
-            (replace(ABSENT, instance_count=None), "unconfirmed_pre_inventory"),
+            (replace(ABSENT, instance_count=None), "pre_cleanup_unconfirmed"),
             (replace(ABSENT, instance_count=False), "unconfirmed_pre_inventory"),
+            (replace(ABSENT, assigned_count=None), "pre_cleanup_unconfirmed"),
             (replace(ABSENT, write_access=None), "unconfirmed_pre_inventory"),
             (replace(ABSENT, startup_settled=False), "pre_startup_unsettled"),
             (replace(ABSENT, instance_count=1), "pre_cleanup_unconfirmed"),
+            (replace(ABSENT, assigned_count=1), "pre_cleanup_unconfirmed"),
             (replace(ABSENT, container=CONTAINER), "pre_cleanup_unconfirmed"),
             (replace(ABSENT, worker=WORKER), "pre_cleanup_unconfirmed"),
             (replace(ABSENT, write_access=True), "pre_cleanup_unconfirmed"),
@@ -147,3 +158,16 @@ class PreTargetTests(unittest.TestCase):
         self.assertEqual(actions, (Action("revoke_write_access", TARGET.service_name, TARGET.service_name),
                                   Action("delete_worker", WORKER.name, WORKER.id),
                                   Action("delete_container", CONTAINER.name, CONTAINER.id)))
+
+    def test_app_delete_requires_direct_zero_readback_on_exact_app(self):
+        action = Action("delete_container", CONTAINER.name, CONTAINER.id)
+        stopped = replace(ABSENT, container=CONTAINER)
+        self.assertIsNone(confirm_container_stopped(TARGET, action, stopped))
+        for snapshot in (replace(stopped, startup_settled=False), replace(stopped, worker=WORKER),
+                         replace(stopped, write_access=True), replace(stopped, instance_count=1),
+                         replace(stopped, assigned_count=1)):
+            with self.subTest(snapshot=snapshot), self.assertRaisesRegex(TargetError, "pre_container_stop_unconfirmed"):
+                confirm_container_stopped(TARGET, action, snapshot)
+        for snapshot in (ABSENT, replace(stopped, container=replace(CONTAINER, id="bcf0c525-7a87-4741-9bd7-cde8a22e4cb0"))):
+            with self.subTest(snapshot=snapshot), self.assertRaisesRegex(TargetError, "wrong_pre_container_delete"):
+                confirm_container_stopped(TARGET, action, snapshot)
