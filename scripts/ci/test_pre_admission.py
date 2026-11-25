@@ -10,6 +10,7 @@ from uuid import UUID
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_admission import AdmissionRecord, SettlementEvidence, SettlementSource, StartupAdmission
+    from pre_start_stop import Deployment
     from pre_target import Inventory, Target, TargetError, verify_cleanup
 
 
@@ -132,6 +133,35 @@ class StartupAdmissionTests(unittest.TestCase):
                               startup_settled=self.authority.startup_settled(TARGET), assigned_count=0)
         with self.assertRaisesRegex(TargetError, "^pre_startup_unsettled$"):
             verify_cleanup(TARGET, inventory)
+
+    def test_late_start_reply_preserves_close_and_cannot_settle_startup(self):
+        start_id = self.authority.admit_start(TARGET)
+        self.assertIsInstance(start_id, UUID)
+        stop = StartupAdmission(self.store, self.observe)
+        closed = AdmissionRecord(TARGET, start_id, closed=True)
+
+        def reply_after_close(target, admitted_id):
+            self.assertTrue(stop.close(target))
+            self.assertFalse(stop.settle(target))
+            self.assertEqual(self.store.read(target), closed)
+            return Deployment(target, admitted_id, UUID(int=2), UUID(int=3))
+
+        dispatch = Mock(side_effect=reply_after_close)
+        self.observe.return_value = dispatch(TARGET, start_id)
+        self.assertFalse(stop.settle(TARGET))
+        self.assertEqual(self.store.read(TARGET), closed)
+        self.assertIsNone(self.authority.admit_start(TARGET))
+        inventory = Inventory(TARGET, None, None, 0, False, True,
+                              startup_settled=stop.startup_settled(TARGET), assigned_count=0)
+        with self.assertRaisesRegex(TargetError, "^pre_startup_unsettled$"):
+            verify_cleanup(TARGET, inventory)
+
+        self.observe.return_value = SettlementEvidence(closed, SettlementSource.RUNTIME, True, True)
+        self.assertTrue(stop.settle(TARGET))
+        self.assertEqual(self.store.read(TARGET), replace(closed, settled_by=SettlementSource.RUNTIME))
+        self.assertIsNone(self.authority.admit_start(TARGET))
+        verify_cleanup(TARGET, replace(inventory, startup_settled=self.authority.startup_settled(TARGET)))
+        dispatch.assert_called_once_with(TARGET, start_id)
 
     def test_only_affirmative_exact_post_close_evidence_settles(self):
         self.authority.admit_start(TARGET)
