@@ -154,8 +154,8 @@ verification passes.
 This handoff describes the dormant PRE contract. Keep rehearsal admission and
 qualification pending until the protected workflow caller and provider adapter
 are available under the existing gates. If protected stop is unavailable for
-an existing reservation, record cleanup as unresolved and track it as a staging
-incident with the staging release operator.
+an existing reservation, record cleanup as unresolved in the private release
+task record and track it as a staging incident with the staging release operator.
 
 When the protected caller refuses startup or loses the create reply, keep
 qualification pending. In the private release task record, retain the rehearsal
@@ -168,9 +168,10 @@ issued. Mark missing evidence and any unverified effects as unresolved. Keep
 raw provider responses and credentials out of the record.
 
 The staging release operator keeps custody of that reservation through cleanup.
-Use the protected stop path for the same reservation, including when startup
-was refused before admission. If the start runner is gone or loses authority,
-the separately authorized stop caller handles fencing, close and settlement.
+When protected stop is available, use it for the same reservation, including
+when startup was refused before admission. If the start runner is gone or loses
+authority, the separately authorized stop caller handles fencing, close and
+settlement.
 Retain the independent post-close proof that pending starts have drained or
 cannot take effect and that recreation and restart are fenced. Keep the
 reservation closed to startup. [Startup and stop contract](../scripts/pre_start_stop.py) ·
