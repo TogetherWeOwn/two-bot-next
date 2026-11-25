@@ -588,8 +588,6 @@ async fn release_apply_observations(
     .await
 }
 
-#[tokio::test]
-#[ignore = "requires agent-testdb or the CI service"]
 async fn locked_release_pre_ledger_drift_refuses_before_ddl_and_grants() -> TestResult {
     use two_bot_cutover::staging_migrate::apply_release_schema;
 
@@ -2017,6 +2015,8 @@ async fn real_sqlx_runner_cases() -> TestResult {
     // missing migration below the ledger maximum.
     applies_missing_0475_after_0481_and_reads_back_both_ledgers().await?;
     recovery_inventory_proves_pre_0482_absence().await?;
+    // Use this test's guarded database route for the locked PRE regression.
+    locked_release_pre_ledger_drift_refuses_before_ddl_and_grants().await?;
     release_schema_is_atomic_across_migrations_contract_and_grants().await
 }
 
