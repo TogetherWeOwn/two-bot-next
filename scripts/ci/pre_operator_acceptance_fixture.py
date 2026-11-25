@@ -3,7 +3,10 @@
 from dataclasses import dataclass
 
 from build_identity import is_build_revision_shape, is_deploy_id_shape
-from pre_target import ProtectedRouteReadback, Target, confirm_protected_route
+from pre_registry_cleanup import (
+    RegistryDisposition, RegistryReadback, RegistryReservation, registry_cleanup_disposition,
+)
+from pre_target import Inventory, ProtectedRouteReadback, Target, TargetError, confirm_protected_route
 from rollback_proof import DIGEST, ProofError, VERSION, require
 from staging_rollout import GateError, decode, runtime_ready
 from worker_container_rollback import gateway_state
@@ -74,9 +77,18 @@ class WorkerEvidence:
 class SweepEvidence:
     # Record the reservation passed to #2563's sweep_target with its outcome.
     # An exception or lost response has no outcome. Only 'cleared' signifies
-    # completion of the independent stop and final readback checks.
+    # completion of the Worker and Container checks.
     reservation: Target
     outcome: str | None
+
+
+@dataclass(frozen=True)
+class RegistryCleanupEvidence:
+    inventory: Inventory
+    readback: RegistryReadback
+    now: int
+    run_status: str
+    publication_settled: bool
 
 
 @dataclass(frozen=True)
@@ -100,16 +112,19 @@ class AcceptedRow:
     cleanup: str
 
 
-def accept(reservation, build, *, receipt, schema, serving, worker, sweep,
+def accept(registry_reservation: RegistryReservation, build, *, receipt, schema, serving, worker, sweep, registry,
            pinned_route, pinned_app_id, read_ingress):
     """Compose a stubbed verified build receipt and scoped observations.
 
     The operator pins come from outside the observations. `receipt` stands in
-    for #2558's verified #2556 build.json. Schema, serving, probes and sweep
-    stand in for evidence captured against each independently observed target.
-    The sweep outcome comes from the current cleanup attempt. After it clears,
-    read private ingress independently using the original route and app pins.
+    for #2558's verified #2556 build.json. The protected publication plan
+    pins the registry reservation before the copy. Readback follows verified
+    target cleanup and independent proof of publisher settlement.
+    The sweep outcome comes from the current cleanup attempt. After it clears
+    and registry absence is verified, read private ingress independently
+    using the original route and app pins.
     """
+    reservation = registry_reservation.target
     require(type(build.run_id) is int and 0 < build.run_id < 10**20
             and is_build_revision_shape(build.revision) and is_deploy_id_shape(build.deploy_id)
             and build.deploy_id.endswith(f".1+{build.revision[:7]}")
@@ -147,6 +162,17 @@ def accept(reservation, build, *, receipt, schema, serving, worker, sweep,
     require(sweep is not None, "pre_cleanup_unproved")
     require(sweep.reservation == reservation, "pre_cleanup_reservation_mismatch")
     require(sweep.outcome == "cleared", "pre_cleanup_unproved")
+    require(registry is not None, "pre_registry_cleanup_unproved")
+    require(registry_reservation.reference.partition("@")[2] == build.image_digest,
+            "pre_registry_build_mismatch")
+    try:
+        disposition = registry_cleanup_disposition(
+            registry_reservation, registry.inventory, registry.readback, now=registry.now,
+            run_status=registry.run_status, publication_settled=registry.publication_settled,
+        )
+    except TargetError as error:
+        raise ProofError(str(error)) from None
+    require(disposition is RegistryDisposition.ALREADY_ABSENT, "pre_registry_cleanup_unproved")
     try:
         confirm_protected_route(reservation, pinned_app_id=pinned_app_id, readback=pinned_route)
         ingress = read_ingress(pinned_route)
