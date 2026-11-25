@@ -59,7 +59,7 @@ class CiEvidenceCheckoutTests(unittest.TestCase):
                 (source / path).touch()
             git(source, "add", "--force", ".")
             git(source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
-                "commit", "--quiet", "-m", "Synthetic CI source")
+                "commit", "--no-gpg-sign", "--quiet", "-m", "Synthetic CI source")
 
             fake_gh = root / "gh"
             fake_gh.write_text(
