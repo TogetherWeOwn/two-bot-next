@@ -735,12 +735,12 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     );
     let receipt: String = sqlx::query_scalar(
         "SELECT pg_get_constraintdef(oid) FROM pg_constraint
-         WHERE conrelid = 'public.internal_action_log'::regclass
-           AND conname = 'internal_action_log_receipt_check'",
+         WHERE conrelid = 'public.internal_action_log'::regclass AND conname = 'internal_action_log_receipt_check'",
     )
     .fetch_one(&mut admin)
     .await?;
-    for definition in ["CHECK (true) NOT VALID", &receipt] {
+    let unenforced = format!("{} NOT ENFORCED", receipt.trim_end_matches(" NOT VALID"));
+    for definition in ["CHECK (true) NOT VALID", &unenforced, &receipt] {
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE public.internal_action_log DROP CONSTRAINT internal_action_log_receipt_check,
              ADD CONSTRAINT internal_action_log_receipt_check {definition}"
@@ -757,6 +757,7 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
             .is_err()
     );
     admin.execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at DROP DEFAULT").await?;
+    assert!(classify().await.is_err());
     let refused = recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await;
     assert_eq!(
         refused.unwrap_err().to_string(),
