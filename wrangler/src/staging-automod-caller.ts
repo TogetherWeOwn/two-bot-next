@@ -24,7 +24,7 @@ type Authority = Pick<Lifecycle, "storage" | "env" | "exclusive"> & {
 };
 
 function refused(): OwnershipRefused {
-  return new OwnershipRefused("staging_automod_caller_refused");
+  return new OwnershipRefused("staging_use_conflict");
 }
 
 function boundTo(expected: Lease, observed: Lease | undefined): boolean {

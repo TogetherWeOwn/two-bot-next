@@ -460,7 +460,7 @@ test("protected AutoMod scopes startup and cleanup to the exact exclusive stagin
 
   t.mock.timers.tick(issued.expiresAt - Date.now());
   values.set(STAGING_USE_KEY, { ...issued, phase: "released" });
-  await assert.rejects(h.bot.start(), /staging_automod_reserved/);
+  await assert.rejects(h.bot.start(), /staging_use_conflict/);
   await h.bot.stagingExpiry();
   assert.equal(h.runtime.running, true);
   await assert.rejects(run("recover", { ...issued, expiresAt: issued.expiresAt + 1 }), refused);
