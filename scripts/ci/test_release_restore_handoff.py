@@ -107,6 +107,8 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
         for app in ("bot", "web"):
             self.assert_refuses_change(("after_undo", app), self.handoff["before"][app],
                                        f"{app.capitalize()} readback precedes phase")
+        self.assert_refuses_change(("forward", "bot", "at"), self.handoff["undo"]["at"],
+                                   "forward Bot readback after phase")
 
     def test_requires_exact_undo_and_post_undo_state(self):
         self.assert_refuses_change(("undo", "sha256"), "0" * 64, "selected schema inverse")
