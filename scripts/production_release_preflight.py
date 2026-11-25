@@ -72,8 +72,8 @@ def verify_preflight(pin, target, plan, fresh, observe, control):
     return owner["epoch"]
 
 
-def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_database, api=github, *, preflight_epoch):
-    """Recheck the stop and the preflight epoch from this run's protected prepare job."""
+def prepared_epoch(pin, run, plan_id, stopped, *, preflight_epoch):
+    """Bind the stop to the preflight epoch from this run's protected prepare job."""
     run_id = run.get("id")
     owner = mapping(stopped.get("owner"))
     epoch = owner.get("epoch")
@@ -88,7 +88,12 @@ def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_databas
             and type(owner.get("oldEpoch")) is int and owner["oldEpoch"] == preflight_epoch
             and type(epoch) is int and epoch == preflight_epoch + 1,
             "production_forward_stopped_fence_unproved")
-    protected_job(run, api, PREPARE_JOB, PREPARE_STEPS)
+    return epoch
+
+
+def approved_plan(pin, run, plan_id, target, api=github):
+    """Authenticate the exact plan and check independent approval for its archive."""
+    require(matches(RUN_ID, plan_id) and plan_id != str(run["id"]), "production_forward_plan_changed")
     plan, artifact = authenticated_plan(plan_id, api, workflow=WORKFLOW_PATH, artifact_name=ARTIFACT)
     require(plan.get("mode") == "plan" and plan.get("migration_target") == "production"
             and plan.get("role") == "two_bot_migrator_ro" and plan.get("target") == target
@@ -99,6 +104,14 @@ def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_databas
     verify_environment(api)
     verify_check(api, run, f"production-apply:{plan_id}:{artifact['archive_digest'].removeprefix('sha256:')}",
                  datetime.now(timezone.utc))
+    return plan, artifact
+
+
+def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_database, api=github, *, preflight_epoch):
+    """Recheck the protected stop and exact plan approval before applying."""
+    epoch = prepared_epoch(pin, run, plan_id, stopped, preflight_epoch=preflight_epoch)
+    protected_job(run, api, PREPARE_JOB, PREPARE_STEPS)
+    plan, artifact = approved_plan(pin, run, plan_id, target, api)
     receipt = forward_receipt(plan_id, plan, apply_database(plan_id, plan))
-    return {**receipt, "run_id": str(run_id), "run_attempt": 1, "stopped_epoch": epoch,
+    return {**receipt, "run_id": str(run["id"]), "run_attempt": 1, "stopped_epoch": epoch,
             "plan_archive_sha256": artifact["archive_digest"], "release_reference": plan["recovery_evidence_ref"]}
