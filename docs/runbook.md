@@ -2812,15 +2812,14 @@ Use a fresh attempt-one plan-only run. Approval expires after 23 hours and
 rechecks approval immediately before DDL. After an intervening apply,
 reconcile both ledgers and use a fresh plan and approval.
 
-The exact Cutover 0475/0479–0482 and Store 0478 plan uses the runner from
-the approved workflow revision. It compares the contract and role policy
-with the planned source, then applies both migration chains, the voice
-heat contract and the new-object grants in a single transaction. A readback
-failure rolls back that transaction. The affected tables can block Bot
-writes until commit or rollback, even though individual statements have
-timeouts. For an uncertain commit, classify both
-ledgers and role state before retrying. A committed change still requires
-an independently qualified recovery route before rollout.
+The ordinary production migration workflow refuses plans that apply
+Cutover 0480, including the exact Cutover 0475/0479–0482 and Store 0478
+bundle. Rehearsal runs that bundle as one transaction across both migration
+chains, the voice heat contract and the new-object grants. If the commit
+outcome is uncertain, reconcile both ledgers and role state before retrying.
+The database inverse verifies both ledgers and role state and retains 0475.
+Live use requires a protected release path that authenticates a stopped
+writer and ties the verified inverse to the prior Worker and image takeover.
 
 ### Redeploy the approved revision
 
