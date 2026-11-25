@@ -632,8 +632,8 @@ unnamed image from the OCI archive and uploads its manifest at the digest
 reference. The OCI layout index locates that image. The protected publisher
 needs an approved Skopeo build and registry access with blob upload, digest
 manifest PUT and digest GET for the dedicated repository. The staging runtime
-also needs pull access to the digest in that repository. Keep registry auth
-in the protected adapter's private auth file.
+also needs pull access to the digest in that repository. Bind Skopeo to the
+protected adapter's private auth file with `--dest-authfile` or `REGISTRY_AUTH_FILE`.
 [Skopeo copy](https://github.com/containers/skopeo/blob/v1.20.0/docs/skopeo-copy.1.md) ·
 [OCI Distribution manifest PUT](https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pushing-manifests)
 
@@ -641,12 +641,13 @@ After copy success, the protected adapter must make a fresh authenticated
 `GET /v2/<namespace>/<repository>/manifests/<manifest-digest>` with
 `Accept: application/vnd.oci.image.manifest.v1+json` on the planned registry.
 Require HTTP 200 from the exact request scope without redirects. Supply the
-effective digest reference, the `Content-Type` media type and
-`Docker-Content-Digest` as descriptor fields, and the original response bytes
-with a 1 MiB cap plus one overflow byte. Set descriptor size to the observed
-byte count. `verify_registry_manifest` returns `<repository>@<manifest-digest>`
-only when scope, descriptor and the hash of those bytes match the plan. The
-expected digest is the producer's `image_manifest_digest` from `build.json`.
+effective digest reference, the `Content-Type` media type without parameters,
+and the original response bytes with a 1 MiB cap plus one overflow byte. Set
+descriptor size to the observed byte count. Only set the descriptor's `digest`
+when the registry sends `Docker-Content-Digest`. `verify_registry_manifest`
+requires the exact scope and OCI manifest media type, and hashes the response
+bytes against the producer's `image_manifest_digest` from `build.json`. Any
+reported digest must also match before it returns `<repository>@<manifest-digest>`.
 Keep admission pending until the protected publisher proves registry authority,
 digest readback and runtime access. This source change supplies an offline
 contract and synthetic evidence.

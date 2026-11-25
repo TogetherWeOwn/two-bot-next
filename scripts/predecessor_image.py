@@ -69,14 +69,14 @@ def verify_registry_manifest(plan: PublicationPlan, *, reference: str, descripto
     """Verify a direct, authenticated digest GET from the planned repository.
 
     The adapter supplies the effective response reference, the registry media
-    type and digest, and the unchanged response bytes. Pass only an HTTP 200
-    from the exact scope, with body reads capped at DESCRIPTOR_LIMIT + 1.
+    type, any reported digest, and the unchanged response bytes. Pass only an
+    HTTP 200 from the exact scope, with body reads capped at DESCRIPTOR_LIMIT + 1.
     """
     require(reference == plan.reference, "predecessor_registry_scope_mismatch")
     descriptor = mapping(descriptor)
     expected = plan.reference.rsplit("@", 1)[1]
     size = descriptor.get("size")
-    require(descriptor.get("mediaType") == MEDIA_TYPE and descriptor.get("digest") == expected
+    require(descriptor.get("mediaType") == MEDIA_TYPE and descriptor.get("digest", expected) == expected
             and type(size) is int and isinstance(body, bytes) and 0 < len(body) == size <= DESCRIPTOR_LIMIT,
             "predecessor_registry_descriptor_mismatch")
     require("sha256:" + sha256(body).hexdigest() == expected, "predecessor_registry_manifest_mismatch")

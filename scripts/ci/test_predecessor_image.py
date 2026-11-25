@@ -47,6 +47,18 @@ class PredecessorImageTests(unittest.TestCase):
         with self.assertRaisesRegex(GateError, "^predecessor_registry_descriptor_mismatch$"):
             verify_registry_manifest(plan, reference=self.reference, descriptor=descriptor, body=changed)
 
+    def test_optional_digest_header_never_replaces_the_raw_body_hash(self):
+        plan = plan_predecessor_image(self.root, staging_repository=REPOSITORY)
+        descriptor = {"mediaType": MEDIA_TYPE, "size": len(self.body)}
+        self.assertEqual(verify_registry_manifest(plan, reference=self.reference,
+                                                 descriptor=descriptor, body=self.body), self.reference)
+        changed = b" " + self.body[1:]
+        with self.assertRaisesRegex(GateError, "^predecessor_registry_manifest_mismatch$"):
+            verify_registry_manifest(plan, reference=self.reference, descriptor=descriptor, body=changed)
+        with self.assertRaisesRegex(GateError, "^predecessor_registry_descriptor_mismatch$"):
+            verify_registry_manifest(plan, reference=self.reference,
+                                     descriptor={**descriptor, "digest": "sha256:" + "f" * 64}, body=self.body)
+
     def test_image_index_media_type_fails_even_with_the_expected_bytes(self):
         plan = plan_predecessor_image(self.root, staging_repository=REPOSITORY)
         index_type = "application/vnd.oci.image.index.v1+json"
