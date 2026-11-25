@@ -29,6 +29,8 @@ const failed = { verdict: "failed", start: false, recover: false };
 
 async function fixture(t: TestContext) {
   t.mock.timers.enable({ apis: ["Date"], now: now() });
+  // Keep the deadlines pending so only the caller can cancel a read.
+  t.mock.method(AbortSignal, "timeout", () => new AbortController().signal);
   const fetch = t.mock.method(globalThis, "fetch", async () => { throw new Error("unexpected network request"); });
   const readControlBearer = t.mock.fn(() => controlBearer);
   const invoke = t.mock.fn<Invoke>(async () => {});
@@ -66,7 +68,7 @@ test("caller cancellation while approvals are pending blocks the bound Worker tr
   const { caller, reads, run, assertTransport } = await fixture(t);
 
   caller.abort();
-  assert.deepEqual(await run, failed);
+  assert.deepEqual(await Promise.race([run, setImmediate()]), failed, "caller abort must settle pending reads");
   reads.start.resolve(approvals.start);
   reads.recover.resolve(approvals.recover);
   await setImmediate();
