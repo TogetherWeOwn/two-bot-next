@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -212,16 +212,17 @@ class AcceptanceTests(unittest.TestCase):
         future_readback = START + timedelta(seconds=admitted_at - START.timestamp() + 0.25)
 
         cases = [
-            ("coherent", latest_start - 0.5, {}, {}, True),
-            ("deadline equals expiry", latest_start, {}, {}, False),
-            ("active but too short", latest_start + 0.5, {}, {}, False),
-            ("expired during setup", expires + 1, {}, {}, False),
-            ("observation after local time", latest_start - 0.5,
+            ("coherent", latest_start - 0.75, 0.25, {}, {}, True),
+            ("deadline equals expiry", latest_start, 0, {}, {}, False),
+            ("active but too short", latest_start + 0.5, 0, {}, {}, False),
+            ("expired during setup", expires + 1, 0, {}, {}, False),
+            ("cutoff crossed while arming", latest_start - 0.5, 0.5, {}, {}, False),
+            ("observation after local time", latest_start - 0.5, 0,
              {"observedAt": observed_at(future_readback)}, {}, False),
-            ("acquisition after observation", admitted_at, {},
+            ("acquisition after observation", admitted_at, 0, {},
              {"acquiredAt": int((START.timestamp() + 601) * 1000)}, False),
         ]
-        for name, probe_at, receipt_fields, lease_fields, passes in cases:
+        for name, signer_ready_at, arm_delay, receipt_fields, lease_fields, passes in cases:
             with self.subTest(name=name):
                 observed = active_observation()
                 observed["lifecycle"].update(receipt_fields)
@@ -231,13 +232,18 @@ class AcceptanceTests(unittest.TestCase):
 
                 def delayed_credentials(_env):
                     nonlocal now
-                    now = probe_at
+                    now = signer_ready_at
                     return signer
+
+                def delayed_alarm(seconds):
+                    nonlocal now
+                    if seconds:
+                        now += arm_delay
 
                 def authenticated_peer(request):
                     if request.get_method() == "POST":
                         timestamp = request.get_header("X-two-timestamp")
-                        self.assertEqual(timestamp, str(int(probe_at)))
+                        self.assertEqual(timestamp, str(int(signer_ready_at + arm_delay)))
                         headers = acceptance.signing_headers(
                             *signer, timestamp, request.get_header("X-two-nonce"), request.data,
                         )
@@ -249,11 +255,14 @@ class AcceptanceTests(unittest.TestCase):
                       patch.object(acceptance.time, "time", side_effect=lambda: now),
                       patch.object(acceptance.time, "monotonic", side_effect=lambda: now - admitted_at),
                       patch.object(acceptance, "credentials", side_effect=delayed_credentials),
+                      patch.object(acceptance.signal, "alarm", side_effect=delayed_alarm) as alarm,
                       patch("sys.stdout", new_callable=StringIO) as stdout,
                       patch("sys.stderr", new_callable=StringIO) as stderr):
                     status = acceptance.main(args, env=env, check=check)
 
                 verdict = status, stdout.getvalue(), stderr.getvalue()
+                if arm_delay:
+                    self.assertEqual(alarm.call_args_list, [call(acceptance.RUN_BUDGET), call(0)])
                 if passes:
                     self.assertEqual(verdict, (0, "PASS: attendance finalized\n", ""))
                     self.assertEqual(reads, [EVENT, EVENT + ":foreign"])
