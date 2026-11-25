@@ -82,6 +82,11 @@ class PreTargetTests(unittest.TestCase):
                         make_config(target, **(args | {"now": target.expires_at}))
                     with self.assertRaisesRegex(TargetError, "wrong_pre_service"):
                         make_config(target, **(args | {"synthetic_service": "two-bot-next-staging"}))
+                    for field, value in (("source_sha", "c" * 40), ("worker_message", "c" * 40),
+                                         ("BOT_BUILD_REVISION", "c" * 40), ("image_manifest_digest", "latest")):
+                        wrong = receipt | {field: value}
+                        with self.subTest(field=field), self.assertRaisesRegex(TargetError, "wrong_pre_build_identity"):
+                            make_config(target, **(args | {"receipt": wrong}))
             self.assertEqual({name: (root / name).read_bytes() for name in files}, files)
 
     def test_cleanup_spares_active_run_and_removes_late_appearance(self):
@@ -170,4 +175,11 @@ class PreTargetTests(unittest.TestCase):
                 confirm_container_stopped(TARGET, action, snapshot)
         for snapshot in (ABSENT, replace(stopped, container=replace(CONTAINER, id="bcf0c525-7a87-4741-9bd7-cde8a22e4cb0"))):
             with self.subTest(snapshot=snapshot), self.assertRaisesRegex(TargetError, "wrong_pre_container_delete"):
+                confirm_container_stopped(TARGET, action, snapshot)
+        for snapshot, reason in (
+            (replace(stopped, target=replace(TARGET, scope="pre-fixture-other")), "wrong_pre_inventory_target"),
+            (replace(stopped, complete=False), "unconfirmed_pre_inventory"),
+            (replace(stopped, instance_count=False), "unconfirmed_pre_inventory"),
+        ):
+            with self.subTest(snapshot=snapshot), self.assertRaisesRegex(TargetError, reason):
                 confirm_container_stopped(TARGET, action, snapshot)
