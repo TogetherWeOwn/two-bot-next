@@ -22,7 +22,8 @@ class ReleaseForwardTests(unittest.TestCase):
                      "sha384_recomputed": "b" * 96}
                     for version in versions]
 
-        self.plan = {"source_sha": "a" * 40, "target": {"host": "prod.invalid", "database": "two_bot"},
+        self.plan = {"source_sha": "a" * 40,
+                     "target": {"host": "prod.invalid", "database": "two_bot", "branch_id": "fixture-branch"},
                      "recovery_evidence_ref": "recovery", "acl_plan_ref": "roles",
                      "pending_before": list(CUTOVER), "pending_store_before": list(STORE),
                      "source_migrations": source((473, *CUTOVER)), "source_store_migrations": source((465, *STORE))}
@@ -97,6 +98,7 @@ class ReleaseForwardTests(unittest.TestCase):
 
     def test_forward_database_boundary_refuses_wrong_fence_or_producer_before_apply(self):
         pin, plan = self.preflight_fixture()
+        preflight_epoch = 17
         run = {"id": 456, "run_attempt": 1, "head_sha": pin.workflow_sha}
         stopped = {"deploymentId": pin.rollback_worker, "running": False,
                    "owner": {"deploymentId": None, "phase": "fenced", "epoch": 18, "oldEpoch": 17,
@@ -106,19 +108,24 @@ class ReleaseForwardTests(unittest.TestCase):
                    {"name": step, "status": "completed", "conclusion": "success"} for step in preflight.PREPARE_STEPS]}
         api = Mock(return_value={"total_count": 1, "jobs": [job]})
         apply = Mock(return_value={**self.outcome, "recovery_evidence_ref": pin.recovery_reference()})
-        with self.assertRaisesRegex(GateError, "production_forward_stopped_fence_unproved"):
-            preflight.apply_under_prepared_fence(pin, run, "123", plan["target"], {**stopped, "running": True}, apply, api)
+        for bad_stop in ({**stopped, "running": True},
+                         {**stopped, "owner": {**stopped["owner"], "oldEpoch": 18, "epoch": 19}}):
+            with self.subTest(stop=bad_stop), self.assertRaisesRegex(GateError, "production_forward_stopped_fence_unproved"):
+                preflight.apply_under_prepared_fence(pin, run, "123", plan["target"], bad_stop, apply, api,
+                                                     preflight_epoch=preflight_epoch)
         api.assert_not_called()
         job["conclusion"] = "cancelled"
         with self.assertRaisesRegex(GateError, "production_inverse_job_invalid"):
-            preflight.apply_under_prepared_fence(pin, run, "123", plan["target"], stopped, apply, api)
+            preflight.apply_under_prepared_fence(pin, run, "123", plan["target"], stopped, apply, api,
+                                                 preflight_epoch=preflight_epoch)
         apply.assert_not_called()
         job["conclusion"] = "success"
         artifact = {"archive_digest": "sha256:" + "f" * 64}
         with (patch.object(preflight, "authenticated_plan", return_value=(plan, artifact)),
               patch.object(preflight, "verify_environment") as environment,
               patch.object(preflight, "verify_check") as approval):
-            result = preflight.apply_under_prepared_fence(pin, run, "123", plan["target"], stopped, apply, api)
+            result = preflight.apply_under_prepared_fence(pin, run, "123", plan["target"], stopped, apply, api,
+                                                          preflight_epoch=preflight_epoch)
         environment.assert_called_once_with(api)
         self.assertEqual(approval.call_args.args[:3], (api, run, "production-apply:123:" + "f" * 64))
         apply.assert_called_once_with("123", plan)

@@ -8,7 +8,8 @@ from ci.production_migrate_claim import WORKFLOW_PATH
 from production_migrate_approval import ARTIFACT, stable_plan, verify_check, verify_environment
 from production_recovery_artifact import protected_job
 from production_recovery_takeover import HEX, RUN_ID, SHA, UUID
-from production_release_forward import forward_receipt, ledger_endpoints
+from production_release_forward import forward_receipt
+from production_release_ledgers import ledger_endpoints
 from staging_migrate_approval import digest_json
 from staging_recovery_status import DIGEST, authenticated_plan, github, matches
 from staging_rollout import mapping, require
@@ -71,18 +72,21 @@ def verify_preflight(pin, target, plan, fresh, observe, control):
     return owner["epoch"]
 
 
-def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_database, api=github):
-    """Recheck the current attempt's stopped writer and approval before applying."""
+def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_database, api=github, *, preflight_epoch):
+    """Recheck the stop and the preflight epoch from this run's protected prepare job."""
     run_id = run.get("id")
     owner = mapping(stopped.get("owner"))
     epoch = owner.get("epoch")
     actor = f"production-schema-release:{run_id}:{pin.candidate_sha}"
     require(type(run_id) is int and matches(RUN_ID, str(run_id)) and run.get("head_sha") == pin.workflow_sha
-            and matches(RUN_ID, plan_id) and plan_id != str(run_id) and run.get("run_attempt") == 1
+            and matches(RUN_ID, plan_id) and plan_id != str(run_id)
+            and type(run.get("run_attempt")) is int and run["run_attempt"] == 1
             and stopped.get("deploymentId") == pin.rollback_worker and stopped.get("running") is False
             and owner.get("phase") == "fenced" and "deploymentId" in owner and owner["deploymentId"] is None
-            and owner.get("actor") == actor and type(epoch) is int and 1 < epoch < 2**53 - 1
-            and type(owner.get("oldEpoch")) is int and owner["oldEpoch"] == epoch - 1,
+            and owner.get("actor") == actor
+            and type(preflight_epoch) is int and 0 < preflight_epoch < 2**53 - 2
+            and type(owner.get("oldEpoch")) is int and owner["oldEpoch"] == preflight_epoch
+            and type(epoch) is int and epoch == preflight_epoch + 1,
             "production_forward_stopped_fence_unproved")
     protected_job(run, api, PREPARE_JOB, PREPARE_STEPS)
     plan, artifact = authenticated_plan(plan_id, api, workflow=WORKFLOW_PATH, artifact_name=ARTIFACT)
