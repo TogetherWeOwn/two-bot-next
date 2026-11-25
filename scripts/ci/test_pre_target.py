@@ -8,7 +8,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
+SCRIPTS = str(Path(__file__).resolve().parents[1])
+
+with patch.object(sys, "path", [SCRIPTS, *sys.path]):
     from pre_target import (Action, Inventory, Resource, Target, TargetError, confirm_container_stopped,
                             make_config, plan_cleanup, verify_cleanup)
 
@@ -46,7 +48,8 @@ class FakeTransport:
 
 class PreTargetTests(unittest.TestCase):
     def test_config_preserves_artifacts_and_uses_only_disposable_names(self):
-        with tempfile.TemporaryDirectory() as scratch:
+        with (patch.object(sys, "path", [SCRIPTS, *sys.path]),
+              tempfile.TemporaryDirectory() as scratch):
             root = Path(scratch)
             files = {"worker/index.js": b"export default {};", "worker/part.mjs": b"export {};",
                      "image.oci.tar": b"synthetic OCI archive bytes"}
@@ -73,7 +76,9 @@ class PreTargetTests(unittest.TestCase):
                     self.assertEqual(config["main"], str(root / "worker/index.js"))
                     self.assertTrue(config["no_bundle"] and config["preserve_file_names"])
                     self.assertEqual(set(config["vars"]), {"BOT_PORT", "CONTAINER_RELEASE", "DATABASE_URL"})
-                    self.assertIn(target.shape.replace("/", "-"), config["vars"]["DATABASE_URL"])
+                    shape = target.shape.replace("/", "-")
+                    self.assertEqual(config["vars"]["DATABASE_URL"],
+                                     f"postgresql://pre_fixture@{name}-{shape}.pre-fixture-test.invalid/pre")
                     self.assertFalse(config["workers_dev"] or config["preview_urls"])
                     self.assertFalse(set(config) & {"env", "route", "routes", "triggers", "build"})
                     with self.assertRaises(TypeError):
