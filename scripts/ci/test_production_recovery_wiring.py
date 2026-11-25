@@ -51,6 +51,27 @@ class RecoveryWiringTests(unittest.TestCase):
                     self.assertEqual(result.returncode, expected, result.stderr)
                     self.assertEqual(bool(runner.stat().st_mode & 0o100), expected == 0)
 
+    def test_interrupted_recovery_isolates_database_and_authenticates_restart(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production-interrupted.yml").read_text())
+        self.assertEqual(set(workflow[True]), {"workflow_call"})
+        jobs = workflow["jobs"]
+        self.assertEqual(jobs["database"]["needs"], "admit")
+        self.assertEqual(jobs["restart"]["needs"], ["admit", "database"])
+        self.assertEqual(jobs["database"]["environment"], "production-migrate-apply")
+        self.assertNotIn("OWNERSHIP_CONTROL_TOKEN", str(jobs["database"]))
+        for phase in ("admit", "restart"):
+            self.assertNotIn("TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL", str(jobs[phase]))
+        phases = jobs["database"]["steps"][2:]
+        self.assertEqual([step["name"] for step in phases], [
+            "Classify the interrupted database state under lock", "Retain the locked database classification",
+            "Run the exact protected inverse for POST", "Retain the verified interrupted inverse",
+        ])
+        for step in phases[2:]:
+            self.assertEqual(step["if"], "steps.classify.outputs.state == 'post'")
+        restart = jobs["restart"]["steps"][2]
+        self.assertIn("DECISION_ARCHIVE_SHA256", restart["env"])
+        self.assertIn("INVERSE_ARCHIVE_SHA256", restart["env"])
+
     def test_workflow_keeps_secrets_scoped_and_all_three_rollbacks_share_the_guard(self):
         path = ROOT / ".github/workflows"
         workflow = yaml.safe_load((path / "deploy-production-recovery.yml").read_text())
