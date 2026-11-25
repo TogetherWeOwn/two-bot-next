@@ -9,32 +9,35 @@ type MockInput = Parameters<typeof mockVoiceObservation>[0];
 function observerWindow(alter?: (checkpoint: string, input: MockInput) => MockInput) {
   const window = mockVoiceMoveWindow();
   const { args } = window;
+  let now = args.now();
   const readings: [string, ReturnType<typeof mockVoiceObservation>][] = [];
   const observe: typeof args.observe = async (request) => {
     const { checkpoint, channelId } = request;
-    const notBefore = args.now();
+    now += 1;
+    const notBefore = now;
     const reading = await args.observe(request);
     const input = {
-      fixture: args.fixture, channelId, notBefore, now: args.now(),
+      fixture: args.fixture, channelId, notBefore, now,
       readableChannelIds: args.fixture.channelIds,
-      reading: { ...reading, channelType: 2, observedAt: new Date(args.now()).toISOString() },
+      reading: { ...reading, channelType: 2, observedAt: new Date(now).toISOString() },
     };
     const observation = mockVoiceObservation(alter ? alter(checkpoint, input) : input);
     readings.push([checkpoint, observation]);
     return observation;
   };
-  return { ...window, readings, input: { ...args, observe } };
+  return { ...window, readings, input: { ...args, observe, now: () => now } };
 }
 
 test("mock observer preserves the pinned room order and the member's effective Connect", async () => {
   const { input, readings } = observerWindow();
   const { guildId, discordId, channelIds: [source, destination] } = input.fixture;
+  let captured = input.now();
   const receipt = await runVoiceMoveAcceptance(input);
   assert.equal(receipt.verdict, "passed");
   assert.equal(receipt.mode, "mock");
-  const observedAt = new Date(input.now()).toISOString();
   const read = (channelId: string, connectedChannelId: string | null, canConnect: boolean) => ({
-    guildId, discordId, channelId, connectedChannelId, canConnect, channelType: 2, observedAt,
+    guildId, discordId, channelId, connectedChannelId, canConnect, channelType: 2,
+    observedAt: new Date(++captured).toISOString(),
   });
   assert.deepEqual(readings, [
     ["before:moved", read(destination, source, true)],
@@ -46,7 +49,7 @@ test("mock observer preserves the pinned room order and the member's effective C
   ]);
 });
 
-test("mock observer binds a readChannels projection to its room and the 60-second limit", async () => {
+test("mock observer binds a readChannels projection to its room and the 60-second limit", () => {
   const { args } = mockVoiceMoveWindow();
   const { fixture } = args;
   const [source, destination] = fixture.channelIds;
@@ -94,6 +97,28 @@ test("mock observer refuses non-voice and out-of-window checkpoint readings", as
   }
 });
 
+test("mock observer refuses a denial readback replayed at the next checkpoint", async () => {
+  const pair: { earlier?: MockInput["reading"]; current?: MockInput["reading"] } = {};
+  const { input, readings, signed } = observerWindow((checkpoint, observed) => {
+    if (checkpoint === "before:not_permitted") pair.earlier = observed.reading;
+    if (checkpoint === "after:not_permitted") {
+      pair.current = observed.reading;
+      return { ...observed, reading: pair.earlier ?? null };
+    }
+    return observed;
+  });
+  const receipt = await runVoiceMoveAcceptance(input);
+  assert.ok(pair.earlier?.observedAt && pair.current?.observedAt);
+  assert.ok(pair.earlier.observedAt < pair.current.observedAt);
+  assert.deepEqual(pair.current, { ...pair.earlier, observedAt: pair.current.observedAt });
+  assert.equal(readings.at(-1)?.[0], "before:not_permitted");
+  assert.equal(receipt.verdict, "failed");
+  assert.equal(receipt.code, "probe_failed");
+  assert.deepEqual(receipt.cases.map(({ outcome }) => outcome), ["moved"]);
+  assert.equal(signed.length, 2);
+  assert.deepEqual(receipt.cleanup, { memberDisconnected: null, off: true, stopped: true });
+});
+
 test("mock observer refuses an unreadable occupied room even when the target is visible", async () => {
   const { input, signed } = observerWindow((checkpoint, observed) => checkpoint === "before:moved"
     ? { ...observed, readableChannelIds: [observed.channelId] }
@@ -112,9 +137,13 @@ test("mock observer refuses unknown occupancy in the disconnect case", async () 
       if (fault === "missing readback") return { ...observed, reading: null };
       if (fault === "unreadable room") return { ...observed, readableChannelIds: [observed.channelId] };
       const reading = { ...observed.reading };
-      if (fault === "missing occupancy") delete reading.connectedChannelId;
-      else reading.connectedChannelId = "100000000000000099";
-      return { ...observed, reading };
+      if (fault === "missing occupancy") {
+        delete reading.connectedChannelId;
+        return { ...observed, reading };
+      }
+      const outside = "100000000000000099";
+      return { ...observed, reading: { ...reading, connectedChannelId: outside },
+        readableChannelIds: [...observed.readableChannelIds, outside] };
     });
     const receipt = await runVoiceMoveAcceptance(input);
     assert.equal(receipt.verdict, "failed", fault);
