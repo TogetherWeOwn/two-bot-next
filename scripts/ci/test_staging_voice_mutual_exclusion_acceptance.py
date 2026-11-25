@@ -75,6 +75,7 @@ CONTAINER = "staging-container-drill.yml"
 ROLLBACK = "staging-rollback-drill.yml"
 MCP = "staging-mcp-proveout.yml"
 VOICE_MOVE = "staging-voice-move.yml"
+AUTOMOD = "staging-automod-preview.yml"
 PRODUCTION = "deploy-production.yml"
 SOAK = "soak"
 PUBLISHER = "staging-soak-evidence"
@@ -104,6 +105,10 @@ EXPLICIT_STANDALONE_GUARD = STANDALONE_GUARD + " && !inputs.deploy_staging_call"
 EXPLICIT_INHERITED_GUARD = "(inputs.deploy_staging_call || " + INHERITED_GUARD + ")"
 MAIN_ONLY = "github.ref == 'refs/heads/main'"
 VOICE_MOVE_GUARD = f"inputs.verify_lease && {MAIN_ONLY} && github.ref_protected && github.run_attempt == 1"
+AUTOMOD_GUARD = (
+    "github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main'"
+    " && github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1"
+)
 # (workflow, job) that must hold the canonical group when run standalone,
 # and whether the hold must be job-level (to keep sibling prod probes free).
 STANDALONE_HOLDERS = {(VOICE, "synthetic"): False,
@@ -618,6 +623,12 @@ def repository_errors(wfs, canonical):
             if (events(workflow) != ("workflow_dispatch",) or job.get("if") != VOICE_MOVE_GUARD
                     or "concurrency" in job or workflow.get("concurrency") != voice_move_queue(canonical)):
                 errors.append(f"{file}: dispatch must hold the guarded canonical lifecycle lock")
+        if file == AUTOMOD:
+            job = (workflow.get("jobs") or {}).get("dry-run") or {}
+            if (events(workflow) != ("workflow_call",) or job.get("if") != AUTOMOD_GUARD
+                    or "concurrency" in job or workflow.get("concurrency") != {
+                        "group": canonical, "cancel-in-progress": "false", "queue": "max"}):
+                errors.append(f"{file}: the dormant job must reserve the full canonical lifecycle window")
         triggers = tuple(t for t in events(workflow) if t != "workflow_call")
         nodes = [("workflow", workflow)] + list((workflow.get("jobs") or {}).items())
         for name, node in nodes:
@@ -635,6 +646,7 @@ def repository_errors(wfs, canonical):
             classified = (file in (DEPLOY, *CONSUMERS) or (file, name) in holders
                           or (file == STAGING_SOAK and admitted_soak(wfs))
                           or (file == VOICE_MOVE and name == "verify-lease")
+                          or (file == AUTOMOD and name == "dry-run")
                           or (measurement and (name in MEASUREMENT_STAGING_JOBS or name in MEASUREMENT_CALLS))
                           or (file, name) in EXEMPT)
             if touches and not classified:
@@ -897,6 +909,7 @@ def target_fixture(group=FIXTURE_GROUP):
     deploy["concurrency"] = dict(lock)
     wfs[MEASUREMENT]["concurrency"] = measurement_queue(group)
     wfs[VOICE_MOVE]["concurrency"] = voice_move_queue(group)
+    wfs[AUTOMOD]["concurrency"] = dict(lock)
     jobs = deploy["jobs"]
     for workflow in (deploy, wfs[VOICE], wfs[HELP]):
         strip_staging_use(workflow)

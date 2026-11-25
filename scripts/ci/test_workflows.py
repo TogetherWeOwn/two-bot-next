@@ -96,6 +96,7 @@ JOB_INVENTORY = {
     # Manual read-only authenticated MCP prove-out (TOG-23456); pinned shape below.
     "staging-mcp-proveout.yml": {"proveout"},
     "staging-voice-move.yml": {"verify-lease"},
+    "staging-automod-preview.yml": {"dry-run"},
     # Manual read-only staging ownership status read; pinned shape below.
     "staging-ownership-status.yml": {"status", "inventory"},
     "production-ownership-status.yml": {"guard", "status"},
@@ -4955,6 +4956,11 @@ def workflow_policy_errors(workflows):
             if workflow != json.loads(contract.read_text()):
                 errors.append(f"{name}: expected the reviewed dispatch, lease and cleanup steps")
             continue
+        if name == "staging-automod-preview.yml":
+            contract = Path(__file__).parent / "fixtures/staging_automod_preview_workflow.json"
+            if workflow != json.loads(contract.read_text()):
+                errors.append(f"{name}: expected the disabled, synthetic-only staging job")
+            continue
         if name == "gradual-promote-proof.yml":
             # Manual gradual-promote proof caller (passive until the fixture
             # lands): pinned shape above; the generic environment/marker
@@ -7608,6 +7614,28 @@ class WorkflowTests(unittest.TestCase):
                     self.fail(f"{file_name}: mutation {label!r} did not apply")
                 with self.subTest(file=file_name, mutation=label):
                     self.assertNotEqual(check(changed), [])
+
+    def test_staging_automod_preview_is_dormant(self):
+        name = "staging-automod-preview.yml"
+        self.assertEqual(workflow_policy_errors(self.workflows), [])
+        for keys, change in (
+                (("on",), {"workflow_dispatch": {}}),
+                (("concurrency",), {"group": "automod-only"}),
+                (("jobs", "dry-run"), {"if": "true"}),
+                (("jobs", "dry-run", "permissions"), {"id-token": "write"}),
+                (("jobs", "dry-run", "steps", 2), {"run": "node wrangler/scripts/staging-use-pipeline.mjs finish"})):
+            with self.subTest(keys=keys, change=change):
+                workflows = deepcopy(self.workflows)
+                node = workflows[name]
+                for key in keys:
+                    node = node[key]
+                node.update(change)
+                self.assertIn(f"{name}: expected the disabled, synthetic-only staging job",
+                              workflow_policy_errors(workflows))
+        workflows = deepcopy(self.workflows)
+        workflows["check.yml"]["jobs"]["worker"] = {"uses": f"./.github/workflows/{name}"}
+        self.assertIn("check.yml:worker: deployment/probe alternative outside approved deploy workflows",
+                      workflow_policy_errors(workflows))
 
     def test_staging_deploy_holds_the_full_window_and_releases_after_every_consumer(self):
         import copy
