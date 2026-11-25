@@ -115,11 +115,9 @@ async fn retained_attendance_schema(conn: &mut PgConnection) -> Result<bool, Run
 
 async fn release_ledger_owner(conn: &mut PgConnection) -> Result<bool, RunError> {
     sqlx::query_scalar(
-        "SELECT current_user::text = $1
-           AND (SELECT pg_get_userbyid(relowner)::text = $1 FROM pg_class
-                WHERE oid = 'public._sqlx_migrations'::regclass)
-           AND (SELECT pg_get_userbyid(relowner)::text = $1 FROM pg_class
-                WHERE oid = 'public._two_bot_migrations'::regclass)",
+        "SELECT current_user::text = $1 AND count(*) = 2 FROM pg_class
+           WHERE oid IN ('public._sqlx_migrations'::regclass, 'public._two_bot_migrations'::regclass)
+             AND pg_get_userbyid(relowner)::text = $1",
     )
     .bind(MIGRATOR_ROLE)
     .fetch_one(conn)
@@ -132,6 +130,8 @@ async fn original_schema(conn: &mut PgConnection) -> Result<bool, RunError> {
 }
 
 async fn expanded_schema(conn: &mut PgConnection) -> Result<bool, RunError> {
+    // SHA-256 of the deparsed 0481 predicates in UTF-8. The constraints may
+    // be validated later, so check the predicates and enforcement separately.
     let expanded: bool = sqlx::query_scalar(
         "SELECT COALESCE((SELECT contract_version FROM public.web_contract_meta WHERE singleton) = '1.1', false)
            AND to_regclass('web_v1.voice_heat') IS NOT NULL
@@ -142,9 +142,14 @@ async fn expanded_schema(conn: &mut PgConnection) -> Result<bool, RunError> {
                WHERE attrelid = 'public.internal_action_log'::regclass
                  AND attname IN ('delivery_hash', 'from_channel_id', 'request_id')
                  AND NOT attisdropped AND atttypid = 'pg_catalog.text'::regtype)
-           AND (SELECT count(*) = 2 FROM pg_constraint
+           AND (SELECT count(*) = 2 FROM pg_constraint c
                WHERE conrelid = 'public.internal_action_log'::regclass AND contype = 'c'
-                 AND conname IN ('internal_action_log_outcome_check', 'internal_action_log_receipt_check'))",
+                 AND COALESCE((to_jsonb(c)->>'conenforced')::boolean, true)
+                 AND encode(sha256(convert_to(pg_get_expr(conbin, conrelid), 'UTF8')), 'hex') =
+                     CASE conname
+                         WHEN 'internal_action_log_outcome_check' THEN 'e068ae014673f22a192652ae7c213f0359a0b82222735be0124715ca5c076fd7'
+                         WHEN 'internal_action_log_receipt_check' THEN '5dda4a971ff9c2ec3e4b17cb832491038a8b513fb648110319698a768b3e1458'
+                     END)",
     )
     .fetch_one(&mut *conn)
     .await
@@ -229,7 +234,8 @@ pub async fn confirm_release_pre(
 
 /// The two database endpoints that can be proved without a forward receipt.
 #[doc(hidden)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
 pub enum InterruptedRelease {
     Pre,
     Post { attendance_fence_sha256: String },
