@@ -1427,6 +1427,15 @@ pub async fn run_release_inverse(req: &Request, fence_sha256: &str) -> Result<Va
             "release inverse requires the production apply binding and attendance fence",
         );
     }
+    for (raw, expected) in [
+        (req.expected_pending.as_deref(), CUTOVER),
+        (req.expected_store_pending.as_deref(), STORE),
+    ] {
+        let pending = parse_expected_pending(raw.unwrap_or_default()).map_err(RunError::Refused)?;
+        if pending.as_slice() != expected {
+            return refuse("release inverse pending lists do not match the protected bundle");
+        }
+    }
     let cutover = check_plan_binding(
         req,
         CUTOVER,

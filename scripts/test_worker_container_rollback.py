@@ -936,22 +936,10 @@ class ProvenanceReceiptTests(unittest.TestCase):
 class MainProvenanceTests(unittest.TestCase):
     """Manual and snapshot rollbacks refuse a bad receipt before any POST."""
 
-    def test_ordinary_production_rollback_refuses_schema_crossing_or_reserved_fence(self):
-        older, expanded = "a" * 40, "b" * 40
-        active = {"owner": {"phase": "active", "actor": "fixture-actor"}}
-        held = {"owner": {"phase": "fenced", "actor": f"production-schema-release:123:{expanded}"}}
-        has_schema = lambda sha: sha == expanded
-        with self.assertRaisesRegex(base.GateError, "production_rollback_requires_protected_inverse"):
-            rollback.require_ordinary_production_rollback(expanded, older, active, has_schema=has_schema)
-        with self.assertRaisesRegex(base.GateError, "production_rollback_fence_reserved"):
-            rollback.require_ordinary_production_rollback(expanded, expanded, held, has_schema=has_schema)
-        rollback.require_ordinary_production_rollback(expanded, expanded, active, has_schema=has_schema)
-
-    def test_production_auto_rollback_admits_same_schema_while_the_edge_routes_old_version(self):
+    def test_ordinary_production_rollback_guards_before_restore_during_propagation(self):
         application = rollback.APPLICATIONS["production"]
         image = f"registry.cloudflare.com/{ACCOUNT}/{application}@sha256:" + "a" * 64
-        control = mock.Mock(return_value={"deploymentId": GOOD_VERSION,
-                                          "owner": {"phase": "active", "actor": "fixture-actor"}})
+        serving_sha = "b" * 40
         with tempfile.TemporaryDirectory() as directory:
             snapshot = Path(directory) / "snapshot.json"
             snapshot.write_text(json.dumps({"has_previous": True, "worker": rollback.WORKERS["production"],
@@ -963,17 +951,31 @@ class MainProvenanceTests(unittest.TestCase):
                     "--actor", "fixture-actor", "--evidence", str(Path(directory) / "evidence.json")]
             client = mock.Mock()
             client.api.return_value = rollout_row("r-prev", image)
-            with (mock.patch.object(rollback, "validate_receipt_against_live"),
-                  mock.patch.object(rollback, "serving_version", return_value=BAD_VERSION),
-                  mock.patch.object(rollback, "version_sha", return_value=SHA),
-                  mock.patch.object(rollback, "application_by_name", return_value={"id": APP_ID}),
-                  mock.patch.object(rollback.subprocess, "run", return_value=mock.Mock(stdout=b"0480_event_attendance.sql\n")),
-                  mock.patch.object(rollback, "control_client", return_value=control),
-                  mock.patch.object(rollback.Rollback, "run", return_value={}) as restore):
-                code, output = self.run_main(argv, client)
-            self.assertEqual(code, 0, output)
-        control.assert_called_once_with("status")
-        restore.assert_called_once_with(GOOD_VERSION, image)
+            for phase, actor, target_tree, refusal in (
+                ("active", "fixture-actor", b"", "production_rollback_requires_protected_inverse"),
+                ("fenced", f"production-schema-release:123:{serving_sha}", b"0480_event_attendance.sql", "production_rollback_fence_reserved"),
+                ("active", "fixture-actor", b"0480_event_attendance.sql", None),
+            ):
+                with (self.subTest(refusal=refusal),
+                      mock.patch.object(rollback, "validate_receipt_against_live"),
+                      mock.patch.object(rollback, "serving_version", return_value=BAD_VERSION),
+                      mock.patch.object(rollback, "version_sha", return_value=serving_sha),
+                      mock.patch.object(rollback, "application_by_name", return_value={"id": APP_ID}),
+                      mock.patch.object(rollback.subprocess, "run", side_effect=lambda args, **_: mock.Mock(
+                          stdout={serving_sha: b"0480_event_attendance.sql", SHA: target_tree}[args[4]],
+                      )),
+                      mock.patch.object(rollback, "control_client", return_value=mock.Mock(return_value={
+                          "deploymentId": GOOD_VERSION, "owner": {"phase": phase, "actor": actor},
+                      })),
+                      mock.patch.object(rollback.Rollback, "run", return_value={}) as restore):
+                    code, output = self.run_main(argv, client)
+                    if refusal:
+                        self.assertEqual(code, 1, output)
+                        self.assertIn(refusal, output)
+                        restore.assert_not_called()
+                    else:
+                        self.assertEqual(code, 0, output)
+                        restore.assert_called_once_with(GOOD_VERSION, image)
 
     URL = "https://two-bot-next-staging.acct.workers.dev"
 
