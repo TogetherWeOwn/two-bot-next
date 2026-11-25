@@ -49,6 +49,17 @@ async function readObservation(reader, signal, versionId, commit) {
   return observedAt;
 }
 
+export function stagingVoiceSessionScopeMatches({ session, fixture, expectedRevision }) {
+  const { version_id, commit } = expectedRevision ?? {};
+  const { discordId, channelIds } = fixture ?? {};
+  return fixture?.environment === "staging" && snowflake(discordId) && Array.isArray(channelIds)
+    && channelIds.length === 2 && snowflake(channelIds[0]) && snowflake(channelIds[1])
+    && new Set([discordId, ...channelIds]).size === 3
+    && session?.environment === "staging" && session.origin === STAGING_ORIGIN && session.discordId === discordId
+    && typeof session.request === "function" && typeof session.move === "function"
+    && matches(version_id, WORKER_VERSION) && matches(commit, COMMIT);
+}
+
 /**
  * Build the protected runner's scoped session from the approved staging fixture and Web
  * revision pins. The injected scope owns both request and move and must use
@@ -56,15 +67,9 @@ async function readObservation(reader, signal, versionId, commit) {
  * including the final URL, redirect flag and a response byte stream.
  * Lease-relative freshness belongs to the runner's preflight.
  */
-export function bindStagingVoiceSession({ session, fixture, expectedRevision } = {}) {
-  const { version_id: versionId, commit } = expectedRevision ?? {};
-  const { discordId, channelIds } = fixture ?? {};
-  if (fixture?.environment !== "staging" || !snowflake(discordId) || !Array.isArray(channelIds)
-    || channelIds.length !== 2 || !snowflake(channelIds[0]) || !snowflake(channelIds[1])
-    || new Set([discordId, ...channelIds]).size !== 3
-    || session?.environment !== "staging" || session.origin !== STAGING_ORIGIN || session.discordId !== discordId
-    || typeof session.request !== "function" || typeof session.move !== "function"
-    || !matches(versionId, WORKER_VERSION) || !matches(commit, COMMIT)) throw unconfirmed();
+export function bindStagingVoiceSession(inputs = {}) {
+  if (!stagingVoiceSessionScopeMatches(inputs)) throw unconfirmed();
+  const { session, fixture: { discordId, channelIds }, expectedRevision: { version_id: versionId, commit } } = inputs;
 
   const orderedChannels = [channelIds[0], channelIds[1]];
   const requestBody = JSON.stringify({ discord_id: discordId, channel_ids: orderedChannels });

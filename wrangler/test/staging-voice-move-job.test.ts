@@ -132,7 +132,13 @@ test("selected job refuses incomplete or mismatched inputs before any self-move"
   ]) {
     assert.equal(await runStagingVoiceMoveJob({ ...env, ...change }, inputs), "failed");
   }
-  assert.equal(await runStagingVoiceMoveJob(env, { ...inputs, previousOff: undefined }), "failed");
+  for (const change of [
+    { previousOff: undefined },
+    { previousOff: { ...inputs.previousOff, voiceMoveEnabled: true } },
+    { webSession: { ...inputs.webSession, origin: "https://example.invalid" } },
+  ]) {
+    assert.equal(await runStagingVoiceMoveJob(env, { ...inputs, ...change }), "failed");
+  }
   // A ready line followed by a failure or malformed row must not authorize the proof.
   const beginReceipt = readFileSync(env.STAGING_USE_RECEIPT, "utf8");
   for (const invalidRow of ['{"action":"failed"}', "{"]) {

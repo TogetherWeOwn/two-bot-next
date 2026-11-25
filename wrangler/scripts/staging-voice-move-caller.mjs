@@ -1,10 +1,9 @@
-import { runStagingVoiceMoveProof } from "./staging-voice-move-acceptance.mjs";
-import { bindStagingVoiceSession } from "./staging-voice-session.mjs";
+import { priorVoiceCleanupMatches, runStagingVoiceMoveProof } from "./staging-voice-move-acceptance.mjs";
+import { bindStagingVoiceSession, stagingVoiceSessionScopeMatches } from "./staging-voice-session.mjs";
 
 const LEASE_MS = 15 * 60_000;
 const READY_MAX_AGE_MS = 60_000;
 const SHA = /^[0-9a-f]{40}$/;
-const WORKER_VERSION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const OBSERVED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const positive = (value) => Number.isSafeInteger(value) && value > 0;
 const matches = (value, pattern) => typeof value === "string" && pattern.test(value);
@@ -43,6 +42,26 @@ function fixturePin(fixture) {
   return { environment, guildId, discordId, channelIds: [source, destination] };
 }
 
+// Compose only approved in-process inputs. The job supplies the lease separately.
+function provideStagingVoiceMoveInputs(options) {
+  const { fixture, previousReady, previousOff, webSession, expectedRevision, observer, control, now = Date.now } = options;
+  const pinnedFixture = fixturePin(fixture);
+  if (!pinnedFixture || webSession?.environment !== "staging" || webSession.discordId !== pinnedFixture.discordId) {
+    return { verdict: "failed", code: "fixture_unconfirmed" };
+  }
+
+  if (!stagingVoiceSessionScopeMatches({ session: webSession, fixture: pinnedFixture, expectedRevision })
+    || !receiptFor(previousReady, "ready") || !receiptFor(previousOff, "status")
+    || typeof observer?.readChannels !== "function" || typeof observer.observe !== "function"
+    || typeof control !== "function" || typeof now !== "function") {
+    return { verdict: "failed", code: "proof_inputs_incomplete" };
+  }
+
+  const { version_id, commit } = expectedRevision;
+  return { fixture: pinnedFixture, previousReady, previousOff, webSession,
+    expectedRevision: { version_id, commit }, observer, control, now };
+}
+
 /**
  * Call between a successful protected `begin` and the parent job's unconditional `finish`.
  * `window` uses the current run ID and numeric attempt, plus the `use` step's
@@ -55,25 +74,15 @@ function fixturePin(fixture) {
 export async function runProtectedStagingVoiceMove(options, runProof = runStagingVoiceMoveProof) {
   if (options?.enabled !== true) return { verdict: "disabled" };
 
-  const { window, ready, fixture, previousReady, previousOff, webSession, expectedRevision,
-    observer, control, now = Date.now } = options;
-  const pinnedFixture = fixturePin(fixture);
-  if (!pinnedFixture || webSession?.environment !== "staging" || webSession.discordId !== pinnedFixture.discordId) {
-    return { verdict: "failed", code: "fixture_unconfirmed" };
-  }
-
-  const { version_id, commit } = expectedRevision ?? {};
-  if (!matches(version_id, WORKER_VERSION) || !matches(commit, SHA)
-    || !receiptFor(previousReady, "ready") || !receiptFor(previousOff, "status")
-    || typeof webSession.request !== "function" || typeof webSession.move !== "function"
-    || typeof observer?.readChannels !== "function" || typeof observer.observe !== "function"
-    || typeof control !== "function" || typeof now !== "function") {
-    return { verdict: "failed", code: "proof_inputs_incomplete" };
-  }
-
+  const inputs = provideStagingVoiceMoveInputs(options);
+  if ("verdict" in inputs) return inputs;
+  const { window, ready } = options;
+  const { now, previousReady, previousOff } = inputs;
   const lease = leaseFromJob(window, ready, now());
   if (!lease) return { verdict: "failed", code: "lease_unconfirmed" };
+  if (!priorVoiceCleanupMatches(lease, ready, previousReady, previousOff)) {
+    return { verdict: "failed", code: "prior_cleanup_unconfirmed" };
+  }
 
-  return runProof({ enabled: true, lease, ready, fixture: pinnedFixture, previousReady, previousOff,
-    bindSession: bindStagingVoiceSession, webSession, expectedRevision: { version_id, commit }, observer, control, now });
+  return runProof({ ...inputs, enabled: true, lease, ready, bindSession: bindStagingVoiceSession });
 }
