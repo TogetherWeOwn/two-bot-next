@@ -420,6 +420,99 @@ async function unusedAutomodReservation(t: TestContext) {
   return { ...h, staging, storage, identity, change, issued, effects, calls, recover };
 }
 
+test("the private AutoMod host acquires the exact approved lease and recovers with its own action record", async t => {
+  const now = 1_800_000_000_000;
+  t.mock.timers.enable({ apis: ["Date"], now });
+  const version = "11111111-1111-1111-1111-111111111111";
+  const env = { ...BOUNDED_STAGING_ENV, ...automodPublication.env, CF_VERSION_METADATA: { id: version } };
+  const h = await harness(t, env, { owner: { ...ACTIVE_OWNER, deploymentId: version } });
+  const request = new Request("https://worker.invalid", { headers: { authorization: `Bearer ${CONTROL_TOKEN}` } });
+  const pin = { workerVersionId: version, sourceSha: env.CONTAINER_RELEASE, namespaceId: "a".repeat(32),
+    workerDeploymentId: "22222222-2222-2222-2222-222222222222", applicationId: "33333333-3333-3333-3333-333333333333",
+    rolloutId: "44444444-4444-4444-4444-444444444444", imageDigest: `sha256:${"b".repeat(64)}` };
+  const change = { ...stagingWindow(), action: "acquire" as const, deploymentId: version, sha: pin.sourceSha,
+    expectedEpoch: ACTIVE_OWNER.epoch };
+  const target = STAGING_AUTOMOD_TARGET;
+  const context = { environment: change.environment, deploymentId: version, sha: change.sha,
+    runId: change.runId, runAttempt: change.runAttempt, target };
+  const signal = new AbortController().signal;
+  let reservation = { change, pin, target };
+  let serving = pin;
+  const effects: ProtectedAutomodEffects = {
+    enabled: false,
+    readRuntime: async lease => ({ lease, running: h.runtime.running }),
+    readCleanupGrant: async lease => ({ lease, before: lease.expiresAt + 5_000 }),
+    stop: async () => { assert.equal(h.runtime.running, false); return true; },
+    fenceAndDrain: async () => assert.fail("unused reservation has no work to drain"),
+    request: async () => assert.fail("unused reservation does not access the registry"),
+  };
+  const readReservation = t.mock.fn(async () => reservation);
+  const adapters: Parameters<typeof TwoBotContainer.bindProtectedAutomodInstance>[2] = {
+    readReservation,
+    readServing: async () => serving,
+    readApproval: async (_action, issuedLease) => ({ action: "recover", issuedLease, target }),
+    effects,
+  };
+  const bind = (control = request) => TwoBotContainer.bindProtectedAutomodInstance(h.bot, control, adapters);
+  const host = bind();
+  const refuse = /staging_use_conflict/;
+  assert.equal("bindProtectedAutomodInstance" in h.bot, false);
+  await assert.rejects(host.acquireLease(pin, change, signal), refuse);
+  effects.enabled = true;
+  await assert.rejects(bind(new Request(request.url)).acquireLease(pin, change, signal), refuse);
+  await assert.rejects(host.acquireLease(pin, { ...change, action: "stop" }, signal), refuse);
+  await assert.rejects(host.acquireLease(pin, { ...change, voiceMove: true }, signal), refuse);
+  await assert.rejects(host.acquireLease(pin, { ...change, runAttempt: 2 }, signal), refuse);
+  const ordinary = await h.bot.fetch(new Request(`https://worker.invalid${STAGING_USE_PATH}`, {
+    method: "POST", headers: { authorization: `Bearer ${CONTROL_TOKEN}`, [DEPLOYMENT_HEADER]: version },
+    body: JSON.stringify({ ...change, purpose: AUTOMOD_STAGING_PURPOSE }),
+  }));
+  assert.equal(ordinary.status, 400);
+  assert.equal(readReservation.mock.callCount(), 0);
+  reservation = { change: { ...change, expiresAt: change.expiresAt + 1 }, pin, target };
+  await assert.rejects(host.acquireLease(pin, change, signal), refuse);
+  reservation = { change, pin: { ...pin, rolloutId: "different-rollout" }, target };
+  await assert.rejects(host.acquireLease(pin, change, signal), refuse);
+  reservation = { change, pin, target };
+  serving = { ...pin, rolloutId: "different-rollout" };
+  await assert.rejects(host.acquireLease(pin, change, signal), refuse);
+  const cancelled = new AbortController();
+  const interrupted = TwoBotContainer.bindProtectedAutomodInstance(h.bot, request, {
+    ...adapters, readServing: async () => { cancelled.abort(); return pin; },
+  });
+  await assert.rejects(interrupted.acquireLease(pin, change, cancelled.signal), { name: "AbortError" });
+  assert.equal(h.values.has(STAGING_USE_KEY), false);
+  assert.equal(h.runtime.destroys, 0);
+
+  serving = pin;
+  const issued = await host.acquireLease(pin, change, signal);
+  assert.equal(issued.purpose, AUTOMOD_STAGING_PURPOSE);
+  assert.deepEqual(await host.authority.readIssuedLease(context, signal), issued);
+  assert.equal(await host.authority.readApproval("start", issued, signal), undefined);
+  assert.deepEqual(await new StagingAutomodRecovery(h.ctx.storage as unknown as DurableObjectStorage).pending(),
+    { lease: issued, phase: "reserved" });
+
+  t.mock.timers.setTime(issued.expiresAt + 1);
+  effects.enabled = false;
+  const approval = await host.authority.readApproval("recover", issued, signal);
+  assert.ok(approval);
+  const transport = bindStagingAutomodDeploymentTransport({ env, controlBearer: CONTROL_TOKEN }, async () => ({
+    schema_version: 1, observed_at: new Date(Date.now()).toISOString(),
+    worker: { deployment_id: pin.workerDeploymentId, version_id: pin.workerVersionId, source_sha: pin.sourceSha,
+      traffic_percent: 100, runtime_policy: "bounded" },
+    container: { application_id: pin.applicationId, namespace_id: pin.namespaceId, rollout_id: pin.rolloutId,
+      rollout_status: "completed", image_digest: pin.imageDigest },
+    ownership: { phase: "active", epoch: issued.epoch },
+  }), host.invokePrivate);
+  const receipt = await transport({ action: "recover", issuedLease: issued }, approval, signal);
+  assert.deepEqual(await receipt.json(), { schema: "two-bot-staging-automod-job.v1", environment: "staging",
+    observedAt: new Date(Date.now()).toISOString(), action: "recover", lease: issued, verdict: "passed" });
+  assert.deepEqual(h.values.get(STAGING_USE_KEY), { ...issued, phase: "released" });
+  assert.equal(await host.authority.readIssuedLease(context, signal), undefined);
+  assert.deepEqual(h.starts, []);
+  assert.deepEqual(h.requests, []);
+});
+
 test("protected AutoMod retires an unused reservation and retries an interrupted release", async t => {
   const h = await unusedAutomodReservation(t);
   const { issued, values, ctx, staging, calls, recover } = h;

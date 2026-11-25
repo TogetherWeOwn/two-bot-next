@@ -31,7 +31,7 @@ import {
 } from "./ownership.ts";
 import {
   AUTOMOD_STAGING_PURPOSE, StagingLifecycle, STAGING_USE_PATH, VOICE_MOVE_LEASE_HEADER, hasAutomodReservation, parseStagingUseChange,
-  voiceMoveAllowed, type StagingUse,
+  voiceMoveAllowed, type StagingUse, type StagingUseChange,
 } from "./staging-lifecycle.ts";
 import { bindStagingAutomodAuthorityProvider, type ReadProtectedAutomodApproval } from "./staging-automod-authority-provider.ts";
 import { runProtectedAutomod, type ProtectedAutomodCall, type ProtectedAutomodEffects } from "./staging-automod-caller.ts";
@@ -161,6 +161,17 @@ import {
  */
 type ProtectedAutomodInvoker = Parameters<typeof bindStagingAutomodDeploymentTransport>[2];
 type AutomodServingPin = Parameters<ProtectedAutomodInvoker>[0];
+type ProtectedAutomodReservation = Readonly<{
+  pin: AutomodServingPin;
+  change: StagingUseChange;
+  target: typeof STAGING_AUTOMOD_TARGET;
+}>;
+
+function sameAutomodServingPin(pin: AutomodServingPin, observed: AutomodServingPin | undefined): boolean {
+  return !!observed && observed.workerDeploymentId === pin.workerDeploymentId && observed.workerVersionId === pin.workerVersionId
+    && observed.sourceSha === pin.sourceSha && observed.applicationId === pin.applicationId
+    && observed.namespaceId === pin.namespaceId && observed.rolloutId === pin.rolloutId && observed.imageDigest === pin.imageDigest;
+}
 
 export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_BOT: DurableObjectNamespace<TwoBotContainer>;
@@ -1043,22 +1054,72 @@ export class TwoBotContainer extends Container<Env> {
     return async (pin, call, signal) => {
       signal.throwIfAborted();
       const { issuedLease } = call;
-      if (!bot.boundedStaging() || bot.env.DISCORD_APPLICATION_ID !== STAGING_AUTOMOD_TARGET.applicationId
-        || bot.env.GUILD_ID !== STAGING_AUTOMOD_TARGET.guildId || issuedLease.purpose !== AUTOMOD_STAGING_PURPOSE
-        || pin.workerVersionId !== bot.id() || pin.sourceSha !== bot.env.CONTAINER_RELEASE
+      if (!bot.isProtectedAutomodStage(pin) || issuedLease.purpose !== AUTOMOD_STAGING_PURPOSE
         || issuedLease.deploymentId !== pin.workerVersionId || issuedLease.sha !== pin.sourceSha) {
         throw new OwnershipRefused("staging_use_conflict");
       }
       const observed = await boundRead(readServing(signal), signal);
-      if (!observed || observed.workerDeploymentId !== pin.workerDeploymentId
-        || observed.workerVersionId !== pin.workerVersionId || observed.sourceSha !== pin.sourceSha
-        || observed.applicationId !== pin.applicationId || observed.namespaceId !== pin.namespaceId
-        || observed.rolloutId !== pin.rolloutId || observed.imageDigest !== pin.imageDigest) {
+      if (!sameAutomodServingPin(pin, observed)) {
         throw new OwnershipRefused("staging_use_conflict");
       }
       signal.throwIfAborted();
       return TwoBotContainer.runProtectedAutomod(bot, call, effects);
     };
+  }
+
+  /** Compose one in-process host. Reservation and per-action records must be
+   * authenticated independently by the protected caller. No network entry
+   * supplies these collaborators. The invoker is only for the job transport.
+   */
+  static bindProtectedAutomodInstance(bot: TwoBotContainer, request: Request, adapters: Readonly<{
+    readReservation: (signal: AbortSignal) => Promise<ProtectedAutomodReservation | undefined>;
+    readApproval: ReadProtectedAutomodApproval;
+    readServing: Parameters<typeof TwoBotContainer.bindProtectedAutomodInvoker>[1];
+    effects: ProtectedAutomodEffects;
+  }>) {
+    const { readReservation, readApproval, readServing, effects } = adapters;
+    return {
+      authority: TwoBotContainer.bindProtectedAutomodAuthority(bot, request, readApproval),
+      invokePrivate: TwoBotContainer.bindProtectedAutomodInvoker(bot, readServing, effects),
+      acquireLease: async (pin: AutomodServingPin, expected: Readonly<StagingUseChange>, signal: AbortSignal) => {
+        signal.throwIfAborted();
+        const deadline = AbortSignal.any([signal, AbortSignal.timeout(2_000)]);
+        const change = parseStagingUseChange(expected);
+        const servingPin = Object.freeze({ ...pin });
+        if (effects.enabled !== true || change?.action !== "acquire" || change.runAttempt !== 1 || change.voiceMove
+          || change.deploymentId !== servingPin.workerVersionId || change.sha !== servingPin.sourceSha
+          || !bot.isProtectedAutomodStage(servingPin) || !await authenticated(request, bot.env.OWNERSHIP_CONTROL_TOKEN)) {
+          throw new OwnershipRefused("staging_use_conflict");
+        }
+        deadline.throwIfAborted();
+        const approved = await boundRead(readReservation(deadline), deadline);
+        const grant = parseStagingUseChange(approved?.change);
+        if (grant?.action !== "acquire" || grant.voiceMove || grant.runId !== change.runId || grant.runAttempt !== change.runAttempt
+          || grant.deploymentId !== change.deploymentId || grant.sha !== change.sha || grant.expectedEpoch !== change.expectedEpoch
+          || grant.expiresAt !== change.expiresAt || approved?.target?.applicationId !== STAGING_AUTOMOD_TARGET.applicationId
+          || approved.target.guildId !== STAGING_AUTOMOD_TARGET.guildId || !sameAutomodServingPin(servingPin, approved.pin)) {
+          throw new OwnershipRefused("staging_use_conflict");
+        }
+        return bot.gated(async () => {
+          deadline.throwIfAborted();
+          if (bot.recoveryFailed || bot.ctx.container?.running !== false) throw new OwnershipRefused("shutdown_unconfirmed");
+          const owner = await bot.ownership.require(change.deploymentId);
+          await bot.requireRecoveryDatabase();
+          deadline.throwIfAborted();
+          const observed = await boundRead(readServing(deadline), deadline);
+          if (!sameAutomodServingPin(servingPin, observed)) throw new OwnershipRefused("staging_use_conflict");
+          deadline.throwIfAborted();
+          return bot.stagingUse.acquire(change, { deploymentId: change.deploymentId, sha: change.sha, owner },
+            () => bot.stopStagingUse(), expiry => bot.scheduleStagingExpiry(expiry), Date.now(), AUTOMOD_STAGING_PURPOSE);
+        });
+      },
+    };
+  }
+
+  private isProtectedAutomodStage(pin: AutomodServingPin): boolean {
+    return this.boundedStaging() && this.env.DISCORD_APPLICATION_ID === STAGING_AUTOMOD_TARGET.applicationId
+      && this.env.GUILD_ID === STAGING_AUTOMOD_TARGET.guildId && pin.workerVersionId === this.id()
+      && pin.sourceSha === this.env.CONTAINER_RELEASE;
   }
 
   /** Snapshot composition. Static so the DO instance exposes no snapshot RPC. */
