@@ -696,7 +696,8 @@ The inventory checks its first-attempt Actions run against the pinned workflow
 SHA before reading and again before publishing. If `main` advances, the dispatch
 must still be a protected-main ancestor. The inventory also requires a complete
 comparison showing no changes to the inventory or plan workflow or executable
-inventory tooling. If GitHub cannot prove that or reports
+inventory tooling. An oversized comparison or one that reaches GitHub's
+300-file limit cannot prove this. If GitHub cannot prove it or reports
 `status_dispatch_superseded`, use a new dispatch from `main` after reviewing the
 current controls. Reruns are refused.
 

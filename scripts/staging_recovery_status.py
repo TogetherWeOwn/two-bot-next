@@ -49,9 +49,10 @@ def github(path, *, binary=False):
 def status_control_path(path):
     # Keep Python import paths in scope, including added modules. The fixture
     # tests can change independently of the runner's inventory tooling.
-    return path in (WORKFLOW, PLAN_WORKFLOW, "scripts") or (
-        path.startswith("scripts/") and not path.startswith(("scripts/ci/test_", "scripts/test_"))
+    test_only = path.startswith(("scripts/ci/test_", "scripts/test_")) or (
+        path.startswith("scripts/ci/fixtures/") and path.endswith(".json")
     )
+    return path in (WORKFLOW, PLAN_WORKFLOW, "scripts") or (path.startswith("scripts/") and not test_only)
 
 
 def verify_dispatch(env, api=github):
@@ -64,8 +65,10 @@ def verify_dispatch(env, api=github):
             and env.get("GITHUB_WORKFLOW_REF") == f"{REPO}/{WORKFLOW}@refs/heads/main",
             "untrusted_status_dispatch")
     run = mapping(api(f"actions/runs/{run_id}"))
+    # GitHub may report the workflow with or without its main ref suffix.
+    main_paths = (WORKFLOW, f"{WORKFLOW}@main", f"{WORKFLOW}@refs/heads/main")
     require(number(run.get("id")) == int(run_id) and number(run.get("run_attempt")) == 1
-            and run.get("path") == WORKFLOW and run.get("head_sha") == sha
+            and run.get("path") in main_paths and run.get("head_sha") == sha
             and all(number(mapping(run.get(key)).get("id")) == REPOSITORY_ID
                     for key in ("repository", "head_repository")), "untrusted_status_dispatch")
     run_identity(run, WORKFLOW, "workflow_dispatch")

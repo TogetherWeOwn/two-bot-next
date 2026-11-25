@@ -81,13 +81,15 @@ def dispatch_fixture():
     repo = {"id": 1396224242, "full_name": status.REPO}
     return {
         DISPATCH_ROUTE: {"id": 19, "run_attempt": 1, "head_sha": WORKFLOW_SHA, "head_branch": "main",
-                         "event": "workflow_dispatch", "path": status.WORKFLOW,
+                         "event": "workflow_dispatch", "path": f"{status.WORKFLOW}@main",
                          "repository": repo.copy(), "head_repository": repo.copy()},
         "branches/main": {"protected": True, "commit": {"sha": MAIN_TIP}},
         COMPARE_ROUTE: {"status": "ahead", "behind_by": 0, "ahead_by": 1,
                         "base_commit": {"sha": WORKFLOW_SHA}, "merge_base_commit": {"sha": WORKFLOW_SHA},
                         "files": [{"status": "added", "filename": "wrangler/test/staging-stop.test.ts"},
-                                  {"status": "modified", "filename": "scripts/ci/test_workflows.py"}]},
+                                  {"status": "modified", "filename": "scripts/ci/test_workflows.py"},
+                                  {"status": "modified", "filename":
+                                   "scripts/ci/fixtures/production_ownership_status_provider.json"}]},
     }
 
 
@@ -273,7 +275,10 @@ class StagingRecoveryStatusTests(unittest.TestCase):
         routes = dispatch_fixture()
         del routes[COMPARE_ROUTE]
         routes["branches/main"]["commit"]["sha"] = WORKFLOW_SHA
-        status.verify_dispatch(DISPATCH, routes.__getitem__)
+        for suffix in ("", "@main", "@refs/heads/main"):
+            with self.subTest(path_suffix=suffix):
+                routes[DISPATCH_ROUTE]["path"] = status.WORKFLOW + suffix
+                status.verify_dispatch(DISPATCH, routes.__getitem__)
 
         for key, value in (("GITHUB_RUN_ATTEMPT", "2"), ("GITHUB_REF_PROTECTED", "false"),
                            ("GITHUB_WORKFLOW_SHA", SOURCE), ("GITHUB_RUN_ID", "19/attempts/2")):
@@ -281,6 +286,7 @@ class StagingRecoveryStatusTests(unittest.TestCase):
                 status.verify_dispatch(dict(DISPATCH, **{key: value}), lambda path: self.fail("unexpected API call"))
 
         for key, value in (("run_attempt", 2), ("id", 20), ("path", status.PLAN_WORKFLOW), ("head_sha", SOURCE),
+                           ("path", f"{status.WORKFLOW}@refs/heads/feature"),
                            ("head_repository", {"id": 1, "full_name": status.REPO}),
                            ("head_branch", "other"), ("event", "push")):
             with self.subTest(run=key), self.assertRaises((status.GateError, status.ProofError)):
@@ -294,6 +300,7 @@ class StagingRecoveryStatusTests(unittest.TestCase):
             status.verify_dispatch(DISPATCH, routes.__getitem__)
 
         for override in ({"status": "diverged"}, {"merge_base_commit": {"sha": SOURCE}},
+                         {"behind_by": 1}, {"ahead_by": 0}, {"base_commit": {"sha": SOURCE}},
                          {"files": None}, {"files": [{"status": "renamed", "filename": "docs/new.md"}]},
                          {"files": [{"status": "modified", "filename": "docs/staging.md"}] * 300}):
             with self.subTest(override=next(iter(override))), self.assertRaises(status.GateError):
