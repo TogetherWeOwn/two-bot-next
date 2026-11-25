@@ -66,7 +66,7 @@
             "STAGING_USE_DEPLOYMENT": "${{ steps.use.outputs.deployment_id }}",
             "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-voice-move-start.jsonl"
           },
-          "run": "node wrangler/scripts/staging-voice-move-job.mjs"
+          "run": "node wrangler/scripts/staging-voice-move-entry.mjs"
         },
         {
           "name": "Release the same lease and read back OFF",
