@@ -39,7 +39,7 @@ def _file_blob(repo, commit, path):
 
 
 def _migration_blobs(repo, tree):
-    entries = git(repo, "ls-tree", "-z", tree.decode("ascii")).split(b"\x00")[:-1]
+    entries = git(repo, "ls-tree", "--full-tree", "-z", tree.decode("ascii")).split(b"\x00")[:-1]
     blobs = {}
     for entry in entries:
         match = MIGRATION_ENTRY.fullmatch(entry)

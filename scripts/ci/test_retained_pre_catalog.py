@@ -67,9 +67,9 @@ class RetainedPreCatalogTests(unittest.TestCase):
     def test_proves_exact_historical_catalog_from_distinct_commits(self):
         (self.repo / "unrelated.txt").write_text("Independent source identity\n")
         second = self.commit()
-        for sha in (self.reconstruction, second):
+        for repo, sha in ((self.repo, self.reconstruction), (self.repo / MIGRATION_PATHS[0], second)):
             with self.subTest(sha=sha):
-                self.assertEqual(catalog.verify_retained_catalog(self.repo, sha), {
+                self.assertEqual(catalog.verify_retained_catalog(repo, sha), {
                     "source_sha": "058141c29cf135304b060d8fd89aa6e21e44a0c6",
                     "reconstruction_sha": sha,
                     "cutover_tree": "8be4d2baba589a053bacc2523cbdcb760fca4d90",
