@@ -1971,7 +1971,7 @@ jobs:
           # runner-owned checkout, so Git refuses it as dubious ownership.
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
+          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
           # Disk hygiene for hosted overflow runners (TOG-12134): the package
           # lists stay on the job-container overlay otherwise.
           rm -rf /var/lib/apt/lists/*
@@ -2448,7 +2448,7 @@ jobs:
           # runner-owned checkout, so Git refuses it as dubious ownership.
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
+          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
           # Disk hygiene for hosted overflow runners (TOG-12134): the package
           # lists stay on the job-container overlay otherwise.
           rm -rf /var/lib/apt/lists/*
