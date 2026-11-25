@@ -120,6 +120,31 @@ offline configuration and validates cleanup evidence.
    (for example `pre-fixture-test`), rehearsal run ID, original start time, and
    PRE shape (`0473/0465` or retained `0475/0465`). Pin the approved synthetic
    database and gateway fixture to that reservation.
+   Before protected start, reconstruct the start inputs locally from those
+   pins. Pass the private ZIP and saved, authenticated GitHub records to
+   [`verify_predecessor_bundle`](../scripts/predecessor_bundle.py). Use the
+   returned receipt and private material from that same ZIP. Build the approved
+   `Target` from the reservation and use `make_config` with the operator's
+   selected scope, rehearsal run, original start and shape to reconstruct the
+   proposed config. Supply the selected synthetic service as `synthetic_service`.
+   Pass the approved target, independently pinned producer run,
+   current time, verified receipt, material directory and proposed config to
+   [`admit_predecessor`](../scripts/predecessor_intake.py). A shared staging or
+   production environment, a different synthetic binding, or an expired
+   reservation stops preparation. Pass the returned config to
+   [`assemble_worker_upload`](../scripts/pre_worker_upload.py) with the same
+   target, time and material. Keep the upload paired with that `Target` for
+   [`ProtectedPre.start`](../scripts/pre_start_stop.py), which performs its own
+   live admission.
+
+   With the inputs already local, these preparation steps need no cloud
+   credentials. Run the same sequence against synthetic inputs from the repo
+   root with an empty environment.
+
+   ```sh
+   env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p test_pre_operator_inputs.py -v
+   ```
+
 2. Admit one rehearsal at a time on its own Worker, Container app and synthetic
    database. Keep ingress private from first create, with no shared staging app,
    production routes, public preview, or access to shared writers. Arm the
