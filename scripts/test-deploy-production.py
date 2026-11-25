@@ -1014,7 +1014,8 @@ class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
               ref="refs/heads/main", auto="", resolved_sha=None, event="workflow_dispatch",
               run_sha="", run_conclusion="", run_updated="", hold="", auto_disabled="", spike="",
-              run_path="", run_event="", cutover_hold="", **responses):
+              run_path="", run_event="", cutover_hold="", release_plan_id="", release_pins="",
+              run_attempt="1", **responses):
         if image is None:
             image = IMAGE if rollback else ""
         api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]},
@@ -1135,6 +1136,7 @@ class GuardBehaviourTests(unittest.TestCase):
             output, summary = Path(tmp) / "output", Path(tmp) / "summary"
             env = {
                 "GITHUB_REPOSITORY": REPO, "GITHUB_REF": ref, "SHA": sha, "ROLLBACK": rollback,
+                "GITHUB_RUN_ATTEMPT": run_attempt, "RELEASE_PLAN_ID": release_plan_id, "RELEASE_PINS": release_pins,
                 "IMAGE": image, "TAKEOVER": takeover, "ALLOW_UNSTAGED": allow_unstaged,
                 "EVENT_NAME": event,
                 "WORKFLOW_RUN_SHA": run_sha, "WORKFLOW_RUN_CONCLUSION": run_conclusion,
@@ -1166,6 +1168,19 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(outputs, {})
         self.assertIn("::error::Refusing production", stdout)
         self.assertIn(reason, stdout)
+
+    def test_dormant_protected_dispatch_refuses_before_provider_access(self):
+        for plan, attempt, reason in (
+            ("", "1", "requires a fresh manual exact-SHA"),
+            ("001", "1", "requires a fresh manual exact-SHA"),
+            ("123", "2", "requires a fresh manual exact-SHA"),
+            ("123", "1", "requires the activation follow-up"),
+        ):
+            with self.subTest(plan=plan, attempt=attempt):
+                result = self.guard(takeover="true", cutover_hold="false", auto_disabled="true",
+                                    release_plan_id=plan, release_pins="{}", run_attempt=attempt)
+                self.assertRefused(result, reason)
+                self.assertEqual(result[3], [])
 
     def recheck(self, sha=SHA, hold="", auto_disabled="", **responses):
         api = {"production-readyz": {"status": 200, "build_revision": "f" * 40},

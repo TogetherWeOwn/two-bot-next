@@ -3151,6 +3151,9 @@ def production_errors(workflow):
         if not isinstance(on.get("schedule"), list) or not on.get("schedule"):
             errors.append(f"{name}: schedule must carry the daily backstop")
     jobs = workflow.get("jobs", {})
+    if any(re.search(r"\binputs\.release_\w+\b", step.get("run") or "")
+           for job in jobs.values() for step in job.get("steps", [])):
+        errors.append(f"{name}: protected release inputs must reach scripts through the environment")
     production, guard = jobs.get("production", {}), jobs.get("guard", {})
     soak, recheck = jobs.get("soak", {}), jobs.get("recheck", {})
     if soak.get("uses") == "$/.github/workflows/staging-soak.yml":
@@ -9030,6 +9033,10 @@ class WorkflowTests(unittest.TestCase):
                 workflow = deepcopy(production)
                 change(workflow)
                 self.assertTrue(production_errors(workflow), label)
+        direct_input = deepcopy(production)
+        direct_input["jobs"]["guard"]["steps"][0]["run"] += "\nunsafe = '${{ inputs.release_pins }}'\n"
+        self.assertIn("deploy-production.yml: protected release inputs must reach scripts through the environment",
+                      production_errors(direct_input))
 
     def test_soak_rejects_unsafe_handoffs(self):
         for mutate in (
@@ -11498,9 +11505,8 @@ class WorkflowTests(unittest.TestCase):
         # A workflow with its own triggers (anything beyond a pure
         # `workflow_call` callee) declares top-level `concurrency`, so two
         # dispatches or pushes cannot race each other on the shared runners.
-        # Pure callees are serialized by their callers instead; the two
-        # deploy-side workflows below serialize at the lane jobs on purpose
-        # (a top-level group would queue work that must stay unqueued).
+        # Pure callees are serialized by their callers. The deploy-side
+        # exceptions below pin their own lane assignments.
         pure_callees = {
             "deploy-production-recovery.yml",
             "reusable-rust-nextest.yml",
@@ -11508,9 +11514,8 @@ class WorkflowTests(unittest.TestCase):
         }
         exempt = {
             *pure_callees,
-            # Serializes at the `production` lane job only, so a sleeping
-            # promotion can never queue an operator rollback behind it (see
-            # the header comment in the workflow).
+            # Ordinary runs take the shared lane at the production job.
+            # Protected releases take it at workflow level.
             "deploy-production.yml",
             # Read-only staging observation and production alerting each use
             # an independent queue, never the lifecycle holders' pending slot.

@@ -8,7 +8,12 @@ PRODUCTION_RELEASE_GROUP = (
     "&& inputs.release_plan_run_id != '' && 'deploy-production' || "
     "format('deploy-production-run-{0}-{1}', github.run_id, github.run_attempt) }}"
 )
-PRODUCTION_GROUP = "${{ inputs.release_plan_run_id != '' && format('deploy-production-release-job-{0}', github.run_id) || github.run_attempt != 1 && needs.guard.outputs.mode != 'rollback' && needs.guard.outputs.allow_unstaged != 'true' && format('deploy-production-refused-{0}-{1}', github.run_id, github.run_attempt) || 'deploy-production' }}"
+PRODUCTION_GROUP = (
+    "${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.run_attempt == 1 "
+    "&& inputs.release_plan_run_id != '' && format('deploy-production-release-job-{0}', github.run_id) "
+    "|| github.run_attempt != 1 && needs.guard.outputs.mode != 'rollback' && needs.guard.outputs.allow_unstaged != 'true' "
+    "&& format('deploy-production-refused-{0}-{1}', github.run_id, github.run_attempt) || 'deploy-production' }}"
+)
 CONTRACT = json.loads((Path(__file__).parent / "fixtures/staging_soak_contract.json").read_text())
 
 
