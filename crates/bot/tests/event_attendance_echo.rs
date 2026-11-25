@@ -27,6 +27,7 @@ use two_bot_cutover::{
     db::CutoverDb,
     member_erasure::{erase_member, ErasureMode},
     privacy::{opt_back_in, opt_out_member, set_analytics_settings},
+    retention::{run_retention, RetentionMode},
 };
 use two_bot_testsupport::TestDatabase;
 
@@ -57,7 +58,20 @@ struct SignedEcho<'a> {
     now: u64,
 }
 
-impl SignedEcho<'_> {
+impl<'a> SignedEcho<'a> {
+    fn new(store: &'a InternalActionStore, now: u64) -> Self {
+        let key = SigningKey {
+            id: "echo-fixture".into(),
+            secret: Secret::new(rand::random::<[u8; 32]>().to_vec()),
+        };
+        Self {
+            store,
+            keys: KeyRing::new(vec![key.clone()]),
+            key,
+            now,
+        }
+    }
+
     async fn request(
         &self,
         flags: &InternalFlags,
@@ -172,16 +186,7 @@ async fn exercise_echo(pool: PgPool) {
     );
     assert!(capture.write_observation(pool, &observation).await.unwrap());
 
-    let key = SigningKey {
-        id: "echo-fixture".into(),
-        secret: Secret::new(rand::random::<[u8; 32]>().to_vec()),
-    };
-    let signed = SignedEcho {
-        store: &store,
-        keys: KeyRing::new(vec![key.clone()]),
-        key,
-        now: now_secs,
-    };
+    let signed = SignedEcho::new(&store, now_secs);
     let enabled = InternalFlags::from_map(
         &[("TWO_INTERNAL_ALLOW_ATTENDANCE_READ".into(), "1".into())].into(),
     );
@@ -316,6 +321,150 @@ async fn exercise_echo(pool: PgPool) {
         Err(ReadRefusal::NotFound),
         "erased span"
     );
+}
+
+#[tokio::test]
+async fn signed_echo_after_attendance_retention() {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test database required");
+    let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .unwrap();
+    let result = tokio::spawn(exercise_echo_retention(db.pool().clone())).await;
+    db.close().await.unwrap();
+    result.unwrap();
+}
+
+async fn exercise_echo_retention(pool: PgPool) {
+    const EXPIRED_KEY: &str = "echo-expired";
+    const EXPIRED_BODY: &[u8] = br#"{"action":"event.attendance.read","event_key":"echo-expired"}"#;
+    let guild = TWO_STAGING_GUILD_ID;
+    let store = InternalActionStore::new(pool.clone());
+    let now: OffsetDateTime = sqlx::query_scalar("SELECT date_trunc('second', clock_timestamp())")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let now_secs = u64::try_from(now.unix_timestamp()).unwrap();
+    let signed = SignedEcho::new(&store, now_secs);
+    let enabled = InternalFlags::from_map(
+        &[("TWO_INTERNAL_ALLOW_ATTENDANCE_READ".into(), "1".into())].into(),
+    );
+    let echo = async |body: &[u8]| {
+        let request = signed
+            .request(&enabled, body, now_secs, &random_nonce())
+            .await
+            .unwrap();
+        read(request, &pool, |_| Some(|| true)).await
+    };
+    let seed_and_read = async |event_id: &str,
+                               key: &str,
+                               body: &[u8],
+                               age,
+                               member: u64,
+                               channel: u64,
+                               room: &str| {
+        let member = member.to_string();
+        let channel = channel.to_string();
+        let start = now - Duration::days(age);
+        let end = start + Duration::minutes(30);
+        let joined = start + Duration::minutes(1);
+        let event = ScheduledEvent {
+            id: event_id.into(),
+            name: "Fixture event".into(),
+            starts_at: iso(start),
+            ends_at: Some(iso(end)),
+            channel_id: Some(channel.clone()),
+            description: None,
+            status: EventStatus::Completed,
+        };
+        store.put_event_key(guild, key, event_id).await.unwrap();
+        upsert_event(&pool, guild, &iso(end), &event).await.unwrap();
+        // Seed historical evidence directly. The live writer admits fresh observations only.
+        sqlx::query(
+            "WITH captured AS (
+                INSERT INTO event_attendance_windows
+                    (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at)
+                SELECT guild_id, $3, event_id, instance_starts_at, starts_at, ends_at
+                FROM event_instance_windows WHERE guild_id = $1 AND event_id = $2 AND is_current
+                RETURNING guild_id, event_key, event_id, instance_starts_at
+             )
+             INSERT INTO event_voice_sessions
+                 (guild_id, member_id, channel_id, channel_name, joined_at, left_at,
+                  name_observed_at, event_keys)
+             SELECT guild_id, $4, $5, $6, $7, $8, $7,
+                    ARRAY[event_key || '/' || event_id || '/' ||
+                          trunc(EXTRACT(EPOCH FROM instance_starts_at) * 1000000)::text]
+             FROM captured",
+        )
+        .bind(guild)
+        .bind(event_id)
+        .bind(key)
+        .bind(&member)
+        .bind(&channel)
+        .bind(room)
+        .bind(joined)
+        .bind(joined + Duration::minutes(12))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let before = echo(body).await.unwrap();
+        assert_eq!(
+            before,
+            json!({
+                "v": 1,
+                "event_key": key,
+                "window": { "starts_at": iso(start), "ends_at": iso(end) },
+                "threshold_minutes": 10,
+                "peak_concurrent": 1,
+                "rooms": [{ "channel_id": channel, "name_at_close": room }],
+                "members": [{
+                    "discord_id": member, "minutes": 12, "sessions": 1,
+                    "first_joined_at": iso(joined),
+                }],
+                "final": true,
+            })
+        );
+        before
+    };
+    seed_and_read(
+        "200000000000000003",
+        EXPIRED_KEY,
+        EXPIRED_BODY,
+        91,
+        300000000000000003,
+        400000000000000003,
+        "Expired fixture room",
+    )
+    .await;
+    let control = seed_and_read(EVENT, EVENT_KEY, READ_BODY, 89, MEMBER, CHANNEL, ROOM).await;
+
+    let report = run_retention(&pool, RetentionMode::Execute).await.unwrap();
+    assert_eq!(report.attendance_raw_deleted, 1);
+    let survivors: Vec<String> = sqlx::query_scalar("SELECT member_id FROM event_voice_sessions")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(survivors, [MEMBER.to_string()]);
+    let expired_window_remains: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM internal_event_keys k
+             JOIN event_attendance_windows h USING (guild_id, event_key, event_id)
+             JOIN event_instance_windows w USING (guild_id, event_id, instance_starts_at)
+             WHERE k.guild_id = $1 AND k.event_key = $2 AND w.is_current
+                 AND w.status = 'completed' AND NOT w.identity_ambiguous AND w.revoked_at IS NULL
+         )",
+    )
+    .bind(guild)
+    .bind(EXPIRED_KEY)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        expired_window_remains,
+        "retention preserves the mapped window"
+    );
+    assert_eq!(echo(EXPIRED_BODY).await, Err(ReadRefusal::NotFound));
+    assert_eq!(echo(READ_BODY).await.unwrap(), control);
 }
 
 async fn exercise_pre_enable_window(
