@@ -96,5 +96,9 @@ class ReleaseCodeqlEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(GateError, "^candidate_check_unproved$"):
             self.read_evidence()
 
+        checks[-1] = {**exact, "conclusion": "failure"}
+        with self.assertRaisesRegex(GateError, "^candidate_check_unproved$"):
+            self.read_evidence()
+
         checks[-1] = exact
         self.assertEqual(self.read_evidence(), {"run_id": RUN_ID, "attempt": 2})
