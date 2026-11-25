@@ -8,11 +8,12 @@ from pathlib import Path
 import subprocess
 import sys
 
-from ci.production_migrate_claim import WORKFLOW_PATH, projection_hash, store_projection_hash
+from ci.production_migrate_claim import WORKFLOW_PATH
 from production_migrate_approval import ARTIFACT as PLAN_ARTIFACT, verify_check, verify_environment
 from production_ownership_status import read_status
 from production_recovery_artifact import FENCE_JOB, FENCE_STEP, authenticated_inverse, current_run, protected_job
 from production_recovery_takeover import RUN_ID, UUID, RecoveryPin, complete_legacy_takeover, observed_phase, verify_inverse
+from production_release_forward import CUTOVER, STORE, ledger_endpoints
 from rollback_proof import ProofError
 from staging_migrate_approval import digest_json
 from staging_recovery_status import DIGEST, authenticated_plan, github, matches
@@ -20,7 +21,6 @@ from staging_rollout import GateError, decode, mapping, require
 from worker_container_rollback import APPLICATIONS, WORKERS, ProvenanceReceipt, Rollback, RollbackClient
 from worker_container_rollback import check_url, control_client, validate_receipt_against_live
 
-CUTOVER, STORE = [475, 479, 480, 481, 482], [478]
 FENCE_ACTOR_PREFIX = "production-schema-release:"
 
 
@@ -154,15 +154,9 @@ def release_admission(env, run, api=github):
     require(plan.get("source_sha") == pin.candidate_sha and plan.get("target") == target
             and digest_json(target) == pin.database_fingerprint and plan.get("migration_target") == "production"
             and plan.get("mode") == "plan" and plan.get("role") == "two_bot_migrator_ro"
-            and plan.get("recovery_evidence_ref") == f"inverse-{reference}"
-            and plan.get("pending_before") == CUTOVER and plan.get("pending_store_before") == STORE
-            and plan.get("plan_manifest_sha256") == projection_hash(plan)
-            and plan.get("store_plan_manifest_sha256") == store_projection_hash(plan),
+            and plan.get("recovery_evidence_ref") == f"inverse-{reference}",
             "production_inverse_plan_mismatch")
-    expanded = [[dict(row, success=True) for row in plan[key]]
-                for key in ("source_migrations", "source_store_migrations")]
-    restored = [[row for row in rows if row["version"] not in removed]
-                for rows, removed in zip(expanded, (CUTOVER[1:], STORE), strict=True)]
+    _, expanded, restored = ledger_endpoints(plan)
     require(digest_json(expanded) == pin.expanded_ledgers_sha256
             and digest_json(restored) == pin.restored_ledgers_sha256, "production_inverse_ledger_pin_invalid")
     approval = {"plan_run_id": plan_id, "plan_archive_sha256": artifact["archive_digest"],
@@ -178,8 +172,8 @@ def run_inverse(binary, directory, pin, plan, approval, env):
     args = [binary, "--target", "production", "--apply", "--source-sha", pin.candidate_sha,
             "--production-host", target["host"], "--production-database", target["database"],
             "--production-branch-id", target["branch_id"], "--recovery-evidence-ref", approval["recovery_ref"],
-            "--acl-plan-ref", plan["acl_plan_ref"], "--expected-pending", "475,479,480,481,482",
-            "--expected-store-pending", "478", "--plan-manifest-sha256", plan["plan_manifest_sha256"],
+            "--acl-plan-ref", plan["acl_plan_ref"], "--expected-pending", ",".join(map(str, CUTOVER)),
+            "--expected-store-pending", ",".join(map(str, STORE)), "--plan-manifest-sha256", plan["plan_manifest_sha256"],
             "--store-plan-manifest-sha256", plan["store_plan_manifest_sha256"], "--plan-run-id", approval["plan_run_id"],
             "--plan-manifest-path", str(plan_path), "--inverse-attendance-fence-sha256", pin.attendance_fence_sha256]
     binding = "TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL"

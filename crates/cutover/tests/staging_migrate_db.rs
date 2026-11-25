@@ -572,7 +572,8 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     admin
         .execute("REVOKE CREATE ON SCHEMA public FROM two_bot_runtime")
         .await?;
-    let (cutover, store) = apply_release_schema(&pool, &expected[0], &expected[1]).await?;
+    let applied = apply_release_schema(&pool, &expected[0], &expected[1]).await?;
+    let (cutover, store) = (applied.cutover, applied.store);
     assert_eq!(cutover.len(), expected[0].len() + 5);
     assert_eq!(store.len(), expected[1].len() + 1);
     let installed: bool = sqlx::query_scalar(
@@ -618,13 +619,19 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     .fetch_one(&mut admin)
     .await?;
     let expected_fence = hex::encode(Sha256::digest(fence));
+    assert_eq!(applied.attendance_fence_sha256, expected_fence);
     assert!(
         recover_release_schema(&pool, &cutover, &store, Some(&"0".repeat(64)))
             .await
             .is_err()
     );
-    let (restored_cutover, restored_store) =
-        recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await?;
+    let (restored_cutover, restored_store) = recover_release_schema(
+        &pool,
+        &cutover,
+        &store,
+        Some(&applied.attendance_fence_sha256),
+    )
+    .await?;
     assert_eq!(
         recover_release_schema(&pool, &cutover, &store, Some(&expected_fence)).await?,
         (restored_cutover.clone(), restored_store.clone())

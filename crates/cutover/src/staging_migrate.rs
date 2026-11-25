@@ -42,7 +42,7 @@ use crate::intake_cap::{read_bytes_capped, IntakeReadError, INTAKE_CAP_LABEL};
 #[path = "release_schema_transaction.rs"]
 mod release_schema_transaction;
 pub use release_schema_transaction::{
-    apply_release_schema, recover_release_schema, undo_release_schema,
+    apply_release_schema, recover_release_schema, undo_release_schema, AppliedRelease,
 };
 
 /// Fixed binding names; each value is a secret and is never echoed.
@@ -1628,6 +1628,7 @@ async fn run_on_pool(
     let mut after = before.clone();
     let mut store_applied = 0usize;
     let mut store_after = store_before.clone();
+    let mut release_fence = None;
     if req.apply
         && req.target == Target::Production
         && pending == [475, 479, 480, 481, 482]
@@ -1635,7 +1636,10 @@ async fn run_on_pool(
     {
         let path = req.plan_manifest_path.as_deref().unwrap_or_default().trim();
         check_release_ledgers(path, &before, &store_before)?;
-        (after, store_after) = apply_release_schema(pool, &before, &store_before).await?;
+        let release = apply_release_schema(pool, &before, &store_before).await?;
+        after = release.cutover;
+        store_after = release.store;
+        release_fence = Some(release.attendance_fence_sha256);
         applied = after.len() - before.len();
         store_applied = store_after.len() - store_before.len();
     } else if req.apply {
@@ -1652,7 +1656,7 @@ async fn run_on_pool(
             store_applied = count;
         }
     }
-    Ok(json!({
+    let mut manifest = json!({
         "runner_version": RUNNER_VERSION,
         "tool": {"name": "two-bot-cutover staging_migrate", "crate_version": env!("CARGO_PKG_VERSION"),
                  "sqlx": SQLX_VERSION, "invocation": "staging-migrate --target staging|production --plan|--apply"},
@@ -1688,7 +1692,11 @@ async fn run_on_pool(
         // four-login memberships and verifier findings from one READ ONLY
         // transaction. Not part of either plan hash.
         "audit": audit,
-    }))
+    });
+    if let Some(fence) = release_fence {
+        manifest["attendance_fence_sha256"] = json!(fence);
+    }
+    Ok(manifest)
 }
 
 #[cfg(test)]
