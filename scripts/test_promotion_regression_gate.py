@@ -110,6 +110,14 @@ class StagingStepTests(unittest.TestCase):
             gate.staging_step(probe(revision=NEWER), rest(0, 50), SHA, auto=False,
                               staging_runs=promoting)
 
+    def test_reviewed_staging_history_uses_the_serving_sha(self):
+        row = {**run_row(SHA, "completed", "success"), "event": "workflow_dispatch",
+               "display_title": f"reviewed staging source {NEWER}"}
+        self.assertTrue(gate.serving_run_promotes(NEWER, [row]))
+        self.assertFalse(gate.serving_run_promotes(SHA, [row]))
+        self.assertFalse(gate.serving_run_promotes(NEWER, [{**row, "event": "push"}]))
+        self.assertFalse(gate.serving_run_promotes(NEWER, [{**row, "conclusion": "failure"}]))
+
     def test_a_missing_probe_receipt_never_skips(self):
         with self.assertRaises(gate.GateError):
             gate.staging_step(None, rest(0, 50), SHA, auto=True)

@@ -211,7 +211,10 @@ def _check_run_identity(run, sha, run_id, attempt):
         raise PromotionError("source run id mismatch")
     if run.get("run_attempt") != attempt or type(run.get("run_attempt")) is not int:
         raise PromotionError("source run attempt mismatch")
-    if run.get("head_sha") != sha:
+    # For a reviewed dispatch, the protected workflow SHA is separate from
+    # the served SHA in its title and the certified build receipt.
+    if (build_identity.staging_source(run) != sha
+            or (build_identity.reviewed_staging_run(run) and (attempt != 1 or not _is_sha(run.get("head_sha"))))):
         raise PromotionError("source run sha mismatch")
     if run.get("head_branch") != STAGING_BRANCH:
         raise PromotionError("source run branch mismatch")
@@ -658,7 +661,7 @@ def _admit(args, github, copy_image):
             or workflow_run.get("head_repository_id") != repo_id
             or type(workflow_run.get("head_repository_id")) is not int
             or workflow_run.get("head_branch") != STAGING_BRANCH
-            or workflow_run.get("head_sha") != args.sha):
+            or workflow_run.get("head_sha") != run["head_sha"]):
         raise PromotionError("artifact run binding mismatch")
     if not _is_digest(meta.get("digest")):
         raise PromotionError("artifact digest mismatch")
@@ -678,7 +681,8 @@ def _admit(args, github, copy_image):
     # 6. Recheck the current source attempt: nothing moved underneath us,
     #    including the repository the run belongs to.
     reread = github.get_json(_run_route(run_id))
-    if _check_run_identity(reread, args.sha, run_id, attempt) != repo_id:
+    if (_check_run_identity(reread, args.sha, run_id, attempt) != repo_id
+            or reread["head_sha"] != run["head_sha"]):
         raise PromotionError("source run repository mismatch")
     _check_run_completed(reread)
 

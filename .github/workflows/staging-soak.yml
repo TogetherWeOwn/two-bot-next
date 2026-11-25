@@ -85,7 +85,7 @@ jobs:
           if [ "$probe" -gt 1 ]; then echo "::error::staging probe refused to run (exit $probe)"; exit 1; fi
           node wrangler/scripts/rest-5xx-counters.mjs --metrics-url "$STAGING_WORKER_URL" --out "$RUNNER_TEMP/staging-soak-counters.json"
           gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-staging.yml/runs" \
-            -f branch=main -f per_page=100 -q '[.workflow_runs[] | {head_sha, head_branch, status, conclusion}]' > "$RUNNER_TEMP/staging-runs.json"
+            -f branch=main -f per_page=100 -q '[.workflow_runs[] | {head_sha, head_branch, display_title, event, status, conclusion}]' > "$RUNNER_TEMP/staging-runs.json"
           python3 scripts/promotion_regression_gate.py staging \
             --probe "$RUNNER_TEMP/staging-soak-probe.json" --counters "$RUNNER_TEMP/staging-soak-counters.json" \
             --sha "$SHA" --auto "$AUTO" --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" \
