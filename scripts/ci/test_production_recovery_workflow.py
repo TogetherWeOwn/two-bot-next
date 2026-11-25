@@ -4,8 +4,9 @@ from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -71,6 +72,24 @@ class RecoveryWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(GateError, "production_inverse_serving_pair_changed"):
             recovery.establish_fence(self.pin, self.candidate, Mock(side_effect=[before, after]), self.control)
         self.control.assert_called_once_with("fence-exact", 20, expected_deployment=self.candidate[0])
+
+    def test_cli_requires_reviewed_plan_approval(self):
+        approval = {"plan_run_id": "321", "plan_archive_sha256": "sha256:" + "8" * 64}
+        with (patch.object(recovery, "current_run"), patch.object(recovery, "verify_environment"),
+              patch.object(recovery, "release_admission", return_value=(self.pin, self.candidate, {}, approval)),
+              patch.object(recovery, "verify_check", side_effect=GateError("unapproved")) as check):
+            self.assertEqual(recovery.main(["fence"], {}), 1)
+            check.assert_called_once()
+
+    def test_inverse_refuses_incomplete_database_readback(self):
+        plan = dict(target=dict(host="db", database="fixture", branch_id="branch"),
+                    acl_plan_ref="acl", plan_manifest_sha256="plan", store_plan_manifest_sha256="store")
+        approval = {"recovery_ref": "ref", "plan_run_id": "321"}
+        env = {"TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL": "fixture"}
+        with TemporaryDirectory() as scratch, patch.object(recovery.subprocess, "run") as run:
+            run.return_value = Mock(returncode=0, stdout=b'{"state":"restored"}')
+            with self.assertRaisesRegex(GateError, "production_inverse_database_readback_invalid"):
+                recovery.run_inverse("fixture", Path(scratch), self.pin, plan, approval, env)
 
     def restore(self):
         recovery.restore_under_fence(self.pin, self.result, self.observe, self.control, self.rollback,
