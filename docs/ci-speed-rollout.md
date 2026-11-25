@@ -24,7 +24,7 @@ and the re-run receipts on the promotion PR close out.
 
 ## What shipped in the pilot (advisory, this repo)
 
-- `dorny/paths-filter` in `.github/workflows/ci-speed.yml` (`changes` job):
+- `dorny/paths-filter` in `.github/workflows/ci-speed.yml` (`report` job):
   affected-only pre-filter for the advisory lane. Required lanes keep the
   existing `job-inputs` selector; the required `ci-ok` aggregator is
   untouched, so no required context can strand.
@@ -44,9 +44,11 @@ and the re-run receipts on the promotion PR close out.
   JUnit to `junit.xml`) with `scripts/ci/flake_ledger.py` parsing JUnit
   into a JSONL flake ledger, uploaded as an artifact with the JUnit.
 - `scripts/ci/ci_minutes.py` + `docs/ci-speed-baseline.json`: the
-  before/after mechanism. The advisory `report` job uploads a comparison
-  skeleton per run; maintainers append measured rows post-merge with
-  `record`. No savings claim until ledger means exist on both sides.
+  before/after mechanism. The advisory `report` job shares one checkout
+  with the selector and uploads `ci-minutes-<run_id>` even if selection
+  fails, provided checkout and report generation succeed and the run is
+  still active. Maintainers append measured rows post-merge with `record`.
+  No minutes-savings claim until ledger means exist on both sides.
 
 ## Org-level home (target, not this repo)
 

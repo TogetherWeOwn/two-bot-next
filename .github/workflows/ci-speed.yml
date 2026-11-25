@@ -5,7 +5,7 @@ name: ci-speed
 # (check.yml `nextest` job, aggregated by `ci-ok`); this workflow keeps the
 # per-run comparison skeleton. Never a required check and never part of
 # ci-ok. No `paths:` filter on the trigger: that would skip the whole
-# workflow including the report job.
+# workflow including the report.
 
 on:
   pull_request:
@@ -23,21 +23,18 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  changes:
-    name: affected paths
+  report:
+    name: ci minutes report
     permissions:
       contents: read
     # Runner routing: explicit standard GitHub-hosted ubuntu-latest; this is
     # a public repository.
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      worker: ${{ steps.filter.outputs.worker }}
-      docs: ${{ steps.filter.outputs.docs }}
-      ci: ${{ steps.filter.outputs.ci }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
+        timeout-minutes: 5
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -48,6 +45,7 @@ jobs:
       # these outputs.
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
+        timeout-minutes: 5
         with:
           filters: |
             rust:
@@ -124,24 +122,11 @@ jobs:
           printf 'paths-filter: rust=%s worker=%s docs=%s ci=%s\n' \
             "$SEL_RUST" "$SEL_WORKER" "$SEL_DOCS" "$SEL_CI"
 
-  report:
-    name: ci minutes report
-    permissions:
-      contents: read
-    needs: [changes]
-    # Always runs: the minutes skeleton is evidence even on Rust-untouched
-    # PRs. The required nextest lane now reports through check.yml.
-    if: always()
-    # Runner routing: see the note on `changes`.
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 1
-
+      # The report uses the checked-out baseline even when selection fails.
+      # Leave the failure visible and let obsolete PR runs cancel normally.
       - name: Write minutes comparison skeleton
+        id: minutes
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         env:
           RUN_ID: ${{ github.run_id }}
           SHA: ${{ github.sha }}
@@ -149,6 +134,7 @@ jobs:
         run: python3 scripts/ci/ci_minutes.py report --baseline docs/ci-speed-baseline.json --run-id "$RUN_ID" --sha "$SHA" --event "$EVENT" --output ci-minutes.json
 
       - name: Upload minutes skeleton
+        if: ${{ !cancelled() && steps.minutes.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-minutes-${{ github.run_id }}

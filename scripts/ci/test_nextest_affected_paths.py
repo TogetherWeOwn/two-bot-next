@@ -5,10 +5,9 @@ promotion itself lives in companion PR #984, read here read-only and never
 edited) runs only when Rust-affecting paths change. Two selectors decide
 that, and they must agree on the lane's inputs:
 
-- `dorny/paths-filter` in `ci-speed.yml` (`changes` job): the affected-only
+- `dorny/paths-filter` in `ci-speed.yml` (`report` job): the affected-only
   pre-filter. Its `rust` set must cover every input that
-  can change nextest behavior, or the advisory signal and the
-  minutes-per-merged-PR report silently stop reflecting the lane.
+  can change nextest behavior so the advisory signal reflects the lane.
 - `scripts/job-inputs.py` (`rust` output): the authoritative selector the
   required lanes gate on. Every behavioral nextest input must select `rust`
   here, or `ci-ok` accepts a skip on a PR the lane should have gated.
@@ -107,8 +106,8 @@ def paths_filter_step():
     """The dorny/paths-filter step and its parsed `filters:` mapping."""
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/ci-speed.yml").read_text())
-    changes = workflow["jobs"]["changes"]
-    step = next(step for step in changes["steps"]
+    report = workflow["jobs"]["report"]
+    step = next(step for step in report["steps"]
                 if str(step.get("uses", "")).startswith("dorny/paths-filter@"))
     return step["uses"], yaml.safe_load(step["with"]["filters"])
 

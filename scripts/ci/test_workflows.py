@@ -141,7 +141,7 @@ JOB_INVENTORY = {
     # SDLC 2.3 CI speed evidence (the shared nextest lane graduated to a
     # required check.yml job): dorny/paths-filter affected-only selection
     # and the minutes-per-merged-PR report.
-    "ci-speed.yml": {"changes", "report"},
+    "ci-speed.yml": {"report"},
     # Shared nextest lane, called by check.yml; org-level home is
     # TogetherWeOwn/.github with a pinned SHA like test-guard.
     "reusable-rust-nextest.yml": {"nextest"},
@@ -11420,6 +11420,51 @@ class WorkflowTests(unittest.TestCase):
         flat = " ".join(rollout.split())
         self.assertIn("local disk", flat)
         self.assertNotIn("adds no cache footprint", flat)
+
+    def test_ci_speed_single_runner_keeps_best_effort_report(self):
+        workflow = self.workflows["ci-speed.yml"]
+        self.assertEqual(workflow["on"], {
+            "pull_request": {"types": ["opened", "synchronize", "reopened"]},
+            "push": {"branches": ["main"]},
+            "workflow_dispatch": "",
+        })
+        self.assertEqual(workflow["concurrency"], {
+            "group": "ci-speed-${{ github.event.pull_request.number || github.sha }}",
+            "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+        })
+        self.assertEqual(set(workflow["jobs"]), {"report"})
+        job = workflow["jobs"]["report"]
+        self.assertEqual(job["name"], "ci minutes report")
+        self.assertEqual(job["runs-on"], PUBLIC_RUNNER)
+        self.assertEqual(job["timeout-minutes"], "10")
+        self.assertFalse({"if", "strategy", "continue-on-error"} & job.keys())
+        checkout, classifier, note, write, upload = job["steps"]
+        self.assertTrue(checkout["uses"].startswith("actions/checkout@"))
+        self.assertEqual(checkout["id"], "checkout")
+        self.assertEqual(checkout["with"], {"persist-credentials": "false", "fetch-depth": "0"})
+        self.assertEqual(checkout["timeout-minutes"], "5")
+        self.assertTrue(classifier["uses"].startswith("dorny/paths-filter@"))
+        self.assertEqual(classifier["id"], "filter")
+        self.assertEqual(classifier["timeout-minutes"], "5")
+        for step in (checkout, classifier, note, write, upload):
+            self.assertNotIn("continue-on-error", step)
+        self.assertEqual(note["name"], "Selection note (advisory only)")
+        self.assertNotIn("if", note)
+        self.assertEqual(write["id"], "minutes")
+        self.assertEqual(write["if"], "${{ !cancelled() && steps.checkout.outcome == 'success' }}")
+        self.assertEqual(write["env"], {
+            "RUN_ID": "${{ github.run_id }}", "SHA": "${{ github.sha }}",
+            "EVENT": "${{ github.event_name }}",
+        })
+        self.assertEqual(write["run"],
+                         'python3 scripts/ci/ci_minutes.py report --baseline docs/ci-speed-baseline.json '
+                         '--run-id "$RUN_ID" --sha "$SHA" --event "$EVENT" --output ci-minutes.json')
+        self.assertEqual(upload["if"], "${{ !cancelled() && steps.minutes.outcome == 'success' }}")
+        self.assertTrue(upload["uses"].startswith("actions/upload-artifact@"))
+        self.assertEqual(upload["with"], {
+            "name": "ci-minutes-${{ github.run_id }}", "path": "ci-minutes.json",
+            "if-no-files-found": "error", "retention-days": "14",
+        })
 
     def test_minimal_grants_and_no_persisted_checkout_credentials(self):
         for name, workflow in self.workflows.items():
