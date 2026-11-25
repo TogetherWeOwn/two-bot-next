@@ -466,7 +466,7 @@ fn set_add_member_flag(on: bool) {
 /// The moderation flag gate needs BOTH vars: the internal allowlist plus the
 /// moderation publish gate. Tests serialize on their own lock and always
 /// restore both vars.
-static MODERATION_FLAG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static MODERATION_FLAG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Serializes the tests that assert exact `internal_action_*_persist_failed`
 /// diagnostic counts on the process-global capture, plus the tests that emit

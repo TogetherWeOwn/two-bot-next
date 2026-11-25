@@ -177,6 +177,53 @@ expiry in protected status for the same run, attempt, expiry, deployment and SHA
 Live qualification needs a signer bound to the dedicated account's own Web session and two dedicated staging
 voice channels with verifiable Connect permissions and occupancy.
 
+The [offline self-move preflight](../wrangler/scripts/staging-voice-move-acceptance.mjs)
+checks the fixture before the acceptance runner can dispatch a move. Its
+`preflightVoiceMoveAcceptance` export takes the following inputs with `enabled: true`.
+
+- `fixture` pins `environment: "staging"`, the guild and dedicated member
+  (`guildId`, `discordId`), and `channelIds` in source-then-destination order.
+- `lease` pins `runId`, `runAttempt`, `expiresAt`, `sha`, `deploymentId` and
+  `epoch` from the protected window. `ready` is its unmodified ready receipt.
+- `evidence.session` projects the Web signer's staging session and configured
+  channel pair. Use `environment: "staging"`, `authenticated: true`,
+  `action: "voice.move_member"`, `discordId`, `channelIds` and `observedAt`.
+- `evidence.readback.source` and `.destination` come from Discord independently
+  of the Web signer and the Bot's move response. Each provides `guildId`,
+  `discordId`, `channelId`, `channelType` (`2` for guild voice),
+  `connectedChannelId`, `canConnect` and `observedAt`. The member starts in the
+  source. Effective Connect is denied there and allowed in the destination.
+- `evidence.previousReady` and `evidence.previousOff` are the ready and final
+  status receipts from `verify_lease` on the same SHA, deployment and epoch.
+  The workflow uploads them after cleanup. Use those receipts for the prior
+  lease and get `ready` from the separate active window that owns the moves.
+  The earlier lease must be released or expired, OFF and stopped within 15
+  minutes before the current acquisition.
+
+Use UTC ISO timestamps with milliseconds for `observedAt`. Current ready,
+session and Discord readbacks must be at most 60 seconds old and belong to
+the current lease window. Start the runner promptly after ready and feed it
+projections directly from the protected Web, Discord and staging readers.
+Keep fixture IDs and readbacks in the protected context. The preflight checks the
+consistency of trusted readbacks offline and returns a verdict with a fixed
+failure code on refusal. The protected Web caller verifies the signed session
+at dispatch. The runner rechecks lease and Discord observations for each case
+and still requires OFF and stopped for its own window.
+
+The same module exports `runProtectedVoiceMoveAcceptance` for the job holding
+the active lease. It defaults off. Pass the current lease and ready receipt,
+the prior ready and OFF receipts, and the protected fixture pin. The bound Web
+session exposes `environment: "staging"` and `discordId` matching the fixture
+member. Its `readCurrent({ signal })` and destination-only `move` use the same
+installed session.
+An independent fixture reader supplies `readChannels({ signal })` and the
+per-case `observe` callback. The control callback uses the existing staging-use
+client. Pass those readbacks directly without rewriting their timestamps or
+subject. Readback failure enters the runner's same-window finish path. The
+enclosing job still holds the staging lock and owns its unconditional finish
+fallback. This adapter has no workflow caller or live transport. Its current
+receipts are marked `mock`.
+
 Attaching the executor gives all signed verbs a five-second nonce deadline. The guild turn
 ends at adapter settlement. The child holds capacity through the audit, with up to five
 seconds beyond the wire deadline. An audit failure or timeout is logged as unconfirmed.

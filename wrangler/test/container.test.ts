@@ -1959,6 +1959,20 @@ test("exact takeover refuses a pending fence without changing ownership", async 
   assert.equal(h.starts.length, 0);
 });
 
+test("exact schema fence refuses a routed version mismatch and confirms a matching stop", async (t) => {
+  const h = await harness(t);
+  const before = h.values.get(OWNER_KEY);
+  const change = { action: "fence-exact", expectedEpoch: 1, actor: "fixture-release" };
+  const wrong = await h.bot.fetch(controlRequest({ ...change, expectedDeploymentId: "deployment-other" }));
+  assert.equal(wrong.status, 503);
+  assert.equal((await wrong.json()).reason, "deployment_mismatch");
+  assert.deepEqual(h.values.get(OWNER_KEY), before);
+  const matched = await h.bot.fetch(controlRequest({ ...change, expectedDeploymentId: ID }));
+  assert.equal(matched.status, 200);
+  const state = await matched.json();
+  assert.partialDeepStrictEqual(state, { owner: { deploymentId: null, epoch: 2 }, running: false });
+});
+
 test("authenticated takeover is CAS audited, tears down first and never auto-starts", async (t) => {
   // A same-owner exact-epoch repeat is a no-op, so the commit path is
   // exercised by a fresh deployment at the fresh epoch.
