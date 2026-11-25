@@ -959,7 +959,7 @@ export class TwoBotContainer extends Container<Env> {
       if (emergencyStop && !await this.confirmedTeardownHold()) await emergencyStop();
       throw error;
     });
-    if (reserved) throw new OwnershipRefused("staging_automod_reserved");
+    if (reserved) throw new OwnershipRefused("staging_use_conflict");
   }
 
   private async automodReserved(): Promise<boolean> {

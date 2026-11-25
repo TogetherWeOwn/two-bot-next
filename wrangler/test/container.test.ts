@@ -348,9 +348,9 @@ test("protected AutoMod purpose excludes ordinary and voice staging callers", as
     assert.deepEqual(values.get(STAGING_USE_KEY), { ...issued, phase: "preparing" });
   }, async () => {}, Date.now(), AUTOMOD_STAGING_PURPOSE), issued);
   assert.deepEqual(await staging.automodBinding(issued, identity, Date.now()), { lease: issued, active: true });
-  await assert.rejects(h.bot.start(), /staging_automod_reserved/);
-  await assert.rejects(h.bot.containerFetch("http://c/readyz"), /staging_automod_reserved/);
-  await assert.rejects(h.bot.destroy(), /staging_automod_reserved/);
+  await assert.rejects(h.bot.start(), /staging_use_conflict/);
+  await assert.rejects(h.bot.containerFetch("http://c/readyz"), /staging_use_conflict/);
+  await assert.rejects(h.bot.destroy(), /staging_use_conflict/);
   for (const action of ["acquire", "release"] as const) {
     assert.equal((await h.bot.fetch(stagingUseRequest(action, window))).status, 503);
   }
@@ -921,7 +921,7 @@ test("bounded staging: preparing AutoMod reservation retries native stop", async
   await h.bot.stagingExpiry();
   assert.equal(h.runtime.running, false);
   assert.deepEqual(values.get(STAGING_USE_KEY), use);
-  await assert.rejects(h.bot.start(), /staging_automod_reserved/);
+  await assert.rejects(h.bot.start(), /staging_use_conflict/);
   h.runtime.running = true;
   await h.bot.onActivityExpired();
   assert.equal(h.runtime.running, false);
