@@ -1,6 +1,6 @@
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pr_evidence as evidence
 
@@ -9,6 +9,17 @@ import pr_attestation as policy
 
 HEAD, OLD = "a" * 40, "b" * 40
 REPO = "TogetherWeOwn/two-bot-next"
+FILES = [{"filename": "test_sample.py", "status": "modified"}]
+SOURCE = "class ExampleTests(TestCase):\n    def test_present(self): pass"
+BODY = "\n".join([
+    "## Verification", "- Ran the evidence fixtures.",
+    "## Attestation", "risk_tier: T1", "```md\n## Example heading\n```",
+    "### Claims", "- C1: Verifies a declaration.",
+    "### Tests", "- C1 | test=test_sample.py::test_present | failed_before=not-run | proof=fixture",
+    "### High-risk checklist", *(f"- [ ] D{i}: Fixture only." for i in range(1, 9)),
+])
+PR = {"number": 1, "state": "open", "base": {"repo": {"full_name": REPO}, "sha": OLD},
+      "head": {"sha": HEAD}, "body": BODY}
 
 
 class EvidenceTests(unittest.TestCase):
@@ -41,15 +52,8 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(list(evidence.named_tests(path, source)), [name], path)
 
     def test_stale_evidence_and_test_name_block(self):
-        body = "\n".join([
-            "## Verification", "- Ran the evidence fixtures.",
-            "## Attestation", "risk_tier: T1", "```md\n## Example heading\n```",
-            "### Claims", "- C1: Verifies a declaration.",
-            "### Tests", "- C1 | test=test_sample.py::test_present | failed_before=not-run | proof=fixture",
-            "### High-risk checklist", *(f"- [ ] D{i}: Fixture only." for i in range(1, 9)),
-        ])
-        files = [{"filename": "test_sample.py", "status": "modified"}]
-        read = lambda _: "class ExampleTests(TestCase):\n    def test_present(self): pass"
+        body, files = BODY, FILES
+        read = lambda _: SOURCE
         evidence.validate(policy, body, files, read)
         fenced = "\n## Notes\n```md\n## Verification\n- Looks verified.\n```"
         link = f"https://github.com/{REPO}/actions/runs/12/job/34"
@@ -75,3 +79,75 @@ class EvidenceTests(unittest.TestCase):
             for block in blocks:
                 with self.assertRaisesRegex(evidence.EvidenceError, "can go stale"):
                     evidence.validate(policy, body.replace(heading, f"{heading}{block}\n"), files, read)
+
+
+class CurrentEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.reader = Mock()
+        self.reader.get.return_value = PR
+        self.identity = (1, REPO, OLD, HEAD)
+        self.enterContext(patch.object(evidence, "sources", return_value=FILES))
+        self.enterContext(patch.object(evidence, "source_blob", return_value=SOURCE))
+
+    def test_description_edit_evaluates_current_pair(self):
+        prior = evidence.evaluate_current(policy, self.reader, *self.identity)
+        self.assertTrue(prior.matches_current(self.reader, *self.identity))
+
+        invalid = dict(PR, body=BODY.replace("test_present", "test_gone"))
+        event = {"action": "edited", "number": 1, "changes": {"body": {"from": BODY}},
+                 "pull_request": invalid}
+        # The workflow's sparse checkout may omit the YAML from the working tree.
+        workflow = evidence.command("git", "show", "HEAD:.github/workflows/pr-evidence.yml")
+        self.assertRegex(workflow, rf"(?m)^  pull_request: \{{types: \[[^\]\n]*\b{event['action']}\b")
+        pr = event["pull_request"]
+        identity = (event["number"], pr["base"]["repo"]["full_name"],
+                    pr["base"]["sha"], pr["head"]["sha"])
+        self.reader.get.return_value = invalid
+        self.assertFalse(prior.matches_current(self.reader, *identity))
+        with self.assertRaisesRegex(evidence.EvidenceError, "no unique matching test"):
+            evidence.evaluate_current(policy, self.reader, *identity)
+
+        updated = BODY.replace("proof=fixture", "proof=updated synthetic evidence")
+        self.reader.get.return_value = dict(PR, body=updated)
+        # The delayed edit payload still contains the invalid body.
+        fresh = evidence.evaluate_current(policy, self.reader, *identity)
+        self.assertEqual(prior.head, fresh.head)
+        self.assertTrue(fresh.matches_current(self.reader, *identity))
+        self.assertFalse(prior.matches_current(self.reader, *identity))
+        self.assertNotIn(updated, repr(fresh))
+        self.reader.get.assert_called_with("pulls/1")
+
+    def test_formatting_and_identity_changes_invalidate_verdict(self):
+        prior = evidence.evaluate_current(policy, self.reader, *self.identity)
+        for body in (BODY + "\n", BODY.replace("\n", "\r\n"), BODY + "\n<!-- updated -->"):
+            with self.subTest(body=body[-25:]):
+                self.reader.get.return_value = dict(PR, body=body)
+                self.assertFalse(prior.matches_current(self.reader, *self.identity))
+        for metadata, identity in (
+                (dict(PR, head={"sha": OLD}), (1, REPO, OLD, OLD)),
+                (dict(PR, number=2), (2, REPO, OLD, HEAD)),
+                (dict(PR, base=dict(PR["base"], sha=HEAD)), (1, REPO, HEAD, HEAD)),
+                (dict(PR, base=dict(PR["base"], repo={"full_name": "example/other"})),
+                 (1, "example/other", OLD, HEAD)),
+        ):
+            self.reader.get.return_value = metadata
+            self.assertFalse(prior.matches_current(self.reader, *identity))
+
+    def test_unavailable_metadata_and_concurrent_edit_refuse(self):
+        prior = evidence.evaluate_current(policy, self.reader, *self.identity)
+        for metadata in (None, {key: value for key, value in PR.items() if key != "body"},
+                         dict(PR, body=None), dict(PR, body=["invalid"]), dict(PR, body="\ud800")):
+            with self.subTest(metadata_type=type(metadata)):
+                self.reader.get.return_value = metadata
+                self.assertFalse(prior.matches_current(self.reader, *self.identity))
+                with self.assertRaises(evidence.EvidenceError):
+                    evidence.evaluate_current(policy, self.reader, *self.identity)
+
+        self.reader.get.side_effect = PermissionError("synthetic credential")
+        self.assertFalse(prior.matches_current(self.reader, *self.identity))
+        with self.assertRaisesRegex(evidence.EvidenceError, r"^Could not read current PR metadata\.$"):
+            evidence.evaluate_current(policy, self.reader, *self.identity)
+
+        self.reader.get.side_effect = [PR, dict(PR, body=BODY + "\n")]
+        with self.assertRaisesRegex(evidence.EvidenceError, "still current"):
+            evidence.evaluate_current(policy, self.reader, *self.identity)

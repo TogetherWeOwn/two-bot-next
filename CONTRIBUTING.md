@@ -444,11 +444,25 @@ re-evaluated. [Hosted qualification (#2378)](https://github.com/TogetherWeOwn/tw
 [Refreshed advisory verdict](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/45099695969/job/137447434088) ·
 [Supported events for workflow rules](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#supported-event-triggers)
 
+The dormant `evaluate_current` helper in [pr_evidence.py](.github/scripts/pr_evidence.py)
+reads the current PR description, validates its evidence and rechecks the
+snapshot before returning a passing verdict. The verdict carries the repository,
+PR number, base and head SHAs, and a SHA-256 digest of the complete UTF-8
+description. Formatting and comment edits change the digest. Missing or
+unreadable metadata prevents a match. A consumer must obtain the verdict from a
+trusted verifier and call `matches_current` with fresh PR metadata before use.
+The local synthetic `pull_request.edited` fixture re-evaluates current evidence
+at the same head. The live advisory workflow does not consume these helpers.
+
 Keep `pr-evidence` advisory until a supported registration path binds the required
 verdict to the protected workflow, exact head and current PR description. It must
 invalidate the previous verdict and re-evaluate after a same-head description
-edit. Any future registration also needs merge-queue verification and green runs
-on `main` and two later PRs, with the SHAs and run and job URLs recorded.
+edit. The pinned ruleset route does not support the `edited` activity and left
+its required verdict green in #2378. The synthetic fixture exercises the
+comparison in source. Required registration still needs a GitHub route that
+enforces the comparison when merging. Any future registration also needs
+merge-queue verification and green runs on `main` and two later PRs, with the SHAs
+and run and job URLs recorded.
 
 The toolchain remains pinned in `rust-toolchain.toml`. CI runs
 `python3 scripts/generate_command_reference.py` to generate ignored
