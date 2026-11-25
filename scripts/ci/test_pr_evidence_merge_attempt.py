@@ -42,6 +42,7 @@ class MergeAttemptTests(unittest.TestCase):
         reader.get.return_value = edited
         fresh = evidence.evaluate_current(policy, reader, *identity)
         self.assertEqual(prior.head, fresh.head)
+        validate.reset_mock()
         attempt_merge(fresh)
-        validate.assert_called_with(policy, edited["body"], [], ANY)
+        validate.assert_called_once_with(policy, edited["body"], [], ANY)
         accept_merge.assert_called_once_with(head)
