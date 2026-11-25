@@ -181,6 +181,14 @@ Both entry points pin this workflow's own protected main identity. A separate
 dispatching workflow supplies its own identity, so it cannot call this path.
 A future activation must review the direct dispatch trigger and provider wiring.
 
+The private `TwoBotContainer.bindProtectedAutomodAuthority` source seam
+reads the durable issued lease under the existing ownership gate, including
+after expiry while the lease is held. It uses the existing staging ownership
+control bearer and checks each independently authenticated approval read.
+The protected integration still needs a sanctioned caller for lifecycle
+issuance and a protected source of the separate `start` and `recover` records.
+Bind those reads through the operator entry and its existing deadlines.
+
 - [ ] **Confirm existing admission evidence.** Check the stopped staging
   baseline, verified recovery, database and gateway proofs, moderation
   eligibility, cleanup reserve and affirmative registry absence with spare

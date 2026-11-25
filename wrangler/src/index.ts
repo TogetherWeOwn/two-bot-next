@@ -32,6 +32,7 @@ import {
   StagingLifecycle, STAGING_USE_PATH, VOICE_MOVE_LEASE_HEADER, hasAutomodReservation, parseStagingUseChange,
   voiceMoveAllowed, type StagingUse,
 } from "./staging-lifecycle.ts";
+import { bindStagingAutomodAuthorityProvider, type ReadProtectedAutomodApproval } from "./staging-automod-authority-provider.ts";
 import { runProtectedAutomod, type ProtectedAutomodCall, type ProtectedAutomodEffects } from "./staging-automod-caller.ts";
 import { StagingAutomodRecovery } from "./staging-automod-recovery.ts";
 import { stagingDatabaseEvidence } from "./staging-database-fingerprint.ts";
@@ -956,6 +957,16 @@ export class TwoBotContainer extends Container<Env> {
 
   private voiceMoveConfigured(): boolean {
     return this.boundedStaging() && ingressEnabled(this.env) && this.env.TWO_INTERNAL_ALLOW_VOICE_MOVE === "1";
+  }
+
+  /** Private composition for the protected host. No DO instance RPC. */
+  static bindProtectedAutomodAuthority(bot: TwoBotContainer, request: Request, readApproval: ReadProtectedAutomodApproval) {
+    return bindStagingAutomodAuthorityProvider(request, bot.env, (context, signal) => bot.gated(async () => {
+      signal.throwIfAborted();
+      const deploymentId = bot.id();
+      const owner = await bot.ownership.require(deploymentId);
+      return bot.stagingUse.readIssuedAutomodLease(context, { deploymentId, owner, sha: bot.env.CONTAINER_RELEASE ?? "" });
+    }), readApproval);
   }
 
   private async requireCompetingStagingUse(emergencyStop?: () => Promise<void>): Promise<void> {
