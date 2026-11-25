@@ -402,7 +402,7 @@ pub async fn apply_release_schema(
     pool: &PgPool,
     expected_cutover: &[LedgerRow],
     expected_store: &[LedgerRow],
-) -> Result<(Vec<LedgerRow>, Vec<LedgerRow>), RunError> {
+) -> Result<AppliedRelease, RunError> {
     let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
     let store = Chain::Store.migrator().map_err(RunError::Refused)?;
     let mut conn = pool
@@ -498,8 +498,22 @@ pub async fn apply_release_schema(
     {
         return Err(failure("release schema or role readback refused"));
     }
+    let attendance_fence_sha256 = hex::encode(Sha256::digest(attendance_fence(&mut tx).await?));
     tx.commit()
         .await
         .map_err(|_| failure("release commit outcome unknown; reconcile both ledgers"))?;
-    Ok(after)
+    Ok(AppliedRelease {
+        cutover: after.0,
+        store: after.1,
+        attendance_fence_sha256,
+    })
+}
+
+/// Both ledgers and the 0475 fence from the committed forward transaction.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct AppliedRelease {
+    pub cutover: Vec<LedgerRow>,
+    pub store: Vec<LedgerRow>,
+    pub attendance_fence_sha256: String,
 }
