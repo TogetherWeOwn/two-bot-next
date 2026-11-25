@@ -31,7 +31,6 @@ fn receiver(bind: String) -> InternalActionConfig {
     .unwrap()
     .unwrap()
 }
-
 #[test]
 fn fixture_rejects_external_network_and_non_fixture_database() {
     let lo = "header\nheader\nlo: 0\n";

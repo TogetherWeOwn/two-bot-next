@@ -40,6 +40,7 @@ fn rehearsal_command_refuses_an_unprepared_process() {
     ] {
         let mut cli = command("invalid-listener");
         cli.args(["rehearse-internal-actions"].into_iter().chain(extra));
+        cli.envs(std::env::var_os("LLVM_PROFILE_FILE").map(|file| ("LLVM_PROFILE_FILE", file)));
         let output = cli.stdout(Stdio::piped()).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
