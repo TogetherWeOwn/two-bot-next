@@ -114,6 +114,38 @@ class PreReaperFixtureTests(unittest.TestCase):
                 self.refused(staging, "^PRE cleanup operation was not confirmed$",
                              operations=OPERATIONS[:index + 1])
 
+    def test_ambiguous_revocation_waits_for_fresh_exact_target_read(self):
+        target = self.target
+        reads = [("status", target), ("inventory", target)]
+        revoke = ("revoke_write_access", target, target.service_name, target.service_name)
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                staging = SyntheticStaging(target)
+                initial = staging.snapshot
+                app = initial.container
+                staging.unconfirmed = None if committed else revoke[0]
+                apply = staging.apply
+
+                def acknowledge_without_confirmation(target, action):
+                    apply(target, action)
+                    return {"accepted": True}
+
+                with patch.object(staging, "apply", side_effect=acknowledge_without_confirmation):
+                    with self.assertRaisesRegex(SweepError, "^PRE cleanup operation was not confirmed$"):
+                        self.sweep(staging)
+                self.assertEqual(staging.events, reads + [revoke])
+                self.assertEqual(staging.snapshot, replace(initial, write_access=not committed))
+
+                staging.events.clear()
+                staging.unconfirmed = None
+                self.assertEqual(self.sweep(staging, now=target.started_at + 2), "cleared")
+                self.assertEqual(staging.events, reads + ([] if committed else [revoke]) + [
+                    ("delete_worker", target, target.worker_name, target.worker_name),
+                    ("stop_container", target, app.name, app.id),
+                    ("delete_container", target, app.name, app.id),
+                    ("inventory", target),
+                ])
+
     def test_container_delete_requires_direct_zero_for_the_pinned_app(self):
         for changes in (
             {"startup_settled": False}, {"write_access": True}, {"container": None},
