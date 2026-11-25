@@ -94,6 +94,15 @@ function jobInputs(t: TestContext) {
       },
     },
   };
+  function assertOff(off: Awaited<ReturnType<typeof args.control>>) {
+    assert.equal(off.action, "status");
+    assert.deepEqual(off.use, { ...ready.use, phase: "released" });
+    assert.equal(off.sha, ready.sha);
+    assert.equal(off.deploymentId, ready.deploymentId);
+    assert.equal(off.epoch, ready.epoch);
+    assert.equal(off.voiceMoveEnabled, false);
+    assert.equal(off.running, false);
+  }
   async function finish() {
     // The workflow contract pins this as an always() step with the original
     // expiry from begin, independent of the proof's exit status.
@@ -101,12 +110,9 @@ function jobInputs(t: TestContext) {
       action: "finish", voiceMove: true, runId: env.GITHUB_RUN_ID,
       runAttempt: Number(env.GITHUB_RUN_ATTEMPT), expiresAt: Number(env.STAGING_USE_EXPIRES_AT),
     }, args.control, now);
-    assert.deepEqual(off.use, { ...ready.use, phase: "released" });
-    assert.equal(off.epoch, ready.epoch);
-    assert.equal(off.voiceMoveEnabled, false);
-    assert.equal(off.running, false);
+    assertOff(off);
   }
-  return { env, inputs, signed, moves, calls, reads, finish };
+  return { env, inputs, signed, moves, calls, reads, assertOff, finish };
 }
 
 test("job defaults off before reading proof inputs", async (t) => {
@@ -233,6 +239,81 @@ test("selected synthetic entry finishes the exact lease after either proof outco
       await finish();
     }
     assert.deepEqual(calls.slice(-3), ["status", "release", "status"]);
+  }
+});
+
+test("protected entry finishes a cancelled pending move and refuses the same attempt", { timeout: 5000 }, async (t) => {
+  const { env, inputs, signed, moves, calls, reads, assertOff, finish } = jobInputs(t);
+  const { now, ...dependencies } = inputs;
+  t.mock.method(Date, "now", now);
+  const { webSession, observer, control } = dependencies;
+  const { request, move } = webSession;
+  const checkpoints: string[] = [];
+  const statuses: Awaited<ReturnType<typeof control>>[] = [];
+  const admitted = Promise.withResolvers<Awaited<ReturnType<typeof move>>>();
+  const lateReply = Promise.withResolvers<Awaited<ReturnType<typeof move>>>();
+  const web = new AbortController();
+
+  webSession.request = function (...args) {
+    assert.equal(this, webSession);
+    return request.apply(this, args);
+  };
+  webSession.move = async function (args) {
+    assert.equal(this, webSession);
+    const response = await move.call(this, args);
+    // The synthetic move took effect. Its valid result is still pending at the Web handoff.
+    const cancelled = new Promise<never>((_, reject) => {
+      web.signal.addEventListener("abort", () => reject(web.signal.reason), { once: true });
+    });
+    admitted.resolve(response);
+    return Promise.race([lateReply.promise, cancelled]);
+  };
+  const provider = bindStagingVoiceMoveProvider({
+    ...dependencies,
+    observer: { ...observer, observe(check) {
+      checkpoints.push(check.checkpoint);
+      return observer.observe(check);
+    } },
+    async control(args: Parameters<typeof control>[0]) {
+      if (args.action === "release") {
+        assert.partialDeepStrictEqual(args, {
+          runId: env.GITHUB_RUN_ID, runAttempt: Number(env.GITHUB_RUN_ATTEMPT),
+          expiresAt: Number(env.STAGING_USE_EXPIRES_AT), sha: env.STAGING_USE_SHA,
+          deploymentId: env.STAGING_USE_DEPLOYMENT,
+        });
+      }
+      const state = await control(args);
+      if (args.action === "status") statuses.push(state);
+      return state;
+    },
+  });
+
+  const proof = runStagingVoiceMoveEntry(env, provider);
+  try {
+    const response = await Promise.race([admitted.promise, proof.then((verdict) => {
+      assert.fail(`Proof returned ${verdict} before move admission`);
+    })]);
+    const destination = inputs.fixture.channelIds[1];
+    assert.deepEqual(reads, ["session", "channels"]);
+    assert.deepEqual(moves, [{ discordId: inputs.fixture.discordId, channelId: destination }]);
+    assert.deepEqual(calls, ["assert"]);
+
+    web.abort();
+    assert.equal(await proof, "failed");
+    assert.deepEqual(checkpoints, ["before:moved"]);
+    assert.deepEqual(calls, ["assert", "status", "release", "status"]);
+    assertOff(statuses.at(-1)!);
+
+    lateReply.resolve(response);
+    assert.equal(await runStagingVoiceMoveEntry(env, provider), "failed");
+    assert.deepEqual(signed.map(({ channel_id }) => channel_id), [destination]);
+    await assert.rejects(pipelineUse({ action: "begin", voiceMove: true, minutes: 15,
+      runId: env.GITHUB_RUN_ID, runAttempt: Number(env.GITHUB_RUN_ATTEMPT),
+    }, control, now), { code: "staging_use_ended" });
+  } finally {
+    web.abort();
+    await proof;
+    await finish();
   }
 });
 
