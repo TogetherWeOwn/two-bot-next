@@ -1,6 +1,7 @@
 """Exercise ledger projections using the producer and readback row shapes."""
 
 from copy import deepcopy
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -35,22 +36,23 @@ class ProductionReleaseLedgerTests(unittest.TestCase):
         self.plan["store_plan_manifest_sha256"] = store_projection_hash(self.plan)
 
     def test_manifest_projects_to_the_rust_inverse_readback_shape(self):
-        attendance = ledger_row(475, "migration 475")
-        expected_cutover = [self.cutover, attendance, *(ledger_row(v, f"migration {v}") for v in range(479, 483))]
-        expected_store = [self.store, ledger_row(478, "migration 478")]
+        fixture = Path(__file__).resolve().parents[2] / "crates/cutover/tests/fixtures/production_release_ledger_readback.json"
+        cutover_prefix, expected_store = json.loads(fixture.read_text(encoding="utf-8"))
+        expected_cutover = cutover_prefix + [ledger_row(v, f"migration {v}") for v in range(479, 483)]
         self.assertEqual(ledger_endpoints(self.plan), (
             [[self.cutover], [self.store]], [expected_cutover, expected_store],
-            [[self.cutover, attendance], [self.store]],
+            [cutover_prefix, [self.store]],
         ))
 
     def test_refuses_source_checksum_or_installed_ledger_drift(self):
-        for field, change in (
-            ("source_migrations", {"sha384_recomputed": "1" * 96}),
-            ("ledger_store_before", {"sha384": "1" * 96}),
-            ("ledger_store_before", {"success": False}),
-            ("ledger_after", {"description": "changed during plan"}),
+        for fields, change in (
+            (("source_migrations",), {"sha384_recomputed": "1" * 96}),
+            (("ledger_store_before", "ledger_store_after"), {"sha384": "1" * 96}),
+            (("ledger_store_before", "ledger_store_after"), {"success": False}),
+            (("ledger_after",), {"description": "changed during plan"}),
         ):
-            with self.subTest(field=field, change=change), self.assertRaises(GateError):
+            with self.subTest(fields=fields, change=change), self.assertRaises(GateError):
                 plan = deepcopy(self.plan)
-                plan[field][0].update(change)
+                for field in fields:
+                    plan[field][0].update(change)
                 ledger_endpoints(plan)
