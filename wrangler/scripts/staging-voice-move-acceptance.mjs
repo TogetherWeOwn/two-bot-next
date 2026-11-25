@@ -160,7 +160,7 @@ export function runVoiceMoveAcceptance(options) {
 
 async function runAcceptance({
   enabled = false, lease, ready, fixture, evidence, caller, observe, control, now = Date.now,
-} = {}, readEvidence) {
+} = {}, bindReaders) {
   const receipt = {
     schema: "two-bot-staging-voice-move-acceptance.v1",
     environment: "staging",
@@ -180,11 +180,21 @@ async function runAcceptance({
 
   try {
     let currentEvidence = evidence;
-    if (readEvidence !== undefined) {
+    if (bindReaders !== undefined) {
       assertReady(binding, ready, now());
       assertFixture(fixture);
+      const readers = bindReaders();
+      caller = readers.session;
+      observe = readers.observe;
       assertCaller(caller, fixture.discordId, observe);
-      currentEvidence = await withinLease(binding, now, readEvidence);
+      currentEvidence = await withinLease(binding, now, async (signal) => {
+        const currentSession = await caller.readCurrent({ signal });
+        signal.throwIfAborted();
+        const readback = await readers.readChannels({ signal });
+        return {
+          session: currentSession, readback, previousReady: readers.previousReady, previousOff: readers.previousOff,
+        };
+      });
     }
     const [source, destination] = assertPreflight(binding, ready, fixture, currentEvidence, now());
     const { guildId, discordId } = fixture;
@@ -257,11 +267,30 @@ export function runProtectedVoiceMoveAcceptance({
   enabled = false, lease, ready, fixture, previousReady, previousOff,
   session, readChannels, observe, control, now,
 } = {}) {
-  return runAcceptance({ enabled, lease, ready, fixture, caller: session, observe, control, now },
-    async (signal) => {
-      const currentSession = await session.readCurrent({ signal });
-      signal.throwIfAborted();
-      const readback = await readChannels({ signal });
-      return { session: currentSession, readback, previousReady, previousOff };
-    });
+  return runAcceptance({ enabled, lease, ready, fixture, control, now },
+    () => ({ session, readChannels, observe, previousReady, previousOff }));
+}
+
+/**
+ * Compose the protected proof with the staging Web session binder and the
+ * independent, fixture-scoped Discord observer. The job still owns its finish fallback.
+ */
+export function runStagingVoiceMoveProof({
+  enabled = false, lease, ready, fixture, previousReady, previousOff,
+  bindSession, webSession, expectedRevision, observer, control, now = Date.now,
+} = {}) {
+  return runAcceptance({ enabled, lease, ready, fixture, control, now }, () => ({
+    // Binding can refuse. Do it inside the runner's same-window finish path.
+    session: bindSession({ session: webSession, fixture, expectedRevision }),
+    previousReady, previousOff,
+    readChannels: (request) => observer.readChannels(request),
+    async observe(request) {
+      const startedAt = now();
+      const state = await observer.observe(request);
+      const captured = observedAt(state);
+      // Each checkpoint needs a new guild-voice observation, even if occupancy stayed the same.
+      require(state?.channelType === GUILD_VOICE && captured >= startedAt && captured <= now(), "discord_unconfirmed");
+      return state;
+    },
+  }));
 }

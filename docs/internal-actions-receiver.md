@@ -224,6 +224,17 @@ enclosing job still holds the staging lock and owns its unconditional finish
 fallback. This adapter has no workflow caller or live transport. Its current
 receipts are marked `mock`.
 
+For the dormant proof composition, call `runStagingVoiceMoveProof` from the
+same module with the current and prior lease receipts. Inject
+`bindStagingVoiceSession` as `bindSession`, the protected `webSession` that
+owns both `request` and `move`, and independently pinned Web `version_id` and
+`commit` in `expectedRevision`. Pass the independent fixture-scoped Discord
+reader as `observer` with `readChannels` and `observe`. Each case checkpoint
+requires a guild-voice observation captured during that read. The protected
+caller arranges the fixture's own departure before the disconnected case and
+retains the enclosing unconditional finish. A session binding refusal takes
+the same exact-window cleanup path as a failed readback.
+
 Attaching the executor gives all signed verbs a five-second nonce deadline. The guild turn
 ends at adapter settlement. The child holds capacity through the audit, with up to five
 seconds beyond the wire deadline. An audit failure or timeout is logged as unconfirmed.
