@@ -6,9 +6,7 @@
 # (`.github/workflows/pr-size.yml`, `.github/workflows/pr-size-weekly.yml`,
 # `.github/workflows/pr-size-gate.yml` and `.github/scripts/pr_size.py`) and
 # runs from that repository at the pinned ref - this repo keeps no copy of
-# the script. To adopt: copy this file to `.github/workflows/pr-size.yml`,
-# repin all three `uses:` refs to the current TogetherWeOwn/.github `main`
-# SHA, and set `exclude-extra` to this repo's generated paths.
+# the script. The org starter caller is `workflow-templates/pr-size.yml`.
 #
 # ADVISORY PART: never make `pr-size` a required check and never add it to
 # a ruleset's required-workflows list. The labeller exits 0 on any API
@@ -67,7 +65,13 @@ concurrency:
 jobs:
   pr-size:
     name: pr-size
-    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''
+    # Review activity and unrelated labels cannot change the advisory size.
+    # Keep repairing manually changed size/* labels and measuring new diffs.
+    if: >-
+      (github.event_name == 'pull_request' &&
+      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      startsWith(github.event.label.name, 'size/'))) ||
+      (github.event_name == 'workflow_dispatch' && inputs.pr_number != '')
     permissions:
       contents: read
       issues: write # Shared size labeller adds labels and maintains its advisory comment.

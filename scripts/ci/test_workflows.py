@@ -188,10 +188,16 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
 # weekly tally runs on schedule or a blank manual dispatch. Pinning these
 # conditions prevents the gate from being silently disabled while its
 # inventory entry and reusable ref stay intact.
-PR_SIZE_JOB_IF = "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''"
+PR_SIZE_LABEL_IF = (
+    "(github.event_name == 'pull_request' && "
+    "((github.event.action != 'labeled' && github.event.action != 'unlabeled') || "
+    "startsWith(github.event.label.name, 'size/'))) || "
+    "(github.event_name == 'workflow_dispatch' && inputs.pr_number != '')"
+)
+PR_SIZE_GATE_IF = "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''"
 PR_SIZE_WEEKLY_IF = "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')"
-PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size"): PR_SIZE_JOB_IF,
-                         ("pr-size.yml", "pr-size-gate"): PR_SIZE_JOB_IF,
+PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size"): PR_SIZE_LABEL_IF,
+                         ("pr-size.yml", "pr-size-gate"): PR_SIZE_GATE_IF,
                          ("pr-size.yml", "pr-size-weekly"): PR_SIZE_WEEKLY_IF}
 # Every ordinary job in this public repository selects standard free hosted
 # Ubuntu directly. A private conversion needs fresh runner/cost qualification.
@@ -9110,7 +9116,10 @@ class WorkflowTests(unittest.TestCase):
 
     def test_pr_size_activation_conditions_are_pinned(self):
         jobs = self.workflows["pr-size.yml"]["jobs"]
-        expected = {"pr-size": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
+        expected = {"pr-size": "(github.event_name == 'pull_request' && "
+                               "((github.event.action != 'labeled' && github.event.action != 'unlabeled') || "
+                               "startsWith(github.event.label.name, 'size/'))) || "
+                               "(github.event_name == 'workflow_dispatch' && inputs.pr_number != '')",
                     "pr-size-gate": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
                     "pr-size-weekly": "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')"}
         for job_id, condition in expected.items():
@@ -9123,6 +9132,9 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(workflow_policy_errors(workflows))
         workflows = deepcopy(self.workflows)
         workflows["pr-size.yml"]["jobs"]["pr-size-gate"]["if"] = expected["pr-size-weekly"]
+        self.assertTrue(workflow_policy_errors(workflows))
+        workflows = deepcopy(self.workflows)
+        workflows["pr-size.yml"]["jobs"]["pr-size"]["if"] = expected["pr-size-gate"]
         self.assertTrue(workflow_policy_errors(workflows))
 
     def test_pr_size_gate_queues_overlapping_pr_and_review_runs(self):
