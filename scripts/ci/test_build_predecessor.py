@@ -16,16 +16,16 @@ from build_predecessor import GateError, image_manifest, package_worker
 LABELS = {"org.opencontainers.image.revision": "a" * 40, "com.togetherweown.build-id": "123-1"}
 
 
-def oci_fixture(path, *, labels=LABELS, bad_config_digest=False, transform_layer=None):
+def oci_fixture(path, *, labels=LABELS, bad_config_digest=False, layer_members=None):
     def add(archive, name, raw):
         member = tarfile.TarInfo(name)
         member.size = len(raw)
         archive.addfile(member, BytesIO(raw))
 
-    def blob(archive, media_type, raw, invalid=False, transform=None):
+    def blob(archive, media_type, raw, invalid=False, members=None):
         digest = ("0" * 64) if invalid else sha256(raw).hexdigest()
-        data = raw if transform is None else transform(raw)
-        if data is not None:
+        payloads = (raw,) if members is None else members(raw)
+        for data in payloads:
             add(archive, f"blobs/sha256/{digest}", data)
         return {"digest": f"sha256:{digest}", "size": len(raw), "mediaType": f"application/vnd.oci.image.{media_type}"}
 
@@ -39,7 +39,7 @@ def oci_fixture(path, *, labels=LABELS, bad_config_digest=False, transform_layer
     layer_bytes = layer_tar("app/two-bot", b"synthetic binary")
     with tarfile.open(path, "w") as archive:
         base = blob(archive, "layer.v1.tar", base_bytes)
-        layer = blob(archive, "layer.v1.tar+gzip", compress(layer_bytes, mtime=0), transform=transform_layer)
+        layer = blob(archive, "layer.v1.tar+gzip", compress(layer_bytes, mtime=0), members=layer_members)
         config = {"os": "linux", "architecture": "amd64", "config": {"Labels": labels},
                   "rootfs": {"type": "layers", "diff_ids": ["sha256:" + sha256(data).hexdigest()
                                                             for data in (base_bytes, layer_bytes)]}}

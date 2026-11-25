@@ -5,8 +5,10 @@ from io import BytesIO
 import json
 from pathlib import Path
 import sys
+import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -18,12 +20,12 @@ from test_build_predecessor import oci_fixture
 WORKFLOW_SHA = "d" * 40
 
 
-def fixture(scratch, run_id, worker_byte, *, transform_layer=None):
+def fixture(scratch, run_id, worker_byte, *, layer_members=None):
     image = scratch / "image.tar"
     build_id, deploy_id = f"{run_id}-1", f"2026.11.25.1+{SOURCE[:7]}"
     labels = {"org.opencontainers.image.revision": SOURCE, "com.togetherweown.build-id": build_id,
               "com.togetherweown.deploy-id": deploy_id}
-    manifest = oci_fixture(image, labels=labels, transform_layer=transform_layer)
+    manifest = oci_fixture(image, labels=labels, layer_members=layer_members)
     worker = {"index.js": worker_byte, "assets/module.wasm": b"wasm"}
     members = {f"worker/{name}": data for name, data in worker.items()}
     members[IMAGE] = image.read_bytes()
@@ -76,17 +78,22 @@ class PredecessorBundleTests(unittest.TestCase):
 
     def test_archive_requires_exact_oci_layer_bytes(self):
         normal_receipt = verify_predecessor_bundle(self.zip_b, **self.pin_b)
-        for transform, reason in (
-            (lambda data: data[:-1], "image_layer_size_mismatch"),
-            (lambda data: bytes([data[0] ^ 1]) + data[1:], "image_layer_digest_mismatch"),
-            (lambda data: None, "image_layer_missing"),
+        for layer_members, reason in (
+            (lambda data: (data[:-1],), "image_layer_size_mismatch"),
+            (lambda data: (bytes([data[0] ^ 1]) + data[1:],), "image_layer_digest_mismatch"),
+            (lambda data: (), "image_layer_missing"),
+            (lambda data: (data, data), "image_layer_member_unproved"),
         ):
             with self.subTest(reason=reason), tempfile.TemporaryDirectory() as scratch:
-                members, receipt = fixture(Path(scratch), 124, b"b", transform_layer=transform)
+                members, receipt = fixture(Path(scratch), 124, b"b", layer_members=layer_members)
                 self.assertEqual(receipt["image_manifest_digest"], normal_receipt["image_manifest_digest"])
                 archive = pack(members, receipt, compression=ZIP_DEFLATED)
                 with self.assertRaisesRegex(GateError, f"^{reason}$"):
                     verify_predecessor_bundle(archive, **metadata(archive, 124, 458))
+
+        with self.subTest(member="sparse"), patch.object(tarfile.TarInfo, "issparse", return_value=True):
+            with self.assertRaisesRegex(GateError, "^image_layer_member_unproved$"):
+                verify_predecessor_bundle(self.zip_b, **self.pin_b)
 
     def test_wrong_run_attempt_or_artifact_is_refused(self):
         with self.assertRaisesRegex(GateError, "^invalid_predecessor_run$"):
