@@ -11436,7 +11436,6 @@ class WorkflowTests(unittest.TestCase):
         job = workflow["jobs"]["report"]
         self.assertEqual(job["name"], "ci minutes report")
         self.assertEqual(job["runs-on"], PUBLIC_RUNNER)
-        self.assertEqual(job["timeout-minutes"], "10")
         self.assertFalse({"if", "strategy", "continue-on-error"} & job.keys())
         checkout, classifier, note, write, upload = job["steps"]
         self.assertTrue(checkout["uses"].startswith("actions/checkout@"))
@@ -11446,6 +11445,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(classifier["uses"].startswith("dorny/paths-filter@"))
         self.assertEqual(classifier["id"], "filter")
         self.assertEqual(classifier["timeout-minutes"], "5")
+        report_minutes = (int(job["timeout-minutes"]) - int(checkout["timeout-minutes"])
+                          - int(classifier["timeout-minutes"]))
+        self.assertEqual(report_minutes, 5)
         for step in (checkout, classifier, note, write, upload):
             self.assertNotIn("continue-on-error", step)
         self.assertEqual(note["name"], "Selection note (advisory only)")

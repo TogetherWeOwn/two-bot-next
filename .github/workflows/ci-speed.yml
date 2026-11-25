@@ -30,7 +30,8 @@ jobs:
     # Runner routing: explicit standard GitHub-hosted ubuntu-latest; this is
     # a public repository.
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Budget five minutes for the report after the two bounded steps below.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         id: checkout
