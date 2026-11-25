@@ -39,7 +39,6 @@ jobs:
     permissions: &read_permissions
       contents: read
       actions: read # Authenticate the exact attempt and approved plan artifact.
-      checks: read # Verify the independent App approval of the bound plan.
     outputs:
       stopped: ${{ steps.stop.outputs.ack }}
     steps:

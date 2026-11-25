@@ -155,6 +155,8 @@ class RecoveryWiringTests(unittest.TestCase):
             variable: "${{ inputs." + pin + " }}" for variable, pin in pins.items()
         })
         jobs = callee["jobs"]
+        for job in jobs.values():
+            self.assertEqual(job["permissions"], {"contents": "read", "actions": "read"})
         prefix = "Production release / Recover production schema / "
         self.assertEqual(prefix + jobs["fence"]["name"], FENCE_JOB)
         self.assertEqual(prefix + jobs["inverse"]["name"], JOB)
