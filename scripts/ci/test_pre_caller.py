@@ -43,7 +43,7 @@ class Fixture(SyntheticStaging):
         self.provisioned = self.snapshot
         self.snapshot = replace(self.snapshot, worker=None, container=None, write_access=False,
                                 startup_settled=False, instance_count=0, assigned_count=0)
-        self.record = self.arm_pin = self.deployment = None
+        self.record = self.arm_pin = self.created = self.verified = None
         self.now = target.started_at + 1
         self.status = "active"
         self.fenced = self.lose_create_reply = self.registry_present = False
@@ -101,13 +101,14 @@ class Fixture(SyntheticStaging):
             raise ValueError("unexpected create")
         self.events.append(("create", upload.target))
         self.snapshot = replace(self.provisioned, startup_settled=False)
-        self.deployment = Deployment(target, start_id, UUID(int=target.run_id), UUID(self.snapshot.container.id))
+        self.created = Deployment(target, start_id, UUID(int=target.run_id), UUID(self.snapshot.container.id))
         if self.lose_create_reply:
             raise TimeoutError("synthetic lost reply")
-        return self.deployment
+        self.verified = self.created
+        return self.verified
 
     def probe(self, deployment, endpoint):
-        if self.fenced or deployment != self.deployment or self.now >= self.target.expires_at:
+        if self.fenced or deployment != self.verified or self.now >= self.target.expires_at:
             raise ValueError("unexpected probe")
         self.events.append((endpoint.value, deployment.target))
         ready = dict(build_revision=REVISION, build_id=RECEIPT["BOT_BUILD_ID"],
@@ -194,6 +195,8 @@ class PreCallerTests(unittest.TestCase):
         start = fixture.caller(Operation.START)
         with self.assertRaisesRegex(TargetError, "^pre_create_unconfirmed$"):
             start.start(Upload(fixture.target))
+        with self.assertRaisesRegex(TargetError, "^pre_probe_unconfirmed$"):
+            fixture.caller(Operation.PROBE).read(fixture.created, verified_receipt=RECEIPT)
         with self.assertRaisesRegex(TargetError, "^pre_start_not_admitted$"):
             start.start(Upload(fixture.target))
         with self.assertRaisesRegex(TargetError, "^pre_operation_denied$"):
@@ -205,7 +208,7 @@ class PreCallerTests(unittest.TestCase):
         fixture.drained = True
         fixture.now = fixture.target.expires_at
         self.assertTrue(fixture.caller(Operation.STOP).stop())
-        self.assertEqual(fixture.record.start_id, fixture.deployment.start_id)
+        self.assertEqual(fixture.record.start_id, fixture.created.start_id)
         self.assertIs(fixture.finalize(), RegistryDisposition.ALREADY_ABSENT)
 
     def test_lost_final_readback_withholds_registry_handback_until_retry(self):
