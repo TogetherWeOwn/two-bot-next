@@ -65,6 +65,37 @@ class RecoveryWiringTests(unittest.TestCase):
                     self.assertEqual(result.returncode, expected, result.stderr)
                     self.assertEqual(bool(runner.stat().st_mode & 0o100), expected == 0)
 
+    def test_interrupted_recovery_isolates_database_and_authenticates_restart(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production-interrupted.yml").read_text())
+        self.assertEqual(set(workflow[True]), {"workflow_call"})
+        jobs = workflow["jobs"]
+        self.assertEqual(jobs["database"]["needs"], "admit")
+        self.assertEqual(jobs["restart"]["needs"], ["admit", "database"])
+        self.assertEqual(jobs["database"]["environment"], "production-migrate-apply")
+        self.assertNotIn("OWNERSHIP_CONTROL_TOKEN", str(jobs["database"]))
+        for phase in ("admit", "restart"):
+            self.assertNotIn("TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL", str(jobs[phase]))
+        phases = jobs["database"]["steps"][2:]
+        self.assertEqual([step["name"] for step in phases], [
+            "Classify the interrupted database state under lock", "Retain the locked database classification",
+            "Run the exact protected inverse for POST", "Retain the verified interrupted inverse",
+        ])
+        for step in phases[2:]:
+            self.assertEqual(step["if"], "steps.classify.outputs.state == 'post'")
+        restart = jobs["restart"]["steps"][2]
+        self.assertIn("DECISION_ARCHIVE_SHA256", restart["env"])
+        self.assertIn("INVERSE_ARCHIVE_SHA256", restart["env"])
+
+    def test_release_retains_the_stop_intent_before_stopping(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production.yml").read_text())
+        prepare = workflow["jobs"]["release-prepare"]["steps"]
+        order = [step.get("name") for step in prepare]
+        retain = order.index("Retain the exact recovery stop intent")
+        self.assertLess(retain, order.index("Confirm the exact stopped writer"))
+        upload = prepare[retain]["with"]
+        self.assertEqual(upload["if-no-files-found"], "error")
+        self.assertTrue(upload["path"].endswith("/production-release-stop-intent.json"))
+
     def test_protected_rollout_verifies_identity_before_takeover(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production.yml").read_text())
         jobs = workflow["jobs"]
@@ -80,6 +111,8 @@ class RecoveryWiringTests(unittest.TestCase):
         path = ROOT / ".github/workflows"
         workflow = yaml.safe_load((path / "deploy-production-recovery.yml").read_text())
         self.assertEqual(set(workflow[True]), {"workflow_call"})
+        self.assertEqual(workflow["env"]["RELEASE_TARGET_FINGERPRINT"], "${{ inputs.target-fingerprint }}")
+        self.assertNotIn("TWO_BOT_PRODUCTION_BRANCH_ID", str(workflow))
         jobs = workflow["jobs"]
         self.assertEqual(jobs["inverse"]["environment"], "production-migrate-apply")
         self.assertEqual(jobs["inverse"]["needs"], "fence")

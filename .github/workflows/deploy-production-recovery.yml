@@ -9,6 +9,7 @@ on:
       candidate-sha: {type: string, required: true}
       pins: {type: string, required: true}
       plan-run-id: {type: string, required: true}
+      target-fingerprint: {type: string, required: true}
       stopped: {type: string, required: true}
       forward-artifact-id: {type: string, required: true}
       forward-archive-sha256: {type: string, required: true}
@@ -24,9 +25,7 @@ env:
   FORWARD_ARTIFACT_ID: ${{ inputs.forward-artifact-id }}
   FORWARD_ARCHIVE_SHA256: ${{ inputs.forward-archive-sha256 }}
   CANDIDATE_WORKER: ${{ inputs.candidate-worker }}
-  PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
-  PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
-  PRODUCTION_BRANCH_ID: ${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}
+  RELEASE_TARGET_FINGERPRINT: ${{ inputs.target-fingerprint }}
 
 jobs:
   fence:

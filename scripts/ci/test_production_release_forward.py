@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from production_release_forward import CUTOVER, STORE, forward_receipt
 import production_release as release
+import production_recovery_workflow as recovery_workflow
 import production_release_preflight as preflight
 from ci.production_migrate_claim import projection_hash, store_projection_hash
 from staging_migrate_approval import digest_json
@@ -106,24 +107,32 @@ class ReleaseForwardTests(unittest.TestCase):
                              "actor": f"production-schema-release:456:{pin.candidate_sha}"}}
         job = {"name": preflight.PREPARE_JOB, "run_id": 456, "run_attempt": 1, "head_sha": pin.workflow_sha,
                "status": "completed", "conclusion": "success", "steps": [
-                   {"name": step, "status": "completed", "conclusion": "success"} for step in preflight.PREPARE_STEPS]}
+                   {"name": step, "status": "completed", "conclusion": "success"} for step in preflight.STOP_INTENT_STEPS]}
         now = datetime(2026, 11, 25, tzinfo=timezone.utc)
         api = Mock(side_effect=lambda route: {"created_at": now.isoformat()} if route == "actions/runs/123"
                    else {"total_count": 1, "jobs": [job]})
         apply = Mock(return_value={**self.outcome, "recovery_evidence_ref": pin.recovery_reference()})
         with self.assertRaisesRegex(GateError, "production_forward_stopped_fence_unproved"):
-            preflight.apply_under_prepared_fence(pin, run, "123", plan["target"], {**stopped, "running": True}, apply, api)
+            preflight.apply_under_bound_fence(pin, run, "123", digest_json(plan["target"]), {**stopped, "running": True}, apply, api)
         api.assert_not_called()
         job["conclusion"] = "cancelled"
         with self.assertRaisesRegex(GateError, "production_inverse_job_invalid"):
-            preflight.apply_under_prepared_fence(pin, run, "123", plan["target"], stopped, apply, api)
+            preflight.apply_under_bound_fence(pin, run, "123", digest_json(plan["target"]), stopped, apply, api)
         apply.assert_not_called()
         job["conclusion"] = "success"
+        retained = job["steps"].pop(1)
+        with self.assertRaisesRegex(GateError, "production_inverse_step_invalid"):
+            preflight.apply_under_bound_fence(pin, run, "123", digest_json(plan["target"]), stopped, apply, api)
+        apply.assert_not_called()
+        job["steps"].insert(1, retained)
         artifact = {"archive_digest": "sha256:" + "f" * 64}
         with (patch.object(preflight, "authenticated_plan", return_value=(plan, artifact)),
               patch.object(preflight, "verify_environment") as environment,
               patch.object(preflight, "verify_check", return_value=(789, now)) as approval):
-            result = preflight.apply_under_prepared_fence(pin, run, "123", plan["target"], stopped, apply, api)
+            with self.assertRaisesRegex(GateError, "production_forward_plan_changed"):
+                preflight.apply_under_bound_fence(pin, run, "123", "0" * 64, stopped, apply, api)
+            apply.assert_not_called()
+            result = preflight.apply_under_bound_fence(pin, run, "123", digest_json(plan["target"]), stopped, apply, api)
         environment.assert_called_once_with(api)
         self.assertEqual(approval.call_args.args[:3], (api, run, "production-apply:123:" + "f" * 64))
         apply.assert_called_once_with("123", plan)
@@ -139,26 +148,40 @@ class ReleaseForwardTests(unittest.TestCase):
                              "actor": actor}}
         artifact = {"archive_digest": "sha256:" + "f" * 64}
         env = {"RELEASE_STOPPED": json.dumps(stopped), "FORWARD_ARTIFACT_ID": "789",
-               "FORWARD_ARCHIVE_SHA256": "a" * 64}
+               "FORWARD_ARCHIVE_SHA256": "a" * 64, "CANDIDATE_WORKER": "",
+               "RELEASE_TARGET_FINGERPRINT": digest_json(plan["target"])}
         document = {**forward_receipt("123", plan, {**self.outcome, "recovery_evidence_ref": pin.recovery_reference()}),
                     "run_id": "456", "run_attempt": 1, "stopped_epoch": 18,
                     "plan_archive_sha256": artifact["archive_digest"], "release_reference": pin.recovery_reference()}
         api = Mock()
-        with (patch.object(release.artifacts, "protected_job") as protected_job,
+        with (patch.object(release, "release_request", return_value=(pin, run, "123")),
+              patch.object(preflight, "authenticated_plan", return_value=(plan, artifact)),
+              patch.object(preflight, "verify_environment"),
+              patch.object(preflight, "verify_check", side_effect=GateError("independent_production_approval_stale")) as check,
+              patch.object(release.artifacts, "protected_job") as protected_job,
               patch.object(release.artifacts, "authentic_document", return_value=document) as authenticate):
-            result = release.forward_document(env, pin, run, "123", plan, artifact, api)
+            with self.assertRaisesRegex(GateError, "independent_production_approval_stale"):
+                release.release_context(env, api)
+            check.reset_mock()
+            result = release.applied_release(env, api)[-1]
+            check.assert_not_called()
             self.assertEqual(result.fence_epoch, 18)
             protected_job.assert_called_once_with(run, api, release.artifacts.FORWARD_JOB,
                                                   release.artifacts.FORWARD_STEPS)
             authenticate.assert_called_once_with(run, release.artifacts.FORWARD_ARTIFACT, "789", "a" * 64, api)
-            for key in ("run_attempt", "stopped_epoch", "restored_ledgers_sha256", "attendance_fence_sha256"):
+            recovered, _, _, approval, _ = recovery_workflow.release_admission(env)
+            self.assertEqual(recovered, result)
+            self.assertEqual(approval["plan_archive_sha256"], artifact["archive_digest"])
+            check.assert_not_called()
+            for key in ("run_attempt", "stopped_epoch", "restored_ledgers_sha256", "attendance_fence_sha256",
+                        "plan_archive_sha256"):
                 with self.subTest(key=key), self.assertRaises(GateError):
                     authenticate.return_value = {**document, key: "foreign"}
-                    release.forward_document(env, pin, run, "123", plan, artifact, api)
+                    release.applied_release(env, api)
             protected_job.side_effect = GateError("protected_job_failed")
             authenticate.reset_mock()
             with self.assertRaisesRegex(GateError, "protected_job_failed"):
-                release.forward_document(env, pin, run, "123", plan, artifact, api)
+                release.applied_release(env, api)
             authenticate.assert_not_called()
 
     def test_takeover_refuses_a_provider_version_different_from_the_uploaded_worker(self):

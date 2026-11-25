@@ -110,14 +110,24 @@ def bound_plan(pin, run, plan_id, target_fingerprint, api=github):
                             and digest_json(mapping(target)) == target_fingerprint, api)
 
 
-def approved_plan(pin, run, plan_id, target, api=github):
-    plan, artifact = _plan_for_target(pin, run, plan_id, lambda planned: planned == target, api)
+def _require_plan_approval(run, plan_id, artifact, api):
     _, approved_at = verify_check(
         api, run, f"production-apply:{plan_id}:{artifact['archive_digest'].removeprefix('sha256:')}",
         datetime.now(timezone.utc),
     )
     require(moment(api(f"actions/runs/{plan_id}").get("created_at")) <= approved_at,
             "independent_production_approval_stale")
+
+
+def approved_plan(pin, run, plan_id, target, api=github):
+    plan, artifact = _plan_for_target(pin, run, plan_id, lambda planned: planned == target, api)
+    _require_plan_approval(run, plan_id, artifact, api)
+    return plan, artifact
+
+
+def approved_bound_plan(pin, run, plan_id, target_fingerprint, api=github):
+    plan, artifact = bound_plan(pin, run, plan_id, target_fingerprint, api)
+    _require_plan_approval(run, plan_id, artifact, api)
     return plan, artifact
 
 
@@ -165,12 +175,23 @@ def interrupted_release_context(env, api=github):
     return pin, origin, plan_id, plan, artifact, epoch + 1
 
 
-def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_database, api=github):
-    """Recheck the current attempt's stopped writer and approval before applying."""
+def _apply_under_fence(pin, run, plan_id, stopped, apply_database, prepare_steps, authorize, api):
     epoch = prepared_epoch(pin, run, plan_id, stopped)
     run_id = run["id"]
-    protected_job(run, api, PREPARE_JOB, PREPARE_STEPS)
-    plan, artifact = approved_plan(pin, run, plan_id, target, api)
+    protected_job(run, api, PREPARE_JOB, prepare_steps)
+    plan, artifact = authorize()
     receipt = forward_receipt(plan_id, plan, apply_database(plan_id, plan))
     return {**receipt, "run_id": str(run_id), "run_attempt": 1, "stopped_epoch": epoch,
             "plan_archive_sha256": artifact["archive_digest"], "release_reference": plan["recovery_evidence_ref"]}
+
+
+def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_database, api=github):
+    """Recheck the current attempt's stopped writer and approval before applying."""
+    return _apply_under_fence(pin, run, plan_id, stopped, apply_database, PREPARE_STEPS,
+                              lambda: approved_plan(pin, run, plan_id, target, api), api)
+
+
+def apply_under_bound_fence(pin, run, plan_id, target_fingerprint, stopped, apply_database, api=github):
+    """Use the fingerprint and the prepare job that retained the stop intent."""
+    return _apply_under_fence(pin, run, plan_id, stopped, apply_database, STOP_INTENT_STEPS,
+                              lambda: approved_bound_plan(pin, run, plan_id, target_fingerprint, api), api)

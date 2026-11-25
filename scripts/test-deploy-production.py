@@ -363,7 +363,7 @@ class StaticGuardTests(unittest.TestCase):
         # new schema and waives the ledger check inside the reviewed gate
         # script, never here.
         self.assertEqual(value(production["needs"]), "[guard, soak, recheck, schema-gate, roles-gate, "
-                         "staging-soak-evidence, release-prepare, release-apply]")
+                         "staging-soak-evidence, release-plan, release-prepare, release-apply]")
         for gate in ("schema-gate", "roles-gate"):
             condition = value(children(JOBS[gate][1:], 4)["if"])
             self.assertEqual(condition, '"!cancelled() && needs.guard.result == \'success\' '
