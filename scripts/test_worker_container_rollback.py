@@ -941,16 +941,12 @@ class MainProvenanceTests(unittest.TestCase):
         image = f"registry.cloudflare.com/{ACCOUNT}/{application}@sha256:" + "a" * 64
         serving_sha = "b" * 40
         with tempfile.TemporaryDirectory() as directory:
-            snapshot = Path(directory) / "snapshot.json"
-            snapshot.write_text(json.dumps({"has_previous": True, "worker": rollback.WORKERS["production"],
-                                            "application": application, "application_id": APP_ID,
-                                            "serving_version": GOOD_VERSION, "serving_rollout_id": "r-prev",
-                                            "serving_image": image, "serving_sha": SHA}), encoding="utf-8")
+            snapshot = self.write_snapshot(directory, worker=rollback.WORKERS["production"],
+                                           application=application, serving_image=image)
             argv = ["rollback", "--variant", "production", "--worker-url",
                     "https://two-bot-next-production.acct.workers.dev", "--snapshot", str(snapshot),
                     "--actor", "fixture-actor", "--evidence", str(Path(directory) / "evidence.json")]
-            client = mock.Mock()
-            client.api.return_value = rollout_row("r-prev", image)
+            client = mock.Mock(api=mock.Mock(return_value=rollout_row("r-prev", image)))
             for phase, actor, target_tree, refusal in (
                 ("active", "fixture-actor", b"", "production_rollback_requires_protected_inverse"),
                 ("fenced", f"production-schema-release:123:{serving_sha}", b"0480_event_attendance.sql", "production_rollback_fence_reserved"),
@@ -969,12 +965,11 @@ class MainProvenanceTests(unittest.TestCase):
                       })),
                       mock.patch.object(rollback.Rollback, "run", return_value={}) as restore):
                     code, output = self.run_main(argv, client)
+                    self.assertEqual(code, int(refusal is not None), output)
                     if refusal:
-                        self.assertEqual(code, 1, output)
                         self.assertIn(refusal, output)
                         restore.assert_not_called()
                     else:
-                        self.assertEqual(code, 0, output)
                         restore.assert_called_once_with(GOOD_VERSION, image)
 
     URL = "https://two-bot-next-staging.acct.workers.dev"

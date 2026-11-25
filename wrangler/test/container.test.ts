@@ -1970,9 +1970,7 @@ test("exact schema fence refuses a routed version mismatch and confirms a matchi
   const matched = await h.bot.fetch(controlRequest({ ...change, expectedDeploymentId: ID }));
   assert.equal(matched.status, 200);
   const state = await matched.json();
-  assert.equal(state.owner.deploymentId, null);
-  assert.equal(state.owner.epoch, 2);
-  assert.equal(state.running, false);
+  assert.partialDeepStrictEqual(state, { owner: { deploymentId: null, epoch: 2 }, running: false });
 });
 
 test("authenticated takeover is CAS audited, tears down first and never auto-starts", async (t) => {

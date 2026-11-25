@@ -500,7 +500,6 @@ async fn warning_history_recovers_on_retained_schema() -> TestResult {
 }
 
 async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> TestResult {
-    use sha2::{Digest, Sha256};
     use two_bot_core::database_roles::{plan_for_phase, Phase};
     use two_bot_cutover::staging_migrate::{
         apply_release_schema, recover_release_schema, undo_release_schema, Chain, LedgerRow,
@@ -627,12 +626,11 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     admin
         .execute("DELETE FROM live_sequence_watermarks WHERE guild_id = '1'")
         .await?;
-    let fence: Vec<u8> = sqlx::query_scalar(
-        "SELECT timestamptz_send(installed_on) FROM _sqlx_migrations WHERE version = 475",
+    let expected_fence: String = sqlx::query_scalar(
+        "SELECT encode(sha256(timestamptz_send(installed_on)), 'hex') FROM _sqlx_migrations WHERE version = 475",
     )
     .fetch_one(&mut admin)
     .await?;
-    let expected_fence = hex::encode(Sha256::digest(fence));
     assert!(
         recover_release_schema(&pool, &cutover, &store, Some(&"0".repeat(64)))
             .await

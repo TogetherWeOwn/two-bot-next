@@ -2189,6 +2189,18 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn release_inverse_refuses_either_mismatched_pending_list() {
+        let cutover = [475, 479, 480, 481, 482];
+        let refusal = "refused: release inverse pending lists do not match the protected bundle";
+        for (pending, store) in [(cutover.as_slice(), "479"), (&cutover[1..], "478")] {
+            let mut req = bound_production_apply(pending, &"a".repeat(40));
+            req.expected_store_pending = Some(store.to_owned());
+            let result = run_release_inverse(&req, &"a".repeat(64)).await;
+            assert_eq!(result.unwrap_err().to_string(), refusal);
+        }
+    }
+
     #[test]
     fn plan_binding_accepts_the_matching_hash() {
         let sha = "a".repeat(40);
