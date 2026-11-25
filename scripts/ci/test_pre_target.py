@@ -81,6 +81,26 @@ class PreTargetTests(unittest.TestCase):
             with self.subTest(readback=readback), self.assertRaisesRegex(TargetError, f"^{reason}$"):
                 confirm_protected_route(TARGET, pinned_app_id=APP_ID, readback=readback)
 
+    def test_protected_route_refuses_malformed_identity_fields(self):
+        class UnnormalizedString(str):
+            pass
+
+        route = ProtectedRouteReadback(TARGET, WORKER.id, CONTAINER)
+        for case, readback, pin, reason in (
+            ("readback type", None, APP_ID, "wrong_pre_route_target"),
+            ("Worker ID type", replace(route, worker_id=None), APP_ID, "wrong_pre_route_worker"),
+            ("app type", replace(route, app=None), APP_ID, "wrong_pre_route_app"),
+            ("pin type", route, None, "wrong_pre_route_app"),
+            ("pin format", route, "not-a-uuid", "wrong_pre_route_app"),
+            ("pin subclass", route, UnnormalizedString(APP_ID), "wrong_pre_route_app"),
+            ("app name subclass", replace(route, app=replace(CONTAINER, name=UnnormalizedString(CONTAINER.name))),
+             APP_ID, "wrong_pre_route_app"),
+            ("app ID subclass", replace(route, app=replace(CONTAINER, id=UnnormalizedString(APP_ID))), APP_ID,
+             "wrong_pre_route_app"),
+        ):
+            with self.subTest(case=case), self.assertRaisesRegex(TargetError, f"^{reason}$"):
+                confirm_protected_route(TARGET, pinned_app_id=pin, readback=readback)
+
     def test_config_preserves_artifacts_and_uses_only_disposable_names(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)

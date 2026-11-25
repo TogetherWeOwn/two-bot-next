@@ -136,8 +136,11 @@ def confirm_protected_route(target, *, pinned_app_id, readback):
     require(type(target) is Target and type(readback) is ProtectedRouteReadback
             and type(readback.target) is Target and readback.target == target, "wrong_pre_route_target")
     require(type(readback.worker_id) is str and readback.worker_id == target.worker_name, "wrong_pre_route_worker")
-    require(isinstance(pinned_app_id, str) and APP_ID.fullmatch(pinned_app_id)
-            and type(readback.app) is Resource and readback.app == Resource(target.container_name, pinned_app_id),
+    app = readback.app
+    require(type(pinned_app_id) is str and APP_ID.fullmatch(pinned_app_id)
+            and type(app) is Resource
+            and type(app.name) is str and app.name == target.container_name
+            and type(app.id) is str and app.id == pinned_app_id,
             "wrong_pre_route_app")
 
 
