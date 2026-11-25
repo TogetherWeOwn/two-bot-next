@@ -187,6 +187,8 @@ watch records. Use the compiled `/readyz` stamps for `build_revision`,
 `build_id`, and `deploy_id`. In production, the binary retains its original
 staging deploy stamp. Use the verified Worker version, image manifest
 digest, and Container application ID, plus the UTC bounds of the watch.
+The bounds accept `Z` or explicit zero offsets. The report compares the
+instants at their supplied fractional precision and displays them in UTC.
 
 ```json
 {

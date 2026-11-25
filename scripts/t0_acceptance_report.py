@@ -2,18 +2,21 @@
 """Compare saved smoke observations with the serving window in an operator handoff."""
 
 import argparse
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
 import re
 
 from build_identity import is_build_id_shape, is_build_revision_shape, is_deploy_id_shape
-from container_stdout_read import MAX_LIMIT, UUID_RE, Refused, parse_instant
+from container_stdout_read import MAX_LIMIT, UUID_RE
 from script_intake import decode_json, read_with_overflow
 from staging_help_embed_smoke import EMBED_KEYS, SCHEMA as HELP_SCHEMA
 
 MAX_BYTES = 64 * 1024
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
+UTC_INSTANT = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})"
+                         r"(?:\.([0-9]+))?(?:Z|[+-]00:?00)")
 WINDOW_FIELDS = ("environment", "build_revision", "build_id", "deploy_id", "image_digest",
                  "worker_version", "application_id", "start", "end")
 SIGNALS = ("ready", "gateway_resumed", "shard_closed", "gateway_reconnect_failed",
@@ -42,31 +45,52 @@ def token(pattern, value):
     return isinstance(value, str) and pattern.fullmatch(value) is not None
 
 
+def utc_instant(value):
+    match = UTC_INSTANT.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError
+    second = datetime.fromisoformat(match[1])
+    # Keep the fraction as digits so parsing cannot truncate sub-microsecond bounds.
+    return second, (match[2] or "").rstrip("0")
+
+
+def format_utc(instant):
+    second, fraction = instant
+    return second.isoformat() + ("." + fraction if fraction else "") + "Z"
+
+
 def serving_window(value):
     if not isinstance(value, dict):
         raise ValueError
     env, revision, build, deploy, digest, worker, app, start, end = map(value.get, WINDOW_FIELDS)
+    start, end = utc_instant(start), utc_instant(end)
     if (not is_build_revision_shape(revision) or not is_build_id_shape(build)
             or not is_deploy_id_shape(deploy) or not deploy.endswith("+" + revision[:7])
             or not isinstance(digest, str) or not digest.startswith("sha256:")
             or not token(HEX_DIGEST, digest[7:]) or not token(UUID_RE, worker) or not token(UUID_RE, app)
-            or env not in ("staging", "production") or parse_instant(start) >= parse_instant(end)):
+            or env not in ("staging", "production") or start >= end):
         raise ValueError
-    return {key: value[key] for key in WINDOW_FIELDS}
+    return {**{key: value[key] for key in WINDOW_FIELDS}, "start": format_utc(start), "end": format_utc(end)}
 
 
 def help_observation(report):
-    if report.get("schema") != HELP_SCHEMA:
+    rows, verdict = report.get("rows"), report.get("verdict")
+    if report.get("schema") != HELP_SCHEMA or not isinstance(rows, list):
         raise ValueError
-    verdict = report.get("verdict")
-    if verdict in ("FAIL", "REFUSED"):
+    if verdict == "REFUSED" and rows == [] and isinstance(report.get("refusal"), str) and report["refusal"]:
         return {"result": "probe_failed"}
-    rows = report.get("rows")
-    if (verdict != "PASS" or "refusal" in report or not isinstance(rows, list)
-            or len(rows) != len(EMBED_KEYS) or not all(
-                isinstance(row, dict) and row.get("name") == key and row.get("result") == "pass"
-                and row.get("actual") == "read-back branding, text and fields match; message deleted"
-                and "cleanup_failed" not in row for key, row in zip(EMBED_KEYS, rows))):
+    if ("refusal" in report or not rows or not all(
+            isinstance(row, dict) and row.get("result") in ("pass", "fail")
+            and isinstance(row.get("actual"), str) and type(row.get("duration_ms")) is int
+            and row["duration_ms"] >= 0 for row in rows)):
+        raise ValueError
+    names = tuple(row.get("name") for row in rows)
+    if verdict == "FAIL" and names in (("preflight",), EMBED_KEYS[:len(rows)]) and any(
+            row["result"] == "fail" for row in rows):
+        return {"result": "probe_failed"}
+    if (verdict != "PASS" or names != EMBED_KEYS or not all(
+            row["result"] == "pass" and row["actual"] == "read-back branding, text and fields match; message deleted"
+            and "cleanup_failed" not in row for row in rows)):
         raise ValueError
     return {"result": "readbacks_and_deletions_recorded"}
 
@@ -124,7 +148,7 @@ def observation(kind, parse, path, binding, expected):
         return gap("unverified", "no existing attribution for these observation bytes")
     try:
         recorded = serving_window(binding.get("window"))
-    except (Refused, ValueError):
+    except ValueError:
         return gap("unverified", "no complete serving identity for this observation")
     if binding["sha256"] != digest:
         return gap("mismatched", "saved observation differs from the attributed bytes")
@@ -159,7 +183,7 @@ def main(argv=None):
         bindings = handoff.get("observations", {})
         if not isinstance(bindings, dict):
             raise ValueError
-    except (OSError, RecursionError, Refused, ValueError):
+    except (OSError, RecursionError, ValueError):
         print(json.dumps({"error": "handoff unreadable or missing a complete expected serving window"}))
         return 2
 

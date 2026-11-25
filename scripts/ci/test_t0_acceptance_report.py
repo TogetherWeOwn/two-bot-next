@@ -60,6 +60,39 @@ class T0AcceptanceReportTests(unittest.TestCase):
         self.assertNotIn("1000000000000000000", result.stdout)
         return json.loads(result.stdout)["observations"]
 
+    def test_reads_outputs_from_the_offline_naming_and_gateway_producers(self):
+        readbacks = self.root / "readbacks.json"
+        readbacks.write_text(json.dumps({"occupied_name": "Fixture owner", "empty_name": "Open seat",
+                                        "readbacks": [
+            {"room_id": "3000000000000000001", "observed_at_ms": i, "humans": humans, "name": name}
+            for i, humans, name in [(1000, 2, "Fixture owner"), (2000, 0, "Open seat"), (3000, 1, "Fixture owner")]
+        ]}), encoding="utf-8")
+        naming = self.root / "naming.json"
+        subprocess.run([sys.executable, "-B", str(SCRIPT.with_name("staging_voice_smoke.py")),
+                        "--naming-observations", str(readbacks), "--evidence", str(naming)],
+                       capture_output=True, check=True, timeout=10)
+
+        packet = {"schema_version": 1, "service": WINDOW["application_id"], "contains": False,
+                  "window": {key: WINDOW[key].replace("Z", ".000Z") for key in ("start", "end")},
+                  "event_count": 1, "limit": 100, "possibly_truncated": False,
+                  "events": [{"ts": "2026-11-25T02:01:00.000Z", "msg": "ready",
+                              "target": "two_bot::gateway", "build_sha": SHA}]}
+        result = subprocess.run([sys.executable, "-B", str(SCRIPT.with_name("passive_gateway_evidence.py")),
+                                 "--service", WINDOW["application_id"], "--sha", SHA,
+                                 "--start", WINDOW["start"], "--end", WINDOW["end"]],
+                                input=json.dumps(packet).encode(), capture_output=True, check=True, timeout=10)
+        gateway = self.root / "gateway.json"
+        gateway.write_bytes(result.stdout)
+        self.paths.update(naming=naming, gateway=gateway)
+        bindings = {kind: {"window": WINDOW, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                    for kind, path in self.paths.items()}
+        rows = self.run_report(bindings)
+        self.assertEqual(rows["naming"]["status"], "attributed")
+        self.assertEqual(rows["naming"]["result"], "transitions_recorded")
+        self.assertEqual(rows["gateway"]["status"], "attributed")
+        self.assertEqual(rows["gateway"]["readiness"], "observed")
+        self.assertEqual(rows["gateway"]["signals"]["ready"], 1)
+
     def test_same_sha_builds_and_windows_do_not_mix(self):
         help_binding = self.save("help", HELP)
         other_build = dict(WINDOW, build_id="901-1", deploy_id="2026.11.25.2+aaaaaaa",
@@ -84,6 +117,37 @@ class T0AcceptanceReportTests(unittest.TestCase):
         self.assertEqual(rows["gateway"]["signals"], GATEWAY["signals"])
         self.assertEqual(rows["gateway"]["endpoint_denial"], "unverified")
         self.assertEqual(self.run_report(bindings, other_window)["naming"]["status"], "attributed")
+
+    def test_utc_spellings_preserve_fractional_window_differences(self):
+        expected = dict(WINDOW, start="2026-11-25T02:00:00.125Z")
+        equivalent = dict(WINDOW, start="2026-11-25T02:00:00.1250+00:00",
+                          end="2026-11-25T02:05:00-0000")
+        binding = self.save("gateway", GATEWAY, equivalent)
+        row = self.run_report({"gateway": binding}, expected)["gateway"]
+        self.assertEqual(row["status"], "attributed")
+        self.assertEqual(row["window"], expected)
+        binding["window"] = dict(equivalent, start="2026-11-25T02:00:00.125000001+0000")
+        self.assertEqual(self.run_report({"gateway": binding}, expected)["gateway"]["fields"], ["start"])
+        for bad in ("2026-11-25T02:00:00", "2026-11-25T02:00:00+00:30", "2026-02-30T02:00:00Z"):
+            with self.subTest(bad=bad):
+                binding["window"] = dict(equivalent, start=bad)
+                self.assertEqual(self.run_report({"gateway": binding}, expected)["gateway"]["status"],
+                                 "unverified")
+
+    def test_help_failure_and_refusal_need_producer_shape(self):
+        preflight = {"name": "preflight", "result": "fail", "actual": "synthetic diagnostic", "duration_ms": 0}
+        failure = {"schema": HELP["schema"], "verdict": "FAIL", "rows": [preflight]}
+        refusal = {"schema": HELP["schema"], "verdict": "REFUSED", "rows": [], "refusal": "synthetic refusal"}
+        for report, status in ((failure, "attributed"), (refusal, "attributed"),
+                               (dict(failure, rows=[]), "unverified"),
+                               (dict(failure, rows=[{}]), "unverified"),
+                               (dict(refusal, rows=None), "unverified"),
+                               (dict(refusal, refusal=""), "unverified")):
+            with self.subTest(report=report):
+                rows = self.run_report({"help": self.save("help", report)})
+                self.assertEqual(rows["help"]["status"], status)
+                if status == "attributed":
+                    self.assertEqual(rows["help"]["result"], "probe_failed")
 
     def test_missing_and_unbound_observations(self):
         self.save("help", HELP)
