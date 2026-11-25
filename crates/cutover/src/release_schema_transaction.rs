@@ -56,6 +56,34 @@ async fn release_roles_clean(conn: &mut PgConnection, query: String) -> Result<b
     Ok(finding.is_none())
 }
 
+async fn legacy_schema(conn: &mut PgConnection, require_pre: bool) -> Result<bool, RunError> {
+    sqlx::query_scalar(
+        "SELECT COALESCE((SELECT contract_version FROM public.web_contract_meta WHERE singleton) = '1.0', false)
+            AND to_regclass('web_v1.voice_heat') IS NULL
+            AND to_regclass('public.voice_heat_hours') IS NULL
+            AND to_regclass('public.event_attendance_windows') IS NULL
+            AND to_regclass('public.event_voice_sessions') IS NULL
+            AND to_regclass('public.event_voice_sessions_id_seq') IS NULL
+            AND to_regclass('public.live_sequence_watermarks') IS NULL
+            AND (NOT $1 OR NOT EXISTS (SELECT FROM pg_attribute
+                WHERE attrelid = 'public.event_instance_windows'::regclass
+                  AND attname = 'attendance_recovered_at' AND NOT attisdropped))
+            AND EXISTS (SELECT FROM pg_attribute
+                WHERE attrelid = 'public.internal_action_log'::regclass AND attname = 'intent_id' AND attnotnull AND NOT attisdropped)
+            AND NOT EXISTS (SELECT FROM pg_attribute WHERE attrelid = 'public.internal_action_log'::regclass
+                AND attname IN ('delivery_hash', 'from_channel_id', 'request_id') AND NOT attisdropped)
+            AND EXISTS (SELECT FROM pg_constraint WHERE conrelid = 'public.internal_action_log'::regclass
+                AND conname = 'internal_action_log_outcome_check' AND contype = 'c' AND convalidated
+                AND pg_get_expr(conbin, conrelid) = '(outcome = ANY (ARRAY[''created''::text, ''updated''::text, ''cancelled''::text]))')
+            AND NOT EXISTS (SELECT FROM pg_constraint WHERE conrelid = 'public.internal_action_log'::regclass
+                AND conname = 'internal_action_log_receipt_check')",
+    )
+    .bind(require_pre)
+    .fetch_one(conn)
+    .await
+    .map_err(|_| failure("release restored schema read failed"))
+}
+
 async fn attendance_fence(conn: &mut PgConnection) -> Result<Vec<u8>, RunError> {
     sqlx::query_scalar(
         "SELECT timestamptz_send(installed_on) FROM public._sqlx_migrations
@@ -83,6 +111,174 @@ async fn retained_attendance_schema(conn: &mut PgConnection) -> Result<bool, Run
     .fetch_one(conn)
     .await
     .map_err(|_| failure("release attendance schema readback failed"))
+}
+
+async fn release_ledger_owner(conn: &mut PgConnection) -> Result<bool, RunError> {
+    sqlx::query_scalar(
+        "SELECT current_user::text = $1
+           AND (SELECT pg_get_userbyid(relowner)::text = $1 FROM pg_class
+                WHERE oid = 'public._sqlx_migrations'::regclass)
+           AND (SELECT pg_get_userbyid(relowner)::text = $1 FROM pg_class
+                WHERE oid = 'public._two_bot_migrations'::regclass)",
+    )
+    .bind(MIGRATOR_ROLE)
+    .fetch_one(conn)
+    .await
+    .map_err(|_| failure("release ledger ownership read failed"))
+}
+
+async fn original_schema(conn: &mut PgConnection) -> Result<bool, RunError> {
+    Ok(legacy_schema(conn, true).await? && release_roles_clean(conn, legacy_verifier()).await?)
+}
+
+async fn expanded_schema(conn: &mut PgConnection) -> Result<bool, RunError> {
+    let expanded: bool = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT contract_version FROM public.web_contract_meta WHERE singleton) = '1.1', false)
+           AND to_regclass('web_v1.voice_heat') IS NOT NULL
+           AND EXISTS (SELECT FROM pg_attribute
+               WHERE attrelid = 'public.internal_action_log'::regclass
+                 AND attname = 'intent_id' AND NOT attisdropped AND NOT attnotnull)
+           AND (SELECT count(*) = 3 FROM pg_attribute
+               WHERE attrelid = 'public.internal_action_log'::regclass
+                 AND attname IN ('delivery_hash', 'from_channel_id', 'request_id')
+                 AND NOT attisdropped AND atttypid = 'pg_catalog.text'::regtype)
+           AND (SELECT count(*) = 2 FROM pg_constraint
+               WHERE conrelid = 'public.internal_action_log'::regclass AND contype = 'c'
+                 AND conname IN ('internal_action_log_outcome_check', 'internal_action_log_receipt_check'))",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|_| failure("release POST schema read failed"))?;
+    Ok(expanded
+        && retained_attendance_schema(conn).await?
+        && release_roles_clean(conn, two_bot_core::database_roles::verification_sql()).await?)
+}
+
+async fn lock_recovery_ledgers(conn: &mut PgConnection) -> Result<(), RunError> {
+    sqlx::raw_sql(
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+         SET LOCAL search_path = pg_catalog, pg_temp;
+         SET LOCAL lock_timeout = '2s';
+         SET LOCAL statement_timeout = '15s';",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|_| failure("release inverse transaction setup failed"))?;
+    conn.lock()
+        .await
+        .map_err(|_| failure("release migration lock unavailable"))?;
+    sqlx::raw_sql(
+        "LOCK TABLE public._sqlx_migrations, public._two_bot_migrations, public.web_contract_meta
+         IN SHARE ROW EXCLUSIVE MODE NOWAIT",
+    )
+    .execute(conn)
+    .await
+    .map_err(|_| failure("release inverse ledgers busy or unavailable"))?;
+    Ok(())
+}
+
+async fn begin_release_readback(
+    pool: &PgPool,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, RunError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|_| failure("release connection unavailable"))?;
+    // SQLx holds the advisory lock on the session, including after rollback.
+    conn.close_on_drop();
+    let mut tx = sqlx::Transaction::begin(conn, None)
+        .await
+        .map_err(|_| failure("release readback transaction unavailable"))?;
+    lock_recovery_ledgers(&mut tx).await?;
+    sqlx::raw_sql(
+        "LOCK TABLE ONLY public.event_instance_windows, ONLY public.internal_action_log
+         IN ACCESS SHARE MODE NOWAIT",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| failure("release readback schema busy or unavailable"))?;
+    Ok(tx)
+}
+
+/// Confirm the original database state after an interrupted forward attempt.
+/// The caller supplies both authenticated pre-apply ledgers and keeps the
+/// writer fenced. The production entry point must verify the target first.
+#[doc(hidden)]
+pub async fn confirm_release_pre(
+    pool: &PgPool,
+    expected_cutover: &[LedgerRow],
+    expected_store: &[LedgerRow],
+) -> Result<(), RunError> {
+    let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
+    let store = Chain::Store.migrator().map_err(RunError::Refused)?;
+    let mut tx = begin_release_readback(pool).await?;
+    let (actual_cutover, actual_store) = ledgers(&mut tx).await?;
+    if actual_cutover != expected_cutover
+        || actual_store != expected_store
+        || !reconcile(&actual_cutover, &cutover).is_ok_and(|pending| pending == CUTOVER)
+        || !reconcile(&actual_store, &store).is_ok_and(|pending| pending == STORE)
+        || !release_ledger_owner(&mut tx).await?
+        || !original_schema(&mut tx).await?
+    {
+        return Err(RunError::Refused("release PRE state unproved".to_owned()));
+    }
+    tx.rollback()
+        .await
+        .map_err(|_| failure("release PRE readback failed"))
+}
+
+/// The two database endpoints that can be proved without a forward receipt.
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum InterruptedRelease {
+    Pre,
+    Post { attendance_fence_sha256: String },
+}
+
+/// Classify both chains and the release schema under the same migration locks.
+/// The protected caller authenticates the original plan and stopped writer.
+#[doc(hidden)]
+pub async fn classify_interrupted_release(
+    pool: &PgPool,
+    expected_cutover: &[LedgerRow],
+    expected_store: &[LedgerRow],
+) -> Result<InterruptedRelease, RunError> {
+    let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
+    let store = Chain::Store.migrator().map_err(RunError::Refused)?;
+    let mut tx = begin_release_readback(pool).await?;
+    let (actual_cutover, actual_store) = ledgers(&mut tx).await?;
+    let unproved = || RunError::Refused("interrupted release database state unproved".to_owned());
+    if !release_ledger_owner(&mut tx).await?
+        || !reconcile(expected_cutover, &cutover).is_ok_and(|pending| pending.is_empty())
+        || !reconcile(expected_store, &store).is_ok_and(|pending| pending.is_empty())
+    {
+        return Err(unproved());
+    }
+    let pre_matches = |actual: &[LedgerRow], expected: &[LedgerRow], pending: &[i64]| {
+        actual.iter().eq(expected
+            .iter()
+            .filter(|row| !pending.contains(&row.version)))
+    };
+    let state = if pre_matches(&actual_cutover, expected_cutover, &CUTOVER)
+        && pre_matches(&actual_store, expected_store, &STORE)
+        && original_schema(&mut tx).await?
+    {
+        InterruptedRelease::Pre
+    } else if actual_cutover == expected_cutover
+        && actual_store == expected_store
+        && expanded_schema(&mut tx).await?
+    {
+        let fence = attendance_fence(&mut tx).await?;
+        InterruptedRelease::Post {
+            attendance_fence_sha256: hex::encode(Sha256::digest(fence)),
+        }
+    } else {
+        return Err(unproved());
+    };
+    tx.rollback()
+        .await
+        .map_err(|_| failure("release classification readback failed"))?;
+    Ok(state)
 }
 
 /// Reverse the exact release bundle on the already verified target. This is
@@ -117,25 +313,7 @@ pub async fn recover_release_schema(
         .begin()
         .await
         .map_err(|_| failure("release inverse transaction unavailable"))?;
-    sqlx::raw_sql(
-        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
-         SET LOCAL search_path = pg_catalog, pg_temp;
-         SET LOCAL lock_timeout = '2s';
-         SET LOCAL statement_timeout = '15s';",
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(|_| failure("release inverse transaction setup failed"))?;
-    tx.lock()
-        .await
-        .map_err(|_| failure("release migration lock unavailable"))?;
-    sqlx::raw_sql(
-        "LOCK TABLE public._sqlx_migrations, public._two_bot_migrations, public.web_contract_meta
-         IN SHARE ROW EXCLUSIVE MODE NOWAIT",
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(|_| failure("release inverse ledgers busy or unavailable"))?;
+    lock_recovery_ledgers(&mut tx).await?;
 
     let (before_cutover, before_store) = ledgers(&mut tx).await?;
     let migrator: bool = sqlx::query_scalar("SELECT current_user::text = $1")
@@ -171,27 +349,7 @@ pub async fn recover_release_schema(
             .execute(&mut *tx)
             .await
             .map_err(|_| failure("release restored attendance table busy or unavailable"))?;
-        let restored: bool = sqlx::query_scalar(
-            "SELECT COALESCE((SELECT contract_version FROM public.web_contract_meta WHERE singleton) = '1.0', false)
-                AND to_regclass('web_v1.voice_heat') IS NULL
-                AND to_regclass('public.voice_heat_hours') IS NULL
-                AND to_regclass('public.event_attendance_windows') IS NULL
-                AND to_regclass('public.event_voice_sessions') IS NULL
-                AND to_regclass('public.event_voice_sessions_id_seq') IS NULL
-                AND to_regclass('public.live_sequence_watermarks') IS NULL
-                AND EXISTS (SELECT FROM pg_attribute
-                    WHERE attrelid = 'public.internal_action_log'::regclass AND attname = 'intent_id' AND attnotnull AND NOT attisdropped)
-                AND NOT EXISTS (SELECT FROM pg_attribute WHERE attrelid = 'public.internal_action_log'::regclass
-                    AND attname IN ('delivery_hash', 'from_channel_id', 'request_id') AND NOT attisdropped)
-                AND EXISTS (SELECT FROM pg_constraint WHERE conrelid = 'public.internal_action_log'::regclass
-                    AND conname = 'internal_action_log_outcome_check' AND contype = 'c' AND convalidated
-                    AND pg_get_expr(conbin, conrelid) = '(outcome = ANY (ARRAY[''created''::text, ''updated''::text, ''cancelled''::text]))')
-                AND NOT EXISTS (SELECT FROM pg_constraint WHERE conrelid = 'public.internal_action_log'::regclass
-                    AND conname = 'internal_action_log_receipt_check')",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|_| failure("release restored schema read failed"))?;
+        let restored = legacy_schema(&mut tx, false).await?;
         if restored
             && retained_attendance_schema(&mut tx).await?
             && release_roles_clean(&mut tx, legacy_verifier()).await?

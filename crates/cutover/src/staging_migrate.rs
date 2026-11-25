@@ -42,7 +42,8 @@ use crate::intake_cap::{read_bytes_capped, IntakeReadError, INTAKE_CAP_LABEL};
 #[path = "release_schema_transaction.rs"]
 mod release_schema_transaction;
 pub use release_schema_transaction::{
-    apply_release_schema, recover_release_schema, undo_release_schema,
+    apply_release_schema, classify_interrupted_release, confirm_release_pre,
+    recover_release_schema, undo_release_schema, InterruptedRelease,
 };
 
 /// Fixed binding names; each value is a secret and is never echoed.
@@ -1423,7 +1424,7 @@ fn project_release_ledger(
     pending: &[i64],
     migrator: &Migrator,
 ) -> Result<Vec<LedgerRow>, RunError> {
-    let invalid = || RunError::Refused("release inverse ledger projection invalid".to_owned());
+    let invalid = || RunError::Refused("release ledger projection invalid".to_owned());
     let mut rows: Vec<LedgerRow> =
         serde_json::from_value(baseline.clone()).map_err(|_| invalid())?;
     if rows
@@ -1448,12 +1449,59 @@ fn project_release_ledger(
     Ok(rows)
 }
 
+fn bound_release_ledgers(
+    req: &Request,
+    operation: &str,
+) -> Result<(Vec<LedgerRow>, Vec<LedgerRow>), RunError> {
+    const CUTOVER: &[i64] = &[475, 479, 480, 481, 482];
+    const STORE: &[i64] = &[478];
+    for (raw, expected) in [
+        (req.expected_pending.as_deref(), CUTOVER),
+        (req.expected_store_pending.as_deref(), STORE),
+    ] {
+        let pending = parse_expected_pending(raw.unwrap_or_default()).map_err(RunError::Refused)?;
+        if pending.as_slice() != expected {
+            return refuse(format!(
+                "release {operation} pending lists do not match the protected bundle"
+            ));
+        }
+    }
+    let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
+    let store = Chain::Store.migrator().map_err(RunError::Refused)?;
+    let cutover_hash = check_plan_binding(req, CUTOVER, &cutover)?;
+    let store_hash = check_store_binding(req, STORE, &store)?;
+    let plan = bound_plan_artifact(req, &cutover_hash, &store_hash)?;
+    Ok((
+        project_release_ledger(&plan["ledger_before"], CUTOVER, &cutover)?,
+        project_release_ledger(&plan["ledger_store_before"], STORE, &store)?,
+    ))
+}
+
+/// Classify under the production apply binding. The caller authenticates
+/// the producing plan artifact and fences writers before relying on this result.
+#[doc(hidden)]
+pub async fn run_release_classification(req: &Request) -> Result<Value, RunError> {
+    if req.target != Target::Production || !req.apply {
+        return refuse("release classification requires the production apply binding");
+    }
+    validate_request(req)?;
+    let (cutover, store) = bound_release_ledgers(req, "classification")?;
+    let options = verify_target(req, tls_policy_from_env()?)?;
+    let pool = connect(options, MIGRATOR_ROLE, Arc::new(AtomicUsize::new(0))).await?;
+    let result = classify_interrupted_release(&pool, &cutover, &store).await;
+    pool.close().await;
+    match result? {
+        InterruptedRelease::Pre => Ok(json!({"state": "pre"})),
+        InterruptedRelease::Post {
+            attendance_fence_sha256,
+        } => Ok(json!({"state": "post", "attendance_fence_sha256": attendance_fence_sha256})),
+    }
+}
+
 /// The protected workflow authenticates the read-only plan and writer fence
 /// before calling this entry point with the existing production binding.
 #[doc(hidden)]
 pub async fn run_release_inverse(req: &Request, fence_sha256: &str) -> Result<Value, RunError> {
-    const CUTOVER: &[i64] = &[475, 479, 480, 481, 482];
-    const STORE: &[i64] = &[478];
     validate_request(req)?;
     if req.target != Target::Production
         || !req.apply
@@ -1466,24 +1514,7 @@ pub async fn run_release_inverse(req: &Request, fence_sha256: &str) -> Result<Va
             "release inverse requires the production apply binding and attendance fence",
         );
     }
-    for (raw, expected) in [
-        (req.expected_pending.as_deref(), CUTOVER),
-        (req.expected_store_pending.as_deref(), STORE),
-    ] {
-        let pending = parse_expected_pending(raw.unwrap_or_default()).map_err(RunError::Refused)?;
-        if pending.as_slice() != expected {
-            return refuse("release inverse pending lists do not match the protected bundle");
-        }
-    }
-    let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
-    let store = Chain::Store.migrator().map_err(RunError::Refused)?;
-    let cutover_hash = check_plan_binding(req, CUTOVER, &cutover)?;
-    let store_hash = check_store_binding(req, STORE, &store)?;
-    let plan = bound_plan_artifact(req, &cutover_hash, &store_hash)?;
-    let expected = (
-        project_release_ledger(&plan["ledger_before"], CUTOVER, &cutover)?,
-        project_release_ledger(&plan["ledger_store_before"], STORE, &store)?,
-    );
+    let expected = bound_release_ledgers(req, "inverse")?;
     let options = verify_target(req, tls_policy_from_env()?)?;
     let pool = connect(options, MIGRATOR_ROLE, Arc::new(AtomicUsize::new(0))).await?;
     let result = release_schema_transaction::recover_release_schema(
@@ -2255,7 +2286,7 @@ mod tests {
         invalid_cutover["ledger_before"][0]["description"] = Value::Null;
         let mut invalid_store = plan.clone();
         invalid_store["ledger_store_before"][0]["sha384"] = json!("wrong");
-        let invalid_projection = "refused: release inverse ledger projection invalid";
+        let invalid_projection = "refused: release ledger projection invalid";
         for (plan, stamp, refusal) in [
             (&invalid_cutover, &fence, invalid_projection),
             (&invalid_store, &fence, invalid_projection),
@@ -2273,6 +2304,10 @@ mod tests {
             let path = temp_manifest(&plan.to_string());
             req.plan_manifest_path = Some(path.to_str().unwrap().to_owned());
             let result = run_release_inverse(&req, stamp).await;
+            if stamp == &fence {
+                let classification = run_release_classification(&req).await;
+                assert_eq!(classification.unwrap_err().to_string(), refusal);
+            }
             std::fs::remove_file(path).unwrap();
             assert_eq!(result.unwrap_err().to_string(), refusal);
         }
