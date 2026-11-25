@@ -423,6 +423,30 @@ and any authorized manual Actions run also stay on GitHub.
 
 ### Exact-head CI evidence
 
+Before opening a PR or editing its description, preflight the draft from the
+repository root with the proposed source and tests committed to `HEAD`.
+
+```sh
+python3 scripts/ci/pr_verification_preflight.py \
+  --title 'fix(scope): describe the change' --body-file /path/to/pr.md
+```
+
+Use `--base` for a local target ref other than `origin/main` and `--pr-number`
+when editing an existing PR. The command runs offline. For setup, install
+the [evidence requirements](.github/scripts/pr-evidence-requirements.txt)
+in a Python 3.12 virtual environment with
+`python3 -m pip --isolated install --no-deps --only-binary=:all: --require-hashes -r .github/scripts/pr-evidence-requirements.txt`.
+Set `PYTHONPATH` to the `.github/scripts` directory from the `TogetherWeOwn/.github`
+revision pinned in the [evidence workflow](.github/workflows/pr-evidence.yml).
+Copy the [squash parser manifests](scripts/fixtures/commit-parser) to a scratch
+directory, run `npm ci --prefix "$parser_dir" --ignore-scripts --no-audit --no-fund`
+with `parser_dir` set to that directory, and set `NODE_PATH` to its `node_modules`.
+
+Use the job summary for Actions URLs. Write Verification commands as bullets
+with inline code and record the complete focused test results, including skips
+or omissions. Local preflight checks metadata and test declarations. The hosted
+checks and review requirements below still apply.
+
 Record commands and results in Verification. Follow the Actions summary links
 to confirm attested tests and report skips or omissions. `pr-evidence` resolves
 Python and Rust declarations and literal `.ts`, `.js`, `.mjs`, and `.cjs` titles.
