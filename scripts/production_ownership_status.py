@@ -104,12 +104,13 @@ def provider_sample(client, account, *, allow_rollout=False):
     return {
         "worker": {"deployment_id": deployment["id"], "version_id": version, "sha": sha, "traffic_percent": 100},
         "container": {"application_id": app_id, "namespace_id": namespace, "rollout_id": rollout["id"],
-                      "rollout_status": "completed", "image_digest": image.removeprefix(prefix)},
+                      "rollout_status": rollout["status"], "image_digest": image.removeprefix(prefix)},
     }
 
 
 def ownership_get(token):
-    return read_json(["node", "wrangler/scripts/production-ownership-control.mjs", "observe"], 20,
+    script = Path(__file__).resolve().parents[1] / "wrangler/scripts/production-ownership-control.mjs"
+    return read_json(["node", str(script), "observe"], 20,
                      {"PATH": os.environ.get("PATH", os.defpath), "PRODUCTION_WORKER_URL": PRODUCTION_URL,
                       "OWNERSHIP_CONTROL_TOKEN": token})
 

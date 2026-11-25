@@ -187,7 +187,13 @@ class ReleaseForwardTests(unittest.TestCase):
         with self.assertRaisesRegex(GateError, "production_release_candidate_pair_unproved"):
             release.take_over(pin, recovery, version, observe, control)
         control.assert_not_called()
+        prior = deepcopy(state)
+        prior["worker"]["sha"] = pin.rollback_sha
+        prior["container"]["image_digest"] = pin.rollback_image
         state["worker"]["version_id"] = version
+        observe.side_effect = [prior, state]
+        pause = Mock()
         with self.assertRaisesRegex(GateError, "lost_ack"):
-            release.take_over(pin, recovery, version, observe, control)
+            release.take_over(pin, recovery, version, observe, control, pause=pause)
         control.assert_called_once_with("takeover-fenced", 18, expected_deployment=version)
+        pause.assert_called_once_with(release.WORKER_RESTORE_POLL_SECONDS)
