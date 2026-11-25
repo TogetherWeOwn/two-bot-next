@@ -9,6 +9,7 @@ from unittest.mock import call, patch
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_sweep import SweepError, sweep_target
     from pre_target import Inventory, Resource, Target
+    from pre_sweep import CleanupReadback
 
 
 READS = ("status", "inventory")
@@ -33,6 +34,9 @@ class SyntheticStaging:
     def inventory(self, target):
         self.events.append(("inventory", target))
         return self.snapshot
+
+    def cleanup_inventory(self, target, *, request):
+        return CleanupReadback(self.inventory(target), request)
 
     def apply(self, target, action):
         self.events.append((action.operation, target, action.name, action.id))
@@ -172,3 +176,45 @@ class PreReaperFixtureTests(unittest.TestCase):
                     with self.assertRaisesRegex(SweepError, f"^PRE {reason}$") as failure:
                         self.sweep(staging)
                 self.assertTrue(failure.exception.__suppress_context__)
+
+    def test_cleanup_rejects_replayed_absence(self):
+        staging = SyntheticStaging(self.target)
+        present = staging.snapshot
+        staging.snapshot = replace(present, worker=None, container=None, instance_count=0,
+                                   assigned_count=0, write_access=False)
+        earlier = staging.inventory(self.target)
+        staging.snapshot = present
+        staging.events.clear()
+
+        error = "^PRE cleanup readback could not be verified$"
+        with patch.object(staging, "inventory", return_value=earlier), \
+             patch.object(staging, "cleanup_inventory", return_value=earlier):
+            with self.assertRaisesRegex(SweepError, error):
+                self.sweep(staging)
+        self.assertEqual(staging.events, [("status", self.target)])
+
+        # A successful earlier cleanup of the same reservation cannot be replayed.
+        staging.snapshot = earlier
+        observations = []
+        observe = staging.cleanup_inventory
+
+        def capture(target, *, request):
+            readback = observe(target, request=request)
+            observations.append(readback)
+            return readback
+
+        with patch.object(staging, "cleanup_inventory", side_effect=capture):
+            self.assertEqual(self.sweep(staging), "cleared")
+        with patch.object(staging, "cleanup_inventory", return_value=observations[0]):
+            with self.assertRaisesRegex(SweepError, error):
+                self.sweep(staging)
+
+        # Even a current request cannot attest absence for a different reservation.
+        sibling = replace(self.target, scope="pre-fixture-other")
+        self.assertEqual(sibling.container_name, self.target.container_name)
+        foreign = replace(earlier, target=sibling)
+        with patch.object(staging, "cleanup_inventory",
+                          side_effect=lambda target, *, request: CleanupReadback(foreign, request)):
+            with self.assertRaisesRegex(SweepError, error):
+                self.sweep(staging)
+        self.assertEqual(self.sweep(staging), "cleared")
