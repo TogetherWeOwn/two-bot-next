@@ -430,10 +430,11 @@ Use paths for generated names and other formats. Organization path floors and
 repository review tiers apply.
 
 `pr-evidence` is advisory. Before merging, check that its latest result covers
-the exact head and current PR description. After a description edit, wait for
-the fresh advisory run even when the head SHA is unchanged. If validation fails,
-use the job output to correct the evidence and confirm the updated result. Follow
-the existing required checks and review policy for the merge.
+the exact head and current PR description. After a description edit, open the
+`pr-evidence` run triggered by that edit in Actions and wait for its result, even
+when the head SHA is unchanged. If validation fails, use the job output to
+correct the evidence and confirm the updated result. Follow the existing required
+checks and review policy for the merge.
 
 GitHub can bind a required workflow to protected source. In the hosted
 qualification, the pinned `pr-standards` workflow kept its opening required
