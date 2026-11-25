@@ -1,32 +1,19 @@
 """Replay the operator's evidence comparison with synthetic records only."""
 
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
-from test_event_cutoff_release_positions import PINS, capture_runner, load_fixture
+from test_event_cutoff_release_positions import PINS, VERIFIER, capture_runner, load_fixture
 
 
-def compare_attribution(position, pin, receipt, requests):
-    """Compare projections of already checked evidence in this example."""
-    nonce = receipt["scope_nonce"]
-    matches = [request for request in requests if request["nonce"].lower() == nonce.lower()]
-    if len(matches) != 1 or matches[0]["nonce"] != nonce:
-        return "attribution gap: signed request"
-
-    expected = {
-        "position": position,
-        "image_digest": pin["image"].split("@", 1)[1],
-        "source_revision": pin["source_revision"],
-        "worker_version": pin["worker_version"],
-        "guild_id": pin["guild_id"],
-        "bot_id": pin["bot_id"],
-    }
-    for field, value in expected.items():
-        actual = matches[0].get(field)
-        if not actual:
-            return f"attribution gap: {field}"
-        if actual != value:
-            return f"attribution mismatch: {field}"
-    return "matches release position"
+REHEARSAL = load_fixture("verify_release_positions")
+with patch.dict(sys.modules, verify_release_positions=REHEARSAL):
+    compare_attribution = load_fixture("verify_handoff").compare_attribution
 
 
 class EventCutoffPermissionAttributionTest(unittest.TestCase):
@@ -77,7 +64,7 @@ class EventCutoffPermissionAttributionTest(unittest.TestCase):
         )
 
     def test_synthetic_pair_matches_reviewed_positions(self):
-        load_fixture("verify_release_positions").verify(PINS, capture_runner(PINS), 0)
+        REHEARSAL.verify(PINS, capture_runner(PINS), 0)
         for position in self.releases:
             with self.subTest(position=position):
                 self.assertEqual(self.compare(position), "matches release position")
@@ -122,6 +109,59 @@ class EventCutoffPermissionAttributionTest(unittest.TestCase):
                 original = self.requests[1].pop(field)
                 self.assertEqual(self.compare("retained"), f"attribution gap: {field}")
                 self.requests[1][field] = original
+
+    def run_handoff(self, exit_code=0):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pins = root / "pins.json"
+            transcript = root / "cutoff.log"
+            attribution = root / "attribution.json"
+            pins.write_text(json.dumps(self.releases), encoding="utf-8")
+            capture = capture_runner(PINS)
+            REHEARSAL.verify(PINS, capture, 0)
+            transcript.write_text(capture, encoding="utf-8")
+            attribution.write_text(json.dumps({
+                "receipts": self.receipts, "requests": self.requests,
+            }), encoding="utf-8")
+            return subprocess.run(
+                [sys.executable, str(VERIFIER.with_name("verify_handoff.py")),
+                 "--pins", str(pins), "--transcript", str(transcript),
+                 "--runner-exit-code", str(exit_code), "--attribution", str(attribution)],
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+
+    def assert_handoff_unresolved(self, result, reason):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, f"Cutoff handoff unresolved: {reason}\n")
+
+    def test_handoff_cli_matches_complete_pair(self):
+        result = self.run_handoff()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "Cutoff handoff evidence matches both release positions\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_handoff_cli_leaves_missing_position_evidence_unresolved(self):
+        for index, position in enumerate(("current", "retained")):
+            with self.subTest(position=position, missing="request"):
+                request = self.requests.pop(index)
+                self.assert_handoff_unresolved(
+                    self.run_handoff(), f"{position} attribution gap: signed request",
+                )
+                self.requests.insert(index, request)
+            with self.subTest(position=position, missing="receipt"):
+                receipt = self.receipts.pop(position)
+                self.assert_handoff_unresolved(
+                    self.run_handoff(), f"{position} attribution gap: expected a v1 receipt with a valid nonce",
+                )
+                self.receipts[position] = receipt
+
+    def test_handoff_cli_leaves_swapped_position_evidence_unresolved(self):
+        self.receipts = {"current": self.receipts["retained"], "retained": self.receipts["current"]}
+        self.assert_handoff_unresolved(self.run_handoff(), "current attribution mismatch: position")
+
+    def test_handoff_cli_leaves_failed_rehearsal_unresolved(self):
+        self.assert_handoff_unresolved(self.run_handoff(exit_code=1), "Rehearsal exited 1")
 
 
 if __name__ == "__main__":
