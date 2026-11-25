@@ -1,10 +1,10 @@
-"""Verify the retained PRE migration catalog using local Git objects.
+"""Verify a predecessor planner's PRE migration catalog using local Git objects.
 
-The caller binds the reconstruction commit to the migration bytes the planner
-actually used and compares source_sha, cutover_sha256 and store_sha256 with its
-authenticated retained inventory proof. Catalog identity carries no producer,
-serving build or database authority. The historical catalog commit is a label
-and need not be present in the local object store.
+The caller binds the candidate commit to the migration bytes the planner will
+read and compares source_sha, cutover_sha256 and store_sha256 with the
+authenticated inventory proof. Catalog identity carries no producer, serving
+build or database authority. The historical retained commit is a label and
+need not be present in the local object store.
 """
 
 from hashlib import sha256, sha384
@@ -84,6 +84,27 @@ def _projection_rows(repo, blobs):
     return rows
 
 
+def _projection_digests(repo, source_sha, cutover, store_tree):
+    projections = {"source_sha": source_sha, "pending_before": [], "pending_store_before": [],
+                   "source_migrations": _projection_rows(repo, cutover),
+                   "source_store_migrations": _projection_rows(repo, _migration_blobs(repo, store_tree))}
+    return {"cutover_sha256": projection_hash(projections), "store_sha256": store_projection_hash(projections)}
+
+
+def verify_predecessor_plan_source(repo, candidate_sha, *, shape):
+    """Verify the immutable catalog that the offline planner will read for this shape."""
+    if shape == "0475/0465":
+        return {"candidate_sha": candidate_sha, **verify_retained_catalog(repo, candidate_sha)}
+    if shape != "0473/0465":
+        raise Refused("unsupported_pre_shape")
+    cutover_tree, store_tree = migration_trees(repo, candidate_sha)
+    if (cutover_tree, store_tree) != migration_trees(repo, ORIGINAL):
+        raise Refused("original_catalog_tree_mismatch")
+    return {"source_sha": ORIGINAL, "candidate_sha": candidate_sha,
+            "cutover_tree": cutover_tree.decode("ascii"), "store_tree": store_tree.decode("ascii"),
+            **_projection_digests(repo, ORIGINAL, _migration_blobs(repo, cutover_tree), store_tree)}
+
+
 def verify_retained_catalog(repo, reconstruction_sha):
     """Return catalog evidence for a full commit SHA in a trusted local repository."""
     cutover_tree, store_tree = migration_trees(repo, reconstruction_sha)
@@ -100,11 +121,8 @@ def verify_retained_catalog(repo, reconstruction_sha):
     fence_sql = _read_blob(repo, landed_blob)
     _verify_lock(repo, lock_blob, fence_sql)
 
-    projections = {"source_sha": RETAINED, "pending_before": [], "pending_store_before": [],
-                   "source_migrations": _projection_rows(repo, cutover),
-                   "source_store_migrations": _projection_rows(repo, _migration_blobs(repo, store_tree))}
     return {"source_sha": RETAINED, "reconstruction_sha": reconstruction_sha,
             "cutover_tree": cutover_tree.decode("ascii"), "store_tree": store_tree.decode("ascii"),
             "lock_blob": lock_blob.decode("ascii"), "landed_0475_blob": landed_blob.decode("ascii"),
             "landed_0475_sha384": sha384(fence_sql).hexdigest(),
-            "cutover_sha256": projection_hash(projections), "store_sha256": store_projection_hash(projections)}
+            **_projection_digests(repo, RETAINED, cutover, store_tree)}
