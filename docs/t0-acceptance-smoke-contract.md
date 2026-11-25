@@ -195,7 +195,7 @@ python3 scripts/t0_acceptance_report.py --handoff handoff.json \
 - **Naming.** Use the #2464 fixture report for same-room occupied, empty before cleanup, and occupied-again readbacks. Record creator-rename HTTP 403 separately.
 - **Gateway.** Use #2467's passive summary with its verified application and single-image window. Only committed READY or RESUMED indicates observed readiness. Endpoint denial needs explicit passive evidence. See #2075 for separate hosted checkpoint coverage.
 
-Record authorized production Help and naming on the [execution card](production-deploy.md#watch-rows-one-per-finding-and-per-checkpoint). The report leaves those production rows unverified.
+Record authorized production Help and naming on the [execution card](production-deploy.md#watch-rows-one-per-finding-and-per-checkpoint). The report cannot attribute either saved format to production.
 Omit missing files. Invalid or unattributed evidence is `unverified`.
 Different bytes or windows are `mismatched`. A bare gateway summary can flag a revision, service, window, or build conflict. An `attributed` row can still show failure or an unobserved signal.
 
