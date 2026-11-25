@@ -2,6 +2,7 @@
 
 import json
 import sys
+from zlib import error as ZlibError
 
 from rollback_proof import ProofError, run_identity
 from staging_recovery_status import (
@@ -12,6 +13,7 @@ from staging_rollout import GateError, mapping, number, require, sequence
 ARTIFACT_STEM = "staging-recovery-status"
 MAIN_PATHS = (WORKFLOW, f"{WORKFLOW}@main", f"{WORKFLOW}@refs/heads/main")
 PROJECTION = ("schema_version", "workflow_sha", "workflow_run_id", "observed_at", "worker", "container", "ownership")
+MAX_OUTPUT_BYTES = 4_096
 
 
 def verify_protected_main(sha, api):
@@ -72,8 +74,11 @@ def read_inventory(workflow_sha, run_id, api=github):
 def main(argv, api=github):
     try:
         require(len(argv) == 2, "invalid_inventory_pin")
-        print(json.dumps(read_inventory(argv[0], argv[1], api), allow_nan=False, separators=(",", ":")))
-    except (GateError, ProofError, OSError, ValueError):
+        inventory = read_inventory(argv[0], argv[1], api)
+        output = json.dumps(inventory, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+        require(len(output) < MAX_OUTPUT_BYTES, "inventory_projection_too_large")  # Include the newline.
+        print(output)
+    except (GateError, ProofError, KeyError, OSError, TypeError, ValueError, OverflowError, ZlibError):
         print("Staging inventory evidence unconfirmed", file=sys.stderr)
         return 1
     return 0

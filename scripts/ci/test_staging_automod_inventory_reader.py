@@ -91,7 +91,7 @@ class InventoryReaderTests(unittest.TestCase):
             {"id": int(RUN) + 1}, {"head_sha": TIP}, {"run_attempt": 2}, {"run_attempt": True},
             {"path": ".github/workflows/staging-automod-preview.yml"}, {"path": reader.WORKFLOW + "@other"},
             {"status": "in_progress"}, {"conclusion": "failure"}, {"event": "push"}, {"head_branch": "topic"},
-            {"head_repository": {"id": 21, "full_name": REPO}},
+            {"repository": {"id": 21, "full_name": REPO}}, {"head_repository": {"id": 21, "full_name": REPO}},
         ):
             with self.subTest(change=change):
                 self.setUp()
@@ -118,9 +118,11 @@ class InventoryReaderTests(unittest.TestCase):
             "merge_base_commit": {"sha": SHA}, "base_commit": {"sha": SHA},
         }
         self.assertEqual(self.read()["workflow_sha"], SHA)
-        comparison["merge_base_commit"] = {"sha": "c" * 40}
-        with self.assertRaises(GateError):
-            self.read()
+        for change in ({"merge_base_commit": {"sha": "c" * 40}}, {"status": "diverged"}, {"behind_by": 1}):
+            with self.subTest(change=change):
+                self.routes[COMPARE_ROUTE] = {**comparison, **change}
+                with self.assertRaises(GateError):
+                    self.read()
 
     def test_refuses_missing_ambiguous_or_unpinned_artifact(self):
         for change in (
@@ -158,7 +160,22 @@ class InventoryReaderTests(unittest.TestCase):
                 with self.assertRaises(GateError):
                     self.read()
         self.archive(complete)
+        self.artifact["size_in_bytes"] += 1
+        with self.assertRaises(GateError):
+            self.read()
+        self.archive(complete)
         self.artifact["digest"] = "sha256:" + "0" * 64
+        self.assert_cli_refusal()
+
+    def test_cli_refuses_oversized_projections_and_malformed_evidence(self):
+        value = receipt()
+        value["worker"]["version_id"] = "x" * reader.MAX_OUTPUT_BYTES
+        self.archive(json.dumps(value))
+        self.assert_cli_refusal()
+        del self.routes[LIST_ROUTE]
+        self.assert_cli_refusal()
+
+    def assert_cli_refusal(self):
         stdout, stderr = StringIO(), StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
             self.assertEqual(reader.main([SHA, RUN], self.api), 1)

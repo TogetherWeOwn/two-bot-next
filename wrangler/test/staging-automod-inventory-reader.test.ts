@@ -37,6 +37,11 @@ test("the dormant inventory reader returns the typed v1 readback for the approve
   assert.deepEqual(result, inventory);
   const schema: 1 | undefined = result?.schema_version;
   assert.equal(schema, 1);
+  for (const observed_at of ["2026-11-25T12:00:00+00:00", "2026-11-25T12:00:00Z"]) {
+    const value = { ...inventory, observed_at };
+    const readAlternate = bindStagingAutomodInventoryReader(async () => JSON.stringify(value));
+    assert.deepEqual(await readAlternate(source, signal), value);
+  }
 });
 
 test("the inventory reader refuses partial or malformed verifier output", async () => {
@@ -54,6 +59,8 @@ test("the inventory reader refuses partial or malformed verifier output", async 
       { ...inventory, container: { ...inventory.container, rollout_status: "queued" } },
       { ...inventory, ownership: { phase: "active", epoch: 0 } },
       { ...inventory, ownership: { phase: "active", epoch: Number.MAX_SAFE_INTEGER + 1 } },
+      { ...inventory, ownership: { ...inventory.ownership, running: false } },
+      { ...inventory, plan: null },
     ].map(value => JSON.stringify(value)),
   ]) {
     const read = bindStagingAutomodInventoryReader(async () => output);
