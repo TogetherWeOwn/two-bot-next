@@ -203,7 +203,7 @@ async fn main() {
     {
         logging::init();
         if let Err(error_class) = internal_action_rehearsal::serve(&cli_args[1..]).await {
-            tracing::error!(error_class, "internal-action rehearsal refused");
+            tracing::error!(error_class, "internal-action startup refused");
             std::process::exit(1);
         }
         return;
