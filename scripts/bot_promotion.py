@@ -153,7 +153,7 @@ def _is_digest(value):
     return isinstance(value, str) and DIGEST.fullmatch(value) is not None
 
 
-def _safe_module_path(path):
+def safe_module_path(path):
     """A certified module path stays inside modules/ as one portable name."""
     if not isinstance(path, str) or not path:
         return False
@@ -360,7 +360,7 @@ def _validate_receipt(receipt, sha, run_id, attempt, repo_id):
                                "compatibility_flags", "modules"}):
         raise PromotionError("receipt worker mismatch")
     entrypoint = worker.get("entrypoint")
-    if not _safe_module_path(entrypoint):
+    if not safe_module_path(entrypoint):
         raise PromotionError("receipt entrypoint mismatch")
     if (not isinstance(worker.get("compatibility_date"), str)
             or COMPAT_DATE.fullmatch(worker["compatibility_date"]) is None):
@@ -377,7 +377,7 @@ def _validate_receipt(receipt, sha, run_id, attempt, repo_id):
         if (not isinstance(member, dict) or set(member) != {"path", "size", "sha256"}):
             raise PromotionError("receipt module entry mismatch")
         path = member.get("path")
-        if not _safe_module_path(path) or path in seen:
+        if not safe_module_path(path) or path in seen:
             raise PromotionError("receipt module path mismatch")
         seen.add(path)
         if not _is_int(member.get("size")) or not 0 <= member["size"] <= MAX_MEMBER_BYTES:
@@ -392,6 +392,32 @@ def _validate_receipt(receipt, sha, run_id, attempt, repo_id):
     return receipt
 
 
+def regular_zip_members(archive):
+    members = archive.infolist()
+    if len({info.filename for info in members}) != len(members):
+        raise PromotionError("artifact archive repeats a member")
+    for info in members:
+        kind = (info.external_attr >> 16) & 0o170000
+        if kind not in (0, 0o100000) or info.is_dir() or info.flag_bits & 1:
+            raise PromotionError("artifact archive carries an unsafe member")
+    return {info.filename: info for info in members}
+
+
+def validate_artifact_run(meta, *, run_id, repo_id, head_sha):
+    """Bind an authenticated GitHub artifact record to a same-repo main run."""
+    workflow_run = meta.get("workflow_run")
+    if (not isinstance(workflow_run, dict)
+            or workflow_run.get("id") != run_id
+            or type(workflow_run.get("id")) is not int
+            or workflow_run.get("repository_id") != repo_id
+            or type(workflow_run.get("repository_id")) is not int
+            or workflow_run.get("head_repository_id") != repo_id
+            or type(workflow_run.get("head_repository_id")) is not int
+            or workflow_run.get("head_branch") != STAGING_BRANCH
+            or workflow_run.get("head_sha") != head_sha):
+        raise PromotionError("artifact run binding mismatch")
+
+
 def _validate_package(blob, sha, run_id, attempt, repo_id):
     """Validate a whole artifact ZIP before any mutation; return receipt+modules."""
     try:
@@ -399,13 +425,7 @@ def _validate_package(blob, sha, run_id, attempt, repo_id):
     except (zipfile.BadZipFile, ValueError):
         raise PromotionError("artifact archive is not a ZIP") from None
     with archive:
-        names = archive.namelist()
-        if len(set(names)) != len(names):
-            raise PromotionError("artifact archive repeats a member")
-        for info in archive.infolist():
-            kind = (info.external_attr >> 16) & 0o170000
-            if kind not in (0, 0o100000) or info.is_dir() or info.flag_bits & 1:
-                raise PromotionError("artifact archive carries an unsafe member")
+        names = regular_zip_members(archive)
         try:
             receipt_info = archive.getinfo("promotion-receipt.json")
         except KeyError:
@@ -469,7 +489,7 @@ def collect_modules(modules_dir):
             if full.is_symlink() or not full.is_file():
                 raise PromotionError("bundle carries an unsafe member")
             rel = full.relative_to(root).as_posix()
-            if not _safe_module_path(rel):
+            if not safe_module_path(rel):
                 raise PromotionError("bundle carries an unsafe member")
             with full.open("rb") as handle:
                 data = read_with_overflow(handle, MAX_MEMBER_BYTES)
@@ -546,7 +566,7 @@ def _certify(args, github):
     _check_evidence_staging(evidence, args.sha, build_id, args.deploy_id)
 
     modules = collect_modules(args.modules)
-    if not _safe_module_path(args.entrypoint) or args.entrypoint not in modules:
+    if not safe_module_path(args.entrypoint) or args.entrypoint not in modules:
         raise PromotionError("bundle entrypoint mismatch")
 
     image = evidence["image"]
@@ -652,17 +672,7 @@ def _admit(args, github, copy_image):
             or meta.get("size_in_bytes") != entry.get("size_in_bytes")
             or meta.get("digest") != entry.get("digest")):
         raise PromotionError("artifact record mismatch")
-    workflow_run = meta.get("workflow_run")
-    if (not isinstance(workflow_run, dict)
-            or workflow_run.get("id") != run_id
-            or type(workflow_run.get("id")) is not int
-            or workflow_run.get("repository_id") != repo_id
-            or type(workflow_run.get("repository_id")) is not int
-            or workflow_run.get("head_repository_id") != repo_id
-            or type(workflow_run.get("head_repository_id")) is not int
-            or workflow_run.get("head_branch") != STAGING_BRANCH
-            or workflow_run.get("head_sha") != run["head_sha"]):
-        raise PromotionError("artifact run binding mismatch")
+    validate_artifact_run(meta, run_id=run_id, repo_id=repo_id, head_sha=run["head_sha"])
     if not _is_digest(meta.get("digest")):
         raise PromotionError("artifact digest mismatch")
 
@@ -960,7 +970,7 @@ def configure_bundle(config, modules_dir, entrypoint):
     """
     if not isinstance(config, dict):
         raise PromotionError("bundle config is not an object")
-    if not _safe_module_path(entrypoint):
+    if not safe_module_path(entrypoint):
         raise PromotionError("bundle entrypoint mismatch")
     root = Path(modules_dir).resolve()
     if not (root / entrypoint).is_file() or (root / entrypoint).is_symlink():
