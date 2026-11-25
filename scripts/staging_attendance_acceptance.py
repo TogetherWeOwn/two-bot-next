@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the staged, signed Web attendance read against one isolated fixture."""
+"""Probe staged signed attendance or compare one rehearsal's offline readbacks."""
 
 import argparse
 from datetime import datetime, timedelta, timezone
@@ -57,7 +57,19 @@ def read_object(path):
         return json_object(read_with_overflow(stream, BODY_CAP))
 
 
-def validate_configuration(phase, origin, rollout, observed):
+def recorded_probe_deadline(lifecycle, use):
+    observed_at = lifecycle.get("observedAt")
+    require(isinstance(observed_at, str) and re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z", observed_at),
+        "staging lease did not cover the probe")
+    since_epoch = datetime.fromisoformat(observed_at) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    observed_ms = since_epoch // timedelta(milliseconds=1)
+    require(type(use.get("acquiredAt")) is int and 0 <= use["acquiredAt"] <= observed_ms,
+            "staging lease did not cover the probe")
+    return observed_ms + RUN_BUDGET * 1000
+
+
+def validate_configuration(phase, origin, rollout, observed, *, recorded=False):
     version, sha, build, deploy = (rollout.get(name) for name in
                                    ("worker_version", "revision", "build_id", "deploy_id"))
     require(isinstance(version, str) and re.fullmatch(UUID, version)
@@ -87,15 +99,39 @@ def validate_configuration(phase, origin, rollout, observed):
                 and type(observed.get("fixture_rows")) is int
                 and observed["fixture_rows"] == 0, "cleanup readback is incomplete")
     else:
+        probe_deadline = recorded_probe_deadline(lifecycle, use) if recorded else (time.time() + RUN_BUDGET) * 1000
         require(lifecycle.get("action") == "ready" and lifecycle.get("running") is True
                 and use.get("phase") == "active"
-                and type(use.get("expiresAt")) is int and use["expiresAt"] > (time.time() + RUN_BUDGET) * 1000,
+                and type(use.get("expiresAt")) is int and use["expiresAt"] > probe_deadline,
                 "staging lease did not cover the probe")
         expected_fixture = "pending" if phase == "pending" else "finalized"
         require(observed.get("signed_ingress") is True and observed.get("primary_fixture") == expected_fixture
                 and (phase != "finalized" or observed.get("foreign_fixture") == "foreign-only"),
                 "signed ingress or synthetic fixture readback is incomplete")
     return version, sha, build, deploy
+
+
+def validate_rehearsal(rollout, observations):
+    require(set(observations) == set(PHASES) and all(isinstance(row, dict) for row in observations.values()),
+            "rehearsal requires all four observations")
+    original_lease = None
+    for phase in PHASES:
+        observed = observations[phase]
+        validate_configuration(phase, STAGING_ORIGIN, rollout, observed, recorded=True)
+        lifecycle = observed["lifecycle"]
+        use = lifecycle["use"]
+        run_id, attempt, acquired, expires = (use.get(field) for field in
+                                             ("runId", "runAttempt", "acquiredAt", "expiresAt"))
+        require(use.get("environment") == "staging" and type(lifecycle.get("epoch")) is int
+                and isinstance(run_id, str) and re.fullmatch(r"[1-9][0-9]{0,19}", run_id)
+                and type(attempt) is int and attempt > 0
+                and type(acquired) is int and type(expires) is int and 0 <= acquired < expires,
+                "staging lease identity did not match")
+        # The owner epoch can remain unchanged when a second window is acquired.
+        lease = (use["epoch"], run_id, attempt, acquired, expires)
+        if phase == "pending":
+            original_lease = lease
+        require(lease == original_lease, "staging lease identity did not match")
 
 
 def fixture_result(event_key, start):
@@ -199,29 +235,33 @@ def deadline(_signum, _frame):
 
 def main(argv=None, *, env=None, check=send):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=PHASES)
+    parser.add_argument("phase", choices=(*PHASES, "rehearsal"))
     parser.add_argument("--rollout", required=True, type=Path)
-    parser.add_argument("--observed", required=True, type=Path)
+    parser.add_argument("--observed", required=True, type=Path, help="phase observation or rehearsal object keyed by phase")
     parser.add_argument("--fixture-start")
     parser.add_argument("--execute", action="store_true", help="enable signed HTTPS reads")
     args = parser.parse_args(argv)
     try:
-        identity = validate_configuration(args.phase, STAGING_ORIGIN, read_object(args.rollout), read_object(args.observed))
-        if args.phase == "cleanup":
-            require(not args.execute and args.fixture_start is None, "cleanup only accepts offline readback")
-        elif not args.execute:
-            print("DRY RUN: attendance configuration matched, no signed check performed")
-            return 2
+        if args.phase == "rehearsal":
+            require(not args.execute and args.fixture_start is None, "rehearsal only accepts offline readback")
+            validate_rehearsal(read_object(args.rollout), read_object(args.observed))
         else:
-            start = fixture_start(args.fixture_start) if args.phase == "finalized" else None
-            signer = credentials(os.environ if env is None else env)
-            old_handler = signal.signal(signal.SIGALRM, deadline)
-            try:
-                signal.alarm(RUN_BUDGET)
-                probe(args.phase, STAGING_ORIGIN, identity, start, signer, check)
-            finally:
-                signal.alarm(0)
-                signal.signal(signal.SIGALRM, old_handler)
+            identity = validate_configuration(args.phase, STAGING_ORIGIN, read_object(args.rollout), read_object(args.observed))
+            if args.phase == "cleanup":
+                require(not args.execute and args.fixture_start is None, "cleanup only accepts offline readback")
+            elif not args.execute:
+                print("DRY RUN: attendance configuration matched, no signed check performed")
+                return 2
+            else:
+                start = fixture_start(args.fixture_start) if args.phase == "finalized" else None
+                signer = credentials(os.environ if env is None else env)
+                old_handler = signal.signal(signal.SIGALRM, deadline)
+                try:
+                    signal.alarm(RUN_BUDGET)
+                    probe(args.phase, STAGING_ORIGIN, identity, start, signer, check)
+                finally:
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, old_handler)
     except (Refused, OSError, ValueError, RecursionError, http.client.HTTPException, ProbeError, SmokeError) as error:
         reason = str(error) if isinstance(error, Refused) else "attendance acceptance input or transport refused"
         print(f"FAIL: {reason}", file=sys.stderr)
