@@ -175,11 +175,18 @@ See the [protected staging readback](automod-preview-spec.md#protected-staging-r
 
 The dormant operator entry checks GitHub's runner metadata against the
 authenticated Actions run before handing the approved serving selection to
-the rehearsal caller. The protected staging host must supply the existing
-lease and action approvals, authenticated inventory, and private invocation.
-Both entry points pin this workflow's own protected main identity. A separate
-dispatching workflow supplies its own identity, so it cannot call this path.
-A future activation must review the direct dispatch trigger and provider wiring.
+the rehearsal caller. `runStagingAutomodProtectedHost` accepts injected readers
+for the existing lease, action approvals, local Worker bindings and staging
+inventory, along with a private invoker. The rehearsal pins the AutoMod
+workflow's own protected main identity. A separate dispatching workflow supplies
+its own identity, so it cannot call this path.
+
+Before activation, review direct dispatch and wire the adapters in the protected
+job. The approved plan pins the inventory producer's workflow SHA and run ID.
+Supply an inventory reader that authenticates the successful protected-main
+staging ownership inventory run, attempt 1 and its named artifact. The first
+admitted action needs an observation at most 60 seconds old within the caller's
+action deadline.
 
 - [ ] **Confirm existing admission evidence.** Check the stopped staging
   baseline, verified recovery, database and gateway proofs, moderation

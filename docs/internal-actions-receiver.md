@@ -186,21 +186,28 @@ Use the existing protected staging window. Confirm the serving and rollback
 identities and that the receiver can write terminal receipts with the
 [voice receipt migration](../crates/cutover/migrations/0481_internal_voice_move_audit.sql)
 applied. Keep fixture references, session material and raw observations in
-the protected context.
+the protected context. Record each owner's role, UTC observation time and
+verdict against the same protected fixture reference. Use role labels such
+as `Discord administrator` and `Ordinary member` in handoff summaries. Keep
+account, guild, room and session identifiers and credentials out of summaries
+and public records.
 
-1. **Discord administration and account custodian.** The Bot lead routes
-   initial custody to the authorized staging guild admin and the designated
-   custodian of one dedicated, non-QA normal account. The admin confirms
-   staging membership, designates two distinct restricted guild-voice rooms
-   in source A, destination B order, and records the original overwrites for
-   restoration. Hand Bot Operations the protected `fixture` with
+1. **Engineering and Discord custody.** Engineering confirms the protected
+   designation of two distinct staging test accounts and their custodians.
+   The Discord administrator attests to authority in the staging guild,
+   confirms the ordinary member's guild membership, designates two distinct
+   restricted guild-voice rooms in source A, destination B order, and records
+   the original overwrites for restoration. The ordinary-member custodian
+   confirms custody of the dedicated non-QA account, ordinary membership
+   without Administrator privileges, and normal sign-in and control of the
+   account's own voice joins and departure. Only the ordinary member is the
+   move subject. Hand Bot Operations the protected `fixture` with
    `environment: "staging"`, `guildId`, `discordId` and `channelIds: [A, B]`.
-   The custodian signs in normally in the protected Web context and handles
-   the account's own joins and departures. Put the account in A before denying
-   its effective Connect there. It must still be in A at preflight, with
-   Connect denied in A and allowed in B. The admin scopes a separate read-only
-   `observer` to the fixture, including access to observe occupancy in either
-   room and the permission facts needed to verify Connect. Its `readChannels`
+   Put the account in A before denying its effective Connect there.
+   At preflight it must still be in A, with Connect denied in A and allowed
+   in B. The admin scopes a separate read-only `observer` to the fixture,
+   including access to observe occupancy in either room and the permission
+   facts needed to verify Connect. Its `readChannels`
    supplies `source` and `destination` at preflight and `observe` supplies
    a new read at each case checkpoint. Each observation includes `guildId`,
    `discordId` and `observedAt`. The checked room supplies `channelId`,
@@ -209,24 +216,47 @@ the protected context.
    a confirmed disconnect). For the refused return, the checked room is A
    and the member stays in B. Take these readings independently of the Web
    session and move response.
-2. **Web Operations.** Confirm that the serving staging build includes the
+2. **Web Operations.** Attest that the serving staging build includes the
    [current-session receipt](https://github.com/TogetherWeOwn/two-web-next/pull/2794)
-   and that its protected settings match the approved member and ordered pair.
-   Record the settings to restore. Hand Bot Operations the independently
-   verified serving Worker UUID and full commit from staging readiness
-   metadata as `expectedRevision: { version_id, commit }`. Supply one scoped
-   `webSession` pinned to staging, the exact Web origin and the fixture member.
+   and that its protected settings match the approved ordinary member and
+   ordered pair. Confirm the configured Bot transport points to the approved
+   staging receiver and record the settings to restore. Hand Bot Operations
+   the independently verified serving Worker UUID and full commit from
+   staging readiness metadata as `expectedRevision: { version_id, commit }`.
+   Supply one scoped `webSession` pinned to staging, the exact Web origin and
+   the fixture member.
    It supplies `request` and destination-only `move` using the same
-   installed current session with fresh membership. The
-   [session binder](../wrangler/scripts/staging-voice-session.mjs) submits the
-   ordered fixture assertions and requires a bounded, private/no-store match
-   receipt with the exact revision pin. It projects the pinned member and
-   ordered pair into preflight with the receipt's `observed_at` unchanged as
+   installed current session with fresh membership. Eligibility comes from
+   `POST /__probe/voice-move/session` with `discord_id` and ordered `channel_ids`.
+   The successful receipt is HTTP 200 with `matched: true`, `observed_at` and
+   the exact pinned `revision` from the same authenticated session.
+   A deployment record or a generic sign-in check alone leaves eligibility
+   unconfirmed. The [session binder](../wrangler/scripts/staging-voice-session.mjs)
+   submits the ordered fixture assertions and requires a bounded,
+   private/no-store match receipt with the exact revision pin. It projects the
+   pinned member and ordered pair into preflight with `observed_at` unchanged as
    `observedAt`. Ready, session and Discord preflight observations must be
    from the active window, at most 60 seconds old and never in the future.
    Preserve the producers' UTC timestamps with milliseconds.
-3. **Bot Operations.** Coordinate fresh exclusive admission under the existing
-   `staging-lifecycle` lock. Use `verify_lease=true` in the
+
+   The dormant [Web handoff reader](../wrangler/scripts/staging-voice-web-handoff.mjs)
+   binds a fresh authenticated companion match to the same scoped session's
+   later private `404 not_found` companion refusal. Call `readStagingVoiceWebReady`
+   with the approved fixture, session and revision. After Web Operations
+   restores and independently verifies the disabled settings, call its
+   `confirmDisabled` on the same installed session. Give each read a deadline.
+   Both reads use the companion route, which does not submit a signed move.
+   Keep the completion handle in process.
+3. **Bot Operations.** The Bot staging custodian holds exclusive staging
+   custody. That custodian confirms release of prior staging use from fresh
+   protected status and hands the agreed nonoverlapping window to the operator
+   responsible for running the fixture. The protected handoff
+   records that operator's acknowledgement and the serving Bot SHA, deployment
+   and owner epoch. Run under the existing
+   [`staging-lifecycle` lock](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
+   Treat a missing, stale or mismatched admission receipt, an overlapping
+   staging use or an unconfirmed writer as incomplete admission.
+   Use `verify_lease=true` in the
    [manual workflow](../.github/workflows/staging-voice-move.yml) from protected
    main on the first attempt for the exact serving Bot SHA. Take the unmodified
    ready and final status projections from its retained
@@ -250,17 +280,33 @@ the protected context.
    in-process caller supplies those dependencies to
    [`bindStagingVoiceMoveProvider(dependencies)`](../wrangler/scripts/staging-voice-move-entry.mjs)
    and passes the returned provider to `runStagingVoiceMoveEntry(env, provider)`.
+   The dormant `bindStagingVoiceMoveHandoffProvider(dependencies, { qualification, soakReceipt, webHandoff })`
+   also requires the completed Web handoff and two protected Web records.
+   Retain the [validated Web `staging-soak/1` receipt](https://github.com/TogetherWeOwn/two-web-next/blob/273d275b20bf686701e0a1b5f5ff25d46edb6fd5/docs/runbook.md#manual-staging-soak-receipt)
+   unchanged as `soakReceipt`. Web Operations separately supplies
+   `qualification` with `verdict: "qualified"` only after verifying the
+   protected smoke, E2E and full soak. That decision carries the matching
+   rollout fields and sample from the receipt. Both records must identify the
+   independently pinned Web commit and Worker version.
+
+   The completed Web handoff records the earlier disabled baseline. For a
+   later proof, Web Operations must separately restore the approved enabled
+   Web version and fixture settings before the runner's fresh preflight.
+   Re-read the current serving version and refresh qualification if the
+   allocation changed. A different Worker version needs its own approved
+   qualification and handoff. Preserve the same installed session and ordered
+   fixture. The eventual live run still needs its own cleanup readbacks.
    The entry uses the current job's lease, and the bound provider uses the
    job's clock. The workflow keeps the proof selector off and its CLI has
    no live input provider. The in-process job returns `disabled`, `failed`
    or `passed`. A pass is mock evidence.
 
-   For a protected live invocation, coordinate the custodian with the
-   [proof runner](../wrangler/scripts/staging-voice-move-acceptance.mjs)
+   For a protected live invocation, coordinate the ordinary-member custodian
+   with the [proof runner](../wrangler/scripts/staging-voice-move-acceptance.mjs)
    before the cases. The runner confirms A to B (`moved`), then B to A
    (`not_permitted`, still in B), then a move to B while disconnected
-   (`not_connected`). The custodian has the account leave B after the
-   `after:not_permitted` observation completes. The `before:not_connected`
+   (`not_connected`). The ordinary-member custodian has the account leave B
+   after the `after:not_permitted` observation completes. The `before:not_connected`
    checkpoint starts immediately. The observer must return a fresh readback
    after the departure within that same checkpoint call. Its budget is up to
    20 seconds, shortened by the remaining lease time.
@@ -271,11 +317,27 @@ the protected context.
    proof admission failure. Confirm the protected final status is for the same
    run, attempt, expiry, SHA, deployment and epoch, with the lease released or
    expired, `voiceMoveEnabled: false` and `running: false`. After interruption,
-   verify this status after native expiry. Confirm the account is disconnected,
-   restore any changed Discord overwrites and temporary Web settings, and verify
-   Discord permissions are restored and Web refuses the staging probes with the
-   fixture disabled.
-   Treat any unconfirmed readback as incomplete cleanup.
+   verify this status after native expiry. If cancellation leaves no
+   `expires_at` output, Bot Operations checks protected `status` and native
+   lifecycle evidence for that run and attempt. If the attempt acquired a
+   lease, require the same-window OFF and stopped readback after native
+   expiry. Record no lease only if the evidence confirms the attempt never
+   acquired one and staging is OFF and stopped.
+
+   Record the outcome and the minimum
+   terminal readback from each owner against the same protected run reference,
+   including when the proof stops early or is cancelled.
+
+   | Owner | Terminal evidence |
+   | --- | --- |
+   | Ordinary-member custodian and independent Discord observer | The custodian confirms departure and the observer independently confirms `connectedChannelId: null`. |
+   | Discord administrator | Changed overwrites are restored and effective permissions match the recorded baseline. |
+   | Web Operations | Temporary settings are restored, the fixture is disabled and the session companion probe returns the private `404 not_found` refusal. |
+   | Bot Operations and Bot staging custodian | Protected readback confirms lease settlement as above, `voiceMoveEnabled: false` and `running: false`. The Bot staging custodian acknowledges return of exclusive staging custody with no outstanding fixture writer. |
+
+   Treat missing, conflicting or unconfirmed readback as incomplete cleanup
+   and leave custody return pending. A mock verdict or a workflow conclusion
+   alone leaves terminal state unconfirmed.
 
 ### Enable order and rollback
 
