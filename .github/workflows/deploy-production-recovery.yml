@@ -7,8 +7,16 @@ on:
   workflow_call:
     inputs:
       admission: {type: string, required: true}
+      database-host: {type: string, required: true}
+      database-name: {type: string, required: true}
+      database-branch-id: {type: string, required: true}
 
 permissions: {}
+
+env:
+  PRODUCTION_HOST: ${{ inputs.database-host }}
+  PRODUCTION_DATABASE: ${{ inputs.database-name }}
+  PRODUCTION_BRANCH_ID: ${{ inputs.database-branch-id }}
 
 jobs:
   fence:
@@ -35,9 +43,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RECOVERY_ADMISSION: ${{ inputs.admission }}
-          PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
-          PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
-          PRODUCTION_BRANCH_ID: ${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
@@ -62,9 +67,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RECOVERY_ADMISSION: ${{ inputs.admission }}
-          PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
-          PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
-          PRODUCTION_BRANCH_ID: ${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}
           STOPPED_FENCE_ACK: ${{ needs.fence.outputs.stopped }}
           TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}
         run: python3 scripts/production_recovery_workflow.py inverse "$GITHUB_WORKSPACE/target/debug/staging-migrate" "$RUNNER_TEMP/production-inverse"
@@ -92,9 +94,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RECOVERY_ADMISSION: ${{ inputs.admission }}
-          PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
-          PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
-          PRODUCTION_BRANCH_ID: ${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}

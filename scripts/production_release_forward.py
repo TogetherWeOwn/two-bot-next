@@ -6,6 +6,7 @@ from staging_migrate_approval import digest_json
 from staging_recovery_status import matches
 from staging_rollout import mapping, require
 
+
 def forward_receipt(plan_id, plan, outcome):
     """Bind both ledger readbacks and the committed 0475 stamp to this plan."""
     before, expanded, restored = ledger_endpoints(plan)
