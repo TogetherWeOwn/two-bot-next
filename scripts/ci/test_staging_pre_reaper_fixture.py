@@ -92,10 +92,11 @@ class PreReaperFixtureTests(unittest.TestCase):
         self.refused(staging, "^PRE cleanup authorization could not be verified$", now=self.target.expires_at)
 
     def test_unrelated_names_and_reservations_never_reach_the_adapter(self):
+        foreign = replace(self.target, run_id=43)
         for mismatch in (
-            {"target": replace(self.target, run_id=43)},
+            {"target": foreign},
             {"worker": Resource("two-bot-next-staging", "two-bot-next-staging")},
-            {"container": Resource("shared-staging", "12345678-1234-4234-8234-123456789abc")},
+            {"container": Resource(foreign.container_name, "12345678-1234-4234-8234-123456789def")},
             {"complete": False},
         ):
             with self.subTest(mismatch=mismatch):
@@ -146,11 +147,14 @@ class PreReaperFixtureTests(unittest.TestCase):
         staging = SyntheticStaging(self.target)
         arrived = staging.snapshot
         empty = replace(arrived, worker=None, container=None, instance_count=0, assigned_count=0, write_access=False)
-        with patch.object(staging, "inventory", side_effect=[empty, arrived]) as inventory:
-            with self.assertRaisesRegex(SweepError, "^PRE cleanup readback could not be verified$"):
-                self.sweep(staging)
-        self.assertEqual(inventory.call_args_list, [call(self.target), call(self.target)])
-        self.assertEqual(staging.events, [("status", self.target)])
+        unsettled = replace(empty, startup_settled=False)
+        for before, after in ((unsettled, unsettled), (empty, arrived)):
+            staging.events.clear()
+            with patch.object(staging, "inventory", side_effect=[before, after]) as inventory, self.subTest():
+                with self.assertRaisesRegex(SweepError, "^PRE cleanup readback could not be verified$"):
+                    self.sweep(staging)
+                self.assertEqual(inventory.call_args_list, [call(self.target), call(self.target)])
+                self.assertEqual(staging.events, [("status", self.target)])
         self.assertEqual(self.sweep(staging), "cleared")
 
     def test_adapter_errors_do_not_expose_raw_details(self):
