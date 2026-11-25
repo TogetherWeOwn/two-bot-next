@@ -551,6 +551,14 @@ It emits the Worker modules, OCI image and their recorded identities. This
 receipt covers packaging. Staging qualification at either PRE endpoint requires
 a compatible isolated target that stops the exact runtime when its use window expires.
 
+Before handing the bundle to a staging caller, use
+[`verify_predecessor_bundle`](../scripts/predecessor_bundle.py) with the reviewed
+workflow SHA, run ID, artifact ID and ZIP digest, the authenticated GitHub run
+and artifact records, and the same private ZIP the caller would use. The
+offline check binds the full Worker file inventory and OCI image stamps to
+the first successful producer attempt. Staging still needs the serving proof
+below.
+
 1. For the reviewed rollback predecessor, record its Worker source SHA and
    module digests, container image digest and expected runtime
    `build_revision`, `build_id` and `deploy_id`. The forward candidate has
@@ -588,6 +596,20 @@ image is stamped with an earlier one, the earlier SHA fails the Worker
 identity check and the later SHA fails readiness. Record the two actual
 revisions and the image digest as a release integration dependency and keep
 qualification pending at both endpoints. Preserve truthful source stamps.
+
+The [registry disposition helper](../scripts/pre_registry_cleanup.py) is an
+offline contract exercised by synthetic fixtures. Keep live registry cleanup
+pending until a protected workflow collects and verifies the evidence below.
+
+For an interrupted or expired isolated rehearsal, the protected workflow must
+record the planned immutable registry reference with the reservation before the
+copy starts. After publication has settled and the exact staging target passes
+cleanup readback, it must authenticate a fresh lookup of that reference.
+`already_absent` records confirmed absence in that repository. A present digest
+yields `unresolved_digest_reference` and leaves registry cleanup open. The
+publication plan creates no reservation tag, and the documented Cloudflare image
+removal can affect rollback images. Preserve shared or retained content and keep
+the existing protected cleanup approval in force. [Cloudflare image management](https://developers.cloudflare.com/containers/guides/image-management/#registry-limits)
 
 Hosted source-level CI runs the
 [synthetic refusal case](../scripts/ci/test_predecessor_serving_identity.py)

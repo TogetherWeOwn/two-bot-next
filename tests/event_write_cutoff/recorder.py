@@ -18,6 +18,8 @@ BOT_ROLE = "111111111111111113"
 CHANNEL = "111111111111111114"
 EVENT = "111111111111111115"
 MESSAGE = "111111111111111116"
+EVENT_CHANNEL = "111111111111111117"
+REPLACEMENT_EVENT_CHANNEL = "111111111111111118"
 EVENT_PATH = rf"/api/v[0-9]+/guilds/{GUILD}/scheduled-events"
 ROLE_PATH = f"/api/v10/guilds/{GUILD}/members/{MEMBER}/roles/{ROLE}"
 MESSAGE_PATH = f"/api/v10/channels/{CHANNEL}/messages"
@@ -70,6 +72,9 @@ class Handler(BaseHTTPRequestHandler):
         raise TimeoutError("fixture barrier deadline")
 
     def dispatch(self):
+        # Count observations separately so reads do not change the mutation journal.
+        with self.server.lock, (self.server.state / "request-count").open("ab") as count:
+            count.write(b"\n")
         if not hmac.compare_digest(self.headers.get("Authorization", ""), self.server.token):
             self.reply(401, {"code": 0, "message": "Synthetic token required"})
             return
@@ -91,8 +96,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.wait_at(operation, "paused-before-permission")
             # The operator owns this state outside both Bot processes and Postgres.
             # Missing or unrecognized state leaves event writes denied.
-            policy = self.server.state / "policy"
-            permissions = CREATE_EVENTS | MANAGE_EVENTS if policy.exists() and policy.read_text() == "open\n" else 0
+            channel_id = body.get("channel_id")
+            if body.get("entity_type") == 2 and operation in ("create", "edit"):
+                operation = f"channel-{operation}"
+                fixture_channel = channel_id in (EVENT_CHANNEL, REPLACEMENT_EVENT_CHANNEL)
+                if fixture_channel:
+                    operation = f"{operation}:{channel_id}"
+                approval = self.server.state / "channel-event-approval"
+                approved = (fixture_channel and approval.exists()
+                            and approval.read_text() == f"{GUILD}:{channel_id}\n")
+            else:
+                policy = self.server.state / "policy"
+                approved = policy.exists() and policy.read_text() == "open\n"
+            permissions = CREATE_EVENTS | MANAGE_EVENTS if approved else 0
             if not permits_event(self.command, permissions, created_by_bot=True):
                 self.record(operation, "denied")
                 self.reply(403, {"code": 50013, "message": "Missing Permissions"})
@@ -104,7 +120,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.reply(200, {
                 "id": EVENT, "guild_id": GUILD, "name": body.get("name", "Synthetic event"),
-                "description": "fixture", "status": body.get("status", 1), "channel_id": None,
+                "description": "fixture", "status": body.get("status", 1), "channel_id": channel_id,
                 "scheduled_start_time": "2099-01-01T00:00:00Z",
             })
         elif self.command == "PUT" and path == ROLE_PATH:

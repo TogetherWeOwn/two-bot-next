@@ -30,5 +30,6 @@ with response:
     print(json.dumps({
         "status": response.status, "replay": response.headers.get("Idempotent-Replay") == "true",
         "code": value.get("error", {}).get("code"), "outcome": value.get("result", {}).get("outcome"),
+        "event_id": value.get("result", {}).get("event_id"),
         "message_id": value.get("result", {}).get("message_id"),
     }))

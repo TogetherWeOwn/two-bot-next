@@ -1,6 +1,9 @@
 //! Round trip through the dormant Bot attendance path with synthetic event evidence.
 
-use std::future::Future;
+use std::{
+    future::Future,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -348,6 +351,7 @@ async fn exercise_echo(pool: PgPool) {
         "a fresh signed read after re-enabling returns the same finalized v1 record"
     );
 
+    staged_echo_permission_evidence(pool, &signed, &enabled, &finalized).await;
     staged_echo_enablement_and_rollback(pool, &signed, &enabled, &finalized).await;
 
     let mark_ambiguous = async |ambiguous| {
@@ -632,6 +636,67 @@ impl WebPeer {
         }
         Ok(())
     }
+}
+
+async fn staged_echo_permission_evidence(
+    pool: &PgPool,
+    signed: &SignedEcho<'_>,
+    enabled: &InternalFlags,
+    finalized: &Value,
+) {
+    let mut web = WebPeer::default();
+    let approved_revision = 1;
+    let expires_at = 10;
+    for (change, next_evidence) in [
+        ("expires at the boundary", (10, approved_revision)),
+        ("changes while still fresh", (9, approved_revision + 1)),
+    ] {
+        // Model the staged permission readback independently of signing time,
+        // rollout identity, lease and the enabled reader flag.
+        let nonce = random_nonce();
+        let signed_request = signed.issue(READ_BODY, signed.now, &nonce);
+        let request = signed.authorize(enabled, &signed_request).await.unwrap();
+        let checks = AtomicUsize::new(0);
+        let pull = read(request, pool, |guild| {
+            assert_eq!(guild.to_string(), TWO_STAGING_GUILD_ID);
+            Some(|| {
+                // Let lookup start under the approved ticket. Present the
+                // changed evidence when the same ticket is checked again.
+                let (now, revision) = if checks.fetch_add(1, Ordering::Relaxed) == 0 {
+                    (9, approved_revision)
+                } else {
+                    next_evidence
+                };
+                now < expires_at && revision == approved_revision
+            })
+        });
+        assert_eq!(
+            web.poll(true, async { pull.await.map_err(PullRefusal::Read) })
+                .await,
+            Err(PullRefusal::Read(ReadRefusal::Unavailable)),
+            "permission evidence {change}"
+        );
+        assert_eq!(checks.load(Ordering::Relaxed), 2);
+        assert!(web.frozen.is_empty());
+        assert_eq!(
+            signed.authorize(enabled, &signed_request).await.err(),
+            Some(ErrorCode::Replayed),
+            "permission refusal still consumes the signed request"
+        );
+    }
+    assert_eq!(web.pulls, 2);
+
+    // A fresh signed request under refreshed approval can still read the same
+    // fixture after the refusals.
+    let request = signed
+        .request(enabled, READ_BODY, signed.now, &random_nonce())
+        .await
+        .unwrap();
+    let pull = read(request, pool, |_| Some(|| true));
+    web.poll(true, async { pull.await.map_err(PullRefusal::Read) })
+        .await
+        .unwrap();
+    assert_eq!(web.frozen.as_slice(), std::slice::from_ref(finalized));
 }
 
 async fn staged_echo_enablement_and_rollback(
