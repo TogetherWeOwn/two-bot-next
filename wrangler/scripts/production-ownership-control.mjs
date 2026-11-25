@@ -141,7 +141,9 @@ async function observationJson(response) {
 export async function control({ action, url, productionUrl = process.env.PRODUCTION_WORKER_URL ?? "", stagingUrl = process.env.STAGING_WORKER_URL ?? "", token, actor, expectedEpoch, expectedDeploymentId, releaseFence = false, takeoverAttempts = 34, takeoverRetryDelayMs = 10000, takeoverWindowMs = 330000, statusAttempts = 34, statusRetryDelayMs = 10000, statusWindowMs = 330000 }, send = fetch, wait = sleep, now = Date.now) {
   const origin = checkOrigin(url, productionUrl, stagingUrl);
   if (!token || token.length < 32) throw new ControlError("OWNERSHIP_CONTROL_TOKEN is missing or invalid; stop before deployment");
-  if (!["preflight", "status", "observe", "takeover", "fence"].includes(action)) throw new ControlError("Unknown action");
+  if (!["preflight", "status", "observe", "takeover", "takeover-fenced", "takeover-capability", "fence"].includes(action)) {
+    throw new ControlError("Unknown action");
+  }
   if (action === "preflight") return { configured: true };
   if (expectedDeploymentId !== undefined && !validDeploymentId(expectedDeploymentId)) {
     throw new ControlError("Expected deployment id is invalid; stop before posting");
@@ -167,6 +169,10 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
     if (!response.ok) {
       const reason = await refusalReason(response);
       throw new HttpFailure(`Ownership control failed (HTTP ${response.status}) reason=${reason} attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`, response.status, reason);
+    }
+    if (init.method === "GET" && (action === "takeover-fenced" || action === "takeover-capability") &&
+        response.headers.get("x-two-bot-exact-takeover") !== "1") {
+      throw new ControlError("Production deployment does not support exact takeover; stop before posting");
     }
     let raw;
     try {
@@ -200,6 +206,39 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
     }
     return current;
   };
+  if (action === "takeover-capability") {
+    if (!expectedDeploymentId) throw new ControlError("Expected deployment id is required");
+    const current = await read({ method: "GET" });
+    if (current.deploymentId !== expectedDeploymentId) {
+      throw new ControlError("Production deployment mismatch; exact takeover capability unproved");
+    }
+    return { deploymentId: current.deploymentId, exactTakeover: true };
+  }
+  if (action === "takeover-fenced") {
+    if (!releaseFence || !expectedDeploymentId || !actor || !/^[a-zA-Z0-9_.:@/-]{1,128}$/.test(actor) ||
+        !Number.isSafeInteger(expectedEpoch) || expectedEpoch < 1 ||
+        !Number.isSafeInteger(expectedEpoch + 1)) {
+      throw new ControlError("Exact fenced takeover requires the deployment, fence epoch and actor");
+    }
+    attempts = 1;
+    const current = await readState();
+    if (current.owner?.phase !== "fenced" || current.owner.deploymentId !== null ||
+        current.owner.epoch !== expectedEpoch) {
+      throw new ControlError("Exact fenced takeover refused; ownership changed");
+    }
+    // Never retry at a newly observed epoch. The caller reconciles a lost
+    // acknowledgement against the same protected recovery evidence.
+    const result = await read({
+      method: "POST",
+      body: JSON.stringify({ action: "takeover-exact", actor, expectedEpoch, expectedDeploymentId }),
+    });
+    if (result.deploymentId !== expectedDeploymentId || result.running ||
+        result.owner?.phase !== "active" || result.owner.deploymentId !== expectedDeploymentId ||
+        result.owner.epoch !== expectedEpoch + 1 || result.owner.actor !== actor) {
+      throw new ControlError("Ownership transition not confirmed; reconcile the fenced takeover");
+    }
+    return result;
+  }
   let postedEpoch;
   const once = async (first) => {
     attempts += 1;
