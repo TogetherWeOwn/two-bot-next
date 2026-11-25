@@ -132,6 +132,18 @@ class ProtectedPreTests(unittest.TestCase):
         self.assertEqual(self.fixture.effects.mock_calls,
                          [call.admission.admit_start(TARGET), call.arm(self.fixture.window, START)])
 
+    def test_arm_at_enclosing_lease_cutoff_refuses_create(self):
+        fixture = self.fixture
+        fixture.now = TARGET.started_at + 60
+        fixture.window = EffectWindow(TARGET, fixture.now)
+        controller = fixture.controller(fixture.authorize)
+        self.assert_refuses("pre_external_stop_unarmed", controller.start, fixture.upload)
+        self.assertLess(fixture.now, TARGET.expires_at)
+        self.assertIsNone(fixture.armed)
+        fixture.before_create.assert_not_called()
+        self.assertEqual(fixture.effects.mock_calls,
+                         [call.admission.admit_start(TARGET), call.arm(fixture.window, START)])
+
     def test_delayed_create_refused_when_stop_races_after_arm(self):
         fixture = self.fixture
         fixture.before_create.side_effect = self.controller.stop
