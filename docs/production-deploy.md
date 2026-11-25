@@ -389,8 +389,9 @@ affected reads under its runtime role and Web's affected reads under its reader
 role on that copy. For the attendance release, record both apps' reads before
 apply, after apply and after the exact reviewed inverse. Match the inverse to
 the release plan and record its confirmed outcome on the same copy. Keep app
-egress disabled, use fresh credentials for the copy and record only counts,
-IDs and checksums.
+egress disabled and use fresh credentials for the copy. Record UTC timestamps
+and outcomes for the rehearsal and cleanup. For data read from the copy,
+record only counts, IDs and checksums.
 
 Verify cleanup independently of the delete and removal operations. Record the
 provider readback that the exact copy is absent and a separate readback that
