@@ -3988,7 +3988,8 @@ def staging_callee_window_errors(name, workflow, consumer):
     # Control credentials and lifecycle commands stay out of the consumer.
     consumer_text = str(jobs[consumer]).lower().replace(" ", "")
     if kind == "voice":
-        consumer_text = consumer_text.replace("'grant_expires_at':'${{inputs.staging_use_expires_at||needs.staging-window.outputs.expires_at}}'", "", 1)
+        # The consumer policy pins both copies, in the early and per-attempt checks.
+        consumer_text = consumer_text.replace("'grant_expires_at':'${{inputs.staging_use_expires_at||needs.staging-window.outputs.expires_at}}'", "", 2)
     for marker in ("staging_use", "staging-use", "ownership_control", "staging_ownership"):
         if marker in consumer_text:
             errors.append(f"{name}:{consumer}: must not contain {marker!r} (no control credential)")
@@ -4004,9 +4005,9 @@ def voice_synthetic_errors(workflow):
     `synthetic`, behind the pinned `staging-window` assert job (needs it) and
     the standalone `staging-use-release` job (staging_callee_window_errors),
     with the called-disjoint / standalone-canonical non-cancelling group and a
-    10 minute timeout. Exactly three steps: pinned checkout without persisted
-    credentials, one Run step (the only holder of the token) that runs the
-    reviewed script, and the evidence upload. No wrangler, no production path,
+    10 minute timeout. A secret-free budget refusal precedes pinned checkout
+    without persisted credentials, one Run step (the only holder of the token)
+    that runs the reviewed script, and the evidence upload. No wrangler, no production path,
     no staging Worker URL, no `set -x`.
     """
     name = "voice-synthetic.yml"
@@ -4037,24 +4038,35 @@ def voice_synthetic_errors(workflow):
         if key in job:
             errors.append(f"{name}:synthetic: must not set {key}")
     steps = job.get("steps") or []
-    runs = [step for step in steps if "run" in step]
     bindings = {"GRANT_EXPIRES_AT": "${{ inputs.staging_use_expires_at || needs.staging-window.outputs.expires_at }}",
                 "VOICE_JOB_ANCHOR": "${{ needs.staging-window.outputs.checked_at }}"}
-    if len(runs) == 1 and any(runs[0].get("env", {}).get(k) != v for k, v in bindings.items()):
-        errors.append(f"{name}:synthetic: must use the original grant and predecessor clock")
-    if len(steps) != 3 or len(runs) != 1 or "scripts/staging_voice_synthetic.py" not in runs[0]["run"]:
-        errors.append(f"{name}:synthetic: must be checkout, one Run step of the reviewed script, evidence upload")
-    elif (runs[0].get("id") != "voice" or job.get("outputs") != {"exercised": "${{ steps.voice.outputs.exercised }}"}
-          or (on.get("workflow_call") or {}).get("outputs") != {"exercised": {"value": "${{ jobs.synthetic.outputs.exercised }}"}}
-          or runs[0]["run"].count("exercised=true") != 1
-          or not re.search(r'(?m)^  if timeout .*scripts/staging_voice_synthetic\.py .*; then\n    printf .*exercised=true.* >> "\$GITHUB_OUTPUT"\n    exit 0$', runs[0]["run"])):
-        errors.append(f"{name}: only a completed voice scenario may attest exercise")
-    if len(steps) == 3 and steps[2].get("with", {}).get("name") != (
-            "voice-synthetic-${{ github.run_id }}"
-            "${{ inputs.artifact_invocation != '' && format('-{0}', inputs.artifact_invocation) || '' }}"):
-        errors.append(f"{name}:synthetic: evidence artifact must include the optional invocation suffix")
+    voice = None
+    if len(steps) != 4:
+        errors.append(f"{name}:synthetic: must be budget check, checkout, one Run step of the reviewed script, evidence upload")
+    else:
+        budget, checkout, voice, upload = steps
+        if (set(budget) - {"name"} != {"id", "env", "run"} or budget.get("id") != "budget"
+                or budget.get("env") != {**bindings, "VOICE_SYNTHETIC_REQUIRED": "${{ vars.VOICE_SYNTHETIC_REQUIRED }}"}):
+            errors.append(f"{name}:synthetic: must check the original grant and predecessor clock before checkout")
+        if checkout != {"uses": STAGING_CHECKOUT_USES,
+                        "with": {"persist-credentials": "false", "fetch-depth": "1"}}:
+            errors.append(f"{name}:synthetic: checkout must be pinned and wait for the budget check")
+        if any(voice.get("env", {}).get(k) != v for k, v in bindings.items()):
+            errors.append(f"{name}:synthetic: must use the original grant and predecessor clock")
+        run = voice.get("run", "")
+        if "scripts/staging_voice_synthetic.py" not in run or {"if", "continue-on-error"} & voice.keys():
+            errors.append(f"{name}:synthetic: must run the reviewed script after successful setup")
+        elif (voice.get("id") != "voice" or job.get("outputs") != {"exercised": "${{ steps.voice.outputs.exercised }}"}
+              or (on.get("workflow_call") or {}).get("outputs") != {"exercised": {"value": "${{ jobs.synthetic.outputs.exercised }}"}}
+              or run.count("exercised=true") != 1
+              or not re.search(r'(?m)^  if timeout .*scripts/staging_voice_synthetic\.py .*; then\n    printf .*exercised=true.* >> "\$GITHUB_OUTPUT"\n    exit 0$', run)):
+            errors.append(f"{name}: only a completed voice scenario may attest exercise")
+        if upload.get("with", {}).get("name") != (
+                "voice-synthetic-${{ github.run_id }}"
+                "${{ inputs.artifact_invocation != '' && format('-{0}', inputs.artifact_invocation) || '' }}"):
+            errors.append(f"{name}:synthetic: evidence artifact must include the optional invocation suffix")
     for step in steps:
-        if "secrets." in str(step) and step is not (runs[0] if runs else None):
+        if "secrets." in str(step) and step is not voice:
             errors.append(f"{name}:synthetic: only the Run step may hold a secret")
     text = str(job).lower().replace(" ", "")
     for marker in ("wrangler", "production", "staging_worker_url", "tojson(secrets", "secrets[", "set-x",
@@ -7412,13 +7424,13 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["synthetic"].pop("if"),
             lambda w: w["jobs"]["synthetic"].__setitem__("environment", "staging"),
             lambda w: w["on"].__setitem__("push", None),
-            lambda w: w["jobs"]["synthetic"]["steps"][1].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["synthetic"]["steps"][-2].__setitem__("run", "wrangler deploy"),
             lambda w: w["jobs"]["staging-window"]["steps"][-1].update(run="true"),
             lambda w: w["jobs"]["synthetic"]["steps"][0].__setitem__("env", {"T": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}),
             lambda w: w["on"]["workflow_call"]["inputs"].pop("artifact_invocation"),
             lambda w: w["on"]["workflow_call"]["inputs"]["artifact_invocation"].update({"required": "true"}),
             lambda w: w["jobs"]["staging-window"]["steps"][4]["with"].update({"name": "collision"}),
-            lambda w: w["jobs"]["synthetic"]["steps"][2]["with"].update({"name": "collision"}),
+            lambda w: w["jobs"]["synthetic"]["steps"][-1]["with"].update({"name": "collision"}),
         ):
             changed = copy.deepcopy(synthetic)
             mutate(changed)
@@ -7435,7 +7447,9 @@ class WorkflowTests(unittest.TestCase):
             (lambda w: w["jobs"]["rerun-refusal"]["steps"][0].update({"run": "exit 0"}), "terminal failure sentinel"),
             (lambda w: w["jobs"]["rerun-refusal"]["needs"].remove("synthetic"), "terminal failure sentinel"),
             (lambda w: w["jobs"]["synthetic"]["steps"][0].update({"env": {"TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}}), "only the Run step may hold a secret"),
-            (lambda w: w["jobs"]["synthetic"]["steps"][1].update({"run": "wrangler deploy"}), "reviewed script"),
+            (lambda w: w["jobs"]["synthetic"]["steps"][0].update({"continue-on-error": "true"}), "before checkout"),
+            (lambda w: w["jobs"]["synthetic"]["steps"][1].update({"if": "always()"}), "wait for the budget check"),
+            (lambda w: w["jobs"]["synthetic"]["steps"][-2].update({"run": "wrangler deploy"}), "reviewed script"),
         )
         for mutate, diagnostic in mutations:
             changed = copy.deepcopy(workflow)
@@ -7531,7 +7545,7 @@ class WorkflowTests(unittest.TestCase):
                 "consumer waits for release": lambda w: w["jobs"][consumer].update({"needs": "staging-use-release"}),
                 "consumer re-holds the lock": lambda w: w["jobs"][consumer].update(
                     {"concurrency": {"group": "staging-lifecycle", "cancel-in-progress": "false"}}),
-                "consumer holds the control credential": lambda w: w["jobs"][consumer]["steps"][1]["env"].update(
+                "consumer holds the control credential": lambda w: w["jobs"][consumer]["steps"][-2]["env"].update(
                     {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
                 "release not main-only": lambda w: release(w).update(
                     {"if": release(w)["if"].replace("github.ref == 'refs/heads/main' && ", "")}),
@@ -7619,6 +7633,49 @@ class WorkflowTests(unittest.TestCase):
                 self.fail(f"mutation {label!r} did not apply")
             with self.subTest(mutation=label):
                 self.assertTrue(staging_full_window_errors(changed))
+
+    def test_voice_refuses_before_checkout_and_rechecks_after_setup(self):
+        steps = self.workflows["voice-synthetic.yml"]["jobs"]["synthetic"]["steps"]
+        self.assertEqual(steps[0].get("id"), "budget")
+        self.assertTrue(steps[1]["uses"].startswith("actions/checkout@"))
+        self.assertEqual(steps[2].get("id"), "voice")
+        budget, _, voice, _ = steps
+
+        def run(step, now, grant, required="", token="fixture"):
+            env = {"VOICE_JOB_ANCHOR": "1000", "GRANT_EXPIRES_AT": str(grant),
+                   "VOICE_WORK_SECONDS": voice["env"]["VOICE_WORK_SECONDS"],
+                   "VOICE_SYNTHETIC_REQUIRED": required, "GITHUB_OUTPUT": "/dev/stdout",
+                   "RUN_ID": "1", "NOW": str(now), "PATH": "/nonexistent"}
+            if step is voice and token:
+                env["TWO_VOICE_SYNTHETIC_BOT_TOKEN"] = token
+            fake = ('date() { printf "%s\n" "$NOW"; }; '
+                    'timeout() { printf "voice invoked\n"; return 90; };\n')
+            return subprocess.run(["/bin/bash", "-c", fake + step["run"]], env=env,
+                                  capture_output=True, text=True, timeout=5, check=False)
+
+        # The known setup deficit and an already-expired grant both fail the
+        # first step, so Actions' default success guard skips checkout and Run.
+        for now, grant in ((1135, 4000000), (1000, 1000000), (1000, 1452000)):
+            with self.subTest(now=now, grant=grant):
+                refused = run(budget, now, grant)
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+                self.assertIn("::error::not enough runner or staging grant time", refused.stdout)
+                self.assertNotIn("voice invoked", refused.stdout)
+                self.assertNotIn("exercised=true", refused.stdout)
+
+        # Checkout can consume the remaining margin. Early admission conveys
+        # no authority to the Run step, which checks the original grant again.
+        self.assertEqual(run(budget, 1000, 1453000).returncode, 0)
+        refused = run(voice, 1001, 1453000)
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("::error::not enough runner or staging grant time", refused.stdout)
+        self.assertNotIn("voice invoked", refused.stdout)
+        self.assertNotIn("exercised=true", refused.stdout)
+        self.assertEqual(run(budget, 1135, 4000000, required="false").returncode, 0)
+        optional = run(voice, 1135, 4000000, required="false", token="")
+        self.assertEqual(optional.returncode, 0, optional.stderr)
+        self.assertIn("::notice::voice synthetic not configured", optional.stdout)
+        self.assertNotIn("exercised=true", optional.stdout)
 
     def test_voice_workflow_refuses_attempts_without_cleanup_time(self):
         voice = self.workflows["voice-synthetic.yml"]["jobs"]["synthetic"]["steps"][-2]
