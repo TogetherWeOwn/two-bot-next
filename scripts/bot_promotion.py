@@ -451,7 +451,7 @@ def _validate_package(blob, sha, run_id, attempt, repo_id):
     return receipt, modules
 
 
-def _collect_modules(modules_dir):
+def collect_modules(modules_dir):
     """The served bundle, minus local environment material and dry-run notes."""
     root = Path(modules_dir)
     collected = {}
@@ -545,7 +545,7 @@ def _certify(args, github):
         raise PromotionError("staging evidence is not strict JSON") from None
     _check_evidence_staging(evidence, args.sha, build_id, args.deploy_id)
 
-    modules = _collect_modules(args.modules)
+    modules = collect_modules(args.modules)
     if not _safe_module_path(args.entrypoint) or args.entrypoint not in modules:
         raise PromotionError("bundle entrypoint mismatch")
 
@@ -920,7 +920,7 @@ def load_admitted(path, sha, *, verify_modules=False):
     if production_image != expected_image:
         raise PromotionError("admission production image mismatch")
     if verify_modules:
-        modules = _collect_modules(Path(path).parent / "modules")
+        modules = collect_modules(Path(path).parent / "modules")
         if set(modules) != {member["path"] for member in receipt["worker"]["modules"]}:
             raise PromotionError("admitted module inventory mismatch")
         for member in receipt["worker"]["modules"]:

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tarfile
 
+from bot_promotion import collect_modules
 from rollback_proof import ProofError
 from staging_qualification import check_evidence
 from staging_recovery_status import github
@@ -84,9 +85,19 @@ def image_manifest(path, labels):
     return manifests[0]["digest"]
 
 
+def package_worker(dry_run, destination):
+    modules = collect_modules(dry_run)
+    require("index.js" in modules, "worker_bundle_entrypoint_missing")
+    for name, data in modules.items():
+        path = destination / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return {name: sha256(data).hexdigest() for name, data in sorted(modules.items())}
+
+
 def build(root, run_id):
     source, artifact = root / "source", root / "artifact"
-    bundle = artifact / "worker"
+    dry_run = root / "wrangler-dry-run"
     image = artifact / "image.oci.tar"
     artifact.mkdir()
     build_id = f"{run_id}-1"
@@ -104,10 +115,9 @@ def build(root, run_id):
     package = mapping(decode((worker / "node_modules/wrangler/package.json").read_bytes()))
     require(package.get("version") == WRANGLER, "archived_wrangler_version_mismatch")
     subprocess.run(["node_modules/.bin/wrangler", "deploy", "--dry-run",
-                    "--containers-rollout=none", "--outdir", str(bundle)], cwd=worker,
+                    "--containers-rollout=none", "--outdir", str(dry_run)], cwd=worker,
                    env={**os.environ, "WRANGLER_SEND_METRICS": "false"}, timeout=120, check=True)
-    modules = {str(path.relative_to(bundle)): digest(path) for path in sorted(bundle.rglob("*")) if path.is_file()}
-    require("index.js" in modules, "worker_bundle_entrypoint_missing")
+    modules = package_worker(dry_run, artifact / "worker")
     save(artifact / "build.json", {"source_sha": SOURCE, "input_tree": INPUT_TREE, "worker_message": SOURCE,
                                   "source_archive_sha256": digest(root / "export/source.tar"),
                                   "worker_modules_sha256": modules, "image_manifest_digest": manifest,
