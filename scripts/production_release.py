@@ -11,8 +11,10 @@ import sys
 from time import sleep
 
 import production_recovery_artifact as artifacts
+from production_attendance_plan import validate_attendance_plan
 from production_ownership_status import read_status
 from production_recovery_takeover import HEX, UUID, RecoveryPin
+from production_release_approval import require_unused_attendance_plan
 from production_release_ledgers import CUTOVER, STORE, ledger_endpoints
 from production_release_preflight import ReleasePreflight, approved_plan, apply_under_prepared_fence, prepared_epoch
 from production_release_preflight import verify_preflight
@@ -201,6 +203,10 @@ def main(argv, env):
         url = check_url("production", env["PRODUCTION_WORKER_URL"])
         control = control_client("production", env["OWNERSHIP_CONTROL_TOKEN"], url, "", actor)
         if argv == ["prepare"]:
+            fresh = mapping(decode((directory / "fresh-plan.json").read_bytes()))
+            validate_attendance_plan(plan)
+            validate_attendance_plan(fresh)
+            epoch = verify_preflight(pin, plan["target"], plan, fresh, lambda: read_status(env), control)
             account = env["CLOUDFLARE_ACCOUNT_ID"]
             client = RollbackClient(account, env["CLOUDFLARE_API_TOKEN"])
             app = APPLICATIONS["production"]
@@ -208,8 +214,6 @@ def main(argv, env):
             validate_receipt_against_live(client, ProvenanceReceipt(
                 WORKERS["production"], app, pin.rollback_worker, pin.rollback_sha, image))
             image_in_registry(image, account, partial(command, cwd=Path(__file__).resolve().parents[1] / "wrangler"))
-            fresh = mapping(decode((directory / "fresh-plan.json").read_bytes()))
-            epoch = verify_preflight(pin, plan["target"], plan, fresh, lambda: read_status(env), control)
             write_json(directory / "preflight.json", {"pin": asdict(pin), "epoch": epoch,
                        "run_id": str(run["id"]), "plan_run_id": plan_id, "plan_archive_sha256": artifact["archive_digest"]})
             output(env, epoch=epoch, archive=pin.candidate_archive, image=pin.candidate_image)
@@ -218,6 +222,7 @@ def main(argv, env):
             require(proof["pin"] == asdict(pin) and proof["plan_archive_sha256"] == artifact["archive_digest"]
                     and proof["run_id"] == str(run["id"]) and proof["plan_run_id"] == plan_id,
                     "production_release_preflight_plan_changed")
+            require_unused_attendance_plan(github, artifact, run)
             ack = stop_prior_pair(pin, str(run["id"]), proof["epoch"], lambda: read_status(env), control)
             write_json(directory / "stopped.json", ack)
             output(env, ack=json.dumps(ack, separators=(",", ":")))

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
@@ -98,6 +99,48 @@ class ReleaseForwardTests(unittest.TestCase):
         shifted["ownership"]["epoch"] += 1
         with self.assertRaisesRegex(GateError, "production_release_retained_pair_changed"):
             preflight.verify_preflight(pin, plan["target"], plan, plan, Mock(side_effect=[state, shifted]), control)
+
+    def test_prepare_rejects_agreeing_invalid_pre_plans_before_reading_provider(self):
+        pin, plan = self.preflight_fixture()
+        plan.update(runner_version=1, plan_run_id="", plan_provenance_verified=False,
+                    applied_count=0, applied_store_count=0)
+        run = {"id": 456}
+        artifact = {"archive_digest": "sha256:" + "8" * 64}
+        with TemporaryDirectory() as temp:
+            directory = Path(temp) / "production-release"
+            directory.mkdir()
+            (directory / "fresh-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            env = {"RUNNER_TEMP": temp, "PRODUCTION_WORKER_URL": "https://prod.invalid",
+                   "OWNERSHIP_CONTROL_TOKEN": "fixture", "CLOUDFLARE_ACCOUNT_ID": "fixture",
+                   "CLOUDFLARE_API_TOKEN": "fixture"}
+            with (patch.object(release, "release_context", return_value=(pin, run, "123", plan, artifact)),
+                  patch.object(release, "check_url"), patch.object(release, "control_client"),
+                  patch.object(release, "read_status") as observe,
+                  patch.object(release, "RollbackClient") as provider):
+                self.assertEqual(release.main(["prepare"], env), 1)
+            observe.assert_not_called()
+            provider.assert_not_called()
+
+    def test_stop_refuses_a_spent_attendance_plan_before_the_provider_call(self):
+        pin, plan = self.preflight_fixture()
+        run = {"id": 456}
+        artifact = {"archive_digest": "sha256:" + "8" * 64}
+        with TemporaryDirectory() as temp:
+            directory = Path(temp) / "production-release"
+            directory.mkdir()
+            proof = {"pin": vars(pin), "epoch": 17, "run_id": "456", "plan_run_id": "123",
+                     "plan_archive_sha256": artifact["archive_digest"]}
+            (directory / "preflight.json").write_text(json.dumps(proof), encoding="utf-8")
+            env = {"RUNNER_TEMP": temp, "PRODUCTION_WORKER_URL": "https://prod.invalid",
+                   "OWNERSHIP_CONTROL_TOKEN": "fixture", "GITHUB_OUTPUT": str(Path(temp) / "output")}
+            with (patch.object(release, "release_context", return_value=(pin, run, "123", plan, artifact)),
+                  patch.object(release, "check_url"), patch.object(release, "control_client"),
+                  patch.object(release, "require_unused_attendance_plan",
+                               side_effect=GateError("production_attendance_plan_superseded_by_release_attempt")) as unused,
+                  patch.object(release, "stop_prior_pair", return_value={}) as stop):
+                self.assertEqual(release.main(["stop"], env), 1)
+            unused.assert_called_once_with(release.github, artifact, run)
+            stop.assert_not_called()
 
     def test_forward_database_boundary_refuses_wrong_fence_or_producer_before_apply(self):
         pin, plan = self.preflight_fixture()
