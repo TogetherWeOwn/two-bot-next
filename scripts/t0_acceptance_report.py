@@ -23,6 +23,8 @@ SIGNALS = ("ready", "gateway_resumed", "shard_closed", "gateway_reconnect_failed
            "identify_planned", "resume_planned")
 GATEWAY_MISMATCHES = ("service_mismatch", "stale_evidence", "mixed_build", "build_mismatch")
 TRANSITIONS = ("empty-room-rename", "occupied-room-return")
+PRODUCTION_WATCH_SCHEMA = "production_watch.v1"
+WATCH_OBSERVATIONS = {"help": ("branding-readbacks-and-deletions",), "naming": TRANSITIONS}
 NEEDED = {
     "help": "Record Help branding, readbacks and deletions during the intended serving window.",
     "naming": "Record occupied, empty before cleanup and occupied-again names on the same room during the window.",
@@ -112,6 +114,42 @@ def naming_observation(report):
     return {"result": "not_observed" if missing else "transitions_recorded", "missing_transitions": missing}
 
 
+def production_watch_observation(kind, report, window):
+    """Read the fixed fields projected from authorized execution-card rows."""
+    rows = report.get("rows")
+    checks = WATCH_OBSERVATIONS[kind]
+    if (report.keys() != {"schema", "signal", "rows"} or report["signal"] != kind
+            or not isinstance(rows, list) or not 1 <= len(rows) <= len(checks)):
+        raise ValueError
+
+    outcomes = {}
+    times = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.keys() != {"utc", "observation", "disposition"}:
+            raise ValueError
+        check, disposition = row["observation"], row["disposition"]
+        if (check not in checks or check in outcomes
+                or disposition not in ("pass", "fail", "not_observed")):
+            raise ValueError
+        times[check] = utc_instant(row["utc"])
+        outcomes[check] = disposition
+
+    start, end = utc_instant(window["start"]), utc_instant(window["end"])
+    if any(not start <= at <= end for at in times.values()):
+        return None
+    missing = [check for check in checks if outcomes.get(check, "not_observed") == "not_observed"]
+    if "fail" in outcomes.values():
+        failure = {"result": "probe_failed"}
+        if kind == "naming" and missing:
+            failure["missing_transitions"] = missing
+        return failure
+    if kind == "help":
+        return {"result": "not_observed" if missing else "readbacks_and_deletions_recorded"}
+    if not missing and times[TRANSITIONS[0]] >= times[TRANSITIONS[1]]:
+        raise ValueError
+    return {"result": "not_observed" if missing else "transitions_recorded", "missing_transitions": missing}
+
+
 def gateway_observation(report):
     counts = report.get("signals")
     if (not is_build_revision_shape(report.get("build_sha")) or not isinstance(counts, dict)
@@ -156,10 +194,15 @@ def observation(kind, parse, path, binding, expected):
     if differing:
         return gap("mismatched", "observation belongs to a different serving window",
                    fields=differing, window=recorded)
-    if expected["environment"] == "production" and kind in ("help", "naming"):
-        return gap("unverified", "this probe format lacks production observations")
     try:
-        outcome = parse(report)
+        if expected["environment"] == "production" and kind in WATCH_OBSERVATIONS:
+            if report.get("schema") != PRODUCTION_WATCH_SCHEMA:
+                return gap("unverified", "this probe format lacks production observations")
+            outcome = production_watch_observation(kind, report, recorded)
+            if outcome is None:
+                return gap("mismatched", "production watch row falls outside the serving window")
+        else:
+            outcome = parse(report)
     except ValueError:
         return gap("unverified", "saved probe output is invalid or refused")
     row = {"status": "attributed", "window": recorded, **outcome}
@@ -173,8 +216,8 @@ def observation(kind, parse, path, binding, expected):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--handoff", required=True, type=Path, help="local serving window and existing attributions")
-    parser.add_argument("--help-report", type=Path, help="saved Help embed smoke JSON")
-    parser.add_argument("--naming-report", type=Path, help="saved room naming observation JSON")
+    parser.add_argument("--help-report", type=Path, help="saved Help smoke or production watch JSON")
+    parser.add_argument("--naming-report", type=Path, help="saved room naming or production watch JSON")
     parser.add_argument("--gateway-report", type=Path, help="saved passive gateway summary JSON")
     args = parser.parse_args(argv)
     try:

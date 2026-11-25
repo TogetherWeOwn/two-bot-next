@@ -18,6 +18,7 @@ WINDOW = {
     "application_id": "22222222-2222-4222-8222-222222222222",
     "start": "2026-11-25T02:00:00Z", "end": "2026-11-25T02:05:00Z",
 }
+PRODUCTION = dict(WINDOW, environment="production")
 HELP = {"schema": "help_embed_smoke.v3", "verdict": "PASS", "rows": [
     {"name": name, "result": "pass", "actual": "read-back branding, text and fields match; message deleted",
      "message_id": str(1000000000000000000 + i), "duration_ms": 10}
@@ -30,6 +31,13 @@ NAMING = {"transport": "offline-naming-observations", "result": "pass", "checks"
 GATEWAY = {"verdict": "observed", "build_sha": SHA, "signals": {
     "ready": 1, "gateway_resumed": 0, "shard_closed": 2,
     "gateway_reconnect_failed": 1, "identify_planned": 1, "resume_planned": 0}}
+
+
+def watch_rows(signal, *observations):
+    return {"schema": "production_watch.v1", "signal": signal, "rows": [
+        {"utc": f"2026-11-25T02:0{index}:00Z", "observation": check, "disposition": disposition}
+        for index, (check, disposition) in enumerate(observations, start=1)
+    ]}
 
 
 class T0AcceptanceReportTests(unittest.TestCase):
@@ -149,6 +157,63 @@ class T0AcceptanceReportTests(unittest.TestCase):
         bindings = {"help": self.save("help", HELP, expected), "naming": self.save("naming", NAMING, expected)}
         rows = self.run_report(bindings, expected)
         self.assertTrue(all(rows[kind]["status"] == "unverified" for kind in bindings))
+
+    def test_production_watch_results_do_not_change_attribution(self):
+        gateway = dict(GATEWAY, signals=dict.fromkeys(GATEWAY["signals"], 0) | {"identify_planned": 1})
+        for disposition, result in (("pass", "readbacks_and_deletions_recorded"),
+                                    ("fail", "probe_failed"), ("not_observed", "not_observed")):
+            with self.subTest(disposition=disposition):
+                help_report = watch_rows("help", ("branding-readbacks-and-deletions", disposition))
+                naming = watch_rows("naming", ("empty-room-rename", "pass"), ("occupied-room-return", disposition))
+                rows = self.run_report({"help": self.save("help", help_report, PRODUCTION),
+                                        "naming": self.save("naming", naming, PRODUCTION),
+                                        "gateway": self.save("gateway", gateway, PRODUCTION)}, PRODUCTION)
+                self.assertEqual((rows["help"]["status"], rows["help"]["result"]), ("attributed", result))
+                naming_result = "transitions_recorded" if disposition == "pass" else result
+                self.assertEqual((rows["naming"]["status"], rows["naming"]["result"]), ("attributed", naming_result))
+                self.assertEqual((rows["gateway"]["status"], rows["gateway"]["readiness"],
+                                  rows["gateway"]["endpoint_denial"]), ("attributed", "not_observed", "unverified"))
+
+    def test_production_watch_requires_in_window_sanitized_rows_and_exact_binding(self):
+        naming = watch_rows("naming", ("empty-room-rename", "pass"))
+        self.assertEqual(self.run_report({}, PRODUCTION)["naming"]["status"], "missing")
+        binding = self.save("naming", naming, PRODUCTION)
+        self.assertEqual(self.run_report({}, PRODUCTION)["naming"]["status"], "unverified")
+        observed = self.run_report({"naming": binding}, PRODUCTION)["naming"]
+        self.assertEqual((observed["status"], observed["result"], observed["missing_transitions"]),
+                         ("attributed", "not_observed", ["occupied-room-return"]))
+        staging = self.run_report({"naming": self.save("naming", naming)}, WINDOW)["naming"]
+        self.assertEqual(staging["status"], "unverified")
+
+        for change in ({"build_id": "901-1"}, {"end": "2026-11-25T02:04:00Z"}):
+            row = self.run_report({"naming": binding}, PRODUCTION | change)["naming"]
+            self.assertEqual((row["status"], row["fields"]), ("mismatched", list(change)))
+            self.assertNotIn("result", row)
+
+        entry = naming["rows"][0]
+        stale = dict(naming, rows=[dict(entry, utc="2026-11-25T02:05:00.000000001Z")])
+        changed = self.save("naming", stale, PRODUCTION)
+        self.assertEqual(self.run_report({"naming": binding}, PRODUCTION)["naming"]["reason"],
+                         "saved observation differs from the attributed bytes")
+        self.assertEqual(self.run_report({"naming": changed}, PRODUCTION)["naming"]["reason"],
+                         "production watch row falls outside the serving window")
+
+        same_time = dict(entry, observation="occupied-room-return")
+        for invalid in (dict(naming, signal="help"), dict(naming, rows=[]), dict(naming, rows=[entry, entry]),
+                        dict(naming, rows=[entry, same_time]),
+                        dict(naming, rows=[dict(entry, note="synthetic private value")])):
+            row = self.run_report({"naming": self.save("naming", invalid, PRODUCTION)}, PRODUCTION)["naming"]
+            self.assertEqual(row["status"], "unverified")
+            self.assertNotIn("synthetic private value", json.dumps(row))
+
+    def test_production_naming_failure_also_reports_missing_readback(self):
+        failure = ("empty-room-rename", "fail")
+        for other in ((), (("occupied-room-return", "not_observed"),)):
+            with self.subTest(other=other):
+                naming = watch_rows("naming", failure, *other)
+                row = self.run_report({"naming": self.save("naming", naming, PRODUCTION)}, PRODUCTION)["naming"]
+                self.assertEqual((row["status"], row["result"], row["missing_transitions"]),
+                                 ("attributed", "probe_failed", ["occupied-room-return"]))
 
     def test_partial_observations_and_reported_gateway_mismatch(self):
         checks = [NAMING["checks"][0], dict(NAMING["checks"][1], verdict="skip")]

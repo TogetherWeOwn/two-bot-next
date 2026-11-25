@@ -195,9 +195,67 @@ python3 scripts/t0_acceptance_report.py --handoff handoff.json \
 - **Naming.** Use the #2464 fixture report for same-room occupied, empty before cleanup, and occupied-again readbacks. Record creator-rename HTTP 403 separately.
 - **Gateway.** Use #2467's passive summary with its verified application and single-image window. Only committed READY or RESUMED indicates observed readiness. Endpoint denial needs explicit passive evidence. See #2075 for separate hosted checkpoint coverage.
 
-Record authorized production Help and naming on the [execution card](production-deploy.md#watch-rows-one-per-finding-and-per-checkpoint). The report cannot attribute either saved format to production.
-Omit missing files. Invalid or unattributed evidence is `unverified`.
-Different bytes or windows are `mismatched`. A bare gateway summary can flag a revision, service, window, or build conflict. An `attributed` row can still show failure or an unobserved signal.
+### Production execution card handoff
+
+After the authorized watch establishes the exact serving window, copy the
+Help and naming observations from the [execution card](production-deploy.md#watch-rows-one-per-finding-and-per-checkpoint)
+into one JSON file per signal. Use the UTC timestamp, signal, observation and
+disposition columns. Keep the card and the underlying readbacks as provenance.
+The projection accepts only the fields below. Omit raw messages, names,
+member or room IDs, URLs and free-text diagnostics.
+
+Synthetic `production-help.json` and `production-naming.json`:
+
+```json
+{"schema":"production_watch.v1","signal":"help","rows":[
+  {"utc":"2026-11-25T02:01:00Z","observation":"branding-readbacks-and-deletions","disposition":"pass"}
+]}
+```
+```json
+{"schema":"production_watch.v1","signal":"naming","rows":[
+  {"utc":"2026-11-25T02:02:00Z","observation":"empty-room-rename","disposition":"pass"},
+  {"utc":"2026-11-25T02:03:00Z","observation":"occupied-room-return","disposition":"pass"}
+]}
+```
+
+Record Help as `pass` when the approved branding readbacks and deletions
+are complete. For naming, use the approved occupied, empty-before-cleanup and
+occupied-again readbacks on one room. Record each transition once and give
+passing transitions increasing UTC timestamps. Use `fail` for an observed
+failure and `not_observed` for an unavailable check. Use an in-window UTC
+timestamp for every row. Omit a missing transition or an entire missing file.
+A supplied projection needs at least one row.
+
+1. In `handoff.json`, use `environment: production` in the independently
+   verified `expected` window. Bind each saved file to its verified window and
+   exact `sha256sum` under `observations`. For a combined report, use a passive
+   gateway summary from the same application and single-image window, with
+   UTC-second bounds and a span of at most 30 minutes. When the observations
+   cover different windows, run the report separately for each verified window
+   and supply only files attributed to it.
+2. Run the offline report with the saved files. Omit a flag when its file is
+   unavailable. The staging Help and voice fixture formats are only accepted
+   for staging handoffs.
+
+```sh
+python3 scripts/t0_acceptance_report.py --handoff handoff.json \
+  --help-report production-help.json --naming-report production-naming.json \
+  --gateway-report passive-gateway-summary.json
+```
+
+| Readback | Complete | Failed or mismatched | Unavailable |
+|---|---|---|---|
+| Help | `attributed`, `result: readbacks_and_deletions_recorded` | `attributed`, `result: probe_failed` | `missing` file or `attributed`, `result: not_observed` |
+| Naming | `attributed`, `result: transitions_recorded` | `attributed`, `result: probe_failed` with `missing_transitions` if another readback is unavailable | `missing` file or `attributed`, `result: not_observed` with `missing_transitions` |
+| Serving identity | `attributed` requires matching window and file hash | `mismatched` for another build, window, file hash, or row timestamp outside the window | `unverified` for missing attribution or invalid input. An incomplete `expected` is a handoff error (exit 2) |
+| Gateway | `attributed`, `readiness: observed` for a committed READY or RESUMED | `mismatched` for a reported service, window or build conflict. A recorded close or failed reconnect appears in `signals` | `missing` file, `unverified` invalid or unusable summary, or `attributed`, `readiness: not_observed` without committed readiness |
+
+Exit 0 confirms that the report was printed. Read each row's `status` and
+`result` and consult the card for observations outside the verified window.
+A gateway summary can flag an existing mismatch before its hash is bound.
+Endpoint denial stays `unverified` in the report. Record explicit passive
+rejection evidence separately on the card per
+[gateway recovery](gateway-recovery.md#recording-endpoint-policy-evidence).
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p test_t0_acceptance_report.py -v

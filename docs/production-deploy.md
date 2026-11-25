@@ -1042,8 +1042,13 @@ whole watch so the rollback dispatch never has to hunt for it.
 | | +24 h checkpoint | `readyz` / `revision` | | |
 | | +48 h checkpoint | `readyz` / `revision` + sign-off | | |
 | | | `gateway` | IDENTIFY / RESUME / READY / RESUMED / invalid session / close code + session-start budget | |
+| | | `help` | Approved branding readbacks and deletions | |
+| | | `naming` | Approved same-room empty and occupied-again transitions | |
 | | | `error-class` | one fixed class below, no raw text | |
 | | | `rollback-decision` | GO / EXTEND / ROLLBACK + version-ID record | |
+
+Use the [optional offline T0 report](t0-acceptance-smoke-contract.md#production-execution-card-handoff)
+to summarize these Help and naming rows with the saved passive gateway summary.
 
 - `readyz`: HTTP status and the four always-present components (`process`, `gateway`,
   `database`, `token_invalid`) (`crates/bot/src/server.rs:228-240`, `:177`, `:191-209`;
