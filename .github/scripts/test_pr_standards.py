@@ -271,8 +271,11 @@ risk_tier: T0
 class AttestationFloor(unittest.TestCase):
     T0_FILES = ".github/workflows/deploy-production.yml"
 
-    def test_organization_app_author_follows_maintainer_standards(self):
-        body = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #123")
+    def test_organization_app_author_matches_maintainer_on_ordinary_branch(self):
+        body = ("## Linked Issues or Issue Description\n\n"
+                "- Refresh the signing key on a failed signature check.\n\n"
+                "## Verification\n\n"
+                "- Signing key rotation fixture passed.\n")
         valid = env(BODY=body + FULL_ATTESTATION, CHANGED_FILES=self.T0_FILES,
                     AUTHOR="maintainer", REPO_PRIVATE="false", REQUIRE_CARD_REF="false",
                     PR_STANDARDS_MODE="warn")
@@ -283,7 +286,7 @@ class AttestationFloor(unittest.TestCase):
             ({"BODY": body}, [("error", "Attestation")]),
             ({"BODY": valid["BODY"].replace("## Verification", "## Notes")},
              [("warning", "PR template")]),
-            ({"BODY": valid["BODY"].replace("Fixes #123", "Refs: TOG-1234")},
+            ({"BODY": body + "\n- See /DEMO/issues/example.\n" + FULL_ATTESTATION},
              [("error", "Internal reference")]),
         )
         for overrides, expected in cases:
