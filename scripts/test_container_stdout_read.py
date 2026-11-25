@@ -264,11 +264,19 @@ class PassiveGatewayEvidenceTests(unittest.TestCase):
                                             "gateway_reconnect_failed": 0, "identify_planned": 0,
                                             "resume_planned": 0})
 
-    def test_empty_or_filtered_window_cannot_claim_build_coverage(self):
+    def test_empty_window_cannot_claim_build_coverage(self):
         unstamped = self.event("http_listening", "two_bot", build_sha="[redacted]")
         for packet in (self.packet(), self.packet(unstamped)):
             self.assertEqual(self.summarize(packet), (1, {"verdict": "no_build_events"}))
+
+    def test_only_applied_message_filter_refuses_a_valid_window(self):
         ready = self.event("ready", "two_bot::gateway")
+        for empty_filter in (None, ""):
+            with self.subTest(contains=empty_filter):
+                unfiltered = self.packet(ready, contains=empty_filter)
+                self.assertIs(unfiltered["contains"], False)
+                code, result = self.summarize(unfiltered)
+                self.assertEqual((code, result["verdict"]), (0, "observed"))
         filtered = self.packet(ready, contains="[redacted]")
         self.assertIs(filtered["contains"], True)
         self.assertEqual(self.summarize(filtered), (1, {"verdict": "filtered_window"}))

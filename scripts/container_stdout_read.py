@@ -371,7 +371,7 @@ def read(transport, service, minutes, end, limit, contains, account_id=None, que
         "schema_version": SCHEMA_VERSION,
         "service": service,
         "window": {"start": format_instant(start), "end": format_instant(end)},
-        "contains": contains is not None,
+        "contains": bool(contains),
         "limit": limit,
         "event_count": len(kept),
         "possibly_truncated": len(events) >= limit,
