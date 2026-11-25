@@ -8,8 +8,8 @@ import unittest
 from unittest.mock import patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
-    from pre_registry_cleanup import (RegistryDisposition, RegistryReadback, RegistryReservation,
-                                      registry_cleanup_disposition)
+    from pre_registry_cleanup import (PublicationSettlement, RegistryDisposition, RegistryReadback,
+                                      RegistryReservation, registry_cleanup_disposition)
     from pre_target import Inventory, Resource, Target, TargetError
 
 
@@ -19,15 +19,16 @@ MANIFEST = b'{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.
 DIGEST = "sha256:" + sha256(MANIFEST).hexdigest()
 REFERENCE = f"{REPOSITORY}@{DIGEST}"
 RESERVATION = RegistryReservation(TARGET, REFERENCE)
+SETTLEMENT = PublicationSettlement(RESERVATION)
 ABSENT = RegistryReadback(TARGET, REFERENCE, False)
 CLEANUP = Inventory(TARGET, None, None, 0, False, True, startup_settled=True, assigned_count=0)
 
 
 class PreRegistryCleanupTests(unittest.TestCase):
     def disposition(self, readback=ABSENT, *, inventory=CLEANUP, run_status="active",
-                    now=TARGET.expires_at, publication_settled=True):
+                    now=TARGET.expires_at, publication_settlement=SETTLEMENT):
         return registry_cleanup_disposition(RESERVATION, inventory, readback, run_status=run_status,
-                                            now=now, publication_settled=publication_settled)
+                                            now=now, publication_settlement=publication_settlement)
 
     def test_interrupted_or_expired_run_reports_shared_digest_unresolved(self):
         retained_tag = f"{REPOSITORY}:retained"
@@ -43,13 +44,23 @@ class PreRegistryCleanupTests(unittest.TestCase):
                 self.assertEqual(manifests[shared_reference.reference], MANIFEST)
                 self.assertEqual(manifests[retained_tag], MANIFEST)
 
-    def test_confirmed_absence_is_idempotent_and_spares_retained_digest(self):
+    def test_same_reservation_settlement_allows_repeatable_absence(self):
+        settlement = PublicationSettlement(replace(RESERVATION))
         retained_reference = f"{REPOSITORY.replace('/staging/', '/retained/')}@{DIGEST}"
         manifests = {retained_reference: MANIFEST}
         for _ in range(2):
             readback = replace(ABSENT, present=RESERVATION.reference in manifests)
-            self.assertIs(self.disposition(readback), RegistryDisposition.ALREADY_ABSENT)
+            self.assertIs(self.disposition(readback, publication_settlement=settlement),
+                          RegistryDisposition.ALREADY_ABSENT)
         self.assertEqual(manifests, {retained_reference: MANIFEST})
+
+    def test_settlement_from_a_different_reservation_with_the_same_digest_is_refused(self):
+        for other in (
+            replace(RESERVATION, target=replace(TARGET, run_id=124)),
+            replace(RESERVATION, reference=REFERENCE.replace("/staging/", "/retained/")),
+        ):
+            with self.subTest(other=other), self.assertRaisesRegex(TargetError, "^wrong_pre_registry_publication_scope$"):
+                self.disposition(publication_settlement=PublicationSettlement(other))
 
     def test_wrong_scope_refuses_even_an_absence_observation(self):
         for readback in (
@@ -74,8 +85,9 @@ class PreRegistryCleanupTests(unittest.TestCase):
         ):
             with self.subTest(error=error), self.assertRaisesRegex(TargetError, f"^{error}$"):
                 self.disposition(inventory=snapshot)
-        with self.assertRaisesRegex(TargetError, "^pre_registry_publication_unsettled$"):
-            self.disposition(publication_settled=False)
+        for settlement in (None, True):
+            with self.subTest(settlement=settlement), self.assertRaisesRegex(TargetError, "^pre_registry_publication_unsettled$"):
+                self.disposition(publication_settlement=settlement)
         for present in (None, 0):
             with self.subTest(present=present), self.assertRaisesRegex(TargetError, "^unconfirmed_pre_registry_readback$"):
                 self.disposition(replace(ABSENT, present=present))

@@ -37,6 +37,18 @@ class RegistryReservation:
 
 
 @dataclass(frozen=True)
+class PublicationSettlement:
+    """Affirmative, independently verified settlement of the reserved publication.
+
+    The caller binds this receipt to the original first-attempt reservation
+    after proving that its publisher can no longer create the reference,
+    including after a lost copy result.
+    """
+
+    reservation: RegistryReservation
+
+
+@dataclass(frozen=True)
 class RegistryReadback:
     """Fresh, authoritative presence for the exact reference, without redirects.
 
@@ -52,14 +64,15 @@ class RegistryReadback:
 
 def registry_cleanup_disposition(
     reservation: RegistryReservation, inventory: Inventory, readback: RegistryReadback, *,
-    now: int, run_status: str, publication_settled: bool,
+    now: int, run_status: str, publication_settlement: PublicationSettlement | None,
 ) -> RegistryDisposition | None:
     """Report a disposition after protected cleanup and publication settlement.
 
-    The caller authenticates the reservation, run status and exact-scope
-    readbacks. It observes the registry after verifying target cleanup and
-    proving that the publisher can no longer create the reference, including
-    after a lost copy result.
+    The caller authenticates the reservation, run status, settlement receipt
+    and exact-scope readbacks. It observes the registry after verifying target
+    cleanup and publication settlement. None for the receipt means settlement
+    is unconfirmed.
+
     None spares an active reservation before its cutoff. The returned verdict
     conveys no mutation authority.
     """
@@ -70,7 +83,9 @@ def registry_cleanup_disposition(
     if plan_cleanup(target, inventory, now=now, run_status=run_status) is None:
         return None
     verify_cleanup(target, inventory)
-    require(publication_settled is True, "pre_registry_publication_unsettled")
+    require(type(publication_settlement) is PublicationSettlement, "pre_registry_publication_unsettled")
+    require(type(publication_settlement.reservation) is RegistryReservation
+            and publication_settlement.reservation == reservation, "wrong_pre_registry_publication_scope")
     require(type(readback.present) is bool, "unconfirmed_pre_registry_readback")
     if readback.present:
         return RegistryDisposition.UNRESOLVED_DIGEST_REFERENCE
