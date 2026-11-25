@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
-import time
 import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
@@ -26,12 +25,28 @@ EVENT = RESULT["event_key"]
 START = acceptance.fixture_start("2026-11-24T16:00:00Z")
 
 
+def observed_at(moment):
+    return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def active_observation():
+    observed = deepcopy(FIXTURE["observed"])
+    lifecycle = observed["lifecycle"]
+    lifecycle["observedAt"] = observed_at(START + timedelta(minutes=10))
+    lifecycle["use"].update(acquiredAt=int(START.timestamp()) * 1000,
+                            expiresAt=int((START.timestamp() + 3600) * 1000))
+    return observed
+
+
 class AcceptanceTests(unittest.TestCase):
     def test_effective_configuration_and_cleanup(self):
-        observed = deepcopy(FIXTURE["observed"])
+        observed = active_observation()
         lifecycle, lease = observed["lifecycle"], observed["lifecycle"]["use"]
-        lease["expiresAt"] = int((time.time() + 60) * 1000)
-        check = acceptance.validate_configuration
+
+        def check(*args):
+            with patch.object(acceptance.time, "time", return_value=START.timestamp() + 2700):
+                return acceptance.validate_configuration(*args)
+
         self.assertEqual(check("finalized", ORIGIN, ROLLOUT, observed), IDENTITY)
         mismatches = {"guild_id": "2", "origin": "https://other.example.test", "build_id": "1234-2",
                       "attendance_read": 1, "attendance_capture": True, "signed_ingress": False, "foreign_fixture": "missing"}
@@ -100,7 +115,7 @@ class AcceptanceTests(unittest.TestCase):
             acceptance.probe("pending", ORIGIN, IDENTITY, START, signer, check)
 
     def test_capture_off_does_not_extend_the_signed_probe_window(self):
-        observed = deepcopy(FIXTURE["observed"])
+        observed = active_observation()
         boundary = int(START.timestamp()) + 3600
         observed["lifecycle"]["use"]["expiresAt"] = (boundary + acceptance.RUN_BUDGET) * 1000
         env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
@@ -145,7 +160,7 @@ class AcceptanceTests(unittest.TestCase):
         check.assert_not_called()
 
     def test_finalized_probe_stops_on_signed_read_refusal_after_preflight(self):
-        observed = deepcopy(FIXTURE["observed"])
+        observed = active_observation()
         now = int(START.timestamp()) + 3600
         observed["lifecycle"]["use"]["expiresAt"] = (now + 60) * 1000
         env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
@@ -184,6 +199,68 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "FAIL: signed attendance response did not match the expected envelope\n")
         self.assertEqual(calls, [("GET", ORIGIN + "/readyz"), ("POST", ORIGIN + "/internal/actions")])
 
+    def test_execute_requires_a_coherent_lease_that_covers_the_armed_probe(self):
+        expires = START.timestamp() + 3600
+        latest_start = expires - acceptance.RUN_BUDGET
+        admitted_at = latest_start - 1
+        env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
+               "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
+        signer = acceptance.credentials(env)
+        args = ["finalized", "--rollout", "rollout", "--observed", "observed",
+                "--fixture-start", START.strftime("%Y-%m-%dT%H:%M:%SZ"), "--execute"]
+        refused = (1, "", "FAIL: staging lease did not cover the probe\n")
+        future_readback = START + timedelta(seconds=admitted_at - START.timestamp() + 0.25)
+
+        cases = [
+            ("coherent", latest_start - 0.5, {}, {}, True),
+            ("deadline equals expiry", latest_start, {}, {}, False),
+            ("active but too short", latest_start + 0.5, {}, {}, False),
+            ("expired during setup", expires + 1, {}, {}, False),
+            ("observation after local time", latest_start - 0.5,
+             {"observedAt": observed_at(future_readback)}, {}, False),
+            ("acquisition after observation", admitted_at, {},
+             {"acquiredAt": int((START.timestamp() + 601) * 1000)}, False),
+        ]
+        for name, probe_at, receipt_fields, lease_fields, passes in cases:
+            with self.subTest(name=name):
+                observed = active_observation()
+                observed["lifecycle"].update(receipt_fields)
+                observed["lifecycle"]["use"].update(lease_fields)
+                now = admitted_at
+                peer, reads, readies = self.signed_peer("finalized")
+
+                def delayed_credentials(_env):
+                    nonlocal now
+                    now = probe_at
+                    return signer
+
+                def authenticated_peer(request):
+                    if request.get_method() == "POST":
+                        timestamp = request.get_header("X-two-timestamp")
+                        self.assertEqual(timestamp, str(int(probe_at)))
+                        headers = acceptance.signing_headers(
+                            *signer, timestamp, request.get_header("X-two-nonce"), request.data,
+                        )
+                        self.assertEqual({name: request.get_header(name.capitalize()) for name in headers}, headers)
+                    return peer(request)
+
+                check = Mock(side_effect=authenticated_peer)
+                with (patch.object(acceptance, "read_object", side_effect=[ROLLOUT, observed]),
+                      patch.object(acceptance.time, "time", side_effect=lambda: now),
+                      patch.object(acceptance.time, "monotonic", side_effect=lambda: now - admitted_at),
+                      patch.object(acceptance, "credentials", side_effect=delayed_credentials),
+                      patch("sys.stdout", new_callable=StringIO) as stdout,
+                      patch("sys.stderr", new_callable=StringIO) as stderr):
+                    status = acceptance.main(args, env=env, check=check)
+
+                verdict = status, stdout.getvalue(), stderr.getvalue()
+                if passes:
+                    self.assertEqual(verdict, (0, "PASS: attendance finalized\n", ""))
+                    self.assertEqual(reads, [EVENT, EVENT + ":foreign"])
+                    self.assertEqual(len(readies), 3)
+                else:
+                    self.assertEqual((verdict, check.call_count), (refused, 0))
+
     def test_acceptance_sequence_uses_one_pinned_rollout(self):
         env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
                "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
@@ -213,7 +290,7 @@ class AcceptanceTests(unittest.TestCase):
             for phase, minutes_after_start, expected_reads in phases:
                 with self.subTest(phase=phase):
                     clock.return_value = START.timestamp() + 60 * minutes_after_start
-                    observed = deepcopy(FIXTURE["observed"])
+                    observed = active_observation()
                     observed.update(attendance_read=phase in ("pending", "finalized"),
                                     primary_fixture="pending" if phase == "pending" else "finalized")
                     lifecycle = observed["lifecycle"]
