@@ -171,7 +171,8 @@ failing the gate after the restore; do not widen the guard to admit one.
 The `/readyz` gate after rollback must report that revision and a ready
 gateway. All production rollback paths require both Worker versions to be
 stamped. Crossing Cutover 0480 or releasing its reserved fence requires
-protected recovery. Keep
+protected recovery. If the apply outcome is uncertain, follow the
+[interrupted release handoff](#interrupted-protected-release). Keep
 every serving version stamped: a secret change publishes a new Worker
 version too, so stage secrets with `wrangler versions secret put --env <env> <KEY>
 --message <sha>` — where `<sha>` is the SHA of the last successful deploy
@@ -402,6 +403,80 @@ goes to the log and the run summary; it never carries SQL text or API
 bodies. A rollback and the live-SHA redeploy skip it: recovery never waits on
 it. The Release Manager exercises the restore path with the [on-demand staging proof](#on-demand-staging-proof)
 once per bot production release, after deploying the candidate to staging.
+
+## Interrupted protected release
+
+If a protected attendance release fails or is cancelled after it may have
+stopped the writer and the database apply result cannot be verified, stop
+and notify the operator responsible for the release task immediately. A failed
+or cancelled job, a missing forward receipt, or a stop intent alone leaves
+the outcome unknown. Leave any ownership fence in place. Do not use Actions
+**Re-run jobs** or dispatch another release, apply, redeploy or ordinary
+rollback. Avoid manual SQL, ownership release, startup-capable probes and
+changes to the production Worker version, secrets, container image or traffic.
+
+Have the release operator confirm that `PRODUCTION_AUTO_PROMOTE_DISABLED=true`
+and keep it set while the handoff is open. Record the effective setting and
+update time. Report any other value or missing readback immediately. An
+expiry-based hold can lapse during the handoff.
+[Automatic promotion](#automatic-promotion).
+
+Use the original run's GitHub Actions page to preserve and hand off the
+following evidence while it is available.
+
+- Record the original protected `deploy-production` run URL and ID, attempt
+  number, workflow ref and full workflow SHA, candidate SHA, and terminal
+  conclusion or last observed status. Link the prepare/STOP and apply jobs.
+  Record the last completed step and the conclusion of each relevant step,
+  including the forward receipt upload. Mark missing evidence explicitly.
+  Report any still-running origin or other queued or active production run to
+  the release operator for coordination. Leave any in-flight apply alone.
+- Preserve the reviewed plan run and its approval, candidate staging archive
+  and image digests, and the pinned predecessor's Worker version, SHA and
+  image digest. Keep any existing preflight, stop intent, stopped-writer,
+  runner, and forward result artifacts. Include the last recorded ownership
+  actor and epoch, and any classification, inverse, or restart receipts from
+  a prior recovery attempt.
+- Record each artifact's producer run, attempt and job, artifact name and ID,
+  archive SHA-256 and expiry when available. Preserve the original artifacts
+  in GitHub Actions and call out the earliest expiry for required evidence.
+  Keep sanitized job evidence in the approved release record. Any saved copy
+  is for audit only. Recovery authenticates the original run's artifacts.
+  Keep credentials, database contents and raw provider responses out of the
+  handoff.
+
+Report the database outcome and writer state as unconfirmed wherever proof
+is missing. The release operator owns reconciliation through the existing
+[production release gate](../CONTRIBUTING.md#production-release-gate). If a
+protected recovery workflow is unavailable or the evidence is incomplete,
+keep the handoff open and the release held.
+
+### Recovery after the protected workflow ships
+
+Use these paths only after the corresponding protected interrupted-release
+workflow ships and its dispatch is documented. The design uses a fresh
+protected dispatch in the same production lane. It authenticates the terminal,
+first-attempt origin, its stop intent and reviewed plan, and the exact serving
+predecessor and ownership epoch before using the database classification.
+
+- **Confirmed PRE.** The protected job checks both migration ledgers, schema
+  and grants under the migration locks. Exact original PRE permits one
+  takeover of the pinned predecessor from the proved stopped epoch, followed
+  by stable readiness.
+- **Confirmed POST.** The protected job checks the exact expanded state under
+  the same locks and requires evidence that the original apply step ran.
+  Keep the writer fenced until the protected inverse succeeds and its result
+  is authenticated. Then the recovery workflow can take over with the pinned
+  predecessor and verify stable readiness.
+- **Ambiguous.** Mixed ledgers, mismatched serving identity, unproved stop,
+  an uncertain inverse, or missing or mismatched evidence stop recovery.
+  The restored endpoint that retains 0475 requires protected reconciliation
+  with verified inverse evidence. Keep the fence and escalate to the release
+  operator without starting a writer or sending another takeover.
+
+In either takeover path, a lost reply can be confirmed only by readback of the
+exact active predecessor at the next epoch under the expected actor. A pending
+or foreign owner leaves the handoff open without another takeover.
 
 ## Attendance predecessor identity at both PRE endpoints
 
