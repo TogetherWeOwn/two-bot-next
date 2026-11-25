@@ -194,30 +194,34 @@ See the [protected staging readback](automod-preview-spec.md#protected-staging-r
   `verdict=passed` confirms that action. Record a returned failure verdict
   with its code. Mark missing, unreadable or mismatched evidence unconfirmed.
   HTTP success alone cannot confirm either action. Retain metadata only,
-  with credentials and member data excluded.
+  with credentials and member data excluded. The protected runner attempts
+  `recover` after every startup attempt, even if startup fails or its reply is
+  lost.
 - [ ] **Stop safely after an unconfirmed startup.** Keep the original lease
-  and journal hold, even after expiry. The protected runner attempts `recover`
-  on that same tuple after the startup attempt, using separate recovery
-  approval and fresh same-lease cleanup authority or durable same-lease
-  completion. Leave the hold in place after failed or unconfirmed recovery.
-  Keep competing uses out. Any protected recovery retry uses the original
-  tuple. Never rerun startup, replace the lease, clear the journal or remove a
-  registry entry by name. A client timeout or abort proves only the wait ended.
-- [ ] **Verify cleanup before closing.** A matching recovery pass confirms
-  durable cleanup and lease retirement. After publication intent, recovery
-  requires same-lease drain of publication and startup, confirmed stop, and
-  independent registry absence. With a durable publication receipt, it may
-  remove only its exact command ID and version and must confirm absence in
-  list and detail. With a lost publication receipt, the full registry must
-  match the saved absent baseline. A present command without durable
-  attribution keeps the hold. A journal-proven unused reservation instead
-  requires confirmed stop and independent stopped readback before durable
-  retirement and release. Keep failed or uncertain cleanup open even after a
-  successful delete if the independent absence read is missing. Retain the
-  exact run and attempt, both receipt outcomes and the matching recovery proof
-  with the rehearsal record. Close as passed only with both matching passes.
-  With confirmed recovery and failed or unconfirmed startup, close as failed
-  with cleanup confirmed.
+  and journal hold, even after expiry. The protected runner uses separate
+  recovery approval and fresh same-lease cleanup authority or durable
+  same-lease completion. Leave the hold in place after failed or unconfirmed
+  recovery and keep competing uses out. The Worker owns cleanup retries on the
+  original tuple. A GitHub job rerun is refused. Never rerun startup, replace
+  the lease, clear the journal or remove a registry entry by name. A client
+  timeout or abort proves only the wait ended.
+- [ ] **Verify cleanup.** A matching recovery pass confirms the Worker
+  verified durable cleanup and lease retirement. After publication intent,
+  the Worker requires same-lease drain of publication and startup, confirmed
+  stop, and independent registry absence. With a durable publication receipt,
+  the Worker may remove only its exact command ID and version and must confirm
+  absence in list and detail. With a lost publication receipt, the full
+  registry must match the saved absent baseline. A present command without
+  durable attribution keeps the hold. A journal-proven unused reservation
+  instead requires confirmed stop and independent stopped readback before
+  durable retirement and release.
+- [ ] **Close with the recorded evidence.** Retain the exact run and attempt,
+  both receipt outcomes and the matching recovery receipt when confirmed.
+  Keep the rehearsal open if recovery fails or its receipt is unconfirmed.
+  For example, the Worker fails recovery if its independent absence read is
+  lost after a successful delete. Close as passed only with both matching
+  passes. With confirmed recovery and failed or unconfirmed startup, close as
+  failed with cleanup confirmed.
 
 ## Verification commands
 
