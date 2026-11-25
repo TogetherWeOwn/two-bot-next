@@ -6,6 +6,7 @@ use twilight_model::{
         event::Event,
         payload::incoming::{GuildCreate, ThreadCreate, ThreadUpdate},
     },
+    util::Timestamp,
 };
 
 fn ready(cache: &SharedCache) {
@@ -56,6 +57,8 @@ fn permission_projection_resolves_event_bits_and_bypass() {
         assert!(evidence.guild_create_events);
         assert_eq!(evidence.guild_manage_events, bypass);
         assert_eq!(evidence.voice.channels, 1);
+        assert_eq!(evidence.voice.create_events, usize::from(bypass));
+        assert_eq!(evidence.voice.manage_events, usize::from(bypass));
         assert_eq!(evidence.voice.either_event_permission, usize::from(bypass));
     }
 }
@@ -87,9 +90,22 @@ fn threads_archived_through_gateway_updates_leave_event_coverage_available() {
     }
     let guild_id = Id::new(100);
     let indexed = cache.with_guild_snapshot(guild_id.get(), |cache| {
-        cache.guild_channels(guild_id).expect("channel index").len()
+        let archived = (1_000..3_049)
+            .filter(|&id| {
+                cache.channel(Id::new(id)).is_some_and(|channel| {
+                    channel
+                        .thread_metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.archived)
+                })
+            })
+            .count();
+        (
+            cache.guild_channels(guild_id).expect("channel index").len(),
+            archived,
+        )
     });
-    assert_eq!(indexed, Some(2052));
+    assert_eq!(indexed, Some((2052, 2049)));
     let evidence = cache
         .event_permission_evidence(guild_id, Id::new(999))
         .expect("retained threads cannot exhaust the event channel limit");
@@ -130,7 +146,9 @@ fn permission_projection_refuses_partial_or_unrelated_cache() {
             "missing role" => guild["members"][0]["roles"] = json!(["101"]),
             "missing overwrites" => guild["channels"][0]["permission_overwrites"] = Value::Null,
             "active timeout" => {
-                guild["members"][0]["communication_disabled_until"] = json!("2099-01-01T00:00:00Z");
+                let hour_from_now = time::OffsetDateTime::now_utc().unix_timestamp() + 3600;
+                let timeout = Timestamp::from_secs(hour_from_now).expect("future timeout");
+                guild["members"][0]["communication_disabled_until"] = json!(timeout);
             }
             "duplicate overwrite" => {
                 let entry = json!({"id":"100","type":0,"allow":"0","deny":"0"});
