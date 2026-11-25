@@ -166,6 +166,19 @@ class ProtectedPreTests(unittest.TestCase):
         self.admission.close.assert_called_once_with(TARGET)
         self.admission.settle.assert_not_called()
 
+    def test_stop_refuses_settlement_when_fence_or_close_returns_false(self):
+        for fenced, closed in ((False, True), (True, False)):
+            with (
+                self.subTest(fenced=fenced, closed=closed),
+                patch.object(self.external, "fence", return_value=fenced) as fence,
+                patch.object(self.admission, "close", return_value=closed) as close,
+                patch.object(self.admission, "settle", return_value=True) as settle,
+            ):
+                self.assertFalse(self.controller.stop())
+                fence.assert_called_once_with(TARGET)
+                close.assert_called_once_with(TARGET)
+                settle.assert_not_called()
+
     def test_reports_both_uncertain_stop_operations_without_provider_detail(self):
         self.external.fence = Mock(side_effect=OSError("provider detail must stay private"))
         self.admission.close.side_effect = OSError("store detail must stay private")
