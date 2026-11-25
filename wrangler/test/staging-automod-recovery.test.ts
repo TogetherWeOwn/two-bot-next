@@ -17,6 +17,7 @@ test("AutoMod recovery reloads the exact intent and receipt after restart", asyn
   recovery = new StagingAutomodRecovery(store);
   const registry = new Registry();
   registry.target = created;
+  registry.mutateReturnedRevision = true;
   const pending = await recovery.pending();
   const nextLease = { ...lease, runAttempt: 3 };
   const startNext = () => recovery.persistIntent({ ...intent, lease: nextLease }, async () => ({ ...admission, lease: nextLease }), now);

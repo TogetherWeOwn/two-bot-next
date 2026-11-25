@@ -191,9 +191,8 @@ export class StagingAutomodRecovery {
       await this.write(journal);
     }
     const { intent, created } = journal;
-    const proof = await this.inspect(adapter, intent, created);
-    if (proof.registry === "owned") {
-      const command = Object.freeze({ id: proof.command.id, version: proof.command.version });
+    const command = await this.inspect(adapter, intent, created);
+    if (command !== null) {
       if (created === null) {
         // A separately proven lost receipt must become durable before DELETE.
         journal = { ...journal, created: command };
@@ -201,7 +200,7 @@ export class StagingAutomodRecovery {
       }
       try { await adapter.removeOwned(Object.freeze({ intent, ...command })); }
       catch { throw new Error("staging_automod_removal_unverified"); }
-      if ((await this.inspect(adapter, intent, command)).registry !== "absent") {
+      if (await this.inspect(adapter, intent, command) !== null) {
         throw new Error("staging_automod_absence_unverified");
       }
     }
@@ -211,17 +210,18 @@ export class StagingAutomodRecovery {
   }
 
   private async inspect(adapter: AutomodCleanup, intent: AutomodIntent, created: CommandRevision | null):
-    Promise<CleanupProof> {
+    Promise<CommandRevision | null> {
     let proof: CleanupProof;
     try { proof = await adapter.inspect(intent, created); }
     catch { throw new Error("staging_automod_cleanup_unverified"); }
+    const registry = proof?.registry;
+    const command = registry === "owned" ? { id: proof.command?.id, version: proof.command?.version } : null;
     if (!proof || !sameIntent(intent, proof.intent) || proof.authorized !== true
       || proof.stopped !== true || proof.publicationDrained !== true
-      || (proof.registry !== "absent" && (proof.registry !== "owned" || !validRevision(proof.command)
-        || (created !== null && !sameRevision(created, proof.command))))) {
+      || (registry !== "absent" && (!validRevision(command) || (created !== null && !sameRevision(created, command))))) {
       throw new Error("staging_automod_cleanup_unverified");
     }
-    return proof;
+    return command === null ? null : Object.freeze(command);
   }
 
   private async read(): Promise<Journal | undefined> {

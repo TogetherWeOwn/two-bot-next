@@ -53,6 +53,7 @@ export class Registry implements AutomodCleanup {
   drained = true;
   keepAfterDelete = false;
   loseDeleteResponse = false;
+  mutateReturnedRevision = false;
   proofIntent = intent as AutomodIntent;
   beforeDelete?: (command: CommandRevision) => void;
 
@@ -66,9 +67,11 @@ export class Registry implements AutomodCleanup {
       stopped: this.stopped as true,
       publicationDrained: this.drained as true,
     };
-    return this.target
-      ? { ...proof, registry: "owned" as const, command: this.target }
-      : { ...proof, registry: "absent" as const };
+    if (!this.target) return { ...proof, registry: "absent" as const };
+    const command = { ...this.target };
+    // Change the adapter's copy after validation but before recover resumes.
+    if (this.mutateReturnedRevision) queueMicrotask(() => queueMicrotask(() => { command.version = other.version; }));
+    return { ...proof, registry: "owned" as const, command };
   }
 
   async removeOwned({ intent: received, id, version }: AutomodOwnedCommand) {
