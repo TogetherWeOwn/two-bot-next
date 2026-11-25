@@ -3044,9 +3044,16 @@ jobs:
       db-compat: ${{ steps.db-compat.outputs.selected }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
         with:
-          # The base/head SHAs must resolve locally for the diff below.
+          # PR selection needs the base and head commits and their merge base.
           fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'pull_request'
+        with:
+          # Non-PR selection uses defaults and the regressions create their own history.
+          fetch-depth: 1
           persist-credentials: false
       - name: Offline job-inputs regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_job_inputs.py' -v
@@ -3154,9 +3161,16 @@ jobs:
       build: ${{ steps.select.outputs.build }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
         with:
-          # The base/head SHAs must resolve locally for the diff below.
+          # PR selection needs the base and head commits for its diff.
           fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'pull_request'
+        with:
+          # Non-PR selection always builds and the regressions create their own history.
+          fetch-depth: 1
           persist-credentials: false
       - name: Offline container-inputs regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_inputs.py' -v
