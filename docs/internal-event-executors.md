@@ -276,8 +276,9 @@ wire attempt, receives a Discord rejection on a fresh key for the former
 channel, and can edit the event in the replacement channel. Real role hierarchy
 and channel overwrites require a separate effective-permission readback. The
 script records policy order, intent and token admission at each barrier,
-per-route counts, immutable Bot image references and the recorder source hash. It checks that an
-original key remains ambiguous after restoring a snapshot containing the claim.
+per-route counts, immutable Bot image references and the recorder source hash.
+It checks that an original key remains ambiguous after restoring a snapshot
+containing the claim.
 It also forces a synthetic request under that same key after restoring a
 snapshot from before the claim, to verify that the cutoff still denies the
 request. Web must keep ambiguous work held in both cases.

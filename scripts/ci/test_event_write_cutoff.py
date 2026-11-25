@@ -24,7 +24,6 @@ class EventWriteCutoffTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "barrier").write_text("none\n")
-            (root / "policy").write_text("closed\n")
             approval = root / "channel-event-approval"
             handler = recorder.Handler.__new__(recorder.Handler)
             handler.server = SimpleNamespace(state=root, token="Bot synthetic", lock=threading.Lock())
@@ -32,15 +31,17 @@ class EventWriteCutoffTest(unittest.TestCase):
             handler.path = f"/api/v10/guilds/{recorder.GUILD}/scheduled-events/{recorder.EVENT}"
             handler.reply = Mock()
 
-            for approved_scope, requested, status in (
-                (None, earlier, 403),
-                (f"{recorder.GUILD}:{earlier}", earlier, 200),
-                (f"{recorder.GUILD}:{replacement}", earlier, 403),
-                (f"{recorder.GUILD}:{replacement}", replacement, 200),
-                (f"{recorder.GUILD}:{replacement}", None, 403),
-                (f"{recorder.GUILD}0:{earlier}", earlier, 403),
+            for policy, approved_scope, requested, status in (
+                ("closed", None, earlier, 403),
+                ("closed", f"{recorder.GUILD}:{earlier}", earlier, 200),
+                ("closed", f"{recorder.GUILD}:{replacement}", earlier, 403),
+                ("closed", f"{recorder.GUILD}:{replacement}", replacement, 200),
+                ("closed", f"{recorder.GUILD}:{replacement}", None, 403),
+                ("closed", f"{recorder.GUILD}0:{earlier}", earlier, 403),
+                ("open", f"{recorder.GUILD}:{replacement}", earlier, 403),
             ):
-                with self.subTest(approved_scope=approved_scope, requested=requested):
+                with self.subTest(policy=policy, approved_scope=approved_scope, requested=requested):
+                    (root / "policy").write_text(f"{policy}\n")
                     if approved_scope is not None:
                         approval.write_text(f"{approved_scope}\n")
                     body = json.dumps({"entity_type": 2 if requested else 3, "channel_id": requested}).encode()
@@ -55,12 +56,13 @@ class EventWriteCutoffTest(unittest.TestCase):
 
             entries = [json.loads(line) for line in (root / "journal.jsonl").read_text().splitlines()]
             self.assertEqual(entries, [
-                ["PATCH", handler.path, "channel-edit", "denied"],
-                ["PATCH", handler.path, "channel-edit", "applied"],
-                ["PATCH", handler.path, "channel-edit", "denied"],
-                ["PATCH", handler.path, "channel-edit", "applied"],
+                ["PATCH", handler.path, f"channel-edit:{earlier}", "denied"],
+                ["PATCH", handler.path, f"channel-edit:{earlier}", "applied"],
+                ["PATCH", handler.path, f"channel-edit:{earlier}", "denied"],
+                ["PATCH", handler.path, f"channel-edit:{replacement}", "applied"],
                 ["PATCH", handler.path, "edit", "denied"],
-                ["PATCH", handler.path, "channel-edit", "denied"],
+                ["PATCH", handler.path, f"channel-edit:{earlier}", "denied"],
+                ["PATCH", handler.path, f"channel-edit:{earlier}", "denied"],
             ])
 
     def test_provider_requires_both_event_permissions_removed(self):

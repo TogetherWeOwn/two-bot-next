@@ -96,9 +96,12 @@ class Handler(BaseHTTPRequestHandler):
             channel_id = body.get("channel_id")
             if body.get("entity_type") == 2 and operation in ("create", "edit"):
                 operation = f"channel-{operation}"
+                fixture_channel = channel_id in (EVENT_CHANNEL, REPLACEMENT_EVENT_CHANNEL)
+                if fixture_channel:
+                    operation = f"{operation}:{channel_id}"
                 approval = self.server.state / "channel-event-approval"
-                approved = (channel_id in (EVENT_CHANNEL, REPLACEMENT_EVENT_CHANNEL)
-                            and approval.exists() and approval.read_text() == f"{GUILD}:{channel_id}\n")
+                approved = (fixture_channel and approval.exists()
+                            and approval.read_text() == f"{GUILD}:{channel_id}\n")
             else:
                 policy = self.server.state / "policy"
                 approved = policy.exists() and policy.read_text() == "open\n"
