@@ -10,7 +10,7 @@ import sys
 from production_ownership_status import read_status
 from production_recovery_artifact import FENCE_JOB, FENCE_STEP, authenticated_inverse, protected_job
 from production_recovery_takeover import HEX, RUN_ID, UUID, complete_legacy_takeover, observed_phase, verify_inverse
-from production_release import forward_document, is_stopped, matches_pair, release_actor, release_context, stopped_ack, write_json
+from production_release import applied_release, is_stopped, matches_pair, release_actor, stopped_ack, write_json
 from production_release_ledgers import CUTOVER, STORE
 from rollback_proof import ProofError
 from staging_migrate_approval import digest_json
@@ -194,8 +194,7 @@ def restore_under_fence(pin, result, observe, control, rollback, image, candidat
 
 
 def release_admission(env):
-    release, run, plan_id, plan, artifact = release_context(env)
-    pin = forward_document(env, release, run, plan_id, plan, artifact)
+    release, run, plan_id, plan, artifact, pin = applied_release(env)
     version = env["CANDIDATE_WORKER"]
     require(version == "" or UUID.fullmatch(version) and version != pin.worker_version,
             "production_inverse_admission_invalid")

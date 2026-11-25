@@ -242,7 +242,7 @@ DEPLOY_MARKERS = (
 )
 # Canonical parsed graph for the protected recovery callee. This pins the
 # caller guard, Environment split, exact commands, permissions, and handoffs.
-PRODUCTION_RECOVERY_GRAPH = "2fd050ea4e2f4ca60328d2c54c077a7219cc3c29269c96313b52d7fbcc69b3a2"
+PRODUCTION_RECOVERY_GRAPH = "2c9c05163c3a06012dd0ac30f25f25556f4c0bff5c8c77851b9ab94ca417bfaa"
 PRODUCTION_INTERRUPTED_GRAPH = "924989beeaa9bbc3ccb03608d183f33b8894eb65f29d5f1cb331191db59ce48d"
 
 

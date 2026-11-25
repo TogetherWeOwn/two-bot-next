@@ -18,9 +18,8 @@ from staging_rollout import mapping, require, sequence
 
 NAMESPACE = re.compile(r"[0-9a-f]{32}")
 PREPARE_JOB = "Production release / Prepare and stop the prior pair"
-PREPARE_STEPS = ("Verify forward release preflight", "Confirm the exact stopped writer")
 STOP_INTENT_STEP = "Retain the exact recovery stop intent"
-STOP_INTENT_STEPS = (PREPARE_STEPS[0], STOP_INTENT_STEP, PREPARE_STEPS[1])
+STOP_INTENT_STEPS = ("Verify forward release preflight", STOP_INTENT_STEP, "Confirm the exact stopped writer")
 
 
 @dataclass(frozen=True)
@@ -115,13 +114,25 @@ def bound_plan(pin, run, plan_id, target_fingerprint, api=github):
                             and digest_json(mapping(target)) == target_fingerprint, api)
 
 
+def _require_plan_approval(run, plan_id, artifact, api):
+    _, approved_at = verify_check(
+        api, run, f"production-apply:{plan_id}:{artifact['archive_digest'].removeprefix('sha256:')}",
+        datetime.now(timezone.utc),
+    )
+    require(moment(mapping(api(f"actions/runs/{plan_id}")).get("created_at")) <= approved_at,
+            "independent_production_approval_stale")
+
+
 def approved_plan(pin, run, plan_id, target, api=github):
     """Authenticate the exact plan and check independent approval for its archive."""
     plan, artifact = _plan_for_target(pin, run, plan_id, lambda planned: planned == target, api)
-    _, approved_at = verify_check(api, run, f"production-apply:{plan_id}:{artifact['archive_digest'].removeprefix('sha256:')}",
-                                  datetime.now(timezone.utc))
-    require(moment(mapping(api(f"actions/runs/{plan_id}")).get("created_at")) <= approved_at,
-            "independent_production_approval_stale")
+    _require_plan_approval(run, plan_id, artifact, api)
+    return plan, artifact
+
+
+def approved_bound_plan(pin, run, plan_id, target_fingerprint, api=github):
+    plan, artifact = bound_plan(pin, run, plan_id, target_fingerprint, api)
+    _require_plan_approval(run, plan_id, artifact, api)
     return plan, artifact
 
 
@@ -168,11 +179,11 @@ def interrupted_release_context(env, api=github):
     return pin, origin, plan_id, plan, artifact, epoch + 1
 
 
-def apply_under_prepared_fence(pin, run, plan_id, target, stopped, apply_database, api=github, *, preflight_epoch):
-    """Recheck the protected stop and exact plan approval before applying."""
+def apply_under_bound_fence(pin, run, plan_id, target_fingerprint, stopped, apply_database, api=github, *, preflight_epoch):
+    """Apply only with the bound fingerprint, durable stop intent and fresh approval."""
     epoch = prepared_epoch(pin, run, plan_id, stopped, preflight_epoch=preflight_epoch)
-    protected_job(run, api, PREPARE_JOB, PREPARE_STEPS)
-    plan, artifact = approved_plan(pin, run, plan_id, target, api)
+    protected_job(run, api, PREPARE_JOB, STOP_INTENT_STEPS)
+    plan, artifact = approved_bound_plan(pin, run, plan_id, target_fingerprint, api)
     receipt = forward_receipt(plan_id, plan, apply_database(plan_id, plan))
     return {**receipt, "run_id": str(run["id"]), "run_attempt": 1, "stopped_epoch": epoch,
             "plan_archive_sha256": artifact["archive_digest"], "release_reference": plan["recovery_evidence_ref"]}

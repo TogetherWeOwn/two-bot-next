@@ -10,9 +10,7 @@ on:
       pins: {type: string, required: true}
       plan-run-id: {type: string, required: true}
       preflight-epoch: {type: string, required: true}
-      database-host: {type: string, required: true}
-      database-name: {type: string, required: true}
-      database-branch-id: {type: string, required: true}
+      target-fingerprint: {type: string, required: true}
       stopped: {type: string, required: true}
       forward-artifact-id: {type: string, required: true}
       forward-archive-sha256: {type: string, required: true}
@@ -29,9 +27,7 @@ env:
   FORWARD_ARTIFACT_ID: ${{ inputs.forward-artifact-id }}
   FORWARD_ARCHIVE_SHA256: ${{ inputs.forward-archive-sha256 }}
   CANDIDATE_WORKER: ${{ inputs.candidate-worker }}
-  PRODUCTION_HOST: ${{ inputs.database-host }}
-  PRODUCTION_DATABASE: ${{ inputs.database-name }}
-  PRODUCTION_BRANCH_ID: ${{ inputs.database-branch-id }}
+  RELEASE_TARGET_FINGERPRINT: ${{ inputs.target-fingerprint }}
 
 jobs:
   fence:

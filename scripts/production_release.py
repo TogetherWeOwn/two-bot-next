@@ -1,6 +1,5 @@
 """Protected attendance release entry points. All provider reads and writes use exact pins."""
 
-from dataclasses import asdict
 from functools import partial
 import json
 import os
@@ -16,8 +15,9 @@ from production_ownership_status import read_status
 from production_recovery_takeover import HEX, UUID, RecoveryPin
 from production_release_approval import require_unused_attendance_plan
 from production_release_ledgers import CUTOVER, STORE, ledger_endpoints
-from production_release_preflight import ReleasePreflight, approved_plan, apply_under_prepared_fence, prepared_epoch
-from production_release_preflight import verify_preflight
+from production_release_preflight import (ReleasePreflight, approved_bound_plan, approved_plan,
+                                          apply_under_bound_fence, bound_plan, prepared_epoch, stop_intent,
+                                          verify_preflight)
 from rollback_proof import ProofError
 from rollback_target_preflight import command, image_in_registry
 from staging_migrate_approval import digest_json
@@ -32,13 +32,12 @@ def release_request(env, api=github):
     run = artifacts.current_run(env, api)
     pin = ReleasePreflight(workflow_sha=run["head_sha"], candidate_sha=env["RELEASE_SHA"],
                            **mapping(decode(env["RELEASE_PINS"].encode())))
-    target = {key: env["PRODUCTION_" + key.upper()] for key in ("host", "database", "branch_id")}
-    return pin, run, env["RELEASE_PLAN_ID"], target
+    return pin, run, env["RELEASE_PLAN_ID"]
 
 
 def release_context(env, api=github):
-    pin, run, plan_id, target = release_request(env, api)
-    plan, artifact = approved_plan(pin, run, plan_id, target, api)
+    pin, run, plan_id = release_request(env, api)
+    plan, artifact = approved_bound_plan(pin, run, plan_id, env["RELEASE_TARGET_FINGERPRINT"], api)
     return pin, run, plan_id, plan, artifact
 
 
@@ -62,6 +61,14 @@ def forward_document(env, pin, run, plan_id, plan, artifact, api=github):
                        pin.rollback_image, pin.application_id, pin.namespace_id, document["database_fingerprint"],
                        document["expanded_ledgers_sha256"], document["restored_ledgers_sha256"],
                        document["attendance_fence_sha256"], epoch)
+
+
+def applied_release(env, api=github):
+    """Continue a committed attempt using the result that bound its approved plan."""
+    pin, run, plan_id = release_request(env, api)
+    plan, artifact = bound_plan(pin, run, plan_id, env["RELEASE_TARGET_FINGERPRINT"], api)
+    recovery = forward_document(env, pin, run, plan_id, plan, artifact, api)
+    return pin, run, plan_id, plan, artifact, recovery
 
 
 def release_actor(run_id, candidate_sha):
@@ -182,11 +189,21 @@ def main(argv, env):
             return 0
         directory = Path(env["RUNNER_TEMP"]) / "production-release"
         directory.mkdir(mode=0o700, exist_ok=True)
+        if argv == ["plan"]:
+            pin, run, plan_id = release_request(env)
+            target = {key: env["PRODUCTION_" + key.upper()] for key in ("host", "database", "branch_id")}
+            require(all(target.values()), "production_release_target_unconfigured")
+            plan, _ = approved_plan(pin, run, plan_id, target)
+            fresh = database(env["RELEASE_RUNNER"], directory, plan, env)
+            require(fresh.get("target") == target, "production_release_fresh_target_changed")
+            write_json(directory / "fresh-plan.json", fresh)
+            output(env, **{"target-fingerprint": digest_json(target)})
+            return 0
         if argv == ["apply"]:
-            pin, run, plan_id, target = release_request(env)
+            pin, run, plan_id = release_request(env)
             stopped = mapping(decode(env["RELEASE_STOPPED"].encode()))
-            receipt = apply_under_prepared_fence(
-                pin, run, plan_id, target, stopped,
+            receipt = apply_under_bound_fence(
+                pin, run, plan_id, env["RELEASE_TARGET_FINGERPRINT"], stopped,
                 lambda approved_id, approved: database(env["RELEASE_RUNNER"], directory, approved, env,
                                                         plan_id=approved_id),
                 preflight_epoch=decode(env["RELEASE_PREFLIGHT_EPOCH"].encode()),
@@ -194,10 +211,10 @@ def main(argv, env):
             write_json(directory / "production-release-forward.json", receipt)
             return 0
 
-        pin, run, plan_id, plan, artifact = release_context(env)
-        if argv == ["plan"]:
-            write_json(directory / "fresh-plan.json", database(env["RELEASE_RUNNER"], directory, plan, env))
-            return 0
+        if argv in (["authorize-deploy"], ["takeover"]):
+            pin, run, _, _, _, recovery = applied_release(env)
+        else:
+            pin, run, plan_id, plan, artifact = release_context(env)
 
         actor = release_actor(str(run["id"]), pin.candidate_sha)
         url = check_url("production", env["PRODUCTION_WORKER_URL"])
@@ -215,20 +232,18 @@ def main(argv, env):
             validate_receipt_against_live(client, ProvenanceReceipt(
                 WORKERS["production"], app, pin.rollback_worker, pin.rollback_sha, image))
             image_in_registry(image, account, partial(command, cwd=Path(__file__).resolve().parents[1] / "wrangler"))
-            write_json(directory / "preflight.json", {"pin": asdict(pin), "epoch": epoch,
-                       "run_id": str(run["id"]), "plan_run_id": plan_id, "plan_archive_sha256": artifact["archive_digest"]})
+            write_json(directory / f"{artifacts.STOP_INTENT_ARTIFACT}.json",
+                       stop_intent(pin, run, plan_id, plan, artifact, epoch))
             output(env, epoch=epoch, archive=pin.candidate_archive, image=pin.candidate_image)
         elif argv == ["stop"]:
-            proof = mapping(decode((directory / "preflight.json").read_bytes()))
-            require(proof["pin"] == asdict(pin) and proof["plan_archive_sha256"] == artifact["archive_digest"]
-                    and proof["run_id"] == str(run["id"]) and proof["plan_run_id"] == plan_id,
+            proof = mapping(decode((directory / f"{artifacts.STOP_INTENT_ARTIFACT}.json").read_bytes()))
+            require(type(proof.get("epoch")) is int and proof == stop_intent(pin, run, plan_id, plan, artifact, proof["epoch"]),
                     "production_release_preflight_plan_changed")
             require_unused_attendance_plan(github, artifact, run)
             ack = stop_prior_pair(pin, str(run["id"]), proof["epoch"], lambda: read_status(env), make_control())
             write_json(directory / "stopped.json", ack)
             output(env, ack=json.dumps(ack, separators=(",", ":")))
         elif argv in (["authorize-deploy"], ["takeover"]):
-            recovery = forward_document(env, pin, run, plan_id, plan, artifact)
             if argv == ["authorize-deploy"]:
                 state = read_status(env)
                 require(matches_pair(state, pin, pin.rollback_worker, pin.rollback_sha, pin.rollback_image)

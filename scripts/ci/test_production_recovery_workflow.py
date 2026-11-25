@@ -90,41 +90,46 @@ class RecoveryWorkflowTests(unittest.TestCase):
         stopped = {**self.ack, "deploymentId": self.pin.worker_version}
         env = {"RELEASE_STOPPED": json.dumps(stopped), "RELEASE_PREFLIGHT_EPOCH": "20",
                "FORWARD_ARTIFACT_ID": "789", "FORWARD_ARCHIVE_SHA256": "8" * 64, "CANDIDATE_WORKER": self.candidate[0],
-               "PRODUCTION_WORKER_URL": "https://fixture.invalid"}
+               "PRODUCTION_WORKER_URL": "https://fixture.invalid", "RELEASE_TARGET_FINGERPRINT": self.pin.database_fingerprint}
         return (release, run, plan_id, plan, artifact), document, env
 
     def test_admission_binds_the_rust_inverse_ledger_rows(self):
         case = self.case
         context, document, env = self.forward_fixture({**case["run"], "run_attempt": 1})
         release, run, plan_id, plan, artifact = context
-        with (patch.object(release_cli, "release_request", return_value=(release, run, plan_id, plan["target"])),
+        with (patch.object(release_cli, "release_request", return_value=(release, run, plan_id)),
               patch.multiple(preflight, authenticated_plan=Mock(return_value=(plan, artifact)), verify_environment=Mock()),
+              patch.object(preflight, "verify_check", side_effect=GateError("unapproved")) as check,
               patch.object(artifacts, "protected_job") as producer,
               patch.object(artifacts, "authentic_document", side_effect=GateError("unproved")) as authenticate,
               patch.object(recovery, "check_url") as provider_url):
-            with patch.object(preflight, "verify_check", side_effect=GateError("unapproved")) as check:
-                self.assertEqual(recovery.main(["fence"], env), 1)
-                check.assert_called_once()
-                self.assertEqual(check.call_args.args[2], "production-apply:321:" + "8" * 64)
-            with patch.object(release_cli, "approved_plan", return_value=(plan, artifact)):
-                self.assertEqual(recovery.main(["fence"], {**env, "RELEASE_PREFLIGHT_EPOCH": "19"}), 1)
-                producer.assert_not_called()
-                self.assertEqual(recovery.main(["fence"], env), 1)
-                authenticate.assert_called_once_with(run, artifacts.FORWARD_ARTIFACT, "789", "8" * 64, recovery.github)
-                provider_url.assert_not_called()
-                authenticate.side_effect, authenticate.return_value = None, document
-                pin, candidate, reviewed, approval, _ = recovery.release_admission(env)
-                self.assertEqual((pin, candidate, reviewed, approval["plan_archive_sha256"]),
-                                 (self.pin, self.candidate, plan, artifact["archive_digest"]))
-                for field, digest in case["source_ledger_digests"].items():
-                    authenticate.return_value = {**document, field: digest}
-                    with self.subTest(field=field), self.assertRaisesRegex(GateError, "production_forward_artifact_mismatch"):
-                        recovery.release_admission(env)
+            with self.assertRaisesRegex(GateError, "unapproved"):
+                release_cli.release_context(env)
+            check.assert_called_once()
+            self.assertEqual(check.call_args.args[2], "production-apply:321:" + "8" * 64)
+            check.reset_mock()
+
+            self.assertEqual(recovery.main(["fence"], {**env, "RELEASE_PREFLIGHT_EPOCH": "19"}), 1)
+            producer.assert_not_called()
+            authenticate.assert_not_called()
+            self.assertEqual(recovery.main(["fence"], env), 1)
+            producer.assert_called_once_with(run, recovery.github, artifacts.FORWARD_JOB, artifacts.FORWARD_STEPS)
+            authenticate.assert_called_once_with(run, artifacts.FORWARD_ARTIFACT, "789", "8" * 64, recovery.github)
+            provider_url.assert_not_called()
+            authenticate.side_effect, authenticate.return_value = None, document
+            pin, candidate, reviewed, approval, _ = recovery.release_admission(env)
+            self.assertEqual((pin, candidate, reviewed, approval["plan_archive_sha256"]),
+                             (self.pin, self.candidate, plan, artifact["archive_digest"]))
+            for field, digest in case["source_ledger_digests"].items():
+                authenticate.return_value = {**document, field: digest}
+                with self.subTest(field=field), self.assertRaisesRegex(GateError, "production_forward_artifact_mismatch"):
+                    recovery.release_admission(env)
+            check.assert_not_called()
 
     def test_restore_refuses_receipts_with_wrong_or_missing_ownership_epoch(self):
         run_env, run = release_run_fixture()
         context, forward, env = self.forward_fixture(run)
-        _, _, plan_id, plan, plan_artifact = context
+        release, _, plan_id, plan, plan_artifact = context
         jobs = [producer(run, artifacts.FORWARD_JOB, artifacts.FORWARD_STEPS),
                 producer(run, artifacts.JOB, (artifacts.WRITE_STEP, artifacts.UPLOAD_STEP))]
         bad_epoch = self.pin.fence_epoch + 2
@@ -161,8 +166,10 @@ class RecoveryWorkflowTests(unittest.TestCase):
                 boundary = Mock(side_effect=AssertionError("provider boundary reached"))
                 blocked = Mock(side_effect=AssertionError("unexpected provider, database or receipt operation"))
                 with (patch.object(staging_recovery_status, "gh", api),
-                      patch.multiple(recovery, release_context=Mock(return_value=context),
-                                     check_url=boundary, RollbackClient=blocked, read_status=blocked,
+                      patch.object(release_cli, "release_request", return_value=(release, run, plan_id)),
+                      patch.multiple(preflight, authenticated_plan=Mock(return_value=(plan, plan_artifact)),
+                                     verify_environment=Mock()),
+                      patch.multiple(recovery, check_url=boundary, RollbackClient=blocked, read_status=blocked,
                                      control_client=blocked, run_inverse=blocked, write_json=blocked),
                       redirect_stderr(StringIO())):
                     if admitted:
