@@ -27,12 +27,16 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
         self.assertEqual(restored["backup_id"], self.plan["backup_id"], "backup lineage")
         self.assertEqual(restored["copy_id"], copy_id, "restored copy")
 
+        sequence = ("restored", "before", "forward", "undo", "after_undo")
+        for previous, following in zip(sequence, sequence[1:]):
+            self.assertLess(utc_time(observed[previous]), utc_time(observed[following]),
+                            "rehearsal order")
         expected_phases = (
-            ("before", "1.0", [], [], None),
-            ("forward", "1.1", [475, 479, 480, 481, 482], [478], self.plan["fence_0475"]),
-            ("after_undo", "1.0", [475], [], self.plan["fence_0475"]),
+            ("before", "forward", "1.0", [], [], None),
+            ("forward", "undo", "1.1", [475, 479, 480, 481, 482], [478], self.plan["fence_0475"]),
+            ("after_undo", None, "1.0", [475], [], self.plan["fence_0475"]),
         )
-        for phase, contract, cutover, store, fence in expected_phases:
+        for phase, next_phase, contract, cutover, store, fence in expected_phases:
             result = observed[phase]
             self.assertEqual(result["copy_id"], copy_id, f"{phase} evidence target")
             bot = {
@@ -45,21 +49,25 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
             if phase == "forward":
                 bot["attendance_windows"] = 0
                 web["voice_heat"] = {"cells": 168, "sample_days": 0}
-            self.assertEqual(result.get("bot"), bot, f"{phase} Bot readback")
-            self.assertEqual(result.get("web"), web, f"{phase} Web readback")
+            for app, expected in (("bot", bot), ("web", web)):
+                reason = f"{phase} {app.capitalize()} readback"
+                readback = result.get(app)
+                self.assertIsInstance(readback, dict, reason)
+                self.assertEqual(readback, {**expected, "at": readback.get("at")}, reason)
+                read_at = utc_time(readback)
+                self.assertGreaterEqual(read_at, utc_time(result), f"{reason} precedes phase")
+                if next_phase is not None:
+                    self.assertLess(read_at, utc_time(observed[next_phase]), f"{reason} after phase")
             self.assertEqual(result["cutover_added"], cutover, f"{phase} Cutover ledger")
             self.assertEqual(result["store_added"], store, f"{phase} Store ledger")
             self.assertEqual(result["fence_0475"], fence, f"{phase} 0475 fence")
+            self.assertEqual(result["retained_ledger_sha256"], self.plan["retained_ledger_sha256"],
+                             f"{phase} retained ledgers")
 
         undo = observed["undo"]
         self.assertEqual(undo["copy_id"], copy_id, "undo target")
         self.assertEqual(undo["sha256"], self.plan["undo_sha256"], "selected schema inverse")
         self.assertEqual(undo["outcome"], "committed", "schema undo outcome")
-        phases = ("restored", "before", "forward", "undo", "after_undo")
-        for previous, following in zip(phases, phases[1:]):
-            self.assertLess(utc_time(observed[previous]), utc_time(observed[following]),
-                            "rehearsal order")
-
         cleanup = observed["cleanup"]
         copy = cleanup["copy_readback"]
         self.assertEqual(copy["copy_id"], copy_id, "copy cleanup target")
@@ -68,8 +76,9 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
         self.assertEqual(entries["copy_id"], copy_id, "credential cleanup target")
         self.assertEqual(entries["entries"], dict.fromkeys(self.plan["temporary_entries"], "absent"),
                          "temporary entry absence")
+        last_app_read = max(utc_time(observed["after_undo"][app]) for app in ("bot", "web"))
         for readback in (copy, entries):
-            self.assertLess(utc_time(observed["after_undo"]), utc_time(readback), "cleanup order")
+            self.assertLess(last_app_read, utc_time(readback), "cleanup order")
             self.assertEqual(utc_time(readback).date(), utc_time(restored).date(), "same-day cleanup")
 
     def assert_refuses_change(self, path, value, reason):
@@ -95,6 +104,9 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
         self.assert_refuses_change(("forward", "bot", "copy_id"), "other-copy", "Bot readback")
         self.assert_refuses_change(("forward", "web", "voice_heat"), None, "Web readback")
         self.assert_refuses_change(("after_undo", "web", "upcoming"), [0, None], "Web readback")
+        for app in ("bot", "web"):
+            self.assert_refuses_change(("after_undo", app), self.handoff["before"][app],
+                                       f"{app.capitalize()} readback precedes phase")
 
     def test_requires_exact_undo_and_post_undo_state(self):
         self.assert_refuses_change(("undo", "sha256"), "0" * 64, "selected schema inverse")
@@ -102,6 +114,9 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
         self.assert_refuses_change(("after_undo", "cutover_added"), [], "Cutover ledger")
         self.assert_refuses_change(("after_undo", "store_added"), [478], "Store ledger")
         self.assert_refuses_change(("after_undo", "fence_0475"), "0" * 64, "0475 fence")
+        for chain in ("cutover", "store"):
+            self.assert_refuses_change(("after_undo", "retained_ledger_sha256", chain), "0" * 64,
+                                       "retained ledgers")
         self.assert_refuses_change(("after_undo", "web", "contract"), "1.1", "Web readback")
         self.assert_refuses_change(("undo", "at"), self.handoff["after_undo"]["at"], "rehearsal order")
 

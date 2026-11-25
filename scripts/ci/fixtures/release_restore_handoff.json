@@ -6,6 +6,10 @@
     "temporary_entries": ["fixture-bot-entry", "fixture-web-entry", "fixture-migrator-entry"],
     "bot_windows": [3, "23f96169a042ef15c88fcfeb80f07b06d84a06466a5a6049694506e9023f50ac"],
     "web_upcoming": [2, "e31caeb813880371fba2b7894f914b3649db1ecc1f211f797c4058c197bc778d"],
+    "retained_ledger_sha256": {
+      "cutover": "0fe85b6fc64f70fa787dd0f34ee24c7d269aabe761b18cb1d5889653b4d1891c",
+      "store": "a2c39fa7ba971edb97d99f7d6dd57b354dd8ed26fed0b79f38b09d99a5170333"
+    },
     "fence_0475": "3ee13c23eddfc4c61eb16e313a507a94dbd7856f7d3da4e2d3643cf93cc8c168"
   },
   "restored": {
@@ -14,26 +18,38 @@
   "before": {
     "copy_id": "fixture-restore", "at": "2026-01-15T12:07:00Z",
     "cutover_added": [], "store_added": [], "fence_0475": null,
+    "retained_ledger_sha256": {
+      "cutover": "0fe85b6fc64f70fa787dd0f34ee24c7d269aabe761b18cb1d5889653b4d1891c",
+      "store": "a2c39fa7ba971edb97d99f7d6dd57b354dd8ed26fed0b79f38b09d99a5170333"
+    },
     "bot": {
       "copy_id": "fixture-restore", "role": "two_bot_runtime",
+      "at": "2026-01-15T12:07:10Z",
       "windows": [3, "23f96169a042ef15c88fcfeb80f07b06d84a06466a5a6049694506e9023f50ac"]
     },
     "web": {
       "copy_id": "fixture-restore", "role": "two_web_reader", "contract": "1.0",
+      "at": "2026-01-15T12:07:20Z",
       "upcoming": [2, "e31caeb813880371fba2b7894f914b3649db1ecc1f211f797c4058c197bc778d"]
     }
   },
   "forward": {
     "copy_id": "fixture-restore", "at": "2026-01-15T12:09:00Z",
     "cutover_added": [475, 479, 480, 481, 482], "store_added": [478],
+    "retained_ledger_sha256": {
+      "cutover": "0fe85b6fc64f70fa787dd0f34ee24c7d269aabe761b18cb1d5889653b4d1891c",
+      "store": "a2c39fa7ba971edb97d99f7d6dd57b354dd8ed26fed0b79f38b09d99a5170333"
+    },
     "fence_0475": "3ee13c23eddfc4c61eb16e313a507a94dbd7856f7d3da4e2d3643cf93cc8c168",
     "bot": {
       "copy_id": "fixture-restore", "role": "two_bot_runtime",
+      "at": "2026-01-15T12:09:10Z",
       "windows": [3, "23f96169a042ef15c88fcfeb80f07b06d84a06466a5a6049694506e9023f50ac"],
       "attendance_windows": 0
     },
     "web": {
       "copy_id": "fixture-restore", "role": "two_web_reader", "contract": "1.1",
+      "at": "2026-01-15T12:09:20Z",
       "upcoming": [2, "e31caeb813880371fba2b7894f914b3649db1ecc1f211f797c4058c197bc778d"],
       "voice_heat": {"cells": 168, "sample_days": 0}
     }
@@ -46,13 +62,19 @@
   "after_undo": {
     "copy_id": "fixture-restore", "at": "2026-01-15T12:11:00Z",
     "cutover_added": [475], "store_added": [],
+    "retained_ledger_sha256": {
+      "cutover": "0fe85b6fc64f70fa787dd0f34ee24c7d269aabe761b18cb1d5889653b4d1891c",
+      "store": "a2c39fa7ba971edb97d99f7d6dd57b354dd8ed26fed0b79f38b09d99a5170333"
+    },
     "fence_0475": "3ee13c23eddfc4c61eb16e313a507a94dbd7856f7d3da4e2d3643cf93cc8c168",
     "bot": {
       "copy_id": "fixture-restore", "role": "two_bot_runtime",
+      "at": "2026-01-15T12:11:10Z",
       "windows": [3, "23f96169a042ef15c88fcfeb80f07b06d84a06466a5a6049694506e9023f50ac"]
     },
     "web": {
       "copy_id": "fixture-restore", "role": "two_web_reader", "contract": "1.0",
+      "at": "2026-01-15T12:11:20Z",
       "upcoming": [2, "e31caeb813880371fba2b7894f914b3649db1ecc1f211f797c4058c197bc778d"]
     }
   },

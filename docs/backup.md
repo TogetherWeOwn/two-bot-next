@@ -106,8 +106,9 @@ reader results with the same restored copy. The reads include the legacy
 windows and upcoming events, plus empty attendance and voice heat on the
 expanded schema. The selected [schema inverse](../sql/release_schema_inverse.sql)
 retains 0475 and its fence, removes only the expansion entries from both
-ledgers and returns the Web contract to 1.0. The example retains only
-aggregate results for each app read.
+ledgers and returns the Web contract to 1.0. The example compares digests of
+the unchanged rows in each ledger against the baseline. It records when
+each app read was taken and keeps only aggregate query results.
 
 Record the provider readback showing the exact copy is absent on the UTC
 day it was restored. Record a separate absence check for all temporary
