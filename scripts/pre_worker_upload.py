@@ -7,7 +7,7 @@ from os import scandir
 from pathlib import Path, PurePosixPath
 import re
 
-from bot_promotion import MAX_MEMBER_BYTES, MAX_MODULES, MAX_TOTAL_BYTES, _safe_module_path
+from bot_promotion import MAX_MEMBER_BYTES, MAX_MODULES, MAX_TOTAL_BYTES, safe_module_path
 from pre_target import Target, TargetError, make_config, require
 from script_intake import read_with_overflow
 
@@ -43,7 +43,7 @@ class WorkerUpload:
 
 def _read_modules(root, hashes):
     require(type(hashes) is dict and ENTRYPOINT in hashes and len(hashes) <= MAX_MODULES
-            and all(_safe_module_path(name)
+            and all(safe_module_path(name)
                     and isinstance(digest, str) and HEX_SHA256.fullmatch(digest)
                     for name, digest in hashes.items()), "invalid_pre_worker_manifest")
     directories = {parent.as_posix() for name in hashes for parent in PurePosixPath(name).parents}
