@@ -14,10 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import staging_automod_inventory_reader as reader
 from rollback_proof import ProofError, REPO
 from staging_rollout import GateError
-from test_staging_recovery_handoff import inventory_receipt
+from test_staging_recovery_handoff import authenticated_plan, inventory_receipt
 
-SHA = "a" * 40
-TIP = "b" * 40
+SHA, TIP = "a" * 40, "b" * 40
 RUN = "1234"
 RUN_ROUTE = f"actions/runs/{RUN}"
 LIST_ROUTE = f"{RUN_ROUTE}/artifacts?per_page=2"
@@ -25,9 +24,9 @@ ZIP_ROUTE = "actions/artifacts/42/zip"
 COMPARE_ROUTE = f"compare/{SHA}...{TIP}?per_page=1&page=1"
 
 
-def receipt():
-    return {**inventory_receipt(None), "workflow_sha": SHA, "workflow_run_id": int(RUN),
-            "observed_at": "2026-11-25T12:00:00.123456+00:00"}
+def receipt(plan=None, **fields):
+    return {**inventory_receipt(plan), "workflow_sha": SHA, "workflow_run_id": int(RUN),
+            "observed_at": "2026-11-25T12:00:00.123456+00:00", **fields}
 
 
 class InventoryReaderTests(unittest.TestCase):
@@ -71,6 +70,9 @@ class InventoryReaderTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         self.assertEqual(self.requests, [(RUN_ROUTE, False), ("branches/main", False),
                                          (LIST_ROUTE, False), (ZIP_ROUTE, True)])
+        for mode, status in (("full_tuple", "verified"), ("provider_only", "worker_unsupported")):
+            self.archive(json.dumps(receipt(authenticated_plan("13"), verification=mode, runtime_database=status)))
+            self.assertEqual(self.read(), expected, status)
 
     def test_refuses_wrong_run_producer_attempt_or_completion(self):
         for sha, run in (("main", RUN), (SHA, "0"), (SHA, "01234"), (SHA, str(2**53))):

@@ -78,11 +78,9 @@ test("the inventory reader refuses invalid pins and forwards the caller's abort"
     assert.equal(forwarded, signal);
     return new Promise(resolve => { finish = resolve; });
   });
-  assert.equal(await read({ ...source, workflowSha: "main" }, signal), undefined);
-  assert.equal(await read({ ...source, runId: 0 }, signal), undefined);
-  assert.equal(await read({ ...source, runId: Number.MAX_SAFE_INTEGER + 1 }, signal), undefined);
+  for (const invalid of [{ workflowSha: "main" }, { runId: 0 }, { runId: Number.MAX_SAFE_INTEGER + 1 }])
+    assert.equal(await read({ ...source, ...invalid }, signal), undefined);
   assert.equal(calls, 0);
-
   const pending = read(source, signal);
   controller.abort();
   assert.equal(await pending, undefined);
