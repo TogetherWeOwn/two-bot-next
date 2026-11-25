@@ -1,0 +1,21 @@
+{
+  "plan_artifact": {
+    "archive_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  "stop_ack": {
+    "deploymentId": "12345678-1234-4567-8123-123456789abc",
+    "running": false,
+    "owner": {
+      "deploymentId": null,
+      "phase": "fenced",
+      "epoch": 18,
+      "oldEpoch": 17,
+      "actor": "production-schema-release:456:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "forward_artifact_env": {
+    "RELEASE_PREFLIGHT_EPOCH": "17",
+    "FORWARD_ARTIFACT_ID": "789",
+    "FORWARD_ARCHIVE_SHA256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}

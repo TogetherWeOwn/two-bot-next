@@ -2,6 +2,8 @@
 
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime, timezone
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -9,6 +11,8 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from production_release_forward import CUTOVER, STORE, forward_receipt
+from production_ownership_status import provider_sample
+import production_release as release
 import production_release_preflight as preflight
 from ci.production_migrate_claim import projection_hash, store_projection_hash
 from staging_migrate_approval import digest_json
@@ -106,7 +110,9 @@ class ReleaseForwardTests(unittest.TestCase):
         job = {"name": preflight.PREPARE_JOB, "run_id": 456, "run_attempt": 1, "head_sha": pin.workflow_sha,
                "status": "completed", "conclusion": "success", "steps": [
                    {"name": step, "status": "completed", "conclusion": "success"} for step in preflight.PREPARE_STEPS]}
-        api = Mock(return_value={"total_count": 1, "jobs": [job]})
+        now = datetime(2026, 11, 25, tzinfo=timezone.utc)
+        api = Mock(side_effect=lambda route: {"created_at": now.isoformat()} if route == "actions/runs/123"
+                   else {"total_count": 1, "jobs": [job]})
         apply = Mock(return_value={**self.outcome, "recovery_evidence_ref": pin.recovery_reference()})
         for bad_stop in ({**stopped, "running": True},
                          {**stopped, "owner": {**stopped["owner"], "oldEpoch": 18, "epoch": 19}}):
@@ -123,7 +129,7 @@ class ReleaseForwardTests(unittest.TestCase):
         artifact = {"archive_digest": "sha256:" + "f" * 64}
         with (patch.object(preflight, "authenticated_plan", return_value=(plan, artifact)),
               patch.object(preflight, "verify_environment") as environment,
-              patch.object(preflight, "verify_check") as approval):
+              patch.object(preflight, "verify_check", return_value=(789, now)) as approval):
             result = preflight.apply_under_prepared_fence(pin, run, "123", plan["target"], stopped, apply, api,
                                                           preflight_epoch=preflight_epoch)
         environment.assert_called_once_with(api)
@@ -131,3 +137,65 @@ class ReleaseForwardTests(unittest.TestCase):
         apply.assert_called_once_with("123", plan)
         self.assertEqual(result["stopped_epoch"], 18)
         self.assertEqual(result["attendance_fence_sha256"], "c" * 64)
+
+    def test_post_commit_requires_an_authentic_forward_result_for_takeover_or_recovery(self):
+        pin, plan = self.preflight_fixture()
+        run = {"id": 456, "run_attempt": 1, "head_sha": pin.workflow_sha}
+        fixture = Path(__file__).with_name("fixtures") / "production_release_forward_stop.json"
+        proof = json.loads(fixture.read_text())
+        artifact = proof["plan_artifact"]
+        env = {**proof["forward_artifact_env"], "RELEASE_STOPPED": json.dumps(proof["stop_ack"])}
+        document = {**forward_receipt("123", plan, {**self.outcome, "recovery_evidence_ref": pin.recovery_reference()}),
+                    "run_id": "456", "run_attempt": 1, "stopped_epoch": 18,
+                    "plan_archive_sha256": artifact["archive_digest"], "release_reference": pin.recovery_reference()}
+        api = Mock()
+        with (patch.object(release.artifacts, "protected_job") as protected_job,
+              patch.object(release.artifacts, "authentic_document", return_value=document) as authenticate):
+            self.assertEqual(release.forward_document(env, pin, run, "123", plan, artifact, api).fence_epoch, 18)
+            protected_job.assert_called_once_with(run, api, release.artifacts.FORWARD_JOB,
+                                                  release.artifacts.FORWARD_STEPS)
+            authenticate.assert_called_once_with(run, release.artifacts.FORWARD_ARTIFACT, "789", "a" * 64, api)
+            for key in ("run_attempt", "stopped_epoch", "restored_ledgers_sha256", "attendance_fence_sha256"):
+                with self.subTest(key=key), self.assertRaises(GateError):
+                    authenticate.return_value = {**document, key: "foreign"}
+                    release.forward_document(env, pin, run, "123", plan, artifact, api)
+            protected_job.side_effect = GateError("protected_job_failed")
+            authenticate.reset_mock()
+            with self.assertRaisesRegex(GateError, "protected_job_failed"):
+                release.forward_document(env, pin, run, "123", plan, artifact, api)
+            authenticate.assert_not_called()
+
+    def test_takeover_refuses_a_provider_version_different_from_the_uploaded_worker(self):
+        data = json.loads(Path(__file__).with_name("fixtures").joinpath("production_ownership_status_provider.json").read_text())
+        provider, takeover = data["provider"], data["release_takeover"]
+        pin = replace(self.preflight_fixture()[0], **takeover["pin"])
+        account = "c" * 32
+        client = Mock(api=provider.__getitem__)
+        state = {**provider_sample(client, account), "ownership": takeover["fenced_owner"]}
+        output = takeover["upload_output"]
+        version = release.produced_version(output)
+        for invalid in ("", output + output, "Current Version ID: abcd-1234\n", "Current Version ID: not-a-uuid\n"):
+            with self.subTest(invalid=invalid), self.assertRaises(GateError):
+                release.produced_version(invalid)
+        recovery = Mock(run_id="456", fence_epoch=18)
+        foreign = {**state, "worker": {**state["worker"], "version_id": pin.rollback_worker}}
+        control = Mock(side_effect=GateError("lost_ack"))
+        with self.assertRaisesRegex(GateError, "production_release_candidate_pair_unproved"):
+            release.take_over(pin, recovery, version, Mock(return_value=foreign), control)
+        control.assert_not_called()
+        prior = {**foreign, "worker": {**foreign["worker"], "sha": pin.rollback_sha}}
+        prior["container"] = {**state["container"], "image_digest": pin.rollback_image}
+        provider[f"/containers/applications/{pin.application_id}/rollouts?limit=100"][0]["status"] = "progressing"
+        progressing = {**provider_sample(client, account, allow_rollout=True), "ownership": state["ownership"]}
+        observe, pause = Mock(side_effect=[prior, progressing, state]), Mock()
+        with self.assertRaisesRegex(GateError, "lost_ack"):
+            release.take_over(pin, recovery, version, observe, control, pause=pause)
+        control.assert_called_once_with("takeover-fenced", 18, expected_deployment=version)
+        self.assertEqual(pause.call_count, 2)
+        owner = {**state["ownership"], "phase": "active", "epoch": 19}
+        control = Mock()
+        release.take_over(pin, recovery, version, Mock(side_effect=[state, {**state, "ownership": owner}]), control)
+        owner["running"] = True
+        with self.assertRaisesRegex(GateError, "production_release_takeover_unconfirmed"):
+            release.take_over(pin, recovery, version, Mock(side_effect=[state, {**state, "ownership": owner}]), control)
+        self.assertEqual(control.call_count, 2)
