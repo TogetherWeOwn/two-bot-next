@@ -1,6 +1,7 @@
 """Small loopback Discord double based on the startup exchange in alive.rs."""
 
 import base64
+from functools import partial
 import hashlib
 from http.client import HTTPConnection, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,7 +11,7 @@ import struct
 from threading import Event
 import sys
 
-from script_intake import decode_json
+from script_intake import decode_legacy_json, unique_object
 
 
 GUILD = "222200000000000001"
@@ -20,6 +21,8 @@ COMMANDS = f"/api/v10/applications/{APP}/guilds/{GUILD}/commands"
 GATEWAY = "ws://127.0.0.1:8081"
 RELEASE = Event()
 READY_SENT = Event()
+# Decode byte-capped inputs with the standard decoder's nesting limit.
+decode_json = partial(decode_legacy_json, object_pairs_hook=unique_object, parse_constant=int)
 
 
 class Discord(BaseHTTPRequestHandler):
@@ -30,7 +33,7 @@ class Discord(BaseHTTPRequestHandler):
         pass
 
     def reply(self, data, code=200):
-        body = json.dumps(data).encode()
+        body = json.dumps(data, allow_nan=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -78,10 +81,11 @@ class Discord(BaseHTTPRequestHandler):
             commands = decode_json(body)
             if not isinstance(commands, list) or any(not isinstance(item, dict) for item in commands):
                 raise ValueError
-        except (OSError, ValueError, RecursionError):
+            self.reply(commands)
+        except (ValueError, RecursionError):
             self.reply({}, 400)
+        except OSError:
             return
-        self.reply(commands)
 
     def send_frame(self, packet):
         body = json.dumps(packet).encode()

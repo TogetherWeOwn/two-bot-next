@@ -17,7 +17,9 @@ PIN = {"image_id": IMAGE, "manifest_digest": "sha256:" + "b" * 64, **STAMPS}
 class PredecessorContainerFixtureTests(unittest.TestCase):
     def test_mock_command_publication(self):
         for token, body, status in [(fixture.TOKEN, b'[{"name":"help"}]', b"200"),
-                                    ("foreign", b"[]", b"401"), (fixture.TOKEN, b"{}", b"400")]:
+                                    ("foreign", b"[]", b"401"), (fixture.TOKEN, b"{}", b"400"),
+                                    (fixture.TOKEN, b'[{"k":1,"k":2}]', b"400"),
+                                    (fixture.TOKEN, b'[{"k":NaN}]', b"400")]:
             client, server = socket.socketpair()
             with self.subTest(status=status), client, server:
                 request = (f"PUT {COMMANDS} HTTP/1.1\r\nConnection: close\r\n"
@@ -64,6 +66,9 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                         anchor = name.rsplit("-", 1)[0] + "-db"
                         self.assertIn(anchor, containers)
                         self.assertEqual(args.count(f"container:{anchor}"), 2)
+                    if name.endswith("-mock"):
+                        decoder = fixture.ROOT / "scripts/script_intake.py"
+                        self.assertIn(f"type=bind,src={decoder},dst=/script_intake.py,readonly", args)
                     if name.endswith("-bot") and failure == "cancel":
                         raise KeyboardInterrupt
                 elif args[0] == "rm":

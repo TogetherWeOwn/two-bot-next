@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+from functools import partial
 import json
 import os
 from pathlib import Path
@@ -16,12 +17,14 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
-from script_intake import decode_json
+from script_intake import decode_legacy_json, unique_object
 
 from fixtures.predecessor_snapshots import GUILD, schema_check, snapshot_sql
 
 
 MOCK = Path(__file__).with_name("fixtures") / "predecessor_discord.py"
+# These local inputs are bounded by the pin reader, mock probe or Docker daemon.
+decode_json = partial(decode_legacy_json, object_pairs_hook=unique_object, parse_constant=int)
 SOURCE = "b689bc3545777c801b8758bcb7160e72a0321724"
 DIGEST = r"sha256:[a-f0-9]{64}"
 STAMPS = dict(zip(
