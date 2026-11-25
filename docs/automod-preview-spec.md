@@ -780,6 +780,12 @@ fails or its reply is lost. Both actions must return a bounded v1 receipt
 confirming the exact scope. The job preserves a startup failure even if
 recovery passes.
 
+The reusable workflow also runs a synthetic contract for the private binding.
+The fixture supplies in-memory context, lease, separate approvals and a fake
+Worker bearer. The test step checks the binding's lease-scoped confirmations
+through a fake private invoker and fails if those outcomes differ from the
+expected verdicts.
+
 The dormant `runStagingAutomodBoundJob` accepts the protected run, attempt,
 staging target, build and deployment, plus the original issued AutoMod lease
 and separate start and recovery approvals. The job adapter refuses out-of-scope
