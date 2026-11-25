@@ -214,6 +214,22 @@ permission recovery paths, other writers, and role and announcement controls.
 
 ### Disposable rehearsal
 
+After Bot Operations admits the artifacts, save their reviewed pins privately
+as `selected.json`. Map the serving record to `current` and the rollback
+record to `retained`. Each position needs the reviewed full `image` reference
+(`repository@sha256:…`), full Git `source_revision`, and `worker_version` as
+strings. Keep the position's Worker version in this file for the handoff check.
+
+The [offline preparation command](../tests/event_write_cutoff/prepare_rehearsal.py)
+prints one line with four space-separated values in this order: current image,
+current revision, retained image, retained revision. It exits with no stdout
+when the reviewed pair is incomplete or ambiguous. Both positions must agree
+on the source revision when they use the same image digest.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 tests/event_write_cutoff/prepare_rehearsal.py --pins selected.json
+```
+
 Pull the admitted Bot images by digest through the registry's read-only path
 and pre-pull the pinned Postgres and recorder images below. The script launches
 only locally present images. It starts a fresh
@@ -223,19 +239,28 @@ to the local recorder. It uses the shipping receiver's compile-time guild
 fence as an inert fixture identifier. It does not use a live guild or the
 Worker ingress.
 
-The runner reads the schema from the current image's
-`org.opencontainers.image.revision` commit. If that revision is missing from
-the checkout, fetch it from `origin` before starting.
+Use Bash to bind both arguments to the reviewed pair and check both local
+image revision labels. The runner reads the schema from the reviewed current
+revision. The command fetches that commit from `origin` if needed.
 
-```sh
+```bash
+unset result
+reviewed_pins="$(PYTHONDONTWRITEBYTECODE=1 python3 tests/event_write_cutoff/prepare_rehearsal.py --pins selected.json)" &&
+IFS=' ' read -r current_image current_revision retained_image retained_revision <<< "$reviewed_pins" &&
+revision_label='{{ index .Config.Labels "org.opencontainers.image.revision" }}' &&
+current_label="$(docker image inspect --format "$revision_label" "$current_image")" &&
+retained_label="$(docker image inspect --format "$revision_label" "$retained_image")" &&
+{
+  [[ "$current_label" == "$current_revision" && "$retained_label" == "$retained_revision" ]] ||
+    { printf '%s\n' 'Local image revisions differ from the reviewed pair' >&2; false; }
+} &&
 docker pull postgres@sha256:372621a978f4513b082d946d6320e2b11a3b359648b81fba8a2ba0df33958f62 &&
 docker pull node@sha256:e7add2a490bb17d97b485b8641bd88455fff7839ade0f5eba493c3508124d413 &&
-current_revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$current_digest_reference")" &&
 (git cat-file -e "${current_revision}^{commit}" || git fetch origin "$current_revision") &&
 git cat-file -e "$current_revision:sql/web_v1.sql" && {
   result=0
   PYTHONDONTWRITEBYTECODE=1 python3 tests/event_write_cutoff/rehearse.py \
-    --current "$current_digest_reference" --retained "$retained_digest_reference" \
+    --current "$current_image" --retained "$retained_image" \
     > cutoff.log || result=$?
 }
 ```
@@ -284,8 +309,8 @@ in [Bot permission readback](#bot-permission-readback) still need their own evid
 
 After the artifacts are admitted and the permission responses have been checked,
 run the [offline handoff check](../tests/event_write_cutoff/verify_handoff.py).
-Add `worker_version`, `guild_id` and `bot_id` as strings to each position in the
-reviewed pins JSON. Put the sanitized evidence in a second JSON object with
+Use the same reviewed `selected.json` and add `guild_id` and `bot_id` as strings
+to each position. Put the sanitized evidence in a second JSON object with
 these two fields.
 
 - `receipts` maps `current` and `retained` to objects with `v` (the JSON number
@@ -298,7 +323,7 @@ these two fields.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 tests/event_write_cutoff/verify_handoff.py \
-  --pins selected.json --transcript cutoff.log --runner-exit-code "$result" \
+  --pins selected.json --transcript cutoff.log --runner-exit-code "${result:?run the rehearsal first}" \
   --attribution attribution.json
 ```
 

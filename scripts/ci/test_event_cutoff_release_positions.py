@@ -1,4 +1,4 @@
-"""Exercise the offline verifier with synthetic pins and runner output."""
+"""Exercise offline rehearsal preparation and verification with synthetic evidence."""
 
 import copy
 from contextlib import redirect_stdout
@@ -18,6 +18,7 @@ VERIFIER = (
     Path(__file__).resolve().parents[2]
     / "tests" / "event_write_cutoff" / "verify_release_positions.py"
 )
+RUNBOOK = VERIFIER.parents[2] / "docs" / "internal-event-executors.md"
 PINS = {
     "current": {"image": "registry.example/bot@sha256:" + "a" * 64, "source_revision": "1" * 40},
     "retained": {"image": "registry.example/bot@sha256:" + "b" * 64, "source_revision": "2" * 40},
@@ -190,6 +191,131 @@ class EventCutoffReleasePositionsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         del self.records[-2]
         self.assert_refused("Missing retained announcement positive control")
+
+
+class EventCutoffPreparationTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        # Rollback appears first in the file to exercise lookup by position.
+        self.pins = {
+            "retained": {**PINS["retained"], "worker_version": "00000000-0000-4000-8000-000000000002"},
+            "current": {**PINS["current"], "worker_version": "00000000-0000-4000-8000-000000000001"},
+        }
+
+    def run_preparation(self, raw=None):
+        pins = self.root / "selected.json"
+        pins.write_text(json.dumps(self.pins) if raw is None else raw, encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, str(VERIFIER.with_name("prepare_rehearsal.py")), "--pins", str(pins)],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+
+    def assert_prepared(self, current, retained):
+        result = self.run_preparation()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "{} {} {} {}\n".format(
+            current["image"], current["source_revision"], retained["image"], retained["source_revision"],
+        ))
+        self.assertEqual(result.stderr, "")
+
+    def assert_refused(self, reason, raw=None):
+        result = self.run_preparation(raw)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, f"Rehearsal preparation refused: {reason}\n")
+
+    def test_preparation_orders_reviewed_positions_by_name(self):
+        self.assert_prepared(PINS["current"], PINS["retained"])
+
+    def test_preparation_keeps_both_positions_for_a_shared_image(self):
+        self.pins["retained"].update(PINS["current"])
+        self.assert_prepared(PINS["current"], PINS["current"])
+
+    def test_preparation_refuses_conflicting_revisions_for_a_shared_image(self):
+        for repository in ("registry.example/bot", "mirror.example/bot"):
+            with self.subTest(repository=repository):
+                self.pins["retained"]["image"] = repository + "@sha256:" + "a" * 64
+                self.assert_refused("shared image has conflicting source revisions")
+
+    def test_preparation_refuses_missing_or_invalid_pins(self):
+        for position in ("current", "retained"):
+            pin = self.pins.pop(position)
+            with self.subTest(position=position, missing=position):
+                self.assert_refused("Selected pins must contain current and retained positions")
+            self.pins[position] = pin
+            for field, invalid, requirement in (
+                ("image", "registry.example/bot:latest", "an immutable"),
+                ("source_revision", "main", "an immutable"),
+                ("worker_version", " \t", "a reviewed"),
+            ):
+                with self.subTest(position=position, field=field):
+                    reviewed = pin.pop(field)
+                    self.assert_refused(f"{position} requires {requirement} {field}")
+                    pin[field] = invalid
+                    self.assert_refused(f"{position} requires {requirement} {field}")
+                    pin[field] = reviewed
+
+    def test_preparation_refuses_duplicate_keys(self):
+        raw = json.dumps(self.pins)
+        for duplicated in (
+            '{"current": {}, ' + raw[1:],
+            raw.replace('"retained": {', '"retained": {"image": null, '),
+        ):
+            with self.subTest(input=duplicated):
+                self.assert_refused("Selected pins contains invalid JSON or duplicate keys", duplicated)
+
+    def test_runbook_checks_both_revision_labels_before_running(self):
+        section = RUNBOOK.read_text(encoding="utf-8").split("### Disposable rehearsal\n", 1)[1]
+        recipe = section.split("```bash\n", 1)[1].split("```", 1)[0]
+        (self.root / "selected.json").write_text(json.dumps(self.pins), encoding="utf-8")
+        transcript = self.root / "cutoff.log"
+        mocks = r'''
+fixture_current=$1 fixture_retained=$2 label_current=$3 label_retained=$4
+fixture_python=$5 fixture_prepare=$6
+docker() {
+  case "$1:$2" in
+    image:inspect)
+      case "$5" in
+        "$fixture_current") printf '%s\n' "$label_current" ;;
+        "$fixture_retained") printf '%s\n' "$label_retained" ;;
+        *) return 8 ;;
+      esac ;;
+    pull:*) return 0 ;;
+    *) return 9 ;;
+  esac
+}
+git() { [[ "$1" == cat-file && "$2" == -e && "$3" == "$label_current"* ]]; }
+python3() {
+  case "$1" in
+    tests/event_write_cutoff/prepare_rehearsal.py) "$fixture_python" "$fixture_prepare" "${@:2}" ;;
+    tests/event_write_cutoff/rehearse.py) printf '%s\n' "${@:2}"; return 7 ;;
+    *) return 9 ;;
+  esac
+}
+result=99
+'''
+        report = '\nrecipe_status=$?\nprintf "%s %s\\n" "$recipe_status" "${result-unset}"\n'
+        current, retained = PINS["current"], PINS["retained"]
+        for mismatch in (None, "current", "retained"):
+            with self.subTest(mismatch=mismatch):
+                transcript.write_text("previous rehearsal\n", encoding="utf-8")
+                result = subprocess.run(
+                    ["bash", "-c", mocks + recipe + report, "rehearsal-fixture",
+                     current["image"], retained["image"],
+                     "3" * 40 if mismatch == "current" else current["source_revision"],
+                     "3" * 40 if mismatch == "retained" else retained["source_revision"],
+                     sys.executable, str(VERIFIER.with_name("prepare_rehearsal.py"))],
+                    cwd=self.root, capture_output=True, text=True, check=True, timeout=10,
+                )
+                captured = transcript.read_text(encoding="utf-8").splitlines()
+                if mismatch is None:
+                    self.assertEqual(result.stdout, "0 7\n")
+                    self.assertEqual(result.stderr, "")
+                    self.assertEqual(captured, ["--current", current["image"], "--retained", retained["image"]])
+                else:
+                    self.assertEqual(result.stdout, "1 unset\n")
+                    self.assertEqual(result.stderr, "Local image revisions differ from the reviewed pair\n")
+                    self.assertEqual(captured, ["previous rehearsal"])
 
 
 if __name__ == "__main__":
