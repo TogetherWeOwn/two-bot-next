@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from build_identity import is_build_revision_shape, is_deploy_id_shape
 from pre_registry_cleanup import (
-    RegistryDisposition, RegistryReadback, RegistryReservation, registry_cleanup_disposition,
+    PublicationSettlement, RegistryDisposition, RegistryReadback, RegistryReservation, registry_cleanup_disposition,
 )
 from pre_target import Inventory, Target, TargetError
 from rollback_proof import DIGEST, ProofError, VERSION, require
@@ -88,7 +88,7 @@ class RegistryCleanupEvidence:
     readback: RegistryReadback
     now: int
     run_status: str
-    publication_settled: bool
+    publication_settlement: PublicationSettlement | None
 
 
 @dataclass(frozen=True)
@@ -152,7 +152,7 @@ def accept(registry_reservation: RegistryReservation, build, *, receipt, schema,
     try:
         disposition = registry_cleanup_disposition(
             registry_reservation, registry.inventory, registry.readback, now=registry.now,
-            run_status=registry.run_status, publication_settled=registry.publication_settled,
+            run_status=registry.run_status, publication_settlement=registry.publication_settlement,
         )
     except TargetError as error:
         raise ProofError(str(error)) from None
