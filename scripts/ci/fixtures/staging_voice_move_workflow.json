@@ -28,7 +28,8 @@
       "timeout-minutes": "10",
       "env": {
         "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
-        "STAGING_USE_VOICE_MOVE": "1"
+        "STAGING_USE_VOICE_MOVE": "1",
+        "STAGING_VOICE_MOVE_PROOF": "false"
       },
       "steps": [
         {
@@ -55,6 +56,17 @@
             "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-voice-move-start.jsonl"
           },
           "run": "node wrangler/scripts/staging-use-pipeline.mjs begin"
+        },
+        {
+          "name": "Prove self-move within the same staging lease",
+          "if": "env.STAGING_VOICE_MOVE_PROOF == 'true' && steps.use.outcome == 'success'",
+          "env": {
+            "STAGING_USE_EXPIRES_AT": "${{ steps.use.outputs.expires_at }}",
+            "STAGING_USE_SHA": "${{ steps.use.outputs.sha }}",
+            "STAGING_USE_DEPLOYMENT": "${{ steps.use.outputs.deployment_id }}",
+            "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-voice-move-start.jsonl"
+          },
+          "run": "node wrangler/scripts/staging-voice-move-job.mjs"
         },
         {
           "name": "Release the same lease and read back OFF",
