@@ -945,11 +945,14 @@ class ArtifactHeadersReadinessTests(unittest.TestCase):
         readyz, health = self.live_headers()
 
         code, message = self.judge(body=old_stamps, headers=old_readyz, health=old_health,
-                                   expected_version=OTHER_VERSION, image=OLD_IMAGE, admission=admission,
+                                   worker_version=OTHER_VERSION, expected_version=OTHER_VERSION,
+                                   image=OLD_IMAGE, admission=admission,
                                    deploy_id=f"2026.10.22.2+{SHA[:7]}")
         self.assertEqual(code, 0, message)
+        self.assertIn("gateway ready", message)
         code, message = self.judge(headers=readyz, health=health)
         self.assertEqual(code, 0, message)
+        self.assertIn("gateway ready", message)
 
         cases = (
             ("previous health", {"headers": readyz, "health": old_health},
