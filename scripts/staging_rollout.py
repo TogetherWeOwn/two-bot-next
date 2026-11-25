@@ -866,7 +866,7 @@ def apply_remediation_fault_injection(config, voice_stall, unpaired_disconnect):
 
 def prepare(args, client):
     staging_url()
-    revision = os.environ.get("GITHUB_SHA", "")
+    revision = os.environ.get("STAGING_SOURCE_SHA", os.environ.get("GITHUB_SHA", ""))
     build_id = f"{os.environ.get('GITHUB_RUN_ID', '')}-{os.environ.get('GITHUB_RUN_ATTEMPT', '')}"
     deploy_id = os.environ.get("DEPLOY_ID", "")
     require(re.fullmatch(r"[0-9a-f]{40}", revision) and re.fullmatch(r"[0-9]+-[0-9]+", build_id)

@@ -1394,6 +1394,27 @@ class OrchestrationTests(OfflineTestCase):
         self.assert_gate("prior_rollout_in_flight", rollout.prepare, self.args, client)
         self.assertFalse(Path(self.args.receipt).exists())
 
+    def test_prepare_stamps_serving_sha_with_distinct_workflow_sha(self):
+        workflow_sha = "f" * 40
+        with patch.dict(os.environ, {"GITHUB_SHA": workflow_sha, "STAGING_SOURCE_SHA": REVISION}):
+            self.prepare_baseline()
+            self.assertEqual(os.environ["GITHUB_SHA"], workflow_sha)
+        generated = json.loads(Path(self.args.deploy_config).read_text())
+        staging = generated["env"]["staging"]
+        self.assertEqual(staging["containers"][0]["image_vars"]["BOT_BUILD_REVISION"], REVISION)
+        self.assertEqual(staging["vars"]["CONTAINER_RELEASE"], REVISION)
+        self.assertEqual(json.loads(Path(self.args.receipt).read_text()), baseline())
+
+    def test_prepare_rejects_serving_sha_mismatch_before_provider_reads(self):
+        # The deploy ID matches the workflow SHA, so falling back would accept it.
+        for source in ("f" * 40, ""):
+            with self.subTest(source=source), patch.dict(os.environ, {"STAGING_SOURCE_SHA": source}):
+                client = FakeClient({APP_PATH: [[app(OLD_IMAGE)]], ROWS_PATH: [[old_row()]]})
+                self.assert_gate("invalid_build_identity", rollout.prepare, self.args, client)
+                self.assertEqual(client.calls, [])
+                self.assertFalse(Path(self.args.receipt).exists())
+                self.assertFalse(Path(self.args.deploy_config).exists())
+
     def test_prepare_invalid_build_identity_and_wrong_config(self):
         with patch.dict(os.environ, {"GITHUB_SHA": "bad-sha"}):
             self.assert_gate("invalid_build_identity", self.prepare_baseline)

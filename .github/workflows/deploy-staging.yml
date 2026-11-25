@@ -415,12 +415,9 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           STAGING_URL: ${{ vars.STAGING_WORKER_URL }}
-          # staging_rollout.py prepare reads GITHUB_SHA as the build revision
-          # (BOT_BUILD_REVISION, CONTAINER_RELEASE, the baseline receipt the
-          # verify step judges against), so stamp the validated deploy SHA, not
-          # the runner's workflow-head default, or a pinned drill would serve
-          # the pin labeled as the head.
-          GITHUB_SHA: ${{ env.DEPLOY_SHA }}
+          # GITHUB_SHA identifies the workflow checkout. Stamp the validated
+          # serving SHA in the build, deployment config and baseline receipt.
+          STAGING_SOURCE_SHA: ${{ env.DEPLOY_SHA }}
           # Opt-in drill switches. test_workflows.py pins the explicit
           # workflow_dispatch guards as defense in depth.
           INJECT_GATEWAY_FAILURE: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_gateway_failure && 'true' || 'false' }}
