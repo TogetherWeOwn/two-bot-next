@@ -8,7 +8,7 @@ function protectedWindow(elapsedMs?: number) {
   const { evidence, caller, ...window } = args;
   const reads: string[] = [];
   return {
-    signed, calls, moves, reads,
+    signed, calls, moves, reads, evidence,
     input: {
       ...window,
       previousReady: evidence.previousReady,
@@ -89,10 +89,11 @@ test("protected voice adapter rejects an unbound caller before collecting readba
 
 test("protected voice adapter finishes the window on mismatched or failed readbacks", async () => {
   const sentinel = "private diagnostic from the fixture reader";
-  for (const fault of ["session", "observer", "prior window"]) {
-    const { input, calls, signed } = protectedWindow();
+  for (const fault of ["session", "observer", "stale channels", "prior window"]) {
+    const { input, calls, signed, evidence } = protectedWindow();
     const result = await runProtectedVoiceMoveAcceptance({
       ...input,
+      evidence,
       previousOff: fault === "prior window" ? undefined : input.previousOff,
       session: {
         ...input.session,
@@ -103,12 +104,16 @@ test("protected voice adapter finishes the window on mismatched or failed readba
       },
       async readChannels(request) {
         if (fault === "observer") throw new Error(sentinel);
-        return input.readChannels(request);
+        const readback = await input.readChannels(request);
+        if (fault !== "stale channels") return readback;
+        const observedAt = new Date(input.ready.use.acquiredAt - 1).toISOString();
+        return { ...readback, source: { ...readback.source, observedAt } };
       },
     });
     assert.equal(result.verdict, "failed");
     assert.equal(result.code, {
-      session: "session_unconfirmed", observer: "probe_failed", "prior window": "prior_cleanup_unconfirmed",
+      session: "session_unconfirmed", observer: "probe_failed", "stale channels": "discord_unconfirmed",
+      "prior window": "prior_cleanup_unconfirmed",
     }[fault]);
     assert.deepEqual(signed, []);
     assert.deepEqual(result.cases, []);
