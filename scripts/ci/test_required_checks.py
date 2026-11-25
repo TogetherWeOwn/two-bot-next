@@ -305,8 +305,30 @@ class RequiredChecksReportTests(unittest.TestCase):
                         f"{always_run} is an always-run gate and may never skip",
                     )
 
+    def test_supply_chain_runs_on_pr_heads_and_metadata_edits(self):
+        supply = self.workflows["supply-chain.yml"]
+        # Opening a draft and pushing to it already schedule both checks.
+        # Marking it ready leaves the head and the lint input unchanged.
+        self.assertEqual(supply["on"]["pull_request"], {
+            "types": ["opened", "edited", "synchronize", "reopened"],
+        })
+        self.assertNotIn("if", supply["jobs"]["pr-lint"])
+
+    def test_supply_chain_retains_non_pr_routes_and_pr_cancellation(self):
+        supply = self.workflows["supply-chain.yml"]
+        self.assertEqual(supply["on"]["merge_group"], {"types": ["checks_requested"]})
+        self.assertEqual(supply["on"]["push"], {"branches": ["main"]})
+        dispatch = supply["on"]["workflow_dispatch"]["inputs"]["pr_number"]
+        self.assertEqual((dispatch["required"], dispatch["type"]), ("true", "string"))
+        self.assertEqual(supply["concurrency"], {
+            "group": "supply-chain-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}",
+            "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+        })
+
     def test_gitleaks_runs_whatever_pr_lint_concluded(self):
-        self.assertIn("!cancelled()", self.workflows["supply-chain.yml"]["jobs"]["gitleaks"]["if"])
+        gitleaks = self.workflows["supply-chain.yml"]["jobs"]["gitleaks"]
+        self.assertEqual(gitleaks["needs"], "pr-lint")
+        self.assertEqual(gitleaks["if"], "${{ !cancelled() }}")
 
 
 if __name__ == "__main__":
