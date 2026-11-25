@@ -1,7 +1,7 @@
+#![cfg(test)]
 use super::*;
 use std::{collections::HashMap, time::Duration};
 use two_bot_core::{backup::guild_config::TWO_STAGING_GUILD_ID, Secret};
-
 const CA: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/event_write_cutoff/fixtures/recorder-ca.der"
