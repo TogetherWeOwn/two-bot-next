@@ -2921,12 +2921,24 @@ jobs:
       - name: Offline parity guard regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_parity_baseline.py' -v
       - name: Fetch public legacy history (no credentials)
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+          GIT_ASKPASS: /bin/false
         run: |
-          git -c credential.helper= clone --bare https://github.com/TogetherWeOwn/two-bot.git "$RUNNER_TEMP/legacy.git"
+          legacy="$RUNNER_TEMP/legacy.git"
           start=$(python3 -c 'import json; print(json.load(open("docs/parity-baseline.json"))["historyStart"])')
-          git -C "$RUNNER_TEMP/legacy.git" -c credential.helper= fetch origin "$start"
+          if [[ ! "$start" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'historyStart must be a full lowercase commit SHA' >&2
+            exit 1
+          fi
+          # Preserve both full histories, including a range start outside main.
+          git init --bare --quiet --initial-branch=main "$legacy"
+          git -C "$legacy" -c credential.helper= fetch --no-tags -- \
+            https://github.com/TogetherWeOwn/two-bot.git refs/heads/main:refs/heads/main "$start"
+          test "$(git -C "$legacy" rev-parse --is-shallow-repository)" = false
+          test "$(git -C "$legacy" cat-file -t "$start")" = commit
       - name: Check baseline ancestry, complete ledger and permalink targets
-        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_parity_baseline.py --legacy-repo "$RUNNER_TEMP/legacy.git"
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_parity_baseline.py --legacy-repo "$RUNNER_TEMP/legacy.git" --main-ref refs/heads/main
 
   self-role-store:
     name: self-role store leases
