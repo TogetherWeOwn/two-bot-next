@@ -861,6 +861,9 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
             restore_version = snap_state.get("serving_version")
             require(isinstance(restore_version, str) and VERSION_ID.fullmatch(restore_version),
                     "invalid_snapshot_version")
+            recorded_sha = snap_state.get("serving_sha")
+            require(args.variant != "production" or recorded_sha is not None,
+                    "production_rollback_source_unproved")
             prev_rollout = base.identifier(snap_state.get("serving_rollout_id"))
             row = base.mapping(client.api(
                 f"/containers/applications/{base.identifier(snap_state.get('application_id'))}"
@@ -878,10 +881,7 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
             # --expected-sha must agree with it. The receipt is then bound
             # to live Cloudflare state exactly like a manual rollback's, so
             # a stale or hand-edited snapshot refuses before any POST
-            # instead of at the stable gate after traffic moved. A
-            # pre-stamp snapshot has no SHA member and keeps the legacy
-            # header-only identity.
-            recorded_sha = snap_state.get("serving_sha")
+            # instead of at the stable gate after traffic moved.
             if recorded_sha is not None:
                 require(isinstance(recorded_sha, str) and SHA.fullmatch(recorded_sha),
                         "invalid_snapshot_sha")

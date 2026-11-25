@@ -972,6 +972,31 @@ class MainProvenanceTests(unittest.TestCase):
                     else:
                         restore.assert_called_once_with(GOOD_VERSION, image)
 
+    def test_production_snapshot_requires_its_own_sha_even_with_explicit_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = self.write_snapshot(directory, worker=rollback.WORKERS["production"],
+                                           application=rollback.APPLICATIONS["production"], serving_sha=None)
+            argv = ["rollback", "--variant", "production", "--worker-url",
+                    "https://two-bot-next-production.acct.workers.dev", "--snapshot", str(snapshot),
+                    "--expected-sha", SHA, "--actor", "fixture-actor",
+                    "--evidence", str(Path(directory) / "evidence.json")]
+            for extra in ([], ["--dry-run"]):
+                with self.subTest(extra=extra):
+                    client = mock.Mock()
+                    client.api.side_effect = rollback.GateError("unexpected_provider_read")
+                    code, output = self.run_main([*argv, *extra], client)
+                    self.assertEqual(code, 1, output)
+                    self.assertIn("production_rollback_source_unproved", output)
+                    client.api.assert_not_called()
+
+    def test_production_schema_guard_requires_an_inspectable_source(self):
+        with self.assertRaisesRegex(rollback.GateError, "^production_rollback_source_unproved$"):
+            rollback.source_has_attendance_schema(None)
+        git_error = rollback.subprocess.CalledProcessError(128, "git")
+        with (mock.patch.object(rollback.subprocess, "run", side_effect=git_error),
+              self.assertRaisesRegex(rollback.GateError, "^production_rollback_source_unproved$")):
+            rollback.source_has_attendance_schema(SHA)
+
     URL = "https://two-bot-next-staging.acct.workers.dev"
 
     def base_env(self):
