@@ -9,11 +9,11 @@ from unittest.mock import Mock, call, patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from ci.test_pre_admission import Store
-    from ci.test_pre_registry_cleanup import ABSENT, RESERVATION
+    from ci.test_pre_registry_cleanup import RESERVATION
     from ci.test_pre_start_stop import PRE_SHAPES, START, TARGET, PreFixture
     from ci.test_staging_pre_reaper_fixture import SyntheticStaging
     from pre_admission import AdmissionRecord, SettlementEvidence, SettlementSource, StartupAdmission
-    from pre_registry_cleanup import RegistryDisposition, registry_cleanup_disposition
+    from pre_registry_cleanup import RegistryDisposition, RegistryReadback, registry_cleanup_disposition
     from pre_start_stop import Operation, ProtectedPre
     from pre_sweep import SweepError, sweep_target
     from pre_target import Resource, TargetError
@@ -67,12 +67,15 @@ class PreRunnerLossHandbackTests(unittest.TestCase):
                             and store.now >= target.expires_at, admission=admission, runtime=Mock(),
                             external_stop=runtime)
         reservation = replace(RESERVATION, target=target)
-        registry_absent = replace(ABSENT, target=target)
+        manifests = set()
+        publication_settled = False
 
         def handback():
+            inventory = reaper.inventory(target)
+            readback = RegistryReadback(target, reservation.reference, reservation.reference in manifests)
             return registry_cleanup_disposition(
-                reservation, reaper.inventory(target), registry_absent,
-                run_status=reaper.run_status(target), now=store.now, publication_settled=True,
+                reservation, inventory, readback, run_status=reaper.run_status(target),
+                now=store.now, publication_settled=publication_settled,
             )
 
         store.now = target.expires_at - 1
@@ -80,6 +83,8 @@ class PreRunnerLossHandbackTests(unittest.TestCase):
         self.assertEqual(reaper.events, [("status", target), ("inventory", target)])
         self.assertIsNone(handback())
 
+        manifests.add(reservation.reference)
+        publication_settled = True
         store.now = target.expires_at
         reaper.events.clear()
         self.assertFalse(stop.stop())
@@ -113,4 +118,6 @@ class PreRunnerLossHandbackTests(unittest.TestCase):
             ("stop_container", target, app.name, app.id), ("delete_container", target, app.name, app.id),
             ("inventory", target),
         ])
+        self.assertIs(handback(), RegistryDisposition.UNRESOLVED_DIGEST_REFERENCE)
+        manifests.remove(reservation.reference)
         self.assertIs(handback(), RegistryDisposition.ALREADY_ABSENT)
