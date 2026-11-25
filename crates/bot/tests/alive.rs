@@ -404,18 +404,17 @@ impl MockDiscord {
                                     "v":10,"user":{"id":"999","username":"mock-bot","discriminator":"0","mfa_enabled":false},
                                     "session_id":SESSION,"resume_gateway_url":resume_url,"guilds":[],"application":{"id":"1111","flags":0}
                                 }}).to_string())).await.unwrap();
-                            }
-                            // On restart this is the exact already-committed dispatch replay.
-                            ws.send(Message::text(json!({"op":0,"s":2,"t":"GUILD_MEMBER_REMOVE","d":{
-                                "guild_id":GUILD,"user":{"id":"77","username":"mock-member","discriminator":"0"}
-                            }}).to_string())).await.unwrap();
-                            if boot == 0 {
-                                ws.send(Message::text(json!({"op":0,"s":3,"t":"VOICE_STATE_UPDATE","d":{
+                                ws.send(Message::text(json!({"op":0,"s":2,"t":"VOICE_STATE_UPDATE","d":{
                                     "guild_id":GUILD,"user_id":VOICE_MEMBER,"channel_id":VOICE_CHANNEL,
                                     "session_id":"fixture-voice","deaf":false,"mute":false,
                                     "self_deaf":false,"self_mute":false,"self_video":false,"suppress":false
                                 }}).to_string())).await.unwrap();
-                            } else {
+                            }
+                            // On restart this replays the dispatch at the exact saved checkpoint.
+                            ws.send(Message::text(json!({"op":0,"s":3,"t":"GUILD_MEMBER_REMOVE","d":{
+                                "guild_id":GUILD,"user":{"id":"77","username":"mock-member","discriminator":"0"}
+                            }}).to_string())).await.unwrap();
+                            if boot == 1 {
                                 ws.send(Message::text(
                                     json!({"op":0,"s":4,"t":"RESUMED","d":{}}).to_string(),
                                 ))
