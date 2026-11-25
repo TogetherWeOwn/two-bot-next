@@ -138,7 +138,7 @@ test("AutoMod job scopes startup and cleanup receipts to the existing caller", a
   assert.deepEqual(calls.splice(0), ["start"]);
   assert.equal(running, true);
 
-  t.mock.timers.setTime(issued.expiresAt);
+  t.mock.timers.setTime(issued.expiresAt + 1);
   for (const [caseName, expected] of [["stale-grant", []], ["other-grant", []], ["other-drain", ["drain"]],
     ["stop-refused", ["drain", "stop"]], ["still-running", ["drain", "stop"]],
     ["other-revision", ["drain", "stop", "read", "read", "read"]]] as const) {
