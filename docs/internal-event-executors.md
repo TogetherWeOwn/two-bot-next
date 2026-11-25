@@ -194,9 +194,9 @@ readback, or elapsed time cannot settle it. Never dispatch under a second key.
 
 ### Disposable rehearsal
 
-Pull the admitted images by digest through the registry's read-only path
-before starting the rehearsal. The script launches only locally present
-pinned images and the Postgres and recorder fixtures. It starts a fresh
+Pull the admitted Bot images by digest through the registry's read-only path
+and pre-pull the pinned Postgres and recorder images below. The script launches
+only locally present images. It starts a fresh
 loopback-only network namespace with no external interface, supplies synthetic
 credentials, and routes the original binary's TLS requests for `discord.com`
 to the local recorder. It uses the shipping receiver's compile-time guild
@@ -204,6 +204,8 @@ fence as an inert fixture identifier. It does not use a live guild or the
 Worker ingress.
 
 ```sh
+docker pull postgres@sha256:372621a978f4513b082d946d6320e2b11a3b359648b81fba8a2ba0df33958f62
+docker pull node@sha256:e7add2a490bb17d97b485b8641bd88455fff7839ade0f5eba493c3508124d413
 PYTHONDONTWRITEBYTECODE=1 python3 tests/event_write_cutoff/rehearse.py \
   --current "$current_digest_reference" --retained "$retained_digest_reference"
 ```

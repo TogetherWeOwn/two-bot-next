@@ -36,9 +36,12 @@ def require(condition, detail):
 
 def wait_for(check, what, timeout=10):
     end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        if check():
-            return
+    while (remaining := end - time.monotonic()) > 0:
+        try:
+            if check(remaining):
+                return
+        except subprocess.TimeoutExpired:
+            break
         time.sleep(0.05)
     raise RuntimeError(f"Timed out waiting for {what}")
 
@@ -96,8 +99,8 @@ class Rehearsal:
         self.docker_run(self.pg, "--add-host", "discord.com:127.0.0.1", DB_IMAGE, "postgres",
                         "-c", "listen_addresses=127.0.0.1", env={"POSTGRES_PASSWORD": self.password,
                                                                   "POSTGRES_DB": self.database})
-        wait_for(lambda: subprocess.run(
-            ["docker", "exec", self.pg, "pg_isready", "-h", "127.0.0.1", "-q"], check=False
+        wait_for(lambda remaining: subprocess.run(
+            ["docker", "exec", self.pg, "pg_isready", "-h", "127.0.0.1", "-q"], check=False, timeout=remaining
         ).returncode == 0, "Postgres")
         for name in ("store", "cutover"):
             folder = f"crates/{name}/migrations"
@@ -121,7 +124,7 @@ class Rehearsal:
         else:
             self.docker_run(self.recorder, *args, namespace=self.pg, entrypoint="python3",
                             env={"SYNTHETIC_BOT_TOKEN": self.token, "SYNTHETIC_HMAC_KEY": self.key})
-        wait_for(lambda: (self.work / "recorder-ready").exists(), "TLS recorder")
+        wait_for(lambda _: (self.work / "recorder-ready").exists(), "TLS recorder")
         interfaces = run("docker", "exec", self.recorder, "cat", "/proc/net/dev").decode()
         require([line.split(":")[0].strip() for line in interfaces.splitlines()[2:]] == ["lo"],
                 "External network interface in rehearsal")
@@ -130,7 +133,7 @@ class Rehearsal:
 
     def was_started(self, name):
         return subprocess.run(["docker", "inspect", name], check=False,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode == 0
 
     def start_bot(self, which):
         name = self.bot_name(which)
@@ -154,10 +157,10 @@ class Rehearsal:
                 },
             )
         try:
-            wait_for(lambda: subprocess.run(
+            wait_for(lambda remaining: subprocess.run(
                 ["docker", "exec", self.recorder, "python3", "-c",
                  f"import socket; socket.create_connection(('127.0.0.1',{port}),0.2).close()"],
-                check=False, capture_output=True,
+                check=False, capture_output=True, timeout=remaining,
             ).returncode == 0, f"{which} receiver")
         except RuntimeError:
             print(run("docker", "logs", name).decode()[-4000:], flush=True)
@@ -208,7 +211,7 @@ class Rehearsal:
         with ThreadPoolExecutor(max_workers=1) as worker:
             response = worker.submit(self.request, which, key, body)
             try:
-                wait_for(lambda: response.done() or any(row[3] == outcome for row in self.journal()[since:]),
+                wait_for(lambda _: response.done() or any(row[3] == outcome for row in self.journal()[since:]),
                          outcome, timeout=4)
                 require(any(row[3] == outcome for row in self.journal()[since:]),
                         f"Receiver answered before the {outcome} barrier")
@@ -277,9 +280,13 @@ class Rehearsal:
         require(answer["code"] == "discord_rejected", "Restore without the claim bypassed the cutoff")
 
         entries = self.journal()
-        denied = [operation for _, _, operation, outcome in entries if outcome == "denied"]
-        require(denied == ["create", "edit", "cancel", "create", "edit", "cancel", "create", "create"],
-                "Expected ordered event denials on both runtimes and after both relevant restores")
+        denied = [row[:3] for row in entries if row[3] == "denied"]
+        events_path = f"/api/v10/guilds/{GUILD}/scheduled-events"
+        create_denial = ("POST", events_path, "create")
+        denied_per_runtime = [create_denial, ("PATCH", f"{events_path}/{EVENT}", "edit"),
+                              ("PATCH", f"{events_path}/{EVENT}", "cancel")]
+        require(denied == denied_per_runtime * 2 + [create_denial] * 2,
+                "Expected ordered event denials at the fixture routes on both runtimes and after both restores")
         applied = [operation for _, _, operation, outcome in entries if outcome == "applied"]
         require(applied == ["role", "role", "create"], "Expected two role writes and one pre-cutoff event effect")
         require(all(row[3] != "unexpected" for row in entries), "Unexpected fixture mutation route")
