@@ -38,7 +38,7 @@ GATEWAY = {"verdict": "observed", "build_sha": SHA, "signals": {
 
 
 def watch_rows(signal, *observations):
-    return {"schema": "production_watch.v1", "signal": signal, "rows": [
+    return {"schema": "production_watch.v2", "signal": signal, "window": PRODUCTION, "rows": [
         {"utc": f"2026-11-25T02:0{index}:00Z", "observation": check, "disposition": disposition}
         for index, (check, disposition) in enumerate(observations, start=1)
     ]}
@@ -83,11 +83,16 @@ class T0AcceptanceReportTests(unittest.TestCase):
         )
 
     def test_assembled_watch_signals_round_trip_with_independent_binding(self):
+        equivalent_window = dict(PRODUCTION, start="2026-11-25T02:00:00.000000000+00:00",
+                                 end="2026-11-25T02:05:00+0000")
         bindings = {}
         for signal, source in (("help", WATCH_HELP), ("naming", WATCH_EMPTY + WATCH_RETURN)):
-            assembled = self.assemble_watch(signal, source)
+            assembled = self.assemble_watch(signal, source, equivalent_window)
             self.assertEqual((assembled.returncode, assembled.stderr), (0, b""))
             self.assertEqual(self.assemble_watch(signal, source).stdout, assembled.stdout)
+            receipt = json.loads(assembled.stdout)
+            self.assertEqual(receipt.keys(), {"schema", "signal", "window", "rows"})
+            self.assertEqual(receipt["window"], PRODUCTION)
             bindings[signal] = self.save(signal, assembled.stdout, PRODUCTION)
         naming = json.loads(self.paths["naming"].read_bytes())
         self.assertEqual(naming["rows"][1]["utc"], "2026-11-25T02:03:00.125+00:00")
@@ -105,6 +110,50 @@ class T0AcceptanceReportTests(unittest.TestCase):
         row = self.run_report(bindings, PRODUCTION)["naming"]
         self.assertEqual((row["status"], row["result"], row["missing_transitions"]),
                          ("attributed", "not_observed", ["occupied-room-return"]))
+
+    def test_assembled_watch_refuses_reattribution_to_overlapping_window(self):
+        bindings = {}
+        for signal, source in (("help", WATCH_HELP), ("naming", WATCH_EMPTY + WATCH_RETURN)):
+            assembled = self.assemble_watch(signal, source)
+            self.assertEqual((assembled.returncode, assembled.stderr), (0, b""))
+            bindings[signal] = self.save(signal, assembled.stdout, PRODUCTION)
+        same = self.run_report(bindings, PRODUCTION)
+        self.assertEqual((same["help"]["status"], same["help"]["result"]),
+                         ("attributed", "readbacks_and_deletions_recorded"))
+        self.assertEqual((same["naming"]["status"], same["naming"]["result"]),
+                         ("attributed", "transitions_recorded"))
+
+        for change in ({"start": "2026-11-25T02:00:00.000000001Z"},
+                       {"end": "2026-11-25T02:04:00Z"}, {"build_id": "901-1"}):
+            other = PRODUCTION | change
+            # The independent handoff agrees with itself, and all saved bytes and timestamps still fit.
+            repackaged = {signal: dict(binding, window=other) for signal, binding in bindings.items()}
+            rows = self.run_report(repackaged, other)
+            for signal in bindings:
+                with self.subTest(signal=signal, change=change):
+                    row = rows[signal]
+                    self.assertEqual(row["status"], "mismatched")
+                    self.assertEqual(row["fields"], list(change))
+                    self.assertNotIn("result", row)
+
+    def test_production_watch_requires_a_supported_receipt_with_a_complete_production_window(self):
+        sentinel = "synthetic private value"
+        for signal, checks in (("help", (("branding-readbacks-and-deletions", "pass"),)),
+                               ("naming", (("empty-room-rename", "pass"), ("occupied-room-return", "pass")))):
+            report = watch_rows(signal, *checks)
+            missing = {key: value for key, value in report.items() if key != "window"}
+            legacy = dict(missing, schema="production_watch.v1")
+            for invalid in (legacy, missing, dict(report, schema="production_watch.v3"),
+                            dict(report, window=WINDOW), dict(report, window=dict(PRODUCTION, end=None)),
+                            dict(report, window=dict(PRODUCTION, note=sentinel)), dict(report, note=sentinel)):
+                with self.subTest(signal=signal, receipt=invalid):
+                    binding = self.save(signal, invalid, PRODUCTION)
+                    row = self.run_report({signal: binding}, PRODUCTION)[signal]
+                    self.assertEqual(row["status"], "unverified")
+                    self.assertNotIn("result", row)
+                    self.assertNotIn(sentinel, json.dumps(row))
+                    if invalid is legacy:
+                        self.assertEqual(row["reason"], "legacy production watch lacks the assembler serving window")
 
     def test_watch_assembly_refuses_late_incomplete_or_unapproved_input_without_echo(self):
         late = WATCH_RETURN.replace(b"02:03:00.125+00:00", b"02:05:00.000000001Z")
