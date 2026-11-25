@@ -793,6 +793,14 @@ workflow holds the `staging-lifecycle` queue across both actions. A future
 caller must leave that queue to the reusable workflow. Worker cleanup owns
 durable retirement and retry for an interrupted runner or unconfirmed recovery.
 
+The dormant `readStagingAutomodJobInputs` adapter takes authenticated staging
+job context and reads the original lifecycle-issued lease plus two action
+approvals from protected authority. It checks the deployment, build and run
+attempt against the lease, then checks each approval against the fixed target,
+its own action and the full issued lease. If one approval is unavailable, the
+other stays usable. The offline test supplies protected readbacks in memory.
+Live use still requires an authenticated provider for those readbacks.
+
 ## 10. Spec self-check (doctest)
 
 The numbers asserted above, verified against themselves. This checks the
