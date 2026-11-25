@@ -408,10 +408,10 @@ once per bot production release, after deploying the candidate to staging.
 
 ## Attendance predecessor identity at both PRE endpoints
 
-Use the same Worker and container identity check at both database endpoints
-derived by `ledger_endpoints` in `scripts/production_release_forward.py` from
-the authenticated forward plan at the pinned release source.
-[Protected release source](https://github.com/TogetherWeOwn/two-bot-next/pull/2458).
+Use the same Worker and container identity check at both database endpoints.
+Derive the endpoints from the authenticated forward plan using `ledger_endpoints`
+at the pinned release revision.
+[Protected release source](https://github.com/TogetherWeOwn/two-bot-next/blob/46bd2f2bd50edd5c9ad73f1f8174e6f923ce1650/scripts/production_release_forward.py#L13).
 
 | Endpoint | Cutover | Store | Schema marker |
 | --- | --- | --- | --- |
