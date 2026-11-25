@@ -39,7 +39,12 @@ use two_bot_cutover::gateway_session::GatewaySessionStore;
 
 const STEP: Duration = Duration::from_secs(5);
 const TOTAL: Duration = Duration::from_secs(45);
-const GUILD: &str = "2222";
+const GUILD: &str = "222200000000000001";
+const ATTENDANCE_EVENT: &str = "200000000000000001";
+const VOICE_MEMBER: &str = "300000000000000001";
+const VOICE_CHANNEL: &str = "400000000000000001";
+const GUILD_PATH: &str = "/api/v10/guilds/222200000000000001";
+const COMMANDS_PATH: &str = "/api/v10/applications/1111/guilds/222200000000000001/commands";
 const SESSION: &str = "alive-mock-session";
 type Logs = Arc<Mutex<String>>;
 
@@ -236,6 +241,9 @@ impl Bot {
             // Website jobs open the same CI-service URL through cutover.
             .env("TWO_DATABASE_TLS", "local-only")
             .env("DISCORD_API_BASE", api)
+            // The read flag alone does not enable private ingress or capture.
+            .env("TWO_INTERNAL_BIND", "invalid-bind")
+            .env("TWO_INTERNAL_ALLOW_ATTENDANCE_READ", "1")
             .env("TWO_ANNOUNCEMENTS", "1")
             .env("TWO_COMMUNITY_SCORECARD", "1")
             .env("RUST_LOG", "two_bot=info")
@@ -401,9 +409,15 @@ impl MockDiscord {
                             ws.send(Message::text(json!({"op":0,"s":2,"t":"GUILD_MEMBER_REMOVE","d":{
                                 "guild_id":GUILD,"user":{"id":"77","username":"mock-member","discriminator":"0"}
                             }}).to_string())).await.unwrap();
-                            if boot == 1 {
+                            if boot == 0 {
+                                ws.send(Message::text(json!({"op":0,"s":3,"t":"VOICE_STATE_UPDATE","d":{
+                                    "guild_id":GUILD,"user_id":VOICE_MEMBER,"channel_id":VOICE_CHANNEL,
+                                    "session_id":"fixture-voice","deaf":false,"mute":false,
+                                    "self_deaf":false,"self_mute":false,"self_video":false,"suppress":false
+                                }}).to_string())).await.unwrap();
+                            } else {
                                 ws.send(Message::text(
-                                    json!({"op":0,"s":3,"t":"RESUMED","d":{}}).to_string(),
+                                    json!({"op":0,"s":4,"t":"RESUMED","d":{}}).to_string(),
                                 ))
                                 .await
                                 .unwrap();
@@ -546,13 +560,11 @@ async fn serve_rest(
                 ("GET", "/api/v10/users/@me") => {
                     ("200 OK", b"{\"id\":\"999\",\"bot\":true}".to_vec())
                 }
-                ("GET", "/api/v10/guilds/2222") => (
+                ("GET", GUILD_PATH) => (
                     "200 OK",
-                    b"{\"id\":\"2222\",\"name\":\"Alive fixture\"}".to_vec(),
+                    json!({"id": GUILD, "name": "Alive fixture"}).to_string().into_bytes(),
                 ),
-                ("PUT", "/api/v10/applications/1111/guilds/2222/commands") => {
-                    ("200 OK", registry_echo)
-                }
+                ("PUT", COMMANDS_PATH) => ("200 OK", registry_echo),
                 ("GET", path) if path.contains("scheduled-events") => ("200 OK", b"[]".to_vec()),
                 _ => (
                     "404 Not Found",
@@ -569,10 +581,15 @@ async fn serve_rest(
     }
 }
 
-async fn get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
+async fn http_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> std::io::Result<String> {
     let mut stream = TcpStream::connect(addr).await?;
     stream
-        .write_all(format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes())
+        .write_all(format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
         .await?;
     let mut response = String::new();
     stream.read_to_string(&mut response).await?;
@@ -583,7 +600,12 @@ async fn wait_http(bot: &mut Bot, addr: SocketAddr, path: &str, code: u16) -> St
     timeout(STEP, async {
         loop {
             bot.assert_alive();
-            if let Ok(Ok(response)) = timeout(Duration::from_millis(250), get(addr, path)).await {
+            if let Ok(Ok(response)) = timeout(
+                Duration::from_millis(250),
+                http_request(addr, "GET", path, ""),
+            )
+            .await
+            {
                 if response.starts_with(&format!("HTTP/1.0 {code}")) {
                     return response;
                 }
@@ -617,12 +639,14 @@ async fn checkpoint(db: &TestDb, seq: u64) {
     })
     .await
     .expect("durable checkpoint deadline");
-    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM events")
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+    let events: Vec<String> =
+        sqlx::query_scalar("SELECT event_type FROM events ORDER BY event_type")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
     assert_eq!(
-        rows, 1,
+        events,
+        ["first_voice_session", "member_leave", "voice_session_start"],
         "restart must not duplicate persisted funnel effects"
     );
 }
@@ -725,6 +749,65 @@ async fn strict_boot_probes(db: &TestDb, api: &str, bots: &mut Vec<Bot>, logs: &
     }
 }
 
+async fn seed_attendance_mapping(db: &TestDb) {
+    // Confirmed completion survives an empty event-mirror poll. A join in
+    // its current grace period would be eligible if capture were armed.
+    let mut tx = db.pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO event_instance_windows
+         (guild_id, event_id, instance_starts_at, starts_at, ends_at, status,
+          observed_at, attendance_recovered_at)
+         VALUES ($1, $2, now() - INTERVAL '30 minutes', now() - INTERVAL '30 minutes',
+                 now() - INTERVAL '1 minute', 'completed', now()::text, NULL)",
+    )
+    .bind(GUILD)
+    .bind(ATTENDANCE_EVENT)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO internal_event_keys (guild_id, event_id, event_key) VALUES ($1, $2, 'boot-fixture')")
+        .bind(GUILD)
+        .bind(ATTENDANCE_EVENT)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+async fn assert_attendance_capture_dormant(db: &TestDb) {
+    let in_grace: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM events e JOIN internal_event_keys k USING (guild_id)
+            JOIN event_instance_windows w USING (guild_id, event_id)
+            WHERE e.guild_id = $1 AND e.member_id = $2 AND e.event_type = 'voice_session_start'
+              AND k.event_key = 'boot-fixture' AND w.status = 'completed'
+              AND e.occurred_at::timestamptz >= w.ends_at
+              AND e.occurred_at::timestamptz < w.ends_at + INTERVAL '15 minutes'
+        )",
+    )
+    .bind(GUILD)
+    .bind(VOICE_MEMBER)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        in_grace,
+        "the ordinary gateway path processed the mapped voice join"
+    );
+    let attendance: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM event_attendance_windows),
+                (SELECT count(*) FROM event_voice_sessions)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        attendance,
+        (0, 0),
+        "the read flag must leave capture dormant"
+    );
+}
+
 async fn lifecycle(
     db: &TestDb,
     discord: &mut MockDiscord,
@@ -760,8 +843,7 @@ async fn lifecycle(
             .await
             .iter()
             .filter(|request| {
-                request.path == "/api/v10/applications/@me"
-                    || request.path == "/api/v10/applications/1111/guilds/2222/commands"
+                request.path == "/api/v10/applications/@me" || request.path == COMMANDS_PATH
             })
             .cloned()
             .collect();
@@ -796,10 +878,7 @@ async fn lifecycle(
         assert_eq!(identity.path, "/api/v10/applications/@me");
         let publish = &sync[2];
         assert_eq!(publish.method, "PUT");
-        assert_eq!(
-            publish.path,
-            "/api/v10/applications/1111/guilds/2222/commands"
-        );
+        assert_eq!(publish.path, COMMANDS_PATH);
         let commands: Vec<Value> = serde_json::from_slice(&publish.body).unwrap();
         let names: Vec<_> = commands
             .iter()
@@ -840,12 +919,12 @@ async fn lifecycle(
                 .await
                 .unwrap()
                 .map(|session| session.sequence),
-            if boot == 0 { None } else { Some(2) }
+            if boot == 0 { None } else { Some(3) }
         );
         assert_eq!(auth["op"], if boot == 0 { 2 } else { 6 });
         if boot == 1 {
             assert_eq!(auth["d"]["session_id"], SESSION);
-            assert_eq!(auth["d"]["seq"], 2);
+            assert_eq!(auth["d"]["seq"], 3);
         }
         wait_http(bot, addr, "/readyz", 503).await; // Authentication alone isn't ready.
         assert_eq!(
@@ -854,7 +933,7 @@ async fn lifecycle(
             "no ready log before READY/RESUMED"
         );
         discord.release.send(()).await.unwrap();
-        checkpoint(db, if boot == 0 { 2 } else { 3 }).await;
+        checkpoint(db, if boot == 0 { 3 } else { 4 }).await;
         assert_eq!(
             raw_url(db).await.as_deref(),
             Some(&*discord.url),
@@ -863,6 +942,19 @@ async fn lifecycle(
         let ready = wait_http(bot, addr, "/readyz", 200).await;
         assert!(ready.contains("\"gateway\",\"ready\""));
         if boot == 0 {
+            let public_response = timeout(
+                STEP,
+                http_request(
+                    addr,
+                    "POST",
+                    "/internal/actions",
+                    r#"{"action":"event.attendance.read","event_key":"boot-fixture"}"#,
+                ),
+            )
+            .await
+            .expect("public listener response deadline")
+            .unwrap();
+            assert!(public_response.starts_with("HTTP/1.0 404"));
             // Deterministic website-job coverage: the events mirror must tick
             // on its own REST socket during the first boot, never the gateway
             // listener. Jitter is bounded by min(cadence, 5s); STEP covers it.
@@ -901,6 +993,7 @@ async fn lifecycle(
         bot.assert_alive();
         assert_ready_correlation(&logs.lock().await);
         bot.terminate().await;
+        assert_attendance_capture_dormant(db).await;
         let rebound = TcpListener::bind(addr)
             .await
             .expect("SIGTERM must release health port");
@@ -959,6 +1052,7 @@ async fn binary_lifecycle(accepting_decoy: bool) {
         discord.rest_requests.lock().await.clear();
         // Inadmissible checkpoint under a checked local bootstrap must IDENTIFY.
         seed_raw(&db, &format!("{}/invalid", decoy.url)).await;
+        seed_attendance_mapping(&db).await;
         let bootstrap = accepting_decoy.then_some(decoy.url.as_str());
         lifecycle(&db, &mut discord, &mut bots, &logs, bootstrap).await;
         assert_eq!(
