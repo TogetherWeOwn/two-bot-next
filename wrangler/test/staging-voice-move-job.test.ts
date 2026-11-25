@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { pipelineUse } from "../scripts/staging-use-pipeline.mjs";
-import { runStagingVoiceMoveEntry } from "../scripts/staging-voice-move-entry.mjs";
+import { bindStagingVoiceMoveProvider, runStagingVoiceMoveEntry } from "../scripts/staging-voice-move-entry.mjs";
 import { runStagingVoiceMoveJob } from "../scripts/staging-voice-move-job.mjs";
 import { mockVoiceMoveWindow } from "./fixtures/staging-voice-move.ts";
 
@@ -233,5 +233,51 @@ test("selected synthetic entry finishes the exact lease after either proof outco
       await finish();
     }
     assert.deepEqual(calls.slice(-3), ["status", "release", "status"]);
+  }
+});
+
+test("bound provider supplies only the protected dependencies to the existing entry", async (t) => {
+  const { env, inputs, signed, calls, reads, finish } = jobInputs(t);
+  const { now, ...dependencies } = inputs;
+  t.mock.method(Date, "now", now);
+  const provider = bindStagingVoiceMoveProvider({
+    ...dependencies,
+    get now() { throw new Error("the job owns the clock"); },
+    get ready() { throw new Error("the job owns the ready receipt"); },
+    get window() { throw new Error("the job owns the lease"); },
+  });
+
+  try {
+    assert.deepEqual(provider(), dependencies);
+    assert.equal(await runStagingVoiceMoveEntry(env, provider), "passed");
+    assert.deepEqual(reads, ["session", "channels"]);
+    assert.equal(signed.length, 3);
+    assert.deepEqual(calls, ["assert", "assert", "assert", "status", "release", "status"]);
+  } finally {
+    await finish();
+  }
+});
+
+test("bound provider skips disabled selection and refuses incomplete dependencies before proof", async (t) => {
+  const { env, inputs, signed, moves, calls, reads, finish } = jobInputs(t);
+  const { now, ...dependencies } = inputs;
+  const clock = t.mock.method(Date, "now", now);
+  let fixtureReads = 0;
+  const disabledProvider = bindStagingVoiceMoveProvider({
+    get fixture() { fixtureReads += 1; return dependencies.fixture; },
+  });
+
+  try {
+    assert.equal(await runStagingVoiceMoveEntry({}, disabledProvider), "disabled");
+    assert.equal(fixtureReads, 0);
+    assert.equal(await runStagingVoiceMoveEntry(env, bindStagingVoiceMoveProvider()), "failed");
+    for (const key of Object.keys(dependencies)) {
+      const provider = bindStagingVoiceMoveProvider({ ...dependencies, [key]: undefined });
+      assert.equal(await runStagingVoiceMoveEntry(env, provider), "failed", key);
+    }
+    assert.equal(clock.mock.callCount(), 0);
+    assert.deepEqual({ signed, moves, calls, reads }, { signed: [], moves: [], calls: [], reads: [] });
+  } finally {
+    await finish();
   }
 });

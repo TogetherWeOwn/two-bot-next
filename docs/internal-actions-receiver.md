@@ -246,9 +246,14 @@ the protected context.
    supplies the epoch.
    Its protected inputs are `fixture`, `previousReady`, `previousOff`,
    `expectedRevision`, `webSession`, `observer` and the bounded staging-use
-   `control` adapter for lease assertion, status and release. The workflow
-   keeps the proof selector off and its CLI has no live input provider. The
-   in-process job returns `disabled`, `failed` or `passed`. A pass is mock evidence.
+   `control` adapter for lease assertion, status and release. An approved
+   in-process caller supplies those dependencies to
+   [`bindStagingVoiceMoveProvider(dependencies)`](../wrangler/scripts/staging-voice-move-entry.mjs)
+   and passes the returned provider to `runStagingVoiceMoveEntry(env, provider)`.
+   The entry uses the current job's lease, and the bound provider uses the
+   job's clock. The workflow keeps the proof selector off and its CLI has
+   no live input provider. The in-process job returns `disabled`, `failed`
+   or `passed`. A pass is mock evidence.
 
    For a protected live invocation, coordinate the custodian with the
    [proof runner](../wrangler/scripts/staging-voice-move-acceptance.mjs)
