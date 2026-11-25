@@ -236,16 +236,21 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         rollout = {"revision": sha, "build_id": f"{run}-1",
                    "deploy_id": "2026.11.25.2+aaaaaaa", "worker_version": worker,
                    "health": 200, "readyz": 200}
+        metadata = {"id": int(run), "run_attempt": 1, "head_sha": sha}
         binding = {"environment": "staging", "runId": run, "runAttempt": 1,
-                   "expiresAt": 1795600000000}
+                   "expiresAt": 1795601100000}  # 10:05 UTC
         attempt = dict(binding, schema="two-bot-staging-use.v1", action="attempt",
                        observedAt="2026-11-25T10:00:00.000Z")
         use = dict(binding, sha=sha, deploymentId=worker, epoch=9, phase="active",
-                   acquiredAt=1795599900000)
+                   acquiredAt=1795600740000)  # 09:59 UTC
         ready = dict(attempt, action="ready", sha=sha, deploymentId=worker,
-                     epoch=9, running=True, use=use)
+                     epoch=9, running=True, use=use, observedAt="2026-11-25T10:00:01.000Z")
+        certify_attempt = dict(attempt, observedAt="2026-11-25T10:01:00.000Z")
+        certify = dict(ready, observedAt="2026-11-25T10:01:01.000Z")
         rollout_path = self.dir / "evidence.json"
+        run_path = self.dir / "run.json"
         start_path = self.dir / "staging-use.jsonl"
+        certify_path = self.dir / "staging-use-certify.jsonl"
         self.evidence = str(self.dir / f"help-embed-synthetic-{run}-2.json")
         fake = FakeDiscord()
         code, _ = self.run_main(fake)
@@ -253,14 +258,18 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         self.assertEqual({}, fake.messages)
         report = self.evidence_json()
 
-        def check(*, pin=rollout, window=(attempt, ready), rows=report,
+        def check(*, pin=rollout, run_metadata=metadata, window=(attempt, ready),
+                  finish=(certify_attempt, certify), rows=report,
                   report_path=Path(self.evidence)):
             rollout_path.write_text(json.dumps(pin))
+            run_path.write_text(json.dumps(run_metadata))
             start_path.write_text("".join(json.dumps(line) + "\n" for line in window))
+            certify_path.write_text("".join(json.dumps(line) + "\n" for line in finish))
             report_path.write_text(json.dumps(rows))
             out = io.StringIO()
             with redirect_stdout(out), redirect_stderr(out):
-                code = evidence_check.main(["--rollout", str(rollout_path), "--start", str(start_path),
+                code = evidence_check.main(["--rollout", str(rollout_path), "--run-metadata", str(run_path),
+                                            "--start", str(start_path), "--certify", str(certify_path),
                                             "--report", str(report_path)])
             return code, out.getvalue()
 
@@ -279,15 +288,25 @@ class HelpEmbedSmokeTests(unittest.TestCase):
 
         for inputs, reason in (
             ({"report_path": self.dir / f"help-embed-synthetic-{old_run}-2.json"}, "different run"),
+            ({"report_path": self.dir / f"help-embed-synthetic-{run}-rendered.json"}, "different run"),
+            ({"run_metadata": dict(metadata, id=int(old_run))}, "different run"),
+            ({"run_metadata": dict(metadata, head_sha="b" * 40)}, "payload checkout differs"),
             ({"window": (dict(attempt, runId=old_run),
                          dict(ready, runId=old_run, use=dict(use, runId=old_run)))}, "different run"),
             ({"window": (attempt,)}, "receipt is incomplete"),
+            ({"window": (attempt, dict(ready, running=False))}, "did not confirm ready"),
             ({"window": (attempt, dict(ready, deploymentId=wrong_worker,
                                        use=dict(use, deploymentId=wrong_worker)))}, "different serving deployment"),
             ({"window": (attempt, dict(ready, use=dict(use, deploymentId=wrong_worker)))},
              "different serving deployment"),
             ({"window": (attempt, dict(ready, sha="b" * 40, use=dict(use, sha="b" * 40)))},
              "different serving deployment"),
+            ({"finish": (certify_attempt,)}, "receipt is incomplete"),
+            ({"finish": (certify_attempt, dict(certify, observedAt="2026-11-25T10:05:00.000Z"))},
+             "outside the active window"),
+            ({"finish": (certify_attempt, dict(certify, epoch=10, use=dict(use, epoch=10)))},
+             "do not bracket Help in one window"),
+            ({"finish": (attempt, ready)}, "do not bracket Help in one window"),
             ({"pin": dict(rollout, deploy_id=None)}, "rollout is incomplete"),
             ({"pin": dict(rollout, build_id=f"{run}-2")}, "not a first attempt"),
             ({"rows": dict(report, schema="help_embed_smoke.v2")}, "current schema"),
