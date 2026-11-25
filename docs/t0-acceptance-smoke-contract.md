@@ -174,3 +174,76 @@ cargo fmt --all -- --check
 `crates/discord/tests/top5_reply_fixtures.rs` and
 `crates/bot/src/smoke_error_contract_tests.rs`) run in hosted CI on the
 exact head; this worker cannot compile `ring`/`rustls` locally.
+
+## Optional operator handoff report
+
+Use the report to summarize saved Help, occupied/empty naming, and passive
+gateway observations for a single serving window. It reads local JSON and
+prints an advisory summary. Exit 0 means the report was written. Release
+decisions continue to use the existing checklist and protected workflow.
+
+In `handoff.json`, copy the intended window from the verified serving and
+watch records. Use the compiled `/readyz` stamps for `build_revision`,
+`build_id`, and `deploy_id`. In production, the binary retains its original
+staging deploy stamp. Use the verified Worker version, image manifest
+digest, and Container application ID, plus the UTC bounds of the watch.
+
+```json
+{
+  "expected": {
+    "environment": "staging",
+    "build_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "build_id": "900-1",
+    "deploy_id": "2026.11.25.1+aaaaaaa",
+    "image_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "worker_version": "11111111-1111-4111-8111-111111111111",
+    "application_id": "22222222-2222-4222-8222-222222222222",
+    "start": "2026-11-25T02:00:00Z",
+    "end": "2026-11-25T02:05:00Z"
+  },
+  "observations": {}
+}
+```
+
+An optional `observations.help`, `observations.naming`, or
+`observations.gateway` entry carries `window` (the same fields as `expected`)
+and `sha256` (64 lowercase hex characters for the exact input file bytes).
+Use an entry only when existing evidence independently ties that particular
+file to the recorded window. Leave the entry absent when all you have is a
+bare probe result, a shared SHA, or the intended window. The report checks
+consistency with supplied attribution. Keep the original provenance in the
+operator handoff.
+
+```sh
+python3 scripts/t0_acceptance_report.py --handoff handoff.json \
+  --help-report help-embed-synthetic.json \
+  --naming-report staging-voice-naming-evidence.json \
+  --gateway-report passive-gateway-summary.json
+```
+
+- **Help.** Supply the saved `help_embed_smoke.v3` report. The original
+  deploy-called Help bundle and its checker in #2463 can establish the
+  staging readback, deletion, and bracketed deployment window. A production
+  branding observation needs its own live readback in the authorized window.
+- **Naming.** Supply the `offline-naming-observations` output from #2464.
+  An absent transition needs a same-room occupied, empty before cleanup,
+  and occupied-again readback. Keep any creator-rename HTTP 403 separate
+  from these transitions. The supplied fixture describes only its own readbacks.
+- **Gateway.** Supply the saved `passive_gateway_evidence.py` summary from
+  #2467. Its SHA and counts need the existing observation's verified
+  application and single-image window to be attributable. Zero counts mean
+  the signal was unobserved. Only a committed READY or RESUMED counts as
+  gateway readiness here. Planned boot paths, closes, and failed reconnects
+  are counted separately. Endpoint denial needs explicit passive evidence.
+  The hosted checkpoint exercise in #2075 covers that path separately.
+
+Omit a file flag for a missing observation. A bare or invalid source remains
+`unverified`. Different observation bytes, build stamps, or window bounds
+are `mismatched`. An `attributed` row identifies the matching window and
+can still show a failed probe or an unobserved signal. The output contains
+no combined pass verdict. Rerun the focused synthetic examples for mixed
+same-SHA builds and windows, missing observations, and unattributed inputs.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p test_t0_acceptance_report.py -v
+```
