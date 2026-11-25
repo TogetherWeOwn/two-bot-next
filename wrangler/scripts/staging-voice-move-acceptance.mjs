@@ -3,6 +3,8 @@ import { isRequestId } from "../src/request-id.ts";
 
 const LEASE_MS = 15 * 60_000; // The protected voice-move workflow's finite window.
 const CHECK_MS = 20_000;
+const READBACK_MAX_AGE_MS = 60_000;
+const GUILD_VOICE = 2;
 const positive = (value) => Number.isSafeInteger(value) && value > 0;
 const matches = (value, pattern) => typeof value === "string" && pattern.test(value);
 const snowflake = (value) => matches(value, /^[1-9][0-9]{0,19}$/) && BigInt(value) <= 0xffffffffffffffffn;
@@ -35,6 +37,73 @@ function active(state, lease, action, at) {
     && state.running === true && state.voiceMoveEnabled === true
     && positive(state.use.acquiredAt) && state.use.acquiredAt <= at && at < lease.expiresAt
     && lease.expiresAt - state.use.acquiredAt <= LEASE_MS;
+}
+
+function observedAt(evidence) {
+  const value = evidence?.observedAt;
+  if (!matches(value, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)) return NaN;
+  const at = Date.parse(value);
+  return positive(at) && new Date(at).toISOString() === value ? at : NaN;
+}
+
+function observationMatches(state, fixture, channelId, connectedChannelId, canConnect) {
+  return state?.guildId === fixture.guildId && state.discordId === fixture.discordId
+    && state.channelId === channelId && state.connectedChannelId === connectedChannelId
+    && state.canConnect === canConnect;
+}
+
+function assertPreflight(binding, ready, fixture, evidence, at) {
+  const readyAt = observedAt(ready);
+  require(positive(at) && active(ready, binding, "ready", readyAt) && readyAt <= at
+    && at - readyAt <= READBACK_MAX_AGE_MS && at < binding.expiresAt - 1000, "lease_unconfirmed");
+
+  const { environment, guildId, discordId, channelIds } = fixture ?? {};
+  require(environment === "staging" && snowflake(guildId) && Array.isArray(channelIds)
+    && channelIds.length === 2, "fixture_invalid");
+  const [source, destination] = channelIds;
+  // The Web staging caller accepts only 17–20 digit member/channel snowflakes.
+  require([discordId, source, destination].every((id) => snowflake(id) && id.length >= 17)
+    && new Set([guildId, discordId, source, destination]).size === 4, "fixture_invalid");
+
+  const { session, readback, previousReady, previousOff } = evidence ?? {};
+  const fresh = (value) => {
+    const captured = observedAt(value);
+    return captured >= ready.use.acquiredAt && captured <= at && at - captured <= READBACK_MAX_AGE_MS;
+  };
+  require(fresh(session) && session.environment === "staging" && session.authenticated === true
+    && session.action === "voice.move_member" && session.discordId === discordId
+    && Array.isArray(session.channelIds) && session.channelIds.length === 2
+    && session.channelIds[0] === source && session.channelIds[1] === destination, "session_unconfirmed");
+  const confirmsChannel = (state, channelId, canConnect) => fresh(state) && state.channelType === GUILD_VOICE
+    && observationMatches(state, fixture, channelId, source, canConnect);
+  require(confirmsChannel(readback?.source, source, false) && confirmsChannel(readback?.destination, destination, true),
+    "discord_unconfirmed");
+
+  const previous = leaseBinding(previousReady?.use);
+  const previousReadyAt = observedAt(previousReady);
+  const offAt = observedAt(previousOff);
+  require(previous && (previous.runId !== binding.runId || previous.runAttempt !== binding.runAttempt)
+    && previous.sha === binding.sha && previous.deploymentId === binding.deploymentId && previous.epoch === binding.epoch
+    && active(previousReady, previous, "ready", previousReadyAt)
+    && offAt >= previousReadyAt && offAt <= ready.use.acquiredAt && ready.use.acquiredAt - offAt <= LEASE_MS
+    && leaseMatches(previousOff, previous, "status") && previousOff.running === false
+    && previousOff.voiceMoveEnabled === false && previousOff.use.acquiredAt === previousReady.use.acquiredAt
+    && (previousOff.use.phase === "released" || (previousOff.use.phase === "active" && offAt >= previous.expiresAt)),
+    "prior_cleanup_unconfirmed");
+  return [source, destination];
+}
+
+/** Validate private projections from trusted readbacks without invoking adapters. */
+export function preflightVoiceMoveAcceptance({ enabled = false, lease, ready, fixture, evidence, now = Date.now } = {}) {
+  if (enabled !== true) return { verdict: "disabled" };
+  try {
+    const binding = leaseBinding(lease);
+    require(binding, "lease_invalid");
+    assertPreflight(binding, ready, fixture, evidence, now());
+    return { verdict: "passed" };
+  } catch (error) {
+    return { verdict: "failed", code: error instanceof AcceptanceFailure ? error.message : "preflight_failed" };
+  }
 }
 
 async function withinLease(lease, now, operation) {
@@ -73,7 +142,7 @@ async function withinLease(lease, now, operation) {
  * mock evidence and no transport.
  */
 export async function runVoiceMoveAcceptance({
-  enabled = false, lease, ready, fixture, caller, observe, control, now = Date.now,
+  enabled = false, lease, ready, fixture, evidence, caller, observe, control, now = Date.now,
 } = {}) {
   const receipt = {
     schema: "two-bot-staging-voice-move-acceptance.v1",
@@ -93,13 +162,8 @@ export async function runVoiceMoveAcceptance({
   const { runId, runAttempt, expiresAt, sha, deploymentId } = binding;
 
   try {
-    require(active(ready, binding, "ready", now()), "lease_unconfirmed");
-    const { environment, guildId, discordId, channelIds } = fixture ?? {};
-    require(environment === "staging" && snowflake(guildId) && snowflake(discordId)
-      && Array.isArray(channelIds) && channelIds.length === 2, "fixture_invalid");
-    const [source, destination] = channelIds;
-    require(snowflake(source) && snowflake(destination) && new Set([guildId, discordId, source, destination]).size === 4,
-      "fixture_invalid");
+    const [source, destination] = assertPreflight(binding, ready, fixture, evidence, now());
+    const { guildId, discordId } = fixture;
     require(caller?.environment === "staging" && caller.discordId === discordId
       && typeof caller.move === "function" && typeof observe === "function", "caller_unconfirmed");
 
@@ -114,9 +178,8 @@ export async function runVoiceMoveAcceptance({
         const state = await withinLease(binding, now, (signal) => observe({
           checkpoint: `${phase}:${outcome}`, channelId: target, signal,
         }));
-        require(state?.guildId === guildId && state.discordId === discordId
-          && state.channelId === target && state.connectedChannelId === connectedChannelId
-          && state.canConnect === canConnect, `${phase}_unconfirmed`);
+        require(observationMatches(state, { guildId, discordId }, target, connectedChannelId, canConnect),
+          `${phase}_unconfirmed`);
         receipt.cleanup.memberDisconnected = connectedChannelId === null;
       };
       await check("before", before);
