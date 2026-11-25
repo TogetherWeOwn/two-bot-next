@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { pipelineUse } from "../scripts/staging-use-pipeline.mjs";
+import { runStagingVoiceMoveEntry } from "../scripts/staging-voice-move-entry.mjs";
 import { runStagingVoiceMoveJob } from "../scripts/staging-voice-move-job.mjs";
 import { mockVoiceMoveWindow } from "./fixtures/staging-voice-move.ts";
 
@@ -159,7 +160,54 @@ test("workflow CLI has no adapter provider even with explicit selection", (t) =>
   assert.equal(result.stderr, "staging_voice_move_proof_failed\n");
 });
 
-test("selected synthetic job finishes the exact lease after either proof outcome", async (t) => {
+test("protected entry CLI stays off by default and refuses selection without a provider", (t) => {
+  const { env } = jobInputs(t);
+  const cli = fileURLToPath(new URL("../scripts/staging-voice-move-entry.mjs", import.meta.url));
+  const disabled = spawnSync(process.execPath, [cli], { env: {}, encoding: "utf8" });
+  assert.equal(disabled.status, 0);
+  assert.equal(disabled.stdout, "");
+  assert.equal(disabled.stderr, "");
+
+  const selected = spawnSync(process.execPath, [cli], { env, encoding: "utf8" });
+  assert.equal(selected.status, 1);
+  assert.equal(selected.stdout, "");
+  assert.equal(selected.stderr, "staging_voice_move_proof_failed\n");
+});
+
+test("protected entry skips provider assembly while disabled", async () => {
+  let calls = 0;
+  for (const selected of [undefined, "false", "TRUE", true]) {
+    assert.equal(await runStagingVoiceMoveEntry({ STAGING_VOICE_MOVE_PROOF: selected }, () => {
+      calls += 1;
+      throw new Error("provider must not run");
+    }), "disabled");
+  }
+  assert.equal(calls, 0);
+});
+
+test("protected entry refuses unconfirmed inputs and leaves the original lease to finish", async (t) => {
+  const { env, inputs, signed, calls, reads, finish } = jobInputs(t);
+  const ready = JSON.parse(readFileSync(env.STAGING_USE_RECEIPT, "utf8").trimEnd().split("\n").at(-1)!);
+  assert.equal(await runStagingVoiceMoveEntry(env), "failed");
+  assert.equal(await runStagingVoiceMoveEntry(env, async () => {
+    throw new Error("private provider error");
+  }), "failed");
+  assert.equal(await runStagingVoiceMoveEntry(env, () => ({ ...inputs, previousOff: undefined })), "failed");
+  for (const mismatch of [
+    { STAGING_USE_DEPLOYMENT: "other-deployment" },
+    { STAGING_USE_EXPIRES_AT: String(Number(env.STAGING_USE_EXPIRES_AT) + 1) },
+  ]) {
+    // Even a provider carrying the correct lease cannot replace mismatched job outputs.
+    assert.equal(await runStagingVoiceMoveEntry({ ...env, ...mismatch }, () => ({
+      ...inputs, ready, window: ready.use,
+    })), "failed");
+  }
+  assert.deepEqual({ signed, calls, reads }, { signed: [], calls: [], reads: [] });
+  await finish();
+  assert.deepEqual(calls, ["status", "release", "status"]);
+});
+
+test("selected synthetic entry finishes the exact lease after either proof outcome", async (t) => {
   for (const fail of [false, true]) {
     const { env, inputs, signed, moves, calls, reads, finish } = jobInputs(t);
     if (fail) {
@@ -169,8 +217,13 @@ test("selected synthetic job finishes the exact lease after either proof outcome
         return observe(request);
       };
     }
+    let providerCalls = 0;
     try {
-      assert.equal(await runStagingVoiceMoveJob(env, inputs), fail ? "failed" : "passed");
+      assert.equal(await runStagingVoiceMoveEntry(env, () => {
+        providerCalls += 1;
+        return inputs;
+      }), fail ? "failed" : "passed");
+      assert.equal(providerCalls, 1);
       assert.deepEqual(reads, ["session", "channels"]);
       const [source, destination] = inputs.fixture.channelIds;
       assert.deepEqual(signed.map(({ channel_id }) => channel_id), fail ? [destination] : [destination, source, destination]);
