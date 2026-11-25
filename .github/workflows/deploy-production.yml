@@ -1416,7 +1416,7 @@ jobs:
   release-plan:
     name: Production release / Read the fresh production plan
     needs: [guard, staging-soak-evidence]
-    if: github.repository_id == '1396224242' && github.ref_protected && inputs.release_plan_run_id != '' && needs.guard.outputs.skip == '' && needs.staging-soak-evidence.outputs.skip == ''
+    if: github.repository_id == '1396224242' && github.ref_protected && github.run_attempt == 1 && inputs.release_plan_run_id != '' && needs.guard.outputs.skip == '' && needs.staging-soak-evidence.outputs.skip == ''
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production-migrate-plan
@@ -1431,16 +1431,30 @@ jobs:
       PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
       PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
       PRODUCTION_BRANCH_ID: ${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}
+    outputs:
+      runner-artifact-id: ${{ steps.release-runner.outputs.artifact-id }}
+      runner-sha256: ${{ steps.build.outputs.sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {ref: "${{ github.sha }}", persist-credentials: false, fetch-depth: 0}
-      - name: Compare the candidate migrations and role policy with the trusted runner
+      - name: Compare the candidate migrations and role policy and build the trusted runner
+        id: build
         run: |
           set -euo pipefail
           git merge-base --is-ancestor "$RELEASE_SHA" HEAD
           git diff --exit-code "$RELEASE_SHA" HEAD -- crates/cutover/migrations crates/store/migrations \
             sql/database_role_matrix.sql sql/verify_database_roles.sql sql/web_v1.sql crates/store/sql/web_v1.sql >/dev/null
           cargo build -p two-bot-cutover --bin staging-migrate --locked
+          checksum=$(sha256sum target/debug/staging-migrate)
+          printf 'sha256=%s\n' "${checksum%% *}" >> "$GITHUB_OUTPUT"
+      - name: Retain the forward runner before stopping the writer
+        id: release-runner
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-release-runner-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/debug/staging-migrate
+          if-no-files-found: error
+          retention-days: 14
       - name: Read both production migration ledgers
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1457,6 +1471,7 @@ jobs:
   release-prepare:
     name: Production release / Prepare and stop the prior pair
     needs: [guard, release-plan, staging-soak-evidence]
+    if: github.run_attempt == 1 && success()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: {name: production, deployment: false}
@@ -1532,7 +1547,8 @@ jobs:
 
   release-apply:
     name: Production release / Apply the approved schema
-    needs: [guard, release-prepare]
+    needs: [guard, release-plan, release-prepare]
+    if: github.run_attempt == 1 && success()
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production-migrate-apply
@@ -1543,13 +1559,32 @@ jobs:
       archive-sha256: ${{ steps.release-forward.outputs.artifact-digest }}
     steps:
       - *release-checkout
-      - name: Build the protected forward runner
-        run: cargo build -p two-bot-cutover --bin staging-migrate --locked
+      - name: Validate the protected forward runner pins
+        env:
+          ARTIFACT_ID: ${{ needs.release-plan.outputs.runner-artifact-id }}
+          RUNNER_SHA256: ${{ needs.release-plan.outputs.runner-sha256 }}
+        run: |
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]{0,19}$ && "$RUNNER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+      - name: Download the prebuilt protected forward runner
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.release-plan.outputs.runner-artifact-id }}
+          path: ${{ runner.temp }}/production-release-runner
+          merge-multiple: true
+      - name: Verify the prebuilt forward runner checksum
+        env:
+          RUNNER_SHA256: ${{ needs.release-plan.outputs.runner-sha256 }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/production-release-runner"
+          test -f staging-migrate && test ! -L staging-migrate
+          printf '%s  staging-migrate\n' "$RUNNER_SHA256" | sha256sum --check --strict
+          chmod u+x staging-migrate
       - name: Apply the protected forward transaction
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_STOPPED: ${{ needs.release-prepare.outputs.stopped }}
-          RELEASE_RUNNER: ${{ github.workspace }}/target/debug/staging-migrate
+          RELEASE_RUNNER: ${{ runner.temp }}/production-release-runner/staging-migrate
           TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}
         run: python3 scripts/production_release.py apply
       - name: Upload the verified forward result
@@ -1594,8 +1629,11 @@ jobs:
     environment: production
     permissions:
       contents: read
+      checks: read # verify the independent App approval for a protected release
       actions: read # fetch the exact immutable staging artifact by ID
       deployments: write # derive the deploy ID from today's production Deployments, then record this one
+    outputs:
+      release-worker: ${{ steps.release-version.outputs.worker }}
     env:
       SHA: ${{ needs.guard.outputs.sha }}
       MODE: ${{ needs.guard.outputs.mode }}
@@ -1718,7 +1756,7 @@ jobs:
       # the promotion. Recovery paths (rollback, live-SHA redeploy) skip it.
       - name: Preflight the rollback target before production mutation
         id: rollback_preflight
-        if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'
+        if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true' && inputs.release_plan_run_id == ''
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -1735,7 +1773,7 @@ jobs:
       # refuses the promotion. Recovery paths skip it.
       - name: Gate on regression against the production baseline
         id: regression_gate
-        if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'
+        if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true' && inputs.release_plan_run_id == ''
         env:
           PROD_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
           PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
@@ -1762,6 +1800,26 @@ jobs:
             --sha "$SHA" --out "$RUNNER_TEMP/production-regression-gate.json"
       # Ordinary promotion consumes only the bytes certified by the exact
       # guarded staging attempt. Recovery remains independent of artifacts.
+      - name: Authorize the exact forward result and stopped pair
+        id: release-authorize
+        if: inputs.release_plan_run_id != ''
+        working-directory: tooling
+        env: &release-deploy-env
+          RELEASE_SHA: ${{ needs.guard.outputs.sha }}
+          RELEASE_PLAN_ID: ${{ inputs.release_plan_run_id }}
+          RELEASE_PINS: ${{ inputs.release_pins }}
+          PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
+          PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
+          PRODUCTION_BRANCH_ID: ${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
+          RELEASE_STOPPED: ${{ needs.release-prepare.outputs.stopped }}
+          FORWARD_ARTIFACT_ID: ${{ needs.release-apply.outputs.artifact-id }}
+          FORWARD_ARCHIVE_SHA256: ${{ needs.release-apply.outputs.archive-sha256 }}
+        run: python3 scripts/production_release.py authorize-deploy
       - name: Admit the immutable staging artifact before production mutation
         if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'
         env:
@@ -1770,11 +1828,19 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           STAGING_RUN_ID: ${{ needs.guard.outputs.staging_run_id }}
           STAGING_ATTEMPT: ${{ needs.guard.outputs.staging_attempt }}
+          APPROVED_ARCHIVE: ${{ steps.release-authorize.outputs.archive }}
+          APPROVED_IMAGE: ${{ steps.release-authorize.outputs.image }}
+          RELEASE_PLAN_ID: ${{ inputs.release_plan_run_id }}
         run: |
           set -euo pipefail
+          approved=()
+          if [ -n "${RELEASE_PLAN_ID:-}" ]; then
+            test -n "$APPROVED_ARCHIVE" && test -n "$APPROVED_IMAGE"
+            approved=(--approved-archive "$APPROVED_ARCHIVE" --approved-image "$APPROVED_IMAGE")
+          fi
           python3 ../tooling/scripts/bot_promotion.py admit --sha "$SHA" \
             --run-id "$STAGING_RUN_ID" --attempt "$STAGING_ATTEMPT" \
-            --account-id "$CLOUDFLARE_ACCOUNT_ID" --out "$RUNNER_TEMP/bot-promotion"
+            --account-id "$CLOUDFLARE_ACCOUNT_ID" --out "$RUNNER_TEMP/bot-promotion" "${approved[@]}"
       # The production event ID is recorded separately. Promoted Rust bytes
       # retain their original staging build/deploy stamps; only the explicitly
       # authorized live-SHA recovery path builds a fresh image.
@@ -1809,12 +1875,17 @@ jobs:
           echo "PRODUCTION_DEPLOY_CONFIG=$config" >> "$GITHUB_ENV"
       - *automatic_recheck
       - name: Refuse to replace a pair protected by a schema recovery fence
-        if: env.MODE == 'deploy'
+        if: env.MODE == 'deploy' && inputs.release_plan_run_id == ''
         env:
           PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
         run: node ../tooling/wrangler/scripts/production-ownership-control.mjs unreserved
+      - name: Recheck the protected pair immediately before upload
+        if: inputs.release_plan_run_id != ''
+        working-directory: tooling
+        env: *release-deploy-env
+        run: python3 scripts/production_release.py authorize-deploy
       - name: Deploy to production
         id: deploy
         if: env.MODE == 'deploy'
@@ -1828,6 +1899,13 @@ jobs:
           # Worker version to its commit in `wrangler versions list`. The
           # rendered config carries the build identity the gate checks.
           command: deploy --config ${{ env.PRODUCTION_DEPLOY_CONFIG }} --env production --message ${{ needs.guard.outputs.sha }} --no-bundle
+      - name: Record the exact Worker version produced by this upload
+        id: release-version
+        if: inputs.release_plan_run_id != ''
+        working-directory: tooling
+        env:
+          WRANGLER_DEPLOY_OUTPUT: ${{ steps.deploy.outputs.command-output }}
+        run: python3 scripts/production_release.py version
       # A Worker-version rollback alone leaves the new container image
       # serving, so a rollback restores BOTH the named Worker version and
       # the named container image, with takeover and the stable gate, in one
@@ -1878,6 +1956,8 @@ jobs:
         env:
           BEFORE: ${{ steps.before.outputs.command-output }}
           AFTER: ${{ steps.after.outputs.command-output }}
+          RELEASE_PLAN_ID: ${{ inputs.release_plan_run_id }}
+          UPLOADED_WORKER: ${{ steps.release-version.outputs.worker }}
         shell: python3 {0}
         run: |
           import json, os, sys
@@ -1924,6 +2004,9 @@ jobs:
                   if prev_sha:
                       summary.write(f" and `sha={prev_sha}`")
                   summary.write("\n")
+          if os.environ.get("RELEASE_PLAN_ID"):
+              if not os.environ.get("UPLOADED_WORKER") or after != [(os.environ["UPLOADED_WORKER"], 100)]:
+                  sys.exit("::error::The Worker version produced by the protected upload must serve 100%")
           if not after:
               print("::error::could not read the active production version after the change")
               sys.exit(1)
@@ -1951,7 +2034,7 @@ jobs:
       # only when the dispatch requested the takeover; a routine deploy leaves
       # the fence held and the gate below keeps failing on fenced answers.
       - name: Read production ownership state without starting
-        if: env.TAKEOVER == 'true'
+        if: env.TAKEOVER == 'true' && inputs.release_plan_run_id == ''
         env:
           PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
@@ -1965,7 +2048,7 @@ jobs:
       # and handed ownership to the target version through the same client.
       - name: Take over production ownership at the read epoch
         id: takeover
-        if: env.TAKEOVER == 'true' && env.MODE == 'deploy'
+        if: env.TAKEOVER == 'true' && env.MODE == 'deploy' && inputs.release_plan_run_id == ''
         env:
           PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
@@ -1981,12 +2064,12 @@ jobs:
             ''|*[!0-9]*) echo "::error::takeover needs the numeric epoch read in the previous step"; exit 1 ;;
           esac
           node ../tooling/wrangler/scripts/production-ownership-control.mjs takeover "$epoch"
-      - name: Verify the promoted production Worker and image
-        if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'
-        env:
+      - name: Verify the exact protected Worker and configured image before takeover
+        if: inputs.release_plan_run_id != ''
+        env: &promotion-identity-env
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
+        run: &promotion-identity |
           set -euo pipefail
           # Identity only: takeover intentionally leaves the process stopped.
           # The next owned /health probe starts it; convergence is proved after
@@ -1995,6 +2078,15 @@ jobs:
             --artifact "$RUNNER_TEMP/bot-promotion/admitted.json" \
             --snapshot "$RUNNER_TEMP/production-rollback-snapshot.json" \
             --expected-worker-version "$NEW_VERSION" --out "$RUNNER_TEMP/production-promotion-evidence.json"
+      - name: Take over only the Worker produced by this protected upload
+        if: inputs.release_plan_run_id != ''
+        working-directory: tooling
+        env: *release-deploy-env
+        run: python3 scripts/production_release.py takeover
+      - name: Verify the promoted production Worker and image
+        if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true' && inputs.release_plan_run_id == ''
+        env: *promotion-identity-env
+        run: *promotion-identity
       # Same contract as staging, plus the build identity and stability:
       # /health must be 200, which proves the Container/DO bindings are wired.
       # /readyz must answer 200 with gateway=ready and this run's build
@@ -2151,7 +2243,7 @@ jobs:
       # without a deploy or a snapshot there is nothing to restore.
       - name: Auto-roll back Worker version and container image
         id: auto_rollback
-        if: failure() && env.MODE == 'deploy' && env.TAKEOVER == 'true' && steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success'
+        if: failure() && env.MODE == 'deploy' && env.TAKEOVER == 'true' && steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success' && inputs.release_plan_run_id == ''
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -2287,7 +2379,7 @@ jobs:
             --sha "$SHA" --version "$NEW_VERSION" --evidence "$RUNNER_TEMP/post-deploy-watch/watch.json"
       - name: Auto-roll back Worker version and container image after a watch breach
         id: watch_rollback
-        if: failure() && steps.watch.outputs.verdict == 'breach'
+        if: failure() && steps.watch.outputs.verdict == 'breach' && inputs.release_plan_run_id == ''
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -2320,6 +2412,11 @@ jobs:
       # outcome, reason and run URL. Never a gate: continue-on-error, a short
       # timeout, and a notice when the bindings are unset. The daily release
       # audit cross-checks GitHub runs, so a missed delivery is still caught.
+      - name: Require a clean completed watch for the protected release
+        if: inputs.release_plan_run_id != ''
+        env:
+          WATCH_VERDICT: ${{ steps.watch.outputs.verdict }}
+        run: test "$WATCH_VERDICT" = clean
       - name: Notify the release log of this production change
         if: always() && (steps.deploy.outcome == 'success' || steps.rollback.outcome == 'success' || steps.rollback.outcome == 'failure')
         continue-on-error: true
@@ -2341,3 +2438,18 @@ jobs:
         run: |
           set -euo pipefail
           python3 ../tooling/scripts/deploy_notify.py --from-workflow --sha "$SHA" --run-url "$RUN_URL"
+
+  release-recover:
+    name: Production release / Recover production schema
+    needs: [guard, release-prepare, release-apply, production]
+    if: "!cancelled() && inputs.release_plan_run_id != '' && needs.release-apply.result == 'success' && needs.production.result != 'success'"
+    permissions: *release-permissions
+    uses: ./.github/workflows/deploy-production-recovery.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    with:
+      candidate-sha: ${{ needs.guard.outputs.sha }}
+      pins: ${{ inputs.release_pins }}
+      plan-run-id: ${{ inputs.release_plan_run_id }}
+      stopped: ${{ needs.release-prepare.outputs.stopped }}
+      forward-artifact-id: ${{ needs.release-apply.outputs.artifact-id }}
+      forward-archive-sha256: ${{ needs.release-apply.outputs.archive-sha256 }}
+      candidate-worker: ${{ needs.production.outputs.release-worker }}
