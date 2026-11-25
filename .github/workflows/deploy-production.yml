@@ -1453,7 +1453,7 @@ jobs:
           name: production-release-runner-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/debug/staging-migrate
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 14
       - name: Read both production migration ledgers
         env:
           GH_TOKEN: ${{ github.token }}

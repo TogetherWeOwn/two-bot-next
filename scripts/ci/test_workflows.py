@@ -11689,6 +11689,7 @@ class WorkflowTests(unittest.TestCase):
         # deploy-side workflows below serialize at the lane jobs on purpose
         # (a top-level group would queue work that must stay unqueued).
         pure_callees = {
+            "deploy-production-interrupted.yml",
             "deploy-production-recovery.yml",
             "reusable-rust-nextest.yml",
             "sbom.yml",
