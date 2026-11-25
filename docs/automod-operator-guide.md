@@ -163,6 +163,62 @@ change from this guide; use the authorized deployment/containment procedure
 (the [runbook](runbook.md#containment-kill-switches-and-feature-flags)
 owns stop boundaries).
 
+## Guarded staging rehearsal checklist
+
+The private workflow is dormant. Its startup and recovery steps are unavailable
+until the protected job, authority provider and runtime wiring land and the
+existing staging gates admit the rehearsal in the sole staging writer's
+exclusive window. Synthetic receipts show the contract in CI. The rehearsal
+uses a fresh isolated session with dedicated intents and session resume,
+member intake, enforcement, registry sync and interaction dispatch off.
+See the [protected staging readback](automod-preview-spec.md#protected-staging-readback).
+
+- [ ] **Confirm existing admission evidence.** Check the stopped staging
+  baseline, verified recovery, database and gateway proofs, moderation
+  eligibility, cleanup reserve and affirmative registry absence with spare
+  capacity. Voice selection or flags disqualify the window. Publication
+  evidence must show the full registry delta and positive scoped readback.
+- [ ] **Pin the run, lease and serving candidate.** Record the protected
+  `staging` job link, `runId` and `runAttempt` (the runner accepts attempt 1).
+  Compare the original lifecycle-issued lease with the protected job context,
+  the staging owner and the serving candidate. Match `deploymentId` to the
+  serving Worker version ID and `sha` to the candidate's full build SHA
+  (`CONTAINER_RELEASE`). Match the fixed staging application and guild in the
+  protected context and both action approvals. Retain the full lease tuple
+  (`environment=staging`, `purpose=automod-preview`, `phase=active`, `runId`,
+  `runAttempt`, `deploymentId`, `sha`, `epoch`, `acquiredAt`, `expiresAt`).
+  Each approval must bind its own action (`start` or `recover`) to that tuple.
+- [ ] **Record both outcomes.** Check each bounded `two-bot-staging-automod-job.v1`
+  receipt for staging, the expected action, the exact original lease and a
+  canonical UTC `observedAt` at or after `acquiredAt`. Only a matching
+  `verdict=passed` confirms that action. Record a returned failure verdict
+  with its code. Mark missing, unreadable or mismatched evidence unconfirmed.
+  HTTP success alone cannot confirm either action. Retain metadata only,
+  with credentials and member data excluded.
+- [ ] **Stop safely after an unconfirmed startup.** Keep the original lease
+  and journal hold, even after expiry. The protected runner attempts `recover`
+  on that same tuple after the startup attempt, using separate recovery
+  approval and fresh same-lease cleanup authority or durable same-lease
+  completion. Leave the hold in place after failed or unconfirmed recovery.
+  Keep competing uses out. Any protected recovery retry uses the original
+  tuple. Never rerun startup, replace the lease, clear the journal or remove a
+  registry entry by name. A client timeout or abort proves only the wait ended.
+- [ ] **Verify cleanup before closing.** A matching recovery pass confirms
+  durable cleanup and lease retirement. After publication intent, recovery
+  requires same-lease drain of publication and startup, confirmed stop, and
+  independent registry absence. With a durable publication receipt, it may
+  remove only its exact command ID and version and must confirm absence in
+  list and detail. With a lost publication receipt, the full registry must
+  match the saved absent baseline. A present command without durable
+  attribution keeps the hold. A journal-proven unused reservation instead
+  requires confirmed stop and independent stopped readback before durable
+  retirement and release. Keep failed or uncertain cleanup open even after a
+  successful delete if the independent absence read is missing. Retain the
+  exact run and attempt, both receipt outcomes and the matching recovery proof
+  with the rehearsal record. Close as passed only with both matching passes.
+  With confirmed recovery and failed or unconfirmed startup, close as failed
+  with cleanup confirmed.
+
 ## Verification commands
 
 Docs-only change: run the checks that cover it, and report only runs seen.
