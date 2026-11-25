@@ -884,11 +884,12 @@ class ArtifactHeadersReadinessTests(unittest.TestCase):
 
     def judge(self, body=None, status="200", headers=None, health=None,
               worker_version=PROD_VERSION, image=PROD_IMAGE,
-              expected_version=PROD_VERSION, extra=()):
+              expected_version=PROD_VERSION, extra=(), admission=None, deploy_id=EVENT):
         artifact = self.root / "admitted.json"
-        artifact.write_text(json.dumps(
-            {"schema_version": 1, "receipt": admitted_receipt(),
-             "production_image": PROD_IMAGE}))
+        if admission is None:
+            admission = {"schema_version": 1, "receipt": admitted_receipt(),
+                         "production_image": PROD_IMAGE}
+        artifact.write_text(json.dumps(admission))
         report = {"build_revision": SHA, "build_id": BUILD,
                   "deploy_id": STAMP, "components": [["gateway", "ready"]]}
         if body is not None:
@@ -896,7 +897,7 @@ class ArtifactHeadersReadinessTests(unittest.TestCase):
         path = self.root / "readyz.json"
         path.write_text(json.dumps(report))
         argv = ["readyz", "--sha", SHA, "--mode", "deploy",
-                "--build-id", "900-1", "--deploy-id", EVENT,
+                "--build-id", "900-1", "--deploy-id", deploy_id,
                 "--status", status, "--body", str(path),
                 "--artifact", str(artifact),
                 "--expected-worker-version", expected_version,
@@ -924,6 +925,46 @@ class ArtifactHeadersReadinessTests(unittest.TestCase):
         code, message = self.judge(headers=headers, health=health)
         self.assertEqual(code, 0, message)
         self.assertIn("gateway ready", message)
+
+    def test_individually_valid_windows_cannot_share_serving_evidence(self):
+        # The same source was built twice. Each complete observation passes
+        # under its own immutable admission and production Worker version.
+        previous = admitted_receipt()
+        previous["source"]["run_attempt"] = 1
+        old_stamps = {"build_id": f"{promo.STAGE_RUN}-1",
+                      "deploy_id": f"2026.10.20.1+{SHA[:7]}"}
+        previous["build"].update(old_stamps)
+        old_stage_image = STAGE_IMAGE.replace(DIGEST_C, OTHER_DIGEST)
+        previous["container"].update(image=old_stage_image, digest=OTHER_DIGEST)
+        previous["staging"].update(
+            old_stamps, image=old_stage_image, worker_version="44444444-4444-4444-8444-444444444444",
+            rollout_id="55555555-5555-4555-8555-555555555555", target_version=1)
+        admission = {"schema_version": 1, "receipt": previous, "production_image": OLD_IMAGE}
+        old_readyz = header_file(self.root, "old-readyz.headers", OTHER_VERSION)
+        old_health = header_file(self.root, "old-health.headers", OTHER_VERSION)
+        readyz, health = self.live_headers()
+
+        code, message = self.judge(body=old_stamps, headers=old_readyz, health=old_health,
+                                   expected_version=OTHER_VERSION, image=OLD_IMAGE, admission=admission,
+                                   deploy_id=f"2026.10.22.2+{SHA[:7]}")
+        self.assertEqual(code, 0, message)
+        code, message = self.judge(headers=readyz, health=health)
+        self.assertEqual(code, 0, message)
+
+        cases = (
+            ("previous health", {"headers": readyz, "health": old_health},
+             "serving identity refused"),
+            ("previous readiness",
+             {"headers": old_readyz, "health": health, "body": old_stamps},
+             "serving identity refused"),
+            ("previous container behind current Worker",
+             {"headers": readyz, "health": health, "body": old_stamps}, "is not this run's build"),
+        )
+        for name, inputs, reason in cases:
+            with self.subTest(name=name):
+                code, message = self.judge(**inputs)
+                self.assertEqual(code, 1, message)
+                self.assertIn(reason, message)
 
     def test_wrong_header_version_on_either_response_refuses(self):
         for role in ("readyz", "health"):
