@@ -380,6 +380,28 @@ or clearing `PRODUCTION_AUTO_PROMOTE_DISABLED` is an operator action
 (record the effective-setting readback and the `updated_at` timestamp);
 code alone does not flip the live setting.
 
+## Restore evidence for release approval
+
+When the [production release gate](../CONTRIBUTING.md#production-release-gate)
+requires a restore rehearsal, identify the fresh provider backup and the exact
+temporary copy in the evidence given to the release reviewer. Record Bot's
+affected reads under its runtime role and Web's affected reads under its reader
+role on that copy. For the attendance release, record both apps' reads before
+apply, after apply and after the exact reviewed inverse. Match the inverse to
+the release plan and record its confirmed outcome on the same copy. Keep app
+egress disabled, use fresh credentials for the copy and record only counts,
+IDs and checksums.
+
+Verify cleanup independently of the delete and removal operations. Record the
+provider readback that the exact copy is absent and a separate readback that
+all temporary credential entries are absent. Take both readbacks after the
+last app read and on the UTC day of the restore. If the release is retried
+with a fresh restore, match the role, inverse and cleanup observations to that
+copy and its rehearsal times. A previous copy's reads or absence checks leave
+the current evidence incomplete, even on the same UTC day. Give the release
+reviewer the current packet for approval. See the
+[synthetic handoff example](backup.md#synthetic-release-restore-handoff).
+
 ## Rollback-target preflight
 
 Every ordinary promotion proves its rollback target before anything in
