@@ -40,12 +40,12 @@ fn fixture_rejects_external_network_and_non_fixture_database() {
     assert!(!isolated(&format!("{lo}eth0: 0\n"), status));
     assert!(!isolated(lo, &status.replace("0000\n", "0001\n")));
     let mut cfg = config();
+    let root = Path::new(CA);
     let bind = receiver("127.0.0.1:8091".into());
-    assert!(verify_config(&cfg, &bind, SIGNING, []).is_ok());
     let url = cfg.database_url.as_ref().unwrap().expose();
     cfg.database_url = Some(Secret::new(format!("{url}&host=192.0.2.1")));
-    let error = verify_config(&cfg, &bind, SIGNING, []).unwrap_err();
-    assert_eq!(error, "rehearsal_database_invalid");
+    let error = prepare_fixture(&cfg, &bind, SIGNING, [], root).err();
+    assert_eq!(error, Some("rehearsal_database_invalid"));
 }
 
 #[test]
@@ -53,17 +53,18 @@ fn fixture_rejects_ordinary_credentials_and_non_loopback_receiver() {
     let bind = receiver("127.0.0.1:8091".into());
     let mut cfg = config();
     let wrong_bind = receiver("10.0.0.1:8091".into());
-    let error = verify_config(&cfg, &wrong_bind, SIGNING, []).unwrap_err();
-    assert_eq!(error, "rehearsal_receiver_not_loopback");
+    let root = Path::new(CA);
+    let error = prepare_fixture(&cfg, &wrong_bind, SIGNING, [], root).err();
+    assert_eq!(error, Some("rehearsal_receiver_not_loopback"));
     for variable in ["PGHOSTADDR", "TWO_DEPLOY_ENV"] {
-        let error = verify_config(&cfg, &bind, SIGNING, [variable.into()]).unwrap_err();
-        assert_eq!(error, "rehearsal_credentials_invalid");
+        let error = prepare_fixture(&cfg, &bind, SIGNING, [variable.into()], root).err();
+        assert_eq!(error, Some("rehearsal_credentials_invalid"));
     }
-    let error = verify_config(&cfg, &bind, "rehearsal:ordinary", []).unwrap_err();
-    assert_eq!(error, "rehearsal_credentials_invalid");
+    let error = prepare_fixture(&cfg, &bind, "rehearsal:ordinary", [], root).err();
+    assert_eq!(error, Some("rehearsal_credentials_invalid"));
     cfg.discord_token = Some(Secret::new("ordinary.fixture.token".into()));
-    let error = verify_config(&cfg, &bind, SIGNING, []).unwrap_err();
-    assert_eq!(error, "rehearsal_token_not_synthetic");
+    let error = prepare_fixture(&cfg, &bind, SIGNING, [], root).err();
+    assert_eq!(error, Some("rehearsal_token_not_synthetic"));
 }
 
 #[tokio::test]
@@ -76,22 +77,21 @@ async fn verified_fixture_binds_and_drains_the_shared_receiver() {
     assert!(fixture_connector(root.parent().unwrap()).is_none());
     let oversized = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
     assert!(fixture_connector(&oversized).is_none());
-    let connector = fixture_connector(root).unwrap();
     let cfg = config();
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let bind = receiver(socket.local_addr().unwrap().to_string());
-    let (token, _) = verify_config(&cfg, &bind, SIGNING, []).unwrap();
+    let (token, _, connector) = prepare_fixture(&cfg, &bind, SIGNING, [], root).unwrap();
     let pool = two_bot_store::pool::connect_lazy_pool_with_tls(
         "postgres://agent_test@agent-testdb:5432/internal_http_unit?sslmode=disable",
         TlsPolicy::LocalOnly,
         1,
     )
     .unwrap();
-    let (_stop, stopping) = watch::channel(true);
+    let signal = std::future::ready(());
     drop(socket);
     tokio::time::timeout(
         Duration::from_secs(5),
-        serve_receiver(&cfg, bind, token, pool, connector, stopping),
+        serve_receiver(&cfg, bind, token, pool, connector, signal),
     )
     .await
     .unwrap()

@@ -1,7 +1,7 @@
 //! Receiver-only entry point for the disposable installed-binary fixture.
 
 use crate::internal_action_http::{self, ReceiverMode};
-use std::{ffi::OsString, fs, io::Read, path::Path, sync::Arc};
+use std::{ffi::OsString, fs, future::Future, io::Read, path::Path, sync::Arc};
 use tokio::sync::{watch, RwLock};
 use two_bot_core::{database_tls::TlsPolicy, internal_action_config::InternalActionConfig, Config};
 use two_bot_discord::internal_actions::RehearsalAnnouncementConnector as Connector;
@@ -13,41 +13,35 @@ pub(crate) async fn serve(args: &[String]) -> Result<(), &'static str> {
     let network = "rehearsal_network_unisolated";
     let interfaces = fs::read_to_string("/proc/self/net/dev").map_err(|_| network)?;
     let status = fs::read_to_string("/proc/self/status").map_err(|_| network)?;
-    if !isolated(&interfaces, &status) {
-        return Err(network);
-    }
+    let ready = isolated(&interfaces, &status);
+    ready.then_some(()).ok_or(network)?;
     let config = Config::from_env().map_err(|_| "rehearsal_config_invalid")?;
     let receiver = InternalActionConfig::from_env()
         .map_err(|_| "rehearsal_receiver_invalid")?
         .ok_or("rehearsal_receiver_invalid")?;
-    let signing = std::env::var("TWO_INTERNAL_KEYS").unwrap_or_default();
-    let (token, database) = verify_config(
+    let (token, database, connector) = prepare_fixture(
         &config,
         &receiver,
-        &signing,
+        &std::env::var("TWO_INTERNAL_KEYS").unwrap_or_default(),
         std::env::vars_os().map(|(name, _)| name),
+        Path::new("/fixture/announcement-ca.der"),
     )?;
-    let connector = fixture_connector(Path::new("/fixture/announcement-ca.der"))
-        .ok_or("rehearsal_ca_invalid")?;
     let pool = two_bot_store::connect_pool_with_tls(database, TlsPolicy::LocalOnly)
         .await
         .map_err(|_| "rehearsal_database_connect_failed")?;
-    let (stop, stopping) = watch::channel(false);
-    tokio::spawn(async move {
-        crate::server::shutdown_signal().await;
-        stop.send_replace(true);
-    });
-    serve_receiver(&config, receiver, token, pool, connector, stopping)
+    let signal = crate::server::shutdown_signal();
+    serve_receiver(&config, receiver, token, pool, connector, signal)
         .await
         .map_err(|_| "rehearsal_receiver_failed")
 }
 
-fn verify_config<'a>(
+fn prepare_fixture<'a>(
     config: &'a Config,
     receiver: &InternalActionConfig,
     signing: &str,
     env_names: impl IntoIterator<Item = OsString>,
-) -> Result<(&'a str, &'a str), &'static str> {
+    root: &Path,
+) -> Result<(&'a str, &'a str, Connector), &'static str> {
     if !receiver.listen_addr().ip().is_loopback() {
         return Err("rehearsal_receiver_not_loopback");
     }
@@ -75,7 +69,8 @@ fn verify_config<'a>(
     if !fixture_database(database) {
         return Err("rehearsal_database_invalid");
     }
-    Ok((token, database))
+    let connector = fixture_connector(root).ok_or("rehearsal_ca_invalid")?;
+    Ok((token, database, connector))
 }
 
 async fn serve_receiver(
@@ -84,8 +79,13 @@ async fn serve_receiver(
     token: &str,
     pool: sqlx::PgPool,
     connector: Connector,
-    stopping: watch::Receiver<bool>,
+    signal: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    let (stop, stopping) = watch::channel(false);
+    tokio::spawn(async move {
+        signal.await;
+        stop.send_replace(true);
+    });
     internal_action_http::bind(
         receiver,
         pool,
