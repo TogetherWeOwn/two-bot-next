@@ -225,6 +225,15 @@ the protected context.
    `observedAt`. Ready, session and Discord preflight observations must be
    from the active window, at most 60 seconds old and never in the future.
    Preserve the producers' UTC timestamps with milliseconds.
+
+   The dormant [Web handoff reader](../wrangler/scripts/staging-voice-web-handoff.mjs)
+   binds a fresh authenticated companion match to the same scoped session's
+   later private `404 not_found` companion refusal. Call `readStagingVoiceWebReady`
+   with the approved fixture, session and revision. After Web Operations
+   restores and independently verifies the disabled settings, call its
+   `confirmDisabled` on the same installed session. Give each read a deadline.
+   Both reads use the companion route, which does not submit a signed move.
+   Keep the completion handle in process.
 3. **Bot Operations.** Coordinate fresh exclusive admission under the existing
    `staging-lifecycle` lock. Use `verify_lease=true` in the
    [manual workflow](../.github/workflows/staging-voice-move.yml) from protected
@@ -246,9 +255,30 @@ the protected context.
    supplies the epoch.
    Its protected inputs are `fixture`, `previousReady`, `previousOff`,
    `expectedRevision`, `webSession`, `observer` and the bounded staging-use
-   `control` adapter for lease assertion, status and release. The workflow
-   keeps the proof selector off and its CLI has no live input provider. The
-   in-process job returns `disabled`, `failed` or `passed`. A pass is mock evidence.
+   `control` adapter for lease assertion, status and release. An approved
+   in-process caller supplies those dependencies to
+   [`bindStagingVoiceMoveProvider(dependencies)`](../wrangler/scripts/staging-voice-move-entry.mjs)
+   and passes the returned provider to `runStagingVoiceMoveEntry(env, provider)`.
+   The dormant `bindStagingVoiceMoveHandoffProvider(dependencies, { qualification, soakReceipt, webHandoff })`
+   also requires the completed Web handoff and two protected Web records.
+   Retain the [validated Web `staging-soak/1` receipt](https://github.com/TogetherWeOwn/two-web-next/blob/273d275b20bf686701e0a1b5f5ff25d46edb6fd5/docs/runbook.md#manual-staging-soak-receipt)
+   unchanged as `soakReceipt`. Web Operations separately supplies
+   `qualification` with `verdict: "qualified"` only after verifying the
+   protected smoke, E2E and full soak. That decision carries the matching
+   rollout fields and sample from the receipt. Both records must identify the
+   independently pinned Web commit and Worker version.
+
+   The completed Web handoff records the earlier disabled baseline. For a
+   later proof, Web Operations must separately restore the approved enabled
+   Web version and fixture settings before the runner's fresh preflight.
+   Re-read the current serving version and refresh qualification if the
+   allocation changed. A different Worker version needs its own approved
+   qualification and handoff. Preserve the same installed session and ordered
+   fixture. The eventual live run still needs its own cleanup readbacks.
+   The entry uses the current job's lease, and the bound provider uses the
+   job's clock. The workflow keeps the proof selector off and its CLI has
+   no live input provider. The in-process job returns `disabled`, `failed`
+   or `passed`. A pass is mock evidence.
 
    For a protected live invocation, coordinate the custodian with the
    [proof runner](../wrangler/scripts/staging-voice-move-acceptance.mjs)

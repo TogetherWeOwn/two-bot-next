@@ -59,6 +59,7 @@ from unittest import mock
 
 import yaml
 
+from staging_pre_reaper_policy import PRE_REAPER, dormant_pre_reaper_errors
 from staging_soak_policy import PRODUCTION_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
@@ -614,6 +615,7 @@ def repository_errors(wfs, canonical):
     errors = []
     callers = {f"./.github/workflows/{name}" for name in CHILDREN.values()}
     holders = set(STANDALONE_HOLDERS) | set(OBSERVERS)
+    dormant_pre_sweep = PRE_REAPER in wfs and not dormant_pre_reaper_errors(wfs)
     for file, workflow in wfs.items():
         measurement = file == MEASUREMENT and is_measurement_caller(workflow, canonical)
         if file == MEASUREMENT and not measurement:
@@ -647,6 +649,7 @@ def repository_errors(wfs, canonical):
                           or (file == STAGING_SOAK and admitted_soak(wfs))
                           or (file == VOICE_MOVE and name == "verify-lease")
                           or (file == AUTOMOD and name == "dry-run")
+                          or (dormant_pre_sweep and (file, name) == (PRE_REAPER, "sweep"))
                           or (measurement and (name in MEASUREMENT_STAGING_JOBS or name in MEASUREMENT_CALLS))
                           or (file, name) in EXEMPT)
             if touches and not classified:
@@ -1006,6 +1009,20 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_checked_in_workflows_meet_the_full_window_contract(self):
         self.assertEqual(lifecycle_errors(load_all()), [])
+
+    def test_pre_reaper_is_classified_only_while_synthetic_and_unwired(self):
+        expected = f"inventory: unclassified staging consumer {PRE_REAPER} sweep"
+        for change in ("caller", "command", "schedule"):
+            with self.subTest(change=change):
+                workflows = load_all()
+                sweep = workflows[PRE_REAPER]
+                if change == "caller":
+                    workflows["check.yml"]["jobs"]["new-caller"] = {"uses": f"./.github/workflows/{PRE_REAPER}"}
+                elif change == "command":
+                    sweep["jobs"]["sweep"]["steps"][1]["run"] = "python3 scripts/pre_live_cleanup.py"
+                else:
+                    sweep["on"]["schedule"] = [{"cron": "17 * * * *"}]
+                self.assertIn(expected, lifecycle_errors(workflows))
 
     def test_every_lifecycle_holder_must_keep_the_non_displacing_queue(self):
         for (file, job), job_level in {(DEPLOY, "deploy"): False, **STANDALONE_HOLDERS}.items():
