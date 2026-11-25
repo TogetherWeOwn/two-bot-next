@@ -10,8 +10,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
+FIXTURE = ROOT / "scripts/ci/fixtures/production_inverse_admission.json"
 sys.path.insert(0, str(ROOT / "scripts"))
-import production_recovery_artifact as artifacts
 import production_recovery_workflow as recovery
 from production_recovery_takeover import RecoveryPin
 from staging_rollout import GateError
@@ -20,10 +20,10 @@ from worker_container_rollback import require_ordinary_production_rollback, sour
 
 class RecoveryWorkflowTests(unittest.TestCase):
     def setUp(self):
-        self.pin = RecoveryPin("123", 1, "a" * 40, "b" * 40, "1" * 8 + "-1111" * 3 + "-" + "1" * 12,
-                               "sha256:" + "1" * 64, "2" * 8 + "-2222" * 3 + "-" + "2" * 12, "2" * 32,
-                               "3" * 64, "4" * 64, "5" * 64, "6" * 64, 21)
-        self.candidate = ("3" * 8 + "-3333" * 3 + "-" + "3" * 12, self.pin.candidate_sha, "sha256:" + "3" * 64)
+        self.case = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        admission = self.case["admission"]
+        self.pin = RecoveryPin(**admission["pin"])
+        self.candidate = (admission["candidate_worker"], self.pin.candidate_sha, admission["candidate_image"])
         self.result = {"state": "restored", **asdict(self.pin)}
         self.state = {
             "worker": {"version_id": self.candidate[0], "sha": self.candidate[1], "traffic_percent": 100},
@@ -39,15 +39,9 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.control = Mock()
         self.rollback = Mock()
 
-    def producer(self, name, steps):
-        return {"name": name, "run_id": 123, "run_attempt": 1, "head_sha": "d" * 40,
-                "status": "completed", "conclusion": "success", "steps": [
-                    {"name": step, "status": "completed", "conclusion": "success"} for step in steps
-                ]}
-
     def test_inverse_requires_exact_durable_stop_and_protected_job_success(self):
-        run = {"id": 123, "head_sha": "d" * 40}
-        job = self.producer(artifacts.FENCE_JOB, (artifacts.FENCE_STEP,))
+        run = self.case["run"]
+        job = self.case["fence_job"]
         api = Mock(return_value={"total_count": 1, "jobs": [job]})
         inverse = Mock(return_value=self.result)
         for ack in ({**self.ack, "running": True}, {**self.ack, "deploymentId": "other"},
@@ -75,17 +69,22 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.control.assert_called_once_with("fence-exact", 20, expected_deployment=self.candidate[0])
 
     def test_admission_binds_the_rust_inverse_ledger_rows(self):
-        fixture = ROOT / "scripts/ci/fixtures/production_inverse_admission.json"
-        case = json.loads(fixture.read_text(encoding="utf-8"))
+        case = self.case
         env = {**case["env"], "RECOVERY_ADMISSION": json.dumps(case["admission"])}
         with patch.object(recovery, "authenticated_plan", return_value=(case["plan"], case["artifact"])):
+            pin, candidate, plan, approval = recovery.release_admission(env, case["run"])
+            self.assertEqual((pin, candidate, plan, approval["plan_archive_sha256"]),
+                             (self.pin, self.candidate, case["plan"], case["artifact"]["archive_digest"]))
             with (patch.object(recovery, "current_run", return_value=case["run"]), patch.object(recovery, "verify_environment"),
                   patch.object(recovery, "verify_check", side_effect=GateError("unapproved")) as check):
                 self.assertEqual(recovery.main(["fence"], env), 1)
                 check.assert_called_once()
-            env["RECOVERY_ADMISSION"] = json.dumps(case["source_admission"])
-            with self.assertRaisesRegex(GateError, "production_inverse_ledger_pin_invalid"):
-                recovery.release_admission(env, case["run"])
+                self.assertEqual(check.call_args.args[2], "production-apply:321:" + "8" * 64)
+            for field in ("expanded_ledgers_sha256", "restored_ledgers_sha256"):
+                admission = deepcopy(case["admission"])
+                admission["pin"][field] = case["source_ledger_digests"][field]
+                with self.subTest(field=field), self.assertRaisesRegex(GateError, "production_inverse_ledger_pin_invalid"):
+                    recovery.release_admission({**env, "RECOVERY_ADMISSION": json.dumps(admission)}, case["run"])
 
     def test_inverse_refuses_incomplete_database_readback(self):
         plan = dict(target=dict(host="db", database="fixture", branch_id="branch"),

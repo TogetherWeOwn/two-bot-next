@@ -3,6 +3,21 @@
     "id": 123,
     "head_sha": "dddddddddddddddddddddddddddddddddddddddd"
   },
+  "fence_job": {
+    "name": "Production release / Recover production schema / Confirm the protected production writer stopped",
+    "run_id": 123,
+    "run_attempt": 1,
+    "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
+    "status": "completed",
+    "conclusion": "success",
+    "steps": [
+      {
+        "name": "Fence the exact serving pair at the pinned epoch",
+        "status": "completed",
+        "conclusion": "success"
+      }
+    ]
+  },
   "env": {
     "PRODUCTION_HOST": "db",
     "PRODUCTION_DATABASE": "fixture",
@@ -139,24 +154,8 @@
   "artifact": {
     "archive_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
   },
-  "source_admission": {
-    "pin": {
-      "run_id": "123",
-      "run_attempt": 1,
-      "candidate_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "rollback_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "worker_version": "11111111-1111-1111-1111-111111111111",
-      "image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-      "application_id": "22222222-2222-2222-2222-222222222222",
-      "namespace_id": "22222222222222222222222222222222",
-      "database_fingerprint": "f6a18707c652e8df138ba00e096b0aac7636b506da2da49c9d318f6b9c2909fd",
-      "expanded_ledgers_sha256": "d45249f0d882d205c0056b38eea75dad3d7f93c033187524296308a6ace201a8",
-      "restored_ledgers_sha256": "c29de03decafd0fc9f438ecdb5c37b2a4d56f024d730aca5da90ae5ff33fad93",
-      "attendance_fence_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
-      "fence_epoch": 21
-    },
-    "plan_run_id": "321",
-    "candidate_worker": "33333333-3333-3333-3333-333333333333",
-    "candidate_image": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+  "source_ledger_digests": {
+    "expanded_ledgers_sha256": "d45249f0d882d205c0056b38eea75dad3d7f93c033187524296308a6ace201a8",
+    "restored_ledgers_sha256": "c29de03decafd0fc9f438ecdb5c37b2a4d56f024d730aca5da90ae5ff33fad93"
   }
 }
