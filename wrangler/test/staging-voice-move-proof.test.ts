@@ -153,16 +153,16 @@ test("protected proof refuses wrong or stale preflight evidence and finishes its
   }
 });
 
-test("protected proof refuses a stale or wrong-room-type checkpoint before a move", async () => {
-  for (const fault of ["stale time", "room type"]) {
+test("protected proof refuses a stale, future or wrong-room-type checkpoint before a move", async () => {
+  for (const fault of ["stale time", "future time", "room type"]) {
     const window = proofWindow();
     const { input, calls, signed } = window;
     const observe = input.observer.observe.bind(input.observer);
     input.observer.observe = async (request) => {
       const state = await observe(request);
-      return fault === "stale time"
-        ? { ...state, observedAt: new Date(input.now() - 2).toISOString() }
-        : { ...state, channelType: 13 };
+      if (fault === "room type") return { ...state, channelType: 13 };
+      const offset = fault === "stale time" ? -2 : 1;
+      return { ...state, observedAt: new Date(input.now() + offset).toISOString() };
     };
     const receipt = await runStagingVoiceMoveProof(input);
     assert.equal(receipt.verdict, "failed", fault);
