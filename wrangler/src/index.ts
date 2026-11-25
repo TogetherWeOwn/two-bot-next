@@ -939,7 +939,6 @@ export class TwoBotContainer extends Container<Env> {
 
   private async owned<T>(operation: (use?: StagingUse) => Promise<T>): Promise<T> {
     return this.gated(async () => {
-      await this.requireCompetingStagingUse();
       if (this.recoveryFailed) throw new OwnershipRefused("shutdown_unconfirmed");
       await this.ownership.require(this.id());
       if (!this.boundedStaging()) return operation();
@@ -953,10 +952,14 @@ export class TwoBotContainer extends Container<Env> {
     return this.boundedStaging() && ingressEnabled(this.env) && this.env.TWO_INTERNAL_ALLOW_VOICE_MOVE === "1";
   }
 
-  private async requireCompetingStagingUse(): Promise<void> {
-    if (this.boundedStaging() && await this.automodReserved()) {
-      throw new OwnershipRefused("staging_automod_reserved");
-    }
+  private async requireCompetingStagingUse(emergencyStop?: () => Promise<void>): Promise<void> {
+    if (!this.boundedStaging()) return;
+    const reserved = await this.automodReserved().catch(async error => {
+      // An emergency stop cannot release the lease or displace its owner.
+      if (emergencyStop && !await this.confirmedTeardownHold()) await emergencyStop();
+      throw error;
+    });
+    if (reserved) throw new OwnershipRefused("staging_automod_reserved");
   }
 
   private async automodReserved(): Promise<boolean> {
@@ -1021,6 +1024,7 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   private async requireStagingUse(): Promise<StagingUse> {
+    await this.requireCompetingStagingUse(() => this.stopStagingUse());
     try {
       await this.requireRecoveryDatabase();
       const owner = await this.ownership.require(this.id());
@@ -1618,7 +1622,11 @@ export class TwoBotContainer extends Container<Env> {
         if (request.headers.get(DEPLOYMENT_HEADER) !== id) throw new OwnershipRefused("deployment_mismatch");
         const owner = await this.ownership.require(id);
         const identity = { deploymentId: id, sha: this.env.CONTAINER_RELEASE ?? "", owner };
-        if (checkAbsence || change) await this.requireCompetingStagingUse();
+        if (checkAbsence || change?.action === "acquire") await this.requireCompetingStagingUse();
+        else if (change) await this.requireCompetingStagingUse(async () => {
+          await this.stagingUse.requireTeardown(change, identity, change.action === "stop");
+          await this.stopStagingUse();
+        });
         let use = await this.stagingUse.read();
         if (checkAbsence) await this.previewAbsent(request);
         if (change) {
@@ -1687,7 +1695,12 @@ export class TwoBotContainer extends Container<Env> {
         // repeat (force), and only a commit clears the flag. A no-op repeat
         // returns the stored record at the posted epoch while every commit
         // lands exactly one epoch higher, so equality is the no-op signal.
-        await this.requireCompetingStagingUse();
+        await this.requireCompetingStagingUse(async () => {
+          const owner = await this.ownership.requireChange(id, change);
+          if (change.action === "fence" || this.recoveryFailed || owner?.phase !== "active" || owner.deploymentId !== id) {
+            await this.stopStagingUse();
+          }
+        });
         const owner = await this.ownership.change(id, change, () => this.destroyInactive(), { force: this.recoveryFailed });
         if (change.action === "takeover" && owner.epoch === change.expectedEpoch) {
           console.log(`two-bot ownership takeover already applied at epoch ${owner.epoch}`);
@@ -1826,7 +1839,7 @@ export class TwoBotContainer extends Container<Env> {
   override async stop(...args: Parameters<Container<Env>["stop"]>): Promise<void> {
     if (!this.boundedStaging()) return super.stop(...args);
     return this.gated(async () => {
-      await this.requireCompetingStagingUse();
+      await this.requireCompetingStagingUse(() => this.stopStagingUse());
       await super.stop(...args);
     });
   }
@@ -1834,7 +1847,7 @@ export class TwoBotContainer extends Container<Env> {
   override async destroy(): Promise<void> {
     if (!this.boundedStaging()) return super.destroy();
     return this.gated(async () => {
-      await this.requireCompetingStagingUse();
+      await this.requireCompetingStagingUse(() => this.stopStagingUse());
       await super.destroy();
     });
   }

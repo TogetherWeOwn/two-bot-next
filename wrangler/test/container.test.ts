@@ -915,15 +915,54 @@ test("bounded staging: preparing AutoMod reservation retries native stop", async
   assert.equal(h.runtime.running, true);
   const [retry] = await h.bot.listSchedules("stagingExpiry");
   assert.equal(retry?.time, Math.ceil((Date.now() + 15_000) / 1000));
-  await assert.rejects(h.bot.start(), /staging_automod_reserved/);
+  await assert.rejects(h.bot.start(), /shutdown_unconfirmed/);
 
   t.mock.method(h.runtime, "destroy", async () => { h.runtime.running = false; });
   await h.bot.stagingExpiry();
   assert.equal(h.runtime.running, false);
   assert.deepEqual(values.get(STAGING_USE_KEY), use);
+  await assert.rejects(h.bot.start(), /staging_automod_reserved/);
   h.runtime.running = true;
   await h.bot.onActivityExpired();
   assert.equal(h.runtime.running, false);
+});
+
+test("bounded staging: uncertain reservation permits only scoped emergency stop", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const h = await harness(t, BOUNDED_STAGING_ENV);
+  const window = stagingWindow();
+  assert.equal((await h.bot.fetch(stagingUseRequest("acquire", window))).status, 200);
+  const lease = h.values.get(STAGING_USE_KEY), get = h.ctx.storage.get;
+  const journalKey = "two-bot:staging-automod-recovery:v1";
+  let unreadable = journalKey;
+  t.mock.method(h.ctx.storage, "get", async (key: string) => {
+    if (key === unreadable) throw new Error("synthetic authority read failure");
+    return get(key);
+  });
+  const fence = { action: "fence", expectedEpoch: ACTIVE_OWNER.epoch, actor: "fixture-operator" };
+  h.runtime.running = true;
+  assert.equal((await h.bot.fetch(stagingUseRequest("release", { ...window, runAttempt: window.runAttempt + 1 }))).status, 503);
+  assert.equal((await h.bot.fetch(controlRequest({ ...fence, expectedEpoch: fence.expectedEpoch + 1 }))).status, 409);
+  assert.equal(h.runtime.running, true);
+  for (const request of [stagingUseRequest("stop", window), stagingUseRequest("release", window), controlRequest(fence)]) {
+    h.runtime.running = true;
+    assert.equal((await h.bot.fetch(request)).status, 503);
+    assert.equal(h.runtime.running, false);
+  }
+  assert.deepEqual(h.values.get(STAGING_USE_KEY), lease);
+  assert.deepEqual(h.values.get(OWNER_KEY), ACTIVE_OWNER);
+  for (unreadable of [journalKey, STAGING_USE_KEY]) {
+    h.runtime.running = true;
+    await assert.rejects(h.bot.start(), /storage_unavailable/);
+    assert.equal(h.runtime.running, false);
+  }
+
+  unreadable = journalKey;
+  h.runtime.running = true;
+  t.mock.method(h.runtime, "destroy", async () => { throw new Error("synthetic stop failure"); });
+  assert.equal((await h.bot.fetch(stagingUseRequest("release", window))).status, 503);
+  const [retry] = await h.bot.listSchedules("stagingExpiry");
+  assert.equal(retry?.time, Math.ceil((Date.now() + 15_000) / 1000));
 });
 
 test("bounded staging: failed control teardown persists a prompt stop-only retry", async (t) => {

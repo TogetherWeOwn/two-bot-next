@@ -718,6 +718,8 @@ During preparation the reservation blocks competing admission and allows
 native shutdown and retry of the previous process. If neither record can
 affirm an active AutoMod lease or pending journal during a storage failure,
 emergency shutdown still stops the native process and retries a failed stop.
+Authenticated cleanup verifies its original scope before an emergency stop.
+The refusal leaves lease and owner records intact until a later verified retry.
 Protected cleanup continues to require fresh remote drain and stopped
 readbacks before releasing the lease.
 

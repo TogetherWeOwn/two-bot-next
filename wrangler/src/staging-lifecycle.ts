@@ -189,17 +189,13 @@ export class StagingLifecycle {
 
   /** Stop under the DO gate without consuming the grant needed by rollback. */
   async stop(change: StagingUseChange, identity: StagingIdentity, stop: () => Promise<void>): Promise<StagingUse> {
-    this.checkIdentity(change, identity);
-    const use = await this.require(identity);
-    if (!sameWindow(use, change)) throw new OwnershipRefused("staging_use_conflict");
+    const use = await this.requireTeardown(change, identity, true);
     await stop();
     return use;
   }
 
   async release(change: StagingUseChange, identity: StagingIdentity, stop: () => Promise<void>): Promise<StagingUse> {
-    this.checkIdentity(change, identity);
-    const use = await this.read();
-    if (!use || use.purpose !== undefined || !sameWindow(use, change)) throw new OwnershipRefused("staging_use_conflict");
+    const use = await this.requireTeardown(change, identity, false);
     const { voiceMove: _voiceMove, ...ended } = use;
     const released = { ...ended, phase: "released" as const };
     // Keep the tombstone even after a confirmed stop. Repeat cleanup is safe;
@@ -207,6 +203,13 @@ export class StagingLifecycle {
     await this.write(released);
     await stop();
     return released;
+  }
+
+  async requireTeardown(change: StagingUseChange, identity: StagingIdentity, requireActive: boolean): Promise<StagingUse> {
+    this.checkIdentity(change, identity);
+    const use = requireActive ? await this.require(identity) : await this.read();
+    if (!use || use.purpose !== undefined || !sameWindow(use, change)) throw new OwnershipRefused("staging_use_conflict");
+    return use;
   }
 
   private checkIdentity(change: StagingUseChange, identity: StagingIdentity): void {
