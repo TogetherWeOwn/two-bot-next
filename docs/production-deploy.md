@@ -418,17 +418,18 @@ the authenticated forward plan at the pinned release source.
 | Before apply | 115 rows through `0473` | 20 rows through `0465` | `attendance_recovered_at` absent. |
 | After guarded inverse | 116 rows through `0475` | 20 rows through `0465` | `attendance_recovered_at` and the original `0475` ledger timestamp retained. |
 
-The locked interrupted-apply classifier calls the first endpoint `pre`.
-Identify the second by its authenticated inverse result. Use the separate
+Match the original endpoint to the authenticated forward plan and the
+restored endpoint to the authenticated inverse result. Use the separate
 [planner receipt checks](https://github.com/TogetherWeOwn/two-bot-next/pull/2478)
 for the full ledgers and retained timestamp.
 
 ### Check the shared rollback SHA
 
-1. For the reviewed candidate, record the Worker source SHA and module
-   digests, the exact container image digest, runtime `build_revision`,
-   `build_id` and `deploy_id`. Pin the reviewed build inputs and keep the
-   Worker UUID pending until observed.
+1. For the reviewed rollback predecessor, record its Worker source SHA and
+   module digests, container image digest and expected runtime
+   `build_revision`, `build_id` and `deploy_id`. The forward candidate has
+   its own source SHA and image digest. Pin the reviewed predecessor inputs
+   and keep its Worker UUID pending until observed.
    [Same-source build inputs](https://github.com/TogetherWeOwn/two-bot-next/pull/2479).
 2. For staged proof at each endpoint, match the protected artifact and
    endpoint receipt to those pins. Record the actual staged Worker UUID and
@@ -438,20 +439,23 @@ for the full ledgers and retained timestamp.
    [prior staging certificate](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/45464932482/artifacts/14955502728)
    and [restored inventory](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/45471105110/artifacts/14956218306)
    demonstrate that identity comparison on the expanded schema.
-3. For authenticated serving readback, match the protected provider and
-   runtime evidence to the endpoint. Before apply, use the protected
-   preflight's bracketed exact-capability evidence and the original plan.
-   For recovery after inverse, use the authenticated inverse and the
-   protected restarted-pair and stable-readiness evidence. Record the
-   production Worker UUID separately from the staged UUID. Keep an endpoint
-   pending when its protected evidence is absent.
+3. For authenticated serving readback, match the protected provider evidence
+   to the endpoint. Before apply, preflight verifies the exact serving pair,
+   takeover capability and original plan. After inverse, match the
+   authenticated inverse to the restored pair and stable-readiness result.
+   Record the production Worker UUID separately from the staged UUID.
+   Preflight records pins and an epoch. The recovery result records the
+   provider state and stable poll count. Use a separate authenticated runtime
+   observation of the same Worker and image for the actual runtime stamps.
+   Keep the runtime identity pending when that observation is missing.
 
 `production_ownership_status.provider_sample` reads `workers/message` on the
 exact 100%-serving Worker version. Release preflight and interrupted recovery
 require that annotation to equal `rollback_sha`. Recovery also uses
 `rollback_sha` as the expected stamped runtime `build_revision` for
 `Rollback.wait_stable`, which checks the Worker version header and gateway
-readiness. Compare the image digest and build ID against their own evidence.
+readiness. The older pre-stamp readiness path can pass with unknown stamps.
+Require observed stamps when claiming a stamped runtime identity.
 
 When the Worker backport is annotated with its own revision and the retained
 image is stamped with an earlier one, the earlier SHA fails the Worker
@@ -459,12 +463,9 @@ identity check and the later SHA fails readiness. Record the two actual
 revisions and the image digest as a release integration dependency and keep
 qualification pending at both endpoints. Preserve truthful source stamps.
 
-Run the single synthetic refusal case from the repository root:
-
-```sh
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=scripts/ci python3 -m unittest \
-  test_predecessor_serving_identity.PredecessorServingIdentityTests.test_no_single_rollback_sha_admits_a_split_stamped_predecessor
-```
+Hosted source-level CI runs the
+[synthetic refusal case](../scripts/ci/test_predecessor_serving_identity.py)
+for both choices of `rollback_sha`.
 
 ## Regression gate against production
 
