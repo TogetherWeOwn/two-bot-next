@@ -2711,8 +2711,11 @@ class ShellStepTests(unittest.TestCase):
         return code, summary, worker
 
     def test_matching_revision_passes_only_when_gateway_ready_and_stable(self):
-        code, summary, worker = self.gate(
-            {"/health": [(200, "{}")], "/readyz": [(200, report())]})
+        with patch.object(ThreadingHTTPServer, "serve_forever", autospec=True,
+                          side_effect=ThreadingHTTPServer.serve_forever) as serve:
+            code, summary, worker = self.gate(
+                {"/health": [(200, "{}")], "/readyz": [(200, report())]})
+        serve.assert_called_once_with(worker.server, poll_interval=0.01)
         self.assertEqual(code, 0, summary)
         self.assertIn("stable 18/18 polls", summary)
         # One first pass plus 18 consecutive stability polls on each path.
