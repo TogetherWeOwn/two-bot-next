@@ -28,7 +28,7 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.state = {
             "worker": {"version_id": self.candidate[0], "sha": self.candidate[1], "traffic_percent": 100},
             "container": {"application_id": self.pin.application_id, "namespace_id": self.pin.namespace_id,
-                          "image_digest": self.candidate[2], "rollout_status": "completed"},
+                          "image_digest": self.candidate[2], "rollout_status": "completed", "rollout_id": "rollout"},
             "ownership": {"epoch": 21, "running": False, "phase": "fenced",
                           "owner_actor": recovery.fence_actor(self.pin)},
         }
@@ -128,11 +128,49 @@ class RecoveryWorkflowTests(unittest.TestCase):
     def test_pending_prior_rollout_keeps_the_writer_stopped(self):
         self.state["worker"].update(version_id=self.pin.worker_version, sha=self.pin.rollback_sha)
         self.state["container"].update(image_digest=self.pin.image_digest, rollout_status="progressing")
-        with self.assertRaisesRegex(GateError, "production_recovery_prior_rollout_pending"):
+        with self.assertRaisesRegex(GateError, "production_recovery_rollout_pending"):
             self.restore()
+        self.assertEqual(self.rollback.sleep.call_count, recovery.WORKER_RESTORE_READS - 1)
         self.rollback.restore_image.assert_not_called()
         self.control.assert_not_called()
         self.rollback.wait_stable.assert_not_called()
+
+    def test_recovery_waits_for_an_exact_rollout_before_image_write_or_takeover(self):
+        for digest in (self.candidate[2], self.pin.image_digest):
+            with self.subTest(digest=digest):
+                self.rollback.reset_mock(side_effect=True)
+                self.control.reset_mock()
+                self.state["worker"].update(version_id=self.pin.worker_version, sha=self.pin.rollback_sha)
+                self.state["container"].update(image_digest=digest, rollout_status="progressing")
+                self.state["ownership"].update(phase="fenced", epoch=21, owner_actor=recovery.fence_actor(self.pin))
+
+                def finish_rollout(_delay):
+                    self.rollback.restore_image.assert_not_called()
+                    self.control.assert_not_called()
+                    self.state["container"]["rollout_status"] = "completed"
+
+                def take_over(*_args, **_kwargs):
+                    self.state["ownership"].update(epoch=22, phase="active", owner_actor=self.pin.actor)
+
+                self.rollback.sleep.side_effect = finish_rollout
+                self.rollback.restore_image.side_effect = lambda _image: self.state["container"].update(
+                    image_digest=self.pin.image_digest)
+                self.control.side_effect = take_over
+                self.restore()
+                self.rollback.sleep.assert_called_once()
+                self.assertEqual(self.rollback.restore_image.call_count, int(digest == self.candidate[2]))
+                self.control.assert_called_once_with("takeover-fenced", 21, expected_deployment=self.pin.worker_version)
+
+    def test_recovery_refuses_changed_rollout_or_stop_while_waiting(self):
+        self.state["worker"].update(version_id=self.pin.worker_version, sha=self.pin.rollback_sha)
+        self.state["container"]["rollout_status"] = "progressing"
+        for group, key, value in (("container", "rollout_id", "new-rollout"), ("ownership", "owner_actor", "other")):
+            with self.subTest(key=key), patch.dict(self.state[group]):
+                self.rollback.sleep.side_effect = lambda _delay: self.state[group].update({key: value})
+                with self.assertRaisesRegex(GateError, "production_(inverse_serving_pair_changed|stopped_fence_unproved)"):
+                    self.restore()
+                self.rollback.restore_image.assert_not_called()
+                self.control.assert_not_called()
 
     def test_post_commit_recovery_reuses_the_forward_stop_and_refuses_an_unknown_worker(self):
         self.assertEqual(recovery.establish_fence(self.pin, self.candidate, self.observe, self.control),

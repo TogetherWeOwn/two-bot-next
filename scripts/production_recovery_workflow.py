@@ -17,6 +17,7 @@ from staging_migrate_approval import digest_json
 from staging_recovery_status import github
 from staging_rollout import GateError, decode, mapping, require
 from worker_container_rollback import APPLICATIONS, WORKERS, ProvenanceReceipt, Rollback, RollbackClient
+from worker_container_rollback import WORKER_RESTORE_POLL_SECONDS, WORKER_RESTORE_READS
 from worker_container_rollback import check_url, control_client, validate_receipt_against_live
 
 
@@ -25,7 +26,7 @@ def fence_actor(pin):
 
 
 def pair_matches(state, pin, version, sha, digest):
-    return matches_pair(state, pin, version, sha, digest) and state["container"].get("rollout_status") == "completed"
+    return matches_pair(state, pin, version, sha, digest, completed=True)
 
 
 def stopped_fence(state, pin):
@@ -79,6 +80,24 @@ def inverse_under_fence(pin, candidate, ack, run, api, inverse):
     return inverse()
 
 
+def wait_for_restore_rollout(pin, candidate, observe, pause):
+    state = observe()
+    worker = state["worker"]
+    initial = state["container"]
+    for attempt in range(WORKER_RESTORE_READS):
+        if attempt:
+            pause(WORKER_RESTORE_POLL_SECONDS)
+            state = observe()
+        stopped_fence(state, pin)
+        image = state["container"]
+        require(worker["version_id"] == pin.worker_version and state["worker"] == worker
+                and recoverable_pair(state, pin, candidate) and image["rollout_id"] == initial["rollout_id"]
+                and image["image_digest"] == initial["image_digest"], "production_inverse_serving_pair_changed")
+        if image["rollout_status"] == "completed":
+            return state
+    raise GateError("production_recovery_rollout_pending")
+
+
 def restore_under_fence(pin, result, observe, control, rollback, image, candidate):
     verify_inverse(pin, result)
     state = observe()
@@ -99,20 +118,12 @@ def restore_under_fence(pin, result, observe, control, rollback, image, candidat
                 if not (state["worker"]["version_id"] == pin.worker_version and recoverable_pair(state, pin, candidate)):
                     raise
             rollback.wait_worker_restore(pin.worker_version)
-        state = observe()
-        stopped_fence(state, pin)
-        require(state["worker"]["version_id"] == pin.worker_version and recoverable_pair(state, pin, candidate),
-                "production_inverse_serving_pair_changed")
+        state = wait_for_restore_rollout(pin, candidate, observe, rollback.sleep)
         if not pair_matches(state, pin, *restored):
-            # A prior-image rollout may already be in flight. Leave the
-            # fence in place and avoid submitting a duplicate image write.
-            require(state["container"]["image_digest"] != pin.image_digest,
-                    "production_recovery_prior_rollout_pending")
             try:
                 rollback.restore_image(image)
             except GateError:
-                state = observe()
-                stopped_fence(state, pin)
+                state = wait_for_restore_rollout(pin, candidate, observe, rollback.sleep)
                 if not pair_matches(state, pin, *restored):
                     raise
 
