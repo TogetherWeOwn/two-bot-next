@@ -423,10 +423,32 @@ and any authorized manual Actions run also stay on GitHub.
 
 ### Exact-head CI evidence
 
-Record commands and results in Verification. Follow the summary links to confirm attested tests and report skips or omissions.
-`pr-evidence` resolves Python and Rust declarations and literal `.ts`, `.js`, `.mjs`, and `.cjs` titles.
-Use paths for generated names and other formats. Organization path floors and repository review tiers apply.
-Register through a protected workflow after queue verification and green main and two later PR runs (SHA and run/job URLs).
+Record commands and results in Verification. Follow the Actions summary links
+to confirm attested tests and report skips or omissions. `pr-evidence` resolves
+Python and Rust declarations and literal `.ts`, `.js`, `.mjs`, and `.cjs` titles.
+Use paths for generated names and other formats. Organization path floors and
+repository review tiers apply.
+
+`pr-evidence` is advisory. Before merging, check that its latest result covers
+the exact head and current PR description. After a description edit, open the
+`pr-evidence` run triggered by that edit in Actions and wait for its result, even
+when the head SHA is unchanged. If validation fails, use the job output to
+correct the evidence and confirm the updated result. Follow the existing required
+checks and review policy for the merge.
+
+GitHub can bind a required workflow to protected source. In the hosted
+qualification, the pinned `pr-standards` workflow kept its opening required
+verdict after PR description edits on the same commit, while advisory `pr-evidence`
+re-evaluated. [Hosted qualification (#2378)](https://github.com/TogetherWeOwn/two-bot-next/pull/2378) ·
+[Opening required verdict](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/45099456637/job/137446679295) ·
+[Refreshed advisory verdict](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/45099695969/job/137447434088) ·
+[Supported events for workflow rules](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#supported-event-triggers)
+
+Keep `pr-evidence` advisory until a supported registration path binds the required
+verdict to the protected workflow, exact head and current PR description. It must
+invalidate the previous verdict and re-evaluate after a same-head description
+edit. Any future registration also needs merge-queue verification and green runs
+on `main` and two later PRs, with the SHAs and run and job URLs recorded.
 
 The toolchain remains pinned in `rust-toolchain.toml`. CI runs
 `python3 scripts/generate_command_reference.py` to generate ignored

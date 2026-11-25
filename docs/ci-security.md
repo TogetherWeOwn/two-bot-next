@@ -21,6 +21,9 @@ base-branch gate provenance without importing modules from the PR checkout.
 Explicit job names match their previous jobs-API identities; permission comments
 explain the existing grants without changing their values.
 
+For the advisory `pr-evidence` check, follow the maintainer procedure and
+registration criteria in [Exact-head CI evidence](../CONTRIBUTING.md#exact-head-ci-evidence).
+
 ## Staging deployment
 
 Staging deployment is governed by `deploy-staging.yml`. Consult the workflow
