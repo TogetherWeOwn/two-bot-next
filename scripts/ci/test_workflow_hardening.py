@@ -125,8 +125,7 @@ class WorkflowHardeningTests(unittest.TestCase):
     def test_reported_permission_scopes_keep_their_grants_and_explanations(self):
         scopes = {
             "deploy-staging.yml": {"certify-promotion": {"actions": "read"}},
-            "pr-size.yml": {"pr-size": {"issues": "write", "pull-requests": "write"},
-                            "pr-size-gate": {"issues": "write", "pull-requests": "write"},
+            "pr-size.yml": {"pr-size-gate": {"issues": "write", "pull-requests": "write"},
                             "pr-size-weekly": {"issues": "read", "pull-requests": "read"}},
             "production-migrate.yml": {"apply": {"actions": "read"}},
             "staging-migrate.yml": {"apply": {"actions": "read"}},

@@ -41,6 +41,7 @@ DECIDE_STEPS = _HISTORY_MODULE.DECIDE_STEPS
 JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
 PROBE_STEPS = _HISTORY_MODULE.PROBE_STEPS
 STATIC_FALSE = "${{ false }}"
+PR_SIZE_ORG_SHA = "649943c1ed8a1af8f8760e075f3923237dd72e50"
 JOB_INVENTORY = {
     "build-predecessor.yml": {"build"},
     # The nextest branch adds its required lane; main adds the production schema gate.
@@ -145,12 +146,9 @@ JOB_INVENTORY = {
     # Shared nextest lane, called by check.yml; org-level home is
     # TogetherWeOwn/.github with a pinned SHA like test-guard.
     "reusable-rust-nextest.yml": {"nextest"},
-    # PR-size labels + required size gate (org reusable): thin caller to
-    # the central labeller, the required gate and the weekly tally. The
-    # advisory `pr-size` job is never required; `pr-size-gate` fails PRs
-    # too large for the automated reviewer and is added to the ruleset
-    # only after it reports on the default branch.
-    "pr-size.yml": {"pr-size", "pr-size-gate", "pr-size-weekly"},
+    # The required gate measures and labels in one job. The weekly tally
+    # remains a separate read-only reusable call.
+    "pr-size.yml": {"pr-size-gate", "pr-size-weekly"},
     # Weekly DORA delivery metrics (docs/dora-metrics.md): the read-only
     # compute job reads 30 days of production Deployments; the main-only
     # publish job commits one JSON file plus a markdown summary to
@@ -177,22 +175,20 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    # caller to the shared nextest lane (local path until
                    # the central move).
                    ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
-                   # PR-size labels + required size gate: thin caller to
-                   # the central reusables, pinned SHA (repin all three
-                   # refs together).
-                   ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
-                   ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
-                   ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964"}
-# PR-size activation (pinned below): the labeller and the required gate run
-# on PR events, plus a manual dispatch carrying an explicit PR number; the
-# weekly tally runs on schedule or a blank manual dispatch. Pinning these
-# conditions prevents the gate from being silently disabled while its
-# inventory entry and reusable ref stay intact.
+                   # Both PR-size reusables use the same reviewed org squash.
+                   ("pr-size.yml", "pr-size-gate"): f"TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@{PR_SIZE_ORG_SHA}",
+                   ("pr-size.yml", "pr-size-weekly"): f"TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@{PR_SIZE_ORG_SHA}"}
+# The combined job runs on PR events and numbered manual dispatches. The
+# weekly tally runs on schedule and blank dispatches.
 PR_SIZE_JOB_IF = "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''"
 PR_SIZE_WEEKLY_IF = "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')"
-PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size"): PR_SIZE_JOB_IF,
-                         ("pr-size.yml", "pr-size-gate"): PR_SIZE_JOB_IF,
+PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size-gate"): PR_SIZE_JOB_IF,
                          ("pr-size.yml", "pr-size-weekly"): PR_SIZE_WEEKLY_IF}
+PR_SIZE_GATE_INPUTS = {
+    "pr-number": "${{ inputs.pr_number || '' }}",
+    "advisory-label": "true",
+    "exclude-extra": "migrations.lock",
+}
 # Every ordinary job in this public repository selects standard free hosted
 # Ubuntu directly. A private conversion needs fresh runner/cost qualification.
 PUBLIC_RUNNER = "ubuntu-latest"
@@ -4922,6 +4918,14 @@ def workflow_policy_errors(workflows):
             errors.append(f"{name}:{job_id}: missing PR-size job")
         elif job.get("if") != expected_if:
             errors.append(f"{name}:{job_id}: PR-size activation condition changed")
+    pr_size_jobs = workflows.get("pr-size.yml", {}).get("jobs", {})
+    gate = pr_size_jobs.get("pr-size-gate", {})
+    if gate.get("name") != "pr-size-gate" or gate.get("with") != PR_SIZE_GATE_INPUTS:
+        errors.append("pr-size.yml:pr-size-gate: required job name or caller inputs changed")
+    if {"needs", "continue-on-error"} & gate.keys():
+        errors.append("pr-size.yml:pr-size-gate: required verdict must stay independent")
+    if "with" in pr_size_jobs.get("pr-size-weekly", {}):
+        errors.append("pr-size.yml:pr-size-weekly: weekly tally must use the reusable defaults")
     for name, workflow in workflows.items():
         jobs = workflow.get("jobs", {})
         if set(jobs) != JOB_INVENTORY.get(name, set()):
@@ -9101,9 +9105,8 @@ class WorkflowTests(unittest.TestCase):
                                           ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@8059ac2b121b63443db656b1e10e927b8af8133c",
                                           ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@8059ac2b121b63443db656b1e10e927b8af8133c",
                                           ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
-                                          ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
-                                          ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
-                                          ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964"})
+                                          ("pr-size.yml", "pr-size-gate"): f"TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@{PR_SIZE_ORG_SHA}",
+                                          ("pr-size.yml", "pr-size-weekly"): f"TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@{PR_SIZE_ORG_SHA}"})
         for (name, job_id), expected_uses in REUSABLE_CALLS.items():
             with self.subTest(workflow=name, job=job_id):
                 job = self.workflows[name]["jobs"].get(job_id, {})
@@ -9125,8 +9128,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_pr_size_activation_conditions_are_pinned(self):
         jobs = self.workflows["pr-size.yml"]["jobs"]
-        expected = {"pr-size": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
-                    "pr-size-gate": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
+        expected = {"pr-size-gate": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
                     "pr-size-weekly": "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')"}
         for job_id, condition in expected.items():
             with self.subTest(job=job_id):
@@ -9139,6 +9141,45 @@ class WorkflowTests(unittest.TestCase):
         workflows = deepcopy(self.workflows)
         workflows["pr-size.yml"]["jobs"]["pr-size-gate"]["if"] = expected["pr-size-weekly"]
         self.assertTrue(workflow_policy_errors(workflows))
+
+    def test_pr_size_one_runner_keeps_labeling_and_required_verdict(self):
+        jobs = self.workflows["pr-size.yml"]["jobs"]
+        self.assertEqual(set(jobs), {"pr-size-gate", "pr-size-weekly"})
+        self.assertEqual(jobs["pr-size-gate"]["name"], "pr-size-gate")
+        self.assertEqual(jobs["pr-size-gate"]["with"], {
+            "pr-number": "${{ inputs.pr_number || '' }}",
+            "advisory-label": "true",
+            "exclude-extra": "migrations.lock",
+        })
+        # The reusable declares a boolean. BaseLoader reads quoted strings
+        # and YAML booleans alike as strings.
+        source = (ROOT / ".github/workflows/pr-size.yml").read_text()
+        gate_inputs = yaml.safe_load(source)["jobs"]["pr-size-gate"]["with"]
+        self.assertIs(gate_inputs["advisory-label"], True)
+        for updates, error in (
+            ({"with": {**jobs["pr-size-gate"]["with"], "advisory-label": "false"}},
+             "required job name or caller inputs changed"),
+            ({"name": "size advisory"}, "required job name or caller inputs changed"),
+            ({"needs": "pr-size-weekly"}, "required verdict must stay independent"),
+            ({"continue-on-error": "true"}, "required verdict must stay independent"),
+        ):
+            with self.subTest(updates=updates):
+                workflows = deepcopy(self.workflows)
+                workflows["pr-size.yml"]["jobs"]["pr-size-gate"].update(updates)
+                self.assertIn(f"pr-size.yml:pr-size-gate: {error}", workflow_policy_errors(workflows))
+
+    def test_pr_size_weekly_keeps_read_only_tally(self):
+        workflow = self.workflows["pr-size.yml"]
+        weekly = workflow["jobs"]["pr-size-weekly"]
+        self.assertEqual(workflow["on"]["schedule"], [{"cron": "17 7 * * 1"}])
+        self.assertEqual(weekly["permissions"], {
+            "contents": "read", "issues": "read", "pull-requests": "read",
+        })
+        self.assertNotIn("with", weekly)
+        workflows = deepcopy(self.workflows)
+        workflows["pr-size.yml"]["jobs"]["pr-size-weekly"]["with"] = {"advisory-label": "true"}
+        self.assertIn("pr-size.yml:pr-size-weekly: weekly tally must use the reusable defaults",
+                      workflow_policy_errors(workflows))
 
     def test_pr_size_gate_queues_overlapping_pr_and_review_runs(self):
         workflow = self.workflows["pr-size.yml"]
@@ -11439,10 +11480,6 @@ class WorkflowTests(unittest.TestCase):
     def test_minimal_grants_and_no_persisted_checkout_credentials(self):
         for name, workflow in self.workflows.items():
             if name == "pr-size.yml":
-                # The org caller template ships an explicit top-level
-                # `contents: read` (its header instructs a byte-exact
-                # copy); every job below still overrides with its own
-                # least-privilege grant, pinned under this test.
                 self.assertEqual(workflow["permissions"], {"contents": "read"})
             else:
                 self.assertEqual(workflow["permissions"], {})
@@ -11536,12 +11573,9 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("release.yml", "attach-sbom"):
                         # TOG-10893: uploads verified SBOMs to the published tag.
                         expected = {"contents": "write"}
-                    elif (name, job_id) in (("pr-size.yml", "pr-size"),
-                                            ("pr-size.yml", "pr-size-gate")):
-                        # Labeller writes the size/* label and keeps the
-                        # one advisory comment; the required gate posts
-                        # the split comment and ensures the exception
-                        # label. Both measure the caller's PR the same way.
+                    elif (name, job_id) == ("pr-size.yml", "pr-size-gate"):
+                        # One job updates size labels, ensures the exception
+                        # label and maintains advisory and required comments.
                         expected = {"contents": "read", "issues": "write",
                                     "pull-requests": "write"}
                     elif (name, job_id) == ("pr-size.yml", "pr-size-weekly"):
