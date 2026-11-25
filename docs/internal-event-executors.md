@@ -256,3 +256,31 @@ until both admitted images can use the disposable trust root at the same
 Discord origin.
 
 The announcement control invokes `rehearse-internal-actions`. For source proof, pass the commit-labeled release image ID to `--candidate`.
+
+### Assemble evidence by release position
+
+Use the reviewed serving and rollback records as independent pins for `current`
+and `retained`. Keep the evidence private. Compare each position as follows.
+
+| Evidence | Compare with the reviewed position |
+| --- | --- |
+| Captured rehearsal stdout and exit status | Run [the existing verifier](../tests/event_write_cutoff/verify_release_positions.py) with the selected `image` and `source_revision` for both positions. It verifies the full digest-pinned image reference and source revision for each position. |
+| Successful v1 permission response | Match `scope_nonce` exactly to the nonce on the signed request in the private attribution record for that position. Use a distinct nonce for each position, even when the same image serves both. Compare the request's `guild_id` and `bot_id` with the pinned scope. |
+| Private request attribution | Use the record of the runtime that answered that request. Compare its position, OCI digest (the `sha256:…` part of the selected `image`) and full source revision with the reviewed pins. Copying intended pins into the request note leaves the responding runtime unattributed. |
+| Separate Worker identity evidence | Compare the Worker version associated with that responding runtime and position in the deployment evidence with the reviewed Worker version. The rehearsal runs without the Worker, and the container-local permission response carries only the nonce, observation time and permission projection. |
+
+A matching nonce joins the response to the request. A matching observation time,
+Git revision or permission count cannot supply a missing OCI digest, Worker
+version or scope. Record **attribution gap** for a missing or ambiguous link and
+**attribution mismatch** for a conflicting value. The permission response in
+either case cannot serve as proof for that position. The observation time dates
+the local read. The applied Discord policy revision and the remaining controls
+in [Bot permission readback](#bot-permission-readback) still need their own evidence.
+
+Replay the synthetic pair and the wrong-build and attribution-gap cases from
+the repository root. The fixture uses the existing rehearsal verifier and
+in-memory examples of the private evidence. It makes no live requests.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/ci/test_event_cutoff_permission_attribution.py -v
+```
