@@ -758,11 +758,13 @@ Live qualification uses the sole staging writer's exclusive window.
 ### Dormant staging workflow
 
 The reusable AutoMod preview workflow has no caller and its staging job is
-disabled. Its offline fixture passes the issued AutoMod lease and pinned run,
-attempt and build to the job runner. Once startup is attempted, the runner
-asks for recovery on the original lease even if startup fails or its reply
-is lost. Both actions must return a bounded v1 receipt confirming the exact
-scope. The job preserves a startup failure even if recovery passes.
+disabled. It requires a direct dispatch of its own protected main ref, and
+the workflow has no dispatch trigger. The offline fixture passes the issued
+AutoMod lease and pinned run, attempt and build to the runner. After attempting
+startup, the runner asks for recovery on the original lease even if startup
+fails or its reply is lost. Both actions must return a bounded v1 receipt
+confirming the exact scope. The job preserves a startup failure even if
+recovery passes.
 
 The live handoff needs the authenticated private invoker and a trusted source
 of the issued AutoMod lease and separate start and recovery approvals. The

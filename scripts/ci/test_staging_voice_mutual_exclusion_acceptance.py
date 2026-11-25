@@ -105,6 +105,10 @@ EXPLICIT_STANDALONE_GUARD = STANDALONE_GUARD + " && !inputs.deploy_staging_call"
 EXPLICIT_INHERITED_GUARD = "(inputs.deploy_staging_call || " + INHERITED_GUARD + ")"
 MAIN_ONLY = "github.ref == 'refs/heads/main'"
 VOICE_MOVE_GUARD = f"inputs.verify_lease && {MAIN_ONLY} && github.ref_protected && github.run_attempt == 1"
+AUTOMOD_GUARD = (
+    "github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main'"
+    " && github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1"
+)
 # (workflow, job) that must hold the canonical group when run standalone,
 # and whether the hold must be job-level (to keep sibling prod probes free).
 STANDALONE_HOLDERS = {(VOICE, "synthetic"): False,
@@ -621,7 +625,7 @@ def repository_errors(wfs, canonical):
                 errors.append(f"{file}: dispatch must hold the guarded canonical lifecycle lock")
         if file == AUTOMOD:
             job = (workflow.get("jobs") or {}).get("dry-run") or {}
-            if (events(workflow) != ("workflow_call",) or job.get("if") != "${{ false }}"
+            if (events(workflow) != ("workflow_call",) or job.get("if") != AUTOMOD_GUARD
                     or "concurrency" in job or workflow.get("concurrency") != {
                         "group": canonical, "cancel-in-progress": "false", "queue": "max"}):
                 errors.append(f"{file}: the dormant job must reserve the full canonical lifecycle window")

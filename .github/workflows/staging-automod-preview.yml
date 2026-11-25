@@ -13,7 +13,11 @@ concurrency:
 
 jobs:
   dry-run:
-    if: ${{ false }}
+    # A reusable workflow sees the caller's workflow ref. This file has no
+    # dispatch trigger, so no caller can satisfy this condition.
+    if: >-
+      github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main' &&
+      github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1
     environment: {name: staging, deployment: false}
     permissions:
       contents: read

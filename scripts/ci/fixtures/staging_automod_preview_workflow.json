@@ -5,7 +5,7 @@
   "concurrency": {"group": "staging-lifecycle", "cancel-in-progress": "false", "queue": "max"},
   "jobs": {
     "dry-run": {
-      "if": "${{ false }}",
+      "if": "github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main' && github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1",
       "environment": {"name": "staging", "deployment": "false"},
       "permissions": {"contents": "read"},
       "runs-on": "ubuntu-latest",
