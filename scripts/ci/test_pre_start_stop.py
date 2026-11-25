@@ -213,3 +213,4 @@ class ProtectedPreTests(unittest.TestCase):
         else:
             fixture.admission.settle.side_effect = None
             self.assertTrue(stop.stop())
+            self.assertEqual(fixture.admission.settle.call_args_list, [call(target), call(target)])
