@@ -84,8 +84,16 @@ class RecoveryArtifactTests(unittest.TestCase):
             self.authenticated({**env, "GITHUB_RUN_ATTEMPT": "2"}, digest, routes)
 
     def test_inverse_archive_rejects_wrong_members_and_payload(self):
-        for spec in ({"archive_name": "other.json"}, {"document": '{"state":"restored","state":"expanded"}'},
+        for spec in ({"archive_name": "other.json"},
                      {"document": {"operation": "undo-0480", "approval": self.approval,
                                    "result": {**self.result, "fence_epoch": 22}}}):
             with self.subTest(spec=spec), self.assertRaises(GateError):
                 self.authenticated(*self.artifact_fixture(**spec))
+
+    def test_inverse_archive_rejects_duplicate_key_in_valid_envelope(self):
+        valid = {"operation": "undo-0480", "approval": self.approval, "result": self.result}
+        duplicate = '{"operation":"other",' + json.dumps(valid)[1:]
+        self.assertEqual(json.loads(duplicate), valid)
+        self.assertEqual(self.authenticated(*self.artifact_fixture(document=valid)), self.result)
+        with self.assertRaisesRegex(GateError, "^invalid_json$"):
+            self.authenticated(*self.artifact_fixture(document=duplicate))
