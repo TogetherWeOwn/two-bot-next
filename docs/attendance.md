@@ -42,6 +42,27 @@ The v2 fixture lists the `not_found` outcome. The [Web reader](https://github.co
 Exit `0` means pass, `1` means fail, and `2` includes preflight without `--execute`.
 Run cleanup even after failure. Record verdicts without credentials, signing headers or raw responses.
 
+## Compare one rehearsal offline
+
+Keep the full sanitized `lifecycle` record in each phase's observation. Save
+the four observations in `rehearsal.json` as one JSON object keyed by `pending`,
+`finalized`, `off` and `cleanup`. Each value is the observed JSON object for
+that phase. Use the rollout receipt from the original pending phase.
+
+```sh
+python3 scripts/staging_attendance_acceptance.py rehearsal --rollout rollout.json \
+  --observed rehearsal.json
+```
+
+The comparison uses each `ready` record's `observedAt` to check that the
+lease covered the probe budget. It uses the pending lease's owner epoch,
+`runId`, `runAttempt`, `acquiredAt` and `expiresAt` for all four phases. A
+later lease on the same rollout may retain the same owner epoch. Its stopped
+release and zero fixture rows belong to that later rehearsal. If the original
+lease has no matching cleanup receipt, leave its cleanup verdict unverified.
+Record `PASS: attendance rehearsal` alongside the separately recorded signed
+probe verdicts from the protected run.
+
 ## Enablement and rollback evidence
 
 Keep attendance enablement on hold until Web Ember M0a and the qualified
@@ -70,8 +91,9 @@ runtime and keep only sanitized outcomes in the evidence.
   After rollback, read back the reader OFF on the same serving receiver build
   and tenant that passed the finalized read, with signed ingress still active.
   A valid signed read of the same retained finalized key must return
-  `403 action_not_allowed` without a result. Then verify the separate stopped,
-  released and fixture-removal cleanup receipt.
+  `403 action_not_allowed` without a result. Then verify the stopped, released
+  and fixture-removal cleanup receipt for the originating lease with the offline
+  comparison above.
 
 The Web caller has its own pull control. When rolling it back, verify its
 effective OFF state separately. Confirm it issues no new pulls during an

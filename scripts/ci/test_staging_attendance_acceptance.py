@@ -1,6 +1,7 @@
 """Offline signed attendance acceptance with synthetic response envelopes."""
 
 from copy import deepcopy
+from datetime import timedelta
 from email.message import Message
 from io import BytesIO, StringIO
 import json
@@ -201,6 +202,69 @@ class AcceptanceTests(unittest.TestCase):
                     self.assertEqual(reads, expected_reads)
                     self.assertEqual(len(readies), len(expected_reads) + 1 if expected_reads else 0)
 
+        no_traffic.assert_not_called()
+
+    def test_rehearsal_evidence_requires_the_originating_lease(self):
+        def observations(acquired, attempt):
+            rows = {}
+            for phase, minutes in zip(acceptance.PHASES, (10, 46, 47, 48)):
+                row = deepcopy(FIXTURE["observed"])
+                row.update(attendance_read=phase in ("pending", "finalized"),
+                           primary_fixture="pending" if phase == "pending" else "finalized")
+                lifecycle = row["lifecycle"]
+                lifecycle["observedAt"] = (acquired + timedelta(minutes=minutes)).isoformat(
+                    timespec="milliseconds").replace("+00:00", "Z")
+                lifecycle["use"].update(environment="staging", runId="1234", runAttempt=attempt,
+                                        acquiredAt=int(acquired.timestamp()) * 1000,
+                                        expiresAt=int((acquired + timedelta(hours=1)).timestamp()) * 1000)
+                if phase == "cleanup":
+                    lifecycle.update(action="release", running=False)
+                    lifecycle["use"]["phase"] = "released"
+                    del row["primary_fixture"], row["foreign_fixture"]
+                    row["fixture_rows"] = 0
+                rows[phase] = row
+            return rows
+
+        first = observations(START, 1)
+        second = observations(START + timedelta(hours=1), 2)
+        no_traffic = Mock(side_effect=AssertionError("unexpected staging request"))
+        with (TemporaryDirectory() as directory,
+              patch.object(acceptance, "credentials", side_effect=AssertionError("unexpected credentials")),
+              patch.object(acceptance.time, "time", return_value=START.timestamp() + 86400)):
+            rollout_path = Path(directory) / "rollout.json"
+            observed_path = Path(directory) / "observed.json"
+            rollout_path.write_text(json.dumps(ROLLOUT), encoding="utf-8")
+
+            def run(rows, phase="rehearsal", extra=()):
+                observed_path.write_text(json.dumps(rows), encoding="utf-8")
+                args = [phase, "--rollout", str(rollout_path), "--observed", str(observed_path), *extra]
+                with (patch("sys.stdout", new_callable=StringIO) as stdout,
+                      patch("sys.stderr", new_callable=StringIO) as stderr):
+                    status = acceptance.main(args, env={}, check=no_traffic)
+                return status, stdout.getvalue(), stderr.getvalue()
+
+            passed = (0, "PASS: attendance rehearsal\n", "")
+            mismatch = (1, "", "FAIL: staging lease identity did not match\n")
+            self.assertEqual(run(first), passed)
+            self.assertEqual(run(second), passed)
+            self.assertEqual(run(second["cleanup"], "cleanup"), (0, "PASS: attendance cleanup\n", ""))
+            for phase in acceptance.PHASES:
+                with self.subTest(phase=phase):
+                    self.assertEqual(run({**first, phase: second[phase]}), mismatch)
+
+            rebound = deepcopy(first["cleanup"])
+            rebound["lifecycle"]["epoch"] += 1
+            rebound["lifecycle"]["use"]["epoch"] += 1
+            self.assertEqual(run({**first, "cleanup": rebound}), mismatch)
+
+            late = deepcopy(first["off"])
+            last_start = START + timedelta(hours=1, seconds=-acceptance.RUN_BUDGET)
+            late["lifecycle"]["observedAt"] = last_start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            self.assertEqual(run({**first, "off": late}), (1, "", "FAIL: staging lease did not cover the probe\n"))
+            self.assertEqual(run({phase: row for phase, row in first.items() if phase != "cleanup"}),
+                             (1, "", "FAIL: rehearsal requires all four observations\n"))
+            self.assertEqual(run(first, extra=("--execute",)),
+                             (1, "", "FAIL: rehearsal only accepts offline readback\n"))
         no_traffic.assert_not_called()
 
     def test_signature_matches_shared_wire_vectors(self):
