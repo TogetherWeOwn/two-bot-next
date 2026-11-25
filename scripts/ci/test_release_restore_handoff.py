@@ -107,8 +107,13 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
         self.assert_handoff(prior, self.plan)
         current = deepcopy(prior)
         plan = current.pop("plan")
-        plan.update(backup_id="fixture-retry-backup", copy_id="fixture-retry-restore")
+        plan.update(
+            backup_id="fixture-retry-backup",
+            copy_id="fixture-retry-restore",
+            temporary_entries=[f"{entry}-retry" for entry in plan["temporary_entries"]],
+        )
         current["restored"]["backup_id"] = plan["backup_id"]
+        current["cleanup"]["credential_readback"]["entries"] = dict.fromkeys(plan["temporary_entries"], "absent")
         readbacks = [
             (phase, app, f"{phase} {app.capitalize()} readback", "readback precedes phase")
             for phase in ("before", "forward", "after_undo") for app in ("bot", "web")
@@ -143,6 +148,11 @@ class ReleaseRestoreHandoffTests(unittest.TestCase):
                     replay[section][key][field] = prior[section][key][field]
                     with self.assertRaisesRegex(AssertionError, reason):
                         self.assert_handoff(replay, plan)
+
+        replay = deepcopy(current)
+        replay["cleanup"]["credential_readback"]["entries"] = prior["cleanup"]["credential_readback"]["entries"]
+        with self.assertRaisesRegex(AssertionError, "temporary entry absence"):
+            self.assert_handoff(replay, plan)
 
     def test_requires_distinct_app_role_observations_on_the_restored_copy(self):
         self.assert_refuses_change(("restored", "backup_id"), "other-backup", "backup lineage")
