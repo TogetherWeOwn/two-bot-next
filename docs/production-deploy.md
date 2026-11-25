@@ -406,134 +406,65 @@ bodies. A rollback and the live-SHA redeploy skip it: recovery never waits on
 it. The Release Manager exercises the restore path with the [on-demand staging proof](#on-demand-staging-proof)
 once per bot production release, after deploying the candidate to staging.
 
-## Attendance release predecessor qualification
+## Attendance predecessor identity at both PRE endpoints
 
-Use this handoff to assemble evidence for the exact Worker and retained
-container that would serve before the attendance expansion and after its
-guarded inverse. The [production release gate](../CONTRIBUTING.md#production-release-gate)
-and [staging rollout contract](staging-rollout-gate.md) govern execution. Use
-source and synthetic evidence for the offline checks.
+Use the same Worker and container identity check at both database endpoints
+derived by `ledger_endpoints` in `scripts/production_release_forward.py` from
+the authenticated forward plan at the pinned release source.
+[Protected release source](https://github.com/TogetherWeOwn/two-bot-next/pull/2458).
 
-### Derive both database endpoints
-
-Pin the full release workflow SHA and its approved forward-plan source SHA.
-Use `ledger_endpoints` in `scripts/production_release_forward.py` at the pinned
-release workflow source to derive `before`, `expanded` and `restored` from the
-authenticated, exact-source plan. It checks both plan projection hashes and
-recomputed migration checksums. Compare whole ordered ledgers, including each
-row's version, description, SHA-384 and success status.
-
-| Endpoint | Cutover | Store | Schema evidence |
+| Endpoint | Cutover | Store | Schema marker |
 | --- | --- | --- | --- |
-| Before forward apply | 115 rows through `0473` | 20 rows through `0465` | Web contract `1.0`, legacy grants, `attendance_recovered_at` absent. |
-| After guarded inverse | 116 rows through `0475` | 20 rows through `0465` | Web contract `1.0`, legacy grants, `attendance_recovered_at` and the original `0475` ledger timestamp retained. |
+| Before apply | 115 rows through `0473` | 20 rows through `0465` | `attendance_recovered_at` absent. |
+| After guarded inverse | 116 rows through `0475` | 20 rows through `0465` | `attendance_recovered_at` and the original `0475` ledger timestamp retained. |
 
-The forward transaction adds Cutover `0475`, `0479`–`0482` and Store `0478`.
-The inverse removes Cutover `0479`–`0482` and Store `0478`. The locked interrupted
-apply classifier's `pre` means the first row of the table. For the second row,
-retain the protected inverse result, including the matched post-apply stamp
-and the restored ledgers. A bare `pre` label does not authenticate either
-readback. See [the release source](https://github.com/TogetherWeOwn/two-bot-next/pull/2458).
+The locked interrupted-apply classifier calls the first endpoint `pre`.
+Identify the second by its authenticated inverse result. Use the separate
+[planner receipt checks](https://github.com/TogetherWeOwn/two-bot-next/pull/2478)
+for the full ledgers and retained timestamp.
 
-### Screen the reviewed candidate offline
+### Check the shared rollback SHA
 
-1. Record the reviewed Worker source SHA and module digests, retained image
-   manifest digest, and stamped runtime `build_revision`, `build_id` and
-   `deploy_id` separately. Record the full protected workflow SHA and the
-   exact planner source SHA for each endpoint. Record review and CI links
-   against their full SHAs. Leave a Worker version UUID or rollout ID pending
-   until its protected producer supplies one.
-2. Run the [predecessor fixture](https://github.com/TogetherWeOwn/two-bot-next/commit/3085fcdc386c6ca13560f31139d7530744c53b5f)
-   against the proposed Worker source using its pinned dependencies. In a
-   scratch checkout, apply the fixture's `wrangler/test/container.test.ts`
-   diff and run the ordinary boot case with the existing Node loader. The
-   fixture commit must be present in the local Git object store.
+1. For the reviewed candidate, record the Worker source SHA and module
+   digests, the exact container image digest, runtime `build_revision`,
+   `build_id` and `deploy_id`. Pin the reviewed build inputs and keep the
+   Worker UUID pending until observed.
+   [Same-source build inputs](https://github.com/TogetherWeOwn/two-bot-next/pull/2479).
+2. For staged proof at each endpoint, match the protected artifact and
+   endpoint receipt to those pins. Record the actual staged Worker UUID and
+   annotation beside the observed image digest and runtime stamps. Use the
+   [promotion evidence contract](#build-identity-and-the-readyz-gate) for
+   artifact validation. The
+   [prior staging certificate](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/45464932482/artifacts/14955502728)
+   and [restored inventory](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/45471105110/artifacts/14956218306)
+   demonstrate that identity comparison on the expanded schema.
+3. For authenticated serving readback, match the protected provider and
+   runtime evidence to the endpoint. Before apply, use the protected
+   preflight's bracketed exact-capability evidence and the original plan.
+   For recovery after inverse, use the authenticated inverse and the
+   protected restarted-pair and stable-readiness evidence. Record the
+   production Worker UUID separately from the staged UUID. Keep an endpoint
+   pending when its protected evidence is absent.
 
-   ```sh
-   fixture_sha=3085fcdc386c6ca13560f31139d7530744c53b5f
-   git show "$fixture_sha" -- wrangler/test/container.test.ts |
-     git -C "$worker_checkout" apply
-   cd "$worker_checkout/wrangler"
-   node --import ./test/cloudflare-loader.mjs --test \
-     --test-name-pattern='^PRE predecessor keeps ordinary ownership and the retained Rust build on boot$' \
-     test/container.test.ts
-   ```
+`production_ownership_status.provider_sample` reads `workers/message` on the
+exact 100%-serving Worker version. Release preflight and interrupted recovery
+require that annotation to equal `rollback_sha`. Recovery also uses
+`rollback_sha` as the expected stamped runtime `build_revision` for
+`Rollback.wait_stable`, which checks the Worker version header and gateway
+readiness. Compare the image digest and build ID against their own evidence.
 
-3. In hosted validation from that fixture source, run each exact case with
-   `TWO_BOT_PREDECESSOR_PLAN_SOURCE` set to the reviewed planner checkout for
-   that endpoint. Run one case per checkout with an empty pending list
-   required in both chains.
+When the Worker backport is annotated with its own revision and the retained
+image is stamped with an earlier one, the earlier SHA fails the Worker
+identity check and the later SHA fails readiness. Record the two actual
+revisions and the image digest as a release integration dependency and keep
+qualification pending at both endpoints. Preserve truthful source stamps.
 
-   ```sh
-   TWO_BOT_PREDECESSOR_PLAN_SOURCE="$pre_0473_checkout" cargo test --locked \
-     -p two-bot-cutover --test predecessor_plan predecessor_plan_accepts_pre_0473 -- --exact
-   TWO_BOT_PREDECESSOR_PLAN_SOURCE="$pre_0475_checkout" cargo test --locked \
-     -p two-bot-cutover --test predecessor_plan predecessor_plan_accepts_pre_0475 -- --exact
-   ```
+Run the single synthetic refusal case from the repository root:
 
-   The historical image's inventory stops at `0470` and rejects applied
-   `0472`. The expanded inventory includes pending migrations. A planner
-   with `0475` pending cannot supply the clean `0473` plan. Keep the exact
-   planner inventories and the retained image pinned independently. The
-   synthetic cases exercise reconciliation and boot behavior. Artifact bytes,
-   schema readback and serving readiness require protected evidence.
-
-4. Check both uses of `rollback_sha` before proposing a release pin.
-   `production_ownership_status.provider_sample` reads `workers/message` on
-   the exact 100%-serving Worker version. `verify_preflight` and
-   `interrupted_pair_phase` require that annotation to equal `rollback_sha`.
-   Recovery passes that SHA as the expected stamped runtime `build_revision`
-   for `Rollback.wait_stable`. Its poll checks the Worker version header
-   and gateway readiness. Record the exact build ID and image digest from their
-   separate producers. A Worker backport annotated with its own revision and a
-   retained image stamped with an earlier revision cannot satisfy both checks.
-   Pinning the older SHA fails the Worker check. Pinning the newer SHA fails
-   readiness. Record the actual mismatch as an integration dependency and
-   leave qualification pending. The offline
-   [split revision test](../scripts/ci/test_predecessor_serving_identity.py)
-   exercises both pins with the same serving version and image.
-
-### Assemble protected evidence for each endpoint
-
-| Evidence | What to match |
-| --- | --- |
-| Reviewed candidate | Exact reviewed source and artifact pins, endpoint planner inventories and offline results. Keep unresolved identity or planner inputs pending. |
-| Protected staging proof | For each endpoint, match the exact Worker modules and retained image to the protected attempt's immutable artifact, verified database binding and both ledger readbacks, stamped readiness and smoke, recovery and final stop. Record workflow SHA, run and attempt, job and artifact IDs, archive digest, environment-specific Worker UUID, rollout, target fingerprint and both ledger digests. |
-| Authenticated readback | Match the exact serving pair and database target using provider and protected database evidence for the endpoint. Keep staging and production Worker UUIDs distinct. Bind the readback to the producing attempt and its expected steps before relying on the archived JSON. |
-
-The existing standard staging inventory's `verified_plan` requires Cutover
-`0481` and Store `0478`. The main-bound ordinary promotion certificate also
-binds the source and compiled stamps for one artifact. If those routes cannot
-admit the exact predecessor and endpoint, record the protected qualification
-as pending. The [prior exact certification](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/45464932482/artifacts/14955502728),
-[recovery child](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/45468078613)
-and [final stopped inventory](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/45471105110/artifacts/14956218306)
-show how to match each producer to the same certified pair even when the
-wrapper supplies no receipt. Those runs used the expanded staging ledgers.
-Follow the existing [promotion evidence contract](#build-identity-and-the-readyz-gate)
-for archive and module validation. Keep the expanded attendance candidate's
-certificate with that candidate.
-
-For the first endpoint, the release owner's protected preflight matches the
-authenticated plan to a fresh read-only plan and brackets the authenticated
-`takeover-capability` GET with provider/ownership samples. Require the exact
-Worker UUID and affirmative capability, 100% traffic, the completed rollout
-with the configured digest and the bound app/namespace. Preserve the recorded
-runtime identity alongside that readback. For interrupted apply at this
-endpoint, also match the authenticated original stop intent and locked `pre`
-classification to the protected restarted-pair result.
-
-For the retained `0475` endpoint, use the protected inverse and recovery
-readback. Match the original plan and artifact lineage, database fingerprint,
-both restored ledgers and preserved `0475` timestamp digest. Match the exact
-prior Worker and digest, the expected actor and recovery epoch and stable
-gateway readiness, including the pinned stamped revision. The protected
-recovery source authenticates the inverse before takeover. Mixed ledgers,
-drift, a pending takeover or a missing inverse result require protected
-reconciliation. Preserve the stop intent and any results and leave the writer
-fenced while the outcome is uncertain. The protected interrupted path defines
-the producer names in `scripts/production_release_interrupted.py` and the
-artifact lineage checks in `scripts/production_recovery_artifact.py`.
+```sh
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=scripts/ci python3 -m unittest \
+  test_predecessor_serving_identity.PredecessorServingIdentityTests.test_no_single_rollback_sha_admits_a_split_stamped_predecessor
+```
 
 ## Regression gate against production
 
