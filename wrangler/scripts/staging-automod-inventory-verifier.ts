@@ -32,12 +32,18 @@ export function bindStagingAutomodInventoryVerifier(
     const work = new Promise<string>((resolve, reject) => {
       const refusal = new Error("Staging inventory verifier failed");
       if (signal.aborted) return reject(refusal);
-      let child;
+      let child: ReturnType<Launch>;
       try {
         child = launch("python3", [SUPERVISOR, "python3", VERIFIER, workflowSha, runId],
           { env: {}, stdio: "pipe", detached: true });
       } catch {
         return reject(refusal);
+      }
+      if (child.pid === undefined) {
+        // A failed spawn can emit an error without having created any pipes.
+        child.once("error", () => {});
+        child.once("close", () => reject(refusal));
+        return;
       }
 
       const stdout = Buffer.alloc(MAX_OUTPUT_BYTES);

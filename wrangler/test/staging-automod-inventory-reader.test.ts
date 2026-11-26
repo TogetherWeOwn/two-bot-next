@@ -129,6 +129,13 @@ test("the verifier refuses excess output even after a complete receipt", async (
   }
 });
 
+test("the verifier returns its fixed refusal when the supervisor cannot spawn", async () => {
+  const run = bindStagingAutomodInventoryVerifier((_, args, options) =>
+    spawn(`${process.execPath}/missing`, args, options));
+  await assert.rejects(run(source.workflowSha, String(source.runId), new AbortController().signal),
+    { message: "Staging inventory verifier failed" });
+});
+
 test("the verifier drains a cancelled descendant without signalling an unrelated child", { timeout: 10_000 }, async () => {
   const controller = new AbortController();
   const { signal } = controller;
