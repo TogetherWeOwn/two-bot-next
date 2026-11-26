@@ -27,10 +27,10 @@ jobs:
           POSTGRES_HOST_AUTH_METHOD: trust
         options: --health-cmd "pg_isready -U agent_test -d two_bot_test_ci" --health-interval 5s --health-timeout 5s --health-retries 12
     steps:
-      - name: Install Python and the disposable Postgres client
+      - name: Install Python
         run: |
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends python3 postgresql-client >/dev/null
+          apt-get install -y -qq --no-install-recommends python3 >/dev/null
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -60,6 +60,9 @@ jobs:
         env:
           CARGO_NET_OFFLINE: 'true'
         run: python3 .github/scripts/mutation_rust_fixture.py
+      - name: Install the disposable Postgres client
+        if: steps.plan.outputs.rust == 'true'
+        run: apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
       - name: Measure Rust PR additions
         if: steps.plan.outputs.rust == 'true'
         env:
