@@ -3225,18 +3225,35 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
-      - name: Install disposable database client
+      - name: Fetch candidate ancestry and install disposable database client
+        shell: bash
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # Both event tips are parents of the exact candidate. Fetch their
+          # complete history without transferring historical file contents.
+          [[ $GITHUB_SHA =~ ^[0-9a-f]{40}$ ]]
+          git -c protocol.version=2 fetch --unshallow --no-tags --no-recurse-submodules \
+            --filter=blob:none origin "$GITHUB_SHA"
+          [[ $(git rev-parse --is-shallow-repository) == false ]]
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends postgresql-client
       - name: Verify the merge-base CLI and stores on candidate migrations and grants
+        shell: bash
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: bash scripts/ci/db_compatibility.sh
+        run: |
+          # Require the event's merge-base inputs to be present locally. A
+          # partial checkout can otherwise fetch a missing commit on demand.
+          if [[ $PR_BASE_SHA =~ ^[0-9a-f]{40}$ && $PR_HEAD_SHA =~ ^[0-9a-f]{40}$ ]]; then
+            for tip in "$PR_BASE_SHA" "$PR_HEAD_SHA"; do
+              local_tip=$(git rev-list --missing=allow-promisor --max-count=1 "$tip" --)
+              [[ $local_tip == "$tip" ]]
+            done
+          fi
+          bash scripts/ci/db_compatibility.sh
 
   # Dependency-aware selector for the container job (TOG-12056): PRs that
   # touch only docs, worker UI or unrelated CI tooling skip the ~15-minute
