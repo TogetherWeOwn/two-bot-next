@@ -470,8 +470,10 @@ run and jobs from GitHub's attempt-specific endpoints. Authenticate the protecte
 workflow revision and the receipt's origin in the exact verification job
 independently of the receipt. Supply those identities to `matches_receipt` with
 the receipt decoded as a JSON object with unique keys. Missing or unmatched
-provenance, PR association, explicit
-attempt identity, or successful verification yields no authoritative result.
+provenance, PR association, explicit attempt identity, or successful verification
+yields no authoritative result. A first-attempt job that omits `run_attempt`
+is ineligible. Qualify the protected producer's first-attempt job records before
+enabling issuance.
 The advisory run metadata does not prove a protected workflow revision or the
 origin of a receipt. Its workflow therefore leaves receipt issuance dormant.
 Matching a receipt establishes what that attempt verified at its last read.

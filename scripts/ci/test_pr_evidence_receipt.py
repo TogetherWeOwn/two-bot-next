@@ -91,7 +91,8 @@ class ReceiptTests(unittest.TestCase):
         for change in ({"pull_requests": []}, {"pull_requests": [dict(association, number=True)]},
                        {"repository": {"full_name": REPO, "id": 9}}, {"workflow_id": 9},
                        {"pull_requests": [dict(association, base={"repo": {"id": 7}, "sha": HEAD})]},
-                       {"path": ".github/workflows/other.yml"}, {"event": "push"}, {"run_attempt": 1}):
+                       {"path": ".github/workflows/other.yml"}, {"event": "push"}, {"run_attempt": 1},
+                       {"status": "in_progress"}, {"conclusion": "failure"}, {"head_sha": BASE}):
             with self.subTest(run=change):
                 self.assertFalse(match(run_record=dict(run, **change)))
         for change in ({"id": 11}, {"run_attempt": 1}, {"head_sha": BASE}, {"conclusion": "cancelled"},
@@ -106,3 +107,13 @@ class ReceiptTests(unittest.TestCase):
         no_attempt = dict(run)
         del no_attempt["run_attempt"]
         self.assertFalse(match(run_record=no_attempt))
+
+        first = replace(ATTEMPT, attempt=1)
+        first_receipt = dict(receipt, attempt=1)
+        first_run = dict(run, run_attempt=1)
+        first_job = dict(job, run_attempt=1)
+        self.assertTrue(match(record=first_receipt, run_record=first_run,
+                              jobs=dict(listing, jobs=[first_job]), attempt=first))
+        del first_job["run_attempt"]
+        self.assertFalse(match(record=first_receipt, run_record=first_run,
+                               jobs=dict(listing, jobs=[first_job]), attempt=first))
