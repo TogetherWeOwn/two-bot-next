@@ -1529,6 +1529,23 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
             ),
             "sparse-checkout-cone-mode": "false",
         })
+    else:
+        checkout_options.update({
+            "sparse-checkout": (
+                "/scripts/build_identity.py\n"
+                "/scripts/ci/production_migrate_claim.py\n"
+                "/scripts/ci/staging_migrate_claim.py\n"
+                "/scripts/production_migrate_approval.py\n"
+                "/scripts/rollback_proof.py\n"
+                "/scripts/script_intake.py\n"
+                "/scripts/staging_migrate_approval.py\n"
+                "/scripts/staging_migrate_reviewed.py\n"
+                "/scripts/staging_recovery_status.py\n"
+                "/scripts/staging_rollout.py\n"
+                "/scripts/worker_container_rollback.py\n"
+            ),
+            "sparse-checkout-cone-mode": "false",
+        })
     if (not str(checkout.get("uses", "")).startswith("actions/checkout@")
             or checkout.get("with") != checkout_options):
         errors.append(f"{prefix} checkout must pin the workflow head and reviewed inputs without persisted credentials")
@@ -9640,6 +9657,32 @@ class WorkflowTests(unittest.TestCase):
                 def change(w, job_id=job_id, permissions=permissions):
                     w["jobs"][job_id]["permissions"] = permissions
                 self.assertTrue(mutated(change))
+
+    def test_production_claim_checkout_pins_exact_paths(self):
+        claim = self.workflows["production-migrate.yml"]["jobs"]["claim"]
+        self.assertEqual(production_claim_errors(claim), [])
+        paths = claim["steps"][0]["with"]["sparse-checkout"]
+        for key, value in (
+                ("ref", "${{ inputs.source_sha }}"),
+                ("persist-credentials", "true"),
+                ("sparse-checkout", "/scripts/\n"),
+                ("sparse-checkout", paths.replace("/scripts/worker_container_rollback.py\n", "")),
+                ("sparse-checkout", paths + "/scripts/incident_issue.py\n"),
+                ("sparse-checkout", None),
+                ("sparse-checkout-cone-mode", "true"),
+                ("sparse-checkout-cone-mode", None),
+                ("fetch-depth", "0")):
+            with self.subTest(key=key, value=value):
+                changed = deepcopy(claim)
+                options = changed["steps"][0]["with"]
+                if value is None:
+                    del options[key]
+                else:
+                    options[key] = value
+                self.assertEqual(production_claim_errors(changed), [
+                    "production-migrate.yml:claim: checkout must pin the "
+                    "workflow head and reviewed inputs without persisted credentials",
+                ])
 
     def test_production_migrate_runner_shape_is_pinned(self):
         # Production mirror of the staging runner: same three jobs, same pinned
