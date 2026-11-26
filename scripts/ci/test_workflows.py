@@ -4102,9 +4102,17 @@ def staging_callee_window_errors(name, workflow, consumer):
         if {key: value for key, value in upload.items() if key != "name"} != expected_upload:
             errors.append(f"{name}:staging-window: must always upload the start receipt for 14 days, "
                           "failing on a missing file")
-        if checkout != {"uses": STAGING_CHECKOUT_USES,
-                        "with": {"persist-credentials": "false", "fetch-depth": "1"}}:
-            errors.append(f"{name}:staging-window: checkout must be the pinned action without persisted credentials")
+        checkout_inputs = {"persist-credentials": "false", "fetch-depth": "1"}
+        if name == "voice-synthetic.yml":
+            checkout_inputs.update({
+                "sparse-checkout": "/wrangler/scripts/staging-use-pipeline.mjs\n"
+                                   "/wrangler/scripts/staging-use.mjs\n"
+                                   "/wrangler/scripts/is-direct-invocation.mjs\n"
+                                   "/wrangler/scripts/ownership-control-response.mjs\n",
+                "sparse-checkout-cone-mode": "false",
+            })
+        if checkout != {"uses": STAGING_CHECKOUT_USES, "with": checkout_inputs}:
+            errors.append(f"{name}:staging-window: checkout must match the pinned action and exact inputs")
         if node != {"uses": STAGING_SETUP_NODE_USES,
                     "with": {"node-version": "22", "package-manager-cache": "false"}}:
             errors.append(f"{name}:staging-window: second step must be the pinned setup-node on Node 22")
@@ -7798,6 +7806,29 @@ class WorkflowTests(unittest.TestCase):
             mutate(changed)
             errors = voice_synthetic_errors(changed)
             self.assertTrue(any(diagnostic in error for error in errors), errors)
+
+    def test_voice_staging_window_checkout_rejects_input_drift(self):
+        workflow = self.workflows["voice-synthetic.yml"]
+        self.assertEqual(voice_synthetic_errors(workflow), [])
+        checkout = workflow["jobs"]["staging-window"]["steps"][0]
+        inputs = checkout["with"]
+        paths = inputs["sparse-checkout"].splitlines(keepends=True)
+        mutations = {
+            "full checkout": {key: inputs[key] for key in ("persist-credentials", "fetch-depth")},
+            "wider checkout": {**inputs, "sparse-checkout": "/wrangler/scripts/\n"},
+            "cone mode": {**inputs, "sparse-checkout-cone-mode": "true"},
+            "ref override": {**inputs, "ref": "main"},
+            "filter override": {**inputs, "filter": "blob:none"},
+            **{f"missing {path.strip()}": {**inputs, "sparse-checkout": "".join(p for p in paths if p != path)}
+               for path in paths},
+        }
+        for label, changed_inputs in mutations.items():
+            with self.subTest(label=label):
+                changed = deepcopy(workflow)
+                changed["jobs"]["staging-window"]["steps"][0]["with"] = changed_inputs
+                self.assertEqual(voice_synthetic_errors(changed), [
+                    "voice-synthetic.yml:staging-window: checkout must match the pinned action and exact inputs",
+                ])
 
     def test_consumer_checks_survive_unexpected_job_inventory(self):
         import copy
