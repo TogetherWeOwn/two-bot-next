@@ -1,4 +1,5 @@
 name: deploy-production
+# guards: release:production-promotion
 
 # Production deploy and rollback, plus automatic promotion of green staging.
 # Triggers: manual dispatch, a completed deploy-staging or check run on main

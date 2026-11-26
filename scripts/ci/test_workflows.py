@@ -5719,19 +5719,19 @@ class WorkflowTests(unittest.TestCase):
         # base-branch policy) and fail closed when that copy is missing.
         steps = self.workflows["supply-chain.yml"]["jobs"]["pr-lint"]["steps"]
         base = next(s for s in steps if s.get("name") == "Check out base-branch gate")
-        self.assertEqual(base["if"],
-                         "github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'")
+        self.assertEqual(base["if"], "github.event_name != 'push'")
         self.assertTrue(str(base.get("uses", "")).startswith("actions/checkout@"))
         self.assertEqual(base["with"]["ref"],
-                         "${{ github.event.pull_request.base.sha || 'main' }}")
+                         "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || 'main' }}")
         verify = next(s for s in steps if s.get("name") == "Verify base-branch gate snapshot")
         self.assertEqual(verify["if"], base["if"])
-        self.assertEqual(verify["env"]["EXPECTED_BASE_SHA"], "${{ steps.changed.outputs.base_sha }}")
+        self.assertEqual(verify["env"]["EXPECTED_BASE_SHA"],
+                         "${{ steps.changed.outputs.base_sha || github.event.merge_group.base_sha }}")
         self.assertEqual(verify["shell"], "python3 -I {0}")
         self.assertIn('if actual != expected:', verify["run"])
         self.assertLess(steps.index(base), steps.index(verify))
         self.assertEqual(base["with"]["path"], "base-gate")
-        self.assertEqual(base["with"]["sparse-checkout"], ".github/scripts")
+        self.assertEqual(base["with"]["sparse-checkout"].splitlines(), [".github/scripts", "ci"])
         self.assertEqual(base["with"]["persist-credentials"], "false")
         check = next(s for s in steps if s.get("name") == "Check title, body, branch and commits")
         self.assertLess(steps.index(base), steps.index(check))
@@ -11263,7 +11263,7 @@ class WorkflowTests(unittest.TestCase):
         workflow = self.workflows["nightly.yml"]
         self.assertEqual(
             set(workflow.get("on") or {}),
-            {"schedule", "workflow_dispatch", "pull_request"},
+            {"schedule"},
         )
         # All four compiling jobs carry the ceiling; the `sweep` aggregate
         # is not a compiling job and is not pinned here.

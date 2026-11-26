@@ -58,6 +58,14 @@ instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
 
+`pr-lint` also runs `python3 ci/workflow_guard.py .` against the candidate
+workflow definitions. PR, merge-group and manual PR validation use the pinned
+base policy. A push to `main` uses the checked-out commit's policy and
+definitions. Use a real path filter on each automatic trigger for new
+advisory work or obtain a reviewed change to the policy for broader admission.
+The required metadata check refreshes on `edited`. Release workflows keep
+the exact-main checks and the completed-only promotion notification.
+
 ### Independent review
 
 Use the `risk_tier` and complete path floors in the
@@ -430,10 +438,13 @@ Use paths for generated names and other formats. Organization path floors and
 repository review tiers apply.
 
 `pr-evidence` is advisory. Before merging, check that its latest result covers
-the exact head and current PR description. After a description edit, open the
-`pr-evidence` run triggered by that edit in Actions and wait for its result, even
-when the head SHA is unchanged. If validation fails, use the job output to
-correct the evidence and confirm the updated result. Follow the existing required
+the exact head and current PR description. The verifier reads the current
+description from GitHub when it runs. Reuse an eligible attempt that validates
+after an edit. If the edit makes a completed result stale, rerun only the
+advisory `pr-evidence` workflow from a matching PR run. If a matching
+head and base are unavailable, use the next eligible PR event with the current
+pair. Required `pr-lint` still runs on edits. On `main`, use the `ci-evidence`
+summary from `check` for exact-head Actions links. Follow the existing required
 checks and review policy for the merge.
 
 GitHub can bind a required workflow to protected source. In the hosted

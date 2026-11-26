@@ -7,8 +7,8 @@ than one repo lives ONCE at org level; per-repo files only call it.
 
 The advisory pilot graduated. `check.yml` calls the shared lane as the
 `nextest` job (rust-selector gated, aggregated by `ci-ok`, 45-minute
-ceiling pinned in `scripts/ci/test_workflows.py`); `ci-speed.yml` keeps
-the affected-paths selection and the minutes-per-merged-PR report.
+ceiling pinned in `scripts/ci/test_workflows.py`). Dispatch `ci-speed.yml`
+from Actions when you need its advisory affected-paths and minutes report.
 No new required-check context was created: `ci-ok` stays the single
 aggregate, so no branch-protection change was needed.
 

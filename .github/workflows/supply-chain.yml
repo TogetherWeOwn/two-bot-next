@@ -1,4 +1,5 @@
 name: supply-chain
+# guards: release:main-commit-lint-and-secret-scan
 
 # Folded lightweight gate (TOG-11810): the old `pr-lint.yml` and
 # `secret-scan.yml` workflows each occupied a whole `two-selfhosted` runner
@@ -82,6 +83,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             .github
+            ci
             scripts/fixtures/commit-parser
           sparse-checkout-cone-mode: true
 
@@ -331,7 +333,7 @@ jobs:
               output.write(f"changed_files_file={files_path}\nbase_sha={base}\n")
 
       - name: Check out base-branch gate
-        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+        if: github.event_name != 'push'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The already-merged policy, never the PR head: the working-tree
@@ -343,16 +345,18 @@ jobs:
           # attestation, and only then judges others. Dispatch uses the trusted
           # main ref, never an API-derived checkout ref. Verify its commit below
           # against the immutable inventory snapshot before running any gate code.
-          ref: ${{ github.event.pull_request.base.sha || 'main' }}
+          ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || 'main' }}
           path: base-gate
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            ci
           sparse-checkout-cone-mode: true
           persist-credentials: false
 
       - name: Verify base-branch gate snapshot
-        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+        if: github.event_name != 'push'
         env:
-          EXPECTED_BASE_SHA: ${{ steps.changed.outputs.base_sha }}
+          EXPECTED_BASE_SHA: ${{ steps.changed.outputs.base_sha || github.event.merge_group.base_sha }}
         shell: python3 -I {0}
         run: |
           import os, re, subprocess
@@ -366,6 +370,25 @@ jobs:
           ], text=True).strip()
           if actual != expected:
               raise SystemExit("Base-branch gate no longer matches the inventory snapshot; rerun")
+
+      - name: Guard automatic workflow demand
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy="$GITHUB_WORKSPACE"
+          if [[ "$GITHUB_EVENT_NAME" != push ]]; then
+            policy="$policy/base-gate"
+            # Check exercises the candidate policy before its first merge.
+            guard_entry=$(git -C "$policy" ls-tree HEAD -- ci/workflow_guard.py)
+            if [[ -z "$guard_entry" ]]; then
+              echo "The pinned base predates the workflow demand guard."
+              exit 0
+            fi
+          fi
+          cd "$RUNNER_TEMP"
+          python3 -I -m venv workflow-guard
+          workflow-guard/bin/python -I -m pip --isolated install --only-binary=:all: --no-deps --require-hashes -r "$policy/ci/workflow-guard-requirements.txt"
+          workflow-guard/bin/python -I "$policy/ci/workflow_guard.py" "$GITHUB_WORKSPACE"
 
       - name: Check title, body, branch and commits
         if: github.event_name != 'merge_group'

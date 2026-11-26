@@ -1,4 +1,5 @@
 name: pipeline benchmark
+# guards: paths
 
 # Evidence job, deliberately not a required PR check. Reused by nightly.
 on:

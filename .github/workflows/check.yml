@@ -1,4 +1,5 @@
 name: check
+# guards: release:exact-main-ci
 
 # Required on main from the first Rust code (see README Contributing):
 # fmt --check, clippy with -D warnings, and the test suite.

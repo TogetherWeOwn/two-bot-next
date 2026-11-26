@@ -1,5 +1,6 @@
 name: ci-speed
 
+# Dispatch this advisory report when a measurement is needed.
 # CI speed evidence (SDLC 2.3): paths-filter affected-only selection and the
 # minutes-per-merged-PR report. The shared nextest lane graduated to required
 # (check.yml `nextest` job, aggregated by `ci-ok`); this workflow keeps the
@@ -8,10 +9,6 @@ name: ci-speed
 # workflow including the report job.
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-  push:
-    branches: [main]
   workflow_dispatch:
 
 # Repo policy (scripts/ci/test_workflows.py): top-level permissions stay
@@ -19,8 +16,8 @@ on:
 permissions: {}
 
 concurrency:
-  group: ci-speed-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-speed-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   changes:
