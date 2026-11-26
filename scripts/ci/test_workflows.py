@@ -5526,6 +5526,12 @@ class ProductionPromotionSkipTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    IGNORED_DB_RUNTIME_RUNNER = (
+        "${{ (github.event_name != 'pull_request' || "
+        "github.event.pull_request.head.repo.full_name == github.repository) "
+        "&& vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}"
+    )
+
     def test_cargo_deny_keeps_transitive_unmaintained_advisories(self):
         config = tomllib.loads((ROOT / "deny.toml").read_text())
         self.assertEqual(config["advisories"]["unmaintained"], "all")
@@ -10937,6 +10943,46 @@ class WorkflowTests(unittest.TestCase):
                         "no extra arguments or default command",
                     )
 
+    def test_ignored_db_runtime_blacksmith_routes_by_event_and_variable(self):
+        workflow = self.workflows["check.yml"]
+        non_pr_events = ("merge_group", "push", "schedule", "workflow_dispatch")
+        self.assertEqual(set(workflow["on"]), {"pull_request", *non_pr_events})
+        actual = workflow["jobs"]["ignored-db-runtime"]["runs-on"]
+        self.assertEqual(actual, self.IGNORED_DB_RUNTIME_RUNNER)
+        expression = actual.removeprefix("${{").removesuffix("}}").strip()
+
+        label = "blacksmith-2vcpu-ubuntu-2404"
+        repository = "TogetherWeOwn/two-bot-next"
+        cases = [
+            ("pull_request", "contributor/two-bot-next", label, PUBLIC_RUNNER),
+            ("pull_request", "", label, PUBLIC_RUNNER),
+        ]
+        for event in ("pull_request", *non_pr_events):
+            head_repo = repository if event == "pull_request" else ""
+            cases.extend(((event, head_repo, label, label),
+                          (event, head_repo, "", PUBLIC_RUNNER),
+                          (event, head_repo, PUBLIC_RUNNER, PUBLIC_RUNNER)))
+
+        # Model the string comparisons and short circuiting used by this pin.
+        # Missing GitHub properties and unset variables are empty strings.
+        for event, head_repo, variable, expected in cases:
+            with self.subTest(event=event, head_repo=head_repo, variable=variable):
+                context = {
+                    "github.event_name": event,
+                    "github.repository": repository,
+                    "github.event.pull_request.head.repo.full_name": head_repo,
+                    "vars.CI_BLACKSMITH_2VCPU": variable,
+                }
+                source = re.sub(r"\b(?:github|vars)\.[\w.]+",
+                                lambda match: repr(context[match[0]]), expression)
+                tree = ast.parse(source.replace("&&", " and ").replace("||", " or "), mode="eval")
+                allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare,
+                           ast.Eq, ast.NotEq, ast.Constant)
+                self.assertTrue(all(isinstance(node, allowed) for node in ast.walk(tree)))
+                result = eval(compile(tree, "<ignored-db-runtime runs-on>", "eval"),
+                              {"__builtins__": {}})
+                self.assertEqual(result, expected)
+
     def test_runner_must_be_explicit_standard_public_hosted(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
         for runs_on in (LEGACY_ROUTED_RUNNER.format(job="worker"),
@@ -10992,7 +11038,9 @@ class WorkflowTests(unittest.TestCase):
                         self.assertNotIn("runs-on", job)
                         self.assertEqual(job["uses"], REUSABLE_CALLS[(name, job_id)])
                         continue
-                    if (name, job_id) == ("deploy-staging.yml", "certify-promotion"):
+                    if (name, job_id) == ("check.yml", "ignored-db-runtime"):
+                        self.assertEqual(job["runs-on"], self.IGNORED_DB_RUNTIME_RUNNER)
+                    elif (name, job_id) == ("deploy-staging.yml", "certify-promotion"):
                         # Artifact-only certification still uses the direct
                         # public-hosted selector without services or a container.
                         self.assertEqual(job["runs-on"], PUBLIC_RUNNER)

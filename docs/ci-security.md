@@ -608,6 +608,23 @@ are preserved until those callers migrate.
 
 ## Public-hosted runner contract
 
+`check.yml` job `ignored-db-runtime` (`ignored db (runtime)`) has its own
+runner route. It uses `CI_BLACKSMITH_2VCPU` for same-repository PRs and the
+existing non-PR events. Fork PRs always use `ubuntu-latest`. An unset variable
+or the cutoff value `ubuntu-latest` also selects GitHub-hosted Ubuntu. The
+cutoff estimates usage periodically and reserves headroom before routing new
+runs. The estimate cannot establish a provider billing cap.
+
+[Blacksmith's 2 vCPU Ubuntu 24.04 runner](https://docs.blacksmith.sh/blacksmith-runners/overview#x64-runners)
+starts a fresh microVM per job. The database lane uses pinned job and service
+images, a disposable PostgreSQL service on its private job network, and a
+60-minute timeout. The Rust selector admits the job, and `ci-ok` requires a
+passing result whenever the selector admits it. The existing `merge_group`
+event has no per-PR fork identity. Qualify that trust boundary before enabling
+a merge queue with this route active.
+
+The general runner contract below applies to the remaining jobs.
+
 Every ordinary job defined in this repository selects `runs-on: ubuntu-latest`
 explicitly. This includes the local reusable nextest and SBOM workflows, not
 only required PR checks. There is no private/self-hosted fallback or overflow

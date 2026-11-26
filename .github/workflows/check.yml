@@ -94,11 +94,8 @@ jobs:
     needs: [job-inputs]
     # Failed, skipped or cancelled dependencies must not make check appear green.
     if: ${{ always() }}
-    # Runner routing: every job uses the explicit standard GitHub-hosted
-    # `runs-on: ubuntu-latest`. This is a public repository, so the
-    # GitHub-hosted Ubuntu runner is free and the org self-hosted runner
-    # group is not used. A private conversion needs fresh runner/cost
-    # qualification before execution; see docs/ci-security.md.
+    # Standard GitHub-hosted Ubuntu is the default for this public repository.
+    # See docs/ci-security.md for the runner contract and private-conversion guard.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
@@ -2394,8 +2391,8 @@ jobs:
     # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
-    # Runner routing: see the note on `check`.
-    runs-on: ubuntu-latest
+    # Fork PRs stay on GitHub. The budget cutoff can return new runs to GitHub.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     # The serial gateway suites can exceed 30 minutes on PRs; retain a hard cap.
     timeout-minutes: 60
     # Keep database isolation inside the job container network namespace:

@@ -1,8 +1,8 @@
-"""Pin explicit standard GitHub-hosted runners in this public repository.
+"""Pin exact runner routing in this public repository.
 
-Every ordinary job selects ubuntu-latest directly: no dormant private,
-self-hosted or overflow route. A private conversion requires fresh runner and
-cost qualification before execution. Offline and stdlib-only: no GitHub
+Ordinary jobs use ubuntu-latest, with a narrowly scoped Blacksmith route.
+A private conversion requires fresh runner and cost qualification before
+execution. Offline and stdlib-only: no GitHub
 credentials, no PyYAML. Visibility is verified separately before execution.
 """
 
@@ -13,6 +13,11 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github/workflows"
 PUBLIC_RUNNER = "ubuntu-latest"
+IGNORED_DB_RUNTIME_RUNNER = (
+    "${{ (github.event_name != 'pull_request' || "
+    "github.event.pull_request.head.repo.full_name == github.repository) "
+    "&& vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}"
+)
 # Negative fixture: the former public-first branch still collected private
 # self-hosted/overflow routing in source, even when it was never selected.
 LEGACY_ROUTED = (
@@ -41,7 +46,7 @@ def jobs(text):
 
 
 def violations(text, workflow_name=None):
-    """Reject indirect or nonstandard runners, including dormant routing."""
+    """Reject unapproved runners, including dormant routing."""
     problems = []
     for job, lines in jobs(text).items():
         keys = {
@@ -57,8 +62,11 @@ def violations(text, workflow_name=None):
             if "runs-on" in keys:
                 problems.append(f"{job}: reusable call must not set runs-on")
             continue
-        if keys.get("runs-on") != PUBLIC_RUNNER:
-            problems.append(f"{job}: runs-on is {keys.get('runs-on')!r}, not {PUBLIC_RUNNER}")
+        expected = PUBLIC_RUNNER
+        if (workflow_name, job) == ("check.yml", "ignored-db-runtime"):
+            expected = IGNORED_DB_RUNTIME_RUNNER
+        if keys.get("runs-on") != expected:
+            problems.append(f"{job}: expected runs-on {expected!r}, got {keys.get('runs-on')!r}")
     # Catch a runs-on hidden anywhere else (nested, flow style, odd indent).
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
     expected = sum(1 for lines in jobs(text).values()
@@ -95,6 +103,20 @@ class RepositoryWorkflowTests(unittest.TestCase):
 
 
 class CheckerMutationTests(unittest.TestCase):
+    def test_blacksmith_route_is_exact_and_scoped_to_ignored_db_runtime(self):
+        canonical = workflow("ignored-db-runtime", IGNORED_DB_RUNTIME_RUNNER)
+        self.assertEqual(violations(canonical, "check.yml"), [])
+        self.assertTrue(violations(canonical, "nightly.yml"))
+        self.assertTrue(violations(workflow("coverage-shard", IGNORED_DB_RUNTIME_RUNNER), "check.yml"))
+        self.assertTrue(violations(workflow("ignored-db-runtime", PUBLIC_RUNNER), "check.yml"))
+        for mutated in (
+            canonical.replace("github.event.pull_request.head.repo.full_name == github.repository", "true"),
+            canonical.replace("CI_BLACKSMITH_2VCPU", "CI_BLACKSMITH_4VCPU"),
+            canonical.replace("|| 'ubuntu-latest'", ""),
+        ):
+            with self.subTest(mutated=mutated):
+                self.assertTrue(violations(mutated, "check.yml"))
+
     def test_canonical_job_passes(self):
         self.assertEqual(violations(workflow("build", PUBLIC_RUNNER)), [])
 

@@ -353,6 +353,13 @@ class SupplyChainTests(unittest.TestCase):
             for job_id, job in workflow["jobs"].items():
                 if "uses" in job:
                     self.assertNotIn("runs-on", job, f"{name}:{job_id}")
+                elif (name, job_id) == ("check", "ignored-db-runtime"):
+                    self.assertEqual(
+                        job["runs-on"],
+                        "${{ (github.event_name != 'pull_request' || "
+                        "github.event.pull_request.head.repo.full_name == github.repository) "
+                        "&& vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}",
+                    )
                 else:
                     self.assertEqual(job["runs-on"], "ubuntu-latest", f"{name}:{job_id}")
             code = "\n".join(
