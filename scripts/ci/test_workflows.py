@@ -4639,14 +4639,14 @@ SLOW_BURN_FIXTURE_RUN = ('set -euo pipefail\n'
 def slow_burn_observer_errors(job):
     """A periodic scrape may observe authority but must never acquire it."""
     steps = job.get("steps") or []
-    if len(steps) != 7 or steps[3] != SLOW_BURN_OBSERVER_STEP:
+    if len(steps) != 6 or steps[2] != SLOW_BURN_OBSERVER_STEP:
         return ["slow-burn-tracker.yml:tracker: must unconditionally observe with the exact isolated control step"]
     errors = []
-    if steps[4].get("if") != SLOW_BURN_SAMPLE_IF:
+    if steps[3].get("if") != SLOW_BURN_SAMPLE_IF:
         errors.append("slow-burn-tracker.yml:tracker: scrape must require a validated active window")
-    if steps[5].get("if") != "${{ !cancelled() && steps.window.outputs.sample == 'true' }}":
+    if steps[4].get("if") != "${{ !cancelled() && steps.window.outputs.sample == 'true' }}":
         errors.append("slow-burn-tracker.yml:tracker: idle must not save a fresh burn cache")
-    upload = steps[6]
+    upload = steps[5]
     if upload.get("with") != {
             "name": "slow-burn-tracker-${{ github.run_id }}",
             "path": "slow-burn-tracker-evidence.json\nslow-burn-exposition.prom\n${{ runner.temp }}/staging-use-observer.jsonl\n",
@@ -4707,8 +4707,8 @@ def slow_burn_tracker_errors(workflow):
     if set(jobs) != {"tracker", "fixture"}:
         errors.append(f"{name}: jobs must be exactly tracker and fixture")
         return errors
-    shapes = (("tracker", "slow-burn tracker", SLOW_BURN_LIVE_IF, SLOW_BURN_LIVE_RUN, 7, 4),
-              ("fixture", "slow-burn fixture proof", SLOW_BURN_FIXTURE_IF, SLOW_BURN_FIXTURE_RUN, 4, 2))
+    shapes = (("tracker", "slow-burn tracker", SLOW_BURN_LIVE_IF, SLOW_BURN_LIVE_RUN, 6, 3),
+              ("fixture", "slow-burn fixture proof", SLOW_BURN_FIXTURE_IF, SLOW_BURN_FIXTURE_RUN, 3, 1))
     for job_id, title, condition, command, step_count, run_index in shapes:
         job = jobs[job_id]
         if job.get("name") != title:
@@ -4737,14 +4737,11 @@ def slow_burn_tracker_errors(workflow):
         if len(steps) != step_count:
             errors.append(f"{name}:{job_id}: must keep exactly {step_count} steps")
             continue
-        checkout, setup_node, run_step, upload = steps[0], steps[1], steps[run_index], steps[-1]
+        checkout, run_step, upload = steps[0], steps[run_index], steps[-1]
         if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
                 or checkout.get("with") != {"persist-credentials": "false", "fetch-depth": "1"}:
             errors.append(f"{name}:{job_id}: checkout must be pinned, must not persist credentials, "
                           "and must not set ref or repository")
-        if not str(setup_node.get("uses", "")).startswith("actions/setup-node@") \
-                or (setup_node.get("with") or {}).get("node-version") != "24":
-            errors.append(f"{name}:{job_id}: setup-node must be pinned at node 24 for the verdict driver")
         if run_step.get("run") != command or "uses" in run_step:
             errors.append(f"{name}:{job_id}: run step must run exactly the reviewed tracker command, "
                           "with inputs passed via env only")
@@ -4774,8 +4771,8 @@ def slow_burn_tracker_errors(workflow):
     if live_secrets != {"staging_metrics_scrape_token", "staging_ownership_control_token", "github_token"}:
         errors.append(f"{name}:tracker: must read only the staging scrape/control bearers and the GitHub token")
     live_steps = live.get("steps") or []
-    if len(live_steps) == 7:
-        restore, track, save = live_steps[2], live_steps[4], live_steps[5]
+    if len(live_steps) == 6:
+        restore, track, save = live_steps[1], live_steps[3], live_steps[4]
         # Split restore/save: a full actions/cache step restores in its main
         # phase, so the save step would overwrite the tracker's fresh ring with
         # the stale cached copy before saving it back.
@@ -4808,7 +4805,7 @@ def slow_burn_tracker_errors(workflow):
     if set(re.findall(r"secrets\.([a-z0-9_]+)", fixture_text)) != {"github_token"}:
         errors.append(f"{name}:fixture: must read only the GitHub token")
     fixture_steps = fixture.get("steps") or []
-    if len(fixture_steps) == 4 and fixture_steps[2].get("env") != SLOW_BURN_FIXTURE_ENV:
+    if len(fixture_steps) == 3 and fixture_steps[1].get("env") != SLOW_BURN_FIXTURE_ENV:
         errors.append(f"{name}:fixture: proof step must take only the GitHub token and the "
                       "dispatch inputs via env")
     return errors
@@ -11004,7 +11001,7 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
         # deployment: false form keeps the five-minute scrape out of the
         # staging deployment history.
         self.assertEqual(live.get("environment"), {"name": "staging", "deployment": "false"})
-        self.assertEqual(live["steps"][4]["env"]["METRICS_SCRAPE_TOKEN"],
+        self.assertEqual(live["steps"][3]["env"]["METRICS_SCRAPE_TOKEN"],
                          "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}")
         # Fixture proofs run in their own job: no Environment, only the job token.
         self.assertIn("fixture", tracker["jobs"])
@@ -11025,10 +11022,10 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             return copy["jobs"]["fixture"]
 
         def live_run(copy, text):
-            live_job(copy)["steps"][4]["run"] = text(live_job(copy)["steps"][4]["run"])
+            live_job(copy)["steps"][3]["run"] = text(live_job(copy)["steps"][3]["run"])
 
         def fixture_run(copy, text):
-            fixture_job(copy)["steps"][2]["run"] = text(fixture_job(copy)["steps"][2]["run"])
+            fixture_job(copy)["steps"][1]["run"] = text(fixture_job(copy)["steps"][1]["run"])
 
         bearer = "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"
         staging = {"name": "staging", "deployment": "false"}
@@ -11043,9 +11040,9 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                 {"defaults": {"run": {"shell": "echo {0}"}}}),
             "fixture job shell default": lambda w: fixture_job(w).update(
                 {"defaults": {"run": {"shell": "echo {0}"}}}),
-            "live run step shell override": lambda w: live_job(w)["steps"][4].update(
+            "live run step shell override": lambda w: live_job(w)["steps"][3].update(
                 {"shell": "echo {0}"}),
-            "fixture run step shell override": lambda w: fixture_job(w)["steps"][2].update(
+            "fixture run step shell override": lambda w: fixture_job(w)["steps"][1].update(
                 {"shell": "echo {0}"}),
             "third job": lambda w: w["jobs"].update({"again": deepcopy(live_job(w))}),
             "fixture job dropped": lambda w: w["jobs"].pop("fixture"),
@@ -11057,21 +11054,21 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             "production environment": lambda w: live_job(w).update(
                 {"environment": {"name": "production", "deployment": "false"}}),
             "no live environment": lambda w: live_job(w).pop("environment"),
-            "unbound secret name": lambda w: live_job(w)["steps"][4]["env"].update(
+            "unbound secret name": lambda w: live_job(w)["steps"][3]["env"].update(
                 {"METRICS_SCRAPE_TOKEN": "${{ secrets.METRICS_SCRAPE_TOKEN }}"}),
-            "production bearer": lambda w: live_job(w)["steps"][4]["env"].update(
+            "production bearer": lambda w: live_job(w)["steps"][3]["env"].update(
                 {"METRICS_SCRAPE_TOKEN": "${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}"}),
-            "dropped bearer": lambda w: live_job(w)["steps"][4]["env"].pop("METRICS_SCRAPE_TOKEN"),
+            "dropped bearer": lambda w: live_job(w)["steps"][3]["env"].pop("METRICS_SCRAPE_TOKEN"),
             # The script reads METRICS_SCRAPE_TOKEN: the bearer must keep that name.
-            "bearer under another name": lambda w: live_job(w)["steps"][4]["env"].update(
-                {"SCRAPE_TOKEN": live_job(w)["steps"][4]["env"].pop("METRICS_SCRAPE_TOKEN")}),
-            "dropped worker url": lambda w: live_job(w)["steps"][4]["env"].pop("STAGING_WORKER_URL"),
+            "bearer under another name": lambda w: live_job(w)["steps"][3]["env"].update(
+                {"SCRAPE_TOKEN": live_job(w)["steps"][3]["env"].pop("METRICS_SCRAPE_TOKEN")}),
+            "dropped worker url": lambda w: live_job(w)["steps"][3]["env"].pop("STAGING_WORKER_URL"),
             "bearer on the job": lambda w: live_job(w).update({"env": {"METRICS_SCRAPE_TOKEN": bearer}}),
-            "bearer on the restore": lambda w: live_job(w)["steps"][2].update(
+            "bearer on the restore": lambda w: live_job(w)["steps"][1].update(
                 {"env": {"METRICS_SCRAPE_TOKEN": bearer}}),
-            "extra staging secret": lambda w: live_job(w)["steps"][4]["env"].update(
+            "extra staging secret": lambda w: live_job(w)["steps"][3]["env"].update(
                 {"X": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
-            "blanket secrets": lambda w: live_job(w)["steps"][4]["env"].update(
+            "blanket secrets": lambda w: live_job(w)["steps"][3]["env"].update(
                 {"ALL": "${{ toJSON(secrets) }}"}),
             "live any branch": lambda w: live_job(w).update(
                 {"if": "(github.event.inputs.fixture || 'live') == 'live'"}),
@@ -11091,30 +11088,30 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                 {"ref": "evil-branch"}),
             "live checkout repository swap": lambda w: live_job(w)["steps"][0]["with"].update(
                 {"repository": "evil/repo"}),
-            "live save only on success": lambda w: live_job(w)["steps"][5].update({"if": "success()"}),
-            "idle scrape allowed": lambda w: live_job(w)["steps"][4].pop("if"),
-            "idle cache refreshed": lambda w: live_job(w)["steps"][5].update({"if": "${{ !cancelled() }}"}),
-            "observer acquires": lambda w: live_job(w)["steps"][3].update(
+            "live save only on success": lambda w: live_job(w)["steps"][4].update({"if": "success()"}),
+            "idle scrape allowed": lambda w: live_job(w)["steps"][3].pop("if"),
+            "idle cache refreshed": lambda w: live_job(w)["steps"][4].update({"if": "${{ !cancelled() }}"}),
+            "observer acquires": lambda w: live_job(w)["steps"][2].update(
                 {"run": SLOW_BURN_OBSERVER_STEP["run"].replace(" observe", " acquire")}),
-            "observer tolerates refusal": lambda w: live_job(w)["steps"][3].update({"continue-on-error": "true"}),
-            "observer gated off": lambda w: live_job(w)["steps"][3].update({"if": "false"}),
-            "observer missing scrape preflight": lambda w: live_job(w)["steps"][3]["env"].pop("METRICS_CONFIGURED"),
-            "observer secret leaked to scrape": lambda w: live_job(w)["steps"][4]["env"].update(
+            "observer tolerates refusal": lambda w: live_job(w)["steps"][2].update({"continue-on-error": "true"}),
+            "observer gated off": lambda w: live_job(w)["steps"][2].update({"if": "false"}),
+            "observer missing scrape preflight": lambda w: live_job(w)["steps"][2]["env"].pop("METRICS_CONFIGURED"),
+            "observer secret leaked to scrape": lambda w: live_job(w)["steps"][3]["env"].update(
                 {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
-            "idle receipt dropped": lambda w: live_job(w)["steps"][6]["with"].update(
+            "idle receipt dropped": lambda w: live_job(w)["steps"][5]["with"].update(
                 {"path": "slow-burn-tracker-evidence.json\nslow-burn-exposition.prom\n"}),
             # Fixture job: proof runs never reach the staging Environment.
             "fixture binds staging": lambda w: fixture_job(w).update({"environment": deepcopy(staging)}),
             "fixture binds deployment staging": lambda w: fixture_job(w).update({"environment": "staging"}),
             "fixture binds tracker environment": lambda w: fixture_job(w).update(
                 {"environment": "slow-burn-tracker"}),
-            "fixture reads the bearer": lambda w: fixture_job(w)["steps"][2]["env"].update(
+            "fixture reads the bearer": lambda w: fixture_job(w)["steps"][1]["env"].update(
                 {"METRICS_SCRAPE_TOKEN": bearer}),
-            "fixture reads the old secret": lambda w: fixture_job(w)["steps"][2]["env"].update(
+            "fixture reads the old secret": lambda w: fixture_job(w)["steps"][1]["env"].update(
                 {"METRICS_SCRAPE_TOKEN": "${{ secrets.METRICS_SCRAPE_TOKEN }}"}),
-            "fixture reads the staging url": lambda w: fixture_job(w)["steps"][2]["env"].update(
+            "fixture reads the staging url": lambda w: fixture_job(w)["steps"][1]["env"].update(
                 {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"}),
-            "fixture blanket secrets": lambda w: fixture_job(w)["steps"][2]["env"].update(
+            "fixture blanket secrets": lambda w: fixture_job(w)["steps"][1]["env"].update(
                 {"ALL": "${{ toJSON(secrets) }}"}),
             "fixture job-level secret": lambda w: fixture_job(w).update({"env": {"T": bearer}}),
             "fixture runs live": lambda w: fixture_job(w).update({"if": "github.ref == 'refs/heads/main'"}),
@@ -11132,9 +11129,9 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             "fixture inline input": lambda w: fixture_run(w, lambda run: run.replace(
                 '"$TRACKER_FIXTURE"', '"${{ github.event.inputs.fixture }}"')),
             "fixture restores the ring": lambda w: fixture_job(w)["steps"].insert(
-                2, deepcopy(live_job(w)["steps"][2])),
+                1, deepcopy(live_job(w)["steps"][1])),
             "fixture saves the ring": lambda w: fixture_job(w)["steps"].insert(
-                3, deepcopy(live_job(w)["steps"][5])),
+                2, deepcopy(live_job(w)["steps"][4])),
             "fixture write grant": lambda w: fixture_job(w).update(
                 {"permissions": {"contents": "write", "issues": "write"}}),
             "fixture persisted credentials": lambda w: fixture_job(w)["steps"][0]["with"].update(
@@ -11147,6 +11144,11 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             "fixture on tracker routing": lambda w: fixture_job(w).update(
                 {"runs-on": LEGACY_ROUTED_RUNNER.format(job="tracker")}),
         }
+        for job_id in ("tracker", "fixture"):
+            with self.subTest(job=job_id, change="redundant node setup"):
+                self.assertTrue(mutate(lambda w: w["jobs"][job_id]["steps"].insert(1, {
+                    "uses": "actions/setup-node@" + "a" * 40, "with": {"node-version": "24"},
+                })))
         for label, change in changes.items():
             with self.subTest(change=label):
                 self.assertTrue(mutate(change))
