@@ -7366,7 +7366,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(job.get("permissions"), {"contents": "read"})
         self.assertIn("job-inputs", job.get("needs", []))
         self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
-        self.assertEqual(job.get("runs-on"), PUBLIC_RUNNER)
+        self.assertEqual(job.get("runs-on"), PR_GATE_RUNNER)
         outputs = job.get("outputs", {})
         for key in ("matrix", "expected-shards", "legs", "widened", "reason"):
             self.assertIn(key, outputs)
@@ -7396,7 +7396,7 @@ class WorkflowTests(unittest.TestCase):
         # every shard reports its own verdict and timing.
         self.assertEqual(strategy.get("fail-fast"), "false")
         self.assertIn("needs.coverage-plan.outputs.matrix", strategy.get("matrix", ""))
-        self.assertEqual(job.get("runs-on"), PUBLIC_RUNNER)
+        self.assertEqual(job.get("runs-on"), PR_GATE_RUNNER)
         upload = next(
             step for step in job["steps"]
             if step.get("name") == "Upload shard coverage report"
@@ -10035,6 +10035,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_staging_privacy_verify_suite_is_required_in_worker(self):
         jobs = self.workflows["check.yml"]["jobs"]
+        self.assertEqual(jobs["worker"]["if"], "${{ always() }}")
         command = "PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_privacy_verify_read.py -v"
         steps = [step for step in jobs["worker"]["steps"] if step.get("run") == command]
         self.assertEqual(len(steps), 1, "worker must run the collector suite exactly once")
@@ -10044,7 +10045,7 @@ class WorkflowTests(unittest.TestCase):
         aggregate = next(step for step in jobs["ci-ok"]["steps"]
                          if step.get("name") == "Aggregate CI verdict")
         self.assertEqual(aggregate["env"]["WORKER_RESULT"], "${{ needs.worker.result }}")
-        self.assertIn('(\"worker\", \"WORKER_RESULT\", \"WORKER_SELECTED\")', aggregate["run"])
+        self.assertIn('(\"worker\", \"WORKER_RESULT\")', aggregate["run"])
 
     def test_staging_privacy_verify_read_shape_is_pinned(self):
         workflows = self.workflows
