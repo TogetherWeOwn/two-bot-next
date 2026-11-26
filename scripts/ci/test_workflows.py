@@ -19,8 +19,12 @@ from unittest.mock import Mock, patch
 
 import yaml
 
+from runner_policy import (
+    CHECK_PR_GATES, IGNORED_DB_RUNTIME_RUNNER, PR_GATE_RUNNER, PR_SIZE_GATE_RUNNER_INPUT,
+    PUBLIC_RUNNER, RUST_TESTS_RUNNER, SUPPLY_CHAIN_PR_GATES, expected_runner,
+)
 from staging_pre_reaper_policy import PRE_REAPER, PRE_REAPER_QUEUE, dormant_pre_reaper_errors
-from staging_soak_policy import PRODUCTION_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
+from staging_soak_policy import PRODUCTION_GROUP, PRODUCTION_RELEASE_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, GUARDS as MEASUREMENT_GUARDS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
     TARGET as MEASUREMENT_TARGET, WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
@@ -41,6 +45,7 @@ DECIDE_STEPS = _HISTORY_MODULE.DECIDE_STEPS
 JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
 PROBE_STEPS = _HISTORY_MODULE.PROBE_STEPS
 STATIC_FALSE = "${{ false }}"
+PR_SIZE_ORG_SHA = "649943c1ed8a1af8f8760e075f3923237dd72e50"
 JOB_INVENTORY = {
     "build-predecessor.yml": {"build"},
     # The nextest branch adds its required lane; main adds the production schema gate.
@@ -62,7 +67,7 @@ JOB_INVENTORY = {
                   "nextest", "db-compatibility"},
     STAGING_SOAK: {"begin", "voice", "finish"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
-                              "promotion-skipped", "production"},
+                              "promotion-skipped", "production", "release-plan", "release-prepare", "release-apply"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "help-embed-synthetic",
                            "user-flow-synthetic", "pinned-history-guard", "certify-promotion",
                            "staging-use-release"},
@@ -70,8 +75,6 @@ JOB_INVENTORY = {
                     "sweep-partition", "sweep-guarded", "sweep-docs", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "mutation.yml": {"rust-mutation", "python-mutation", "worker-mutation"},
-    # One-off read-only reference writer for the fixed source snapshot.
-    "configuration-reference.yml": {"configuration-reference"},
     "release.yml": {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"},
     # Daily digest release (docs/releases.md): at most one vYYYY.MDD.P tag a day,
     # plus the missing-digest alert; pinned shape below.
@@ -145,12 +148,9 @@ JOB_INVENTORY = {
     # Shared nextest lane, called by check.yml; org-level home is
     # TogetherWeOwn/.github with a pinned SHA like test-guard.
     "reusable-rust-nextest.yml": {"nextest"},
-    # PR-size labels + required size gate (org reusable): thin caller to
-    # the central labeller, the required gate and the weekly tally. The
-    # advisory `pr-size` job is never required; `pr-size-gate` fails PRs
-    # too large for the automated reviewer and is added to the ruleset
-    # only after it reports on the default branch.
-    "pr-size.yml": {"pr-size", "pr-size-gate", "pr-size-weekly"},
+    # The required gate measures and labels in one job. The weekly tally
+    # remains a separate read-only reusable call.
+    "pr-size.yml": {"pr-size-gate", "pr-size-weekly"},
     # Weekly DORA delivery metrics (docs/dora-metrics.md): the read-only
     # compute job reads 30 days of production Deployments; the main-only
     # publish job commits one JSON file plus a markdown summary to
@@ -177,25 +177,21 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    # caller to the shared nextest lane (local path until
                    # the central move).
                    ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
-                   # PR-size labels + required size gate: thin caller to
-                   # the central reusables, pinned SHA (repin all three
-                   # refs together).
-                   ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
-                   ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
-                   ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964"}
-# PR-size activation (pinned below): the labeller and the required gate run
-# on PR events, plus a manual dispatch carrying an explicit PR number; the
-# weekly tally runs on schedule or a blank manual dispatch. Pinning these
-# conditions prevents the gate from being silently disabled while its
-# inventory entry and reusable ref stay intact.
+                   # Both PR-size reusables use the same reviewed org squash.
+                   ("pr-size.yml", "pr-size-gate"): f"TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@{PR_SIZE_ORG_SHA}",
+                   ("pr-size.yml", "pr-size-weekly"): f"TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@{PR_SIZE_ORG_SHA}"}
+# The combined job runs on PR events and numbered manual dispatches. The
+# weekly tally runs on schedule and blank dispatches.
 PR_SIZE_JOB_IF = "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''"
 PR_SIZE_WEEKLY_IF = "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')"
-PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size"): PR_SIZE_JOB_IF,
-                         ("pr-size.yml", "pr-size-gate"): PR_SIZE_JOB_IF,
+PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size-gate"): PR_SIZE_JOB_IF,
                          ("pr-size.yml", "pr-size-weekly"): PR_SIZE_WEEKLY_IF}
-# Every ordinary job in this public repository selects standard free hosted
-# Ubuntu directly. A private conversion needs fresh runner/cost qualification.
-PUBLIC_RUNNER = "ubuntu-latest"
+PR_SIZE_GATE_INPUTS = {
+    "runs-on": PR_SIZE_GATE_RUNNER_INPUT,
+    "pr-number": "${{ inputs.pr_number || '' }}",
+    "advisory-label": "true",
+    "exclude-extra": "migrations.lock",
+}
 # Negative fixture only: even a public-first route retains dormant source paths.
 LEGACY_ROUTED_RUNNER = (
     "${{{{ fromJSON((!github.event.repository.private && '[\"ubuntu-latest\"]') || "
@@ -242,7 +238,7 @@ DEPLOY_MARKERS = (
 )
 # Canonical parsed graph for the protected recovery callee. This pins the
 # caller guard, Environment split, exact commands, permissions, and handoffs.
-PRODUCTION_RECOVERY_GRAPH = "581651c0eb95b463adaf47dfbb9465ff8d886a829911bce50e34aede33bf907d"
+PRODUCTION_RECOVERY_GRAPH = "2fd050ea4e2f4ca60328d2c54c077a7219cc3c29269c96313b52d7fbcc69b3a2"
 
 
 class UniqueKeyLoader(yaml.BaseLoader):
@@ -727,7 +723,7 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
     """
     errors = []
     inputs = (((workflow.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {})
-    if set(inputs) != {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold"}:
+    if set(inputs) != {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold", "release_plan_run_id", "release_pins"}:
         errors.append(f"{name}: production inputs must contain only the reviewed deploy/restore controls")
     jobs = workflow.get("jobs", {}) or {}
     steps = ((jobs.get("production") or {}).get("steps") or [])
@@ -1252,7 +1248,18 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
                   "staging_health_contract_probe.py", "staging-use-user-flow.jsonl", "staging-use-user-flow"))
     steps = [{key: value for key, value in step.items() if key != "name"}
              for step in job.get("steps") or []]
-    if (len(steps) != 6 or steps[:2] != STAGING_TOOLING_STEPS
+    checkout, setup_node = STAGING_TOOLING_STEPS
+    scoped_checkout = {**checkout, "with": {
+        **checkout["with"],
+        "sparse-checkout": "/scripts/build_identity.py\n"
+                           "/scripts/script_intake.py\n"
+                           "/scripts/staging_health_contract_probe.py\n"
+                           "/wrangler/scripts/is-direct-invocation.mjs\n"
+                           "/wrangler/scripts/ownership-control-response.mjs\n"
+                           "/wrangler/scripts/staging-use.mjs\n",
+        "sparse-checkout-cone-mode": "false",
+    }}
+    if (len(steps) != 6 or steps[:2] != [scoped_checkout, setup_node]
             or steps[2].get("run") != "node wrangler/scripts/staging-use.mjs ready"
             or (steps[3].get("with") or {}).get("path") != "${{ runner.temp }}/staging-use-user-flow.jsonl"
             or steps[5] != {"if": "always()", "uses": STAGING_UPLOAD_USES,
@@ -1692,8 +1699,10 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
             errors.append(f"{name}: must preserve all pending staging migration requests")
         errors.extend(staging_claim_errors(claim))
     else:
-        if workflow.get("concurrency") != {"group": "production-migrate", "cancel-in-progress": "false"}:
-            errors.append(f"{name}: must serialize production plan and apply runs")
+        if (workflow.get("concurrency") != {"group": "production-migrate", "cancel-in-progress": "false", "queue": "max"}
+                or any("concurrency" in job for job in (plan, claim))
+                or apply.get("concurrency") != {"group": "deploy-production", "cancel-in-progress": "false", "queue": "max"}):
+            errors.append(f"{name}: only the apply job may share the production deploy and recovery lane")
         errors.extend(production_claim_errors(claim))
     if plan.get("environment") != plan_env:
         errors.append(f"{name}:plan: must read the {plan_env} Environment binding")
@@ -1728,9 +1737,24 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                 or "if" in steps[ddl[0]] or "continue-on-error" in steps[ddl[0]]):
             errors.append(f"{name}:apply: must verify the exact native approval before building and running DDL")
         checkouts = [step for step in steps if (step.get("with") or {}).get("path") == "approval-tools"]
+        checkout_options = {
+            "path": "approval-tools",
+            "persist-credentials": "false",
+            "ref": "${{ github.sha }}",
+            "sparse-checkout": (
+                "/scripts/build_identity.py\n"
+                "/scripts/ci/staging_migrate_claim.py\n"
+                "/scripts/rollback_proof.py\n"
+                "/scripts/script_intake.py\n"
+                "/scripts/staging_migrate_approval.py\n"
+                "/scripts/staging_recovery_status.py\n"
+                "/scripts/staging_rollout.py\n"
+                "/scripts/worker_container_rollback.py\n"
+            ),
+            "sparse-checkout-cone-mode": "false",
+        }
         if (len(checkouts) != 1 or not str(checkouts[0].get("uses", "")).startswith("actions/checkout@")
-                or checkouts[0].get("with") != {"path": "approval-tools", "persist-credentials": "false",
-                                               "ref": "${{ github.sha }}"}
+                or checkouts[0].get("with") != checkout_options
                 or "if" in checkouts[0] or "continue-on-error" in checkouts[0]):
             errors.append(f"{name}:apply: must load the verifier at the trusted workflow SHA")
     else:
@@ -1935,6 +1959,25 @@ ROLLBACK_DRILL_ENV = {
     "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-worker-drill-use.ndjson",
 }
 
+ROLLBACK_DRILL_CHECKOUT = {
+    "persist-credentials": "false",
+    "fetch-depth": "1",
+    "sparse-checkout-cone-mode": "false",
+    "sparse-checkout": (
+        "/scripts/build_identity.py\n"
+        "/scripts/script_intake.py\n"
+        "/scripts/staging_drill_use.py\n"
+        "/scripts/staging_rollback_drill.py\n"
+        "/scripts/staging_rollout.py\n"
+        "/scripts/worker_container_rollback.py\n"
+        "/wrangler/scripts/is-direct-invocation.mjs\n"
+        "/wrangler/scripts/ownership-control-response.mjs\n"
+        "/wrangler/scripts/ownership-control.mjs\n"
+        "/wrangler/scripts/staging-use-pipeline.mjs\n"
+        "/wrangler/scripts/staging-use.mjs\n"
+    ),
+}
+
 
 def rollback_proof_job_errors(job, mode):
     """Pin the dispatcher/observer to reviewed tooling and the smallest token."""
@@ -2032,15 +2075,24 @@ def staging_rollback_drill_errors(workflow):
     for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
         if key in job:
             errors.append(f"{name}:drill: must not set {key} (bindings stay on the single Run step)")
-    text = str(job).lower()
-    for marker in ("wrangler", "force", "production", "toJSON(secrets".lower(), "secrets["):
-        if marker in text.replace(" ", ""):
-            errors.append(f"{name}:drill: must not contain {marker!r} (script-only, unforced, staging-only)")
     steps = job.get("steps") or []
     if len(steps) != 4 or any(key in step for step in steps[:3] for key in ("if", "continue-on-error")):
         errors.append(f"{name}:drill: must run checkout, setup-node, drill and evidence upload")
         return errors
     checkout, node, run, upload = steps
+    checkout_for_marker_scan = checkout
+    if checkout.get("with") == ROLLBACK_DRILL_CHECKOUT:
+        # The exact checkout paths are data. Keep scanning every other field
+        # for Wrangler invocations and the other forbidden markers.
+        options = dict(ROLLBACK_DRILL_CHECKOUT)
+        del options["sparse-checkout"]
+        checkout_for_marker_scan = {**checkout, "with": options}
+    else:
+        errors.append(f"{name}:drill: must check out only the pinned runtime files")
+    text = str({**job, "steps": [checkout_for_marker_scan, node, run, upload]}).lower().replace(" ", "")
+    for marker in ("wrangler", "force", "production", "toJSON(secrets".lower(), "secrets["):
+        if marker in text:
+            errors.append(f"{name}:drill: must not contain {marker!r} (script-only, unforced, staging-only)")
     evidence = "${{ runner.temp }}/staging-rollback-drill-evidence.json"
     if (upload.get("with") or {}) != {
             "name": "staging-worker-rollback-drill",
@@ -2195,6 +2247,11 @@ EVENTS_READ_ENV = {
 }
 EVENTS_READ_COMMAND = ('python3 scripts/staging_events_read.py --window-start "$WINDOW_START" '
                        '--window-end "$WINDOW_END" --output "staging-events-read-$RUN_ID.json"')
+EVENTS_READ_PATHS = (
+    "/scripts/staging_events_read.py",
+    "/scripts/staging_automation_read_smoke.py",
+    "/scripts/script_intake.py",
+)
 
 
 def staging_events_read_errors(workflow):
@@ -2269,9 +2326,10 @@ def staging_events_read_errors(workflow):
         errors.append(f"{name}:read: must run exactly checkout, the read and the upload, unconditionally")
         return errors
     checkout, run, upload = steps
-    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or (checkout.get("with") or {}).get("persist-credentials") != "false":
-        errors.append(f"{name}:read: checkout must be pinned and must not persist credentials")
+    if checkout.get("uses") != STAGING_CHECKOUT_USES or checkout.get("with") != {
+            "persist-credentials": "false", "fetch-depth": "1", "sparse-checkout-cone-mode": "false",
+            "sparse-checkout": "\n".join(EVENTS_READ_PATHS) + "\n"}:
+        errors.append(f"{name}:read: checkout must use the workflow head and only the reader's files")
     if run.get("env") != EVENTS_READ_ENV:
         errors.append(f"{name}:read: Run step must bind exactly the three secrets, the two windows and the run id")
     if run.get("run") != EVENTS_READ_COMMAND or "uses" in run or "shell" in run:
@@ -2634,7 +2692,18 @@ def staging_mcp_proveout_errors(workflow):
     cleanup_if = "always() && steps.use.outputs.expires_at != ''"
     expected = [
         {"uses": STAGING_CHECKOUT_USES,
-         "with": {"persist-credentials": "false", "fetch-depth": "1"}},
+         "with": {
+             "persist-credentials": "false", "fetch-depth": "1",
+             "sparse-checkout-cone-mode": "false",
+             "sparse-checkout": (
+                 "/scripts/script_intake.py\n"
+                 "/scripts/staging_mcp_proveout.py\n"
+                 "/wrangler/scripts/is-direct-invocation.mjs\n"
+                 "/wrangler/scripts/ownership-control-response.mjs\n"
+                 "/wrangler/scripts/staging-use-pipeline.mjs\n"
+                 "/wrangler/scripts/staging-use.mjs\n"
+             ),
+         }},
         {"uses": STAGING_SETUP_NODE_USES,
          "with": {"node-version": "22", "package-manager-cache": "false"}},
         {"id": "use", "env": {**control_env, "STAGING_USE_MINUTES": "15",
@@ -3128,6 +3197,14 @@ def daily_digest_errors(workflow):
     return errors
 
 
+PRODUCTION_GATE_IF = (
+    "!cancelled() && needs.guard.result == 'success' "
+    "&& (needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') "
+    "&& needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
+    "&& needs.guard.outputs.skip == ''"
+)
+
+
 def production_errors(workflow):
     """deploy-production is the one live route: dispatch, green-staging completion or schedule, chained to staging."""
     name = "deploy-production.yml"
@@ -3152,6 +3229,7 @@ def production_errors(workflow):
     needs = [needs] if isinstance(needs, str) else (needs or [])
     expected_production_if = (
         "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
+        "(needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') && "
         "(needs.soak.result == 'success' || needs.soak.result == 'skipped') && "
         "((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || "
         "(needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && "
@@ -3160,7 +3238,8 @@ def production_errors(workflow):
         "needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
     )
     if production.get("environment") != "production" \
-            or set(needs) != {"guard", "soak", "recheck", "schema-gate", "roles-gate", "staging-soak-evidence"}:
+            or set(needs) != {"guard", "soak", "recheck", "schema-gate", "roles-gate", "staging-soak-evidence",
+                                "release-prepare", "release-apply"}:
         errors.append(f"{name}:production: must wait for the guard, the soak, the recheck, "
                       "the schema gate, the roles gate, the staging soak evidence and the protected Environment")
     if production.get("if") != expected_production_if:
@@ -3169,8 +3248,9 @@ def production_errors(workflow):
     # The production job shares its lane with the protected status read. The guard, gates,
     # soak and recheck run outside it, so a sleeping automatic promotion can
     # never delay an operator rollback.
-    if "concurrency" in workflow:
-        errors.append(f"{name}: must not hold the deploy lane at workflow level")
+    if workflow.get("concurrency") != {"group": PRODUCTION_RELEASE_GROUP,
+                                       "cancel-in-progress": "false", "queue": "max"}:
+        errors.append(f"{name}: only a fresh manual protected release may hold the workflow-wide production lane")
     if jobs.get("production", {}).get("concurrency") != {"group": PRODUCTION_GROUP,
                                                          "cancel-in-progress": "false", "queue": "max"}:
         errors.append(f"{name}:production: must hold the deploy-production lane without cancelling")
@@ -3287,13 +3367,11 @@ def production_errors(workflow):
     if (recheck.get("permissions") or {}).get("actions") != "read":
         errors.append(f"{name}:recheck: must read workflow runs to see an active operator dispatch")
     guard_outputs = guard.get("outputs") or {}
-    for output in ("auto", "green_at"):
+    for output in ("auto", "green_at", "protected_release"):
         if output not in guard_outputs:
             errors.append(f"{name}:guard: must publish the {output} output for the soak and recheck jobs")
-    expected_gate_if = ("needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
-                        "&& needs.guard.outputs.skip == ''")
     for gate_name in ("schema-gate", "roles-gate"):
-        if jobs.get(gate_name, {}).get("if") != expected_gate_if:
+        if jobs.get(gate_name, {}).get("if") != PRODUCTION_GATE_IF:
             errors.append(f"{name}:{gate_name}: must run only for ordinary non-skipped deploys")
     guard_text = str(guard).lower()
     guard_markers = tuple(marker for marker in DEPLOY_MARKERS if marker not in ("production_worker_url", "/readyz"))
@@ -3603,10 +3681,9 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:schema-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:schema-gate: must keep contents:read only")
-    if gate.get("if") != ("needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
-                          "&& needs.guard.outputs.skip == ''"):
-        errors.append(f"{name}:gate: must run only for ordinary non-skipped deploys")
-    if gate.get("needs") != "guard":
+    if gate.get("if") != PRODUCTION_GATE_IF:
+        errors.append(f"{name}:gate: must run only for admitted deploys, after any protected apply")
+    if gate.get("needs") != ["guard", "release-apply"]:
         errors.append(f"{name}:schema-gate: must wait for the guard (it gates the guarded SHA)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
         errors.append(f"{name}:schema-gate: must use the explicit ubuntu-latest runner for job 'schema-gate'")
@@ -3770,11 +3847,10 @@ def production_roles_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:roles-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:roles-gate: must keep contents:read only")
-    if gate.get("if") != ("needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
-                          "&& needs.guard.outputs.skip == ''"):
-        errors.append(f"{name}:roles-gate: must run only for ordinary non-skipped deploys")
-    if gate.get("needs") != "guard":
-        errors.append(f"{name}:roles-gate: must wait for the guard (it gates the guarded SHA)")
+    if gate.get("if") != PRODUCTION_GATE_IF:
+        errors.append(f"{name}:roles-gate: must run only for admitted deploys, after any protected apply")
+    if gate.get("needs") != ["guard", "release-apply"]:
+        errors.append(f"{name}:roles-gate: must wait for the guard and any protected apply")
     if not runner_allowed("roles-gate", gate.get("runs-on")):
         errors.append(f"{name}:roles-gate: must use the explicit ubuntu-latest runner for job 'roles-gate'")
     if gate.get("timeout-minutes") != "30":
@@ -4846,10 +4922,23 @@ DISJOINT_PRE_REAPER_EXPRESSIONS.update({
     ("staging-voice-move.yml", None): "${{ inputs.verify_lease && github.ref == 'refs/heads/main' && "
                                     "github.ref_protected && github.run_attempt == 1 && 'staging-lifecycle' || "
                                     "format('staging-voice-move-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
+    ("staging-automod-preview.yml", None): (
+        "${{ inputs.rehearse && github.repository_id == '1396224242' && github.ref == 'refs/heads/main' && "
+        "github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main' && "
+        "github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1 && "
+        "'staging-lifecycle' || format('staging-automod-refused-{0}-{1}', github.run_id, github.run_attempt) }}"
+    ),
     ("pipeline-benchmark.yml", None): "${{ github.workflow }}-pipeline-benchmark-"
                                      "${{ github.event.pull_request.number || github.ref }}",
+    ("deploy-production.yml", None): PRODUCTION_RELEASE_GROUP,
     ("deploy-production.yml", "production"): PRODUCTION_GROUP,
 })
+
+
+# pr-size: one group per PR head commit (push, label, review); manual apart.
+PR_SIZE_CONCURRENCY_GROUP = ("${{ github.workflow }}-"
+                             "${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}-"
+                             "${{ github.event.pull_request.head.sha || 'manual' }}")
 
 
 def staging_pre_reaper_errors(workflows):
@@ -4871,8 +4960,7 @@ def staging_pre_reaper_errors(workflows):
                 # This expression's first term is the top-level workflow name.
                 may_collide = not (
                     workflow.get("name") == "pr-size" and "workflow_call" not in workflow.get("on", {})
-                    and group == "${{ github.workflow }}-"
-                                 "${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}"
+                    and group == PR_SIZE_CONCURRENCY_GROUP
                 )
             else:
                 may_collide = DISJOINT_PRE_REAPER_EXPRESSIONS.get((file, job)) != group
@@ -4914,6 +5002,14 @@ def workflow_policy_errors(workflows):
             errors.append(f"{name}:{job_id}: missing PR-size job")
         elif job.get("if") != expected_if:
             errors.append(f"{name}:{job_id}: PR-size activation condition changed")
+    pr_size_jobs = workflows.get("pr-size.yml", {}).get("jobs", {})
+    gate = pr_size_jobs.get("pr-size-gate", {})
+    if gate.get("name") != "pr-size-gate" or gate.get("with") != PR_SIZE_GATE_INPUTS:
+        errors.append("pr-size.yml:pr-size-gate: required job name or caller inputs changed")
+    if {"needs", "continue-on-error"} & gate.keys():
+        errors.append("pr-size.yml:pr-size-gate: required verdict must stay independent")
+    if "with" in pr_size_jobs.get("pr-size-weekly", {}):
+        errors.append("pr-size.yml:pr-size-weekly: weekly tally must use the reusable defaults")
     for name, workflow in workflows.items():
         jobs = workflow.get("jobs", {})
         if set(jobs) != JOB_INVENTORY.get(name, set()):
@@ -5017,7 +5113,7 @@ def workflow_policy_errors(workflows):
         if name == "staging-automod-preview.yml":
             contract = Path(__file__).parent / "fixtures/staging_automod_preview_workflow.json"
             if workflow != json.loads(contract.read_text()):
-                errors.append(f"{name}: expected the disabled, synthetic-only staging job")
+                errors.append(f"{name}: expected the default-off protected staging dispatch")
             continue
         if name == "build-predecessor.yml":
             contract = Path(__file__).parent / "fixtures/build_predecessor_workflow.json"
@@ -5129,6 +5225,21 @@ class ProductionStatusTests(unittest.TestCase):
             import production_ownership_status as status
         self.status = status
         self.fixture = json.loads((Path(__file__).parent / "fixtures/production_ownership_status_provider.json").read_text())
+
+    def test_recovery_projection_preserves_unfinished_rollout_status(self):
+        status = self.status
+        account = "c" * 32
+        provider = self.fixture["provider"]
+        rollouts = next(rows for key, rows in provider.items() if "/rollouts?" in key)
+        client = Mock()
+        client.api.side_effect = provider.__getitem__
+        for phase in ("pending", "progressing"):
+            with self.subTest(phase=phase):
+                rollouts[0]["status"] = phase
+                report = status.provider_sample(client, account, allow_rollout=True)
+                self.assertEqual(report["container"]["rollout_status"], phase)
+                with self.assertRaisesRegex(status.GateError, "latest_rollout_unbound"):
+                    status.provider_sample(client, account)
 
     def test_wrong_dispatch_and_environment_refuse(self):
         status, fixture = self.status, self.fixture
@@ -6863,7 +6974,11 @@ class WorkflowTests(unittest.TestCase):
             "verify_disposable_postgres",
         )
         checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
-        self.assertEqual(checkout["with"]["fetch-depth"], "0")
+        # The pinned action defaults to the event ref and SHA when ref is absent.
+        self.assertEqual(checkout, {
+            "uses": STAGING_CHECKOUT_USES,
+            "with": {"persist-credentials": "false", "fetch-depth": "1"},
+        })
 
     def test_ignored_test_names_include_intervening_comments_and_blank_lines(self):
         separators = (
@@ -7329,7 +7444,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(job.get("permissions"), {"contents": "read"})
         self.assertIn("job-inputs", job.get("needs", []))
         self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
-        self.assertEqual(job.get("runs-on"), PUBLIC_RUNNER)
+        self.assertEqual(job.get("runs-on"), PR_GATE_RUNNER)
+        checkout = job["steps"][0]["with"]
+        self.assertEqual(checkout.get("persist-credentials"), "false")
+        self.assertEqual(checkout.get("fetch-depth"),
+                         "${{ !github.event.merge_group.base_sha && github.event.pull_request && 2 || 0 }}")
         outputs = job.get("outputs", {})
         for key in ("matrix", "expected-shards", "legs", "widened", "reason"):
             self.assertIn(key, outputs)
@@ -7337,6 +7456,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("steps.plan.outputs.expected-shards", outputs["expected-shards"])
         step = next(step for step in job["steps"] if step.get("id") == "plan")
         self.assertEqual(step.get("name"), "Plan coverage shards")
+        self.assertEqual(step["env"]["PLAN_BASE"],
+                         "${{ github.event.merge_group.base_sha || "
+                         "(github.event.pull_request && format('{0}^1', github.sha)) || "
+                         "github.event.before || 'origin/main' }}")
+        self.assertEqual(step["env"]["PLAN_HEAD"], "${{ github.sha }}")
         self.assertIn("scripts/ci/plan-coverage-shards.py", step["run"])
         self.assertIn("--shards 4", step["run"])
         self.assertIn("--output plan.json", step["run"])
@@ -7359,16 +7483,26 @@ class WorkflowTests(unittest.TestCase):
         # every shard reports its own verdict and timing.
         self.assertEqual(strategy.get("fail-fast"), "false")
         self.assertIn("needs.coverage-plan.outputs.matrix", strategy.get("matrix", ""))
-        self.assertEqual(job.get("runs-on"), PUBLIC_RUNNER)
+        self.assertEqual(job.get("runs-on"), PR_GATE_RUNNER)
         upload = next(
             step for step in job["steps"]
             if step.get("name") == "Upload shard coverage report"
         )
         self.assertIn("actions/upload-artifact@", upload.get("uses", ""))
         self.assertEqual(upload["with"]["name"], "coverage-shard-${{ matrix.shard_index }}")
-        self.assertEqual(upload["with"]["path"], "lcov-shard-${{ matrix.shard_index }}.info")
+        self.assertEqual(upload["with"]["path"].splitlines(), [
+            "lcov-shard-${{ matrix.shard_index }}.info",
+            "lcov-shard-${{ matrix.shard_index }}.identity",
+        ])
         self.assertEqual(upload["with"]["if-no-files-found"], "error")
         self.assertEqual(upload["with"].get("overwrite"), "true")
+        bind = next(step for step in job["steps"] if step.get("name") == "Bind shard coverage report")
+        self.assertLess(job["steps"].index(bind), job["steps"].index(upload))
+        self.assertEqual(bind["env"]["COVERAGE_SELECTOR"], "${{ toJSON(needs.job-inputs.outputs) }}")
+        self.assertEqual(bind["env"]["COVERAGE_MATRIX"], "${{ needs.coverage-plan.outputs.matrix }}")
+        self.assertEqual(bind["env"]["EXPECTED_SHARDS"], "${{ needs.coverage-plan.outputs.expected-shards }}")
+        self.assertEqual(bind["env"]["SHARD_INDEX"], "${{ matrix.shard_index }}")
+        self.assertEqual(bind["env"]["SHARD_LEGS"], "${{ matrix.legs }}")
 
     def test_coverage_shard_leg_selection_matches_the_planner(self):
         # Every planner leg id guards exactly one legs block, and the
@@ -7478,6 +7612,15 @@ class WorkflowTests(unittest.TestCase):
             if step.get("name") == "sccache stats (advisory speed evidence)")
         self.assertIn("sccache --show-stats", stats.get("run", ""))
 
+    def test_patch_coverage_fetches_the_pr_merge_parent_and_keeps_other_history(self):
+        job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
+        checkout = job["steps"][0]
+        self.assertTrue(checkout["uses"].startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"], {
+            "persist-credentials": "false",
+            "fetch-depth": "${{ github.event_name == 'pull_request' && 2 || 0 }}",
+        })
+
     def test_patch_coverage_merge_unions_shards_and_gates(self):
         # The merge keeps the required `patch coverage` check name: it
         # downloads every shard report, unions them with strict N-of-N, and
@@ -7512,7 +7655,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(
             merge.get("env", {}).get("EXPECTED_SHARDS"),
             "${{ needs.coverage-plan.outputs.expected-shards }}")
+        self.assertEqual(merge["env"]["COVERAGE_SELECTOR"], "${{ toJSON(needs.job-inputs.outputs) }}")
+        self.assertEqual(merge["env"]["COVERAGE_MATRIX"], "${{ needs.coverage-plan.outputs.matrix }}")
         self.assertIn("scripts/ci/merge-coverage-shards.py", merge["run"])
+        self.assertIn("--artifact-dir coverage-shards", merge["run"])
         self.assertIn('--expected-shards "$EXPECTED_SHARDS"', merge["run"])
         self.assertIn("--source-root /__w/two-bot-next/two-bot-next",
                       " ".join(shell_logical_lines(merge["run"])))
@@ -7685,11 +7831,12 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(file=file_name, mutation=label):
                     self.assertNotEqual(check(changed), [])
 
-    def test_staging_automod_preview_is_dormant(self):
+    def test_staging_automod_preview_requires_protected_opt_in(self):
         name = "staging-automod-preview.yml"
         self.assertEqual(workflow_policy_errors(self.workflows), [])
         for keys, change in (
-                (("on",), {"workflow_dispatch": {}}),
+                (("on",), {"workflow_call": ""}),
+                (("on", "workflow_dispatch", "inputs", "rehearse"), {"default": "true"}),
                 (("concurrency",), {"group": "automod-only"}),
                 (("jobs", "dry-run"), {"if": "true"}),
                 (("jobs", "dry-run", "permissions"), {"id-token": "write"}),
@@ -7697,19 +7844,27 @@ class WorkflowTests(unittest.TestCase):
                 (("jobs", "dry-run", "steps", 3), {
                     "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
                 (("jobs", "dry-run", "steps", 4), {
-                    "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}})):
+                    "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
+                (("jobs", "dry-run", "steps", 5), {"env": {"STAGING_AUTOMOD_REHEARSAL": "true"}}),
+                (("jobs", "dry-run", "steps", 5, "env"), {
+                    "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"})):
             with self.subTest(keys=keys, change=change):
                 workflows = deepcopy(self.workflows)
                 node = workflows[name]
                 for key in keys:
                     node = node[key]
                 node.update(change)
-                self.assertIn(f"{name}: expected the disabled, synthetic-only staging job",
+                self.assertIn(f"{name}: expected the default-off protected staging dispatch",
                               workflow_policy_errors(workflows))
         workflows = deepcopy(self.workflows)
         workflows["check.yml"]["jobs"]["worker"] = {"uses": f"./.github/workflows/{name}"}
         self.assertIn("check.yml:worker: deployment/probe alternative outside approved deploy workflows",
                       workflow_policy_errors(workflows))
+
+        workflows = deepcopy(self.workflows)
+        lock = workflows[name]["concurrency"]
+        lock["group"] = lock["group"].replace("staging-automod-refused-{0}-{1}", PRE_REAPER_QUEUE)
+        self.assertIn(f"{name}: the PRE sweep queue must remain exclusive", staging_pre_reaper_errors(workflows))
 
     def test_staging_pre_reaper_is_dormant(self):
         self.assertEqual(staging_pre_reaper_errors(self.workflows), [])
@@ -8576,6 +8731,64 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(user_flow_synthetic_errors(changed["deploy-staging.yml"]), label)
                 self.assertTrue(workflow_policy_errors(changed), label)
 
+    def test_user_flow_synthetic_pins_checkout_scope_and_provenance(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(user_flow_synthetic_errors(staging), [])
+        checkout = staging["jobs"]["user-flow-synthetic"]["steps"][0]["with"]
+        scope = checkout["sparse-checkout"].splitlines(keepends=True)
+        overrides = {
+            "extra path": {"sparse-checkout": checkout["sparse-checkout"] + "/scripts/\n"},
+            "cone mode": {"sparse-checkout-cone-mode": "true"},
+            "deployed SHA": {"ref": DEPLOY_SHA_EXPRESSION},
+            "other repository": {"repository": "fixture/other"},
+            "other directory": {"path": "other-checkout"},
+            "different filter": {"filter": "tree:0"},
+            "persisted credentials": {"persist-credentials": "true"},
+            "full history": {"fetch-depth": "0"},
+        }
+        for missing in scope:
+            overrides[f"missing {missing.strip()}"] = {
+                "sparse-checkout": "".join(path for path in scope if path != missing)}
+        variants = {label: {**checkout, **override} for label, override in overrides.items()}
+        variants["full checkout"] = STAGING_TOOLING_STEPS[0]["with"]
+        for label, options in variants.items():
+            with self.subTest(label=label):
+                changed = deepcopy(staging)
+                changed["jobs"]["user-flow-synthetic"]["steps"][0]["with"] = options
+                self.assertTrue(user_flow_synthetic_errors(changed))
+
+    def test_user_flow_synthetic_loads_both_probes_from_scoped_checkout(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(user_flow_synthetic_errors(staging), [])
+        checkout, _, ready, _, probe, _ = staging["jobs"]["user-flow-synthetic"]["steps"]
+        with tempfile.TemporaryDirectory() as directory:
+            runner_temp = Path(directory)
+            worktree = runner_temp / "checkout"
+            for pattern in checkout["with"]["sparse-checkout"].splitlines():
+                path = pattern.removeprefix("/")
+                target = worktree / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / path).read_bytes())
+            receipt = runner_temp / "staging-use-user-flow.jsonl"
+            env = {
+                "PATH": os.environ.get("PATH", os.defpath),
+                # An unparseable origin reaches both commands and cannot make an HTTP request.
+                "STAGING_WORKER_URL": "https://[",
+                "STAGING_USE_RECEIPT": str(receipt),
+                "RUNNER_TEMP": str(runner_temp),
+                "EXPECTED_SHA": "a" * 40,
+            }
+            node = subprocess.run(shlex.split(ready["run"]), cwd=worktree, env=env,
+                                  capture_output=True, text=True, timeout=5, check=False)
+            self.assertEqual((node.returncode, node.stderr), (1, "staging_origin_invalid\n"), node.stderr)
+            self.assertEqual(node.stdout, receipt.read_text())
+            self.assertEqual([json.loads(line)["action"] for line in node.stdout.splitlines()], ["attempt", "failed"])
+            python = subprocess.run(["bash", "-eo", "pipefail", "-c", probe["run"]], cwd=worktree, env=env,
+                                    capture_output=True, text=True, timeout=5, check=False)
+            self.assertEqual((python.returncode, python.stderr), (2, ""), python.stderr)
+            self.assertIn("FAIL origin: refusing: not the two-bot-next-staging workers.dev origin", python.stdout)
+            self.assertFalse((runner_temp / "staging-user-flow-synthetic.json").exists())
+
     def test_qualification_assertions_are_exact_and_keep_secrets_out_of_consumers(self):
         for job_id, entry, receipt, artifact in (
                 ("user-flow-synthetic", "staging_health_contract_probe.py", "staging-use-user-flow.jsonl", "staging-use-user-flow"),
@@ -9069,9 +9282,8 @@ class WorkflowTests(unittest.TestCase):
                                           ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@8059ac2b121b63443db656b1e10e927b8af8133c",
                                           ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@8059ac2b121b63443db656b1e10e927b8af8133c",
                                           ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
-                                          ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
-                                          ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
-                                          ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964"})
+                                          ("pr-size.yml", "pr-size-gate"): f"TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@{PR_SIZE_ORG_SHA}",
+                                          ("pr-size.yml", "pr-size-weekly"): f"TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@{PR_SIZE_ORG_SHA}"})
         for (name, job_id), expected_uses in REUSABLE_CALLS.items():
             with self.subTest(workflow=name, job=job_id):
                 job = self.workflows[name]["jobs"].get(job_id, {})
@@ -9093,8 +9305,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_pr_size_activation_conditions_are_pinned(self):
         jobs = self.workflows["pr-size.yml"]["jobs"]
-        expected = {"pr-size": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
-                    "pr-size-gate": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
+        expected = {"pr-size-gate": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
                     "pr-size-weekly": "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')"}
         for job_id, condition in expected.items():
             with self.subTest(job=job_id):
@@ -9108,16 +9319,60 @@ class WorkflowTests(unittest.TestCase):
         workflows["pr-size.yml"]["jobs"]["pr-size-gate"]["if"] = expected["pr-size-weekly"]
         self.assertTrue(workflow_policy_errors(workflows))
 
-    def test_pr_size_gate_queues_overlapping_pr_and_review_runs(self):
-        workflow = self.workflows["pr-size.yml"]
-        # One group for both event families prevents overlapping verdicts.
-        # Both settings matter: disabling active cancellation alone still
-        # lets a third run evict a pending required check.
-        self.assertEqual(workflow["concurrency"], {
-            "group": "${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}",
-            "cancel-in-progress": "false",
-            "queue": "max",
+    def test_pr_size_one_runner_keeps_labeling_and_required_verdict(self):
+        jobs = self.workflows["pr-size.yml"]["jobs"]
+        self.assertEqual(set(jobs), {"pr-size-gate", "pr-size-weekly"})
+        self.assertEqual(jobs["pr-size-gate"]["name"], "pr-size-gate")
+        self.assertEqual(jobs["pr-size-gate"]["with"], {
+            "runs-on": PR_SIZE_GATE_RUNNER_INPUT,
+            "pr-number": "${{ inputs.pr_number || '' }}",
+            "advisory-label": "true",
+            "exclude-extra": "migrations.lock",
         })
+        # The reusable declares a boolean. BaseLoader reads quoted strings
+        # and YAML booleans alike as strings.
+        source = (ROOT / ".github/workflows/pr-size.yml").read_text()
+        gate_inputs = yaml.safe_load(source)["jobs"]["pr-size-gate"]["with"]
+        self.assertIs(gate_inputs["advisory-label"], True)
+        for updates, error in (
+            ({"with": {**jobs["pr-size-gate"]["with"], "advisory-label": "false"}},
+             "required job name or caller inputs changed"),
+            ({"name": "size advisory"}, "required job name or caller inputs changed"),
+            ({"needs": "pr-size-weekly"}, "required verdict must stay independent"),
+            ({"continue-on-error": "true"}, "required verdict must stay independent"),
+        ):
+            with self.subTest(updates=updates):
+                workflows = deepcopy(self.workflows)
+                workflows["pr-size.yml"]["jobs"]["pr-size-gate"].update(updates)
+                self.assertIn(f"pr-size.yml:pr-size-gate: {error}", workflow_policy_errors(workflows))
+
+    def test_pr_size_weekly_keeps_read_only_tally(self):
+        workflow = self.workflows["pr-size.yml"]
+        weekly = workflow["jobs"]["pr-size-weekly"]
+        self.assertEqual(workflow["on"]["schedule"], [{"cron": "17 7 * * 1"}])
+        self.assertEqual(weekly["permissions"], {
+            "contents": "read", "issues": "read", "pull-requests": "read",
+        })
+        self.assertNotIn("with", weekly)
+        workflows = deepcopy(self.workflows)
+        workflows["pr-size.yml"]["jobs"]["pr-size-weekly"]["with"] = {"advisory-label": "true"}
+        self.assertIn("pr-size.yml:pr-size-weekly: weekly tally must use the reusable defaults",
+                      workflow_policy_errors(workflows))
+
+    def test_pr_size_gate_cancels_superseded_pr_and_review_runs(self):
+        workflow = self.workflows["pr-size.yml"]
+        # All PR events on one head commit share a group and the newest
+        # cancels the older; a new push is a new group, so a required gate
+        # never waits behind stale runs. Manual dispatch is separate.
+        self.assertEqual(workflow["concurrency"], {
+            "group": PR_SIZE_CONCURRENCY_GROUP,
+            "cancel-in-progress": "${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_review' }}",
+        })
+        self.assertNotIn("queue", workflow["concurrency"])
+        group = workflow["concurrency"]["group"]
+        # Keyed by head commit: a stale review on an old commit can never
+        # cancel the current push's gate, and manual runs stay apart.
+        self.assertIn("github.event.pull_request.head.sha || 'manual'", group)
         self.assertEqual(workflow["jobs"]["pr-size-gate"]["name"], "pr-size-gate")
 
     def test_pr_size_gate_rechecks_on_grants_and_revocations(self):
@@ -9163,11 +9418,23 @@ class WorkflowTests(unittest.TestCase):
                 without('origin.get("head_repository_id") != origin.get("repository_id")'),
         }
         self.assertIn("inputs.cutover_hold", str(guard_step))
+        self.assertIn('refuse("protected release requires the activation follow-up")', guard_step["run"])
         for label, change in mutations.items():
             with self.subTest(label):
                 workflow = deepcopy(production)
                 change(workflow)
                 self.assertTrue(production_errors(workflow), label)
+
+    def test_production_apply_uses_the_protected_preflight_epoch(self):
+        jobs = self.workflows["deploy-production.yml"]["jobs"]
+        prepare = jobs["release-prepare"]
+        preflight = next(step for step in prepare["steps"] if step.get("id") == "preflight")
+        self.assertEqual(preflight["run"], "python3 scripts/production_release.py prepare")
+        self.assertEqual(prepare["outputs"].get("epoch"), "${{ steps.preflight.outputs.epoch }}")
+        apply = jobs["release-apply"]
+        self.assertIn("release-prepare", apply["needs"])
+        transaction = next(step for step in apply["steps"] if step.get("run") == "python3 scripts/production_release.py apply")
+        self.assertEqual(transaction["env"].get("RELEASE_PREFLIGHT_EPOCH"), "${{ needs.release-prepare.outputs.epoch }}")
 
     def test_soak_rejects_unsafe_handoffs(self):
         for mutate in (
@@ -9301,12 +9568,10 @@ class WorkflowTests(unittest.TestCase):
         needs = [needs] if isinstance(needs, str) else needs
         self.assertIn("guard", needs)
         self.assertIn("schema-gate", needs)
-        self.assertEqual(production["jobs"]["schema-gate"].get("needs"), "guard")
+        self.assertEqual(production["jobs"]["schema-gate"].get("needs"), ["guard", "release-apply"])
         self.assertEqual(production["jobs"]["schema-gate"].get("environment"),
                          "production-migrate-plan")
-        self.assertEqual(production["jobs"]["schema-gate"].get("if"),
-                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
-                         " && needs.guard.outputs.skip == ''")
+        self.assertEqual(production["jobs"]["schema-gate"].get("if"), PRODUCTION_GATE_IF)
 
     def test_production_roles_gate_shape_is_pinned_and_mutations_fail(self):
         import copy
@@ -9346,12 +9611,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("guard", needs)
         self.assertIn("schema-gate", needs)
         self.assertIn("roles-gate", needs)
-        self.assertEqual(production["jobs"]["roles-gate"].get("needs"), "guard")
+        self.assertEqual(production["jobs"]["roles-gate"].get("needs"), ["guard", "release-apply"])
         self.assertEqual(production["jobs"]["roles-gate"].get("environment"),
                          "production-migrate-plan")
-        self.assertEqual(production["jobs"]["roles-gate"].get("if"),
-                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
-                         " && needs.guard.outputs.skip == ''")
+        self.assertEqual(production["jobs"]["roles-gate"].get("if"), PRODUCTION_GATE_IF)
 
     def test_staging_migrate_runner_shape_is_pinned(self):
         # TOG-11572: the slice's own workflow must satisfy its carve-out, and
@@ -9554,6 +9817,53 @@ class WorkflowTests(unittest.TestCase):
                     w["jobs"][job_id]["permissions"] = permissions
                 self.assertTrue(mutated(change))
 
+    def test_staging_apply_approval_checkout_is_pinned(self):
+        workflow = self.workflows["staging-migrate.yml"]
+        self.assertEqual(staging_migrate_errors(workflow), [])
+
+        def approval_checkout(workflow):
+            return next(step["with"] for step in workflow["jobs"]["apply"]["steps"]
+                        if step.get("with", {}).get("path") == "approval-tools")
+
+        checkout = approval_checkout(workflow)
+        self.assertIn("sparse-checkout", checkout)
+        paths = checkout["sparse-checkout"]
+        for changes in (
+                {"sparse-checkout": None, "sparse-checkout-cone-mode": None},
+                {"sparse-checkout": paths.replace("/scripts/build_identity.py\n", "")},
+                {"sparse-checkout": paths + "/scripts/\n"},
+                {"sparse-checkout-cone-mode": "true"},
+                {"ref": "${{ inputs.source_sha }}"},
+                {"persist-credentials": "true"}):
+            with self.subTest(changes=changes):
+                changed = deepcopy(workflow)
+                options = approval_checkout(changed)
+                for key, value in changes.items():
+                    if value is None:
+                        del options[key]
+                    else:
+                        options[key] = value
+                self.assertEqual(staging_migrate_errors(changed), [
+                    "staging-migrate.yml:apply: must load the verifier at the trusted workflow SHA",
+                ])
+
+        steps = workflow["jobs"]["apply"]["steps"]
+        verifier = next(step for step in steps if step.get("name") == "Verify the native staging approval")
+        _, *args = shlex.split(verifier["run"])
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            for pattern in paths.splitlines():
+                path = pattern.removeprefix("/")
+                destination = scratch / checkout["path"] / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes((ROOT / path).read_bytes())
+            # A missing manifest exercises startup without credentials or API calls.
+            result = subprocess.run([sys.executable, "-B", "-S", *args], cwd=scratch,
+                                    env={}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "staging migration approval evidence unavailable or malformed\n")
+
     def test_production_migrate_runner_shape_is_pinned(self):
         # Production mirror of the staging runner: same three jobs, same pinned
         # actions, public-hosted runner, pipefail and provenance gates, with
@@ -9568,6 +9878,10 @@ class WorkflowTests(unittest.TestCase):
             change(workflow)
             return production_migrate_errors(workflow)
 
+        for job in ("plan", "claim"):
+            with self.subTest(job=job):
+                self.assertTrue(mutated(lambda w: w["jobs"][job].update(concurrency={"group": "deploy-production"})))
+        self.assertTrue(mutated(lambda w: w["jobs"]["apply"].pop("concurrency")))
         for trigger in ("push", "pull_request", "schedule", "workflow_call"):
             with self.subTest(trigger=trigger):
                 self.assertTrue(mutated(lambda w, t=trigger: w["on"].update({t: ""})))
@@ -9732,6 +10046,8 @@ class WorkflowTests(unittest.TestCase):
                 {"run": 'python3 scripts/staging_rollback_drill.py --target-version "${{ inputs.target_version }}"'}),
             "forced rollback": lambda w: job(w)["steps"][2].update(
                 {"run": 'python3 scripts/staging_rollback_drill.py --target-version "$TARGET_VERSION" --force'}),
+            "wrangler command after drill": lambda w: job(w)["steps"][2].update(
+                {"run": job(w)["steps"][2]["run"] + "\nwrangler deploy"}),
             "other script": lambda w: job(w)["steps"][2].update(
                 {"run": 'python3 scripts/other.py --target-version "$TARGET_VERSION"'}),
         }
@@ -9806,6 +10122,63 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(covering), 1)
         self.assertNotIn("if", covering[0])
 
+    def test_staging_worker_drill_checkout_only_materializes_runtime_files(self):
+        workflow = self.workflows["staging-rollback-drill.yml"]
+        self.assertEqual(staging_rollback_drill_errors(workflow), [])
+        for label, update in {
+            "full checkout": {"sparse-checkout": ""},
+            "missing cleanup helper": {"sparse-checkout": ROLLBACK_DRILL_CHECKOUT["sparse-checkout"].replace(
+                "/wrangler/scripts/staging-use.mjs\n", "")},
+            "extra directory": {"sparse-checkout": ROLLBACK_DRILL_CHECKOUT["sparse-checkout"] + "/docs/\n"},
+            "cone mode": {"sparse-checkout-cone-mode": "true"},
+        }.items():
+            with self.subTest(checkout=label):
+                changed = deepcopy(workflow)
+                changed["jobs"]["drill"]["steps"][0]["with"].update(update)
+                self.assertIn("staging-rollback-drill.yml:drill: must check out only the pinned runtime files",
+                              staging_rollback_drill_errors(changed))
+
+    def test_staging_worker_drill_runs_from_sparse_checkout(self):
+        drill = self.workflows["staging-rollback-drill.yml"]["jobs"]["drill"]
+        patterns = drill["steps"][0]["with"]["sparse-checkout"].splitlines()
+        runtime_paths = [pattern.removeprefix("/") for pattern in patterns]
+        # The isolated subprocess needs only the checked-out runtime and these
+        # offline fixtures. It cannot import from the full repository.
+        fixtures = (
+            "scripts/staging_cloudflare_fixture.py",
+            "scripts/test_staging_drill_use.py",
+            "scripts/test_staging_rollback_drill.py",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in (*runtime_paths, *fixtures):
+                relative = Path(path)
+                self.assertFalse(relative.is_absolute() or ".." in relative.parts, path)
+                dest = root / relative
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes((ROOT / relative).read_bytes())
+            env = {"PATH": os.environ.get("PATH", os.defpath)}
+            # The Python fixture fakes the staging-use subprocess transports.
+            # Import their actual ESM entry points here to exercise the loader.
+            commands = (
+                ["node", "--input-type=module", "-e",
+                 "globalThis.fetch = () => { throw new Error('offline fixture'); }; "
+                 "await import('./wrangler/scripts/staging-use.mjs'); "
+                 "await import('./wrangler/scripts/staging-use-pipeline.mjs');"],
+                [sys.executable, "-I", "-B", "scripts/test_staging_rollback_drill.py",
+                 "ClientAndControlTests.test_minimal_child_environment_runs_node_preflight_without_network",
+                 "MainTests.test_success_writes_evidence_and_summary_without_secrets",
+                 "MainTests.test_unproved_policy_exits_nonzero_before_any_window_or_mutation",
+                 "LifecycleTests.test_failed_leg_restores_without_a_new_check_and_releases",
+                 "LifecycleTests.test_ownership_authentication_failure_stops_use_and_cleanup",
+                 "MainTests.test_cleanup_failure_exits_nonzero_and_still_writes_evidence",
+                 "DryRunPlanPinTests.test_plan_pins_labeled_versions_and_numbered_leg_order"],
+            )
+            for command in commands:
+                with self.subTest(executable=command[0]):
+                    result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_staging_container_drill_shape_is_pinned(self):
         workflows = self.workflows
         self.assertEqual(staging_container_drill_errors(workflows["staging-container-drill.yml"]), [])
@@ -9867,6 +10240,58 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
+    def test_staging_container_drill_sparse_checkout_materializes_runtime_inputs(self):
+        workflow = self.workflows["staging-container-drill.yml"]
+        checkout = workflow["jobs"]["container-drill"]["steps"][0]["with"]
+        self.assertEqual(checkout["fetch-depth"], "1")
+        self.assertNotIn("ref", checkout)
+        self.assertNotIn("filter", checkout)
+        self.assertEqual(checkout.get("sparse-checkout-cone-mode"), "false")
+        self.assertTrue(checkout.get("sparse-checkout"))
+
+        # Materialize the job's rules in a disposable checkout. The lint image's
+        # Git supports sparse-checkout set but predates check-rules.
+        objects, revision = subprocess.check_output(
+            ["git", "rev-parse", "--path-format=absolute", "--git-path", "objects", "HEAD"],
+            cwd=ROOT, text=True, timeout=10,
+        ).splitlines()
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(["git", "init", "--quiet"], cwd=directory, check=True, timeout=10)
+            # Borrow objects without changing Git config or the index of the runner-owned checkout.
+            (Path(directory) / ".git/objects/info/alternates").write_text(objects + "\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "sparse-checkout", "set", "--no-cone", "--stdin"], cwd=directory,
+                input=checkout["sparse-checkout"], text=True, check=True, timeout=10,
+            )
+            subprocess.run(["git", "checkout", "--quiet", "--detach", revision], cwd=directory,
+                           check=True, timeout=10)
+            tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=directory, timeout=10)
+            paths = tracked.rstrip(b"\0").split(b"\0")
+            selected = {path for path in paths if os.path.lexists(Path(directory) / os.fsdecode(path))}
+
+        inputs = {
+            b"Dockerfile",  # The generated config still validates the other environments' images.
+            b"scripts/build_identity.py",
+            b"scripts/script_intake.py",
+            b"scripts/staging_container_drill.py",
+            b"scripts/staging_drill_use.py",
+            b"scripts/staging_rollback_drill.py",
+            b"scripts/staging_rollout.py",
+            b"scripts/worker_container_rollback.py",
+            b"wrangler/package-lock.json",
+            b"wrangler/package.json",
+            b"wrangler/scripts/is-direct-invocation.mjs",
+            b"wrangler/scripts/ownership-control-response.mjs",
+            b"wrangler/scripts/ownership-control.mjs",
+            b"wrangler/scripts/staging-use-pipeline.mjs",
+            b"wrangler/scripts/staging-use.mjs",
+            b"wrangler/src/index.ts",
+            b"wrangler/tsconfig.json",
+            b"wrangler/wrangler.toml",
+        }
+        inputs.update(path for path in paths if path.startswith(b"wrangler/src/"))
+        self.assertEqual(selected, inputs)
+
     def test_staging_events_read_shape_is_pinned(self):
         workflows = self.workflows
         self.assertEqual(staging_events_read_errors(workflows["staging-events-read.yml"]), [])
@@ -9915,6 +10340,17 @@ class WorkflowTests(unittest.TestCase):
             "extra step": lambda w: job(w)["steps"].append({"run": "echo done"}),
             "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
                 {"persist-credentials": "true"}),
+            "unpinned checkout action": lambda w: job(w)["steps"][0].update({"uses": "actions/checkout@v7"}),
+            "retargeted ref": lambda w: job(w)["steps"][0]["with"].update({"ref": "refs/heads/main"}),
+            "retargeted repository": lambda w: job(w)["steps"][0]["with"].update({"repository": "other/repo"}),
+            "retargeted path": lambda w: job(w)["steps"][0]["with"].update({"path": "another-checkout"}),
+            "full-depth fetch": lambda w: job(w)["steps"][0]["with"].update({"fetch-depth": "0"}),
+            "fetch filter override": lambda w: job(w)["steps"][0]["with"].update({"filter": "blob:limit=1m"}),
+            "cone mode": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout-cone-mode": "true"}),
+            "full checkout": lambda w: job(w)["steps"][0]["with"].pop("sparse-checkout"),
+            "missing transitive import": lambda w: job(w)["steps"][0]["with"].update(
+                {"sparse-checkout": "\n".join(EVENTS_READ_PATHS[:-1]) + "\n"}),
+            "whole scripts directory": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout": "/scripts/\n"}),
             "extra secret": lambda w: job(w)["steps"][1]["env"].update(
                 {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
             "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
@@ -9948,6 +10384,35 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
+    def test_staging_events_read_starts_with_only_checkout_files(self):
+        checkout = self.workflows["staging-events-read.yml"]["jobs"]["read"]["steps"][0]["with"]
+        self.assertEqual(checkout["sparse-checkout-cone-mode"], "false")
+        git_env = {"PATH": os.environ.get("PATH", os.defpath), "GIT_ALLOW_PROTOCOL": "file",
+                   "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        with tempfile.TemporaryDirectory(prefix="events-read-checkout-") as directory:
+            root = Path(directory) / "checkout"
+
+            def git(*args, stdin=None):
+                result = subprocess.run(
+                    ["git", "-c", f"safe.directory={ROOT}", *args], env=git_env,
+                    input=stdin, capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout
+
+            git("clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(root))
+            git("-C", root, "sparse-checkout", "set", "--no-cone", "--stdin", stdin=checkout["sparse-checkout"])
+            git("-C", root, "checkout", "--quiet", "--detach", "HEAD")
+            tracked = git("-C", root, "ls-files", "-z").split("\0")
+            materialized = {path for path in tracked if path and (root / path).is_file()}
+            self.assertEqual(materialized, {pattern[1:] for pattern in EVENTS_READ_PATHS})
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", "scripts/staging_events_read.py", "--help"],
+                cwd=root, env={}, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--window-start", result.stdout)
+
     def test_staging_privacy_verify_checkout_cannot_retarget_the_reviewed_head(self):
         self.assertEqual(workflow_policy_errors(self.workflows), [])
         for key, value in (("ref", "unreviewed-branch"),
@@ -9964,6 +10429,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_staging_privacy_verify_suite_is_required_in_worker(self):
         jobs = self.workflows["check.yml"]["jobs"]
+        self.assertEqual(jobs["worker"]["if"], "${{ always() }}")
         command = "PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_privacy_verify_read.py -v"
         steps = [step for step in jobs["worker"]["steps"] if step.get("run") == command]
         self.assertEqual(len(steps), 1, "worker must run the collector suite exactly once")
@@ -9973,7 +10439,7 @@ class WorkflowTests(unittest.TestCase):
         aggregate = next(step for step in jobs["ci-ok"]["steps"]
                          if step.get("name") == "Aggregate CI verdict")
         self.assertEqual(aggregate["env"]["WORKER_RESULT"], "${{ needs.worker.result }}")
-        self.assertIn('(\"worker\", \"WORKER_RESULT\", \"WORKER_SELECTED\")', aggregate["run"])
+        self.assertIn('(\"worker\", \"WORKER_RESULT\")', aggregate["run"])
 
     def test_staging_privacy_verify_read_shape_is_pinned(self):
         workflows = self.workflows
@@ -10902,12 +11368,172 @@ class WorkflowTests(unittest.TestCase):
                     )
 
     def test_runner_must_be_explicit_standard_public_hosted(self):
-        self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
+        self.assertTrue(runner_allowed("container", self.workflows["check.yml"]["jobs"]["container"]["runs-on"]))
         for runs_on in (LEGACY_ROUTED_RUNNER.format(job="worker"),
                         "ubuntu-latest-16-cores", ["ubuntu-latest"], ["self-hosted"],
                         "${{ vars.CI_OVERFLOW_RUNNER }}", "${{ matrix.runner }}"):
             with self.subTest(runs_on=runs_on):
                 self.assertFalse(runner_allowed("worker", runs_on))
+
+    def test_rust_tests_boat_is_scoped_to_rust_tests(self):
+        weakened_fork_guard = RUST_TESTS_RUNNER.replace(
+            "github.event.pull_request.head.repo.full_name == github.repository", "true"
+        )
+        weakened_actor_guard = RUST_TESTS_RUNNER.replace(
+            "github.triggering_actor == 'Rick7C2'", "true"
+        )
+        for workflow, job_id, runs_on in (
+            ("check.yml", "rust-tests", weakened_fork_guard),
+            ("check.yml", "rust-tests", weakened_actor_guard),
+            ("check.yml", "rust-tests", IGNORED_DB_RUNTIME_RUNNER),
+            ("check.yml", "ignored-db-runtime", RUST_TESTS_RUNNER),
+            ("check.yml", "coverage-shard", RUST_TESTS_RUNNER),
+            ("nightly.yml", "rust-tests", RUST_TESTS_RUNNER),
+        ):
+            with self.subTest(workflow=workflow, job=job_id):
+                self.assertNotEqual(runs_on, expected_runner(workflow, job_id))
+
+    def test_rust_tests_boat_routes_by_event_and_variable(self):
+        workflow = self.workflows["check.yml"]
+        self.assertEqual(set(workflow["on"]), {
+            "pull_request", "merge_group", "push", "schedule", "workflow_dispatch",
+        })
+        self.assertEqual(workflow["on"]["pull_request"], {"types": ["opened", "synchronize", "reopened"]})
+
+        repository = "TogetherWeOwn/two-bot-next"
+        defaults = {
+            "github.event_name": "pull_request",
+            "github.repository": repository,
+            "github.event.repository.private": False,
+            "github.event.pull_request.head.repo.full_name": repository,
+            "github.event.pull_request.base.ref": "main",
+            "github.ref": "refs/pull/2720/merge",
+            "github.ref_protected": False,
+            "github.run_attempt": "1",
+            "github.actor": "Rick7C2",
+            "github.triggering_actor": "Rick7C2",
+            "vars.CI_HEAVY_RUNNER": "boat",
+        }
+        app = {"github.actor": "togetherweown[bot]", "github.triggering_actor": "togetherweown[bot]"}
+        push = {"github.event_name": "push", "github.ref": "refs/heads/main", "github.ref_protected": True}
+        cases = (
+            ("eligible maintainer", {}, "boat"),
+            ("eligible app", app, "boat"),
+            # The main push writes a shared cache consumed by credentialed nextest.
+            ("protected main push", {**app, **push}, PUBLIC_RUNNER),
+            ("unprotected main push", {**push, "github.ref_protected": False}, PUBLIC_RUNNER),
+            ("branch push", {**push, "github.ref": "refs/heads/other"}, PUBLIC_RUNNER),
+            ("fork PR", {"github.event.pull_request.head.repo.full_name": "contributor/two-bot-next"}, PUBLIC_RUNNER),
+            ("missing PR head", {"github.event.pull_request.head.repo.full_name": ""}, PUBLIC_RUNNER),
+            ("other base branch", {"github.event.pull_request.base.ref": "other"}, PUBLIC_RUNNER),
+            ("private repository", {"github.event.repository.private": True}, PUBLIC_RUNNER),
+            ("missing visibility", {"github.event.repository.private": None}, PUBLIC_RUNNER),
+            ("other repository", {"github.repository": "TogetherWeOwn/other"}, PUBLIC_RUNNER),
+            ("Dependabot", {"github.actor": "dependabot[bot]", "github.triggering_actor": "dependabot[bot]"}, PUBLIC_RUNNER),
+            ("other originating actor", {"github.actor": "someone-else"}, PUBLIC_RUNNER),
+            ("other triggering actor", {"github.triggering_actor": "someone-else"}, PUBLIC_RUNNER),
+            ("missing triggering actor", {"github.triggering_actor": ""}, PUBLIC_RUNNER),
+            ("eligible actors on a rerun", {"github.run_attempt": "2"}, PUBLIC_RUNNER),
+            ("maintainer reruns Dependabot", {"github.run_attempt": "2", "github.actor": "dependabot[bot]"}, PUBLIC_RUNNER),
+            ("off-list user reruns maintainer", {"github.run_attempt": "2", "github.triggering_actor": "someone-else"}, PUBLIC_RUNNER),
+            ("missing attempt", {"github.run_attempt": ""}, PUBLIC_RUNNER),
+            ("unset variable", {"vars.CI_HEAVY_RUNNER": ""}, PUBLIC_RUNNER),
+            ("reserve closed", {"vars.CI_HEAVY_RUNNER": PUBLIC_RUNNER}, PUBLIC_RUNNER),
+            ("approved label in uppercase", {"vars.CI_HEAVY_RUNNER": "BOAT"}, "BOAT"),
+            ("other runner label", {"vars.CI_HEAVY_RUNNER": "blacksmith-2vcpu-ubuntu-2404"}, PUBLIC_RUNNER),
+            *((event, {**push, "github.event_name": event}, PUBLIC_RUNNER)
+              for event in ("merge_group", "schedule", "workflow_dispatch", "pull_request_target", "")),
+        )
+        expression = self.workflows["check.yml"]["jobs"]["rust-tests"]["runs-on"]
+        self.assertEqual(expression, RUST_TESTS_RUNNER)
+        self.assert_runner_cases(expression, defaults, cases)
+
+    def test_ignored_db_runtime_blacksmith_routes_by_event_and_variable(self):
+        label = "blacksmith-2vcpu-ubuntu-2404"
+        repository = "TogetherWeOwn/two-bot-next"
+        defaults = {
+            "github.event_name": "pull_request",
+            "github.repository": repository,
+            "github.event.pull_request.head.repo.full_name": repository,
+            "vars.CI_BLACKSMITH_2VCPU": label,
+        }
+        cases = (
+            ("same-repository PR", {}, label),
+            ("fork PR", {"github.event.pull_request.head.repo.full_name": "contributor/two-bot-next"}, PUBLIC_RUNNER),
+            ("missing PR head", {"github.event.pull_request.head.repo.full_name": ""}, PUBLIC_RUNNER),
+            ("unset variable", {"vars.CI_BLACKSMITH_2VCPU": ""}, PUBLIC_RUNNER),
+            ("reserve closed", {"vars.CI_BLACKSMITH_2VCPU": PUBLIC_RUNNER}, PUBLIC_RUNNER),
+            ("approved label in uppercase", {"vars.CI_BLACKSMITH_2VCPU": label.upper()}, label.upper()),
+            ("other size", {"vars.CI_BLACKSMITH_2VCPU": "blacksmith-4vcpu-ubuntu-2404"}, PUBLIC_RUNNER),
+            ("other provider", {"vars.CI_BLACKSMITH_2VCPU": "boat"}, PUBLIC_RUNNER),
+            *((event, {"github.event_name": event, "github.event.pull_request.head.repo.full_name": ""}, label)
+              for event in ("merge_group", "push", "schedule", "workflow_dispatch")),
+        )
+        expression = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]["runs-on"]
+        self.assertEqual(expression, IGNORED_DB_RUNTIME_RUNNER)
+        self.assert_runner_cases(expression, defaults, cases)
+
+    def test_blacksmith_pr_gate_routes_by_event_repository_and_variable(self):
+        label = "blacksmith-2vcpu-ubuntu-2404"
+        repository = "TogetherWeOwn/two-bot-next"
+        defaults = {
+            "github.event_name": "pull_request",
+            "github.repository": repository,
+            "github.event.pull_request.head.repo.full_name": repository,
+            "vars.CI_BLACKSMITH_2VCPU": label,
+        }
+        cases = (
+            ("same-repository PR", {}, label),
+            ("fork PR", {"github.event.pull_request.head.repo.full_name": "fork/two-bot-next"}, PUBLIC_RUNNER),
+            ("missing head repository", {"github.event.pull_request.head.repo.full_name": ""}, PUBLIC_RUNNER),
+            ("missing variable", {"vars.CI_BLACKSMITH_2VCPU": ""}, PUBLIC_RUNNER),
+            ("budget cutoff", {"vars.CI_BLACKSMITH_2VCPU": PUBLIC_RUNNER}, PUBLIC_RUNNER),
+            ("invalid label", {"vars.CI_BLACKSMITH_2VCPU": "blacksmith-4vcpu-ubuntu-2404"}, PUBLIC_RUNNER),
+            ("different provider", {"vars.CI_BLACKSMITH_2VCPU": "boat"}, PUBLIC_RUNNER),
+            *((event, {"github.event_name": event}, PUBLIC_RUNNER) for event in
+              ("push", "merge_group", "schedule", "workflow_dispatch", "pull_request_target")),
+        )
+        for workflow, jobs in (("check.yml", CHECK_PR_GATES), ("supply-chain.yml", SUPPLY_CHAIN_PR_GATES)):
+            for job in sorted(jobs):
+                with self.subTest(workflow=workflow, job=job):
+                    expression = self.workflows[workflow]["jobs"][job]["runs-on"]
+                    self.assertEqual(expression, PR_GATE_RUNNER)
+                    self.assert_runner_cases(expression, defaults, (*cases,
+                        ("review", {"github.event_name": "pull_request_review"}, PUBLIC_RUNNER)))
+
+        size_jobs = self.workflows["pr-size.yml"]["jobs"]
+        size_input = size_jobs["pr-size-gate"]["with"]["runs-on"]
+        self.assertEqual(size_input, PR_SIZE_GATE_RUNNER_INPUT)
+        expression = size_input.removeprefix("${{ toJSON(").removesuffix(") }}")
+        self.assert_runner_cases(expression, defaults, (*cases,
+            ("same-repository review", {"github.event_name": "pull_request_review"}, label),
+            ("fork review", {"github.event_name": "pull_request_review",
+                             "github.event.pull_request.head.repo.full_name": "fork/two-bot-next"}, PUBLIC_RUNNER),
+        ))
+        self.assertNotIn("runs-on", size_jobs["pr-size-weekly"].get("with", {}))
+
+    def assert_runner_cases(self, expression, defaults, cases):
+        expression = expression.removeprefix("${{").removesuffix("}}").strip()
+        for name, overrides, expected in cases:
+            with self.subTest(case=name):
+                context = {**defaults, **overrides}
+                # Apply GitHub's case-insensitive comparisons without changing
+                # the spelling of the label returned from the variable.
+                text = re.sub(r"toJSON\((github\.[\w.]+)\)",
+                              lambda match: repr(json.dumps(context[match[1]])), expression)
+                text = re.sub(r"\b(?:github|vars)\.[\w.]+",
+                              lambda match: repr(context[match[0]]), text)
+                tree = ast.parse(text.replace("&&", " and ").replace("||", " or "), mode="eval")
+                allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare,
+                           ast.Eq, ast.NotEq, ast.Constant)
+                self.assertTrue(all(isinstance(node, allowed) for node in ast.walk(tree)))
+                for comparison in (node for node in ast.walk(tree) if isinstance(node, ast.Compare)):
+                    for operand in (comparison.left, *comparison.comparators):
+                        self.assertIsInstance(operand, ast.Constant)
+                        self.assertIsInstance(operand.value, str)
+                        operand.value = operand.value.casefold()
+                result = eval(compile(tree, "<runner selection>", "eval"), {"__builtins__": {}})
+                self.assertEqual(result, expected)
 
     def test_certify_promotion_runner_must_be_explicit_public_hosted(self):
         # Artifact-only certification retains service/container isolation and
@@ -10963,8 +11589,7 @@ class WorkflowTests(unittest.TestCase):
                         self.assertNotIn("services", job)
                         self.assertNotIn("container", job)
                     else:
-                        # All ordinary jobs share the explicit public-hosted contract.
-                        self.assertTrue(runner_allowed(job_id, job["runs-on"]))
+                        self.assertEqual(job["runs-on"], expected_runner(name, job_id))
                     if job.get("services"):
                         self.assertIn("container", job)
                         for service in job["services"].values():
@@ -11227,7 +11852,7 @@ class WorkflowTests(unittest.TestCase):
         workflow = self.workflows["nightly.yml"]
         self.assertEqual(
             set(workflow.get("on") or {}),
-            {"schedule", "workflow_dispatch", "pull_request"},
+            {"schedule", "workflow_dispatch"},
         )
         # All four compiling jobs carry the ceiling; the `sweep` aggregate
         # is not a compiling job and is not pinned here.
@@ -11237,6 +11862,13 @@ class WorkflowTests(unittest.TestCase):
                     workflow["jobs"][name].get("timeout-minutes"),
                     "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}",
                 )
+
+    def test_pipeline_benchmark_keeps_focused_pr_coverage(self):
+        workflow = self.workflows["pipeline-benchmark.yml"]
+        paths = workflow["on"]["pull_request"]["paths"]
+        self.assertIn("Cargo.lock", paths)
+        self.assertIn("scripts/*pipeline_bench*", paths)
+        self.assertIn("workflow_call", workflow["on"])
 
     def test_nextest_container_pins_disposable_database_service_address(self):
         # Same hardening as the check.yml lanes: the shared lane runs the
@@ -11403,10 +12035,6 @@ class WorkflowTests(unittest.TestCase):
     def test_minimal_grants_and_no_persisted_checkout_credentials(self):
         for name, workflow in self.workflows.items():
             if name == "pr-size.yml":
-                # The org caller template ships an explicit top-level
-                # `contents: read` (its header instructs a byte-exact
-                # copy); every job below still overrides with its own
-                # least-privilege grant, pinned under this test.
                 self.assertEqual(workflow["permissions"], {"contents": "read"})
             else:
                 self.assertEqual(workflow["permissions"], {})
@@ -11440,7 +12068,8 @@ class WorkflowTests(unittest.TestCase):
                         # run's manifest artifact for the provenance gate.
                         expected = {"contents": "read", "actions": "read"}
                     elif (name == "production-migrate.yml" and job_id in ("claim", "apply")
-                          or name == "deploy-production-recovery.yml"):
+                          or name == "deploy-production-recovery.yml"
+                          or (name == "deploy-production.yml" and job_id.startswith("release-"))):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-staging.yml", "deploy"):
                         # Derives the deploy ID from today's staging
@@ -11500,12 +12129,9 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("release.yml", "attach-sbom"):
                         # TOG-10893: uploads verified SBOMs to the published tag.
                         expected = {"contents": "write"}
-                    elif (name, job_id) in (("pr-size.yml", "pr-size"),
-                                            ("pr-size.yml", "pr-size-gate")):
-                        # Labeller writes the size/* label and keeps the
-                        # one advisory comment; the required gate posts
-                        # the split comment and ensures the exception
-                        # label. Both measure the caller's PR the same way.
+                    elif (name, job_id) == ("pr-size.yml", "pr-size-gate"):
+                        # One job updates size labels, ensures the exception
+                        # label and maintains advisory and required comments.
                         expected = {"contents": "read", "issues": "write",
                                     "pull-requests": "write"}
                     elif (name, job_id) == ("pr-size.yml", "pr-size-weekly"):
@@ -11653,9 +12279,9 @@ class WorkflowTests(unittest.TestCase):
         }
         exempt = {
             *pure_callees,
-            # Serializes at the `production` lane job only, so a sleeping
-            # promotion can never queue an operator rollback behind it (see
-            # the header comment in the workflow).
+            # Ordinary deploys serialize at the `production` job, so an
+            # automatic soak leaves the lane free for rollback. Protected
+            # dispatches serialize at the workflow level.
             "deploy-production.yml",
             # Read-only staging observation and production alerting each use
             # an independent queue, never the lifecycle holders' pending slot.

@@ -10,8 +10,13 @@ this suite before it can silently skip coverage.
 """
 
 import importlib.util
+import os
 from pathlib import Path
 import re
+import runpy
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -79,7 +84,6 @@ class SelectionTests(unittest.TestCase):
     def test_crate_changes_run_rust_and_worker(self):
         rust = ["crates/core/src/lib.rs", "crates/bot/src/main.rs",
                 "crates/store/src/web.rs", "crates/cutover/build.rs",
-                "crates/core/Cargo.toml",
                 "crates/store/migrations/0400_initial.sql",
                 "crates/core/tests/feeds.rs",
                 "crates/core/tests/fixtures/feeds/rss.xml",
@@ -97,7 +101,6 @@ class SelectionTests(unittest.TestCase):
 
     def test_rust_only_inputs(self):
         for path in ["sql/web_v1.sql", "sql/database_roles.sql",
-                     ".cargo/config.toml",
                      "tests/voice_templates/corpus.json",
                      "tests/voice_templates/validate.py"]:
             with self.subTest(path=path):
@@ -180,12 +183,12 @@ class SelectionTests(unittest.TestCase):
                 self.assertIn(RUST, selected, path)
                 self.assertIn(WORKER, selected, path)
 
-    def test_parity_scripts_also_gate_parity(self):
+    def test_parity_scripts_run_everything(self):
         for path in ["scripts/check_parity_baseline.py",
                      "scripts/test_parity_baseline.py"]:
             with self.subTest(path=path):
                 selected = inputs.classify(path)
-                self.assertEqual(selected, {RUST, WORKER, PARITY}, path)
+                self.assertEqual(selected, inputs.ALL_JOBS, path)
 
     def test_receiver_contract_doc_selects_its_worker_conformance_check(self):
         path = "docs/internal-actions-receiver.md"
@@ -199,7 +202,6 @@ class SelectionTests(unittest.TestCase):
     def test_worker_tree_selects_worker_only(self):
         for path in ["wrangler/src/index.ts",
                      "wrangler/test/container-env.test.ts",
-                     "wrangler/package.json",
                      "wrangler/scripts/check-env-bindings.py"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
@@ -264,6 +266,7 @@ class SelectionTests(unittest.TestCase):
         # docs/database-roles.md left this list: the voice owner-grant
         # journal regression reads its content, so it selects rust.
         for path in ["docs/gateway-recovery.md",
+                     "docs/uppercase-guide.MD",
                      "docs/leveling-port.md", "docs/feeds-port.md",
                      "docs/distroless-evaluation.md", "docs/build-cache.md",
                      "docs/member-journey-parity.md"]:
@@ -294,9 +297,8 @@ class SelectionTests(unittest.TestCase):
         # Markdown chrome still raises the informational docs flag, which
         # gates nothing.
         skip = ["LICENSE", "CHANGELOG.md", ".editorconfig", ".gitignore",
-                ".gitleaks.toml", ".gitleaksignore",
                 ".github/pull_request_template.md",
-                ".github/CODEOWNERS", ".github/dependabot.yml",
+                ".github/CODEOWNERS",
                 "README.md", "AGENTS.md", "CONTEXT.md",
                 "PACKAGES.md"]
         self.assertEqual(jobs(skip),
@@ -306,7 +308,9 @@ class SelectionTests(unittest.TestCase):
     def test_unrecognized_paths_fail_closed(self):
         for path in ["brand-new-dir/thing.txt", "Dockerfile.new",
                      "scripts", "crates", "wrangler", "deploy/svc",
-                     ".github/UNKNOWN", ".gitattributes", "odd-root-file.rs"]:
+                     ".github/UNKNOWN", ".gitattributes", "odd-root-file.rs",
+                     "docs/unknown.py", ".gitleaks.toml", ".gitleaksignore",
+                     ".github/dependabot.yml"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path),
                                  {RUST, WORKER, PARITY, SUPPLY}, path)
@@ -345,58 +349,64 @@ class SelectionTests(unittest.TestCase):
                          {RUST: False, WORKER: False, PARITY: False,
                           SUPPLY: False, DOCS: False})
 
-    @staticmethod
-    def fake_diff(changed):
-        def diff(base, head, root=None, diff_filter=None):
-            return list(changed) if diff_filter != "D" else []
-        return diff
-
     def test_cli_prints_all_jobs(self):
-        with patch.object(inputs, "git_diff_names",
-                          side_effect=self.fake_diff(["crates/core/src/lib.rs"])):
+        with patch.object(inputs, "git_changes", return_value=(["crates/core/src/lib.rs"], [])):
             with patch("builtins.print") as printed:
-                self.assertEqual(
-                    inputs.main(["--base-ref", "a", "--head-ref", "b"]), 0)
+                self.assertEqual(inputs.main(["--base-ref", "a", "--head-ref", "b"]), 0)
                 printed.assert_any_call("rust=true")
                 printed.assert_any_call("worker=true")
                 printed.assert_any_call("parity=false")
                 printed.assert_any_call("supply=true")
                 printed.assert_any_call("docs=false")
+                printed.assert_any_call("db-compat=false")
+                printed.assert_any_call("migrations=false")
+                printed.assert_any_call("workflow-fixtures=true")
 
     def test_cli_job_flag_prints_single_value(self):
-        with patch.object(inputs, "git_diff_names",
-                          side_effect=self.fake_diff(
-                              ["docs/gateway-recovery.md"])):
+        with patch.object(inputs, "git_changes", return_value=(["docs/gateway-recovery.md"], [])):
             for job, want in ((RUST, "false"), (WORKER, "true"),
-                              (PARITY, "false"), (SUPPLY, "false"),
-                              (DOCS, "true")):
+                              (PARITY, "false"), (SUPPLY, "false"), (DOCS, "true"),
+                              (inputs.DB_COMPAT, "false"), (inputs.MIGRATIONS, "false"),
+                              (inputs.WORKFLOW_FIXTURES, "false")):
                 with self.subTest(job=job), patch("builtins.print") as printed:
-                    self.assertEqual(
-                        inputs.main(["--base-ref", "a", "--head-ref", "b",
-                                     "--job", job]), 0)
+                    self.assertEqual(inputs.main(["--base-ref", "a", "--head-ref", "b",
+                                                  "--job", job]), 0)
                     printed.assert_called_once_with(want)
 
     def test_cli_selects_all_jobs_on_deletion(self):
-        def diff(base, head, root=None, diff_filter=None):
-            return ["docs/metrics.md"] if diff_filter != "D" \
-                else ["docs/runbook.md"]
-        with patch.object(inputs, "git_diff_names", side_effect=diff):
+        with patch.object(inputs, "git_changes",
+                          return_value=(["docs/metrics.md"], ["docs/runbook.md"])):
             with patch("builtins.print") as printed:
-                self.assertEqual(
-                    inputs.main(["--base-ref", "a", "--head-ref", "b"]), 0)
-                printed.assert_any_call("rust=true")
-                printed.assert_any_call("worker=true")
-                printed.assert_any_call("parity=true")
-                printed.assert_any_call("supply=true")
-                printed.assert_any_call("docs=true")
+                self.assertEqual(inputs.main(["--base-ref", "a", "--head-ref", "b"]), 0)
+                for job in inputs.OUTPUTS:
+                    printed.assert_any_call(f"{job}=true")
 
     def test_cli_fails_closed_when_diff_is_undecidable(self):
-        import subprocess
-        with patch.object(inputs, "git_diff_names",
+        with patch.object(inputs, "git_changes",
                           side_effect=subprocess.CalledProcessError(128, "git")):
             with patch("builtins.print"):
-                self.assertEqual(
-                    inputs.main(["--base-ref", "a", "--head-ref", "b"]), 2)
+                self.assertEqual(inputs.main(["--base-ref", "a", "--head-ref", "b"]), 2)
+
+    def test_workflow_plan_requires_all_lanes_for_shared_dependency_or_empty_diff(self):
+        for paths in ([], ["wrangler/package-lock.json"], ["crates/core/Cargo.toml"],
+                      [".cargo/config.toml"], [".github/actions/build/action.yml"],
+                      [".github/workflows/supply-chain.yml"], ["scripts/smoke.py"],
+                      ["scripts/job-inputs.py"], ["migrations.lock"],
+                      ["docs/guide.md", "unknown/input.bin"]):
+            with self.subTest(paths=paths):
+                selection = inputs.workflow_selection(paths, [])
+                self.assertEqual({job for job, selected in selection.items() if selected} - {DOCS},
+                                 set(inputs.OUTPUTS) - {DOCS})
+
+    def test_docs_keeps_real_consumers_and_sql_keeps_migration_lanes(self):
+        docs = inputs.workflow_selection(["docs/production-deploy.md"], [])
+        self.assertEqual({job for job, selected in docs.items() if selected}, {DOCS, WORKER})
+        rollout = inputs.workflow_selection(["docs/ci-speed-rollout.md"], [])
+        self.assertTrue(rollout[inputs.WORKFLOW_FIXTURES])
+        db = inputs.workflow_selection(["crates/store/migrations/0500_fixture.sql"], [])
+        self.assertTrue(db[inputs.MIGRATIONS])
+        self.assertTrue(db[inputs.DB_COMPAT])
+        self.assertTrue(db[RUST])
 
     def test_db_compatibility_scope_includes_removed_and_quoted_paths(self):
         for path in ("migrations.lock", "crates/cutover/migrations/0480_é.sql",
@@ -410,6 +420,127 @@ class SelectionTests(unittest.TestCase):
             ["docs/database-roles.md", "wrangler/src/index.ts", "crates/core/src/lib.rs"]))
 
 
+class GitCandidateSelectionTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.git("init", "-q", "-b", "main")
+
+    def git(self, *args):
+        return subprocess.check_output(
+            ["git", "-C", str(self.root), "-c", "user.name=CI fixture",
+             "-c", "user.email=ci@example.invalid", "-c", "commit.gpgSign=false", *args],
+            text=True, timeout=5).strip()
+
+    def commit(self, label):
+        self.git("add", ".")
+        self.git("commit", "-qm", label)
+        return self.git("rev-parse", "HEAD")
+
+    def test_mutation_planner_uses_real_selector(self):
+        planner = runpy.run_path(str(ROOT / ".github/scripts/mutation_scope.py"))
+        path = self.root / "wrangler/src/fixture.ts"
+        path.parent.mkdir(parents=True)
+        path.write_text("export const active = false;\n")
+        base = self.commit("base")
+        path.write_text("export const active = true;\n")
+        head = self.commit("candidate")
+        output = self.root / "outputs"
+        with patch.dict(os.environ, BASE_SHA=base, HEAD_SHA=head,
+                        GITHUB_OUTPUT=str(output), RUNNER_TEMP=str(self.root)):
+            planner["main"](self.root)
+        self.assertIn("worker=true", output.read_text().splitlines())
+        self.assertEqual((self.root / "worker-mutation-plan.json").read_text(),
+                         '{"wrangler/src/fixture.ts": [1]}')
+
+    def test_diverged_pr_candidate_and_unknown_change_types(self):
+        (self.root / "guide.md").write_text("original")
+        common = self.commit("common")
+        self.git("switch", "-qc", "topic")
+        self.git("mv", "guide.md", "renamed.md")
+        head = self.commit("rename")
+        self.git("switch", "-q", "main")
+        (self.root / "other.md").write_text("base-only")
+        (self.root / "alias.md").symlink_to("other.md")
+        base = self.commit("base advances")
+        self.git("merge", "-q", "--no-ff", "topic", "-m", "candidate")
+        merge = self.git("rev-parse", "HEAD")
+        with self.assertRaises(inputs.JobInputsError):
+            inputs.pr_comparison(self.root, head, base, merge)
+        self.assertEqual(inputs.pr_comparison(self.root, base, head, merge), (common, merge))
+        changed, uncertain = inputs.git_changes(common, merge, self.root)
+        self.assertCountEqual(changed, ["other.md", "renamed.md"])
+        self.assertCountEqual(uncertain, ["guide.md", "alias.md"])
+        self.assertTrue(all(inputs.workflow_selection(changed, uncertain).values()))
+
+    def test_workflow_bootstraps_selector_from_event_base(self):
+        path = self.root / "scripts/job-inputs.py"
+        path.parent.mkdir()
+        path.write_bytes((ROOT / "scripts/job-inputs.py").read_bytes())
+        guide = self.root / "guide.md"
+        guide.write_text("original")
+        base = self.commit("base selector")
+        self.git("switch", "-qc", "topic")
+        guide.write_text("edited")
+        head = self.commit("guide change")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "topic", "-m", "candidate")
+        merge = self.git("rev-parse", "HEAD")
+
+        selector_job = WorkflowSurfaceTests.job_text(CHECK_YML.read_text(), "job-inputs")
+        step = selector_job.split("id: select\n", 1)[1].split("\n      - name:", 1)[0]
+        script = textwrap.dedent(step.split("run: |\n", 1)[1])
+        output = self.root / "outputs"
+        env = {**os.environ, "EVENT_NAME": "pull_request", "BASE_SHA": base,
+               "HEAD_SHA": head, "MERGE_SHA": merge, "RUNNER_TEMP": str(self.root),
+               "GITHUB_WORKSPACE": str(self.root), "GITHUB_OUTPUT": str(output)}
+        # A checkout-local copy cannot decide which suites run.
+        path.write_text("raise SystemExit('checkout selector must not run')\n")
+        for candidate, selected in ((merge, "false"), (head, "true")):
+            with self.subTest(candidate=candidate):
+                output.write_text("")
+                run = subprocess.run(["bash", "-e", "-c", script], cwd=self.root,
+                                     env={**env, "MERGE_SHA": candidate},
+                                     capture_output=True, text=True, timeout=5)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                plan = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                self.assertEqual(tuple(plan), inputs.OUTPUTS)
+                for lane in (RUST, WORKER, inputs.MIGRATIONS, inputs.DB_COMPAT, inputs.WORKFLOW_FIXTURES):
+                    self.assertEqual(plan[lane], selected, run.stdout)
+
+    def test_database_proof_binds_base_only_migration_to_candidate(self):
+        guide = self.root / "guide.md"
+        guide.write_text("original")
+        common = self.commit("common")
+        self.git("switch", "-qc", "topic")
+        guide.write_text("edited")
+        head = self.commit("docs change")
+        self.git("switch", "-q", "main")
+        migration = self.root / "crates/store/migrations/0500_fixture.sql"
+        migration.parent.mkdir(parents=True)
+        migration.write_text("-- fixture\n")
+        base = self.commit("migration on base")
+        self.git("merge", "-q", "--no-ff", "topic", "-m", "candidate")
+        merge = self.git("rev-parse", "HEAD")
+        changed, uncertain = inputs.git_changes(common, merge, self.root)
+        self.assertTrue(inputs.workflow_selection(changed, uncertain)[inputs.DB_COMPAT])
+
+        # Exercise the actual identity check before the build and database work.
+        script = (ROOT / "scripts/ci/db_compatibility.sh").read_text().split("scratch=$(mktemp", 1)[0]
+        env = {**os.environ, "GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "pull_request",
+               "GITHUB_SHA": merge, "PR_BASE_SHA": base, "PR_HEAD_SHA": head}
+        for ref, expected in ((merge, 0), (head, 1)):
+            with self.subTest(ref=ref):
+                self.git("switch", "-q", "--detach", ref)
+                run = subprocess.run(["bash", "-c", script], cwd=self.root,
+                                     env=env, capture_output=True, text=True, timeout=5)
+                self.assertEqual(run.returncode, expected, run.stderr)
+                self.assertEqual(migration.is_file(), expected == 0)
+                if expected:
+                    self.assertIn("checkout does not match the PR event merge", run.stderr)
+
+
 class DocsIndexWiringTests(unittest.TestCase):
     def test_docs_index_inputs_and_ungated_execution(self):
         for path in ("docs/README.md", "docs/nested/new-guide.md"):
@@ -419,7 +550,7 @@ class DocsIndexWiringTests(unittest.TestCase):
                 self.assertTrue(selected[WORKER])
         for path in ("scripts/check_docs_index.py", "scripts/test_docs_index.py"):
             with self.subTest(path=path):
-                self.assertEqual(inputs.classify(path), {RUST, WORKER})
+                self.assertEqual(inputs.classify(path), inputs.ALL_JOBS)
         body = CHECK_YML.read_text()
         step = body.split("- name: Docs index, orphan and byte-budget conformance (offline)\n", 1)[1].split("\n      - ", 1)[0]
         self.assertIn("python3 -m unittest discover -s scripts -p 'test_docs_index.py' -v", step)
@@ -602,9 +733,9 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertLess(self.text.index("  job-inputs:"),
                         self.text.index("\n  container-inputs:"))
 
-    def test_selector_exposes_five_outputs(self):
+    def test_selector_exposes_all_lanes(self):
         outputs = self.selector.split("outputs:", 1)[1].split("steps:", 1)[0]
-        for job in ("rust", "worker", "parity", "supply", "docs"):
+        for job in inputs.OUTPUTS:
             self.assertIn(job, outputs)
 
     def test_selector_checks_out_full_history(self):
@@ -656,7 +787,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
         body = self.text.split("\n  ci-ok:")[1]
         self.assertIn(
             '("supply-chain", "SUPPLY_CHAIN_RESULT", "SUPPLY_SELECTED")', body)
-        self.assertIn('result == "skipped" and not selected(sel_var)', body)
+        self.assertIn('result == "skipped" and selected == "false"', body)
 
     def test_ci_ok_aggregator_exists_and_is_always_run(self):
         # CI standard rule 3 (TOG-14881): one required aggregator named

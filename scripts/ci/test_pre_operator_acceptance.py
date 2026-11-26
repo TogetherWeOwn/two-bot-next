@@ -9,8 +9,8 @@ from unittest.mock import patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from ci.pre_operator_acceptance_fixture import (
-        AcceptedRow, Build, Probe, RegistryCleanupEvidence, SchemaEvidence,
-        SchemaState, ServingEvidence, SweepEvidence, WorkerEvidence, accept,
+        SAMPLE_BUILD, SAMPLE_READY_REPORT, AcceptedRow, RegistryCleanupEvidence,
+        SchemaState, SweepEvidence, accept, sample_endpoint,
     )
     from ci.test_pre_sweep_inventory_retry import APP_ID, EXPIRED, SIBLING, FakeProvider
     from pre_registry_cleanup import PublicationSettlement, RegistryReadback, RegistryReservation
@@ -22,32 +22,24 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.p
 class PreOperatorAcceptanceTests(unittest.TestCase):
     def setUp(self):
         self.target = Target("pre-fixture-operator", 42, 1_800_000_000, "0473/0465")
-        self.build = Build(17, "a" * 40, "2026.11.25.1+aaaaaaa", "sha256:" + "b" * 64)
+        self.build = SAMPLE_BUILD
         self.original = SchemaState((115, 473), (20, 465), False, None)
         self.restored = SchemaState((116, 475), (20, 465), True, 1_800_000_001)
         self.version = "12345678-1234-4234-8234-123456789abc"
-        self.report = {"build_revision": "a" * 40, "build_id": "17-1", "deploy_id": "2026.11.25.1+aaaaaaa",
-                       "components": [["process", "ready"], ["database", "ready"], ["gateway", "ready"]]}
+        self.report = SAMPLE_READY_REPORT
 
     def registry_reservation(self, target):
         repository = f"registry.example.invalid/{target.scope}/two-bot-next-attendance-predecessor-staging"
         return RegistryReservation(target, f"{repository}@{self.build.image_digest}")
 
     def evidence(self, target, state):
-        reservation = self.registry_reservation(target)
-        return {
-            "receipt": {"source_sha": "a" * 40, "worker_message": "a" * 40, "BOT_BUILD_REVISION": "a" * 40,
-                        "BOT_BUILD_ID": "17-1", "BOT_DEPLOY_ID": "2026.11.25.1+aaaaaaa",
-                        "image_manifest_digest": "sha256:" + "b" * 64},
-            "schema": SchemaEvidence(target, state),
-            "serving": ServingEvidence(target, self.version, "a" * 40, "sha256:" + "b" * 64),
-            "worker": WorkerEvidence(target, Probe(200, self.version),
-                                     Probe(200, self.version, json.dumps(self.report).encode())),
+        reference = self.registry_reservation(target).reference
+        return sample_endpoint(target, state, self.version) | {
             "sweep": SweepEvidence(target, "cleared"),
             "registry": RegistryCleanupEvidence(
                 Inventory(target, None, None, 0, False, True, startup_settled=True, assigned_count=0),
-                RegistryReadback(target, reservation.reference, False), target.expires_at, "active",
-                PublicationSettlement(reservation),
+                RegistryReadback(target, reference, False), target.expires_at, "active",
+                PublicationSettlement(self.registry_reservation(target)),
             ),
         }
 
@@ -145,8 +137,25 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
             with self.subTest(path=path):
                 failed = replace(getattr(worker, path), status=503)
                 self.refuse(evidence | {"worker": replace(worker, **{path: failed})}, reason)
-        stale_health = replace(worker.health, worker_version="12345678-1234-4234-8234-123456789def")
-        self.refuse(evidence | {"worker": replace(worker, health=stale_health)}, "pre_worker_health_unproved")
+
+    def test_both_successful_probes_must_match_the_pinned_worker(self):
+        evidence = self.evidence(self.target, self.original)
+        accepted = accept(self.registry_reservation(self.target), self.build, **evidence)
+        self.assertEqual(accepted, AcceptedRow(self.target, self.build, self.original, self.version, "cleared"))
+
+        worker = evidence["worker"]
+        other_version = "12345678-1234-4234-8234-123456789def"
+        other_health = replace(worker.health, worker_version=other_version)
+        other_readyz = replace(worker.readyz, worker_version=other_version)
+        cases = (
+            ("health from other Worker", replace(worker, health=other_health), "pre_worker_health_unproved"),
+            ("readiness from other Worker", replace(worker, readyz=other_readyz), "pre_worker_readiness_unproved"),
+            ("both from other Worker", replace(worker, health=other_health, readyz=other_readyz),
+             "pre_worker_health_unproved"),
+        )
+        for name, observation, reason in cases:
+            with self.subTest(observation=name):
+                self.refuse(evidence | {"worker": observation}, reason)
 
     def test_direct_container_probes_do_not_establish_worker_readiness(self):
         evidence = self.evidence(self.target, self.original)

@@ -1,10 +1,12 @@
 """Join synthetic PRE evidence in memory. This fixture has no release caller."""
 
 from dataclasses import dataclass
+import json
 
 from build_identity import is_build_revision_shape, is_deploy_id_shape
 from pre_registry_cleanup import (
-    PublicationSettlement, RegistryDisposition, RegistryReadback, RegistryReservation, registry_cleanup_disposition,
+    PublicationSettlement, RegistryDisposition, RegistryReadback, RegistryReservation,
+    registry_cleanup_disposition,
 )
 from pre_target import Inventory, Target, TargetError
 from rollback_proof import DIGEST, ProofError, VERSION, require
@@ -109,6 +111,26 @@ def accept(registry_reservation: RegistryReservation, build, *, receipt, schema,
     target cleanup and independent proof of publisher settlement.
     """
     reservation = registry_reservation.target
+    verify_endpoint(reservation, build, receipt=receipt, schema=schema, serving=serving, worker=worker)
+    require(sweep is not None, "pre_cleanup_unproved")
+    require(sweep.reservation == reservation, "pre_cleanup_reservation_mismatch")
+    require(sweep.outcome == "cleared", "pre_cleanup_unproved")
+    require(registry is not None, "pre_registry_cleanup_unproved")
+    require(registry_reservation.reference.partition("@")[2] == build.image_digest,
+            "pre_registry_build_mismatch")
+    try:
+        disposition = registry_cleanup_disposition(
+            registry_reservation, registry.inventory, registry.readback, now=registry.now,
+            run_status=registry.run_status, publication_settlement=registry.publication_settlement,
+        )
+    except TargetError as error:
+        raise ProofError(str(error)) from None
+    require(disposition is RegistryDisposition.ALREADY_ABSENT, "pre_registry_cleanup_unproved")
+    return AcceptedRow(reservation, build, schema.state, serving.worker_version, sweep.outcome)
+
+
+def verify_endpoint(reservation, build, *, receipt, schema, serving, worker):
+    """Prove the serving endpoint independently of terminal cleanup."""
     require(type(build.run_id) is int and 0 < build.run_id < 10**20
             and is_build_revision_shape(build.revision) and is_deploy_id_shape(build.deploy_id)
             and build.deploy_id.endswith(f".1+{build.revision[:7]}")
@@ -143,18 +165,22 @@ def accept(registry_reservation: RegistryReservation, build, *, receipt, schema,
         raise ProofError("pre_worker_readiness_unproved") from None
     require(ready, "pre_worker_readiness_unproved")
 
-    require(sweep is not None, "pre_cleanup_unproved")
-    require(sweep.reservation == reservation, "pre_cleanup_reservation_mismatch")
-    require(sweep.outcome == "cleared", "pre_cleanup_unproved")
-    require(registry is not None, "pre_registry_cleanup_unproved")
-    require(registry_reservation.reference.partition("@")[2] == build.image_digest,
-            "pre_registry_build_mismatch")
-    try:
-        disposition = registry_cleanup_disposition(
-            registry_reservation, registry.inventory, registry.readback, now=registry.now,
-            run_status=registry.run_status, publication_settlement=registry.publication_settlement,
-        )
-    except TargetError as error:
-        raise ProofError(str(error)) from None
-    require(disposition is RegistryDisposition.ALREADY_ABSENT, "pre_registry_cleanup_unproved")
-    return AcceptedRow(reservation, build, schema.state, serving.worker_version, sweep.outcome)
+
+SAMPLE_BUILD = Build(17, "a" * 40, "2026.11.25.1+aaaaaaa", "sha256:" + "b" * 64)
+SAMPLE_READY_REPORT = {
+    "build_revision": "a" * 40, "build_id": "17-1", "deploy_id": "2026.11.25.1+aaaaaaa",
+    "components": [["process", "ready"], ["database", "ready"], ["gateway", "ready"]],
+}
+
+
+def sample_endpoint(reservation, state, worker_version):
+    """Return the synthetic predecessor and serving observations for one shape."""
+    return {
+        "receipt": {"source_sha": "a" * 40, "worker_message": "a" * 40, "BOT_BUILD_REVISION": "a" * 40,
+                    "BOT_BUILD_ID": "17-1", "BOT_DEPLOY_ID": "2026.11.25.1+aaaaaaa",
+                    "image_manifest_digest": "sha256:" + "b" * 64},
+        "schema": SchemaEvidence(reservation, state),
+        "serving": ServingEvidence(reservation, worker_version, "a" * 40, "sha256:" + "b" * 64),
+        "worker": WorkerEvidence(reservation, Probe(200, worker_version),
+                                 Probe(200, worker_version, json.dumps(SAMPLE_READY_REPORT).encode())),
+    }

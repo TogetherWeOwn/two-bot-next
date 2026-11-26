@@ -105,6 +105,29 @@ writer if the startup client disappears or startup stalls. The job also
 verifies explicit stop and empty runtime state. The fixture has no network or
 host file mounts.
 
+#### Offline predecessor image verdict
+
+Record **offline image liveness, identity and teardown verified** in the private
+release task record when the verified predecessor image runs without network
+access or a Discord token, `/health` and `/version` return 200, and the observed
+build stamps match the verified bundle. Expect `/readyz` to return 503 with the
+gateway and database parked. Confirm a clean exit and that the probe
+container and disposable extracted files were removed before recording the
+verdict. Keep receipt values and local paths in the private record.
+
+Keep protected staging admission pending. The protected caller still needs
+the exact archived Worker modules and image digest on a disposable Worker and
+Container app with private ingress from first create. Verify the app's effective
+synthetic database binding, ledger and schema for `0473/0465` and retained
+`0475/0465` in separate reservations.
+Full readiness also needs isolated gateway and REST fixtures with external
+Discord egress denied. Require proof that the stop fence is armed before
+startup, enforces the original expiry after runner loss, and blocks delayed
+creates and legacy keepalives. The independent stop caller must be able to
+stop the exact target and obtain settlement and stopped readback.
+Use the existing [disposable exact PRE rehearsal](#disposable-exact-pre-rehearsal)
+for protected admission and cleanup.
+
 #### Disposable exact PRE rehearsal
 
 Keep qualification pending until a protected caller can enforce private
@@ -120,6 +143,35 @@ offline configuration and validates cleanup evidence.
    (for example `pre-fixture-test`), rehearsal run ID, original start time, and
    PRE shape (`0473/0465` or retained `0475/0465`). Pin the approved synthetic
    database and gateway fixture to that reservation.
+   Before protected start, reconstruct the start inputs locally from those
+   pins. Pass the private ZIP and saved, authenticated GitHub records to
+   [`verify_predecessor_bundle`](../scripts/predecessor_bundle.py). Use the
+   returned receipt and private material from that same ZIP. Build the approved
+   `Target` from the reservation and use `make_config` with the operator's
+   selected scope, rehearsal run, original start and shape to reconstruct the
+   proposed config. Supply the selected synthetic service as `synthetic_service`.
+   Pass the approved target, independently pinned producer run,
+   current time, verified receipt, material directory and proposed config to
+   [`admit_predecessor`](../scripts/predecessor_intake.py). A shared staging or
+   production environment, a different synthetic binding, or an expired
+   reservation stops preparation. Pass the returned config to
+   [`assemble_worker_upload`](../scripts/pre_worker_upload.py) with the same
+   target, time and material. Keep the upload paired with that `Target` for
+   [`ProtectedPre.start`](../scripts/pre_start_stop.py), which performs its own
+   live admission.
+
+   With the inputs already local, these preparation steps need no cloud
+   credentials. Run the same sequence against synthetic inputs from the repo
+   root with an empty environment. Use the absolute path to an installed
+   Python 3.11 or newer. This example resolves Python 3.12 before clearing
+   the environment.
+
+   ```sh
+   pre_python=$(command -v python3.12) &&
+     env -i PYTHONDONTWRITEBYTECODE=1 "$pre_python" -m unittest discover \
+       -s scripts/ci -p test_pre_operator_inputs.py -v
+   ```
+
 2. Admit one rehearsal at a time on its own Worker, Container app and synthetic
    database. Keep ingress private from first create, with no shared staging app,
    production routes, public preview, or access to shared writers. Arm the
@@ -142,11 +194,64 @@ offline configuration and validates cleanup evidence.
    both counts proved zero. Workflow status and resource disappearance alone
    leave stop unverified. See the [cleanup fixtures](../scripts/ci/test_pre_target.py).
 
+The [dormant Container lookup](../scripts/pre_container_lookup.py) checks the
+exact Get Application path, staging account, pinned app UUID and full PRE
+reservation. A 404 counts only when the authenticated reader can attribute it
+to the application handler's documented not-found result independently of the
+provider's generic error envelope. Cleanup still requires separate evidence of
+instance counts and startup settlement. [Get Application schema](https://github.com/cloudflare/api-schemas/blob/9a5e4d44bd74d90fa9e4822142b8eb67e4ba3c70/openapi.json)
+
 The [dormant sweep workflow](https://github.com/TogetherWeOwn/two-bot-next/blob/b3e6030f0493683efd94413aacdd04379e45b2fb/.github/workflows/staging-pre-reaper.yml)
 is intended as a scheduled cleanup fallback. Scheduled runs can arrive late
 or be dropped. The staging release operator owns an unverified stop or cleanup
 as a staging incident. Keep admission closed and qualification pending,
 reconcile the exact reservation, and repeat cleanup with fresh inventory until
+verification passes.
+
+##### Startup refusal handoff
+
+This handoff describes the dormant PRE contract. Keep rehearsal admission and
+qualification pending until the protected workflow caller and provider adapter
+are available under the existing gates. If protected stop is unavailable for
+an existing reservation, record cleanup as unresolved in the private release
+task record and track it as a staging incident with the staging release operator.
+
+When the protected caller refuses startup or loses the create reply, keep
+qualification pending. In the private release task record, retain the rehearsal
+run and attempt, pinned predecessor artifact, full reservation (scope, run ID,
+original start and PRE shape), original expiry, and start ID if confirmed.
+Record the bounded refusal code if available and the last confirmed step, and
+link the protected run and relevant jobs or receipts. Preserve independent
+provider or runtime observations for that same reservation and start ID if
+issued. Mark missing evidence and any unverified effects as unresolved. Keep
+raw provider responses and credentials out of the record.
+
+| Refusal evidence | Release decision to record |
+| --- | --- |
+| The source stamped on the currently serving Worker contains Cutover 0480 and the proposed rollback target source lacks it. | Ordinary rollback refuses the source pair even if the database has returned to PRE. Once the protected caller and qualified predecessor are available under the existing release gate, use the protected database classification. Confirmed expanded POST requires an authenticated guarded inverse before takeover. Confirmed original PRE follows the protected PRE path. [Protected recovery paths](production-deploy.md#recovery-after-the-protected-workflow-ships) |
+| The pinned Worker and image lack independently verified exact takeover bound to this reservation. | Record that no compatible predecessor has been proved. Keep the release held and preserve any existing fence. Recovering the PRE schema leaves this decision open until the exact pair and its reservation-bound takeover are proved. [Predecessor identity and ledger checks](production-deploy.md#attendance-predecessor-identity-at-both-pre-endpoints) |
+
+Record both findings if both apply. A protected return requires a qualified
+predecessor and the existing approvals and evidence for the classified path.
+
+The staging release operator keeps custody of that reservation through cleanup.
+When protected stop is available, use it for the same reservation, including
+when startup was refused before admission. If the start runner is gone or loses
+authority, the separately authorized stop caller handles fencing, close and
+settlement.
+Retain the independent post-close proof that pending starts have drained or
+cannot take effect and that recreation and restart are fenced. Keep the
+reservation closed to startup. [Startup and stop contract](../scripts/pre_start_stop.py) ·
+[Settlement evidence](../scripts/pre_admission.py).
+
+Record the cleanup outcome in the same private release task record. Link the
+fresh exact-target readback from step 4 and the direct zero-count proof for the
+pinned app ID or affirmative proof the app was never created. If a registry
+reference was reserved, link its
+[separate disposition](production-deploy.md#check-the-shared-rollback-sha).
+Record verified absence only where the evidence proves it. If proof is missing,
+record the unresolved step and last confirmed observation there and track the
+open cleanup as a staging incident under the same operator until fresh
 verification passes.
 
 ### Trusted client and receipt contract (partial wiring, not activated)

@@ -154,6 +154,15 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          # Keep the passive probe and alert imports scoped to this job.
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/build_identity.py
+            /scripts/incident_issue.py
+            /scripts/prod_passive_probe.py
+            /scripts/script_intake.py
+            /scripts/synthetic_alert.py
+            /scripts/synthetic_alert_history.py
       - name: Run the passive production probe
         id: probe
         if: vars.PRODUCTION_WORKER_URL != ''

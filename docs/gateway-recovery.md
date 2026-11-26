@@ -153,6 +153,13 @@ The window bounds are UTC seconds ending in `Z`, matching the readback's
 built from the same commit, the release watch must establish which image served
 throughout the supplied window before those logs can be attributed to it.
 
+Successful `passive_gateway_summary.v1` output retains the verified capture
+`window.start` and `window.end`, the source SHA, the verdict and signal counts.
+The bounds use the packet's millisecond format with a zero fraction. Keep the
+independent application and serving-image readback with the handoff. The
+summary carries no application or image identity, and matching bounds cannot
+distinguish different images that share the same revision and bounds.
+
 `ready` records a committed READY after IDENTIFY. `gateway_resumed` records a
 committed RESUMED that published readiness. These are historical gateway
 readiness observations. `gateway_connecting.resume` records the planned boot

@@ -16,6 +16,42 @@ from production_recovery_takeover import RecoveryPin
 from staging_rollout import GateError
 
 
+def artifact_archive(run, artifact, artifact_id, document, archive_name=None):
+    archive = BytesIO()
+    with ZipFile(archive, "w") as bundle:
+        bundle.writestr(archive_name or f"{artifact}.json",
+                        document if isinstance(document, str) else json.dumps(document))
+    raw = archive.getvalue()
+    digest = sha256(raw).hexdigest()
+    entry = {"id": artifact_id, "name": f"{artifact}-{run['id']}-1", "digest": f"sha256:{digest}",
+             "expired": False, "size_in_bytes": len(raw)}
+    meta = {**entry, "workflow_run": {"id": run["id"], "repository_id": artifacts.REPO_ID,
+                                     "head_repository_id": artifacts.REPO_ID, "head_branch": "main",
+                                     "head_sha": run["head_sha"]}}
+    path = f"actions/artifacts/{artifact_id}"
+    return digest, entry, {path: meta, f"{path}/zip": raw}
+
+
+def release_run_fixture():
+    repo = {"full_name": artifacts.REPO, "id": artifacts.REPO_ID}
+    run = {"id": 123, "head_sha": "d" * 40, "head_branch": "main", "run_attempt": 1,
+           "status": "in_progress", "event": "workflow_dispatch", "path": artifacts.WORKFLOW,
+           "repository": repo, "head_repository": repo, "actor": {"id": 42}, "triggering_actor": {"id": 42}}
+    env = {"GITHUB_RUN_ID": "123", "GITHUB_SHA": "d" * 40, "GITHUB_WORKFLOW_SHA": "d" * 40,
+           "GITHUB_REPOSITORY": artifacts.REPO, "GITHUB_REPOSITORY_ID": str(artifacts.REPO_ID),
+           "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_ACTOR_ID": "42",
+           "GITHUB_REF": "refs/heads/main", "GITHUB_REF_PROTECTED": "true",
+           "GITHUB_WORKFLOW_REF": f"{artifacts.REPO}/{artifacts.WORKFLOW}@refs/heads/main"}
+    return env, run
+
+
+def producer(run, name, steps):
+    return {"name": name, "run_id": run["id"], "run_attempt": run["run_attempt"], "head_sha": run["head_sha"],
+            "status": "completed", "conclusion": "success", "steps": [
+                {"name": step, "status": "completed", "conclusion": "success"} for step in steps
+            ]}
+
+
 class RecoveryArtifactTests(unittest.TestCase):
     def setUp(self):
         self.pin = RecoveryPin("123", 1, "a" * 40, "b" * 40, "1" * 8 + "-1111" * 3 + "-" + "1" * 12,
@@ -24,40 +60,17 @@ class RecoveryArtifactTests(unittest.TestCase):
         self.result = {"state": "restored", **asdict(self.pin)}
         self.approval = {"plan_run_id": "121"}
 
-    def producer(self, name, steps):
-        return {"name": name, "run_id": 123, "run_attempt": 1, "head_sha": "d" * 40,
-                "status": "completed", "conclusion": "success", "steps": [
-                    {"name": step, "status": "completed", "conclusion": "success"} for step in steps
-                ]}
-
     def artifact_fixture(self, document=None, archive_name=None):
         document = document if document is not None else {"operation": "undo-0480", "approval": self.approval,
                                                           "result": self.result}
-        archive_name = archive_name or artifacts.ARTIFACT + ".json"
+        env, run = release_run_fixture()
         root = "actions/runs/123"
-        repo = {"full_name": artifacts.REPO, "id": artifacts.REPO_ID}
-        run = {"id": 123, "head_sha": "d" * 40, "head_branch": "main", "run_attempt": 1,
-               "status": "in_progress", "event": "workflow_dispatch", "path": artifacts.WORKFLOW,
-               "repository": repo, "head_repository": repo, "actor": {"id": 42}, "triggering_actor": {"id": 42}}
-        env = {"GITHUB_RUN_ID": "123", "GITHUB_SHA": "d" * 40, "GITHUB_WORKFLOW_SHA": "d" * 40,
-               "GITHUB_REPOSITORY": artifacts.REPO, "GITHUB_REPOSITORY_ID": str(artifacts.REPO_ID),
-               "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_ACTOR_ID": "42",
-               "GITHUB_REF": "refs/heads/main", "GITHUB_REF_PROTECTED": "true",
-               "GITHUB_WORKFLOW_REF": f"{artifacts.REPO}/{artifacts.WORKFLOW}@refs/heads/main"}
-        archive = BytesIO()
-        with ZipFile(archive, "w") as bundle:
-            bundle.writestr(archive_name, document if isinstance(document, str) else json.dumps(document))
-        raw = archive.getvalue()
-        digest = sha256(raw).hexdigest()
-        entry = {"id": 987, "name": f"{artifacts.ARTIFACT}-123-1", "digest": f"sha256:{digest}",
-                 "expired": False, "size_in_bytes": len(raw)}
-        meta = {**entry, "workflow_run": {"id": 123, "repository_id": artifacts.REPO_ID,
-                                         "head_repository_id": artifacts.REPO_ID, "head_branch": "main", "head_sha": "d" * 40}}
+        digest, entry, archive_routes = artifact_archive(run, artifacts.ARTIFACT, 987, document, archive_name)
         return env, digest, {root: run,
                              root + "/attempts/1/jobs?per_page=30": {"total_count": 1, "jobs": [
-                                 self.producer(artifacts.JOB, (artifacts.WRITE_STEP, artifacts.UPLOAD_STEP))]},
+                                 producer(run, artifacts.JOB, (artifacts.WRITE_STEP, artifacts.UPLOAD_STEP))]},
                              root + "/artifacts?per_page=30": {"total_count": 1, "artifacts": [entry]},
-                             "actions/artifacts/987": meta, "actions/artifacts/987/zip": raw}
+                             **archive_routes}
 
     def authenticated(self, env, digest, routes):
         return artifacts.authenticated_inverse(self.pin, self.approval, "987", digest, env,
