@@ -625,9 +625,20 @@ jobs:
     # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
-    # The org switch selects Boat within the prepaid reserve.
-    # Fork pull_request events always use GitHub-hosted runners.
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_HEAVY_RUNNER || 'ubuntu-latest' }}
+    # Boat's public-repo allowlist checks both actors. Use only the prepaid label
+    # on first-attempt PRs from this repo and protected pushes to main.
+    runs-on: >-
+      ${{ github.repository == 'TogetherWeOwn/two-bot-next'
+      && toJSON(github.event.repository.private) == 'false'
+      && github.run_attempt == '1'
+      && (github.actor == 'Rick7C2' || github.actor == 'togetherweown[bot]')
+      && (github.triggering_actor == 'Rick7C2' || github.triggering_actor == 'togetherweown[bot]')
+      && ((github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.base.ref == 'main')
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && toJSON(github.ref_protected) == 'true'))
+      && vars.CI_HEAVY_RUNNER == 'boat' && 'boat' || 'ubuntu-latest' }}
     # Suite-only since the HARD patch-coverage measurement split out of this
     # lane: the combined job outgrew 60 minutes (59m54s on main, one 60m07s
     # mid-measurement kill), while the replay alone measured ~30 min of a

@@ -1,18 +1,18 @@
 """Pin explicit standard GitHub-hosted runners in this public repository.
 
-Every ordinary job selects ubuntu-latest directly: no dormant private,
-self-hosted or overflow route. A private conversion requires fresh runner and
-cost qualification before execution. Offline and stdlib-only: no GitHub
-credentials, no PyYAML. Visibility is verified separately before execution.
+Ordinary jobs select ubuntu-latest directly, with one prepaid Boat exception
+for check.yml's rust-tests. A private conversion requires fresh runner and
+cost qualification before execution. This check uses only the standard library.
 """
 
 from pathlib import Path
 import re
 import unittest
 
+from ci.runner_policy import PUBLIC_RUNNER, expected_runner
+
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github/workflows"
-PUBLIC_RUNNER = "ubuntu-latest"
 # Negative fixture: the former public-first branch still collected private
 # self-hosted/overflow routing in source, even when it was never selected.
 LEGACY_ROUTED = (
@@ -57,8 +57,14 @@ def violations(text, workflow_name=None):
             if "runs-on" in keys:
                 problems.append(f"{job}: reusable call must not set runs-on")
             continue
-        if keys.get("runs-on") != PUBLIC_RUNNER:
-            problems.append(f"{job}: runs-on is {keys.get('runs-on')!r}, not {PUBLIC_RUNNER}")
+        expected = expected_runner(workflow_name, job)
+        actual = keys.get("runs-on")
+        if actual == ">-" and expected != PUBLIC_RUNNER:
+            folded = re.search(r"(?m)^    runs-on: >-\n((?:^      \S[^\n]*\n)+)", "\n".join(lines) + "\n")
+            if folded:
+                actual = " ".join(line[6:] for line in folded[1].splitlines())
+        if actual != expected:
+            problems.append(f"{job}: runs-on is {actual!r}, expected {expected!r}")
     # Catch a runs-on hidden anywhere else (nested, flow style, odd indent).
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
     expected = sum(1 for lines in jobs(text).values()

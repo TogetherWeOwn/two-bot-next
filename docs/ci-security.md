@@ -610,24 +610,21 @@ are preserved until those callers migrate.
 
 Ordinary jobs select `runs-on: ubuntu-latest` explicitly, including the local
 reusable nextest and SBOM jobs. The sole exception is `check.yml` job
-`rust-tests` (`rust tests`). It uses the organization variable `CI_HEAVY_RUNNER`
-for same-repository PRs and the workflow's existing non-PR events. The prepaid
-reserve switch sets the variable to `boat` while starts fit the allowance and
-`ubuntu-latest` otherwise. An unset variable also selects `ubuntu-latest`.
-Fork `pull_request` events always select `ubuntu-latest`. The workflow policy
-test pins the exact expression and the event set. External pinned reusable
-workflows use their own runner policy.
+`rust-tests` (`rust tests`). Boat is eligible on the first attempt of a
+same-repository PR targeting `main` or a push to protected `main`, with the
+repository explicitly public. Both the original and triggering actors must
+match Boat's allowlist of `Rick7C2` and `togetherweown[bot]`. The prepaid
+reserve switch selects `boat` while starts fit the allowance. The job accepts
+only that label from `CI_HEAVY_RUNNER` and falls back to `ubuntu-latest` for
+any other value, including an unset variable.
 
-Boat requires both the run actor and the triggering actor to be on the public
-repository allowlist. The configured actors are `Rick7C2` and the
-`togetherweown[bot]` App. An off-list actor or a plan limit can prevent a job
-already assigned to Boat from running. The reserve switch applies to new runs.
-
-The `merge_group` trigger remains defined. Main currently has no active merge
-queue. A group would select the org variable and present a synthetic commit
-without the source repository of each included PR. Qualify the group trust and
-actor boundary before enabling a queue with the Boat route active. The policy
-test also rejects adding `pull_request_target` to this workflow.
+Fork PRs, Dependabot, off-list or missing actors, reruns, queue groups,
+schedules, and manual dispatches use `ubuntu-latest`. GitHub retains the
+original actor on a rerun and may report a different triggering actor.
+Reruns use the hosted route even when both actors are allowlisted. The workflow
+tests pin the job's expression and event set. External pinned reusable workflows
+use their own runner policy. A plan limit can still delay or refuse a job that
+has already been assigned to Boat before the reserve switch changes.
 
 This contract is for a **public repository**. GitHub's
 [standard runner specification](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories)
@@ -645,7 +642,9 @@ a fresh Linux VM for each job and deletes it when the job ends. It supports job
 and service containers, cache and artifact actions. The `boat` label selects
 4 vCPU, 8 GB RAM and 4 GB swap. The `rust-tests` job keeps its existing pinned
 images, service limits, disk guard and 45-minute timeout. `ci-ok` waits for the
-job and requires success whenever the Rust selector selects it.
+job and requires success whenever the Rust selector selects it. Only pushes
+to `main` can save the existing shared GitHub Actions cache. Eligible Boat jobs
+on that push path share the cache trust boundary with GitHub-hosted consumers.
 
 GitHub's [service-container contract](https://docs.github.com/en/actions/concepts/use-cases/about-service-containers)
 supports Linux job/service containers on hosted Ubuntu. Container jobs reach
