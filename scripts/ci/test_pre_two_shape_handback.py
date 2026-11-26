@@ -34,6 +34,7 @@ class ShapeFixture:
         self.publication_settled = True
 
         app = Resource(target.container_name, app_id)
+        self.app_id = app_id
         self.route = ProtectedRouteReadback(target, target.worker_name, app)
         self.read_ingress = Mock(side_effect=lambda _, *, request: IngressReadback(self.route, False, request))
         worker = Resource(target.worker_name, target.worker_name)
@@ -79,7 +80,7 @@ class ShapeFixture:
             )
         return accept(self.registry, SAMPLE_BUILD, **self.endpoint,
                       sweep=SweepEvidence(self.target, outcome), registry=registry,
-                      pinned_route=self.route, pinned_app_id=self.route.app.id,
+                      pinned_route=self.route, pinned_app_id=self.app_id,
                       read_ingress=self.read_ingress)
 
 
@@ -193,3 +194,11 @@ class PreTwoShapeHandbackTests(unittest.TestCase):
         with self.assertRaisesRegex(TargetError, "^pre_retained_reservation_not_independent$"):
             self.advance()
         self.assertEqual(self.effects.mock_calls, [call.reserve()])
+
+    def test_route_must_match_independently_pinned_app(self):
+        first = self.first
+        first.route = replace(first.route, app=replace(first.route.app,
+                                                       id="12345678-1234-4234-8234-123456789def"))
+        with self.assertRaisesRegex(ProofError, "^pre_ingress_unproved$"):
+            self.advance()
+        self.assertEqual(self.effects.mock_calls, [])
