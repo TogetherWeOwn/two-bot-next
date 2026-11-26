@@ -206,11 +206,12 @@ class T0AcceptanceReportTests(unittest.TestCase):
         })
 
         invalid_order = ("unverified", "saved probe output is invalid or refused")
+        outside_window = ("mismatched", "production watch row falls outside the serving window")
         for first, second, rejection in (
             (late, early, invalid_order),
             (early, "2026-11-25T02:02:00.123456700-00:00", invalid_order),
-            (early, "2026-11-25T02:02:00.123456702Z",
-             ("mismatched", "production watch row falls outside the serving window")),
+            ("2026-11-25T02:02:00.123456699Z", late, outside_window),
+            (early, "2026-11-25T02:02:00.123456702Z", outside_window),
         ):
             with self.subTest(first=first, second=second):
                 refused = assemble(first, second)
