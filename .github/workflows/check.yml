@@ -94,11 +94,8 @@ jobs:
     needs: [job-inputs]
     # Failed, skipped or cancelled dependencies must not make check appear green.
     if: ${{ always() }}
-    # Runner routing: every job uses the explicit standard GitHub-hosted
-    # `runs-on: ubuntu-latest`. This is a public repository, so the
-    # GitHub-hosted Ubuntu runner is free and the org self-hosted runner
-    # group is not used. A private conversion needs fresh runner/cost
-    # qualification before execution; see docs/ci-security.md.
+    # Standard GitHub-hosted Ubuntu is the default for this public repository.
+    # See docs/ci-security.md for the guarded runner routes.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
@@ -163,9 +160,11 @@ jobs:
           SEL_PARITY: ${{ needs.job-inputs.outputs.parity }}
           SEL_SUPPLY: ${{ needs.job-inputs.outputs.supply }}
           SEL_DOCS: ${{ needs.job-inputs.outputs.docs }}
+          SEL_MIGRATIONS: ${{ needs.job-inputs.outputs.migrations }}
+          SEL_WORKFLOW_FIXTURES: ${{ needs.job-inputs.outputs.workflow-fixtures }}
         run: |
-          printf 'job-inputs: rust=%s worker=%s parity=%s supply=%s docs=%s\n' \
-            "$SEL_RUST" "$SEL_WORKER" "$SEL_PARITY" "$SEL_SUPPLY" "$SEL_DOCS"
+          printf 'job-inputs: rust=%s worker=%s parity=%s supply=%s docs=%s migrations=%s workflow-fixtures=%s\n' \
+            "$SEL_RUST" "$SEL_WORKER" "$SEL_PARITY" "$SEL_SUPPLY" "$SEL_DOCS" "$SEL_MIGRATIONS" "$SEL_WORKFLOW_FIXTURES"
 
       # The database jobs skip when `job inputs changed` fails (they are not
       # required checks); `worker check` always runs and fails closed on a
@@ -174,23 +173,6 @@ jobs:
       - name: require job inputs selection to pass
         if: needs.job-inputs.result != 'success'
         run: exit 1
-
-      - name: Check migration numbering and immutability
-        env:
-          MIGRATION_BASE: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
-        run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
-          python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
-
-      # Squawk-subset migration lint (required, docs/quality-gates.md): in
-      # --strict mode four rules fail the PR; dropping-object stays advisory
-      # because coordinated removals still require a final DROP. Broken tooling
-      # still fails so blindness cannot hide.
-      - name: Squawk migration lint (required)
-        env:
-          SQUAWK_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
-        run: |
-          python3 scripts/ci/check-squawk-migrations.py --base-ref "$SQUAWK_BASE" --strict
 
       # Finish the pinned toolchain before the first pip run. The image ships
       # the pinned Rust version without rustfmt or clippy, and rust-toolchain.toml
@@ -233,7 +215,29 @@ jobs:
           node-version: 22
 
       - name: Source-level CI gate regressions
+        if: needs.job-inputs.outputs.workflow-fixtures != 'false'
         run: PYTHONPATH="$RUNNER_TEMP/zizmor" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+
+      - name: Source-level CI gate regressions (prose changes)
+        if: needs.job-inputs.outputs.workflow-fixtures == 'false'
+        run: |
+          export PYTHONPATH="$RUNNER_TEMP/zizmor" PYTHONDONTWRITEBYTECODE=1
+          python3 - <<'PY'
+          import unittest
+
+          class DocsLoader(unittest.TestLoader):
+              def loadTestsFromModule(self, module, *, pattern=None):
+                  if module.__name__ == "test_workflows":
+                      return self.suiteClass()
+                  return super().loadTestsFromModule(module, pattern=pattern)
+
+          loader = DocsLoader()
+          suite = loader.discover("scripts/ci", pattern="test_*.py")
+          if not suite.countTestCases():
+              raise SystemExit("No source-level CI tests discovered")
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() and not loader.errors else 1)
+          PY
 
       - name: Ratchet Python script intake (HARD)
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
@@ -627,8 +631,18 @@ jobs:
     # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
-    # Runner routing: see the note on `check`.
-    runs-on: ubuntu-latest
+    # Boat's public-repo allowlist checks both actors. Keep the shared main
+    # cache writer on GitHub-hosted runners by using Boat only on eligible PRs.
+    runs-on: >-
+      ${{ github.repository == 'TogetherWeOwn/two-bot-next'
+      && toJSON(github.event.repository.private) == 'false'
+      && github.run_attempt == '1'
+      && (github.actor == 'Rick7C2' || github.actor == 'togetherweown[bot]')
+      && (github.triggering_actor == 'Rick7C2' || github.triggering_actor == 'togetherweown[bot]')
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.base.ref == 'main'
+      && vars.CI_HEAVY_RUNNER == 'boat' && vars.CI_HEAVY_RUNNER || 'ubuntu-latest' }}
     # Suite-only since the HARD patch-coverage measurement split out of this
     # lane: the combined job outgrew 60 minutes (59m54s on main, one 60m07s
     # mid-measurement kill), while the replay alone measured ~30 min of a
@@ -1837,8 +1851,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # The HARD gate diffs base/head blobs.
-          fetch-depth: 0
+          # PR coverage compares the event merge commit with its first parent.
+          # Other events can diff against an earlier SHA or origin/main.
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
 
       - name: Download shard coverage reports
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -2394,8 +2409,11 @@ jobs:
     # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
-    # Runner routing: see the note on `check`.
-    runs-on: ubuntu-latest
+    # Fork PRs stay on GitHub. The budget variable can enable only the 2-vCPU route.
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     # The serial gateway suites can exceed 30 minutes on PRs; retain a hard cap.
     timeout-minutes: 60
     # Keep database isolation inside the job container network namespace:
@@ -3041,58 +3059,78 @@ jobs:
       supply: ${{ steps.select.outputs.supply }}
       docs: ${{ steps.select.outputs.docs }}
       voice: ${{ steps.select.outputs.voice }}
-      db-compat: ${{ steps.db-compat.outputs.selected }}
+      db-compat: ${{ steps.select.outputs.db-compat }}
+      migrations: ${{ steps.select.outputs.migrations }}
+      workflow-fixtures: ${{ steps.select.outputs.workflow-fixtures }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The base/head SHAs must resolve locally for the diff below.
           fetch-depth: 0
           persist-credentials: false
-      - name: Offline job-inputs regressions
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_job_inputs.py' -v
       - name: Select jobs or run all
         id: select
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          rust=true worker=true parity=true supply=true docs=false voice=true
-          if [ "$EVENT_NAME" = "pull_request" ] \
-            && [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ] \
-            && result=$(python3 scripts/job-inputs.py \
-              --base-ref "$BASE_SHA" --head-ref "$HEAD_SHA"); then
-            rust=$(printf '%s' "$result" | sed -n 's/^rust=//p')
-            worker=$(printf '%s' "$result" | sed -n 's/^worker=//p')
-            parity=$(printf '%s' "$result" | sed -n 's/^parity=//p')
-            supply=$(printf '%s' "$result" | sed -n 's/^supply=//p')
-            docs=$(printf '%s' "$result" | sed -n 's/^docs=//p')
-            voice=$(printf '%s' "$result" | sed -n 's/^voice=//p')
-            rust=${rust:-true} worker=${worker:-true} parity=${parity:-true}
-            supply=${supply:-true} docs=${docs:-false} voice=${voice:-true}
-          fi
-          printf 'job-inputs: rust=%s worker=%s parity=%s supply=%s docs=%s voice=%s (event=%s)\n' \
-            "$rust" "$worker" "$parity" "$supply" "$docs" "$voice" "$EVENT_NAME"
-          printf 'rust=%s\nworker=%s\nparity=%s\nsupply=%s\ndocs=%s\nvoice=%s\n' \
-            "$rust" "$worker" "$parity" "$supply" "$docs" "$voice" >>"$GITHUB_OUTPUT"
 
-      - name: Select PR database compatibility
-        id: db-compat
-        env:
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          selected=false
-          if [[ $GITHUB_EVENT_NAME == pull_request ]]; then
-            [[ $PR_BASE_SHA =~ ^[0-9a-f]{40}$ && $PR_HEAD_SHA =~ ^[0-9a-f]{40}$ ]]
-            prior=$(git merge-base --all "$PR_BASE_SHA" "$PR_HEAD_SHA")
-            [[ $prior =~ ^[0-9a-f]{40}$ ]]
-            selected=$(python3 scripts/job-inputs.py --base-ref "$prior" --head-ref "$PR_HEAD_SHA" --job db-compat)
-            [[ $selected == true || $selected == false ]]
+          valid_selection() {
+            local key row
+            for key in rust worker parity supply docs voice db-compat migrations workflow-fixtures; do
+              IFS= read -r row || return 1
+              [[ "$row" == "$key=true" || "$row" == "$key=false" ]] || return 1
+            done
+            ! IFS= read -r row
+          }
+
+          db_compat=false
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            db_compat=true
           fi
-          printf 'selected=%s\n' "$selected" >> "$GITHUB_OUTPUT"
+          result=$(printf '%s\n' rust=true worker=true parity=true supply=true docs=false voice=true \
+            "db-compat=$db_compat" migrations=true workflow-fixtures=true)
+          # Only the immutable event base may grant a skip. An older policy,
+          # missing history, or invalid output defaults the whole plan to full.
+          if [[ "$EVENT_NAME" == pull_request && "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            selector=$(mktemp "$RUNNER_TEMP/job-inputs.XXXXXXXX")
+            trap 'rm -- "$selector"' EXIT
+            if git show "$BASE_SHA:scripts/job-inputs.py" > "$selector" \
+              && plan=$(python3 -I "$selector" --root "$GITHUB_WORKSPACE" \
+                --base-ref "$BASE_SHA" --head-ref "$HEAD_SHA" --merge-ref "$MERGE_SHA") \
+              && valid_selection <<< "$plan"; then
+              result="$plan"
+            else
+              echo "job-inputs: using the full plan because the base selector could not verify this comparison"
+            fi
+          fi
+          printf 'job-inputs (event=%s):\n%s\n' "$EVENT_NAME" "$result"
+          printf '%s\n' "$result" >> "$GITHUB_OUTPUT"
+
+      - name: Offline job-inputs regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_job_inputs.py' -v
+
+      - name: Check migration numbering and immutability
+        if: steps.select.outputs.migrations != 'false'
+        env:
+          MIGRATION_BASE: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
+          python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
+
+      # Squawk-subset migration lint (required, docs/quality-gates.md): in
+      # --strict mode four rules fail the PR; dropping-object stays advisory
+      # because coordinated removals still require a final DROP. Broken tooling
+      # still fails so blindness cannot hide.
+      - name: Squawk migration lint (required)
+        if: steps.select.outputs.migrations != 'false'
+        env:
+          SQUAWK_BASE: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+        run: |
+          python3 scripts/ci/check-squawk-migrations.py --base-ref "$SQUAWK_BASE" --strict
 
   db-compatibility:
     name: prior revision database compatibility
@@ -3119,7 +3157,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install disposable database client
@@ -3943,18 +3981,14 @@ jobs:
           NEXTEST_RESULT: ${{ needs.nextest.result }}
           DB_COMPAT_RESULT: ${{ needs.db-compatibility.result }}
           DB_COMPAT_SELECTED: ${{ needs.job-inputs.outputs.db-compat }}
+          MIGRATIONS_SELECTED: ${{ needs.job-inputs.outputs.migrations }}
+          WORKFLOW_FIXTURES_SELECTED: ${{ needs.job-inputs.outputs.workflow-fixtures }}
         run: |
           python3 - <<'PY'
           import os
           import sys
 
           failures = []
-
-          def selected(name):
-              # The selector shell defaults undecidable diffs to true and the
-              # outputs fall back to true, so a missing output with a
-              # successful selector is treated as selected (fail-closed).
-              return os.environ.get(name, "") != "false"
 
           if os.environ.get("JOB_INPUTS_RESULT") != "success":
               failures.append(
@@ -3963,7 +3997,6 @@ jobs:
                   "refusing to trust skips")
           else:
               gated = [
-                  ("worker", "WORKER_RESULT", "WORKER_SELECTED"),
                   ("parity-docs", "PARITY_DOCS_RESULT", "PARITY_SELECTED"),
                   ("supply-chain", "SUPPLY_CHAIN_RESULT", "SUPPLY_SELECTED"),
                   ("self-role-store", "SELF_ROLE_RESULT", "RUST_SELECTED"),
@@ -3981,14 +4014,19 @@ jobs:
                   ("nextest", "NEXTEST_RESULT", "RUST_SELECTED"),
                   ("db-compatibility", "DB_COMPAT_RESULT", "DB_COMPAT_SELECTED"),
               ]
+              selector_vars = {sel_var for _, _, sel_var in gated}
+              selector_vars.update({"MIGRATIONS_SELECTED", "WORKER_SELECTED", "WORKFLOW_FIXTURES_SELECTED"})
+              for var in sorted(selector_vars):
+                  if os.environ.get(var) not in {"true", "false"}:
+                      failures.append(f"{var}: missing or invalid job-inputs output")
               for job, result_var, sel_var in gated:
                   result = os.environ.get(result_var, "")
-                  if result == "success":
+                  selected = os.environ.get(sel_var)
+                  if result == "success" or (result == "skipped" and selected == "false"):
                       continue
-                  if result == "skipped" and not selected(sel_var):
-                      continue
-                  failures.append(f"{job}: result={result!r} selected={selected(sel_var)}")
+                  failures.append(f"{job}: result={result!r} selected={selected!r}")
               for job, var in (("check", "CHECK_RESULT"),
+                               ("worker", "WORKER_RESULT"),
                                ("container-inputs", "CONTAINER_INPUTS_RESULT")):
                   result = os.environ.get(var, "")
                   if result != "success":
