@@ -19,6 +19,8 @@ import unittest
 
 import yaml
 
+from runner_policy import PR_GATE_RUNNER
+
 ROOT = Path(__file__).resolve().parents[2]
 REQUIRED = {"ci-ok", "gitleaks", "pr-lint"}
 TRIGGER_FILTERS = {"paths", "paths-ignore", "branches", "branches-ignore"}
@@ -83,7 +85,7 @@ class RequiredChecksReportTests(unittest.TestCase):
             self.assertIn(job, agg["needs"], job)
         # Advisory image smoke remains off the image-build critical path.
         self.assertNotIn("container", agg["needs"])
-        self.assertEqual(agg["runs-on"], "ubuntu-latest")
+        self.assertEqual(agg["runs-on"], PR_GATE_RUNNER)
         body = "\n".join(step.get("run", "") for step in agg["steps"])
         for marker in ("JOB_INPUTS_RESULT", "CONTAINER_INPUTS_RESULT", "SUPPLY_CHAIN_RESULT",
                        "CHECK_RESULT", "WORKER_RESULT", "PARITY_DOCS_RESULT",
@@ -111,7 +113,7 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertEqual(job.get("permissions"), {"contents": "read"})
         self.assertIn("job-inputs", job.get("needs", []))
         self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
-        self.assertEqual(job.get("runs-on"), "ubuntu-latest")
+        self.assertEqual(job.get("runs-on"), PR_GATE_RUNNER)
         text = str(job)
         install = [step for step in job.get("steps", [])
                    if step.get("name") == "Install pinned cargo-fuzz"]
