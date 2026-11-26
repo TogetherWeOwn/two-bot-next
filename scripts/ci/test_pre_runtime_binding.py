@@ -129,7 +129,7 @@ class RuntimeBindingTests(unittest.TestCase):
         self.assertTrue(fixture.caller(Operation.STOP).stop())
 
     def test_post_read_recheck_refuses_stop_or_cutoff_and_preserves_cleanup(self):
-        for condition in ("stop", "cutoff", "stop after recheck"):
+        for condition in ("stop", "cutoff", "stop after recheck", "cutoff after recheck"):
             with self.subTest(condition=condition):
                 fixture = Fixture()
                 create_process = fixture.create_private
@@ -167,7 +167,10 @@ class RuntimeBindingTests(unittest.TestCase):
 
                     def effect(checked):
                         timeline.append("effect")
-                        stop()
+                        if condition == "stop after recheck":
+                            stop()
+                        else:
+                            fixture.now = target.expires_at
                         pinned = checked.deployment
                         return create_process(pinned.target, pinned.start_id, upload)
 
@@ -179,9 +182,12 @@ class RuntimeBindingTests(unittest.TestCase):
                     fixture.caller(Operation.START).start(Upload(fixture.target))
                 rechecked.assert_called_once()
                 self.assertEqual(rechecked.call_args.args[0].start_id, fixture.record.start_id)
-                if condition == "stop after recheck":
+                if condition.endswith("after recheck"):
                     launch.assert_called_once()
-                    self.assertEqual(timeline, ["read", "recheck", "effect", "stop"])
+                    expected = ["read", "recheck", "effect"]
+                    if condition == "stop after recheck":
+                        expected.append("stop")
+                    self.assertEqual(timeline, expected)
                 else:
                     launch.assert_not_called()
                     expected = ["read", "stop", "recheck"] if condition == "stop" else ["read", "recheck"]
