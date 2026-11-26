@@ -72,6 +72,16 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
+          # Keep the inventory entry point and its local Python imports together.
+          sparse-checkout: |
+            /scripts/build_identity.py
+            /scripts/ci/staging_migrate_claim.py
+            /scripts/rollback_proof.py
+            /scripts/script_intake.py
+            /scripts/staging_recovery_status.py
+            /scripts/staging_rollout.py
+            /scripts/worker_container_rollback.py
+          sparse-checkout-cone-mode: false
       - name: Verify protected dispatch and authenticate the supplied plan
         env:
           GH_TOKEN: ${{ github.token }}
