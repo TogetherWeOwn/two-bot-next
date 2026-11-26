@@ -44,6 +44,15 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          # Include the local imports of both the Node lifecycle and Python probe.
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/script_intake.py
+            /scripts/staging_mcp_proveout.py
+            /wrangler/scripts/is-direct-invocation.mjs
+            /wrangler/scripts/ownership-control-response.mjs
+            /wrangler/scripts/staging-use-pipeline.mjs
+            /wrangler/scripts/staging-use.mjs
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
