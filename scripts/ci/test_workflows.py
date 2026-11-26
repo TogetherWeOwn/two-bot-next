@@ -1253,7 +1253,18 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
                   "staging_health_contract_probe.py", "staging-use-user-flow.jsonl", "staging-use-user-flow"))
     steps = [{key: value for key, value in step.items() if key != "name"}
              for step in job.get("steps") or []]
-    if (len(steps) != 6 or steps[:2] != STAGING_TOOLING_STEPS
+    checkout, setup_node = STAGING_TOOLING_STEPS
+    scoped_checkout = {**checkout, "with": {
+        **checkout["with"],
+        "sparse-checkout": "/scripts/build_identity.py\n"
+                           "/scripts/script_intake.py\n"
+                           "/scripts/staging_health_contract_probe.py\n"
+                           "/wrangler/scripts/is-direct-invocation.mjs\n"
+                           "/wrangler/scripts/ownership-control-response.mjs\n"
+                           "/wrangler/scripts/staging-use.mjs\n",
+        "sparse-checkout-cone-mode": "false",
+    }}
+    if (len(steps) != 6 or steps[:2] != [scoped_checkout, setup_node]
             or steps[2].get("run") != "node wrangler/scripts/staging-use.mjs ready"
             or (steps[3].get("with") or {}).get("path") != "${{ runner.temp }}/staging-use-user-flow.jsonl"
             or steps[5] != {"if": "always()", "uses": STAGING_UPLOAD_USES,
@@ -8630,6 +8641,64 @@ class WorkflowTests(unittest.TestCase):
                 mutate(changed["deploy-staging.yml"])
                 self.assertTrue(user_flow_synthetic_errors(changed["deploy-staging.yml"]), label)
                 self.assertTrue(workflow_policy_errors(changed), label)
+
+    def test_user_flow_synthetic_pins_checkout_scope_and_provenance(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(user_flow_synthetic_errors(staging), [])
+        checkout = staging["jobs"]["user-flow-synthetic"]["steps"][0]["with"]
+        scope = checkout["sparse-checkout"].splitlines(keepends=True)
+        overrides = {
+            "extra path": {"sparse-checkout": checkout["sparse-checkout"] + "/scripts/\n"},
+            "cone mode": {"sparse-checkout-cone-mode": "true"},
+            "deployed SHA": {"ref": DEPLOY_SHA_EXPRESSION},
+            "other repository": {"repository": "fixture/other"},
+            "other directory": {"path": "other-checkout"},
+            "different filter": {"filter": "tree:0"},
+            "persisted credentials": {"persist-credentials": "true"},
+            "full history": {"fetch-depth": "0"},
+        }
+        for missing in scope:
+            overrides[f"missing {missing.strip()}"] = {
+                "sparse-checkout": "".join(path for path in scope if path != missing)}
+        variants = {label: {**checkout, **override} for label, override in overrides.items()}
+        variants["full checkout"] = STAGING_TOOLING_STEPS[0]["with"]
+        for label, options in variants.items():
+            with self.subTest(label=label):
+                changed = deepcopy(staging)
+                changed["jobs"]["user-flow-synthetic"]["steps"][0]["with"] = options
+                self.assertTrue(user_flow_synthetic_errors(changed))
+
+    def test_user_flow_synthetic_loads_both_probes_from_scoped_checkout(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(user_flow_synthetic_errors(staging), [])
+        checkout, _, ready, _, probe, _ = staging["jobs"]["user-flow-synthetic"]["steps"]
+        with tempfile.TemporaryDirectory() as directory:
+            runner_temp = Path(directory)
+            worktree = runner_temp / "checkout"
+            for pattern in checkout["with"]["sparse-checkout"].splitlines():
+                path = pattern.removeprefix("/")
+                target = worktree / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / path).read_bytes())
+            receipt = runner_temp / "staging-use-user-flow.jsonl"
+            env = {
+                "PATH": os.environ.get("PATH", os.defpath),
+                # An unparseable origin reaches both commands and cannot make an HTTP request.
+                "STAGING_WORKER_URL": "https://[",
+                "STAGING_USE_RECEIPT": str(receipt),
+                "RUNNER_TEMP": str(runner_temp),
+                "EXPECTED_SHA": "a" * 40,
+            }
+            node = subprocess.run(shlex.split(ready["run"]), cwd=worktree, env=env,
+                                  capture_output=True, text=True, timeout=5, check=False)
+            self.assertEqual((node.returncode, node.stderr), (1, "staging_origin_invalid\n"), node.stderr)
+            self.assertEqual(node.stdout, receipt.read_text())
+            self.assertEqual([json.loads(line)["action"] for line in node.stdout.splitlines()], ["attempt", "failed"])
+            python = subprocess.run(["bash", "-eo", "pipefail", "-c", probe["run"]], cwd=worktree, env=env,
+                                    capture_output=True, text=True, timeout=5, check=False)
+            self.assertEqual((python.returncode, python.stderr), (2, ""), python.stderr)
+            self.assertIn("FAIL origin: refusing: not the two-bot-next-staging workers.dev origin", python.stdout)
+            self.assertFalse((runner_temp / "staging-user-flow-synthetic.json").exists())
 
     def test_qualification_assertions_are_exact_and_keep_secrets_out_of_consumers(self):
         for job_id, entry, receipt, artifact in (
