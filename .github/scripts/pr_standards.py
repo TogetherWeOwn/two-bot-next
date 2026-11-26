@@ -30,8 +30,7 @@ A PR whose changed paths hit the T0 risk floor must carry a complete T0 attestat
 (`risk_tier: T0`, non-empty Claims and Tests subsections, checked D1–D8, no leftover
 placeholders): that too is always an error, regardless of PR_STANDARDS_MODE, the same
 way internal references already are. The floor runs before the dependency-bot exemption,
-so bot PRs touching T0 paths need a human-written attestation; only generated release
-PRs authored by a bot are exempt.
+so bot PRs touching T0 paths need a human-written attestation.
 Only the required template sections (beyond an empty body), the advisory title/body remainder
 (agent links, localhost, private-network addresses, tailnet names), branch names and commit
 history follow PR_STANDARDS_MODE, so a repo can land the gate in warn mode, clear its open
@@ -358,14 +357,10 @@ def check_pull_request(env):
 
     # T0 attestation floor first: it runs before the dependency-bot early
     # return, so a bot PR touching a T0 path still needs a (human-written)
-    # attestation. Generated release PRs authored by a bot stay exempt
-    # (automation cannot attest); a human branch wearing the release-please--
-    # prefix is not exempt, since the caller controls the branch name.
-    generated_release = head_ref.startswith("release-please--") and author.endswith("[bot]")
-    if not generated_release:
-        changed = [line.strip() for line in (env.get("CHANGED_FILES") or "").splitlines()
-                   if line.strip()]
-        out.extend(attestation_findings(body, changed))
+    # attestation.
+    changed = [line.strip() for line in (env.get("CHANGED_FILES") or "").splitlines()
+               if line.strip()]
+    out.extend(attestation_findings(body, changed))
     if author.endswith("[bot]") and author.startswith(("dependabot", "renovate")):
         if header_errors(title):
             out.append(Finding("warning", "PR title", f"{author} title '{title}' is not conventional; set "
