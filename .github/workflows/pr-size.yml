@@ -55,11 +55,14 @@ permissions:
   contents: read
 
 concurrency:
-  # PR activity and reviews share one group per pull request. Every run reads
-  # live PR state when it executes, so the newest event supersedes older ones:
-  # cancel the older run instead of queueing behind it (a queue held #2708's
-  # required gate for over an hour on 2026-11-26). Manual dispatch never cancels.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}
+  # Separate groups so a required gate never queues behind stale runs
+  # (a queue held #2708's gate for over an hour on 2026-11-26):
+  #   pull_request: one group per PR; a new push cancels the older run.
+  #   pull_request_review: one group per PR head commit; a newer review on
+  #     the same commit supersedes an older one, but a late review on an old
+  #     commit can never cancel the current push's gate.
+  #   workflow_dispatch: its own group, never cancels or evicts PR runs.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}-${{ github.event_name == 'pull_request' && 'push' || github.event_name == 'pull_request_review' && format('review-{0}', github.event.pull_request.head.sha) || 'manual' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_review' }}
 
 jobs:
