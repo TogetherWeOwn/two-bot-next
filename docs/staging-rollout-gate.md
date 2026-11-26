@@ -208,28 +208,7 @@ as a staging incident. Keep admission closed and qualification pending,
 reconcile the exact reservation, and repeat cleanup with fresh inventory until
 verification passes.
 
-#### Discord fixture transport
-
-Run `python3 scripts/pre_discord_transport.py` as an operator preflight before
-any hosted qualification create. It currently exits nonzero. The archived
-Worker omits `DISCORD_GATEWAY_URL` and `DISCORD_API_BASE` from its Container
-environment. Cloudflare documents application environment variables and
-Container start options. The approved facility still needs evidence that both
-values reach the unchanged process, that the loopback listeners run in its
-network namespace, and that public Discord egress stays denied from the first
-start through every restart. Require this evidence for the exact Worker and
-image before replacing the preflight refusal. [Application configuration](https://developers.cloudflare.com/api/resources/containers/subresources/applications/methods/create/)
-· [Container start](https://developers.cloudflare.com/containers/api/durable-object-container/#start)
-· [Outbound traffic](https://developers.cloudflare.com/containers/configuration/outbound-traffic/#block-outbound-traffic)
-
-For direct image evidence, the [local fixture](../scripts/ci/predecessor_container_fixture.py)
-uses the admitted image and an isolated loopback namespace. It observes a
-nonempty synthetic REST command sync and the gateway checkpoint independently
-for both PRE shapes. Its `direct-container-only` receipt covers the Rust
-process. Hosted qualification still requires the exact Worker invocation and
-independent stop.
-
-##### Startup refusal handoff
+#### Startup refusal handoff
 
 This handoff describes the dormant PRE contract. Keep rehearsal admission and
 qualification pending until the protected workflow caller and provider adapter
@@ -274,6 +253,28 @@ Record verified absence only where the evidence proves it. If proof is missing,
 record the unresolved step and last confirmed observation there and track the
 open cleanup as a staging incident under the same operator until fresh
 verification passes.
+
+
+#### Discord fixture transport
+
+Run `python3 scripts/pre_discord_transport.py` as an operator preflight before
+any hosted qualification create. It currently exits nonzero. The archived
+Worker omits `DISCORD_GATEWAY_URL` and `DISCORD_API_BASE` from its Container
+environment. Cloudflare documents application environment variables and
+Container start options. The approved facility still needs evidence that both
+values reach the unchanged process, that the loopback listeners run in its
+network namespace, and that public Discord egress stays denied from the first
+start through every restart. Require this evidence for the exact Worker and
+image before replacing the preflight refusal. [Application configuration](https://developers.cloudflare.com/api/resources/containers/subresources/applications/methods/create/)
+· [Container start](https://developers.cloudflare.com/containers/api/durable-object-container/#start)
+· [Outbound traffic](https://developers.cloudflare.com/containers/configuration/outbound-traffic/#block-outbound-traffic)
+
+For direct image evidence, the [local fixture](../scripts/ci/predecessor_container_fixture.py)
+uses the admitted image and an isolated loopback namespace. It observes a
+nonempty synthetic REST command sync and the gateway checkpoint independently
+for both PRE shapes. Its `direct-container-only` receipt covers the Rust
+process. Hosted qualification still requires the exact Worker invocation and
+independent stop.
 
 ### Trusted client and receipt contract (partial wiring, not activated)
 
