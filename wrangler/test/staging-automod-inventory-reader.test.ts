@@ -166,15 +166,18 @@ test("the verifier drains a cancelled descendant without signalling an unrelated
 
 test("an exited verifier drains the descendant holding its pipe and preserves exit seven", { timeout: 5_000 }, async () => {
   let descendant = 0;
+  let bytes = 0;
   let status: number | null | undefined;
-  const program = verifierWithDescendant(receipt, { exitCode: 7, holdStdout: true });
+  const program = verifierWithDescendant(cappedReceipt, { exitCode: 7, holdStdout: true });
   const run = bindStagingAutomodInventoryVerifier(syntheticVerifier(program, child => {
+    child.stdout.on("data", chunk => { bytes += chunk.length; });
     child.stderr.once("data", chunk => { descendant = Number(chunk); });
     child.once("close", code => { status = code; });
   }));
   await assert.rejects(run(source.workflowSha, String(source.runId), new AbortController().signal),
     { message: "Staging inventory verifier failed" });
   assert.equal(status, 7);
+  assert.equal(bytes, 4_096);
   assert.ok(descendant > 0);
   assert.throws(() => process.kill(descendant, 0), { code: "ESRCH" });
 });
