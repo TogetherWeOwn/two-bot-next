@@ -147,7 +147,7 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
 
     def test_both_successful_probes_must_match_the_pinned_worker(self):
         evidence = self.evidence(self.target, self.original)
-        accepted = accept(self.target, self.build, **evidence)
+        accepted = accept(self.registry_reservation(self.target), self.build, **evidence)
         self.assertEqual(accepted, AcceptedRow(self.target, self.build, self.original, self.version, "cleared"))
 
         worker = evidence["worker"]
