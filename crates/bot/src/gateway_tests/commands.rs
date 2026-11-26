@@ -40,9 +40,18 @@ async fn bootstrap(
     rest: &MockRest,
     vars: &HashMap<String, String>,
 ) -> Arc<crate::command_runtime::CommandRuntime> {
+    let executor = ActionExecutor::with_proxy(TOKEN.into(), Some(rest.origin())).unwrap();
+    bootstrap_with_executor(db, rest, vars, executor).await
+}
+
+async fn bootstrap_with_executor(
+    db: &TestDb,
+    rest: &MockRest,
+    vars: &HashMap<String, String>,
+    executor: ActionExecutor,
+) -> Arc<crate::command_runtime::CommandRuntime> {
     let config =
         GatewayCommandConfig::from_map_for_activation(2222, vars, true).expect("command config");
-    let executor = ActionExecutor::with_proxy(TOKEN.into(), Some(rest.origin())).unwrap();
     let commands = tokio::time::timeout(
         BOUND,
         GatewayCommands::bootstrap(db.pool.clone(), executor, config),
@@ -683,10 +692,18 @@ async fn slow_prefix_rest_commits_checkpoint_and_reservation_fences_resume() {
     let mut script = bootstrap_responses();
     script.extend([
         ScriptedResponse::json(200, json!({})),
-        ScriptedResponse::json(200, json!({"id": "9000"})).delayed(Duration::from_secs(2)),
+        ScriptedResponse::json(200, json!({"id": "9000"})),
     ]);
-    let rest = MockRest::start(script, ScriptedResponse::status(500)).await;
-    let commands = bootstrap(&db, &rest, &vars(Some("0"))).await;
+    let (rest, pending_reply) = MockRest::start_gated(script, ScriptedResponse::status(500)).await;
+    // Leave room for the checkpoint and readiness waits before the client can time out.
+    let rest_timeout = Duration::from_secs(40);
+    let executor = ActionExecutor::with_proxy_and_moderation_timeout(
+        TOKEN.into(),
+        Some(rest.origin()),
+        rest_timeout,
+    )
+    .unwrap();
+    let commands = bootstrap_with_executor(&db, &rest, &vars(Some("0")), executor).await;
     let mut gateway = CommandGateway::start(45000).await;
     let (runner, state) = spawn_runner_with_commands(&db, &gateway.url, Some(commands)).await;
     assert_eq!(gateway.authentication().await["op"], 2);
@@ -695,16 +712,17 @@ async fn slow_prefix_rest_commits_checkpoint_and_reservation_fences_resume() {
     wait_requests(&rest, 3).await;
     wait_connected(&state).await;
     assert_registry(&rest);
+    let earliest_rest_deadline = tokio::time::Instant::now() + rest_timeout;
     gateway.send(prefix(2, 60)).await;
-    wait_requests(&rest, 4).await;
+    tokio::time::timeout(BOUND, pending_reply.wait_for_request())
+        .await
+        .expect("pending prefix response");
     // Detached command work never blocks the serial checkpoint writer: the
     // capture commits while the prefix POST is still in flight.
     wait_sequence(&db.store, 2).await;
-    assert_eq!(
-        *state.read().await,
-        GatewayState::Connected,
-        "checkpoint commits during slow detached REST"
-    );
+    // The committed row can become visible before the writer restores readiness.
+    // The response gate keeps the POST pending through both observations.
+    wait_connected(&state).await;
     assert_eq!(db.count().await, 1, "capture committed with REST pending");
     let attempt: String = sqlx::query_scalar(
         "SELECT outcome FROM automation_audit_log WHERE id = 'custom:text:attempt:60'",
@@ -716,7 +734,14 @@ async fn slow_prefix_rest_commits_checkpoint_and_reservation_fences_resume() {
     // Abandon the shard mid-send: the dispatch guard cancels the in-flight
     // POST, so the attempt stays unresolved instead of recording a guess.
     runner.abort();
-    let _ = runner.await;
+    assert!(runner
+        .await
+        .expect_err("runner must be cancelled while the POST is pending")
+        .is_cancelled());
+    assert!(
+        tokio::time::Instant::now() < earliest_rest_deadline,
+        "checkpoint and cancellation must finish before the prefix POST can time out"
+    );
     gateway.stop().await;
     let result: Option<String> = sqlx::query_scalar(
         "SELECT outcome FROM automation_audit_log WHERE id = 'custom:text:result:60'",

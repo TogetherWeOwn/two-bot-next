@@ -488,6 +488,9 @@ class SupplyChainTests(unittest.TestCase):
                        "CHECK_RESULT": "success"}
                 for var in re.findall(r"^\s+(\w+_RESULT): \$\{\{", job, re.M):
                     env.setdefault(var, "success")
+                # ci-ok refuses missing selector outputs, so select every other lane.
+                for var in re.findall(r"^\s+(\w+_SELECTED): \$\{\{", job, re.M):
+                    env.setdefault(var, "true")
                 result = subprocess.run(["python3", "-c", script], env=env, capture_output=True)
                 self.assertEqual(result.returncode, 1 if fail else 0, result.stdout.decode())
 
