@@ -392,7 +392,7 @@ jobs:
           cd "$RUNNER_TEMP"
           python3.12 -I -m venv workflow-guard
           workflow-guard/bin/python -I -m pip --isolated install --only-binary=:all: --no-deps --require-hashes -r "$policy/ci/workflow-guard-requirements.txt"
-          workflow-guard/bin/python -I "$policy/ci/workflow_guard.py" "$GITHUB_WORKSPACE"
+          workflow-guard/bin/python -I "$policy/ci/workflow_guard.py" "$GITHUB_WORKSPACE/.github/workflows"
 
       - name: Check title, body, branch and commits
         if: github.event_name != 'merge_group'

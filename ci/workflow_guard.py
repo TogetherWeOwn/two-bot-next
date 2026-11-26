@@ -12,27 +12,33 @@ import yaml
 FILTERABLE = {"pull_request", "pull_request_target", "push"}
 PR_EVENTS = {"pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment"}
 INDIRECT_OR_EXPLICIT = {"workflow_call", "workflow_dispatch", "schedule"}
-CODE_EVENTS = {"opened", "synchronize", "reopened"}
-METADATA_EVENTS = CODE_EVENTS | {"ready_for_review"}
+CODE_EVENTS = ["opened", "synchronize", "reopened"]
+METADATA_EVENTS = ["opened", "edited", "synchronize", "reopened"]
 METADATA_REFRESH = {"supply-chain.yml", "pr-evidence.yml"}
 MAX_WORKFLOW_BYTES = 1024 * 1024
-HEADER = re.compile(r"^# guards: (\S+)(?:[ \t]+\([^\r\n]*\))?[ \t]*$", re.MULTILINE)
-RELEASES = {
-    "check.yml": ("release:exact-main-ci", {"pull_request", "merge_group", "push"}),
-    "supply-chain.yml": ("release:main-commit-lint-and-secret-scan", {"pull_request", "merge_group", "push"}),
-    "deploy-production.yml": ("release:production-promotion", {"workflow_run"}),
-    "staging-migrate-reviewed.yml": ("release:reviewed-staging-migration", {"push"}),
+HEADER = re.compile(r"^# guards: (\S+)(?:[ \t]+\([^\r\n]*\))?[ \t]*\r?$", re.MULTILINE)
+MAIN_AND_QUEUE = {"push": {"branches": ["main"]}, "merge_group": {"types": ["checks_requested"]}}
+REVIEW_TYPES = [*CODE_EVENTS, "ready_for_review", "labeled", "unlabeled"]
+ADMISSIONS = {
+    "check.yml": ("release:exact-main-ci", {**MAIN_AND_QUEUE, "pull_request": {"types": CODE_EVENTS}}),
+    "supply-chain.yml": ("release:main-commit-lint-and-secret-scan",
+                         {**MAIN_AND_QUEUE, "pull_request": {"types": METADATA_EVENTS}}),
+    "deploy-production.yml": ("release:production-promotion", {"workflow_run": {
+        "workflows": ["deploy-staging", "check"], "types": ["completed"], "branches": ["main"],
+    }}),
+    "staging-migrate-reviewed.yml": ("release:reviewed-staging-migration", {"push": {
+        "branches": ["main"], "paths": [".github/staging-apply/*.json"],
+    }}),
+    "pr-size.yml": ("required:pr-size-gate", {
+        "pull_request": {"types": REVIEW_TYPES}, "pull_request_review": {"types": ["submitted", "dismissed"]},
+    }),
+    "vote-kick-fuzz-smoke.yml": ("branch:ci/vote-kick-fuzz-smoke", {"push": {"branches": ["ci/vote-kick-fuzz-smoke"]}}),
+    "mutation.yml": ("", {"pull_request": {"types": CODE_EVENTS}}),
+    "pr-evidence.yml": ("", {"pull_request": {"types": [*METADATA_EVENTS, "ready_for_review"]}}),
+    "review-rules.yml": ("", {"pull_request": {}, "merge_group": {}}),
+    "test-guard.yml": ("", {"pull_request": {"types": REVIEW_TYPES}}),
 }
-# These existing advisory checks need to see PR changes across the repository.
-# Bound their automatic surfaces so an annotation cannot add new triggers.
-ADVISORY_PR_TYPES = {
-    "mutation.yml": CODE_EVENTS,
-    "pr-evidence.yml": METADATA_EVENTS | {"edited"},
-    "review-rules.yml": CODE_EVENTS,
-    "test-guard.yml": METADATA_EVENTS | {"labeled", "unlabeled"},
-}
-# The one-off writer is pending retirement in #2694. Only its fixed historical
-# source and PR condition are admitted, and deleting the workflow also passes.
+# Admit only the historical snapshot while it awaits retirement in #2694.
 LEGACY_SNAPSHOT = "5586b6fee3e8165e191d5d3c95469f50a88deb0a13491bc1caeb576bf28fff28"
 
 
@@ -80,51 +86,54 @@ def options_list(options, key):
 
 def can_push_main(options):
     branches = options_list(options, "branches")
-    if branches is None:
-        return options_list(options, "tags") is None and options_list(options, "tags-ignore") is None
-    # Literal branches that exclude main are the only branch lists the guard
-    # treats as off-main. GitHub's negation and glob order can admit main.
-    return "main" in branches or any(re.search(r"[^A-Za-z0-9._/-]", branch) for branch in branches)
+    return branches is None or "main" in branches or any(
+        re.search(r"[^A-Za-z0-9._/-]", branch) for branch in branches)
 
 
-def has_path_filter(options):
-    paths = options_list(options, "paths")
-    ignored = options_list(options, "paths-ignore")
-    return bool(paths) != bool(ignored) and not set(paths or ()) & {"**", "**/*"}
+def has_path_filter(event, options):
+    if event == "push" and (not options_list(options, "branches") or {"tags", "tags-ignore"} & options.keys()):
+        return False
+    positives = [path for path in options_list(options, "paths") or () if not path.startswith("!")]
+    return "paths-ignore" not in options and bool(positives) and all(
+        re.match(r"^[A-Za-z0-9_.-]+(?:/|$)", path) for path in positives)
 
 
 def findings(name, data):
     text = data.decode("utf-8")
     workflow = yaml.load(text, Loader=UniqueKeyLoader)
     events = trigger_options(workflow)
-    if not events:
+    if not events and name not in ADMISSIONS:
         return []
-    job_names = {job.get("name", key) for key, job in workflow["jobs"].items()}
     markers = HEADER.findall(text)
     guard = markers[0] if len(markers) == 1 else ""
-    release = RELEASES.get(name) == (guard, set(events))
-    pr_types = {event: set(options_list(events[event], "types") or CODE_EVENTS)
-                for event in events.keys() & PR_EVENTS}
-    advisory_events = {"pull_request", "merge_group"} if name == "review-rules.yml" else {"pull_request"}
-    approved_advisory = (set(events) == advisory_events and name in ADVISORY_PR_TYPES
-                         and pr_types["pull_request"] <= ADVISORY_PR_TYPES[name])
+    options = events.get("pull_request")
+    # #2648 owns removal of this transitional draft-ready refresh.
+    if name == "supply-chain.yml" and options == {"types": [*METADATA_EVENTS, "ready_for_review"]}:
+        events["pull_request"] = {"types": METADATA_EVENTS}
+    admitted = ADMISSIONS.get(name) == (guard, events)
+    if name == "pr-size.yml":
+        job = workflow["jobs"].get("pr-size-gate", {})
+        admitted = admitted and job.get("name") == "pr-size-gate"
+    release = admitted and guard.startswith("release:")
     legacy = name == "configuration-reference.yml" and hashlib.sha256(data).hexdigest() == LEGACY_SNAPSHOT
-    approved_branch = (name == "vote-kick-fuzz-smoke.yml" and guard == "branch:ci/vote-kick-fuzz-smoke"
-                       and events == {"push": {"branches": ["ci/vote-kick-fuzz-smoke"]}})
-    required = (name == "pr-size.yml" and guard == "required:pr-size-gate"
-                and "pr-size-gate" in job_names and set(events) == {"pull_request", "pull_request_review"})
 
     errors = []
-    if guard == "paths":
+    if name in ADMISSIONS and not admitted:
+        errors.append("automatic triggers differ from the reviewed workflow contract")
+    elif guard == "paths":
         for event, options in sorted(events.items()):
-            if event not in FILTERABLE or not has_path_filter(options):
+            if event not in FILTERABLE:
+                errors.append("an automatic event does not support a paths filter")
+            elif not has_path_filter(event, options):
                 errors.append(f"{event} declares no paths filter")
-    elif not any((release, required, approved_advisory, approved_branch, legacy)):
+    elif not (admitted or legacy):
         errors.append("automatic triggers need a required, release, paths or dedicated CI branch guard")
     if len(markers) > 1:
         errors.append("multiple guard declarations")
-    for event, activities in sorted(pr_types.items()):
-        refresh = event == "pull_request" and name in METADATA_REFRESH and (release or approved_advisory)
+    pr_events = events.keys() & PR_EVENTS
+    for event in sorted(pr_events):
+        activities = options_list(events[event], "types") or []
+        refresh = event == "pull_request" and name in METADATA_REFRESH and admitted
         if "edited" in activities and not refresh:
             errors.append(f"{event} types include 'edited'")
     if "workflow_run" in events:
@@ -132,7 +141,7 @@ def findings(name, data):
             errors.append("workflow_run must fire only on completed, never requested/in_progress")
         if not release:
             errors.append("workflow_run needs a reviewed release guard")
-    if pr_types and "push" in events and can_push_main(events["push"]) and not release:
+    if pr_events and "push" in events and can_push_main(events["push"]) and not release:
         errors.append("runs on PRs and main pushes without a reviewed release guard")
     return errors
 
@@ -140,7 +149,7 @@ def findings(name, data):
 def check_directory(directory):
     if directory.is_symlink() or directory.parent.is_symlink() or not directory.is_dir():
         return ["Missing or invalid workflows directory"]
-    paths = sorted(path for path in directory.iterdir() if path.suffix in (".yml", ".yaml"))
+    paths = sorted(path for path in directory.iterdir() if path.suffix.lower() in (".yml", ".yaml"))
     if not paths:
         return ["No workflows found"]
     errors = []

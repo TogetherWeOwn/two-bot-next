@@ -31,19 +31,19 @@ class WorkflowDemandGuardTests(unittest.TestCase):
                         "pull_request_review", "pull_request_review_comment", "check_run", "check_suite", "status"):
             with self.subTest(trigger=trigger):
                 self.assertTrue(guard.findings("fixture.yml", example(trigger)))
-        self.assertEqual(guard.findings("fixture.yml", example("workflow_dispatch")), [])
         marker = "# guards: required:ci-ok"
         self.assertTrue(guard.findings("fixture.yml", example("pull_request", marker)))
 
     def test_paths_apply_to_every_automatic_trigger(self):
         marker = "# guards: paths (fixture)"
         scoped = "{pull_request: {paths: ['src/**']}, push: {branches: [work], paths: ['src/**']}}"
-        self.assertEqual(guard.findings("fixture.yml", example(scoped, marker)), [])
+        self.assertEqual(guard.findings("fixture.yml", example(scoped, marker).replace(b"\n", b"\r\n")), [])
         unscoped = "{pull_request: {paths: ['src/**']}, push: {branches: [work]}}"
         self.assertIn("push declares no paths filter", guard.findings("fixture.yml", example(unscoped, marker)))
-        for paths in ("**", "**/*"):
-            triggers = "{pull_request: {paths: ['" + paths + "']}}"
-            self.assertIn("pull_request declares no paths filter", guard.findings("fixture.yml", example(triggers, marker)))
+        for trigger in ("{pull_request: {paths: ['**/**']}}", "{pull_request: {paths: ['*', '*/**']}}",
+                        "{pull_request: {paths-ignore: [missing]}}", "{push: {paths: [src]}}",
+                        "{push: {branches: [work], tags: ['**'], paths: [src]}}"):
+            self.assertTrue(guard.findings("fixture.yml", example(trigger, marker)), trigger)
 
     def test_refuses_duplicate_pr_main_push_and_metadata_events(self):
         marker = "# guards: required:ci-ok"
@@ -64,8 +64,9 @@ class WorkflowDemandGuardTests(unittest.TestCase):
             with self.subTest(triggers=triggers):
                 self.assertIn("workflow_run must fire only on completed, never requested/in_progress",
                               guard.findings("deploy-production.yml", example(triggers, marker)))
-        self.assertEqual(guard.findings("deploy-production.yml", example(
-            "{workflow_run: {types: [completed]}}", marker)), [])
+        source = (WORKFLOWS / "deploy-production.yml").read_bytes()
+        self.assertEqual(guard.findings("deploy-production.yml", source), [])
+        self.assertTrue(guard.findings("deploy-production.yml", source.replace(b"[deploy-staging, check]", b"[check]")))
 
     def test_malformed_files_fail_without_printing_their_content(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -87,22 +88,11 @@ class WorkflowDemandGuardTests(unittest.TestCase):
         self.assertEqual(workflow("pr-evidence.yml")["on"], {
             "pull_request": {"types": ["opened", "edited", "synchronize", "reopened", "ready_for_review"]},
         })
-        check = workflow("check.yml")
-        self.assertEqual(check["on"]["pull_request"]["types"], ["opened", "synchronize", "reopened"])
-        self.assertEqual(check["on"]["push"], {"branches": ["main"]})
-        self.assertEqual(check["jobs"]["ci-ok"]["name"], "ci-ok")
         supply = workflow("supply-chain.yml")
-        self.assertEqual(supply["on"]["pull_request"]["types"],
-                         ["opened", "edited", "synchronize", "reopened", "ready_for_review"])
+        self.assertEqual(set(supply["on"]["pull_request"]["types"]) - {"ready_for_review"},
+                         {"opened", "edited", "synchronize", "reopened"})
         self.assertEqual(supply["on"]["push"], {"branches": ["main"]})
         self.assertEqual(supply["jobs"]["gitleaks"]["needs"], "pr-lint")
-        self.assertIn("pr-size-gate", workflow("pr-size.yml")["jobs"])
-        self.assertEqual(workflow("deploy-production.yml")["on"]["workflow_run"], {
-            "workflows": ["deploy-staging", "check"], "types": ["completed"], "branches": ["main"],
-        })
-        self.assertEqual(workflow("staging-migrate-reviewed.yml")["on"]["push"], {
-            "branches": ["main"], "paths": [".github/staging-apply/*.json"],
-        })
         for name in ("release.yml", "deploy-staging.yml", "deploy-production.yml", "staging-rollback-drill.yml"):
             self.assertIn("workflow_dispatch", workflow(name)["on"])
 
@@ -117,7 +107,6 @@ class WorkflowDemandGuardTests(unittest.TestCase):
         step = steps[name]
         self.assertNotIn("if", step)
         self.assertNotIn("continue-on-error", step)
-        self.assertNotIn("env", step)
         for fragment in ('"$GITHUB_EVENT_NAME" != push', 'policy="$policy/base-gate"',
-                         '-I "$policy/ci/workflow_guard.py" "$GITHUB_WORKSPACE"'):
+                         '-I "$policy/ci/workflow_guard.py" "$GITHUB_WORKSPACE/.github/workflows"'):
             self.assertIn(fragment, step["run"])

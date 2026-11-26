@@ -323,10 +323,10 @@ The nightly partition workflow exercises this deprecated flag on the pinned Rust
 toolchain; recheck its protocol when upgrading rather than falling back to parsing
 mixed console output.
 
-Verify a change with an actual executing `pull_request` run on its exact head,
-record each heavy job's time and headroom, and aim for at most 35 minutes per
-leg. Test counts are not a runtime guarantee. Rebalance only from measured
-results; a skipped job or a 180-minute manual pass is not PR-cap evidence.
+Verify sweep timing from an executing scheduled run. Record its exact main SHA
+and each heavy job's time and headroom, aiming for 35 minutes per leg. Use Check
+for pre-merge validation. The manual nightly command in the #1845 acceptance
+manifest records the historical route. Rebalance only from measured results.
 Offline contracts run in the existing source-level CI suite:
 
 ```sh
