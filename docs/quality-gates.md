@@ -7,6 +7,23 @@ legs, the `coverage-shard` matrix runs them alongside per-shard disposable
 Postgres services, and `patch-coverage` merges and gates — rather than the
 lint-only `check` lane.
 
+Check's `job-inputs` job uses the selector from the PR event's base commit.
+It verifies the tested merge commit and classifies a single diff against the
+common ancestor, so base changes that affect the candidate also select their
+suites. Missing history, deletions, file type changes, shared CI or dependency
+inputs, and unknown paths select every applicable lane. Main pushes, merge
+queues, scheduled runs, and manual runs use the full applicable plan.
+
+Migration numbering, checksum and Squawk checks run in `job-inputs` before
+selected suites acquire runners. The prior-revision database proof compares
+the common ancestor with that same PR merge commit. Ordinary Markdown changes
+skip the workflow fixture module except for the CI speed rollout guide that
+module checks.
+The remaining source-level fixtures, docs checks, and required contexts still
+report. Worker docs and Rust content dependencies retain their existing
+checks. `ci-ok` accepts a skipped lane only after a successful selector
+explicitly deselects it.
+
 - Python intake (HARD) runs in `check` on PRs, merge-queue runs and pushes.
   It compares stdlib intake calls in `scripts/` and `.github/scripts/`
   against the checked-out base. Test files are exempt. It caps direct calls,

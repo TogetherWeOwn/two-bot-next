@@ -276,13 +276,16 @@ class MigrationTests(unittest.TestCase):
 
     def test_workflow_compares_event_baseline_and_runs_fixtures(self):
         workflow = (SCRIPT.parent.parent / ".github/workflows/check.yml").read_text()
-        step = workflow.split("- name: Check migration numbering and immutability", 1)[1].split("- name:", 1)[0]
+        selector = workflow.split("\n  job-inputs:\n", 1)[1].split("\n  db-compatibility:\n", 1)[0]
+        step = selector.split("- name: Check migration numbering and immutability", 1)[1].split("- name:", 1)[0]
+        self.assertIn("steps.select.outputs.migrations != 'false'", step)
+        self.assertIn("github.event.merge_group.base_sha", step)
         self.assertIn("github.event.pull_request.base.sha", step)
         self.assertIn("github.event.before", step)
         self.assertIn("'origin/main'", step)
         self.assertIn('python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"', step)
         self.assertIn("python3 scripts/test-check-migrations.py", step)
-        checkout = workflow.split("steps:", 1)[1].split("- name:", 1)[0]
+        checkout = selector.split("steps:", 1)[1].split("- name:", 1)[0]
         self.assertIn("fetch-depth: 0", checkout)
 
 
