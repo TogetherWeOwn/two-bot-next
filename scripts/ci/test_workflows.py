@@ -3637,11 +3637,20 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
             or (checkout.get("with") or {}).get("fetch-depth") != "0" \
             or "needs.guard.outputs.sha" not in str((checkout.get("with") or {}).get("ref", "")):
         errors.append(f"{name}:schema-gate: checkout must be pinned, credentialless, full-depth and on the guarded SHA")
-    if not str(tooling.get("uses", "")).startswith("actions/checkout@") \
-            or (tooling.get("with") or {}).get("persist-credentials") != "false" \
-            or (tooling.get("with") or {}).get("path") != "tooling" \
-            or "github.sha" not in str((tooling.get("with") or {}).get("ref", "")):
-        errors.append(f"{name}:schema-gate: tooling checkout must be pinned, credentialless and on the workflow commit")
+    if tooling != {
+        "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "with": {
+            "ref": "${{ github.sha }}",
+            "path": "tooling",
+            "persist-credentials": "false",
+            "fetch-depth": "1",
+            "sparse-checkout": "/scripts/ci/production_schema_gate.py\n"
+                               "/scripts/ci/schema_gate_common.py\n"
+                               "/scripts/script_intake.py\n",
+            "sparse-checkout-cone-mode": "false",
+        },
+    }:
+        errors.append(f"{name}:schema-gate: tooling checkout must use only the reviewed schema gate files")
     if ("needs.guard.outputs.sha" not in str(sha_check.get("env", ""))
             or "git rev-parse HEAD" not in str(sha_check.get("run", ""))):
         errors.append(f"{name}:schema-gate: SHA check must pin the step to the guarded SHA")
@@ -9350,6 +9359,11 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["schema-gate"].__setitem__("environment", "production-migrate-apply"),
             lambda w: w["jobs"]["schema-gate"].__setitem__("if", "github.ref == 'refs/heads/main'"),
             lambda w: w["jobs"]["schema-gate"].__setitem__("needs", "production"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][1]["with"].pop("sparse-checkout"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][1]["with"].__setitem__(
+                "sparse-checkout-cone-mode", "true"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][1]["with"].__setitem__(
+                "ref", "${{ needs.guard.outputs.sha }}"),
             lambda w: w["jobs"]["production"].__setitem__("needs", "guard"),
             lambda w: w["jobs"]["production"].__setitem__("needs", ["schema-gate"]),
             lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__("run", "wrangler deploy"),
