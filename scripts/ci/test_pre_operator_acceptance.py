@@ -144,8 +144,25 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
             with self.subTest(path=path):
                 failed = replace(getattr(worker, path), status=503)
                 self.refuse(evidence | {"worker": replace(worker, **{path: failed})}, reason)
-        stale_health = replace(worker.health, worker_version="12345678-1234-4234-8234-123456789def")
-        self.refuse(evidence | {"worker": replace(worker, health=stale_health)}, "pre_worker_health_unproved")
+
+    def test_both_successful_probes_must_match_the_pinned_worker(self):
+        evidence = self.evidence(self.target, self.original)
+        accepted = accept(self.registry_reservation(self.target), self.build, **evidence)
+        self.assertEqual(accepted, AcceptedRow(self.target, self.build, self.original, self.version, "cleared"))
+
+        worker = evidence["worker"]
+        other_version = "12345678-1234-4234-8234-123456789def"
+        other_health = replace(worker.health, worker_version=other_version)
+        other_readyz = replace(worker.readyz, worker_version=other_version)
+        cases = (
+            ("health from other Worker", replace(worker, health=other_health), "pre_worker_health_unproved"),
+            ("readiness from other Worker", replace(worker, readyz=other_readyz), "pre_worker_readiness_unproved"),
+            ("both from other Worker", replace(worker, health=other_health, readyz=other_readyz),
+             "pre_worker_health_unproved"),
+        )
+        for name, observation, reason in cases:
+            with self.subTest(observation=name):
+                self.refuse(evidence | {"worker": observation}, reason)
 
     def test_direct_container_probes_do_not_establish_worker_readiness(self):
         evidence = self.evidence(self.target, self.original)
