@@ -45,6 +45,7 @@ DECIDE_STEPS = _HISTORY_MODULE.DECIDE_STEPS
 JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
 PROBE_STEPS = _HISTORY_MODULE.PROBE_STEPS
 STATIC_FALSE = "${{ false }}"
+PR_SIZE_ORG_SHA = "649943c1ed8a1af8f8760e075f3923237dd72e50"
 JOB_INVENTORY = {
     "build-predecessor.yml": {"build"},
     # The nextest branch adds its required lane; main adds the production schema gate.
@@ -74,8 +75,6 @@ JOB_INVENTORY = {
                     "sweep-partition", "sweep-guarded", "sweep-docs", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "mutation.yml": {"rust-mutation", "python-mutation", "worker-mutation"},
-    # One-off read-only reference writer for the fixed source snapshot.
-    "configuration-reference.yml": {"configuration-reference"},
     "release.yml": {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"},
     # Daily digest release (docs/releases.md): at most one vYYYY.MDD.P tag a day,
     # plus the missing-digest alert; pinned shape below.
@@ -149,12 +148,9 @@ JOB_INVENTORY = {
     # Shared nextest lane, called by check.yml; org-level home is
     # TogetherWeOwn/.github with a pinned SHA like test-guard.
     "reusable-rust-nextest.yml": {"nextest"},
-    # PR-size labels + required size gate (org reusable): thin caller to
-    # the central labeller, the required gate and the weekly tally. The
-    # advisory `pr-size` job is never required; `pr-size-gate` fails PRs
-    # too large for the automated reviewer and is added to the ruleset
-    # only after it reports on the default branch.
-    "pr-size.yml": {"pr-size", "pr-size-gate", "pr-size-weekly"},
+    # The required gate measures and labels in one job. The weekly tally
+    # remains a separate read-only reusable call.
+    "pr-size.yml": {"pr-size-gate", "pr-size-weekly"},
     # Weekly DORA delivery metrics (docs/dora-metrics.md): the read-only
     # compute job reads 30 days of production Deployments; the main-only
     # publish job commits one JSON file plus a markdown summary to
@@ -181,22 +177,21 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    # caller to the shared nextest lane (local path until
                    # the central move).
                    ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
-                   # PR-size labels + required size gate: thin caller to
-                   # the central reusables, pinned SHA (repin all three
-                   # refs together).
-                   ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
-                   ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
-                   ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964"}
-# PR-size activation (pinned below): the labeller and the required gate run
-# on PR events, plus a manual dispatch carrying an explicit PR number; the
-# weekly tally runs on schedule or a blank manual dispatch. Pinning these
-# conditions prevents the gate from being silently disabled while its
-# inventory entry and reusable ref stay intact.
+                   # Both PR-size reusables use the same reviewed org squash.
+                   ("pr-size.yml", "pr-size-gate"): f"TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@{PR_SIZE_ORG_SHA}",
+                   ("pr-size.yml", "pr-size-weekly"): f"TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@{PR_SIZE_ORG_SHA}"}
+# The combined job runs on PR events and numbered manual dispatches. The
+# weekly tally runs on schedule and blank dispatches.
 PR_SIZE_JOB_IF = "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''"
 PR_SIZE_WEEKLY_IF = "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')"
-PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size"): PR_SIZE_JOB_IF,
-                         ("pr-size.yml", "pr-size-gate"): PR_SIZE_JOB_IF,
+PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size-gate"): PR_SIZE_JOB_IF,
                          ("pr-size.yml", "pr-size-weekly"): PR_SIZE_WEEKLY_IF}
+PR_SIZE_GATE_INPUTS = {
+    "runs-on": PR_SIZE_GATE_RUNNER_INPUT,
+    "pr-number": "${{ inputs.pr_number || '' }}",
+    "advisory-label": "true",
+    "exclude-extra": "migrations.lock",
+}
 # Negative fixture only: even a public-first route retains dormant source paths.
 LEGACY_ROUTED_RUNNER = (
     "${{{{ fromJSON((!github.event.repository.private && '[\"ubuntu-latest\"]') || "
@@ -1253,7 +1248,18 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
                   "staging_health_contract_probe.py", "staging-use-user-flow.jsonl", "staging-use-user-flow"))
     steps = [{key: value for key, value in step.items() if key != "name"}
              for step in job.get("steps") or []]
-    if (len(steps) != 6 or steps[:2] != STAGING_TOOLING_STEPS
+    checkout, setup_node = STAGING_TOOLING_STEPS
+    scoped_checkout = {**checkout, "with": {
+        **checkout["with"],
+        "sparse-checkout": "/scripts/build_identity.py\n"
+                           "/scripts/script_intake.py\n"
+                           "/scripts/staging_health_contract_probe.py\n"
+                           "/wrangler/scripts/is-direct-invocation.mjs\n"
+                           "/wrangler/scripts/ownership-control-response.mjs\n"
+                           "/wrangler/scripts/staging-use.mjs\n",
+        "sparse-checkout-cone-mode": "false",
+    }}
+    if (len(steps) != 6 or steps[:2] != [scoped_checkout, setup_node]
             or steps[2].get("run") != "node wrangler/scripts/staging-use.mjs ready"
             or (steps[3].get("with") or {}).get("path") != "${{ runner.temp }}/staging-use-user-flow.jsonl"
             or steps[5] != {"if": "always()", "uses": STAGING_UPLOAD_USES,
@@ -1731,9 +1737,24 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                 or "if" in steps[ddl[0]] or "continue-on-error" in steps[ddl[0]]):
             errors.append(f"{name}:apply: must verify the exact native approval before building and running DDL")
         checkouts = [step for step in steps if (step.get("with") or {}).get("path") == "approval-tools"]
+        checkout_options = {
+            "path": "approval-tools",
+            "persist-credentials": "false",
+            "ref": "${{ github.sha }}",
+            "sparse-checkout": (
+                "/scripts/build_identity.py\n"
+                "/scripts/ci/staging_migrate_claim.py\n"
+                "/scripts/rollback_proof.py\n"
+                "/scripts/script_intake.py\n"
+                "/scripts/staging_migrate_approval.py\n"
+                "/scripts/staging_recovery_status.py\n"
+                "/scripts/staging_rollout.py\n"
+                "/scripts/worker_container_rollback.py\n"
+            ),
+            "sparse-checkout-cone-mode": "false",
+        }
         if (len(checkouts) != 1 or not str(checkouts[0].get("uses", "")).startswith("actions/checkout@")
-                or checkouts[0].get("with") != {"path": "approval-tools", "persist-credentials": "false",
-                                               "ref": "${{ github.sha }}"}
+                or checkouts[0].get("with") != checkout_options
                 or "if" in checkouts[0] or "continue-on-error" in checkouts[0]):
             errors.append(f"{name}:apply: must load the verifier at the trusted workflow SHA")
     else:
@@ -1938,6 +1959,25 @@ ROLLBACK_DRILL_ENV = {
     "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-worker-drill-use.ndjson",
 }
 
+ROLLBACK_DRILL_CHECKOUT = {
+    "persist-credentials": "false",
+    "fetch-depth": "1",
+    "sparse-checkout-cone-mode": "false",
+    "sparse-checkout": (
+        "/scripts/build_identity.py\n"
+        "/scripts/script_intake.py\n"
+        "/scripts/staging_drill_use.py\n"
+        "/scripts/staging_rollback_drill.py\n"
+        "/scripts/staging_rollout.py\n"
+        "/scripts/worker_container_rollback.py\n"
+        "/wrangler/scripts/is-direct-invocation.mjs\n"
+        "/wrangler/scripts/ownership-control-response.mjs\n"
+        "/wrangler/scripts/ownership-control.mjs\n"
+        "/wrangler/scripts/staging-use-pipeline.mjs\n"
+        "/wrangler/scripts/staging-use.mjs\n"
+    ),
+}
+
 
 def rollback_proof_job_errors(job, mode):
     """Pin the dispatcher/observer to reviewed tooling and the smallest token."""
@@ -2035,15 +2075,24 @@ def staging_rollback_drill_errors(workflow):
     for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
         if key in job:
             errors.append(f"{name}:drill: must not set {key} (bindings stay on the single Run step)")
-    text = str(job).lower()
-    for marker in ("wrangler", "force", "production", "toJSON(secrets".lower(), "secrets["):
-        if marker in text.replace(" ", ""):
-            errors.append(f"{name}:drill: must not contain {marker!r} (script-only, unforced, staging-only)")
     steps = job.get("steps") or []
     if len(steps) != 4 or any(key in step for step in steps[:3] for key in ("if", "continue-on-error")):
         errors.append(f"{name}:drill: must run checkout, setup-node, drill and evidence upload")
         return errors
     checkout, node, run, upload = steps
+    checkout_for_marker_scan = checkout
+    if checkout.get("with") == ROLLBACK_DRILL_CHECKOUT:
+        # The exact checkout paths are data. Keep scanning every other field
+        # for Wrangler invocations and the other forbidden markers.
+        options = dict(ROLLBACK_DRILL_CHECKOUT)
+        del options["sparse-checkout"]
+        checkout_for_marker_scan = {**checkout, "with": options}
+    else:
+        errors.append(f"{name}:drill: must check out only the pinned runtime files")
+    text = str({**job, "steps": [checkout_for_marker_scan, node, run, upload]}).lower().replace(" ", "")
+    for marker in ("wrangler", "force", "production", "toJSON(secrets".lower(), "secrets["):
+        if marker in text:
+            errors.append(f"{name}:drill: must not contain {marker!r} (script-only, unforced, staging-only)")
     evidence = "${{ runner.temp }}/staging-rollback-drill-evidence.json"
     if (upload.get("with") or {}) != {
             "name": "staging-worker-rollback-drill",
@@ -2198,6 +2247,11 @@ EVENTS_READ_ENV = {
 }
 EVENTS_READ_COMMAND = ('python3 scripts/staging_events_read.py --window-start "$WINDOW_START" '
                        '--window-end "$WINDOW_END" --output "staging-events-read-$RUN_ID.json"')
+EVENTS_READ_PATHS = (
+    "/scripts/staging_events_read.py",
+    "/scripts/staging_automation_read_smoke.py",
+    "/scripts/script_intake.py",
+)
 
 
 def staging_events_read_errors(workflow):
@@ -2272,9 +2326,10 @@ def staging_events_read_errors(workflow):
         errors.append(f"{name}:read: must run exactly checkout, the read and the upload, unconditionally")
         return errors
     checkout, run, upload = steps
-    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or (checkout.get("with") or {}).get("persist-credentials") != "false":
-        errors.append(f"{name}:read: checkout must be pinned and must not persist credentials")
+    if checkout.get("uses") != STAGING_CHECKOUT_USES or checkout.get("with") != {
+            "persist-credentials": "false", "fetch-depth": "1", "sparse-checkout-cone-mode": "false",
+            "sparse-checkout": "\n".join(EVENTS_READ_PATHS) + "\n"}:
+        errors.append(f"{name}:read: checkout must use the workflow head and only the reader's files")
     if run.get("env") != EVENTS_READ_ENV:
         errors.append(f"{name}:read: Run step must bind exactly the three secrets, the two windows and the run id")
     if run.get("run") != EVENTS_READ_COMMAND or "uses" in run or "shell" in run:
@@ -2637,7 +2692,18 @@ def staging_mcp_proveout_errors(workflow):
     cleanup_if = "always() && steps.use.outputs.expires_at != ''"
     expected = [
         {"uses": STAGING_CHECKOUT_USES,
-         "with": {"persist-credentials": "false", "fetch-depth": "1"}},
+         "with": {
+             "persist-credentials": "false", "fetch-depth": "1",
+             "sparse-checkout-cone-mode": "false",
+             "sparse-checkout": (
+                 "/scripts/script_intake.py\n"
+                 "/scripts/staging_mcp_proveout.py\n"
+                 "/wrangler/scripts/is-direct-invocation.mjs\n"
+                 "/wrangler/scripts/ownership-control-response.mjs\n"
+                 "/wrangler/scripts/staging-use-pipeline.mjs\n"
+                 "/wrangler/scripts/staging-use.mjs\n"
+             ),
+         }},
         {"uses": STAGING_SETUP_NODE_USES,
          "with": {"node-version": "22", "package-manager-cache": "false"}},
         {"id": "use", "env": {**control_env, "STAGING_USE_MINUTES": "15",
@@ -4936,6 +5002,14 @@ def workflow_policy_errors(workflows):
             errors.append(f"{name}:{job_id}: missing PR-size job")
         elif job.get("if") != expected_if:
             errors.append(f"{name}:{job_id}: PR-size activation condition changed")
+    pr_size_jobs = workflows.get("pr-size.yml", {}).get("jobs", {})
+    gate = pr_size_jobs.get("pr-size-gate", {})
+    if gate.get("name") != "pr-size-gate" or gate.get("with") != PR_SIZE_GATE_INPUTS:
+        errors.append("pr-size.yml:pr-size-gate: required job name or caller inputs changed")
+    if {"needs", "continue-on-error"} & gate.keys():
+        errors.append("pr-size.yml:pr-size-gate: required verdict must stay independent")
+    if "with" in pr_size_jobs.get("pr-size-weekly", {}):
+        errors.append("pr-size.yml:pr-size-weekly: weekly tally must use the reusable defaults")
     for name, workflow in workflows.items():
         jobs = workflow.get("jobs", {})
         if set(jobs) != JOB_INVENTORY.get(name, set()):
@@ -7367,6 +7441,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("job-inputs", job.get("needs", []))
         self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
         self.assertEqual(job.get("runs-on"), PR_GATE_RUNNER)
+        checkout = job["steps"][0]["with"]
+        self.assertEqual(checkout.get("persist-credentials"), "false")
+        self.assertEqual(checkout.get("fetch-depth"),
+                         "${{ !github.event.merge_group.base_sha && github.event.pull_request && 2 || 0 }}")
         outputs = job.get("outputs", {})
         for key in ("matrix", "expected-shards", "legs", "widened", "reason"):
             self.assertIn(key, outputs)
@@ -7374,6 +7452,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("steps.plan.outputs.expected-shards", outputs["expected-shards"])
         step = next(step for step in job["steps"] if step.get("id") == "plan")
         self.assertEqual(step.get("name"), "Plan coverage shards")
+        self.assertEqual(step["env"]["PLAN_BASE"],
+                         "${{ github.event.merge_group.base_sha || "
+                         "(github.event.pull_request && format('{0}^1', github.sha)) || "
+                         "github.event.before || 'origin/main' }}")
+        self.assertEqual(step["env"]["PLAN_HEAD"], "${{ github.sha }}")
         self.assertIn("scripts/ci/plan-coverage-shards.py", step["run"])
         self.assertIn("--shards 4", step["run"])
         self.assertIn("--output plan.json", step["run"])
@@ -8644,6 +8727,64 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(user_flow_synthetic_errors(changed["deploy-staging.yml"]), label)
                 self.assertTrue(workflow_policy_errors(changed), label)
 
+    def test_user_flow_synthetic_pins_checkout_scope_and_provenance(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(user_flow_synthetic_errors(staging), [])
+        checkout = staging["jobs"]["user-flow-synthetic"]["steps"][0]["with"]
+        scope = checkout["sparse-checkout"].splitlines(keepends=True)
+        overrides = {
+            "extra path": {"sparse-checkout": checkout["sparse-checkout"] + "/scripts/\n"},
+            "cone mode": {"sparse-checkout-cone-mode": "true"},
+            "deployed SHA": {"ref": DEPLOY_SHA_EXPRESSION},
+            "other repository": {"repository": "fixture/other"},
+            "other directory": {"path": "other-checkout"},
+            "different filter": {"filter": "tree:0"},
+            "persisted credentials": {"persist-credentials": "true"},
+            "full history": {"fetch-depth": "0"},
+        }
+        for missing in scope:
+            overrides[f"missing {missing.strip()}"] = {
+                "sparse-checkout": "".join(path for path in scope if path != missing)}
+        variants = {label: {**checkout, **override} for label, override in overrides.items()}
+        variants["full checkout"] = STAGING_TOOLING_STEPS[0]["with"]
+        for label, options in variants.items():
+            with self.subTest(label=label):
+                changed = deepcopy(staging)
+                changed["jobs"]["user-flow-synthetic"]["steps"][0]["with"] = options
+                self.assertTrue(user_flow_synthetic_errors(changed))
+
+    def test_user_flow_synthetic_loads_both_probes_from_scoped_checkout(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(user_flow_synthetic_errors(staging), [])
+        checkout, _, ready, _, probe, _ = staging["jobs"]["user-flow-synthetic"]["steps"]
+        with tempfile.TemporaryDirectory() as directory:
+            runner_temp = Path(directory)
+            worktree = runner_temp / "checkout"
+            for pattern in checkout["with"]["sparse-checkout"].splitlines():
+                path = pattern.removeprefix("/")
+                target = worktree / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / path).read_bytes())
+            receipt = runner_temp / "staging-use-user-flow.jsonl"
+            env = {
+                "PATH": os.environ.get("PATH", os.defpath),
+                # An unparseable origin reaches both commands and cannot make an HTTP request.
+                "STAGING_WORKER_URL": "https://[",
+                "STAGING_USE_RECEIPT": str(receipt),
+                "RUNNER_TEMP": str(runner_temp),
+                "EXPECTED_SHA": "a" * 40,
+            }
+            node = subprocess.run(shlex.split(ready["run"]), cwd=worktree, env=env,
+                                  capture_output=True, text=True, timeout=5, check=False)
+            self.assertEqual((node.returncode, node.stderr), (1, "staging_origin_invalid\n"), node.stderr)
+            self.assertEqual(node.stdout, receipt.read_text())
+            self.assertEqual([json.loads(line)["action"] for line in node.stdout.splitlines()], ["attempt", "failed"])
+            python = subprocess.run(["bash", "-eo", "pipefail", "-c", probe["run"]], cwd=worktree, env=env,
+                                    capture_output=True, text=True, timeout=5, check=False)
+            self.assertEqual((python.returncode, python.stderr), (2, ""), python.stderr)
+            self.assertIn("FAIL origin: refusing: not the two-bot-next-staging workers.dev origin", python.stdout)
+            self.assertFalse((runner_temp / "staging-user-flow-synthetic.json").exists())
+
     def test_qualification_assertions_are_exact_and_keep_secrets_out_of_consumers(self):
         for job_id, entry, receipt, artifact in (
                 ("user-flow-synthetic", "staging_health_contract_probe.py", "staging-use-user-flow.jsonl", "staging-use-user-flow"),
@@ -9137,9 +9278,8 @@ class WorkflowTests(unittest.TestCase):
                                           ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@8059ac2b121b63443db656b1e10e927b8af8133c",
                                           ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@8059ac2b121b63443db656b1e10e927b8af8133c",
                                           ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
-                                          ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
-                                          ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
-                                          ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964"})
+                                          ("pr-size.yml", "pr-size-gate"): f"TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@{PR_SIZE_ORG_SHA}",
+                                          ("pr-size.yml", "pr-size-weekly"): f"TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@{PR_SIZE_ORG_SHA}"})
         for (name, job_id), expected_uses in REUSABLE_CALLS.items():
             with self.subTest(workflow=name, job=job_id):
                 job = self.workflows[name]["jobs"].get(job_id, {})
@@ -9161,8 +9301,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_pr_size_activation_conditions_are_pinned(self):
         jobs = self.workflows["pr-size.yml"]["jobs"]
-        expected = {"pr-size": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
-                    "pr-size-gate": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
+        expected = {"pr-size-gate": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
                     "pr-size-weekly": "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')"}
         for job_id, condition in expected.items():
             with self.subTest(job=job_id):
@@ -9175,6 +9314,46 @@ class WorkflowTests(unittest.TestCase):
         workflows = deepcopy(self.workflows)
         workflows["pr-size.yml"]["jobs"]["pr-size-gate"]["if"] = expected["pr-size-weekly"]
         self.assertTrue(workflow_policy_errors(workflows))
+
+    def test_pr_size_one_runner_keeps_labeling_and_required_verdict(self):
+        jobs = self.workflows["pr-size.yml"]["jobs"]
+        self.assertEqual(set(jobs), {"pr-size-gate", "pr-size-weekly"})
+        self.assertEqual(jobs["pr-size-gate"]["name"], "pr-size-gate")
+        self.assertEqual(jobs["pr-size-gate"]["with"], {
+            "runs-on": PR_SIZE_GATE_RUNNER_INPUT,
+            "pr-number": "${{ inputs.pr_number || '' }}",
+            "advisory-label": "true",
+            "exclude-extra": "migrations.lock",
+        })
+        # The reusable declares a boolean. BaseLoader reads quoted strings
+        # and YAML booleans alike as strings.
+        source = (ROOT / ".github/workflows/pr-size.yml").read_text()
+        gate_inputs = yaml.safe_load(source)["jobs"]["pr-size-gate"]["with"]
+        self.assertIs(gate_inputs["advisory-label"], True)
+        for updates, error in (
+            ({"with": {**jobs["pr-size-gate"]["with"], "advisory-label": "false"}},
+             "required job name or caller inputs changed"),
+            ({"name": "size advisory"}, "required job name or caller inputs changed"),
+            ({"needs": "pr-size-weekly"}, "required verdict must stay independent"),
+            ({"continue-on-error": "true"}, "required verdict must stay independent"),
+        ):
+            with self.subTest(updates=updates):
+                workflows = deepcopy(self.workflows)
+                workflows["pr-size.yml"]["jobs"]["pr-size-gate"].update(updates)
+                self.assertIn(f"pr-size.yml:pr-size-gate: {error}", workflow_policy_errors(workflows))
+
+    def test_pr_size_weekly_keeps_read_only_tally(self):
+        workflow = self.workflows["pr-size.yml"]
+        weekly = workflow["jobs"]["pr-size-weekly"]
+        self.assertEqual(workflow["on"]["schedule"], [{"cron": "17 7 * * 1"}])
+        self.assertEqual(weekly["permissions"], {
+            "contents": "read", "issues": "read", "pull-requests": "read",
+        })
+        self.assertNotIn("with", weekly)
+        workflows = deepcopy(self.workflows)
+        workflows["pr-size.yml"]["jobs"]["pr-size-weekly"]["with"] = {"advisory-label": "true"}
+        self.assertIn("pr-size.yml:pr-size-weekly: weekly tally must use the reusable defaults",
+                      workflow_policy_errors(workflows))
 
     def test_pr_size_gate_cancels_superseded_pr_and_review_runs(self):
         workflow = self.workflows["pr-size.yml"]
@@ -9634,6 +9813,53 @@ class WorkflowTests(unittest.TestCase):
                     w["jobs"][job_id]["permissions"] = permissions
                 self.assertTrue(mutated(change))
 
+    def test_staging_apply_approval_checkout_is_pinned(self):
+        workflow = self.workflows["staging-migrate.yml"]
+        self.assertEqual(staging_migrate_errors(workflow), [])
+
+        def approval_checkout(workflow):
+            return next(step["with"] for step in workflow["jobs"]["apply"]["steps"]
+                        if step.get("with", {}).get("path") == "approval-tools")
+
+        checkout = approval_checkout(workflow)
+        self.assertIn("sparse-checkout", checkout)
+        paths = checkout["sparse-checkout"]
+        for changes in (
+                {"sparse-checkout": None, "sparse-checkout-cone-mode": None},
+                {"sparse-checkout": paths.replace("/scripts/build_identity.py\n", "")},
+                {"sparse-checkout": paths + "/scripts/\n"},
+                {"sparse-checkout-cone-mode": "true"},
+                {"ref": "${{ inputs.source_sha }}"},
+                {"persist-credentials": "true"}):
+            with self.subTest(changes=changes):
+                changed = deepcopy(workflow)
+                options = approval_checkout(changed)
+                for key, value in changes.items():
+                    if value is None:
+                        del options[key]
+                    else:
+                        options[key] = value
+                self.assertEqual(staging_migrate_errors(changed), [
+                    "staging-migrate.yml:apply: must load the verifier at the trusted workflow SHA",
+                ])
+
+        steps = workflow["jobs"]["apply"]["steps"]
+        verifier = next(step for step in steps if step.get("name") == "Verify the native staging approval")
+        _, *args = shlex.split(verifier["run"])
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            for pattern in paths.splitlines():
+                path = pattern.removeprefix("/")
+                destination = scratch / checkout["path"] / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes((ROOT / path).read_bytes())
+            # A missing manifest exercises startup without credentials or API calls.
+            result = subprocess.run([sys.executable, "-B", "-S", *args], cwd=scratch,
+                                    env={}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "staging migration approval evidence unavailable or malformed\n")
+
     def test_production_migrate_runner_shape_is_pinned(self):
         # Production mirror of the staging runner: same three jobs, same pinned
         # actions, public-hosted runner, pipefail and provenance gates, with
@@ -9816,6 +10042,8 @@ class WorkflowTests(unittest.TestCase):
                 {"run": 'python3 scripts/staging_rollback_drill.py --target-version "${{ inputs.target_version }}"'}),
             "forced rollback": lambda w: job(w)["steps"][2].update(
                 {"run": 'python3 scripts/staging_rollback_drill.py --target-version "$TARGET_VERSION" --force'}),
+            "wrangler command after drill": lambda w: job(w)["steps"][2].update(
+                {"run": job(w)["steps"][2]["run"] + "\nwrangler deploy"}),
             "other script": lambda w: job(w)["steps"][2].update(
                 {"run": 'python3 scripts/other.py --target-version "$TARGET_VERSION"'}),
         }
@@ -9890,6 +10118,63 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(covering), 1)
         self.assertNotIn("if", covering[0])
 
+    def test_staging_worker_drill_checkout_only_materializes_runtime_files(self):
+        workflow = self.workflows["staging-rollback-drill.yml"]
+        self.assertEqual(staging_rollback_drill_errors(workflow), [])
+        for label, update in {
+            "full checkout": {"sparse-checkout": ""},
+            "missing cleanup helper": {"sparse-checkout": ROLLBACK_DRILL_CHECKOUT["sparse-checkout"].replace(
+                "/wrangler/scripts/staging-use.mjs\n", "")},
+            "extra directory": {"sparse-checkout": ROLLBACK_DRILL_CHECKOUT["sparse-checkout"] + "/docs/\n"},
+            "cone mode": {"sparse-checkout-cone-mode": "true"},
+        }.items():
+            with self.subTest(checkout=label):
+                changed = deepcopy(workflow)
+                changed["jobs"]["drill"]["steps"][0]["with"].update(update)
+                self.assertIn("staging-rollback-drill.yml:drill: must check out only the pinned runtime files",
+                              staging_rollback_drill_errors(changed))
+
+    def test_staging_worker_drill_runs_from_sparse_checkout(self):
+        drill = self.workflows["staging-rollback-drill.yml"]["jobs"]["drill"]
+        patterns = drill["steps"][0]["with"]["sparse-checkout"].splitlines()
+        runtime_paths = [pattern.removeprefix("/") for pattern in patterns]
+        # The isolated subprocess needs only the checked-out runtime and these
+        # offline fixtures. It cannot import from the full repository.
+        fixtures = (
+            "scripts/staging_cloudflare_fixture.py",
+            "scripts/test_staging_drill_use.py",
+            "scripts/test_staging_rollback_drill.py",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in (*runtime_paths, *fixtures):
+                relative = Path(path)
+                self.assertFalse(relative.is_absolute() or ".." in relative.parts, path)
+                dest = root / relative
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes((ROOT / relative).read_bytes())
+            env = {"PATH": os.environ.get("PATH", os.defpath)}
+            # The Python fixture fakes the staging-use subprocess transports.
+            # Import their actual ESM entry points here to exercise the loader.
+            commands = (
+                ["node", "--input-type=module", "-e",
+                 "globalThis.fetch = () => { throw new Error('offline fixture'); }; "
+                 "await import('./wrangler/scripts/staging-use.mjs'); "
+                 "await import('./wrangler/scripts/staging-use-pipeline.mjs');"],
+                [sys.executable, "-I", "-B", "scripts/test_staging_rollback_drill.py",
+                 "ClientAndControlTests.test_minimal_child_environment_runs_node_preflight_without_network",
+                 "MainTests.test_success_writes_evidence_and_summary_without_secrets",
+                 "MainTests.test_unproved_policy_exits_nonzero_before_any_window_or_mutation",
+                 "LifecycleTests.test_failed_leg_restores_without_a_new_check_and_releases",
+                 "LifecycleTests.test_ownership_authentication_failure_stops_use_and_cleanup",
+                 "MainTests.test_cleanup_failure_exits_nonzero_and_still_writes_evidence",
+                 "DryRunPlanPinTests.test_plan_pins_labeled_versions_and_numbered_leg_order"],
+            )
+            for command in commands:
+                with self.subTest(executable=command[0]):
+                    result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_staging_container_drill_shape_is_pinned(self):
         workflows = self.workflows
         self.assertEqual(staging_container_drill_errors(workflows["staging-container-drill.yml"]), [])
@@ -9951,6 +10236,58 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
+    def test_staging_container_drill_sparse_checkout_materializes_runtime_inputs(self):
+        workflow = self.workflows["staging-container-drill.yml"]
+        checkout = workflow["jobs"]["container-drill"]["steps"][0]["with"]
+        self.assertEqual(checkout["fetch-depth"], "1")
+        self.assertNotIn("ref", checkout)
+        self.assertNotIn("filter", checkout)
+        self.assertEqual(checkout.get("sparse-checkout-cone-mode"), "false")
+        self.assertTrue(checkout.get("sparse-checkout"))
+
+        # Materialize the job's rules in a disposable checkout. The lint image's
+        # Git supports sparse-checkout set but predates check-rules.
+        objects, revision = subprocess.check_output(
+            ["git", "rev-parse", "--path-format=absolute", "--git-path", "objects", "HEAD"],
+            cwd=ROOT, text=True, timeout=10,
+        ).splitlines()
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(["git", "init", "--quiet"], cwd=directory, check=True, timeout=10)
+            # Borrow objects without changing Git config or the index of the runner-owned checkout.
+            (Path(directory) / ".git/objects/info/alternates").write_text(objects + "\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "sparse-checkout", "set", "--no-cone", "--stdin"], cwd=directory,
+                input=checkout["sparse-checkout"], text=True, check=True, timeout=10,
+            )
+            subprocess.run(["git", "checkout", "--quiet", "--detach", revision], cwd=directory,
+                           check=True, timeout=10)
+            tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=directory, timeout=10)
+            paths = tracked.rstrip(b"\0").split(b"\0")
+            selected = {path for path in paths if os.path.lexists(Path(directory) / os.fsdecode(path))}
+
+        inputs = {
+            b"Dockerfile",  # The generated config still validates the other environments' images.
+            b"scripts/build_identity.py",
+            b"scripts/script_intake.py",
+            b"scripts/staging_container_drill.py",
+            b"scripts/staging_drill_use.py",
+            b"scripts/staging_rollback_drill.py",
+            b"scripts/staging_rollout.py",
+            b"scripts/worker_container_rollback.py",
+            b"wrangler/package-lock.json",
+            b"wrangler/package.json",
+            b"wrangler/scripts/is-direct-invocation.mjs",
+            b"wrangler/scripts/ownership-control-response.mjs",
+            b"wrangler/scripts/ownership-control.mjs",
+            b"wrangler/scripts/staging-use-pipeline.mjs",
+            b"wrangler/scripts/staging-use.mjs",
+            b"wrangler/src/index.ts",
+            b"wrangler/tsconfig.json",
+            b"wrangler/wrangler.toml",
+        }
+        inputs.update(path for path in paths if path.startswith(b"wrangler/src/"))
+        self.assertEqual(selected, inputs)
+
     def test_staging_events_read_shape_is_pinned(self):
         workflows = self.workflows
         self.assertEqual(staging_events_read_errors(workflows["staging-events-read.yml"]), [])
@@ -9999,6 +10336,17 @@ class WorkflowTests(unittest.TestCase):
             "extra step": lambda w: job(w)["steps"].append({"run": "echo done"}),
             "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
                 {"persist-credentials": "true"}),
+            "unpinned checkout action": lambda w: job(w)["steps"][0].update({"uses": "actions/checkout@v7"}),
+            "retargeted ref": lambda w: job(w)["steps"][0]["with"].update({"ref": "refs/heads/main"}),
+            "retargeted repository": lambda w: job(w)["steps"][0]["with"].update({"repository": "other/repo"}),
+            "retargeted path": lambda w: job(w)["steps"][0]["with"].update({"path": "another-checkout"}),
+            "full-depth fetch": lambda w: job(w)["steps"][0]["with"].update({"fetch-depth": "0"}),
+            "fetch filter override": lambda w: job(w)["steps"][0]["with"].update({"filter": "blob:limit=1m"}),
+            "cone mode": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout-cone-mode": "true"}),
+            "full checkout": lambda w: job(w)["steps"][0]["with"].pop("sparse-checkout"),
+            "missing transitive import": lambda w: job(w)["steps"][0]["with"].update(
+                {"sparse-checkout": "\n".join(EVENTS_READ_PATHS[:-1]) + "\n"}),
+            "whole scripts directory": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout": "/scripts/\n"}),
             "extra secret": lambda w: job(w)["steps"][1]["env"].update(
                 {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
             "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
@@ -10031,6 +10379,35 @@ class WorkflowTests(unittest.TestCase):
         del missing["staging-events-read.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_events_read_starts_with_only_checkout_files(self):
+        checkout = self.workflows["staging-events-read.yml"]["jobs"]["read"]["steps"][0]["with"]
+        self.assertEqual(checkout["sparse-checkout-cone-mode"], "false")
+        git_env = {"PATH": os.environ.get("PATH", os.defpath), "GIT_ALLOW_PROTOCOL": "file",
+                   "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        with tempfile.TemporaryDirectory(prefix="events-read-checkout-") as directory:
+            root = Path(directory) / "checkout"
+
+            def git(*args, stdin=None):
+                result = subprocess.run(
+                    ["git", "-c", f"safe.directory={ROOT}", *args], env=git_env,
+                    input=stdin, capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout
+
+            git("clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(root))
+            git("-C", root, "sparse-checkout", "set", "--no-cone", "--stdin", stdin=checkout["sparse-checkout"])
+            git("-C", root, "checkout", "--quiet", "--detach", "HEAD")
+            tracked = git("-C", root, "ls-files", "-z").split("\0")
+            materialized = {path for path in tracked if path and (root / path).is_file()}
+            self.assertEqual(materialized, {pattern[1:] for pattern in EVENTS_READ_PATHS})
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", "scripts/staging_events_read.py", "--help"],
+                cwd=root, env={}, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--window-start", result.stdout)
 
     def test_staging_privacy_verify_checkout_cannot_retarget_the_reviewed_head(self):
         self.assertEqual(workflow_policy_errors(self.workflows), [])
@@ -11129,7 +11506,6 @@ class WorkflowTests(unittest.TestCase):
             ("fork review", {"github.event_name": "pull_request_review",
                              "github.event.pull_request.head.repo.full_name": "fork/two-bot-next"}, PUBLIC_RUNNER),
         ))
-        self.assertNotIn("runs-on", size_jobs["pr-size"]["with"])
         self.assertNotIn("runs-on", size_jobs["pr-size-weekly"].get("with", {}))
 
     def assert_runner_cases(self, expression, defaults, cases):
@@ -11655,10 +12031,6 @@ class WorkflowTests(unittest.TestCase):
     def test_minimal_grants_and_no_persisted_checkout_credentials(self):
         for name, workflow in self.workflows.items():
             if name == "pr-size.yml":
-                # The org caller template ships an explicit top-level
-                # `contents: read` (its header instructs a byte-exact
-                # copy); every job below still overrides with its own
-                # least-privilege grant, pinned under this test.
                 self.assertEqual(workflow["permissions"], {"contents": "read"})
             else:
                 self.assertEqual(workflow["permissions"], {})
@@ -11753,12 +12125,9 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("release.yml", "attach-sbom"):
                         # TOG-10893: uploads verified SBOMs to the published tag.
                         expected = {"contents": "write"}
-                    elif (name, job_id) in (("pr-size.yml", "pr-size"),
-                                            ("pr-size.yml", "pr-size-gate")):
-                        # Labeller writes the size/* label and keeps the
-                        # one advisory comment; the required gate posts
-                        # the split comment and ensures the exception
-                        # label. Both measure the caller's PR the same way.
+                    elif (name, job_id) == ("pr-size.yml", "pr-size-gate"):
+                        # One job updates size labels, ensures the exception
+                        # label and maintains advisory and required comments.
                         expected = {"contents": "read", "issues": "write",
                                     "pull-requests": "write"}
                     elif (name, job_id) == ("pr-size.yml", "pr-size-weekly"):

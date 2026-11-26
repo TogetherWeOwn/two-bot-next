@@ -10,7 +10,7 @@ from unittest.mock import patch
 from zipfile import ZipFile
 
 from test_predecessor_bundle import fixture, metadata, pack
-from test_pre_worker_upload import receive_multipart
+from test_pre_worker_upload import database_fixture, receive_multipart
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_target import Target, TargetError, make_config
@@ -52,7 +52,8 @@ class PreOperatorInputsTests(unittest.TestCase):
                 verified_receipt=receipt, material_root=self.root, plan=propose(receipt),
             )
             return config, assemble_worker_upload(approved, now=self.now, receipt=receipt,
-                                                  material_root=self.root, config=config)
+                                                  material_root=self.root, config=config,
+                                                  **database_fixture(approved))
 
     def test_reconstructs_both_pinned_pre_start_inputs_without_credentials(self):
         for run, shape, suffix in ((789, "0473/0465", "0473-0465"), (790, "0475/0465", "0475-0465")):
@@ -67,8 +68,10 @@ class PreOperatorInputsTests(unittest.TestCase):
                 self.assertEqual(upload.target.expires_at, 1_800_003_600)
                 parts = receive_multipart(upload.content_type, upload.body)
                 metadata_part = decode_json(parts[0][3])
-                self.assertIn({"type": "plain_text", "name": "DATABASE_URL", "text": database},
-                              metadata_part["bindings"])
+                secret = database_fixture(approved)["database_url"]
+                self.assertEqual([binding for binding in metadata_part["bindings"]
+                                  if binding["name"] == "DATABASE_URL"],
+                                 [{"name": "DATABASE_URL", "type": "secret_text", "text": secret}])
                 self.assertEqual(metadata_part["annotations"]["workers/message"], self.receipt["source_sha"])
                 self.assertIn(("index.js", "index.js", "application/javascript+module", self.worker), parts)
 

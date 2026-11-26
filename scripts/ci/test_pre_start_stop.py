@@ -40,11 +40,13 @@ class PreFixture:
         self.admission.settle.return_value = True
         self.effects = Mock(admission=self.admission)
         self.now = target.started_at
+        self.enclosing_cutoff = target.expires_at
         self.armed = None
         self.fenced = False
         self.created = None
         self.before_create = Mock()
         self.after_create = Mock()
+        self.before_probe_reply = Mock()
         self.reply = ProbeReply(200, self.deployment.worker_version, b"{}")
 
     def controller(self, authorize):
@@ -63,6 +65,10 @@ class PreFixture:
         self.fenced = True
         return True
 
+    def confirm_probe_active(self, target, start_id):
+        return (self.armed == (target, start_id) and not self.fenced
+                and target.started_at <= self.now < min(target.expires_at, self.enclosing_cutoff))
+
     def allow_effect(self, target, start_id):
         if self.fenced or self.armed != (target, start_id) or self.now >= target.expires_at:
             raise OSError("effect refused")
@@ -80,7 +86,9 @@ class PreFixture:
         if deployment != self.created:
             raise OSError("unbound deployment")
         self.effects.probe(deployment, endpoint)
-        return self.reply
+        reply = self.reply
+        self.before_probe_reply()
+        return reply
 
 
 class ProtectedPreTests(unittest.TestCase):
@@ -155,6 +163,43 @@ class ProtectedPreTests(unittest.TestCase):
         fixture.effects.probe.assert_not_called()
         fixture.reply = replace(fixture.reply, worker_version=UUID(int=5))
         self.assert_refuses("pre_probe_unconfirmed", self.controller.probe, deployment, Endpoint.READINESS)
+
+    def test_probe_acceptance_requires_active_reservation_at_reply(self):
+        for outcome in ("timely", "stopped", "expired", "enclosing_cutoff"):
+            with self.subTest(outcome=outcome):
+                fixture = PreFixture()
+                controller = fixture.controller(lambda t, op: t == TARGET and op in (Operation.START, Operation.PROBE))
+                stop = fixture.controller(lambda t, op: (t, op) == (TARGET, Operation.STOP))
+                deployment = controller.start(fixture.upload)
+                if outcome == "enclosing_cutoff":
+                    fixture.enclosing_cutoff = TARGET.expires_at - 5
+                fixture.now = fixture.enclosing_cutoff - 1
+                fixture.reply = ProbeReply(200, deployment.worker_version, b'{"components":[["gateway","ready"]]}')
+                stop_results = []
+
+                def before_reply():
+                    if outcome == "stopped":
+                        stop_results.append(stop.stop())
+                    elif outcome in ("expired", "enclosing_cutoff"):
+                        fixture.now = fixture.enclosing_cutoff
+
+                fixture.before_probe_reply.side_effect = before_reply
+                if outcome == "timely":
+                    self.assertIs(controller.probe(deployment, Endpoint.READINESS), fixture.reply)
+                else:
+                    self.assert_refuses("pre_probe_unconfirmed", controller.probe, deployment, Endpoint.READINESS)
+                fixture.effects.probe.assert_called_once_with(deployment, Endpoint.READINESS)
+                self.assertEqual(stop_results, [True] if outcome == "stopped" else [])
+
+    def test_probe_acceptance_refuses_unconfirmed_authority(self):
+        fixture = self.fixture
+        deployment = self.controller.start(fixture.upload)
+        responses = (None, 1, OSError("private authority detail"))
+        with patch.object(fixture, "confirm_probe_active", side_effect=responses) as confirm:
+            for response in responses:
+                with self.subTest(response=response):
+                    self.assert_refuses("pre_probe_unconfirmed", self.controller.probe, deployment, Endpoint.HEALTH)
+        self.assertEqual(confirm.call_args_list, [call(TARGET, deployment.start_id)] * len(responses))
 
     def test_rehearsal_probe_sequence_for_both_pre_snapshots(self):
         probes = ((Endpoint.HEALTH, 200, b'{"status":"ok"}'),
