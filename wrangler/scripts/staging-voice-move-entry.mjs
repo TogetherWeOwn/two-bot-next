@@ -1,5 +1,7 @@
 import { isDirectInvocation } from "./is-direct-invocation.mjs";
+import { stagingVoiceFixturePin } from "./staging-voice-move-caller.mjs";
 import { runStagingVoiceMoveJob } from "./staging-voice-move-job.mjs";
+import { stagingVoiceSessionScopeMatches } from "./staging-voice-session.mjs";
 import { stagingVoiceWebHandoffInputs } from "./staging-voice-web-handoff.mjs";
 
 /** Bind dependencies already held by the protected caller. The job supplies
@@ -24,11 +26,35 @@ export function bindStagingVoiceMoveHandoffProvider(dependencies, evidence) {
  * deadlines. The job reads its own ready receipt and the workflow owns finish.
  */
 export async function runStagingVoiceMoveEntry(env = {}, provideProofInputs) {
+  return runEntry(env, provideProofInputs);
+}
+
+/** Rehearse with mock adapters and a frozen, in-process approval. The approval
+ * pins the current run and attempt (as runner strings), ordered fixture, Web
+ * revision and exact scoped Web session before the job reads its ready row.
+ */
+export function runStagingVoiceMoveRehearsal(env, approval, dependencies) {
+  return runEntry(env, bindStagingVoiceMoveProvider(dependencies), (inputs) => {
+    const { runId, runAttempt, fixture, expectedRevision, webSession } = approval ?? {};
+    if (!Object.isFrozen(approval) || !runId || runId !== env.GITHUB_RUN_ID
+      || !runAttempt || runAttempt !== env.GITHUB_RUN_ATTEMPT
+      || fixture !== inputs.fixture || expectedRevision !== inputs.expectedRevision || webSession !== inputs.webSession) {
+      return false;
+    }
+    const pinnedFixture = stagingVoiceFixturePin(fixture);
+    return pinnedFixture !== null && [fixture, fixture.channelIds, expectedRevision, webSession].every(Object.isFrozen)
+      && stagingVoiceSessionScopeMatches({ session: webSession, fixture: pinnedFixture, expectedRevision });
+  });
+}
+
+async function runEntry(env, provideProofInputs, admit) {
   if (env.STAGING_VOICE_MOVE_PROOF !== "true") return "disabled";
   if (typeof provideProofInputs !== "function") return "failed";
 
   try {
-    return await runStagingVoiceMoveJob(env, await provideProofInputs());
+    const inputs = await provideProofInputs();
+    if (admit && !admit(inputs)) return "failed";
+    return await runStagingVoiceMoveJob(env, inputs);
   } catch {
     // Provider failures can include private inputs. Report only the verdict.
     return "failed";
