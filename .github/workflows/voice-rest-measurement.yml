@@ -290,6 +290,17 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          # Keep the script directory together for the shared promotion helper import.
+          sparse-checkout: |
+            /scripts/ci/voice_lifecycle_evidence.py
+            /scripts/ci/voice_measurement_cleanup.py
+            /scripts/ci/voice_measurement_terminal.py
+            /scripts/script_intake.py
+            /wrangler/package.json
+            /wrangler/scripts/
+            /wrangler/src/alert-rules.ts
+            /wrangler/src/metrics-scrape.ts
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
