@@ -11288,7 +11288,7 @@ class WorkflowTests(unittest.TestCase):
         workflow = self.workflows["nightly.yml"]
         self.assertEqual(
             set(workflow.get("on") or {}),
-            {"schedule", "workflow_dispatch", "pull_request"},
+            {"schedule", "workflow_dispatch"},
         )
         # All four compiling jobs carry the ceiling; the `sweep` aggregate
         # is not a compiling job and is not pinned here.
@@ -11298,6 +11298,13 @@ class WorkflowTests(unittest.TestCase):
                     workflow["jobs"][name].get("timeout-minutes"),
                     "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}",
                 )
+
+    def test_pipeline_benchmark_keeps_focused_pr_coverage(self):
+        workflow = self.workflows["pipeline-benchmark.yml"]
+        paths = workflow["on"]["pull_request"]["paths"]
+        self.assertIn("Cargo.lock", paths)
+        self.assertIn("scripts/*pipeline_bench*", paths)
+        self.assertIn("workflow_call", workflow["on"])
 
     def test_nextest_container_pins_disposable_database_service_address(self):
         # Same hardening as the check.yml lanes: the shared lane runs the
