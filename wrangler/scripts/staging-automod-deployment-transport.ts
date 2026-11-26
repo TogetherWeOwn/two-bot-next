@@ -87,7 +87,7 @@ export function bindStagingAutomodDeploymentTransport(worker: Worker,
         current = binding ?? servingBinding(inventory, admitted.issuedLease);
       }
       if (!sameLease(current.issuedLease, admitted.issuedLease)
-        || (admitted.action === "start" && !fresh(current.observed))) {
+        || (admitted.action === "start" && (!fresh(current.observed) || Date.now() >= admitted.issuedLease.expiresAt))) {
         throw new Error("AutoMod serving deployment unconfirmed");
       }
       signal.throwIfAborted();
