@@ -74,8 +74,6 @@ JOB_INVENTORY = {
                     "sweep-partition", "sweep-guarded", "sweep-docs", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "mutation.yml": {"rust-mutation", "python-mutation", "worker-mutation"},
-    # One-off read-only reference writer for the fixed source snapshot.
-    "configuration-reference.yml": {"configuration-reference"},
     "release.yml": {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"},
     # Daily digest release (docs/releases.md): at most one vYYYY.MDD.P tag a day,
     # plus the missing-digest alert; pinned shape below.
