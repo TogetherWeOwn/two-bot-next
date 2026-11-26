@@ -1585,7 +1585,7 @@ def reviewed_migrate_errors(workflow):
     # Pin the reviewed trigger, checkouts, containers, job order, shells and secret scopes.
     encoded = json.dumps(workflow, sort_keys=True, separators=(",", ":")).encode()
     digest = hashlib.sha256(encoded).hexdigest()
-    return [] if digest == "b7ea9bfd21484f7a8c6dc0d49ea703ab8c25c68b18affeab45f2ec4a04fa7ab2" else [
+    return [] if digest == "1ae7e3b5c9fa8aa270218aec8905f4011ce16d347f8cb322e0b7d7fe6aed48d3" else [
         "reviewed staging migration workflow contract changed"]
 
 
@@ -7762,6 +7762,27 @@ class WorkflowTests(unittest.TestCase):
         lock = workflows[name]["concurrency"]
         lock["group"] = lock["group"].replace("staging-automod-refused-{0}-{1}", PRE_REAPER_QUEUE)
         self.assertIn(f"{name}: the PRE sweep queue must remain exclusive", staging_pre_reaper_errors(workflows))
+
+    def test_reviewed_staging_authorize_checkout(self):
+        workflow = self.workflows["staging-migrate-reviewed.yml"]
+        checkout = workflow["jobs"]["authorize"]["steps"][0]
+        self.assertEqual(checkout["with"], {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": "false",
+            "fetch-depth": "0",
+            "sparse-checkout": "scripts\n.github/staging-apply\n",
+        })
+        self.assertEqual(reviewed_migrate_errors(workflow), [])
+        for key, value in (
+                ("fetch-depth", "1"),
+                ("sparse-checkout", "scripts\n"),
+                ("sparse-checkout", ".github/staging-apply\n"),
+                ("sparse-checkout", "scripts\n.github/staging-apply\ndocs\n")):
+            with self.subTest(key=key, value=value):
+                changed = deepcopy(workflow)
+                changed["jobs"]["authorize"]["steps"][0]["with"][key] = value
+                self.assertEqual(reviewed_migrate_errors(changed),
+                                 ["reviewed staging migration workflow contract changed"])
 
     def test_staging_pre_reaper_is_dormant(self):
         self.assertEqual(staging_pre_reaper_errors(self.workflows), [])
