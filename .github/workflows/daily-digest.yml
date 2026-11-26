@@ -54,16 +54,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          # Include the resolver's helper and the adapter's notes config.
-          # CalVer reads tags and history through the GitHub API. Keep Git's
-          # root metadata in the same blob fetch as the adapter files.
+          # Keep adapter directories so new sibling imports are available.
+          # CalVer reads tags and history through the GitHub API.
           sparse-checkout: |
             /.gitattributes
-            /.github/scripts/daily-digest.cjs
+            /.github/scripts/
             /.gitignore
             /release-please-config.json
-            /scripts/build_identity.py
-            /scripts/digest_resolve.py
+            /scripts/
           sparse-checkout-cone-mode: false
           fetch-depth: 1
           persist-credentials: false
@@ -146,15 +144,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Include Git's root metadata and the alert's dynamic import chain.
+          # Keep the directory containing the alert's dynamic import chain.
           sparse-checkout: |
             /.gitattributes
             /.gitignore
-            /scripts/digest_alert.py
-            /scripts/incident_issue.py
-            /scripts/script_intake.py
-            /scripts/synthetic_alert.py
-            /scripts/synthetic_alert_history.py
+            /scripts/
           sparse-checkout-cone-mode: false
           persist-credentials: false
           fetch-depth: 1
