@@ -34,7 +34,9 @@ name: supply-chain
 
 on:
   pull_request:
-    types: [opened, edited, synchronize, reopened, ready_for_review]
+    # Both checks already run on drafts. Edits can change lint input at the
+    # same head, so they still need a fresh verdict.
+    types: [opened, edited, synchronize, reopened]
   merge_group:
     types: [checks_requested]
   push:

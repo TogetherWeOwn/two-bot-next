@@ -14,8 +14,8 @@ from enum import Enum
 from typing import Protocol
 from uuid import UUID
 
-from pre_target import Target, TargetError, require
-from staging_health_contract_probe import BODY_CAP
+from pre_target import ProtectedRouteReadback, Target, TargetError, confirm_protected_route, require
+from staging_health_contract_probe import BODY_CAP, TIMEOUT_SECONDS
 
 
 class Operation(Enum):
@@ -71,6 +71,36 @@ class ProbeReply:
     body: bytes = field(repr=False)
 
 
+@dataclass(frozen=True)
+class ProbeBindingIdentity:
+    worker_id: str
+    deployment: Deployment
+
+
+@dataclass(frozen=True)
+class PrivateHttpReply:
+    status: int
+    worker_versions: tuple[str, ...] = field(repr=False)
+    body: bytes = field(repr=False)
+
+
+class PrivateProbeBinding(Protocol):
+    """Authenticated handle to one private service, with no alternate destination.
+
+    The adapter must check the current reservation, exact binding destination,
+    authorization, deadline and stop fence at send time. The adapter must
+    enforce the total timeout and cap the response read, without redirects or
+    retries. Return every x-two-worker-version field value, regardless of
+    header case.
+    """
+
+    @property
+    def identity(self) -> ProbeBindingIdentity: ...
+
+    def request(self, method: str, path: str, *, expected: ProbeBindingIdentity,
+                follow_redirects: bool, timeout_seconds: int, max_body_bytes: int) -> PrivateHttpReply: ...
+
+
 class PrivateRuntime(Protocol):
     """Enforce authorization, exact operation, deadline and stop at effect time.
 
@@ -78,7 +108,7 @@ class PrivateRuntime(Protocol):
     app identity, private ingress from first create, current unrouted readback
     and an authenticated service binding restricted to this exact Worker.
     Resolve and compare the deployment against the authoritative identity for
-    the full reservation on each bounded GET without following redirects.
+    the full reservation on each bounded GET using the `probe_private_get` contract.
     Controller instances can span different runners, so retain that identity
     outside the controller. Refuse effects outside the admission window,
     after a fence, or for unverified identities. Treat a lost reply as uncertain.
@@ -125,6 +155,42 @@ def _call(operation, *args, failure):
     raise TargetError(failure) from None
 
 
+def _valid_deployment(deployment):
+    return (type(deployment) is Deployment and type(deployment.target) is Target
+            and all(type(value) is UUID and value.int for value in
+                    (deployment.start_id, deployment.worker_version, deployment.container_id)))
+
+
+def probe_private_get(deployment: Deployment, endpoint: Endpoint, *, pinned_deployment: Deployment,
+                      pinned_route: ProtectedRouteReadback, binding: PrivateProbeBinding) -> ProbeReply:
+    """Verify the outbound probe against independent protected pins.
+
+    The caller supplies the authoritative deployment and pinned route from the
+    reservation independently of the binding. This helper has no provider client.
+    """
+    require(type(endpoint) is Endpoint, "invalid_pre_probe")
+    require(_valid_deployment(pinned_deployment) and _valid_deployment(deployment)
+            and deployment == pinned_deployment, "pre_deployment_unconfirmed")
+    confirm_protected_route(deployment.target, pinned_app_id=str(pinned_deployment.container_id),
+                            readback=pinned_route)
+    expected = ProbeBindingIdentity(pinned_route.worker_id, pinned_deployment)
+    identity = _call(lambda: binding.identity, failure="pre_probe_binding_unconfirmed")
+    require(type(identity) is ProbeBindingIdentity and type(identity.worker_id) is str
+            and _valid_deployment(identity.deployment) and identity == expected, "pre_probe_binding_unconfirmed")
+
+    reply = _call(lambda: binding.request("GET", endpoint.value, expected=expected, follow_redirects=False,
+                                          timeout_seconds=TIMEOUT_SECONDS, max_body_bytes=BODY_CAP + 1),
+                  failure="pre_probe_unconfirmed")
+    require(type(reply) is PrivateHttpReply and type(reply.status) is int
+            and 200 <= reply.status <= 599, "pre_probe_unconfirmed")
+    require(not 300 <= reply.status <= 399, "pre_probe_redirect")
+    stamp = reply.worker_versions
+    require(type(stamp) is tuple and len(stamp) == 1 and type(stamp[0]) is str
+            and stamp[0] == str(deployment.worker_version), "pre_probe_version_unconfirmed")
+    require(type(reply.body) is bytes and len(reply.body) <= BODY_CAP, "pre_probe_unconfirmed")
+    return ProbeReply(reply.status, deployment.worker_version, reply.body)
+
+
 class ProtectedPre:
     def __init__(self, target: Target, *, authorize: Callable[[Target, Operation], bool],
                  admission: StartupAdmission, runtime: PrivateRuntime, external_stop: ExternalStop):
@@ -140,10 +206,7 @@ class ProtectedPre:
         require(allowed is True, "pre_operation_denied")
 
     def _require_deployment(self, deployment):
-        require(type(deployment) is Deployment and type(deployment.target) is Target
-                and deployment.target == self._target
-                and all(type(value) is UUID and value.int for value in
-                        (deployment.start_id, deployment.worker_version, deployment.container_id)),
+        require(_valid_deployment(deployment) and deployment.target == self._target,
                 "pre_deployment_unconfirmed")
 
     def start(self, upload: WorkerUpload) -> Deployment:
