@@ -183,6 +183,46 @@ class T0AcceptanceReportTests(unittest.TestCase):
                 self.assertEqual((refused.returncode, refused.stdout), (2, b""))
                 self.assertEqual(refused.stderr, b"production watch refused: missing or invalid rows or serving window\n")
 
+    def test_naming_watch_preserves_exact_same_second_order_and_bounds(self):
+        early = "2026-11-25T02:02:00.1234567Z"
+        late = "2026-11-25T02:02:00.123456701+0000"
+        window = dict(PRODUCTION, start=early, end="2026-11-25T02:02:00.123456701Z")
+        equivalent = dict(window, start="2026-11-25T02:02:00.123456700+00:00",
+                          end="2026-11-25T02:02:00.1234567010-0000")
+
+        def assemble(first, second):
+            empty = WATCH_EMPTY.replace(b"2026-11-25T02:02:00Z", first.encode())
+            returned = WATCH_RETURN.replace(b"2026-11-25T02:03:00.125+00:00", second.encode())
+            return self.assemble_watch("naming", empty + returned, equivalent)
+
+        assembled = assemble(early, late)
+        self.assertEqual((assembled.returncode, assembled.stderr), (0, b""))
+        receipt = json.loads(assembled.stdout)
+        self.assertEqual(receipt["window"], window)
+        self.assertEqual([row["utc"] for row in receipt["rows"]], [early, late])
+        binding = self.save("naming", assembled.stdout, equivalent)
+        self.assertEqual(self.run_report({"naming": binding}, window)["naming"], {
+            "status": "attributed", "window": window, "result": "transitions_recorded", "missing_transitions": [],
+        })
+
+        invalid_order = ("unverified", "saved probe output is invalid or refused")
+        for first, second, rejection in (
+            (late, early, invalid_order),
+            (early, "2026-11-25T02:02:00.123456700-00:00", invalid_order),
+            (early, "2026-11-25T02:02:00.123456702Z",
+             ("mismatched", "production watch row falls outside the serving window")),
+        ):
+            with self.subTest(first=first, second=second):
+                refused = assemble(first, second)
+                self.assertEqual((refused.returncode, refused.stdout), (2, b""))
+                # Give the reader matching attribution so it must reject the timestamps itself.
+                changed = dict(receipt, rows=[dict(row, utc=stamp)
+                                             for row, stamp in zip(receipt["rows"], (first, second))])
+                binding = self.save("naming", changed, equivalent)
+                row = self.run_report({"naming": binding}, window)["naming"]
+                self.assertEqual((row["status"], row["reason"]), rejection)
+                self.assertNotIn("result", row)
+
     def test_reads_outputs_from_the_offline_naming_and_gateway_producers(self):
         readbacks = self.root / "readbacks.json"
         slots = [{"room_id": "3000000000000000001", "observed_at_ms": i, "humans": humans, "name": name}
