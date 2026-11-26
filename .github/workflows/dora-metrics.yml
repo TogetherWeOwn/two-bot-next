@@ -94,7 +94,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -106,7 +106,7 @@ jobs:
           WEEK: ${{ needs.metrics.outputs.week }}
         run: |
           set -euo pipefail
-          branch=automation/dora-metrics
+          destination=refs/heads/automation/dora-metrics
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # Git HTTPS uses Basic auth, not the API bearer scheme. Mask the
@@ -114,10 +114,13 @@ jobs:
           basic_auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
           printf '::add-mask::%s\n' "$basic_auth"
           auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: Basic ${basic_auth}")
-          git "${auth[@]}" fetch origin
           base=HEAD
-          if git rev-parse --verify -q "origin/${branch}" >/dev/null; then
-            base="origin/${branch}"
+          # Fall back only after a successful lookup without the exact ref.
+          # ls-remote patterns can also match ref suffixes.
+          remote_refs=$(git "${auth[@]}" ls-remote --heads origin "$destination")
+          if [[ "$remote_refs"$'\n' == *$'\t'"$destination"$'\n'* ]]; then
+            git "${auth[@]}" fetch --depth=1 --no-tags --no-recurse-submodules --refmap= origin "$destination"
+            base=FETCH_HEAD
           fi
           # Publish the computed files on the branch's existing tree so a
           # same-week rerun modifies rather than adds files. Keep the
@@ -133,7 +136,7 @@ jobs:
             exit 0
           fi
           git commit -m "chore(metrics): weekly DORA metrics for ${WEEK}"
-          git "${auth[@]}" push origin "HEAD:refs/heads/${branch}" || {
-            echo "::error::DORA publication to ${branch} was refused; evidence preserved"
+          git "${auth[@]}" push origin "HEAD:$destination" || {
+            echo "::error::DORA publication to ${destination#refs/heads/} was refused; evidence preserved"
             exit 1
           }
