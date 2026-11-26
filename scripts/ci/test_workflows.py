@@ -189,6 +189,7 @@ PR_SIZE_WEEKLY_IF = "github.event_name == 'schedule' || (github.event_name == 'w
 PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size-gate"): PR_SIZE_JOB_IF,
                          ("pr-size.yml", "pr-size-weekly"): PR_SIZE_WEEKLY_IF}
 PR_SIZE_GATE_INPUTS = {
+    "runs-on": PR_SIZE_GATE_RUNNER_INPUT,
     "pr-number": "${{ inputs.pr_number || '' }}",
     "advisory-label": "true",
     "exclude-extra": "migrations.lock",
@@ -9170,6 +9171,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(jobs), {"pr-size-gate", "pr-size-weekly"})
         self.assertEqual(jobs["pr-size-gate"]["name"], "pr-size-gate")
         self.assertEqual(jobs["pr-size-gate"]["with"], {
+            "runs-on": PR_SIZE_GATE_RUNNER_INPUT,
             "pr-number": "${{ inputs.pr_number || '' }}",
             "advisory-label": "true",
             "exclude-extra": "migrations.lock",
@@ -11157,7 +11159,6 @@ class WorkflowTests(unittest.TestCase):
             ("fork review", {"github.event_name": "pull_request_review",
                              "github.event.pull_request.head.repo.full_name": "fork/two-bot-next"}, PUBLIC_RUNNER),
         ))
-        self.assertNotIn("runs-on", size_jobs["pr-size"]["with"])
         self.assertNotIn("runs-on", size_jobs["pr-size-weekly"].get("with", {}))
 
     def assert_runner_cases(self, expression, defaults, cases):
