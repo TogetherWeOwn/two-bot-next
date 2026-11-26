@@ -248,10 +248,11 @@ class AcceptanceTests(unittest.TestCase):
         observed = active_observation()
         now = int(START.timestamp()) + 3600
         observed["lifecycle"]["use"]["expiresAt"] = (now + 60) * 1000
+        plan = plan_for_observation(observed)
         env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
                "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
         args = ["finalized", "--rollout", "rollout", "--observed", "observed",
-                "--fixture-start", START.strftime("%Y-%m-%dT%H:%M:%SZ"), "--execute"]
+                "--plan", "plan", "--execute"]
 
         def run(duplicate):
             calls = []
@@ -283,7 +284,7 @@ class AcceptanceTests(unittest.TestCase):
                 raise HTTPError(request.full_url, 404, "not_found", headers, BytesIO(json.dumps(envelope).encode()))
 
             with (patch.object(acceptance, "no_redirect_opener") as opener,
-                  patch.object(acceptance, "read_object", side_effect=[ROLLOUT, observed]),
+                  patch.object(acceptance, "read_object", side_effect=[plan, ROLLOUT, observed]),
                   patch.object(acceptance.time, "time", return_value=now),
                   patch.object(acceptance.time, "monotonic", return_value=0),
                   patch("sys.stdout", new_callable=StringIO) as stdout,
@@ -292,8 +293,9 @@ class AcceptanceTests(unittest.TestCase):
                 status = acceptance.main(args, env=env)
             return status, stdout.getvalue(), stderr.getvalue(), calls
 
-        self.assertEqual(run(duplicate=False),
-                         (0, "PASS: attendance finalized\n", "", ["readyz", EVENT, "readyz", EVENT + ":foreign", "readyz"]))
+        receipt = json.dumps(signed_receipt("finalized", plan), sort_keys=True)
+        self.assertEqual(run(duplicate=False), (0, f"{receipt}\nPASS: attendance finalized\n", "",
+                                               ["readyz", EVENT, "readyz", EVENT + ":foreign", "readyz"]))
         self.assertEqual(run(duplicate=True),
                          (1, "", "FAIL: attendance acceptance input or transport refused\n", ["readyz", EVENT]))
 
