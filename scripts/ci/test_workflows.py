@@ -4866,6 +4866,12 @@ DISJOINT_PRE_REAPER_EXPRESSIONS.update({
 })
 
 
+# pr-size: one group per PR head commit (push, label, review); manual apart.
+PR_SIZE_CONCURRENCY_GROUP = ("${{ github.workflow }}-"
+                             "${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}-"
+                             "${{ github.event.pull_request.head.sha || 'manual' }}")
+
+
 def staging_pre_reaper_errors(workflows):
     errors = dormant_pre_reaper_errors(workflows)
     for file, workflow in workflows.items():
@@ -4885,8 +4891,7 @@ def staging_pre_reaper_errors(workflows):
                 # This expression's first term is the top-level workflow name.
                 may_collide = not (
                     workflow.get("name") == "pr-size" and "workflow_call" not in workflow.get("on", {})
-                    and group == "${{ github.workflow }}-"
-                                 "${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}"
+                    and group == PR_SIZE_CONCURRENCY_GROUP
                 )
             else:
                 may_collide = DISJOINT_PRE_REAPER_EXPRESSIONS.get((file, job)) != group
@@ -9155,16 +9160,20 @@ class WorkflowTests(unittest.TestCase):
         workflows["pr-size.yml"]["jobs"]["pr-size-gate"]["if"] = expected["pr-size-weekly"]
         self.assertTrue(workflow_policy_errors(workflows))
 
-    def test_pr_size_gate_queues_overlapping_pr_and_review_runs(self):
+    def test_pr_size_gate_cancels_superseded_pr_and_review_runs(self):
         workflow = self.workflows["pr-size.yml"]
-        # One group for both event families prevents overlapping verdicts.
-        # Both settings matter: disabling active cancellation alone still
-        # lets a third run evict a pending required check.
+        # All PR events on one head commit share a group and the newest
+        # cancels the older; a new push is a new group, so a required gate
+        # never waits behind stale runs. Manual dispatch is separate.
         self.assertEqual(workflow["concurrency"], {
-            "group": "${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}",
-            "cancel-in-progress": "false",
-            "queue": "max",
+            "group": PR_SIZE_CONCURRENCY_GROUP,
+            "cancel-in-progress": "${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_review' }}",
         })
+        self.assertNotIn("queue", workflow["concurrency"])
+        group = workflow["concurrency"]["group"]
+        # Keyed by head commit: a stale review on an old commit can never
+        # cancel the current push's gate, and manual runs stay apart.
+        self.assertIn("github.event.pull_request.head.sha || 'manual'", group)
         self.assertEqual(workflow["jobs"]["pr-size-gate"]["name"], "pr-size-gate")
 
     def test_pr_size_gate_rechecks_on_grants_and_revocations(self):
