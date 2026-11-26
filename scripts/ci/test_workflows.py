@@ -9920,6 +9920,47 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn("staging-rollback-drill.yml:drill: must check out only the pinned runtime files",
                               staging_rollback_drill_errors(changed))
 
+    def test_staging_worker_drill_runs_from_sparse_checkout(self):
+        drill = self.workflows["staging-rollback-drill.yml"]["jobs"]["drill"]
+        patterns = drill["steps"][0]["with"]["sparse-checkout"].splitlines()
+        runtime_paths = [pattern.removeprefix("/") for pattern in patterns]
+        # The isolated subprocess needs only the checked-out runtime and these
+        # offline fixtures. It cannot import from the full repository.
+        fixtures = (
+            "scripts/staging_cloudflare_fixture.py",
+            "scripts/test_staging_drill_use.py",
+            "scripts/test_staging_rollback_drill.py",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in (*runtime_paths, *fixtures):
+                relative = Path(path)
+                self.assertFalse(relative.is_absolute() or ".." in relative.parts, path)
+                dest = root / relative
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes((ROOT / relative).read_bytes())
+            env = {"PATH": os.environ.get("PATH", os.defpath)}
+            # The Python fixture fakes the staging-use subprocess transports.
+            # Import their actual ESM entry points here to exercise the loader.
+            commands = (
+                ["node", "--input-type=module", "-e",
+                 "globalThis.fetch = () => { throw new Error('offline fixture'); }; "
+                 "await import('./wrangler/scripts/staging-use.mjs'); "
+                 "await import('./wrangler/scripts/staging-use-pipeline.mjs');"],
+                [sys.executable, "-I", "-B", "scripts/test_staging_rollback_drill.py",
+                 "ClientAndControlTests.test_minimal_child_environment_runs_node_preflight_without_network",
+                 "MainTests.test_success_writes_evidence_and_summary_without_secrets",
+                 "MainTests.test_unproved_policy_exits_nonzero_before_any_window_or_mutation",
+                 "LifecycleTests.test_failed_leg_restores_without_a_new_check_and_releases",
+                 "LifecycleTests.test_ownership_authentication_failure_stops_use_and_cleanup",
+                 "MainTests.test_cleanup_failure_exits_nonzero_and_still_writes_evidence",
+                 "DryRunPlanPinTests.test_plan_pins_labeled_versions_and_numbered_leg_order"],
+            )
+            for command in commands:
+                with self.subTest(executable=command[0]):
+                    result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_staging_container_drill_shape_is_pinned(self):
         workflows = self.workflows
         self.assertEqual(staging_container_drill_errors(workflows["staging-container-drill.yml"]), [])
