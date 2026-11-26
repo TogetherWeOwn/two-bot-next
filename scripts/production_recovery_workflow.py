@@ -1,75 +1,74 @@
 """Run the protected database inverse and complete a fenced provider restore."""
 
-from dataclasses import asdict
-from datetime import datetime, timezone
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 
-from ci.production_migrate_claim import WORKFLOW_PATH
-from production_migrate_approval import ARTIFACT as PLAN_ARTIFACT, verify_check, verify_environment
 from production_ownership_status import read_status
-from production_recovery_artifact import FENCE_JOB, FENCE_STEP, authenticated_inverse, current_run, protected_job
-from production_recovery_takeover import RUN_ID, UUID, RecoveryPin, complete_legacy_takeover, observed_phase, verify_inverse
-from production_release_ledgers import CUTOVER, STORE, ledger_endpoints
+from production_recovery_artifact import FENCE_JOB, FENCE_STEP, authenticated_inverse, protected_job
+from production_recovery_takeover import UUID, complete_legacy_takeover, observed_phase, verify_inverse
+from production_release import forward_document, is_stopped, matches_pair, release_actor, release_context, stopped_ack, write_json
+from production_release_ledgers import CUTOVER, STORE
 from rollback_proof import ProofError
 from staging_migrate_approval import digest_json
-from staging_recovery_status import DIGEST, authenticated_plan, github, matches
+from staging_recovery_status import github
 from staging_rollout import GateError, decode, mapping, require
 from worker_container_rollback import APPLICATIONS, WORKERS, ProvenanceReceipt, Rollback, RollbackClient
+from worker_container_rollback import WORKER_RESTORE_POLL_SECONDS, WORKER_RESTORE_READS
 from worker_container_rollback import check_url, control_client, validate_receipt_against_live
-
-FENCE_ACTOR_PREFIX = "production-schema-release:"
 
 
 def fence_actor(pin):
-    return f"{FENCE_ACTOR_PREFIX}{pin.run_id}:{pin.candidate_sha}"
+    return release_actor(pin.run_id, pin.candidate_sha)
 
 
 def pair_matches(state, pin, version, sha, digest):
-    worker, image = mapping(state.get("worker")), mapping(state.get("container"))
-    return (worker.get("version_id") == version and worker.get("sha") == sha
-            and worker.get("traffic_percent") == 100 and image.get("image_digest") == digest
-            and image.get("application_id") == pin.application_id
-            and image.get("namespace_id") == pin.namespace_id and image.get("rollout_status") == "completed")
+    return matches_pair(state, pin, version, sha, digest, completed=True)
 
 
 def stopped_fence(state, pin):
-    owner = mapping(state.get("ownership"))
-    require(owner.get("phase") == "fenced" and owner.get("running") is False
-            and type(owner.get("epoch")) is int and owner["epoch"] == pin.fence_epoch
-            and owner.get("owner_actor") == fence_actor(pin), "production_stopped_fence_unproved")
+    require(is_stopped(state, pin.fence_epoch, fence_actor(pin)), "production_stopped_fence_unproved")
 
 
 def verify_fence_ack(ack, pin, candidate_version):
-    owner = mapping(ack.get("owner"))
-    require(ack.get("deploymentId") in (pin.worker_version, candidate_version) and ack.get("running") is False
-            and owner.get("phase") == "fenced" and "deploymentId" in owner and owner["deploymentId"] is None
-            and owner.get("actor") == fence_actor(pin) and type(owner.get("epoch")) is int
-            and owner["epoch"] == pin.fence_epoch and type(owner.get("oldEpoch")) is int
-            and owner["oldEpoch"] == pin.fence_epoch - 1, "production_stopped_fence_ack_invalid")
+    require(ack.get("deploymentId") in (pin.worker_version, candidate_version),
+            "production_stopped_fence_ack_invalid")
+    return stopped_ack(ack, pin.fence_epoch, fence_actor(pin), ack["deploymentId"])
+
+
+def recoverable_pair(state, pin, candidate):
+    # A provider failure can leave either component at its reviewed endpoint.
+    # An ambiguous Worker publish has no candidate ID and therefore only
+    # permits recovery if the exact prior Worker still serves.
+    return any(matches_pair(state, pin, version, sha, image)
+               for version, sha in ((pin.worker_version, pin.rollback_sha), candidate[:2]) if version
+               for image in (pin.image_digest, candidate[2]))
 
 
 def establish_fence(pin, pair, observe, control):
     state = observe()
-    require(any(pair_matches(state, pin, *members) for members in (
-        pair, (pin.worker_version, pin.rollback_sha, pin.image_digest),
-    )), "production_inverse_serving_pair_changed")
-    owner = mapping(state.get("ownership"))
-    require(owner.get("phase") in ("active", "fenced") and type(owner.get("epoch")) is int
-            and owner["epoch"] == pin.fence_epoch - 1, "production_inverse_fence_epoch_changed")
+    require(recoverable_pair(state, pin, pair), "production_inverse_serving_pair_changed")
+    actor = fence_actor(pin)
     version = state["worker"]["version_id"]
-    ack = control("fence-exact", pin.fence_epoch - 1, expected_deployment=version)
-    verify_fence_ack(ack, pin, pair[0])
+    if is_stopped(state, pin.fence_epoch, actor):
+        # The authenticated forward stop is still in force, even when the
+        # exact candidate version now serves. Preserve its original ack.
+        return pin, None
+    owner = mapping(state.get("ownership"))
+    require(version == pair[0] and owner.get("phase") == "active" and owner.get("owner_actor") == actor
+            and type(owner.get("epoch")) is int and owner["epoch"] == pin.fence_epoch + 1,
+            "production_inverse_fence_epoch_changed")
+    epoch = owner["epoch"]
+    recovered = replace(pin, fence_epoch=epoch + 1)
+    ack = stopped_ack(control("fence-exact", epoch, expected_deployment=version), epoch + 1, actor, version)
     after = observe()
-    require(after.get("worker") == state["worker"] and after.get("container") == state["container"],
+    require(recoverable_pair(after, pin, pair) and after["worker"] == state["worker"],
             "production_inverse_serving_pair_changed")
-    stopped_fence(after, pin)
-    return {"deploymentId": ack["deploymentId"], "running": False, "owner": {
-        key: ack["owner"][key] for key in ("deploymentId", "phase", "epoch", "oldEpoch", "actor")
-    }}
+    stopped_fence(after, recovered)
+    return recovered, ack
 
 
 def inverse_under_fence(pin, candidate, ack, run, api, inverse):
@@ -81,6 +80,24 @@ def inverse_under_fence(pin, candidate, ack, run, api, inverse):
     return inverse()
 
 
+def wait_for_restore_rollout(pin, candidate, observe, pause):
+    state = observe()
+    worker = state["worker"]
+    initial = state["container"]
+    for attempt in range(WORKER_RESTORE_READS):
+        if attempt:
+            pause(WORKER_RESTORE_POLL_SECONDS)
+            state = observe()
+        stopped_fence(state, pin)
+        image = state["container"]
+        require(worker["version_id"] == pin.worker_version and state["worker"] == worker
+                and recoverable_pair(state, pin, candidate) and image["rollout_id"] == initial["rollout_id"]
+                and image["image_digest"] == initial["image_digest"], "production_inverse_serving_pair_changed")
+        if image["rollout_status"] == "completed":
+            return state
+    raise GateError("production_recovery_rollout_pending")
+
+
 def restore_under_fence(pin, result, observe, control, rollback, image, candidate):
     verify_inverse(pin, result)
     state = observe()
@@ -90,9 +107,7 @@ def restore_under_fence(pin, result, observe, control, rollback, image, candidat
         # match a reviewed endpoint, in the order this operation writes them.
         worker = mapping(state.get("worker"))
         prior_version = worker.get("version_id") == pin.worker_version and worker.get("sha") == pin.rollback_sha
-        require(pair_matches(state, pin, *candidate)
-                or (prior_version and pair_matches(state, pin, *restored[:2], candidate[2])),
-                "production_inverse_serving_pair_changed")
+        require(recoverable_pair(state, pin, candidate), "production_inverse_serving_pair_changed")
         stopped_fence(state, pin)
         if not prior_version:
             try:
@@ -100,21 +115,18 @@ def restore_under_fence(pin, result, observe, control, rollback, image, candidat
             except GateError:
                 state = observe()
                 stopped_fence(state, pin)
-                if not (pair_matches(state, pin, *restored) or pair_matches(state, pin, *restored[:2], candidate[2])):
+                if not (state["worker"]["version_id"] == pin.worker_version and recoverable_pair(state, pin, candidate)):
                     raise
             rollback.wait_worker_restore(pin.worker_version)
-        state = observe()
-        stopped_fence(state, pin)
-        require(pair_matches(state, pin, *restored) or pair_matches(state, pin, *restored[:2], candidate[2]),
-                "production_inverse_serving_pair_changed")
+        state = wait_for_restore_rollout(pin, candidate, observe, rollback.sleep)
         if not pair_matches(state, pin, *restored):
             try:
                 rollback.restore_image(image)
             except GateError:
-                state = observe()
-                stopped_fence(state, pin)
+                state = wait_for_restore_rollout(pin, candidate, observe, rollback.sleep)
                 if not pair_matches(state, pin, *restored):
                     raise
+
     def observe_restored():
         observed = observe()
         if mapping(observed.get("ownership")).get("phase") == "fenced":
@@ -131,38 +143,17 @@ def restore_under_fence(pin, result, observe, control, rollback, image, candidat
     rollback.wait_stable(pin.worker_version, rollback.now())
 
 
-def release_admission(env, run, api=github):
-    admission = mapping(decode(env["RECOVERY_ADMISSION"].encode()))
-    required = {"pin", "plan_run_id", "candidate_worker", "candidate_image"}
-    require(set(admission) == required, "production_inverse_admission_invalid")
-    pin = RecoveryPin(**mapping(admission["pin"]))
-    verify_inverse(pin, {"state": "restored", **asdict(pin)})
-    candidate_ver, candidate_image = admission["candidate_worker"], admission["candidate_image"]
-    plan_id = admission["plan_run_id"]
-    require(pin.run_id == str(run["id"]) and matches(RUN_ID, plan_id) and plan_id != pin.run_id
-            and matches(UUID, candidate_ver) and candidate_ver != pin.worker_version
-            and matches(DIGEST, candidate_image) and candidate_image != pin.image_digest,
+def release_admission(env):
+    release, run, plan_id, plan, artifact = release_context(env)
+    pin = forward_document(env, release, run, plan_id, plan, artifact)
+    version = env["CANDIDATE_WORKER"]
+    require(version == "" or UUID.fullmatch(version) and version != pin.worker_version,
             "production_inverse_admission_invalid")
-    plan, artifact = authenticated_plan(plan_id, api, workflow=WORKFLOW_PATH, artifact_name=PLAN_ARTIFACT)
-    target = {"host": env["PRODUCTION_HOST"], "database": env["PRODUCTION_DATABASE"],
-              "branch_id": env["PRODUCTION_BRANCH_ID"]}
-    reference = digest_json({"operation": "undo-0480", "candidate_sha": pin.candidate_sha,
-                             "candidate_worker": candidate_ver, "candidate_image": candidate_image,
-                             "rollback_sha": pin.rollback_sha, "rollback_worker": pin.worker_version,
-                             "rollback_image": pin.image_digest, "application_id": pin.application_id,
-                             "namespace_id": pin.namespace_id, "workflow_sha": run["head_sha"]})
-    require(plan.get("source_sha") == pin.candidate_sha and plan.get("target") == target
-            and digest_json(target) == pin.database_fingerprint and plan.get("migration_target") == "production"
-            and plan.get("mode") == "plan" and plan.get("role") == "two_bot_migrator_ro"
-            and plan.get("recovery_evidence_ref") == f"inverse-{reference}",
-            "production_inverse_plan_mismatch")
-    _, expanded, restored = ledger_endpoints(plan)
-    require(digest_json(expanded) == pin.expanded_ledgers_sha256
-            and digest_json(restored) == pin.restored_ledgers_sha256, "production_inverse_ledger_pin_invalid")
     approval = {"plan_run_id": plan_id, "plan_archive_sha256": artifact["archive_digest"],
                 "workflow_sha": run["head_sha"], "recovery_ref": plan["recovery_evidence_ref"],
-                "candidate_worker": candidate_ver, "candidate_image": candidate_image}
-    return pin, (candidate_ver, pin.candidate_sha, candidate_image), plan, approval
+                "candidate_worker": version, "candidate_image": release.candidate_image,
+                "forward_artifact_id": env["FORWARD_ARTIFACT_ID"], "forward_archive_sha256": env["FORWARD_ARCHIVE_SHA256"]}
+    return pin, (version, pin.candidate_sha, release.candidate_image), plan, approval, run
 
 
 def run_inverse(binary, directory, pin, plan, approval, env):
@@ -191,14 +182,10 @@ def run_inverse(binary, directory, pin, plan, approval, env):
 
 def main(argv, env):
     try:
-        run = current_run(env)
-        pin, candidate, plan, approval = release_admission(env, run)
-        verify_environment(github)
-        verify_check(github, run, f"production-apply:{approval['plan_run_id']}:"
-                     f"{approval['plan_archive_sha256'].removeprefix('sha256:')}", datetime.now(timezone.utc))
+        pin, candidate, plan, approval, run = release_admission(env)
 
         def observe():
-            return read_status(env)
+            return read_status(env, allow_rollout=True)
 
         def retained_pair():
             account = env["CLOUDFLARE_ACCOUNT_ID"]
@@ -213,17 +200,25 @@ def main(argv, env):
             url = check_url("production", env["PRODUCTION_WORKER_URL"])
             retained_pair()
             control = control_client("production", env["OWNERSHIP_CONTROL_TOKEN"], url, "", fence_actor(pin))
-            ack = establish_fence(pin, candidate, observe, control)
+            pin, ack = establish_fence(pin, candidate, observe, control)
+            if ack is None:
+                ack = mapping(decode(env["RELEASE_STOPPED"].encode()))
+            verify_fence_ack(ack, pin, candidate[0])
+            write_json(Path(env["RUNNER_TEMP"]) / "production-release-recovery-stop.json", ack)
             with Path(env["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
                 print(f"ack={json.dumps(ack, separators=(',', ':'))}", file=output)
             return 0
 
         ack = mapping(decode(env["STOPPED_FENCE_ACK"].encode()))
+        epoch = mapping(ack.get("owner")).get("epoch")
+        require(type(epoch) is int and epoch in (pin.fence_epoch, pin.fence_epoch + 2),
+                "production_inverse_fence_epoch_changed")
+        pin = replace(pin, fence_epoch=epoch)
         if len(argv) == 3 and argv[0] == "inverse":
             directory = Path(argv[2])
             directory.mkdir(mode=0o700)
-            result = inverse_under_fence(pin, candidate, ack, current_run(env), github,
-                                         lambda: run_inverse(argv[1], directory, pin, plan, approval, env))
+            result = inverse_under_fence(pin, candidate, ack, run, github,
+                                        lambda: run_inverse(argv[1], directory, pin, plan, approval, env))
             (directory / "production-release-inverse.json").write_text(json.dumps({
                 "operation": "undo-0480", "approval": approval, "result": result,
             }) + "\n", encoding="utf-8")
@@ -236,6 +231,13 @@ def main(argv, env):
             rollback = Rollback(client, control, url, "production", receipt.worker, receipt.application, pin.application_id,
                                 pin.rollback_sha, pin.run_id)
             restore_under_fence(pin, result, observe, control, rollback, receipt.image, candidate)
+            state = observe()
+            actor = mapping(state.get("ownership")).get("owner_actor")
+            require(actor == pin.actor and observed_phase(pin, lambda: state) == "active",
+                    "production_recovery_takeover_unconfirmed")
+            write_json(Path(env["RUNNER_TEMP"]) / "production-release-restored.json",
+                       {"approval": approval, "inverse": result, "provider": state,
+                        "stable_polls": rollback.evidence["stable_polls"]})
         else:
             raise GateError("production_inverse_operation_invalid")
     except (GateError, ProofError, KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError):

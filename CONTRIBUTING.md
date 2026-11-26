@@ -18,7 +18,9 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
 - **Body.** Use the [PR template](.github/pull_request_template.md), in short,
   active sentences. `pr-lint` requires two sections: Linked Issues or Issue
   Description, and Verification (the commands you ran and their results).
-  What Changed and Notes for reviewers are optional. A PR created through the
+  What Changed and reviewer notes are optional. Keep the final `## Notes for reviewers`
+  heading even when empty so integrations can append markup outside Attestation.
+  Put model attribution under that heading. A PR created through the
   API gets no template, so paste it in. `docs`, `chore`, `build`, `ci`, `style`,
   `test` and `revert` PRs need no linked issue. The `pr-lint` check fails an
   empty body and, on a public repo, a tracker id, instance UI link or the

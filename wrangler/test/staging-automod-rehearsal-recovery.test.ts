@@ -21,7 +21,7 @@ const { help, preview } = publication.replies;
 const commands = `https://discord.com/api/v10/applications/${target.applicationId}/guilds/${target.guildId}/commands`;
 const detail = `${commands}/${preview.id}`;
 
-async function rehearsal(t: TestContext) {
+async function rehearsal(t: TestContext, acknowledgeStartup?: () => Promise<void>) {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: Date.parse("2026-01-01T00:00:00Z") });
   const network = t.mock.method(globalThis, "fetch", async () => assert.fail("unexpected network access"));
   const values = new Map<string, unknown>();
@@ -62,7 +62,11 @@ async function rehearsal(t: TestContext) {
     exclusive: <T>(operation: () => Promise<T>) => operation() };
   const effects: ProtectedAutomodEffects = {
     enabled: true,
-    dryRun: { policy, start: async () => { effectsTaken.push("start"); running = true; } },
+    dryRun: { policy, start: async () => {
+      effectsTaken.push("start");
+      running = true;
+      await acknowledgeStartup?.();
+    } },
     readRuntime: async lease => ({ lease, running, policy }),
     readCleanupGrant: async lease => ({ lease, before: issuedLease.expiresAt + 60_000 }),
     fenceAndDrain: async lease => {
@@ -104,7 +108,7 @@ async function rehearsal(t: TestContext) {
   const invoke = t.mock.fn<Providers["invoke"]>(async (_pin, call) => {
     if (call.action === "recover" && !recoveryReachable) throw new Error("synthetic private route unavailable");
     await runProtectedAutomod(call, authority, effects);
-    if (call.action === "start") {
+    if (call.action === "start" && !acknowledgeStartup) {
       t.mock.timers.setTime(issuedLease.expiresAt + 1);
       throw new Error("synthetic private startup result lost after the effect");
     }
@@ -131,8 +135,8 @@ async function rehearsal(t: TestContext) {
     assert.deepEqual(effectsTaken, ["start"]);
     assert.equal(network.mock.callCount(), 0);
   };
-  const assertReleased = async () => {
-    assert.deepEqual(effectsTaken, ["start", "drain", "stop", "delete", "absent", "absent"]);
+  const assertReleased = async (beforeCleanup = ["start"]) => {
+    assert.deepEqual(effectsTaken, [...beforeCleanup, "drain", "stop", "delete", "absent", "absent"]);
     assert.equal(running, false);
     assert.equal(command, undefined);
     assert.equal(await journal.completedFor(issuedLease), true);
@@ -150,6 +154,58 @@ async function rehearsal(t: TestContext) {
   };
   return { issuedLease, pin, run, observe, invoke, assertOriginalCalls, assertHeld, assertReleased, loseStartupAndHold };
 }
+
+test("startup approved before expiry cannot reach the private invoker at expiry", async t => {
+  const h = await rehearsal(t);
+  const { expiresAt } = h.issuedLease;
+  t.mock.timers.setTime(expiresAt - 6_000);
+  const queued = Promise.withResolvers<AbortSignal>();
+  const pending = Promise.withResolvers<Inventory>();
+  const readInventory = t.mock.fn<Providers["readInventory"]>(async signal => {
+    if (Date.now() >= expiresAt) return h.observe();
+    queued.resolve(signal);
+    return pending.promise;
+  });
+  const run = h.run(true, readInventory);
+  try {
+    // The authority adapter and Worker have admitted startup before this read.
+    const signal = await Promise.race([queued.promise, run.then(() => undefined)]);
+    assert.ok(signal, "startup must reach the inventory read before expiry");
+    assert.equal(h.invoke.mock.callCount(), 0);
+    t.mock.timers.setTime(expiresAt);
+    assert.equal(signal.aborted, false);
+  } finally {
+    // Supply a fresh observation for the exact original pin.
+    pending.resolve(h.observe());
+  }
+
+  assert.deepEqual(await run, { verdict: "failed", start: false, recover: true });
+  assert.deepEqual(h.invoke.mock.calls.map(({ arguments: [pin, call] }) => ({ pin, call })), [
+    { pin: h.pin, call: { action: "recover", issuedLease: h.issuedLease } },
+  ]);
+  assert.equal(readInventory.mock.callCount(), 2);
+  await h.assertReleased([]);
+});
+
+test("startup acknowledged after expiry still permits durable cleanup on the original pin", async t => {
+  const started = Promise.withResolvers<true>();
+  const acknowledgement = Promise.withResolvers<void>();
+  const h = await rehearsal(t, () => { started.resolve(true); return acknowledgement.promise; });
+  const { expiresAt } = h.issuedLease;
+  t.mock.timers.setTime(expiresAt - 6_000);
+  const run = h.run(true);
+  try {
+    assert.equal(await Promise.race([started.promise, run.then(() => false)]), true);
+    await h.assertHeld();
+    t.mock.timers.setTime(expiresAt + 1);
+  } finally {
+    acknowledgement.resolve();
+  }
+
+  assert.deepEqual(await run, { verdict: "failed", start: false, recover: true });
+  h.assertOriginalCalls();
+  await h.assertReleased();
+});
 
 test("a replacement Worker version cannot recover after the private startup result is lost", async t => {
   const h = await rehearsal(t);

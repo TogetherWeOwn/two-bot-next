@@ -65,6 +65,7 @@ permissions: {}
 concurrency:
   group: production-migrate
   cancel-in-progress: false
+  queue: max
 
 jobs:
   plan:
@@ -223,6 +224,10 @@ jobs:
     # grant and contract delta together with the migrations after role readback.
     if: github.ref == 'refs/heads/main' && inputs.mode == 'apply'
     needs: [plan, claim]
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+      queue: max
     environment: production-migrate-apply
     # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
     # note on `check` in check.yml.
