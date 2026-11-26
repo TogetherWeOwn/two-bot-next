@@ -94,6 +94,11 @@ jobs:
       pull-requests: write # Required gate posts the split comment before failing an over-gate PR.
     uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964
     with:
+      runs-on: >-
+        ${{ toJSON((github.event_name == 'pull_request' || github.event_name == 'pull_request_review')
+        && github.event.pull_request.head.repo.full_name == github.repository
+        && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+        && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest') }}
       pr-number: ${{ inputs.pr_number || '' }}
       # Same generated path as the labeller, so the gate measures the
       # same diff the labels report.
