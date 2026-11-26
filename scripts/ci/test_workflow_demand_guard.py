@@ -33,6 +33,9 @@ class WorkflowDemandGuardTests(unittest.TestCase):
                 self.assertTrue(guard.findings("fixture.yml", example(trigger)))
         marker = "# guards: required:ci-ok"
         self.assertTrue(guard.findings("fixture.yml", example("pull_request", marker)))
+        size = WORKFLOWS / "pr-size.yml"
+        self.assertEqual(guard.findings(size.name, size.read_bytes()), [])
+        self.assertTrue(guard.findings(size.name, size.read_bytes().replace(b"pr-size-gate / gate", b"pr-size-gate")))
 
     def test_paths_apply_to_every_automatic_trigger(self):
         marker = "# guards: paths (fixture)"

@@ -16,7 +16,7 @@ CODE_EVENTS = ["opened", "synchronize", "reopened"]
 METADATA_EVENTS = ["opened", "edited", "synchronize", "reopened"]
 METADATA_REFRESH = {"supply-chain.yml", "pr-evidence.yml"}
 MAX_WORKFLOW_BYTES = 1024 * 1024
-HEADER = re.compile(r"^# guards: (\S+)(?:[ \t]+\([^\r\n]*\))?[ \t]*\r?$", re.MULTILINE)
+HEADER = re.compile(r"^# guards: (\S+(?: / \S+)?)(?:[ \t]+\([^\r\n]*\))?[ \t]*\r?$", re.MULTILINE)
 MAIN_AND_QUEUE = {"push": {"branches": ["main"]}, "merge_group": {"types": ["checks_requested"]}}
 REVIEW_TYPES = [*CODE_EVENTS, "ready_for_review", "labeled", "unlabeled"]
 ADMISSIONS = {
@@ -29,7 +29,7 @@ ADMISSIONS = {
     "staging-migrate-reviewed.yml": ("release:reviewed-staging-migration", {"push": {
         "branches": ["main"], "paths": [".github/staging-apply/*.json"],
     }}),
-    "pr-size.yml": ("required:pr-size-gate", {
+    "pr-size.yml": ("required:pr-size-gate / gate", {
         "pull_request": {"types": REVIEW_TYPES}, "pull_request_review": {"types": ["submitted", "dismissed"]},
     }),
     "vote-kick-fuzz-smoke.yml": ("branch:ci/vote-kick-fuzz-smoke", {"push": {"branches": ["ci/vote-kick-fuzz-smoke"]}}),

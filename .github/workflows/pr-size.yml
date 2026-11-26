@@ -36,7 +36,7 @@
 # so each caller job below grants only what the file it calls requests.
 
 name: pr-size
-# guards: required:pr-size-gate
+# guards: required:pr-size-gate / gate
 
 on:
   pull_request:
