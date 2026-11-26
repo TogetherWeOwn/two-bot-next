@@ -219,16 +219,14 @@ def request(target, path):
 def serve():
     if {name for _, name in socket.if_nameindex()} != {"lo"}:
         sys.exit("Discord fixture requires a loopback-only network namespace")
+    if not RESERVATION:
+        sys.exit("Discord fixture requires a reservation marker")
     ThreadingHTTPServer(("127.0.0.1", PORT), Discord).serve_forever()
 
 
 if __name__ == "__main__":
     if len(sys.argv) == 1:
-        if {name for _, name in socket.if_nameindex()} != {"lo"}:
-            sys.exit("Discord fixture requires a loopback-only network namespace")
-        if not RESERVATION:
-            sys.exit("Discord fixture requires a reservation marker")
-        ThreadingHTTPServer(("127.0.0.1", PORT), Discord).serve_forever()
+        serve()
     elif len(sys.argv) == 3 and sys.argv[1] == "--check-peers":
         print(json.dumps(check_peers(sys.argv[2])))
 
