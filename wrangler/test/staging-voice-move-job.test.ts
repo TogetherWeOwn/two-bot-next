@@ -530,6 +530,7 @@ test("an earlier Web handoff requires a fresh companion match in the next reserv
         ...first.inputs,
         webSession: { ...first.inputs.webSession, move: (request) => move(request) },
       });
+      const moveCall = t.mock.method(web.scopedInputs.webSession, "move");
       const firstReady = JSON.parse(readFileSync(first.env.STAGING_USE_RECEIPT, "utf8").trimEnd().split("\n").at(-1)!);
       const { qualification, soakReceipt } = web;
       const [source, destination] = first.inputs.fixture.channelIds;
@@ -541,6 +542,7 @@ test("an earlier Web handoff requires a fresh companion match in the next reserv
         web.enableCompanion();
         const provider = bindStagingVoiceMoveHandoffProvider(web.scopedInputs, { qualification, soakReceipt, webHandoff });
         assert.equal(await runStagingVoiceMoveEntry(first.env, provider), "passed");
+        assert.equal(moveCall.mock.callCount(), 3);
         assert.deepEqual(first.moves, moved);
         assert.equal(web.readCount(), 3);
       } finally {
@@ -553,6 +555,7 @@ test("an earlier Web handoff requires a fresh companion match in the next reserv
       try {
         now = second.inputs.now();
         move = second.inputs.webSession.move;
+        moveCall.mock.resetCalls();
         if (refresh) web.enableCompanion();
         const provider = bindStagingVoiceMoveHandoffProvider({
           ...second.inputs, webSession: web.scopedInputs.webSession, previousReady: firstReady, previousOff: firstOff,
@@ -561,6 +564,7 @@ test("an earlier Web handoff requires a fresh companion match in the next reserv
         assert.equal(await runStagingVoiceMoveEntry(second.env, provider), refresh ? "passed" : "failed");
         assert.equal(web.readCount(), 4, "the second job reads the companion again");
         assert.deepEqual(second.reads, ["channels"]);
+        assert.equal(moveCall.mock.callCount(), refresh ? 3 : 0);
         assert.deepEqual(second.signed.map(({ channel_id }) => channel_id), refresh ? [destination, source, destination] : []);
         assert.deepEqual(second.moves, refresh ? moved : []);
         const finishCalls = ["status", "release", "status"];
