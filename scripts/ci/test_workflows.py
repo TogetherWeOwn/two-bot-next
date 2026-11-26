@@ -2403,8 +2403,8 @@ def staging_retention_census_errors(workflow):
     binding's login holds only two_bot_migrator_ro), on the public-hosted runner
     for job `census`, with its own non-cancelling concurrency group and a
     30 minute timeout covering the script's single ~900 s in-job sleep.
-    Exactly two unconditional steps: pinned checkout without persisted
-    credentials, and one bash Run step that calls the reviewed script with
+    Exactly two unconditional steps: pinned checkout of the census script
+    without persisted credentials, and one bash Run step that calls it with
     the secret plus the three non-secret staging pins via the environment
     only. Log only, no artifact upload: counts, digests and timestamps
     never leave the run log and summary. No wrangler, no production path,
@@ -2461,10 +2461,17 @@ def staging_retention_census_errors(workflow):
                                                                    "two_bot_staging_database",
                                                                    "two_bot_staging_branch_id"}:
         errors.append(f"{name}:census: Run step may reference only the three staging pins")
-    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
-            or (checkout.get("with") or {}).get("fetch-depth") != "1":
-        errors.append(f"{name}:census: checkout must be pinned, shallow and must not persist credentials")
+    if checkout != {
+        "uses": STAGING_CHECKOUT_USES,
+        "with": {
+            "persist-credentials": "false",
+            "fetch-depth": "1",
+            "sparse-checkout": "/scripts/staging_retention_census.py",
+            "sparse-checkout-cone-mode": "false",
+        },
+    }:
+        errors.append(f"{name}:census: checkout must use the pinned action and materialize only the census script "
+                      "at the dispatch SHA, shallow and without persisted credentials")
     if run.get("env") != CENSUS_ENV:
         errors.append(f"{name}:census: Run step must bind exactly the plan secret and the three pins")
     if run.get("run") != CENSUS_COMMAND or "uses" in run or run.get("shell") != "bash":
@@ -10175,6 +10182,14 @@ class WorkflowTests(unittest.TestCase):
                 {"uses": "actions/upload-artifact@pinned"}),
             "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
                 {"persist-credentials": "true"}),
+            "different checkout action": lambda w: job(w)["steps"][0].update(
+                {"uses": "actions/checkout@v7"}),
+            "unshallow checkout": lambda w: job(w)["steps"][0]["with"].update({"fetch-depth": "0"}),
+            "full worktree": lambda w: job(w)["steps"][0]["with"].pop("sparse-checkout"),
+            "wider worktree": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout": "/scripts/"}),
+            "cone checkout": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout-cone-mode": "true"}),
+            "checkout filter override": lambda w: job(w)["steps"][0]["with"].update({"filter": "blob:none"}),
+            "checkout ref override": lambda w: job(w)["steps"][0]["with"].update({"ref": "main"}),
             "extra secret": lambda w: job(w)["steps"][1]["env"].update(
                 {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
             "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
