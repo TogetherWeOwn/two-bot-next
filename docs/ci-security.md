@@ -529,6 +529,8 @@ resolve such a response.
 
 ## Source snowflakes
 
+The first command includes the [offline workflow fixtures](#offline-enforcement).
+
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
 python3 scripts/ci/check-src-snowflakes.py
@@ -717,6 +719,10 @@ missing/nested selectors and runners on reusable-workflow calls. The parsed
 workflow suite, supply-chain, production deploy, channel CI and staging
 ownership fixtures also pin the direct hosted contract while retaining their
 other isolation and behavior assertions.
+
+Use Node.js 22 on `PATH` for `test_workflows.py`, matching the hosted check.
+The offline manual rollback drill fixture loads the Node helpers from the
+sparse file set.
 
 ```sh
 python3 scripts/test-runner-routing.py
