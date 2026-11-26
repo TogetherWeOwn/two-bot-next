@@ -7403,9 +7403,19 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertIn("actions/upload-artifact@", upload.get("uses", ""))
         self.assertEqual(upload["with"]["name"], "coverage-shard-${{ matrix.shard_index }}")
-        self.assertEqual(upload["with"]["path"], "lcov-shard-${{ matrix.shard_index }}.info")
+        self.assertEqual(upload["with"]["path"].splitlines(), [
+            "lcov-shard-${{ matrix.shard_index }}.info",
+            "lcov-shard-${{ matrix.shard_index }}.identity",
+        ])
         self.assertEqual(upload["with"]["if-no-files-found"], "error")
         self.assertEqual(upload["with"].get("overwrite"), "true")
+        bind = next(step for step in job["steps"] if step.get("name") == "Bind shard coverage report")
+        self.assertLess(job["steps"].index(bind), job["steps"].index(upload))
+        self.assertEqual(bind["env"]["COVERAGE_SELECTOR"], "${{ toJSON(needs.job-inputs.outputs) }}")
+        self.assertEqual(bind["env"]["COVERAGE_MATRIX"], "${{ needs.coverage-plan.outputs.matrix }}")
+        self.assertEqual(bind["env"]["EXPECTED_SHARDS"], "${{ needs.coverage-plan.outputs.expected-shards }}")
+        self.assertEqual(bind["env"]["SHARD_INDEX"], "${{ matrix.shard_index }}")
+        self.assertEqual(bind["env"]["SHARD_LEGS"], "${{ matrix.legs }}")
 
     def test_coverage_shard_leg_selection_matches_the_planner(self):
         # Every planner leg id guards exactly one legs block, and the
@@ -7558,7 +7568,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(
             merge.get("env", {}).get("EXPECTED_SHARDS"),
             "${{ needs.coverage-plan.outputs.expected-shards }}")
+        self.assertEqual(merge["env"]["COVERAGE_SELECTOR"], "${{ toJSON(needs.job-inputs.outputs) }}")
+        self.assertEqual(merge["env"]["COVERAGE_MATRIX"], "${{ needs.coverage-plan.outputs.matrix }}")
         self.assertIn("scripts/ci/merge-coverage-shards.py", merge["run"])
+        self.assertIn("--artifact-dir coverage-shards", merge["run"])
         self.assertIn('--expected-shards "$EXPECTED_SHARDS"', merge["run"])
         self.assertIn("--source-root /__w/two-bot-next/two-bot-next",
                       " ".join(shell_logical_lines(merge["run"])))
