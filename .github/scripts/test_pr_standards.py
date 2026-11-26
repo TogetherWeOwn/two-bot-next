@@ -587,7 +587,8 @@ class Template(unittest.TestCase):
                 invocation = ["sh", "-c", command.replace("pr.md", '"$1"'),
                               "preflight-test", str(body_file)]
                 body = GOOD_BODY + FULL_ATTESTATION
-                malformed = [body + suffix, body + suffix + notes, body + "\n```\n" + notes + suffix]
+                malformed = [body + suffix, body + suffix + notes, body + "\n```\n" + notes + suffix,
+                             body.replace("## Attestation", "```md\n## Attestation") + notes + suffix]
                 if operation == "create":
                     malformed.append(body)
                 for candidate in malformed:
@@ -595,16 +596,22 @@ class Template(unittest.TestCase):
                         body_file.write_text(candidate, encoding="utf-8")
                         rejected = subprocess.run(invocation, cwd=root, env=environment,
                                                   capture_output=True, text=True)
+                        published = sink.exists()
+                        sink.unlink(missing_ok=True)
                         self.assertEqual(1, rejected.returncode, rejected.stderr)
                         self.assertIn("## Notes for reviewers", rejected.stderr)
-                        self.assertFalse(sink.exists())
-                good = (body + notes + suffix).replace("\n", "\r\n").encode()
+                        self.assertFalse(published)
+                body_with_example = body.replace("### Claims", "~~~~md\n### High-risk checklist\n"
+                                                "~~~\n## Example heading\n~~~~\n\n### Claims")
+                good = (body_with_example + notes + suffix).replace("\n", "\r\n").encode()
                 body_file.write_bytes(good)
                 accepted = subprocess.run(invocation, cwd=root, env=environment,
                                           capture_output=True, text=True)
-                self.assertEqual(0, accepted.returncode, accepted.stderr)
-                self.assertEqual(good, sink.read_bytes())
-                sink.unlink()
+                published_body = sink.read_bytes() if sink.exists() else None
+                sink.unlink(missing_ok=True)
+                with self.subTest(operation=operation, body="closed fenced example"):
+                    self.assertEqual(0, accepted.returncode, accepted.stderr)
+                    self.assertEqual(good, published_body)
 
     def test_unfilled_template_fails_in_error_mode(self):
         f = ps.evaluate(env(BODY=self.text, PR_STANDARDS_MODE="error"))
