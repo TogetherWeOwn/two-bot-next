@@ -37,6 +37,11 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/rollback_proof.py
+            /scripts/script_intake.py
+            /scripts/incident_issue.py
       - name: Prove the staging failure-to-restore chain
         env:
           GH_TOKEN: ${{ github.token }}
@@ -68,6 +73,11 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/rollback_proof.py
+            /scripts/script_intake.py
+            /scripts/incident_issue.py
       - name: File the incident issue for the failed proof
         env:
           GITHUB_TOKEN: ${{ github.token }}

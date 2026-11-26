@@ -9744,6 +9744,23 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(prod_job["if"], stag_job["if"])
                 self.assertEqual(prod_job.get("runs-on"), stag_job.get("runs-on"))
 
+    def test_staging_rollback_proof_and_alert_checkout_only_their_scripts(self):
+        jobs = self.workflows["staging-rollback-drill.yml"]["jobs"]
+        for job_id in ("proof", "alert"):
+            with self.subTest(job=job_id):
+                options = deepcopy(jobs[job_id]["steps"][0]["with"])
+                patterns = options.pop("sparse-checkout", "").splitlines()
+                self.assertEqual(patterns, [
+                    "/scripts/rollback_proof.py",
+                    "/scripts/script_intake.py",
+                    "/scripts/incident_issue.py",
+                ])
+                self.assertEqual(options, {
+                    "persist-credentials": "false",
+                    "fetch-depth": "1",
+                    "sparse-checkout-cone-mode": "false",
+                })
+
     def test_staging_rollback_drill_shape_is_pinned(self):
         workflows = self.workflows
         self.assertEqual(staging_rollback_drill_errors(workflows["staging-rollback-drill.yml"]), [])
