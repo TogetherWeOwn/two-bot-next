@@ -1728,9 +1728,24 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                 or "if" in steps[ddl[0]] or "continue-on-error" in steps[ddl[0]]):
             errors.append(f"{name}:apply: must verify the exact native approval before building and running DDL")
         checkouts = [step for step in steps if (step.get("with") or {}).get("path") == "approval-tools"]
+        checkout_options = {
+            "path": "approval-tools",
+            "persist-credentials": "false",
+            "ref": "${{ github.sha }}",
+            "sparse-checkout": (
+                "/scripts/build_identity.py\n"
+                "/scripts/ci/staging_migrate_claim.py\n"
+                "/scripts/rollback_proof.py\n"
+                "/scripts/script_intake.py\n"
+                "/scripts/staging_migrate_approval.py\n"
+                "/scripts/staging_recovery_status.py\n"
+                "/scripts/staging_rollout.py\n"
+                "/scripts/worker_container_rollback.py\n"
+            ),
+            "sparse-checkout-cone-mode": "false",
+        }
         if (len(checkouts) != 1 or not str(checkouts[0].get("uses", "")).startswith("actions/checkout@")
-                or checkouts[0].get("with") != {"path": "approval-tools", "persist-credentials": "false",
-                                               "ref": "${{ github.sha }}"}
+                or checkouts[0].get("with") != checkout_options
                 or "if" in checkouts[0] or "continue-on-error" in checkouts[0]):
             errors.append(f"{name}:apply: must load the verifier at the trusted workflow SHA")
     else:
@@ -9721,6 +9736,53 @@ class WorkflowTests(unittest.TestCase):
                 def change(w, job_id=job_id, permissions=permissions):
                     w["jobs"][job_id]["permissions"] = permissions
                 self.assertTrue(mutated(change))
+
+    def test_staging_apply_approval_checkout_is_pinned(self):
+        workflow = self.workflows["staging-migrate.yml"]
+        self.assertEqual(staging_migrate_errors(workflow), [])
+
+        def approval_checkout(workflow):
+            return next(step["with"] for step in workflow["jobs"]["apply"]["steps"]
+                        if step.get("with", {}).get("path") == "approval-tools")
+
+        checkout = approval_checkout(workflow)
+        self.assertIn("sparse-checkout", checkout)
+        paths = checkout["sparse-checkout"]
+        for changes in (
+                {"sparse-checkout": None, "sparse-checkout-cone-mode": None},
+                {"sparse-checkout": paths.replace("/scripts/build_identity.py\n", "")},
+                {"sparse-checkout": paths + "/scripts/\n"},
+                {"sparse-checkout-cone-mode": "true"},
+                {"ref": "${{ inputs.source_sha }}"},
+                {"persist-credentials": "true"}):
+            with self.subTest(changes=changes):
+                changed = deepcopy(workflow)
+                options = approval_checkout(changed)
+                for key, value in changes.items():
+                    if value is None:
+                        del options[key]
+                    else:
+                        options[key] = value
+                self.assertEqual(staging_migrate_errors(changed), [
+                    "staging-migrate.yml:apply: must load the verifier at the trusted workflow SHA",
+                ])
+
+        steps = workflow["jobs"]["apply"]["steps"]
+        verifier = next(step for step in steps if step.get("name") == "Verify the native staging approval")
+        _, *args = shlex.split(verifier["run"])
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            for pattern in paths.splitlines():
+                path = pattern.removeprefix("/")
+                destination = scratch / checkout["path"] / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes((ROOT / path).read_bytes())
+            # A missing manifest exercises startup without credentials or API calls.
+            result = subprocess.run([sys.executable, "-B", "-S", *args], cwd=scratch,
+                                    env={}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "staging migration approval evidence unavailable or malformed\n")
 
     def test_production_migrate_runner_shape_is_pinned(self):
         # Production mirror of the staging runner: same three jobs, same pinned
