@@ -33,7 +33,7 @@ export async function runStagingVoiceMoveEntry(env = {}, provideProofInputs) {
  * pins the current run and attempt (as runner strings), ordered fixture, Web
  * revision and exact scoped Web session before the job reads its ready row.
  */
-export function runStagingVoiceMoveRehearsal(env, approval, dependencies) {
+export function runStagingVoiceMoveRehearsal(env = {}, approval, dependencies) {
   return runEntry(env, bindStagingVoiceMoveProvider(dependencies), (inputs) => {
     const { runId, runAttempt, fixture, expectedRevision, webSession } = approval ?? {};
     if (!Object.isFrozen(approval) || !runId || runId !== env.GITHUB_RUN_ID

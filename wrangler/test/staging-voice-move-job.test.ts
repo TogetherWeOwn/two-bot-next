@@ -404,6 +404,7 @@ test("rehearsal entry requires the immutable fixture and Web session from this r
   const selection = { ...env, get STAGING_USE_RECEIPT() { receiptReads += 1; return env.STAGING_USE_RECEIPT; } };
 
   try {
+    assert.equal(await runStagingVoiceMoveRehearsal(), "disabled");
     const mutableFixture = Object.freeze({ ...approval.fixture, channelIds: [...approval.fixture.channelIds] });
     for (const [label, pin, supplied] of [
       ["empty approval", Object.freeze({}), scoped],
@@ -411,6 +412,8 @@ test("rehearsal entry requires the immutable fixture and Web session from this r
       ["mutable channel pair", Object.freeze({ ...approval, fixture: mutableFixture }), { ...scoped, fixture: mutableFixture }],
       ["prior run", Object.freeze({ ...approval, runId: "12344" }), scoped],
       ["other attempt", Object.freeze({ ...approval, runAttempt: "2" }), scoped],
+      ["different fixture object", approval, { ...scoped, fixture: Object.freeze({ ...scoped.fixture }) }],
+      ["different revision object", approval, { ...scoped, expectedRevision: Object.freeze({ ...scoped.expectedRevision }) }],
       ["different session with the same metadata", approval, { ...scoped, webSession: Object.freeze({ ...scoped.webSession }) }],
     ] as const) {
       assert.equal(await runStagingVoiceMoveRehearsal(selection, pin, supplied), "failed", label);
