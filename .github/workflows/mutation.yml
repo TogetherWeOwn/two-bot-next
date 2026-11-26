@@ -99,7 +99,21 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 .github/scripts/mutation_python_history.py
+        run: |
+          if [[ -f .github/scripts/mutation_python_history.py ]]; then
+            python3 .github/scripts/mutation_python_history.py
+          else
+            # The PR merge ref can carry this workflow before its head carries the helper.
+            [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$(git rev-parse HEAD)" == "$HEAD_SHA" ]]
+            history=()
+            if [[ "$(git rev-parse --is-shallow-repository)" == true ]]; then
+              history=(--unshallow)
+            fi
+            git fetch --no-tags --no-recurse-submodules "${history[@]}" -- origin "$BASE_SHA" "$HEAD_SHA"
+            [[ "$(git rev-parse --is-shallow-repository)" == false ]]
+            python3 .github/scripts/mutation_scope.py
+          fi
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: steps.plan.outputs.python_fixture == 'true'
         with:
