@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, call, patch
 from urllib.error import HTTPError
+from urllib.response import addinfourl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import staging_attendance_acceptance as acceptance
@@ -248,6 +249,59 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(stderr.getvalue(), "FAIL: signed attendance response did not match the expected envelope\n")
         self.assertEqual(calls, [("GET", ORIGIN + "/readyz"), ("POST", ORIGIN + "/internal/actions")])
+
+    def test_finalized_receipt_refuses_nested_duplicate_keys(self):
+        observed = active_observation()
+        now = int(START.timestamp()) + 3600
+        observed["lifecycle"]["use"]["expiresAt"] = (now + 60) * 1000
+        env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
+               "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
+        args = ["finalized", "--rollout", "rollout", "--observed", "observed",
+                "--fixture-start", START.strftime("%Y-%m-%dT%H:%M:%SZ"), "--execute"]
+
+        def run(duplicate):
+            calls = []
+
+            def open_response(request, *, timeout):
+                headers = Message()
+                headers["content-type"] = "application/json"
+                if request.get_method() == "GET":
+                    self.assertEqual(request.full_url, ORIGIN + "/readyz")
+                    calls.append("readyz")
+                    headers["x-two-worker-version"] = ROLLOUT["worker_version"]
+                    return addinfourl(BytesIO(json.dumps(READY).encode()), headers, request.full_url, 200)
+                self.assertEqual(request.get_method(), "POST")
+                self.assertEqual(request.full_url, ORIGIN + "/internal/actions")
+                event_key = decode_json(request.data)["event_key"]
+                calls.append(event_key)
+                headers["cache-control"] = "no-store"
+                envelope = {"request_id": request.get_header("X-request-id")}
+                if event_key == EVENT:
+                    envelope.update(ok=True, result=RESULT)
+                    body = json.dumps(envelope).encode()
+                    if duplicate:
+                        # A last-wins decoder would still see the valid result.
+                        body = body.replace(b'"starts_at":',
+                                            b'"starts_at":"synthetic-private-response-text","starts_at":', 1)
+                    return addinfourl(BytesIO(body), headers, request.full_url, 200)
+                self.assertEqual(event_key, EVENT + ":foreign")
+                envelope.update(ok=False, error={"code": "not_found", "message": "request refused", "retryable": False})
+                raise HTTPError(request.full_url, 404, "not_found", headers, BytesIO(json.dumps(envelope).encode()))
+
+            with (patch.object(acceptance, "no_redirect_opener") as opener,
+                  patch.object(acceptance, "read_object", side_effect=[ROLLOUT, observed]),
+                  patch.object(acceptance.time, "time", return_value=now),
+                  patch.object(acceptance.time, "monotonic", return_value=0),
+                  patch("sys.stdout", new_callable=StringIO) as stdout,
+                  patch("sys.stderr", new_callable=StringIO) as stderr):
+                opener.return_value.open.side_effect = open_response
+                status = acceptance.main(args, env=env)
+            return status, stdout.getvalue(), stderr.getvalue(), calls
+
+        self.assertEqual(run(duplicate=False),
+                         (0, "PASS: attendance finalized\n", "", ["readyz", EVENT, "readyz", EVENT + ":foreign", "readyz"]))
+        self.assertEqual(run(duplicate=True),
+                         (1, "", "FAIL: attendance acceptance input or transport refused\n", ["readyz", EVENT]))
 
     def test_execute_requires_a_coherent_lease_that_covers_the_armed_probe(self):
         expires = START.timestamp() + 3600

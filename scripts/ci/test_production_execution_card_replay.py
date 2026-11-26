@@ -1,5 +1,7 @@
 """Replay synthetic Help, naming and gateway evidence through one execution card."""
 
+from copy import deepcopy
+from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
@@ -7,8 +9,16 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock
 
+from test_production_recovery_artifact import producer, release_run_fixture
 from test_t0_acceptance_report import PRODUCTION, SCRIPTS, WATCH_EMPTY, WATCH_HEADER, WATCH_HELP, WATCH_RETURN
+
+sys.path.insert(0, str(SCRIPTS))
+from production_recovery_artifact import FORWARD_JOB, FORWARD_STEPS, protected_job
+from production_recovery_takeover import RecoveryPin
+from production_recovery_workflow import fence_actor, restore_under_fence
+from staging_rollout import GateError
 
 
 class ProductionExecutionCardReplayTests(unittest.TestCase):
@@ -58,8 +68,110 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
             args.extend((f"--{signal}-report", str(path)))
         handoff.write_text(json.dumps({"expected": expected, "observations": bindings}), encoding="utf-8")
         report = json.loads(self.invoke("t0_acceptance_report.py", *args))
+        self.assertEqual(set(report), {"expected", "observations"})
         self.assertEqual(report["expected"], expected)
         return report["observations"]
+
+    def recover_predecessor(self, pin, candidate, before):
+        inverse = {"state": "restored", **asdict(pin)}
+        version, sha, digest = before
+        serving = {
+            "worker": {"version_id": version, "sha": sha, "traffic_percent": 100},
+            "container": {"application_id": pin.application_id, "namespace_id": pin.namespace_id,
+                          "image_digest": digest, "rollout_id": "00000000-0000-4000-8000-000000000001",
+                          "rollout_status": "completed"},
+            "ownership": {"phase": "fenced", "running": False, "epoch": pin.fence_epoch,
+                          "owner_actor": fence_actor(pin)},
+        }
+
+        def takeover(_operation, _epoch, *, expected_deployment):
+            self.assertEqual(serving["worker"]["version_id"], expected_deployment)
+            self.assertEqual(serving["container"]["image_digest"], pin.image_digest)
+            serving["ownership"].update(phase="active", running=True, epoch=pin.fence_epoch + 1,
+                                        owner_actor=pin.actor)
+
+        def wait_stable(version, _started):
+            self.assertEqual(serving["worker"]["version_id"], version)
+            self.assertEqual(serving["ownership"]["phase"], "active")
+            self.assertIs(serving["ownership"]["running"], True)
+
+        rollback, control = Mock(), Mock(side_effect=takeover)
+
+        def wait_worker_restore(version):
+            # The provider can acknowledge the restore before that version is visible.
+            rollback.post_worker_restore.assert_called_once_with(version)
+            serving["worker"].update(version_id=version, sha=pin.rollback_sha)
+
+        rollback.wait_worker_restore.side_effect = wait_worker_restore
+        rollback.restore_image.side_effect = lambda _image: serving["container"].update(
+            image_digest=pin.image_digest, rollout_id="00000000-0000-4000-8000-000000000002",
+        )
+        rollback.wait_stable.side_effect = wait_stable
+        observe = Mock(side_effect=lambda: deepcopy(serving))
+        restore_under_fence(pin, inverse, observe, control, rollback, "fixture-image", candidate)
+        if before == candidate:
+            rollback.post_worker_restore.assert_called_once_with(pin.worker_version)
+            rollback.wait_worker_restore.assert_called_once_with(pin.worker_version)
+            rollback.restore_image.assert_called_once_with("fixture-image")
+        else:
+            rollback.post_worker_restore.assert_not_called()
+            rollback.wait_worker_restore.assert_not_called()
+            rollback.restore_image.assert_not_called()
+        control.assert_called_once_with("takeover-fenced", pin.fence_epoch, expected_deployment=pin.worker_version)
+        rollback.wait_stable.assert_called_once_with(pin.worker_version, rollback.now.return_value)
+        return serving
+
+    def test_recovery_readiness_cannot_certify_the_forward_candidate(self):
+        fixture = Path(__file__).with_name("fixtures") / "production_inverse_admission.json"
+        case = json.loads(fixture.read_text(encoding="utf-8"))
+        admission = case["admission"]
+        pin = RecoveryPin(**admission["pin"])
+        candidate = (admission["candidate_worker"], pin.candidate_sha, admission["candidate_image"])
+        predecessor = (pin.worker_version, pin.rollback_sha, pin.image_digest)
+        intended = dict(PRODUCTION, worker_version=candidate[0], build_revision=candidate[1],
+                        image_digest=candidate[2], application_id=pin.application_id)
+        _, origin = release_run_fixture()
+        origin["id"] = 456
+        for conclusion, before in (("cancelled", predecessor), ("success", candidate)):
+            with self.subTest(forward_job=conclusion):
+                # Applying the schema can finish before the run is interrupted at receipt upload.
+                job = producer(origin, FORWARD_JOB, FORWARD_STEPS)
+                job["conclusion"] = conclusion
+                job["steps"][-1]["conclusion"] = conclusion
+                api = Mock(return_value={"total_count": 1, "jobs": [job]})
+                if conclusion == "cancelled":
+                    with self.assertRaisesRegex(GateError, "^production_inverse_job_invalid$"):
+                        protected_job(origin, api, FORWARD_JOB, FORWARD_STEPS)
+                else:
+                    protected_job(origin, api, FORWARD_JOB, FORWARD_STEPS)
+
+                serving = self.recover_predecessor(pin, candidate, before)
+                restored = dict(
+                    PRODUCTION, build_revision=serving["worker"]["sha"], build_id="899-1",
+                    deploy_id="2026.11.24.1+bbbbbbb", image_digest=serving["container"]["image_digest"],
+                    worker_version=serving["worker"]["version_id"], application_id=serving["container"]["application_id"],
+                )
+                window_path = self.root / "recovered-window.json"
+                window_path.write_text(json.dumps(restored), encoding="utf-8")
+                help_report = self.assemble_watch("help", WATCH_HELP, window_path)
+                gateway = self.summarize_gateway(
+                    restored, "gateway_resumed", "2026-11-25T02:01:00.000Z", "recovered-gateway.json",
+                )
+                reports = {"help": (help_report, restored), "gateway": (gateway, restored)}
+                recovered = self.replay(restored, reports)
+                self.assertEqual((recovered["help"]["status"], recovered["help"]["result"]),
+                                 ("attributed", "readbacks_and_deletions_recorded"))
+                self.assertEqual((recovered["gateway"]["status"], recovered["gateway"]["readiness"]),
+                                 ("attributed", "observed"))
+
+                refused = self.replay(intended, reports)
+                self.assertEqual(refused["help"]["fields"],
+                                 ["build_revision", "build_id", "deploy_id", "image_digest", "worker_version"])
+                self.assertEqual(refused["gateway"]["reason"], "gateway summary names a different build revision")
+                for signal in reports:
+                    row = refused[signal]
+                    self.assertEqual(row["status"], "mismatched")
+                    self.assertTrue({"result", "readiness", "signals"}.isdisjoint(row))
 
     def test_rollback_window_rejects_pre_rollback_readiness_with_exact_digest(self):
         # The restored image came from the same source revision. Its serving identity is distinct.
