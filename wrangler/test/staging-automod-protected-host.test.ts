@@ -142,6 +142,37 @@ test("missing or mismatched staging inventory refuses before private invocation"
   assert.equal(invokePrivate.mock.callCount(), 0);
 });
 
+test("authenticated inventory reader exceptions are redacted before private invocation", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now });
+  const network = t.mock.method(globalThis, "fetch", async () => assert.fail("unexpected network access"));
+  const { access, host, invokePrivate } = fixture(t);
+  const detail = new Error("synthetic private inventory diagnostics");
+  const beforeInventory = ["run", "lease", "approval:start", "approval:recover", "worker"];
+  const failureModes = {
+    rejection: () => Promise.reject(detail),
+    throw: () => { throw detail; },
+  };
+
+  for (const [mode, fail] of Object.entries(failureModes)) {
+    const reads: { source: typeof inventorySource; aborted: boolean }[] = [];
+    const readAuthenticatedInventory: Host["readAuthenticatedInventory"] = (source, signal) => {
+      access.push("inventory");
+      reads.push({ source, aborted: signal.aborted });
+      return fail();
+    };
+    assert.deepEqual(await runStagingAutomodProtectedHost(options, { ...host, readAuthenticatedInventory }), noActions, mode);
+    assert.deepEqual(access.splice(0), [...beforeInventory, "inventory", "inventory"], mode);
+    assert.deepEqual(reads, [{ source: inventorySource, aborted: false }, { source: inventorySource, aborted: false }], mode);
+    assert.equal(invokePrivate.mock.callCount(), 0, mode);
+  }
+
+  assert.deepEqual(await runStagingAutomodProtectedHost(options, host), { verdict: "passed", start: true, recover: true });
+  assert.deepEqual(access, [...beforeInventory, "inventory", "invoke:start", "invoke:recover"]);
+  assert.deepEqual(invokePrivate.mock.calls.map(({ arguments: [pin, call] }) => [pin, call]),
+    [[pin, { action: "start", issuedLease }], [pin, { action: "recover", issuedLease }]]);
+  assert.equal(network.mock.callCount(), 0);
+});
+
 test("a separately approved recovery can still use the original serving pin", async t => {
   t.mock.timers.enable({ apis: ["Date"], now });
   const { host, invokePrivate } = fixture(t);
