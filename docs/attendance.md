@@ -54,12 +54,18 @@ python3 scripts/staging_attendance_acceptance.py rehearsal --rollout rollout.jso
   --observed rehearsal.json
 ```
 
-The comparison uses each `ready` record's `observedAt` to check that the
-lease covered the probe budget. It uses the pending lease's owner epoch,
-`runId`, `runAttempt`, `acquiredAt` and `expiresAt` for all four phases. A
-later lease on the same rollout may retain the same owner epoch. Its stopped
-release and zero fixture rows belong to that later rehearsal. If the original
-lease has no matching cleanup receipt, leave its cleanup verdict unverified.
+The comparison requires strictly increasing `observedAt` timestamps from the
+trusted staging client in pending, finalized, OFF and cleanup order. The client
+stamps each successful observation in UTC at millisecond precision. Tied
+timestamps leave the order unverified. Each `ready` record must leave enough
+time in the active lease for the probe budget. A stopped `release` may be
+observed after expiry as recovery for that same lease.
+
+All four phases must match the pending lease's owner epoch, `runId`,
+`runAttempt`, `acquiredAt` and `expiresAt`. A later lease on the same rollout
+may retain the same owner epoch. Its stopped release and zero fixture rows
+belong to that later rehearsal. If the original lease has no matching cleanup
+receipt, leave its cleanup verdict unverified.
 Record `PASS: attendance rehearsal` alongside the separately recorded signed
 probe verdicts from the protected run.
 

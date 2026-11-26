@@ -75,8 +75,6 @@ JOB_INVENTORY = {
                     "sweep-partition", "sweep-guarded", "sweep-docs", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "mutation.yml": {"rust-mutation", "python-mutation", "worker-mutation"},
-    # One-off read-only reference writer for the fixed source snapshot.
-    "configuration-reference.yml": {"configuration-reference"},
     "release.yml": {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"},
     # Daily digest release (docs/releases.md): at most one vYYYY.MDD.P tag a day,
     # plus the missing-digest alert; pinned shape below.
@@ -1250,7 +1248,18 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
                   "staging_health_contract_probe.py", "staging-use-user-flow.jsonl", "staging-use-user-flow"))
     steps = [{key: value for key, value in step.items() if key != "name"}
              for step in job.get("steps") or []]
-    if (len(steps) != 6 or steps[:2] != STAGING_TOOLING_STEPS
+    checkout, setup_node = STAGING_TOOLING_STEPS
+    scoped_checkout = {**checkout, "with": {
+        **checkout["with"],
+        "sparse-checkout": "/scripts/build_identity.py\n"
+                           "/scripts/script_intake.py\n"
+                           "/scripts/staging_health_contract_probe.py\n"
+                           "/wrangler/scripts/is-direct-invocation.mjs\n"
+                           "/wrangler/scripts/ownership-control-response.mjs\n"
+                           "/wrangler/scripts/staging-use.mjs\n",
+        "sparse-checkout-cone-mode": "false",
+    }}
+    if (len(steps) != 6 or steps[:2] != [scoped_checkout, setup_node]
             or steps[2].get("run") != "node wrangler/scripts/staging-use.mjs ready"
             or (steps[3].get("with") or {}).get("path") != "${{ runner.temp }}/staging-use-user-flow.jsonl"
             or steps[5] != {"if": "always()", "uses": STAGING_UPLOAD_USES,
@@ -1728,9 +1737,24 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                 or "if" in steps[ddl[0]] or "continue-on-error" in steps[ddl[0]]):
             errors.append(f"{name}:apply: must verify the exact native approval before building and running DDL")
         checkouts = [step for step in steps if (step.get("with") or {}).get("path") == "approval-tools"]
+        checkout_options = {
+            "path": "approval-tools",
+            "persist-credentials": "false",
+            "ref": "${{ github.sha }}",
+            "sparse-checkout": (
+                "/scripts/build_identity.py\n"
+                "/scripts/ci/staging_migrate_claim.py\n"
+                "/scripts/rollback_proof.py\n"
+                "/scripts/script_intake.py\n"
+                "/scripts/staging_migrate_approval.py\n"
+                "/scripts/staging_recovery_status.py\n"
+                "/scripts/staging_rollout.py\n"
+                "/scripts/worker_container_rollback.py\n"
+            ),
+            "sparse-checkout-cone-mode": "false",
+        }
         if (len(checkouts) != 1 or not str(checkouts[0].get("uses", "")).startswith("actions/checkout@")
-                or checkouts[0].get("with") != {"path": "approval-tools", "persist-credentials": "false",
-                                               "ref": "${{ github.sha }}"}
+                or checkouts[0].get("with") != checkout_options
                 or "if" in checkouts[0] or "continue-on-error" in checkouts[0]):
             errors.append(f"{name}:apply: must load the verifier at the trusted workflow SHA")
     else:
@@ -6950,7 +6974,11 @@ class WorkflowTests(unittest.TestCase):
             "verify_disposable_postgres",
         )
         checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
-        self.assertEqual(checkout["with"]["fetch-depth"], "0")
+        # The pinned action defaults to the event ref and SHA when ref is absent.
+        self.assertEqual(checkout, {
+            "uses": STAGING_CHECKOUT_USES,
+            "with": {"persist-credentials": "false", "fetch-depth": "1"},
+        })
 
     def test_ignored_test_names_include_intervening_comments_and_blank_lines(self):
         separators = (
@@ -7417,6 +7445,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("job-inputs", job.get("needs", []))
         self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
         self.assertEqual(job.get("runs-on"), PR_GATE_RUNNER)
+        checkout = job["steps"][0]["with"]
+        self.assertEqual(checkout.get("persist-credentials"), "false")
+        self.assertEqual(checkout.get("fetch-depth"),
+                         "${{ !github.event.merge_group.base_sha && github.event.pull_request && 2 || 0 }}")
         outputs = job.get("outputs", {})
         for key in ("matrix", "expected-shards", "legs", "widened", "reason"):
             self.assertIn(key, outputs)
@@ -7424,6 +7456,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("steps.plan.outputs.expected-shards", outputs["expected-shards"])
         step = next(step for step in job["steps"] if step.get("id") == "plan")
         self.assertEqual(step.get("name"), "Plan coverage shards")
+        self.assertEqual(step["env"]["PLAN_BASE"],
+                         "${{ github.event.merge_group.base_sha || "
+                         "(github.event.pull_request && format('{0}^1', github.sha)) || "
+                         "github.event.before || 'origin/main' }}")
+        self.assertEqual(step["env"]["PLAN_HEAD"], "${{ github.sha }}")
         self.assertIn("scripts/ci/plan-coverage-shards.py", step["run"])
         self.assertIn("--shards 4", step["run"])
         self.assertIn("--output plan.json", step["run"])
@@ -8694,6 +8731,64 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(user_flow_synthetic_errors(changed["deploy-staging.yml"]), label)
                 self.assertTrue(workflow_policy_errors(changed), label)
 
+    def test_user_flow_synthetic_pins_checkout_scope_and_provenance(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(user_flow_synthetic_errors(staging), [])
+        checkout = staging["jobs"]["user-flow-synthetic"]["steps"][0]["with"]
+        scope = checkout["sparse-checkout"].splitlines(keepends=True)
+        overrides = {
+            "extra path": {"sparse-checkout": checkout["sparse-checkout"] + "/scripts/\n"},
+            "cone mode": {"sparse-checkout-cone-mode": "true"},
+            "deployed SHA": {"ref": DEPLOY_SHA_EXPRESSION},
+            "other repository": {"repository": "fixture/other"},
+            "other directory": {"path": "other-checkout"},
+            "different filter": {"filter": "tree:0"},
+            "persisted credentials": {"persist-credentials": "true"},
+            "full history": {"fetch-depth": "0"},
+        }
+        for missing in scope:
+            overrides[f"missing {missing.strip()}"] = {
+                "sparse-checkout": "".join(path for path in scope if path != missing)}
+        variants = {label: {**checkout, **override} for label, override in overrides.items()}
+        variants["full checkout"] = STAGING_TOOLING_STEPS[0]["with"]
+        for label, options in variants.items():
+            with self.subTest(label=label):
+                changed = deepcopy(staging)
+                changed["jobs"]["user-flow-synthetic"]["steps"][0]["with"] = options
+                self.assertTrue(user_flow_synthetic_errors(changed))
+
+    def test_user_flow_synthetic_loads_both_probes_from_scoped_checkout(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(user_flow_synthetic_errors(staging), [])
+        checkout, _, ready, _, probe, _ = staging["jobs"]["user-flow-synthetic"]["steps"]
+        with tempfile.TemporaryDirectory() as directory:
+            runner_temp = Path(directory)
+            worktree = runner_temp / "checkout"
+            for pattern in checkout["with"]["sparse-checkout"].splitlines():
+                path = pattern.removeprefix("/")
+                target = worktree / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / path).read_bytes())
+            receipt = runner_temp / "staging-use-user-flow.jsonl"
+            env = {
+                "PATH": os.environ.get("PATH", os.defpath),
+                # An unparseable origin reaches both commands and cannot make an HTTP request.
+                "STAGING_WORKER_URL": "https://[",
+                "STAGING_USE_RECEIPT": str(receipt),
+                "RUNNER_TEMP": str(runner_temp),
+                "EXPECTED_SHA": "a" * 40,
+            }
+            node = subprocess.run(shlex.split(ready["run"]), cwd=worktree, env=env,
+                                  capture_output=True, text=True, timeout=5, check=False)
+            self.assertEqual((node.returncode, node.stderr), (1, "staging_origin_invalid\n"), node.stderr)
+            self.assertEqual(node.stdout, receipt.read_text())
+            self.assertEqual([json.loads(line)["action"] for line in node.stdout.splitlines()], ["attempt", "failed"])
+            python = subprocess.run(["bash", "-eo", "pipefail", "-c", probe["run"]], cwd=worktree, env=env,
+                                    capture_output=True, text=True, timeout=5, check=False)
+            self.assertEqual((python.returncode, python.stderr), (2, ""), python.stderr)
+            self.assertIn("FAIL origin: refusing: not the two-bot-next-staging workers.dev origin", python.stdout)
+            self.assertFalse((runner_temp / "staging-user-flow-synthetic.json").exists())
+
     def test_qualification_assertions_are_exact_and_keep_secrets_out_of_consumers(self):
         for job_id, entry, receipt, artifact in (
                 ("user-flow-synthetic", "staging_health_contract_probe.py", "staging-use-user-flow.jsonl", "staging-use-user-flow"),
@@ -9722,6 +9817,53 @@ class WorkflowTests(unittest.TestCase):
                     w["jobs"][job_id]["permissions"] = permissions
                 self.assertTrue(mutated(change))
 
+    def test_staging_apply_approval_checkout_is_pinned(self):
+        workflow = self.workflows["staging-migrate.yml"]
+        self.assertEqual(staging_migrate_errors(workflow), [])
+
+        def approval_checkout(workflow):
+            return next(step["with"] for step in workflow["jobs"]["apply"]["steps"]
+                        if step.get("with", {}).get("path") == "approval-tools")
+
+        checkout = approval_checkout(workflow)
+        self.assertIn("sparse-checkout", checkout)
+        paths = checkout["sparse-checkout"]
+        for changes in (
+                {"sparse-checkout": None, "sparse-checkout-cone-mode": None},
+                {"sparse-checkout": paths.replace("/scripts/build_identity.py\n", "")},
+                {"sparse-checkout": paths + "/scripts/\n"},
+                {"sparse-checkout-cone-mode": "true"},
+                {"ref": "${{ inputs.source_sha }}"},
+                {"persist-credentials": "true"}):
+            with self.subTest(changes=changes):
+                changed = deepcopy(workflow)
+                options = approval_checkout(changed)
+                for key, value in changes.items():
+                    if value is None:
+                        del options[key]
+                    else:
+                        options[key] = value
+                self.assertEqual(staging_migrate_errors(changed), [
+                    "staging-migrate.yml:apply: must load the verifier at the trusted workflow SHA",
+                ])
+
+        steps = workflow["jobs"]["apply"]["steps"]
+        verifier = next(step for step in steps if step.get("name") == "Verify the native staging approval")
+        _, *args = shlex.split(verifier["run"])
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            for pattern in paths.splitlines():
+                path = pattern.removeprefix("/")
+                destination = scratch / checkout["path"] / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes((ROOT / path).read_bytes())
+            # A missing manifest exercises startup without credentials or API calls.
+            result = subprocess.run([sys.executable, "-B", "-S", *args], cwd=scratch,
+                                    env={}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "staging migration approval evidence unavailable or malformed\n")
+
     def test_production_migrate_runner_shape_is_pinned(self):
         # Production mirror of the staging runner: same three jobs, same pinned
         # actions, public-hosted runner, pipefail and provenance gates, with
@@ -10097,6 +10239,58 @@ class WorkflowTests(unittest.TestCase):
         del missing["staging-container-drill.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_container_drill_sparse_checkout_materializes_runtime_inputs(self):
+        workflow = self.workflows["staging-container-drill.yml"]
+        checkout = workflow["jobs"]["container-drill"]["steps"][0]["with"]
+        self.assertEqual(checkout["fetch-depth"], "1")
+        self.assertNotIn("ref", checkout)
+        self.assertNotIn("filter", checkout)
+        self.assertEqual(checkout.get("sparse-checkout-cone-mode"), "false")
+        self.assertTrue(checkout.get("sparse-checkout"))
+
+        # Materialize the job's rules in a disposable checkout. The lint image's
+        # Git supports sparse-checkout set but predates check-rules.
+        objects, revision = subprocess.check_output(
+            ["git", "rev-parse", "--path-format=absolute", "--git-path", "objects", "HEAD"],
+            cwd=ROOT, text=True, timeout=10,
+        ).splitlines()
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(["git", "init", "--quiet"], cwd=directory, check=True, timeout=10)
+            # Borrow objects without changing Git config or the index of the runner-owned checkout.
+            (Path(directory) / ".git/objects/info/alternates").write_text(objects + "\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "sparse-checkout", "set", "--no-cone", "--stdin"], cwd=directory,
+                input=checkout["sparse-checkout"], text=True, check=True, timeout=10,
+            )
+            subprocess.run(["git", "checkout", "--quiet", "--detach", revision], cwd=directory,
+                           check=True, timeout=10)
+            tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=directory, timeout=10)
+            paths = tracked.rstrip(b"\0").split(b"\0")
+            selected = {path for path in paths if os.path.lexists(Path(directory) / os.fsdecode(path))}
+
+        inputs = {
+            b"Dockerfile",  # The generated config still validates the other environments' images.
+            b"scripts/build_identity.py",
+            b"scripts/script_intake.py",
+            b"scripts/staging_container_drill.py",
+            b"scripts/staging_drill_use.py",
+            b"scripts/staging_rollback_drill.py",
+            b"scripts/staging_rollout.py",
+            b"scripts/worker_container_rollback.py",
+            b"wrangler/package-lock.json",
+            b"wrangler/package.json",
+            b"wrangler/scripts/is-direct-invocation.mjs",
+            b"wrangler/scripts/ownership-control-response.mjs",
+            b"wrangler/scripts/ownership-control.mjs",
+            b"wrangler/scripts/staging-use-pipeline.mjs",
+            b"wrangler/scripts/staging-use.mjs",
+            b"wrangler/src/index.ts",
+            b"wrangler/tsconfig.json",
+            b"wrangler/wrangler.toml",
+        }
+        inputs.update(path for path in paths if path.startswith(b"wrangler/src/"))
+        self.assertEqual(selected, inputs)
 
     def test_staging_events_read_shape_is_pinned(self):
         workflows = self.workflows

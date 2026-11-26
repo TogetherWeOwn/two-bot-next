@@ -15,6 +15,9 @@ type Approval = Parameters<ReturnType<typeof bindStagingAutomodDeploymentTranspo
 type BoundAuthority = typeof boundStagingAutomodAuthority<AuthorityContext, Approval["issuedLease"], Approval["action"], Approval>;
 type Providers = Readonly<{
   authority: Parameters<BoundAuthority>[0];
+  // Only an authenticated caller can prepare. Durable confirmation uses the
+  // separate, read-only authority deadline below.
+  prepareLease?: (context: AuthorityContext) => Promise<void>;
   readWorker: () => TransportInputs[0];
   readInventory: TransportInputs[1];
   invoke: TransportInputs[2];
@@ -46,6 +49,13 @@ export async function runStagingAutomodRehearsal(
   if (!admitted(context)) return { verdict: "failed", code: "context_unconfirmed" } as const;
 
   const expected = { ...context, target: STAGING_AUTOMOD_TARGET };
+  if (providers.prepareLease) {
+    try { await providers.prepareLease(expected); }
+    catch {
+      // An interrupted acquisition can already be durable. Read the exact
+      // issued lease independently before approving either action.
+    }
+  }
   const inputs = await readStagingAutomodJobInputs(expected, boundStagingAutomodAuthority(providers.authority));
   if (!inputs) return { verdict: "failed", code: "lease_unconfirmed" } as const;
 
