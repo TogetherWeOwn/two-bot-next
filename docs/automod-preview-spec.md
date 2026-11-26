@@ -773,11 +773,12 @@ Live qualification uses the sole staging writer's exclusive window.
 
 The AutoMod preview workflow accepts a direct dispatch of its own protected
 main ref on attempt 1. The rehearsal input defaults to off. An eligible
-opt-in holds the shared staging lifecycle queue. The checked-in command
-builds a host binding only from the compiled rehearsal plan's serving and
-inventory selection and the job's Actions OIDC request variables. The default
-plan selects neither, so an opted-in rehearsal still fails with
-`host_unavailable`. The host must
+opt-in holds the shared staging lifecycle queue. A host binding needs the
+job's Actions OIDC request variables and a serving and inventory selection.
+That selection must come from authenticated post-deploy evidence for the
+dispatch SHA, because source cannot name its own commit's deployment. The
+checked-in command has no such resolver yet, so an opted-in rehearsal still
+fails with `host_unavailable`. The host must
 prepare the approved serving and inventory selection and verified staging
 fixture before supplying the existing authority and private adapters.
 The offline fixture passes the issued AutoMod lease and pinned run, attempt
@@ -832,8 +833,8 @@ The strict bounded body names one operation: `acquire`, `read-lease`,
 operation returns 404. The run ID, attempt and build in the body must equal the
 token's claims. The Container reads reservations and approvals only from the
 plan compiled into the build (`wrangler/src/staging-automod-plan.ts`). That plan
-is off by default. A reservation needs the enabled plan and its window. Start
-also needs the plan's separate start permission. Recovery on the original lease
+is off by default. A reservation and a start each need the enabled plan, its
+window and the plan's start permission. Recovery on the original lease
 of the verified run is allowed whatever the plan says. Before it invokes, the
 Container rereads its own approval. Serving checks compare the Worker version,
 build and owner epoch with local identity. They compare the rest of the pin
@@ -845,7 +846,9 @@ Recovery retires an unused reservation after a confirmed native stop.
 host and instance shapes over the bridge. It uses a fixed staging Worker URL
 and mints a new OIDC token for each call. The workflow job adds only
 `id-token: write` and the staging control bearer for its last step. Enabling
-the plan is a separate reviewed change and deploy-staging run.
+the plan is a separate reviewed change and deploy-staging run. It also needs
+the post-deploy selection resolver and a GitHub read credential for the
+inventory verifier, which today runs with an empty environment.
 
 ## 10. Spec self-check (doctest)
 

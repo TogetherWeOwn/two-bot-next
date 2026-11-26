@@ -1,4 +1,3 @@
-import { STAGING_AUTOMOD_PLAN, type StagingAutomodPlan } from "../src/staging-automod-plan.ts";
 import { isDirectInvocation } from "./is-direct-invocation.mjs";
 import { bindStagingAutomodInstanceClient } from "./staging-automod-instance-client.ts";
 import { runStagingAutomodProtectedHost } from "./staging-automod-protected-host.ts";
@@ -24,14 +23,15 @@ export async function runStagingAutomodDispatch(env: DispatchEnv = {}, binding?:
     serving: binding.serving, inventorySource: binding.inventorySource }, binding.host);
 }
 
-/** Assemble the bridge binding from the compiled plan. Only an explicit opt
- * in, the Actions OIDC request variables and the plan's serving and inventory
- * selection produce one. The default plan selects neither, so the checked-in
- * command keeps its fixed host_unavailable failure. No input selects a plan.
+/** Assemble the bridge binding. Only an explicit opt in, the Actions OIDC
+ * request variables and a serving and inventory selection produce one. The
+ * selection must come from authenticated post-deploy evidence for the
+ * dispatch SHA, never from source or input. The checked-in command has no
+ * such resolver yet, so it keeps its fixed host_unavailable failure.
  */
 export function bindStagingAutomodDispatch(env: DispatchEnv,
-  plan: StagingAutomodPlan = STAGING_AUTOMOD_PLAN): Binding | undefined {
-  const { serving, inventorySource } = plan;
+  selection?: Pick<Binding, "serving" | "inventorySource">): Binding | undefined {
+  const { serving, inventorySource } = selection ?? {};
   if (env.STAGING_AUTOMOD_REHEARSAL !== "true" || !serving || !inventorySource) return;
   const client = bindStagingAutomodInstanceClient(env, serving);
   return client && { serving, inventorySource, host: client.host };

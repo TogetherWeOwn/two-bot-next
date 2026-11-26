@@ -3,7 +3,6 @@ import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { URL, fileURLToPath } from "node:url";
 import { bindStagingAutomodDispatch, runStagingAutomodDispatch } from "../scripts/staging-automod-dispatch.ts";
-import { STAGING_AUTOMOD_PLAN } from "../src/staging-automod-plan.ts";
 import { STAGING_AUTOMOD_TARGET as target } from "../src/staging-automod-recovery.ts";
 import { AUTOMOD_STAGING_PURPOSE } from "../src/staging-use-window.ts";
 import { lease } from "./fixtures/staging-automod-recovery.ts";
@@ -37,14 +36,12 @@ test("the rehearsal dispatch requires explicit opt in and an approved host bindi
   assert.deepEqual(await runStagingAutomodDispatch(runner), { verdict: "failed", code: "host_unavailable" });
 });
 
-test("the compiled plan alone selects the bridge binding, and only with the OIDC request variables", async t => {
+test("the bridge binding needs an explicit selection and the OIDC request variables", async t => {
   const oidc = { ACTIONS_ID_TOKEN_REQUEST_URL: "https://pipelines.actions.githubusercontent.com/token",
     ACTIONS_ID_TOKEN_REQUEST_TOKEN: "synthetic-request-token", OWNERSHIP_CONTROL_TOKEN: "c".repeat(43) };
   const fetch = t.mock.method(globalThis, "fetch", unexpected);
-  assert.equal(STAGING_AUTOMOD_PLAN.serving, null);
-  assert.equal(STAGING_AUTOMOD_PLAN.inventorySource, null);
   assert.equal(bindStagingAutomodDispatch({ ...runner, ...oidc }), undefined);
-  const plan = { ...STAGING_AUTOMOD_PLAN, serving, inventorySource };
+  const plan = { serving, inventorySource };
   assert.equal(bindStagingAutomodDispatch({ ...runner, ...oidc, STAGING_AUTOMOD_REHEARSAL: "false" }, plan), undefined);
   assert.equal(bindStagingAutomodDispatch(runner, plan), undefined);
   assert.equal(bindStagingAutomodDispatch({ ...runner, ...oidc, ACTIONS_ID_TOKEN_REQUEST_TOKEN: "" }, plan), undefined);
