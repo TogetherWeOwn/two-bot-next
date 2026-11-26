@@ -1,9 +1,12 @@
+import { STAGING_AUTOMOD_PLAN, type StagingAutomodPlan } from "../src/staging-automod-plan.ts";
 import { isDirectInvocation } from "./is-direct-invocation.mjs";
+import { bindStagingAutomodInstanceClient } from "./staging-automod-instance-client.ts";
 import { runStagingAutomodProtectedHost } from "./staging-automod-protected-host.ts";
 
 type ProtectedHost = Parameters<typeof runStagingAutomodProtectedHost>;
 type HostOptions = NonNullable<ProtectedHost[0]>;
-type DispatchEnv = NonNullable<HostOptions["runner"]> & Readonly<{ STAGING_AUTOMOD_REHEARSAL?: string }>;
+type DispatchEnv = NonNullable<HostOptions["runner"]> & Parameters<typeof bindStagingAutomodInstanceClient>[0]
+  & Readonly<{ STAGING_AUTOMOD_REHEARSAL?: string }>;
 type Binding = Required<Pick<HostOptions, "serving" | "inventorySource">> & Readonly<{
   host: NonNullable<ProtectedHost[1]>;
 }>;
@@ -21,10 +24,22 @@ export async function runStagingAutomodDispatch(env: DispatchEnv = {}, binding?:
     serving: binding.serving, inventorySource: binding.inventorySource }, binding.host);
 }
 
+/** Assemble the bridge binding from the compiled plan. Only an explicit opt
+ * in, the Actions OIDC request variables and the plan's serving and inventory
+ * selection produce one. The default plan selects neither, so the checked-in
+ * command keeps its fixed host_unavailable failure. No input selects a plan.
+ */
+export function bindStagingAutomodDispatch(env: DispatchEnv,
+  plan: StagingAutomodPlan = STAGING_AUTOMOD_PLAN): Binding | undefined {
+  const { serving, inventorySource } = plan;
+  if (env.STAGING_AUTOMOD_REHEARSAL !== "true" || !serving || !inventorySource) return;
+  const client = bindStagingAutomodInstanceClient(env, serving);
+  return client && { serving, inventorySource, host: client.host };
+}
+
 if (isDirectInvocation(process.argv[1], import.meta.url)) {
-  // The checked-in CLI has no approved host binding. A future protected change
-  // must assemble one in source. No dispatch input selects a provider or plan.
-  const result = await runStagingAutomodDispatch(process.env).catch(() => ({ verdict: "failed" } as const));
+  const result = await runStagingAutomodDispatch(process.env, bindStagingAutomodDispatch(process.env))
+    .catch(() => ({ verdict: "failed" } as const));
   if (result.verdict === "passed") console.log("staging_automod_rehearsal_passed");
   if (result.verdict === "failed") {
     console.error("staging_automod_rehearsal_failed");

@@ -174,6 +174,7 @@ export async function readChange(request: Request): Promise<OwnershipChange | nu
 /** Bound control input independently of the untrusted Content-Length header. */
 export async function readControlBody(request: Request,
   decode = (bytes: Uint8Array): unknown => JSON.parse(new TextDecoder().decode(bytes)),
+  limit = 1024,
 ): Promise<unknown> {
   const reader = request.body?.getReader();
   if (!reader) return null;
@@ -192,7 +193,7 @@ export async function readControlBody(request: Request,
       }
       if (step.done) break;
       size += step.value.byteLength;
-      if (size > 1024) {
+      if (size > limit) {
         void reader.cancel().catch(() => {});
         return null;
       }

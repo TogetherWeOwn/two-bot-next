@@ -36,6 +36,14 @@ import {
 import { bindStagingAutomodAuthorityProvider, type ReadProtectedAutomodApproval } from "./staging-automod-authority-provider.ts";
 import { runProtectedAutomod, type ProtectedAutomodCall, type ProtectedAutomodEffects } from "./staging-automod-caller.ts";
 import { STAGING_AUTOMOD_TARGET, StagingAutomodRecovery } from "./staging-automod-recovery.ts";
+import {
+  STAGING_AUTOMOD_BODY_BYTES, STAGING_AUTOMOD_OIDC_HEADER, STAGING_AUTOMOD_PATH, operationRun,
+  parseStagingAutomodOperation, verifyStagingAutomodOidc,
+} from "./staging-automod-bridge.ts";
+import {
+  STAGING_AUTOMOD_PLAN, automodRecoverAllowed, automodReservationAllowed, automodStartAllowed, type StagingAutomodPlan,
+} from "./staging-automod-plan.ts";
+import { parseUniqueJson } from "./unique-json.ts";
 import { stagingDatabaseEvidence } from "./staging-database-fingerprint.ts";
 import { PREVIEW_HEADER, parseRegistryJson, previewRefusal, readPreview, readPreviewAbsent } from "./staging-preview.ts";
 import {
@@ -895,6 +903,10 @@ export class TwoBotContainer extends Container<Env> {
   private readonly ownership = new OwnershipFence(this.ctx.storage);
   private readonly stagingUse = new StagingLifecycle(this.ctx.storage);
   private readonly automodRecovery = new StagingAutomodRecovery(this.ctx.storage);
+  // The build-compiled plan and in-DO effects for the protected AutoMod
+  // bridge. Instance fields are not Durable Object RPC methods.
+  private automodPlan: StagingAutomodPlan = STAGING_AUTOMOD_PLAN;
+  private automodEffects: ProtectedAutomodEffects | undefined;
   private readonly initialization: Promise<void>;
   private recoveryFailed = false;
   // Last container git SHA seen on /readyz this tick. Tags the keepalive
@@ -1306,6 +1318,7 @@ export class TwoBotContainer extends Container<Env> {
     const url = new URL(request.url);
     if (url.pathname === CONTROL_PATH) return this.control(request);
     if (url.pathname === STAGING_USE_PATH) return this.stagingControl(request);
+    if (url.pathname === STAGING_AUTOMOD_PATH) return this.stagingAutomodBridge(request);
     if (url.pathname === ACTIONS_PATH) return this.internalActions(request);
     if (url.pathname === EVENTSUB_PATH) return this.internalEventsub(request);
     const mcpAuditRead = url.origin === "http://c" && url.pathname === OPS_AUDIT_PATH
@@ -1768,6 +1781,97 @@ export class TwoBotContainer extends Container<Env> {
       refused(error);
       return envelope(503, "unavailable", true, {}, requestId);
     }
+  }
+
+  /** Fetch-only bridge for the protected staging AutoMod job. The Worker
+   * requires bounded staging and the control bearer and stamps this version.
+   * This entry repeats those checks, then verifies the Actions OIDC token
+   * before any storage, lease or Container read. One closed operation then
+   * reaches the matching in-process bindProtectedAutomodInstance member.
+   */
+  private async stagingAutomodBridge(request: Request): Promise<Response> {
+    if (!this.boundedStaging() || request.method !== "POST") return notFound();
+    if (!await authenticated(request, this.env.OWNERSHIP_CONTROL_TOKEN)) {
+      return new Response("unauthorized", { status: 401, headers: withSecurityHeaders() });
+    }
+    const headers = withSecurityHeaders({ "cache-control": "no-store" });
+    const refusal = () => Response.json({ error: "staging_automod_refused" }, { status: 403, headers });
+    const id = this.env.CF_VERSION_METADATA?.id;
+    if (typeof id !== "string" || request.headers.get(DEPLOYMENT_HEADER) !== id) return refusal();
+    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(10_000)]);
+    const run = await verifyStagingAutomodOidc(request.headers.get(STAGING_AUTOMOD_OIDC_HEADER),
+      this.env.CONTAINER_RELEASE, signal);
+    if (!run || signal.aborted) return refusal();
+    const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
+    const body = await readControlBody(request, bytes => parseUniqueJson(decoder.decode(bytes)),
+      STAGING_AUTOMOD_BODY_BYTES).catch(() => null);
+    const operation = parseStagingAutomodOperation(body);
+    if (operation === "unknown") return notFound();
+    if (!operation) return Response.json({ error: "staging_automod_invalid" }, { status: 400, headers });
+    const scope = operationRun(operation);
+    if (scope.runId !== run.runId || scope.runAttempt !== run.runAttempt || scope.sha !== run.sha) return refusal();
+
+    const plan = this.automodPlan;
+    const pin = operation.op === "acquire" || operation.op === "invoke" ? operation.pin : undefined;
+    const epoch = operation.op === "acquire" ? operation.change.expectedEpoch
+      : operation.op === "invoke" ? operation.call.issuedLease.epoch : undefined;
+    const instance = TwoBotContainer.bindProtectedAutomodInstance(this, request, {
+      readReservation: async () => operation.op === "acquire"
+        && automodReservationAllowed(plan, run, operation.change, Date.now())
+        ? { change: operation.change, pin: operation.pin, target: plan.target } : undefined,
+      readApproval: async (action, issuedLease) => {
+        const allowed = action === "start" ? automodStartAllowed(plan, run, issuedLease, Date.now())
+          : action === "recover" && automodRecoverAllowed(plan, run, issuedLease);
+        return allowed ? { action, issuedLease, target: plan.target } : undefined;
+      },
+      // Local identity and owner epoch, plus the runner's fresh authenticated
+      // inventory pin for the application, namespace, rollout and digest.
+      readServing: async readSignal => {
+        readSignal.throwIfAborted();
+        if (!pin || pin.workerVersionId !== this.id() || pin.sourceSha !== this.env.CONTAINER_RELEASE) return;
+        const owner = await this.ownership.require(pin.workerVersionId);
+        return owner.epoch === epoch ? pin : undefined;
+      },
+      effects: this.automodEffects ?? this.nativeAutomodEffects(plan),
+    });
+    try {
+      let value: unknown = null;
+      if (operation.op === "acquire") value = await instance.acquireLease(operation.pin, operation.change, signal);
+      else if (operation.op === "read-lease") {
+        value = await instance.authority.readIssuedLease(operation.context, signal) ?? null;
+      } else if (operation.op === "read-approval") {
+        value = await instance.authority.readApproval(operation.action, operation.issuedLease, signal) ?? null;
+      } else {
+        // The DO rereads its own approval; the runner's copy grants nothing.
+        const { call } = operation;
+        if (!await instance.authority.readApproval(call.action, call.issuedLease, signal)) return refusal();
+        await instance.invokePrivate(operation.pin, call, signal);
+      }
+      signal.throwIfAborted();
+      return Response.json({ value }, { headers });
+    } catch {
+      return refusal();
+    }
+  }
+
+  /** In-DO effects for the bridge. This build has no dry-run launch adapter,
+   * so start stays refused even with an enabled plan. Recovery can retire an
+   * unused reservation with a confirmed native stop. */
+  private nativeAutomodEffects(plan: StagingAutomodPlan): ProtectedAutomodEffects {
+    return {
+      enabled: plan.enabled === true && plan.allowStart === true,
+      readRuntime: async lease => {
+        const running = this.ctx.container?.running;
+        return typeof running === "boolean" ? { lease, running } : undefined;
+      },
+      readCleanupGrant: async lease => ({ lease, before: lease.expiresAt + plan.cleanupMs }),
+      fenceAndDrain: async () => undefined,
+      stop: async () => {
+        await this.stopStagingUse();
+        return this.ctx.container?.running === false;
+      },
+      request: async () => { throw new OwnershipRefused("staging_use_conflict"); },
+    };
   }
 
   private async stagingControl(request: Request): Promise<Response> {
@@ -2548,6 +2652,20 @@ export default {
 
     if (url.pathname === STAGING_USE_PATH
       && (env.TWO_DEPLOY_ENV !== "staging" || env.STAGING_RUNTIME_POLICY !== "bounded")) return notFound();
+    // Protected AutoMod bridge: bounded staging, POST and the control bearer
+    // only. The DO verifies the Actions OIDC token and the compiled plan.
+    if (url.pathname === STAGING_AUTOMOD_PATH) {
+      if (env.TWO_DEPLOY_ENV !== "staging" || env.STAGING_RUNTIME_POLICY !== "bounded"
+        || request.method !== "POST") return notFound();
+      if (!await authenticated(request, env.OWNERSHIP_CONTROL_TOKEN)) {
+        return new Response("unauthorized", { status: 401, headers: withSecurityHeaders() });
+      }
+      try {
+        const forwarded = new Request(request);
+        forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
+        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+      } catch (error) { return refused(error); }
+    }
     if (url.pathname === CONTROL_PATH || url.pathname === STAGING_USE_PATH) {
       if (!await authenticated(request, env.OWNERSHIP_CONTROL_TOKEN)) {
         return new Response("unauthorized", { status: 401, headers: withSecurityHeaders() });

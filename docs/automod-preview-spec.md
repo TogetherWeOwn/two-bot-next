@@ -773,8 +773,11 @@ Live qualification uses the sole staging writer's exclusive window.
 
 The AutoMod preview workflow accepts a direct dispatch of its own protected
 main ref on attempt 1. The rehearsal input defaults to off. An eligible
-opt-in holds the shared staging lifecycle queue. The checked-in command has
-no protected host binding and refuses an opted-in rehearsal. The host must
+opt-in holds the shared staging lifecycle queue. The checked-in command
+builds a host binding only from the compiled rehearsal plan's serving and
+inventory selection and the job's Actions OIDC request variables. The default
+plan selects neither, so an opted-in rehearsal still fails with
+`host_unavailable`. The host must
 prepare the approved serving and inventory selection and verified staging
 fixture before supplying the existing authority and private adapters.
 The offline fixture passes the issued AutoMod lease and pinned run, attempt
@@ -809,6 +812,40 @@ attempt against the lease, then checks each approval against the fixed target,
 its own action and the full issued lease. If one approval is unavailable, the
 other stays usable. The offline test supplies protected readbacks in memory.
 Live use still requires an authenticated provider for those readbacks.
+
+### Protected AutoMod bridge
+
+`POST /internal/staging-automod` lets the protected job reach the in-process
+`bindProtectedAutomodInstance` members. It does not exist outside bounded
+staging. The Worker requires the existing staging ownership control bearer and
+stamps its own version before it forwards to the singleton Container. The
+Container repeats those checks. It then verifies a fresh GitHub Actions OIDC
+token. The token must be RS256 from GitHub's JWKS, for the audience
+`two-bot-staging-automod`, within 60 seconds of clock skew, and for this
+repository's protected `main` ref. It must also name the direct
+`workflow_dispatch` of `staging-automod-preview.yml`, attempt 1, the `staging`
+environment, and a `sha` equal to `CONTAINER_RELEASE`. A failed check returns a
+fixed refusal before any storage, lease, plan or Container read.
+
+The strict bounded body names one operation: `acquire`, `read-lease`,
+`read-approval` (start or recover), or `invoke` (start or recover). Any other
+operation returns 404. The run ID, attempt and build in the body must equal the
+token's claims. The Container reads reservations and approvals only from the
+plan compiled into the build (`wrangler/src/staging-automod-plan.ts`). That plan
+is off by default. A reservation needs the enabled plan and its window. Start
+also needs the plan's separate start permission. Recovery on the original lease
+of the verified run is allowed whatever the plan says. Before it invokes, the
+Container rereads its own approval. Serving checks compare the Worker version,
+build and owner epoch with local identity. They compare the rest of the pin
+with the runner's freshly authenticated inventory. This build supplies no
+dry-run launch adapter, so start stays refused even with an enabled plan.
+Recovery retires an unused reservation after a confirmed native stop.
+
+`wrangler/scripts/staging-automod-instance-client.ts` implements the protected
+host and instance shapes over the bridge. It uses a fixed staging Worker URL
+and mints a new OIDC token for each call. The workflow job adds only
+`id-token: write` and the staging control bearer for its last step. Enabling
+the plan is a separate reviewed change and deploy-staging run.
 
 ## 10. Spec self-check (doctest)
 

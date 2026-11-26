@@ -7786,7 +7786,8 @@ class WorkflowTests(unittest.TestCase):
                 (("on", "workflow_dispatch", "inputs", "rehearse"), {"default": "true"}),
                 (("concurrency",), {"group": "automod-only"}),
                 (("jobs", "dry-run"), {"if": "true"}),
-                (("jobs", "dry-run", "permissions"), {"id-token": "write"}),
+                (("jobs", "dry-run", "permissions"), {"actions": "read"}),
+                (("jobs", "dry-run", "permissions"), {"id-token": "read"}),
                 (("jobs", "dry-run", "steps", 2), {"run": "node wrangler/scripts/staging-use-pipeline.mjs finish"}),
                 (("jobs", "dry-run", "steps", 3), {
                     "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
@@ -7794,7 +7795,11 @@ class WorkflowTests(unittest.TestCase):
                     "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
                 (("jobs", "dry-run", "steps", 5), {"env": {"STAGING_AUTOMOD_REHEARSAL": "true"}}),
                 (("jobs", "dry-run", "steps", 5, "env"), {
-                    "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"})):
+                    "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}"}),
+                (("jobs", "dry-run", "steps", 5, "env"), {
+                    "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"}),
+                (("jobs", "dry-run", "steps", 4), {
+                    "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}})):
             with self.subTest(keys=keys, change=change):
                 workflows = deepcopy(self.workflows)
                 node = workflows[name]
