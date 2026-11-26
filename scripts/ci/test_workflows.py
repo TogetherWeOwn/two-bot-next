@@ -10027,17 +10027,27 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(workflow_policy_errors(workflows), [])
 
     def test_staging_events_read_starts_with_only_checkout_files(self):
-        workflow = self.workflows["staging-events-read.yml"]
-        self.assertEqual(staging_events_read_errors(workflow), [])
-        checkout = workflow["jobs"]["read"]["steps"][0]
-        paths = checkout["with"]["sparse-checkout"].splitlines()
+        checkout = self.workflows["staging-events-read.yml"]["jobs"]["read"]["steps"][0]["with"]
+        self.assertEqual(checkout["sparse-checkout-cone-mode"], "false")
+        git_env = {"PATH": os.environ.get("PATH", os.defpath), "GIT_ALLOW_PROTOCOL": "file",
+                   "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
         with tempfile.TemporaryDirectory(prefix="events-read-checkout-") as directory:
-            root = Path(directory)
-            for pattern in paths:
-                relative = pattern.removeprefix("/")
-                destination = root / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes((ROOT / relative).read_bytes())
+            root = Path(directory) / "checkout"
+
+            def git(*args, stdin=None):
+                result = subprocess.run(
+                    ["git", "-c", f"safe.directory={ROOT}", *args], env=git_env,
+                    input=stdin, capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout
+
+            git("clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(root))
+            git("-C", root, "sparse-checkout", "set", "--no-cone", "--stdin", stdin=checkout["sparse-checkout"])
+            git("-C", root, "checkout", "--quiet", "--detach", "HEAD")
+            tracked = git("-C", root, "ls-files", "-z").split("\0")
+            materialized = {path for path in tracked if path and (root / path).is_file()}
+            self.assertEqual(materialized, {pattern[1:] for pattern in EVENTS_READ_PATHS})
             result = subprocess.run(
                 [sys.executable, "-I", "-B", "scripts/staging_events_read.py", "--help"],
                 cwd=root, env={}, capture_output=True, text=True, timeout=10,
