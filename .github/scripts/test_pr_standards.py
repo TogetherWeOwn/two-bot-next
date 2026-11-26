@@ -4,6 +4,8 @@ import io
 import json
 import os
 import re
+import subprocess
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -557,6 +559,52 @@ class Template(unittest.TestCase):
                 ("", notes + footer)):
             with self.subTest(attestation=attestation[-70:], suffix=suffix[:30]):
                 self.assertIn(("error", "Attestation"), levels(findings(attestation, suffix)))
+
+    def test_create_and_edit_preflight_the_published_body(self):
+        root = Path(HERE).parents[1]
+        guide = (root / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        notes = "\n\n## Notes for reviewers\n\n"
+        attribution = "\n\nCreated with the sample model in the sample harness.\n"
+        footer = ('\n<!-- codesmith:footer -->\n---\n'
+                  '<a href="https://example.com/pr-proof">Synthetic proof</a>\n'
+                  '<!-- /codesmith:footer -->\n')
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            sink = scratch / "published.md"
+            body_file = scratch / "pr.md"
+            gh = scratch / "gh"
+            gh.write_text('#!/bin/sh\nfor arg do body="$arg"; done\ncat -- "$body" > "$PR_TEST_SINK"\n',
+                          encoding="utf-8")
+            gh.chmod(0o700)
+            environment = dict(os.environ, PATH=f"{scratch}{os.pathsep}{os.environ['PATH']}",
+                               PR_TEST_SINK=str(sink), PYTHONDONTWRITEBYTECODE="1")
+            for operation, arguments, suffix in (
+                    ("create", "--draft --base main --head docs/describe-the-change", attribution),
+                    ("edit", "123", attribution + footer)):
+                command = ("python3 .github/scripts/pr_body_preflight.py pr.md && "
+                           f"gh pr {operation} {arguments} --body-file pr.md")
+                self.assertIn(command, guide.splitlines())
+                invocation = ["sh", "-c", command.replace("pr.md", '"$1"'),
+                              "preflight-test", str(body_file)]
+                body = GOOD_BODY + FULL_ATTESTATION
+                malformed = [body + suffix, body + suffix + notes, body + "\n```\n" + notes + suffix]
+                if operation == "create":
+                    malformed.append(body)
+                for candidate in malformed:
+                    with self.subTest(operation=operation, body_tail=candidate[-120:]):
+                        body_file.write_text(candidate, encoding="utf-8")
+                        rejected = subprocess.run(invocation, cwd=root, env=environment,
+                                                  capture_output=True, text=True)
+                        self.assertEqual(1, rejected.returncode, rejected.stderr)
+                        self.assertIn("## Notes for reviewers", rejected.stderr)
+                        self.assertFalse(sink.exists())
+                good = (body + notes + suffix).replace("\n", "\r\n").encode()
+                body_file.write_bytes(good)
+                accepted = subprocess.run(invocation, cwd=root, env=environment,
+                                          capture_output=True, text=True)
+                self.assertEqual(0, accepted.returncode, accepted.stderr)
+                self.assertEqual(good, sink.read_bytes())
+                sink.unlink()
 
     def test_unfilled_template_fails_in_error_mode(self):
         f = ps.evaluate(env(BODY=self.text, PR_STANDARDS_MODE="error"))

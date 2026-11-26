@@ -408,13 +408,25 @@ marking a PR ready is not a substitute for pushing its final head.
 
 ```sh
 git push origin HEAD:docs/describe-the-change
-gh pr create --draft --base main --head docs/describe-the-change --body-file pr.md
+python3 .github/scripts/pr_body_preflight.py pr.md && gh pr create --draft --base main --head docs/describe-the-change --body-file pr.md
 # After the work is complete:
 gh pr ready <pr-number>
 gh pr checks <pr-number>
 gh run list --workflow check.yml --commit <head-sha>
 gh run view <run-id> --json headSha,url,jobs
 ```
+
+Before editing a description, run the same offline preflight on the final body,
+including any retained integration footer. Put attribution and footer text
+under `## Notes for reviewers`. API and T3 callers should preflight a local
+file and pass its exact contents as the body.
+
+```sh
+python3 .github/scripts/pr_body_preflight.py pr.md && gh pr edit 123 --body-file pr.md
+```
+
+The preflight checks where reviewer notes begin. The hosted checks validate the
+full Attestation and Verification.
 
 Use your own public-safe branch name and the repository PR template. Batch each
 review round into one push. `ci-ok` is the aggregate CI verdict: both selectors,
