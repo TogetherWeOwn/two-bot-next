@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
 import tomllib
 import unittest
@@ -228,7 +229,7 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertNotIn("ports", job["services"]["agent-testdb"])
         self.assertNotIn("secrets.", str(job))
         checkout = job["steps"][0]["with"]
-        self.assertEqual(checkout["ref"], "${{ github.event.pull_request.head.sha }}")
+        self.assertEqual(checkout["ref"], "${{ github.sha }}")
         self.assertEqual(checkout["persist-credentials"], "false")
         self.assertEqual(self.run_aggregator("ci-ok", {"db-compatibility": "skipped"}, selected=""), 1)
 
@@ -299,11 +300,39 @@ class RequiredChecksReportTests(unittest.TestCase):
             with self.subTest(aggregator=name):
                 skipped = {job: "skipped" for job in gated}
                 self.assertEqual(self.run_aggregator(name, skipped, selected="false"), 0)
-                for always_run in ("check", "container-inputs"):
+                for always_run in ("check", "worker", "container-inputs"):
                     self.assertEqual(
                         self.run_aggregator(name, {**skipped, always_run: "skipped"}, selected="false"), 1,
                         f"{always_run} is an always-run gate and may never skip",
                     )
+
+    def test_aggregate_requires_boolean_selection_and_real_results(self):
+        for selection in ("", "FALSE", "unexpected"):
+            with self.subTest(selection=selection):
+                self.assertEqual(self.run_aggregator("ci-ok", {}, selected=selection), 1)
+        for job in ("job-inputs", "db-compatibility", "worker", "patch-coverage"):
+            for result in ("", "cancelled", "failure"):
+                with self.subTest(job=job, result=result):
+                    self.assertEqual(self.run_aggregator("ci-ok", {job: result}, selected="false"), 1)
+
+    def test_docs_fixture_route_preserves_unrelated_regressions(self):
+        jobs = self.workflows["check.yml"]["jobs"]
+        full, docs = [step for step in jobs["check"]["steps"]
+                      if step.get("name", "").startswith("Source-level CI gate regressions")]
+        self.assertEqual(full["if"], "needs.job-inputs.outputs.workflow-fixtures != 'false'")
+        self.assertEqual(docs["if"], "needs.job-inputs.outputs.workflow-fixtures == 'false'")
+        with tempfile.TemporaryDirectory() as directory:
+            suites = Path(directory) / "scripts/ci"
+            suites.mkdir(parents=True)
+            fixture = "import unittest\nclass Fixture(unittest.TestCase):\n def test_fixture(self): {}\n"
+            (suites / "test_workflows.py").write_text(fixture.format("self.fail('workflow suite ran')"))
+            (suites / "test_other.py").write_text(fixture.format("pass"))
+            run = subprocess.run(["bash", "-e", "-c", docs["run"]], cwd=directory,
+                                 env={**os.environ, "RUNNER_TEMP": directory},
+                                 capture_output=True, text=True, timeout=5)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertIn("test_other.Fixture", run.stderr)
+            self.assertNotIn("test_workflows.Fixture", run.stderr)
 
     def test_gitleaks_runs_whatever_pr_lint_concluded(self):
         self.assertIn("!cancelled()", self.workflows["supply-chain.yml"]["jobs"]["gitleaks"]["if"])
