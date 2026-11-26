@@ -19,8 +19,9 @@ from unittest.mock import Mock, patch
 
 import yaml
 
+from runner_policy import IGNORED_DB_RUNTIME_RUNNER, PUBLIC_RUNNER, RUST_TESTS_RUNNER, expected_runner
 from staging_pre_reaper_policy import PRE_REAPER, PRE_REAPER_QUEUE, dormant_pre_reaper_errors
-from staging_soak_policy import PRODUCTION_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
+from staging_soak_policy import PRODUCTION_GROUP, PRODUCTION_RELEASE_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, GUARDS as MEASUREMENT_GUARDS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
     TARGET as MEASUREMENT_TARGET, WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
@@ -62,7 +63,7 @@ JOB_INVENTORY = {
                   "nextest", "db-compatibility"},
     STAGING_SOAK: {"begin", "voice", "finish"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
-                              "promotion-skipped", "production"},
+                              "promotion-skipped", "production", "release-plan", "release-prepare", "release-apply"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "help-embed-synthetic",
                            "user-flow-synthetic", "pinned-history-guard", "certify-promotion",
                            "staging-use-release"},
@@ -193,9 +194,6 @@ PR_SIZE_WEEKLY_IF = "github.event_name == 'schedule' || (github.event_name == 'w
 PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size"): PR_SIZE_JOB_IF,
                          ("pr-size.yml", "pr-size-gate"): PR_SIZE_JOB_IF,
                          ("pr-size.yml", "pr-size-weekly"): PR_SIZE_WEEKLY_IF}
-# Every ordinary job in this public repository selects standard free hosted
-# Ubuntu directly. A private conversion needs fresh runner/cost qualification.
-PUBLIC_RUNNER = "ubuntu-latest"
 # Negative fixture only: even a public-first route retains dormant source paths.
 LEGACY_ROUTED_RUNNER = (
     "${{{{ fromJSON((!github.event.repository.private && '[\"ubuntu-latest\"]') || "
@@ -727,7 +725,7 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
     """
     errors = []
     inputs = (((workflow.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {})
-    if set(inputs) != {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold"}:
+    if set(inputs) != {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold", "release_plan_run_id", "release_pins"}:
         errors.append(f"{name}: production inputs must contain only the reviewed deploy/restore controls")
     jobs = workflow.get("jobs", {}) or {}
     steps = ((jobs.get("production") or {}).get("steps") or [])
@@ -3130,6 +3128,14 @@ def daily_digest_errors(workflow):
     return errors
 
 
+PRODUCTION_GATE_IF = (
+    "!cancelled() && needs.guard.result == 'success' "
+    "&& (needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') "
+    "&& needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
+    "&& needs.guard.outputs.skip == ''"
+)
+
+
 def production_errors(workflow):
     """deploy-production is the one live route: dispatch, green-staging completion or schedule, chained to staging."""
     name = "deploy-production.yml"
@@ -3154,6 +3160,7 @@ def production_errors(workflow):
     needs = [needs] if isinstance(needs, str) else (needs or [])
     expected_production_if = (
         "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
+        "(needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') && "
         "(needs.soak.result == 'success' || needs.soak.result == 'skipped') && "
         "((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || "
         "(needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && "
@@ -3162,7 +3169,8 @@ def production_errors(workflow):
         "needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
     )
     if production.get("environment") != "production" \
-            or set(needs) != {"guard", "soak", "recheck", "schema-gate", "roles-gate", "staging-soak-evidence"}:
+            or set(needs) != {"guard", "soak", "recheck", "schema-gate", "roles-gate", "staging-soak-evidence",
+                                "release-prepare", "release-apply"}:
         errors.append(f"{name}:production: must wait for the guard, the soak, the recheck, "
                       "the schema gate, the roles gate, the staging soak evidence and the protected Environment")
     if production.get("if") != expected_production_if:
@@ -3171,8 +3179,9 @@ def production_errors(workflow):
     # The production job shares its lane with the protected status read. The guard, gates,
     # soak and recheck run outside it, so a sleeping automatic promotion can
     # never delay an operator rollback.
-    if "concurrency" in workflow:
-        errors.append(f"{name}: must not hold the deploy lane at workflow level")
+    if workflow.get("concurrency") != {"group": PRODUCTION_RELEASE_GROUP,
+                                       "cancel-in-progress": "false", "queue": "max"}:
+        errors.append(f"{name}: only a fresh manual protected release may hold the workflow-wide production lane")
     if jobs.get("production", {}).get("concurrency") != {"group": PRODUCTION_GROUP,
                                                          "cancel-in-progress": "false", "queue": "max"}:
         errors.append(f"{name}:production: must hold the deploy-production lane without cancelling")
@@ -3289,13 +3298,11 @@ def production_errors(workflow):
     if (recheck.get("permissions") or {}).get("actions") != "read":
         errors.append(f"{name}:recheck: must read workflow runs to see an active operator dispatch")
     guard_outputs = guard.get("outputs") or {}
-    for output in ("auto", "green_at"):
+    for output in ("auto", "green_at", "protected_release"):
         if output not in guard_outputs:
             errors.append(f"{name}:guard: must publish the {output} output for the soak and recheck jobs")
-    expected_gate_if = ("needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
-                        "&& needs.guard.outputs.skip == ''")
     for gate_name in ("schema-gate", "roles-gate"):
-        if jobs.get(gate_name, {}).get("if") != expected_gate_if:
+        if jobs.get(gate_name, {}).get("if") != PRODUCTION_GATE_IF:
             errors.append(f"{name}:{gate_name}: must run only for ordinary non-skipped deploys")
     guard_text = str(guard).lower()
     guard_markers = tuple(marker for marker in DEPLOY_MARKERS if marker not in ("production_worker_url", "/readyz"))
@@ -3605,10 +3612,9 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:schema-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:schema-gate: must keep contents:read only")
-    if gate.get("if") != ("needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
-                          "&& needs.guard.outputs.skip == ''"):
-        errors.append(f"{name}:gate: must run only for ordinary non-skipped deploys")
-    if gate.get("needs") != "guard":
+    if gate.get("if") != PRODUCTION_GATE_IF:
+        errors.append(f"{name}:gate: must run only for admitted deploys, after any protected apply")
+    if gate.get("needs") != ["guard", "release-apply"]:
         errors.append(f"{name}:schema-gate: must wait for the guard (it gates the guarded SHA)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
         errors.append(f"{name}:schema-gate: must use the explicit ubuntu-latest runner for job 'schema-gate'")
@@ -3772,11 +3778,10 @@ def production_roles_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:roles-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:roles-gate: must keep contents:read only")
-    if gate.get("if") != ("needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
-                          "&& needs.guard.outputs.skip == ''"):
-        errors.append(f"{name}:roles-gate: must run only for ordinary non-skipped deploys")
-    if gate.get("needs") != "guard":
-        errors.append(f"{name}:roles-gate: must wait for the guard (it gates the guarded SHA)")
+    if gate.get("if") != PRODUCTION_GATE_IF:
+        errors.append(f"{name}:roles-gate: must run only for admitted deploys, after any protected apply")
+    if gate.get("needs") != ["guard", "release-apply"]:
+        errors.append(f"{name}:roles-gate: must wait for the guard and any protected apply")
     if not runner_allowed("roles-gate", gate.get("runs-on")):
         errors.append(f"{name}:roles-gate: must use the explicit ubuntu-latest runner for job 'roles-gate'")
     if gate.get("timeout-minutes") != "30":
@@ -4848,10 +4853,23 @@ DISJOINT_PRE_REAPER_EXPRESSIONS.update({
     ("staging-voice-move.yml", None): "${{ inputs.verify_lease && github.ref == 'refs/heads/main' && "
                                     "github.ref_protected && github.run_attempt == 1 && 'staging-lifecycle' || "
                                     "format('staging-voice-move-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
+    ("staging-automod-preview.yml", None): (
+        "${{ inputs.rehearse && github.repository_id == '1396224242' && github.ref == 'refs/heads/main' && "
+        "github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main' && "
+        "github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1 && "
+        "'staging-lifecycle' || format('staging-automod-refused-{0}-{1}', github.run_id, github.run_attempt) }}"
+    ),
     ("pipeline-benchmark.yml", None): "${{ github.workflow }}-pipeline-benchmark-"
                                      "${{ github.event.pull_request.number || github.ref }}",
+    ("deploy-production.yml", None): PRODUCTION_RELEASE_GROUP,
     ("deploy-production.yml", "production"): PRODUCTION_GROUP,
 })
+
+
+# pr-size: one group per PR head commit (push, label, review); manual apart.
+PR_SIZE_CONCURRENCY_GROUP = ("${{ github.workflow }}-"
+                             "${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}-"
+                             "${{ github.event.pull_request.head.sha || 'manual' }}")
 
 
 def staging_pre_reaper_errors(workflows):
@@ -4873,8 +4891,7 @@ def staging_pre_reaper_errors(workflows):
                 # This expression's first term is the top-level workflow name.
                 may_collide = not (
                     workflow.get("name") == "pr-size" and "workflow_call" not in workflow.get("on", {})
-                    and group == "${{ github.workflow }}-"
-                                 "${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}"
+                    and group == PR_SIZE_CONCURRENCY_GROUP
                 )
             else:
                 may_collide = DISJOINT_PRE_REAPER_EXPRESSIONS.get((file, job)) != group
@@ -5019,7 +5036,7 @@ def workflow_policy_errors(workflows):
         if name == "staging-automod-preview.yml":
             contract = Path(__file__).parent / "fixtures/staging_automod_preview_workflow.json"
             if workflow != json.loads(contract.read_text()):
-                errors.append(f"{name}: expected the disabled, synthetic-only staging job")
+                errors.append(f"{name}: expected the default-off protected staging dispatch")
             continue
         if name == "build-predecessor.yml":
             contract = Path(__file__).parent / "fixtures/build_predecessor_workflow.json"
@@ -7495,6 +7512,15 @@ class WorkflowTests(unittest.TestCase):
             if step.get("name") == "sccache stats (advisory speed evidence)")
         self.assertIn("sccache --show-stats", stats.get("run", ""))
 
+    def test_patch_coverage_fetches_the_pr_merge_parent_and_keeps_other_history(self):
+        job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
+        checkout = job["steps"][0]
+        self.assertTrue(checkout["uses"].startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"], {
+            "persist-credentials": "false",
+            "fetch-depth": "${{ github.event_name == 'pull_request' && 2 || 0 }}",
+        })
+
     def test_patch_coverage_merge_unions_shards_and_gates(self):
         # The merge keeps the required `patch coverage` check name: it
         # downloads every shard report, unions them with strict N-of-N, and
@@ -7702,11 +7728,12 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(file=file_name, mutation=label):
                     self.assertNotEqual(check(changed), [])
 
-    def test_staging_automod_preview_is_dormant(self):
+    def test_staging_automod_preview_requires_protected_opt_in(self):
         name = "staging-automod-preview.yml"
         self.assertEqual(workflow_policy_errors(self.workflows), [])
         for keys, change in (
-                (("on",), {"workflow_dispatch": {}}),
+                (("on",), {"workflow_call": ""}),
+                (("on", "workflow_dispatch", "inputs", "rehearse"), {"default": "true"}),
                 (("concurrency",), {"group": "automod-only"}),
                 (("jobs", "dry-run"), {"if": "true"}),
                 (("jobs", "dry-run", "permissions"), {"id-token": "write"}),
@@ -7714,19 +7741,27 @@ class WorkflowTests(unittest.TestCase):
                 (("jobs", "dry-run", "steps", 3), {
                     "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
                 (("jobs", "dry-run", "steps", 4), {
-                    "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}})):
+                    "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
+                (("jobs", "dry-run", "steps", 5), {"env": {"STAGING_AUTOMOD_REHEARSAL": "true"}}),
+                (("jobs", "dry-run", "steps", 5, "env"), {
+                    "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"})):
             with self.subTest(keys=keys, change=change):
                 workflows = deepcopy(self.workflows)
                 node = workflows[name]
                 for key in keys:
                     node = node[key]
                 node.update(change)
-                self.assertIn(f"{name}: expected the disabled, synthetic-only staging job",
+                self.assertIn(f"{name}: expected the default-off protected staging dispatch",
                               workflow_policy_errors(workflows))
         workflows = deepcopy(self.workflows)
         workflows["check.yml"]["jobs"]["worker"] = {"uses": f"./.github/workflows/{name}"}
         self.assertIn("check.yml:worker: deployment/probe alternative outside approved deploy workflows",
                       workflow_policy_errors(workflows))
+
+        workflows = deepcopy(self.workflows)
+        lock = workflows[name]["concurrency"]
+        lock["group"] = lock["group"].replace("staging-automod-refused-{0}-{1}", PRE_REAPER_QUEUE)
+        self.assertIn(f"{name}: the PRE sweep queue must remain exclusive", staging_pre_reaper_errors(workflows))
 
     def test_staging_pre_reaper_is_dormant(self):
         self.assertEqual(staging_pre_reaper_errors(self.workflows), [])
@@ -9125,16 +9160,20 @@ class WorkflowTests(unittest.TestCase):
         workflows["pr-size.yml"]["jobs"]["pr-size-gate"]["if"] = expected["pr-size-weekly"]
         self.assertTrue(workflow_policy_errors(workflows))
 
-    def test_pr_size_gate_queues_overlapping_pr_and_review_runs(self):
+    def test_pr_size_gate_cancels_superseded_pr_and_review_runs(self):
         workflow = self.workflows["pr-size.yml"]
-        # One group for both event families prevents overlapping verdicts.
-        # Both settings matter: disabling active cancellation alone still
-        # lets a third run evict a pending required check.
+        # All PR events on one head commit share a group and the newest
+        # cancels the older; a new push is a new group, so a required gate
+        # never waits behind stale runs. Manual dispatch is separate.
         self.assertEqual(workflow["concurrency"], {
-            "group": "${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}",
-            "cancel-in-progress": "false",
-            "queue": "max",
+            "group": PR_SIZE_CONCURRENCY_GROUP,
+            "cancel-in-progress": "${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_review' }}",
         })
+        self.assertNotIn("queue", workflow["concurrency"])
+        group = workflow["concurrency"]["group"]
+        # Keyed by head commit: a stale review on an old commit can never
+        # cancel the current push's gate, and manual runs stay apart.
+        self.assertIn("github.event.pull_request.head.sha || 'manual'", group)
         self.assertEqual(workflow["jobs"]["pr-size-gate"]["name"], "pr-size-gate")
 
     def test_pr_size_gate_rechecks_on_grants_and_revocations(self):
@@ -9180,11 +9219,23 @@ class WorkflowTests(unittest.TestCase):
                 without('origin.get("head_repository_id") != origin.get("repository_id")'),
         }
         self.assertIn("inputs.cutover_hold", str(guard_step))
+        self.assertIn('refuse("protected release requires the activation follow-up")', guard_step["run"])
         for label, change in mutations.items():
             with self.subTest(label):
                 workflow = deepcopy(production)
                 change(workflow)
                 self.assertTrue(production_errors(workflow), label)
+
+    def test_production_apply_uses_the_protected_preflight_epoch(self):
+        jobs = self.workflows["deploy-production.yml"]["jobs"]
+        prepare = jobs["release-prepare"]
+        preflight = next(step for step in prepare["steps"] if step.get("id") == "preflight")
+        self.assertEqual(preflight["run"], "python3 scripts/production_release.py prepare")
+        self.assertEqual(prepare["outputs"].get("epoch"), "${{ steps.preflight.outputs.epoch }}")
+        apply = jobs["release-apply"]
+        self.assertIn("release-prepare", apply["needs"])
+        transaction = next(step for step in apply["steps"] if step.get("run") == "python3 scripts/production_release.py apply")
+        self.assertEqual(transaction["env"].get("RELEASE_PREFLIGHT_EPOCH"), "${{ needs.release-prepare.outputs.epoch }}")
 
     def test_soak_rejects_unsafe_handoffs(self):
         for mutate in (
@@ -9318,12 +9369,10 @@ class WorkflowTests(unittest.TestCase):
         needs = [needs] if isinstance(needs, str) else needs
         self.assertIn("guard", needs)
         self.assertIn("schema-gate", needs)
-        self.assertEqual(production["jobs"]["schema-gate"].get("needs"), "guard")
+        self.assertEqual(production["jobs"]["schema-gate"].get("needs"), ["guard", "release-apply"])
         self.assertEqual(production["jobs"]["schema-gate"].get("environment"),
                          "production-migrate-plan")
-        self.assertEqual(production["jobs"]["schema-gate"].get("if"),
-                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
-                         " && needs.guard.outputs.skip == ''")
+        self.assertEqual(production["jobs"]["schema-gate"].get("if"), PRODUCTION_GATE_IF)
 
     def test_production_roles_gate_shape_is_pinned_and_mutations_fail(self):
         import copy
@@ -9363,12 +9412,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("guard", needs)
         self.assertIn("schema-gate", needs)
         self.assertIn("roles-gate", needs)
-        self.assertEqual(production["jobs"]["roles-gate"].get("needs"), "guard")
+        self.assertEqual(production["jobs"]["roles-gate"].get("needs"), ["guard", "release-apply"])
         self.assertEqual(production["jobs"]["roles-gate"].get("environment"),
                          "production-migrate-plan")
-        self.assertEqual(production["jobs"]["roles-gate"].get("if"),
-                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
-                         " && needs.guard.outputs.skip == ''")
+        self.assertEqual(production["jobs"]["roles-gate"].get("if"), PRODUCTION_GATE_IF)
 
     def test_staging_migrate_runner_shape_is_pinned(self):
         # TOG-11572: the slice's own workflow must satisfy its carve-out, and
@@ -10930,6 +10977,125 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(runs_on=runs_on):
                 self.assertFalse(runner_allowed("worker", runs_on))
 
+    def test_rust_tests_boat_is_scoped_to_rust_tests(self):
+        weakened_fork_guard = RUST_TESTS_RUNNER.replace(
+            "github.event.pull_request.head.repo.full_name == github.repository", "true"
+        )
+        weakened_actor_guard = RUST_TESTS_RUNNER.replace(
+            "github.triggering_actor == 'Rick7C2'", "true"
+        )
+        for workflow, job_id, runs_on in (
+            ("check.yml", "rust-tests", weakened_fork_guard),
+            ("check.yml", "rust-tests", weakened_actor_guard),
+            ("check.yml", "rust-tests", IGNORED_DB_RUNTIME_RUNNER),
+            ("check.yml", "ignored-db-runtime", RUST_TESTS_RUNNER),
+            ("check.yml", "coverage-shard", RUST_TESTS_RUNNER),
+            ("nightly.yml", "rust-tests", RUST_TESTS_RUNNER),
+        ):
+            with self.subTest(workflow=workflow, job=job_id):
+                self.assertNotEqual(runs_on, expected_runner(workflow, job_id))
+
+    def test_rust_tests_boat_routes_by_event_and_variable(self):
+        workflow = self.workflows["check.yml"]
+        self.assertEqual(set(workflow["on"]), {
+            "pull_request", "merge_group", "push", "schedule", "workflow_dispatch",
+        })
+        self.assertEqual(workflow["on"]["pull_request"], {"types": ["opened", "synchronize", "reopened"]})
+
+        repository = "TogetherWeOwn/two-bot-next"
+        defaults = {
+            "github.event_name": "pull_request",
+            "github.repository": repository,
+            "github.event.repository.private": False,
+            "github.event.pull_request.head.repo.full_name": repository,
+            "github.event.pull_request.base.ref": "main",
+            "github.ref": "refs/pull/2720/merge",
+            "github.ref_protected": False,
+            "github.run_attempt": "1",
+            "github.actor": "Rick7C2",
+            "github.triggering_actor": "Rick7C2",
+            "vars.CI_HEAVY_RUNNER": "boat",
+        }
+        app = {"github.actor": "togetherweown[bot]", "github.triggering_actor": "togetherweown[bot]"}
+        push = {"github.event_name": "push", "github.ref": "refs/heads/main", "github.ref_protected": True}
+        cases = (
+            ("eligible maintainer", {}, "boat"),
+            ("eligible app", app, "boat"),
+            # The main push writes a shared cache consumed by credentialed nextest.
+            ("protected main push", {**app, **push}, PUBLIC_RUNNER),
+            ("unprotected main push", {**push, "github.ref_protected": False}, PUBLIC_RUNNER),
+            ("branch push", {**push, "github.ref": "refs/heads/other"}, PUBLIC_RUNNER),
+            ("fork PR", {"github.event.pull_request.head.repo.full_name": "contributor/two-bot-next"}, PUBLIC_RUNNER),
+            ("missing PR head", {"github.event.pull_request.head.repo.full_name": ""}, PUBLIC_RUNNER),
+            ("other base branch", {"github.event.pull_request.base.ref": "other"}, PUBLIC_RUNNER),
+            ("private repository", {"github.event.repository.private": True}, PUBLIC_RUNNER),
+            ("missing visibility", {"github.event.repository.private": None}, PUBLIC_RUNNER),
+            ("other repository", {"github.repository": "TogetherWeOwn/other"}, PUBLIC_RUNNER),
+            ("Dependabot", {"github.actor": "dependabot[bot]", "github.triggering_actor": "dependabot[bot]"}, PUBLIC_RUNNER),
+            ("other originating actor", {"github.actor": "someone-else"}, PUBLIC_RUNNER),
+            ("other triggering actor", {"github.triggering_actor": "someone-else"}, PUBLIC_RUNNER),
+            ("missing triggering actor", {"github.triggering_actor": ""}, PUBLIC_RUNNER),
+            ("eligible actors on a rerun", {"github.run_attempt": "2"}, PUBLIC_RUNNER),
+            ("maintainer reruns Dependabot", {"github.run_attempt": "2", "github.actor": "dependabot[bot]"}, PUBLIC_RUNNER),
+            ("off-list user reruns maintainer", {"github.run_attempt": "2", "github.triggering_actor": "someone-else"}, PUBLIC_RUNNER),
+            ("missing attempt", {"github.run_attempt": ""}, PUBLIC_RUNNER),
+            ("unset variable", {"vars.CI_HEAVY_RUNNER": ""}, PUBLIC_RUNNER),
+            ("reserve closed", {"vars.CI_HEAVY_RUNNER": PUBLIC_RUNNER}, PUBLIC_RUNNER),
+            ("approved label in uppercase", {"vars.CI_HEAVY_RUNNER": "BOAT"}, "BOAT"),
+            ("other runner label", {"vars.CI_HEAVY_RUNNER": "blacksmith-2vcpu-ubuntu-2404"}, PUBLIC_RUNNER),
+            *((event, {**push, "github.event_name": event}, PUBLIC_RUNNER)
+              for event in ("merge_group", "schedule", "workflow_dispatch", "pull_request_target", "")),
+        )
+        self.assert_runner_cases("rust-tests", defaults, cases)
+
+    def test_ignored_db_runtime_blacksmith_routes_by_event_and_variable(self):
+        label = "blacksmith-2vcpu-ubuntu-2404"
+        repository = "TogetherWeOwn/two-bot-next"
+        defaults = {
+            "github.event_name": "pull_request",
+            "github.repository": repository,
+            "github.event.pull_request.head.repo.full_name": repository,
+            "vars.CI_BLACKSMITH_2VCPU": label,
+        }
+        cases = (
+            ("same-repository PR", {}, label),
+            ("fork PR", {"github.event.pull_request.head.repo.full_name": "contributor/two-bot-next"}, PUBLIC_RUNNER),
+            ("missing PR head", {"github.event.pull_request.head.repo.full_name": ""}, PUBLIC_RUNNER),
+            ("unset variable", {"vars.CI_BLACKSMITH_2VCPU": ""}, PUBLIC_RUNNER),
+            ("reserve closed", {"vars.CI_BLACKSMITH_2VCPU": PUBLIC_RUNNER}, PUBLIC_RUNNER),
+            ("approved label in uppercase", {"vars.CI_BLACKSMITH_2VCPU": label.upper()}, label.upper()),
+            ("other size", {"vars.CI_BLACKSMITH_2VCPU": "blacksmith-4vcpu-ubuntu-2404"}, PUBLIC_RUNNER),
+            ("other provider", {"vars.CI_BLACKSMITH_2VCPU": "boat"}, PUBLIC_RUNNER),
+            *((event, {"github.event_name": event, "github.event.pull_request.head.repo.full_name": ""}, label)
+              for event in ("merge_group", "push", "schedule", "workflow_dispatch")),
+        )
+        self.assert_runner_cases("ignored-db-runtime", defaults, cases)
+
+    def assert_runner_cases(self, job_id, defaults, cases):
+        expression = self.workflows["check.yml"]["jobs"][job_id]["runs-on"]
+        self.assertEqual(expression, expected_runner("check.yml", job_id))
+        expression = expression.removeprefix("${{").removesuffix("}}").strip()
+        for name, overrides, expected in cases:
+            with self.subTest(case=name):
+                context = {**defaults, **overrides}
+                # Apply GitHub's case-insensitive comparisons without changing
+                # the spelling of the label returned from the variable.
+                text = re.sub(r"toJSON\((github\.[\w.]+)\)",
+                              lambda match: repr(json.dumps(context[match[1]])), expression)
+                text = re.sub(r"\b(?:github|vars)\.[\w.]+",
+                              lambda match: repr(context[match[0]]), text)
+                tree = ast.parse(text.replace("&&", " and ").replace("||", " or "), mode="eval")
+                allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare,
+                           ast.Eq, ast.NotEq, ast.Constant)
+                self.assertTrue(all(isinstance(node, allowed) for node in ast.walk(tree)))
+                for comparison in (node for node in ast.walk(tree) if isinstance(node, ast.Compare)):
+                    for operand in (comparison.left, *comparison.comparators):
+                        self.assertIsInstance(operand, ast.Constant)
+                        self.assertIsInstance(operand.value, str)
+                        operand.value = operand.value.casefold()
+                result = eval(compile(tree, f"<{job_id} runs-on>", "eval"), {"__builtins__": {}})
+                self.assertEqual(result, expected)
+
     def test_certify_promotion_runner_must_be_explicit_public_hosted(self):
         # Artifact-only certification retains service/container isolation and
         # the same direct hosted selector as every other ordinary job.
@@ -10984,8 +11150,7 @@ class WorkflowTests(unittest.TestCase):
                         self.assertNotIn("services", job)
                         self.assertNotIn("container", job)
                     else:
-                        # All ordinary jobs share the explicit public-hosted contract.
-                        self.assertTrue(runner_allowed(job_id, job["runs-on"]))
+                        self.assertEqual(job["runs-on"], expected_runner(name, job_id))
                     if job.get("services"):
                         self.assertIn("container", job)
                         for service in job["services"].values():
@@ -11248,7 +11413,7 @@ class WorkflowTests(unittest.TestCase):
         workflow = self.workflows["nightly.yml"]
         self.assertEqual(
             set(workflow.get("on") or {}),
-            {"schedule", "workflow_dispatch", "pull_request"},
+            {"schedule", "workflow_dispatch"},
         )
         # All four compiling jobs carry the ceiling; the `sweep` aggregate
         # is not a compiling job and is not pinned here.
@@ -11258,6 +11423,13 @@ class WorkflowTests(unittest.TestCase):
                     workflow["jobs"][name].get("timeout-minutes"),
                     "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}",
                 )
+
+    def test_pipeline_benchmark_keeps_focused_pr_coverage(self):
+        workflow = self.workflows["pipeline-benchmark.yml"]
+        paths = workflow["on"]["pull_request"]["paths"]
+        self.assertIn("Cargo.lock", paths)
+        self.assertIn("scripts/*pipeline_bench*", paths)
+        self.assertIn("workflow_call", workflow["on"])
 
     def test_nextest_container_pins_disposable_database_service_address(self):
         # Same hardening as the check.yml lanes: the shared lane runs the
@@ -11461,7 +11633,8 @@ class WorkflowTests(unittest.TestCase):
                         # run's manifest artifact for the provenance gate.
                         expected = {"contents": "read", "actions": "read"}
                     elif (name == "production-migrate.yml" and job_id in ("claim", "apply")
-                          or name == "deploy-production-recovery.yml"):
+                          or name == "deploy-production-recovery.yml"
+                          or (name == "deploy-production.yml" and job_id.startswith("release-"))):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-staging.yml", "deploy"):
                         # Derives the deploy ID from today's staging
@@ -11674,9 +11847,9 @@ class WorkflowTests(unittest.TestCase):
         }
         exempt = {
             *pure_callees,
-            # Serializes at the `production` lane job only, so a sleeping
-            # promotion can never queue an operator rollback behind it (see
-            # the header comment in the workflow).
+            # Ordinary deploys serialize at the `production` job, so an
+            # automatic soak leaves the lane free for rollback. Protected
+            # dispatches serialize at the workflow level.
             "deploy-production.yml",
             # Read-only staging observation and production alerting each use
             # an independent queue, never the lifecycle holders' pending slot.
