@@ -94,9 +94,8 @@ jobs:
     needs: [job-inputs]
     # Failed, skipped or cancelled dependencies must not make check appear green.
     if: ${{ always() }}
-    # Runner routing: rust-tests has the only prepaid Boat route. Other jobs
-    # use standard GitHub-hosted Ubuntu. See docs/ci-security.md for the
-    # public-repository policy and private-conversion checks.
+    # Standard GitHub-hosted Ubuntu is the default for this public repository.
+    # See docs/ci-security.md for the guarded runner routes.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
@@ -636,7 +635,7 @@ jobs:
       && github.event_name == 'pull_request'
       && github.event.pull_request.head.repo.full_name == github.repository
       && github.event.pull_request.base.ref == 'main'
-      && vars.CI_HEAVY_RUNNER == 'boat' && 'boat' || 'ubuntu-latest' }}
+      && vars.CI_HEAVY_RUNNER == 'boat' && vars.CI_HEAVY_RUNNER || 'ubuntu-latest' }}
     # Suite-only since the HARD patch-coverage measurement split out of this
     # lane: the combined job outgrew 60 minutes (59m54s on main, one 60m07s
     # mid-measurement kill), while the replay alone measured ~30 min of a
@@ -2402,8 +2401,11 @@ jobs:
     # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
-    # Runner routing: see the note on `check`.
-    runs-on: ubuntu-latest
+    # Fork PRs stay on GitHub. The budget variable can enable only the 2-vCPU route.
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     # The serial gateway suites can exceed 30 minutes on PRs; retain a hard cap.
     timeout-minutes: 60
     # Keep database isolation inside the job container network namespace:

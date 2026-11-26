@@ -609,8 +609,9 @@ are preserved until those callers migrate.
 ## Public-hosted runner contract
 
 Ordinary jobs select `runs-on: ubuntu-latest` explicitly, including the local
-reusable nextest and SBOM jobs. The sole exception is `check.yml` job
-`rust-tests` (`rust tests`). Boat is eligible on the first attempt of a
+reusable nextest and SBOM jobs. The two exceptions are in `check.yml`.
+
+The `rust-tests` job (`rust tests`) can use Boat on the first attempt of a
 same-repository PR targeting `main`, with the repository explicitly public.
 Both the original and triggering actors must
 match Boat's allowlist of `Rick7C2` and `togetherweown[bot]`. The prepaid
@@ -625,6 +626,14 @@ Reruns use the hosted route even when both actors are allowlisted. The workflow
 tests pin the job's expression and event set. External pinned reusable workflows
 use their own runner policy. A plan limit can still delay or refuse a job that
 has already been assigned to Boat before the reserve switch changes.
+
+The `ignored-db-runtime` job (`ignored db (runtime)`) can use the 2 vCPU
+Blacksmith runner through `CI_BLACKSMITH_2VCPU` for same-repository PRs and
+existing non-PR events. It uses `ubuntu-latest` for forks or whenever the
+variable is unset, set to Ubuntu by the cutoff, or set to an unapproved size.
+The cutoff estimates cycle usage and reserves headroom before routing new jobs.
+GitHub merge-group events lack the source repositories of all member PRs.
+Verify queue trust before enabling the merge queue with Blacksmith routing.
 
 This contract is for a **public repository**. GitHub's
 [standard runner specification](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories)
@@ -646,6 +655,11 @@ job and requires success whenever the Rust selector selects it. Only GitHub-host
 pushes to `main` can save the shared Rust cache, which the hosted nextest lane
 restores on runs with R2 credentials. GitHub scopes caches written by PR jobs
 to the PR merge ref, outside the main cache scope.
+
+[Blacksmith's 2 vCPU Ubuntu runner](https://docs.blacksmith.sh/blacksmith-runners/overview#x64-runners)
+provides an ephemeral VM with 8 GB of RAM and 80 GB of disk. The runtime database
+job keeps its 60-minute timeout, pinned disposable PostgreSQL service and
+job-private Docker network. `ci-ok` requires it whenever Rust is selected.
 
 GitHub's [service-container contract](https://docs.github.com/en/actions/concepts/use-cases/about-service-containers)
 supports Linux job/service containers on hosted Ubuntu. Container jobs reach
