@@ -9935,6 +9935,49 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
+    def test_staging_container_drill_sparse_checkout_materializes_runtime_inputs(self):
+        workflow = self.workflows["staging-container-drill.yml"]
+        checkout = workflow["jobs"]["container-drill"]["steps"][0]["with"]
+        self.assertEqual(checkout["fetch-depth"], "1")
+        self.assertNotIn("ref", checkout)
+        self.assertNotIn("filter", checkout)
+        self.assertEqual(checkout.get("sparse-checkout-cone-mode"), "false")
+        self.assertTrue(checkout.get("sparse-checkout"))
+
+        # Ask Git to apply the job's rules to the actual tracked paths. A string
+        # check would miss changes in match scope or a later exclusion rule.
+        tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT, timeout=10)
+        with tempfile.TemporaryDirectory() as directory:
+            rules = Path(directory) / "sparse-checkout"
+            rules.write_text(checkout["sparse-checkout"], encoding="utf-8")
+            selected = subprocess.check_output(
+                ["git", "sparse-checkout", "check-rules", "--no-cone", "--rules-file", str(rules), "-z"],
+                cwd=ROOT, input=tracked, timeout=10,
+            )
+
+        inputs = {
+            b"Dockerfile",  # The generated config still validates the other environments' images.
+            b"scripts/build_identity.py",
+            b"scripts/script_intake.py",
+            b"scripts/staging_container_drill.py",
+            b"scripts/staging_drill_use.py",
+            b"scripts/staging_rollback_drill.py",
+            b"scripts/staging_rollout.py",
+            b"scripts/worker_container_rollback.py",
+            b"wrangler/package-lock.json",
+            b"wrangler/package.json",
+            b"wrangler/scripts/is-direct-invocation.mjs",
+            b"wrangler/scripts/ownership-control-response.mjs",
+            b"wrangler/scripts/ownership-control.mjs",
+            b"wrangler/scripts/staging-use-pipeline.mjs",
+            b"wrangler/scripts/staging-use.mjs",
+            b"wrangler/src/index.ts",
+            b"wrangler/tsconfig.json",
+            b"wrangler/wrangler.toml",
+        }
+        inputs.update(path for path in tracked.split(b"\0") if path.startswith(b"wrangler/src/"))
+        self.assertEqual(set(selected.split(b"\0")) - {b""}, inputs)
+
     def test_staging_events_read_shape_is_pinned(self):
         workflows = self.workflows
         self.assertEqual(staging_events_read_errors(workflows["staging-events-read.yml"]), [])
