@@ -94,9 +94,13 @@ jobs:
     needs: [job-inputs]
     # Failed, skipped or cancelled dependencies must not make check appear green.
     if: ${{ always() }}
-    # Standard GitHub-hosted Ubuntu is the default for this public repository.
-    # See docs/ci-security.md for the guarded runner routes.
-    runs-on: ubuntu-latest
+    # Same-repository PR gates can use the budgeted Blacksmith runner.
+    # Fork PRs and non-PR events fall back to GitHub-hosted Ubuntu.
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 30
     container:
       image: rust:1.100-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
@@ -1085,7 +1089,7 @@ jobs:
   # changes, pushes to main and schedules) and partitions them into shards;
   # each shard runs its legs with --no-report and uploads its LCOV; the
   # `patch-coverage` merge unions the reports and applies the unchanged HARD
-  # 80%-of-added-lines bar. Parallelism is free on GitHub-hosted runners.
+  # 80%-of-added-lines bar.
   coverage-plan:
     name: coverage plan
     permissions:
@@ -1095,7 +1099,11 @@ jobs:
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on `check`.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -1192,7 +1200,11 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.coverage-plan.outputs.matrix) }}
     # Runner routing: see the note on `check`.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     # One shard's legs plus the instrumented build stay far below the 60-minute
     # ceiling the old single job needed (its llvm-cov replay alone measured
     # ~30 min of a 42m16s job, with one 60m07s mid-measurement kill). 45 minutes
@@ -1804,11 +1816,24 @@ jobs:
             exit 1
           fi
 
+      - name: Bind shard coverage report
+        env:
+          COVERAGE_SELECTOR: ${{ toJSON(needs.job-inputs.outputs) }}
+          COVERAGE_MATRIX: ${{ needs.coverage-plan.outputs.matrix }}
+          EXPECTED_SHARDS: ${{ needs.coverage-plan.outputs.expected-shards }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_LEGS: ${{ matrix.legs }}
+        run: |
+          python3 scripts/ci/merge-coverage-shards.py --bind-shard "$SHARD_INDEX" \
+            --expected-shards "$EXPECTED_SHARDS"
+
       - name: Upload shard coverage report
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-shard-${{ matrix.shard_index }}
-          path: lcov-shard-${{ matrix.shard_index }}.info
+          path: |
+            lcov-shard-${{ matrix.shard_index }}.info
+            lcov-shard-${{ matrix.shard_index }}.identity
           if-no-files-found: error
           overwrite: true
           retention-days: 14
@@ -1840,11 +1865,15 @@ jobs:
     # Fail-closed merge: runs whenever Rust was selected and planning
     # succeeded, even when a shard failed, so a partial shard set can never
     # read as measured. The merge script refuses anything but exactly N-of-N
-    # valid shard reports, and `ci-ok` independently fails on any failed,
-    # cancelled or unexpectedly skipped shard.
+    # valid shard reports bound to this checkout, selector and plan. `ci-ok`
+    # independently fails on any failed, cancelled or unexpectedly skipped shard.
     if: ${{ always() && !cancelled() && needs.job-inputs.outputs.rust != 'false' && needs.coverage-plan.result == 'success' }}
     # Runner routing: see the note on `check`.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     # Download, union and gate only: no toolchain, container or database.
     timeout-minutes: 15
     steps:
@@ -1864,20 +1893,14 @@ jobs:
 
       - name: Merge coverage shards
         env:
+          COVERAGE_SELECTOR: ${{ toJSON(needs.job-inputs.outputs) }}
+          COVERAGE_MATRIX: ${{ needs.coverage-plan.outputs.matrix }}
           EXPECTED_SHARDS: ${{ needs.coverage-plan.outputs.expected-shards }}
         run: |
           set -euo pipefail
-          args=()
-          count=0
-          for report in coverage-shards/lcov-shard-*.info; do
-            [ -e "$report" ] || continue
-            args+=(--report "$report")
-            count=$((count + 1))
-          done
-          echo "merging $count shard reports (expecting $EXPECTED_SHARDS)"
           # Shards produce absolute SF paths inside the job container; this
           # host-only job has a different checkout root. Relativize at merge.
-          python3 scripts/ci/merge-coverage-shards.py "${args[@]}" \
+          python3 scripts/ci/merge-coverage-shards.py --artifact-dir coverage-shards \
             --expected-shards "$EXPECTED_SHARDS" \
             --source-root /__w/two-bot-next/two-bot-next \
             --out "$GITHUB_WORKSPACE/lcov.info"
@@ -1934,7 +1957,11 @@ jobs:
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on `check`.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
     # Keep database isolation inside the job container network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
@@ -2855,7 +2882,11 @@ jobs:
     # Skip when the selector sees no Rust inputs (not a required check).
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on the first job above.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 15
     # Each job container has a private service network; never publish a fixed
     # host port outside that isolated service network.
@@ -2930,7 +2961,11 @@ jobs:
     # aggregator only enforces this job when parity was selected.
     if: needs.job-inputs.outputs.parity != 'false'
     # Runner routing: see the note on the first job above.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2967,7 +3002,11 @@ jobs:
     # aggregator only enforces this job when rust was selected.
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on the first job above.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 30
     # A job container resolves service names directly. The test's fixed
     # agent-testdb endpoint cannot fall back to an inherited DATABASE_URL.
@@ -3062,7 +3101,11 @@ jobs:
     permissions:
       contents: read
     # Runner routing: see the note on the first job above.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.select.outputs.rust }}
@@ -3150,7 +3193,11 @@ jobs:
     if: github.event_name == 'pull_request' && needs.job-inputs.outputs.db-compat != 'false'
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 45
     container:
       image: rust:1.100-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
@@ -3198,7 +3245,11 @@ jobs:
     permissions:
       contents: read
     # Runner routing: see the note on the first job above.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       build: ${{ steps.select.outputs.build }}
@@ -3235,7 +3286,6 @@ jobs:
     permissions:
       contents: read
     needs: container-inputs
-    # Runner routing: see the note on the first job above.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -3333,7 +3383,11 @@ jobs:
     # Skip when the selector sees no Rust inputs (not a required check).
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on the first job above.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 15
     # Keep database isolation inside the job container network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
@@ -3421,7 +3475,11 @@ jobs:
     # Skip when the selector sees no Rust inputs (not a required check).
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on the first job above.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 15
     # Keep database isolation inside the job container network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
@@ -3492,7 +3550,11 @@ jobs:
     # Skip when the selector sees no Rust inputs (not a required check).
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on the first job above.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 15
     # Service DNS stays inside this job's network; never publish a shared port.
     container:
@@ -3521,6 +3583,8 @@ jobs:
         env:
           RUST_TOOLCHAIN: "1.100.0" # Match rust-toolchain.toml; floating stable can drift.
           RUST_COMPONENTS: ''
+          # The digest-pinned job image already contains this exact toolchain.
+          TWO_RUSTUP_NO_UPDATE: '1'
         run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -3590,7 +3654,11 @@ jobs:
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on `check`.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 30
     container:
       image: rust:1.100-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
@@ -3692,7 +3760,11 @@ jobs:
     # missing selector fails closed via the guard step, never a false green.
     if: ${{ always() }}
     # Runner routing: see the note on the first job above.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 10
     defaults:
       run:
@@ -3963,7 +4035,11 @@ jobs:
     # A skipped or cancelled dependency must not read as green.
     if: ${{ always() }}
     # Runner routing: see the note on the first job above.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Aggregate CI verdict
