@@ -243,6 +243,14 @@ jobs:
           raise SystemExit(0 if result.wasSuccessful() and not loader.errors else 1)
           PY
 
+      - name: Verify review reply examples against the required workflow
+        run: |
+          curl --fail --silent --show-error --proto '=https' --connect-timeout 5 \
+            --max-time 20 --retry 2 --retry-max-time 40 \
+            --output "$RUNNER_TEMP/pr-standards-required.yml" \
+            'https://raw.githubusercontent.com/TogetherWeOwn/.github/97fc0e24038021dfaa1fc9da754c6c5d6429130f/.github/workflows/pr-standards-required.yml'
+          PR_STANDARDS_WORKFLOW="$RUNNER_TEMP/pr-standards-required.yml" python3 scripts/test_pr_review_reply_examples.py -v
+
       - name: Ratchet Python script intake (HARD)
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
         env:
