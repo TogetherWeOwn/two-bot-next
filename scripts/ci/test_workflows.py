@@ -3659,19 +3659,33 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:schema-gate: SHA check must pin the step to the guarded SHA")
     if "cargo build -p two-bot-cutover --bin staging-migrate --locked" not in str(build.get("run", "")):
         errors.append(f"{name}:schema-gate: build must compile the reviewed staging-migrate binary locked")
-    # The gate runs only the trusted tooling copy: an exact command line, so a
-    # dropped `tooling/` prefix (the candidate's copy) or an interpreter-path
-    # prefix cannot pass, and no PYTHON* key may redirect imports.
-    gate_env = run.get("env") or {}
-    if (run.get("shell") != "bash"
+    # The gate step is pinned whole: only the trusted tooling copy runs, over
+    # pipefail, with exactly the plan binding, identity pins and guard outputs.
+    # No other env key (PYTHONPATH, BASH_ENV, PATH, LD_PRELOAD), working
+    # directory, `if` or `continue-on-error` can slip in beside the secret,
+    # and no job- or workflow-level env/defaults can reach the step.
+    if (gate.keys() & {"env", "defaults", "continue-on-error"}
+            or workflow.keys() & {"env", "defaults"}):
+        errors.append(f"{name}:schema-gate: job and workflow must not set env, defaults or continue-on-error")
+    if ({key: value for key, value in run.items() if key != "run"} != {
+            "name": "Fail closed on schema drift",
+            "env": {
+                "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL": "${{ secrets.TWO_BOT_PRODUCTION_PLAN_DATABASE_URL }}",
+                "TWO_BOT_PRODUCTION_HOST": "${{ vars.TWO_BOT_PRODUCTION_HOST }}",
+                "TWO_BOT_PRODUCTION_DATABASE": "${{ vars.TWO_BOT_PRODUCTION_DATABASE }}",
+                "TWO_BOT_PRODUCTION_BRANCH_ID": "${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}",
+                "SOURCE_SHA": "${{ needs.guard.outputs.sha }}",
+                "MODE": "${{ needs.guard.outputs.mode }}",
+                "ALLOW_UNSTAGED": "${{ needs.guard.outputs.allow_unstaged }}",
+            },
+            "shell": "bash",
+        }
             or shell_logical_lines(str(run.get("run", ""))) != [
                 "set -o pipefail",
                 'python3 tooling/scripts/ci/production_schema_gate.py'
                 ' --binary ./target/debug/staging-migrate --source-sha "$SOURCE_SHA"'
                 ' --mode "$MODE" --allow-unstaged "$ALLOW_UNSTAGED"',
-            ]
-            or any(str(key).upper().startswith("PYTHON") for key in gate_env)
-            or "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL" not in str(gate_env)):
+            ]):
         errors.append(f"{name}:schema-gate: gate step must run the reviewed script over pipefail "
                       "with the plan binding, the guarded SHA and the guard-verified waive flags")
     # The expected production identity is pinned independently of the secret
@@ -9385,6 +9399,18 @@ class WorkflowTests(unittest.TestCase):
                     "python3 tooling/", "PYTHONPATH=scripts python3 tooling/")),
             lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
                 "PYTHONPATH", "scripts"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4]["env"].__setitem__('BASH_ENV', 'scripts/evil.sh'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4]["env"].__setitem__('PATH', './bin:/usr/bin'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4]["env"].__setitem__('LD_PRELOAD', './evil.so'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__('if', 'false'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__('continue-on-error', True),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__('working-directory', 'scripts'),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("env", {"PYTHONPATH": "scripts"}),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("continue-on-error", True),
+            lambda w: w["jobs"]["schema-gate"].__setitem__(
+                "defaults", {"run": {"working-directory": "scripts"}}),
+            lambda w: w.__setitem__("env", {"PYTHONPATH": "scripts"}),
+            lambda w: w.__setitem__("defaults", {"run": {"shell": "sh"}}),
             lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
                 "LEAK", "${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}"),
             lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
