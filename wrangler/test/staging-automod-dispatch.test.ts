@@ -4,6 +4,8 @@ import { test } from "node:test";
 import { URL, fileURLToPath } from "node:url";
 import { runStagingAutomodDispatch } from "../scripts/staging-automod-dispatch.ts";
 import { STAGING_AUTOMOD_TARGET as target } from "../src/staging-automod-recovery.ts";
+import { AUTOMOD_STAGING_PURPOSE } from "../src/staging-use-window.ts";
+import { lease } from "./fixtures/staging-automod-recovery.ts";
 
 type Binding = NonNullable<Parameters<typeof runStagingAutomodDispatch>[1]>;
 const workflow = ".github/workflows/staging-automod-preview.yml";
@@ -63,6 +65,59 @@ test("direct dispatch authenticates the current run before asking for the exact 
   assert.deepEqual(reads, [runner.GITHUB_RUN_ID, runner.GITHUB_RUN_ID, {
     ...serving, environment: "staging", runId: runner.GITHUB_RUN_ID, runAttempt: 1, target,
   }]);
+});
+
+test("direct dispatch refuses borrowed guild or lease approvals for a matching deployment", async t => {
+  const now = Date.parse("2026-01-01T00:00:30Z");
+  t.mock.timers.enable({ apis: ["Date"], now });
+  const fetch = t.mock.method(globalThis, "fetch", unexpected);
+  const issuedLease = { ...lease, ...serving, purpose: AUTOMOD_STAGING_PURPOSE,
+    runId: runner.GITHUB_RUN_ID, runAttempt: 1, acquiredAt: now - 1_000, expiresAt: now + 1_000 } as const;
+  const controlBearer = "synthetic-staging-control-bearer";
+  type Host = Binding["host"];
+  const readAuthenticatedInventory = t.mock.fn<Host["readAuthenticatedInventory"]>(async source => {
+    assert.deepEqual(source, inventorySource);
+    return { schema_version: 1, workflow_sha: inventorySource.workflowSha, workflow_run_id: inventorySource.runId,
+      observed_at: new Date(now).toISOString(),
+      worker: { deployment_id: "22222222-2222-2222-2222-222222222222", version_id: serving.deploymentId,
+        source_sha: serving.sha, traffic_percent: 100, runtime_policy: "bounded" },
+      container: { application_id: "33333333-3333-3333-3333-333333333333", namespace_id: "a".repeat(32),
+        rollout_id: "44444444-4444-4444-4444-444444444444", rollout_status: "completed", image_digest: `sha256:${"b".repeat(64)}` },
+      ownership: { phase: "active", epoch: issuedLease.epoch } };
+  });
+  const invokePrivate = t.mock.fn<Host["invokePrivate"]>(async () => {});
+  const host: Host = {
+    readRun: async () => run,
+    authority: { readIssuedLease: async () => issuedLease, readApproval: async action => ({ action, target, issuedLease }) },
+    readWorker: () => ({ controlBearer, env: { TWO_DEPLOY_ENV: "staging", STAGING_RUNTIME_POLICY: "bounded",
+      DISCORD_APPLICATION_ID: target.applicationId, GUILD_ID: target.guildId, CONTAINER_RELEASE: serving.sha,
+      CF_VERSION_METADATA: { id: serving.deploymentId }, OWNERSHIP_CONTROL_TOKEN: controlBearer } }),
+    readAuthenticatedInventory,
+    invokePrivate,
+  };
+  const binding = { serving, inventorySource, host };
+
+  // The other run has the same serving build and ownership epoch. Inventory
+  // alone cannot distinguish its lease or confirm an approval's guild.
+  for (const [label, scope] of [
+    ["another guild", { target: { ...target, guildId: "1000000000000000000" }, issuedLease }],
+    ["another lease", { target, issuedLease: { ...issuedLease, runId: String(run.id + 2) } }],
+  ] as const) {
+    const readApproval = t.mock.fn<Host["authority"]["readApproval"]>(async action => ({ action, ...scope }));
+    const authority = { ...host.authority, readApproval };
+    assert.deepEqual(await runStagingAutomodDispatch(runner, { ...binding, host: { ...host, authority } }),
+      { verdict: "failed", start: false, recover: false }, label);
+    assert.deepEqual(readApproval.mock.calls.map(({ arguments: [action, original] }) => [action, original]),
+      [["start", issuedLease], ["recover", issuedLease]], label);
+    assert.equal(readAuthenticatedInventory.mock.callCount(), 0, label);
+    assert.equal(invokePrivate.mock.callCount(), 0, label);
+  }
+
+  assert.deepEqual(await runStagingAutomodDispatch(runner, binding), { verdict: "passed", start: true, recover: true });
+  assert.equal(readAuthenticatedInventory.mock.callCount(), 1);
+  assert.deepEqual(invokePrivate.mock.calls.map(({ arguments: [, call] }) => call),
+    [{ action: "start", issuedLease }, { action: "recover", issuedLease }]);
+  assert.equal(fetch.mock.callCount(), 0);
 });
 
 test("the checked-in workflow command fails closed without an in-process host", () => {

@@ -7,8 +7,12 @@ import unittest
 from unittest.mock import Mock, call, patch
 from uuid import UUID
 
+from test_pre_admission import Store
+
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
-    from pre_start_stop import Deployment, Endpoint, Operation, ProbeReply, ProtectedPre, StartupAdmission
+    from pre_admission import AdmissionRecord, SettlementEvidence, SettlementSource, StartupAdmission
+    from pre_start_stop import Deployment, Endpoint, Operation, ProbeReply, ProtectedPre
+    from pre_start_stop import StartupAdmission as AdmissionProtocol
     from pre_target import Inventory, Target, TargetError, verify_cleanup
 
 
@@ -30,7 +34,7 @@ class PreFixture:
         self.deployment = Deployment(target, START, UUID(int=2), UUID(int=3))
         self.upload = Upload(target)
         self.authorize = Mock(return_value=True)
-        self.admission = Mock(spec_set=StartupAdmission)
+        self.admission = Mock(spec_set=AdmissionProtocol)
         self.admission.admit_start.side_effect = [START, None]
         self.admission.close.return_value = True
         self.admission.settle.return_value = True
@@ -173,6 +177,39 @@ class ProtectedPreTests(unittest.TestCase):
                                  *(call.probe(deployment, endpoint) for endpoint, _, _ in probes)])
                 probe_permissions = [call(target, Operation.PROBE)] * (len(probes) + 1)
                 self.assertEqual(fixture.authorize.call_args_list, [call(target, Operation.START), *probe_permissions])
+
+    def test_resumed_stop_preserves_admission_and_requires_its_exact_start_id(self):
+        for proof_start_id, settled in ((START, True), (UUID(int=4), False)):
+            with self.subTest(proof_start_id=proof_start_id):
+                fixture = PreFixture()
+                store = Store()
+                start_observer = Mock(return_value=None)
+                start = ProtectedPre(TARGET, authorize=lambda t, op: (t, op) == (TARGET, Operation.START),
+                                     admission=StartupAdmission(store, start_observer),
+                                     runtime=fixture, external_stop=fixture)
+                with patch("pre_admission.uuid4", return_value=START):
+                    deployment = start.start(fixture.upload)
+                self.assertEqual(deployment, fixture.deployment)
+                self.assertEqual(store.read(TARGET), AdmissionRecord(TARGET, deployment.start_id, closed=False))
+                self.assertFalse(fixture.fenced)
+                start_observer.assert_not_called()
+
+                proof_record = AdmissionRecord(deployment.target, proof_start_id, closed=True)
+                observe = Mock(side_effect=lambda _: SettlementEvidence(
+                    proof_record, SettlementSource.RUNTIME, startup_drained=True, restart_fenced=fixture.fenced))
+                fixture.effects.attach_mock(observe, "observe")
+                resumed_admission = StartupAdmission(store, observe)
+                stop = ProtectedPre(TARGET, authorize=lambda t, op: (t, op) == (TARGET, Operation.STOP),
+                                    admission=resumed_admission, runtime=fixture, external_stop=fixture)
+                self.assertIs(stop.stop(), settled)
+
+                closed = AdmissionRecord(TARGET, deployment.start_id, closed=True)
+                self.assertEqual(fixture.effects.mock_calls, [call.arm(TARGET, START),
+                                 call.create(TARGET, START, fixture.upload), call.fence(TARGET), call.observe(closed)])
+                self.assertEqual(store.records, {
+                    TARGET: replace(closed, settled_by=SettlementSource.RUNTIME if settled else None),
+                })
+                self.assertIs(resumed_admission.startup_settled(TARGET), settled)
 
     def test_lost_start_reply_requires_affirmative_exact_stop_evidence(self):
         cases = (
