@@ -58,11 +58,24 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                         # Declare one byte more than is sent, then close.
                         self.close_connection = True
                         value = str(int(value) + 1)
+                    if failure == "unframed" and key == "Content-Length":
+                        # A complete body ended only by close has no declared length.
+                        self.close_connection = True
+                        return
                 super().send_header(key, value)
 
             def reply(self, data, code=200):
-                if self.peer() == bad_peer == "REST" and failure == "payload" and code == 200:
-                    data = {"id": "0"}
+                if self.peer() == bad_peer == "REST" and code == 200 and failure in ("payload", "oversized"):
+                    if failure == "payload":
+                        data = {"id": "0"}
+                    else:
+                        # Correct JSON padded past the 4096-byte cap.
+                        body = json.dumps(data).encode() + b" " * 4096
+                        self.send_response(code)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
                 super().reply(data, code)
 
             def send_frame(self, packet):
@@ -96,7 +109,8 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                 # only protocol or payload validation can refuse them.
                 for bad_peer, failures in (("gateway", ("missing", "wrong", "challenge", "connection",
                                                         "truncated", "payload")),
-                                           ("REST", ("missing", "wrong", "truncated", "payload"))):
+                                           ("REST", ("missing", "wrong", "truncated", "unframed", "oversized",
+                                                     "payload"))):
                     for failure in failures:
                         with self.subTest(peer=bad_peer, failure=failure):
                             with self.assertRaisesRegex(fixture.Refused, f"{bad_peer} fixture unconfirmed"):
