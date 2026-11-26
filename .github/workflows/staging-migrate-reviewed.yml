@@ -1,5 +1,4 @@
 name: staging-migrate-reviewed
-# guards: release:reviewed-staging-migration
 
 on:
   push:

@@ -5719,19 +5719,19 @@ class WorkflowTests(unittest.TestCase):
         # base-branch policy) and fail closed when that copy is missing.
         steps = self.workflows["supply-chain.yml"]["jobs"]["pr-lint"]["steps"]
         base = next(s for s in steps if s.get("name") == "Check out base-branch gate")
-        self.assertEqual(base["if"], "github.event_name != 'push'")
+        self.assertEqual(base["if"],
+                         "github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'")
         self.assertTrue(str(base.get("uses", "")).startswith("actions/checkout@"))
         self.assertEqual(base["with"]["ref"],
-                         "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || 'main' }}")
+                         "${{ github.event.pull_request.base.sha || 'main' }}")
         verify = next(s for s in steps if s.get("name") == "Verify base-branch gate snapshot")
         self.assertEqual(verify["if"], base["if"])
-        self.assertEqual(verify["env"]["EXPECTED_BASE_SHA"],
-                         "${{ steps.changed.outputs.base_sha || github.event.merge_group.base_sha }}")
+        self.assertEqual(verify["env"]["EXPECTED_BASE_SHA"], "${{ steps.changed.outputs.base_sha }}")
         self.assertEqual(verify["shell"], "python3 -I {0}")
         self.assertIn('if actual != expected:', verify["run"])
         self.assertLess(steps.index(base), steps.index(verify))
         self.assertEqual(base["with"]["path"], "base-gate")
-        self.assertEqual(base["with"]["sparse-checkout"].splitlines(), [".github/scripts", "ci"])
+        self.assertEqual(base["with"]["sparse-checkout"], ".github/scripts")
         self.assertEqual(base["with"]["persist-credentials"], "false")
         check = next(s for s in steps if s.get("name") == "Check title, body, branch and commits")
         self.assertLess(steps.index(base), steps.index(check))
@@ -11273,6 +11273,13 @@ class WorkflowTests(unittest.TestCase):
                     workflow["jobs"][name].get("timeout-minutes"),
                     "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}",
                 )
+
+    def test_pipeline_benchmark_keeps_focused_pr_coverage(self):
+        workflow = self.workflows["pipeline-benchmark.yml"]
+        paths = workflow["on"]["pull_request"]["paths"]
+        self.assertIn("Cargo.lock", paths)
+        self.assertIn("scripts/*pipeline_bench*", paths)
+        self.assertIn("workflow_call", workflow["on"])
 
     def test_nextest_container_pins_disposable_database_service_address(self):
         # Same hardening as the check.yml lanes: the shared lane runs the

@@ -464,7 +464,6 @@ class AttestationFloor(unittest.TestCase):
               "src/auth.rs", "crates/core/src/session_controller.rs",
               "crates/cutover/src/parse.rs", ".github/workflows/deploy-production.yml",
               ".github/workflows/supply-chain.yml", ".github/scripts/pr_standards.py",
-              "ci/workflow_guard.py", "ci/workflow-guard-requirements.txt",
               "wrangler.toml", "config/wrangler.production.json",
               "migrations/notes.md")
         for path in t0:

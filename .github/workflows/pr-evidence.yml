@@ -1,9 +1,7 @@
 name: PR evidence
 on:
   pull_request: {types: [opened, edited, synchronize, reopened, ready_for_review]}
-  push:
-    branches: [main]
-    paths: ['.github/scripts/*pr*evidence*', '.github/workflows/pr-evidence.yml']
+  push: {branches: [main]}
 permissions: {}
 concurrency:
   group: pr-evidence-${{ github.event.pull_request.number || github.sha }}

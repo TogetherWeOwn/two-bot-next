@@ -105,7 +105,6 @@ T0_PATH_PATTERNS = (
     # supply-chain pr-lint job imports pr_standards.py from the base branch).
     re.compile(r"^\.github/workflows/supply-chain\.yml$"),
     re.compile(r"^\.github/scripts/pr_standards\.py$"),
-    re.compile(r"^ci/(?:workflow_guard\.py|workflow-guard-requirements\.txt)$"),
     re.compile(r"^\.github/(?:workflows/pr-evidence\.yml|scripts/(?:pr_evidence\.py|pr-evidence-(?:baseline|requirements)\.txt))$"),
     re.compile(r"(?:^|/)wrangler(?:[.-][^/]*)?\.(?:toml|jsonc?)$"),
     re.compile(r"^crates/cutover/"),

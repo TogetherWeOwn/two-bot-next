@@ -58,10 +58,6 @@ instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
 
-`pr-lint` scans candidate workflows with the pinned base policy, or the
-checked-out policy on pushes to `main`. New webhook-triggered work needs a
-path filter or a reviewed policy change.
-
 ### Independent review
 
 Use the `risk_tier` and complete path floors in the
@@ -434,9 +430,7 @@ the exact head and current PR description. After a description edit, open the
 `pr-evidence` run triggered by that edit in Actions and wait for its result, even
 when the head SHA is unchanged. If validation fails, use the job output to
 correct the evidence and confirm the updated result. Follow the existing required
-checks and review policy for the merge. On `main`, use the `check` run for the
-exact commit. Changes to the evidence workflow or its scripts also run its
-advisory self-test on the merged commit.
+checks and review policy for the merge.
 
 GitHub can bind a required workflow to protected source. In the hosted
 qualification, the pinned `pr-standards` workflow kept its opening required

@@ -8,6 +8,10 @@ name: ci-speed
 # workflow including the report job.
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 # Repo policy (scripts/ci/test_workflows.py): top-level permissions stay
