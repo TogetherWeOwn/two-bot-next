@@ -13,6 +13,8 @@ from unittest.mock import patch
 
 import yaml
 
+from ci.runner_policy import expected_runner
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -354,7 +356,7 @@ class SupplyChainTests(unittest.TestCase):
                 if "uses" in job:
                     self.assertNotIn("runs-on", job, f"{name}:{job_id}")
                 else:
-                    self.assertEqual(job["runs-on"], "ubuntu-latest", f"{name}:{job_id}")
+                    self.assertEqual(job["runs-on"], expected_runner(path.name, job_id), f"{name}:{job_id}")
             code = "\n".join(
                 line for line in path.read_text().splitlines()
                 if not line.lstrip().startswith("#")
