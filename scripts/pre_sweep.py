@@ -1,10 +1,20 @@
 """Apply the exact PRE cleanup plan through an injected staging adapter."""
 
-from pre_target import confirm_container_stopped, plan_cleanup, verify_cleanup
+from dataclasses import dataclass
+
+from pre_target import Inventory, confirm_container_stopped, plan_cleanup, require, verify_cleanup
 
 
 class SweepError(RuntimeError):
     """Cleanup could not be established. Messages are safe for workflow logs."""
+
+
+@dataclass(frozen=True)
+class CleanupReadback:
+    """Exact-target inventory acquired for one in-process cleanup request."""
+
+    inventory: Inventory
+    request: object
 
 
 def sweep_target(target, adapter, *, now):
@@ -14,8 +24,10 @@ def sweep_target(target, adapter, *, now):
     complete, fresh inventory for each call. Its apply method returns True only
     when the named exact operation is confirmed. Before app deletion the
     adapter's stop_container method stops the pinned app and returns fresh
-    direct health while the app is still readable. Final inventory preserves
-    proved counts and reads resource absence afresh. Startup settlement must
+    direct health while the app is still readable. The adapter's cleanup_inventory
+    method binds the supplied request to fresh complete resource and access
+    observations for this target, preserving independently proved counts. It
+    must not attach the request to cached listings. Startup settlement must
     come from the independent admission authority.
     """
     try:
@@ -41,7 +53,10 @@ def sweep_target(target, adapter, *, now):
             raise SweepError("PRE cleanup operation was not confirmed")
 
     try:
-        verify_cleanup(target, adapter.inventory(target))
+        request = object()
+        readback = adapter.cleanup_inventory(target, request=request)
+        require(type(readback) is CleanupReadback and readback.request is request, "wrong_pre_cleanup_readback")
+        verify_cleanup(target, readback.inventory)
     except Exception:
         raise SweepError("PRE cleanup readback could not be verified") from None
     return "cleared"
