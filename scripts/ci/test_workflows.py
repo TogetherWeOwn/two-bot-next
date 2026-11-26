@@ -4868,11 +4868,10 @@ DISJOINT_PRE_REAPER_EXPRESSIONS.update({
 })
 
 
-# pr-size: pushes per PR, reviews per head commit, manual runs apart.
+# pr-size: one group per PR head commit (push, label, review); manual apart.
 PR_SIZE_CONCURRENCY_GROUP = ("${{ github.workflow }}-"
                              "${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}-"
-                             "${{ github.event_name == 'pull_request' && 'push' || github.event_name == 'pull_request_review'"
-                             " && format('review-{0}', github.event.pull_request.head.sha) || 'manual' }}")
+                             "${{ github.event.pull_request.head.sha || 'manual' }}")
 
 
 def staging_pre_reaper_errors(workflows):
@@ -9165,19 +9164,18 @@ class WorkflowTests(unittest.TestCase):
 
     def test_pr_size_gate_cancels_superseded_pr_and_review_runs(self):
         workflow = self.workflows["pr-size.yml"]
-        # Pushes cancel older pushes per PR; reviews supersede reviews per
-        # head commit; manual dispatch is separate. No queue setting, so a
-        # required gate never waits behind stale runs.
+        # All PR events on one head commit share a group and the newest
+        # cancels the older; a new push is a new group, so a required gate
+        # never waits behind stale runs. Manual dispatch is separate.
         self.assertEqual(workflow["concurrency"], {
             "group": PR_SIZE_CONCURRENCY_GROUP,
             "cancel-in-progress": "${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_review' }}",
         })
         self.assertNotIn("queue", workflow["concurrency"])
         group = workflow["concurrency"]["group"]
-        # Review runs are keyed by head commit, so a stale review run can
-        # never cancel the current push's gate; manual runs stay apart.
-        self.assertIn("format('review-{0}', github.event.pull_request.head.sha)", group)
-        self.assertIn("'manual'", group)
+        # Keyed by head commit: a stale review on an old commit can never
+        # cancel the current push's gate, and manual runs stay apart.
+        self.assertIn("github.event.pull_request.head.sha || 'manual'", group)
         self.assertEqual(workflow["jobs"]["pr-size-gate"]["name"], "pr-size-gate")
 
     def test_pr_size_gate_rechecks_on_grants_and_revocations(self):
