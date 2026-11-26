@@ -103,8 +103,14 @@ class NativeRustToolchainTest(unittest.TestCase):
         self.assertIn("--profile minimal", calls[0])
 
     def test_tickets_postgres_reuses_pinned_image_toolchain(self):
+        self.assert_reuses_pinned_image_toolchain("tickets-postgres")
+
+    def test_self_role_store_reuses_pinned_image_toolchain(self):
+        self.assert_reuses_pinned_image_toolchain("self-role-store")
+
+    def assert_reuses_pinned_image_toolchain(self, job):
         workflow = yaml.safe_load((ROOT / ".github/workflows/check.yml").read_text())
-        steps = workflow["jobs"]["tickets-postgres"]["steps"]
+        steps = workflow["jobs"][job]["steps"]
         setup = next(step for step in steps if step.get("id") == "toolchain")
         retry = steps[steps.index(setup) + 1]
         self.assertEqual(setup["run"], "bash .github/scripts/install-rust-toolchain.sh")
