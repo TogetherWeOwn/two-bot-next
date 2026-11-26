@@ -76,6 +76,28 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          # Keep the drill's Python and Node helpers, Worker bundle inputs, and
+          # the Dockerfile still referenced by the generated multi-env config.
+          sparse-checkout: |
+            /Dockerfile
+            /scripts/build_identity.py
+            /scripts/script_intake.py
+            /scripts/staging_container_drill.py
+            /scripts/staging_drill_use.py
+            /scripts/staging_rollback_drill.py
+            /scripts/staging_rollout.py
+            /scripts/worker_container_rollback.py
+            /wrangler/package-lock.json
+            /wrangler/package.json
+            /wrangler/scripts/is-direct-invocation.mjs
+            /wrangler/scripts/ownership-control-response.mjs
+            /wrangler/scripts/ownership-control.mjs
+            /wrangler/scripts/staging-use-pipeline.mjs
+            /wrangler/scripts/staging-use.mjs
+            /wrangler/src/
+            /wrangler/tsconfig.json
+            /wrangler/wrangler.toml
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22

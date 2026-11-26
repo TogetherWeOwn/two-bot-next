@@ -7,9 +7,10 @@ pr-lint), so this test parses the YAML as text the way
 scripts/test-pr-lint.py does: indentation aware, stdlib only, hermetic.
 
 Guards:
-- pull_request fires on opened/synchronize/reopened/ready_for_review, plus
+- pull_request fires on opened/synchronize/reopened, including drafts, plus
   `edited` for the co-hosted pr-lint job (a title/body edit must re-run
-  the convention check).
+  the convention check). Marking a draft ready keeps those inputs and the
+  head SHA, so it needs no fresh run.
 - gitleaks is never skipped by an edit or a failed pr-lint. An `edited` run
   shares the concurrency group, so it can cancel the synchronize run's scan;
   a skipped gitleaks would then pass the required check with the head never
@@ -39,7 +40,7 @@ WORKFLOW = ROOT / ".github/workflows/supply-chain.yml"
 SCAN_SCRIPT = ROOT / ".github/scripts/gitleaks-scan.sh"
 SELF_TEST_SCRIPT = ROOT / ".github/scripts/test-gitleaks-scan.sh"
 
-REQUIRED_PR_TYPES = ["opened", "edited", "synchronize", "reopened", "ready_for_review"]
+REQUIRED_PR_TYPES = ["opened", "edited", "synchronize", "reopened"]
 
 
 def section_lines(text, header, indent):
@@ -77,6 +78,10 @@ class SecretScanSurfaceTests(unittest.TestCase):
         )
         self.assertEqual(flow_list(types_line.split("types:", 1)[1]), REQUIRED_PR_TYPES)
 
+    def test_pr_lint_is_unconditional_on_admitted_events(self):
+        job_block, indent = section_lines(self.text, "pr-lint:", 2)
+        self.assertFalse(any(line.startswith(" " * (indent + 2) + "if:") for line in job_block))
+
     def test_gitleaks_never_skipped_by_edit_or_failed_lint(self):
         # An `edited` run can cancel the synchronize run's scan (same
         # concurrency group), and a skipped job passes a required check, so
@@ -86,6 +91,7 @@ class SecretScanSurfaceTests(unittest.TestCase):
         keys = [line.strip() for line in job_block
                 if len(line) - len(line.lstrip()) == 4 and not line.strip().startswith("#")]
         self.assertFalse(any("edited" in key or "event.action" in key for key in keys))
+        self.assertIn("needs: pr-lint", keys)
         if_lines = [key for key in keys if key.startswith("if:")]
         self.assertEqual(if_lines, ["if: ${{ !cancelled() }}"])
 

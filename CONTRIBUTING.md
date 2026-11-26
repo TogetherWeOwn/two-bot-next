@@ -18,7 +18,9 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
 - **Body.** Use the [PR template](.github/pull_request_template.md), in short,
   active sentences. `pr-lint` requires two sections: Linked Issues or Issue
   Description, and Verification (the commands you ran and their results).
-  What Changed and Notes for reviewers are optional. A PR created through the
+  What Changed and reviewer notes are optional. Keep the final `## Notes for reviewers`
+  heading even when empty so integrations can append markup outside Attestation.
+  Put model attribution under that heading. A PR created through the
   API gets no template, so paste it in. `docs`, `chore`, `build`, `ci`, `style`,
   `test` and `revert` PRs need no linked issue. The `pr-lint` check fails an
   empty body and, on a public repo, a tracker id, instance UI link or the
@@ -248,6 +250,9 @@ in `scripts/ci/test_required_checks.py`. Advisory `container smoke` is exempt
 because the SBOM job gates image security. `ci-evidence` is exempt because
 it publishes links after the aggregate verdict.
 
+When an SBOM retry cannot find its own attempt's handoff, use the
+[producer-rooted retry plan](docs/ci-security.md#recover-a-missing-sbom-handoff-on-a-check-retry).
+
 The PR-only `prior revision database compatibility` job gates `ci-ok` for
 schema, migration, grant and lane inputs. It upgrades a disposable copy of
 the merge-base database with both candidate migration chains, the web
@@ -280,10 +285,8 @@ the toolchain and builder-image pins together.
 
 ### Nightly test partitions
 
-`nightly.yml` retains its wiring-change PR selector and event timeout allow-list:
-45 minutes per heavy PR job (also the fallback for any other event), 180 minutes
-only for schedule/manual runs. Do not raise the PR cap to accommodate workload.
-The original serial all-feature workload is split into:
+`nightly.yml` runs at 03:17 UTC and on manual dispatch, with 180 minutes per
+heavy job. The benchmark runs on its watched PR paths, including root `Cargo.lock`.
 
 - `sweep-plan`: generate the command reference, compile Cargo's default workspace
   test selection (`--no-run`, including ordinary examples), and discover each
@@ -319,10 +322,8 @@ The nightly partition workflow exercises this deprecated flag on the pinned Rust
 toolchain; recheck its protocol when upgrading rather than falling back to parsing
 mixed console output.
 
-Verify a change with an actual executing `pull_request` run on its exact head,
-record each heavy job's time and headroom, and aim for at most 35 minutes per
-leg. Test counts are not a runtime guarantee. Rebalance only from measured
-results; a skipped job or a 180-minute manual pass is not PR-cap evidence.
+Verify sweep changes by dispatching nightly on the candidate ref. Record the
+source SHA, time and headroom per job, aiming for at most 35 minutes per leg.
 Offline contracts run in the existing source-level CI suite:
 
 ```sh
@@ -332,24 +333,22 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_night
 
 ### Pull-request size labels and required size gate
 
-`.github/workflows/pr-size.yml` labels every pull request `size/S` (up to 100
-counted lines), `size/M` (up to 400), `size/L` (up to 1000) or `size/XL`, and
-keeps one advisory comment on pull requests over the 400-line threshold.
-Counted lines are additions + deletions excluding lockfiles, generated files
-and fixtures (plus `migrations.lock`, the generated migration inventory; the
-hand-written migration SQL stays counted). The labeller and the gate live
-once in the org
-[TogetherWeOwn/.github](https://github.com/TogetherWeOwn/.github) repository
-(CI-STANDARD.md, "Advisory PR-size labels" and "PR size gate"); the workflow
-here is a thin caller pinned to a central SHA and passes only this repo's
-generated paths. The labels are advisory only: the `pr-size` job is never a
-required check and never blocks a merge. The separate `pr-size-gate` job in
-the same workflow is required once added to the repository ruleset and fails
-pull requests too large for the automated reviewer (warn from 200 counted
-lines, fail over 400 lines or 20 files, hard stop at 1000); it is promoted to
-the ruleset only after it has reported on the default branch (two-step
-ship). A Monday run of the same workflow prints the weekly tally of merged
-pull requests per size; the labels are the durable record behind it.
+`.github/workflows/pr-size.yml` uses one runner to refresh the advisory label
+and run the required `pr-size-gate / gate` check. The label is `size/S` (up to
+100 counted lines), `size/M` (up to 400), `size/L` (up to 1,000) or `size/XL`.
+The job maintains one advisory comment for pull requests over 400 counted lines.
+A label or advisory comment failure leaves the required verdict to the gate.
+
+The gate warns from 200 counted lines and fails over 400 lines or 20 files
+without a valid size exception. The hard stop applies from 1,000 counted lines.
+Counted lines are additions plus deletions excluding lockfiles, generated files,
+fixtures and `migrations.lock`, the generated migration inventory.
+Hand-written migration SQL counts. The caller pins the shared workflow at an
+org commit and supplies this repo's generated path exclusion.
+[Org PR size policy](https://github.com/TogetherWeOwn/.github/blob/main/STANDARD.md)
+
+A separate read-only job uses the same org pin and tallies merged pull requests
+by advisory label each Monday.
 
 ### Issues
 
@@ -455,6 +454,27 @@ using the intended policy and call `matches_current` with fresh PR metadata
 before use. The synthetic `pull_request.edited` fixture re-evaluates current
 evidence at the same head. The live advisory workflow does not consume these
 helpers.
+
+The dormant [description receipt contract](.github/scripts/pr_evidence_receipt.py)
+binds a passing verifier snapshot to the repository, PR, base and head SHAs,
+protected workflow revision, run, attempt and verification job. It reuses the
+verifier's digest of exactly the UTF-8 description passed to validation and
+rechecked afterward. Line endings, whitespace and Unicode code points are
+preserved. A null description is read as empty. The receipt contains no body text.
+
+For offline matching, obtain the expected snapshot from a fresh PR read and the
+run and jobs from GitHub's attempt-specific endpoints. Authenticate the protected
+workflow revision and the receipt's origin in the exact verification job
+independently of the receipt. Supply those identities to `matches_receipt` with
+the receipt decoded as a JSON object with unique keys. The run must state its
+attempt explicitly. A job may omit `run_attempt` only when its authoritative run
+identifies attempt 1 and the job comes from that attempt's jobs endpoint. Every
+rerun must state the matching attempt on the job. Missing or unmatched provenance,
+PR association, attempt identity or successful verification yields no
+authoritative result.
+The advisory run metadata does not prove a protected workflow revision or the
+origin of a receipt. Its workflow therefore leaves receipt issuance dormant.
+Matching a receipt establishes what that attempt verified at its last read.
 
 Keep `pr-evidence` advisory until a supported registration path binds the required
 verdict to the protected workflow, exact head and current PR description. It must

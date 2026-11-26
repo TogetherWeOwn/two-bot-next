@@ -44,27 +44,40 @@ class WorkflowHardeningTests(unittest.TestCase):
             self.assertNotIn("${{", step["run"])
             for event, succeeds, selected in (("pull_request", True, False),
                                                ("pull_request", False, True),
+                                               ("pull_request", None, True),
                                                ("workflow_dispatch", True, True),
                                                ("$(printf not-a-command)", True, True)):
                 with self.subTest(job=job_id, event=event, succeeds=succeeds):
                     with tempfile.TemporaryDirectory() as tmp:
                         output = Path(tmp) / "output"
                         result = ("rust=false\\nworker=false\\nparity=false\\nsupply=false\\n"
-                                  "docs=true\\nvoice=false\\n" if job_id == "job-inputs" else "false\\n")
-                        shim = "python3() { printf '%b' '" + result + "'; return " + ("0" if succeeds else "1") + "; }\n"
+                                  "docs=true\\nvoice=false\\ndb-compat=false\\nmigrations=false\\n"
+                                  "workflow-fixtures=false\\n" if job_id == "job-inputs" else "false\\n")
+                        if succeeds is None and job_id == "job-inputs":
+                            # An older or malformed selector cannot grant a partial skip.
+                            result = "rust=false\\nworker=false\\n"
+                        if succeeds is None and job_id == "container-inputs":
+                            continue  # The independent container selector is unchanged here.
+                        shim = ("git() { test \"$*\" = 'show " + "a" * 40
+                                + ":scripts/job-inputs.py'; }\n"
+                                "python3() { printf '%b' '" + result + "'; return "
+                                + ("1" if succeeds is False else "0") + "; }\n")
                         proc = subprocess.run(
                             ["bash", "-e", "-o", "pipefail", "-c", shim + step["run"]],
                             env={"PATH": os.defpath, "EVENT_NAME": event, "BASE_SHA": "a" * 40,
-                                 "HEAD_SHA": "b" * 40, "GITHUB_OUTPUT": str(output)},
+                                 "HEAD_SHA": "b" * 40, "MERGE_SHA": "c" * 40,
+                                 "RUNNER_TEMP": tmp, "GITHUB_WORKSPACE": tmp, "GITHUB_OUTPUT": str(output)},
                             capture_output=True, text=True, timeout=5,
                         )
                         self.assertEqual(proc.returncode, 0, proc.stderr)
                         values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-                        for key in (("rust", "worker", "parity", "supply", "voice")
+                        for key in (("rust", "worker", "parity", "supply", "voice", "migrations", "workflow-fixtures")
                                     if job_id == "job-inputs" else ("build",)):
                             self.assertEqual(values[key], str(selected).lower())
                         if job_id == "job-inputs":
                             self.assertEqual(values["docs"], str(not selected).lower())
+                            self.assertEqual(values["db-compat"],
+                                             str(selected and event == "pull_request").lower())
                         self.assertIn("(event=" + event + ")", proc.stdout)
 
     def test_supported_shell_transports_the_original_python_guards_unchanged(self):
@@ -125,8 +138,7 @@ class WorkflowHardeningTests(unittest.TestCase):
     def test_reported_permission_scopes_keep_their_grants_and_explanations(self):
         scopes = {
             "deploy-staging.yml": {"certify-promotion": {"actions": "read"}},
-            "pr-size.yml": {"pr-size": {"issues": "write", "pull-requests": "write"},
-                            "pr-size-gate": {"issues": "write", "pull-requests": "write"},
+            "pr-size.yml": {"pr-size-gate": {"issues": "write", "pull-requests": "write"},
                             "pr-size-weekly": {"issues": "read", "pull-requests": "read"}},
             "production-migrate.yml": {"apply": {"actions": "read"}},
             "staging-migrate.yml": {"apply": {"actions": "read"}},
