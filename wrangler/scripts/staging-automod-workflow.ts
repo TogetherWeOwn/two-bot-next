@@ -2,6 +2,7 @@ import { boundRead, releaseUpstream } from "../src/internal-actions.ts";
 import type { ProtectedAutomodCall } from "../src/staging-automod-caller.ts";
 import { sameLease } from "../src/staging-automod-recovery.ts";
 import { AUTOMOD_STAGING_PURPOSE } from "../src/staging-lifecycle.ts";
+import { boundStagingAutomodInventoryRead } from "./staging-automod-inventory-verifier.ts";
 
 type Lease = ProtectedAutomodCall["issuedLease"];
 type Job = Readonly<Pick<Lease, "runId" | "runAttempt" | "sha">>;
@@ -17,7 +18,12 @@ function hasKeys<K extends string>(value: unknown, keys: readonly K[]): value is
     && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 }
 
-async function readReceipt(response: Response, signal: AbortSignal): Promise<unknown> {
+function enforceDeadline(controller: AbortController, deadline: number): void {
+  if (performance.now() >= deadline) controller.abort();
+  controller.signal.throwIfAborted();
+}
+
+async function readReceipt(response: Response, controller: AbortController, deadline: number): Promise<unknown> {
   const reader = response.body?.getReader();
   if (!reader) return;
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -25,7 +31,10 @@ async function readReceipt(response: Response, signal: AbortSignal): Promise<unk
   let bytes = 0;
   try {
     for (;;) {
-      const { done, value } = await boundRead(reader.read(), signal);
+      enforceDeadline(controller, deadline);
+      const { done, value } = await boundRead(reader.read(), controller.signal);
+      // The final read can win the race against the timer or its abort listener.
+      enforceDeadline(controller, deadline);
       if (done) return JSON.parse(text + decoder.decode());
       bytes += value.byteLength;
       if (bytes > MAX_RECEIPT_BYTES) return;
@@ -40,9 +49,10 @@ async function readReceipt(response: Response, signal: AbortSignal): Promise<unk
 async function confirmed(action: ProtectedAutomodCall["action"], issuedLease: Lease, invoke: Invoke): Promise<boolean> {
   const controller = new AbortController();
   const { signal } = controller;
+  const deadline = performance.now() + REQUEST_MS;
   const timer = setTimeout(() => controller.abort(), REQUEST_MS);
   try {
-    const response = await boundRead(invoke(Object.freeze({ action, issuedLease }), signal).then(reply => {
+    const response = await boundStagingAutomodInventoryRead(invoke(Object.freeze({ action, issuedLease }), signal).then(reply => {
       if (signal.aborted) releaseUpstream(reply);
       return reply;
     }), signal);
@@ -50,12 +60,13 @@ async function confirmed(action: ProtectedAutomodCall["action"], issuedLease: Le
       releaseUpstream(response);
       return false;
     }
-    const receipt = await readReceipt(response, signal);
+    const receipt = await readReceipt(response, controller, deadline);
     if (!hasKeys(receipt, RECEIPT_KEYS) || receipt.schema !== "two-bot-staging-automod-job.v1"
       || receipt.environment !== "staging" || receipt.action !== action || receipt.verdict !== "passed"
       || !hasKeys(receipt.lease, LEASE_KEYS) || receipt.lease.purpose !== AUTOMOD_STAGING_PURPOSE
       || !sameLease(issuedLease, receipt.lease) || typeof receipt.observedAt !== "string") return false;
     const at = Date.parse(receipt.observedAt);
+    enforceDeadline(controller, deadline);
     return Number.isFinite(at) && at >= issuedLease.acquiredAt && new Date(at).toISOString() === receipt.observedAt;
   } catch {
     return false;
