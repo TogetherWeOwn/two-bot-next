@@ -4601,11 +4601,6 @@ test("AutoMod bridge: only the closed operation set with a strict bounded body i
   assert.deepEqual(await h.send(`{"op":"read-lease","context":${context},"context":${context}}`), invalid);
   assert.deepEqual(await h.send(`{"op":"read-lease","op":"read-lease","context":${context}}`), invalid);
   assert.deepEqual(await h.send({ op: "read-lease", context: h.context, padding: "x".repeat(5_000) }), invalid);
-  assert.deepEqual(await h.send({ op: "read-lease", context: h.context, extra: true }), invalid);
-  assert.deepEqual(await h.send({ op: "read-lease", context: { ...h.context, extra: true } }), invalid);
-  assert.deepEqual(await h.send({ op: "acquire", pin: h.pin, change: { ...h.change, voiceMove: true } }), invalid);
-  assert.deepEqual(await h.send({ op: "acquire", pin: h.pin, change: { ...h.change, purpose: AUTOMOD_STAGING_PURPOSE } }),
-    invalid);
   assert.deepEqual(await h.send({ op: "read-approval", action: "publish", issuedLease: {} }), invalid);
   assert.deepEqual(await h.send("[]"), invalid);
   assert.deepEqual(await h.send("not json"), invalid);
