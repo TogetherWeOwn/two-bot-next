@@ -840,11 +840,10 @@ Container rereads its own approval. Serving checks compare the Worker version,
 build and owner epoch with local identity. They compare the rest of the pin
 with the runner's freshly authenticated inventory. This build supplies no
 dry-run launch adapter, so start stays refused even with an enabled plan.
-Recovery retires an unused reservation after a confirmed native stop. Before
-enabling the plan, native expiry recovery for an interrupted active journal,
-or an equivalent protected operator recovery path, must be implemented. A
-new workflow attempt or a different release cannot recover the original
-attempt because the bridge binds recovery to its run, attempt and release.
+Recovery retires an unused reservation after a confirmed native stop. Native
+expiry recovery for an interrupted active journal, or an equivalent protected
+operator path, must exist before enabling because a new attempt or release
+cannot recover the original run-bound lease.
 
 `wrangler/scripts/staging-automod-instance-client.ts` implements the protected
 host and instance shapes over the bridge. It uses a fixed staging Worker URL
