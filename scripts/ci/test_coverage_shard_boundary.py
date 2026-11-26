@@ -30,6 +30,11 @@ def load_script(name, filename):
     return module
 
 
+def fixture_env():
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    return dict(env, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+
 MERGE = load_script("boundary_merge", "merge-coverage-shards.py")
 GATE = load_script("boundary_gate", "check-patch-coverage.py")
 
@@ -83,7 +88,7 @@ class CoverageShardBoundaryTests(unittest.TestCase):
         def git(*args):
             return subprocess.run(
                 ["git", "-C", str(repo), *args], capture_output=True, text=True,
-                check=True, timeout=15,
+                check=True, timeout=15, env=fixture_env(),
             ).stdout.strip()
 
         git("init", "--quiet")
@@ -104,7 +109,7 @@ class CoverageShardBoundaryTests(unittest.TestCase):
         git("add", SOURCE)
         git("-c", "user.name=Coverage Fixture", "-c", "user.email=fixture@example.invalid",
             "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "change executable statements")
-        with patch.object(GATE, "ROOT", repo):
+        with patch.object(GATE, "ROOT", repo), patch.dict(os.environ, fixture_env(), clear=True):
             added, error = GATE.added_lines(base, "HEAD")
         self.assertEqual(error, "")
         expected = {
@@ -265,7 +270,7 @@ class CoverageRetryTests(unittest.TestCase):
     def git(self, *args):
         return subprocess.run(
             ["git", "-C", str(self.directory), *args], capture_output=True,
-            text=True, check=True, timeout=15,
+            text=True, check=True, timeout=15, env=fixture_env(),
         ).stdout.strip()
 
     def commit(self, message):
@@ -274,7 +279,7 @@ class CoverageRetryTests(unittest.TestCase):
         return self.git("rev-parse", "HEAD")
 
     def step(self, step, attempt, **overrides):
-        env = dict(os.environ, GITHUB_WORKSPACE=str(self.directory), GITHUB_SHA=self.source,
+        env = dict(fixture_env(), GITHUB_WORKSPACE=str(self.directory), GITHUB_SHA=self.source,
                    GITHUB_RUN_ID="12345", GITHUB_RUN_ATTEMPT=str(attempt),
                    COVERAGE_SELECTOR=self.selector, COVERAGE_MATRIX=self.plan, EXPECTED_SHARDS="2")
         env.update(overrides)
@@ -365,6 +370,20 @@ class CoverageRetryTests(unittest.TestCase):
         result = self.step(merge, 2)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("do not match the 2 planned indices", result.stdout)
+        self.assertFalse((self.directory / "lcov.info").exists())
+
+    def test_workflow_rejects_intact_pairs_swapped_between_planned_indices(self):
+        first = self.upload(0, 1, hits=1)
+        second = self.upload(1, 2, hits=0)
+        for suffix in (".info", ".identity"):
+            original = first.with_suffix(suffix)
+            other = second.with_suffix(suffix)
+            original_bytes, other_bytes = original.read_bytes(), other.read_bytes()
+            original.write_bytes(other_bytes)
+            other.write_bytes(original_bytes)
+        result = self.step(self.consumer["Merge coverage shards"], 2)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("coverage shard 0 identity mismatch", result.stdout)
         self.assertFalse((self.directory / "lcov.info").exists())
 
     def test_workflow_accepts_single_nonempty_shard(self):
