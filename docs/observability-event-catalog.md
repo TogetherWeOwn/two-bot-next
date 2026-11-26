@@ -30,6 +30,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | --- | --- | --- |
 | `gateway intents resolved` | `crates/bot/src/main.rs` (`run`) | Boot resolved the gateway intents; `voice_presences` states whether `GUILD_PRESENCES` was requested (the enabling flag may be a secret binding, so only the boolean is logged). `false` means voice-room game names can never be detected this boot |
 | `durable gateway initialized; shard connecting` | `crates/bot/src/main.rs` (`run`) | Supervisor built the shard; `resume=true` means a saved checkpoint was offered, `false` means fresh IDENTIFY |
+| `saved gateway resume endpoint refused by admission policy` | `crates/bot/src/gateway.rs` (`record_resume_endpoint_policy_refusal`) | Optional JSON-only boot receipt after the policy rejects an eligible saved endpoint and its checkpoint is cleared. The fixed `msg` is `gateway_resume_endpoint_policy_refused` and the event has no span context. |
 | `community facts arming refused; capture disabled` | `crates/bot/src/main.rs` (`run`) | Facts-sink arming refused at boot; capture stays disabled exactly like the scorecard flag being off |
 | `gateway shard loop started` | `crates/bot/src/gateway.rs` (`run_shard`) | Reception task entered the Twilight stream loop |
 | `gateway reconnect failed; Twilight will retry` | `crates/bot/src/gateway.rs` (`run_shard`) | Transport reconnect attempt failed; Twilight owns the retry |
