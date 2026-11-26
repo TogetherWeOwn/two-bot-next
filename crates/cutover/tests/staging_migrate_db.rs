@@ -676,6 +676,20 @@ async fn seed_release_pre(
 ) -> Result<ReleaseLedgers, Box<dyn std::error::Error + Send + Sync>> {
     use two_bot_core::database_roles::{plan_for_phase, Phase};
 
+    // SQLx creates the ledgers as the migrator. Set their storage options
+    // before seeding so autoanalyze cannot start on the populated ledgers.
+    let mut setup = pool.begin().await?;
+    for chain in [Chain::Cutover, Chain::Store] {
+        setup.ensure_migrations_table(chain.table()).await?;
+    }
+    sqlx::raw_sql(
+        "ALTER TABLE public._sqlx_migrations SET (autovacuum_enabled = false);
+         ALTER TABLE public._two_bot_migrations SET (autovacuum_enabled = false);",
+    )
+    .execute(&mut *setup)
+    .await?;
+    setup.commit().await?;
+
     let mut pre = Vec::new();
     let mut expanded = Vec::new();
     for (chain, limit) in [(Chain::Cutover, 473), (Chain::Store, 465)] {
@@ -711,6 +725,15 @@ async fn seed_release_pre(
                 .collect::<Vec<_>>(),
         );
     }
+    // These PRE tables also take part in the release lock set. The options
+    // live only until this fixture database is dropped.
+    sqlx::raw_sql(
+        "ALTER TABLE public.web_contract_meta SET (autovacuum_enabled = false);
+         ALTER TABLE public.event_instance_windows SET (autovacuum_enabled = false);
+         ALTER TABLE public.internal_action_log SET (autovacuum_enabled = false);",
+    )
+    .execute(&mut *admin)
+    .await?;
     let (contract, _) = include_str!("../../../sql/web_v1.sql")
         .split_once("-- Voice heat contract 1.1:")
         .unwrap();
@@ -794,6 +817,16 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
         .await?;
     let applied = apply_release_schema(&pool, &expected[0], &expected[1]).await?;
     let (cutover, store) = (applied.cutover, applied.store);
+    // The inverse locks these new tables too. Set the options while the
+    // tables are still empty, before exercising the watermark guard.
+    sqlx::raw_sql(
+        "ALTER TABLE public.voice_heat_hours SET (autovacuum_enabled = false);
+         ALTER TABLE public.event_attendance_windows SET (autovacuum_enabled = false);
+         ALTER TABLE public.event_voice_sessions SET (autovacuum_enabled = false);
+         ALTER TABLE public.live_sequence_watermarks SET (autovacuum_enabled = false);",
+    )
+    .execute(&mut admin)
+    .await?;
     assert_eq!(cutover.len(), expected[0].len() + 5);
     assert_eq!(store.len(), expected[1].len() + 1);
     let installed: bool = sqlx::query_scalar(
@@ -815,6 +848,18 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
             .unwrap_err()
             .to_string(),
         "refused: release inverse post-apply evidence changed"
+    );
+    // A reader can coexist with the inverse's initial ledger lock, but must
+    // still block its NOWAIT upgrade to ACCESS EXCLUSIVE.
+    let mut reader = admin.begin().await?;
+    reader
+        .execute("LOCK TABLE public._sqlx_migrations IN ACCESS SHARE MODE")
+        .await?;
+    let busy = undo_release_schema(&pool, &cutover, &store).await;
+    reader.rollback().await?;
+    assert_eq!(
+        busy.unwrap_err().to_string(),
+        "failed: guarded release inverse refused or failed"
     );
     admin
         .execute("INSERT INTO live_sequence_watermarks (guild_id, seq) VALUES ('1', 1)")

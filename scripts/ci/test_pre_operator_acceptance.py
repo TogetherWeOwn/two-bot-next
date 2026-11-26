@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from ci.pre_operator_acceptance_fixture import (
@@ -56,7 +56,7 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
             ),
             "pinned_route": route,
             "pinned_app_id": app_id,
-            "read_ingress": lambda _: IngressReadback(route, False),
+            "read_ingress": lambda _, *, request: IngressReadback(route, False, request),
         }
 
     def refuse(self, evidence, reason):
@@ -153,8 +153,25 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
             with self.subTest(path=path):
                 failed = replace(getattr(worker, path), status=503)
                 self.refuse(evidence | {"worker": replace(worker, **{path: failed})}, reason)
-        stale_health = replace(worker.health, worker_version="12345678-1234-4234-8234-123456789def")
-        self.refuse(evidence | {"worker": replace(worker, health=stale_health)}, "pre_worker_health_unproved")
+
+    def test_both_successful_probes_must_match_the_pinned_worker(self):
+        evidence = self.evidence(self.target, self.original)
+        accepted = accept(self.registry_reservation(self.target), self.build, **evidence)
+        self.assertEqual(accepted, AcceptedRow(self.target, self.build, self.original, self.version, "cleared"))
+
+        worker = evidence["worker"]
+        other_version = "12345678-1234-4234-8234-123456789def"
+        other_health = replace(worker.health, worker_version=other_version)
+        other_readyz = replace(worker.readyz, worker_version=other_version)
+        cases = (
+            ("health from other Worker", replace(worker, health=other_health), "pre_worker_health_unproved"),
+            ("readiness from other Worker", replace(worker, readyz=other_readyz), "pre_worker_readiness_unproved"),
+            ("both from other Worker", replace(worker, health=other_health, readyz=other_readyz),
+             "pre_worker_health_unproved"),
+        )
+        for name, observation, reason in cases:
+            with self.subTest(observation=name):
+                self.refuse(evidence | {"worker": observation}, reason)
 
     def test_direct_container_probes_do_not_establish_worker_readiness(self):
         evidence = self.evidence(self.target, self.original)
@@ -260,7 +277,10 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
         staging.snapshot = replace(staging.snapshot, container=route.app,
                                    startup_settled=admission.startup_settled(target))
 
-        read_ingress = evidence["read_ingress"] = Mock(return_value=IngressReadback(route, True))
+        ingress_present = True
+        read_ingress = evidence["read_ingress"] = Mock(
+            side_effect=lambda _, *, request: IngressReadback(route, ingress_present, request),
+        )
 
         def handoff():
             outcome = sweep_target(target, staging, now=store.now)
@@ -273,12 +293,12 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
         worker = staging.snapshot.worker
         with self.assertRaisesRegex(ProofError, "^pre_ingress_unproved$"):
             handoff()
-        read_ingress.assert_called_once_with(route)
+        read_ingress.assert_called_once_with(route, request=ANY)
         cleared = staging.snapshot
         self.assertIsNone(cleared.worker)
         self.assertIsNone(cleared.container)
 
-        read_ingress.return_value = IngressReadback(route, False)
+        ingress_present = False
         for lingering in (replace(cleared, worker=worker), replace(cleared, container=route.app)):
             with self.subTest(lingering=lingering), patch.object(
                 staging, "inventory", side_effect=[cleared, lingering]
@@ -286,10 +306,12 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
                 with self.assertRaisesRegex(SweepError, "^PRE cleanup readback could not be verified$"):
                     handoff()
                 self.assertEqual(inventory.call_args_list, [call(target), call(target)])
-        read_ingress.assert_called_once_with(route)
+        read_ingress.assert_called_once_with(route, request=ANY)
 
         self.assertEqual(handoff(), AcceptedRow(target, self.build, self.original, self.version, "cleared"))
-        self.assertEqual(read_ingress.call_args_list, [call(route), call(route)])
+        self.assertEqual(read_ingress.call_args_list, [call(route, request=ANY), call(route, request=ANY)])
+        first, later = read_ingress.call_args_list
+        self.assertIsNot(first.kwargs["request"], later.kwargs["request"])
 
     def test_private_ingress_absence_requires_the_independently_pinned_scope(self):
         evidence = self.evidence(self.target, self.original)
@@ -302,11 +324,24 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
         for observed in (replace(route, target=replace(self.target, shape="0475/0465")),
                          replace(route, worker_id="sibling-worker"), wrong_app):
             with self.subTest(observed=observed):
-                read_ingress.return_value = IngressReadback(observed, False)
+                read_ingress.side_effect = lambda _, *, request: IngressReadback(observed, False, request)
                 self.refuse(evidence, "pre_ingress_unproved")
         for present in (None, 0):
             with self.subTest(present=present):
-                read_ingress.return_value = IngressReadback(route, present)
+                read_ingress.side_effect = lambda _, *, request: IngressReadback(route, present, request)
                 self.refuse(evidence, "pre_ingress_unproved")
         read_ingress.side_effect = TimeoutError("synthetic private detail")
+        self.refuse(evidence, "pre_ingress_unproved")
+
+    def test_refuses_replayed_ingress_absence_for_the_same_reservation(self):
+        evidence = self.evidence(self.target, self.original)
+        reservation = self.registry_reservation(self.target)
+        route = evidence["pinned_route"]
+        read_ingress = Mock(side_effect=evidence["read_ingress"])
+        evidence["read_ingress"] = read_ingress
+
+        self.assertEqual(accept(reservation, self.build, **evidence).reservation, self.target)
+        old_request = read_ingress.call_args.kwargs["request"]
+        read_ingress.side_effect = None
+        read_ingress.return_value = IngressReadback(route, False, old_request)
         self.refuse(evidence, "pre_ingress_unproved")

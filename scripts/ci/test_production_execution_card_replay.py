@@ -104,3 +104,15 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
         self.assertEqual(gateway["endpoint_denial"], "unverified")
         for field in ("result", "signals", "readiness"):
             self.assertNotIn(field, gateway)
+
+        # The current label and exact hash can both be correct for the supplied file path.
+        # The saved producer output itself still came from the older window.
+        mislabeled = self.replay(restored, reports | {"gateway": (old_gateway, restored)})
+        self.assertEqual(mislabeled["help"], coherent["help"])
+        self.assertEqual(mislabeled["naming"], coherent["naming"])
+        gateway = mislabeled["gateway"]
+        self.assertEqual(gateway["status"], "mismatched")
+        self.assertEqual(gateway["fields"], ["start", "end"])
+        self.assertEqual(gateway["endpoint_denial"], "unverified")
+        for field in ("result", "signals", "readiness"):
+            self.assertNotIn(field, gateway)

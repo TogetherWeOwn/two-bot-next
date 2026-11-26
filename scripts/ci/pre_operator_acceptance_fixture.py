@@ -97,10 +97,12 @@ class IngressReadback:
 
     The scope identifies the lookup even when the route itself is absent.
     It comes from the reader's authenticated context, never from the request.
+    The reader binds the request token only to a new observation.
     """
 
     scope: ProtectedRouteReadback
     present: bool | None
+    request: object
 
 
 @dataclass(frozen=True)
@@ -175,8 +177,10 @@ def accept(registry_reservation: RegistryReservation, build, *, receipt, schema,
     require(disposition is RegistryDisposition.ALREADY_ABSENT, "pre_registry_cleanup_unproved")
     try:
         confirm_protected_route(reservation, pinned_app_id=pinned_app_id, readback=pinned_route)
-        ingress = read_ingress(pinned_route)
-        require(type(ingress) is IngressReadback and ingress.present is False, "pre_ingress_unproved")
+        request = object()
+        ingress = read_ingress(pinned_route, request=request)
+        require(type(ingress) is IngressReadback and ingress.request is request
+                and ingress.present is False, "pre_ingress_unproved")
         confirm_protected_route(reservation, pinned_app_id=pinned_app_id, readback=ingress.scope)
     except Exception:
         raise ProofError("pre_ingress_unproved") from None
