@@ -3704,12 +3704,14 @@ jobs:
           RUST_TOOLCHAIN: "nightly-2026-10-01" # Pinned nightly for libFuzzer; stable pin stays in rust-toolchain.toml.
           RUST_COMPONENTS: rust-src
         run: bash .github/scripts/install-rust-toolchain.sh
-      # Per-job dependency cache: the key includes the job id (no
-      # shared-key), so this job keeps its own entry; saved on pushes only.
+      # Key and prune the per-job cache using the separate fuzz workspace.
+      # Keep the installed tool and registry data, and compile from source.
       - name: Restore cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
+          workspaces: fuzz
+          cache-targets: 'false'
           save-if: ${{ github.event_name == 'push' }}
       - name: Install pinned cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
