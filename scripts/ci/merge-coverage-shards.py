@@ -1,17 +1,89 @@
 #!/usr/bin/env python3
 """Merge sharded LCOV reports into one union report (fail-closed).
 
-Each coverage shard uploads its own LCOV file; the merge job combines them
-with key union (hit counts summed) and the unchanged HARD gate in
+Each coverage shard uploads its LCOV file and identity; the merge job checks
+both before combining the reports by key (hit counts summed). The HARD gate in
 check-patch-coverage.py reads the merged report. Any missing, empty or
 malformed shard fails the merge: partial data must never pass as measured.
 """
 
 import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+from script_intake import decode_json
+sys.path.pop(0)
+
+
+def artifact_context(expected):
+    """Use the checkout, selector and executable matrix shared by both jobs."""
+    source = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"], capture_output=True, text=True,
+        timeout=15, check=True,
+    ).stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", source) or source != os.environ.get("GITHUB_SHA"):
+        raise ValueError("coverage checkout does not match the workflow SHA")
+
+    selector = decode_json(os.environ.get("COVERAGE_SELECTOR", ""), max_depth=4)
+    if not isinstance(selector, dict) or any(not isinstance(value, str) for value in selector.values()):
+        raise ValueError("invalid job-inputs outputs for coverage")
+
+    matrix = decode_json(os.environ.get("COVERAGE_MATRIX", ""), max_depth=4)
+    entries = matrix.get("include") if isinstance(matrix, dict) else None
+    if not isinstance(entries, list) or not entries or len(entries) != expected:
+        raise ValueError("coverage matrix does not match the expected shard count")
+    shards = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.keys() != {"shard_index", "legs"}:
+            raise ValueError("invalid coverage matrix entry")
+        index, legs = entry["shard_index"], entry["legs"]
+        if (type(index) is not int or index < 0 or index in shards
+                or not isinstance(legs, str) or not legs.strip()):
+            raise ValueError("invalid coverage shard index or legs in the matrix")
+        shards[index] = legs
+
+    # GitHub retains successful shards across attempts of the same run.
+    # Canonicalize the inputs so JSON serialization order cannot break reuse.
+    identity = json.dumps([source, selector, sorted(shards.items())], sort_keys=True)
+    return hashlib.sha256(identity.encode()).hexdigest(), shards
+
+
+def report_identity(report, identity, index):
+    with report.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    return f"{identity}:{index}:{digest}\n".encode()
+
+
+def bind_report(index, expected):
+    identity, shards = artifact_context(expected)
+    if index not in shards or os.environ.get("SHARD_LEGS") != shards[index]:
+        raise ValueError(f"executed coverage shard {index} does not match the matrix")
+    report = Path(f"lcov-shard-{index}.info")
+    if report.stat().st_size == 0:
+        raise ValueError(f"shard report is empty: {report}")
+    report.with_suffix(".identity").write_bytes(report_identity(report, identity, index))
+
+
+def artifact_reports(directory, expected):
+    identity, shards = artifact_context(expected)
+    reports = {index: directory / f"lcov-shard-{index}.info" for index in sorted(shards)}
+    names = {report.with_suffix(suffix).name for report in reports.values()
+             for suffix in (".info", ".identity")}
+    if {path.name for path in directory.iterdir()} != names:
+        raise ValueError(f"downloaded reports and identity files do not match the {expected} planned indices")
+    for index, report in reports.items():
+        bound_identity = report_identity(report, identity, index)
+        with report.with_suffix(".identity").open("rb") as stamp:
+            if stamp.read(len(bound_identity) + 1) != bound_identity:
+                raise ValueError(f"coverage shard {index} identity mismatch (source, selector, plan or report)")
+    return list(reports.values())
 
 
 def _source_path(filename, source_roots):
@@ -115,25 +187,30 @@ def _write_lcov(path, hits):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--report", action="append", default=[],
-                        help="shard LCOV report (repeatable)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--report", action="append", default=[], help="local LCOV report (repeatable)")
+    mode.add_argument("--bind-shard", type=int, help="bind this matrix shard before upload")
+    mode.add_argument("--artifact-dir", type=Path, help="verify downloaded shard artifacts before merging")
     parser.add_argument("--expected-shards", type=int, required=True)
     parser.add_argument("--source-root", action="append", default=[],
                         help="absolute producing checkout root (repeatable); "
                              "this checkout and repo-relative SF paths are also accepted")
-    parser.add_argument("--out", required=True)
+    parser.add_argument("--out")
     args = parser.parse_args(argv)
-    if len(args.report) != args.expected_shards:
-        print(
-            f"::error::coverage merge needs exactly {args.expected_shards} "
-            f"shard reports, got {len(args.report)}; failing closed",
-            flush=True,
-        )
-        return 1
+    if args.bind_shard is None and not args.out:
+        parser.error("--out is required to merge coverage reports")
     try:
-        merged = merge_lcov(args.report, source_roots=args.source_root)
-    except ValueError as exc:
-        print(f"::error::coverage merge failed ({exc}); failing closed",
+        if args.bind_shard is not None:
+            bind_report(args.bind_shard, args.expected_shards)
+            return 0
+        reports = args.report
+        if args.artifact_dir:
+            reports = artifact_reports(args.artifact_dir, args.expected_shards)
+        if len(reports) != args.expected_shards:
+            raise ValueError(f"needs exactly {args.expected_shards} shard reports, got {len(reports)}")
+        merged = merge_lcov(reports, source_roots=args.source_root)
+    except (OSError, ValueError, RecursionError, subprocess.SubprocessError) as exc:
+        print(f"::error::coverage report processing failed ({exc}); failing closed",
               flush=True)
         return 1
     try:
@@ -142,7 +219,7 @@ def main(argv=None):
         print(f"::error::could not write merged coverage: {exc}", flush=True)
         return 1
     print(
-        f"merged {len(args.report)} coverage shards "
+        f"merged {len(reports)} coverage shards "
         f"({len(merged)} executable lines)",
         flush=True,
     )
