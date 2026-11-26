@@ -554,9 +554,17 @@ test("the private AutoMod host acquires the exact approved lease and recovers wi
   assert.equal((await host.acquireLease(pin, following, signal)).runId, following.runId);
 });
 
-test("the AutoMod instance host acquires exactly once and runs both approved actions on the bound Container", async t => {
+async function exerciseAutomodInstanceHost(t: TestContext, loseRecovery: boolean) {
   const now = 1_800_000_000_000;
   t.mock.timers.enable({ apis: ["Date"], now });
+  const nativeTimeout = AbortSignal.timeout.bind(AbortSignal);
+  const deadlines = new WeakMap<AbortSignal, AbortController>();
+  t.mock.method(AbortSignal, "timeout", (ms: number) => {
+    if (ms !== 2_000) return nativeTimeout(ms);
+    const controller = new AbortController();
+    deadlines.set(controller.signal, controller);
+    return controller.signal;
+  });
   const network = t.mock.method(globalThis, "fetch", async () => assert.fail("unexpected network access"));
   const { env, replies: { help, preview } } = automodPublication;
   const version = "11111111-1111-1111-1111-111111111111";
@@ -593,7 +601,8 @@ test("the AutoMod instance host acquires exactly once and runs both approved act
   const steps: string[] = [];
   let command: typeof preview | undefined;
   let inventoryRollout = "55555555-5555-5555-5555-555555555555";
-  let recoveryReachable = false;
+  let recoveryReachable = !loseRecovery;
+  let acquisitionSignal: AbortSignal | undefined;
   const instance = TwoBotContainer.bindProtectedAutomodInstance(h.bot, control, {
     readReservation: async () => { steps.push("acquire"); return { change, pin, target }; },
     readServing: async () => pin,
@@ -653,9 +662,15 @@ test("the AutoMod instance host acquires exactly once and runs both approved act
       ...instance,
       authority: { ...instance.authority, readIssuedLease },
       acquireLease: async (...scope) => {
-        await instance.acquireLease(...scope);
+        acquisitionSignal = scope[2];
+        const deadline = deadlines.get(acquisitionSignal);
+        assert.ok(deadline);
+        assert.deepEqual(await instance.acquireLease(...scope), issued);
+        assert.deepEqual(h.values.get(STAGING_USE_KEY), issued);
+        deadline.abort(new DOMException("synthetic acquisition deadline expired after issuance", "TimeoutError"));
         steps.push("lost-acquire-reply");
-        throw new Error("synthetic acquisition response lost after issuance");
+        acquisitionSignal.throwIfAborted();
+        return assert.fail("the acquisition reply must be unavailable");
       },
       invokePrivate: async (attested, call, signal) => {
         steps.push(`invoke:${call.action}`);
@@ -696,6 +711,12 @@ test("the AutoMod instance host acquires exactly once and runs both approved act
   assert.equal(h.values.has(STAGING_USE_KEY), false);
   runEvidence = run;
   assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), { verdict: "failed", start: false, recover: false });
+  assert.equal(acquisitionSignal?.aborted, true);
+  assert.equal(readIssuedLease.mock.callCount(), 2);
+  const confirmingSignal = readIssuedLease.mock.calls[1]?.arguments[1];
+  assert.ok(confirmingSignal);
+  assert.notEqual(confirmingSignal, acquisitionSignal);
+  assert.equal(confirmingSignal.aborted, false);
   assert.deepEqual(h.values.get(STAGING_USE_KEY), issued);
   assert.deepEqual(await journal.pending(), { lease: issued, phase: "reserved" });
   assert.deepEqual(steps.slice(1, 4), ["run", "acquire", "lost-acquire-reply"]);
@@ -706,23 +727,32 @@ test("the AutoMod instance host acquires exactly once and runs both approved act
   // use the held tuple without acquiring a replacement or repeating acquisition.
   inventoryRollout = pin.rolloutId;
   steps.length = 0;
-  assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), { verdict: "failed", start: true, recover: false });
+  assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), {
+    verdict: loseRecovery ? "failed" : "passed", start: true, recover: !loseRecovery,
+  });
   assert.equal(steps[0], "run");
   assert.deepEqual(steps.slice(1, 3).sort(), ["approve:recover", "approve:start"]);
-  assert.deepEqual(steps.slice(3), ["inventory", "invoke:start", "start", "invoke:recover"]);
+  assert.deepEqual(steps.slice(3), ["inventory", "invoke:start", "start", "invoke:recover",
+    ...(loseRecovery ? [] : ["drain", "stop", "delete"])]);
   assert.equal(Date.now(), issued.expiresAt + 1);
-  assert.deepEqual(h.values.get(STAGING_USE_KEY), issued);
-  assert.ok(await journal.pending());
-
-  recoveryReachable = true;
-  steps.length = 0;
-  assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), { verdict: "failed", start: false, recover: true });
-  assert.deepEqual(steps, ["run", "approve:recover", "inventory", "invoke:recover", "drain", "stop", "delete"]);
+  if (loseRecovery) {
+    assert.deepEqual(h.values.get(STAGING_USE_KEY), issued);
+    assert.ok(await journal.pending());
+    recoveryReachable = true;
+    steps.length = 0;
+    assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), { verdict: "failed", start: false, recover: true });
+    assert.deepEqual(steps, ["run", "approve:recover", "inventory", "invoke:recover", "drain", "stop", "delete"]);
+  }
   assert.equal(h.runtime.running, false);
   assert.equal(command, undefined);
   assert.equal(await journal.completedFor(issued), true);
   assert.deepEqual(h.values.get(STAGING_USE_KEY), { ...issued, phase: "released" });
   assert.equal(network.mock.callCount(), 0);
+}
+
+test("the AutoMod instance host acquires exactly once and runs both approved actions on the bound Container", async t => {
+  await t.test("startup and recovery complete in one invocation", t => exerciseAutomodInstanceHost(t, false));
+  await t.test("recovery reentry retires the original expired lease", t => exerciseAutomodInstanceHost(t, true));
 });
 
 test("protected AutoMod retires an unused reservation and retries an interrupted release", async t => {
