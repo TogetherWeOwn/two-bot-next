@@ -7366,7 +7366,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(job.get("permissions"), {"contents": "read"})
         self.assertIn("job-inputs", job.get("needs", []))
         self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
-        self.assertEqual(job.get("runs-on"), PUBLIC_RUNNER)
+        self.assertEqual(job.get("runs-on"), PR_GATE_RUNNER)
         outputs = job.get("outputs", {})
         for key in ("matrix", "expected-shards", "legs", "widened", "reason"):
             self.assertIn(key, outputs)
@@ -7396,7 +7396,7 @@ class WorkflowTests(unittest.TestCase):
         # every shard reports its own verdict and timing.
         self.assertEqual(strategy.get("fail-fast"), "false")
         self.assertIn("needs.coverage-plan.outputs.matrix", strategy.get("matrix", ""))
-        self.assertEqual(job.get("runs-on"), PUBLIC_RUNNER)
+        self.assertEqual(job.get("runs-on"), PR_GATE_RUNNER)
         upload = next(
             step for step in job["steps"]
             if step.get("name") == "Upload shard coverage report"
