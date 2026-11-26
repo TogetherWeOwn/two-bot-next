@@ -2634,7 +2634,18 @@ def staging_mcp_proveout_errors(workflow):
     cleanup_if = "always() && steps.use.outputs.expires_at != ''"
     expected = [
         {"uses": STAGING_CHECKOUT_USES,
-         "with": {"persist-credentials": "false", "fetch-depth": "1"}},
+         "with": {
+             "persist-credentials": "false", "fetch-depth": "1",
+             "sparse-checkout-cone-mode": "false",
+             "sparse-checkout": (
+                 "/scripts/script_intake.py\n"
+                 "/scripts/staging_mcp_proveout.py\n"
+                 "/wrangler/scripts/is-direct-invocation.mjs\n"
+                 "/wrangler/scripts/ownership-control-response.mjs\n"
+                 "/wrangler/scripts/staging-use-pipeline.mjs\n"
+                 "/wrangler/scripts/staging-use.mjs\n"
+             ),
+         }},
         {"uses": STAGING_SETUP_NODE_USES,
          "with": {"node-version": "22", "package-manager-cache": "false"}},
         {"id": "use", "env": {**control_env, "STAGING_USE_MINUTES": "15",
