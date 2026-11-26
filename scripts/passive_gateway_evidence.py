@@ -13,6 +13,7 @@ from container_stdout_read import (
 from script_intake import decode_json, read_with_overflow
 
 MAX_PACKET_BYTES = 4 * 1024 * 1024
+SUMMARY_SCHEMA = "passive_gateway_summary.v1"
 PACKET_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z")
 SIGNALS = {
     "gateway_connecting": "two_bot",
@@ -82,7 +83,8 @@ def summarize(packet, *, service, sha, start, end):
     if not builds:
         return {"verdict": "no_build_events"}
     verdict = "observed" if any(signals.values()) else "not_observed"
-    return {"verdict": verdict, "build_sha": sha, "signals": signals}
+    return {"schema": SUMMARY_SCHEMA, "verdict": verdict, "build_sha": sha,
+            "window": {"start": window["start"], "end": window["end"]}, "signals": signals}
 
 
 def main(argv=None, *, stdin=None, stdout=None):
