@@ -59,6 +59,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                         self.close_connection = True
                         value = str(int(value) + 1)
                     repeat = {("duplicate", "Content-Length"): "65536", ("duplicate", "Connection"): "close",
+                              ("duplicate upgrade", "Upgrade"): "h2c",
                               ("duplicate accept", "Sec-WebSocket-Accept"): discord.websocket_accept("forged")}
                     if (failure, key) in repeat:
                         # Keep the valid copy first, then repeat it with a value a
@@ -115,7 +116,8 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                 # Status and reservation stay valid in the later cases, so
                 # only protocol or payload validation can refuse them.
                 for bad_peer, failures in (("gateway", ("missing", "wrong", "challenge", "connection",
-                                                        "duplicate", "duplicate accept", "truncated", "payload")),
+                                                        "duplicate", "duplicate upgrade", "duplicate accept",
+                                                        "truncated", "payload")),
                                            ("REST", ("missing", "wrong", "truncated", "unframed", "oversized",
                                                      "duplicate", "payload"))):
                     for failure in failures:
