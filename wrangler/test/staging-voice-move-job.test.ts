@@ -64,10 +64,10 @@ function beginFixture(ready: ReturnType<typeof mockVoiceMoveWindow>["args"]["rea
     STAGING_USE_SHA: outputs.sha, STAGING_USE_DEPLOYMENT: outputs.deployment_id };
 }
 
-function jobInputs(t: TestContext) {
+function jobInputs(t: TestContext, window = mockVoiceMoveWindow()) {
   const dir = mkdtempSync(join(tmpdir(), "staging-voice-move-job-"));
   t.after(() => rmSync(dir, { recursive: true }));
-  const { args, calls, signed, moves, restoreSource } = mockVoiceMoveWindow();
+  const { args, calls, signed, moves, restoreSource } = window;
   const { ready, fixture, caller, evidence, now } = args;
   const env = { ...beginFixture(ready, dir), STAGING_VOICE_MOVE_PROOF: "true" };
   const expectedRevision = { version_id: "11111111-2222-3333-4444-555555555555", commit: "b".repeat(40) };
@@ -116,6 +116,7 @@ function jobInputs(t: TestContext) {
       runAttempt: Number(env.GITHUB_RUN_ATTEMPT), expiresAt: Number(env.STAGING_USE_EXPIRES_AT),
     }, control, now);
     assertOff(off);
+    return off;
   }
   return { env, inputs, signed, moves, calls, reads, restoreSource, assertOff, finish };
 }
@@ -514,6 +515,59 @@ test("qualified same-session Web handoff refuses a replaced voice fixture assign
         expiresAt: Number(env.STAGING_USE_EXPIRES_AT), sha: env.STAGING_USE_SHA,
         deploymentId: env.STAGING_USE_DEPLOYMENT,
       });
+    });
+  }
+});
+
+test("an earlier Web handoff requires a fresh companion match in the next reservation", async (t) => {
+  for (const refresh of [false, true]) {
+    await t.test(refresh ? "new reservation with current match" : "new reservation with earlier match", async (t) => {
+      const first = jobInputs(t);
+      let now = first.inputs.now();
+      t.mock.method(Date, "now", () => now);
+      let move = first.inputs.webSession.move;
+      const web = mockWebHandoff({
+        ...first.inputs,
+        webSession: { ...first.inputs.webSession, move: (request) => move(request) },
+      });
+      const firstReady = JSON.parse(readFileSync(first.env.STAGING_USE_RECEIPT, "utf8").trimEnd().split("\n").at(-1)!);
+      const { qualification, soakReceipt } = web;
+      const [source, destination] = first.inputs.fixture.channelIds;
+      const moved = [{ discordId: first.inputs.fixture.discordId, channelId: destination }];
+      let webHandoff;
+      let firstOff;
+      try {
+        webHandoff = await web.complete(t.signal);
+        web.enableCompanion();
+        const provider = bindStagingVoiceMoveHandoffProvider(web.scopedInputs, { qualification, soakReceipt, webHandoff });
+        assert.equal(await runStagingVoiceMoveEntry(first.env, provider), "passed");
+        assert.deepEqual(first.moves, moved);
+        assert.equal(web.readCount(), 3);
+      } finally {
+        firstOff = await first.finish();
+      }
+
+      // The old match is only seconds old, but it precedes the next acquisition.
+      // Keep the build, ordered fixture, handoff, and request/move functions identical.
+      const second = jobInputs(t, mockVoiceMoveWindow(1000, { acquiredAt: now + 1000, runId: "12346" }));
+      try {
+        now = second.inputs.now();
+        move = second.inputs.webSession.move;
+        if (refresh) web.enableCompanion();
+        const provider = bindStagingVoiceMoveHandoffProvider({
+          ...second.inputs, webSession: web.scopedInputs.webSession, previousReady: firstReady, previousOff: firstOff,
+        }, { qualification, soakReceipt, webHandoff });
+
+        assert.equal(await runStagingVoiceMoveEntry(second.env, provider), refresh ? "passed" : "failed");
+        assert.equal(web.readCount(), 4, "the second job reads the companion again");
+        assert.deepEqual(second.reads, ["channels"]);
+        assert.deepEqual(second.signed.map(({ channel_id }) => channel_id), refresh ? [destination, source, destination] : []);
+        assert.deepEqual(second.moves, refresh ? moved : []);
+        const finishCalls = ["status", "release", "status"];
+        assert.deepEqual(second.calls, refresh ? ["assert", "assert", "assert", ...finishCalls] : finishCalls);
+      } finally {
+        await second.finish();
+      }
     });
   }
 });
