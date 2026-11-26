@@ -9944,16 +9944,25 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(checkout.get("sparse-checkout-cone-mode"), "false")
         self.assertTrue(checkout.get("sparse-checkout"))
 
-        # Ask Git to apply the job's rules to the actual tracked paths. A string
-        # check would miss changes in match scope or a later exclusion rule.
-        tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT, timeout=10)
+        # Materialize the job's rules in a disposable checkout. The lint image's
+        # Git supports sparse-checkout set but predates check-rules.
+        objects, revision = subprocess.check_output(
+            ["git", "rev-parse", "--path-format=absolute", "--git-path", "objects", "HEAD"],
+            cwd=ROOT, text=True, timeout=10,
+        ).splitlines()
         with tempfile.TemporaryDirectory() as directory:
-            rules = Path(directory) / "sparse-checkout"
-            rules.write_text(checkout["sparse-checkout"], encoding="utf-8")
-            selected = subprocess.check_output(
-                ["git", "sparse-checkout", "check-rules", "--no-cone", "--rules-file", str(rules), "-z"],
-                cwd=ROOT, input=tracked, timeout=10,
+            subprocess.run(["git", "init", "--quiet"], cwd=directory, check=True, timeout=10)
+            # Borrow objects without changing Git config or the index of the runner-owned checkout.
+            (Path(directory) / ".git/objects/info/alternates").write_text(objects + "\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "sparse-checkout", "set", "--no-cone", "--stdin"], cwd=directory,
+                input=checkout["sparse-checkout"], text=True, check=True, timeout=10,
             )
+            subprocess.run(["git", "checkout", "--quiet", "--detach", revision], cwd=directory,
+                           check=True, timeout=10)
+            tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=directory, timeout=10)
+            paths = tracked.rstrip(b"\0").split(b"\0")
+            selected = {path for path in paths if os.path.lexists(Path(directory) / os.fsdecode(path))}
 
         inputs = {
             b"Dockerfile",  # The generated config still validates the other environments' images.
@@ -9975,8 +9984,8 @@ class WorkflowTests(unittest.TestCase):
             b"wrangler/tsconfig.json",
             b"wrangler/wrangler.toml",
         }
-        inputs.update(path for path in tracked.split(b"\0") if path.startswith(b"wrangler/src/"))
-        self.assertEqual(set(selected.split(b"\0")) - {b""}, inputs)
+        inputs.update(path for path in paths if path.startswith(b"wrangler/src/"))
+        self.assertEqual(selected, inputs)
 
     def test_staging_events_read_shape_is_pinned(self):
         workflows = self.workflows
