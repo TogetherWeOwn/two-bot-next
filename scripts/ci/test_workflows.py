@@ -242,7 +242,7 @@ DEPLOY_MARKERS = (
 )
 # Canonical parsed graph for the protected recovery callee. This pins the
 # caller guard, Environment split, exact commands, permissions, and handoffs.
-PRODUCTION_RECOVERY_GRAPH = "581651c0eb95b463adaf47dfbb9465ff8d886a829911bce50e34aede33bf907d"
+PRODUCTION_RECOVERY_GRAPH = "bdecf0c2a8ad9ee6b6402527f2b22fc199b48279fc0992177326685409ddf894"
 
 
 class UniqueKeyLoader(yaml.BaseLoader):
@@ -1692,8 +1692,10 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
             errors.append(f"{name}: must preserve all pending staging migration requests")
         errors.extend(staging_claim_errors(claim))
     else:
-        if workflow.get("concurrency") != {"group": "production-migrate", "cancel-in-progress": "false"}:
-            errors.append(f"{name}: must serialize production plan and apply runs")
+        if (workflow.get("concurrency") != {"group": "production-migrate", "cancel-in-progress": "false", "queue": "max"}
+                or any("concurrency" in job for job in (plan, claim))
+                or apply.get("concurrency") != {"group": "deploy-production", "cancel-in-progress": "false", "queue": "max"}):
+            errors.append(f"{name}: only the apply job may share the production deploy and recovery lane")
         errors.extend(production_claim_errors(claim))
     if plan.get("environment") != plan_env:
         errors.append(f"{name}:plan: must read the {plan_env} Environment binding")
@@ -4846,6 +4848,12 @@ DISJOINT_PRE_REAPER_EXPRESSIONS.update({
     ("staging-voice-move.yml", None): "${{ inputs.verify_lease && github.ref == 'refs/heads/main' && "
                                     "github.ref_protected && github.run_attempt == 1 && 'staging-lifecycle' || "
                                     "format('staging-voice-move-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
+    ("staging-automod-preview.yml", None): (
+        "${{ inputs.rehearse && github.repository_id == '1396224242' && github.ref == 'refs/heads/main' && "
+        "github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main' && "
+        "github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1 && "
+        "'staging-lifecycle' || format('staging-automod-refused-{0}-{1}', github.run_id, github.run_attempt) }}"
+    ),
     ("pipeline-benchmark.yml", None): "${{ github.workflow }}-pipeline-benchmark-"
                                      "${{ github.event.pull_request.number || github.ref }}",
     ("deploy-production.yml", "production"): PRODUCTION_GROUP,
@@ -5017,7 +5025,7 @@ def workflow_policy_errors(workflows):
         if name == "staging-automod-preview.yml":
             contract = Path(__file__).parent / "fixtures/staging_automod_preview_workflow.json"
             if workflow != json.loads(contract.read_text()):
-                errors.append(f"{name}: expected the disabled, synthetic-only staging job")
+                errors.append(f"{name}: expected the default-off protected staging dispatch")
             continue
         if name == "build-predecessor.yml":
             contract = Path(__file__).parent / "fixtures/build_predecessor_workflow.json"
@@ -5129,6 +5137,21 @@ class ProductionStatusTests(unittest.TestCase):
             import production_ownership_status as status
         self.status = status
         self.fixture = json.loads((Path(__file__).parent / "fixtures/production_ownership_status_provider.json").read_text())
+
+    def test_recovery_projection_preserves_unfinished_rollout_status(self):
+        status = self.status
+        account = "c" * 32
+        provider = self.fixture["provider"]
+        rollouts = next(rows for key, rows in provider.items() if "/rollouts?" in key)
+        client = Mock()
+        client.api.side_effect = provider.__getitem__
+        for phase in ("pending", "progressing"):
+            with self.subTest(phase=phase):
+                rollouts[0]["status"] = phase
+                report = status.provider_sample(client, account, allow_rollout=True)
+                self.assertEqual(report["container"]["rollout_status"], phase)
+                with self.assertRaisesRegex(status.GateError, "latest_rollout_unbound"):
+                    status.provider_sample(client, account)
 
     def test_wrong_dispatch_and_environment_refuse(self):
         status, fixture = self.status, self.fixture
@@ -7685,11 +7708,12 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(file=file_name, mutation=label):
                     self.assertNotEqual(check(changed), [])
 
-    def test_staging_automod_preview_is_dormant(self):
+    def test_staging_automod_preview_requires_protected_opt_in(self):
         name = "staging-automod-preview.yml"
         self.assertEqual(workflow_policy_errors(self.workflows), [])
         for keys, change in (
-                (("on",), {"workflow_dispatch": {}}),
+                (("on",), {"workflow_call": ""}),
+                (("on", "workflow_dispatch", "inputs", "rehearse"), {"default": "true"}),
                 (("concurrency",), {"group": "automod-only"}),
                 (("jobs", "dry-run"), {"if": "true"}),
                 (("jobs", "dry-run", "permissions"), {"id-token": "write"}),
@@ -7697,19 +7721,27 @@ class WorkflowTests(unittest.TestCase):
                 (("jobs", "dry-run", "steps", 3), {
                     "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
                 (("jobs", "dry-run", "steps", 4), {
-                    "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}})):
+                    "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
+                (("jobs", "dry-run", "steps", 5), {"env": {"STAGING_AUTOMOD_REHEARSAL": "true"}}),
+                (("jobs", "dry-run", "steps", 5, "env"), {
+                    "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"})):
             with self.subTest(keys=keys, change=change):
                 workflows = deepcopy(self.workflows)
                 node = workflows[name]
                 for key in keys:
                     node = node[key]
                 node.update(change)
-                self.assertIn(f"{name}: expected the disabled, synthetic-only staging job",
+                self.assertIn(f"{name}: expected the default-off protected staging dispatch",
                               workflow_policy_errors(workflows))
         workflows = deepcopy(self.workflows)
         workflows["check.yml"]["jobs"]["worker"] = {"uses": f"./.github/workflows/{name}"}
         self.assertIn("check.yml:worker: deployment/probe alternative outside approved deploy workflows",
                       workflow_policy_errors(workflows))
+
+        workflows = deepcopy(self.workflows)
+        lock = workflows[name]["concurrency"]
+        lock["group"] = lock["group"].replace("staging-automod-refused-{0}-{1}", PRE_REAPER_QUEUE)
+        self.assertIn(f"{name}: the PRE sweep queue must remain exclusive", staging_pre_reaper_errors(workflows))
 
     def test_staging_pre_reaper_is_dormant(self):
         self.assertEqual(staging_pre_reaper_errors(self.workflows), [])
@@ -9568,6 +9600,10 @@ class WorkflowTests(unittest.TestCase):
             change(workflow)
             return production_migrate_errors(workflow)
 
+        for job in ("plan", "claim"):
+            with self.subTest(job=job):
+                self.assertTrue(mutated(lambda w: w["jobs"][job].update(concurrency={"group": "deploy-production"})))
+        self.assertTrue(mutated(lambda w: w["jobs"]["apply"].pop("concurrency")))
         for trigger in ("push", "pull_request", "schedule", "workflow_call"):
             with self.subTest(trigger=trigger):
                 self.assertTrue(mutated(lambda w, t=trigger: w["on"].update({t: ""})))

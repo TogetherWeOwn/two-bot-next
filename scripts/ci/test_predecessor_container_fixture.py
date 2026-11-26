@@ -5,13 +5,17 @@ from dataclasses import replace
 import json
 import socket
 import sqlite3
+import subprocess
+import sys
 import unittest
 from unittest.mock import Mock
+from uuid import UUID
 
 import predecessor_container_fixture as fixture
 from fixtures.predecessor_discord import COMMANDS, Discord
 from fixtures.predecessor_snapshots import GUILD, PROJECTIONS
-from test_pre_start_stop import Endpoint, PreFixture, ProbeReply, TARGET
+from pre_target import Inventory, Resource, Target
+from test_pre_start_stop import Endpoint, PreFixture, ProbeReply
 
 
 STAMPS = {"build_revision": fixture.SOURCE, "build_id": "test-1", "deploy_id": "test.1"}
@@ -19,6 +23,15 @@ IMAGE = "sha256:" + "a" * 64
 PIN = {"image_id": IMAGE, "manifest_digest": "sha256:" + "b" * 64, **STAMPS}
 POSTGRES_IMAGE = "sha256:" + "c" * 64
 MOCK_IMAGE = "sha256:" + "d" * 64
+APP_ID = "5cb771af-3421-4223-8a06-39e061f06400"
+OTHER_APP_ID = "bcf0c525-7a87-4741-9bd7-cde8a22e4cb0"
+
+
+def admission(tip, scope="pre-fixture-test"):
+    target = Target(scope, 123, 1_800_000_000, f"{tip:04}/0465")
+    inventory = Inventory(target, None, Resource(target.container_name, APP_ID), 0, False, True)
+    url = f"postgresql://pre_fixture@two-bot-next-pre-123-1800003600-{tip:04}-0465.{scope}.invalid/pre"
+    return target, fixture.AppDatabaseReadback(inventory, url)
 
 
 def query_ledger(query, tip, *, recovery_timestamp):
@@ -55,6 +68,17 @@ def query_ledger(query, tip, *, recovery_timestamp):
 
 
 class PredecessorContainerFixtureTests(unittest.TestCase):
+    def test_cli_help_without_tomllib(self):
+        result = subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import runpy, sys; sys.modules['tomllib'] = None; "
+             "sys.argv = ['predecessor_container_fixture.py', '--help']; "
+             "runpy.run_path(sys.argv[0], run_name='__main__')"],
+            cwd=fixture.ROOT / "scripts/ci", capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Opt-in direct-container rehearsal", result.stdout)
+
     def test_mock_command_publication(self):
         for token, body, status in [(fixture.TOKEN, b'[{"name":"help"}]', b"200"),
                                     ("foreign", b"[]", b"401"), (fixture.TOKEN, b"{}", b"400"),
@@ -83,17 +107,61 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
             with self.subTest(stamp=stamp), self.assertRaisesRegex(fixture.Refused, "identity or stamps"):
                 fixture.verify_image(docker, PIN, False)
 
+    def test_bound_endpoint_refuses_foreign_app_or_database_before_mutation(self):
+        target, readback = admission(473)
+        inventory = readback.inventory
+        url = readback.database_url
+        # Give every case a compatible schema. Identity alone must stop the
+        # rehearsal before the first Docker operation, even snapshot seeding.
+        for case, observed, reason in (
+            ("shared app", replace(readback, inventory=replace(inventory, container=Resource(
+                "two-bot-next-staging", APP_ID))), "app inventory mismatch"),
+            ("other app UUID", replace(readback, inventory=replace(inventory, container=Resource(
+                target.container_name, OTHER_APP_ID))), "app identity mismatch"),
+            ("absent app", replace(readback, inventory=replace(inventory, container=None)),
+             "app identity mismatch"),
+            ("other app scope", replace(readback, inventory=replace(inventory, target=replace(
+                target, scope="pre-fixture-other"))), "app inventory mismatch"),
+            ("unconfirmed app", replace(readback, inventory=replace(inventory, complete=False)),
+             "app inventory mismatch"),
+            ("shared DB", replace(readback, database_url="postgresql://pre_fixture@shared-staging.invalid/pre"),
+             "database identity mismatch"),
+            ("other DB scope", replace(readback, database_url=url.replace("pre-fixture-test", "pre-fixture-other")),
+             "database identity mismatch"),
+            ("other DB run", replace(readback, database_url=url.replace("-123-", "-124-")),
+             "database identity mismatch"),
+            ("other PRE shape", replace(readback, database_url=admission(475)[1].database_url),
+             "database identity mismatch"),
+            ("other database", replace(readback, database_url=url + "_other"), "database identity mismatch"),
+            ("URL override", replace(readback, database_url=url + "?host=shared-staging.invalid"),
+             "database identity mismatch"),
+            ("missing readback", None, "missing isolated PRE admission or readback"),
+        ):
+            with self.subTest(case=case):
+                docker = Mock(return_value="t")
+                with self.assertRaisesRegex(fixture.Refused, reason):
+                    fixture.run_bound_endpoint(docker, IMAGE, IMAGE, IMAGE, STAMPS, target=target,
+                                               expected_app_id=APP_ID, readback=observed)
+                docker.assert_not_called()
+
     def test_endpoints_and_failure_cleanup(self):
         prefixes = set()
-        for tip, post_start_tip, failure in [
-            (473, 473, None), (475, 475, None),
-            (473, 475, "ledger"), (475, 473, "ledger_query"),
-            (475, 475, "retained_timestamp"),
-            (473, 473, "stamp"), (475, 475, "checkpoint"),
-            (473, 473, "setup"), (475, 475, "premature"), (473, 473, "cancel"),
+        for tip, post_start_tip, failure, scope in [
+            (473, 473, None, "pre-fixture-prodcheck"),
+            (475, 475, None, "pre-fixture-pooler"),
+            (473, 475, "ledger", "pre-fixture-prodcheck"),
+            (475, 473, "ledger_query", "pre-fixture-pooler"),
+            (475, 475, "retained_timestamp", "pre-fixture-pooler"),
+            (473, 473, "stamp", "pre-fixture-test"),
+            (475, 475, "checkpoint", "pre-fixture-test"),
+            (473, 473, "setup", "pre-fixture-test"),
+            (475, 475, "premature", "pre-fixture-test"),
+            (473, 473, "cancel", "pre-fixture-test"),
         ]:
             containers, released = {}, False
-            pre = PreFixture(replace(TARGET, shape=f"{tip:04d}/0465"))
+            target, readback = admission(tip, scope)
+            pre = PreFixture(target)
+            pre.deployment = replace(pre.deployment, container_id=UUID(APP_ID))
             controller = pre.controller(pre.authorize)
             deployment = None
             trace = []
@@ -122,6 +190,8 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                         self.assertIn(f"type=bind,src={decoder},dst=/script_intake.py,readonly", args)
                     if name.endswith("-bot"):
                         self.assertEqual(args[-1], IMAGE)
+                        self.assertEqual([arg for arg in args if arg.startswith("DATABASE_URL=")],
+                                         ["DATABASE_URL=postgres://offline_bot:offline-fixture@127.0.0.1/postgres"])
                         if failure == "cancel":
                             raise KeyboardInterrupt
                         # The private adapter stands in for completed scoped
@@ -180,9 +250,10 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                         return json.dumps([reply.status, json.loads(reply.body)])
                     return json.dumps([status, body])
 
-            with self.subTest(tip=tip, post_start_tip=post_start_tip, failure=failure):
+            with self.subTest(tip=tip, post_start_tip=post_start_tip, failure=failure, scope=scope):
                 def rehearse():
-                    return fixture.run_endpoint(docker, IMAGE, POSTGRES_IMAGE, MOCK_IMAGE, STAMPS, tip)
+                    return fixture.run_bound_endpoint(docker, IMAGE, POSTGRES_IMAGE, MOCK_IMAGE, STAMPS, target=target,
+                                                      expected_app_id=APP_ID, readback=readback)
 
                 if failure == "cancel":
                     with self.assertRaises(KeyboardInterrupt):

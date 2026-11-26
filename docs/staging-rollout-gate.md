@@ -142,6 +142,13 @@ offline configuration and validates cleanup evidence.
    both counts proved zero. Workflow status and resource disappearance alone
    leave stop unverified. See the [cleanup fixtures](../scripts/ci/test_pre_target.py).
 
+The [dormant Container lookup](../scripts/pre_container_lookup.py) checks the
+exact Get Application path, staging account, pinned app UUID and full PRE
+reservation. A 404 counts only when the authenticated reader can attribute it
+to the application handler's documented not-found result independently of the
+provider's generic error envelope. Cleanup still requires separate evidence of
+instance counts and startup settlement. [Get Application schema](https://github.com/cloudflare/api-schemas/blob/9a5e4d44bd74d90fa9e4822142b8eb67e4ba3c70/openapi.json)
+
 The [dormant sweep workflow](https://github.com/TogetherWeOwn/two-bot-next/blob/b3e6030f0493683efd94413aacdd04379e45b2fb/.github/workflows/staging-pre-reaper.yml)
 is intended as a scheduled cleanup fallback. Scheduled runs can arrive late
 or be dropped. The staging release operator owns an unverified stop or cleanup
