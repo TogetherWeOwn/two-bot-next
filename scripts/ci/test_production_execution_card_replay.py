@@ -7,8 +7,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from test_t0_acceptance_report import PRODUCTION, SCRIPTS, WATCH_EMPTY, WATCH_HEADER, WATCH_HELP, WATCH_RETURN
+
+sys.path.insert(0, str(SCRIPTS))
+from test_staging_help_embed_smoke import CHANNEL, STAGING_GUILD, TOKEN, FakeDiscord, payloads, smoke
 
 
 class ProductionExecutionCardReplayTests(unittest.TestCase):
@@ -60,6 +64,51 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
         report = json.loads(self.invoke("t0_acceptance_report.py", *args))
         self.assertEqual(report["expected"], expected)
         return report["observations"]
+
+    def test_help_watch_distinguishes_failed_cleanup_from_unavailable_observation(self):
+        payload_path = self.root / "help-payloads.json"
+        payload_path.write_text(json.dumps(payloads()), encoding="utf-8")
+        window_path = self.root / "window.json"
+        window_path.write_text(json.dumps(PRODUCTION), encoding="utf-8")
+        cases = (
+            (204, "pass", "readbacks_and_deletions_recorded"),
+            (403, "fail", "probe_failed"),
+            (None, "not_observed", "not_observed"),
+        )
+        for delete_status, expected_disposition, result in cases:
+            with self.subTest(disposition=expected_disposition):
+                disposition = "not_observed"
+                if delete_status is not None:
+                    discord = FakeDiscord(delete_status=delete_status)
+                    with mock.patch.object(smoke, "make_transport", side_effect=AssertionError("network access")):
+                        smoke_report = smoke.run(payload_path, STAGING_GUILD, TOKEN, CHANNEL, transport=discord)
+                    receipt = smoke_report.evidence()
+                    disposition = receipt["verdict"].lower()
+                    self.assertEqual(disposition, expected_disposition)
+                    first_row = receipt["rows"][0]
+                    self.assertEqual(first_row["name"], "help")
+                    message_path = f"/channels/{CHANNEL}/messages/{first_row['message_id']}"
+                    self.assertEqual([method for method, path, _ in discord.calls if path == message_path],
+                                     ["GET", "DELETE"])
+                    if disposition == "fail":
+                        self.assertEqual(smoke_report.exit_code(), 3)
+                        self.assertEqual(len(receipt["rows"]), 1)
+                        self.assertIs(first_row["cleanup_failed"], True)
+                        self.assertTrue(first_row["actual"].startswith("cleanup delete failed ("))
+                        self.assertEqual(set(discord.messages), {first_row["message_id"]})
+                    else:
+                        self.assertEqual(smoke_report.exit_code(), 0)
+                        self.assertEqual(len(receipt["rows"]), len(smoke.EMBED_KEYS))
+                        self.assertFalse(discord.messages)
+
+                # The operator transcribes the approved card row. An unavailable
+                # observation has no cleanup verdict to transcribe.
+                source = WATCH_HELP.replace(b"\tpass\n", b"\t" + disposition.encode() + b"\n")
+                report = self.assemble_watch("help", source, window_path)
+                row = self.replay(PRODUCTION, {"help": (report, PRODUCTION)})["help"]
+                self.assertEqual((row["status"], row["window"], row["result"]),
+                                 ("attributed", PRODUCTION, result))
+                self.assertEqual("needed" in row, disposition != "pass")
 
     def test_rollback_window_rejects_pre_rollback_readiness_with_exact_digest(self):
         # The restored image came from the same source revision. Its serving identity is distinct.
