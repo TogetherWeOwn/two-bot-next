@@ -107,7 +107,8 @@ EXPLICIT_INHERITED_GUARD = "(inputs.deploy_staging_call || " + INHERITED_GUARD +
 MAIN_ONLY = "github.ref == 'refs/heads/main'"
 VOICE_MOVE_GUARD = f"inputs.verify_lease && {MAIN_ONLY} && github.ref_protected && github.run_attempt == 1"
 AUTOMOD_GUARD = (
-    "github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main'"
+    f"inputs.rehearse && github.repository_id == '1396224242' && {MAIN_ONLY}"
+    " && github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main'"
     " && github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1"
 )
 # (workflow, job) that must hold the canonical group when run standalone,
@@ -627,10 +628,9 @@ def repository_errors(wfs, canonical):
                 errors.append(f"{file}: dispatch must hold the guarded canonical lifecycle lock")
         if file == AUTOMOD:
             job = (workflow.get("jobs") or {}).get("dry-run") or {}
-            if (events(workflow) != ("workflow_call",) or job.get("if") != AUTOMOD_GUARD
-                    or "concurrency" in job or workflow.get("concurrency") != {
-                        "group": canonical, "cancel-in-progress": "false", "queue": "max"}):
-                errors.append(f"{file}: the dormant job must reserve the full canonical lifecycle window")
+            if (events(workflow) != ("workflow_dispatch",) or job.get("if") != AUTOMOD_GUARD
+                    or "concurrency" in job or workflow.get("concurrency") != automod_queue(canonical)):
+                errors.append(f"{file}: dispatch must hold the guarded canonical lifecycle lock")
         triggers = tuple(t for t in events(workflow) if t != "workflow_call")
         nodes = [("workflow", workflow)] + list((workflow.get("jobs") or {}).items())
         for name, node in nodes:
@@ -677,6 +677,13 @@ def voice_move_queue(canonical):
     return {"group": expr(f"{VOICE_MOVE_GUARD} && '{canonical}' || "
                           "format('staging-voice-move-refused-{0}-{1}', github.run_id, github.run_attempt)"),
             "cancel-in-progress": "false", "queue": "max"}
+
+
+def automod_queue(canonical):
+    return {"group": expr(f"{AUTOMOD_GUARD} && '{canonical}' || "
+                          "format('staging-automod-refused-{0}-{1}', github.run_id, github.run_attempt)"),
+            "cancel-in-progress": "false", "queue": "max"}
+
 
 GUARD_SHA = expr("needs.guard.outputs.sha")
 # Ordinary guarded deploy only: rollback and the live-SHA cure never queue on
@@ -912,7 +919,7 @@ def target_fixture(group=FIXTURE_GROUP):
     deploy["concurrency"] = dict(lock)
     wfs[MEASUREMENT]["concurrency"] = measurement_queue(group)
     wfs[VOICE_MOVE]["concurrency"] = voice_move_queue(group)
-    wfs[AUTOMOD]["concurrency"] = dict(lock)
+    wfs[AUTOMOD]["concurrency"] = automod_queue(group)
     jobs = deploy["jobs"]
     for workflow in (deploy, wfs[VOICE], wfs[HELP]):
         strip_staging_use(workflow)

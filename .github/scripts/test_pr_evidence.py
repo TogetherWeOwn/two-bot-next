@@ -1,5 +1,6 @@
 import sys
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pr_evidence as evidence
@@ -20,9 +21,31 @@ BODY = "\n".join([
 ])
 PR = {"number": 1, "state": "open", "base": {"repo": {"full_name": REPO}, "sha": OLD},
       "head": {"sha": HEAD}, "body": BODY}
+FOOTER = Path(__file__).with_name("fixtures").joinpath("cubic-pr-footer.txt").read_text(encoding="utf-8")
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_generated_footer_stays_outside_attestation(self):
+        body = BODY.replace("risk_tier: T1", "risk_tier: T0").replace("- [ ] D", "- [x] D")
+        notes = "\n\n## Notes for reviewers\n\n"
+        attribution = "Created with the sample model in the sample harness.\n\n"
+        read = lambda _: SOURCE
+
+        for trailing in (notes + FOOTER, notes + attribution + FOOTER,
+                         (notes + attribution + FOOTER).replace("\n", "\r\n")):
+            with self.subTest(trailing=trailing[:70]):
+                evidence.validate(policy, body + trailing, FILES, read)
+
+        for malformed, issue in (
+                (body + "\n\n" + attribution + FOOTER, "checklist_shape_invalid"),
+                (body + "\n\n" + FOOTER + notes, "checklist_shape_invalid"),
+                (body + "\n\n<div>Unexpected evidence</div>" + notes + FOOTER, "checklist_shape_invalid"),
+                (body.replace("[x] D8", "[ ] D8") + notes + FOOTER, "checklist_unchecked"),
+                (body.replace("## Attestation", "## Other") + notes + FOOTER, "include Attestation")):
+            with self.subTest(issue=issue):
+                with self.assertRaisesRegex(evidence.EvidenceError, issue):
+                    evidence.validate(policy, malformed, FILES, read)
+
     def test_attempt_urls_only_after_head_and_job_match(self):
         run = f"{HEAD}\tpull_request\t.github/workflows/check.yml\t12\t2"
         job = f"34\t{HEAD}\t12\t2\tsuccess\tworker check"
@@ -121,7 +144,10 @@ class CurrentEvidenceTests(unittest.TestCase):
 
     def test_formatting_and_identity_changes_invalidate_verdict(self):
         prior = evidence.evaluate_current(policy, self.reader, *self.identity)
-        for body in (BODY + "\n", BODY.replace("\n", "\r\n"), BODY + "\n<!-- updated -->"):
+        with_footer = BODY + "\n" + FOOTER
+        self.assertEqual(evidence.evidence_sections(policy, BODY), evidence.evidence_sections(policy, with_footer))
+        for body in (BODY + "\n", BODY.replace("\n", "\r\n"), BODY + "\n<!-- updated -->",
+                     with_footer):
             with self.subTest(body=body[-25:]):
                 self.reader.get.return_value = dict(PR, body=body)
                 self.assertFalse(prior.matches_current(self.reader, *self.identity))
