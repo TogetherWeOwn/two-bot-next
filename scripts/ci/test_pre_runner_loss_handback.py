@@ -87,10 +87,12 @@ class PreRunnerLossHandbackTests(unittest.TestCase):
         publication_settled = True
         store.now = target.expires_at
         reaper.events.clear()
+        # The runtime fixture's clock stays in-window so only the fence can deny effects.
+        self.assertTrue(runtime.external_stop.allows_effect(target, START))
         self.assertFalse(stop.stop())
         closed = replace(opened, closed=True)
         self.assertEqual(store.read(target), closed)
-        self.assertTrue(runtime.fenced)
+        self.assertFalse(runtime.external_stop.allows_effect(target, START))
         observe.assert_called_once_with(closed)
         with self.assertRaisesRegex(SweepError, "^PRE container stop could not be verified$"):
             sweep_target(target, reaper, now=store.now)
