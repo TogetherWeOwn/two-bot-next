@@ -206,6 +206,18 @@ jobs:
           path: tooling
           persist-credentials: false
           fetch-depth: 1
+          # The plan verifier reads the manifest from the source checkout.
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/build_identity.py
+            /scripts/ci/staging_migrate_claim.py
+            /scripts/ci/staging_rollback_compatibility.py
+            /scripts/rollback_proof.py
+            /scripts/script_intake.py
+            /scripts/staging_bootstrap.py
+            /scripts/staging_recovery_status.py
+            /scripts/staging_rollout.py
+            /scripts/worker_container_rollback.py
       - name: Verify the recovery plan and both ledgers
         id: recovery-plan
         if: ${{ inputs.recovery_mode != 'standard' }}
