@@ -48,6 +48,11 @@ jobs:
       pull-requests: write # Maintain advisory and required gate comments.
     uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@649943c1ed8a1af8f8760e075f3923237dd72e50
     with:
+      runs-on: >-
+        ${{ toJSON((github.event_name == 'pull_request' || github.event_name == 'pull_request_review')
+        && github.event.pull_request.head.repo.full_name == github.repository
+        && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+        && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest') }}
       pr-number: ${{ inputs.pr_number || '' }}
       advisory-label: true
       # The generated inventory is excluded. Hand-written migration SQL is counted.
