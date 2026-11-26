@@ -199,6 +199,36 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "FAIL: signed attendance response did not match the expected envelope\n")
         self.assertEqual(calls, [("GET", ORIGIN + "/readyz"), ("POST", ORIGIN + "/internal/actions")])
 
+    def test_finalized_probe_stops_when_serving_build_switches(self):
+        args = ["finalized", "--rollout", "rollout", "--observed", "observed",
+                "--fixture-start", START.strftime("%Y-%m-%dT%H:%M:%SZ"), "--execute"]
+        env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
+               "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
+        ready = ("GET", ORIGIN + "/readyz")
+        signed = ("POST", ORIGIN + "/internal/actions")
+        for drift in (False, True):
+            with self.subTest(build_switch=drift):
+                peer, keys, _ = self.signed_peer("finalized", drift=drift)
+                check = Mock(side_effect=peer)
+                with (patch.object(acceptance, "read_object", side_effect=[ROLLOUT, active_observation()]),
+                      patch.object(acceptance.time, "time", return_value=START.timestamp() + 2760),
+                      patch.object(acceptance.time, "monotonic", return_value=0),
+                      patch("sys.stdout", new_callable=StringIO) as stdout,
+                      patch("sys.stderr", new_callable=StringIO) as stderr):
+                    status = acceptance.main(args, env=env, check=check)
+
+                verdict = status, stdout.getvalue(), stderr.getvalue()
+                requests = [entry.args[0] for entry in check.call_args_list]
+                traffic = [(request.get_method(), request.full_url) for request in requests]
+                if drift:
+                    self.assertEqual(traffic, [ready, signed, ready])
+                    self.assertEqual(keys, [EVENT])
+                    self.assertEqual(verdict, (1, "", "FAIL: serving build did not match the staging rollout\n"))
+                else:
+                    self.assertEqual(traffic, [ready, signed, ready, signed, ready])
+                    self.assertEqual(keys, [EVENT, EVENT + ":foreign"])
+                    self.assertEqual(verdict, (0, "PASS: attendance finalized\n", ""))
+
     def test_execute_requires_a_coherent_lease_that_covers_the_armed_probe(self):
         expires = START.timestamp() + 3600
         latest_start = expires - acceptance.RUN_BUDGET
