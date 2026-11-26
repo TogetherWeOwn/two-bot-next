@@ -9,23 +9,25 @@ import sys
 import yaml
 
 
-AUTOMATIC = {"pull_request", "pull_request_target", "push", "workflow_run"}
-PR_EVENTS = {"pull_request", "pull_request_target"}
+FILTERABLE = {"pull_request", "pull_request_target", "push"}
+PR_EVENTS = {"pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment"}
+INDIRECT_OR_EXPLICIT = {"workflow_call", "workflow_dispatch", "schedule"}
 CODE_EVENTS = {"opened", "synchronize", "reopened"}
 METADATA_EVENTS = CODE_EVENTS | {"ready_for_review"}
+METADATA_REFRESH = {"supply-chain.yml", "pr-evidence.yml"}
 MAX_WORKFLOW_BYTES = 1024 * 1024
 HEADER = re.compile(r"^# guards: (\S+)(?:[ \t]+\([^\r\n]*\))?[ \t]*$", re.MULTILINE)
 RELEASES = {
-    "check.yml": "release:exact-main-ci",
-    "supply-chain.yml": "release:main-commit-lint-and-secret-scan",
-    "deploy-production.yml": "release:production-promotion",
-    "staging-migrate-reviewed.yml": "release:reviewed-staging-migration",
+    "check.yml": ("release:exact-main-ci", {"pull_request", "merge_group", "push"}),
+    "supply-chain.yml": ("release:main-commit-lint-and-secret-scan", {"pull_request", "merge_group", "push"}),
+    "deploy-production.yml": ("release:production-promotion", {"workflow_run"}),
+    "staging-migrate-reviewed.yml": ("release:reviewed-staging-migration", {"push"}),
 }
 # These existing advisory checks need to see PR changes across the repository.
 # Bound their automatic surfaces so an annotation cannot add new triggers.
 ADVISORY_PR_TYPES = {
     "mutation.yml": CODE_EVENTS,
-    "pr-evidence.yml": METADATA_EVENTS,
+    "pr-evidence.yml": METADATA_EVENTS | {"edited"},
     "review-rules.yml": CODE_EVENTS,
     "test-guard.yml": METADATA_EVENTS | {"labeled", "unlabeled"},
 }
@@ -39,7 +41,7 @@ class UniqueKeyLoader(yaml.BaseLoader):
         mapping = {}
         for key_node, value_node in node.value:
             key = self.construct_object(key_node, deep=deep)
-            if not isinstance(key, str) or key in mapping:
+            if not isinstance(key, str) or key == "<<" or key in mapping:
                 raise ValueError("invalid or duplicate YAML key")
             mapping[key] = self.construct_object(value_node, deep=deep)
         return mapping
@@ -56,7 +58,7 @@ def trigger_options(workflow):
     if not isinstance(events, dict) or not events:
         raise ValueError("missing or invalid workflow triggers")
     settings = {}
-    for event in events.keys() & AUTOMATIC:
+    for event in events.keys() - INDIRECT_OR_EXPLICIT:
         options = events[event]
         if options in ("", "null", "~"):
             options = {}
@@ -88,7 +90,7 @@ def can_push_main(options):
 def has_path_filter(options):
     paths = options_list(options, "paths")
     ignored = options_list(options, "paths-ignore")
-    return bool(paths) != bool(ignored)
+    return bool(paths) != bool(ignored) and not set(paths or ()) & {"**", "**/*"}
 
 
 def findings(name, data):
@@ -100,30 +102,30 @@ def findings(name, data):
     job_names = {job.get("name", key) for key, job in workflow["jobs"].items()}
     markers = HEADER.findall(text)
     guard = markers[0] if len(markers) == 1 else ""
-    release = RELEASES.get(name) == guard
+    release = RELEASES.get(name) == (guard, set(events))
     pr_types = {event: set(options_list(events[event], "types") or CODE_EVENTS)
                 for event in events.keys() & PR_EVENTS}
-    approved_advisory = (set(events) == {"pull_request"} and name in ADVISORY_PR_TYPES
+    advisory_events = {"pull_request", "merge_group"} if name == "review-rules.yml" else {"pull_request"}
+    approved_advisory = (set(events) == advisory_events and name in ADVISORY_PR_TYPES
                          and pr_types["pull_request"] <= ADVISORY_PR_TYPES[name])
     legacy = name == "configuration-reference.yml" and hashlib.sha256(data).hexdigest() == LEGACY_SNAPSHOT
-    branch = guard.removeprefix("branch:")
-    approved_branch = (guard.startswith("branch:ci/") and set(events) == {"push"}
-                       and re.fullmatch(r"ci/[A-Za-z0-9._/-]+", branch)
-                       and events["push"] == {"branches": [branch]})
-    required = guard.startswith("required:") and guard.removeprefix("required:") in job_names
+    approved_branch = (name == "vote-kick-fuzz-smoke.yml" and guard == "branch:ci/vote-kick-fuzz-smoke"
+                       and events == {"push": {"branches": ["ci/vote-kick-fuzz-smoke"]}})
+    required = (name == "pr-size.yml" and guard == "required:pr-size-gate"
+                and "pr-size-gate" in job_names and set(events) == {"pull_request", "pull_request_review"})
 
     errors = []
     if guard == "paths":
         for event, options in sorted(events.items()):
-            if event == "workflow_run" or not has_path_filter(options):
+            if event not in FILTERABLE or not has_path_filter(options):
                 errors.append(f"{event} declares no paths filter")
     elif not any((release, required, approved_advisory, approved_branch, legacy)):
         errors.append("automatic triggers need a required, release, paths or dedicated CI branch guard")
     if len(markers) > 1:
         errors.append("multiple guard declarations")
     for event, activities in sorted(pr_types.items()):
-        if "edited" in activities and (name, guard, event) != (
-                "supply-chain.yml", RELEASES["supply-chain.yml"], "pull_request"):
+        refresh = event == "pull_request" and name in METADATA_REFRESH and (release or approved_advisory)
+        if "edited" in activities and not refresh:
             errors.append(f"{event} types include 'edited'")
     if "workflow_run" in events:
         if options_list(events["workflow_run"], "types") != ["completed"]:

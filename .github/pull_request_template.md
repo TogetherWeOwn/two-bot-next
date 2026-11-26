@@ -52,6 +52,7 @@ configs at any depth (including wrangler.production.toml); prose like docs/wrang
 is not a config. Deploy scripts outside these paths still require a declared T0 when critical.
 Renames inspect both old and new paths; deleting a T0 file is still T0.
 .github/workflows/pr-evidence.yml, .github/scripts/pr_evidence.py and its requirements and baseline are T0.
+ci/workflow_guard.py and ci/workflow-guard-requirements.txt are T0.
 T2 requires only root or docs/ .md/.rst files or explicitly allowlisted text basenames:
 README.txt, LICENSE.txt, NOTICE.txt, CHANGELOG.txt, CONTRIBUTING.txt, CODE_OF_CONDUCT.txt,
 SECURITY.txt, SUPPORT.txt, AUTHORS.txt (case-insensitive). Critical directory floors win.

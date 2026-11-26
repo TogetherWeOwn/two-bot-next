@@ -1,6 +1,6 @@
 name: PR evidence
 on:
-  pull_request: {types: [opened, synchronize, reopened, ready_for_review]}
+  pull_request: {types: [opened, edited, synchronize, reopened, ready_for_review]}
 permissions: {}
 concurrency:
   group: pr-evidence-${{ github.event.pull_request.number || github.sha }}

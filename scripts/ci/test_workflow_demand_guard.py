@@ -27,12 +27,13 @@ class WorkflowDemandGuardTests(unittest.TestCase):
         self.assertEqual(guard.check_directory(WORKFLOWS), [])
 
     def test_automatic_triggers_need_reviewed_purpose(self):
-        for trigger in ("pull_request", "[pull_request_target, workflow_dispatch]", "push", "workflow_run"):
+        for trigger in ("pull_request", "push", "workflow_run", "merge_group", "issue_comment",
+                        "pull_request_review", "pull_request_review_comment", "check_run", "check_suite", "status"):
             with self.subTest(trigger=trigger):
                 self.assertTrue(guard.findings("fixture.yml", example(trigger)))
         self.assertEqual(guard.findings("fixture.yml", example("workflow_dispatch")), [])
-        self.assertEqual(guard.findings("fixture.yml", example("pull_request", "# guards: required:ci-ok")), [])
-        self.assertTrue(guard.findings("fixture.yml", example("pull_request", "# guards: required:unknown")))
+        marker = "# guards: required:ci-ok"
+        self.assertTrue(guard.findings("fixture.yml", example("pull_request", marker)))
 
     def test_paths_apply_to_every_automatic_trigger(self):
         marker = "# guards: paths (fixture)"
@@ -40,6 +41,9 @@ class WorkflowDemandGuardTests(unittest.TestCase):
         self.assertEqual(guard.findings("fixture.yml", example(scoped, marker)), [])
         unscoped = "{pull_request: {paths: ['src/**']}, push: {branches: [work]}}"
         self.assertIn("push declares no paths filter", guard.findings("fixture.yml", example(unscoped, marker)))
+        for paths in ("**", "**/*"):
+            triggers = "{pull_request: {paths: ['" + paths + "']}}"
+            self.assertIn("pull_request declares no paths filter", guard.findings("fixture.yml", example(triggers, marker)))
 
     def test_refuses_duplicate_pr_main_push_and_metadata_events(self):
         marker = "# guards: required:ci-ok"
@@ -71,16 +75,17 @@ class WorkflowDemandGuardTests(unittest.TestCase):
                 example("{pull_request: {}, pull_request: {}}", "# synthetic-value"))
             (directory / "link.yml").symlink_to(directory / "duplicate.yml")
             (directory / "bad-types.yml").write_bytes(example("{pull_request: {types: edited}}"))
+            (directory / "merge-key.yml").write_bytes(example("{<<: {pull_request: {}}}"))
             self.assertEqual(guard.check_directory(directory), [
                 f"{name}.yml: unreadable YAML or invalid workflow trigger configuration"
-                for name in ("bad-types", "duplicate", "link")
+                for name in ("bad-types", "duplicate", "link", "merge-key")
             ])
 
     def test_real_advisory_and_protected_event_routes(self):
         self.assertEqual(workflow("nightly.yml")["on"], {"schedule": [{"cron": "17 3 * * *"}]})
         self.assertEqual(set(workflow("ci-speed.yml")["on"]), {"workflow_dispatch"})
         self.assertEqual(workflow("pr-evidence.yml")["on"], {
-            "pull_request": {"types": ["opened", "synchronize", "reopened", "ready_for_review"]},
+            "pull_request": {"types": ["opened", "edited", "synchronize", "reopened", "ready_for_review"]},
         })
         check = workflow("check.yml")
         self.assertEqual(check["on"]["pull_request"]["types"], ["opened", "synchronize", "reopened"])
@@ -116,7 +121,3 @@ class WorkflowDemandGuardTests(unittest.TestCase):
         for fragment in ('"$GITHUB_EVENT_NAME" != push', 'policy="$policy/base-gate"',
                          '-I "$policy/ci/workflow_guard.py" "$GITHUB_WORKSPACE"'):
             self.assertIn(fragment, step["run"])
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -375,6 +375,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          [[ ! -L "$GITHUB_WORKSPACE/ci" ]]
+          for file in ci/workflow_guard.py ci/workflow-guard-requirements.txt; do
+            [[ -f "$GITHUB_WORKSPACE/$file" && ! -L "$GITHUB_WORKSPACE/$file" ]]
+          done
           policy="$GITHUB_WORKSPACE"
           if [[ "$GITHUB_EVENT_NAME" != push ]]; then
             policy="$policy/base-gate"
@@ -386,7 +390,7 @@ jobs:
             fi
           fi
           cd "$RUNNER_TEMP"
-          python3 -I -m venv workflow-guard
+          python3.12 -I -m venv workflow-guard
           workflow-guard/bin/python -I -m pip --isolated install --only-binary=:all: --no-deps --require-hashes -r "$policy/ci/workflow-guard-requirements.txt"
           workflow-guard/bin/python -I "$policy/ci/workflow_guard.py" "$GITHUB_WORKSPACE"
 

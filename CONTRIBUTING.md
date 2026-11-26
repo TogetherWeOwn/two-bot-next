@@ -58,13 +58,10 @@ instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
 
-`pr-lint` also runs `python3 ci/workflow_guard.py .` against the candidate
-workflow definitions. PR, merge-group and manual PR validation use the pinned
-base policy. A push to `main` uses the checked-out commit's policy and
-definitions. Use a real path filter on each automatic trigger for new
-advisory work or obtain a reviewed change to the policy for broader admission.
-The required metadata check refreshes on `edited`. Release workflows keep
-the exact-main checks and the completed-only promotion notification.
+`pr-lint` scans candidate workflow definitions with the pinned base policy
+and uses the checked-out policy on pushes to `main`. New webhook-triggered
+work needs a path filter or a reviewed policy change. Required metadata
+and advisory PR evidence still refresh on `edited`.
 
 ### Independent review
 
@@ -288,10 +285,9 @@ the toolchain and builder-image pins together.
 
 ### Nightly test partitions
 
-`nightly.yml` retains its wiring-change PR selector and event timeout allow-list:
-45 minutes per heavy PR job (also the fallback for any other event), 180 minutes
-only for schedule/manual runs. Do not raise the PR cap to accommodate workload.
-The original serial all-feature workload is split into:
+`nightly.yml` runs at 03:17 UTC with a 180-minute ceiling per heavy job.
+The required Check lane still exercises affected PRs, including wiring changes.
+The nightly sweep is split into:
 
 - `sweep-plan`: generate the command reference, compile Cargo's default workspace
   test selection (`--no-run`, including ordinary examples), and discover each
@@ -438,14 +434,12 @@ Use paths for generated names and other formats. Organization path floors and
 repository review tiers apply.
 
 `pr-evidence` is advisory. Before merging, check that its latest result covers
-the exact head and current PR description. The verifier reads the current
-description from GitHub when it runs. Reuse an eligible attempt that validates
-after an edit. If the edit makes a completed result stale, rerun only the
-advisory `pr-evidence` workflow from a matching PR run. If a matching
-head and base are unavailable, use the next eligible PR event with the current
-pair. Required `pr-lint` still runs on edits. On `main`, use the `ci-evidence`
-summary from `check` for exact-head Actions links. Follow the existing required
-checks and review policy for the merge.
+the exact head and current PR description. After a description edit, open the
+`pr-evidence` run triggered by that edit in Actions and wait for its result, even
+when the head SHA is unchanged. If validation fails, use the job output to
+correct the evidence and confirm the updated result. Follow the existing required
+checks and review policy for the merge. On `main`, use the `ci-evidence` summary
+from `check` for exact-head Actions links.
 
 GitHub can bind a required workflow to protected source. In the hosted
 qualification, the pinned `pr-standards` workflow kept its opening required

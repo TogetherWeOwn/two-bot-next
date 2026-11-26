@@ -32,8 +32,8 @@ while the advisory check is green. Retain the matching workflow run attempt
 (`GET /actions/runs/{run_id}/attempts/{attempt}/jobs`). A job may omit
 `run_attempt` on the first attempt. Reruns require an explicit match to
 exclude jobs from earlier attempts.
-After the edit, capture the PR again and rerun only the matching advisory
-workflow. Keep the new attempt and its jobs response. Use the Actions job
+After the edit, capture the PR again and keep the later advisory run attempt
+and jobs response triggered by that edit. Use the Actions job
 log to confirm the reason if `Verify and publish evidence` fails. Keep each
 description stable through its run and capture. Restore a valid description
 after the rehearsal and confirm the resulting advisory run succeeds.
@@ -97,9 +97,9 @@ membership at check time.
 [Run API response][archived-run-api] · [Commit lookup][archived-commit-pulls] ·
 [Merged PR metadata][archived-pr]
 
-The advisory `pr-evidence` workflow subscribes to PR opens, updates, reopens
-and transitions to ready for review. Its verifier refuses `merge_group` in
-verify mode before publishing evidence. A future adapter needs a supported source that binds the exact
+The advisory `pr-evidence` workflow subscribes to PR events. Its verifier
+refuses `merge_group` in verify mode before publishing evidence. A future
+adapter needs a supported source that binds the exact
 group to every PR number and queued PR head SHA. Confirm each PR's
 current base ref matches the protected target. Pass the target repository
 (`base.repo.full_name`, including for fork PRs), PR number, current PR base
