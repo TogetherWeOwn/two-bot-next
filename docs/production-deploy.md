@@ -453,6 +453,44 @@ watch, recovery or cleanup. If the readback is unclear, keep production
 changes on hold and reconcile with the other team. A later attempt uses
 fresh coordination.
 
+### Resume a deferred window
+
+Record the deferral, last confirmed run state and who will resume the release
+in the private coordination record. If deferring before dispatch, follow the
+abort checks above and have both teams acknowledge the handoff of the window.
+If a run was dispatched, use the after-dispatch rule above. Carry forward the
+pinned release plan, full candidate SHA and artifact identity, rollback plan,
+and original receipt links with producer run, attempt, digest and expiry where
+applicable. Keep credentials, raw responses and member data out of the record.
+
+- **Carry forward exact-candidate evidence.** Keep CI and PR review evidence,
+  staging deploy and smoke results, and immutable artifact receipts while the
+  selected workflow still admits them for the same candidate. For Bot, verify
+  the current qualifying staging attempt and its
+  [promotion certificate](#build-identity-and-the-readyz-gate). The protected
+  Bot migration workflow checks the original plan artifact, a matching fresh
+  plan and a still-valid approval check. A prior production migration dispatch
+  supersedes the plan if GitHub created it at or after the plan run's creation
+  time and its first attempt started a non-skipped apply job. For Web, recheck the
+  candidate's staging deploy and E2E evidence against the serving version and
+  soak. Where applicable, revalidate the exact
+  [Kit cutover packet and proof](https://github.com/TogetherWeOwn/two-web-next/blob/main/docs/kit-cutover-release.md#protected-release-and-recovery).
+  Replace expired, superseded or mismatched evidence through the applicable
+  workflow before proceeding.
+- **Refresh evidence for the new attempt.** Recheck custody, run status and
+  the standing-down team's promotion hold for the new window. Re-read the
+  serving versions, rollback target and any applicable live ledger, roles or
+  writer ownership through the normal preflight. Let the protected attempt
+  collect its own measurements, including Bot's fresh promotion soak where
+  required and Web's attempt-bound staging sample and production baseline.
+  Before data or schema changes, take and verify a fresh provider backup and
+  bind any required [restore rehearsal](#restore-evidence-for-release-approval)
+  to that backup and its new copy. Follow the
+  [production release gate](../CONTRIBUTING.md#production-release-gate) for
+  approval bound to the current plan and evidence. Use a fresh protected
+  dispatch for an authorized staged Bot promotion. After dispatch, use that
+  rollout's smoke and [watch results](#post-deploy-watch) before returning custody.
+
 ## Interrupted protected release
 
 If a protected attendance release fails or is cancelled after it may have
