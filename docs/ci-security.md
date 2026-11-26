@@ -608,12 +608,26 @@ are preserved until those callers migrate.
 
 ## Public-hosted runner contract
 
-Every ordinary job defined in this repository selects `runs-on: ubuntu-latest`
-explicitly. This includes the local reusable nextest and SBOM workflows, not
-only required PR checks. There is no private/self-hosted fallback or overflow
-variable switch. External pinned reusable workflows retain their own runner
-policy; this change neither rewrites those workflows nor conceals routing in
-an external workflow, variable or generated file.
+Ordinary jobs select `runs-on: ubuntu-latest` explicitly, including the local
+reusable nextest and SBOM jobs. The sole exception is `check.yml` job
+`rust-tests` (`rust tests`). It uses the organization variable `CI_HEAVY_RUNNER`
+for same-repository PRs and the workflow's existing non-PR events. The prepaid
+reserve switch sets the variable to `boat` while starts fit the allowance and
+`ubuntu-latest` otherwise. An unset variable also selects `ubuntu-latest`.
+Fork `pull_request` events always select `ubuntu-latest`. The workflow policy
+test pins the exact expression and the event set. External pinned reusable
+workflows use their own runner policy.
+
+Boat requires both the run actor and the triggering actor to be on the public
+repository allowlist. The configured actors are `Rick7C2` and the
+`togetherweown[bot]` App. An off-list actor or a plan limit can prevent a job
+already assigned to Boat from running. The reserve switch applies to new runs.
+
+The `merge_group` trigger remains defined. Main currently has no active merge
+queue. A group would select the org variable and present a synthetic commit
+without the source repository of each included PR. Qualify the group trust and
+actor boundary before enabling a queue with the Boat route active. The policy
+test also rejects adding `pull_request_target` to this workflow.
 
 This contract is for a **public repository**. GitHub's
 [standard runner specification](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories)
@@ -626,14 +640,12 @@ hosted minutes. The offline fixtures cannot observe repository visibility.
 
 ### Compatibility and limits
 
-The former public branch already selected `ubuntu-latest` for every ordinary
-job definition. The current inventory is 88 jobs across 29 changed workflows,
-including the split nightly legs and bounded staging startup/cleanup jobs.
-Replacing the expression with the literal changes the source contract,
-not the public runner platform. All job containers, service images/options,
-platforms, resource/time limits, permissions, protected environments and test
-selection remain unchanged. No runner registration, fleet setting, secret or
-organization variable is changed.
+[Boat CI](https://docs.boat.dev/ci.md#github-actions-runners-runs-on-boat) starts
+a fresh Linux VM for each job and deletes it when the job ends. It supports job
+and service containers, cache and artifact actions. The `boat` label selects
+4 vCPU, 8 GB RAM and 4 GB swap. The `rust-tests` job keeps its existing pinned
+images, service limits, disk guard and 45-minute timeout. `ci-ok` waits for the
+job and requires success whenever the Rust selector selects it.
 
 GitHub's [service-container contract](https://docs.github.com/en/actions/concepts/use-cases/about-service-containers)
 supports Linux job/service containers on hosted Ubuntu. Container jobs reach

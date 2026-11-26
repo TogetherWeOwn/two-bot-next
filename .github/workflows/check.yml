@@ -94,11 +94,9 @@ jobs:
     needs: [job-inputs]
     # Failed, skipped or cancelled dependencies must not make check appear green.
     if: ${{ always() }}
-    # Runner routing: every job uses the explicit standard GitHub-hosted
-    # `runs-on: ubuntu-latest`. This is a public repository, so the
-    # GitHub-hosted Ubuntu runner is free and the org self-hosted runner
-    # group is not used. A private conversion needs fresh runner/cost
-    # qualification before execution; see docs/ci-security.md.
+    # Runner routing: rust-tests has the only prepaid Boat route. Other jobs
+    # use standard GitHub-hosted Ubuntu. See docs/ci-security.md for the
+    # public-repository policy and private-conversion checks.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
@@ -627,8 +625,9 @@ jobs:
     # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
-    # Runner routing: see the note on `check`.
-    runs-on: ubuntu-latest
+    # The org switch selects Boat within the prepaid reserve.
+    # Fork pull_request events always use GitHub-hosted runners.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_HEAVY_RUNNER || 'ubuntu-latest' }}
     # Suite-only since the HARD patch-coverage measurement split out of this
     # lane: the combined job outgrew 60 minutes (59m54s on main, one 60m07s
     # mid-measurement kill), while the replay alone measured ~30 min of a

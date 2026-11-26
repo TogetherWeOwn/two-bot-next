@@ -193,9 +193,14 @@ PR_SIZE_WEEKLY_IF = "github.event_name == 'schedule' || (github.event_name == 'w
 PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size"): PR_SIZE_JOB_IF,
                          ("pr-size.yml", "pr-size-gate"): PR_SIZE_JOB_IF,
                          ("pr-size.yml", "pr-size-weekly"): PR_SIZE_WEEKLY_IF}
-# Every ordinary job in this public repository selects standard free hosted
-# Ubuntu directly. A private conversion needs fresh runner/cost qualification.
+# Ordinary jobs select standard public-hosted Ubuntu. Only the required Rust
+# test lane in check.yml may use the prepaid Boat route.
 PUBLIC_RUNNER = "ubuntu-latest"
+RUST_TESTS_RUNNER = (
+    "${{ (github.event_name != 'pull_request' || "
+    "github.event.pull_request.head.repo.full_name == github.repository) "
+    "&& vars.CI_HEAVY_RUNNER || 'ubuntu-latest' }}"
+)
 # Negative fixture only: even a public-first route retains dormant source paths.
 LEGACY_ROUTED_RUNNER = (
     "${{{{ fromJSON((!github.event.repository.private && '[\"ubuntu-latest\"]') || "
@@ -264,6 +269,12 @@ def load_workflows():
 def runner_allowed(job_id, runs_on):
     # Job ids remain at call sites for per-job diagnostics; no indirect selector is allowed.
     return runs_on == PUBLIC_RUNNER
+
+
+def workflow_runner_allowed(workflow, job_id, runs_on):
+    if (workflow, job_id) == ("check.yml", "rust-tests"):
+        return runs_on == RUST_TESTS_RUNNER
+    return runner_allowed(job_id, runs_on)
 
 
 def shell_logical_lines(script):
@@ -10945,6 +10956,57 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(runs_on=runs_on):
                 self.assertFalse(runner_allowed("worker", runs_on))
 
+    def test_rust_tests_boat_is_the_only_runner_exception(self):
+        weakened_fork_guard = RUST_TESTS_RUNNER.replace(
+            "github.event.pull_request.head.repo.full_name == github.repository", "true"
+        )
+        for workflow, job_id, runs_on in (
+            ("check.yml", "rust-tests", weakened_fork_guard),
+            ("check.yml", "coverage-shard", RUST_TESTS_RUNNER),
+            ("nightly.yml", "rust-tests", RUST_TESTS_RUNNER),
+        ):
+            with self.subTest(workflow=workflow, job=job_id):
+                self.assertFalse(workflow_runner_allowed(workflow, job_id, runs_on))
+
+    def test_rust_tests_boat_routes_by_event_and_variable(self):
+        workflow = self.workflows["check.yml"]
+        non_pr_events = ("merge_group", "push", "schedule", "workflow_dispatch")
+        # A new event would route through the non-PR branch of the expression.
+        self.assertEqual(set(workflow["on"]), {"pull_request", *non_pr_events})
+        expression = workflow["jobs"]["rust-tests"]["runs-on"]
+        self.assertEqual(expression, RUST_TESTS_RUNNER)
+        expression = expression.removeprefix("${{").removesuffix("}}").strip()
+
+        # Model only string comparisons and short circuiting for this pin.
+        # GitHub reads absent fields and unset variables as empty strings here.
+        repository = "togetherweown/two-bot-next"
+        cases = [
+            ("pull_request", repository, "", PUBLIC_RUNNER),
+            ("pull_request", repository, PUBLIC_RUNNER, PUBLIC_RUNNER),
+            ("pull_request", repository, "boat", "boat"),
+            ("pull_request", "contributor/two-bot-next", "boat", PUBLIC_RUNNER),
+            ("pull_request", "", "boat", PUBLIC_RUNNER),
+        ]
+        for event in non_pr_events:
+            cases.extend(((event, "", "boat", "boat"), (event, "", "", PUBLIC_RUNNER),
+                          (event, "", PUBLIC_RUNNER, PUBLIC_RUNNER)))
+        for event, head_repo, variable, expected in cases:
+            with self.subTest(event=event, head_repo=head_repo, variable=variable):
+                context = {
+                    "github.event_name": event,
+                    "github.repository": repository,
+                    "github.event.pull_request.head.repo.full_name": head_repo,
+                    "vars.CI_HEAVY_RUNNER": variable,
+                }
+                text = re.sub(r"\b(?:github|vars)\.[\w.]+",
+                              lambda match: repr(context[match[0]]), expression)
+                tree = ast.parse(text.replace("&&", " and ").replace("||", " or "), mode="eval")
+                allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare,
+                           ast.Eq, ast.NotEq, ast.Constant)
+                self.assertTrue(all(isinstance(node, allowed) for node in ast.walk(tree)))
+                result = eval(compile(tree, "<rust-tests runs-on>", "eval"), {"__builtins__": {}})
+                self.assertEqual(result, expected)
+
     def test_certify_promotion_runner_must_be_explicit_public_hosted(self):
         # Artifact-only certification retains service/container isolation and
         # the same direct hosted selector as every other ordinary job.
@@ -10999,8 +11061,7 @@ class WorkflowTests(unittest.TestCase):
                         self.assertNotIn("services", job)
                         self.assertNotIn("container", job)
                     else:
-                        # All ordinary jobs share the explicit public-hosted contract.
-                        self.assertTrue(runner_allowed(job_id, job["runs-on"]))
+                        self.assertTrue(workflow_runner_allowed(name, job_id, job["runs-on"]))
                     if job.get("services"):
                         self.assertIn("container", job)
                         for service in job["services"].values():
