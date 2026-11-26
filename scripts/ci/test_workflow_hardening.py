@@ -19,21 +19,16 @@ def workflow(name):
 
 
 class WorkflowHardeningTests(unittest.TestCase):
-    def test_pr_evidence_push_only_replays_verifier_changes(self):
-        triggers = workflow("pr-evidence.yml")["on"]
-        self.assertEqual(triggers, {
+    def test_pr_evidence_groups_only_main_pushes(self):
+        evidence = workflow("pr-evidence.yml")
+        self.assertEqual(evidence["concurrency"], {
+            "group": "pr-evidence-${{ github.event_name == 'push' && 'main' || "
+                     "github.event.pull_request.number || github.sha }}",
+            "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+        })
+        self.assertEqual(evidence["on"], {
             "pull_request": {"types": ["opened", "edited", "synchronize", "reopened", "ready_for_review"]},
-            "push": {
-                "branches": ["main"],
-                "paths": [
-                    ".github/workflows/pr-evidence.yml",
-                    ".github/scripts/pr_evidence.py",
-                    ".github/scripts/pr-evidence-baseline.txt",
-                    ".github/scripts/pr-evidence-requirements.txt",
-                    ".github/scripts/test_pr_evidence.py",
-                    ".github/scripts/fixtures/cubic-pr-footer.txt",
-                ],
-            },
+            "push": {"branches": ["main"]},
         })
 
     def test_setup_python_uses_github_distribution_with_reviewed_versions(self):
