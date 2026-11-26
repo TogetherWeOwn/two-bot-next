@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
 import { runStagingAutomodProtectedHost } from "../scripts/staging-automod-protected-host.ts";
-import { STAGING_AUTOMOD_TARGET as target } from "../src/staging-automod-recovery.ts";
-import { AUTOMOD_STAGING_PURPOSE } from "../src/staging-use-window.ts";
+import { runProtectedAutomod, type ProtectedAutomodEffects } from "../src/staging-automod-caller.ts";
+import { StagingAutomodLifecycle } from "../src/staging-automod-lifecycle.ts";
+import { STAGING_AUTOMOD_TARGET as target, StagingAutomodRecovery } from "../src/staging-automod-recovery.ts";
+import { AUTOMOD_STAGING_PURPOSE, StagingLifecycle, type StagingIdentity } from "../src/staging-lifecycle.ts";
+import publication from "./fixtures/staging-automod-publication.json" with { type: "json" };
 import { lease } from "./fixtures/staging-automod-recovery.ts";
 
 type Host = NonNullable<Parameters<typeof runStagingAutomodProtectedHost>[1]>;
@@ -34,6 +37,9 @@ const inventory: Inventory = {
     rollout_id: "44444444-4444-4444-4444-444444444444", rollout_status: "completed", image_digest: `sha256:${"b".repeat(64)}` },
   ownership: { phase: "active", epoch: issuedLease.epoch },
 };
+const pin = { workerDeploymentId: inventory.worker.deployment_id, workerVersionId: deploymentId, sourceSha: sha,
+  applicationId: inventory.container.application_id, namespaceId: inventory.container.namespace_id,
+  rolloutId: inventory.container.rollout_id, imageDigest: inventory.container.image_digest };
 
 function fixture(t: TestContext) {
   const access: string[] = [];
@@ -87,9 +93,6 @@ test("the protected host composes both actions on one authenticated serving pin"
   assert.deepEqual(await runStagingAutomodProtectedHost(options, host), { verdict: "passed", start: true, recover: true });
   assert.deepEqual(access, ["run", "lease", "approval:start", "approval:recover", "worker", "inventory", "invoke:start", "invoke:recover"]);
   const calls = invokePrivate.mock.calls.map(({ arguments: [pin, call] }) => ({ pin, call }));
-  const pin = { workerDeploymentId: inventory.worker.deployment_id, workerVersionId: deploymentId, sourceSha: sha,
-    applicationId: inventory.container.application_id, namespaceId: inventory.container.namespace_id,
-    rolloutId: inventory.container.rollout_id, imageDigest: inventory.container.image_digest };
   assert.deepEqual(calls, [{ pin, call: { action: "start", issuedLease } }, { pin, call: { action: "recover", issuedLease } }]);
   assert.equal(calls[0]?.pin, calls[1]?.pin);
   assert.equal(network.mock.callCount(), 0);
@@ -139,6 +142,37 @@ test("missing or mismatched staging inventory refuses before private invocation"
   assert.equal(invokePrivate.mock.callCount(), 0);
 });
 
+test("authenticated inventory reader exceptions are redacted before private invocation", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now });
+  const network = t.mock.method(globalThis, "fetch", async () => assert.fail("unexpected network access"));
+  const { access, host, invokePrivate } = fixture(t);
+  const detail = new Error("synthetic private inventory diagnostics");
+  const beforeInventory = ["run", "lease", "approval:start", "approval:recover", "worker"];
+  const failureModes = {
+    rejection: () => Promise.reject(detail),
+    throw: () => { throw detail; },
+  };
+
+  for (const [mode, fail] of Object.entries(failureModes)) {
+    const reads: { source: typeof inventorySource; aborted: boolean }[] = [];
+    const readAuthenticatedInventory: Host["readAuthenticatedInventory"] = (source, signal) => {
+      access.push("inventory");
+      reads.push({ source, aborted: signal.aborted });
+      return fail();
+    };
+    assert.deepEqual(await runStagingAutomodProtectedHost(options, { ...host, readAuthenticatedInventory }), noActions, mode);
+    assert.deepEqual(access.splice(0), [...beforeInventory, "inventory", "inventory"], mode);
+    assert.deepEqual(reads, [{ source: inventorySource, aborted: false }, { source: inventorySource, aborted: false }], mode);
+    assert.equal(invokePrivate.mock.callCount(), 0, mode);
+  }
+
+  assert.deepEqual(await runStagingAutomodProtectedHost(options, host), { verdict: "passed", start: true, recover: true });
+  assert.deepEqual(access, [...beforeInventory, "inventory", "invoke:start", "invoke:recover"]);
+  assert.deepEqual(invokePrivate.mock.calls.map(({ arguments: [pin, call] }) => [pin, call]),
+    [[pin, { action: "start", issuedLease }], [pin, { action: "recover", issuedLease }]]);
+  assert.equal(network.mock.callCount(), 0);
+});
+
 test("a separately approved recovery can still use the original serving pin", async t => {
   t.mock.timers.enable({ apis: ["Date"], now });
   const { host, invokePrivate } = fixture(t);
@@ -147,4 +181,127 @@ test("a separately approved recovery can still use the original serving pin", as
   assert.deepEqual(await runStagingAutomodProtectedHost(options, { ...host, authority }),
     { verdict: "failed", start: false, recover: true });
   assert.deepEqual(invokePrivate.mock.calls.map(({ arguments: [, call] }) => call), [{ action: "recover", issuedLease }]);
+});
+
+test("the protected host holds a lost publication acknowledgement until the scoped registry is reconciled", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: issuedLease.acquiredAt });
+  const network = t.mock.method(globalThis, "fetch", async () => assert.fail("unexpected network access"));
+  const values = new Map<string, unknown>();
+  const storage = {
+    get: async (key: string) => structuredClone(values.get(key)),
+    put: async (key: string | Record<string, unknown>, value?: unknown) => {
+      for (const [name, record] of Object.entries(structuredClone(typeof key === "string" ? { [key]: value } : key))) {
+        values.set(name, record);
+      }
+    },
+    sync: async () => {},
+  } as unknown as DurableObjectStorage;
+  const staging = new StagingLifecycle(storage);
+  const journal = new StagingAutomodRecovery(storage);
+  const { purpose, ...publicationLease } = issuedLease;
+  const identity: StagingIdentity = { deploymentId, sha, owner: { deploymentId, epoch: issuedLease.epoch,
+    phase: "active", actor: "synthetic", timestamp: new Date().toISOString(),
+    oldEpoch: issuedLease.epoch - 1, oldDeploymentId: null } };
+  assert.deepEqual(await staging.acquire({ ...publicationLease, action: "acquire", expectedEpoch: issuedLease.epoch },
+    identity, async () => {}, async () => {}, Date.now(), purpose), issuedLease);
+  t.mock.timers.setTime(now);
+
+  const { host: hostFixture } = fixture(t);
+  const host: Host = { ...hostFixture, authority: { ...hostFixture.authority,
+    readIssuedLease: context => staging.readIssuedAutomodLease(context, identity) } };
+  const { help, preview } = publication.replies;
+  const bot = "https://discord.com/api/v10/users/@me";
+  const commands = `https://discord.com/api/v10/applications/${target.applicationId}/guilds/${target.guildId}/commands`;
+  const list = `${commands}?with_localizations=true`;
+  const registry = new Map<string, typeof help | typeof preview>([[help.id, help]]);
+  const env = { ...publication.env, ...host.readWorker().env, TWO_MODERATION: "1", TWO_OWEN_USER_ID: preview.id };
+  // The fixture awaits each operation before issuing the next one.
+  const authority = { storage, staging, env, identity: async () => identity,
+    exclusive: <T>(operation: () => Promise<T>) => operation() };
+  const calls: string[] = [];
+  const policy = { memberIntake: false, enforcement: false, resume: false, registrySync: false,
+    interactionDispatch: false, dedicatedIntents: true };
+  const start = t.mock.fn(async () => assert.fail("publication was never confirmed"));
+  const effects: ProtectedAutomodEffects = {
+    enabled: true, dryRun: { policy, start },
+    readRuntime: async () => ({ lease: issuedLease, running: false }),
+    readCleanupGrant: async () => ({ lease: issuedLease, before: issuedLease.expiresAt + 5_000 }),
+    fenceAndDrain: async () => {
+      calls.push("drain");
+      return { lease: issuedLease, publicationDrained: true, startupDrained: true };
+    },
+    stop: async () => { calls.push("stop"); return true; },
+    request: async (url, init) => {
+      calls.push(`${init.method} ${url}`);
+      if (init.method === "POST" && url === commands) {
+        assert.deepEqual(JSON.parse(String(init.body)), publication.definition);
+        registry.set(preview.id, preview);
+        throw new Error("synthetic publication acknowledgement lost after the registry write");
+      }
+      if (init.method === "GET" && url === bot) return Response.json(publication.identity);
+      if (init.method === "GET" && url === list) {
+        assert.deepEqual(await staging.read(), issuedLease);
+        assert.equal(await journal.completedFor(issuedLease), false);
+        return Response.json([...registry.values()]);
+      }
+      assert.fail("unexpected scoped registry request");
+    },
+  };
+  const publisher = new StagingAutomodLifecycle({ ...authority, ...effects,
+    observe: async () => ({ ...await staging.automodBinding(issuedLease, identity, Date.now()), purpose, running: false }),
+    get: async url => {
+      if (url === bot) return publication.identity;
+      assert.equal(url, commands);
+      return [...registry.values()];
+    },
+  });
+  await assert.rejects(publisher.publish({ lease: publicationLease, purposes: [purpose],
+    origin: "https://two-bot-next-staging.example.workers.dev", cleanupReserveMs: 500,
+    verifiedRecoveryPair: true, verifiedRuntimeDatabase: true, verifiedGatewayIntents: true }),
+  { message: "staging_automod_publication_uncertain" });
+  assert.deepEqual(calls.splice(0), [`GET ${bot}`, `GET ${list}`, `GET ${list}`, `POST ${commands}`]);
+  assert.deepEqual(registry.get(preview.id), preview);
+  const pending = await journal.pending();
+  assert.ok(pending && "target" in pending);
+  assert.deepEqual(pending.lease, publicationLease);
+  assert.deepEqual(pending.target, target);
+
+  const invokePrivate = t.mock.fn<Host["invokePrivate"]>(async (_pin, call) => runProtectedAutomod(call, authority, effects));
+  const assertRecovery = async (actions: ("start" | "recover")[], recover: boolean, protectedHost: Host) => {
+    assert.deepEqual(await runStagingAutomodProtectedHost(options, { ...protectedHost, invokePrivate }),
+      { verdict: "failed", start: false, recover });
+    assert.deepEqual(invokePrivate.mock.calls.map(({ arguments: [pin, call] }) => ({ pin, call })),
+      actions.map(action => ({ pin, call: { action, issuedLease } })));
+    invokePrivate.mock.resetCalls();
+    assert.deepEqual(calls.splice(0), ["drain", "stop", `GET ${bot}`, `GET ${list}`]);
+  };
+  const assertHeld = async () => {
+    assert.deepEqual(await staging.read(), issuedLease);
+    assert.deepEqual(await journal.pending(), pending);
+    assert.equal(await journal.completedFor(issuedLease), false);
+    await assert.rejects(publisher.otherUse(async () => assert.fail("competing use ran")),
+      { message: "staging_automod_lifecycle_refused" });
+  };
+  await assertRecovery(["start", "recover"], false, host);
+  await assertHeld();
+  assert.deepEqual(registry.get(preview.id), preview);
+
+  // Independent reconciliation changes the synthetic registry outside the
+  // caller. With no durable receipt, recovery cannot attribute or delete the row.
+  t.mock.timers.setTime(issuedLease.expiresAt + 1);
+  const recoveryHost: Host = { ...host, authority: { ...host.authority,
+    readApproval: async (action, ...args) => action === "recover" ? host.authority.readApproval(action, ...args) : undefined } };
+  assert.equal(registry.delete(preview.id), true);
+  registry.set(help.id, { ...help, description: "synthetic registry drift" });
+  await assertRecovery(["recover"], false, recoveryHost);
+  await assertHeld();
+
+  registry.set(help.id, help);
+  await assertRecovery(["recover"], true, recoveryHost);
+  assert.deepEqual([...registry.values()], [help]);
+  assert.equal(await journal.completedFor(issuedLease), true);
+  assert.equal(await journal.pending(), undefined);
+  assert.deepEqual(await staging.read(), { ...issuedLease, phase: "released" });
+  assert.equal(start.mock.callCount(), 0);
+  assert.equal(network.mock.callCount(), 0);
 });

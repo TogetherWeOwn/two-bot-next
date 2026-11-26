@@ -142,6 +142,21 @@ export class StagingLifecycle {
     await this.sync();
   }
 
+  /** The Container calls this under its gate after confirming native stop.
+   * A preparing record has never issued a lease. Active journals stay held. */
+  async retireExpiredAutomodPreparation(identity: StagingIdentity): Promise<StagingUse> {
+    await this.sync();
+    const use = await this.read();
+    if (use?.purpose !== AUTOMOD_STAGING_PURPOSE || use.phase !== "preparing" || !ownedBy(use, identity)
+      || Date.now() < use.expiresAt || await new StagingAutomodRecovery(this.storage).pending()) {
+      throw new OwnershipRefused("staging_use_conflict");
+    }
+    const retired = { ...use, phase: "released" as const };
+    await this.write(retired);
+    await this.sync();
+    return retired;
+  }
+
   private async requireAutomodLease(expected: Readonly<StagingUse>, identity: StagingIdentity): Promise<StagingUse> {
     const use = await this.read();
     if (use?.purpose !== AUTOMOD_STAGING_PURPOSE || use.phase === "preparing" || !ownedBy(use, identity)
