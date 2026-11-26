@@ -8,13 +8,13 @@ from unittest.mock import ANY, Mock, call, patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from ci.pre_operator_acceptance_fixture import (
-        PRE_STATES, SAMPLE_BUILD, AcceptedRow, RegistryCleanupEvidence, SweepEvidence, accept,
+        PRE_STATES, SAMPLE_BUILD, AcceptedRow, IngressReadback, RegistryCleanupEvidence, SweepEvidence, accept,
         sample_endpoint, verify_endpoint,
     )
     from pre_registry_cleanup import RegistryReadback, RegistryReservation
     from pre_start_stop import Operation, ProtectedPre
     from pre_sweep import CleanupReadback, SweepError, sweep_target
-    from pre_target import Action, Inventory, Resource, Target, TargetError, require
+    from pre_target import Action, Inventory, ProtectedRouteReadback, Resource, Target, TargetError, require
     from rollback_proof import ProofError
 
 
@@ -34,6 +34,8 @@ class ShapeFixture:
         self.publication_settled = True
 
         app = Resource(target.container_name, app_id)
+        self.route = ProtectedRouteReadback(target, target.worker_name, app)
+        self.read_ingress = Mock(side_effect=lambda _, *, request: IngressReadback(self.route, False, request))
         worker = Resource(target.worker_name, target.worker_name)
         self.before = Inventory(target, worker, app, 1, True, True, startup_settled=True, assigned_count=1)
         self.drained = replace(self.before, worker=None, write_access=False, instance_count=0, assigned_count=0)
@@ -76,7 +78,9 @@ class ShapeFixture:
                 self.finalizer.run_status(self.target), self.publication_settled,
             )
         return accept(self.registry, SAMPLE_BUILD, **self.endpoint,
-                      sweep=SweepEvidence(self.target, outcome), registry=registry)
+                      sweep=SweepEvidence(self.target, outcome), registry=registry,
+                      pinned_route=self.route, pinned_app_id=self.route.app.id,
+                      read_ingress=self.read_ingress)
 
 
 def start_retained_after_handback(original, reserve, start):
