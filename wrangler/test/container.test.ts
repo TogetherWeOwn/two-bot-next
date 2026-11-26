@@ -4327,8 +4327,6 @@ test("background metrics: metrics storage failure cannot notify and retains the 
   assert.equal(h.schedules.mock.callCount(), 1);
 });
 
-// Protected AutoMod bridge. Tokens are signed by a synthetic key served as
-// GitHub's JWKS through a mocked fetch; nothing leaves the process.
 const BRIDGE_VERSION = "11111111-1111-1111-1111-111111111111";
 const BRIDGE_ENV = { ...BOUNDED_STAGING_ENV, ...automodPublication.env, CF_VERSION_METADATA: { id: BRIDGE_VERSION } };
 const BRIDGE_JWKS_URL = "https://token.actions.githubusercontent.com/.well-known/jwks";
@@ -4365,8 +4363,6 @@ async function bridgeHarness(t: TestContext, env: Partial<Env> = BRIDGE_ENV, ver
   const reads = { get: t.mock.method(h.ctx.storage, "get"), put: t.mock.method(h.ctx.storage, "put"),
     delete: t.mock.method(h.ctx.storage, "delete") };
   const storageCalls = () => reads.get.mock.callCount() + reads.put.mock.callCount() + reads.delete.mock.callCount();
-  // Record which plan fields the DO reads. notAfter is read only by the
-  // reservation and start gates.
   const planReads: string[] = [];
   const setPlan = (plan: StagingAutomodPlan) => {
     (h.bot as unknown as { automodPlan: StagingAutomodPlan }).automodPlan = new Proxy(plan, {
@@ -4421,14 +4417,12 @@ test("AutoMod bridge: the Worker route needs bounded staging, POST and the contr
   assert.equal(routed, 0);
   assert.equal(h.jwks.mock.callCount(), 0);
 
-  // The Worker overwrites a forged deployment header; the DO refuses one sent directly.
   const forged = h.request(body, { deployment: "forged-deployment" });
   const routedResponse = await worker.fetch(forged, edge());
   assert.equal(routedResponse.status, 200);
   assert.deepEqual(await routedResponse.json(), { value: null });
   assert.deepEqual(await h.send(body, { deployment: "forged-deployment" }), BRIDGE_REFUSED);
   assert.equal(routed, 1);
-  // The DO repeats the bearer and method checks for a direct caller.
   assert.equal((await h.send(body, { bearer: "" })).status, 401);
   assert.equal((await h.send(body, { bearer: "x".repeat(43) })).status, 401);
   assert.equal((await h.send(body, { method: "GET" })).status, 404);
@@ -4464,7 +4458,6 @@ test("AutoMod bridge: every unverified Actions token is refused before storage, 
   assert.equal(h.runtime.destroys, 0);
   assert.equal(h.values.has(STAGING_USE_KEY), false);
 
-  // Skew within 60 seconds is accepted; the accepted control issues the lease.
   const skewed = actionsToken({ iat: now - 400, nbf: now - 400, exp: now - 30 });
   const accepted = await h.send(body, { token: skewed });
   assert.equal(accepted.status, 200);
@@ -4516,8 +4509,6 @@ test("AutoMod bridge: the default plan refuses start, and recover retires the or
   assert.deepEqual(await h.send({ op: "read-approval", action: "start", issuedLease: issued }),
     { status: 200, body: { value: { action: "start", issuedLease: issued, target: STAGING_AUTOMOD_TARGET } } });
 
-  // Each gate refuses alone: the default, a disabled plan in its window, a
-  // plan without start permission and a closed window.
   for (const plan of disabled.slice(0, 4)) {
     h.setPlan(plan);
     assert.deepEqual(await h.send({ op: "read-approval", action: "start", issuedLease: issued }),
@@ -4593,7 +4584,6 @@ test("AutoMod bridge: an aborted start leaves the original lease for recovery an
     { status: 200, body: { value: null } });
   assert.deepEqual(h.values.get(STAGING_USE_KEY), { ...issued, phase: "released" });
   assert.equal(await new StagingAutomodRecovery(h.ctx.storage as unknown as DurableObjectStorage).pending(), undefined);
-  // The same run cannot take a second lease.
   assert.deepEqual(await h.send({ op: "acquire", pin: h.pin, change: h.change }), BRIDGE_REFUSED);
   assert.deepEqual(h.values.get(STAGING_USE_KEY), { ...issued, phase: "released" });
   assert.deepEqual(h.starts, []);
