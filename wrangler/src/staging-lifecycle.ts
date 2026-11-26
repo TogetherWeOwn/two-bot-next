@@ -119,6 +119,15 @@ export class StagingLifecycle {
     return use;
   }
 
+  /** Read the issued record under the ownership gate, including after expiry
+   * while recovery still holds the lease. Preparation and retirement are not issuance. */
+  async readIssuedAutomodLease(scope: Readonly<Pick<StagingWindow, "runId" | "runAttempt">>, identity: StagingIdentity) {
+    await this.sync();
+    const use = await this.read();
+    if (use?.purpose === AUTOMOD_STAGING_PURPOSE && use.phase === "active" && ownedBy(use, identity)
+      && use.runId === scope.runId && use.runAttempt === scope.runAttempt) return Object.freeze(use);
+  }
+
   /** Retain the original issued tuple for recovery after release or expiry.
    * Ownership remains fenced to the same deployment, build and epoch. */
   async automodBinding(expected: Readonly<StagingUse>, identity: StagingIdentity, now: number) {
@@ -131,6 +140,21 @@ export class StagingLifecycle {
     const use = await this.requireAutomodLease(expected, identity);
     if (use.phase !== "released") await this.write({ ...use, phase: "released" });
     await this.sync();
+  }
+
+  /** The Container calls this under its gate after confirming native stop.
+   * A preparing record has never issued a lease. Active journals stay held. */
+  async retireExpiredAutomodPreparation(identity: StagingIdentity): Promise<StagingUse> {
+    await this.sync();
+    const use = await this.read();
+    if (use?.purpose !== AUTOMOD_STAGING_PURPOSE || use.phase !== "preparing" || !ownedBy(use, identity)
+      || Date.now() < use.expiresAt || await new StagingAutomodRecovery(this.storage).pending()) {
+      throw new OwnershipRefused("staging_use_conflict");
+    }
+    const retired = { ...use, phase: "released" as const };
+    await this.write(retired);
+    await this.sync();
+    return retired;
   }
 
   private async requireAutomodLease(expected: Readonly<StagingUse>, identity: StagingIdentity): Promise<StagingUse> {

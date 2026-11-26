@@ -57,16 +57,18 @@ def read_object(path):
         return json_object(read_with_overflow(stream, BODY_CAP))
 
 
-def recorded_probe_deadline(lifecycle, use):
+def validate_probe_window(lifecycle, *, recorded=False):
+    use = lifecycle["use"]
     observed_at = lifecycle.get("observedAt")
     require(isinstance(observed_at, str) and re.fullmatch(
         r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z", observed_at),
         "staging lease did not cover the probe")
     since_epoch = datetime.fromisoformat(observed_at) - datetime(1970, 1, 1, tzinfo=timezone.utc)
     observed_ms = since_epoch // timedelta(milliseconds=1)
-    require(type(use.get("acquiredAt")) is int and 0 <= use["acquiredAt"] <= observed_ms,
+    start_ms = observed_ms if recorded else time.time() * 1000
+    require(type(use.get("acquiredAt")) is int and 0 <= use["acquiredAt"] <= observed_ms <= start_ms
+            and type(use.get("expiresAt")) is int and start_ms + RUN_BUDGET * 1000 < use["expiresAt"],
             "staging lease did not cover the probe")
-    return observed_ms + RUN_BUDGET * 1000
 
 
 def validate_configuration(phase, origin, rollout, observed, *, recorded=False):
@@ -99,11 +101,10 @@ def validate_configuration(phase, origin, rollout, observed, *, recorded=False):
                 and type(observed.get("fixture_rows")) is int
                 and observed["fixture_rows"] == 0, "cleanup readback is incomplete")
     else:
-        probe_deadline = recorded_probe_deadline(lifecycle, use) if recorded else (time.time() + RUN_BUDGET) * 1000
         require(lifecycle.get("action") == "ready" and lifecycle.get("running") is True
-                and use.get("phase") == "active"
-                and type(use.get("expiresAt")) is int and use["expiresAt"] > probe_deadline,
+                and use.get("phase") == "active",
                 "staging lease did not cover the probe")
+        validate_probe_window(lifecycle, recorded=recorded)
         expected_fixture = "pending" if phase == "pending" else "finalized"
         require(observed.get("signed_ingress") is True and observed.get("primary_fixture") == expected_fixture
                 and (phase != "finalized" or observed.get("foreign_fixture") == "foreign-only"),
@@ -246,7 +247,8 @@ def main(argv=None, *, env=None, check=send):
             require(not args.execute and args.fixture_start is None, "rehearsal only accepts offline readback")
             validate_rehearsal(read_object(args.rollout), read_object(args.observed))
         else:
-            identity = validate_configuration(args.phase, STAGING_ORIGIN, read_object(args.rollout), read_object(args.observed))
+            rollout, observed = read_object(args.rollout), read_object(args.observed)
+            identity = validate_configuration(args.phase, STAGING_ORIGIN, rollout, observed)
             if args.phase == "cleanup":
                 require(not args.execute and args.fixture_start is None, "cleanup only accepts offline readback")
             elif not args.execute:
@@ -258,6 +260,8 @@ def main(argv=None, *, env=None, check=send):
                 old_handler = signal.signal(signal.SIGALRM, deadline)
                 try:
                     signal.alarm(RUN_BUDGET)
+                    # Use a wall-clock sample after arming to cover the whole alarm.
+                    validate_probe_window(observed["lifecycle"])
                     probe(args.phase, STAGING_ORIGIN, identity, start, signer, check)
                 finally:
                     signal.alarm(0)
