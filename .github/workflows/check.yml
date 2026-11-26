@@ -2391,8 +2391,8 @@ jobs:
     # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
-    # Fork PRs stay on GitHub. The budget cutoff can return new runs to GitHub.
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
+    # Fork PRs stay on GitHub. The budget variable can enable only this runner.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     # The serial gateway suites can exceed 30 minutes on PRs; retain a hard cap.
     timeout-minutes: 60
     # Keep database isolation inside the job container network namespace:

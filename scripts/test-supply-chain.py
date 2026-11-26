@@ -358,7 +358,8 @@ class SupplyChainTests(unittest.TestCase):
                         job["runs-on"],
                         "${{ (github.event_name != 'pull_request' || "
                         "github.event.pull_request.head.repo.full_name == github.repository) "
-                        "&& vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}",
+                        "&& vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404' "
+                        "&& 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}",
                     )
                 else:
                     self.assertEqual(job["runs-on"], "ubuntu-latest", f"{name}:{job_id}")

@@ -609,11 +609,12 @@ are preserved until those callers migrate.
 ## Public-hosted runner contract
 
 `check.yml` job `ignored-db-runtime` (`ignored db (runtime)`) has its own
-runner route. It uses `CI_BLACKSMITH_2VCPU` for same-repository PRs and the
-existing non-PR events. Fork PRs always use `ubuntu-latest`. An unset variable
-or the cutoff value `ubuntu-latest` also selects GitHub-hosted Ubuntu. The
-cutoff estimates usage periodically and reserves headroom before routing new
-runs. The estimate cannot establish a provider billing cap.
+runner route. Same-repository PRs and the existing non-PR events use
+`blacksmith-2vcpu-ubuntu-2404` when `CI_BLACKSMITH_2VCPU` matches that label.
+Fork PRs and any other variable value, including an unset variable or the
+cutoff value `ubuntu-latest`, use GitHub-hosted Ubuntu. The cutoff estimates
+usage periodically and reserves headroom before routing new runs. The
+estimate cannot establish a provider billing cap.
 
 [Blacksmith's 2 vCPU Ubuntu 24.04 runner](https://docs.blacksmith.sh/blacksmith-runners/overview#x64-runners)
 starts a fresh microVM per job. The database lane uses pinned job and service

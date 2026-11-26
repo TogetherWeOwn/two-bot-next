@@ -16,7 +16,8 @@ PUBLIC_RUNNER = "ubuntu-latest"
 IGNORED_DB_RUNTIME_RUNNER = (
     "${{ (github.event_name != 'pull_request' || "
     "github.event.pull_request.head.repo.full_name == github.repository) "
-    "&& vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}"
+    "&& vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404' "
+    "&& 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}"
 )
 # Negative fixture: the former public-first branch still collected private
 # self-hosted/overflow routing in source, even when it was never selected.
@@ -112,6 +113,7 @@ class CheckerMutationTests(unittest.TestCase):
         for mutated in (
             canonical.replace("github.event.pull_request.head.repo.full_name == github.repository", "true"),
             canonical.replace("CI_BLACKSMITH_2VCPU", "CI_BLACKSMITH_4VCPU"),
+            canonical.replace(" == 'blacksmith-2vcpu-ubuntu-2404' && 'blacksmith-2vcpu-ubuntu-2404'", ""),
             canonical.replace("|| 'ubuntu-latest'", ""),
         ):
             with self.subTest(mutated=mutated):

@@ -5529,7 +5529,8 @@ class WorkflowTests(unittest.TestCase):
     IGNORED_DB_RUNTIME_RUNNER = (
         "${{ (github.event_name != 'pull_request' || "
         "github.event.pull_request.head.repo.full_name == github.repository) "
-        "&& vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}"
+        "&& vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404' "
+        "&& 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}"
     )
 
     def test_cargo_deny_keeps_transitive_unmaintained_advisories(self):
@@ -10961,7 +10962,9 @@ class WorkflowTests(unittest.TestCase):
             head_repo = repository if event == "pull_request" else ""
             cases.extend(((event, head_repo, label, label),
                           (event, head_repo, "", PUBLIC_RUNNER),
-                          (event, head_repo, PUBLIC_RUNNER, PUBLIC_RUNNER)))
+                          (event, head_repo, PUBLIC_RUNNER, PUBLIC_RUNNER),
+                          (event, head_repo, "blacksmith-4vcpu-ubuntu-2404", PUBLIC_RUNNER),
+                          (event, head_repo, "self-hosted", PUBLIC_RUNNER)))
 
         # Model the string comparisons and short circuiting used by this pin.
         # Missing GitHub properties and unset variables are empty strings.
