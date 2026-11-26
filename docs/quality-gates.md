@@ -46,7 +46,11 @@ lint-only `check` lane.
   absolute roots and parent traversal fail closed, rather than silently
   producing an uncovered verdict on the host runner's different checkout root.
   Shard uploads overwrite the same shard's earlier artifact on a failed-job
-  re-run. Measurement also uses
+  retry. Each artifact carries an identity file that binds its LCOV bytes and
+  shard index to the checkout SHA, selector outputs and full coverage matrix.
+  The merge requires a matching report and identity file for every planned
+  shard. A retained shard from an earlier attempt can satisfy the merge when
+  those inputs still match. Measurement also uses
   `--ignore-run-fail` to preserve LCOV output when tests invoked by llvm-cov fail.
   A build or report-generation failure fails this gate. Each shard probes the
   compiler cache before measurement with a 30-second limit. If its backend cannot

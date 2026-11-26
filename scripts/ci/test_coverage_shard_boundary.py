@@ -1,6 +1,7 @@
 """Offline regression tests for producer/consumer coverage workspace boundaries."""
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -8,6 +9,8 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -234,6 +237,152 @@ class CoverageShardBoundaryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn("failing closed", result.stdout + result.stderr)
                 self.assertFalse(output.exists())
+
+
+class CoverageRetryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        workflow = yaml.load((ROOT / ".github/workflows/check.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        cls.consumer = {step["name"]: step for step in workflow["jobs"]["patch-coverage"]["steps"]
+                        if "name" in step}
+        cls.producer = {step["name"]: step for step in workflow["jobs"]["coverage-shard"]["steps"]
+                        if "name" in step}
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR"))
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        (self.directory / "scripts").symlink_to(ROOT / "scripts", target_is_directory=True)
+        self.git("init", "--quiet")
+        self.source = self.commit("source under test")
+        self.selector = '{"rust":"true","worker":"false"}'
+        self.plan = json.dumps({"include": [
+            {"shard_index": 0, "legs": "sweep-nonignored"},
+            {"shard_index": 1, "legs": "sweep-ignored"},
+        ]})
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-C", str(self.directory), *args], capture_output=True,
+            text=True, check=True, timeout=15,
+        ).stdout.strip()
+
+    def commit(self, message):
+        self.git("-c", "user.name=Coverage Fixture", "-c", "user.email=fixture@example.invalid",
+                 "-c", "commit.gpgsign=false", "commit", "--quiet", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def step(self, step, attempt, **overrides):
+        env = dict(os.environ, GITHUB_WORKSPACE=str(self.directory), GITHUB_SHA=self.source,
+                   GITHUB_RUN_ID="12345", GITHUB_RUN_ATTEMPT=str(attempt),
+                   COVERAGE_SELECTOR=self.selector, COVERAGE_MATRIX=self.plan, EXPECTED_SHARDS="2")
+        env.update(overrides)
+        return subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+                              cwd=self.directory, env=env, capture_output=True, text=True,
+                              check=False, timeout=15)
+
+    def upload(self, index, attempt, hits, **overrides):
+        report = self.directory / f"lcov-shard-{index}.info"
+        report.write_text(f"TN:\nSF:{CONTAINER_ROOT}/{SOURCE}\nDA:129,{hits}\nend_of_record\n")
+        if stamp := self.producer.get("Bind shard coverage report"):
+            plan = json.loads(overrides.get("COVERAGE_MATRIX", self.plan))
+            legs = next(entry["legs"] for entry in plan["include"] if entry["shard_index"] == index)
+            result = self.step(stamp, attempt, SHARD_INDEX=str(index),
+                               SHARD_LEGS=legs, **overrides)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        download = self.consumer["Download shard coverage reports"]["with"]
+        destination = self.directory / download["path"]
+        if download.get("merge-multiple") != "true":
+            destination /= f"coverage-shard-{index}"
+        destination.mkdir(parents=True, exist_ok=True)
+        upload = self.producer["Upload shard coverage report"]["with"]
+        for filename in upload["path"].splitlines():
+            path = self.directory / filename.replace("${{ matrix.shard_index }}", str(index))
+            path.replace(destination / path.name)
+        return destination / report.name
+
+    def test_workflow_rejects_foreign_retry_artifacts(self):
+        foreign = {
+            "selector": {"COVERAGE_SELECTOR": '{"rust":"true","worker":"true"}'},
+            "assigned legs": {"COVERAGE_MATRIX": self.plan.replace("sweep-nonignored", "discord-internal_events")},
+            "other shard legs": {"COVERAGE_MATRIX": self.plan.replace('"sweep-ignored"', '"sweep-ignored discord-internal_events"')},
+        }
+        for name, overrides in foreign.items():
+            with self.subTest(changed=name):
+                # Shard 0 is retained and is the only evidence of a hit. Shard 1
+                # is replaced. Both reports match the current count and index set.
+                self.upload(0, 1, hits=1, **overrides)
+                self.upload(1, 2, hits=0)
+                result = self.step(self.consumer["Merge coverage shards"], 2)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("coverage shard 0 identity mismatch", result.stdout)
+                self.assertFalse((self.directory / "lcov.info").exists())
+
+    def test_workflow_accepts_exact_retained_retry_artifact(self):
+        self.upload(0, 1, hits=1)
+        # The retry's replacement overwrites the old artifact at the same index.
+        self.upload(1, 1, hits=3)
+        self.upload(1, 2, hits=0, COVERAGE_SELECTOR='{"worker":"false","rust":"true"}')
+        result = self.step(self.consumer["Merge coverage shards"], 2)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        hits, error = GATE.read_lcov(self.directory / "lcov.info")
+        self.assertEqual(error, "")
+        self.assertEqual(hits, {(SOURCE, 129): 1})
+        self.assertEqual(GATE.evaluate(hits, {(SOURCE, 129)}), (1, 1, []))
+
+    def test_workflow_rejects_retained_report_from_another_checkout(self):
+        self.upload(0, 1, hits=1)
+        self.source = self.commit("different source")
+        self.upload(1, 2, hits=0)
+        result = self.step(self.consumer["Merge coverage shards"], 2)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("coverage shard 0 identity mismatch", result.stdout)
+        self.assertFalse((self.directory / "lcov.info").exists())
+
+    def test_workflow_rejects_missing_or_mismatched_artifact_evidence(self):
+        merge = self.consumer["Merge coverage shards"]
+        first = self.upload(0, 1, hits=1)
+        result = self.step(merge, 2)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("do not match the 2 planned indices", result.stdout)
+        self.assertFalse((self.directory / "lcov.info").exists())
+        second = self.upload(1, 2, hits=0)
+        first.write_bytes(second.read_bytes())
+        result = self.step(merge, 2)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("coverage shard 0 identity mismatch", result.stdout)
+        self.assertFalse((self.directory / "lcov.info").exists())
+        first = self.upload(0, 1, hits=1)
+        first.with_suffix(".identity").unlink()
+        result = self.step(merge, 2)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("do not match the 2 planned indices", result.stdout)
+        self.assertFalse((self.directory / "lcov.info").exists())
+        first = self.upload(0, 1, hits=1)
+        first.with_suffix(".identity").rename(first.with_name("lcov-shard-2.identity"))
+        first.rename(first.with_name("lcov-shard-2.info"))
+        result = self.step(merge, 2)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("do not match the 2 planned indices", result.stdout)
+        self.assertFalse((self.directory / "lcov.info").exists())
+
+    def test_workflow_accepts_single_nonempty_shard(self):
+        self.plan = json.dumps({"include": [{"shard_index": 0, "legs": "sweep-nonignored"}]})
+        self.upload(0, 1, hits=1, EXPECTED_SHARDS="1")
+        result = self.step(self.consumer["Merge coverage shards"], 2, EXPECTED_SHARDS="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_publisher_rejects_checkout_and_assignment_mismatches(self):
+        stamp = self.producer["Bind shard coverage report"]
+        result = self.step(stamp, 2, SHARD_INDEX="0", SHARD_LEGS="sweep-ignored")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("executed coverage shard 0 does not match the matrix", result.stdout)
+        result = self.step(stamp, 2, SHARD_INDEX="0", SHARD_LEGS="sweep-nonignored",
+                           GITHUB_SHA="a" * 40)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("coverage checkout does not match the workflow SHA", result.stdout)
+        self.assertFalse((self.directory / "lcov-shard-0.identity").exists())
 
 
 if __name__ == "__main__":
