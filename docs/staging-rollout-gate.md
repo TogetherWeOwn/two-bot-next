@@ -105,6 +105,29 @@ writer if the startup client disappears or startup stalls. The job also
 verifies explicit stop and empty runtime state. The fixture has no network or
 host file mounts.
 
+#### Offline predecessor image verdict
+
+Record **offline image liveness, identity and teardown verified** in the private
+release task record when the verified predecessor image runs without network
+access or a Discord token, `/health` and `/version` return 200, and the observed
+build stamps match the verified bundle. Expect `/readyz` to return 503 with the
+gateway and database parked. Confirm a clean exit and that the probe
+container and disposable extracted files were removed before recording the
+verdict. Keep receipt values and local paths in the private record.
+
+Keep protected staging admission pending. The protected caller still needs
+the exact archived Worker modules and image digest on a disposable Worker and
+Container app with private ingress from first create. Verify the app's effective
+synthetic database binding, ledger and schema for `0473/0465` and retained
+`0475/0465` in separate reservations.
+Full readiness also needs isolated gateway and REST fixtures with external
+Discord egress denied. Require proof that the stop fence is armed before
+startup, enforces the original expiry after runner loss, and blocks delayed
+creates and legacy keepalives. The independent stop caller must be able to
+stop the exact target and obtain settlement and stopped readback.
+Use the existing [disposable exact PRE rehearsal](#disposable-exact-pre-rehearsal)
+for protected admission and cleanup.
+
 #### Disposable exact PRE rehearsal
 
 Keep qualification pending until a protected caller can enforce private
@@ -127,6 +150,35 @@ the process receives both synthetic endpoints and that public egress is blocked.
    (for example `pre-fixture-test`), rehearsal run ID, original start time, and
    PRE shape (`0473/0465` or retained `0475/0465`). Pin the approved synthetic
    database and gateway fixture to that reservation.
+   Before protected start, reconstruct the start inputs locally from those
+   pins. Pass the private ZIP and saved, authenticated GitHub records to
+   [`verify_predecessor_bundle`](../scripts/predecessor_bundle.py). Use the
+   returned receipt and private material from that same ZIP. Build the approved
+   `Target` from the reservation and use `make_config` with the operator's
+   selected scope, rehearsal run, original start and shape to reconstruct the
+   proposed config. Supply the selected synthetic service as `synthetic_service`.
+   Pass the approved target, independently pinned producer run,
+   current time, verified receipt, material directory and proposed config to
+   [`admit_predecessor`](../scripts/predecessor_intake.py). A shared staging or
+   production environment, a different synthetic binding, or an expired
+   reservation stops preparation. Pass the returned config to
+   [`assemble_worker_upload`](../scripts/pre_worker_upload.py) with the same
+   target, time and material. Keep the upload paired with that `Target` for
+   [`ProtectedPre.start`](../scripts/pre_start_stop.py), which performs its own
+   live admission.
+
+   With the inputs already local, these preparation steps need no cloud
+   credentials. Run the same sequence against synthetic inputs from the repo
+   root with an empty environment. Use the absolute path to an installed
+   Python 3.11 or newer. This example resolves Python 3.12 before clearing
+   the environment.
+
+   ```sh
+   pre_python=$(command -v python3.12) &&
+     env -i PYTHONDONTWRITEBYTECODE=1 "$pre_python" -m unittest discover \
+       -s scripts/ci -p test_pre_operator_inputs.py -v
+   ```
+
 2. Admit one rehearsal at a time on its own Worker, Container app and synthetic
    database. Keep ingress private from first create, with no shared staging app,
    production routes, public preview, or access to shared writers. Arm the
@@ -148,6 +200,13 @@ the process receives both synthetic endpoints and that public egress is blocked.
    readback showing settled startup, no write access, no Worker or app, and
    both counts proved zero. Workflow status and resource disappearance alone
    leave stop unverified. See the [cleanup fixtures](../scripts/ci/test_pre_target.py).
+
+The [dormant Container lookup](../scripts/pre_container_lookup.py) checks the
+exact Get Application path, staging account, pinned app UUID and full PRE
+reservation. A 404 counts only when the authenticated reader can attribute it
+to the application handler's documented not-found result independently of the
+provider's generic error envelope. Cleanup still requires separate evidence of
+instance counts and startup settlement. [Get Application schema](https://github.com/cloudflare/api-schemas/blob/9a5e4d44bd74d90fa9e4822142b8eb67e4ba3c70/openapi.json)
 
 The [dormant sweep workflow](https://github.com/TogetherWeOwn/two-bot-next/blob/b3e6030f0493683efd94413aacdd04379e45b2fb/.github/workflows/staging-pre-reaper.yml)
 is intended as a scheduled cleanup fallback. Scheduled runs can arrive late

@@ -21,6 +21,7 @@
  */
 
 import { Container } from "@cloudflare/containers";
+import type { bindStagingAutomodDeploymentTransport } from "../scripts/staging-automod-deployment-transport.ts";
 // SDK 0.3.7 reattaches outbound callbacks even for an already-running process.
 // https://developers.cloudflare.com/containers/container-package/
 export { ContainerProxy } from "@cloudflare/containers";
@@ -29,11 +30,12 @@ import {
   authenticated, deploymentId, readChange, readControlBody, refused,
 } from "./ownership.ts";
 import {
-  StagingLifecycle, STAGING_USE_PATH, VOICE_MOVE_LEASE_HEADER, hasAutomodReservation, parseStagingUseChange,
-  voiceMoveAllowed, type StagingUse,
+  AUTOMOD_STAGING_PURPOSE, StagingLifecycle, STAGING_USE_PATH, VOICE_MOVE_LEASE_HEADER, hasAutomodReservation, parseStagingUseChange,
+  voiceMoveAllowed, type StagingUse, type StagingUseChange,
 } from "./staging-lifecycle.ts";
+import { bindStagingAutomodAuthorityProvider, type ReadProtectedAutomodApproval } from "./staging-automod-authority-provider.ts";
 import { runProtectedAutomod, type ProtectedAutomodCall, type ProtectedAutomodEffects } from "./staging-automod-caller.ts";
-import { StagingAutomodRecovery } from "./staging-automod-recovery.ts";
+import { STAGING_AUTOMOD_TARGET, StagingAutomodRecovery } from "./staging-automod-recovery.ts";
 import { stagingDatabaseEvidence } from "./staging-database-fingerprint.ts";
 import { PREVIEW_HEADER, parseRegistryJson, previewRefusal, readPreview, readPreviewAbsent } from "./staging-preview.ts";
 import {
@@ -69,6 +71,7 @@ import {
   REQUEST_TIMEOUT_MS,
   SIGNING_HEADERS,
   allowlistedHeaders,
+  boundRead,
   envelope,
   forwardRequest,
   handleActionsIngress,
@@ -156,6 +159,20 @@ import {
  * Plus the optional reviewed TWO_* flags in container-env.ts (TOG-12020) and
  * the optional reviewed DISCORD_* snowflake IDs there (TOG-19025, M3.6).
  */
+type ProtectedAutomodInvoker = Parameters<typeof bindStagingAutomodDeploymentTransport>[2];
+type AutomodServingPin = Parameters<ProtectedAutomodInvoker>[0];
+type ProtectedAutomodReservation = Readonly<{
+  pin: AutomodServingPin;
+  change: StagingUseChange;
+  target: Readonly<{ applicationId: string; guildId: string }>;
+}>;
+
+function sameAutomodServingPin(pin: AutomodServingPin, observed: AutomodServingPin | undefined): boolean {
+  return !!observed && observed.workerDeploymentId === pin.workerDeploymentId && observed.workerVersionId === pin.workerVersionId
+    && observed.sourceSha === pin.sourceSha && observed.applicationId === pin.applicationId
+    && observed.namespaceId === pin.namespaceId && observed.rolloutId === pin.rolloutId && observed.imageDigest === pin.imageDigest;
+}
+
 export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_BOT: DurableObjectNamespace<TwoBotContainer>;
   /** Cloudflare version identity, never a client-supplied owner name. */
@@ -898,8 +915,12 @@ export class TwoBotContainer extends Container<Env> {
     // A deployment can reattach to a running old process. Reconcile before
     // ingress or alarms are delivered, not just before the next cold start.
     this.initialization = ctx.blockConcurrencyWhile(async () => {
+      let use: StagingUse | undefined;
       try {
-        if (this.boundedStaging() && await this.deferStagingTeardown(await this.stagingUse.read())) return;
+        if (this.boundedStaging()) {
+          use = await this.stagingUse.read();
+          if (await this.deferStagingTeardown(use)) return;
+        }
         const owner = await this.ownership.require(this.id());
         if (this.boundedStaging()) {
           const [pending] = await this.listSchedules<boolean>("stagingExpiry");
@@ -908,8 +929,8 @@ export class TwoBotContainer extends Container<Env> {
             return;
           }
           await this.requireRecoveryDatabase();
-          const use = await this.stagingUse.require({ deploymentId: this.id(), sha: this.env.CONTAINER_RELEASE ?? "", owner });
-          await this.scheduleStagingExpiry(use.expiresAt);
+          const active = await this.stagingUse.require({ deploymentId: this.id(), sha: this.env.CONTAINER_RELEASE ?? "", owner });
+          await this.scheduleStagingExpiry(active.expiresAt);
         }
       } catch (error) {
         refused(error);
@@ -917,7 +938,12 @@ export class TwoBotContainer extends Container<Env> {
           this.recoveryFailed = true;
           return;
         }
-        try { await this.destroyInactive(); }
+        try {
+          await this.destroyInactive();
+          if (use?.purpose === AUTOMOD_STAGING_PURPOSE && use.phase === "preparing") {
+            await this.scheduleStagingExpiry(Math.max(Date.now(), use.expiresAt));
+          }
+        }
         catch {
           this.recoveryFailed = true;
           if (this.boundedStaging()) await this.scheduleStagingExpiry(Date.now() + 15_000, true);
@@ -956,6 +982,16 @@ export class TwoBotContainer extends Container<Env> {
 
   private voiceMoveConfigured(): boolean {
     return this.boundedStaging() && ingressEnabled(this.env) && this.env.TWO_INTERNAL_ALLOW_VOICE_MOVE === "1";
+  }
+
+  /** Private composition for the protected host. No DO instance RPC. */
+  static bindProtectedAutomodAuthority(bot: TwoBotContainer, request: Request, readApproval: ReadProtectedAutomodApproval) {
+    return bindStagingAutomodAuthorityProvider(request, bot.env, (context, signal) => bot.gated(async () => {
+      signal.throwIfAborted();
+      const deploymentId = bot.id();
+      const owner = await bot.ownership.require(deploymentId);
+      return bot.stagingUse.readIssuedAutomodLease(context, { deploymentId, owner, sha: bot.env.CONTAINER_RELEASE ?? "" });
+    }), readApproval);
   }
 
   private async requireCompetingStagingUse(emergencyStop?: () => Promise<void>): Promise<void> {
@@ -1013,6 +1049,87 @@ export class TwoBotContainer extends Container<Env> {
         return runtime?.running === bot.ctx.container?.running ? runtime : undefined;
       },
     });
+  }
+
+  /** Bind an in-process instance for the authenticated AutoMod transport. The
+   * protected caller independently reads the current serving deployment and
+   * rollout for this instance. Each action compares that evidence to the
+   * original pin before entering the existing DO gate.
+   */
+  static bindProtectedAutomodInvoker(bot: TwoBotContainer,
+    readServing: (signal: AbortSignal) => Promise<AutomodServingPin | undefined>,
+    effects: ProtectedAutomodEffects,
+  ): ProtectedAutomodInvoker {
+    return async (pin, call, signal) => {
+      signal.throwIfAborted();
+      const { issuedLease } = call;
+      if (!TwoBotContainer.isProtectedAutomodStage(bot, pin) || issuedLease.purpose !== AUTOMOD_STAGING_PURPOSE
+        || issuedLease.deploymentId !== pin.workerVersionId || issuedLease.sha !== pin.sourceSha) {
+        throw new OwnershipRefused("staging_use_conflict");
+      }
+      const observed = await boundRead(readServing(signal), signal);
+      if (!sameAutomodServingPin(pin, observed)) {
+        throw new OwnershipRefused("staging_use_conflict");
+      }
+      signal.throwIfAborted();
+      return TwoBotContainer.runProtectedAutomod(bot, call, effects);
+    };
+  }
+
+  /** Compose one in-process host. Reservation and per-action records must be
+   * authenticated independently by the protected caller. No network entry
+   * supplies these collaborators. The invoker is only for the job transport.
+   */
+  static bindProtectedAutomodInstance(bot: TwoBotContainer, request: Request, adapters: Readonly<{
+    readReservation: (signal: AbortSignal) => Promise<ProtectedAutomodReservation | undefined>;
+    readApproval: ReadProtectedAutomodApproval;
+    readServing: Parameters<typeof TwoBotContainer.bindProtectedAutomodInvoker>[1];
+    effects: ProtectedAutomodEffects;
+  }>) {
+    const { readReservation, readApproval, readServing, effects } = adapters;
+    return {
+      authority: TwoBotContainer.bindProtectedAutomodAuthority(bot, request, readApproval),
+      invokePrivate: TwoBotContainer.bindProtectedAutomodInvoker(bot, readServing, effects),
+      acquireLease: async (pin: AutomodServingPin, expected: Readonly<StagingUseChange>, signal: AbortSignal) => {
+        signal.throwIfAborted();
+        const deadline = AbortSignal.any([signal, AbortSignal.timeout(2_000)]);
+        const change = parseStagingUseChange(expected);
+        const servingPin = Object.freeze({ ...pin });
+        if (effects.enabled !== true || change?.action !== "acquire" || change.runAttempt !== 1 || change.voiceMove
+          || change.deploymentId !== servingPin.workerVersionId || change.sha !== servingPin.sourceSha
+          || !TwoBotContainer.isProtectedAutomodStage(bot, servingPin)
+          || !await authenticated(request, bot.env.OWNERSHIP_CONTROL_TOKEN)) {
+          throw new OwnershipRefused("staging_use_conflict");
+        }
+        deadline.throwIfAborted();
+        const approved = await boundRead(readReservation(deadline), deadline);
+        const grant = parseStagingUseChange(approved?.change);
+        if (grant?.action !== "acquire" || grant.voiceMove || grant.runId !== change.runId || grant.runAttempt !== change.runAttempt
+          || grant.deploymentId !== change.deploymentId || grant.sha !== change.sha || grant.expectedEpoch !== change.expectedEpoch
+          || grant.expiresAt !== change.expiresAt || approved?.target?.applicationId !== STAGING_AUTOMOD_TARGET.applicationId
+          || approved.target.guildId !== STAGING_AUTOMOD_TARGET.guildId || !sameAutomodServingPin(servingPin, approved.pin)) {
+          throw new OwnershipRefused("staging_use_conflict");
+        }
+        return bot.gated(async () => {
+          deadline.throwIfAborted();
+          if (bot.recoveryFailed || bot.ctx.container?.running !== false) throw new OwnershipRefused("shutdown_unconfirmed");
+          const owner = await bot.ownership.require(change.deploymentId);
+          await bot.requireRecoveryDatabase();
+          deadline.throwIfAborted();
+          const observed = await boundRead(readServing(deadline), deadline);
+          if (!sameAutomodServingPin(servingPin, observed)) throw new OwnershipRefused("staging_use_conflict");
+          deadline.throwIfAborted();
+          return bot.stagingUse.acquire(change, { deploymentId: change.deploymentId, sha: change.sha, owner },
+            () => bot.stopStagingUse(), expiry => bot.scheduleStagingExpiry(expiry), Date.now(), AUTOMOD_STAGING_PURPOSE);
+        });
+      },
+    };
+  }
+
+  private static isProtectedAutomodStage(bot: TwoBotContainer, pin: AutomodServingPin): boolean {
+    return bot.boundedStaging() && bot.env.DISCORD_APPLICATION_ID === STAGING_AUTOMOD_TARGET.applicationId
+      && bot.env.GUILD_ID === STAGING_AUTOMOD_TARGET.guildId && pin.workerVersionId === bot.id()
+      && pin.sourceSha === bot.env.CONTAINER_RELEASE;
   }
 
   /** Snapshot composition. Static so the DO instance exposes no snapshot RPC. */
@@ -1125,6 +1242,17 @@ export class TwoBotContainer extends Container<Env> {
           return;
         }
         await this.destroyInactive();
+        if (use?.purpose === AUTOMOD_STAGING_PURPOSE && use.phase === "preparing") {
+          if (use.expiresAt > Date.now()) {
+            await this.scheduleStagingExpiry(use.expiresAt);
+            this.recoveryFailed = false;
+            return;
+          }
+          if (this.ctx.container?.running !== false) throw new OwnershipRefused("shutdown_unconfirmed");
+          const deploymentId = this.id();
+          const owner = await this.ownership.require(deploymentId);
+          use = await this.stagingUse.retireExpiredAutomodPreparation({ deploymentId, owner, sha: this.env.CONTAINER_RELEASE ?? "" });
+        }
         this.deleteSchedules("stagingExpiry");
         this.recoveryFailed = false;
         this.stagingReceipt("expiry", use, "stopped");
@@ -1135,6 +1263,11 @@ export class TwoBotContainer extends Container<Env> {
         try {
           if (this.ctx.container?.running) await super.destroy();
           if (this.ctx.container?.running) throw new OwnershipRefused("shutdown_unconfirmed");
+          // A native stop alone cannot retire a preparation whose storage or
+          // ownership check failed. Keep its hold and retry through the gate.
+          if (use?.purpose === AUTOMOD_STAGING_PURPOSE && use.phase === "preparing") {
+            throw new OwnershipRefused("staging_use_conflict");
+          }
           this.deleteSchedules("keepalive");
           this.deleteSchedules("stagingExpiry");
           this.recoveryFailed = false;

@@ -188,6 +188,14 @@ staging ownership inventory run, attempt 1 and its named artifact. The first
 admitted action needs an observation at most 60 seconds old within the caller's
 action deadline.
 
+The private `TwoBotContainer.bindProtectedAutomodAuthority` source seam
+reads the durable issued lease under the existing ownership gate, including
+after expiry while the lease is held. It uses the existing staging ownership
+control bearer and checks each independently authenticated approval read.
+The protected integration still needs a sanctioned caller for lifecycle
+issuance and a protected source of the separate `start` and `recover` records.
+Bind those reads through the operator entry and its existing deadlines.
+
 - [ ] **Confirm existing admission evidence.** Check the stopped staging
   baseline, verified recovery, database and gateway proofs, moderation
   eligibility, cleanup reserve and affirmative registry absence with spare

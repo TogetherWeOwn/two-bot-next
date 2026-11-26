@@ -56,44 +56,50 @@ def successful(row):
     return row.get("status") == "completed" and row.get("conclusion") == "success"
 
 
+def workflow_evidence(source, api, *, workflow, path, event, checks):
+    """Read the latest main run and its attempt-bound GitHub Actions checks."""
+    listing = f"actions/workflows/{workflow}/runs"
+    runs = collect(api, listing, "workflow_runs", head_sha=source, branch="main", event=event)
+    require(runs and all(run.get("head_sha") == source and positive(run.get("id"))
+                         and positive(run.get("run_number")) for run in runs), "candidate_ci_unproved")
+    latest = max(runs, key=lambda run: (run["run_number"], run["id"]))
+    run_id = latest["id"]
+    run_path = f"actions/runs/{run_id}"
+    current = mapping(api(run_path))
+    run_identity(current, path, event)
+    attempt, suite = current.get("run_attempt"), current.get("check_suite_id")
+    require(all(current.get(key) == latest[key] for key in ("id", "head_sha", "run_number"))
+            and positive(attempt) and positive(suite) and successful(current), "candidate_ci_unproved")
+    jobs = collect(api, f"{run_path}/attempts/{attempt}/jobs", "jobs")
+    for name in checks:
+        selected = [job for job in jobs if job.get("name") == name]
+        require(len(selected) == 1, "candidate_check_job_unproved")
+        job = selected[0]
+        require(job.get("run_id") == run_id and job.get("run_attempt") == attempt
+                and job.get("head_sha") == source and positive(job.get("id"))
+                and successful(job), "candidate_check_job_unproved")
+        url = job.get("check_run_url")
+        require(isinstance(url, str)
+                and re.fullmatch(rf"https://api\.github\.com/repos/{REPO}/check-runs/[1-9][0-9]{{0,19}}", url),
+                "candidate_check_job_unproved")
+        params = urlencode({"check_name": name, "app_id": 15368, "filter": "latest", "per_page": 100})
+        runs = sequence(mapping(api(f"commits/{source}/check-runs?{params}")).get("check_runs"))
+        bound = [check for check in map(mapping, runs) if check.get("url") == url]
+        require(len(bound) == 1, "candidate_check_unproved")
+        check = bound[0]
+        require(check.get("head_sha") == source and check.get("name") == name
+                and mapping(check.get("app")).get("id") == 15368
+                and mapping(check.get("check_suite")).get("id") == suite and successful(check),
+                "candidate_check_unproved")
+    return {"run_id": run_id, "attempt": attempt}
+
+
 def check_evidence(source, api):
-    evidence = {}
-    for workflow, checks in CHECKS.items():
-        path = f"actions/workflows/{workflow}/runs"
-        runs = collect(api, path, "workflow_runs", head_sha=source, branch="main", event="push")
-        require(runs and all(run.get("head_sha") == source and positive(run.get("id"))
-                             and positive(run.get("run_number")) for run in runs), "candidate_ci_unproved")
-        latest = max(runs, key=lambda run: (run["run_number"], run["id"]))
-        run_id = latest["id"]
-        run_path = f"actions/runs/{run_id}"
-        current = mapping(api(run_path))
-        run_identity(current, f".github/workflows/{workflow}", "push")
-        attempt, suite = current.get("run_attempt"), current.get("check_suite_id")
-        require(all(current.get(key) == latest[key] for key in ("id", "head_sha", "run_number"))
-                and positive(attempt) and positive(suite) and successful(current), "candidate_ci_unproved")
-        jobs = collect(api, f"{run_path}/attempts/{attempt}/jobs", "jobs")
-        for name in checks:
-            selected = [job for job in jobs if job.get("name") == name]
-            require(len(selected) == 1, "candidate_check_job_unproved")
-            job = selected[0]
-            require(job.get("run_id") == run_id and job.get("run_attempt") == attempt
-                    and job.get("head_sha") == source and positive(job.get("id"))
-                    and successful(job), "candidate_check_job_unproved")
-            url = job.get("check_run_url")
-            require(isinstance(url, str)
-                    and re.fullmatch(rf"https://api\.github\.com/repos/{REPO}/check-runs/[1-9][0-9]{{0,19}}", url),
-                    "candidate_check_job_unproved")
-            params = urlencode({"check_name": name, "app_id": 15368, "filter": "latest", "per_page": 100})
-            runs = sequence(mapping(api(f"commits/{source}/check-runs?{params}")).get("check_runs"))
-            bound = [check for check in map(mapping, runs) if check.get("url") == url]
-            require(len(bound) == 1, "candidate_check_unproved")
-            check = bound[0]
-            require(check.get("head_sha") == source and check.get("name") == name
-                    and mapping(check.get("app")).get("id") == 15368
-                    and mapping(check.get("check_suite")).get("id") == suite and successful(check),
-                    "candidate_check_unproved")
-        evidence[workflow] = {"run_id": run_id, "attempt": attempt}
-    return evidence
+    return {
+        workflow: workflow_evidence(source, api, workflow=workflow, path=f".github/workflows/{workflow}",
+                                    event="push", checks=checks)
+        for workflow, checks in CHECKS.items()
+    }
 
 
 def authorize(env, inputs, fresh_plan, lockfile, api=github, git=check_git):

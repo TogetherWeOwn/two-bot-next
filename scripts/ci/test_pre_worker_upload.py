@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bot_promotion import MAX_MEMBER_BYTES, MAX_TOTAL_BYTES
 from predecessor_bundle import IMAGE, verify_predecessor_bundle
 from pre_target import ProtectedRouteReadback, Resource, Target, TargetError, confirm_protected_route, make_config
-from pre_worker_upload import assemble_worker_upload
+from pre_worker_upload import DatabaseEndpoint, assemble_worker_upload
 from script_intake import decode_json
 from test_pre_start_stop import PRE_SHAPES, PreFixture
 from test_pre_target import APP_ID
@@ -30,6 +30,14 @@ MODULES = {
     "lib/message.txt": ("text/plain", b"fixture\r\n"),
     "lib/data.bin": ("application/octet-stream", bytes([0, 128, 255, 10, 13])),
 }
+
+
+def database_fixture(target):
+    endpoint = DatabaseEndpoint(target=target, service=target.service_name,
+                                host=f"{target.service_name}.{target.scope}.db.invalid", port=5432,
+                                database="pre", user="pre_fixture", disposable=True)
+    url = f"postgresql://{endpoint.user}:fixture%40password@{endpoint.host}:5432/pre?sslmode=verify-full"
+    return {"database_endpoint": endpoint, "database_url": url}
 
 
 def receive_multipart(content_type, body):
@@ -69,7 +77,7 @@ class PreWorkerUploadTests(unittest.TestCase):
     def assemble(self, **overrides):
         return assemble_worker_upload(**{
             "target": self.target, "now": self.target.started_at, "receipt": self.receipt,
-            "material_root": self.root, "config": self.config, **overrides,
+            "material_root": self.root, "config": self.config, **database_fixture(self.target), **overrides,
         })
 
     def test_multipart_preserves_module_names_types_bytes_and_version_metadata(self):
@@ -85,7 +93,7 @@ class PreWorkerUploadTests(unittest.TestCase):
             "bindings": [
                 {"name": "BOT_PORT", "type": "plain_text", "text": "8080"},
                 {"name": "CONTAINER_RELEASE", "type": "plain_text", "text": self.revision},
-                {"name": "DATABASE_URL", "type": "plain_text", "text": self.config["vars"]["DATABASE_URL"]},
+                {"name": "DATABASE_URL", "type": "secret_text", "text": database_fixture(self.target)["database_url"]},
                 {"name": "TWO_BOT", "type": "durable_object_namespace", "class_name": "TwoBotContainer"},
                 {"name": "CF_VERSION_METADATA", "type": "version_metadata"},
             ],
@@ -98,6 +106,31 @@ class PreWorkerUploadTests(unittest.TestCase):
         self.assertEqual(self.assemble(), upload)
         for name, (_, data) in MODULES.items():
             self.assertEqual((self.worker / name).read_bytes(), data)
+
+    def test_accepts_tls_query_options_in_either_order(self):
+        database_url = database_fixture(self.target)["database_url"]
+        base, _ = database_url.split("?")
+        for query in ("sslmode=require&channel_binding=require", "channel_binding=require&sslmode=require"):
+            with self.subTest(query=query):
+                url = base + "?" + query
+                upload = self.assemble(database_url=url)
+                metadata = decode_json(receive_multipart(upload.content_type, upload.body)[0][3])
+                self.assertIn({"name": "DATABASE_URL", "type": "secret_text", "text": url}, metadata["bindings"])
+        for query in ("sslmode=require&sslmode=verify-full", "channel_binding=require&channel_binding=require&sslmode=require",
+                      "sslmode=disable&channel_binding=require", "channel_binding=require"):
+            with self.subTest(query=query), self.assertRaisesRegex(TargetError, "^invalid_pre_database_url$"):
+                self.assemble(database_url=base + "?" + query)
+
+    def test_multipart_boundary_is_independent_of_database_password(self):
+        database_url = database_fixture(self.target)["database_url"]
+        original = self.assemble()
+        changed = self.assemble(database_url=database_url.replace("fixture%40password", "another-fixture"))
+        self.assertEqual(original.content_type, changed.content_type)
+        self.assertNotEqual(original.body, changed.body)
+
+        boundary = original.content_type.split("boundary=", 1)[1]
+        with self.assertRaisesRegex(TargetError, "^pre_worker_boundary_collision$"):
+            self.assemble(database_url=database_url.replace("fixture%40password", "--" + boundary))
 
     def test_refuses_wrong_entrypoint_and_missing_entrypoint_hash(self):
         self.config["main"] = str(self.worker / "lib/helper.mjs")
@@ -174,7 +207,8 @@ class PreWorkerUploadTests(unittest.TestCase):
                 self.assertEqual(other.worker_name, self.target.worker_name)
                 with self.assertRaisesRegex(TargetError, "^wrong_pre_worker_config$"):
                     self.assemble(target=other)
-                self.assertEqual(self.assemble(target=other, config=self.make_config(other)).target, other)
+                self.assertEqual(self.assemble(target=other, config=self.make_config(other),
+                                               **database_fixture(other)).target, other)
         with self.assertRaisesRegex(TargetError, "^pre_admission_expired$"):
             self.assemble(now=self.target.expires_at)
 
@@ -208,13 +242,15 @@ class PreWorkerUploadTests(unittest.TestCase):
                 target = replace(self.target, shape=shape)
                 args = dict(target=target, now=target.started_at, receipt=receipt, material_root=root)
                 config = make_config(**args, synthetic_service=target.service_name)
-                upload = assemble_worker_upload(**args, config=config)
+                database = database_fixture(target)
+                upload = assemble_worker_upload(**args, config=config, **database)
                 parts = receive_multipart(upload.content_type, upload.body)
                 self.assertEqual({name: data for name, _, _, data in parts[1:]},
                                  {name.removeprefix("worker/"): data for name, data in members.items() if name != IMAGE})
                 self.assertEqual((root / IMAGE).read_bytes(), members[IMAGE])
                 with self.assertRaisesRegex(TargetError, "^wrong_pre_worker_config$"):
-                    assemble_worker_upload(**args, config={**config, "vars": {**config["vars"], **overrides}})
+                    assemble_worker_upload(**args, config={**config, "vars": {**config["vars"], **overrides}},
+                                           **database)
                 upload.require_unrouted(observed_target=target, complete=True, workers_dev=False,
                                         preview_urls=False, routes=(), custom_domains=())
                 route = ProtectedRouteReadback(target, target.worker_name, Resource(target.container_name, APP_ID))

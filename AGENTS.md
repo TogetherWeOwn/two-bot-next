@@ -61,6 +61,33 @@ its remaining findings, then push the resolution before expecting GitHub to merg
   comment that names what replaced it.
 - Never bypass a required check, a ruleset or a failing test.
 
+### Review replies
+
+Reply in the finding's own thread. Before posting, inspect the raw Markdown
+and confirm its first line is `Fixed in <commit sha>`, `Rejected: <proof>` or
+`Duplicate of <link>`. Put any model attribution after a blank line below that
+first line. The required `pr-standards` check counts the first line of Devin
+Review replies. Follow the [organization's review reply rules](https://github.com/TogetherWeOwn/.github/blob/main/CONTRIBUTING.md#4-reviews).
+
+Copy the body from the appropriate example and replace the sample SHA, proof,
+model and account with the real values.
+
+```markdown
+Fixed in 1a2b3c4
+
+> [!NOTE]
+> 🤖 **<model> responding on behalf of <account>**
+
+The parser now rejects an empty field before saving it.
+```
+
+```markdown
+Rejected: src/example.rs:42 already rejects the empty field before saving it.
+
+> [!NOTE]
+> 🤖 **<model> responding on behalf of <account>**
+```
+
 ## T3 Code workflow
 
 The lead manages the queue, dependencies and up to four active task threads per project.
