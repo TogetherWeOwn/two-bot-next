@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
+from test_production_recovery_artifact import producer, release_run_fixture
 from test_t0_acceptance_report import PRODUCTION, SCRIPTS, WATCH_EMPTY, WATCH_HEADER, WATCH_HELP, WATCH_RETURN
 
 sys.path.insert(0, str(SCRIPTS))
@@ -77,7 +78,7 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
         serving = {
             "worker": {"version_id": version, "sha": sha, "traffic_percent": 100},
             "container": {"application_id": pin.application_id, "namespace_id": pin.namespace_id,
-                          "image_digest": digest, "rollout_status": "completed"},
+                          "image_digest": digest, "rollout_id": "initial-rollout", "rollout_status": "completed"},
             "ownership": {"phase": "fenced", "running": False, "epoch": pin.fence_epoch,
                           "owner_actor": fence_actor(pin)},
         }
@@ -101,7 +102,9 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
             serving["worker"].update(version_id=version, sha=pin.rollback_sha)
 
         rollback.wait_worker_restore.side_effect = wait_worker_restore
-        rollback.restore_image.side_effect = lambda _image: serving["container"].update(image_digest=pin.image_digest)
+        rollback.restore_image.side_effect = lambda _image: serving["container"].update(
+            image_digest=pin.image_digest, rollout_id="restored-rollout",
+        )
         rollback.wait_stable.side_effect = wait_stable
         observe = Mock(side_effect=lambda: deepcopy(serving))
         restore_under_fence(pin, inverse, observe, control, rollback, "fixture-image", candidate)
@@ -126,14 +129,14 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
         predecessor = (pin.worker_version, pin.rollback_sha, pin.image_digest)
         intended = dict(PRODUCTION, worker_version=candidate[0], build_revision=candidate[1],
                         image_digest=candidate[2], application_id=pin.application_id)
-        origin = dict(case["run"], id=456)
+        _, origin = release_run_fixture()
+        origin["id"] = 456
         for conclusion, before in (("cancelled", predecessor), ("success", candidate)):
             with self.subTest(forward_job=conclusion):
                 # Applying the schema can finish before the run is interrupted at receipt upload.
-                steps = [{"name": name, "status": "completed", "conclusion": result}
-                         for name, result in zip(FORWARD_STEPS, ("success", conclusion))]
-                job = dict(case["fence_job"], name=FORWARD_JOB, run_id=origin["id"],
-                           conclusion=conclusion, steps=steps)
+                job = producer(origin, FORWARD_JOB, FORWARD_STEPS)
+                job["conclusion"] = conclusion
+                job["steps"][-1]["conclusion"] = conclusion
                 api = Mock(return_value={"total_count": 1, "jobs": [job]})
                 if conclusion == "cancelled":
                     with self.assertRaisesRegex(GateError, "^production_inverse_job_invalid$"):
