@@ -58,10 +58,11 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                         # Declare one byte more than is sent, then close.
                         self.close_connection = True
                         value = str(int(value) + 1)
-                    if failure == "duplicate" and key in ("Content-Length", "Sec-WebSocket-Accept"):
-                        # Keep the valid copy first, then repeat it with a bad value.
+                    if failure == "duplicate" and key in ("Content-Length", "Connection"):
+                        # Keep the valid copy first, then repeat it with a value a
+                        # joined or first-value read would still accept.
                         super().send_header(key, value)
-                        value = "65536" if key == "Content-Length" else discord.websocket_accept("forged")
+                        value = "65536" if key == "Content-Length" else "close"
                     if failure == "unframed" and key == "Content-Length":
                         # A complete body ended only by close has no declared length.
                         self.close_connection = True
