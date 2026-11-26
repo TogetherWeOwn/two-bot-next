@@ -1938,6 +1938,25 @@ ROLLBACK_DRILL_ENV = {
     "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-worker-drill-use.ndjson",
 }
 
+ROLLBACK_DRILL_CHECKOUT = {
+    "persist-credentials": "false",
+    "fetch-depth": "1",
+    "sparse-checkout-cone-mode": "false",
+    "sparse-checkout": (
+        "/scripts/build_identity.py\n"
+        "/scripts/script_intake.py\n"
+        "/scripts/staging_drill_use.py\n"
+        "/scripts/staging_rollback_drill.py\n"
+        "/scripts/staging_rollout.py\n"
+        "/scripts/worker_container_rollback.py\n"
+        "/wrangler/scripts/is-direct-invocation.mjs\n"
+        "/wrangler/scripts/ownership-control-response.mjs\n"
+        "/wrangler/scripts/ownership-control.mjs\n"
+        "/wrangler/scripts/staging-use-pipeline.mjs\n"
+        "/wrangler/scripts/staging-use.mjs\n"
+    ),
+}
+
 
 def rollback_proof_job_errors(job, mode):
     """Pin the dispatcher/observer to reviewed tooling and the smallest token."""
@@ -2035,15 +2054,24 @@ def staging_rollback_drill_errors(workflow):
     for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
         if key in job:
             errors.append(f"{name}:drill: must not set {key} (bindings stay on the single Run step)")
-    text = str(job).lower()
-    for marker in ("wrangler", "force", "production", "toJSON(secrets".lower(), "secrets["):
-        if marker in text.replace(" ", ""):
-            errors.append(f"{name}:drill: must not contain {marker!r} (script-only, unforced, staging-only)")
     steps = job.get("steps") or []
     if len(steps) != 4 or any(key in step for step in steps[:3] for key in ("if", "continue-on-error")):
         errors.append(f"{name}:drill: must run checkout, setup-node, drill and evidence upload")
         return errors
     checkout, node, run, upload = steps
+    checkout_for_marker_scan = checkout
+    if checkout.get("with") == ROLLBACK_DRILL_CHECKOUT:
+        # The exact checkout paths are data. Keep scanning every other field
+        # for Wrangler invocations and the other forbidden markers.
+        options = dict(ROLLBACK_DRILL_CHECKOUT)
+        del options["sparse-checkout"]
+        checkout_for_marker_scan = {**checkout, "with": options}
+    else:
+        errors.append(f"{name}:drill: must check out only the pinned runtime files")
+    text = str({**job, "steps": [checkout_for_marker_scan, node, run, upload]}).lower().replace(" ", "")
+    for marker in ("wrangler", "force", "production", "toJSON(secrets".lower(), "secrets["):
+        if marker in text:
+            errors.append(f"{name}:drill: must not contain {marker!r} (script-only, unforced, staging-only)")
     evidence = "${{ runner.temp }}/staging-rollback-drill-evidence.json"
     if (upload.get("with") or {}) != {
             "name": "staging-worker-rollback-drill",
@@ -2198,6 +2226,11 @@ EVENTS_READ_ENV = {
 }
 EVENTS_READ_COMMAND = ('python3 scripts/staging_events_read.py --window-start "$WINDOW_START" '
                        '--window-end "$WINDOW_END" --output "staging-events-read-$RUN_ID.json"')
+EVENTS_READ_PATHS = (
+    "/scripts/staging_events_read.py",
+    "/scripts/staging_automation_read_smoke.py",
+    "/scripts/script_intake.py",
+)
 
 
 def staging_events_read_errors(workflow):
@@ -2272,9 +2305,10 @@ def staging_events_read_errors(workflow):
         errors.append(f"{name}:read: must run exactly checkout, the read and the upload, unconditionally")
         return errors
     checkout, run, upload = steps
-    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or (checkout.get("with") or {}).get("persist-credentials") != "false":
-        errors.append(f"{name}:read: checkout must be pinned and must not persist credentials")
+    if checkout.get("uses") != STAGING_CHECKOUT_USES or checkout.get("with") != {
+            "persist-credentials": "false", "fetch-depth": "1", "sparse-checkout-cone-mode": "false",
+            "sparse-checkout": "\n".join(EVENTS_READ_PATHS) + "\n"}:
+        errors.append(f"{name}:read: checkout must use the workflow head and only the reader's files")
     if run.get("env") != EVENTS_READ_ENV:
         errors.append(f"{name}:read: Run step must bind exactly the three secrets, the two windows and the run id")
     if run.get("run") != EVENTS_READ_COMMAND or "uses" in run or "shell" in run:
@@ -7403,9 +7437,19 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertIn("actions/upload-artifact@", upload.get("uses", ""))
         self.assertEqual(upload["with"]["name"], "coverage-shard-${{ matrix.shard_index }}")
-        self.assertEqual(upload["with"]["path"], "lcov-shard-${{ matrix.shard_index }}.info")
+        self.assertEqual(upload["with"]["path"].splitlines(), [
+            "lcov-shard-${{ matrix.shard_index }}.info",
+            "lcov-shard-${{ matrix.shard_index }}.identity",
+        ])
         self.assertEqual(upload["with"]["if-no-files-found"], "error")
         self.assertEqual(upload["with"].get("overwrite"), "true")
+        bind = next(step for step in job["steps"] if step.get("name") == "Bind shard coverage report")
+        self.assertLess(job["steps"].index(bind), job["steps"].index(upload))
+        self.assertEqual(bind["env"]["COVERAGE_SELECTOR"], "${{ toJSON(needs.job-inputs.outputs) }}")
+        self.assertEqual(bind["env"]["COVERAGE_MATRIX"], "${{ needs.coverage-plan.outputs.matrix }}")
+        self.assertEqual(bind["env"]["EXPECTED_SHARDS"], "${{ needs.coverage-plan.outputs.expected-shards }}")
+        self.assertEqual(bind["env"]["SHARD_INDEX"], "${{ matrix.shard_index }}")
+        self.assertEqual(bind["env"]["SHARD_LEGS"], "${{ matrix.legs }}")
 
     def test_coverage_shard_leg_selection_matches_the_planner(self):
         # Every planner leg id guards exactly one legs block, and the
@@ -7558,7 +7602,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(
             merge.get("env", {}).get("EXPECTED_SHARDS"),
             "${{ needs.coverage-plan.outputs.expected-shards }}")
+        self.assertEqual(merge["env"]["COVERAGE_SELECTOR"], "${{ toJSON(needs.job-inputs.outputs) }}")
+        self.assertEqual(merge["env"]["COVERAGE_MATRIX"], "${{ needs.coverage-plan.outputs.matrix }}")
         self.assertIn("scripts/ci/merge-coverage-shards.py", merge["run"])
+        self.assertIn("--artifact-dir coverage-shards", merge["run"])
         self.assertIn('--expected-shards "$EXPECTED_SHARDS"', merge["run"])
         self.assertIn("--source-root /__w/two-bot-next/two-bot-next",
                       " ".join(shell_logical_lines(merge["run"])))
@@ -9803,6 +9850,8 @@ class WorkflowTests(unittest.TestCase):
                 {"run": 'python3 scripts/staging_rollback_drill.py --target-version "${{ inputs.target_version }}"'}),
             "forced rollback": lambda w: job(w)["steps"][2].update(
                 {"run": 'python3 scripts/staging_rollback_drill.py --target-version "$TARGET_VERSION" --force'}),
+            "wrangler command after drill": lambda w: job(w)["steps"][2].update(
+                {"run": job(w)["steps"][2]["run"] + "\nwrangler deploy"}),
             "other script": lambda w: job(w)["steps"][2].update(
                 {"run": 'python3 scripts/other.py --target-version "$TARGET_VERSION"'}),
         }
@@ -9876,6 +9925,63 @@ class WorkflowTests(unittest.TestCase):
         covering = [s for s in worker_steps if "test_rollback_proof.py" in str(s.get("run") or "")]
         self.assertEqual(len(covering), 1)
         self.assertNotIn("if", covering[0])
+
+    def test_staging_worker_drill_checkout_only_materializes_runtime_files(self):
+        workflow = self.workflows["staging-rollback-drill.yml"]
+        self.assertEqual(staging_rollback_drill_errors(workflow), [])
+        for label, update in {
+            "full checkout": {"sparse-checkout": ""},
+            "missing cleanup helper": {"sparse-checkout": ROLLBACK_DRILL_CHECKOUT["sparse-checkout"].replace(
+                "/wrangler/scripts/staging-use.mjs\n", "")},
+            "extra directory": {"sparse-checkout": ROLLBACK_DRILL_CHECKOUT["sparse-checkout"] + "/docs/\n"},
+            "cone mode": {"sparse-checkout-cone-mode": "true"},
+        }.items():
+            with self.subTest(checkout=label):
+                changed = deepcopy(workflow)
+                changed["jobs"]["drill"]["steps"][0]["with"].update(update)
+                self.assertIn("staging-rollback-drill.yml:drill: must check out only the pinned runtime files",
+                              staging_rollback_drill_errors(changed))
+
+    def test_staging_worker_drill_runs_from_sparse_checkout(self):
+        drill = self.workflows["staging-rollback-drill.yml"]["jobs"]["drill"]
+        patterns = drill["steps"][0]["with"]["sparse-checkout"].splitlines()
+        runtime_paths = [pattern.removeprefix("/") for pattern in patterns]
+        # The isolated subprocess needs only the checked-out runtime and these
+        # offline fixtures. It cannot import from the full repository.
+        fixtures = (
+            "scripts/staging_cloudflare_fixture.py",
+            "scripts/test_staging_drill_use.py",
+            "scripts/test_staging_rollback_drill.py",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in (*runtime_paths, *fixtures):
+                relative = Path(path)
+                self.assertFalse(relative.is_absolute() or ".." in relative.parts, path)
+                dest = root / relative
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes((ROOT / relative).read_bytes())
+            env = {"PATH": os.environ.get("PATH", os.defpath)}
+            # The Python fixture fakes the staging-use subprocess transports.
+            # Import their actual ESM entry points here to exercise the loader.
+            commands = (
+                ["node", "--input-type=module", "-e",
+                 "globalThis.fetch = () => { throw new Error('offline fixture'); }; "
+                 "await import('./wrangler/scripts/staging-use.mjs'); "
+                 "await import('./wrangler/scripts/staging-use-pipeline.mjs');"],
+                [sys.executable, "-I", "-B", "scripts/test_staging_rollback_drill.py",
+                 "ClientAndControlTests.test_minimal_child_environment_runs_node_preflight_without_network",
+                 "MainTests.test_success_writes_evidence_and_summary_without_secrets",
+                 "MainTests.test_unproved_policy_exits_nonzero_before_any_window_or_mutation",
+                 "LifecycleTests.test_failed_leg_restores_without_a_new_check_and_releases",
+                 "LifecycleTests.test_ownership_authentication_failure_stops_use_and_cleanup",
+                 "MainTests.test_cleanup_failure_exits_nonzero_and_still_writes_evidence",
+                 "DryRunPlanPinTests.test_plan_pins_labeled_versions_and_numbered_leg_order"],
+            )
+            for command in commands:
+                with self.subTest(executable=command[0]):
+                    result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_staging_container_drill_shape_is_pinned(self):
         workflows = self.workflows
@@ -9986,6 +10092,17 @@ class WorkflowTests(unittest.TestCase):
             "extra step": lambda w: job(w)["steps"].append({"run": "echo done"}),
             "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
                 {"persist-credentials": "true"}),
+            "unpinned checkout action": lambda w: job(w)["steps"][0].update({"uses": "actions/checkout@v7"}),
+            "retargeted ref": lambda w: job(w)["steps"][0]["with"].update({"ref": "refs/heads/main"}),
+            "retargeted repository": lambda w: job(w)["steps"][0]["with"].update({"repository": "other/repo"}),
+            "retargeted path": lambda w: job(w)["steps"][0]["with"].update({"path": "another-checkout"}),
+            "full-depth fetch": lambda w: job(w)["steps"][0]["with"].update({"fetch-depth": "0"}),
+            "fetch filter override": lambda w: job(w)["steps"][0]["with"].update({"filter": "blob:limit=1m"}),
+            "cone mode": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout-cone-mode": "true"}),
+            "full checkout": lambda w: job(w)["steps"][0]["with"].pop("sparse-checkout"),
+            "missing transitive import": lambda w: job(w)["steps"][0]["with"].update(
+                {"sparse-checkout": "\n".join(EVENTS_READ_PATHS[:-1]) + "\n"}),
+            "whole scripts directory": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout": "/scripts/\n"}),
             "extra secret": lambda w: job(w)["steps"][1]["env"].update(
                 {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
             "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
@@ -10018,6 +10135,35 @@ class WorkflowTests(unittest.TestCase):
         del missing["staging-events-read.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_events_read_starts_with_only_checkout_files(self):
+        checkout = self.workflows["staging-events-read.yml"]["jobs"]["read"]["steps"][0]["with"]
+        self.assertEqual(checkout["sparse-checkout-cone-mode"], "false")
+        git_env = {"PATH": os.environ.get("PATH", os.defpath), "GIT_ALLOW_PROTOCOL": "file",
+                   "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        with tempfile.TemporaryDirectory(prefix="events-read-checkout-") as directory:
+            root = Path(directory) / "checkout"
+
+            def git(*args, stdin=None):
+                result = subprocess.run(
+                    ["git", "-c", f"safe.directory={ROOT}", *args], env=git_env,
+                    input=stdin, capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout
+
+            git("clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(root))
+            git("-C", root, "sparse-checkout", "set", "--no-cone", "--stdin", stdin=checkout["sparse-checkout"])
+            git("-C", root, "checkout", "--quiet", "--detach", "HEAD")
+            tracked = git("-C", root, "ls-files", "-z").split("\0")
+            materialized = {path for path in tracked if path and (root / path).is_file()}
+            self.assertEqual(materialized, {pattern[1:] for pattern in EVENTS_READ_PATHS})
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", "scripts/staging_events_read.py", "--help"],
+                cwd=root, env={}, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--window-start", result.stdout)
 
     def test_staging_privacy_verify_checkout_cannot_retarget_the_reviewed_head(self):
         self.assertEqual(workflow_policy_errors(self.workflows), [])

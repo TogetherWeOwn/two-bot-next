@@ -1816,11 +1816,24 @@ jobs:
             exit 1
           fi
 
+      - name: Bind shard coverage report
+        env:
+          COVERAGE_SELECTOR: ${{ toJSON(needs.job-inputs.outputs) }}
+          COVERAGE_MATRIX: ${{ needs.coverage-plan.outputs.matrix }}
+          EXPECTED_SHARDS: ${{ needs.coverage-plan.outputs.expected-shards }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_LEGS: ${{ matrix.legs }}
+        run: |
+          python3 scripts/ci/merge-coverage-shards.py --bind-shard "$SHARD_INDEX" \
+            --expected-shards "$EXPECTED_SHARDS"
+
       - name: Upload shard coverage report
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-shard-${{ matrix.shard_index }}
-          path: lcov-shard-${{ matrix.shard_index }}.info
+          path: |
+            lcov-shard-${{ matrix.shard_index }}.info
+            lcov-shard-${{ matrix.shard_index }}.identity
           if-no-files-found: error
           overwrite: true
           retention-days: 14
@@ -1852,8 +1865,8 @@ jobs:
     # Fail-closed merge: runs whenever Rust was selected and planning
     # succeeded, even when a shard failed, so a partial shard set can never
     # read as measured. The merge script refuses anything but exactly N-of-N
-    # valid shard reports, and `ci-ok` independently fails on any failed,
-    # cancelled or unexpectedly skipped shard.
+    # valid shard reports bound to this checkout, selector and plan. `ci-ok`
+    # independently fails on any failed, cancelled or unexpectedly skipped shard.
     if: ${{ always() && !cancelled() && needs.job-inputs.outputs.rust != 'false' && needs.coverage-plan.result == 'success' }}
     # Runner routing: see the note on `check`.
     runs-on: >-
@@ -1880,20 +1893,14 @@ jobs:
 
       - name: Merge coverage shards
         env:
+          COVERAGE_SELECTOR: ${{ toJSON(needs.job-inputs.outputs) }}
+          COVERAGE_MATRIX: ${{ needs.coverage-plan.outputs.matrix }}
           EXPECTED_SHARDS: ${{ needs.coverage-plan.outputs.expected-shards }}
         run: |
           set -euo pipefail
-          args=()
-          count=0
-          for report in coverage-shards/lcov-shard-*.info; do
-            [ -e "$report" ] || continue
-            args+=(--report "$report")
-            count=$((count + 1))
-          done
-          echo "merging $count shard reports (expecting $EXPECTED_SHARDS)"
           # Shards produce absolute SF paths inside the job container; this
           # host-only job has a different checkout root. Relativize at merge.
-          python3 scripts/ci/merge-coverage-shards.py "${args[@]}" \
+          python3 scripts/ci/merge-coverage-shards.py --artifact-dir coverage-shards \
             --expected-shards "$EXPECTED_SHARDS" \
             --source-root /__w/two-bot-next/two-bot-next \
             --out "$GITHUB_WORKSPACE/lcov.info"
@@ -3576,6 +3583,8 @@ jobs:
         env:
           RUST_TOOLCHAIN: "1.100.0" # Match rust-toolchain.toml; floating stable can drift.
           RUST_COMPONENTS: ''
+          # The digest-pinned job image already contains this exact toolchain.
+          TWO_RUSTUP_NO_UPDATE: '1'
         run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
