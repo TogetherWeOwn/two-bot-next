@@ -79,33 +79,18 @@ class AcceptanceTests(unittest.TestCase):
             check("cleanup", ORIGIN, ROLLOUT, {**observed, "fixture_rows": 1})
 
     def test_rehearsal_requires_boolean_attendance_flags_in_every_phase(self):
-        observations = {}
-        for phase, minutes, read_enabled in (("pending", 10, True), ("finalized", 46, True),
-                                             ("off", 47, False), ("cleanup", 48, False)):
-            row = deepcopy(FIXTURE["observed"])
-            row.update(attendance_read=read_enabled, attendance_capture=False,
-                       primary_fixture="pending" if phase == "pending" else "finalized")
-            lifecycle = row["lifecycle"]
-            observed_at = START + timedelta(minutes=minutes)
-            lifecycle["observedAt"] = observed_at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            lease = lifecycle["use"]
-            lease.update(environment="staging", runId="1234", runAttempt=1,
-                         acquiredAt=int(START.timestamp()) * 1000,
-                         expiresAt=int((START + timedelta(hours=1)).timestamp()) * 1000)
-            if phase == "cleanup":
-                lifecycle.update(action="release", running=False)
-                lease["phase"] = "released"
-                del row["primary_fixture"], row["foreign_fixture"]
-                row["fixture_rows"] = 0
-            observations[phase] = row
+        observations = self.observations(PLAN, START)
 
         no_traffic = Mock(side_effect=AssertionError("unexpected staging request"))
         with (TemporaryDirectory() as directory,
               patch.object(acceptance, "credentials", side_effect=AssertionError("unexpected credentials")) as credentials):
             rollout_path = Path(directory) / "rollout.json"
             observed_path = Path(directory) / "observed.json"
+            plan_path = Path(directory) / "plan.json"
             rollout_path.write_text(json.dumps(ROLLOUT), encoding="utf-8")
+            plan_path.write_text(json.dumps(PLAN), encoding="utf-8")
             args = ["rehearsal", "--rollout", str(rollout_path), "--observed", str(observed_path)]
+            args.extend(["--plan", str(plan_path)])
 
             def run(rows):
                 observed_path.write_text(json.dumps(rows), encoding="utf-8")
