@@ -35,6 +35,8 @@ NAMING = {"transport": "offline-naming-observations", "result": "pass", "checks"
 GATEWAY = {"verdict": "observed", "build_sha": SHA, "signals": {
     "ready": 1, "gateway_resumed": 0, "shard_closed": 2,
     "gateway_reconnect_failed": 1, "identify_planned": 1, "resume_planned": 0}}
+WINDOWED_GATEWAY = dict(GATEWAY, schema="passive_gateway_summary.v1",
+                        window={key: WINDOW[key].replace("Z", ".000Z") for key in ("start", "end")})
 
 
 def watch_rows(signal, *observations):
@@ -273,7 +275,7 @@ class T0AcceptanceReportTests(unittest.TestCase):
         self.assertTrue(all(rows[kind]["status"] == "unverified" for kind in bindings))
 
     def test_production_watch_results_do_not_change_attribution(self):
-        gateway = dict(GATEWAY, signals=dict.fromkeys(GATEWAY["signals"], 0) | {"identify_planned": 1})
+        gateway = dict(WINDOWED_GATEWAY, signals=dict.fromkeys(GATEWAY["signals"], 0) | {"identify_planned": 1})
         for disposition, result in (("pass", "readbacks_and_deletions_recorded"),
                                     ("fail", "probe_failed"), ("not_observed", "not_observed")):
             with self.subTest(disposition=disposition):
@@ -287,6 +289,40 @@ class T0AcceptanceReportTests(unittest.TestCase):
                 self.assertEqual((rows["naming"]["status"], rows["naming"]["result"]), ("attributed", naming_result))
                 self.assertEqual((rows["gateway"]["status"], rows["gateway"]["readiness"],
                                   rows["gateway"]["endpoint_denial"]), ("attributed", "not_observed", "unverified"))
+
+    def test_production_gateway_requires_supported_summary_with_capture_bounds(self):
+        bounds = WINDOWED_GATEWAY["window"]
+        sentinel = "synthetic private value"
+        for summary in (GATEWAY, dict(WINDOWED_GATEWAY, schema="passive_gateway_summary.v2"),
+                        dict(GATEWAY, window=bounds), dict(WINDOWED_GATEWAY, window={"start": bounds["start"]}),
+                        dict(WINDOWED_GATEWAY, window=dict(bounds, service=sentinel)),
+                        dict(WINDOWED_GATEWAY, window=dict(bounds, end=sentinel)),
+                        dict(WINDOWED_GATEWAY, window=dict(bounds, end=bounds["start"])),
+                        dict(WINDOWED_GATEWAY, window=dict(bounds, end="2026-11-25T02:31:00Z")),
+                        dict(WINDOWED_GATEWAY, window=dict(bounds, end="2026-11-25T02:05:00.000000001Z"))):
+            with self.subTest(summary=summary):
+                row = self.run_report({"gateway": self.save("gateway", summary, PRODUCTION)}, PRODUCTION)["gateway"]
+                self.assertEqual((row["status"], row["endpoint_denial"]), ("unverified", "unverified"))
+                self.assertNotIn(sentinel, json.dumps(row))
+                for field in ("result", "signals", "readiness"):
+                    self.assertNotIn(field, row)
+
+    def test_production_gateway_compares_each_bound_without_truncation(self):
+        alternate = dict(PRODUCTION, start="2026-11-25T02:00:00.000000000+00:00",
+                         end="2026-11-25T02:05:00+0000")
+        quiet = dict(WINDOWED_GATEWAY, verdict="not_observed", signals=dict.fromkeys(GATEWAY["signals"], 0))
+        binding = self.save("gateway", quiet, alternate)
+        self.assertEqual(self.run_report({}, PRODUCTION)["gateway"]["status"], "unverified")
+        row = self.run_report({"gateway": binding}, PRODUCTION)["gateway"]
+        self.assertEqual((row["status"], row["result"], row["readiness"], row["endpoint_denial"]),
+                         ("attributed", "not_observed", "not_observed", "unverified"))
+        for key in ("start", "end"):
+            with self.subTest(bound=key):
+                shifted = {**PRODUCTION, key: PRODUCTION[key].replace("Z", ".000000001Z")}
+                binding["window"] = shifted
+                row = self.run_report({"gateway": binding}, shifted)["gateway"]
+                self.assertEqual((row["status"], row["fields"]), ("mismatched", [key]))
+                self.assertNotIn("signals", row)
 
     def test_production_watch_requires_in_window_sanitized_rows_and_exact_binding(self):
         naming = watch_rows("naming", ("empty-room-rename", "pass"))

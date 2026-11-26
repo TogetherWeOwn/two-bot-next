@@ -55,14 +55,15 @@ permissions:
   contents: read
 
 concurrency:
-  # PR activity and reviews share one queue so required checks cannot race
-  # to publish verdicts. Each run reads live PR state when it executes,
-  # including when GitHub admits events in a different order than dispatch.
-  # The default single pending slot evicts a queued check on the next event.
-  # GitHub's max queue holds up to 100 pending runs per group.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}
-  cancel-in-progress: false
-  queue: max
+  # One group per PR head commit for push, label and review events: the newest
+  # event cancels the older run on the same commit (each run reads live PR
+  # state), so verdicts for one commit never overlap. A new push is a new
+  # commit and a new group, so its required gate never waits behind stale runs
+  # (a queue held #2708's gate for over an hour on 2026-11-26), and a late
+  # review on an old commit cannot cancel it. Manual dispatch has its own
+  # group and never cancels.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}-${{ github.event.pull_request.head.sha || 'manual' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_review' }}
 
 jobs:
   pr-size:
@@ -93,6 +94,11 @@ jobs:
       pull-requests: write # Required gate posts the split comment before failing an over-gate PR.
     uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964
     with:
+      runs-on: >-
+        ${{ toJSON((github.event_name == 'pull_request' || github.event_name == 'pull_request_review')
+        && github.event.pull_request.head.repo.full_name == github.repository
+        && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+        && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest') }}
       pr-number: ${{ inputs.pr_number || '' }}
       # Same generated path as the labeller, so the gate measures the
       # same diff the labels report.
