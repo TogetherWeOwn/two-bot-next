@@ -22,6 +22,19 @@ PR = {"number": 1, "state": "open", "base": {"repo": {"full_name": REPO}, "sha":
       "head": {"sha": HEAD}, "body": BODY}
 
 
+def successful_attempt(attempt):
+    complete = {"status": "completed", "conclusion": "success"}
+    repository = {"full_name": REPO, "id": attempt.repo_id}
+    association = {"number": PR["number"], "base": {"repo": repository, "sha": BASE}, "head": {"sha": HEAD}}
+    run = dict(complete, id=attempt.run_id, run_attempt=attempt.attempt, workflow_id=attempt.workflow_id,
+               path=".github/workflows/pr-evidence.yml", event="pull_request", head_sha=HEAD,
+               repository=repository, pull_requests=[association])
+    step = dict(complete, name="Verify and publish evidence")
+    job = dict(complete, name="pr-evidence", id=attempt.job_id, run_id=attempt.run_id,
+               run_attempt=attempt.attempt, head_sha=HEAD, steps=[step])
+    return run, job
+
+
 class ReceiptTests(unittest.TestCase):
     def setUp(self):
         self.reader = Mock()
@@ -61,13 +74,9 @@ class ReceiptTests(unittest.TestCase):
                 self.issue()
 
     def test_parser_requires_the_exact_protected_attempt_and_description(self):
-        complete = {"status": "completed", "conclusion": "success"}
-        association = {"number": 1, "base": {"repo": {"id": 7}, "sha": BASE}, "head": {"sha": HEAD}}
-        run = dict(complete, id=10, run_attempt=2, workflow_id=8, path=".github/workflows/pr-evidence.yml",
-                   event="pull_request", head_sha=HEAD, repository={"full_name": REPO, "id": 7},
-                   pull_requests=[association])
-        step = dict(complete, name="Verify and publish evidence")
-        job = dict(complete, name="pr-evidence", id=12, run_id=10, run_attempt=2, head_sha=HEAD, steps=[step])
+        run, job = successful_attempt(ATTEMPT)
+        association, = run["pull_requests"]
+        step, = job["steps"]
         listing = {"total_count": 1, "jobs": [job]}
         receipt = json.loads(json.dumps(self.issue()))
         verdict, _ = evidence.current_snapshot(self.reader, *IDENTITY)
@@ -128,3 +137,34 @@ class ReceiptTests(unittest.TestCase):
         for job_attempt in (None, True, "1", 2):
             with self.subTest(first_job_attempt=job_attempt):
                 self.assertFalse(match_first(first_run, dict(job, run_attempt=job_attempt)))
+
+    def test_delayed_higher_attempt_cannot_replace_or_cross_pr(self):
+        old_receipt = self.issue()
+        old_run, old_job = successful_attempt(ATTEMPT)
+        old_verdict, _ = evidence.current_snapshot(self.reader, *IDENTITY)
+
+        def match(record, snapshot, run, job, attempt):
+            return matches_receipt(record, snapshot, run, {"total_count": 1, "jobs": [job]},
+                                   attempt=attempt, receipt_job_id=attempt.job_id)
+
+        self.assertTrue(match(old_receipt, old_verdict, old_run, old_job, ATTEMPT))
+
+        edited = dict(PR, body="Valid edited description at the same head")
+        self.reader.get.return_value = edited
+        fresh_attempt = replace(ATTEMPT, run_id=11, attempt=1, job_id=13)
+        fresh_receipt = self.issue(fresh_attempt)
+        fresh_run, fresh_job = successful_attempt(fresh_attempt)
+        del fresh_job["run_attempt"]
+        fresh_verdict, _ = evidence.current_snapshot(self.reader, *IDENTITY)
+        self.assertTrue(match(fresh_receipt, fresh_verdict, fresh_run, fresh_job, fresh_attempt))
+        self.assertFalse(match(old_receipt, fresh_verdict, old_run, old_job, ATTEMPT))
+
+        self.reader.get.return_value = dict(edited, number=2)
+        other_verdict, _ = evidence.current_snapshot(self.reader, 2, REPO, BASE, HEAD)
+        self.assertEqual(other_verdict, replace(fresh_verdict, number=2))
+        self.assertFalse(match(fresh_receipt, other_verdict, fresh_run, fresh_job, fresh_attempt))
+
+        association, = fresh_run["pull_requests"]
+        other_run = dict(fresh_run, pull_requests=[dict(association, number=2)])
+        self.assertFalse(match(fresh_receipt, other_verdict, other_run, fresh_job, fresh_attempt))
+        self.assertFalse(match(fresh_receipt, fresh_verdict, other_run, fresh_job, fresh_attempt))
