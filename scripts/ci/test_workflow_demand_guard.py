@@ -83,11 +83,14 @@ class WorkflowDemandGuardTests(unittest.TestCase):
             ])
 
     def test_real_advisory_and_protected_event_routes(self):
-        self.assertEqual(workflow("nightly.yml")["on"], {"schedule": [{"cron": "17 3 * * *"}]})
+        nightly = workflow("nightly.yml")
+        self.assertEqual(set(nightly["on"]), {"schedule", "workflow_dispatch", "pull_request"})
+        self.assertEqual(nightly["jobs"]["pipeline-benchmark"]["uses"], "./.github/workflows/pipeline-benchmark.yml")
         self.assertEqual(set(workflow("ci-speed.yml")["on"]), {"workflow_dispatch"})
-        self.assertEqual(workflow("pr-evidence.yml")["on"], {
-            "pull_request": {"types": ["opened", "edited", "synchronize", "reopened", "ready_for_review"]},
-        })
+        evidence = workflow("pr-evidence.yml")["on"]
+        self.assertEqual(evidence["pull_request"]["types"],
+                         ["opened", "edited", "synchronize", "reopened", "ready_for_review"])
+        self.assertEqual(evidence["push"]["paths"], [".github/scripts/*pr*evidence*", ".github/workflows/pr-evidence.yml"])
         supply = workflow("supply-chain.yml")
         self.assertEqual(set(supply["on"]["pull_request"]["types"]) - {"ready_for_review"},
                          {"opened", "edited", "synchronize", "reopened"})

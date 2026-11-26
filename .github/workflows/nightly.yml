@@ -4,6 +4,8 @@ on:
   schedule:
     # Off the hour to avoid the busiest scheduled-run window (UTC).
     - cron: '17 3 * * *'
+  workflow_dispatch:
+  pull_request:
 
 permissions: {}
 

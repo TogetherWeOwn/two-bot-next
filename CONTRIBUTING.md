@@ -285,9 +285,10 @@ the toolchain and builder-image pins together.
 
 ### Nightly test partitions
 
-`nightly.yml` runs at 03:17 UTC with a 180-minute ceiling per heavy job.
-The required Check lane still exercises affected PRs, including wiring changes.
-The nightly sweep is split into:
+`nightly.yml` retains its wiring-change PR selector and event timeout allow-list:
+45 minutes per heavy PR job (also the fallback for any other event), 180 minutes
+only for schedule/manual runs. Do not raise the PR cap to accommodate workload.
+The original serial all-feature workload is split into:
 
 - `sweep-plan`: generate the command reference, compile Cargo's default workspace
   test selection (`--no-run`, including ordinary examples), and discover each
@@ -323,10 +324,10 @@ The nightly partition workflow exercises this deprecated flag on the pinned Rust
 toolchain; recheck its protocol when upgrading rather than falling back to parsing
 mixed console output.
 
-Verify sweep timing from an executing scheduled run. Record its exact main SHA
-and each heavy job's time and headroom, aiming for 35 minutes per leg. Use Check
-for pre-merge validation. The manual nightly command in the #1845 acceptance
-manifest records the historical route. Rebalance only from measured results.
+Verify a change with an actual executing `pull_request` run on its exact head,
+record each heavy job's time and headroom, and aim for at most 35 minutes per
+leg. Test counts are not a runtime guarantee. Rebalance only from measured
+results; a skipped job or a 180-minute manual pass is not PR-cap evidence.
 Offline contracts run in the existing source-level CI suite:
 
 ```sh
@@ -438,8 +439,9 @@ the exact head and current PR description. After a description edit, open the
 `pr-evidence` run triggered by that edit in Actions and wait for its result, even
 when the head SHA is unchanged. If validation fails, use the job output to
 correct the evidence and confirm the updated result. Follow the existing required
-checks and review policy for the merge. On `main`, use the `ci-evidence` summary
-from `check` for exact-head Actions links.
+checks and review policy for the merge. On `main`, use the `check` run for the
+exact commit. Changes to the evidence workflow or its scripts also run its
+advisory self-test on the merged commit.
 
 GitHub can bind a required workflow to protected source. In the hosted
 qualification, the pinned `pr-standards` workflow kept its opening required

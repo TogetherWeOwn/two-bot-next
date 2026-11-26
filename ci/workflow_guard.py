@@ -34,7 +34,12 @@ ADMISSIONS = {
     }),
     "vote-kick-fuzz-smoke.yml": ("branch:ci/vote-kick-fuzz-smoke", {"push": {"branches": ["ci/vote-kick-fuzz-smoke"]}}),
     "mutation.yml": ("", {"pull_request": {"types": CODE_EVENTS}}),
-    "pr-evidence.yml": ("", {"pull_request": {"types": [*METADATA_EVENTS, "ready_for_review"]}}),
+    # Required Check does not replace the benchmark in nightly's full PR sweep.
+    "nightly.yml": ("", {"pull_request": {}}),
+    "pr-evidence.yml": ("", {
+        "pull_request": {"types": [*METADATA_EVENTS, "ready_for_review"]},
+        "push": {"branches": ["main"], "paths": [".github/scripts/*pr*evidence*", ".github/workflows/pr-evidence.yml"]},
+    }),
     "review-rules.yml": ("", {"pull_request": {}, "merge_group": {}}),
     "test-guard.yml": ("", {"pull_request": {"types": REVIEW_TYPES}}),
 }
@@ -141,7 +146,8 @@ def findings(name, data):
             errors.append("workflow_run must fire only on completed, never requested/in_progress")
         if not release:
             errors.append("workflow_run needs a reviewed release guard")
-    if pr_events and "push" in events and can_push_main(events["push"]) and not release:
+    evidence_change = name == "pr-evidence.yml" and admitted
+    if pr_events and "push" in events and can_push_main(events["push"]) and not (release or evidence_change):
         errors.append("runs on PRs and main pushes without a reviewed release guard")
     return errors
 
