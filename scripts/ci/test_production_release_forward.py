@@ -254,6 +254,7 @@ class ReleaseForwardTests(unittest.TestCase):
         artifact = {"archive_digest": "sha256:" + "8" * 64}
         recovery = Mock()
         worker_url = "https://prod.invalid"
+        uploaded_version = "12345678-1234-4567-8123-123456789aaa"
         with (TemporaryDirectory() as temp,
               patch.object(release, "release_context", return_value=(pin, run, "123", plan, artifact)),
               patch.object(release, "check_url", return_value=worker_url),
@@ -261,13 +262,13 @@ class ReleaseForwardTests(unittest.TestCase):
               patch.object(release, "control_client") as control_client,
               patch.object(release, "take_over") as take_over):
             env = {"RUNNER_TEMP": temp, "PRODUCTION_WORKER_URL": worker_url,
-                   "OWNERSHIP_CONTROL_TOKEN": "fixture", "NEW_VERSION": pin.rollback_worker}
+                   "OWNERSHIP_CONTROL_TOKEN": "fixture", "NEW_VERSION": uploaded_version}
             self.assertEqual(release.main(["takeover"], env), 0)
         control_client.assert_called_once_with("production", "fixture", worker_url, "",
                                                f"production-schema-release:456:{pin.candidate_sha}")
         take_over.assert_called_once()
         release_pin, proven_recovery, version, _, control = take_over.call_args.args
-        self.assertEqual((release_pin, proven_recovery, version), (pin, recovery, pin.rollback_worker))
+        self.assertEqual((release_pin, proven_recovery, version), (pin, recovery, uploaded_version))
         self.assertIs(control, control_client.return_value)
 
     def test_takeover_refuses_a_provider_version_different_from_the_uploaded_worker(self):
