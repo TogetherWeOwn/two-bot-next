@@ -9663,6 +9663,23 @@ class WorkflowTests(unittest.TestCase):
                     "staging-migrate.yml:apply: must load the verifier at the trusted workflow SHA",
                 ])
 
+        steps = workflow["jobs"]["apply"]["steps"]
+        verifier = next(step for step in steps if step.get("name") == "Verify the native staging approval")
+        _, *args = shlex.split(verifier["run"])
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            for pattern in paths.splitlines():
+                path = pattern.removeprefix("/")
+                destination = scratch / checkout["path"] / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes((ROOT / path).read_bytes())
+            # A missing manifest exercises startup without credentials or API calls.
+            result = subprocess.run([sys.executable, "-B", "-S", *args], cwd=scratch,
+                                    env={}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "staging migration approval evidence unavailable or malformed\n")
+
     def test_production_migrate_runner_shape_is_pinned(self):
         # Production mirror of the staging runner: same three jobs, same pinned
         # actions, public-hosted runner, pipefail and provenance gates, with
