@@ -144,13 +144,22 @@ class OperatorRehearsalTests(unittest.TestCase):
                          [ORIGINAL["body"], ORIGINAL["body"], invalid["body"], EDITED["body"]])
 
         before = capture(ORIGINAL, 10, "success")
+        fresh = capture(EDITED, 13, "success")
         # A rerun can verify the live description, but its run ID and creation time stay fixed.
-        automatic = self.rehearse("pr", before, capture(EDITED, 13, "success"))
-        rerun = self.rehearse("pr", before, capture(EDITED, 10, "success", attempt=2))
+        rerun = capture(EDITED, 10, "success", attempt=2)
+        automatic = self.rehearse("pr", before, fresh)
         self.assertEqual((automatic.returncode, automatic.stdout),
                          (0, "current_advisory=success\nprior_hosted=stale_green\n"), automatic.stderr)
-        self.assertEqual((rerun.returncode, rerun.stdout, rerun.stderr),
-                         (2, "", "Invalid or unmatched evidence capture.\n"))
+        for case, current in (
+                ("rerun", rerun),
+                ("reused run ID with later timestamp",
+                 dict(rerun, run=dict(rerun["run"], created_at=fresh["run"]["created_at"]))),
+                ("distinct run ID with unchanged timestamp",
+                 dict(fresh, run=dict(fresh["run"], created_at=before["run"]["created_at"])))):
+            with self.subTest(case=case):
+                result = self.rehearse("pr", before, current)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (2, "", "Invalid or unmatched evidence capture.\n"))
 
     def test_description_edit_keeps_a_cancelling_verification_route(self):
         path = ROOT / WORKFLOW_PATH
