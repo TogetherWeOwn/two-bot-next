@@ -210,13 +210,17 @@ class AcceptanceTests(unittest.TestCase):
                 "--fixture-start", START.strftime("%Y-%m-%dT%H:%M:%SZ"), "--execute"]
         refused = (1, "", "FAIL: staging lease did not cover the probe\n")
         future_readback = START + timedelta(seconds=admitted_at - START.timestamp() + 0.25)
+        stale_expiry = int((START.timestamp() + 1800) * 1000)
 
         cases = [
-            ("coherent", latest_start - 0.75, 0.25, {}, {}, True),
+            # Both cases have half a second of slack before arming the alarm.
+            ("one millisecond inside after arming", latest_start - 0.5, 0.499, {}, {}, True),
+            ("cutoff reached while arming", latest_start - 0.5, 0.5, {}, {}, False),
+            # The receipt covered a probe when observed, but the lease expired before entry.
+            ("stale readback at entry", admitted_at, 0, {}, {"expiresAt": stale_expiry}, False),
             ("deadline equals expiry", latest_start, 0, {}, {}, False),
             ("active but too short", latest_start + 0.5, 0, {}, {}, False),
             ("expired during setup", expires + 1, 0, {}, {}, False),
-            ("cutoff crossed while arming", latest_start - 0.5, 0.5, {}, {}, False),
             ("observation after local time", latest_start - 0.5, 0,
              {"observedAt": observed_at(future_readback)}, {}, False),
             ("acquisition after observation", admitted_at, 0, {},
