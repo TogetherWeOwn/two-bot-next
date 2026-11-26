@@ -9,7 +9,8 @@ from pathlib import Path
 import re
 
 from build_identity import is_build_id_shape, is_build_revision_shape, is_deploy_id_shape
-from container_stdout_read import MAX_LIMIT, UUID_RE
+from container_stdout_read import MAX_LIMIT, MAX_MINUTES, UUID_RE
+from passive_gateway_evidence import SUMMARY_SCHEMA as GATEWAY_SUMMARY_SCHEMA
 from script_intake import decode_json, read_with_overflow
 from staging_help_embed_smoke import EMBED_KEYS, SCHEMA as HELP_SCHEMA
 
@@ -173,6 +174,21 @@ def gateway_observation(report):
     return {"result": verdict, "readiness": readiness, "signals": {key: counts[key] for key in SIGNALS}}
 
 
+def gateway_summary_window(report):
+    if report.keys() == {"verdict", "build_sha", "signals"}:
+        return None  # Legacy successful summaries carry no capture bounds.
+    if (report.keys() != {"schema", "verdict", "build_sha", "window", "signals"}
+            or report["schema"] != GATEWAY_SUMMARY_SCHEMA):
+        raise ValueError
+    window = report["window"]
+    if not isinstance(window, dict) or window.keys() != {"start", "end"}:
+        raise ValueError
+    start, end = utc_instant(window["start"]), utc_instant(window["end"])
+    if start[1] or end[1] or not 0 < (end[0] - start[0]).total_seconds() <= MAX_MINUTES * 60:
+        raise ValueError
+    return {"start": format_utc(start), "end": format_utc(end)}
+
+
 def observation(kind, parse, path, binding, expected):
     def gap(status, reason, **details):
         return {"status": status, "reason": reason, "needed": NEEDED[kind], **details}
@@ -219,6 +235,15 @@ def observation(kind, parse, path, binding, expected):
                            fields=differing)
         else:
             outcome = parse(report)
+        if kind == "gateway":
+            bounds = gateway_summary_window(report)
+            if bounds is None and expected["environment"] == "production":
+                return gap("unverified", "legacy gateway summary lacks capture window bounds")
+            if bounds is not None:
+                differing = [key for key in bounds if bounds[key] != recorded[key]]
+                if differing:
+                    return gap("mismatched", "gateway summary capture window differs from the serving window",
+                               fields=differing)
     except ValueError:
         return gap("unverified", "saved probe output is invalid or refused")
     row = {"status": "attributed", "window": recorded, **outcome}

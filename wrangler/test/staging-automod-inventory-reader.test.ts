@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import test from "node:test";
+import { fileURLToPath, URL } from "node:url";
 import { bindStagingAutomodInventoryReader } from "../scripts/staging-automod-inventory-reader.ts";
+import { bindStagingAutomodInventoryVerifier } from "../scripts/staging-automod-inventory-verifier.ts";
 
 const source = { workflowSha: "a".repeat(40), runId: 1234 };
 const inventory = {
@@ -86,5 +89,60 @@ test("the inventory reader refuses invalid pins and forwards the caller's abort"
   assert.equal(await pending, undefined);
   finish(JSON.stringify(inventory));
   assert.equal(await read(source, signal), undefined);
+  assert.equal(calls, 1);
+});
+
+const receipt = JSON.stringify(inventory) + "\n";
+const cappedReceipt = receipt.padEnd(4_096);
+const writeCappedReceipt = `process.stdout.write(${JSON.stringify(cappedReceipt)});`;
+
+test("the verifier invokes the checked-in script with the exact pins and accepts 4096 bytes on exit zero", async () => {
+  const { signal } = new AbortController();
+  const run = bindStagingAutomodInventoryVerifier((file, args, options, callback) => {
+    assert.equal(file, "python3");
+    assert.deepEqual(args, [fileURLToPath(new URL("../../scripts/staging_automod_inventory_reader.py", import.meta.url)),
+      source.workflowSha, String(source.runId)]);
+    assert.equal(options.signal, signal);
+    assert.deepEqual(options.env, {});
+    execFile(process.execPath, ["-e", writeCappedReceipt], options, callback);
+  });
+  assert.deepEqual(await bindStagingAutomodInventoryReader(run)(source, signal), inventory);
+});
+
+test("the verifier refuses nonzero exit and excess stdout even after a complete receipt", async () => {
+  const { signal } = new AbortController();
+  const multibyteOutput = receipt + "é".repeat(2_048);
+  for (const [program, expectedErrorCode] of [
+    [`${writeCappedReceipt} process.exitCode = 7;`, 7],
+    [`${writeCappedReceipt} process.stdout.write(" ");`, "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"],
+    [`process.stdout.write(${JSON.stringify(multibyteOutput)});`, "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"],
+  ] as const) {
+    let errorCode: number | string | undefined;
+    const run = bindStagingAutomodInventoryVerifier((_, __, options, callback) => {
+      execFile(process.execPath, ["-e", program], options, (error, stdout) => {
+        errorCode = error?.code;
+        callback(error, stdout);
+      });
+    });
+    await assert.rejects(run(source.workflowSha, String(source.runId), signal), { message: "Staging inventory verifier failed" });
+    assert.equal(errorCode, expectedErrorCode);
+  }
+});
+
+test("the verifier abort kills the child and discards stdout already received", { timeout: 10_000 }, async () => {
+  const controller = new AbortController();
+  const { signal } = controller;
+  const exited = Promise.withResolvers<NodeJS.Signals | null>();
+  let calls = 0;
+  const run = bindStagingAutomodInventoryVerifier((_, __, options, callback) => {
+    calls += 1;
+    const child = execFile(process.execPath, ["-e", `${writeCappedReceipt} setTimeout(() => {}, 5_000);`], options, callback);
+    child.stdout?.once("data", () => controller.abort());
+    child.once("exit", (_, killSignal) => exited.resolve(killSignal));
+  });
+  const read = bindStagingAutomodInventoryReader(run);
+  assert.equal(await read(source, signal), undefined);
+  assert.equal(await exited.promise, "SIGTERM");
+  await assert.rejects(run(source.workflowSha, String(source.runId), signal), { message: "Staging inventory verifier failed" });
   assert.equal(calls, 1);
 });

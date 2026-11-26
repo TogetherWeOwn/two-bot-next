@@ -108,6 +108,26 @@ test("lease retirement during an approval read invalidates the result", async t 
   assert.deepEqual((await authority.inputs())?.approvals, {});
 });
 
+test("recovery at lease expiry refuses a record if the issued identity rolls during readback", async t => {
+  const h = await fixture(t);
+  t.mock.timers.setTime(expiresAt);
+  const stable = h.bind(async action => h.approvals[action]);
+  assert.deepEqual(await stable.inputs(), { context, issuedLease: h.issued, approvals: { recover: h.approvals.recover } });
+  h.readLease.mock.resetCalls();
+
+  const replacement = { ...h.issued, epoch: epoch + 1 };
+  const rolled = h.bind(async action => {
+    // Model a replacement snapshot that still resolves for the same run scope.
+    h.identity.owner = { ...owner, epoch: replacement.epoch, oldEpoch: epoch };
+    h.records.set(STAGING_USE_KEY, replacement);
+    return h.approvals[action];
+  });
+  const bounded = boundStagingAutomodAuthority(rolled.provider);
+  assert.equal(await bounded.readApproval("recover", h.issued), undefined);
+  assert.deepEqual(rolled.approve.mock.calls.map(({ arguments: [action, issued] }) => [action, issued]), [["recover", h.issued]]);
+  assert.deepEqual(await Promise.all(h.readLease.mock.calls.map(({ result }) => result)), [h.issued, replacement]);
+});
+
 test("Container authority reads under the gate and refuses a fenced owner", async t => {
   const h = await fixture(t);
   h.records.set(OWNER_KEY, owner);
