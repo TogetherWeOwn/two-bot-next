@@ -5,9 +5,10 @@ Use evidence.json from the trusted intended rollout as the pin. Supply the
 GitHub Actions run metadata and original files from the authenticated Help
 start, Help report and promotion certification artifacts of that same protected
 deploy attempt. The Help job uses the workflow head to render its payloads.
-The certification readiness step runs downstream of the Help job, so the two
-ready receipts bracket the readbacks and deletion acknowledgements. This
-checks consistency offline given authenticated provenance for all inputs.
+The readiness receipts bracket the Help job, and each Discord snowflake
+supplies a message creation time. The report supplies the readback and deletion
+acknowledgements. This checks consistency offline given authenticated
+provenance for all inputs.
 """
 
 import argparse
@@ -32,6 +33,7 @@ WINDOW_SCHEMA = "two-bot-staging-use.v1"
 READBACK_AND_DELETE = "read-back branding, text and fields match; message deleted"
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 MILLISECOND = timedelta(milliseconds=1)
+DISCORD_EPOCH_MS = 1_420_070_400_000
 
 
 class Refused(ValueError):
@@ -119,7 +121,7 @@ def check_window(raw, sha, worker, run):
     return (epoch, acquired, expiry), observed_ms
 
 
-def check_report(report):
+def check_report(report, before_ms, after_ms):
     require(report.get("schema") == SCHEMA and report.get("verdict") == "PASS"
             and "refusal" not in report, "Help report did not pass with the current schema")
     rows = report.get("rows")
@@ -131,7 +133,13 @@ def check_report(report):
                 and row.get("result") == "pass" and row.get("actual") == READBACK_AND_DELETE
                 and "cleanup_failed" not in row and is_snowflake(row.get("message_id")),
                 "Help report is missing a readback or deletion acknowledgement")
-        message_ids.add(row["message_id"])
+        message_id = row["message_id"]
+        created_ms = (int(message_id) >> 22) + DISCORD_EPOCH_MS
+        # Help posts after readiness and certification waits for Help to finish.
+        # These ordered events can share a timestamp at millisecond precision.
+        require(before_ms <= created_ms <= after_ms,
+                "Help message creation is outside the readiness bounds")
+        message_ids.add(message_id)
     require(len(message_ids) == len(rows), "Help report repeats a message ID")
 
 
@@ -153,7 +161,7 @@ def main(argv=None):
         start, before = check_window(read(args.start), sha, worker, run)
         finish, after = check_window(read(args.certify), sha, worker, run)
         require(start == finish and before < after, "readiness receipts do not bracket Help in one window")
-        check_report(object_from_json(read(args.report)))
+        check_report(object_from_json(read(args.report)), before, after)
     except Refused as error:
         print(f"REFUSED {error}", file=sys.stderr)
         return 1

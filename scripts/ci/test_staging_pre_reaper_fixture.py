@@ -7,12 +7,96 @@ import unittest
 from unittest.mock import call, patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
+    from pre_cleanup_run import CleanupRunStatus, classify_cleanup_run
     from pre_sweep import SweepError, sweep_target
     from pre_target import Inventory, Resource, Target
 
 
 READS = ("status", "inventory")
 OPERATIONS = ("revoke_write_access", "delete_worker", "stop_container", "delete_container")
+RUN_SHA = "a" * 40
+RUN_WORKFLOW_ID = 17
+RUN_PATH = ".github/workflows/staging-pre-qualification.yml"
+
+
+def run_record():
+    repository = {"id": 1396224242, "full_name": "TogetherWeOwn/two-bot-next"}
+    return {"id": 42, "workflow_id": RUN_WORKFLOW_ID, "run_attempt": 1, "path": RUN_PATH,
+            "head_sha": RUN_SHA, "head_branch": "main", "event": "workflow_dispatch",
+            "repository": repository, "head_repository": repository.copy(),
+            "status": "completed", "conclusion": "success"}
+
+
+def run_status(target, run):
+    return classify_cleanup_run(target, run, expected_workflow_id=RUN_WORKFLOW_ID, expected_head_sha=RUN_SHA)
+
+
+class CleanupRunFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.target = Target("pre-fixture-first", 42, 1_800_000_000, "0473/0465")
+
+    def test_wrong_or_missing_run_identity_is_unresolved(self):
+        for field, wrong in (
+            ("id", 43), ("id", 42.0), ("id", "42"),
+            ("run_attempt", 2), ("run_attempt", 0), ("run_attempt", True),
+            ("workflow_id", 18), ("workflow_id", 17.0),
+            ("path", ".github/workflows/staging-pre-periodic.yml"),
+            ("path", f"{RUN_PATH}@refs/heads/other"), ("path", []),
+            ("head_sha", "b" * 40), ("head_sha", []), ("head_branch", "other"), ("event", "schedule"),
+        ):
+            missing = run_record()
+            del missing[field]
+            for record in (dict(run_record(), **{field: wrong}), missing):
+                with self.subTest(field=field, value=record.get(field)):
+                    self.assertIs(run_status(self.target, record), CleanupRunStatus.UNRESOLVED)
+        for key in ("repository", "head_repository"):
+            for bad in (None, [], {}, {"id": 1396224242}, {"full_name": "TogetherWeOwn/two-bot-next"},
+                        {"id": 1396224243, "full_name": "TogetherWeOwn/two-bot-next"},
+                        {"id": 1396224242, "full_name": "another-owner/two-bot-next"}):
+                with self.subTest(key=key, bad=bad):
+                    self.assertIs(run_status(self.target, dict(run_record(), **{key: bad})),
+                                  CleanupRunStatus.UNRESOLVED)
+            record = run_record()
+            del record[key]
+            self.assertIs(run_status(self.target, record), CleanupRunStatus.UNRESOLVED)
+
+    def test_unconfirmed_read_and_invalid_pins_are_unresolved(self):
+        for response in (None, [], {"message": "Not Found"}, {"workflow_runs": [run_record()]}):
+            with self.subTest(response=response):
+                self.assertIs(run_status(self.target, response), CleanupRunStatus.UNRESOLVED)
+        for workflow_id, sha in ((True, RUN_SHA), (0, RUN_SHA), (10**20, RUN_SHA), (RUN_WORKFLOW_ID, "a" * 39)):
+            with self.subTest(workflow_id=workflow_id, sha=sha):
+                self.assertIs(classify_cleanup_run(self.target, run_record(), expected_workflow_id=workflow_id,
+                                                   expected_head_sha=sha), CleanupRunStatus.UNRESOLVED)
+
+    def test_only_coherent_status_and_conclusion_are_classified(self):
+        for status in ("queued", "in_progress", "requested", "waiting", "pending"):
+            with self.subTest(status=status):
+                observed = run_status(self.target, dict(run_record(), status=status, conclusion=None))
+                self.assertIs(observed, CleanupRunStatus.ACTIVE)
+                self.assertEqual(observed.sweep_status, "active")
+        for conclusion in ("action_required", "cancelled", "failure", "neutral", "skipped", "stale",
+                           "startup_failure", "timed_out"):
+            with self.subTest(conclusion=conclusion):
+                observed = run_status(self.target, dict(run_record(), conclusion=conclusion))
+                self.assertIs(observed, CleanupRunStatus.TERMINAL_UNSUCCESSFUL)
+                self.assertEqual(observed.sweep_status, "terminal")
+        for path in (RUN_PATH, f"{RUN_PATH}@main", f"{RUN_PATH}@refs/heads/main"):
+            with self.subTest(path=path):
+                observed = run_status(self.target, dict(run_record(), path=path))
+                self.assertIs(observed, CleanupRunStatus.TERMINAL_SUCCESS)
+                self.assertEqual(observed.sweep_status, "terminal")
+        for record in (
+            dict(run_record(), status="queued"), dict(run_record(), status="completed", conclusion=None),
+            dict(run_record(), conclusion="unknown"), dict(run_record(), conclusion=[]),
+            dict(run_record(), status="success"), dict(run_record(), status=[]),
+            {key: value for key, value in dict(run_record(), status="queued").items() if key != "conclusion"},
+            {key: value for key, value in run_record().items() if key != "status"},
+        ):
+            with self.subTest(record=record):
+                observed = run_status(self.target, record)
+                self.assertIs(observed, CleanupRunStatus.UNRESOLVED)
+                self.assertIsNone(observed.sweep_status)
 
 
 class SyntheticStaging:
@@ -142,6 +226,19 @@ class PreReaperFixtureTests(unittest.TestCase):
                     with self.assertRaisesRegex(SweepError, "^PRE cleanup readback could not be verified$"):
                         self.sweep(staging)
                 self.assertEqual(inventory.call_args_list, [call(self.target), call(self.target)])
+
+    def test_actions_success_still_needs_fresh_provider_absence(self):
+        staging = SyntheticStaging(self.target)
+        staging.status = run_status(self.target, run_record()).sweep_status
+        empty = replace(staging.snapshot, worker=None, container=None, instance_count=0,
+                        assigned_count=0, write_access=False)
+        returned_worker = replace(empty, worker=staging.snapshot.worker)
+        with patch.object(staging, "inventory", side_effect=[empty, returned_worker]) as inventory:
+            with self.assertRaisesRegex(SweepError, "^PRE cleanup readback could not be verified$"):
+                self.sweep(staging)
+            self.assertEqual(inventory.call_args_list, [call(self.target), call(self.target)])
+        staging.snapshot = empty
+        self.assertEqual(self.sweep(staging), "cleared")
 
     def test_late_start_requires_another_sweep_before_success(self):
         staging = SyntheticStaging(self.target)

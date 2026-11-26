@@ -1,11 +1,18 @@
 {
   "name": "staging-automod-preview",
-  "on": {"workflow_call": ""},
+  "on": {
+    "workflow_dispatch": {
+      "inputs": {"rehearse": {"description": "Request the guarded AutoMod staging rehearsal", "type": "boolean", "default": "false"}}
+    }
+  },
   "permissions": {},
-  "concurrency": {"group": "staging-lifecycle", "cancel-in-progress": "false", "queue": "max"},
+  "concurrency": {
+    "group": "${{ inputs.rehearse && github.repository_id == '1396224242' && github.ref == 'refs/heads/main' && github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main' && github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1 && 'staging-lifecycle' || format('staging-automod-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
+    "cancel-in-progress": "false", "queue": "max"
+  },
   "jobs": {
     "dry-run": {
-      "if": "github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main' && github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1",
+      "if": "inputs.rehearse && github.repository_id == '1396224242' && github.ref == 'refs/heads/main' && github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main' && github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1",
       "environment": {"name": "staging", "deployment": "false"},
       "permissions": {"contents": "read"},
       "runs-on": "ubuntu-latest",
@@ -30,6 +37,11 @@
         {
           "name": "Exercise the AutoMod operator entry with synthetic run evidence",
           "run": "node --test wrangler/test/staging-automod-operator-entry.test.ts"
+        },
+        {
+          "name": "Run the guarded AutoMod rehearsal entry",
+          "env": {"STAGING_AUTOMOD_REHEARSAL": "${{ inputs.rehearse }}"},
+          "run": "node wrangler/scripts/staging-automod-dispatch.ts"
         }
       ]
     }

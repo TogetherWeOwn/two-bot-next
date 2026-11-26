@@ -12,7 +12,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from recorder import CHANNEL, EVENT, GUILD, MEMBER, MESSAGE, MESSAGE_PATH, ROLE
+from recorder import (
+    CHANNEL, EVENT, EVENT_CHANNEL, GUILD, MEMBER, MESSAGE, MESSAGE_PATH, REPLACEMENT_EVENT_CHANNEL, ROLE,
+)
 
 HERE = Path(__file__).resolve().parent
 BOT_PORTS = {"current": 8091, "retained": 8092}
@@ -164,7 +166,10 @@ class Rehearsal:
                     "DISCORD_API_BASE": "invalid fixture background origin",
                     "TWO_INTERNAL_ACTIONS": "1", "TWO_INTERNAL_BIND": f"127.0.0.1:{port}",
                     "TWO_INTERNAL_KEYS": f"rehearsal:{self.key}", "TWO_INTERNAL_CALLERS": "rehearsal:fixture",
-                    "TWO_INTERNAL_CHANNEL_KEYS": f"ann:{CHANNEL}", "TWO_INTERNAL_ROLE_KEYS": f"member:{ROLE}",
+                    "TWO_INTERNAL_CHANNEL_KEYS": (
+                        f"ann:{CHANNEL},event:{EVENT_CHANNEL},replacement:{REPLACEMENT_EVENT_CHANNEL}"
+                    ),
+                    "TWO_INTERNAL_ROLE_KEYS": f"member:{ROLE}",
                     "TWO_INTERNAL_ALLOW_EVENT_CANCEL": "1",
                     **overrides,
                 },
@@ -246,14 +251,18 @@ class Rehearsal:
         return answer
 
     def exercise(self):
-        update = {
+        event = {
             "action": "event.upsert", "event_key": "mapped", "name": "Synthetic event",
             "starts_at": "2099-01-01T00:00:00Z", "ends_at": "2099-01-01T01:00:00Z",
-            "location": "Synthetic location",
         }
+        update = {**event, "location": "Synthetic location"}
         create = {**update, "event_key": "unmapped"}
         cancel = {"action": "event.cancel", "event_key": "mapped"}
         role = {"action": "role.assign", "discord_id": MEMBER, "role_key": "member"}
+        events_path = f"/api/v10/guilds/{GUILD}/scheduled-events"
+        channel_edit = f"channel-edit:{EVENT_CHANNEL}"
+        replacement_edit = f"channel-edit:{REPLACEMENT_EVENT_CHANNEL}"
+        channel_denial = ("PATCH", f"{events_path}/{EVENT}", channel_edit)
         self.start_bot("current")
         self.start_bot("retained")
         cases = (("create", create), ("edit", update), ("cancel", cancel))
@@ -264,11 +273,40 @@ class Rehearsal:
                 require(answer["code"] == "discord_rejected", "Event denial was not a Discord rejection")
             require(self.request(which, f"{which}-role", role)["outcome"] == "assigned", "Role was not assigned")
 
+        scoped_edit = {**event, "channel_key": "event"}
+        prior_key = "current-channel-edit"
+        self.write("channel-event-approval", f"{GUILD}:{EVENT_CHANNEL}")
+        answer = self.request("current", prior_key, scoped_edit)
+        require(answer["status"] == 200 and answer["outcome"] == "updated" and answer["event_id"] == EVENT
+                and not answer["replay"] and self.claim(prior_key) == "completed",
+                "Current channel edit did not produce a durable receipt")
+
         self.stop_bot("current")
         self.stop_bot("retained")
+        replacement_scope = f"{GUILD}:{REPLACEMENT_EVENT_CHANNEL}"
+        self.write("channel-event-approval", replacement_scope)
         self.restore_database(self.snapshot_database())
         self.restart_recorder_with_cutoff()
+        require((self.work / "channel-event-approval").read_text() == replacement_scope + "\n",
+                "Recorder restart did not retain the replacement channel scope")
         self.start_bot("retained")
+        before_replay = self.journal()
+        request_count = self.work / "request-count"
+        requests_before_replay = request_count.stat().st_size
+        replay = self.request("retained", prior_key, scoped_edit)
+        require(replay == {**answer, "replay": True} and self.claim(prior_key) == "completed"
+                and request_count.stat().st_size == requests_before_replay,
+                "Retained replay did not preserve the original receipt without a wire attempt")
+        rejected = self.request("retained", "retained-old-channel-edit", scoped_edit)
+        require(rejected["code"] == "discord_rejected" and not rejected["replay"]
+                and self.journal()[len(before_replay):] == [(*channel_denial, "denied")],
+                "Fresh retained key did not encounter the changed channel approval")
+        replacement = self.request("retained", "retained-replacement-channel-edit",
+                                   {**scoped_edit, "channel_key": "replacement"})
+        require(replacement["status"] == 200 and replacement["outcome"] == "updated"
+                and replacement["event_id"] == EVENT and not replacement["replay"],
+                "Replacement channel did not retain scoped authority")
+
         answer = self.request("retained", "rollback-create", create)
         require(answer["code"] == "discord_rejected", "A restored rollback bypassed the cutoff")
         self.start_bot("current")
@@ -300,14 +338,14 @@ class Rehearsal:
 
         entries = self.journal()
         denied = [row[:3] for row in entries if row[3] == "denied"]
-        events_path = f"/api/v10/guilds/{GUILD}/scheduled-events"
         create_denial = ("POST", events_path, "create")
         denied_per_runtime = [create_denial, ("PATCH", f"{events_path}/{EVENT}", "edit"),
                               ("PATCH", f"{events_path}/{EVENT}", "cancel")]
-        require(denied == denied_per_runtime * 2 + [create_denial] * 2,
-                "Expected ordered event denials at the fixture routes on both runtimes and after both restores")
+        require(denied == denied_per_runtime * 2 + [channel_denial] + [create_denial] * 2,
+                "Expected ordered event denials on both runtimes, including the superseded channel scope")
         applied = [operation for _, _, operation, outcome in entries if outcome == "applied"]
-        require(applied == ["role", "role", "create"], "Expected two role writes and one pre-cutoff event effect")
+        require(applied == ["role", "role", channel_edit, replacement_edit, "create"],
+                "Expected only the role writes, approved channel edits and pre-cutoff event effect")
         require(all(row[3] != "unexpected" for row in entries), "Unexpected fixture mutation route")
         print(json.dumps({"recorder": entries, "event_and_role_verdict": "passed"}), flush=True)
 
