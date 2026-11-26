@@ -27,6 +27,9 @@ class ReleaseHelperCompatibilityTests(unittest.TestCase):
               as review):
             expected = (plan, archive)
             self.assertEqual(preflight.bound_plan(pin, run, "124", digest_json(target), api), expected)
+            with self.assertRaisesRegex(GateError, "production_forward_plan_changed"):
+                wrong_target = {**target, "branch_id": "different-branch"}
+                preflight.approved_plan(pin, run, "124", target=wrong_target, api=api)
             review.assert_not_called()
             self.assertEqual(preflight.approved_plan(pin, run, "124", target=target, api=api), expected)
             review.assert_called_once()
