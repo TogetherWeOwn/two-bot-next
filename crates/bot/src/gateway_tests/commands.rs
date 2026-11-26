@@ -683,9 +683,9 @@ async fn slow_prefix_rest_commits_checkpoint_and_reservation_fences_resume() {
     let mut script = bootstrap_responses();
     script.extend([
         ScriptedResponse::json(200, json!({})),
-        ScriptedResponse::json(200, json!({"id": "9000"})).delayed(Duration::from_secs(2)),
+        ScriptedResponse::json(200, json!({"id": "9000"})),
     ]);
-    let rest = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let (rest, pending_reply) = MockRest::start_gated(script, ScriptedResponse::status(500)).await;
     let commands = bootstrap(&db, &rest, &vars(Some("0"))).await;
     let mut gateway = CommandGateway::start(45000).await;
     let (runner, state) = spawn_runner_with_commands(&db, &gateway.url, Some(commands)).await;
@@ -696,15 +696,15 @@ async fn slow_prefix_rest_commits_checkpoint_and_reservation_fences_resume() {
     wait_connected(&state).await;
     assert_registry(&rest);
     gateway.send(prefix(2, 60)).await;
-    wait_requests(&rest, 4).await;
+    tokio::time::timeout(BOUND, pending_reply.wait_for_request())
+        .await
+        .expect("pending prefix response");
     // Detached command work never blocks the serial checkpoint writer: the
     // capture commits while the prefix POST is still in flight.
     wait_sequence(&db.store, 2).await;
-    assert_eq!(
-        *state.read().await,
-        GatewayState::Connected,
-        "checkpoint commits during slow detached REST"
-    );
+    // The committed row can become visible before the writer restores readiness.
+    // The response gate keeps the POST pending through both observations.
+    wait_connected(&state).await;
     assert_eq!(db.count().await, 1, "capture committed with REST pending");
     let attempt: String = sqlx::query_scalar(
         "SELECT outcome FROM automation_audit_log WHERE id = 'custom:text:attempt:60'",
