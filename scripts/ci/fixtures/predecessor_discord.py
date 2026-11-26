@@ -167,16 +167,22 @@ def check_peers(reservation, port=PORT):
             return False
 
     def gateway_hello(response):
-        if (response.getheader("Upgrade", "").lower() != "websocket"
+        connection_tokens = {token.strip().lower() for token in response.getheader("Connection", "").split(",")}
+        if ("upgrade" not in connection_tokens
+                or response.getheader("Upgrade", "").lower() != "websocket"
                 or response.getheader("Sec-WebSocket-Accept") != websocket_accept(key)):
             return False
         frame = response.fp.read(2)
-        return (len(frame) == 2 and frame[0] == 0x81 and 0 < frame[1] <= 125
-                and decode_json(response.fp.read(frame[1])) == HELLO)
+        if len(frame) != 2 or frame[0] != 0x81 or not 0 < frame[1] <= 125:
+            return False
+        payload = response.fp.read(frame[1])
+        return len(payload) == frame[1] and decode_json(payload) == HELLO
 
     def rest_application(response):
-        data = response.read(4097)
-        return len(data) <= 4096 and decode_json(data) == {"id": APP}
+        # A declared length lets read() refuse a truncated body (IncompleteRead).
+        if response.length is None or response.length > 4096:
+            return False
+        return decode_json(response.read()) == {"id": APP}
 
     return {"gateway": observe("/?v=10&encoding=json", upgrade, 101, gateway_hello),
             "rest": observe(APPLICATION, {"Authorization": f"Bot {TOKEN}", "Connection": "close"},

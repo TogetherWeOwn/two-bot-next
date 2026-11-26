@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from production_release_forward import CUTOVER, STORE, forward_receipt
@@ -100,6 +101,88 @@ class ReleaseForwardTests(unittest.TestCase):
         with self.assertRaisesRegex(GateError, "production_release_retained_pair_changed"):
             preflight.verify_preflight(pin, plan["target"], plan, plan, Mock(side_effect=[state, shifted]), control)
 
+    def test_prepare_rejects_agreeing_invalid_pre_plans_before_reading_provider(self):
+        pin, plan = self.preflight_fixture()
+        # The read-only shape is valid, but the required PRE audit findings are absent.
+        plan.update(runner_version=1, plan_run_id="", plan_provenance_verified=False,
+                    applied_count=0, applied_store_count=0)
+        run = {"id": 456}
+        artifact = {"archive_digest": "sha256:" + "8" * 64}
+        with TemporaryDirectory() as temp:
+            directory = Path(temp) / "production-release"
+            directory.mkdir()
+            (directory / "fresh-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            env = {"RUNNER_TEMP": temp, "PRODUCTION_WORKER_URL": "https://prod.invalid",
+                   "OWNERSHIP_CONTROL_TOKEN": "fixture", "CLOUDFLARE_ACCOUNT_ID": "fixture",
+                   "CLOUDFLARE_API_TOKEN": "fixture"}
+            with (patch.object(release, "release_context", return_value=(pin, run, "123", plan, artifact)),
+                  patch.object(release, "check_url"), patch.object(release, "control_client") as control,
+                  patch.object(release, "require_unused_attendance_plan") as unused,
+                  patch.object(release, "read_status") as observe,
+                  patch.object(release, "RollbackClient") as provider):
+                self.assertEqual(release.main(["prepare"], env), 1)
+            unused.assert_not_called()
+            control.assert_not_called()
+            observe.assert_not_called()
+            provider.assert_not_called()
+
+    def test_prepare_checks_single_use_before_provider_access(self):
+        pin, plan = self.preflight_fixture()
+        fresh = {**plan, "role_verified_connections": 2}
+        run = {"id": 456}
+        artifact = {"run_id": 123, "artifact_id": 789, "archive_digest": "sha256:" + "8" * 64}
+        provider_steps = ["control", "preflight", "provider", "provenance", "registry", "write_proof"]
+        spent = GateError("production_attendance_plan_superseded_by_release_attempt")
+        for refusal, expected_steps in ((spent, []), (None, provider_steps)):
+            with self.subTest(approved=refusal is None), TemporaryDirectory() as temp:
+                directory = Path(temp) / "production-release"
+                directory.mkdir()
+                (directory / "fresh-plan.json").write_text(json.dumps(fresh), encoding="utf-8")
+                output_path = Path(temp) / "output"
+                env = {"RUNNER_TEMP": temp, "PRODUCTION_WORKER_URL": "https://prod.invalid",
+                       "OWNERSHIP_CONTROL_TOKEN": "fixture", "CLOUDFLARE_ACCOUNT_ID": "fixture",
+                       "CLOUDFLARE_API_TOKEN": "fixture", "GITHUB_OUTPUT": str(output_path)}
+                calls = Mock()
+                calls.approval.side_effect = refusal
+                calls.preflight.return_value = 17
+                calls.write_proof.side_effect = release.write_json
+                with (patch.object(release, "release_context", return_value=(pin, run, "123", plan, artifact)),
+                      patch.object(release, "check_url"),
+                      patch.multiple(release, validate_attendance_plan=calls.validate,
+                                     require_unused_attendance_plan=calls.approval,
+                                     control_client=calls.control, verify_preflight=calls.preflight,
+                                     read_status=calls.observe, RollbackClient=calls.provider,
+                                     validate_receipt_against_live=calls.provenance,
+                                     image_in_registry=calls.registry, write_json=calls.write_proof)):
+                    self.assertEqual(release.main(["prepare"], env), int(refusal is not None))
+                self.assertEqual(calls.mock_calls[:3], [call.validate(plan), call.validate(fresh),
+                                                        call.approval(release.github, artifact, run)])
+                self.assertEqual([name for name, _, _ in calls.mock_calls[3:]], expected_steps)
+                self.assertEqual((directory / "preflight.json").exists(), refusal is None)
+                self.assertEqual(output_path.exists(), refusal is None)
+
+    def test_stop_refuses_a_spent_attendance_plan_before_the_provider_call(self):
+        pin, plan = self.preflight_fixture()
+        run = {"id": 456}
+        artifact = {"archive_digest": "sha256:" + "8" * 64}
+        with TemporaryDirectory() as temp:
+            directory = Path(temp) / "production-release"
+            directory.mkdir()
+            proof = {"pin": vars(pin), "epoch": 17, "run_id": "456", "plan_run_id": "123",
+                     "plan_archive_sha256": artifact["archive_digest"]}
+            (directory / "preflight.json").write_text(json.dumps(proof), encoding="utf-8")
+            env = {"RUNNER_TEMP": temp, "PRODUCTION_WORKER_URL": "https://prod.invalid",
+                   "OWNERSHIP_CONTROL_TOKEN": "fixture", "GITHUB_OUTPUT": str(Path(temp) / "output")}
+            with (patch.object(release, "release_context", return_value=(pin, run, "123", plan, artifact)),
+                  patch.object(release, "check_url"), patch.object(release, "control_client") as control,
+                  patch.object(release, "require_unused_attendance_plan",
+                               side_effect=GateError("production_attendance_plan_superseded_by_release_attempt")) as unused,
+                  patch.object(release, "stop_prior_pair", return_value={}) as stop):
+                self.assertEqual(release.main(["stop"], env), 1)
+            unused.assert_called_once_with(release.github, artifact, run)
+            control.assert_not_called()
+            stop.assert_not_called()
+
     def test_forward_database_boundary_refuses_wrong_fence_or_producer_before_apply(self):
         pin, plan = self.preflight_fixture()
         preflight_epoch = 17
@@ -164,6 +247,29 @@ class ReleaseForwardTests(unittest.TestCase):
             with self.assertRaisesRegex(GateError, "protected_job_failed"):
                 release.forward_document(env, pin, run, "123", plan, artifact, api)
             authenticate.assert_not_called()
+
+    def test_takeover_cli_passes_the_ownership_client(self):
+        pin, plan = self.preflight_fixture()
+        run = {"id": 456}
+        artifact = {"archive_digest": "sha256:" + "8" * 64}
+        recovery = Mock()
+        worker_url = "https://prod.invalid"
+        uploaded_version = "12345678-1234-4567-8123-123456789aaa"
+        with (TemporaryDirectory() as temp,
+              patch.object(release, "release_context", return_value=(pin, run, "123", plan, artifact)),
+              patch.object(release, "check_url", return_value=worker_url),
+              patch.object(release, "forward_document", return_value=recovery),
+              patch.object(release, "control_client") as control_client,
+              patch.object(release, "take_over") as take_over):
+            env = {"RUNNER_TEMP": temp, "PRODUCTION_WORKER_URL": worker_url,
+                   "OWNERSHIP_CONTROL_TOKEN": "fixture", "NEW_VERSION": uploaded_version}
+            self.assertEqual(release.main(["takeover"], env), 0)
+        control_client.assert_called_once_with("production", "fixture", worker_url, "",
+                                               f"production-schema-release:456:{pin.candidate_sha}")
+        take_over.assert_called_once()
+        release_pin, proven_recovery, version, _, control = take_over.call_args.args
+        self.assertEqual((release_pin, proven_recovery, version), (pin, recovery, uploaded_version))
+        self.assertIs(control, control_client.return_value)
 
     def test_takeover_refuses_a_provider_version_different_from_the_uploaded_worker(self):
         data = json.loads(Path(__file__).with_name("fixtures").joinpath("production_ownership_status_provider.json").read_text())

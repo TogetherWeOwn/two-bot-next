@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+from dataclasses import dataclass, field
 from functools import partial
 import json
 import os
@@ -17,6 +18,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
+from pre_target import Inventory, Target, TargetError, check_inventory
 from script_intake import decode_legacy_json, unique_object
 
 from fixtures.predecessor_discord import GATEWAY, REST, TOKEN
@@ -34,6 +36,7 @@ STAMPS = dict(zip(
      "com.togetherweown.deploy-id"),
 ))
 
+
 class Refused(Exception):
     pass
 
@@ -41,6 +44,37 @@ class Refused(Exception):
 def require(condition, message):
     if not condition:
         raise Refused(message)
+
+
+@dataclass(frozen=True)
+class AppDatabaseReadback:
+    """Fresh authenticated app inventory and its effective synthetic binding."""
+
+    inventory: Inventory
+    database_url: str = field(repr=False)
+
+
+def run_bound_endpoint(docker, image, postgres, mock_image, stamps, *, target, expected_app_id, readback):
+    """Rehearse the PRE shape of an independently admitted app.
+
+    The caller pins the reservation and app UUID independently of readback.
+    It authenticates both observations together for the exact app and scope.
+    The observed URL is evidence only. The rehearsal connects to its own
+    loopback snapshot using the existing local fixture configuration.
+    """
+    require(type(target) is Target and type(readback) is AppDatabaseReadback,
+            "missing isolated PRE admission or readback")
+    try:
+        check_inventory(target, readback.inventory)
+    except TargetError:
+        raise Refused("isolated PRE app inventory mismatch") from None
+    app = readback.inventory.container
+    require(app is not None and type(expected_app_id) is str and app.id == expected_app_id,
+            "isolated PRE app identity mismatch")
+    url = readback.database_url
+    require(type(url) is str and url == target.synthetic_database_url,
+            "isolated PRE database identity mismatch")
+    return run_endpoint(docker, image, postgres, mock_image, stamps, int(target.shape.split("/")[0]))
 
 
 def verify_image(docker, pin, synthetic):

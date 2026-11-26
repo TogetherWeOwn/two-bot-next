@@ -1,18 +1,21 @@
 """Pin explicit standard GitHub-hosted runners in this public repository.
 
-Every ordinary job selects ubuntu-latest directly: no dormant private,
-self-hosted or overflow route. A private conversion requires fresh runner and
-cost qualification before execution. Offline and stdlib-only: no GitHub
-credentials, no PyYAML. Visibility is verified separately before execution.
+Ordinary jobs select ubuntu-latest directly, with scoped Boat and Blacksmith
+routes for CI gates. A private conversion requires fresh runner and cost
+qualification before execution. This check uses only the standard library.
 """
 
 from pathlib import Path
 import re
 import unittest
 
+from ci.runner_policy import (
+    IGNORED_DB_RUNTIME_RUNNER, PR_GATE_RUNNER, PR_SIZE_GATE_RUNNER_INPUT,
+    PUBLIC_RUNNER, expected_runner,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github/workflows"
-PUBLIC_RUNNER = "ubuntu-latest"
 # Negative fixture: the former public-first branch still collected private
 # self-hosted/overflow routing in source, even when it was never selected.
 LEGACY_ROUTED = (
@@ -43,6 +46,7 @@ def jobs(text):
 def violations(text, workflow_name=None):
     """Reject indirect or nonstandard runners, including dormant routing."""
     problems = []
+    runner_keys = 0
     for job, lines in jobs(text).items():
         keys = {
             line.strip().split(":", 1)[0]: line.split(":", 1)[1].strip()
@@ -56,15 +60,28 @@ def violations(text, workflow_name=None):
             # A reusable-workflow call has no runner; the called file is checked.
             if "runs-on" in keys:
                 problems.append(f"{job}: reusable call must not set runs-on")
+            if (workflow_name, job) == ("pr-size.yml", "pr-size-gate"):
+                runner_keys += 1
+                folded = re.search(
+                    r"(?m)^    with:\n      runs-on: >-\n((?:^        \S[^\n]*\n)+)",
+                    "\n".join(lines) + "\n",
+                )
+                if not folded or " ".join(line.strip() for line in folded[1].splitlines()) != PR_SIZE_GATE_RUNNER_INPUT:
+                    problems.append(f"{job}: invalid reusable runner input")
             continue
-        if keys.get("runs-on") != PUBLIC_RUNNER:
-            problems.append(f"{job}: runs-on is {keys.get('runs-on')!r}, not {PUBLIC_RUNNER}")
+        runner_keys += 1
+        expected = expected_runner(workflow_name, job)
+        actual = keys.get("runs-on")
+        if actual == ">-" and expected != PUBLIC_RUNNER:
+            folded = re.search(r"(?m)^    runs-on: >-\n((?:^      \S[^\n]*\n)+)", "\n".join(lines) + "\n")
+            if folded:
+                actual = " ".join(line[6:] for line in folded[1].splitlines())
+        if actual != expected:
+            problems.append(f"{job}: runs-on is {actual!r}, expected {expected!r}")
     # Catch a runs-on hidden anywhere else (nested, flow style, odd indent).
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
-    expected = sum(1 for lines in jobs(text).values()
-                   if not any(re.match(r"^    uses:", line) for line in lines))
-    if len(re.findall(r"(?m)^\s*runs-on:", code)) != expected:
-        problems.append("runs-on appears outside the job-level keys")
+    if len(re.findall(r"(?m)^\s*runs-on:", code)) != runner_keys:
+        problems.append("unexpected runs-on key count")
     for forbidden in ("self-hosted", "two-selfhosted", "CI_OVERFLOW_"):
         if forbidden in code:
             problems.append(f"dormant runner routing remains: {forbidden}")
@@ -86,15 +103,35 @@ class RepositoryWorkflowTests(unittest.TestCase):
             hosted_jobs += text.count(f"    runs-on: {PUBLIC_RUNNER}")
         self.assertGreaterEqual(hosted_jobs, 88)
 
-    def test_required_check_jobs_and_their_needs_are_hosted(self):
-        check = jobs((WORKFLOWS / "check.yml").read_text())
-        supply = jobs((WORKFLOWS / "supply-chain.yml").read_text())
-        for job, lines in [*((j, check[j]) for j in ("check", "self-role-store", "parity-docs", "container-inputs", "ci-ok")),
-                           *((j, supply[j]) for j in ("pr-lint", "gitleaks"))]:
-            self.assertIn(f"    runs-on: {PUBLIC_RUNNER}", lines, job)
-
 
 class CheckerMutationTests(unittest.TestCase):
+    def test_blacksmith_route_is_exact_and_scoped_to_ignored_db_runtime(self):
+        canonical = workflow("ignored-db-runtime", IGNORED_DB_RUNTIME_RUNNER)
+        self.assertEqual(violations(canonical, "check.yml"), [])
+        self.assertTrue(violations(canonical, "nightly.yml"))
+        self.assertTrue(violations(workflow("coverage-shard", IGNORED_DB_RUNTIME_RUNNER), "check.yml"))
+        self.assertTrue(violations(workflow("ignored-db-runtime", PUBLIC_RUNNER), "check.yml"))
+        for mutated in (
+            canonical.replace("github.event.pull_request.head.repo.full_name == github.repository", "true"),
+            canonical.replace("CI_BLACKSMITH_2VCPU", "CI_BLACKSMITH_4VCPU"),
+            canonical.replace("|| 'ubuntu-latest'", ""),
+            workflow("ignored-db-runtime", "${{ vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}"),
+        ):
+            with self.subTest(mutated=mutated):
+                self.assertTrue(violations(mutated, "check.yml"))
+
+    def test_pr_gate_blacksmith_route_rejects_unapproved_jobs_and_missing_guards(self):
+        self.assertEqual(violations(workflow("ci-ok", PR_GATE_RUNNER), "check.yml"), [])
+        self.assertTrue(violations(workflow("ci-ok", PUBLIC_RUNNER), "check.yml"))
+        self.assertTrue(violations(workflow("container", PR_GATE_RUNNER), "check.yml"))
+        self.assertTrue(violations(workflow("gitleaks", PR_GATE_RUNNER), "nightly.yml"))
+        for guard in ("github.event_name == 'pull_request'",
+                      "github.event.pull_request.head.repo.full_name == github.repository",
+                      "vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'"):
+            with self.subTest(guard=guard):
+                self.assertTrue(violations(workflow("gitleaks", PR_GATE_RUNNER.replace(guard, "true")),
+                                           "supply-chain.yml"))
+
     def test_canonical_job_passes(self):
         self.assertEqual(violations(workflow("build", PUBLIC_RUNNER)), [])
 

@@ -10,6 +10,7 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.p
     from pre_cleanup_run import CleanupRunStatus, classify_cleanup_run
     from pre_sweep import SweepError, sweep_target
     from pre_target import Inventory, Resource, Target
+    from pre_sweep import CleanupReadback
 
 
 READS = ("status", "inventory")
@@ -118,6 +119,9 @@ class SyntheticStaging:
         self.events.append(("inventory", target))
         return self.snapshot
 
+    def cleanup_inventory(self, target, *, request):
+        return CleanupReadback(self.inventory(target), request)
+
     def apply(self, target, action):
         self.events.append((action.operation, target, action.name, action.id))
         if action.operation == self.unconfirmed:
@@ -198,6 +202,38 @@ class PreReaperFixtureTests(unittest.TestCase):
                 self.refused(staging, "^PRE cleanup operation was not confirmed$",
                              operations=OPERATIONS[:index + 1])
 
+    def test_ambiguous_revocation_waits_for_fresh_exact_target_read(self):
+        target = self.target
+        reads = [("status", target), ("inventory", target)]
+        revoke = ("revoke_write_access", target, target.service_name, target.service_name)
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                staging = SyntheticStaging(target)
+                initial = staging.snapshot
+                app = initial.container
+                staging.unconfirmed = None if committed else revoke[0]
+                apply = staging.apply
+
+                def acknowledge_without_confirmation(target, action):
+                    apply(target, action)
+                    return {"accepted": True}
+
+                with patch.object(staging, "apply", side_effect=acknowledge_without_confirmation):
+                    with self.assertRaisesRegex(SweepError, "^PRE cleanup operation was not confirmed$"):
+                        self.sweep(staging)
+                self.assertEqual(staging.events, reads + [revoke])
+                self.assertEqual(staging.snapshot, replace(initial, write_access=not committed))
+
+                staging.events.clear()
+                staging.unconfirmed = None
+                self.assertEqual(self.sweep(staging, now=target.started_at + 2), "cleared")
+                self.assertEqual(staging.events, reads + ([] if committed else [revoke]) + [
+                    ("delete_worker", target, target.worker_name, target.worker_name),
+                    ("stop_container", target, app.name, app.id),
+                    ("delete_container", target, app.name, app.id),
+                    ("inventory", target),
+                ])
+
     def test_container_delete_requires_direct_zero_for_the_pinned_app(self):
         for changes in (
             {"startup_settled": False}, {"write_access": True}, {"container": None},
@@ -269,3 +305,45 @@ class PreReaperFixtureTests(unittest.TestCase):
                     with self.assertRaisesRegex(SweepError, f"^PRE {reason}$") as failure:
                         self.sweep(staging)
                 self.assertTrue(failure.exception.__suppress_context__)
+
+    def test_cleanup_rejects_replayed_absence(self):
+        staging = SyntheticStaging(self.target)
+        present = staging.snapshot
+        staging.snapshot = replace(present, worker=None, container=None, instance_count=0,
+                                   assigned_count=0, write_access=False)
+        earlier = staging.inventory(self.target)
+        staging.snapshot = present
+        staging.events.clear()
+
+        error = "^PRE cleanup readback could not be verified$"
+        with patch.object(staging, "inventory", return_value=earlier), \
+             patch.object(staging, "cleanup_inventory", return_value=earlier):
+            with self.assertRaisesRegex(SweepError, error):
+                self.sweep(staging)
+        self.assertEqual(staging.events, [("status", self.target)])
+
+        # A successful earlier cleanup of the same reservation cannot be replayed.
+        staging.snapshot = earlier
+        observations = []
+        observe = staging.cleanup_inventory
+
+        def capture(target, *, request):
+            readback = observe(target, request=request)
+            observations.append(readback)
+            return readback
+
+        with patch.object(staging, "cleanup_inventory", side_effect=capture):
+            self.assertEqual(self.sweep(staging), "cleared")
+        with patch.object(staging, "cleanup_inventory", return_value=observations[0]):
+            with self.assertRaisesRegex(SweepError, error):
+                self.sweep(staging)
+
+        # Even a current request cannot attest absence for a different reservation.
+        sibling = replace(self.target, scope="pre-fixture-other")
+        self.assertEqual(sibling.container_name, self.target.container_name)
+        foreign = replace(earlier, target=sibling)
+        with patch.object(staging, "cleanup_inventory",
+                          side_effect=lambda target, *, request: CleanupReadback(foreign, request)):
+            with self.assertRaisesRegex(SweepError, error):
+                self.sweep(staging)
+        self.assertEqual(self.sweep(staging), "cleared")
