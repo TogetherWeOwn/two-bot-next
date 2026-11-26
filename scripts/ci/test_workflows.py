@@ -10964,6 +10964,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(workflow["on"]), {
             "pull_request", "merge_group", "push", "schedule", "workflow_dispatch",
         })
+        self.assertEqual(workflow["on"]["pull_request"], {"types": ["opened", "synchronize", "reopened"]})
         expression = workflow["jobs"]["rust-tests"]["runs-on"]
         self.assertEqual(expression, RUST_TESTS_RUNNER)
         expression = expression.removeprefix("${{").removesuffix("}}").strip()
@@ -10987,7 +10988,8 @@ class WorkflowTests(unittest.TestCase):
         cases = (
             ("eligible maintainer", {}, "boat"),
             ("eligible app", app, "boat"),
-            ("protected main push", {**app, **push}, "boat"),
+            # The main push writes a shared cache consumed by credentialed nextest.
+            ("protected main push", {**app, **push}, PUBLIC_RUNNER),
             ("unprotected main push", {**push, "github.ref_protected": False}, PUBLIC_RUNNER),
             ("branch push", {**push, "github.ref": "refs/heads/other"}, PUBLIC_RUNNER),
             ("fork PR", {"github.event.pull_request.head.repo.full_name": "contributor/two-bot-next"}, PUBLIC_RUNNER),

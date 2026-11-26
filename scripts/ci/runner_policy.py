@@ -7,11 +7,9 @@ RUST_TESTS_RUNNER = (
     "&& github.run_attempt == '1' "
     "&& (github.actor == 'Rick7C2' || github.actor == 'togetherweown[bot]') "
     "&& (github.triggering_actor == 'Rick7C2' || github.triggering_actor == 'togetherweown[bot]') "
-    "&& ((github.event_name == 'pull_request' "
+    "&& github.event_name == 'pull_request' "
     "&& github.event.pull_request.head.repo.full_name == github.repository "
-    "&& github.event.pull_request.base.ref == 'main') "
-    "|| (github.event_name == 'push' && github.ref == 'refs/heads/main' "
-    "&& toJSON(github.ref_protected) == 'true')) "
+    "&& github.event.pull_request.base.ref == 'main' "
     "&& vars.CI_HEAVY_RUNNER == 'boat' && 'boat' || 'ubuntu-latest' }}"
 )
 

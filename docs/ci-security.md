@@ -611,14 +611,14 @@ are preserved until those callers migrate.
 Ordinary jobs select `runs-on: ubuntu-latest` explicitly, including the local
 reusable nextest and SBOM jobs. The sole exception is `check.yml` job
 `rust-tests` (`rust tests`). Boat is eligible on the first attempt of a
-same-repository PR targeting `main` or a push to protected `main`, with the
-repository explicitly public. Both the original and triggering actors must
+same-repository PR targeting `main`, with the repository explicitly public.
+Both the original and triggering actors must
 match Boat's allowlist of `Rick7C2` and `togetherweown[bot]`. The prepaid
 reserve switch selects `boat` while starts fit the allowance. The job accepts
 only that label from `CI_HEAVY_RUNNER` and falls back to `ubuntu-latest` for
 any other value, including an unset variable.
 
-Fork PRs, Dependabot, off-list or missing actors, reruns, queue groups,
+Fork PRs, Dependabot, off-list or missing actors, reruns, pushes, queue groups,
 schedules, and manual dispatches use `ubuntu-latest`. GitHub retains the
 original actor on a rerun and may report a different triggering actor.
 Reruns use the hosted route even when both actors are allowlisted. The workflow
@@ -642,9 +642,10 @@ a fresh Linux VM for each job and deletes it when the job ends. It supports job
 and service containers, cache and artifact actions. The `boat` label selects
 4 vCPU, 8 GB RAM and 4 GB swap. The `rust-tests` job keeps its existing pinned
 images, service limits, disk guard and 45-minute timeout. `ci-ok` waits for the
-job and requires success whenever the Rust selector selects it. Only pushes
-to `main` can save the existing shared GitHub Actions cache. Eligible Boat jobs
-on that push path share the cache trust boundary with GitHub-hosted consumers.
+job and requires success whenever the Rust selector selects it. Only GitHub-hosted
+pushes to `main` can save the shared Rust cache, which the hosted nextest lane
+restores on runs with R2 credentials. GitHub scopes caches written by PR jobs
+to the PR merge ref, outside the main cache scope.
 
 GitHub's [service-container contract](https://docs.github.com/en/actions/concepts/use-cases/about-service-containers)
 supports Linux job/service containers on hosted Ubuntu. Container jobs reach
