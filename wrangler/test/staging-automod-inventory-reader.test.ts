@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
 import test from "node:test";
 import { fileURLToPath, URL } from "node:url";
@@ -129,9 +129,18 @@ test("the verifier refuses excess output even after a complete receipt", async (
   }
 });
 
-test("the verifier returns its fixed refusal when the supervisor cannot spawn", async () => {
-  const run = bindStagingAutomodInventoryVerifier((_, args, options) =>
-    spawn(`${process.execPath}/missing`, args, options));
+test("the verifier returns its fixed refusal when spawn fails without pipes", async () => {
+  type Launch = NonNullable<Parameters<typeof bindStagingAutomodInventoryVerifier>[0]>;
+  const run = bindStagingAutomodInventoryVerifier(() => {
+    const child = new ChildProcess();
+    Object.assign(child, { stdin: null, stdout: null, stderr: null });
+    queueMicrotask(() => {
+      child.emit("error", Object.assign(new Error("synthetic descriptor limit"), { code: "EMFILE" }));
+      child.emit("close", -1);
+    });
+    // Node declares piped stdio at launch even when no process or pipes are created.
+    return child as ReturnType<Launch>;
+  });
   await assert.rejects(run(source.workflowSha, String(source.runId), new AbortController().signal),
     { message: "Staging inventory verifier failed" });
 });
