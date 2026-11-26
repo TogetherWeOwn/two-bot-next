@@ -434,7 +434,7 @@ class AcceptanceTests(unittest.TestCase):
 
         no_traffic.assert_not_called()
 
-    def test_rehearsal_evidence_requires_the_originating_lease(self):
+    def test_rehearsal_requires_ordered_observations_from_one_lease(self):
         def observations(acquired, attempt):
             rows = {}
             for phase, minutes in zip(acceptance.PHASES, (10, 46, 47, 48)):
@@ -491,6 +491,34 @@ class AcceptanceTests(unittest.TestCase):
             last_start = START + timedelta(hours=1, seconds=-acceptance.RUN_BUDGET)
             late["lifecycle"]["observedAt"] = last_start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
             self.assertEqual(run({**first, "off": late}), (1, "", "FAIL: staging lease did not cover the probe\n"))
+
+            for earlier, later in zip(acceptance.PHASES, acceptance.PHASES[1:]):
+                earlier_stamp = first[earlier]["lifecycle"]["observedAt"]
+                later_stamp = first[later]["lifecycle"]["observedAt"]
+                reason = "cleanup readback is incomplete" if later == "cleanup" else "staging lease did not cover the probe"
+                for order, stamp in (("reversed", earlier_stamp), ("tied", later_stamp)):
+                    with self.subTest(earlier=earlier, later=later, order=order):
+                        unordered = deepcopy(first)
+                        unordered[earlier]["lifecycle"]["observedAt"] = later_stamp
+                        unordered[later]["lifecycle"]["observedAt"] = stamp
+                        self.assertEqual(run(unordered), (1, "", f"FAIL: {reason}\n"))
+
+            cleanup = deepcopy(first["cleanup"])
+            del cleanup["lifecycle"]["observedAt"]
+            incomplete = (1, "", "FAIL: cleanup readback is incomplete\n")
+            with self.subTest(cleanup="missing timestamp"):
+                self.assertEqual(run({**first, "cleanup": cleanup}), incomplete)
+            for invalid in (1234, "2026-11-24T16:48:00Z", "2026-11-31T16:48:00.000Z"):
+                with self.subTest(cleanup=invalid):
+                    cleanup["lifecycle"]["observedAt"] = invalid
+                    self.assertEqual(run({**first, "cleanup": cleanup}), incomplete)
+
+            for offset in (timedelta(minutes=47, milliseconds=1), timedelta(hours=1, minutes=5)):
+                with self.subTest(cleanup=offset):
+                    cleanup["lifecycle"]["observedAt"] = (START + offset).isoformat(
+                        timespec="milliseconds").replace("+00:00", "Z")
+                    self.assertEqual(run({**first, "cleanup": cleanup}), passed)
+
             self.assertEqual(run({phase: row for phase, row in first.items() if phase != "cleanup"}),
                              (1, "", "FAIL: rehearsal requires all four observations\n"))
             self.assertEqual(run(first, extra=("--execute",)),
