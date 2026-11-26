@@ -453,6 +453,44 @@ watch, recovery or cleanup. If the readback is unclear, keep production
 changes on hold and reconcile with the other team. A later attempt uses
 fresh coordination.
 
+### Resume a deferred window
+
+Record the deferral, last confirmed run state and who will resume the release
+in the private coordination record. If deferring before dispatch, follow the
+abort checks above and have both teams acknowledge the handoff of the window.
+If a run was dispatched, use the after-dispatch rule above. Carry forward the
+pinned release plan, full candidate SHA and artifact identity, rollback plan,
+and original receipt links with producer run, attempt, digest and expiry where
+applicable. Keep credentials, raw responses and member data out of the record.
+
+- **Carry forward exact-candidate evidence.** Keep CI and PR review evidence,
+  staging deploy and smoke results, and immutable artifact receipts while the
+  selected workflow still admits them for the same candidate. For Bot, verify
+  the current qualifying staging attempt and its
+  [promotion certificate](#build-identity-and-the-readyz-gate). The protected
+  Bot migration workflow checks the original plan artifact, a matching fresh
+  plan and a still-valid approval check. A prior production migration dispatch
+  supersedes the plan if GitHub created it at or after the plan run's creation
+  time and its first attempt started a non-skipped apply job. For Web, recheck the
+  candidate's staging deploy and E2E evidence against the serving version and
+  soak. Where applicable, revalidate the exact
+  [Kit cutover packet and proof](https://github.com/TogetherWeOwn/two-web-next/blob/main/docs/kit-cutover-release.md#protected-release-and-recovery).
+  Replace expired, superseded or mismatched evidence through the applicable
+  workflow before proceeding.
+- **Refresh evidence for the new attempt.** Recheck custody, run status and
+  the standing-down team's promotion hold for the new window. Re-read the
+  serving versions, rollback target and any applicable live ledger, roles or
+  writer ownership through the normal preflight. Let the protected attempt
+  collect its own measurements, including Bot's fresh promotion soak where
+  required and Web's attempt-bound staging sample and production baseline.
+  Before data or schema changes, take and verify a fresh provider backup and
+  bind any required [restore rehearsal](#restore-evidence-for-release-approval)
+  to that backup and its new copy. Follow the
+  [production release gate](../CONTRIBUTING.md#production-release-gate) for
+  approval bound to the current plan and evidence. Use a fresh protected
+  dispatch for an authorized staged Bot promotion. After dispatch, use that
+  rollout's smoke and [watch results](#post-deploy-watch) before returning custody.
+
 ## Interrupted protected release
 
 If a protected attendance release fails or is cancelled after it may have
@@ -602,8 +640,9 @@ Before handing the bundle to a staging caller, use
 workflow SHA, run ID, artifact ID and ZIP digest, the authenticated GitHub run
 and artifact records, and the same private ZIP the caller would use. The
 offline check binds the full Worker file inventory and OCI image stamps to
-the first successful producer attempt. Staging still needs the serving proof
-below.
+the first successful producer attempt. It also verifies that every layer named
+in the selected OCI manifest is present at its declared size and SHA-256 digest.
+Staging still needs the serving proof below.
 
 1. For the reviewed rollback predecessor, record its Worker source SHA and
    module digests, container image digest and expected runtime
@@ -660,6 +699,43 @@ the existing protected cleanup approval in force. [Cloudflare image management](
 Hosted source-level CI runs the
 [synthetic refusal case](../scripts/ci/test_predecessor_serving_identity.py)
 for both choices of `rollback_sha`.
+
+### Prepare the predecessor image for isolated staging
+
+Open [`materialize_predecessor_bundle`](../scripts/materialize_predecessor.py)
+with the same private verified ZIP and its reviewed pins. Within that context,
+call [`plan_predecessor_image`](../scripts/predecessor_image.py) with the
+protected caller's authorized staging repository. Use a dedicated repository
+named `two-bot-next-attendance-predecessor-staging` in that registry namespace.
+The plan checks the local image archive hash and the stamped manifest digest
+against the build receipt. Keep the materialization private and stable until
+the copy completes.
+
+The planned argv uses `skopeo copy --preserve-digests --dest-tls-verify=true oci-archive:<archive>
+docker://<repository>@<manifest-digest>`. Skopeo 1.20.0 selects the single
+unnamed image from the OCI archive and uploads its manifest at the digest
+reference. The OCI layout index locates that image. The protected publisher
+needs an approved Skopeo build and registry access with blob upload, digest
+manifest PUT and digest GET for the dedicated repository. The staging runtime
+also needs pull access to the digest in that repository. Bind Skopeo to the
+protected adapter's private auth file with `--dest-authfile` or `REGISTRY_AUTH_FILE`.
+[Skopeo copy](https://github.com/containers/skopeo/blob/v1.20.0/docs/skopeo-copy.1.md) ·
+[OCI Distribution manifest PUT](https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#pushing-manifests)
+
+After copy success, the protected adapter must make a fresh authenticated
+`GET /v2/<namespace>/<repository>/manifests/<manifest-digest>` with
+`Accept: application/vnd.oci.image.manifest.v1+json` on the planned registry.
+Require HTTP 200 from the exact request scope without redirects. Supply the
+effective digest reference, the `Content-Type` media type without parameters,
+and the original response bytes with a 1 MiB cap plus one overflow byte. Set
+descriptor size to the observed byte count. Only set the descriptor's `digest`
+when the registry sends `Docker-Content-Digest`. `verify_registry_manifest`
+requires the exact scope and OCI manifest media type, and hashes the response
+bytes against the producer's `image_manifest_digest` from `build.json`. Any
+reported digest must also match before it returns `<repository>@<manifest-digest>`.
+Keep admission pending until the protected publisher proves registry authority,
+digest readback and runtime access. This source change supplies an offline
+contract and synthetic evidence.
 
 ## Regression gate against production
 
