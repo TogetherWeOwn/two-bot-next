@@ -167,6 +167,14 @@ provider or runtime observations for that same reservation and start ID if
 issued. Mark missing evidence and any unverified effects as unresolved. Keep
 raw provider responses and credentials out of the record.
 
+| Refusal evidence | Release decision to record |
+| --- | --- |
+| The release source contains Cutover 0480 and the proposed predecessor source lacks it. | Ordinary rollback refuses the source pair even if the database has returned to PRE. Once the protected caller and qualified predecessor are available under the existing release gate, use the protected database classification. Confirmed expanded POST requires an authenticated guarded inverse before takeover. Confirmed original PRE follows the protected PRE path. [Protected recovery paths](production-deploy.md#recovery-after-the-protected-workflow-ships) |
+| The pinned Worker and image lack independently verified exact takeover bound to this reservation. | Record that no compatible predecessor has been proved. Keep the release held and preserve any existing fence. Recovering the PRE schema leaves this decision open until the exact pair and its reservation-bound takeover are proved. [Predecessor identity and ledger checks](production-deploy.md#attendance-predecessor-identity-at-both-pre-endpoints) |
+
+Record both findings if both apply. A protected return requires a qualified
+predecessor and the existing approvals and evidence for the classified path.
+
 The staging release operator keeps custody of that reservation through cleanup.
 When protected stop is available, use it for the same reservation, including
 when startup was refused before admission. If the start runner is gone or loses
