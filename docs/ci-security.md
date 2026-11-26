@@ -529,6 +529,8 @@ resolve such a response.
 
 ## Source snowflakes
 
+The first command includes the [offline workflow fixtures](#offline-enforcement).
+
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
 python3 scripts/ci/check-src-snowflakes.py
@@ -609,7 +611,8 @@ are preserved until those callers migrate.
 ## Public-hosted runner contract
 
 Ordinary jobs select `runs-on: ubuntu-latest` explicitly, including the local
-reusable nextest and SBOM jobs. The two exceptions are in `check.yml`.
+reusable nextest and SBOM jobs. The runner policy fixtures pin the permitted
+Boat and Blacksmith routes.
 
 The `rust-tests` job (`rust tests`) can use Boat on the first attempt of a
 same-repository PR targeting `main`, with the repository explicitly public.
@@ -634,6 +637,13 @@ variable is unset, set to Ubuntu by the cutoff, or set to an unapproved size.
 The cutoff estimates cycle usage and reserves headroom before routing new jobs.
 GitHub merge-group events lack the source repositories of all member PRs.
 Verify queue trust before enabling the merge queue with Blacksmith routing.
+
+The other directly hosted `ci-ok` gates and their dependencies in `check.yml`,
+`pr-lint` and `gitleaks` in `supply-chain.yml`, and the required size gate in
+`pr-size.yml` use the same validated 2 vCPU variable on same-repository
+`pull_request` events. The size gate also uses it on same-repository
+`pull_request_review` events. These routes use `ubuntu-latest` for forks,
+missing or unapproved labels, and events outside those PR triggers.
 
 This contract is for a **public repository**. GitHub's
 [standard runner specification](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories)
@@ -712,11 +722,16 @@ any subsequent production exercise retain their separate release approval.
 ### Offline enforcement
 
 `scripts/test-runner-routing.py` checks every tracked workflow definition,
-rejecting dormant routing, indirect selectors, nonstandard runner labels,
-missing/nested selectors and runners on reusable-workflow calls. The parsed
+rejecting dormant routing, unapproved selectors, nonstandard runner labels,
+and misplaced runner keys. It also pins the size gate's reusable runner input.
+The parsed
 workflow suite, supply-chain, production deploy, channel CI and staging
 ownership fixtures also pin the direct hosted contract while retaining their
 other isolation and behavior assertions.
+
+Use Node.js 22 on `PATH` for `test_workflows.py`, matching the hosted check.
+The offline manual rollback drill fixture loads the Node helpers from the
+sparse file set.
 
 ```sh
 python3 scripts/test-runner-routing.py

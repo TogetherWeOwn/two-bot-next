@@ -1,6 +1,6 @@
-import { boundRead } from "../src/internal-actions.ts";
 import { invokeProtectedAutomodJob } from "../src/staging-automod-entry.ts";
 import { sameLease } from "../src/staging-automod-recovery.ts";
+import { boundStagingAutomodInventoryRead } from "./staging-automod-inventory-verifier.ts";
 import type { runStagingAutomodBoundJob, runStagingAutomodPrivateJob } from "./staging-automod-private-job.ts";
 
 type Transport = Parameters<typeof runStagingAutomodPrivateJob>[3];
@@ -82,7 +82,7 @@ export function bindStagingAutomodDeploymentTransport(worker: Worker,
       signal.throwIfAborted();
       let current = binding;
       if (!current) {
-        const inventory = await boundRead(readInventory(signal), signal);
+        const inventory = await boundStagingAutomodInventoryRead(readInventory(signal), signal);
         signal.throwIfAborted();
         current = binding ?? servingBinding(inventory, admitted.issuedLease);
       }
