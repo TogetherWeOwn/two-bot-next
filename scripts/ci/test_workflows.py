@@ -7509,6 +7509,15 @@ class WorkflowTests(unittest.TestCase):
             if step.get("name") == "sccache stats (advisory speed evidence)")
         self.assertIn("sccache --show-stats", stats.get("run", ""))
 
+    def test_patch_coverage_fetches_the_pr_merge_parent_and_keeps_other_history(self):
+        job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
+        checkout = job["steps"][0]
+        self.assertTrue(checkout["uses"].startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"], {
+            "persist-credentials": "false",
+            "fetch-depth": "${{ github.event_name == 'pull_request' && 2 || 0 }}",
+        })
+
     def test_patch_coverage_merge_unions_shards_and_gates(self):
         # The merge keeps the required `patch coverage` check name: it
         # downloads every shard report, unions them with strict N-of-N, and
