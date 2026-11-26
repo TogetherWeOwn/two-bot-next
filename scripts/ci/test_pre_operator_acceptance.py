@@ -9,8 +9,8 @@ from unittest.mock import patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from ci.pre_operator_acceptance_fixture import (
-        AcceptedRow, Build, Probe, RegistryCleanupEvidence, SchemaEvidence,
-        SchemaState, ServingEvidence, SweepEvidence, WorkerEvidence, accept,
+        SAMPLE_BUILD, SAMPLE_READY_REPORT, AcceptedRow, RegistryCleanupEvidence,
+        SchemaState, SweepEvidence, accept, sample_endpoint,
     )
     from ci.test_pre_sweep_inventory_retry import APP_ID, EXPIRED, SIBLING, FakeProvider
     from pre_registry_cleanup import RegistryReadback, RegistryReservation
@@ -22,12 +22,11 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.p
 class PreOperatorAcceptanceTests(unittest.TestCase):
     def setUp(self):
         self.target = Target("pre-fixture-operator", 42, 1_800_000_000, "0473/0465")
-        self.build = Build(17, "a" * 40, "2026.11.25.1+aaaaaaa", "sha256:" + "b" * 64)
+        self.build = SAMPLE_BUILD
         self.original = SchemaState((115, 473), (20, 465), False, None)
         self.restored = SchemaState((116, 475), (20, 465), True, 1_800_000_001)
         self.version = "12345678-1234-4234-8234-123456789abc"
-        self.report = {"build_revision": "a" * 40, "build_id": "17-1", "deploy_id": "2026.11.25.1+aaaaaaa",
-                       "components": [["process", "ready"], ["database", "ready"], ["gateway", "ready"]]}
+        self.report = SAMPLE_READY_REPORT
 
     def registry_reservation(self, target):
         repository = f"registry.example.invalid/{target.scope}/two-bot-next-attendance-predecessor-staging"
@@ -35,14 +34,7 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
 
     def evidence(self, target, state):
         reference = self.registry_reservation(target).reference
-        return {
-            "receipt": {"source_sha": "a" * 40, "worker_message": "a" * 40, "BOT_BUILD_REVISION": "a" * 40,
-                        "BOT_BUILD_ID": "17-1", "BOT_DEPLOY_ID": "2026.11.25.1+aaaaaaa",
-                        "image_manifest_digest": "sha256:" + "b" * 64},
-            "schema": SchemaEvidence(target, state),
-            "serving": ServingEvidence(target, self.version, "a" * 40, "sha256:" + "b" * 64),
-            "worker": WorkerEvidence(target, Probe(200, self.version),
-                                     Probe(200, self.version, json.dumps(self.report).encode())),
+        return sample_endpoint(target, state, self.version) | {
             "sweep": SweepEvidence(target, "cleared"),
             "registry": RegistryCleanupEvidence(
                 Inventory(target, None, None, 0, False, True, startup_settled=True, assigned_count=0),
