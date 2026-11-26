@@ -22,6 +22,10 @@ Job map (each a pure function of the changed paths):
   path is documentation (``docs/`` or a ``*.md`` outside ``.github/``), so
   the ``docs-only PR skips heavy jobs`` verification has an explicit signal
   alongside ``rust=false``, ``supply=false`` and container ``build=false``.
+- ``db-compat`` and ``migrations`` select the prior-revision database proof
+  and the migration lint preflight.
+- ``workflow-fixtures`` keeps the full workflow regression module for code,
+  ambiguous changes and the operations guide that module reads.
 
 Coupling notes (verified 2026-10-02, enforced by test_job_inputs.py):
 - Rust tests read a pinned doc set by content (parity/cutover/commands/
@@ -45,15 +49,17 @@ Coupling notes (verified 2026-10-02, enforced by test_job_inputs.py):
   tests/voice_templates/ (coverage.json, test_validator.py, README.md) are
   validated by the check job's hermetic offline step, which always runs, so
   an asset-only change there selects no job and skips the heavy matrix.
-- Worker verification steps execute scripts/test-*.py against the checkout, so
-  scripts/ changes select ``rust`` + ``worker`` (parity scripts add parity).
+- Shared scripts, workflow and action sources, and dependency files select
+  every applicable suite.
 - No workflow-level ``paths:`` filter: that would skip the whole workflow
   including the always-reporting ``check`` aggregator. Selection is per-job
   via the ``job-inputs`` job's outputs.
 """
 
 import argparse
+import re
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,8 +67,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # Bounded-subprocess policy (docs/bounded-subprocess-checks.md): every child
 # wait is finite so a stalled child fails closed here instead of hanging
 # until the external CI ceiling. Local Git diffs answer in well under a
-# second; 30s bounds the stall without touching valid runs. Both diff calls
-# below share this one value.
+# second; 30s bounds the stall without touching valid runs.
 GIT_TIMEOUT_SECONDS = 30
 
 
@@ -78,8 +83,12 @@ DOCS = "docs"
 # Live voice synthetic offline suite (not a CI job; never part of ALL_JOBS).
 VOICE = "voice"
 DB_COMPAT = "db-compat"
+MIGRATIONS = "migrations"
+WORKFLOW_FIXTURES = "workflow-fixtures"
+OUTPUTS = (RUST, WORKER, PARITY, SUPPLY, DOCS, VOICE, DB_COMPAT, MIGRATIONS, WORKFLOW_FIXTURES)
 ALL_JOBS = frozenset({RUST, WORKER, PARITY, SUPPLY})
 NO_JOBS = frozenset()
+SHA = re.compile(r"[0-9a-f]{40}")
 
 # Exact files that revalidate everything (gate wiring, manifests).
 ALL_EXACT = frozenset({
@@ -89,6 +98,12 @@ ALL_EXACT = frozenset({
     "rust-toolchain.toml",
     "deny.toml",
     "migrations.lock",
+})
+
+DEPENDENCY_FILES = frozenset({
+    "Cargo.toml", "Cargo.lock", "package.json", "package-lock.json",
+    "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", ".npmrc",
+    "rust-toolchain", "rust-toolchain.toml", "pyproject.toml", "uv.lock",
 })
 
 # The change-detection filter itself (CI standard rule 4, TOG-14881): an edit
@@ -107,7 +122,6 @@ SELECTOR_EXACT = frozenset({
 # fixture is read by the parity job as well.
 RUST_PREFIXES = (
     "sql/",
-    ".cargo/",
 )
 RUST_WORKER_PREFIXES = (
     "crates/",
@@ -126,10 +140,8 @@ VOICE_TEMPLATE_RUST_INPUTS = frozenset({
     "tests/voice_templates/validate.py",
 })
 
-# scripts/ verifications run in both the check and worker jobs; parity
-# scripts additionally gate the parity-docs job.
+# Shared scripts can change the implementation of any gate.
 SCRIPTS_PREFIX = "scripts/"
-PARITY_SCRIPT_MARKER = "parity"
 
 # The whole worker tree selects the worker job (typecheck, tests, and the
 # env-bindings scripts under wrangler/scripts/).
@@ -222,19 +234,15 @@ WORKER_WORKFLOWS = frozenset({
 })
 WORKFLOWS_PREFIX = ".github/workflows/"
 
-# Repo chrome no job reads: licenses, editor/ignore files, secret config
-# (gitleaks runs in its own workflow), PR template/owners, dependabot, and
-# root markdown (proven reader-free by test_job_inputs.py).
+# Repo chrome no test suite reads. Source policy such as the Gitleaks
+# configuration and Dependabot settings uses the full default.
 SKIP_EXACT = frozenset({
     "LICENSE",
     "CHANGELOG.md",
     ".editorconfig",
     ".gitignore",
-    ".gitleaks.toml",
-    ".gitleaksignore",
     ".github/pull_request_template.md",
     ".github/CODEOWNERS",
-    ".github/dependabot.yml",
 })
 
 # The worker job's release-lifecycle verification reads the release-please
@@ -292,9 +300,9 @@ def classify(path):
     here, so every set below stays within ``ALL_JOBS``.
     """
     path = normalize(path)
-    if path in ALL_EXACT:
-        return ALL_JOBS
-    if path in SELECTOR_EXACT:
+    if (path in ALL_EXACT or path in SELECTOR_EXACT
+            or Path(path).name in DEPENDENCY_FILES or path.endswith(".lock")
+            or path.startswith((".github/actions/", ".github/scripts/", "ci/", ".cargo/", SCRIPTS_PREFIX))):
         return ALL_JOBS
     if path in IMAGE_ONLY_EXACT:
         return frozenset({SUPPLY})
@@ -313,11 +321,6 @@ def classify(path):
         return NO_JOBS
     if path.startswith(RUST_PREFIXES) or path.startswith(TESTS_PREFIX):
         return frozenset({RUST})
-    if path.startswith(SCRIPTS_PREFIX):
-        jobs = {RUST, WORKER}
-        if PARITY_SCRIPT_MARKER in Path(path).name:
-            jobs.add(PARITY)
-        return frozenset(jobs)
     if path in RUST_WORKER_DOCS or path in RUST_WORKER_EXACT:
         return frozenset({RUST, WORKER})
     if path.startswith(WORKER_PREFIX):
@@ -334,7 +337,7 @@ def classify(path):
         if path in WORKER_DOCS:
             jobs.add(WORKER)
         return frozenset(jobs)
-    if path.startswith(DOCS_PREFIX):
+    if path.startswith(DOCS_PREFIX) and Path(path).suffix.lower() == ".md":
         # No file reader in PR-run code (proven by the reader-coverage
         # test), but runbook.test.ts asserts on the docs/ listing itself.
         return frozenset({WORKER})
@@ -441,21 +444,11 @@ def selection(changed, deleted=()):
     return jobs
 
 
-def git_diff_names(base_ref, head_ref, root=ROOT, diff_filter=None):
-    """Repo-relative paths changed between two refs (two-dot diff).
-
-    ``--no-renames`` reports a rename as a delete plus an add: the
-    deletion rule in :func:`selection` then forces full jobs. Without it a
-    rename like ``src/x.rs`` -> ``docs/y.md`` would classify as a docs-only
-    change while Rust code was deleted.
-    """
-    command = ["git", "-C", str(root), "diff", "--name-only", "--no-renames", "-z"]
-    if diff_filter is not None:
-        command.append(f"--diff-filter={diff_filter}")
-    command.append(f"{base_ref}..{head_ref}")
+def git(root, *args):
     try:
         output = subprocess.run(
-            command, capture_output=True, text=True, errors="surrogateescape", check=True,
+            ["git", "-C", str(root), *args], capture_output=True, text=True,
+            encoding="utf-8", errors="surrogateescape", check=True,
             timeout=GIT_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as error:
         raise JobInputsError(
@@ -467,46 +460,98 @@ def git_diff_names(base_ref, head_ref, root=ROOT, diff_filter=None):
             f"job-inputs: git diff spawn failed ({error}); "
             "next: re-run the selector on a runner with git "
             "installed") from error
-    return [path for path in output.stdout.split("\0") if path]
+    return output.stdout
+
+
+def git_changes(base_ref, head_ref, root=ROOT):
+    """Return regular files and changes requiring all lanes, from one Git diff."""
+    diff = git(root, "diff", "--raw", "--no-abbrev", "-z", "--no-renames",
+               "--ignore-submodules=none", "--no-ext-diff", "--no-textconv",
+               f"{base_ref}..{head_ref}", "--")
+    rows = diff.split("\0")
+    if rows[-1] or len(rows) % 2 == 0:
+        raise JobInputsError("job-inputs: incomplete raw diff; next: verify checkout history")
+    changed, uncertain = [], []
+    for header, path in zip(rows[0:-1:2], rows[1:-1:2]):
+        fields = header.split()
+        if len(fields) != 5 or not path or not fields[0].startswith(":"):
+            raise JobInputsError("job-inputs: invalid raw diff; next: verify checkout history")
+        modes, status = (fields[0][1:], fields[1]), fields[-1]
+        if (status == "M" and modes == ("100644", "100644")
+                or status == "A" and modes == ("000000", "100644")):
+            # Whitespace and unusual spellings must not alias a safe path.
+            if path == normalize(path) and path.isascii() and path.isprintable():
+                changed.append(path)
+                continue
+        uncertain.append(path)
+    return changed, uncertain
 
 
 def changed_files(base_ref, head_ref, root=ROOT):
-    """Repo-relative paths changed between two refs (two-dot diff)."""
-    return git_diff_names(base_ref, head_ref, root)
+    """Return all changed names for the advisory mutation planner."""
+    changed, uncertain = git_changes(base_ref, head_ref, root)
+    return changed + uncertain
+
+
+def pr_comparison(root, base, head, merge):
+    """Bind selection to the actual tested tree and include changes on both sides."""
+    if not all(SHA.fullmatch(sha) for sha in (base, head, merge)):
+        raise JobInputsError("job-inputs: missing event SHAs; next: verify PR event metadata")
+    if git(root, "rev-list", "--parents", "-n", "1", "HEAD", "--").split() != [merge, base, head]:
+        raise JobInputsError("job-inputs: checkout does not match the event merge; next: verify PR checkout")
+    prior = git(root, "merge-base", "--all", base, head).strip()
+    if not SHA.fullmatch(prior):
+        raise JobInputsError("job-inputs: no unique merge base; next: verify PR history")
+    return prior, merge
+
+
+def workflow_selection(changed, uncertain):
+    jobs = selection(changed, uncertain)
+    full = (bool(uncertain) or not changed
+            or any(classify(path) == ALL_JOBS for path in changed))
+    if full:
+        return {job: job != DOCS or jobs[DOCS] for job in OUTPUTS}
+
+    jobs[VOICE] = voice_selected(changed)
+    jobs[DB_COMPAT] = jobs[MIGRATIONS] = db_compat_selected(changed)
+    # test_workflows.py reads this guide. Keep its suite on every code change
+    # and on edits of that guide. The remaining source-level suites still
+    # run, including the independent docs and workflow-contract guards.
+    jobs[WORKFLOW_FIXTURES] = any(
+        not is_docs(path) or Path(path).suffix != ".md" or path == "docs/ci-speed-rollout.md"
+        for path in changed)
+    return jobs
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-ref", required=True)
     parser.add_argument("--head-ref", required=True)
-    parser.add_argument("--job", choices=(RUST, WORKER, PARITY, SUPPLY, DOCS, VOICE, DB_COMPAT),
+    parser.add_argument("--merge-ref", help="exact GitHub candidate merge commit")
+    parser.add_argument("--root", type=Path, default=ROOT, help="checkout containing the commits")
+    parser.add_argument("--job", choices=OUTPUTS,
                         default=None,
                         help="print only this job's selection (default: all)")
     args = parser.parse_args(argv)
     try:
-        if args.job == DB_COMPAT:
-            print("true" if db_compat_selected(git_diff_names(args.base_ref, args.head_ref)) else "false")
-            return 0
-        changed = git_diff_names(args.base_ref, args.head_ref,
-                                 diff_filter="ACMRTUXB")
-        deleted = git_diff_names(args.base_ref, args.head_ref,
-                                 diff_filter="D")
+        base, head = args.base_ref, args.head_ref
+        if args.merge_ref is not None:
+            base, head = pr_comparison(args.root, base, head, args.merge_ref)
+        jobs = workflow_selection(*git_changes(base, head, args.root))
     except subprocess.CalledProcessError as exc:
         # Undecidable diff (shallow clone, missing ref): fail closed.
         print(f"job-inputs: git diff failed ({exc.returncode}); "
               "selecting full jobs; next: verify the refs exist and "
-              "re-run the selector", flush=True)
+              "re-run the selector", file=sys.stderr, flush=True)
         return 2
     except JobInputsError as exc:
         # Undecidable diff (stalled or unspawnable git): fail closed.
-        print(f"{exc}; selecting full jobs", flush=True)
+        print(f"{exc}; selecting full jobs", file=sys.stderr, flush=True)
         return 2
-    jobs = selection(changed, deleted)
-    jobs[VOICE] = voice_selected(changed, deleted)
     if args.job is not None:
         print("true" if jobs[args.job] else "false")
     else:
-        for job in (RUST, WORKER, PARITY, SUPPLY, DOCS, VOICE):
+        for job in OUTPUTS:
             print(f"{job}={'true' if jobs[job] else 'false'}")
     return 0
 

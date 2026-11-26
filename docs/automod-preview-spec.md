@@ -769,18 +769,22 @@ with the new startup phases. Before rollback to one of those builds, finish
 recovery and retire the AutoMod lease with a Worker that understands both.
 Live qualification uses the sole staging writer's exclusive window.
 
-### Dormant staging workflow
+### Protected staging workflow
 
-The reusable AutoMod preview workflow has no caller and its staging job is
-disabled. It requires a direct dispatch of its own protected main ref, and
-the workflow has no dispatch trigger. The offline fixture passes the issued
-AutoMod lease and pinned run, attempt and build to the runner. After attempting
+The AutoMod preview workflow accepts a direct dispatch of its own protected
+main ref on attempt 1. The rehearsal input defaults to off. An eligible
+opt-in holds the shared staging lifecycle queue. The checked-in command has
+no protected host binding and refuses an opted-in rehearsal. The host must
+prepare the approved serving and inventory selection and verified staging
+fixture before supplying the existing authority and private adapters.
+The offline fixture passes the issued AutoMod lease and pinned run, attempt
+and build to the runner. After attempting
 startup, the runner asks for recovery on the original lease even if startup
 fails or its reply is lost. Both actions must return a bounded v1 receipt
 confirming the exact scope. The job preserves a startup failure even if
 recovery passes.
 
-The reusable workflow also runs a synthetic contract for the private binding.
+The workflow runs a synthetic contract for the private binding.
 The fixture supplies in-memory context, lease, separate approvals and a fake
 Worker bearer. The test step checks the binding's lease-scoped confirmations
 through a fake private invoker and fails if those outcomes differ from the
@@ -794,9 +798,8 @@ bearer in the in-process request header and supplies approval separately from
 the serialized action and lease. The runner checks the private Worker entry's
 v1 receipts for both actions and uses the original lease for recovery.
 Live use still needs the protected context and authority provider and the
-deployment-bound private Container invoker. The reusable workflow holds the
-`staging-lifecycle` queue across both actions. A future caller must leave that
-queue to the reusable workflow. Worker cleanup owns
+deployment-bound private Container invoker. The direct-dispatch workflow holds
+the `staging-lifecycle` queue across both actions. Worker cleanup owns
 durable retirement and retry for an interrupted runner or unconfirmed recovery.
 
 The dormant `readStagingAutomodJobInputs` adapter takes authenticated staging
