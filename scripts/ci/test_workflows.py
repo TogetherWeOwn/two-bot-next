@@ -19,6 +19,7 @@ from unittest.mock import Mock, patch
 
 import yaml
 
+from runner_policy import IGNORED_DB_RUNTIME_RUNNER, PUBLIC_RUNNER, RUST_TESTS_RUNNER, expected_runner
 from staging_pre_reaper_policy import PRE_REAPER, PRE_REAPER_QUEUE, dormant_pre_reaper_errors
 from staging_soak_policy import PRODUCTION_GROUP, PRODUCTION_RELEASE_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
@@ -193,9 +194,6 @@ PR_SIZE_WEEKLY_IF = "github.event_name == 'schedule' || (github.event_name == 'w
 PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size"): PR_SIZE_JOB_IF,
                          ("pr-size.yml", "pr-size-gate"): PR_SIZE_JOB_IF,
                          ("pr-size.yml", "pr-size-weekly"): PR_SIZE_WEEKLY_IF}
-# Every ordinary job in this public repository selects standard free hosted
-# Ubuntu directly. A private conversion needs fresh runner/cost qualification.
-PUBLIC_RUNNER = "ubuntu-latest"
 # Negative fixture only: even a public-first route retains dormant source paths.
 LEGACY_ROUTED_RUNNER = (
     "${{{{ fromJSON((!github.event.repository.private && '[\"ubuntu-latest\"]') || "
@@ -10970,6 +10968,125 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(runs_on=runs_on):
                 self.assertFalse(runner_allowed("worker", runs_on))
 
+    def test_rust_tests_boat_is_scoped_to_rust_tests(self):
+        weakened_fork_guard = RUST_TESTS_RUNNER.replace(
+            "github.event.pull_request.head.repo.full_name == github.repository", "true"
+        )
+        weakened_actor_guard = RUST_TESTS_RUNNER.replace(
+            "github.triggering_actor == 'Rick7C2'", "true"
+        )
+        for workflow, job_id, runs_on in (
+            ("check.yml", "rust-tests", weakened_fork_guard),
+            ("check.yml", "rust-tests", weakened_actor_guard),
+            ("check.yml", "rust-tests", IGNORED_DB_RUNTIME_RUNNER),
+            ("check.yml", "ignored-db-runtime", RUST_TESTS_RUNNER),
+            ("check.yml", "coverage-shard", RUST_TESTS_RUNNER),
+            ("nightly.yml", "rust-tests", RUST_TESTS_RUNNER),
+        ):
+            with self.subTest(workflow=workflow, job=job_id):
+                self.assertNotEqual(runs_on, expected_runner(workflow, job_id))
+
+    def test_rust_tests_boat_routes_by_event_and_variable(self):
+        workflow = self.workflows["check.yml"]
+        self.assertEqual(set(workflow["on"]), {
+            "pull_request", "merge_group", "push", "schedule", "workflow_dispatch",
+        })
+        self.assertEqual(workflow["on"]["pull_request"], {"types": ["opened", "synchronize", "reopened"]})
+
+        repository = "TogetherWeOwn/two-bot-next"
+        defaults = {
+            "github.event_name": "pull_request",
+            "github.repository": repository,
+            "github.event.repository.private": False,
+            "github.event.pull_request.head.repo.full_name": repository,
+            "github.event.pull_request.base.ref": "main",
+            "github.ref": "refs/pull/2720/merge",
+            "github.ref_protected": False,
+            "github.run_attempt": "1",
+            "github.actor": "Rick7C2",
+            "github.triggering_actor": "Rick7C2",
+            "vars.CI_HEAVY_RUNNER": "boat",
+        }
+        app = {"github.actor": "togetherweown[bot]", "github.triggering_actor": "togetherweown[bot]"}
+        push = {"github.event_name": "push", "github.ref": "refs/heads/main", "github.ref_protected": True}
+        cases = (
+            ("eligible maintainer", {}, "boat"),
+            ("eligible app", app, "boat"),
+            # The main push writes a shared cache consumed by credentialed nextest.
+            ("protected main push", {**app, **push}, PUBLIC_RUNNER),
+            ("unprotected main push", {**push, "github.ref_protected": False}, PUBLIC_RUNNER),
+            ("branch push", {**push, "github.ref": "refs/heads/other"}, PUBLIC_RUNNER),
+            ("fork PR", {"github.event.pull_request.head.repo.full_name": "contributor/two-bot-next"}, PUBLIC_RUNNER),
+            ("missing PR head", {"github.event.pull_request.head.repo.full_name": ""}, PUBLIC_RUNNER),
+            ("other base branch", {"github.event.pull_request.base.ref": "other"}, PUBLIC_RUNNER),
+            ("private repository", {"github.event.repository.private": True}, PUBLIC_RUNNER),
+            ("missing visibility", {"github.event.repository.private": None}, PUBLIC_RUNNER),
+            ("other repository", {"github.repository": "TogetherWeOwn/other"}, PUBLIC_RUNNER),
+            ("Dependabot", {"github.actor": "dependabot[bot]", "github.triggering_actor": "dependabot[bot]"}, PUBLIC_RUNNER),
+            ("other originating actor", {"github.actor": "someone-else"}, PUBLIC_RUNNER),
+            ("other triggering actor", {"github.triggering_actor": "someone-else"}, PUBLIC_RUNNER),
+            ("missing triggering actor", {"github.triggering_actor": ""}, PUBLIC_RUNNER),
+            ("eligible actors on a rerun", {"github.run_attempt": "2"}, PUBLIC_RUNNER),
+            ("maintainer reruns Dependabot", {"github.run_attempt": "2", "github.actor": "dependabot[bot]"}, PUBLIC_RUNNER),
+            ("off-list user reruns maintainer", {"github.run_attempt": "2", "github.triggering_actor": "someone-else"}, PUBLIC_RUNNER),
+            ("missing attempt", {"github.run_attempt": ""}, PUBLIC_RUNNER),
+            ("unset variable", {"vars.CI_HEAVY_RUNNER": ""}, PUBLIC_RUNNER),
+            ("reserve closed", {"vars.CI_HEAVY_RUNNER": PUBLIC_RUNNER}, PUBLIC_RUNNER),
+            ("approved label in uppercase", {"vars.CI_HEAVY_RUNNER": "BOAT"}, "BOAT"),
+            ("other runner label", {"vars.CI_HEAVY_RUNNER": "blacksmith-2vcpu-ubuntu-2404"}, PUBLIC_RUNNER),
+            *((event, {**push, "github.event_name": event}, PUBLIC_RUNNER)
+              for event in ("merge_group", "schedule", "workflow_dispatch", "pull_request_target", "")),
+        )
+        self.assert_runner_cases("rust-tests", defaults, cases)
+
+    def test_ignored_db_runtime_blacksmith_routes_by_event_and_variable(self):
+        label = "blacksmith-2vcpu-ubuntu-2404"
+        repository = "TogetherWeOwn/two-bot-next"
+        defaults = {
+            "github.event_name": "pull_request",
+            "github.repository": repository,
+            "github.event.pull_request.head.repo.full_name": repository,
+            "vars.CI_BLACKSMITH_2VCPU": label,
+        }
+        cases = (
+            ("same-repository PR", {}, label),
+            ("fork PR", {"github.event.pull_request.head.repo.full_name": "contributor/two-bot-next"}, PUBLIC_RUNNER),
+            ("missing PR head", {"github.event.pull_request.head.repo.full_name": ""}, PUBLIC_RUNNER),
+            ("unset variable", {"vars.CI_BLACKSMITH_2VCPU": ""}, PUBLIC_RUNNER),
+            ("reserve closed", {"vars.CI_BLACKSMITH_2VCPU": PUBLIC_RUNNER}, PUBLIC_RUNNER),
+            ("approved label in uppercase", {"vars.CI_BLACKSMITH_2VCPU": label.upper()}, label.upper()),
+            ("other size", {"vars.CI_BLACKSMITH_2VCPU": "blacksmith-4vcpu-ubuntu-2404"}, PUBLIC_RUNNER),
+            ("other provider", {"vars.CI_BLACKSMITH_2VCPU": "boat"}, PUBLIC_RUNNER),
+            *((event, {"github.event_name": event, "github.event.pull_request.head.repo.full_name": ""}, label)
+              for event in ("merge_group", "push", "schedule", "workflow_dispatch")),
+        )
+        self.assert_runner_cases("ignored-db-runtime", defaults, cases)
+
+    def assert_runner_cases(self, job_id, defaults, cases):
+        expression = self.workflows["check.yml"]["jobs"][job_id]["runs-on"]
+        self.assertEqual(expression, expected_runner("check.yml", job_id))
+        expression = expression.removeprefix("${{").removesuffix("}}").strip()
+        for name, overrides, expected in cases:
+            with self.subTest(case=name):
+                context = {**defaults, **overrides}
+                # Apply GitHub's case-insensitive comparisons without changing
+                # the spelling of the label returned from the variable.
+                text = re.sub(r"toJSON\((github\.[\w.]+)\)",
+                              lambda match: repr(json.dumps(context[match[1]])), expression)
+                text = re.sub(r"\b(?:github|vars)\.[\w.]+",
+                              lambda match: repr(context[match[0]]), text)
+                tree = ast.parse(text.replace("&&", " and ").replace("||", " or "), mode="eval")
+                allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare,
+                           ast.Eq, ast.NotEq, ast.Constant)
+                self.assertTrue(all(isinstance(node, allowed) for node in ast.walk(tree)))
+                for comparison in (node for node in ast.walk(tree) if isinstance(node, ast.Compare)):
+                    for operand in (comparison.left, *comparison.comparators):
+                        self.assertIsInstance(operand, ast.Constant)
+                        self.assertIsInstance(operand.value, str)
+                        operand.value = operand.value.casefold()
+                result = eval(compile(tree, f"<{job_id} runs-on>", "eval"), {"__builtins__": {}})
+                self.assertEqual(result, expected)
+
     def test_certify_promotion_runner_must_be_explicit_public_hosted(self):
         # Artifact-only certification retains service/container isolation and
         # the same direct hosted selector as every other ordinary job.
@@ -11024,8 +11141,7 @@ class WorkflowTests(unittest.TestCase):
                         self.assertNotIn("services", job)
                         self.assertNotIn("container", job)
                     else:
-                        # All ordinary jobs share the explicit public-hosted contract.
-                        self.assertTrue(runner_allowed(job_id, job["runs-on"]))
+                        self.assertEqual(job["runs-on"], expected_runner(name, job_id))
                     if job.get("services"):
                         self.assertIn("container", job)
                         for service in job["services"].values():
