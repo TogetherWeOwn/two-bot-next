@@ -11881,6 +11881,8 @@ class WorkflowTests(unittest.TestCase):
                                     "actions": "write"}
                     elif (name, job_id) == ("staging-rollback-drill.yml", "proof"):
                         expected = {"contents": "read", "actions": "write"}
+                    elif (name, job_id) == ("staging-automod-preview.yml", "dry-run"):
+                        expected["id-token"] = "write"
                     elif (name, job_id) == ("daily-digest.yml", "rollback-proof-watch"):
                         # Reads the daily proof run; opens or closes its incident issue.
                         expected = {"contents": "read", "actions": "read", "issues": "write"}
