@@ -1938,6 +1938,25 @@ ROLLBACK_DRILL_ENV = {
     "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-worker-drill-use.ndjson",
 }
 
+ROLLBACK_DRILL_CHECKOUT = {
+    "persist-credentials": "false",
+    "fetch-depth": "1",
+    "sparse-checkout-cone-mode": "false",
+    "sparse-checkout": (
+        "/scripts/build_identity.py\n"
+        "/scripts/script_intake.py\n"
+        "/scripts/staging_drill_use.py\n"
+        "/scripts/staging_rollback_drill.py\n"
+        "/scripts/staging_rollout.py\n"
+        "/scripts/worker_container_rollback.py\n"
+        "/wrangler/scripts/is-direct-invocation.mjs\n"
+        "/wrangler/scripts/ownership-control-response.mjs\n"
+        "/wrangler/scripts/ownership-control.mjs\n"
+        "/wrangler/scripts/staging-use-pipeline.mjs\n"
+        "/wrangler/scripts/staging-use.mjs\n"
+    ),
+}
+
 
 def rollback_proof_job_errors(job, mode):
     """Pin the dispatcher/observer to reviewed tooling and the smallest token."""
@@ -2035,15 +2054,24 @@ def staging_rollback_drill_errors(workflow):
     for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
         if key in job:
             errors.append(f"{name}:drill: must not set {key} (bindings stay on the single Run step)")
-    text = str(job).lower()
-    for marker in ("wrangler", "force", "production", "toJSON(secrets".lower(), "secrets["):
-        if marker in text.replace(" ", ""):
-            errors.append(f"{name}:drill: must not contain {marker!r} (script-only, unforced, staging-only)")
     steps = job.get("steps") or []
     if len(steps) != 4 or any(key in step for step in steps[:3] for key in ("if", "continue-on-error")):
         errors.append(f"{name}:drill: must run checkout, setup-node, drill and evidence upload")
         return errors
     checkout, node, run, upload = steps
+    checkout_for_marker_scan = checkout
+    if checkout.get("with") == ROLLBACK_DRILL_CHECKOUT:
+        # The exact checkout paths are data. Keep scanning every other field
+        # for Wrangler invocations and the other forbidden markers.
+        options = dict(ROLLBACK_DRILL_CHECKOUT)
+        del options["sparse-checkout"]
+        checkout_for_marker_scan = {**checkout, "with": options}
+    else:
+        errors.append(f"{name}:drill: must check out only the pinned runtime files")
+    text = str({**job, "steps": [checkout_for_marker_scan, node, run, upload]}).lower().replace(" ", "")
+    for marker in ("wrangler", "force", "production", "toJSON(secrets".lower(), "secrets["):
+        if marker in text:
+            errors.append(f"{name}:drill: must not contain {marker!r} (script-only, unforced, staging-only)")
     evidence = "${{ runner.temp }}/staging-rollback-drill-evidence.json"
     if (upload.get("with") or {}) != {
             "name": "staging-worker-rollback-drill",
@@ -9822,6 +9850,8 @@ class WorkflowTests(unittest.TestCase):
                 {"run": 'python3 scripts/staging_rollback_drill.py --target-version "${{ inputs.target_version }}"'}),
             "forced rollback": lambda w: job(w)["steps"][2].update(
                 {"run": 'python3 scripts/staging_rollback_drill.py --target-version "$TARGET_VERSION" --force'}),
+            "wrangler command after drill": lambda w: job(w)["steps"][2].update(
+                {"run": job(w)["steps"][2]["run"] + "\nwrangler deploy"}),
             "other script": lambda w: job(w)["steps"][2].update(
                 {"run": 'python3 scripts/other.py --target-version "$TARGET_VERSION"'}),
         }
@@ -9895,6 +9925,63 @@ class WorkflowTests(unittest.TestCase):
         covering = [s for s in worker_steps if "test_rollback_proof.py" in str(s.get("run") or "")]
         self.assertEqual(len(covering), 1)
         self.assertNotIn("if", covering[0])
+
+    def test_staging_worker_drill_checkout_only_materializes_runtime_files(self):
+        workflow = self.workflows["staging-rollback-drill.yml"]
+        self.assertEqual(staging_rollback_drill_errors(workflow), [])
+        for label, update in {
+            "full checkout": {"sparse-checkout": ""},
+            "missing cleanup helper": {"sparse-checkout": ROLLBACK_DRILL_CHECKOUT["sparse-checkout"].replace(
+                "/wrangler/scripts/staging-use.mjs\n", "")},
+            "extra directory": {"sparse-checkout": ROLLBACK_DRILL_CHECKOUT["sparse-checkout"] + "/docs/\n"},
+            "cone mode": {"sparse-checkout-cone-mode": "true"},
+        }.items():
+            with self.subTest(checkout=label):
+                changed = deepcopy(workflow)
+                changed["jobs"]["drill"]["steps"][0]["with"].update(update)
+                self.assertIn("staging-rollback-drill.yml:drill: must check out only the pinned runtime files",
+                              staging_rollback_drill_errors(changed))
+
+    def test_staging_worker_drill_runs_from_sparse_checkout(self):
+        drill = self.workflows["staging-rollback-drill.yml"]["jobs"]["drill"]
+        patterns = drill["steps"][0]["with"]["sparse-checkout"].splitlines()
+        runtime_paths = [pattern.removeprefix("/") for pattern in patterns]
+        # The isolated subprocess needs only the checked-out runtime and these
+        # offline fixtures. It cannot import from the full repository.
+        fixtures = (
+            "scripts/staging_cloudflare_fixture.py",
+            "scripts/test_staging_drill_use.py",
+            "scripts/test_staging_rollback_drill.py",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in (*runtime_paths, *fixtures):
+                relative = Path(path)
+                self.assertFalse(relative.is_absolute() or ".." in relative.parts, path)
+                dest = root / relative
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes((ROOT / relative).read_bytes())
+            env = {"PATH": os.environ.get("PATH", os.defpath)}
+            # The Python fixture fakes the staging-use subprocess transports.
+            # Import their actual ESM entry points here to exercise the loader.
+            commands = (
+                ["node", "--input-type=module", "-e",
+                 "globalThis.fetch = () => { throw new Error('offline fixture'); }; "
+                 "await import('./wrangler/scripts/staging-use.mjs'); "
+                 "await import('./wrangler/scripts/staging-use-pipeline.mjs');"],
+                [sys.executable, "-I", "-B", "scripts/test_staging_rollback_drill.py",
+                 "ClientAndControlTests.test_minimal_child_environment_runs_node_preflight_without_network",
+                 "MainTests.test_success_writes_evidence_and_summary_without_secrets",
+                 "MainTests.test_unproved_policy_exits_nonzero_before_any_window_or_mutation",
+                 "LifecycleTests.test_failed_leg_restores_without_a_new_check_and_releases",
+                 "LifecycleTests.test_ownership_authentication_failure_stops_use_and_cleanup",
+                 "MainTests.test_cleanup_failure_exits_nonzero_and_still_writes_evidence",
+                 "DryRunPlanPinTests.test_plan_pins_labeled_versions_and_numbered_leg_order"],
+            )
+            for command in commands:
+                with self.subTest(executable=command[0]):
+                    result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_staging_container_drill_shape_is_pinned(self):
         workflows = self.workflows
