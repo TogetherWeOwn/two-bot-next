@@ -111,17 +111,21 @@ test("the verifier invokes the checked-in script with the exact pins and accepts
   assert.deepEqual(await bindStagingAutomodInventoryReader(run)(source, signal), inventory);
 });
 
-test("the verifier refuses nonzero exit and excess output even after a complete receipt", async () => {
+test("the verifier refuses excess output even after a complete receipt", async () => {
   const { signal } = new AbortController();
   const multibyteOutput = receipt + "é".repeat(2_048);
-  for (const program of [
-    `${writeCappedReceipt} process.exitCode = 7;`,
-    `${writeCappedReceipt} process.stdout.write(" ");`,
-    `process.stdout.write(${JSON.stringify(multibyteOutput)});`,
-    `${writeCappedReceipt} process.stderr.write(" ".repeat(4097));`,
+  for (const [program, overflow] of [
+    [`${writeCappedReceipt} process.stdout.write(" ");`, "stdout"],
+    [`process.stdout.write(${JSON.stringify(multibyteOutput)});`, "stdout"],
+    [`${writeCappedReceipt} process.stderr.write(" ".repeat(4097));`, "stderr"],
   ] as const) {
-    const run = bindStagingAutomodInventoryVerifier(syntheticVerifier(program));
+    const bytes = { stdout: 0, stderr: 0 };
+    const run = bindStagingAutomodInventoryVerifier(syntheticVerifier(program, child => {
+      child.stdout.on("data", chunk => { bytes.stdout += chunk.length; });
+      child.stderr.on("data", chunk => { bytes.stderr += chunk.length; });
+    }));
     await assert.rejects(run(source.workflowSha, String(source.runId), signal), { message: "Staging inventory verifier failed" });
+    assert.ok(bytes[overflow] > 4_096);
   }
 });
 
@@ -170,8 +174,14 @@ test("an exited verifier drains the descendant holding its pipe and preserves ex
 
 test("abort after supervisor exit still discards the completed receipt", async () => {
   const controller = new AbortController();
-  const run = bindStagingAutomodInventoryVerifier(syntheticVerifier(writeCappedReceipt,
-    child => child.once("exit", () => controller.abort())));
+  let status: number | null | undefined;
+  let bytes = 0;
+  const run = bindStagingAutomodInventoryVerifier(syntheticVerifier(writeCappedReceipt, child => {
+    child.stdout.on("data", chunk => { bytes += chunk.length; });
+    child.once("exit", code => { status = code; controller.abort(); });
+  }));
   await assert.rejects(run(source.workflowSha, String(source.runId), controller.signal),
     { message: "Staging inventory verifier failed" });
+  assert.equal(status, 0);
+  assert.equal(bytes, 4_096);
 });

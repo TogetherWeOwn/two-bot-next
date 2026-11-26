@@ -19,7 +19,8 @@ def supervise(argv):
     if select.select([control], [], [], 0)[0]:
         return 1
 
-    child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, process_group=0)
+    # The trusted verifier and its gh child inherit this session's process group.
+    child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, start_new_session=True)
     try:
         pidfd = os.pidfd_open(child.pid)
         try:
