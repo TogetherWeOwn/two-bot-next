@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 import re
 
+from pre_inventory import RESOURCE_NAME
+from pre_registry_cleanup import RegistryReservation
 from pre_target import APP_ID, Resource, Target, TargetError, require
 
 
@@ -51,6 +53,34 @@ def read_reserved_container_app(scope, *, read):
     TargetError means unknown. Cleanup requires separate instance counts and
     startup settlement evidence.
     """
+    result = _read_reserved_container_app(scope, read=read)
+    return None if result is None else Resource(result["name"], result["id"])
+
+
+def confirm_reserved_container_configuration(scope, *, namespace_id, image, read) -> None:
+    """Check the configured namespace and image of one reserved scheduler-backed app.
+
+    Pin namespace_id from the exact Worker version's Container binding and image
+    from the verified immutable registry publication for the same Target.
+    Reuse the authenticated reader contract of read_reserved_container_app.
+    A match establishes app configuration only. Running image, effective writer
+    and process launch authorization require independent evidence.
+    """
+    require(type(scope) is ContainerAppScope, "invalid_pre_container_scope")
+    require(type(namespace_id) is str and RESOURCE_NAME.fullmatch(namespace_id),
+            "invalid_pre_container_namespace")
+    require(type(image) is RegistryReservation and image.target == scope.target,
+            "wrong_pre_container_image_scope")
+    result = _read_reserved_container_app(scope, read=read)
+    require(result is not None, "pre_container_configuration_unconfirmed")
+    namespace, config = result.get("durable_objects"), result.get("configuration")
+    require(type(namespace) is dict and type(namespace.get("namespace_id")) is str
+            and namespace["namespace_id"] == namespace_id, "pre_container_namespace_mismatch")
+    require(type(config) is dict and type(config.get("image")) is str
+            and config["image"] == image.reference, "pre_container_image_mismatch")
+
+
+def _read_reserved_container_app(scope, *, read):
     require(type(scope) is ContainerAppScope, "invalid_pre_container_scope")
     path = f"/accounts/{scope.account_id}/containers/applications/{scope.app_id}"
     try:
@@ -72,7 +102,7 @@ def read_reserved_container_app(scope, *, read):
         require(type(result) is dict and all(type(result.get(key)) is str and result[key] == expected
                 for key, expected in (("account_id", scope.account_id), ("id", scope.app_id), ("name", name))),
                 "wrong_pre_app_detail")
-        return Resource(name, scope.app_id)
+        return result
 
     require(reply.status == 404 and reply.application_not_found and body["success"] is False
             and result is None and len(errors) == 1, "pre_container_lookup_unconfirmed")

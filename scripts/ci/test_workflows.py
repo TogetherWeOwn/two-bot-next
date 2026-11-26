@@ -238,7 +238,7 @@ DEPLOY_MARKERS = (
 )
 # Canonical parsed graph for the protected recovery callee. This pins the
 # caller guard, Environment split, exact commands, permissions, and handoffs.
-PRODUCTION_RECOVERY_GRAPH = "bdecf0c2a8ad9ee6b6402527f2b22fc199b48279fc0992177326685409ddf894"
+PRODUCTION_RECOVERY_GRAPH = "2fd050ea4e2f4ca60328d2c54c077a7219cc3c29269c96313b52d7fbcc69b3a2"
 
 
 class UniqueKeyLoader(yaml.BaseLoader):
@@ -6974,7 +6974,11 @@ class WorkflowTests(unittest.TestCase):
             "verify_disposable_postgres",
         )
         checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
-        self.assertEqual(checkout["with"]["fetch-depth"], "0")
+        # The pinned action defaults to the event ref and SHA when ref is absent.
+        self.assertEqual(checkout, {
+            "uses": STAGING_CHECKOUT_USES,
+            "with": {"persist-credentials": "false", "fetch-depth": "1"},
+        })
 
     def test_ignored_test_names_include_intervening_comments_and_blank_lines(self):
         separators = (
