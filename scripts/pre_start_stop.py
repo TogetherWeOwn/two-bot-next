@@ -140,6 +140,16 @@ class ExternalStop(Protocol):
     def arm(self, target: Target, start_id: UUID) -> bool: ...
     def fence(self, target: Target) -> bool: ...
 
+    def confirm_probe_active(self, target: Target, start_id: UUID) -> bool:
+        """Confirm acceptance against the current fence and trusted authority time.
+
+        Use one authoritative observation without network I/O. Return True only
+        for the exact armed Target and start ID while unfenced, at or after
+        target.started_at and before both target.expires_at and any earlier
+        enclosing cutoff. Refuse if any of that state is unknown or stale.
+        """
+        ...
+
 
 class OfflineExternalStop:
     """In-memory claim and fence model for one fixed provider account.
@@ -299,6 +309,9 @@ class ProtectedPre:
         require(type(reply) is ProbeReply and type(reply.status) is int and 200 <= reply.status <= 599
                 and type(reply.worker_version) is UUID and reply.worker_version == deployment.worker_version
                 and type(reply.body) is bytes and len(reply.body) <= BODY_CAP, "pre_probe_unconfirmed")
+        active = _call(lambda: self._external_stop.confirm_probe_active(self._target, deployment.start_id),
+                       failure="pre_probe_unconfirmed")
+        require(active is True, "pre_probe_unconfirmed")
         return reply
 
     def stop(self) -> bool:

@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { bindStagingAutomodDeploymentTransport } from "../scripts/staging-automod-deployment-transport.ts";
+import { bindStagingAutomodInventoryReader } from "../scripts/staging-automod-inventory-reader.ts";
+import { bindStagingAutomodInventoryVerifier } from "../scripts/staging-automod-inventory-verifier.ts";
 import { runStagingAutomodPrivateJob } from "../scripts/staging-automod-private-job.ts";
 import { STAGING_AUTOMOD_TARGET as target } from "../src/staging-automod-recovery.ts";
 import { AUTOMOD_STAGING_PURPOSE } from "../src/staging-use-window.ts";
 import { lease } from "./fixtures/staging-automod-recovery.ts";
+import { syntheticVerifier, verifierWithDescendant } from "./fixtures/staging-automod-verifier.ts";
 
 type Inputs = Parameters<typeof bindStagingAutomodDeploymentTransport>;
 type Read = Inputs[1];
@@ -179,4 +182,42 @@ test("caller cancellation keeps a late serving observation from resolving the pr
   }
   assert.equal(read.mock.callCount(), 1);
   assert.equal(invoke.mock.callCount(), 0);
+});
+
+test("a timed out inventory verifier drains before recovery can read or invoke", { timeout: 10_000 }, async t => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now });
+  const network = t.mock.method(globalThis, "fetch", async () => assert.fail("unexpected network access"));
+  const source = { workflowSha: "c".repeat(40), runId: 1234 };
+  const receipt = JSON.stringify({ ...inventory, workflow_sha: source.workflowSha, workflow_run_id: source.runId });
+  let descendant = 0;
+  let closed = false;
+  let calls = 0;
+  const checkDrained = () => {
+    assert.equal(closed, true);
+    assert.ok(descendant > 0);
+    assert.throws(() => process.kill(descendant, 0), { code: "ESRCH" });
+  };
+  const run = bindStagingAutomodInventoryVerifier((file, args, options) => {
+    calls += 1;
+    if (calls === 1) {
+      return syntheticVerifier(verifierWithDescendant(receipt), child => {
+        child.stderr.once("data", chunk => { descendant = Number(chunk); t.mock.timers.tick(15_000); });
+        child.once("close", () => { closed = true; });
+      })(file, args, options);
+    }
+    checkDrained();
+    return syntheticVerifier(`process.stdout.write(${JSON.stringify(receipt)});`)(file, args, options);
+  });
+  const read = bindStagingAutomodInventoryReader(run);
+  const invoke = t.mock.fn<Invoke>(async (_, call) => {
+    checkDrained();
+    assert.equal(call.action, "recover");
+  });
+  const transport = bindStagingAutomodDeploymentTransport(worker, signal => read(source, signal), invoke);
+  assert.deepEqual(await runStagingAutomodPrivateJob(job, issuedLease, approvals, transport),
+    { verdict: "failed", start: false, recover: true });
+  checkDrained();
+  assert.equal(calls, 2);
+  assert.equal(invoke.mock.callCount(), 1);
+  assert.equal(network.mock.callCount(), 0);
 });
