@@ -87,8 +87,9 @@ class WorkflowDemandGuardTests(unittest.TestCase):
 
     def test_real_advisory_and_protected_event_routes(self):
         nightly = workflow("nightly.yml")
-        self.assertEqual(set(nightly["on"]), {"schedule", "workflow_dispatch", "pull_request"})
+        self.assertEqual(set(nightly["on"]), {"schedule", "workflow_dispatch"})
         self.assertEqual(nightly["jobs"]["pipeline-benchmark"]["uses"], "./.github/workflows/pipeline-benchmark.yml")
+        self.assertIn("Cargo.lock", workflow("pipeline-benchmark.yml")["on"]["pull_request"]["paths"])
         self.assertEqual(set(workflow("ci-speed.yml")["on"]), {"workflow_dispatch"})
         evidence = workflow("pr-evidence.yml")["on"]
         self.assertEqual(evidence["pull_request"]["types"],

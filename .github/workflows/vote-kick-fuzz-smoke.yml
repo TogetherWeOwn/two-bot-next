@@ -1,5 +1,4 @@
 name: vote_kick fuzz smoke
-# guards: branch:ci/vote-kick-fuzz-smoke
 
 # Manual, bounded 60 s libFuzzer smoke for the vote_kick target on a GitHub-hosted
 # runner. Not scheduled and not a required check. Uses only the committed synthetic

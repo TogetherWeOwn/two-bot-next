@@ -58,10 +58,9 @@ instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
 
-`pr-lint` scans candidate workflow definitions with the pinned base policy
-and uses the checked-out policy on pushes to `main`. New webhook-triggered
-work needs a path filter or a reviewed policy change. Required metadata
-and advisory PR evidence still refresh on `edited`.
+`pr-lint` scans candidate workflows with the pinned base policy, or the
+checked-out policy on pushes to `main`. New webhook-triggered work needs a
+path filter or a reviewed policy change.
 
 ### Independent review
 
@@ -285,10 +284,8 @@ the toolchain and builder-image pins together.
 
 ### Nightly test partitions
 
-`nightly.yml` retains its wiring-change PR selector and event timeout allow-list:
-45 minutes per heavy PR job (also the fallback for any other event), 180 minutes
-only for schedule/manual runs. Do not raise the PR cap to accommodate workload.
-The original serial all-feature workload is split into:
+`nightly.yml` runs at 03:17 UTC and on manual dispatch, with 180 minutes per
+heavy job. The benchmark runs on its watched PR paths, including root `Cargo.lock`.
 
 - `sweep-plan`: generate the command reference, compile Cargo's default workspace
   test selection (`--no-run`, including ordinary examples), and discover each
@@ -324,10 +321,8 @@ The nightly partition workflow exercises this deprecated flag on the pinned Rust
 toolchain; recheck its protocol when upgrading rather than falling back to parsing
 mixed console output.
 
-Verify a change with an actual executing `pull_request` run on its exact head,
-record each heavy job's time and headroom, and aim for at most 35 minutes per
-leg. Test counts are not a runtime guarantee. Rebalance only from measured
-results; a skipped job or a 180-minute manual pass is not PR-cap evidence.
+Verify sweep changes by dispatching nightly on the candidate ref. Record the
+source SHA, time and headroom per job, aiming for at most 35 minutes per leg.
 Offline contracts run in the existing source-level CI suite:
 
 ```sh

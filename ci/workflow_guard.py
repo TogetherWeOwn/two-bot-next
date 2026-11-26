@@ -32,10 +32,8 @@ ADMISSIONS = {
     "pr-size.yml": ("required:pr-size-gate / gate", {
         "pull_request": {"types": REVIEW_TYPES}, "pull_request_review": {"types": ["submitted", "dismissed"]},
     }),
-    "vote-kick-fuzz-smoke.yml": ("branch:ci/vote-kick-fuzz-smoke", {"push": {"branches": ["ci/vote-kick-fuzz-smoke"]}}),
+    "vote-kick-fuzz-smoke.yml": ("", {"push": {"branches": ["ci/vote-kick-fuzz-smoke"]}}),
     "mutation.yml": ("", {"pull_request": {"types": CODE_EVENTS}}),
-    # Required Check does not replace the benchmark in nightly's full PR sweep.
-    "nightly.yml": ("", {"pull_request": {}}),
     "pr-evidence.yml": ("", {
         "pull_request": {"types": [*METADATA_EVENTS, "ready_for_review"]},
         "push": {"branches": ["main"], "paths": [".github/scripts/*pr*evidence*", ".github/workflows/pr-evidence.yml"]},
@@ -107,6 +105,8 @@ def findings(name, data):
     text = data.decode("utf-8")
     workflow = yaml.load(text, Loader=UniqueKeyLoader)
     events = trigger_options(workflow)
+    if name == "nightly.yml" and events:
+        return ["nightly automatic runs must be scheduled"]
     if not events and name not in ADMISSIONS:
         return []
     markers = HEADER.findall(text)

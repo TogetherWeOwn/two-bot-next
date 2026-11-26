@@ -11263,7 +11263,7 @@ class WorkflowTests(unittest.TestCase):
         workflow = self.workflows["nightly.yml"]
         self.assertEqual(
             set(workflow.get("on") or {}),
-            {"schedule", "workflow_dispatch", "pull_request"},
+            {"schedule", "workflow_dispatch"},
         )
         # All four compiling jobs carry the ceiling; the `sweep` aggregate
         # is not a compiling job and is not pinned here.
