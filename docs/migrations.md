@@ -165,10 +165,12 @@ they use `PAPERCLIP_RUN_SCRATCH_DIR` when supplied; no database, Rust compilatio
 or network access is involved. The checker defaults to the repository containing
 the script; `--root` is available for fixtures/other checkouts.
 
-The existing required `check` job runs these fixtures and the checker **before**
-Rust compilation. It checks the PR base SHA on pull requests, the push-before SHA
-on `main` pushes, and `origin/main` on manual dispatches (including release
-branches). Git history is fetched with `fetch-depth: 0`, as documented by
+The `job inputs changed` job runs these fixtures and the checker when the
+migration selector is active, before the selected suites acquire runners.
+The checker uses the PR base SHA on pull requests, the merge-group base SHA
+in the merge queue, the push-before SHA on `main` pushes, and `origin/main`
+when the event supplies no baseline. Git history is fetched with
+`fetch-depth: 0`, as documented by
 [actions/checkout](https://github.com/actions/checkout#fetch-all-history-for-all-tags-and-branches).
 Missing Git baselines fail closed. Symlinked migrations and ancestors (including
 `crates` itself), and a symlinked `migrations.lock` itself, are rejected in
@@ -181,3 +183,8 @@ Without `--base-ref`, the checker verifies current numbering and hashes only;
 it cannot determine whether a justification was changed. CI always supplies the
 baseline so edits accompanied by silent checksum rewrites and removals of both a
 migration and its lock entry cannot pass.
+
+The disposable PR database proof uses the common ancestor for the prior
+binary and the selected merge commit for the candidate schema. If its
+checkout and the PR event disagree, refresh the candidate by pushing the
+branch against the current base.
