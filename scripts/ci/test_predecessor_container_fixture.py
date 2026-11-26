@@ -58,11 +58,13 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                         # Declare one byte more than is sent, then close.
                         self.close_connection = True
                         value = str(int(value) + 1)
-                    if failure == "duplicate" and key in ("Content-Length", "Connection"):
+                    repeat = {("duplicate", "Content-Length"): "65536", ("duplicate", "Connection"): "close",
+                              ("duplicate accept", "Sec-WebSocket-Accept"): discord.websocket_accept("forged")}
+                    if (failure, key) in repeat:
                         # Keep the valid copy first, then repeat it with a value a
                         # joined or first-value read would still accept.
                         super().send_header(key, value)
-                        value = "65536" if key == "Content-Length" else "close"
+                        value = repeat[failure, key]
                     if failure == "unframed" and key == "Content-Length":
                         # A complete body ended only by close has no declared length.
                         self.close_connection = True
@@ -113,7 +115,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                 # Status and reservation stay valid in the later cases, so
                 # only protocol or payload validation can refuse them.
                 for bad_peer, failures in (("gateway", ("missing", "wrong", "challenge", "connection",
-                                                        "duplicate", "truncated", "payload")),
+                                                        "duplicate", "duplicate accept", "truncated", "payload")),
                                            ("REST", ("missing", "wrong", "truncated", "unframed", "oversized",
                                                      "duplicate", "payload"))):
                     for failure in failures:
