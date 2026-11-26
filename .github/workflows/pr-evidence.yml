@@ -1,7 +1,16 @@
 name: PR evidence
 on:
   pull_request: {types: [opened, edited, synchronize, reopened, ready_for_review]}
-  push: {branches: [main]}
+  # Replay the verifier fixtures on main when the workflow or its inputs change.
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/pr-evidence.yml
+      - .github/scripts/pr_evidence.py
+      - .github/scripts/pr-evidence-baseline.txt
+      - .github/scripts/pr-evidence-requirements.txt
+      - .github/scripts/test_pr_evidence.py
+      - .github/scripts/fixtures/cubic-pr-footer.txt
 permissions: {}
 concurrency:
   group: pr-evidence-${{ github.event.pull_request.number || github.sha }}

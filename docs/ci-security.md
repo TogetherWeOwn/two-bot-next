@@ -97,8 +97,9 @@ membership at check time.
 [Run API response][archived-run-api] · [Commit lookup][archived-commit-pulls] ·
 [Merged PR metadata][archived-pr]
 
-The advisory `pr-evidence` workflow subscribes to PR events and pushes to
-`main`. Its verifier refuses `merge_group` in verify mode before publishing
+The advisory `pr-evidence` workflow subscribes to PR events and replays its
+fixtures on pushes to `main` that change the workflow, verifier or fixture
+inputs. Its verifier refuses `merge_group` in verify mode before publishing
 evidence. A future adapter needs a supported source that binds the exact
 group to every PR number and queued PR head SHA. Confirm each PR's
 current base ref matches the protected target. Pass the target repository
