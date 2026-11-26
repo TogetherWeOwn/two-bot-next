@@ -743,7 +743,7 @@ class ContainerSelectorTests(TimeoutPolicyAssertions, unittest.TestCase):
 
 
 class JobSelectorTests(TimeoutPolicyAssertions, unittest.TestCase):
-    SELECTION = re.compile(r"^(rust|worker|parity|supply|docs|voice)=(true|false)$",
+    SELECTION = re.compile(rf"^(?:{'|'.join(map(re.escape, job.OUTPUTS))})=(?:true|false)$",
                            re.MULTILINE)
 
     @staticmethod

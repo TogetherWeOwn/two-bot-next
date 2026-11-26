@@ -3997,7 +3997,6 @@ jobs:
                   "refusing to trust skips")
           else:
               gated = [
-                  ("worker", "WORKER_RESULT", "WORKER_SELECTED"),
                   ("parity-docs", "PARITY_DOCS_RESULT", "PARITY_SELECTED"),
                   ("supply-chain", "SUPPLY_CHAIN_RESULT", "SUPPLY_SELECTED"),
                   ("self-role-store", "SELF_ROLE_RESULT", "RUST_SELECTED"),
@@ -4016,7 +4015,7 @@ jobs:
                   ("db-compatibility", "DB_COMPAT_RESULT", "DB_COMPAT_SELECTED"),
               ]
               selector_vars = {sel_var for _, _, sel_var in gated}
-              selector_vars.update({"MIGRATIONS_SELECTED", "WORKFLOW_FIXTURES_SELECTED"})
+              selector_vars.update({"MIGRATIONS_SELECTED", "WORKER_SELECTED", "WORKFLOW_FIXTURES_SELECTED"})
               for var in sorted(selector_vars):
                   if os.environ.get(var) not in {"true", "false"}:
                       failures.append(f"{var}: missing or invalid job-inputs output")
@@ -4027,6 +4026,7 @@ jobs:
                       continue
                   failures.append(f"{job}: result={result!r} selected={selected!r}")
               for job, var in (("check", "CHECK_RESULT"),
+                               ("worker", "WORKER_RESULT"),
                                ("container-inputs", "CONTAINER_INPUTS_RESULT")):
                   result = os.environ.get(var, "")
                   if result != "success":

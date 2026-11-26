@@ -487,6 +487,12 @@ def git_changes(base_ref, head_ref, root=ROOT):
     return changed, uncertain
 
 
+def changed_files(base_ref, head_ref, root=ROOT):
+    """Return all changed names for the advisory mutation planner."""
+    changed, uncertain = git_changes(base_ref, head_ref, root)
+    return changed + uncertain
+
+
 def pr_comparison(root, base, head, merge):
     """Bind selection to the actual tested tree and include changes on both sides."""
     if not all(SHA.fullmatch(sha) for sha in (base, head, merge)):

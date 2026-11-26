@@ -10,8 +10,10 @@ this suite before it can silently skip coverage.
 """
 
 import importlib.util
+import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 import tempfile
 import unittest
@@ -417,6 +419,34 @@ class SelectionTests(unittest.TestCase):
 
 
 class GitCandidateSelectionTests(unittest.TestCase):
+    def test_mutation_planner_uses_real_selector(self):
+        planner = runpy.run_path(str(ROOT / ".github/scripts/mutation_scope.py"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.check_output(
+                    ["git", "-C", directory, "-c", "user.name=CI fixture",
+                     "-c", "user.email=ci@example.invalid", "-c", "commit.gpgSign=false", *args],
+                    text=True, timeout=5).strip()
+
+            git("init", "-q")
+            path = root / "wrangler/src/fixture.ts"
+            path.parent.mkdir(parents=True)
+            path.write_text("export const active = false;\n")
+            git("add", ".")
+            git("commit", "-qm", "base")
+            base = git("rev-parse", "HEAD")
+            path.write_text("export const active = true;\n")
+            git("commit", "-qam", "candidate")
+            output = root / "outputs"
+            with patch.dict(os.environ, BASE_SHA=base, HEAD_SHA=git("rev-parse", "HEAD"),
+                            GITHUB_OUTPUT=str(output), RUNNER_TEMP=directory):
+                planner["main"](root)
+            self.assertIn("worker=true", output.read_text().splitlines())
+            self.assertEqual((root / "worker-mutation-plan.json").read_text(),
+                             '{"wrangler/src/fixture.ts": [1]}')
+
     def test_diverged_pr_candidate_and_unknown_change_types(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

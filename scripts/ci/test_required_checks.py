@@ -300,7 +300,7 @@ class RequiredChecksReportTests(unittest.TestCase):
             with self.subTest(aggregator=name):
                 skipped = {job: "skipped" for job in gated}
                 self.assertEqual(self.run_aggregator(name, skipped, selected="false"), 0)
-                for always_run in ("check", "container-inputs"):
+                for always_run in ("check", "worker", "container-inputs"):
                     self.assertEqual(
                         self.run_aggregator(name, {**skipped, always_run: "skipped"}, selected="false"), 1,
                         f"{always_run} is an always-run gate and may never skip",
