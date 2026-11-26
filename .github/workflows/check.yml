@@ -1837,8 +1837,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # The HARD gate diffs base/head blobs.
-          fetch-depth: 0
+          # PR coverage compares the event merge commit with its first parent.
+          # Other events can diff against an earlier SHA or origin/main.
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
 
       - name: Download shard coverage reports
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
