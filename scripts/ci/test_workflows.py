@@ -7441,6 +7441,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("job-inputs", job.get("needs", []))
         self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
         self.assertEqual(job.get("runs-on"), PR_GATE_RUNNER)
+        checkout = job["steps"][0]["with"]
+        self.assertEqual(checkout.get("persist-credentials"), "false")
+        self.assertEqual(checkout.get("fetch-depth"),
+                         "${{ !github.event.merge_group.base_sha && github.event.pull_request && 2 || 0 }}")
         outputs = job.get("outputs", {})
         for key in ("matrix", "expected-shards", "legs", "widened", "reason"):
             self.assertIn(key, outputs)
@@ -7448,6 +7452,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("steps.plan.outputs.expected-shards", outputs["expected-shards"])
         step = next(step for step in job["steps"] if step.get("id") == "plan")
         self.assertEqual(step.get("name"), "Plan coverage shards")
+        self.assertEqual(step["env"]["PLAN_BASE"],
+                         "${{ github.event.merge_group.base_sha || "
+                         "(github.event.pull_request && format('{0}^1', github.sha)) || "
+                         "github.event.before || 'origin/main' }}")
+        self.assertEqual(step["env"]["PLAN_HEAD"], "${{ github.sha }}")
         self.assertIn("scripts/ci/plan-coverage-shards.py", step["run"])
         self.assertIn("--shards 4", step["run"])
         self.assertIn("--output plan.json", step["run"])
