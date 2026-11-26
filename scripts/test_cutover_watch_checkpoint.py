@@ -74,6 +74,32 @@ class CutoverWatchCheckpointTests(unittest.TestCase):
         self.assertTrue(row.endswith("| GO |"), row)
         self.assertEqual(requested, [PRODUCTION + "/readyz"])
 
+    def test_http_200_with_missing_or_nonstring_component_readiness_is_extend(self):
+        status, ready_body = READY
+        cases = (
+            ("missing component", []),
+            ("missing value", [["gateway"]]),
+            ("null", [["gateway", None]]),
+            ("boolean", [["gateway", True]]),
+            ("number", [["gateway", 1]]),
+            ("array", [["gateway", ["ready"]]]),
+            ("object", [["gateway", {"state": "ready"}]]),
+        )
+        for label, gateway_rows in cases:
+            with self.subTest(label=label):
+                report = json.loads(ready_body)
+                report["components"] = [
+                    part for part in report["components"] if part[0] != "gateway"
+                ] + gateway_rows
+                response = (status, json.dumps(report).encode())
+                with mock.patch("socket.socket", side_effect=AssertionError("network forbidden")):
+                    code, output, requested = self.run_checkpoint(response, "--format", "json")
+                self.assertEqual(code, 1, output)
+                receipt = json.loads(output)
+                self.assertEqual(receipt["verdict"], "EXTEND")
+                self.assertEqual(receipt["reason"], "readyz_unexpected")
+                self.assertEqual(requested, [PRODUCTION + "/readyz"])
+
     def test_every_checkpoint_label_emits_its_row(self):
         for label in ("+15m", "+1h", "+6h", "+24h", "+48h"):
             with self.subTest(label):
