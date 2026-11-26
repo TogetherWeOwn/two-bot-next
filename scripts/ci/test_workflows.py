@@ -1090,8 +1090,18 @@ def staging_full_window_errors(workflow, name="deploy-staging.yml"):
                       "'staging-use-release'")
     steps = [{key: value for key, value in step.items() if key != "name"}
              for step in release.get("steps") or []]
+    checkout = STAGING_TOOLING_STEPS[0]
+    release_checkout = {**checkout, "with": {
+        **checkout["with"],
+        "sparse-checkout": "/wrangler/scripts/is-direct-invocation.mjs\n"
+                           "/wrangler/scripts/ownership-control-response.mjs\n"
+                           "/wrangler/scripts/staging-use-pipeline.mjs\n"
+                           "/wrangler/scripts/staging-use.mjs\n",
+        "sparse-checkout-cone-mode": "false",
+    }}
     if steps != [
-        *STAGING_TOOLING_STEPS,
+        release_checkout,
+        STAGING_TOOLING_STEPS[1],
         {"run": "node wrangler/scripts/staging-use-pipeline.mjs finish",
          "env": {**STAGING_CONTROL_ENV,
                  "STAGING_USE_EXPIRES_AT": f"${{{{ {expiry} }}}}",
@@ -7874,6 +7884,29 @@ class WorkflowTests(unittest.TestCase):
             except (KeyError, IndexError, TypeError, StopIteration):
                 self.fail(f"mutation {label!r} did not apply")
             with self.subTest(mutation=label):
+                self.assertTrue(staging_full_window_errors(changed))
+
+    def test_staging_deploy_release_pins_checkout_scope_and_provenance(self):
+        staging = self.workflows["deploy-staging.yml"]
+        checkout = staging["jobs"]["staging-use-release"]["steps"][0]["with"]
+        scope = checkout["sparse-checkout"].splitlines(keepends=True)
+        overrides = [
+            {"sparse-checkout": "wrangler/scripts\n"},
+            {"sparse-checkout-cone-mode": "true"},
+            {"ref": "${{ inputs.sha }}"},
+            {"repository": "fixture/other"},
+            {"path": "other-checkout"},
+            {"filter": "tree:0"},
+            {"persist-credentials": "true"},
+            {"fetch-depth": "0"},
+            *({"sparse-checkout": "".join(scope[:index] + scope[index + 1:])}
+              for index in range(len(scope))),
+        ]
+        full = {key: value for key, value in checkout.items() if not key.startswith("sparse-checkout")}
+        for options in [full, *({**checkout, **override} for override in overrides)]:
+            with self.subTest(options=options):
+                changed = deepcopy(staging)
+                changed["jobs"]["staging-use-release"]["steps"][0]["with"] = options
                 self.assertTrue(staging_full_window_errors(changed))
 
     def test_voice_refuses_before_checkout_and_rechecks_after_setup(self):

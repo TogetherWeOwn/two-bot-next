@@ -966,6 +966,12 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
+          sparse-checkout: |
+            /wrangler/scripts/is-direct-invocation.mjs
+            /wrangler/scripts/ownership-control-response.mjs
+            /wrangler/scripts/staging-use-pipeline.mjs
+            /wrangler/scripts/staging-use.mjs
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
