@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import UUID
 
 from scripts.ci.test_staging_pre_reaper_fixture import SyntheticStaging
@@ -14,7 +14,7 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.p
     from pre_admission import SettlementEvidence, SettlementSource, StartupAdmission
     from pre_caller import ProtectedPreCaller, finalize_pre
     from pre_registry_cleanup import PublicationSettlement, RegistryDisposition, RegistryReadback, RegistryReservation
-    from pre_start_stop import Deployment, Endpoint, Operation, ProbeReply
+    from pre_start_stop import Deployment, EffectWindow, Endpoint, Operation, ProbeReply
     from pre_sweep import SweepError
     from pre_target import Target, TargetError
 
@@ -40,6 +40,8 @@ class Fixture(SyntheticStaging):
     def __init__(self, target=ORIGINAL):
         super().__init__(target)
         self.target = target
+        self.window = EffectWindow(target, target.expires_at)
+        self.before_create = Mock()
         self.provisioned = self.snapshot
         self.snapshot = replace(self.snapshot, worker=None, container=None, write_access=False,
                                 startup_settled=False, instance_count=0, assigned_count=0)
@@ -59,6 +61,7 @@ class Fixture(SyntheticStaging):
         return ProtectedPreCaller(
             self.target, authorize=lambda target, op: target == self.target and op in operations,
             store=self, observe_settlement=self.observe_settlement, runtime=self, external_stop=self,
+            effect_window=self.window if Operation.START in operations else None,
         )
 
     def read(self, target):
@@ -84,11 +87,16 @@ class Fixture(SyntheticStaging):
         self.events.append(("settlement", record.target))
         return SettlementEvidence(record, SettlementSource.PROVIDER, self.drained, self.fenced)
 
-    def arm(self, target, start_id):
+    def arm(self, window, start_id):
+        target = window.target
         self.events.append(("arm", target))
-        if self.fenced or self.now >= target.expires_at or self.read(target).start_id != start_id:
+        if self.fenced or self.arm_pin is not None or self.read(target).start_id != start_id:
             return False
-        self.arm_pin = (target, start_id)
+        try:
+            window.require_open(self.now)
+        except TargetError:
+            return False
+        self.arm_pin = (window, start_id)
         return True
 
     def fence(self, target):
@@ -97,12 +105,23 @@ class Fixture(SyntheticStaging):
         return self.fenced
 
     def confirm_probe_active(self, target, start_id):
-        return (self.arm_pin == (target, start_id) and not self.fenced
-                and target.started_at <= self.now < target.expires_at)
+        if self.arm_pin is None or self.fenced:
+            return False
+        window, armed_start_id = self.arm_pin
+        if window.target != target or armed_start_id != start_id:
+            return False
+        try:
+            window.require_open(self.now)
+        except TargetError:
+            return False
+        return True
 
-    def create_private(self, target, start_id, upload):
-        if self.fenced or self.arm_pin != (target, start_id) or self.now >= target.expires_at:
+    def create_private(self, window, start_id, upload):
+        self.before_create()
+        if self.fenced or self.arm_pin != (window, start_id):
             raise ValueError("unexpected create")
+        window.require_open(self.now)
+        target = window.target
         self.events.append(("create", upload.target))
         self.snapshot = replace(self.provisioned, startup_settled=False)
         self.created = Deployment(target, start_id, UUID(int=target.run_id), UUID(self.snapshot.container.id))
@@ -112,8 +131,10 @@ class Fixture(SyntheticStaging):
         return self.verified
 
     def probe(self, deployment, endpoint):
-        if self.fenced or deployment != self.verified or self.now >= self.target.expires_at:
+        if self.fenced or self.arm_pin is None or deployment != self.verified:
             raise ValueError("unexpected probe")
+        window, _ = self.arm_pin
+        window.require_open(self.now)
         self.events.append((endpoint.value, deployment.target))
         ready = dict(build_revision=REVISION, build_id=RECEIPT["BOT_BUILD_ID"],
                      deploy_id=RECEIPT["BOT_DEPLOY_ID"], components=self.gateway)
@@ -150,6 +171,36 @@ class Fixture(SyntheticStaging):
 
 
 class PreCallerTests(unittest.TestCase):
+    def test_delayed_create_honors_lease_and_preserves_independent_stop(self):
+        for target in (ORIGINAL, RETAINED):
+            with self.subTest(shape=target.shape):
+                fixture = Fixture(target)
+                cutoff = target.started_at + 60
+                fixture.window = EffectWindow(target, cutoff)
+                fixture.before_create.side_effect = lambda: setattr(fixture, "now", cutoff + 1)
+                start = fixture.caller(Operation.START)
+                with self.assertRaisesRegex(TargetError, "^pre_create_unconfirmed$"):
+                    start.start(Upload(target))
+                fixture.before_create.assert_called_once_with()
+                self.assertLess(fixture.now, target.expires_at)
+                self.assertEqual(fixture.steps(), ["admit", "arm"])
+                self.assertIsNone(fixture.created)
+                self.assertIsNone(fixture.snapshot.worker)
+                self.assertIsNone(fixture.snapshot.container)
+                self.assertFalse(fixture.snapshot.write_access)
+                opened = fixture.record
+                self.assertFalse(opened.closed)
+                self.assertEqual(fixture.arm_pin, (fixture.window, opened.start_id))
+
+                stop = fixture.caller(Operation.STOP)
+                fixture.drained = False
+                self.assertFalse(stop.stop())
+                closed = replace(opened, closed=True)
+                self.assertEqual(fixture.record, closed)
+                fixture.drained = True
+                self.assertTrue(stop.stop())
+                self.assertEqual(fixture.record, replace(closed, settled_by=SettlementSource.PROVIDER))
+
     def test_both_shapes_cross_independent_start_read_stop_and_terminal_sweep(self):
         for target in (ORIGINAL, RETAINED):
             with self.subTest(shape=target.shape):

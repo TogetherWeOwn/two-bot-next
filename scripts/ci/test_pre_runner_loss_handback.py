@@ -50,14 +50,14 @@ class PreRunnerLossHandbackTests(unittest.TestCase):
         starter = ProtectedPre(target, authorize=lambda t, op: (t, op) == (target, Operation.START)
                                and store.now < target.expires_at,
                                admission=StartupAdmission(store, start_observer), runtime=runtime,
-                               external_stop=runtime)
+                               external_stop=runtime, effect_window=runtime.window)
         runtime.after_create.side_effect = CancelledError()
         with patch("pre_admission.uuid4", return_value=START), self.assertRaises(CancelledError):
             starter.start(runtime.upload)
         opened = AdmissionRecord(target, START, closed=False)
         self.assertEqual(store.read(target), opened)
         self.assertEqual(runtime.created, runtime.deployment)
-        self.assertEqual(runtime.effects.mock_calls, [call.arm(target, START),
+        self.assertEqual(runtime.effects.mock_calls, [call.arm(runtime.window, START),
                                                      call.create(target, START, runtime.upload)])
         start_observer.assert_not_called()
 
