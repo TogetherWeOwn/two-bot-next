@@ -28,8 +28,8 @@ use two_bot::live_gateway::LiveGateway;
 use two_bot::voice_rooms::{build_production_runtime, VoiceEventSink};
 use two_bot_core::gateway_funnel::GatewayFunnelBuffer;
 use two_bot_core::gateway_session::{
-    boot_action_with_policy, dispatch_action, invalidates_session, BootAction, DispatchAction,
-    GatewaySession, ResumePolicy,
+    boot_decision_with_policy, dispatch_action, invalidates_session, BootAction, BootDecision,
+    DispatchAction, GatewaySession, ResumePolicy,
 };
 use two_bot_core::{AutomodPolicy, ComponentStatus, Config, InviteState, Snowflake};
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
@@ -214,15 +214,18 @@ pub async fn load_boot_session(
 ) -> Result<Option<GatewaySession>, sqlx::Error> {
     tokio::time::timeout(CHECKPOINT_IO_MAX, async {
         let (saved, directive) = store.load_for_boot().await?;
-        match boot_action_with_policy(
+        let decision = boot_decision_with_policy(
             saved.as_ref(),
             directive,
             two_bot_core::funnel::now_millis_for_test(),
             store.resume_policy(),
-        ) {
+        );
+        match decision.action {
             BootAction::Resume => Ok(saved),
             BootAction::DiscardAndIdentify => {
                 store.clear().await?;
+                let configured = std::env::var("TWO_GATEWAY_RESUME_DENIAL_EVIDENCE").ok();
+                record_resume_endpoint_policy_refusal(decision, configured.as_deref());
                 Ok(None)
             }
             BootAction::Identify => Ok(None),
@@ -230,6 +233,17 @@ pub async fn load_boot_session(
     })
     .await
     .map_err(|_| sqlx::Error::InvalidArgument("gateway boot deadline exceeded".into()))?
+}
+
+fn record_resume_endpoint_policy_refusal(decision: BootDecision, configured: Option<&str>) {
+    if decision.resume_endpoint_policy_refused && configured == Some("1") {
+        info!(
+            name: crate::logging::GATEWAY_ENDPOINT_REFUSAL_EVENT,
+            parent: None,
+            msg = crate::logging::GATEWAY_ENDPOINT_REFUSAL_EVENT,
+            "saved gateway resume endpoint refused by admission policy"
+        );
+    }
 }
 
 // The ordered checkpoint writer gets its own pool, distinct from the shared
@@ -2591,6 +2605,93 @@ mod deferred_poison_acceptance;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_policy_receipt_is_default_off_and_has_no_correlation() {
+        use two_bot_core::gateway_session::BootDirective;
+
+        let admitted = GatewaySession {
+            session_id: "synthetic-session".into(),
+            sequence: 1,
+            resume_url: "wss://gateway.discord.gg".into(),
+            updated_at_ms: 1000,
+        };
+        let denied = GatewaySession {
+            resume_url: "wss://example.invalid".into(),
+            ..admitted.clone()
+        };
+        let decision = |session| {
+            boot_decision_with_policy(
+                Some(session),
+                BootDirective::None,
+                1000,
+                ResumePolicy::default(),
+            )
+        };
+        let span = || {
+            tracing::info_span!(
+                "synthetic_gateway_boot",
+                guild_id = "fixture-guild",
+                interaction_id = "fixture-interaction",
+                request_id = "fixture-request",
+                run_id = "fixture-run",
+                member_id = "fixture-member",
+                endpoint = "fixture-endpoint",
+                payload = "fixture-payload",
+                token = "fixture-token",
+            )
+        };
+        let capture = crate::logging::Capture::default();
+        tracing::subscriber::with_default(
+            crate::logging::capture_subscriber(capture.clone()),
+            || {
+                let span = span();
+                let _entered = span.enter();
+                for configured in [None, Some(""), Some("0"), Some("true")] {
+                    record_resume_endpoint_policy_refusal(decision(&denied), configured);
+                }
+                record_resume_endpoint_policy_refusal(decision(&admitted), Some("1"));
+                assert!(capture.text().is_empty());
+                record_resume_endpoint_policy_refusal(decision(&denied), Some("1"));
+            },
+        );
+        let pretty = crate::logging::Capture::default();
+        tracing::subscriber::with_default(
+            crate::logging::capture_pretty_subscriber(pretty.clone()),
+            || {
+                let span = span();
+                let _entered = span.enter();
+                record_resume_endpoint_policy_refusal(decision(&denied), Some("1"));
+                assert!(pretty.text().is_empty());
+                tracing::info!(msg = "synthetic_pretty_control");
+            },
+        );
+        assert!(pretty.text().contains("synthetic_pretty_control"));
+        let events = capture.lines();
+        let [event] = events.as_slice() else {
+            panic!("expected one explicit refusal");
+        };
+        let fields = event.as_object().unwrap();
+        assert_eq!(fields.len(), 7);
+        for key in [
+            "ts",
+            "level",
+            "msg",
+            "target",
+            "build_sha",
+            "release",
+            "message",
+        ] {
+            assert!(fields.contains_key(key), "missing envelope field {key}");
+        }
+        assert_eq!(event["msg"], "gateway_resume_endpoint_policy_refused");
+        assert_eq!(event["target"], "two_bot::gateway");
+        assert_eq!(
+            event["message"],
+            "saved gateway resume endpoint refused by admission policy"
+        );
+        println!("gateway_policy_receipt_fixture={event}");
+    }
 
     #[test]
     fn snapshot_owner_subscribes_to_scheduled_events() {

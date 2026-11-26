@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 use tracing::{Event, Subscriber};
 use tracing_log::NormalizeEvent;
 use tracing_subscriber::{
-    filter::{FilterExt, LevelFilter},
+    filter::{filter_fn, FilterExt, LevelFilter},
     fmt::{
         format::{JsonFields, Writer},
         time::{FormatTime, SystemTime},
@@ -17,6 +17,8 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
     EnvFilter, Layer,
 };
+
+pub(crate) const GATEWAY_ENDPOINT_REFUSAL_EVENT: &str = "gateway_resume_endpoint_policy_refused";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LogFormat {
@@ -196,9 +198,12 @@ where
             tracing_subscriber::registry()
                 .with(layer.json().event_format(JsonEvent).with_filter(filter)),
         ),
-        LogFormat::Pretty => {
-            Box::new(tracing_subscriber::registry().with(layer.pretty().with_filter(filter)))
-        }
+        LogFormat::Pretty => Box::new(tracing_subscriber::registry().with(
+            layer.pretty().with_filter(filter.and(filter_fn(|metadata| {
+                // Pretty can attach the current span even to a root event.
+                metadata.name() != GATEWAY_ENDPOINT_REFUSAL_EVENT
+            }))),
+        )),
     }
 }
 
@@ -430,6 +435,11 @@ impl Capture {
 #[cfg(test)]
 pub(crate) fn capture_subscriber(capture: Capture) -> Box<dyn Subscriber + Send + Sync> {
     subscriber(LogFormat::Json, filter(None, None), capture)
+}
+
+#[cfg(test)]
+pub(crate) fn capture_pretty_subscriber(capture: Capture) -> Box<dyn Subscriber + Send + Sync> {
+    subscriber(LogFormat::Pretty, filter(None, None), capture)
 }
 
 #[cfg(test)]

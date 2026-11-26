@@ -293,7 +293,7 @@ class T0AcceptanceReportTests(unittest.TestCase):
     def test_production_gateway_requires_supported_summary_with_capture_bounds(self):
         bounds = WINDOWED_GATEWAY["window"]
         sentinel = "synthetic private value"
-        for summary in (GATEWAY, dict(WINDOWED_GATEWAY, schema="passive_gateway_summary.v2"),
+        for summary in (GATEWAY, dict(WINDOWED_GATEWAY, schema="passive_gateway_summary.v3"),
                         dict(GATEWAY, window=bounds), dict(WINDOWED_GATEWAY, window={"start": bounds["start"]}),
                         dict(WINDOWED_GATEWAY, window=dict(bounds, service=sentinel)),
                         dict(WINDOWED_GATEWAY, window=dict(bounds, end=sentinel)),
@@ -306,6 +306,63 @@ class T0AcceptanceReportTests(unittest.TestCase):
                 self.assertNotIn(sentinel, json.dumps(row))
                 for field in ("result", "signals", "readiness"):
                     self.assertNotIn(field, row)
+
+    def test_endpoint_policy_receipt_needs_an_explicit_exact_window_refusal(self):
+        at = "2026-11-25T02:01:00.125Z"
+        marker = {"ts": at, "msg": "gateway_resume_endpoint_policy_refused",
+                  "target": "two_bot::gateway", "build_sha": SHA}
+        opaque = "synthetic private value"
+
+        def summarize(*events):
+            packet = {"schema_version": 1, "service": PRODUCTION["application_id"], "contains": False,
+                      "window": WINDOWED_GATEWAY["window"], "event_count": len(events),
+                      "limit": 100, "possibly_truncated": False, "events": events}
+            return self.invoke("passive_gateway_evidence.py", "--service", PRODUCTION["application_id"],
+                               "--sha", SHA, "--start", PRODUCTION["start"], "--end", PRODUCTION["end"],
+                               stdin=json.dumps(packet).encode())
+
+        receipt = summarize(dict(marker, endpoint=opaque, payload=opaque, token=opaque, member_id=opaque))
+        binding = self.save("gateway", receipt, PRODUCTION)
+        row = self.run_report({"gateway": binding}, PRODUCTION)["gateway"]
+        self.assertEqual((row["status"], row["endpoint_denial"], row["endpoint_denial_at"], row["readiness"]),
+                         ("attributed", "observed", at, "not_observed"))
+        self.assertNotIn(opaque.encode(), receipt)
+        self.assertNotIn(opaque, json.dumps(row))
+        self.assertEqual(self.run_report({}, PRODUCTION)["gateway"]["endpoint_denial"], "unverified")
+        for change in ({"application_id": WINDOW["worker_version"]},
+                       {"image_digest": "sha256:" + "c" * 64}):
+            row = self.run_report({"gateway": binding}, PRODUCTION | change)["gateway"]
+            self.assertEqual((row["status"], row["endpoint_denial"]), ("mismatched", "unverified"))
+
+        other_bounds = dict(PRODUCTION, start="2026-11-25T02:00:00.000000001Z")
+        row = self.run_report({"gateway": dict(binding, window=other_bounds)}, other_bounds)["gateway"]
+        self.assertEqual((row["status"], row["fields"], row["endpoint_denial"]),
+                         ("mismatched", ["start"], "unverified"))
+
+        parsed = json.loads(receipt)
+        for variant, status in (
+            (dict(parsed, endpoint_policy_refused_at="2026-11-25T02:05:00.001Z"), "mismatched"),
+            (dict(parsed, endpoint_policy_refused_at=opaque), "unverified"),
+            ({key: value for key, value in parsed.items() if key != "endpoint_policy_refused_at"}, "unverified"),
+            (dict(parsed, schema=WINDOWED_GATEWAY["schema"]), "unverified"),
+            (dict(parsed, endpoint=opaque), "unverified"),
+        ):
+            changed = self.save("gateway", variant, PRODUCTION)
+            row = self.run_report({"gateway": binding}, PRODUCTION)["gateway"]
+            self.assertEqual((row["status"], row["endpoint_denial"]), ("mismatched", "unverified"))
+            row = self.run_report({"gateway": changed}, PRODUCTION)["gateway"]
+            self.assertEqual((row["status"], row["endpoint_denial"]), (status, "unverified"))
+            self.assertNotIn("endpoint_denial_at", row)
+            self.assertNotIn(opaque, json.dumps(row))
+
+        generic = summarize(dict(marker, msg="ready"), dict(marker, msg="gateway_reconnect_failed"),
+                            dict(marker, msg="gateway_connecting", target="two_bot", resume=False),
+                            dict(marker, msg="shard_closed", target="two_bot::logging"),
+                            dict(marker, target="two_bot"))
+        row = self.run_report({"gateway": self.save("gateway", generic, PRODUCTION)}, PRODUCTION)["gateway"]
+        self.assertEqual((row["status"], row["readiness"], row["endpoint_denial"]),
+                         ("attributed", "observed", "unverified"))
+        self.assertNotIn("endpoint_denial_at", row)
 
     def test_production_gateway_compares_each_bound_without_truncation(self):
         alternate = dict(PRODUCTION, start="2026-11-25T02:00:00.000000000+00:00",
