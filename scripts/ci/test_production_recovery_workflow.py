@@ -1,13 +1,15 @@
 """Synthetic checks for the production recovery handoffs and failure ordering."""
 
+from contextlib import redirect_stderr
 from copy import deepcopy
 from dataclasses import asdict, replace
+from io import StringIO
 import json
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = ROOT / "scripts/ci/fixtures/production_inverse_admission.json"
@@ -16,8 +18,10 @@ import production_recovery_artifact as artifacts
 import production_recovery_workflow as recovery
 import production_release as release_cli
 import production_release_preflight as preflight
+import staging_recovery_status
 from production_recovery_takeover import RecoveryPin
 from staging_rollout import GateError
+from test_production_recovery_artifact import artifact_archive, producer, release_run_fixture
 from worker_container_rollback import require_ordinary_production_rollback, source_has_attendance_schema
 
 
@@ -72,10 +76,9 @@ class RecoveryWorkflowTests(unittest.TestCase):
                                      Mock(side_effect=[before, after]), self.control)
         self.control.assert_called_once_with("fence-exact", 20, expected_deployment=self.candidate[0])
 
-    def test_admission_binds_the_rust_inverse_ledger_rows(self):
+    def forward_fixture(self, run):
         case = self.case
         plan, artifact, plan_id = case["plan"], case["artifact"], case["admission"]["plan_run_id"]
-        run = {**case["run"], "run_attempt": 1}
         release = Mock(**asdict(self.pin), workflow_sha=run["head_sha"], rollback_worker=self.pin.worker_version,
                        rollback_image=self.pin.image_digest, candidate_image=self.candidate[2])
         release.recovery_reference.return_value = plan["recovery_evidence_ref"]
@@ -88,6 +91,12 @@ class RecoveryWorkflowTests(unittest.TestCase):
         env = {"RELEASE_STOPPED": json.dumps(stopped), "RELEASE_PREFLIGHT_EPOCH": "20",
                "FORWARD_ARTIFACT_ID": "789", "FORWARD_ARCHIVE_SHA256": "8" * 64, "CANDIDATE_WORKER": self.candidate[0],
                "PRODUCTION_WORKER_URL": "https://fixture.invalid"}
+        return (release, run, plan_id, plan, artifact), document, env
+
+    def test_admission_binds_the_rust_inverse_ledger_rows(self):
+        case = self.case
+        context, document, env = self.forward_fixture({**case["run"], "run_attempt": 1})
+        release, run, plan_id, plan, artifact = context
         with (patch.object(release_cli, "release_request", return_value=(release, run, plan_id, plan["target"])),
               patch.multiple(preflight, authenticated_plan=Mock(return_value=(plan, artifact)), verify_environment=Mock()),
               patch.object(artifacts, "protected_job") as producer,
@@ -111,6 +120,64 @@ class RecoveryWorkflowTests(unittest.TestCase):
                     authenticate.return_value = {**document, field: digest}
                     with self.subTest(field=field), self.assertRaisesRegex(GateError, "production_forward_artifact_mismatch"):
                         recovery.release_admission(env)
+
+    def test_restore_refuses_receipts_with_wrong_or_missing_ownership_epoch(self):
+        run_env, run = release_run_fixture()
+        context, forward, env = self.forward_fixture(run)
+        _, _, plan_id, plan, plan_artifact = context
+        jobs = [producer(run, artifacts.FORWARD_JOB, artifacts.FORWARD_STEPS),
+                producer(run, artifacts.JOB, (artifacts.WRITE_STEP, artifacts.UPLOAD_STEP))]
+        bad_epoch = self.pin.fence_epoch + 2
+        cases = (
+            ("matching epochs", forward, self.result, True, True),
+            ("wrong forward epoch", {**forward, "stopped_epoch": bad_epoch}, self.result, False, False),
+            ("missing forward epoch", {k: v for k, v in forward.items() if k != "stopped_epoch"},
+             self.result, False, False),
+            ("wrong inverse epoch", forward, {**self.result, "fence_epoch": bad_epoch}, True, False),
+            ("missing inverse epoch", forward, {k: v for k, v in self.result.items() if k != "fence_epoch"},
+             True, False),
+        )
+        for name, forward_doc, inverse_result, fetch_inverse, admitted in cases:
+            with self.subTest(case=name):
+                # Repack each changed receipt and bind its actual digest in the
+                # workflow inputs and inverse approval. Only the epoch differs.
+                forward_digest, forward_entry, forward_routes = artifact_archive(
+                    run, artifacts.FORWARD_ARTIFACT, 789, forward_doc)
+                approval = {"plan_run_id": plan_id, "plan_archive_sha256": plan_artifact["archive_digest"],
+                            "workflow_sha": run["head_sha"], "recovery_ref": plan["recovery_evidence_ref"],
+                            "candidate_worker": self.candidate[0], "candidate_image": self.candidate[2],
+                            "forward_artifact_id": "789", "forward_archive_sha256": forward_digest}
+                inverse_digest, inverse_entry, inverse_routes = artifact_archive(
+                    run, artifacts.ARTIFACT, 987,
+                    {"operation": "undo-0480", "approval": approval, "result": inverse_result})
+                root = f"actions/runs/{run['id']}"
+                routes = {root: run, f"{root}/attempts/1/jobs?per_page=30": {"total_count": len(jobs), "jobs": jobs},
+                          f"{root}/artifacts?per_page=30": {"total_count": 2, "artifacts": [forward_entry, inverse_entry]},
+                          **forward_routes, **inverse_routes}
+                api = Mock(side_effect=lambda path, **_: routes[path.removeprefix(f"repos/{artifacts.REPO}/")])
+                restore_env = {**run_env, **env, "FORWARD_ARCHIVE_SHA256": forward_digest,
+                               "STOPPED_FENCE_ACK": env["RELEASE_STOPPED"], "ARTIFACT_ID": "987",
+                               "ARCHIVE_SHA256": inverse_digest}
+                boundary = Mock(side_effect=AssertionError("provider boundary reached"))
+                blocked = Mock(side_effect=AssertionError("unexpected provider, database or receipt operation"))
+                with (patch.object(staging_recovery_status, "gh", api),
+                      patch.multiple(recovery, release_context=Mock(return_value=context),
+                                     check_url=boundary, RollbackClient=blocked, read_status=blocked,
+                                     control_client=blocked, run_inverse=blocked, write_json=blocked),
+                      redirect_stderr(StringIO())):
+                    if admitted:
+                        with self.assertRaisesRegex(AssertionError, "^provider boundary reached$"):
+                            recovery.main(["restore"], restore_env)
+                        boundary.assert_called_once_with("production", env["PRODUCTION_WORKER_URL"])
+                    else:
+                        self.assertEqual(recovery.main(["restore"], restore_env), 1)
+                        boundary.assert_not_called()
+                downloads = [request for request in api.call_args_list if request.kwargs.get("binary")]
+                expected = [call(f"repos/{artifacts.REPO}/actions/artifacts/789/zip", binary=True)]
+                if fetch_inverse:
+                    expected.append(call(f"repos/{artifacts.REPO}/actions/artifacts/987/zip", binary=True))
+                self.assertEqual(downloads, expected)
+                blocked.assert_not_called()
 
     def test_inverse_refuses_incomplete_database_readback(self):
         plan = dict(target=dict(host="db", database="fixture", branch_id="branch"),
