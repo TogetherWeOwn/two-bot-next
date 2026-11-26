@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tarfile
 
-from bot_promotion import collect_modules
+from bot_promotion import DIGEST, collect_modules
 from rollback_proof import ProofError
 from staging_qualification import check_evidence
 from staging_recovery_status import github
@@ -69,8 +69,36 @@ def read_descriptor(archive, descriptor, media_type):
     descriptor = mapping(descriptor)
     address = descriptor.get("digest")
     require(descriptor.get("mediaType") == media_type and isinstance(address, str)
-            and re.fullmatch(r"sha256:[0-9a-f]{64}", address), "image_descriptor_unproved")
+            and DIGEST.fullmatch(address), "image_descriptor_unproved")
     return archive_json(archive, f"blobs/sha256/{address[7:]}", descriptor)
+
+
+def verify_layers(archive, descriptors):
+    require(isinstance(descriptors, list), "image_layer_descriptor_unproved")
+    expected = {}
+    for descriptor in descriptors:
+        descriptor = mapping(descriptor)
+        address, size = descriptor.get("digest"), descriptor.get("size")
+        require(isinstance(address, str) and DIGEST.fullmatch(address)
+                and type(size) is int and size >= 0, "image_layer_descriptor_unproved")
+        name = f"blobs/sha256/{address[7:]}"
+        identity = (address, size)
+        require(expected.setdefault(name, identity) == identity, "image_layer_size_mismatch")
+
+    # Read each selected blob once, in physical order, even when the TAR is inside a compressed ZIP.
+    verified = set()
+    for member in archive.getmembers():
+        if member.name not in expected:
+            continue
+        address, size = expected[member.name]
+        require(member.name not in verified and member.isfile() and not member.issparse(),
+                "image_layer_member_unproved")
+        require(member.size == size, "image_layer_size_mismatch")
+        with archive.extractfile(member) as stream:
+            require("sha256:" + file_digest(stream, "sha256").hexdigest() == address,
+                    "image_layer_digest_mismatch")
+        verified.add(member.name)
+    require(len(verified) == len(expected), "image_layer_missing")
 
 
 def image_manifest(path, labels, *, fileobj=None):
@@ -79,9 +107,11 @@ def image_manifest(path, labels, *, fileobj=None):
         require(isinstance(manifests, list) and len(manifests) == 1, "image_manifest_ambiguous")
         manifest = read_descriptor(archive, manifests[0], "application/vnd.oci.image.manifest.v1+json")
         config = read_descriptor(archive, manifest.get("config"), "application/vnd.oci.image.config.v1+json")
-    actual_labels = mapping(mapping(config.get("config")).get("Labels"))
-    require(config.get("os") == "linux" and config.get("architecture") == "amd64"
-            and all(actual_labels.get(key) == value for key, value in labels.items()), "image_build_stamp_mismatch")
+        actual_labels = mapping(mapping(config.get("config")).get("Labels"))
+        require(config.get("os") == "linux" and config.get("architecture") == "amd64"
+                and all(actual_labels.get(key) == value for key, value in labels.items()),
+                "image_build_stamp_mismatch")
+        verify_layers(archive, manifest.get("layers"))
     return manifests[0]["digest"]
 
 

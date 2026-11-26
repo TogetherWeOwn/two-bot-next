@@ -5,7 +5,9 @@ This repo is public. Do not put internal ticket ids, instance links, localhost o
 addresses in the title, the body, a commit message or the branch name. Name the branch after the change,
 for example `fix/sudo-window`. Link only public GitHub issues (`Fixes #123`).
 Write short, plain sentences. `pr-lint` requires the title, the linked issue (feat/fix/perf/refactor/security)
-and Verification; the other sections are optional context for the reviewer.
+and Verification. Fill in Attestation.
+Keep the final `## Notes for reviewers` heading even if you have no notes. Put any model attribution
+under it so that closing prose and markup appended by integrations stay outside Attestation.
 Full rules: CONTRIBUTING.md, "Pull request standards".
 -->
 
@@ -97,7 +99,7 @@ risk_tier: <T0|T1|T2>
 - [ ] D7: <failure propagation, non-empty evidence and honest verdicts>
 - [ ] D8: <malformed shapes, Unicode, parsing and host validation>
 
-## Notes for reviewers (optional)
+## Notes for reviewers
 
 <!-- Risks, follow-ups, or anything the reviewer should look at first. -->
 

@@ -134,6 +134,18 @@ class CutoverDocLinks(unittest.TestCase):
             problems += _problems(doc, doc.read_text(encoding="utf-8"))
         self.assertEqual(problems, [])
 
+    def test_offline_predecessor_verdict_links_to_protected_rehearsal(self):
+        doc = ROOT / "docs" / "staging-rollout-gate.md"
+        _, heading, rest = doc.read_text(encoding="utf-8").partition(
+            "#### Offline predecessor image verdict\n"
+        )
+        self.assertTrue(heading)
+        section = rest.split("\n#### ", 1)[0]
+        self.assertIn("`/readyz` to return 503", section)
+        self.assertIn("Keep protected staging admission pending", section)
+        self.assertIn("#disposable-exact-pre-rehearsal", LINK.findall(section))
+        self.assertEqual(_problems(doc, section), [])
+
     def test_disposable_pre_rehearsal_links_and_cutoff_match_source(self):
         doc = ROOT / "docs" / "staging-rollout-gate.md"
         _, heading, rest = doc.read_text(encoding="utf-8").partition(
