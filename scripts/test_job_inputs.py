@@ -16,6 +16,7 @@ import re
 import runpy
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -419,69 +420,122 @@ class SelectionTests(unittest.TestCase):
 
 
 class GitCandidateSelectionTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.git("init", "-q", "-b", "main")
+
+    def git(self, *args):
+        return subprocess.check_output(
+            ["git", "-C", str(self.root), "-c", "user.name=CI fixture",
+             "-c", "user.email=ci@example.invalid", "-c", "commit.gpgSign=false", *args],
+            text=True, timeout=5).strip()
+
+    def commit(self, label):
+        self.git("add", ".")
+        self.git("commit", "-qm", label)
+        return self.git("rev-parse", "HEAD")
+
     def test_mutation_planner_uses_real_selector(self):
         planner = runpy.run_path(str(ROOT / ".github/scripts/mutation_scope.py"))
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-
-            def git(*args):
-                return subprocess.check_output(
-                    ["git", "-C", directory, "-c", "user.name=CI fixture",
-                     "-c", "user.email=ci@example.invalid", "-c", "commit.gpgSign=false", *args],
-                    text=True, timeout=5).strip()
-
-            git("init", "-q")
-            path = root / "wrangler/src/fixture.ts"
-            path.parent.mkdir(parents=True)
-            path.write_text("export const active = false;\n")
-            git("add", ".")
-            git("commit", "-qm", "base")
-            base = git("rev-parse", "HEAD")
-            path.write_text("export const active = true;\n")
-            git("commit", "-qam", "candidate")
-            output = root / "outputs"
-            with patch.dict(os.environ, BASE_SHA=base, HEAD_SHA=git("rev-parse", "HEAD"),
-                            GITHUB_OUTPUT=str(output), RUNNER_TEMP=directory):
-                planner["main"](root)
-            self.assertIn("worker=true", output.read_text().splitlines())
-            self.assertEqual((root / "worker-mutation-plan.json").read_text(),
-                             '{"wrangler/src/fixture.ts": [1]}')
+        path = self.root / "wrangler/src/fixture.ts"
+        path.parent.mkdir(parents=True)
+        path.write_text("export const active = false;\n")
+        base = self.commit("base")
+        path.write_text("export const active = true;\n")
+        head = self.commit("candidate")
+        output = self.root / "outputs"
+        with patch.dict(os.environ, BASE_SHA=base, HEAD_SHA=head,
+                        GITHUB_OUTPUT=str(output), RUNNER_TEMP=str(self.root)):
+            planner["main"](self.root)
+        self.assertIn("worker=true", output.read_text().splitlines())
+        self.assertEqual((self.root / "worker-mutation-plan.json").read_text(),
+                         '{"wrangler/src/fixture.ts": [1]}')
 
     def test_diverged_pr_candidate_and_unknown_change_types(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+        (self.root / "guide.md").write_text("original")
+        common = self.commit("common")
+        self.git("switch", "-qc", "topic")
+        self.git("mv", "guide.md", "renamed.md")
+        head = self.commit("rename")
+        self.git("switch", "-q", "main")
+        (self.root / "other.md").write_text("base-only")
+        (self.root / "alias.md").symlink_to("other.md")
+        base = self.commit("base advances")
+        self.git("merge", "-q", "--no-ff", "topic", "-m", "candidate")
+        merge = self.git("rev-parse", "HEAD")
+        with self.assertRaises(inputs.JobInputsError):
+            inputs.pr_comparison(self.root, head, base, merge)
+        self.assertEqual(inputs.pr_comparison(self.root, base, head, merge), (common, merge))
+        changed, uncertain = inputs.git_changes(common, merge, self.root)
+        self.assertCountEqual(changed, ["other.md", "renamed.md"])
+        self.assertCountEqual(uncertain, ["guide.md", "alias.md"])
+        self.assertTrue(all(inputs.workflow_selection(changed, uncertain).values()))
 
-            def git(*args):
-                return subprocess.check_output(["git", "-C", directory, *args],
-                                               text=True, timeout=5).strip()
+    def test_workflow_bootstraps_selector_from_event_base(self):
+        path = self.root / "scripts/job-inputs.py"
+        path.parent.mkdir()
+        path.write_bytes((ROOT / "scripts/job-inputs.py").read_bytes())
+        guide = self.root / "guide.md"
+        guide.write_text("original")
+        base = self.commit("base selector")
+        self.git("switch", "-qc", "topic")
+        guide.write_text("edited")
+        head = self.commit("guide change")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "topic", "-m", "candidate")
+        merge = self.git("rev-parse", "HEAD")
 
-            git("init", "-q", "-b", "main")
-            git("config", "user.name", "CI fixture")
-            git("config", "user.email", "ci@example.invalid")
-            git("config", "commit.gpgSign", "false")
-            (root / "guide.md").write_text("original")
-            git("add", ".")
-            git("commit", "-qm", "common")
-            common = git("rev-parse", "HEAD")
-            git("switch", "-qc", "topic")
-            git("mv", "guide.md", "renamed.md")
-            git("commit", "-qm", "rename")
-            head = git("rev-parse", "HEAD")
-            git("switch", "-q", "main")
-            (root / "other.md").write_text("base-only")
-            (root / "alias.md").symlink_to("other.md")
-            git("add", ".")
-            git("commit", "-qm", "base advances")
-            base = git("rev-parse", "HEAD")
-            git("merge", "-q", "--no-ff", "topic", "-m", "candidate")
-            merge = git("rev-parse", "HEAD")
-            with self.assertRaises(inputs.JobInputsError):
-                inputs.pr_comparison(root, head, base, merge)
-            self.assertEqual(inputs.pr_comparison(root, base, head, merge), (common, merge))
-            changed, uncertain = inputs.git_changes(common, merge, root)
-            self.assertCountEqual(changed, ["other.md", "renamed.md"])
-            self.assertCountEqual(uncertain, ["guide.md", "alias.md"])
-            self.assertTrue(all(inputs.workflow_selection(changed, uncertain).values()))
+        selector_job = WorkflowSurfaceTests.job_text(CHECK_YML.read_text(), "job-inputs")
+        step = selector_job.split("id: select\n", 1)[1].split("\n      - name:", 1)[0]
+        script = textwrap.dedent(step.split("run: |\n", 1)[1])
+        output = self.root / "outputs"
+        env = {**os.environ, "EVENT_NAME": "pull_request", "BASE_SHA": base,
+               "HEAD_SHA": head, "MERGE_SHA": merge, "RUNNER_TEMP": str(self.root),
+               "GITHUB_WORKSPACE": str(self.root), "GITHUB_OUTPUT": str(output)}
+        # A checkout-local copy cannot decide which suites run.
+        path.write_text("raise SystemExit('checkout selector must not run')\n")
+        for candidate, selected in ((merge, "false"), (head, "true")):
+            with self.subTest(candidate=candidate):
+                output.write_text("")
+                run = subprocess.run(["bash", "-e", "-c", script], cwd=self.root,
+                                     env={**env, "MERGE_SHA": candidate},
+                                     capture_output=True, text=True, timeout=5)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                plan = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                self.assertEqual(tuple(plan), inputs.OUTPUTS)
+                for lane in (RUST, WORKER, inputs.MIGRATIONS, inputs.DB_COMPAT, inputs.WORKFLOW_FIXTURES):
+                    self.assertEqual(plan[lane], selected, run.stdout)
+
+    def test_database_proof_binds_base_only_migration_to_candidate(self):
+        guide = self.root / "guide.md"
+        guide.write_text("original")
+        common = self.commit("common")
+        self.git("switch", "-qc", "topic")
+        guide.write_text("edited")
+        head = self.commit("docs change")
+        self.git("switch", "-q", "main")
+        migration = self.root / "crates/store/migrations/0500_fixture.sql"
+        migration.parent.mkdir(parents=True)
+        migration.write_text("-- fixture\n")
+        base = self.commit("migration on base")
+        self.git("merge", "-q", "--no-ff", "topic", "-m", "candidate")
+        merge = self.git("rev-parse", "HEAD")
+        changed, uncertain = inputs.git_changes(common, merge, self.root)
+        self.assertTrue(inputs.workflow_selection(changed, uncertain)[inputs.DB_COMPAT])
+
+        # Exercise the actual identity check before the build and database work.
+        script = (ROOT / "scripts/ci/db_compatibility.sh").read_text().split("scratch=$(mktemp", 1)[0]
+        env = {**os.environ, "GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "pull_request",
+               "GITHUB_SHA": merge, "PR_BASE_SHA": base, "PR_HEAD_SHA": head}
+        for ref, expected in ((merge, 0), (head, 1)):
+            with self.subTest(ref=ref):
+                self.git("switch", "-q", "--detach", ref)
+                run = subprocess.run(["bash", "-c", script], cwd=self.root,
+                                     env=env, capture_output=True, text=True, timeout=5)
+                self.assertEqual(run.returncode, expected, run.stderr)
+                self.assertEqual(migration.is_file(), expected == 0)
 
 
 class DocsIndexWiringTests(unittest.TestCase):

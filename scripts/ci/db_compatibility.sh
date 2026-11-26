@@ -4,19 +4,22 @@ set -euo pipefail
 export LC_ALL=C
 [[ ${GITHUB_ACTIONS:-} == true && ${GITHUB_EVENT_NAME:-} == pull_request ]]
 [[ $PR_HEAD_SHA =~ ^[0-9a-f]{40}$ && $PR_BASE_SHA =~ ^[0-9a-f]{40}$ ]]
-head_tree=$PWD
-[[ $(git rev-parse HEAD) == "$PR_HEAD_SHA" ]]
+[[ $GITHUB_SHA =~ ^[0-9a-f]{40}$ ]]
+candidate_tree=$PWD
+# The selector evaluated this merge, including changes from the event base.
+[[ $(git rev-list --parents -n 1 HEAD --) == "$GITHUB_SHA $PR_BASE_SHA $PR_HEAD_SHA" ]]
 prior_sha=$(git merge-base --all "$PR_BASE_SHA" "$PR_HEAD_SHA")
 [[ $prior_sha =~ ^[0-9a-f]{40}$ ]]
 scratch=$(mktemp -d "${RUNNER_TEMP:?}/db-compat.XXXXXXXX")
 prior_tree=$scratch/prior
 git worktree add --detach "$prior_tree" "$prior_sha"
-printf 'PR head %s, event base %s, merge base %s\n' "$PR_HEAD_SHA" "$PR_BASE_SHA" "$prior_sha"
+printf 'Candidate merge %s, PR head %s, event base %s, merge base %s\n' \
+  "$GITHUB_SHA" "$PR_HEAD_SHA" "$PR_BASE_SHA" "$prior_sha"
 [[ $(git -C "$prior_tree" rev-parse HEAD) == "$prior_sha" ]]
 
 adapter_source() {
   # A base that already has the lane must supply its own adapters.
-  if [[ -f $1/scripts/ci/db_compatibility.sh ]]; then printf '%s\n' "$1"; else printf '%s\n' "$head_tree"; fi
+  if [[ -f $1/scripts/ci/db_compatibility.sh ]]; then printf '%s\n' "$1"; else printf '%s\n' "$candidate_tree"; fi
 }
 
 # Exercise the future merge-base route even on the bootstrap PR.
@@ -43,7 +46,7 @@ build() {
   )
 }
 build "$prior_tree" prior
-build "$head_tree" head
+build "$candidate_tree" head
 prior="$scratch/build-prior/debug"
 head="$scratch/build-head/debug"
 
@@ -114,7 +117,7 @@ archives=("$scratch"/backups/two-funnel-*.ndjson.gz)
 [[ ${#archives[@]} == 1 && -s ${archives[0]} ]]
 
 prior_matrix="$prior_tree/sql/database_role_matrix.sql"
-head_matrix="$head_tree/sql/database_role_matrix.sql"
+head_matrix="$candidate_tree/sql/database_role_matrix.sql"
 head_matrix_additions() {
   {
     echo 'BEGIN READ ONLY; SET LOCAL search_path = pg_catalog, pg_temp; WITH prior AS ('

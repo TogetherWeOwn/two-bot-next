@@ -15,8 +15,10 @@ inputs, and unknown paths select every applicable lane. Main pushes, merge
 queues, scheduled runs, and manual runs use the full applicable plan.
 
 Migration numbering, checksum and Squawk checks run in `job-inputs` before
-selected suites acquire runners. Ordinary Markdown changes skip the workflow
-fixture module except for the CI speed rollout guide that module checks.
+selected suites acquire runners. The prior-revision database proof compares
+the common ancestor with that same PR merge commit. Ordinary Markdown changes
+skip the workflow fixture module except for the CI speed rollout guide that
+module checks.
 The remaining source-level fixtures, docs checks, and required contexts still
 report. Worker docs and Rust content dependencies retain their existing
 checks. `ci-ok` accepts a skipped lane only after a successful selector

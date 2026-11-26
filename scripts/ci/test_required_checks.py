@@ -229,7 +229,7 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertNotIn("ports", job["services"]["agent-testdb"])
         self.assertNotIn("secrets.", str(job))
         checkout = job["steps"][0]["with"]
-        self.assertEqual(checkout["ref"], "${{ github.event.pull_request.head.sha }}")
+        self.assertEqual(checkout["ref"], "${{ github.sha }}")
         self.assertEqual(checkout["persist-credentials"], "false")
         self.assertEqual(self.run_aggregator("ci-ok", {"db-compatibility": "skipped"}, selected=""), 1)
 
