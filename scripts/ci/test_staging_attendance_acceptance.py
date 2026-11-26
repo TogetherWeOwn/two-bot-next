@@ -67,6 +67,56 @@ class AcceptanceTests(unittest.TestCase):
         with self.assertRaises(acceptance.Refused):
             check("cleanup", ORIGIN, ROLLOUT, {**observed, "fixture_rows": 1})
 
+    def test_rehearsal_requires_boolean_attendance_flags_in_every_phase(self):
+        observations = {}
+        for phase, minutes, read_enabled in (("pending", 10, True), ("finalized", 46, True),
+                                             ("off", 47, False), ("cleanup", 48, False)):
+            row = deepcopy(FIXTURE["observed"])
+            row.update(attendance_read=read_enabled, attendance_capture=False,
+                       primary_fixture="pending" if phase == "pending" else "finalized")
+            lifecycle = row["lifecycle"]
+            observed_at = START + timedelta(minutes=minutes)
+            lifecycle["observedAt"] = observed_at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            lease = lifecycle["use"]
+            lease.update(environment="staging", runId="1234", runAttempt=1,
+                         acquiredAt=int(START.timestamp()) * 1000,
+                         expiresAt=int((START + timedelta(hours=1)).timestamp()) * 1000)
+            if phase == "cleanup":
+                lifecycle.update(action="release", running=False)
+                lease["phase"] = "released"
+                del row["primary_fixture"], row["foreign_fixture"]
+                row["fixture_rows"] = 0
+            observations[phase] = row
+
+        no_traffic = Mock(side_effect=AssertionError("unexpected staging request"))
+        with (TemporaryDirectory() as directory,
+              patch.object(acceptance, "credentials", side_effect=AssertionError("unexpected credentials")) as credentials):
+            rollout_path = Path(directory) / "rollout.json"
+            observed_path = Path(directory) / "observed.json"
+            rollout_path.write_text(json.dumps(ROLLOUT), encoding="utf-8")
+            args = ["rehearsal", "--rollout", str(rollout_path), "--observed", str(observed_path)]
+
+            def run(rows):
+                observed_path.write_text(json.dumps(rows), encoding="utf-8")
+                with (patch("sys.stdout", new_callable=StringIO) as stdout,
+                      patch("sys.stderr", new_callable=StringIO) as stderr):
+                    status = acceptance.main(args, env={}, check=no_traffic)
+                return status, stdout.getvalue(), stderr.getvalue()
+
+            self.assertEqual(run(observations), (0, "PASS: attendance rehearsal\n", ""))
+            for phase, row in observations.items():
+                for flag in ("attendance_read", "attendance_capture"):
+                    missing = row.copy()
+                    expected = missing.pop(flag)
+                    for case, invalid in (("missing", missing), ("number", {**row, flag: int(expected)}),
+                                          ("string", {**row, flag: json.dumps(expected)})):
+                        with self.subTest(phase=phase, flag=flag, case=case):
+                            self.assertEqual(run({**observations, phase: invalid}),
+                                             (1, "", "FAIL: attendance flags differ from the phase\n"))
+
+        credentials.assert_not_called()
+        no_traffic.assert_not_called()
+
     def signed_peer(self, phase, *, wrong_result=False, drift=False):
         requests, readies = [], []
 

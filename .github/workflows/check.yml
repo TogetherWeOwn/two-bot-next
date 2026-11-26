@@ -94,11 +94,8 @@ jobs:
     needs: [job-inputs]
     # Failed, skipped or cancelled dependencies must not make check appear green.
     if: ${{ always() }}
-    # Runner routing: every job uses the explicit standard GitHub-hosted
-    # `runs-on: ubuntu-latest`. This is a public repository, so the
-    # GitHub-hosted Ubuntu runner is free and the org self-hosted runner
-    # group is not used. A private conversion needs fresh runner/cost
-    # qualification before execution; see docs/ci-security.md.
+    # Standard GitHub-hosted Ubuntu is the default for this public repository.
+    # See docs/ci-security.md for the guarded runner routes.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
@@ -627,8 +624,18 @@ jobs:
     # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
-    # Runner routing: see the note on `check`.
-    runs-on: ubuntu-latest
+    # Boat's public-repo allowlist checks both actors. Keep the shared main
+    # cache writer on GitHub-hosted runners by using Boat only on eligible PRs.
+    runs-on: >-
+      ${{ github.repository == 'TogetherWeOwn/two-bot-next'
+      && toJSON(github.event.repository.private) == 'false'
+      && github.run_attempt == '1'
+      && (github.actor == 'Rick7C2' || github.actor == 'togetherweown[bot]')
+      && (github.triggering_actor == 'Rick7C2' || github.triggering_actor == 'togetherweown[bot]')
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.base.ref == 'main'
+      && vars.CI_HEAVY_RUNNER == 'boat' && vars.CI_HEAVY_RUNNER || 'ubuntu-latest' }}
     # Suite-only since the HARD patch-coverage measurement split out of this
     # lane: the combined job outgrew 60 minutes (59m54s on main, one 60m07s
     # mid-measurement kill), while the replay alone measured ~30 min of a
@@ -1837,8 +1844,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # The HARD gate diffs base/head blobs.
-          fetch-depth: 0
+          # PR coverage compares the event merge commit with its first parent.
+          # Other events can diff against an earlier SHA or origin/main.
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
 
       - name: Download shard coverage reports
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -2394,8 +2402,11 @@ jobs:
     # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
-    # Runner routing: see the note on `check`.
-    runs-on: ubuntu-latest
+    # Fork PRs stay on GitHub. The budget variable can enable only the 2-vCPU route.
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     # The serial gateway suites can exceed 30 minutes on PRs; retain a hard cap.
     timeout-minutes: 60
     # Keep database isolation inside the job container network namespace:
