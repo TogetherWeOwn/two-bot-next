@@ -166,11 +166,16 @@ def check_peers(reservation, port=PORT):
         except (HTTPException, OSError, ValueError, RecursionError):
             return False
 
+    def single(response, name):
+        # Refuse a repeated security-sensitive header instead of picking one copy.
+        values = response.headers.get_all(name) or []
+        return values[0] if len(values) == 1 else None
+
     def gateway_hello(response):
-        connection_tokens = {token.strip().lower() for token in response.getheader("Connection", "").split(",")}
+        connection_tokens = {token.strip().lower() for token in (single(response, "Connection") or "").split(",")}
         if ("upgrade" not in connection_tokens
-                or response.getheader("Upgrade", "").lower() != "websocket"
-                or response.getheader("Sec-WebSocket-Accept") != websocket_accept(key)):
+                or (single(response, "Upgrade") or "").lower() != "websocket"
+                or single(response, "Sec-WebSocket-Accept") != websocket_accept(key)):
             return False
         frame = response.fp.read(2)
         if len(frame) != 2 or frame[0] != 0x81 or not 0 < frame[1] <= 125:
@@ -179,8 +184,9 @@ def check_peers(reservation, port=PORT):
         return len(payload) == frame[1] and decode_json(payload) == HELLO
 
     def rest_application(response):
-        # A declared length lets read() refuse a truncated body (IncompleteRead).
-        if response.length is None or response.length > 4096:
+        # One declared length lets read() refuse a truncated body (IncompleteRead).
+        if (single(response, "Content-Length") is None or response.length is None
+                or response.length > 4096):
             return False
         return decode_json(response.read()) == {"id": APP}
 
