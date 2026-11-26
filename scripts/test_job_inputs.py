@@ -12,6 +12,8 @@ this suite before it can silently skip coverage.
 import importlib.util
 from pathlib import Path
 import re
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -79,7 +81,6 @@ class SelectionTests(unittest.TestCase):
     def test_crate_changes_run_rust_and_worker(self):
         rust = ["crates/core/src/lib.rs", "crates/bot/src/main.rs",
                 "crates/store/src/web.rs", "crates/cutover/build.rs",
-                "crates/core/Cargo.toml",
                 "crates/store/migrations/0400_initial.sql",
                 "crates/core/tests/feeds.rs",
                 "crates/core/tests/fixtures/feeds/rss.xml",
@@ -97,7 +98,6 @@ class SelectionTests(unittest.TestCase):
 
     def test_rust_only_inputs(self):
         for path in ["sql/web_v1.sql", "sql/database_roles.sql",
-                     ".cargo/config.toml",
                      "tests/voice_templates/corpus.json",
                      "tests/voice_templates/validate.py"]:
             with self.subTest(path=path):
@@ -180,12 +180,12 @@ class SelectionTests(unittest.TestCase):
                 self.assertIn(RUST, selected, path)
                 self.assertIn(WORKER, selected, path)
 
-    def test_parity_scripts_also_gate_parity(self):
+    def test_parity_scripts_run_everything(self):
         for path in ["scripts/check_parity_baseline.py",
                      "scripts/test_parity_baseline.py"]:
             with self.subTest(path=path):
                 selected = inputs.classify(path)
-                self.assertEqual(selected, {RUST, WORKER, PARITY}, path)
+                self.assertEqual(selected, inputs.ALL_JOBS, path)
 
     def test_receiver_contract_doc_selects_its_worker_conformance_check(self):
         path = "docs/internal-actions-receiver.md"
@@ -199,7 +199,6 @@ class SelectionTests(unittest.TestCase):
     def test_worker_tree_selects_worker_only(self):
         for path in ["wrangler/src/index.ts",
                      "wrangler/test/container-env.test.ts",
-                     "wrangler/package.json",
                      "wrangler/scripts/check-env-bindings.py"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
@@ -294,9 +293,8 @@ class SelectionTests(unittest.TestCase):
         # Markdown chrome still raises the informational docs flag, which
         # gates nothing.
         skip = ["LICENSE", "CHANGELOG.md", ".editorconfig", ".gitignore",
-                ".gitleaks.toml", ".gitleaksignore",
                 ".github/pull_request_template.md",
-                ".github/CODEOWNERS", ".github/dependabot.yml",
+                ".github/CODEOWNERS",
                 "README.md", "AGENTS.md", "CONTEXT.md",
                 "PACKAGES.md"]
         self.assertEqual(jobs(skip),
@@ -306,7 +304,9 @@ class SelectionTests(unittest.TestCase):
     def test_unrecognized_paths_fail_closed(self):
         for path in ["brand-new-dir/thing.txt", "Dockerfile.new",
                      "scripts", "crates", "wrangler", "deploy/svc",
-                     ".github/UNKNOWN", ".gitattributes", "odd-root-file.rs"]:
+                     ".github/UNKNOWN", ".gitattributes", "odd-root-file.rs",
+                     "docs/unknown.py", ".gitleaks.toml", ".gitleaksignore",
+                     ".github/dependabot.yml"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path),
                                  {RUST, WORKER, PARITY, SUPPLY}, path)
@@ -345,58 +345,64 @@ class SelectionTests(unittest.TestCase):
                          {RUST: False, WORKER: False, PARITY: False,
                           SUPPLY: False, DOCS: False})
 
-    @staticmethod
-    def fake_diff(changed):
-        def diff(base, head, root=None, diff_filter=None):
-            return list(changed) if diff_filter != "D" else []
-        return diff
-
     def test_cli_prints_all_jobs(self):
-        with patch.object(inputs, "git_diff_names",
-                          side_effect=self.fake_diff(["crates/core/src/lib.rs"])):
+        with patch.object(inputs, "git_changes", return_value=(["crates/core/src/lib.rs"], [])):
             with patch("builtins.print") as printed:
-                self.assertEqual(
-                    inputs.main(["--base-ref", "a", "--head-ref", "b"]), 0)
+                self.assertEqual(inputs.main(["--base-ref", "a", "--head-ref", "b"]), 0)
                 printed.assert_any_call("rust=true")
                 printed.assert_any_call("worker=true")
                 printed.assert_any_call("parity=false")
                 printed.assert_any_call("supply=true")
                 printed.assert_any_call("docs=false")
+                printed.assert_any_call("db-compat=false")
+                printed.assert_any_call("migrations=false")
+                printed.assert_any_call("workflow-fixtures=true")
 
     def test_cli_job_flag_prints_single_value(self):
-        with patch.object(inputs, "git_diff_names",
-                          side_effect=self.fake_diff(
-                              ["docs/gateway-recovery.md"])):
+        with patch.object(inputs, "git_changes", return_value=(["docs/gateway-recovery.md"], [])):
             for job, want in ((RUST, "false"), (WORKER, "true"),
-                              (PARITY, "false"), (SUPPLY, "false"),
-                              (DOCS, "true")):
+                              (PARITY, "false"), (SUPPLY, "false"), (DOCS, "true"),
+                              (inputs.DB_COMPAT, "false"), (inputs.MIGRATIONS, "false"),
+                              (inputs.WORKFLOW_FIXTURES, "false")):
                 with self.subTest(job=job), patch("builtins.print") as printed:
-                    self.assertEqual(
-                        inputs.main(["--base-ref", "a", "--head-ref", "b",
-                                     "--job", job]), 0)
+                    self.assertEqual(inputs.main(["--base-ref", "a", "--head-ref", "b",
+                                                  "--job", job]), 0)
                     printed.assert_called_once_with(want)
 
     def test_cli_selects_all_jobs_on_deletion(self):
-        def diff(base, head, root=None, diff_filter=None):
-            return ["docs/metrics.md"] if diff_filter != "D" \
-                else ["docs/runbook.md"]
-        with patch.object(inputs, "git_diff_names", side_effect=diff):
+        with patch.object(inputs, "git_changes",
+                          return_value=(["docs/metrics.md"], ["docs/runbook.md"])):
             with patch("builtins.print") as printed:
-                self.assertEqual(
-                    inputs.main(["--base-ref", "a", "--head-ref", "b"]), 0)
-                printed.assert_any_call("rust=true")
-                printed.assert_any_call("worker=true")
-                printed.assert_any_call("parity=true")
-                printed.assert_any_call("supply=true")
-                printed.assert_any_call("docs=true")
+                self.assertEqual(inputs.main(["--base-ref", "a", "--head-ref", "b"]), 0)
+                for job in inputs.OUTPUTS:
+                    printed.assert_any_call(f"{job}=true")
 
     def test_cli_fails_closed_when_diff_is_undecidable(self):
-        import subprocess
-        with patch.object(inputs, "git_diff_names",
+        with patch.object(inputs, "git_changes",
                           side_effect=subprocess.CalledProcessError(128, "git")):
             with patch("builtins.print"):
-                self.assertEqual(
-                    inputs.main(["--base-ref", "a", "--head-ref", "b"]), 2)
+                self.assertEqual(inputs.main(["--base-ref", "a", "--head-ref", "b"]), 2)
+
+    def test_workflow_plan_requires_all_lanes_for_shared_dependency_or_empty_diff(self):
+        for paths in ([], ["wrangler/package-lock.json"], ["crates/core/Cargo.toml"],
+                      [".cargo/config.toml"], [".github/actions/build/action.yml"],
+                      [".github/workflows/supply-chain.yml"], ["scripts/smoke.py"],
+                      ["scripts/job-inputs.py"], ["migrations.lock"],
+                      ["docs/guide.md", "unknown/input.bin"]):
+            with self.subTest(paths=paths):
+                selection = inputs.workflow_selection(paths, [])
+                self.assertEqual({job for job, selected in selection.items() if selected} - {DOCS},
+                                 set(inputs.OUTPUTS) - {DOCS})
+
+    def test_docs_keeps_real_consumers_and_sql_keeps_migration_lanes(self):
+        docs = inputs.workflow_selection(["docs/production-deploy.md"], [])
+        self.assertEqual({job for job, selected in docs.items() if selected}, {DOCS, WORKER})
+        rollout = inputs.workflow_selection(["docs/ci-speed-rollout.md"], [])
+        self.assertTrue(rollout[inputs.WORKFLOW_FIXTURES])
+        db = inputs.workflow_selection(["crates/store/migrations/0500_fixture.sql"], [])
+        self.assertTrue(db[inputs.MIGRATIONS])
+        self.assertTrue(db[inputs.DB_COMPAT])
+        self.assertTrue(db[RUST])
 
     def test_db_compatibility_scope_includes_removed_and_quoted_paths(self):
         for path in ("migrations.lock", "crates/cutover/migrations/0480_é.sql",
@@ -410,6 +416,44 @@ class SelectionTests(unittest.TestCase):
             ["docs/database-roles.md", "wrangler/src/index.ts", "crates/core/src/lib.rs"]))
 
 
+class GitCandidateSelectionTests(unittest.TestCase):
+    def test_diverged_pr_candidate_and_unknown_change_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.check_output(["git", "-C", directory, *args],
+                                               text=True, timeout=5).strip()
+
+            git("init", "-q", "-b", "main")
+            git("config", "user.name", "CI fixture")
+            git("config", "user.email", "ci@example.invalid")
+            git("config", "commit.gpgSign", "false")
+            (root / "guide.md").write_text("original")
+            git("add", ".")
+            git("commit", "-qm", "common")
+            common = git("rev-parse", "HEAD")
+            git("switch", "-qc", "topic")
+            git("mv", "guide.md", "renamed.md")
+            git("commit", "-qm", "rename")
+            head = git("rev-parse", "HEAD")
+            git("switch", "-q", "main")
+            (root / "other.md").write_text("base-only")
+            (root / "alias.md").symlink_to("other.md")
+            git("add", ".")
+            git("commit", "-qm", "base advances")
+            base = git("rev-parse", "HEAD")
+            git("merge", "-q", "--no-ff", "topic", "-m", "candidate")
+            merge = git("rev-parse", "HEAD")
+            with self.assertRaises(inputs.JobInputsError):
+                inputs.pr_comparison(root, head, base, merge)
+            self.assertEqual(inputs.pr_comparison(root, base, head, merge), (common, merge))
+            changed, uncertain = inputs.git_changes(common, merge, root)
+            self.assertCountEqual(changed, ["other.md", "renamed.md"])
+            self.assertCountEqual(uncertain, ["guide.md", "alias.md"])
+            self.assertTrue(all(inputs.workflow_selection(changed, uncertain).values()))
+
+
 class DocsIndexWiringTests(unittest.TestCase):
     def test_docs_index_inputs_and_ungated_execution(self):
         for path in ("docs/README.md", "docs/nested/new-guide.md"):
@@ -419,7 +463,7 @@ class DocsIndexWiringTests(unittest.TestCase):
                 self.assertTrue(selected[WORKER])
         for path in ("scripts/check_docs_index.py", "scripts/test_docs_index.py"):
             with self.subTest(path=path):
-                self.assertEqual(inputs.classify(path), {RUST, WORKER})
+                self.assertEqual(inputs.classify(path), inputs.ALL_JOBS)
         body = CHECK_YML.read_text()
         step = body.split("- name: Docs index, orphan and byte-budget conformance (offline)\n", 1)[1].split("\n      - ", 1)[0]
         self.assertIn("python3 -m unittest discover -s scripts -p 'test_docs_index.py' -v", step)
@@ -602,9 +646,9 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertLess(self.text.index("  job-inputs:"),
                         self.text.index("\n  container-inputs:"))
 
-    def test_selector_exposes_five_outputs(self):
+    def test_selector_exposes_all_lanes(self):
         outputs = self.selector.split("outputs:", 1)[1].split("steps:", 1)[0]
-        for job in ("rust", "worker", "parity", "supply", "docs"):
+        for job in inputs.OUTPUTS:
             self.assertIn(job, outputs)
 
     def test_selector_checks_out_full_history(self):
@@ -656,7 +700,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
         body = self.text.split("\n  ci-ok:")[1]
         self.assertIn(
             '("supply-chain", "SUPPLY_CHAIN_RESULT", "SUPPLY_SELECTED")', body)
-        self.assertIn('result == "skipped" and not selected(sel_var)', body)
+        self.assertIn('result == "skipped" and selected == "false"', body)
 
     def test_ci_ok_aggregator_exists_and_is_always_run(self):
         # CI standard rule 3 (TOG-14881): one required aggregator named

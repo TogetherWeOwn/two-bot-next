@@ -18,7 +18,7 @@ Call sites under test
 5. ``scripts/ci/check-squawk-migrations.py`` ``git`` (changed-path diff)
 6. ``scripts/ci/check-squawk-migrations.py`` ``changed_paths`` rev-parse
 7. ``scripts/container-inputs.py`` ``changed_files`` (image selector)
-8. ``scripts/job-inputs.py`` ``git_diff_names`` (job selector)
+8. ``scripts/job-inputs.py`` ``git_changes`` (job selector)
 
 Locked contract
 ---------------
@@ -746,59 +746,34 @@ class JobSelectorTests(TimeoutPolicyAssertions, unittest.TestCase):
     SELECTION = re.compile(r"^(rust|worker|parity|supply|docs|voice)=(true|false)$",
                            re.MULTILINE)
 
-    def test_argv_variants_preserved(self):
-        seen = []
+    @staticmethod
+    def raw_change(path):
+        return f":100644 100644 {'a' * 40} {'b' * 40} M\0{path}\0"
 
-        def recording(command, **kwargs):
-            seen.append((command, kwargs))
-            return _ok_text(stdout="docs/a.md\0")
-
-        with mock.patch.object(job.subprocess, "run", side_effect=recording):
-            job.git_diff_names("a", "b", root=Path("/tmp"), diff_filter="ACMRTUXB")
-            job.git_diff_names("a", "b", root=Path("/tmp"), diff_filter="D")
-            job.git_diff_names("a", "b", root=Path("/tmp"))
-        self.assertEqual(
-            [command for command, _ in seen],
-            [["git", "-C", "/tmp", "diff", "--name-only", "--no-renames", "-z",
-              "--diff-filter=ACMRTUXB", "a..b"],
-             ["git", "-C", "/tmp", "diff", "--name-only", "--no-renames", "-z",
-              "--diff-filter=D", "a..b"],
-             ["git", "-C", "/tmp", "diff", "--name-only", "--no-renames", "-z", "a..b"]],
-            "diff argv variants must be preserved exactly",
-        )
-        for _, kwargs in seen:
-            self.assertTrue(kwargs.get("capture_output"), "must stay captured")
-            self.assertTrue(kwargs.get("text"), "must stay in text mode")
-            self.assertTrue(kwargs.get("check"), "must keep check=True")
+    def test_diff_reads_modes_deletions_and_names_once(self):
+        with mock.patch.object(job.subprocess, "run", return_value=_ok_text(
+                stdout=self.raw_change("docs/a.md"))) as run:
+            self.assertEqual(job.git_changes("a", "b", root=Path("/fixture")), (["docs/a.md"], []))
+        command = run.call_args.args[0]
+        self.assertEqual(command, ["git", "-C", "/fixture", "diff", "--raw", "--no-abbrev",
+                                   "-z", "--no-renames", "--ignore-submodules=none",
+                                   "--no-ext-diff", "--no-textconv", "a..b", "--"])
+        kwargs = run.call_args.kwargs
+        for key in ("capture_output", "text", "check"):
+            self.assertTrue(kwargs[key], key)
+        self.assert_valid_timeout(kwargs, "single job diff")
 
     def test_db_selector_keeps_non_ascii_and_newlines_in_paths(self):
         path = "crates/cutover/migrations/0480_é\n.sql"
-        with mock.patch.object(job.subprocess, "run", return_value=_ok_text(stdout=f"{path}\0")):
-            self.assertEqual(job.git_diff_names("a", "b"), [path])
-            self.assertTrue(job.db_compat_selected(job.git_diff_names("a", "b")))
-
-    def test_both_main_calls_are_bounded_with_one_policy_value(self):
-        calls = []
-
-        def recording(command, **kwargs):
-            calls.append(kwargs)
-            return _ok_text(stdout="docs/a.md\0")
-
-        out = io.StringIO()
-        with mock.patch.object(job.subprocess, "run", side_effect=recording), \
-                contextlib.redirect_stdout(out):
-            code = job.main(["--base-ref", "a", "--head-ref", "b"])
-        self.assertEqual(code, 0)
-        self.assertEqual(len(calls), 2, "changed plus deleted diffs must both run")
-        values = [self.assert_valid_timeout(kwargs, f"job call {index}")
-                  for index, kwargs in enumerate(calls)]
-        self.assertEqual(values[0], values[1],
-                         "one tool must use one policy value")
+        with mock.patch.object(job.subprocess, "run", return_value=_ok_text(stdout=self.raw_change(path))):
+            changed, uncertain = job.git_changes("a", "b")
+            self.assertEqual((changed, uncertain), ([], [path]))
+            self.assertTrue(job.workflow_selection(changed, uncertain)[job.DB_COMPAT])
 
     def _assert_never_returns_a_diff(self, effect, label):
         with mock.patch.object(job.subprocess, "run", **_mock_kwargs(effect)):
             try:
-                job.git_diff_names("a", "b")
+                job.git_changes("a", "b")
             except RAW_SUBPROCESS_ERRORS as error:
                 self.fail(f"must map raw {type(error).__name__} ({label})")
             except Exception:
@@ -848,26 +823,13 @@ class JobSelectorTests(TimeoutPolicyAssertions, unittest.TestCase):
         self._assert_main_selects_full_jobs(subprocess.CalledProcessError(128, "git"),
                                             "main nonzero", "failed")
 
-    def test_second_diff_failure_selects_full_jobs(self):
-        out, err = io.StringIO(), io.StringIO()
-        effects = [_ok_text(stdout="docs/a.md\0"),
-                   subprocess.TimeoutExpired("git", 30)]
-        with mock.patch.object(job.subprocess, "run", side_effect=effects), \
-                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            try:
-                code = job.main(["--base-ref", "a", "--head-ref", "b"])
-            except RAW_SUBPROCESS_ERRORS as error:
-                self.fail(f"main must map raw {type(error).__name__} (second diff)")
-        self.assertEqual(code, 2, "a failed deleted-diff must exit 2")
-        combined = out.getvalue() + err.getvalue()
-        self.assertIn("job-inputs:", combined, "must keep the prefix (second diff)")
-        self.assert_next_action(combined, "second diff")
-        self.assertIsNone(self.SELECTION.search(combined),
-                          "must emit no selection line (second diff)")
+    def test_incomplete_nul_delimited_diff_selects_full_jobs(self):
+        self._assert_main_selects_full_jobs(
+            _ok_text(stdout=self.raw_change("docs/a.md")[:-1]),
+            "incomplete diff", "incomplete")
 
     def test_valid_docs_diff_output_unchanged(self):
-        code, out, _ = self._run_main([_ok_text(stdout="docs/runbook.md\0"),
-                                       _ok_text(stdout="")])
+        code, out, _ = self._run_main(_ok_text(stdout=self.raw_change("docs/runbook.md")))
         self.assertEqual(code, 0)
         # Proven classification: an ordinary docs page selects the worker job
         # only (runbook.test.ts asserts on the docs/ listing itself).
@@ -878,7 +840,7 @@ class JobSelectorTests(TimeoutPolicyAssertions, unittest.TestCase):
 
     def test_valid_rust_diff_output_unchanged(self):
         code, out, _ = self._run_main(
-            [_ok_text(stdout="crates/core/src/lib.rs\0"), _ok_text(stdout="")])
+            _ok_text(stdout=self.raw_change("crates/core/src/lib.rs")))
         self.assertEqual(code, 0)
         self.assertIn("rust=true", out)
         self.assertIn("worker=true", out)
