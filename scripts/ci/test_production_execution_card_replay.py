@@ -78,7 +78,8 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
         serving = {
             "worker": {"version_id": version, "sha": sha, "traffic_percent": 100},
             "container": {"application_id": pin.application_id, "namespace_id": pin.namespace_id,
-                          "image_digest": digest, "rollout_id": "initial-rollout", "rollout_status": "completed"},
+                          "image_digest": digest, "rollout_id": "00000000-0000-4000-8000-000000000001",
+                          "rollout_status": "completed"},
             "ownership": {"phase": "fenced", "running": False, "epoch": pin.fence_epoch,
                           "owner_actor": fence_actor(pin)},
         }
@@ -103,7 +104,7 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
 
         rollback.wait_worker_restore.side_effect = wait_worker_restore
         rollback.restore_image.side_effect = lambda _image: serving["container"].update(
-            image_digest=pin.image_digest, rollout_id="restored-rollout",
+            image_digest=pin.image_digest, rollout_id="00000000-0000-4000-8000-000000000002",
         )
         rollback.wait_stable.side_effect = wait_stable
         observe = Mock(side_effect=lambda: deepcopy(serving))
