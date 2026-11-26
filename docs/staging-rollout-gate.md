@@ -105,6 +105,29 @@ writer if the startup client disappears or startup stalls. The job also
 verifies explicit stop and empty runtime state. The fixture has no network or
 host file mounts.
 
+#### Offline predecessor image verdict
+
+Record **offline image liveness, identity and teardown verified** in the private
+release task record when the verified predecessor image runs without network
+access or a Discord token, `/health` and `/version` return 200, and the observed
+build stamps match the verified bundle. Expect `/readyz` to return 503 with the
+gateway and database parked. Confirm a clean exit and that the probe
+container and disposable extracted files were removed before recording the
+verdict. Keep receipt values and local paths in the private record.
+
+Keep protected staging admission pending. The protected caller still needs
+the exact archived Worker modules and image digest on a disposable Worker and
+Container app with private ingress from first create. Verify the app's effective
+synthetic database binding, ledger and schema for `0473/0465` and retained
+`0475/0465` in separate reservations.
+Full readiness also needs isolated gateway and REST fixtures with external
+Discord egress denied. Require proof that the stop fence is armed before
+startup, enforces the original expiry after runner loss, and blocks delayed
+creates and legacy keepalives. The independent stop caller must be able to
+stop the exact target and obtain settlement and stopped readback.
+Use the existing [disposable exact PRE rehearsal](#disposable-exact-pre-rehearsal)
+for protected admission and cleanup.
+
 #### Disposable exact PRE rehearsal
 
 Keep qualification pending until a protected caller can enforce private
