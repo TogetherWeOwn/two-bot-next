@@ -158,6 +158,42 @@ edit procedure in force.
 [merge-api]: https://docs.github.com/en/rest/pulls/pulls?apiVersion=2022-11-28#merge-a-pull-request
 [draft-prs]: https://docs.github.com/en/pull-requests/reference/pull-requests#draft-pull-requests
 
+## Recover a missing SBOM handoff on a Check retry
+
+GitHub can retain the image job's earlier success while retrying the verifier.
+The verifier requires `sbom-partial-<run>-<attempt>` from its own attempt.
+**Re-run failed jobs** can repeat this failure. Retry **PR SBOM dry-run / image
+scan and SBOM** to regenerate the handoff and run the verifier, `ci-ok` and
+`ci-evidence` together.
+
+1. Confirm the verifier log names the missing handoff. Record the PR number,
+   full head SHA, Check run ID and attempt. In a temporary directory outside
+   the repo, save complete single-page responses from these GitHub REST GET
+   routes under `repos/TogetherWeOwn/two-bot-next`.
+
+   | File | GET route |
+   | --- | --- |
+   | `pr.json` | `pulls/<pr>` |
+   | `runs.json` | `actions/workflows/check.yml/runs?event=pull_request&head_sha=<sha>&per_page=100` |
+   | `jobs.json` | `actions/runs/<run>/attempts/<attempt>/jobs?per_page=100` |
+   | `artifacts.json` | `actions/runs/<run>/artifacts?per_page=100` |
+
+2. Generate the read-only plan. Resolve other failed or cancelled Check lanes
+   and recapture stale or incomplete responses before using it.
+
+   ```sh
+   python3 -B scripts/plan_sbom_retry.py --pr "$pr" --head "$sha" \
+     --run "$run" --attempt "$attempt" "$snapshot_dir"
+   ```
+
+3. Immediately before retrying, the PR's retry owner refreshes the PR and Check
+   run list and checks both the branch tip and `refs/pull/<pr>/head`. Stop on a
+   changed head or attempt, or an active or newer Check run. Open
+   `producer_job_url`, confirm the job name and use **Re-run job** once.
+4. Confirm the producer uploaded `expected_artifact`, the verifier downloaded
+   it and `ci-ok` passed on the pinned head. Record the run, attempt and job
+   links and follow the usual protected merge process.
+
 ## Recover a failed default CodeQL upload
 
 Use this maintainer checklist when GitHub's default CodeQL run on a PR has
