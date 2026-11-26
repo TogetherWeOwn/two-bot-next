@@ -158,6 +158,87 @@ edit procedure in force.
 [merge-api]: https://docs.github.com/en/rest/pulls/pulls?apiVersion=2022-11-28#merge-a-pull-request
 [draft-prs]: https://docs.github.com/en/pull-requests/reference/pull-requests#draft-pull-requests
 
+## Recover a missing SBOM handoff on a Check retry
+
+GitHub can retain the image job's earlier success while retrying the verifier.
+The verifier requires `sbom-partial-<run>-<attempt>` from its own attempt.
+**Re-run failed jobs** can repeat this failure. Retry **PR SBOM dry-run / image
+scan and SBOM** to regenerate the handoff and run the verifier, `ci-ok` and
+`ci-evidence` together.
+
+1. The PR maintainer records one retry owner on the PR. The owner confirms
+   the missing handoff in the verifier log and records the PR number, full
+   head SHA, Check run ID and attempt. Save complete single-page responses
+   outside the repo from these GET routes under `repos/TogetherWeOwn/two-bot-next`.
+
+   | File | GET route |
+   | --- | --- |
+   | `pr.json` | `pulls/<pr>` |
+   | `runs.json` | `actions/workflows/check.yml/runs?event=pull_request&head_sha=<sha>&per_page=100` |
+   | `jobs.json` | `actions/runs/<run>/attempts/<attempt>/jobs?per_page=100` |
+   | `artifacts.json` | `actions/runs/<run>/artifacts?per_page=100` |
+
+2. Generate the read-only plan. Resolve other failed or cancelled Check lanes
+   and recapture stale or incomplete responses before using it.
+
+   ```sh
+   python3 -B scripts/plan_sbom_retry.py --pr "$pr" --head "$sha" \
+     --run "$run" --attempt "$attempt" "$snapshot_dir"
+   ```
+
+3. Just before retrying, the retry owner regenerates the plan from fresh
+   responses. Both the branch tip and `refs/pull/<pr>/head` must equal the
+   plan's `head_sha`. Stop on any change or refusal. Open `producer_job_url`,
+   confirm the job name and use **Re-run job** once.
+4. Confirm the producer uploaded `expected_artifact`, the verifier downloaded
+   it and `ci-ok` passed on the pinned head. Record the run, attempt and job
+   links and follow the usual protected merge process.
+
+## Recover a failed default CodeQL upload
+
+Use this maintainer checklist when GitHub's default CodeQL run on a PR has
+completed with a runner or results-upload failure.
+
+1. Open the failed run and its job logs. Record the run URL, attempt, full
+   head SHA, affected languages and failing step. Confirm the job output
+   identifies a runner or upload service error, such as a server error while
+   uploading SARIF. Check GitHub Status for related degradation. Treat the
+   failed upload as incomplete scan evidence. If GitHub reports a security
+   finding, follow the normal security triage. If the failure is ambiguous,
+   stop and investigate before using this checklist.
+2. Read the open PR's `head.sha`, head repository and branch in the GitHub
+   REST API. Check the actual remote branch tip and `refs/pull/<number>/head`
+   with `git ls-remote`, using the head repository for the branch and the
+   base repository for the PR ref. Require both refs, the PR metadata and the
+   failed run to agree on the full SHA and verify the run belongs to this PR.
+   Stop on a mismatch. Once the run is terminal and the affected service has
+   recovered, check whether GitHub accepts a manual rerun of that run. If
+   accepted, use the original SHA and the new attempt in step 4. Record an
+   explicit run-level refusal before considering a fresh head. Resolve
+   permission, quota or transient API errors through their normal paths.
+3. If GitHub refuses the rerun and the failure is confirmed infrastructure-only,
+   the branch maintainer may make one normal fast-forward on the existing PR
+   branch. Prepare an empty commit whose sole parent is the failed head. Verify
+   both commit tree IDs match, then re-read the PR and both remote refs
+   immediately before pushing. Proceed only while the incident is clear and
+   all three still point to the failed head. Stop if the push is rejected.
+4. After a same-head rerun, verify the branch, PR metadata and
+   `refs/pull/<number>/head` still show the original SHA. After a fast-forward,
+   verify all three show the child SHA. Stop if they disagree or the PR ref
+   stays stale. Require a completed, passing default CodeQL scan for this PR
+   ref and exact SHA. Check the current attempt of the rerun or replacement
+   scan and its jobs for every required language. Confirm GitHub shows the
+   required code scanning results on that head. Record the run and job links
+   with the full SHA and keep the PR blocked if any required check is missing
+   or failing on that head.
+5. Before protected squash, follow the existing
+   [review policy](../CONTRIBUTING.md#independent-review). Reuse prior review
+   only when the reviewed PR diff is unchanged, including any effect of a
+   base change, and record both SHAs and why the review still applies. Check
+   all [required checks](../CONTRIBUTING.md#required-checks) and
+   [production merge evidence](../CONTRIBUTING.md#production-merge-evidence)
+   for the exact head you intend to merge.
+
 ## Staging deployment
 
 Staging deployment is governed by `deploy-staging.yml`. Consult the workflow
@@ -484,6 +565,8 @@ resolve such a response.
 
 ## Source snowflakes
 
+The first command includes the [offline workflow fixtures](#offline-enforcement).
+
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
 python3 scripts/ci/check-src-snowflakes.py
@@ -563,12 +646,40 @@ are preserved until those callers migrate.
 
 ## Public-hosted runner contract
 
-Every ordinary job defined in this repository selects `runs-on: ubuntu-latest`
-explicitly. This includes the local reusable nextest and SBOM workflows, not
-only required PR checks. There is no private/self-hosted fallback or overflow
-variable switch. External pinned reusable workflows retain their own runner
-policy; this change neither rewrites those workflows nor conceals routing in
-an external workflow, variable or generated file.
+Ordinary jobs select `runs-on: ubuntu-latest` explicitly, including the local
+reusable nextest and SBOM jobs. The runner policy fixtures pin the permitted
+Boat and Blacksmith routes.
+
+The `rust-tests` job (`rust tests`) can use Boat on the first attempt of a
+same-repository PR targeting `main`, with the repository explicitly public.
+Both the original and triggering actors must
+match Boat's allowlist of `Rick7C2` and `togetherweown[bot]`. The prepaid
+reserve switch selects `boat` while starts fit the allowance. The job accepts
+only that label from `CI_HEAVY_RUNNER` and falls back to `ubuntu-latest` for
+any other value, including an unset variable.
+
+Fork PRs, Dependabot, off-list or missing actors, reruns, pushes, queue groups,
+schedules, and manual dispatches use `ubuntu-latest`. GitHub retains the
+original actor on a rerun and may report a different triggering actor.
+Reruns use the hosted route even when both actors are allowlisted. The workflow
+tests pin the job's expression and event set. External pinned reusable workflows
+use their own runner policy. A plan limit can still delay or refuse a job that
+has already been assigned to Boat before the reserve switch changes.
+
+The `ignored-db-runtime` job (`ignored db (runtime)`) can use the 2 vCPU
+Blacksmith runner through `CI_BLACKSMITH_2VCPU` for same-repository PRs and
+existing non-PR events. It uses `ubuntu-latest` for forks or whenever the
+variable is unset, set to Ubuntu by the cutoff, or set to an unapproved size.
+The cutoff estimates cycle usage and reserves headroom before routing new jobs.
+GitHub merge-group events lack the source repositories of all member PRs.
+Verify queue trust before enabling the merge queue with Blacksmith routing.
+
+The other directly hosted `ci-ok` gates and their dependencies in `check.yml`,
+`pr-lint` and `gitleaks` in `supply-chain.yml`, and the required size gate in
+`pr-size.yml` use the same validated 2 vCPU variable on same-repository
+`pull_request` events. The size gate also uses it on same-repository
+`pull_request_review` events. These routes use `ubuntu-latest` for forks,
+missing or unapproved labels, and events outside those PR triggers.
 
 This contract is for a **public repository**. GitHub's
 [standard runner specification](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories)
@@ -581,14 +692,20 @@ hosted minutes. The offline fixtures cannot observe repository visibility.
 
 ### Compatibility and limits
 
-The former public branch already selected `ubuntu-latest` for every ordinary
-job definition. The current inventory is 88 jobs across 29 changed workflows,
-including the split nightly legs and bounded staging startup/cleanup jobs.
-Replacing the expression with the literal changes the source contract,
-not the public runner platform. All job containers, service images/options,
-platforms, resource/time limits, permissions, protected environments and test
-selection remain unchanged. No runner registration, fleet setting, secret or
-organization variable is changed.
+[Boat CI](https://docs.boat.dev/ci.md#github-actions-runners-runs-on-boat) starts
+a fresh Linux VM for each job and deletes it when the job ends. It supports job
+and service containers, cache and artifact actions. The `boat` label selects
+4 vCPU, 8 GB RAM and 4 GB swap. The `rust-tests` job keeps its existing pinned
+images, service limits, disk guard and 45-minute timeout. `ci-ok` waits for the
+job and requires success whenever the Rust selector selects it. Only GitHub-hosted
+pushes to `main` can save the shared Rust cache, which the hosted nextest lane
+restores on runs with R2 credentials. GitHub scopes caches written by PR jobs
+to the PR merge ref, outside the main cache scope.
+
+[Blacksmith's 2 vCPU Ubuntu runner](https://docs.blacksmith.sh/blacksmith-runners/overview#x64-runners)
+provides an ephemeral VM with 8 GB of RAM and 80 GB of disk. The runtime database
+job keeps its 60-minute timeout, pinned disposable PostgreSQL service and
+job-private Docker network. `ci-ok` requires it whenever Rust is selected.
 
 GitHub's [service-container contract](https://docs.github.com/en/actions/concepts/use-cases/about-service-containers)
 supports Linux job/service containers on hosted Ubuntu. Container jobs reach
@@ -641,11 +758,16 @@ any subsequent production exercise retain their separate release approval.
 ### Offline enforcement
 
 `scripts/test-runner-routing.py` checks every tracked workflow definition,
-rejecting dormant routing, indirect selectors, nonstandard runner labels,
-missing/nested selectors and runners on reusable-workflow calls. The parsed
+rejecting dormant routing, unapproved selectors, nonstandard runner labels,
+and misplaced runner keys. It also pins the size gate's reusable runner input.
+The parsed
 workflow suite, supply-chain, production deploy, channel CI and staging
 ownership fixtures also pin the direct hosted contract while retaining their
 other isolation and behavior assertions.
+
+Use Node.js 22 on `PATH` for `test_workflows.py`, matching the hosted check.
+The offline manual rollback drill fixture loads the Node helpers from the
+sparse file set.
 
 ```sh
 python3 scripts/test-runner-routing.py

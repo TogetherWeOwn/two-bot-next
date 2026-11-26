@@ -102,6 +102,29 @@ class NativeRustToolchainTest(unittest.TestCase):
         self.assertNotIn("--component", calls[0])
         self.assertIn("--profile minimal", calls[0])
 
+    def test_tickets_postgres_reuses_pinned_image_toolchain(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/check.yml").read_text())
+        steps = workflow["jobs"]["tickets-postgres"]["steps"]
+        setup = next(step for step in steps if step.get("id") == "toolchain")
+        retry = steps[steps.index(setup) + 1]
+        self.assertEqual(setup["run"], "bash .github/scripts/install-rust-toolchain.sh")
+        self.assertTrue(setup["continue-on-error"])
+        self.assertEqual(retry["if"], "steps.toolchain.outcome == 'failure'")
+
+        baseline = setup["env"] | {"TWO_RUSTUP_NO_UPDATE": "0"}
+        control, control_calls, _, control_env = self.run_script(env=baseline)
+        proc, calls, _, github_env = self.run_script(env=setup["env"])
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(calls[0], control_calls[0].replace(" --profile", " --no-update --profile"))
+        self.assertNotIn("--no-update", control_calls[0])
+        self.assertEqual(calls[1:], control_calls[1:])
+        self.assertEqual(github_env, control_env)
+
+        pin = setup["env"]["RUST_TOOLCHAIN"]
+        self.assertIn(f'rustup toolchain install "{pin}" --profile minimal', retry["run"])
+        self.assertNotIn("--no-update", retry["run"])
+
     def test_spaced_component_list_is_split(self):
         proc, calls, _, _ = self.run_script(env={"RUST_COMPONENTS": "rust-src, rustfmt"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
