@@ -7909,6 +7909,36 @@ class WorkflowTests(unittest.TestCase):
                 changed["jobs"]["staging-use-release"]["steps"][0]["with"] = options
                 self.assertTrue(staging_full_window_errors(changed))
 
+    def test_staging_deploy_release_runs_from_scoped_checkout(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(staging_full_window_errors(staging), [])
+        checkout, _, finish, _ = staging["jobs"]["staging-use-release"]["steps"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "checkout"
+            for pattern in checkout["with"]["sparse-checkout"].splitlines():
+                path = pattern.removeprefix("/")
+                target = worktree / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / path).read_bytes())
+            receipt = root / "staging-use-release.jsonl"
+            # The CLI must load all its imports and fail before making a request.
+            env = {
+                "PATH": os.environ.get("PATH", os.defpath),
+                "GITHUB_RUN_ID": "123",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "STAGING_USE_EXPIRES_AT": "1700000300000",
+                "STAGING_USE_RECEIPT": str(receipt),
+            }
+            result = subprocess.run(shlex.split(finish["run"]), cwd=worktree, capture_output=True,
+                                    text=True, check=False, timeout=5, env=env)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(result.stderr, "staging_origin_invalid\n")
+            self.assertEqual(result.stdout, receipt.read_text())
+            rows = [json.loads(line) for line in result.stdout.splitlines()]
+            self.assertEqual([(row["action"], row.get("code")) for row in rows],
+                             [("attempt", None), ("failed", "staging_origin_invalid")])
+
     def test_voice_refuses_before_checkout_and_rechecks_after_setup(self):
         steps = self.workflows["voice-synthetic.yml"]["jobs"]["synthetic"]["steps"]
         self.assertEqual(steps[0].get("id"), "budget")
