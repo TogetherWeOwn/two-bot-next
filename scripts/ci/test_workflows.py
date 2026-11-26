@@ -19,7 +19,10 @@ from unittest.mock import Mock, patch
 
 import yaml
 
-from runner_policy import IGNORED_DB_RUNTIME_RUNNER, PUBLIC_RUNNER, RUST_TESTS_RUNNER, expected_runner
+from runner_policy import (
+    CHECK_PR_GATES, IGNORED_DB_RUNTIME_RUNNER, PR_GATE_RUNNER, PR_SIZE_GATE_RUNNER_INPUT,
+    PUBLIC_RUNNER, RUST_TESTS_RUNNER, SUPPLY_CHAIN_PR_GATES, expected_runner,
+)
 from staging_pre_reaper_policy import PRE_REAPER, PRE_REAPER_QUEUE, dormant_pre_reaper_errors
 from staging_soak_policy import PRODUCTION_GROUP, PRODUCTION_RELEASE_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
@@ -7363,7 +7366,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(job.get("permissions"), {"contents": "read"})
         self.assertIn("job-inputs", job.get("needs", []))
         self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
-        self.assertEqual(job.get("runs-on"), PUBLIC_RUNNER)
+        self.assertEqual(job.get("runs-on"), PR_GATE_RUNNER)
         outputs = job.get("outputs", {})
         for key in ("matrix", "expected-shards", "legs", "widened", "reason"):
             self.assertIn(key, outputs)
@@ -7393,7 +7396,7 @@ class WorkflowTests(unittest.TestCase):
         # every shard reports its own verdict and timing.
         self.assertEqual(strategy.get("fail-fast"), "false")
         self.assertIn("needs.coverage-plan.outputs.matrix", strategy.get("matrix", ""))
-        self.assertEqual(job.get("runs-on"), PUBLIC_RUNNER)
+        self.assertEqual(job.get("runs-on"), PR_GATE_RUNNER)
         upload = next(
             step for step in job["steps"]
             if step.get("name") == "Upload shard coverage report"
@@ -10032,6 +10035,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_staging_privacy_verify_suite_is_required_in_worker(self):
         jobs = self.workflows["check.yml"]["jobs"]
+        self.assertEqual(jobs["worker"]["if"], "${{ always() }}")
         command = "PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_privacy_verify_read.py -v"
         steps = [step for step in jobs["worker"]["steps"] if step.get("run") == command]
         self.assertEqual(len(steps), 1, "worker must run the collector suite exactly once")
@@ -10041,7 +10045,7 @@ class WorkflowTests(unittest.TestCase):
         aggregate = next(step for step in jobs["ci-ok"]["steps"]
                          if step.get("name") == "Aggregate CI verdict")
         self.assertEqual(aggregate["env"]["WORKER_RESULT"], "${{ needs.worker.result }}")
-        self.assertIn('(\"worker\", \"WORKER_RESULT\", \"WORKER_SELECTED\")', aggregate["run"])
+        self.assertIn('(\"worker\", \"WORKER_RESULT\")', aggregate["run"])
 
     def test_staging_privacy_verify_read_shape_is_pinned(self):
         workflows = self.workflows
@@ -10994,7 +10998,7 @@ class WorkflowTests(unittest.TestCase):
                     )
 
     def test_runner_must_be_explicit_standard_public_hosted(self):
-        self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
+        self.assertTrue(runner_allowed("container", self.workflows["check.yml"]["jobs"]["container"]["runs-on"]))
         for runs_on in (LEGACY_ROUTED_RUNNER.format(job="worker"),
                         "ubuntu-latest-16-cores", ["ubuntu-latest"], ["self-hosted"],
                         "${{ vars.CI_OVERFLOW_RUNNER }}", "${{ matrix.runner }}"):
@@ -11070,7 +11074,9 @@ class WorkflowTests(unittest.TestCase):
             *((event, {**push, "github.event_name": event}, PUBLIC_RUNNER)
               for event in ("merge_group", "schedule", "workflow_dispatch", "pull_request_target", "")),
         )
-        self.assert_runner_cases("rust-tests", defaults, cases)
+        expression = self.workflows["check.yml"]["jobs"]["rust-tests"]["runs-on"]
+        self.assertEqual(expression, RUST_TESTS_RUNNER)
+        self.assert_runner_cases(expression, defaults, cases)
 
     def test_ignored_db_runtime_blacksmith_routes_by_event_and_variable(self):
         label = "blacksmith-2vcpu-ubuntu-2404"
@@ -11093,11 +11099,51 @@ class WorkflowTests(unittest.TestCase):
             *((event, {"github.event_name": event, "github.event.pull_request.head.repo.full_name": ""}, label)
               for event in ("merge_group", "push", "schedule", "workflow_dispatch")),
         )
-        self.assert_runner_cases("ignored-db-runtime", defaults, cases)
+        expression = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]["runs-on"]
+        self.assertEqual(expression, IGNORED_DB_RUNTIME_RUNNER)
+        self.assert_runner_cases(expression, defaults, cases)
 
-    def assert_runner_cases(self, job_id, defaults, cases):
-        expression = self.workflows["check.yml"]["jobs"][job_id]["runs-on"]
-        self.assertEqual(expression, expected_runner("check.yml", job_id))
+    def test_blacksmith_pr_gate_routes_by_event_repository_and_variable(self):
+        label = "blacksmith-2vcpu-ubuntu-2404"
+        repository = "TogetherWeOwn/two-bot-next"
+        defaults = {
+            "github.event_name": "pull_request",
+            "github.repository": repository,
+            "github.event.pull_request.head.repo.full_name": repository,
+            "vars.CI_BLACKSMITH_2VCPU": label,
+        }
+        cases = (
+            ("same-repository PR", {}, label),
+            ("fork PR", {"github.event.pull_request.head.repo.full_name": "fork/two-bot-next"}, PUBLIC_RUNNER),
+            ("missing head repository", {"github.event.pull_request.head.repo.full_name": ""}, PUBLIC_RUNNER),
+            ("missing variable", {"vars.CI_BLACKSMITH_2VCPU": ""}, PUBLIC_RUNNER),
+            ("budget cutoff", {"vars.CI_BLACKSMITH_2VCPU": PUBLIC_RUNNER}, PUBLIC_RUNNER),
+            ("invalid label", {"vars.CI_BLACKSMITH_2VCPU": "blacksmith-4vcpu-ubuntu-2404"}, PUBLIC_RUNNER),
+            ("different provider", {"vars.CI_BLACKSMITH_2VCPU": "boat"}, PUBLIC_RUNNER),
+            *((event, {"github.event_name": event}, PUBLIC_RUNNER) for event in
+              ("push", "merge_group", "schedule", "workflow_dispatch", "pull_request_target")),
+        )
+        for workflow, jobs in (("check.yml", CHECK_PR_GATES), ("supply-chain.yml", SUPPLY_CHAIN_PR_GATES)):
+            for job in sorted(jobs):
+                with self.subTest(workflow=workflow, job=job):
+                    expression = self.workflows[workflow]["jobs"][job]["runs-on"]
+                    self.assertEqual(expression, PR_GATE_RUNNER)
+                    self.assert_runner_cases(expression, defaults, (*cases,
+                        ("review", {"github.event_name": "pull_request_review"}, PUBLIC_RUNNER)))
+
+        size_jobs = self.workflows["pr-size.yml"]["jobs"]
+        size_input = size_jobs["pr-size-gate"]["with"]["runs-on"]
+        self.assertEqual(size_input, PR_SIZE_GATE_RUNNER_INPUT)
+        expression = size_input.removeprefix("${{ toJSON(").removesuffix(") }}")
+        self.assert_runner_cases(expression, defaults, (*cases,
+            ("same-repository review", {"github.event_name": "pull_request_review"}, label),
+            ("fork review", {"github.event_name": "pull_request_review",
+                             "github.event.pull_request.head.repo.full_name": "fork/two-bot-next"}, PUBLIC_RUNNER),
+        ))
+        self.assertNotIn("runs-on", size_jobs["pr-size"]["with"])
+        self.assertNotIn("runs-on", size_jobs["pr-size-weekly"].get("with", {}))
+
+    def assert_runner_cases(self, expression, defaults, cases):
         expression = expression.removeprefix("${{").removesuffix("}}").strip()
         for name, overrides, expected in cases:
             with self.subTest(case=name):
@@ -11117,7 +11163,7 @@ class WorkflowTests(unittest.TestCase):
                         self.assertIsInstance(operand, ast.Constant)
                         self.assertIsInstance(operand.value, str)
                         operand.value = operand.value.casefold()
-                result = eval(compile(tree, f"<{job_id} runs-on>", "eval"), {"__builtins__": {}})
+                result = eval(compile(tree, "<runner selection>", "eval"), {"__builtins__": {}})
                 self.assertEqual(result, expected)
 
     def test_certify_promotion_runner_must_be_explicit_public_hosted(self):
