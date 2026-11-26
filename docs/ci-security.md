@@ -166,10 +166,10 @@ The verifier requires `sbom-partial-<run>-<attempt>` from its own attempt.
 scan and SBOM** to regenerate the handoff and run the verifier, `ci-ok` and
 `ci-evidence` together.
 
-1. Confirm the verifier log names the missing handoff. Record the PR number,
-   full head SHA, Check run ID and attempt. In a temporary directory outside
-   the repo, save complete single-page responses from these GitHub REST GET
-   routes under `repos/TogetherWeOwn/two-bot-next`.
+1. The PR maintainer records one retry owner on the PR. The owner confirms
+   the missing handoff in the verifier log and records the PR number, full
+   head SHA, Check run ID and attempt. Save complete single-page responses
+   outside the repo from these GET routes under `repos/TogetherWeOwn/two-bot-next`.
 
    | File | GET route |
    | --- | --- |
@@ -186,10 +186,10 @@ scan and SBOM** to regenerate the handoff and run the verifier, `ci-ok` and
      --run "$run" --attempt "$attempt" "$snapshot_dir"
    ```
 
-3. Immediately before retrying, regenerate the plan from fresh responses and
-   confirm the branch tip and `refs/pull/<pr>/head` match. Stop if the plan
-   changed or is refused. Open `producer_job_url`, confirm the job name and
-   use **Re-run job** once.
+3. Just before retrying, the retry owner regenerates the plan from fresh
+   responses. Both the branch tip and `refs/pull/<pr>/head` must equal the
+   plan's `head_sha`. Stop on any change or refusal. Open `producer_job_url`,
+   confirm the job name and use **Re-run job** once.
 4. Confirm the producer uploaded `expected_artifact`, the verifier downloaded
    it and `ci-ok` passed on the pinned head. Record the run, attempt and job
    links and follow the usual protected merge process.
