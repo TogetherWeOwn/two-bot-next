@@ -250,6 +250,9 @@ in `scripts/ci/test_required_checks.py`. Advisory `container smoke` is exempt
 because the SBOM job gates image security. `ci-evidence` is exempt because
 it publishes links after the aggregate verdict.
 
+When an SBOM retry cannot find its own attempt's handoff, use the
+[producer-rooted retry plan](docs/ci-security.md#recover-a-missing-sbom-handoff-on-a-check-retry).
+
 The PR-only `prior revision database compatibility` job gates `ci-ok` for
 schema, migration, grant and lane inputs. It upgrades a disposable copy of
 the merge-base database with both candidate migration chains, the web
