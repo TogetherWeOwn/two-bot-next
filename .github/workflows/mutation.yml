@@ -12,6 +12,12 @@ concurrency:
 jobs:
   rust-mutation:
     name: Rust changed-line mutation (WARN)
+    needs: python-mutation
+    # A failed or incomplete shared plan leaves this lane's own planner in charge.
+    if: >-
+      ${{ !cancelled() && (needs.python-mutation.result != 'success' ||
+          needs.python-mutation.outputs.rust != 'false' ||
+          needs.python-mutation.outputs.fixture != 'false') }}
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -84,6 +90,13 @@ jobs:
 
   python-mutation:
     name: Python changed-line mutation (WARN)
+    # Use the existing Python runner for admission. Each admitted lane still
+    # computes its own exact-head patch and reports its own verdicts.
+    outputs:
+      rust: ${{ steps.plan.outputs.rust }}
+      fixture: ${{ steps.plan.outputs.fixture }}
+      worker: ${{ steps.plan.outputs.worker }}
+      worker_fixture: ${{ steps.plan.outputs.worker_fixture }}
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -129,6 +142,11 @@ jobs:
 
   worker-mutation:
     name: Worker changed-line mutation (WARN)
+    needs: python-mutation
+    if: >-
+      ${{ !cancelled() && (needs.python-mutation.result != 'success' ||
+          needs.python-mutation.outputs.worker != 'false' ||
+          needs.python-mutation.outputs.worker_fixture != 'false') }}
     permissions:
       contents: read
     runs-on: ubuntu-latest
