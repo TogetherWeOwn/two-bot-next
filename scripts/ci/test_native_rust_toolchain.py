@@ -108,6 +108,14 @@ class NativeRustToolchainTest(unittest.TestCase):
     def test_self_role_store_reuses_pinned_image_toolchain(self):
         self.assert_reuses_pinned_image_toolchain("self-role-store")
 
+    def test_no_update_opt_in_does_not_skip_component_updates(self):
+        proc, calls, _, _ = self.run_script(
+            env={"TWO_RUSTUP_NO_UPDATE": "1", "RUST_COMPONENTS": "rustfmt,clippy"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--component rustfmt --component clippy", calls[0])
+        self.assertNotIn("--no-update", calls[0])
+
     def assert_reuses_pinned_image_toolchain(self, job):
         workflow = yaml.safe_load((ROOT / ".github/workflows/check.yml").read_text())
         steps = workflow["jobs"][job]["steps"]
