@@ -51,7 +51,8 @@ def matches_receipt(receipt, verdict, run, listing, *, attempt, receipt_job_id):
 
     The caller authenticates the protected workflow revision in `attempt` and the
     output origin in `receipt_job_id` independently of the receipt. `verdict` is
-    the expected snapshot from a fresh PR read. Files alone establish no provenance.
+    the expected snapshot from a fresh PR read. `run` and `listing` must come from
+    GitHub's endpoints for that exact attempt. Files alone establish no provenance.
     """
     try:
         if (not isinstance(attempt, ReceiptAttempt) or not isinstance(verdict, evidence.EvidenceVerdict)
@@ -76,7 +77,9 @@ def matches_receipt(receipt, verdict, run, listing, *, attempt, receipt_job_id):
             and _fields_match(association["head"], {"sha": verdict.head})
             and _fields_match(listing, {"total_count": 1})
             and _fields_match(job, dict(success, id=attempt.job_id, name="pr-evidence",
-                                        run_id=attempt.run_id, run_attempt=attempt.attempt, head_sha=verdict.head))
+                                        run_id=attempt.run_id, head_sha=verdict.head))
+            and ((attempt.attempt == 1 and "run_attempt" not in job)
+                 or _fields_match(job, {"run_attempt": attempt.attempt}))
             and _fields_match(step, success)
         )
     except (AttributeError, KeyError, TypeError, ValueError):

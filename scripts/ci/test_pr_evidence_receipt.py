@@ -111,9 +111,20 @@ class ReceiptTests(unittest.TestCase):
         first = replace(ATTEMPT, attempt=1)
         first_receipt = dict(receipt, attempt=1)
         first_run = dict(run, run_attempt=1)
-        first_job = dict(job, run_attempt=1)
-        self.assertTrue(match(record=first_receipt, run_record=first_run,
-                              jobs=dict(listing, jobs=[first_job]), attempt=first))
-        del first_job["run_attempt"]
-        self.assertFalse(match(record=first_receipt, run_record=first_run,
-                               jobs=dict(listing, jobs=[first_job]), attempt=first))
+
+        def match_first(run_record, job_record):
+            return match(record=first_receipt, run_record=run_record,
+                         jobs=dict(listing, jobs=[job_record]), attempt=first)
+
+        self.assertTrue(match_first(first_run, dict(job, run_attempt=1)))
+        without_job_attempt = dict(job)
+        del without_job_attempt["run_attempt"]
+        self.assertTrue(match_first(first_run, without_job_attempt))
+
+        for run_record in (no_attempt, run, dict(first_run, id=11), dict(first_run, run_attempt=True),
+                           dict(first_run, conclusion="failure"), dict(first_run, status="in_progress")):
+            with self.subTest(first_run=run_record):
+                self.assertFalse(match_first(run_record, without_job_attempt))
+        for job_attempt in (None, True, "1", 2):
+            with self.subTest(first_job_attempt=job_attempt):
+                self.assertFalse(match_first(first_run, dict(job, run_attempt=job_attempt)))
