@@ -96,6 +96,10 @@ class Fixture(SyntheticStaging):
         self.fenced = target == self.target
         return self.fenced
 
+    def confirm_probe_active(self, target, start_id):
+        return (self.arm_pin == (target, start_id) and not self.fenced
+                and target.started_at <= self.now < target.expires_at)
+
     def create_private(self, target, start_id, upload):
         if self.fenced or self.arm_pin != (target, start_id) or self.now >= target.expires_at:
             raise ValueError("unexpected create")
