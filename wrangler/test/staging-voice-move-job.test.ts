@@ -109,13 +109,13 @@ function jobInputs(t: TestContext, prepareReady = beginFixture) {
     assert.equal(off.voiceMoveEnabled, false);
     assert.equal(off.running, false);
   }
-  async function finish() {
+  async function finish(control = args.control) {
     // The workflow contract pins this as an always() step with the original
     // expiry from begin, independent of the proof's exit status.
     const off = await pipelineUse({
       action: "finish", voiceMove: true, runId: env.GITHUB_RUN_ID,
       runAttempt: Number(env.GITHUB_RUN_ATTEMPT), expiresAt: Number(env.STAGING_USE_EXPIRES_AT),
-    }, args.control, now);
+    }, control, now);
     assertOff(off);
   }
   return { env, inputs, signed, moves, calls, reads, restoreSource, assertOff, finish };
@@ -523,6 +523,52 @@ test("completed Web handoff cannot replace the enabled companion at proof prefli
     assert.deepEqual(calls, ["status", "release", "status"]);
   } finally {
     await finish();
+  }
+});
+
+test("qualified same-session Web handoff refuses a replaced voice fixture assignment", async (t) => {
+  for (const replaced of [false, true]) {
+    await t.test(replaced ? "replaced destination" : "original assignment", async (t) => {
+      const { env, inputs, signed, moves, calls, reads, finish } = jobInputs(t);
+      t.mock.method(Date, "now", inputs.now);
+      const web = mockWebHandoff(inputs);
+      const { fixture, webSession, control } = web.scopedInputs;
+      const [source, destination] = fixture.channelIds;
+      const move = t.mock.method(webSession, "move");
+      const cleanupRequests: Parameters<typeof control>[0][] = [];
+
+      try {
+        const webHandoff = await web.complete(t.signal);
+        assert.equal(web.readCount(), 2);
+        web.enableCompanion();
+        // The session, qualified build, and Bot lease are identical. Only the
+        // destination in the assignment supplied to Bot Operations changes.
+        const provider = bindStagingVoiceMoveHandoffProvider({
+          ...web.scopedInputs,
+          fixture: replaced ? { ...fixture, channelIds: [source, "999000000000000001"] } : fixture,
+        }, { qualification: web.qualification, soakReceipt: web.soakReceipt, webHandoff });
+
+        assert.equal(await runStagingVoiceMoveEntry(env, provider), replaced ? "failed" : "passed");
+        assert.equal(web.readCount(), replaced ? 2 : 3);
+        assert.deepEqual(reads, replaced ? [] : ["channels"]);
+        assert.equal(move.mock.callCount(), replaced ? 0 : 3);
+        assert.deepEqual(signed.map(({ channel_id }) => channel_id), replaced ? [] : [destination, source, destination]);
+        assert.deepEqual(moves, replaced ? [] : [{ discordId: fixture.discordId, channelId: destination }]);
+        assert.deepEqual(calls, replaced ? [] : ["assert", "assert", "assert", "status", "release", "status"]);
+      } finally {
+        await finish((request: Parameters<typeof control>[0]) => {
+          cleanupRequests.push(request);
+          return control(request);
+        });
+      }
+
+      assert.deepEqual(cleanupRequests.map(({ action }) => action), ["status", "release", "status"]);
+      assert.partialDeepStrictEqual(cleanupRequests[1], {
+        runId: env.GITHUB_RUN_ID, runAttempt: Number(env.GITHUB_RUN_ATTEMPT),
+        expiresAt: Number(env.STAGING_USE_EXPIRES_AT), sha: env.STAGING_USE_SHA,
+        deploymentId: env.STAGING_USE_DEPLOYMENT,
+      });
+    });
   }
 });
 

@@ -342,7 +342,8 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual(value(unstaged["type"]), "boolean")
         self.assertEqual(value(unstaged["default"]), "false")
         # Unknown inputs are rejected by GitHub before a production run.
-        self.assertEqual(set(inputs), {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold"})
+        self.assertEqual(set(inputs), {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold",
+                                       "release_plan_run_id", "release_pins"})
         self.assertNotIn("inject_error_rate_spike", "\n".join(LINES))
         self.assertNotIn("INJECT_ERROR_RATE_SPIKE", "\n".join(LINES))
         self.assertNotIn("inject_gateway_failure", "\n".join(LINES))
@@ -358,12 +359,14 @@ class StaticGuardTests(unittest.TestCase):
         # the prod schema gate and the prod roles gate. A rollback serves no
         # new schema and waives the ledger check inside the reviewed gate
         # script, never here.
-        self.assertEqual(value(production["needs"]),
-                         "[guard, soak, recheck, schema-gate, roles-gate, staging-soak-evidence]")
+        self.assertEqual(value(production["needs"]), "[guard, soak, recheck, schema-gate, roles-gate, "
+                         "staging-soak-evidence, release-prepare, release-apply]")
         for gate in ("schema-gate", "roles-gate"):
             condition = value(children(JOBS[gate][1:], 4)["if"])
-            self.assertEqual(condition, "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
-                                        " && needs.guard.outputs.skip == ''")
+            self.assertEqual(condition, '"!cancelled() && needs.guard.result == \'success\' '
+                "&& (needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') "
+                "&& needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
+                "&& needs.guard.outputs.skip == ''\"")
         production_if = value(children(JOBS["production"][1:], 4)["if"])
         self.assertIn("needs.guard.outputs.mode == 'rollback'", production_if)
         self.assertIn("needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'", production_if)
@@ -379,11 +382,15 @@ class StaticGuardTests(unittest.TestCase):
             self.assertIn("          environment: production", step)
 
     def test_concurrency_queues_instead_of_cancelling(self):
-        # Job-level concurrency on production only: the guard, gates, soak
-        # and recheck run outside the lane, so an automatic run can never
-        # delay an operator rollback behind a sleeping promotion. Running
-        # jobs are never cancelled (cancel-in-progress is false).
-        self.assertNotIn("concurrency", TOP)
+        # Ordinary guard, gates, soak and recheck run outside the lane. The
+        # protected dispatches hold it across their jobs without cancelling.
+        global_lane = children(TOP["concurrency"][1:], 2)
+        self.assertEqual(value(global_lane["group"]),
+            "${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
+            "&& github.run_attempt == 1 && inputs.release_plan_run_id != '' "
+            "&& 'deploy-production' || format('deploy-production-run-{0}-{1}', github.run_id, github.run_attempt) }}")
+        self.assertEqual(value(global_lane["cancel-in-progress"]), "false")
+        self.assertEqual(value(global_lane["queue"]), "max")
         conc = children(JOBS["production"][1:], 4).get("concurrency", [])
         self.assertIn("|| 'deploy-production' }}", "\n".join(conc))
         self.assertIn("cancel-in-progress: false", "\n".join(conc))
@@ -403,17 +410,24 @@ class StaticGuardTests(unittest.TestCase):
         # scripts/test-runner-routing.py also rejects dormant/indirect routes.
         self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "soak",
                                       "staging-soak-evidence", "recheck",
-                                      "promotion-skipped", "production"])
+                                      "promotion-skipped", "release-plan", "release-prepare", "release-apply",
+                                      "production"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertEqual(runs_on, "ubuntu-latest", name)
 
     def test_permissions_are_least_privilege(self):
         self.assertEqual(value(TOP["permissions"]), "{}")
+        release_permissions = children(JOBS["release-plan"][1:], 4)["permissions"]
+        self.assertEqual(value(release_permissions), "&release-permissions")
         for name, job in JOBS.items():
+            block = children(job[1:], 4)["permissions"]
+            if value(block) == "*release-permissions":
+                self.assertIn(name, {"release-prepare", "release-apply"})
+                block = release_permissions
             granted = {
-                key: value(block)
-                for key, block in children(children(job[1:], 4)["permissions"][1:], 6).items()
+                key: value(permission)
+                for key, permission in children(block[1:], 6).items()
             }
             if name == "promotion-skipped":
                 # Reporting and uploading a receipt grants no repository authority.
@@ -428,6 +442,8 @@ class StaticGuardTests(unittest.TestCase):
                 # artifact by ID for same-SHA promotion.
                 self.assertEqual(granted, {"contents": "read", "actions": "read", "deployments": "write"})
                 continue
+            if name.startswith("release-"):
+                self.assertEqual(granted, {"contents": "read", "actions": "read", "checks": "read"})
             self.assertEqual(set(granted.values()), {"read"}, name)
         self.assertEqual(
             set(children(children(JOBS["production"][1:], 4)["permissions"][1:], 6)),
@@ -463,15 +479,16 @@ class StaticGuardTests(unittest.TestCase):
     def test_production_deploys_only_validated_guard_outputs(self):
         # Raw inputs reach only the guard step's env; everything downstream
         # reads the guard's validated outputs.
-        input_lines = [line.strip() for line in LINES if "inputs." in line]
+        ordinary = {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold"}
+        input_lines = [line.strip() for line in LINES if ordinary.intersection(re.findall(r"inputs\.(\w+)", line))]
         self.assertEqual(input_lines, ["SHA: ${{ inputs.sha }}", "ROLLBACK: ${{ inputs.rollback }}",
                                        "IMAGE: ${{ inputs.image }}",
                                        "ALLOW_UNSTAGED: ${{ inputs.allow_unstaged }}",
                                        "TAKEOVER: ${{ inputs.takeover }}",
                                        "CUTOVER_HOLD: ${{ inputs.cutover_hold }}"])
         production = "\n".join(JOBS["production"])
-        # No production step reads any raw input or fault switch.
-        self.assertEqual([line for line in production.splitlines() if "inputs." in line], [])
+        # The plan ID selects the protected lane; deploy steps use only validated inputs.
+        self.assertEqual(set(re.findall(r"inputs\.(\w+)", production)), {"release_plan_run_id"})
         self.assertNotIn("INJECT_ERROR_RATE_SPIKE", production)
         self.assertNotIn("--rehearsal-firing", production)
         self.assertIn("ref: ${{ needs.guard.outputs.sha }}", production)
@@ -997,7 +1014,7 @@ class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
               ref="refs/heads/main", auto="", resolved_sha=None, event="workflow_dispatch",
               run_sha="", run_conclusion="", run_updated="", hold="", auto_disabled="", spike="",
-              run_path="", run_event="", cutover_hold="", **responses):
+              run_path="", run_event="", cutover_hold="", release_plan="", release_pins="", **responses):
         if image is None:
             image = IMAGE if rollback else ""
         api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]},
@@ -1120,6 +1137,7 @@ class GuardBehaviourTests(unittest.TestCase):
                 "GITHUB_REPOSITORY": REPO, "GITHUB_REF": ref, "SHA": sha, "ROLLBACK": rollback,
                 "IMAGE": image, "TAKEOVER": takeover, "ALLOW_UNSTAGED": allow_unstaged,
                 "EVENT_NAME": event,
+                "GITHUB_RUN_ATTEMPT": "1", "RELEASE_PLAN_ID": release_plan, "RELEASE_PINS": release_pins,
                 "WORKFLOW_RUN_SHA": run_sha, "WORKFLOW_RUN_CONCLUSION": run_conclusion,
                 "WORKFLOW_RUN_UPDATED_AT": run_updated, "HOLD_UNTIL": hold,
                 "AUTO_DISABLED": auto_disabled,
@@ -1201,7 +1219,7 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
                                    "takeover": "true", "allow_unstaged": "false",
                                    "skip": "", "soak_seconds": "0",
-                                   "auto": "false", "green_at": "",
+                                   "auto": "false", "green_at": "", "protected_release": "false",
                                    "staging_run_id": "501", "staging_attempt": "2"})
         self.assertIn("Takeover: on", summary)
         self.assertIn(SHA, summary)
@@ -1380,7 +1398,7 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(outputs, {"sha": SHA, "mode": "rollback", "version": VERSION,
                                    "restore_image": IMAGE, "takeover": "false",
                                    "allow_unstaged": "false", "skip": "", "soak_seconds": "0",
-                                   "auto": "false", "green_at": "",
+                                   "auto": "false", "green_at": "", "protected_release": "false",
                                    "staging_run_id": "", "staging_attempt": ""})
         self.assertIn(VERSION, summary)
 
@@ -1425,7 +1443,7 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
                                    "takeover": "true", "allow_unstaged": "true",
                                    "skip": "", "soak_seconds": "0",
-                                   "auto": "false", "green_at": "",
+                                   "auto": "false", "green_at": "", "protected_release": "false",
                                    "staging_run_id": "", "staging_attempt": ""})
         self.assertIn("operator confirms the SHA is live", summary)
         self.assertIn(("production-readyz", {"url": "https://production.example.test/readyz", "timeout": 10}), calls)
@@ -1474,6 +1492,18 @@ class GuardBehaviourTests(unittest.TestCase):
             with self.subTest(ref=ref):
                 result = self.guard(ref=ref)
                 self.assertRefused(result, "from main only")
+                self.assertEqual(result[3], [])
+
+    def test_dormant_protected_dispatch_refuses_before_api_calls(self):
+        for plan, pins, reason in (
+            ("123", "{}", "protected release requires the activation follow-up"),
+            ("123", "", "with both release inputs"),
+            ("", "{}", "with both release inputs"),
+        ):
+            with self.subTest(plan=plan, pins=pins):
+                result = self.guard(takeover="true", cutover_hold="false", auto_disabled="true",
+                                    release_plan=plan, release_pins=pins)
+                self.assertRefused(result, reason)
                 self.assertEqual(result[3], [])
 
     def test_sha_not_on_main_is_refused(self):
@@ -1698,7 +1728,7 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
                                    "takeover": "true", "allow_unstaged": "false",
                                    "skip": "", "soak_seconds": "0",
-                                   "auto": "false", "green_at": "",
+                                   "auto": "false", "green_at": "", "protected_release": "false",
                                    "staging_run_id": "501", "staging_attempt": "2"})
         self.assertIn("Approval: automated", summary)
         self.assertIn("deploy-staging run `501`", summary)

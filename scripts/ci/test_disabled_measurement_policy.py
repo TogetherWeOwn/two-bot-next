@@ -3,7 +3,9 @@
 from copy import deepcopy
 import importlib.util
 from pathlib import Path
+import sys
 import unittest
+from unittest.mock import patch
 
 from voice_measurement_policy import GUARDS, WORKFLOW
 import test_workflows as policy
@@ -12,7 +14,9 @@ import test_staging_voice_mutual_exclusion_acceptance as lifecycle
 RUNNER_PATH = Path(__file__).resolve().parents[1] / "test-runner-routing.py"
 SPEC = importlib.util.spec_from_file_location("runner_routing", RUNNER_PATH)
 runner = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(runner)
+# Match the routing script's direct invocation while loading it in isolation.
+with patch.object(sys, "path", [str(RUNNER_PATH.parent), *sys.path]):
+    SPEC.loader.exec_module(runner)
 TARGET = "./.github/workflows/voice-synthetic.yml"
 
 
