@@ -71,8 +71,16 @@ class PreFixture:
         return True
 
     def confirm_probe_active(self, target, start_id):
-        return (self.armed == (target, start_id) and not self.fenced
-                and target.started_at <= self.now < min(target.expires_at, self.enclosing_cutoff))
+        if self.armed is None or self.fenced:
+            return False
+        window, armed_start_id = self.armed
+        if window.target != target or armed_start_id != start_id:
+            return False
+        try:
+            window.require_open(self.now)
+        except TargetError:
+            return False
+        return self.now < min(window.cutoff, self.enclosing_cutoff)
 
     def allow_effect(self, target, start_id):
         if self.fenced or self.armed is None:
@@ -263,6 +271,7 @@ class ProtectedPreTests(unittest.TestCase):
                 deployment = controller.start(fixture.upload)
                 if outcome == "enclosing_cutoff":
                     fixture.enclosing_cutoff = TARGET.expires_at - 5
+                    fixture.window = EffectWindow(TARGET, fixture.enclosing_cutoff)
                 fixture.now = fixture.enclosing_cutoff - 1
                 fixture.reply = ProbeReply(200, deployment.worker_version, b'{"components":[["gateway","ready"]]}')
                 stop_results = []
