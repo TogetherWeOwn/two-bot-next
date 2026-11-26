@@ -1,37 +1,83 @@
-import type { ExecFileException, ExecFileOptionsWithBufferEncoding } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 import { fileURLToPath, URL } from "node:url";
+import { boundRead } from "../src/internal-actions.ts";
 import type { bindStagingAutomodInventoryReader } from "./staging-automod-inventory-reader.ts";
 
-type Execute = (
+type Launch = (
   file: string,
   args: string[],
-  options: ExecFileOptionsWithBufferEncoding,
-  callback: (error: ExecFileException | null, stdout: Buffer) => void,
-) => void;
+  options: { env: Record<string, never>; stdio: "pipe"; detached: true },
+) => ChildProcessByStdio<Writable, Readable, Readable>;
 
+const SUPERVISOR = fileURLToPath(new URL("../../scripts/staging_automod_verifier_supervisor.py", import.meta.url));
 const VERIFIER = fileURLToPath(new URL("../../scripts/staging_automod_inventory_reader.py", import.meta.url));
 const MAX_OUTPUT_BYTES = 4_096;
+const active = new WeakMap<AbortSignal, Set<Promise<string>>>();
 
-/** The injected executor uses execFile semantics. The reader supplies validated pins. */
+/** Keep deadline races for provider calls and join any managed verifier on that action's signal. */
+export async function boundStagingAutomodInventoryRead<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  try {
+    return await boundRead(work, signal);
+  } finally {
+    if (signal.aborted) await Promise.allSettled(active.get(signal) ?? []);
+  }
+}
+
+/** The trusted launcher supplies piped stdio. The reader supplies validated pins. */
 export function bindStagingAutomodInventoryVerifier(
-  execute: Execute,
+  launch: Launch = spawn,
 ): Parameters<typeof bindStagingAutomodInventoryReader>[0] {
-  return (workflowSha, runId, signal) => new Promise((resolve, reject) => {
-    const refusal = new Error("Staging inventory verifier failed");
-    if (signal.aborted) return reject(refusal);
-    try {
-      execute("python3", [VERIFIER, workflowSha, runId], {
-        encoding: "buffer",
-        env: {},
-        maxBuffer: MAX_OUTPUT_BYTES,
-        signal,
-      }, (error, stdout) => {
-        // execFile can supply partial stdout alongside an error.
-        if (error || signal.aborted || stdout.length > MAX_OUTPUT_BYTES) return reject(refusal);
-        resolve(stdout.toString("utf8"));
+  return (workflowSha, runId, signal) => {
+    const work = new Promise<string>((resolve, reject) => {
+      const refusal = new Error("Staging inventory verifier failed");
+      if (signal.aborted) return reject(refusal);
+      let child;
+      try {
+        child = launch("python3", [SUPERVISOR, "python3", VERIFIER, workflowSha, runId],
+          { env: {}, stdio: "pipe", detached: true });
+      } catch {
+        return reject(refusal);
+      }
+
+      const stdout = Buffer.alloc(MAX_OUTPUT_BYTES);
+      let length = 0;
+      let stderrLength = 0;
+      let refused = false;
+      const cancel = () => {
+        if (refused) return;
+        refused = true;
+        // EOF wakes the supervisor even when cancellation precedes its startup.
+        child.stdin.end();
+      };
+      child.stdin.on("error", cancel);
+      child.on("error", cancel);
+      child.stdout.on("error", cancel);
+      child.stderr.on("error", cancel);
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (refused) return;
+        if (length + chunk.length > MAX_OUTPUT_BYTES) return cancel();
+        length += chunk.copy(stdout, length);
       });
-    } catch {
-      reject(refusal);
-    }
-  });
+      child.stderr.on("data", (chunk: Buffer) => {
+        if (refused) return;
+        stderrLength += chunk.length;
+        if (stderrLength > MAX_OUTPUT_BYTES) cancel();
+      });
+      child.once("close", code => {
+        signal.removeEventListener("abort", cancel);
+        if (code !== 0 || refused || signal.aborted) return reject(refusal);
+        resolve(stdout.toString("utf8", 0, length));
+      });
+      signal.addEventListener("abort", cancel, { once: true });
+      if (signal.aborted) cancel();
+    });
+
+    const pending = active.get(signal) ?? new Set<Promise<string>>();
+    active.set(signal, pending);
+    pending.add(work);
+    const forget = () => pending.delete(work);
+    void work.then(forget, forget);
+    return work;
+  };
 }

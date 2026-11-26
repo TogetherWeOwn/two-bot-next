@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import test from "node:test";
 import { fileURLToPath, URL } from "node:url";
 import { bindStagingAutomodInventoryReader } from "../scripts/staging-automod-inventory-reader.ts";
 import { bindStagingAutomodInventoryVerifier } from "../scripts/staging-automod-inventory-verifier.ts";
+import { syntheticVerifier, verifierWithDescendant } from "./fixtures/staging-automod-verifier.ts";
 
 const source = { workflowSha: "a".repeat(40), runId: 1234 };
 const inventory = {
@@ -98,51 +100,78 @@ const writeCappedReceipt = `process.stdout.write(${JSON.stringify(cappedReceipt)
 
 test("the verifier invokes the checked-in script with the exact pins and accepts 4096 bytes on exit zero", async () => {
   const { signal } = new AbortController();
-  const run = bindStagingAutomodInventoryVerifier((file, args, options, callback) => {
+  const run = bindStagingAutomodInventoryVerifier((file, args, options) => {
     assert.equal(file, "python3");
-    assert.deepEqual(args, [fileURLToPath(new URL("../../scripts/staging_automod_inventory_reader.py", import.meta.url)),
+    assert.deepEqual(args, [fileURLToPath(new URL("../../scripts/staging_automod_verifier_supervisor.py", import.meta.url)),
+      "python3", fileURLToPath(new URL("../../scripts/staging_automod_inventory_reader.py", import.meta.url)),
       source.workflowSha, String(source.runId)]);
-    assert.equal(options.signal, signal);
-    assert.deepEqual(options.env, {});
-    execFile(process.execPath, ["-e", writeCappedReceipt], options, callback);
+    assert.deepEqual(options, { env: {}, stdio: "pipe", detached: true });
+    return syntheticVerifier(writeCappedReceipt)(file, args, options);
   });
   assert.deepEqual(await bindStagingAutomodInventoryReader(run)(source, signal), inventory);
 });
 
-test("the verifier refuses nonzero exit and excess stdout even after a complete receipt", async () => {
+test("the verifier refuses nonzero exit and excess output even after a complete receipt", async () => {
   const { signal } = new AbortController();
   const multibyteOutput = receipt + "é".repeat(2_048);
-  for (const [program, expectedErrorCode] of [
-    [`${writeCappedReceipt} process.exitCode = 7;`, 7],
-    [`${writeCappedReceipt} process.stdout.write(" ");`, "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"],
-    [`process.stdout.write(${JSON.stringify(multibyteOutput)});`, "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"],
+  for (const program of [
+    `${writeCappedReceipt} process.exitCode = 7;`,
+    `${writeCappedReceipt} process.stdout.write(" ");`,
+    `process.stdout.write(${JSON.stringify(multibyteOutput)});`,
+    `${writeCappedReceipt} process.stderr.write(" ".repeat(4097));`,
   ] as const) {
-    let errorCode: number | string | undefined;
-    const run = bindStagingAutomodInventoryVerifier((_, __, options, callback) => {
-      execFile(process.execPath, ["-e", program], options, (error, stdout) => {
-        errorCode = error?.code;
-        callback(error, stdout);
-      });
-    });
+    const run = bindStagingAutomodInventoryVerifier(syntheticVerifier(program));
     await assert.rejects(run(source.workflowSha, String(source.runId), signal), { message: "Staging inventory verifier failed" });
-    assert.equal(errorCode, expectedErrorCode);
   }
 });
 
-test("the verifier abort kills the child and discards stdout already received", { timeout: 10_000 }, async () => {
+test("the verifier drains a cancelled descendant without signalling an unrelated child", { timeout: 10_000 }, async () => {
   const controller = new AbortController();
   const { signal } = controller;
-  const exited = Promise.withResolvers<NodeJS.Signals | null>();
+  const unrelated = spawn(process.execPath, ["-e", "setTimeout(() => {}, 7_000);"], { stdio: "ignore", env: {} });
+  const unrelatedClosed = once(unrelated, "close");
+  let descendant = 0;
+  let closed = false;
   let calls = 0;
-  const run = bindStagingAutomodInventoryVerifier((_, __, options, callback) => {
+  const run = bindStagingAutomodInventoryVerifier(syntheticVerifier(verifierWithDescendant(receipt), child => {
     calls += 1;
-    const child = execFile(process.execPath, ["-e", `${writeCappedReceipt} setTimeout(() => {}, 5_000);`], options, callback);
-    child.stdout?.once("data", () => controller.abort());
-    child.once("exit", (_, killSignal) => exited.resolve(killSignal));
-  });
-  const read = bindStagingAutomodInventoryReader(run);
-  assert.equal(await read(source, signal), undefined);
-  assert.equal(await exited.promise, "SIGTERM");
-  await assert.rejects(run(source.workflowSha, String(source.runId), signal), { message: "Staging inventory verifier failed" });
-  assert.equal(calls, 1);
+    child.stderr.once("data", chunk => { descendant = Number(chunk); controller.abort(); });
+    child.once("close", () => { closed = true; });
+  }));
+  try {
+    assert.equal(await bindStagingAutomodInventoryReader(run)(source, signal), undefined);
+    assert.equal(closed, true);
+    assert.ok(descendant > 0);
+    assert.throws(() => process.kill(descendant, 0), { code: "ESRCH" });
+    assert.equal(unrelated.exitCode, null);
+    assert.equal(unrelated.signalCode, null);
+    await assert.rejects(run(source.workflowSha, String(source.runId), signal), { message: "Staging inventory verifier failed" });
+    assert.equal(calls, 1);
+  } finally {
+    unrelated.kill();
+    await unrelatedClosed;
+  }
+});
+
+test("an exited verifier drains the descendant holding its pipe and preserves exit seven", { timeout: 5_000 }, async () => {
+  let descendant = 0;
+  let status: number | null | undefined;
+  const program = verifierWithDescendant(receipt, { exitCode: 7, holdStdout: true });
+  const run = bindStagingAutomodInventoryVerifier(syntheticVerifier(program, child => {
+    child.stderr.once("data", chunk => { descendant = Number(chunk); });
+    child.once("close", code => { status = code; });
+  }));
+  await assert.rejects(run(source.workflowSha, String(source.runId), new AbortController().signal),
+    { message: "Staging inventory verifier failed" });
+  assert.equal(status, 7);
+  assert.ok(descendant > 0);
+  assert.throws(() => process.kill(descendant, 0), { code: "ESRCH" });
+});
+
+test("abort after supervisor exit still discards the completed receipt", async () => {
+  const controller = new AbortController();
+  const run = bindStagingAutomodInventoryVerifier(syntheticVerifier(writeCappedReceipt,
+    child => child.once("exit", () => controller.abort())));
+  await assert.rejects(run(source.workflowSha, String(source.runId), controller.signal),
+    { message: "Staging inventory verifier failed" });
 });

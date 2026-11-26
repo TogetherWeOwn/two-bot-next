@@ -2,6 +2,7 @@ import { boundRead, releaseUpstream } from "../src/internal-actions.ts";
 import type { ProtectedAutomodCall } from "../src/staging-automod-caller.ts";
 import { sameLease } from "../src/staging-automod-recovery.ts";
 import { AUTOMOD_STAGING_PURPOSE } from "../src/staging-lifecycle.ts";
+import { boundStagingAutomodInventoryRead } from "./staging-automod-inventory-verifier.ts";
 
 type Lease = ProtectedAutomodCall["issuedLease"];
 type Job = Readonly<Pick<Lease, "runId" | "runAttempt" | "sha">>;
@@ -42,7 +43,7 @@ async function confirmed(action: ProtectedAutomodCall["action"], issuedLease: Le
   const { signal } = controller;
   const timer = setTimeout(() => controller.abort(), REQUEST_MS);
   try {
-    const response = await boundRead(invoke(Object.freeze({ action, issuedLease }), signal).then(reply => {
+    const response = await boundStagingAutomodInventoryRead(invoke(Object.freeze({ action, issuedLease }), signal).then(reply => {
       if (signal.aborted) releaseUpstream(reply);
       return reply;
     }), signal);
