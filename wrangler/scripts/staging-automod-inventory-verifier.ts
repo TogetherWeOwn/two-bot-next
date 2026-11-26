@@ -40,9 +40,10 @@ export function bindStagingAutomodInventoryVerifier(
         return reject(refusal);
       }
       if (child.pid === undefined) {
-        // A failed spawn can emit an error without having created any pipes.
-        child.once("error", () => {});
-        child.once("close", () => reject(refusal));
+        // A descriptor-limit error can arrive without pipes or a close event.
+        const rejectLaunch = () => reject(refusal);
+        child.once("error", rejectLaunch);
+        child.once("close", rejectLaunch);
         return;
       }
 

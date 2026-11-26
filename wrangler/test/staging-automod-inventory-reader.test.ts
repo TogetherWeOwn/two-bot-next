@@ -129,18 +129,23 @@ test("the verifier refuses excess output even after a complete receipt", async (
   }
 });
 
-test("the verifier returns its fixed refusal when spawn fails without pipes", async () => {
+test("the verifier returns its fixed refusal when spawn fails without pipes", { timeout: 2_000 }, async () => {
   type Launch = NonNullable<Parameters<typeof bindStagingAutomodInventoryVerifier>[0]>;
   const run = bindStagingAutomodInventoryVerifier(() => {
     const child = new ChildProcess();
     Object.assign(child, { stdin: null, stdout: null, stderr: null });
     queueMicrotask(() => {
       child.emit("error", Object.assign(new Error("synthetic descriptor limit"), { code: "EMFILE" }));
-      child.emit("close", -1);
     });
     // Node declares piped stdio at launch even when no process or pipes are created.
     return child as ReturnType<Launch>;
   });
+  await assert.rejects(run(source.workflowSha, String(source.runId), new AbortController().signal),
+    { message: "Staging inventory verifier failed" });
+});
+
+test("the verifier returns its fixed refusal when spawn throws", async () => {
+  const run = bindStagingAutomodInventoryVerifier(() => { throw new Error("synthetic launch failure"); });
   await assert.rejects(run(source.workflowSha, String(source.runId), new AbortController().signal),
     { message: "Staging inventory verifier failed" });
 });
