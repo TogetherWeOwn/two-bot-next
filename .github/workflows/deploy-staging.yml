@@ -886,6 +886,16 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
+          # Trusted certification tools and the config used for workflow-head deployments.
+          sparse-checkout: |
+            /scripts/bot_promotion.py
+            /scripts/build_identity.py
+            /scripts/script_intake.py
+            /wrangler/scripts/is-direct-invocation.mjs
+            /wrangler/scripts/ownership-control-response.mjs
+            /wrangler/scripts/staging-use.mjs
+            /wrangler/wrangler.toml
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: staging-rollout-evidence
