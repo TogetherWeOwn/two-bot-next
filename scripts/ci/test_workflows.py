@@ -2198,6 +2198,11 @@ EVENTS_READ_ENV = {
 }
 EVENTS_READ_COMMAND = ('python3 scripts/staging_events_read.py --window-start "$WINDOW_START" '
                        '--window-end "$WINDOW_END" --output "staging-events-read-$RUN_ID.json"')
+EVENTS_READ_PATHS = (
+    "/scripts/staging_events_read.py",
+    "/scripts/staging_automation_read_smoke.py",
+    "/scripts/script_intake.py",
+)
 
 
 def staging_events_read_errors(workflow):
@@ -2272,9 +2277,10 @@ def staging_events_read_errors(workflow):
         errors.append(f"{name}:read: must run exactly checkout, the read and the upload, unconditionally")
         return errors
     checkout, run, upload = steps
-    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or (checkout.get("with") or {}).get("persist-credentials") != "false":
-        errors.append(f"{name}:read: checkout must be pinned and must not persist credentials")
+    if checkout.get("uses") != STAGING_CHECKOUT_USES or checkout.get("with") != {
+            "persist-credentials": "false", "fetch-depth": "1", "sparse-checkout-cone-mode": "false",
+            "sparse-checkout": "\n".join(EVENTS_READ_PATHS) + "\n"}:
+        errors.append(f"{name}:read: checkout must use the workflow head and only the reader's files")
     if run.get("env") != EVENTS_READ_ENV:
         errors.append(f"{name}:read: Run step must bind exactly the three secrets, the two windows and the run id")
     if run.get("run") != EVENTS_READ_COMMAND or "uses" in run or "shell" in run:
@@ -9999,6 +10005,17 @@ class WorkflowTests(unittest.TestCase):
             "extra step": lambda w: job(w)["steps"].append({"run": "echo done"}),
             "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
                 {"persist-credentials": "true"}),
+            "unpinned checkout action": lambda w: job(w)["steps"][0].update({"uses": "actions/checkout@v7"}),
+            "retargeted ref": lambda w: job(w)["steps"][0]["with"].update({"ref": "refs/heads/main"}),
+            "retargeted repository": lambda w: job(w)["steps"][0]["with"].update({"repository": "other/repo"}),
+            "retargeted path": lambda w: job(w)["steps"][0]["with"].update({"path": "another-checkout"}),
+            "full-depth fetch": lambda w: job(w)["steps"][0]["with"].update({"fetch-depth": "0"}),
+            "fetch filter override": lambda w: job(w)["steps"][0]["with"].update({"filter": "blob:limit=1m"}),
+            "cone mode": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout-cone-mode": "true"}),
+            "full checkout": lambda w: job(w)["steps"][0]["with"].pop("sparse-checkout"),
+            "missing transitive import": lambda w: job(w)["steps"][0]["with"].update(
+                {"sparse-checkout": "\n".join(EVENTS_READ_PATHS[:-1]) + "\n"}),
+            "whole scripts directory": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout": "/scripts/\n"}),
             "extra secret": lambda w: job(w)["steps"][1]["env"].update(
                 {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
             "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
@@ -10031,6 +10048,35 @@ class WorkflowTests(unittest.TestCase):
         del missing["staging-events-read.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_events_read_starts_with_only_checkout_files(self):
+        checkout = self.workflows["staging-events-read.yml"]["jobs"]["read"]["steps"][0]["with"]
+        self.assertEqual(checkout["sparse-checkout-cone-mode"], "false")
+        git_env = {"PATH": os.environ.get("PATH", os.defpath), "GIT_ALLOW_PROTOCOL": "file",
+                   "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        with tempfile.TemporaryDirectory(prefix="events-read-checkout-") as directory:
+            root = Path(directory) / "checkout"
+
+            def git(*args, stdin=None):
+                result = subprocess.run(
+                    ["git", "-c", f"safe.directory={ROOT}", *args], env=git_env,
+                    input=stdin, capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout
+
+            git("clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(root))
+            git("-C", root, "sparse-checkout", "set", "--no-cone", "--stdin", stdin=checkout["sparse-checkout"])
+            git("-C", root, "checkout", "--quiet", "--detach", "HEAD")
+            tracked = git("-C", root, "ls-files", "-z").split("\0")
+            materialized = {path for path in tracked if path and (root / path).is_file()}
+            self.assertEqual(materialized, {pattern[1:] for pattern in EVENTS_READ_PATHS})
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", "scripts/staging_events_read.py", "--help"],
+                cwd=root, env={}, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--window-start", result.stdout)
 
     def test_staging_privacy_verify_checkout_cannot_retarget_the_reviewed_head(self):
         self.assertEqual(workflow_policy_errors(self.workflows), [])
