@@ -133,7 +133,7 @@ export function bindStagingAutomodInstanceClient(env: ClientEnv, serving: Servin
         await response.body?.cancel().catch(() => {});
         return;
       }
-      return JSON.parse(await boundedText(response, MAX_RUN_BYTES));
+      return parseUniqueJson(await boundedText(response, MAX_RUN_BYTES));
     },
     // Local mirror for the job-side admission checks. The DO enforces the
     // authoritative environment, bearer, build and ownership again.

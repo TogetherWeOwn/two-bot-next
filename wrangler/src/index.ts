@@ -1064,9 +1064,9 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   /** Bind an in-process instance for the authenticated AutoMod transport. The
-   * protected caller independently reads the current serving deployment and
-   * rollout for this instance. Each action compares that evidence to the
-   * original pin before entering the existing DO gate.
+   * protected caller supplies the authenticated inventory pin. Local identity
+   * checks cover the Worker version, build and owner epoch before the existing
+   * DO gate. The remaining provider identity fields are runner evidence.
    */
   static bindProtectedAutomodInvoker(bot: TwoBotContainer,
     readServing: (signal: AbortSignal) => Promise<AutomodServingPin | undefined>,
