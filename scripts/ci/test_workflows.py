@@ -20,7 +20,7 @@ from unittest.mock import Mock, patch
 import yaml
 
 from staging_pre_reaper_policy import PRE_REAPER, PRE_REAPER_QUEUE, dormant_pre_reaper_errors
-from staging_soak_policy import PRODUCTION_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
+from staging_soak_policy import PRODUCTION_GROUP, PRODUCTION_RELEASE_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, GUARDS as MEASUREMENT_GUARDS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
     TARGET as MEASUREMENT_TARGET, WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
@@ -62,7 +62,7 @@ JOB_INVENTORY = {
                   "nextest", "db-compatibility"},
     STAGING_SOAK: {"begin", "voice", "finish"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
-                              "promotion-skipped", "production"},
+                              "promotion-skipped", "production", "release-plan", "release-prepare", "release-apply"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "help-embed-synthetic",
                            "user-flow-synthetic", "pinned-history-guard", "certify-promotion",
                            "staging-use-release"},
@@ -242,7 +242,7 @@ DEPLOY_MARKERS = (
 )
 # Canonical parsed graph for the protected recovery callee. This pins the
 # caller guard, Environment split, exact commands, permissions, and handoffs.
-PRODUCTION_RECOVERY_GRAPH = "581651c0eb95b463adaf47dfbb9465ff8d886a829911bce50e34aede33bf907d"
+PRODUCTION_RECOVERY_GRAPH = "bdecf0c2a8ad9ee6b6402527f2b22fc199b48279fc0992177326685409ddf894"
 
 
 class UniqueKeyLoader(yaml.BaseLoader):
@@ -727,7 +727,7 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
     """
     errors = []
     inputs = (((workflow.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {})
-    if set(inputs) != {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold"}:
+    if set(inputs) != {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold", "release_plan_run_id", "release_pins"}:
         errors.append(f"{name}: production inputs must contain only the reviewed deploy/restore controls")
     jobs = workflow.get("jobs", {}) or {}
     steps = ((jobs.get("production") or {}).get("steps") or [])
@@ -1692,8 +1692,10 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
             errors.append(f"{name}: must preserve all pending staging migration requests")
         errors.extend(staging_claim_errors(claim))
     else:
-        if workflow.get("concurrency") != {"group": "production-migrate", "cancel-in-progress": "false"}:
-            errors.append(f"{name}: must serialize production plan and apply runs")
+        if (workflow.get("concurrency") != {"group": "production-migrate", "cancel-in-progress": "false", "queue": "max"}
+                or any("concurrency" in job for job in (plan, claim))
+                or apply.get("concurrency") != {"group": "deploy-production", "cancel-in-progress": "false", "queue": "max"}):
+            errors.append(f"{name}: only the apply job may share the production deploy and recovery lane")
         errors.extend(production_claim_errors(claim))
     if plan.get("environment") != plan_env:
         errors.append(f"{name}:plan: must read the {plan_env} Environment binding")
@@ -3128,6 +3130,14 @@ def daily_digest_errors(workflow):
     return errors
 
 
+PRODUCTION_GATE_IF = (
+    "!cancelled() && needs.guard.result == 'success' "
+    "&& (needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') "
+    "&& needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
+    "&& needs.guard.outputs.skip == ''"
+)
+
+
 def production_errors(workflow):
     """deploy-production is the one live route: dispatch, green-staging completion or schedule, chained to staging."""
     name = "deploy-production.yml"
@@ -3152,6 +3162,7 @@ def production_errors(workflow):
     needs = [needs] if isinstance(needs, str) else (needs or [])
     expected_production_if = (
         "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
+        "(needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') && "
         "(needs.soak.result == 'success' || needs.soak.result == 'skipped') && "
         "((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || "
         "(needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && "
@@ -3160,7 +3171,8 @@ def production_errors(workflow):
         "needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
     )
     if production.get("environment") != "production" \
-            or set(needs) != {"guard", "soak", "recheck", "schema-gate", "roles-gate", "staging-soak-evidence"}:
+            or set(needs) != {"guard", "soak", "recheck", "schema-gate", "roles-gate", "staging-soak-evidence",
+                                "release-prepare", "release-apply"}:
         errors.append(f"{name}:production: must wait for the guard, the soak, the recheck, "
                       "the schema gate, the roles gate, the staging soak evidence and the protected Environment")
     if production.get("if") != expected_production_if:
@@ -3169,8 +3181,9 @@ def production_errors(workflow):
     # The production job shares its lane with the protected status read. The guard, gates,
     # soak and recheck run outside it, so a sleeping automatic promotion can
     # never delay an operator rollback.
-    if "concurrency" in workflow:
-        errors.append(f"{name}: must not hold the deploy lane at workflow level")
+    if workflow.get("concurrency") != {"group": PRODUCTION_RELEASE_GROUP,
+                                       "cancel-in-progress": "false", "queue": "max"}:
+        errors.append(f"{name}: only a fresh manual protected release may hold the workflow-wide production lane")
     if jobs.get("production", {}).get("concurrency") != {"group": PRODUCTION_GROUP,
                                                          "cancel-in-progress": "false", "queue": "max"}:
         errors.append(f"{name}:production: must hold the deploy-production lane without cancelling")
@@ -3287,13 +3300,11 @@ def production_errors(workflow):
     if (recheck.get("permissions") or {}).get("actions") != "read":
         errors.append(f"{name}:recheck: must read workflow runs to see an active operator dispatch")
     guard_outputs = guard.get("outputs") or {}
-    for output in ("auto", "green_at"):
+    for output in ("auto", "green_at", "protected_release"):
         if output not in guard_outputs:
             errors.append(f"{name}:guard: must publish the {output} output for the soak and recheck jobs")
-    expected_gate_if = ("needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
-                        "&& needs.guard.outputs.skip == ''")
     for gate_name in ("schema-gate", "roles-gate"):
-        if jobs.get(gate_name, {}).get("if") != expected_gate_if:
+        if jobs.get(gate_name, {}).get("if") != PRODUCTION_GATE_IF:
             errors.append(f"{name}:{gate_name}: must run only for ordinary non-skipped deploys")
     guard_text = str(guard).lower()
     guard_markers = tuple(marker for marker in DEPLOY_MARKERS if marker not in ("production_worker_url", "/readyz"))
@@ -3603,10 +3614,9 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:schema-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:schema-gate: must keep contents:read only")
-    if gate.get("if") != ("needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
-                          "&& needs.guard.outputs.skip == ''"):
-        errors.append(f"{name}:gate: must run only for ordinary non-skipped deploys")
-    if gate.get("needs") != "guard":
+    if gate.get("if") != PRODUCTION_GATE_IF:
+        errors.append(f"{name}:gate: must run only for admitted deploys, after any protected apply")
+    if gate.get("needs") != ["guard", "release-apply"]:
         errors.append(f"{name}:schema-gate: must wait for the guard (it gates the guarded SHA)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
         errors.append(f"{name}:schema-gate: must use the explicit ubuntu-latest runner for job 'schema-gate'")
@@ -3770,11 +3780,10 @@ def production_roles_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:roles-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:roles-gate: must keep contents:read only")
-    if gate.get("if") != ("needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
-                          "&& needs.guard.outputs.skip == ''"):
-        errors.append(f"{name}:roles-gate: must run only for ordinary non-skipped deploys")
-    if gate.get("needs") != "guard":
-        errors.append(f"{name}:roles-gate: must wait for the guard (it gates the guarded SHA)")
+    if gate.get("if") != PRODUCTION_GATE_IF:
+        errors.append(f"{name}:roles-gate: must run only for admitted deploys, after any protected apply")
+    if gate.get("needs") != ["guard", "release-apply"]:
+        errors.append(f"{name}:roles-gate: must wait for the guard and any protected apply")
     if not runner_allowed("roles-gate", gate.get("runs-on")):
         errors.append(f"{name}:roles-gate: must use the explicit ubuntu-latest runner for job 'roles-gate'")
     if gate.get("timeout-minutes") != "30":
@@ -4846,8 +4855,15 @@ DISJOINT_PRE_REAPER_EXPRESSIONS.update({
     ("staging-voice-move.yml", None): "${{ inputs.verify_lease && github.ref == 'refs/heads/main' && "
                                     "github.ref_protected && github.run_attempt == 1 && 'staging-lifecycle' || "
                                     "format('staging-voice-move-refused-{0}-{1}', github.run_id, github.run_attempt) }}",
+    ("staging-automod-preview.yml", None): (
+        "${{ inputs.rehearse && github.repository_id == '1396224242' && github.ref == 'refs/heads/main' && "
+        "github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main' && "
+        "github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1 && "
+        "'staging-lifecycle' || format('staging-automod-refused-{0}-{1}', github.run_id, github.run_attempt) }}"
+    ),
     ("pipeline-benchmark.yml", None): "${{ github.workflow }}-pipeline-benchmark-"
                                      "${{ github.event.pull_request.number || github.ref }}",
+    ("deploy-production.yml", None): PRODUCTION_RELEASE_GROUP,
     ("deploy-production.yml", "production"): PRODUCTION_GROUP,
 })
 
@@ -5017,7 +5033,7 @@ def workflow_policy_errors(workflows):
         if name == "staging-automod-preview.yml":
             contract = Path(__file__).parent / "fixtures/staging_automod_preview_workflow.json"
             if workflow != json.loads(contract.read_text()):
-                errors.append(f"{name}: expected the disabled, synthetic-only staging job")
+                errors.append(f"{name}: expected the default-off protected staging dispatch")
             continue
         if name == "build-predecessor.yml":
             contract = Path(__file__).parent / "fixtures/build_predecessor_workflow.json"
@@ -5129,6 +5145,21 @@ class ProductionStatusTests(unittest.TestCase):
             import production_ownership_status as status
         self.status = status
         self.fixture = json.loads((Path(__file__).parent / "fixtures/production_ownership_status_provider.json").read_text())
+
+    def test_recovery_projection_preserves_unfinished_rollout_status(self):
+        status = self.status
+        account = "c" * 32
+        provider = self.fixture["provider"]
+        rollouts = next(rows for key, rows in provider.items() if "/rollouts?" in key)
+        client = Mock()
+        client.api.side_effect = provider.__getitem__
+        for phase in ("pending", "progressing"):
+            with self.subTest(phase=phase):
+                rollouts[0]["status"] = phase
+                report = status.provider_sample(client, account, allow_rollout=True)
+                self.assertEqual(report["container"]["rollout_status"], phase)
+                with self.assertRaisesRegex(status.GateError, "latest_rollout_unbound"):
+                    status.provider_sample(client, account)
 
     def test_wrong_dispatch_and_environment_refuse(self):
         status, fixture = self.status, self.fixture
@@ -7685,11 +7716,12 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(file=file_name, mutation=label):
                     self.assertNotEqual(check(changed), [])
 
-    def test_staging_automod_preview_is_dormant(self):
+    def test_staging_automod_preview_requires_protected_opt_in(self):
         name = "staging-automod-preview.yml"
         self.assertEqual(workflow_policy_errors(self.workflows), [])
         for keys, change in (
-                (("on",), {"workflow_dispatch": {}}),
+                (("on",), {"workflow_call": ""}),
+                (("on", "workflow_dispatch", "inputs", "rehearse"), {"default": "true"}),
                 (("concurrency",), {"group": "automod-only"}),
                 (("jobs", "dry-run"), {"if": "true"}),
                 (("jobs", "dry-run", "permissions"), {"id-token": "write"}),
@@ -7697,19 +7729,27 @@ class WorkflowTests(unittest.TestCase):
                 (("jobs", "dry-run", "steps", 3), {
                     "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
                 (("jobs", "dry-run", "steps", 4), {
-                    "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}})):
+                    "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
+                (("jobs", "dry-run", "steps", 5), {"env": {"STAGING_AUTOMOD_REHEARSAL": "true"}}),
+                (("jobs", "dry-run", "steps", 5, "env"), {
+                    "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"})):
             with self.subTest(keys=keys, change=change):
                 workflows = deepcopy(self.workflows)
                 node = workflows[name]
                 for key in keys:
                     node = node[key]
                 node.update(change)
-                self.assertIn(f"{name}: expected the disabled, synthetic-only staging job",
+                self.assertIn(f"{name}: expected the default-off protected staging dispatch",
                               workflow_policy_errors(workflows))
         workflows = deepcopy(self.workflows)
         workflows["check.yml"]["jobs"]["worker"] = {"uses": f"./.github/workflows/{name}"}
         self.assertIn("check.yml:worker: deployment/probe alternative outside approved deploy workflows",
                       workflow_policy_errors(workflows))
+
+        workflows = deepcopy(self.workflows)
+        lock = workflows[name]["concurrency"]
+        lock["group"] = lock["group"].replace("staging-automod-refused-{0}-{1}", PRE_REAPER_QUEUE)
+        self.assertIn(f"{name}: the PRE sweep queue must remain exclusive", staging_pre_reaper_errors(workflows))
 
     def test_staging_pre_reaper_is_dormant(self):
         self.assertEqual(staging_pre_reaper_errors(self.workflows), [])
@@ -9163,11 +9203,23 @@ class WorkflowTests(unittest.TestCase):
                 without('origin.get("head_repository_id") != origin.get("repository_id")'),
         }
         self.assertIn("inputs.cutover_hold", str(guard_step))
+        self.assertIn('refuse("protected release requires the activation follow-up")', guard_step["run"])
         for label, change in mutations.items():
             with self.subTest(label):
                 workflow = deepcopy(production)
                 change(workflow)
                 self.assertTrue(production_errors(workflow), label)
+
+    def test_production_apply_uses_the_protected_preflight_epoch(self):
+        jobs = self.workflows["deploy-production.yml"]["jobs"]
+        prepare = jobs["release-prepare"]
+        preflight = next(step for step in prepare["steps"] if step.get("id") == "preflight")
+        self.assertEqual(preflight["run"], "python3 scripts/production_release.py prepare")
+        self.assertEqual(prepare["outputs"].get("epoch"), "${{ steps.preflight.outputs.epoch }}")
+        apply = jobs["release-apply"]
+        self.assertIn("release-prepare", apply["needs"])
+        transaction = next(step for step in apply["steps"] if step.get("run") == "python3 scripts/production_release.py apply")
+        self.assertEqual(transaction["env"].get("RELEASE_PREFLIGHT_EPOCH"), "${{ needs.release-prepare.outputs.epoch }}")
 
     def test_soak_rejects_unsafe_handoffs(self):
         for mutate in (
@@ -9301,12 +9353,10 @@ class WorkflowTests(unittest.TestCase):
         needs = [needs] if isinstance(needs, str) else needs
         self.assertIn("guard", needs)
         self.assertIn("schema-gate", needs)
-        self.assertEqual(production["jobs"]["schema-gate"].get("needs"), "guard")
+        self.assertEqual(production["jobs"]["schema-gate"].get("needs"), ["guard", "release-apply"])
         self.assertEqual(production["jobs"]["schema-gate"].get("environment"),
                          "production-migrate-plan")
-        self.assertEqual(production["jobs"]["schema-gate"].get("if"),
-                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
-                         " && needs.guard.outputs.skip == ''")
+        self.assertEqual(production["jobs"]["schema-gate"].get("if"), PRODUCTION_GATE_IF)
 
     def test_production_roles_gate_shape_is_pinned_and_mutations_fail(self):
         import copy
@@ -9346,12 +9396,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("guard", needs)
         self.assertIn("schema-gate", needs)
         self.assertIn("roles-gate", needs)
-        self.assertEqual(production["jobs"]["roles-gate"].get("needs"), "guard")
+        self.assertEqual(production["jobs"]["roles-gate"].get("needs"), ["guard", "release-apply"])
         self.assertEqual(production["jobs"]["roles-gate"].get("environment"),
                          "production-migrate-plan")
-        self.assertEqual(production["jobs"]["roles-gate"].get("if"),
-                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
-                         " && needs.guard.outputs.skip == ''")
+        self.assertEqual(production["jobs"]["roles-gate"].get("if"), PRODUCTION_GATE_IF)
 
     def test_staging_migrate_runner_shape_is_pinned(self):
         # TOG-11572: the slice's own workflow must satisfy its carve-out, and
@@ -9568,6 +9616,10 @@ class WorkflowTests(unittest.TestCase):
             change(workflow)
             return production_migrate_errors(workflow)
 
+        for job in ("plan", "claim"):
+            with self.subTest(job=job):
+                self.assertTrue(mutated(lambda w: w["jobs"][job].update(concurrency={"group": "deploy-production"})))
+        self.assertTrue(mutated(lambda w: w["jobs"]["apply"].pop("concurrency")))
         for trigger in ("push", "pull_request", "schedule", "workflow_call"):
             with self.subTest(trigger=trigger):
                 self.assertTrue(mutated(lambda w, t=trigger: w["on"].update({t: ""})))
@@ -11440,7 +11492,8 @@ class WorkflowTests(unittest.TestCase):
                         # run's manifest artifact for the provenance gate.
                         expected = {"contents": "read", "actions": "read"}
                     elif (name == "production-migrate.yml" and job_id in ("claim", "apply")
-                          or name == "deploy-production-recovery.yml"):
+                          or name == "deploy-production-recovery.yml"
+                          or (name == "deploy-production.yml" and job_id.startswith("release-"))):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-staging.yml", "deploy"):
                         # Derives the deploy ID from today's staging
@@ -11653,9 +11706,9 @@ class WorkflowTests(unittest.TestCase):
         }
         exempt = {
             *pure_callees,
-            # Serializes at the `production` lane job only, so a sleeping
-            # promotion can never queue an operator rollback behind it (see
-            # the header comment in the workflow).
+            # Ordinary deploys serialize at the `production` job, so an
+            # automatic soak leaves the lane free for rollback. Protected
+            # dispatches serialize at the workflow level.
             "deploy-production.yml",
             # Read-only staging observation and production alerting each use
             # an independent queue, never the lifecycle holders' pending slot.

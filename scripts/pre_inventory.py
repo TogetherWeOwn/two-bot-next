@@ -3,11 +3,15 @@
 from dataclasses import dataclass, field
 import re
 
-from pre_target import APP_ID, Resource, Target, require
+from pre_target import APP_ID, Resource, Target, TargetError, require
 
 
 RESOURCE_NAME = re.compile(r"[A-Za-z0-9_-]{1,128}")
 MAX_ROWS = 1000
+CONTAINER_APPLICATIONS = "/containers/applications"
+APPLICATIONS_PER_PAGE = 100
+MAX_APPLICATION_PAGES = MAX_ROWS // APPLICATIONS_PER_PAGE
+MAX_PAGE_TOKEN_LENGTH = 4096
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,66 @@ def _resources_by_name(listing, *, container):
     return by_name, ids
 
 
+def _require_source_target(target, source_target):
+    require(type(target) is Target and type(source_target) is Target and source_target == target,
+            "wrong_pre_inventory_target")
+
+
+def read_provider_listing(target, source_target, *, route, read_page):
+    """Assemble one complete listing from an injected, authenticated read context.
+
+    The caller binds source_target and read_page to the same exact reservation
+    and provider account. read_page receives an account-relative GET path and
+    structured query parameters. It must encode those parameters without
+    adding filters and supply a fresh, size-bounded decoded response. Paging
+    establishes traversal only. Admission and startup settlement still need
+    independent proof.
+
+    Cloudflare's Container list documents result_info with next_page_token,
+    page_token and per_page. Require the requested size and cursor to be
+    echoed, with no next_page_token on the final response. The Worker scripts
+    list documents neither paging nor a completion marker, so refuse it.
+    """
+    _require_source_target(target, source_target)
+    require(route == CONTAINER_APPLICATIONS, "unsupported_pre_listing_route")
+
+    rows, seen_tokens = [], set()
+    query = {"per_page": APPLICATIONS_PER_PAGE}
+    for _ in range(MAX_APPLICATION_PAGES):
+        try:
+            response = read_page(CONTAINER_APPLICATIONS, query.copy())
+        except Exception:
+            raise TargetError("pre_listing_read_failed") from None
+        require(isinstance(response, dict)
+                and response.keys() <= {"success", "errors", "messages", "result", "result_info"}
+                and response.get("success") is True and response.get("errors", []) == []
+                and response.get("messages", []) == [], "unrecognized_pre_listing_page")
+        page, info = response.get("result"), response.get("result_info")
+        require(isinstance(page, list) and len(page) <= APPLICATIONS_PER_PAGE,
+                "invalid_pre_listing_page_size")
+        require(isinstance(info, dict) and info.keys() <= {"per_page", "page_token", "next_page_token"}
+                and type(info.get("per_page")) is int and info["per_page"] == APPLICATIONS_PER_PAGE
+                and info.get("page_token", "") == query.get("page_token", ""), "wrong_pre_listing_page")
+        require(page or (not rows and "next_page_token" not in info), "empty_pre_listing_page")
+        for row in page:
+            require(isinstance(row, dict), "unrecognized_pre_resource")
+            rows.append({"name": row.get("name"), "id": row.get("id")})
+
+        if "next_page_token" not in info:
+            listing = {"rows": rows, "total_count": len(rows), "complete": True}
+            _resources_by_name(listing, container=True)
+            return listing
+
+        token = info["next_page_token"]
+        require(isinstance(token, str) and 0 < len(token) <= MAX_PAGE_TOKEN_LENGTH
+                and token.isascii() and token.isprintable() and not token.isspace()
+                and token not in seen_tokens, "invalid_pre_listing_cursor")
+        seen_tokens.add(token)
+        query["page_token"] = token
+
+    raise TargetError("pre_listing_page_limit")
+
+
 def _direct_counts(detail, app):
     require(isinstance(detail, dict) and detail.get("id") == app.id
             and detail.get("name") == app.name, "wrong_pre_app_detail")
@@ -67,16 +131,17 @@ def normalize_inventory(target, source_target, *, workers, applications, pinned_
     For the future adapter, source_target comes from authenticated read
     context for the whole observation. Each listing is a normalized dict with
     rows, total_count and complete. The adapter attests completion and supplies
-    the assembled row total only after validated traversal. Worker rows carry
-    id. App rows carry name and id. A present app needs an independently pinned
-    UUID and the fresh detail response's health.instances.active and assigned.
+    the assembled row total only after validated traversal. For supported
+    provider routes, read_provider_listing supplies that contract. Worker rows
+    carry id. App rows carry name and id. A present app needs an independently
+    pinned UUID and the fresh detail response's health.instances.active and
+    assigned.
 
     TargetError means unknown inventory. Complete absence supplies no counts,
     including after deletion. The adapter builds Inventory using this
     projection and its independent access, admission and prior count evidence.
     """
-    require(type(target) is Target and type(source_target) is Target and source_target == target,
-            "wrong_pre_inventory_target")
+    _require_source_target(target, source_target)
     require(pinned_app_id is None or (isinstance(pinned_app_id, str) and APP_ID.fullmatch(pinned_app_id)),
             "invalid_pre_app_pin")
     worker_names, _ = _resources_by_name(workers, container=False)
