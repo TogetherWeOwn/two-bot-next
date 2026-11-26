@@ -248,7 +248,8 @@ class PassiveGatewayEvidenceTests(unittest.TestCase):
             self.event("gateway_resumed", "two_bot::gateway"),
         )
         self.assertEqual(self.summarize(packet), (0, {
-            "verdict": "observed", "build_sha": self.SHA,
+            "schema": "passive_gateway_summary.v1", "verdict": "observed", "build_sha": self.SHA,
+            "window": {"start": "2026-10-11T12:15:00.000Z", "end": "2026-10-11T12:20:00.000Z"},
             "signals": {"ready": 1, "gateway_resumed": 1, "shard_closed": 1,
                         "gateway_reconnect_failed": 1, "identify_planned": 1, "resume_planned": 1},
         }))
@@ -259,7 +260,8 @@ class PassiveGatewayEvidenceTests(unittest.TestCase):
             self.event("ready", "two_bot::gateway"),
         )
         self.assertEqual(self.summarize(packet), (0, {
-            "verdict": "observed", "build_sha": self.SHA,
+            "schema": "passive_gateway_summary.v1", "verdict": "observed", "build_sha": self.SHA,
+            "window": {"start": "2026-10-11T12:15:00.000Z", "end": "2026-10-11T12:20:00.000Z"},
             "signals": {"ready": 1, "gateway_resumed": 0, "shard_closed": 0,
                         "gateway_reconnect_failed": 0, "identify_planned": 1, "resume_planned": 0},
         }))

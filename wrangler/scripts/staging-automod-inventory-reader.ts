@@ -1,5 +1,5 @@
-import { boundRead } from "../src/internal-actions.ts";
 import type { bindStagingAutomodDeploymentTransport } from "./staging-automod-deployment-transport.ts";
+import { boundStagingAutomodInventoryRead } from "./staging-automod-inventory-verifier.ts";
 
 type Inventory = NonNullable<Awaited<ReturnType<Parameters<typeof bindStagingAutomodDeploymentTransport>[1]>>>;
 type InventorySource = Readonly<{ workflowSha: string; runId: number }>;
@@ -51,7 +51,7 @@ export function bindStagingAutomodInventoryReader(runVerifier: RunVerifier) {
   return async ({ workflowSha, runId }: InventorySource, signal: AbortSignal): Promise<InventoryReadback | undefined> => {
     if (signal.aborted || !matches(workflowSha, SHA) || !Number.isSafeInteger(runId) || runId <= 0) return;
     try {
-      const output = await boundRead(runVerifier(workflowSha, String(runId), signal), signal);
+      const output = await boundStagingAutomodInventoryRead(runVerifier(workflowSha, String(runId), signal), signal);
       if (signal.aborted || typeof output !== "string" || output.length > MAX_OUTPUT_LENGTH) return;
       const value: unknown = JSON.parse(output);
       if (readback(value, workflowSha, runId)) return value;
