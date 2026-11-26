@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch as mock_patch
 
 from mutation_python import RUN_SECONDS, measure, snapshot, verdict
+from mutation_python_history import prepare_history
 from mutation_rust_fixture import commit
 from mutation_scope import added_lines, git, pr_diff, python_lines
 
@@ -16,10 +17,59 @@ NEW = OLD.replace("> 3", ">= 3")
 HEADER = "import unittest\nimport yaml\nfrom rule import eligible, legacy\n\nclass RuleTests(unittest.TestCase):\n"
 
 
+def test_exact_checkout_history(scratch):
+    upstream = scratch / "upstream"
+    (upstream / "scripts").mkdir(parents=True)
+    git(upstream, "init", "-q")
+    module = upstream / MODULE
+    module.write_text(OLD)
+    seed = commit(upstream, "seed")
+    old_tree = git(upstream, "rev-parse", "HEAD^{tree}").strip()
+    module.write_text(NEW)
+    commit(upstream, "changed operator")
+    new_tree = git(upstream, "rev-parse", "HEAD^{tree}").strip()
+
+    def node(message, tree, *parents):
+        return git(upstream, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                   "commit-tree", tree, "-m", message,
+                   *(arg for parent in parents for arg in ("-p", parent))).strip()
+
+    old = node("old", old_tree, seed)
+    common = node("common", old_tree, old)
+    fast_head = node("changed operator on short history", new_tree, common)
+    # Both tips reach old within depth three. Only the full graph shows
+    # that the head also reaches the newer common commit via the long arm.
+    base = node("base", old_tree, common)
+    side = node("side", old_tree, old)
+    long_arm = node("second on long arm", old_tree, node("first on long arm", old_tree, common))
+    head = node("changed operator after merge", new_tree, side, long_arm)
+    for label, base_sha, head_sha, shallow in (
+        ("bounded", common, fast_head, "true"),
+        ("fallback", base, head, "false"),
+    ):
+        git(upstream, "update-ref", f"refs/heads/{label}-head", head_sha)
+        git(upstream, "update-ref", f"refs/heads/{label}-base", base_sha)
+        checkout = scratch / label
+        checkout.mkdir()
+        git(checkout, "init", "-q")
+        git(checkout, "remote", "add", "origin", upstream.as_uri())
+        git(checkout, "fetch", "--no-tags", "--depth=1", "origin", head_sha)
+        git(checkout, "checkout", "--detach", head_sha)
+        with mock_patch("mutation_python_history.HISTORY_DEPTH", 3):
+            prepare_history(checkout, base_sha, head_sha)
+        assert git(checkout, "rev-parse", "--is-shallow-repository").strip() == shallow
+        merge_base, diff = pr_diff(checkout, base_sha, head_sha)
+        assert merge_base == common, merge_base
+        assert python_lines(added_lines(diff)) == {MODULE: {4}}
+        assert git(checkout, "rev-parse", "HEAD^{tree}").strip() == new_tree
+        assert git(checkout, "archive", "HEAD") == git(upstream, "archive", head_sha)
+
+
 def main():
     if os.environ.get("GITHUB_ACTIONS") != "true":
         raise SystemExit("mutation fixtures run only in GitHub Actions")
     with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as scratch:
+        test_exact_checkout_history(Path(scratch))
         root = Path(scratch, "repo")
         root.mkdir()
         git(root, "init", "-q")
