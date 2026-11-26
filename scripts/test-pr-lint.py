@@ -484,6 +484,8 @@ class ChangedFileInventoryTests(unittest.TestCase):
                     return subprocess.check_output(["git", "-C", str(repo), *args],
                                                    text=True, stderr=subprocess.PIPE).strip()
                 git("init", "--quiet")
+                # Background repacking can race teardown of this disposable repo.
+                git("config", "maintenance.auto", "false")
                 git("config", "user.name", "Fixture")
                 git("config", "user.email", "fixture@example.invalid")
                 for index, changes in enumerate(git_changes):
