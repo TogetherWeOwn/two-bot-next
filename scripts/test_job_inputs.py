@@ -266,6 +266,7 @@ class SelectionTests(unittest.TestCase):
         # docs/database-roles.md left this list: the voice owner-grant
         # journal regression reads its content, so it selects rust.
         for path in ["docs/gateway-recovery.md",
+                     "docs/uppercase-guide.MD",
                      "docs/leveling-port.md", "docs/feeds-port.md",
                      "docs/distroless-evaluation.md", "docs/build-cache.md",
                      "docs/member-journey-parity.md"]:
@@ -536,6 +537,8 @@ class GitCandidateSelectionTests(unittest.TestCase):
                                      env=env, capture_output=True, text=True, timeout=5)
                 self.assertEqual(run.returncode, expected, run.stderr)
                 self.assertEqual(migration.is_file(), expected == 0)
+                if expected:
+                    self.assertIn("checkout does not match the PR event merge", run.stderr)
 
 
 class DocsIndexWiringTests(unittest.TestCase):

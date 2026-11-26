@@ -7,7 +7,10 @@ export LC_ALL=C
 [[ $GITHUB_SHA =~ ^[0-9a-f]{40}$ ]]
 candidate_tree=$PWD
 # The selector evaluated this merge, including changes from the event base.
-[[ $(git rev-list --parents -n 1 HEAD --) == "$GITHUB_SHA $PR_BASE_SHA $PR_HEAD_SHA" ]]
+if [[ $(git rev-list --parents -n 1 HEAD --) != "$GITHUB_SHA $PR_BASE_SHA $PR_HEAD_SHA" ]]; then
+  printf '%s\n' 'Database proof checkout does not match the PR event merge. Push the branch to refresh the candidate.' >&2
+  exit 1
+fi
 prior_sha=$(git merge-base --all "$PR_BASE_SHA" "$PR_HEAD_SHA")
 [[ $prior_sha =~ ^[0-9a-f]{40}$ ]]
 scratch=$(mktemp -d "${RUNNER_TEMP:?}/db-compat.XXXXXXXX")

@@ -337,7 +337,7 @@ def classify(path):
         if path in WORKER_DOCS:
             jobs.add(WORKER)
         return frozenset(jobs)
-    if path.startswith(DOCS_PREFIX) and Path(path).suffix == ".md":
+    if path.startswith(DOCS_PREFIX) and Path(path).suffix.lower() == ".md":
         # No file reader in PR-run code (proven by the reader-coverage
         # test), but runbook.test.ts asserts on the docs/ listing itself.
         return frozenset({WORKER})
