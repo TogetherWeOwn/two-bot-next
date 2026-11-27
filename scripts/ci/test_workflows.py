@@ -242,7 +242,7 @@ DEPLOY_MARKERS = (
 )
 # Canonical parsed graph for the protected recovery callee. This pins the
 # caller guard, Environment split, exact commands, permissions, and handoffs.
-PRODUCTION_RECOVERY_GRAPH = "2fd050ea4e2f4ca60328d2c54c077a7219cc3c29269c96313b52d7fbcc69b3a2"
+PRODUCTION_RECOVERY_GRAPH = "ab704b3add3f417e074d3dfefc9756fcc16e69f7a937d33f08038434337a3f51"
 PRODUCTION_INTERRUPTED_GRAPH = "924989beeaa9bbc3ccb03608d183f33b8894eb65f29d5f1cb331191db59ce48d"
 
 
@@ -12657,8 +12657,10 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                         # Read-only fetch of the producing plan
                         # run's manifest artifact for the provenance gate.
                         expected = {"contents": "read", "actions": "read"}
+                    elif name == "deploy-production-recovery.yml":
+                        # Recovery authenticates the committed forward receipt and its plan.
+                        expected["actions"] = "read"
                     elif (name == "production-migrate.yml" and job_id in ("claim", "apply")
-                          or name == "deploy-production-recovery.yml"
                           or name == "deploy-production-interrupted.yml"
                           or (name == "deploy-production.yml" and job_id.startswith("release-"))):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}

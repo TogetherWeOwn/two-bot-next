@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from production_release_forward import CUTOVER, STORE, forward_receipt
 from production_ownership_status import provider_sample
 import production_release as release
+import production_recovery_workflow as recovery_workflow
 import production_release_preflight as preflight
 from ci.production_migrate_claim import projection_hash, store_projection_hash
 from staging_migrate_approval import digest_json
@@ -158,7 +159,11 @@ class ReleaseForwardTests(unittest.TestCase):
                 self.assertEqual(calls.mock_calls[:3], [call.validate(plan), call.validate(fresh),
                                                         call.approval(release.github, artifact, run)])
                 self.assertEqual([name for name, _, _ in calls.mock_calls[3:]], expected_steps)
-                self.assertEqual((directory / "preflight.json").exists(), refusal is None)
+                intent = directory / f"{preflight.STOP_INTENT_ARTIFACT}.json"
+                self.assertEqual(intent.exists(), refusal is None)
+                if refusal is None:
+                    self.assertEqual(json.loads(intent.read_text()),
+                                     preflight.stop_intent(pin, run, "123", plan, artifact, 17))
                 self.assertEqual(output_path.exists(), refusal is None)
 
     def test_stop_refuses_a_spent_attendance_plan_before_the_provider_call(self):
@@ -168,9 +173,8 @@ class ReleaseForwardTests(unittest.TestCase):
         with TemporaryDirectory() as temp:
             directory = Path(temp) / "production-release"
             directory.mkdir()
-            proof = {"pin": vars(pin), "epoch": 17, "run_id": "456", "plan_run_id": "123",
-                     "plan_archive_sha256": artifact["archive_digest"]}
-            (directory / "preflight.json").write_text(json.dumps(proof), encoding="utf-8")
+            proof = preflight.stop_intent(pin, run, "123", plan, artifact, 17)
+            release.write_json(directory / "production-release-stop-intent.json", proof)
             env = {"RUNNER_TEMP": temp, "PRODUCTION_WORKER_URL": "https://prod.invalid",
                    "OWNERSHIP_CONTROL_TOKEN": "fixture", "GITHUB_OUTPUT": str(Path(temp) / "output")}
             with (patch.object(release, "release_context", return_value=(pin, run, "123", plan, artifact)),
@@ -186,13 +190,14 @@ class ReleaseForwardTests(unittest.TestCase):
     def test_forward_database_boundary_refuses_wrong_fence_or_producer_before_apply(self):
         pin, plan = self.preflight_fixture()
         preflight_epoch = 17
+        fingerprint = digest_json(plan["target"])
         run = {"id": 456, "run_attempt": 1, "head_sha": pin.workflow_sha}
         stopped = {"deploymentId": pin.rollback_worker, "running": False,
                    "owner": {"deploymentId": None, "phase": "fenced", "epoch": 18, "oldEpoch": 17,
                              "actor": f"production-schema-release:456:{pin.candidate_sha}"}}
         job = {"name": preflight.PREPARE_JOB, "run_id": 456, "run_attempt": 1, "head_sha": pin.workflow_sha,
                "status": "completed", "conclusion": "success", "steps": [
-                   {"name": step, "status": "completed", "conclusion": "success"} for step in preflight.PREPARE_STEPS]}
+                   {"name": step, "status": "completed", "conclusion": "success"} for step in preflight.STOP_INTENT_STEPS]}
         now = datetime(2026, 11, 25, tzinfo=timezone.utc)
         api = Mock(side_effect=lambda route: {"created_at": now.isoformat()} if route == "actions/runs/123"
                    else {"total_count": 1, "jobs": [job]})
@@ -200,26 +205,112 @@ class ReleaseForwardTests(unittest.TestCase):
         for bad_stop in ({**stopped, "running": True},
                          {**stopped, "owner": {**stopped["owner"], "oldEpoch": 18, "epoch": 19}}):
             with self.subTest(stop=bad_stop), self.assertRaisesRegex(GateError, "production_forward_stopped_fence_unproved"):
-                preflight.apply_under_prepared_fence(pin, run, "123", plan["target"], bad_stop, apply, api,
-                                                     preflight_epoch=preflight_epoch)
+                preflight.apply_under_bound_fence(pin, run, "123", fingerprint, bad_stop, apply, api,
+                                                  preflight_epoch=preflight_epoch)
         api.assert_not_called()
         job["conclusion"] = "cancelled"
         with self.assertRaisesRegex(GateError, "production_inverse_job_invalid"):
-            preflight.apply_under_prepared_fence(pin, run, "123", plan["target"], stopped, apply, api,
-                                                 preflight_epoch=preflight_epoch)
+            preflight.apply_under_bound_fence(pin, run, "123", fingerprint, stopped, apply, api,
+                                              preflight_epoch=preflight_epoch)
         apply.assert_not_called()
         job["conclusion"] = "success"
+        retained = job["steps"].pop(1)
+        with self.assertRaisesRegex(GateError, "production_inverse_step_invalid"):
+            preflight.apply_under_bound_fence(pin, run, "123", fingerprint, stopped, apply, api,
+                                              preflight_epoch=preflight_epoch)
+        apply.assert_not_called()
+        job["steps"].insert(1, retained)
         artifact = {"archive_digest": "sha256:" + "f" * 64}
         with (patch.object(preflight, "authenticated_plan", return_value=(plan, artifact)),
               patch.object(preflight, "verify_environment") as environment,
               patch.object(preflight, "verify_check", return_value=(789, now)) as approval):
-            result = preflight.apply_under_prepared_fence(pin, run, "123", plan["target"], stopped, apply, api,
-                                                          preflight_epoch=preflight_epoch)
+            with self.assertRaisesRegex(GateError, "production_forward_plan_changed"):
+                preflight.apply_under_bound_fence(pin, run, "123", "0" * 64, stopped, apply, api,
+                                                  preflight_epoch=preflight_epoch)
+            apply.assert_not_called()
+            result = preflight.apply_under_bound_fence(pin, run, "123", fingerprint, stopped, apply, api,
+                                                       preflight_epoch=preflight_epoch)
         environment.assert_called_once_with(api)
         self.assertEqual(approval.call_args.args[:3], (api, run, "production-apply:123:" + "f" * 64))
         apply.assert_called_once_with("123", plan)
         self.assertEqual(result["stopped_epoch"], 18)
         self.assertEqual(result["attendance_fence_sha256"], "c" * 64)
+
+    def test_plan_only_exports_the_fingerprint_after_the_target_matches(self):
+        pin, plan = self.preflight_fixture()
+        target = plan["target"]
+        run = {"id": 456, "run_attempt": 1, "head_sha": pin.workflow_sha}
+        with (TemporaryDirectory() as temp,
+              patch.object(release, "release_request", return_value=(pin, run, "123")),
+              patch.object(release, "approved_plan", return_value=(plan, {})) as approve,
+              patch.object(release, "database") as database,
+              patch("sys.stderr")):
+            output = Path(temp) / "output"
+            env = {"RUNNER_TEMP": temp, "GITHUB_OUTPUT": str(output), "RELEASE_RUNNER": "fixture-runner",
+                   **{f"PRODUCTION_{key.upper()}": value for key, value in target.items()}}
+            database.return_value = {**plan, "target": {**target, "branch_id": "other-branch"}}
+            self.assertEqual(release.main(["plan"], env), 1)
+            self.assertFalse(output.exists())
+            database.return_value = plan
+            self.assertEqual(release.main(["plan"], env), 0)
+            approve.assert_called_with(pin, run, "123", target)
+            self.assertEqual(output.read_text(), f"target-fingerprint={digest_json(target)}\n")
+
+    def test_prepare_retains_the_epoch_it_exports(self):
+        pin, plan = self.preflight_fixture()
+        run = {"id": 456, "run_attempt": 1, "head_sha": pin.workflow_sha}
+        artifact = {"archive_digest": "sha256:" + "f" * 64}
+        with (TemporaryDirectory() as temp,
+              patch.object(release, "release_context", return_value=(pin, run, "123", plan, artifact)),
+              patch.object(release, "check_url"),
+              patch.object(release, "validate_attendance_plan"), patch.object(release, "require_unused_attendance_plan"),
+              patch.object(release, "control_client"), patch.object(release, "RollbackClient"),
+              patch.object(release, "validate_receipt_against_live"), patch.object(release, "image_in_registry"),
+              patch.object(release, "verify_preflight", return_value=17)):
+            directory = Path(temp) / "production-release"
+            directory.mkdir()
+            release.write_json(directory / "fresh-plan.json", plan)
+            output = Path(temp) / "output"
+            env = {"RUNNER_TEMP": temp, "GITHUB_OUTPUT": str(output),
+                   "PRODUCTION_WORKER_URL": "https://fixture.invalid", "OWNERSHIP_CONTROL_TOKEN": "fixture",
+                   "CLOUDFLARE_ACCOUNT_ID": "fixture", "CLOUDFLARE_API_TOKEN": "fixture"}
+            self.assertEqual(release.main(["prepare"], env), 0)
+            intent = json.loads((directory / "production-release-stop-intent.json").read_text())
+            self.assertEqual(intent, preflight.stop_intent(pin, run, "123", plan, artifact, 17))
+            self.assertIn(f"epoch={intent['epoch']}", output.read_text().splitlines())
+
+    def test_stop_refuses_missing_or_changed_intent_before_fencing(self):
+        pin, plan = self.preflight_fixture()
+        run = {"id": 456, "run_attempt": 1, "head_sha": pin.workflow_sha}
+        artifact = {"archive_digest": "sha256:" + "f" * 64}
+        intent = preflight.stop_intent(pin, run, "123", plan, artifact, 17)
+        with (TemporaryDirectory() as temp,
+              patch.object(release, "release_context", return_value=(pin, run, "123", plan, artifact)),
+              patch.object(release, "check_url"), patch.object(release, "control_client") as control,
+              patch.object(release, "require_unused_attendance_plan") as unused,
+              patch.object(release, "read_status") as observe, patch("sys.stderr")):
+            env = {"RUNNER_TEMP": temp, "PRODUCTION_WORKER_URL": "https://fixture.invalid",
+                   "OWNERSHIP_CONTROL_TOKEN": "fixture"}
+            self.assertEqual(release.main(["stop"], env), 1)
+            path = Path(temp) / "production-release" / "production-release-stop-intent.json"
+            for key, value in (("epoch", None), ("epoch", True), ("target_fingerprint", "0" * 64)):
+                with self.subTest(key=key, value=value):
+                    release.write_json(path, {**intent, key: value})
+                    self.assertEqual(release.main(["stop"], env), 1)
+            observe.assert_not_called()
+            unused.assert_not_called()
+            control.assert_not_called()
+            observe.return_value = {
+                "worker": {"version_id": pin.rollback_worker, "sha": pin.rollback_sha, "traffic_percent": 100},
+                "container": {"image_digest": pin.rollback_image, "application_id": pin.application_id,
+                              "namespace_id": pin.namespace_id},
+                "ownership": {"phase": "active", "running": True, "epoch": 17},
+            }
+            release.write_json(path, {**intent, "epoch": 18})
+            self.assertEqual(release.main(["stop"], env), 1)
+            unused.assert_called_once_with(release.github, artifact, run)
+            observe.assert_called_once_with(env)
+            control.return_value.assert_not_called()
 
     def test_post_commit_requires_an_authentic_forward_result_for_takeover_or_recovery(self):
         pin, plan = self.preflight_fixture()
@@ -227,25 +318,40 @@ class ReleaseForwardTests(unittest.TestCase):
         fixture = Path(__file__).with_name("fixtures") / "production_release_forward_stop.json"
         proof = json.loads(fixture.read_text())
         artifact = proof["plan_artifact"]
-        env = {**proof["forward_artifact_env"], "RELEASE_STOPPED": json.dumps(proof["stop_ack"])}
+        env = {**proof["forward_artifact_env"], "RELEASE_STOPPED": json.dumps(proof["stop_ack"]),
+               "RELEASE_TARGET_FINGERPRINT": digest_json(plan["target"]), "CANDIDATE_WORKER": ""}
         document = {**forward_receipt("123", plan, {**self.outcome, "recovery_evidence_ref": pin.recovery_reference()}),
                     "run_id": "456", "run_attempt": 1, "stopped_epoch": 18,
                     "plan_archive_sha256": artifact["archive_digest"], "release_reference": pin.recovery_reference()}
         api = Mock()
-        with (patch.object(release.artifacts, "protected_job") as protected_job,
+        with (patch.object(release, "release_request", return_value=(pin, run, "123")),
+              patch.object(preflight, "authenticated_plan", return_value=(plan, artifact)),
+              patch.object(preflight, "verify_environment"),
+              patch.object(preflight, "verify_check", side_effect=GateError("independent_production_approval_stale")) as check,
+              patch.object(release.artifacts, "protected_job") as protected_job,
               patch.object(release.artifacts, "authentic_document", return_value=document) as authenticate):
-            self.assertEqual(release.forward_document(env, pin, run, "123", plan, artifact, api).fence_epoch, 18)
+            with self.assertRaisesRegex(GateError, "independent_production_approval_stale"):
+                release.release_context(env, api)
+            check.reset_mock()
+            result = release.applied_release(env, api)[-1]
+            check.assert_not_called()
+            self.assertEqual(result.fence_epoch, 18)
             protected_job.assert_called_once_with(run, api, release.artifacts.FORWARD_JOB,
                                                   release.artifacts.FORWARD_STEPS)
             authenticate.assert_called_once_with(run, release.artifacts.FORWARD_ARTIFACT, "789", "a" * 64, api)
-            for key in ("run_attempt", "stopped_epoch", "restored_ledgers_sha256", "attendance_fence_sha256"):
+            recovered, _, _, approval, _ = recovery_workflow.release_admission(env)
+            self.assertEqual(recovered, result)
+            self.assertEqual(approval["plan_archive_sha256"], artifact["archive_digest"])
+            check.assert_not_called()
+            for key in ("run_attempt", "stopped_epoch", "restored_ledgers_sha256", "attendance_fence_sha256",
+                        "plan_archive_sha256"):
                 with self.subTest(key=key), self.assertRaises(GateError):
                     authenticate.return_value = {**document, key: "foreign"}
-                    release.forward_document(env, pin, run, "123", plan, artifact, api)
+                    release.applied_release(env, api)
             protected_job.side_effect = GateError("protected_job_failed")
             authenticate.reset_mock()
             with self.assertRaisesRegex(GateError, "protected_job_failed"):
-                release.forward_document(env, pin, run, "123", plan, artifact, api)
+                release.applied_release(env, api)
             authenticate.assert_not_called()
 
     def test_takeover_cli_passes_the_ownership_client(self):
@@ -256,9 +362,8 @@ class ReleaseForwardTests(unittest.TestCase):
         worker_url = "https://prod.invalid"
         uploaded_version = "12345678-1234-4567-8123-123456789aaa"
         with (TemporaryDirectory() as temp,
-              patch.object(release, "release_context", return_value=(pin, run, "123", plan, artifact)),
+              patch.object(release, "applied_release", return_value=(pin, run, "123", plan, artifact, recovery)),
               patch.object(release, "check_url", return_value=worker_url),
-              patch.object(release, "forward_document", return_value=recovery),
               patch.object(release, "control_client") as control_client,
               patch.object(release, "take_over") as take_over):
             env = {"RUNNER_TEMP": temp, "PRODUCTION_WORKER_URL": worker_url,

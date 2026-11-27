@@ -1437,16 +1437,14 @@ jobs:
       contents: read
       actions: read
       checks: read
-    env: &release-env
+    env:
       RELEASE_SHA: ${{ needs.guard.outputs.sha }}
       RELEASE_PLAN_ID: ${{ inputs.release_plan_run_id }}
       RELEASE_PINS: ${{ inputs.release_pins }}
-      PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
-      PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
-      PRODUCTION_BRANCH_ID: ${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}
     outputs:
       runner-artifact-id: ${{ steps.release-runner.outputs.artifact-id }}
       runner-sha256: ${{ steps.build.outputs.sha256 }}
+      target-fingerprint: ${{ steps.release-target.outputs.target-fingerprint }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {ref: "${{ github.sha }}", persist-credentials: false, fetch-depth: 0}
@@ -1469,7 +1467,11 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Read both production migration ledgers
+        id: release-target
         env:
+          PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
+          PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
+          PRODUCTION_BRANCH_ID: ${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_RUNNER: ${{ github.workspace }}/target/debug/staging-migrate
           TWO_BOT_PRODUCTION_PLAN_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_PLAN_DATABASE_URL }}
@@ -1489,7 +1491,11 @@ jobs:
     timeout-minutes: 15
     environment: {name: production, deployment: false}
     permissions: *release-permissions
-    env: *release-env
+    env: &release-env
+      RELEASE_SHA: ${{ needs.guard.outputs.sha }}
+      RELEASE_PLAN_ID: ${{ inputs.release_plan_run_id }}
+      RELEASE_PINS: ${{ inputs.release_pins }}
+      RELEASE_TARGET_FINGERPRINT: ${{ needs.release-plan.outputs.target-fingerprint }}
     outputs:
       epoch: ${{ steps.preflight.outputs.epoch }}
       stopped: ${{ steps.release-stop.outputs.ack }}
@@ -1543,6 +1549,14 @@ jobs:
             --probe "$RUNNER_TEMP/production-release/baseline-probe.json" \
             --counters "$RUNNER_TEMP/production-release/baseline-counters.json" \
             --sha "$RELEASE_SHA" --out "$RUNNER_TEMP/production-release/regression-gate.json"
+      - name: Retain the exact recovery stop intent
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-release-stop-intent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-release/production-release-stop-intent.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
       - name: Confirm the exact stopped writer
         id: release-stop
         env: *release-provider-env
@@ -1553,7 +1567,7 @@ jobs:
         with:
           name: production-release-prepare-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/production-release/preflight.json
+            ${{ runner.temp }}/production-release/production-release-stop-intent.json
             ${{ runner.temp }}/production-release/stopped.json
             ${{ runner.temp }}/production-release/regression-gate.json
           if-no-files-found: error
