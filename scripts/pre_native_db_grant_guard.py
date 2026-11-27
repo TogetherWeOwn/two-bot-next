@@ -4,11 +4,11 @@ from dataclasses import dataclass
 import re
 
 from pre_native_cleanup import Reservation
+from pre_native_rehearsal import DATABASE_HOST
 from pre_target import Target, check_clock, require
-from pre_worker_upload import DATABASE_NAME, DATABASE_TLS, DNS_LABEL, DatabaseEndpoint
+from pre_worker_upload import DATABASE_NAME, DATABASE_TLS, DatabaseEndpoint
 
 
-_HOST = re.compile(rf"(?:{DNS_LABEL}\.)+[a-z](?:[a-z0-9-]{{0,61}}[a-z0-9])?")
 _SCHEMA_MODES = ("pre_migration", "post_migration")
 
 
@@ -25,11 +25,12 @@ class DatabaseIdentity:
 class GrantReadback:
     """Complete effective privileges and catalog evidence for one schema mode.
 
-    Derive schema_shape from the observed catalog. The three counts cover all
-    production or shared grants, including effective privileges through role
-    membership, ownership and PUBLIC. Cover inherited and assumable authority
-    when assessing flags and cross-schema writes. Incomplete inventory cannot
-    establish that these counts or flags are clear.
+    In each mode, derive the reserved predecessor's cutover/store shape from
+    the observed catalog. The restricted counts cover all production or shared
+    grants, including effective privileges through membership, ownership and
+    PUBLIC. Cover inherited and assumable authority when assessing flags and
+    cross-schema writes. Count explicit parameter SET and ALTER SYSTEM grants,
+    including grants through PUBLIC. Incomplete inventory fails verification.
     """
 
     identity: DatabaseIdentity
@@ -39,10 +40,12 @@ class GrantReadback:
     restricted_database_grants: int
     restricted_schema_grants: int
     restricted_role_grants: int
+    parameter_grants: int
     superuser: bool
     bypassrls: bool
     createrole: bool
     createdb: bool
+    replication: bool
     cross_schema_write: bool
 
 
@@ -72,7 +75,7 @@ def _valid_identity(identity, target):
             and type(observed.run_id) is int and type(observed.started_at) is int and observed == target
             and type(endpoint.service) is str and endpoint.service == target.service_name
             and endpoint.disposable is True
-            and type(endpoint.host) is str and len(endpoint.host) <= 253 and _HOST.fullmatch(endpoint.host)
+            and type(endpoint.host) is str and len(endpoint.host) <= 253 and DATABASE_HOST.fullmatch(endpoint.host)
             and type(endpoint.port) is int and 0 < endpoint.port <= 65535
             and all(type(name) is str and 0 < len(name) <= 63 and re.fullmatch(DATABASE_NAME, name)
                     for name in (endpoint.database, endpoint.user))
@@ -121,8 +124,10 @@ def verify_native_pre_db_grants(*, enabled=False, reservation: Reservation | Non
         modes.add(row.schema_mode)
         require(all(_zero(count) for count in (row.restricted_database_grants, row.restricted_schema_grants,
                                                row.restricted_role_grants)), "pre_db_restricted_grants")
-        require(all(flag is False for flag in (row.superuser, row.bypassrls, row.createrole, row.createdb,
-                                               row.cross_schema_write)), "pre_db_privileged_grants")
+        require(_zero(row.parameter_grants)
+                and all(flag is False for flag in (row.superuser, row.bypassrls, row.createrole, row.createdb,
+                                                   row.replication, row.cross_schema_write)),
+                "pre_db_privileged_grants")
 
     require(type(revocation) is RevocationReadback and _valid_identity(revocation.identity, target)
             and revocation.identity == pinned_identity, "wrong_pre_db_revocation_target")
