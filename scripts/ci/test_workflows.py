@@ -4281,8 +4281,11 @@ def voice_synthetic_errors(workflow):
         if "GITHUB_" in budget.get("run", ""):
             errors.append(f"{name}:synthetic: budget check must not access Actions command files")
         if checkout != {"uses": STAGING_CHECKOUT_USES,
-                        "with": {"persist-credentials": "false", "fetch-depth": "1"}}:
-            errors.append(f"{name}:synthetic: checkout must be pinned and wait for the budget check")
+                        "with": {"persist-credentials": "false", "fetch-depth": "1",
+                                 "sparse-checkout": "/scripts/staging_voice_synthetic.py\n"
+                                                    "/scripts/script_intake.py\n",
+                                 "sparse-checkout-cone-mode": "false"}}:
+            errors.append(f"{name}:synthetic: checkout must be pinned, sparse and wait for the budget check")
         if any(voice.get("env", {}).get(k) != v for k, v in bindings.items()):
             errors.append(f"{name}:synthetic: must use the original grant and predecessor clock")
         run = voice.get("run", "")
@@ -7822,6 +7825,10 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["synthetic"]["steps"][-2].__setitem__("run", "wrangler deploy"),
             lambda w: w["jobs"]["staging-window"]["steps"][-1].update(run="true"),
             lambda w: w["jobs"]["synthetic"]["steps"][0].__setitem__("env", {"T": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}),
+            lambda w: w["jobs"]["synthetic"]["steps"][1]["with"].pop("sparse-checkout"),
+            lambda w: w["jobs"]["synthetic"]["steps"][1]["with"].update({
+                "sparse-checkout": "/scripts/staging_voice_synthetic.py\n"}),
+            lambda w: w["jobs"]["synthetic"]["steps"][1]["with"].pop("sparse-checkout-cone-mode"),
             lambda w: w["on"]["workflow_call"]["inputs"].pop("artifact_invocation"),
             lambda w: w["on"]["workflow_call"]["inputs"]["artifact_invocation"].update({"required": "true"}),
             lambda w: w["jobs"]["staging-window"]["steps"][4]["with"].update({"name": "collision"}),
