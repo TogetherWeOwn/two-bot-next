@@ -16,7 +16,6 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.p
 
 SHAPES = ("0473/0465", "0475/0465")
 START = 1_800_000_000
-DIGEST = "sha256:" + "a" * 64
 
 
 class RehearsalFixture:
@@ -26,7 +25,7 @@ class RehearsalFixture:
         self.deployment = Deployment(self.target, UUID(int=1), UUID(int=2), UUID(int=3))
         self.database = DatabaseEndpoint(self.target, self.target.service_name, "db.invalid", 5432,
                                          "fixture", "fixture_writer", True)
-        self.expected = RuntimeIdentity(self.deployment, DIGEST, self.database)
+        self.expected = RuntimeIdentity(self.deployment, "sha256:" + "a" * 64, self.database)
         self.policy = LaunchPolicy("durable-object", "ws://127.0.0.1:8081",
                                    "http://[::1]:8082", True, False, self.database)
         if shape == SHAPES[1]:
@@ -179,6 +178,7 @@ class NativeRehearsalTests(unittest.TestCase):
         ]
         invalid += [("localhost_addresses", value, "discord_fixture_unconfirmed")
                     for value in (None, frozenset(), frozenset({"::1", "192.0.2.1"}), ("::1",))]
+        invalid.append(("localhost_addresses", frozenset({"::1"}), "runtime_policy_mismatch"))
         for field, value, error in invalid:
             with self.subTest(field=field, value=value):
                 trial = RehearsalFixture(SHAPES[1] if field == "localhost_addresses" else SHAPES[0])
