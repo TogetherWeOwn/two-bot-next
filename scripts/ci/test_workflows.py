@@ -8089,6 +8089,34 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                                     capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_staging_automod_dispatch_runs_from_sparse_checkout(self):
+        steps = self.workflows["staging-automod-preview.yml"]["jobs"]["dry-run"]["steps"]
+        deny_fetch = "--import=data:text/javascript,globalThis.fetch=()=>process.exit(70)"
+        probe = """
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+const [node, entry, ...args] = process.argv.slice(1);
+const { bindStagingAutomodDispatch } = await import("./" + entry);
+for (const optIn of ["false", "true"]) {
+  const env = { ...process.env, STAGING_AUTOMOD_REHEARSAL: optIn,
+    ACTIONS_ID_TOKEN_REQUEST_URL: "https://pipelines.actions.githubusercontent.com/token",
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: "synthetic-oidc-request", OWNERSHIP_CONTROL_TOKEN: "synthetic".repeat(5) };
+  assert.equal(await bindStagingAutomodDispatch(env), undefined);
+  const { status, stdout, stderr } = spawnSync(node, [entry, ...args], { env, encoding: "utf8", timeout: 5_000 });
+  assert.deepEqual([status, stdout, stderr], optIn === "true" ? [1, "", "staging_automod_rehearsal_failed\\n"] : [0, "", ""]);
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="staging-automod-checkout-") as directory:
+            for pattern in steps[0]["with"]["sparse-checkout"].splitlines():
+                self.assertRegex(pattern, r"\A/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+\.(?:mjs|ts|json)\Z")
+                target = Path(directory) / pattern[1:]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / pattern[1:]).read_bytes())
+            result = subprocess.run(["node", "--input-type=module", "-e", probe, *shlex.split(steps[-1]["run"])],
+                                    cwd=directory, env={"PATH": os.environ["PATH"], "NODE_OPTIONS": deny_fetch},
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_staging_automod_preview_requires_protected_opt_in(self):
         name = "staging-automod-preview.yml"
         self.assertEqual(workflow_policy_errors(self.workflows), [])
@@ -8097,7 +8125,8 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                 (("on", "workflow_dispatch", "inputs", "rehearse"), {"default": "true"}),
                 (("concurrency",), {"group": "automod-only"}),
                 (("jobs", "dry-run"), {"if": "true"}),
-                (("jobs", "dry-run", "permissions"), {"id-token": "write"}),
+                (("jobs", "dry-run", "permissions"), {"actions": "read"}),
+                (("jobs", "dry-run", "permissions"), {"id-token": "read"}),
                 (("jobs", "dry-run", "steps", 2), {"run": "node wrangler/scripts/staging-use-pipeline.mjs finish"}),
                 (("jobs", "dry-run", "steps", 3), {
                     "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
@@ -8105,7 +8134,11 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                     "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OWNERSHIP_CONTROL_TOKEN }}"}}),
                 (("jobs", "dry-run", "steps", 5), {"env": {"STAGING_AUTOMOD_REHEARSAL": "true"}}),
                 (("jobs", "dry-run", "steps", 5, "env"), {
-                    "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"})):
+                    "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}"}),
+                (("jobs", "dry-run", "steps", 5, "env"), {
+                    "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"}),
+                (("jobs", "dry-run", "steps", 4), {
+                    "env": {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}})):
             with self.subTest(keys=keys, change=change):
                 workflows = deepcopy(self.workflows)
                 node = workflows[name]
@@ -12712,6 +12745,8 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                                     "actions": "write"}
                     elif (name, job_id) == ("staging-rollback-drill.yml", "proof"):
                         expected = {"contents": "read", "actions": "write"}
+                    elif (name, job_id) == ("staging-automod-preview.yml", "dry-run"):
+                        expected["id-token"] = "write"
                     elif (name, job_id) == ("daily-digest.yml", "rollback-proof-watch"):
                         # Reads the daily proof run; opens or closes its incident issue.
                         expected = {"contents": "read", "actions": "read", "issues": "write"}
