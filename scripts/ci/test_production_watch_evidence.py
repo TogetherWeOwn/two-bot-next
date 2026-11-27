@@ -114,6 +114,14 @@ class ProductionWatchEvidenceTests(unittest.TestCase):
                     self.assert_refused(release, bundle, f"invalid_{domain}_receipt")
         self.assert_refused(valid_release, dict(valid_bundle, extra={}), "invalid_bundle_inventory")
 
+    def test_release_and_receipts_refuse_extra_fields(self):
+        release, bundle = fixture()
+        self.assert_refused(dict(release, extra=True), bundle, "invalid_release_pin")
+        for domain in bundle:
+            with self.subTest(domain=domain):
+                extra_receipt = dict(bundle[domain], extra=True)
+                self.assert_refused(release, dict(bundle, **{domain: extra_receipt}), f"invalid_{domain}_receipt")
+
     def test_every_domain_rejects_drift_from_any_release_pin(self):
         for domain in fixture()[1]:
             for field, value in (
