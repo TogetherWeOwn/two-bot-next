@@ -11,7 +11,7 @@ from uuid import UUID
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_start_stop import (
-        Deployment, Endpoint, Operation, PrivateHttpReply, PrivateRuntime, ProbeBindingIdentity,
+        Deployment, Endpoint, ExternalStop, Operation, PrivateHttpReply, PrivateRuntime, ProbeBindingIdentity,
         ProbeReply, ProtectedPre, probe_private_get,
     )
     from pre_target import ProtectedRouteReadback, Resource, Target, TargetError
@@ -112,7 +112,10 @@ class PrivateProbeTransportTests(unittest.TestCase):
         runtime = Mock(spec_set=PrivateRuntime)
         runtime.probe.side_effect = self.probe
         authorize = Mock(return_value=True)
-        controller = ProtectedPre(TARGET, authorize=authorize, admission=Mock(), runtime=runtime, external_stop=Mock())
+        stop_authority = Mock(spec_set=ExternalStop)
+        stop_authority.confirm_probe_active.return_value = True
+        controller = ProtectedPre(TARGET, authorize=authorize, admission=Mock(), runtime=runtime,
+                                  external_stop=stop_authority)
         for endpoint, reply in ((Endpoint.HEALTH, HEALTH),
                                 (Endpoint.READINESS, replace(HEALTH, body=b"x" * BODY_CAP)),
                                 (Endpoint.READINESS, replace(HEALTH, status=503, body=b"{}"))):
@@ -123,3 +126,4 @@ class PrivateProbeTransportTests(unittest.TestCase):
                                  ProbeReply(reply.status, DEPLOYMENT.worker_version, reply.body))
                 self.assert_sent_once(endpoint)
         self.assertEqual(authorize.call_args_list, [call(TARGET, Operation.PROBE)] * 3)
+        self.assertEqual(stop_authority.confirm_probe_active.call_args_list, [call(TARGET, DEPLOYMENT.start_id)] * 3)

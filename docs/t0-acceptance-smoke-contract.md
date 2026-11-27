@@ -185,6 +185,20 @@ The offline report prints advisory JSON. Exit 0 confirms output. In `handoff.jso
 Optional `observations` entries keyed by `help`, `naming`, or `gateway` hold `window` (same fields as `expected`) and `sha256` (64 lowercase hex digits for the exact file bytes).
 Include an entry only when existing evidence independently ties those bytes to that window. Keep the original provenance in the handoff.
 
+Include any independently verified in-window serving identity readbacks in the
+optional `serving_readbacks` array. Each object uses the seven identity fields
+from `expected` (everything except `start` and `end`) plus `utc`, the readback
+time in the same UTC format. Use readbacks of the same environment. An invalid
+readback or one outside the inclusive bounds gives exit 2.
+
+A differing identity anywhere inside the window sets `window_status` to
+`interrupted` and marks every supplied observation `mismatched`, withholding
+Help, naming and gateway results. This includes a different deploy or Worker
+version at the same source revision, even if the original identity serves again
+by the end. Retain the interrupted watch as evidence and report against a new,
+independently verified single-deploy window. Matching or absent readbacks add
+no continuity proof. The verified window and per-file attribution are still required.
+
 ```sh
 python3 scripts/t0_acceptance_report.py --handoff handoff.json \
   --help-report help.json --naming-report staging-voice-naming-evidence.json \

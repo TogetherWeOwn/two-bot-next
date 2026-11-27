@@ -271,6 +271,17 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
           path: approval-tools
+          # Include the verifier and its transitive Python imports.
+          sparse-checkout: |
+            /scripts/build_identity.py
+            /scripts/ci/staging_migrate_claim.py
+            /scripts/rollback_proof.py
+            /scripts/script_intake.py
+            /scripts/staging_migrate_approval.py
+            /scripts/staging_recovery_status.py
+            /scripts/staging_rollout.py
+            /scripts/worker_container_rollback.py
+          sparse-checkout-cone-mode: false
       - name: Install Python for the staging approval verifier
         run: apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 >/dev/null
       - name: Verify the native staging approval
