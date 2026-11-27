@@ -5765,6 +5765,18 @@ class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflows = load_workflows()
 
+    def test_release_sbom_readers_checkout_only_their_python_files(self):
+        jobs = self.workflows["release.yml"]["jobs"]
+        for job_id in ("sbom-target", "verify-sbom"):
+            with self.subTest(job=job_id):
+                checkout = jobs[job_id]["steps"][0]
+                self.assertTrue(checkout["uses"].startswith("actions/checkout@"))
+                self.assertEqual(checkout["with"], {
+                    "persist-credentials": "false",
+                    "sparse-checkout": "/scripts/release-sbom-target.py\n/scripts/script_intake.py\n",
+                    "sparse-checkout-cone-mode": "false",
+                })
+
     def assert_bookworm_image(self, workflows, workflow, job):
         actual = workflows[workflow]["jobs"].get(job, {}).get("container", {})
         self.assertIsInstance(actual, dict, f"{workflow}:{job} requires a container")
