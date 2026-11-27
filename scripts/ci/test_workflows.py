@@ -86,6 +86,7 @@ JOB_INVENTORY = {
     "staging-migrate-reviewed.yml": {"authorize", "plan", "apply"},
     "production-migrate.yml": {"plan", "claim", "apply"},
     "deploy-production-recovery.yml": {"fence", "inverse", "restore"},
+    "deploy-production-interrupted.yml": {"admit", "database", "restart"},
     # On-demand staging automatic recovery proof plus the manual Worker-only drill.
     "staging-rollback-drill.yml": {"drill", "proof", "alert"},
     # Container-image backout/restore drill: manual, staging-only, pinned shape below.
@@ -242,6 +243,7 @@ DEPLOY_MARKERS = (
 # Canonical parsed graph for the protected recovery callee. This pins the
 # caller guard, Environment split, exact commands, permissions, and handoffs.
 PRODUCTION_RECOVERY_GRAPH = "2fd050ea4e2f4ca60328d2c54c077a7219cc3c29269c96313b52d7fbcc69b3a2"
+PRODUCTION_INTERRUPTED_GRAPH = "924989beeaa9bbc3ccb03608d183f33b8894eb65f29d5f1cb331191db59ce48d"
 
 
 class UniqueKeyLoader(yaml.BaseLoader):
@@ -1535,9 +1537,24 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
         errors.append(f"{prefix} must execute four fail-closed transport steps")
         return errors
     checkout, fetch, publish, upload = steps
+    checkout_options = {"persist-credentials": "false", "ref": "${{ github.sha }}"}
+    if staging:
+        checkout_options.update({
+            "sparse-checkout": (
+                "/scripts/build_identity.py\n"
+                "/scripts/ci/staging_migrate_claim.py\n"
+                "/scripts/rollback_proof.py\n"
+                "/scripts/script_intake.py\n"
+                "/scripts/staging_migrate_approval.py\n"
+                "/scripts/staging_recovery_status.py\n"
+                "/scripts/staging_rollout.py\n"
+                "/scripts/worker_container_rollback.py\n"
+            ),
+            "sparse-checkout-cone-mode": "false",
+        })
     if (not str(checkout.get("uses", "")).startswith("actions/checkout@")
-            or checkout.get("with") != {"persist-credentials": "false", "ref": "${{ github.sha }}"}):
-        errors.append(f"{prefix} checkout must pin the workflow head without persisted credentials")
+            or checkout.get("with") != checkout_options):
+        errors.append(f"{prefix} checkout must pin the workflow head and reviewed inputs without persisted credentials")
     if (not str(fetch.get("uses", "")).startswith("actions/download-artifact@")
             or fetch.get("with") != {"name": manifest, "path": "current-plan"}):
         errors.append(f"{prefix} must read this dispatch's plan artifact, not an arbitrary run")
@@ -4108,9 +4125,17 @@ def staging_callee_window_errors(name, workflow, consumer):
         if {key: value for key, value in upload.items() if key != "name"} != expected_upload:
             errors.append(f"{name}:staging-window: must always upload the start receipt for 14 days, "
                           "failing on a missing file")
-        if checkout != {"uses": STAGING_CHECKOUT_USES,
-                        "with": {"persist-credentials": "false", "fetch-depth": "1"}}:
-            errors.append(f"{name}:staging-window: checkout must be the pinned action without persisted credentials")
+        checkout_inputs = {"persist-credentials": "false", "fetch-depth": "1"}
+        if name == "voice-synthetic.yml":
+            checkout_inputs.update({
+                "sparse-checkout": "/wrangler/scripts/staging-use-pipeline.mjs\n"
+                                   "/wrangler/scripts/staging-use.mjs\n"
+                                   "/wrangler/scripts/is-direct-invocation.mjs\n"
+                                   "/wrangler/scripts/ownership-control-response.mjs\n",
+                "sparse-checkout-cone-mode": "false",
+            })
+        if checkout != {"uses": STAGING_CHECKOUT_USES, "with": checkout_inputs}:
+            errors.append(f"{name}:staging-window: checkout must match the pinned action and exact inputs")
         if node != {"uses": STAGING_SETUP_NODE_USES,
                     "with": {"node-version": "22", "package-manager-cache": "false"}}:
             errors.append(f"{name}:staging-window: second step must be the pinned setup-node on Node 22")
@@ -4258,8 +4283,11 @@ def voice_synthetic_errors(workflow):
         if "GITHUB_" in budget.get("run", ""):
             errors.append(f"{name}:synthetic: budget check must not access Actions command files")
         if checkout != {"uses": STAGING_CHECKOUT_USES,
-                        "with": {"persist-credentials": "false", "fetch-depth": "1"}}:
-            errors.append(f"{name}:synthetic: checkout must be pinned and wait for the budget check")
+                        "with": {"persist-credentials": "false", "fetch-depth": "1",
+                                 "sparse-checkout": "/scripts/staging_voice_synthetic.py\n"
+                                                    "/scripts/script_intake.py\n",
+                                 "sparse-checkout-cone-mode": "false"}}:
+            errors.append(f"{name}:synthetic: checkout must be pinned, sparse and wait for the budget check")
         if any(voice.get("env", {}).get(k) != v for k, v in bindings.items()):
             errors.append(f"{name}:synthetic: must use the original grant and predecessor clock")
         run = voice.get("run", "")
@@ -5235,9 +5263,11 @@ def workflow_policy_errors(workflows):
             # below would flag its production-migrate Environment binding.
             errors.extend(production_migrate_errors(workflow))
             continue
-        if name == "deploy-production-recovery.yml":
+        if name in ("deploy-production-recovery.yml", "deploy-production-interrupted.yml"):
+            expected = (PRODUCTION_RECOVERY_GRAPH if name == "deploy-production-recovery.yml"
+                        else PRODUCTION_INTERRUPTED_GRAPH)
             graph = hashlib.sha256(json.dumps(workflow, sort_keys=True).encode()).hexdigest()
-            if graph != PRODUCTION_RECOVERY_GRAPH:
+            if graph != expected:
                 errors.append(f"{name}: protected recovery graph changed")
             continue
         if name == "staging-ownership-status.yml":
@@ -6509,6 +6539,31 @@ class WorkflowTests(unittest.TestCase):
             r"--test lfg_interactions(?: --test \S+)* -- --ignored --test-threads=1",
         )
 
+    def test_community_db_bootstrap_is_ready_before_cargo(self):
+        job = self.workflows["check.yml"]["jobs"]["community-db"]
+        service = job["services"]["agent-testdb"]
+        self.assertNotIn("ports", service)
+        self.assertEqual(service["env"], {
+            "POSTGRES_USER": "agent_test",
+            "POSTGRES_DB": "two_bot_test_ci",
+            "POSTGRES_HOST_AUTH_METHOD": "trust",
+        })
+        self.assertEqual(
+            job["env"]["TWO_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        # TCP excludes the entrypoint's temporary socket-only server. A SQL
+        # connection also proves that the actual bootstrap database exists.
+        self.assertIn(
+            '--health-cmd "psql -X -w -h 127.0.0.1 -U agent_test '
+            '-d two_bot_test_ci -Atqc \'SELECT 1\'"',
+            service["options"],
+        )
+        self.assertNotRegex(
+            "\n".join(step.get("run", "") for step in job["steps"]),
+            r"\b(?:apt-get|createdb)\b",
+        )
+
     def test_tickets_postgres_acceptance_receives_disposable_database_url(self):
         job = self.workflows["check.yml"]["jobs"]["tickets-postgres"]
         prepare = next(
@@ -7774,6 +7829,10 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["synthetic"]["steps"][-2].__setitem__("run", "wrangler deploy"),
             lambda w: w["jobs"]["staging-window"]["steps"][-1].update(run="true"),
             lambda w: w["jobs"]["synthetic"]["steps"][0].__setitem__("env", {"T": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}),
+            lambda w: w["jobs"]["synthetic"]["steps"][1]["with"].pop("sparse-checkout"),
+            lambda w: w["jobs"]["synthetic"]["steps"][1]["with"].update({
+                "sparse-checkout": "/scripts/staging_voice_synthetic.py\n"}),
+            lambda w: w["jobs"]["synthetic"]["steps"][1]["with"].pop("sparse-checkout-cone-mode"),
             lambda w: w["on"]["workflow_call"]["inputs"].pop("artifact_invocation"),
             lambda w: w["on"]["workflow_call"]["inputs"]["artifact_invocation"].update({"required": "true"}),
             lambda w: w["jobs"]["staging-window"]["steps"][4]["with"].update({"name": "collision"}),
@@ -7804,6 +7863,29 @@ class WorkflowTests(unittest.TestCase):
             mutate(changed)
             errors = voice_synthetic_errors(changed)
             self.assertTrue(any(diagnostic in error for error in errors), errors)
+
+    def test_voice_staging_window_checkout_rejects_input_drift(self):
+        workflow = self.workflows["voice-synthetic.yml"]
+        self.assertEqual(voice_synthetic_errors(workflow), [])
+        checkout = workflow["jobs"]["staging-window"]["steps"][0]
+        inputs = checkout["with"]
+        paths = inputs["sparse-checkout"].splitlines(keepends=True)
+        mutations = {
+            "full checkout": {key: inputs[key] for key in ("persist-credentials", "fetch-depth")},
+            "wider checkout": {**inputs, "sparse-checkout": "/wrangler/scripts/\n"},
+            "cone mode": {**inputs, "sparse-checkout-cone-mode": "true"},
+            "ref override": {**inputs, "ref": "main"},
+            "filter override": {**inputs, "filter": "blob:none"},
+            **{f"missing {path.strip()}": {**inputs, "sparse-checkout": "".join(p for p in paths if p != path)}
+               for path in paths},
+        }
+        for label, changed_inputs in mutations.items():
+            with self.subTest(label=label):
+                changed = deepcopy(workflow)
+                changed["jobs"]["staging-window"]["steps"][0]["with"] = changed_inputs
+                self.assertEqual(voice_synthetic_errors(changed), [
+                    "voice-synthetic.yml:staging-window: checkout must match the pinned action and exact inputs",
+                ])
 
     def test_consumer_checks_survive_unexpected_job_inventory(self):
         import copy
@@ -8699,6 +8781,22 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                 mutate(changed)
                 self.assertTrue(cloudflare_environment_errors(changed), label)
                 self.assertTrue(workflow_policy_errors(changed), label)
+
+    def test_predecessor_checkout_keeps_history_and_limits_worktree(self):
+        name = "build-predecessor.yml"
+        rejection = f"{name}: expected the pinned protected workflow"
+        self.assertNotIn(rejection, workflow_policy_errors(self.workflows))
+        steps = self.workflows[name]["jobs"]["build"]["steps"]
+        checkout = steps[0]["with"]
+        self.assertEqual(checkout["fetch-depth"], "0")
+        self.assertNotIn("filter", checkout)
+        self.assertNotIn("sparse-checkout", checkout)
+        prepare = next(step for step in steps if step.get("name") ==
+                       "Verify the protected input and export the reviewed tree")
+        self.assertEqual(prepare["run"].splitlines()[-2:], [
+            "git sparse-checkout set --cone scripts",
+            "python3 scripts/build_predecessor.py prepare",
+        ])
 
     def test_pinned_sha_is_dispatch_only_and_ancestor_checked(self):
         workflows = self.workflows
@@ -9870,6 +9968,14 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             workflow = deepcopy(migrate)
             change(workflow)
             return staging_migrate_errors(workflow)
+
+        for option, value in (("sparse-checkout", "/scripts/\n"),
+                              ("sparse-checkout", "/scripts/ci/staging_migrate_claim.py\n"),
+                              ("sparse-checkout-cone-mode", "true")):
+            with self.subTest(checkout={option: value}):
+                def change_checkout(w):
+                    w["jobs"]["claim"]["steps"][0]["with"][option] = value
+                self.assertTrue(mutated(change_checkout))
 
         for trigger in ("push", "pull_request", "schedule", "workflow_call"):
             with self.subTest(trigger=trigger):
@@ -12387,6 +12493,7 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                         expected = {"contents": "read", "actions": "read"}
                     elif (name == "production-migrate.yml" and job_id in ("claim", "apply")
                           or name == "deploy-production-recovery.yml"
+                          or name == "deploy-production-interrupted.yml"
                           or (name == "deploy-production.yml" and job_id.startswith("release-"))):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-staging.yml", "deploy"):
@@ -12590,6 +12697,7 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
         # deploy-side workflows below serialize at the lane jobs on purpose
         # (a top-level group would queue work that must stay unqueued).
         pure_callees = {
+            "deploy-production-interrupted.yml",
             "deploy-production-recovery.yml",
             "reusable-rust-nextest.yml",
             "sbom.yml",
