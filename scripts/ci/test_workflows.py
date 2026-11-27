@@ -3648,8 +3648,19 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
     if tooling != {"uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
                    "if": "${{ inputs.reviewed_plan != '' }}",
                    "with": {"ref": "${{ github.sha }}", "path": "tooling", "persist-credentials": "false",
-                            "fetch-depth": "1"}}:
-        errors.append(f"{name}:schema-gate: reviewed plan proof must use the credentialless workflow checkout")
+                            "fetch-depth": "1", "sparse-checkout-cone-mode": "false",
+                            "sparse-checkout": (
+                                "/scripts/build_identity.py\n"
+                                "/scripts/ci/staging_migrate_claim.py\n"
+                                "/scripts/ci/staging_rollback_compatibility.py\n"
+                                "/scripts/rollback_proof.py\n"
+                                "/scripts/script_intake.py\n"
+                                "/scripts/staging_bootstrap.py\n"
+                                "/scripts/staging_recovery_status.py\n"
+                                "/scripts/staging_rollout.py\n"
+                                "/scripts/worker_container_rollback.py\n"
+                            )}}:
+        errors.append(f"{name}:schema-gate: reviewed plan proof must use the credentialless sparse workflow checkout")
     if proof != {"name": "Verify the recovery plan and both ledgers", "id": "recovery-plan",
                  "if": "${{ inputs.recovery_mode != 'standard' }}",
                  "env": {"RECOVERY_PLAN_SOURCE": "${{ inputs.sha }}", "REVIEWED_PLAN": "${{ inputs.reviewed_plan }}",
