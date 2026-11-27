@@ -21,9 +21,9 @@ export type StagingAutomodQualificationPin = Readonly<{
 const MAX_OBSERVATION_AGE_MS = 60_000;
 const UUID = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const OPTIONS = [
-  { name: "text", type: 3, required: true, autocomplete: false, min_length: 1, max_length: 2000 },
-  { name: "mentions", type: 4, required: false, autocomplete: false, min_value: 0, max_value: 100 },
-  { name: "attachments", type: 3, required: false, autocomplete: false, max_length: 1000 },
+  { name: "text", type: 3, required: true, autocomplete: false, choiceCount: 0, min_length: 1, max_length: 2000 },
+  { name: "mentions", type: 4, required: false, autocomplete: false, choiceCount: 0, min_value: 0, max_value: 100 },
+  { name: "attachments", type: 3, required: false, autocomplete: false, choiceCount: 0, max_length: 1000 },
 ] as const;
 
 function field(value: unknown, key: PropertyKey): unknown {
@@ -58,13 +58,15 @@ function time(value: unknown): value is number {
 
 /** Verify a bounded, decoded staging qualification receipt. The caller supplies
  * independently authenticated pins, observations and a trusted UTC clock. The
- * registry projection comes from the complete, unique guild command read and
- * normalizes omitted required/autocomplete flags to false. Its interval spans
- * the entire read. Router outcomes come from synthetic dispatch on the pinned
- * source with Manage Guild alone and with moderation permissions but without
- * Manage Guild or Administrator. Cold refusal counters cover the entire isolated pre-lease probe,
- * including transient lease/Container activity between the two state samples.
- * Times are UTC epoch milliseconds. No input field is returned or logged.
+ * registry projection spans the complete, unique guild command read. Normalize
+ * omitted required/autocomplete flags to false and count choices from the raw
+ * options, rejecting malformed choice fields. Router outcomes come from
+ * synthetic dispatch on the pinned source with Manage Guild alone and with
+ * moderation permissions without Manage Guild or Administrator.
+ * The pre-lease probe's outer scope comes from the authenticated collector.
+ * Keep the unscoped Worker refusal unchanged and count all lease/Container
+ * activity between the two state samples. The v1 Worker refusal uses ISO time.
+ * Other timestamps are UTC epoch milliseconds. No input field is returned or logged.
  */
 export function verifyStagingAutomodReceipt(receipt: unknown, pin: StagingAutomodQualificationPin,
   now = Date.now()): boolean {
@@ -87,9 +89,12 @@ export function verifyStagingAutomodReceipt(receipt: unknown, pin: StagingAutomo
     const cold = field(receipt, "coldStartRefusal");
     const coldStartedAt = field(cold, "startedAt");
     const coldCompletedAt = field(cold, "completedAt");
-    const refusedAt = field(field(cold, "response"), "observedAt");
+    const refusalObservedAt = field(field(cold, "response"), "observedAt");
+    const refusedAt = typeof refusalObservedAt === "string" && refusalObservedAt.length === 24
+      ? Date.parse(refusalObservedAt) : NaN;
     if (!time(beforeAt) || !time(afterAt) || !time(readStartedAt) || !time(readCompletedAt)
       || !time(coldStartedAt) || !time(coldCompletedAt) || !time(refusedAt)
+      || new Date(refusedAt).toISOString() !== refusalObservedAt
       || coldStartedAt < now - MAX_OBSERVATION_AGE_MS || coldStartedAt >= coldCompletedAt
       || refusedAt < coldStartedAt || refusedAt > coldCompletedAt
       || coldCompletedAt > acquiredAt || acquiredAt > beforeAt || beforeAt > readStartedAt
@@ -111,7 +116,7 @@ export function verifyStagingAutomodReceipt(receipt: unknown, pin: StagingAutomo
       router: { sourceSha, name: STAGING_AUTOMOD_TARGET.name, requiredPermission: 32,
         withManageGuild: "admitted", withoutManageGuild: "denied" },
       coldStartRefusal: { scope, action: "start", startedAt: coldStartedAt, completedAt: coldCompletedAt,
-        response: { schema: "two-bot-staging-automod-job.v1", environment: "staging", observedAt: refusedAt,
+        response: { schema: "two-bot-staging-automod-job.v1", environment: "staging", observedAt: refusalObservedAt,
           verdict: "failed", code: "request_refused" }, before: stopped, after: stopped,
         effects: { leaseWrites: 0, containerAcquisitions: 0, containerInvocations: 0,
           containerStarts: 0, containerStops: 0, containerWrites: 0 } },

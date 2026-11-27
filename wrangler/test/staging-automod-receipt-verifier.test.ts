@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { verifyStagingAutomodReceipt, type StagingAutomodQualificationPin } from "../scripts/staging-automod-receipt-verifier.ts";
+import { runProtectedAutomodJob } from "../src/staging-automod-job.ts";
 
 const now = 1_800_000_000_000;
 const scope = {
@@ -32,16 +33,16 @@ function receipt() {
     registry: { scope: structuredClone(scope), startedAt: now - 300, completedAt: now - 200,
       command: { ...pin.command, applicationId: "1469137636663758888", guildId: "1545644954272137297",
         name: "automod-preview", type: 1, default_member_permissions: "32", options: [
-          { name: "text", type: 3, required: true, autocomplete: false, min_length: 1, max_length: 2000 },
-          { name: "mentions", type: 4, required: false, autocomplete: false, min_value: 0, max_value: 100 },
-          { name: "attachments", type: 3, required: false, autocomplete: false, max_length: 1000 },
+          { name: "text", type: 3, required: true, autocomplete: false, choiceCount: 0, min_length: 1, max_length: 2000 },
+          { name: "mentions", type: 4, required: false, autocomplete: false, choiceCount: 0, min_value: 0, max_value: 100 },
+          { name: "attachments", type: 3, required: false, autocomplete: false, choiceCount: 0, max_length: 1000 },
         ] },
     },
     after: { scope: structuredClone(scope), identity: { ...identity }, observedAt: now - 100 },
     router: { sourceSha: scope.lease.sha, name: "automod-preview", requiredPermission: 32,
       withManageGuild: "admitted", withoutManageGuild: "denied" },
     coldStartRefusal: { scope: structuredClone(scope), action: "start", startedAt: now - 700, completedAt: now - 600,
-      response: { schema: "two-bot-staging-automod-job.v1", environment: "staging", observedAt: now - 650,
+      response: { schema: "two-bot-staging-automod-job.v1", environment: "staging", observedAt: new Date(now - 650).toISOString(),
         verdict: "failed", code: "request_refused" },
       before: { lease: "absent", container: "stopped" }, after: { lease: "absent", container: "stopped" },
       effects: { leaseWrites: 0, containerAcquisitions: 0, containerInvocations: 0,
@@ -98,7 +99,7 @@ test("requires all three exact preview options and their bounds", () => {
     { index: 0, fields: { required: false } }, { index: 0, fields: { min_length: 0 } },
     { index: 0, fields: { max_length: 2001 } }, { index: 0, fields: { autocomplete: true } },
     { index: 1, fields: { type: 3 } }, { index: 1, fields: { min_value: -1 } },
-    { index: 1, fields: { max_value: 101 } }, { index: 2, fields: { required: true } },
+    { index: 1, fields: { max_value: 101 } }, { index: 1, fields: { choiceCount: 1 } }, { index: 2, fields: { required: true } },
     { index: 2, fields: { max_length: 1001 } }, { index: 2, fields: { name: "member" } },
   ];
   for (const { index, fields } of changes) {
@@ -173,8 +174,10 @@ test("requires an unscoped pre-admission refusal and affirmative zero side effec
   const unrelated = receipt();
   unrelated.coldStartRefusal.action = "recover";
   assert.equal(verify(unrelated), false);
-  for (const patch of [{ verdict: "passed" }, { code: "operation_unconfirmed" }, { observedAt: now - 701 },
-    { observedAt: now - 599 }, { environment: "production" }, { schema: "unknown" }]) {
+  for (const patch of [{ verdict: "passed" }, { code: "operation_unconfirmed" },
+    { observedAt: new Date(now - 701).toISOString() }, { observedAt: new Date(now - 599).toISOString() },
+    { observedAt: now - 650 }, { observedAt: new Date(now - 650).toISOString().replace("Z", "+00:00") },
+    { environment: "production" }, { schema: "unknown" }]) {
     const evidence = receipt();
     Object.assign(evidence.coldStartRefusal.response, patch);
     assert.equal(verify(evidence), false);
@@ -194,4 +197,13 @@ test("requires an unscoped pre-admission refusal and affirmative zero side effec
   const missing = receipt();
   Reflect.deleteProperty(missing.coldStartRefusal, "effects");
   assert.equal(verify(missing), false);
+});
+
+test("accepts the exact v1 refusal emitted by the merged job adapter", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: now - 650 });
+  const response = await runProtectedAutomodJob({ action: "start", issuedLease: scope.lease }, undefined,
+    async () => assert.fail("refusal reached the private caller"));
+  const evidence = receipt();
+  assert.deepEqual(response, evidence.coldStartRefusal.response);
+  assert.equal(verify({ ...evidence, coldStartRefusal: { ...evidence.coldStartRefusal, response } }), true);
 });
