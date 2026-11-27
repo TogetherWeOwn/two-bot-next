@@ -829,14 +829,14 @@ authenticated inventory supplies the remaining serving fields.
 
 The default-off compiled plan gates reservation and start. Recovery uses the
 original lease even when the plan is off. The DO rereads approval at invocation.
-The client mints an OIDC token per call to a fixed staging URL. The workflow's
-job-level `id-token: write` and dispatch-only bearer support that client.
+The client mints an OIDC token per call to a fixed staging URL. Earlier workflow
+steps share the job-level OIDC grant. Only dispatch receives the staging bearer.
 
 Enabling requires a reviewed change and protected staging deploy, an
-authenticated post-deploy selection with the client imports, a GitHub read
-credential for inventory verification, a dry-run launch adapter, and protected
-interruption recovery. A later attempt or release cannot recover the original
-lease through the bridge.
+authenticated serving and inventory selection with its exact lease reservation,
+the client imports, scoped GitHub access for run and inventory readback, a
+dry-run launch adapter and protected interruption recovery. A later attempt or
+release cannot recover the original lease through the bridge.
 
 ## 10. Spec self-check (doctest)
 

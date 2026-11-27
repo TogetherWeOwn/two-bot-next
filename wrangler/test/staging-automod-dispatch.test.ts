@@ -41,13 +41,18 @@ test("the bridge binding needs an explicit selection and the OIDC request variab
     ACTIONS_ID_TOKEN_REQUEST_TOKEN: "synthetic-request-token", OWNERSHIP_CONTROL_TOKEN: "c".repeat(43) };
   const fetch = t.mock.method(globalThis, "fetch", unexpected);
   assert.equal(await bindStagingAutomodDispatch({ ...runner, ...oidc }), undefined);
-  const plan = { serving, inventorySource };
+  const pin = { workerVersionId: serving.deploymentId, sourceSha: serving.sha, workerDeploymentId: "deployment",
+    applicationId: "application", namespaceId: "namespace", rolloutId: "rollout", imageDigest: "sha256:fixture" };
+  const change = { ...serving, action: "acquire", environment: "staging", runId: runner.GITHUB_RUN_ID,
+    runAttempt: 1, expectedEpoch: lease.epoch, expiresAt: lease.expiresAt } as const;
+  const plan = { serving, inventorySource, reservation: { pin, change } };
   assert.equal(await bindStagingAutomodDispatch({ ...runner, ...oidc, STAGING_AUTOMOD_REHEARSAL: "false" }, plan), undefined);
   assert.equal(await bindStagingAutomodDispatch(runner, plan), undefined);
   assert.equal(await bindStagingAutomodDispatch({ ...runner, ...oidc, ACTIONS_ID_TOKEN_REQUEST_TOKEN: "" }, plan), undefined);
   const binding = await bindStagingAutomodDispatch({ ...runner, ...oidc }, plan);
   assert.deepEqual([binding?.serving, binding?.inventorySource], [serving, inventorySource]);
-  assert.equal(typeof binding?.host.invokePrivate, "function");
+  assert.equal(typeof binding?.wiring?.instance.acquireLease, "function");
+  assert.deepEqual(binding?.wiring?.reservation, plan.reservation);
   assert.equal(fetch.mock.callCount(), 0);
 
   // A fetch-only stub is not an in-process host.
