@@ -25,7 +25,9 @@ use two_bot_core::{
 pub(crate) const USAGE: &str = "\
   two-bot reconcile-member --guild <id> --list [--limit <n>]
       List fenced rows: prepared ban intents, running dispatches and
-      quarantined imports. Read-only; claim tokens never print.
+      quarantined imports. Read-only; member IDs are redacted and claim tokens
+      never print. A request ID containing the member ID is also redacted.
+      Use the ledger for exact identifiers.
       Shows 25 rows by default, at most 100; a capped listing ends with
       `showing <shown> of <total> rows (truncated; rerun with --limit <total>)`.
       Past 100 rows no rerun converges: resolve shown rows and re-list.
@@ -298,13 +300,13 @@ async fn run(
                             format!("execute_at={}", row.execute_at.as_deref().unwrap_or(""))
                         }
                     };
-                    // codeql[rust/cleartext-logging]: FP - Discord user IDs are public guild-visible snowflakes, not secrets; --list is an identifiers-only operator report to stdout; claim tokens never print; connection/SQL errors are redacted; output is staging-guild fenced; printing the fenced member ID is the tool purpose.
-                    println!(
-                        "{}\t{}\t{}\t{detail}",
-                        row.kind.as_str(),
-                        row.request_id,
-                        row.user_id
-                    );
+                    // Imported rows can contain the member ID in the request ID.
+                    let request = if row.request_id.contains(row.user_id.as_str()) {
+                        "[redacted]"
+                    } else {
+                        row.request_id.as_str()
+                    };
+                    println!("{}\t{request}\t[redacted]\t{detail}", row.kind.as_str());
                 }
                 // The store pages before counting, so a listing that ends
                 // exactly at the cap prints no receipt; only a capped one

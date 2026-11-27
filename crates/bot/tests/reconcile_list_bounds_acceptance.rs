@@ -12,7 +12,8 @@
 //!   `showing {shown} of {total} rows (truncated; rerun with --limit {total})`.
 //! - At or under the limit, no `showing ...` line prints — even when the shown
 //!   count equals the cap, the command must count before deciding.
-//! - Claim tokens, hashes and row-internal column words never appear in stdout.
+//! - Member IDs, claim tokens, hashes and row-internal column words never appear
+//!   in member-list stdout.
 //!
 //! Database tests use the authorized disposable test database only
 //! (`TWO_TEST_DATABASE_URL`, `agent-testdb` principal): they skip with a
@@ -259,9 +260,20 @@ async fn member_list_capped_prints_fixed_truncation_receipt() {
     assert_eq!(lines.len(), DEFAULT_LIMIT + 1, "25 rows plus the receipt");
     assert_eq!(lines[DEFAULT_LIMIT], receipt(25, 31));
     for line in &lines[..DEFAULT_LIMIT] {
-        assert!(line.contains('\t'), "row line keeps the tab shape: {line}");
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields.len(), 4, "row line keeps the tab shape: {line}");
+        assert_eq!(fields[2], "[redacted]", "member ID column is redacted");
     }
+    assert!(lines[0].starts_with("running_unban\tbound-00-running\t"));
     let text = lines.join("\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for i in 0..=30 {
+        let user = member_user(i);
+        assert!(
+            !text.contains(user.as_str()) && !stderr.contains(user.as_str()),
+            "member IDs stay out of stdout and stderr"
+        );
+    }
     assert!(!text.contains(token.as_str()), "claim token never prints");
     for internal in ["claim_token", "retry_generation", "dispatch_uncertain"] {
         assert!(
@@ -269,6 +281,43 @@ async fn member_list_capped_prints_fixed_truncation_receipt() {
             "row internal never prints: {internal}"
         );
     }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn member_list_redacts_request_ids_that_contain_member_ids() {
+    let Some(bootstrap) = bootstrap_url("member list imported requests") else {
+        return;
+    };
+    let db = fixture(&bootstrap).await;
+    for (i, prefix) in [(0, ""), (1, "legacy-")] {
+        let user = member_user(i);
+        sqlx::query(
+            "INSERT INTO moderation_scheduled_unbans
+             (request_id, guild_id, user_id, execute_at, reason, state, created_at)
+             VALUES ($1, $2, $3, $4::text::timestamptz, 'imported expiry', 'quarantined',
+                     $5::text::timestamptz)",
+        )
+        .bind(format!("{prefix}{user}"))
+        .bind(GUILD)
+        .bind(user)
+        .bind(DUE)
+        .bind(NOW)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    let url = child_url(&db);
+    let output = cli(
+        &["reconcile-member", "--guild", GUILD, "--list"],
+        Some(&url),
+    )
+    .await;
+    let lines = stdout_lines(&output);
+    assert_eq!(lines.len(), 2);
+    assert!(lines.iter().all(|line| {
+        line.starts_with("quarantined_unban\t[redacted]\t[redacted]\texecute_at=")
+    }));
     db.close().await.unwrap();
 }
 

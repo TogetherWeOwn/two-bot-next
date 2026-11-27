@@ -190,20 +190,20 @@ async fn rendezvous(barrier: &tokio::sync::Barrier) {
 async fn isolated_claim_scenario(
     pool: PgPool,
     barrier: std::sync::Arc<tokio::sync::Barrier>,
-    nonce: &'static str,
     remove: bool,
 ) {
     let guild = "same-guild";
     let id = "same-id";
+    let nonce = format!("{}-{}", std::process::id(), u8::from(remove));
     assert!(put_scheduled(&pool, &write(guild, id, &iso(T0), None))
         .await
         .unwrap());
     rendezvous(&barrier).await;
-    let claimed = claim_due(&pool, guild, &iso(NOW), "same-claim", &iso(LEASE), nonce)
+    let claimed = claim_due(&pool, guild, &iso(NOW), "same-claim", &iso(LEASE), &nonce)
         .await
         .unwrap();
     assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].occurrence_nonce.as_deref(), Some(nonce));
+    assert_eq!(claimed[0].occurrence_nonce.as_deref(), Some(nonce.as_str()));
     rendezvous(&barrier).await;
     if remove {
         assert!(delete_scheduled(&pool, guild, id).await.unwrap());
@@ -221,16 +221,10 @@ async fn concurrent_suites_keep_identical_ids_and_claims_isolated() {
     let other = barrier.clone();
     let (first, second) = tokio::join!(
         tokio::spawn(with_db(move |pool| isolated_claim_scenario(
-            pool,
-            barrier,
-            "nonce-first",
-            true
+            pool, barrier, true
         ))),
         tokio::spawn(with_db(move |pool| isolated_claim_scenario(
-            pool,
-            other,
-            "nonce-second",
-            false
+            pool, other, false
         ))),
     );
     first.unwrap();
