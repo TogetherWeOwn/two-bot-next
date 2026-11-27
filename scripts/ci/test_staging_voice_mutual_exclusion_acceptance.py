@@ -60,7 +60,7 @@ from unittest import mock
 import yaml
 
 from staging_pre_reaper_policy import PRE_REAPER, dormant_pre_reaper_errors
-from staging_soak_policy import PRODUCTION_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
+from staging_soak_policy import PRODUCTION_GROUP, PRODUCTION_RELEASE_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
     WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
@@ -222,7 +222,10 @@ def group_values(raw, context, triggers):
     if EXPRESSION not in raw:
         return frozenset({("lit", raw.casefold())})
     if context == "standalone" and raw == PRODUCTION_GROUP:
-        return frozenset({("lit", "deploy-production"), ("attempt", "deploy-production-refused-")})
+        return frozenset({("lit", "deploy-production"), ("attempt", "deploy-production-refused-"),
+                          ("run", "deploy-production-release-job-")})
+    if context == "standalone" and raw == PRODUCTION_RELEASE_GROUP:
+        return frozenset({("lit", "deploy-production"), ("attempt", "deploy-production-run-")})
     called = CALLED_FORM.fullmatch(raw.strip())
     if called:
         prefix, fallback = called.groups()
@@ -1619,8 +1622,8 @@ class LockOracleControls(unittest.TestCase):
             yaml.load("concurrency:\n  group: one\n  group: two\n", Loader=UniqueKeyLoader)
 
 
-def step_index(job, needle):
-    return next(i for i, step in enumerate(job["steps"]) if needle in str(step))
+def step_index(job, needle, *, field="run"):
+    return next(i for i, step in enumerate(job["steps"]) if needle in step.get(field, ""))
 
 
 class PromotionSoakControls(unittest.TestCase):
@@ -1790,9 +1793,10 @@ class PromotionSoakControls(unittest.TestCase):
             "reads staging outside the held grant")
 
     def test_control_credential_stays_in_lifecycle_only_steps(self):
-        for needle in (BASELINE, FINAL_PROBE, "upload-artifact"):
-            def leak(w, j, s, p, n=needle):
-                s["steps"][step_index(s, n)].setdefault("env", {})["OWNERSHIP_CONTROL_TOKEN"] = OWNERSHIP_TOKEN
+        for needle, field in ((BASELINE, "run"), (FINAL_PROBE, "run"), ("upload-artifact", "uses")):
+            def leak(w, j, s, p, needle=needle, field=field):
+                env = s["steps"][step_index(s, needle, field=field)].setdefault("env", {})
+                env["OWNERSHIP_CONTROL_TOKEN"] = OWNERSHIP_TOKEN
             self.assert_mutation_rejected(leak, "mixes the staging control credential")
         self.assert_mutation_rejected(
             lambda w, j, s, p: s.update(env={"OWNERSHIP_CONTROL_TOKEN": OWNERSHIP_TOKEN}),
@@ -1804,7 +1808,7 @@ class PromotionSoakControls(unittest.TestCase):
 
     def test_lifecycle_evidence_is_retained_per_attempt(self):
         def artifact(s):
-            return s["steps"][step_index(s, "upload-artifact")]
+            return s["steps"][step_index(s, "upload-artifact", field="uses")]
         self.assert_mutation_rejected(lambda w, j, s, p: s["steps"].remove(artifact(s)),
                                       "always be retained per run attempt")
         self.assert_mutation_rejected(lambda w, j, s, p: artifact(s).pop("if"),

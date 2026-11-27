@@ -134,6 +134,18 @@ class CutoverDocLinks(unittest.TestCase):
             problems += _problems(doc, doc.read_text(encoding="utf-8"))
         self.assertEqual(problems, [])
 
+    def test_offline_predecessor_verdict_links_to_protected_rehearsal(self):
+        doc = ROOT / "docs" / "staging-rollout-gate.md"
+        _, heading, rest = doc.read_text(encoding="utf-8").partition(
+            "#### Offline predecessor image verdict\n"
+        )
+        self.assertTrue(heading)
+        section = rest.split("\n#### ", 1)[0]
+        self.assertIn("`/readyz` to return 503", section)
+        self.assertIn("Keep protected staging admission pending", section)
+        self.assertIn("#disposable-exact-pre-rehearsal", LINK.findall(section))
+        self.assertEqual(_problems(doc, section), [])
+
     def test_disposable_pre_rehearsal_links_and_cutoff_match_source(self):
         doc = ROOT / "docs" / "staging-rollout-gate.md"
         _, heading, rest = doc.read_text(encoding="utf-8").partition(
@@ -147,6 +159,22 @@ class CutoverDocLinks(unittest.TestCase):
         self.assertIsNotNone(cutoff, "PRE admission cutoff must be a literal in pre_target.py")
         self.assertIn(f"expires {int(cutoff[1]) / 60:g} minutes", section)
         self.assertEqual(_problems(doc, section), [])
+
+    def test_startup_refusal_rows_link_to_distinct_decisions(self):
+        doc = ROOT / "docs" / "staging-rollout-gate.md"
+        _, heading, rest = doc.read_text(encoding="utf-8").partition("##### Startup refusal handoff\n")
+        self.assertTrue(heading)
+        section = rest.split("\n### ", 1)[0]
+        rows = [line for line in section.splitlines() if line.startswith("|")]
+        for refusal, procedure in (
+            ("Cutover 0480", "production-deploy.md#recovery-after-the-protected-workflow-ships"),
+            ("exact takeover", "production-deploy.md#attendance-predecessor-identity-at-both-pre-endpoints"),
+        ):
+            with self.subTest(refusal=refusal):
+                matches = [row for row in rows if refusal in row.split("|", 2)[1]]
+                self.assertEqual(len(matches), 1)
+                self.assertIn(procedure, LINK.findall(matches[0]))
+                self.assertEqual(_problems(doc, matches[0]), [])
 
     def test_automod_runtime_doc_is_found(self):
         self.assertIn(ROOT / "docs" / "automod-runtime.md", AUTOMOD_DOCS)

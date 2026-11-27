@@ -3,6 +3,7 @@
 from copy import deepcopy
 from datetime import timedelta
 from email.message import Message
+from http.client import HTTPResponse
 from io import BytesIO, StringIO
 import json
 from pathlib import Path
@@ -11,6 +12,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, call, patch
 from urllib.error import HTTPError
+from urllib.response import addinfourl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import staging_attendance_acceptance as acceptance
@@ -18,11 +20,22 @@ from script_intake import decode_json
 
 
 FIXTURE = decode_json(Path(__file__).with_name("fixtures").joinpath("staging_attendance_acceptance.json").read_bytes())
-ROLLOUT, READY, RESULT = (FIXTURE[key] for key in ("rollout", "ready", "result"))
+ROLLOUT, READY, RESULT, PLAN = (FIXTURE[key] for key in ("rollout", "ready", "result", "plan"))
 IDENTITY = tuple(ROLLOUT[key] for key in ("worker_version", "revision", "build_id", "deploy_id"))
 ORIGIN = acceptance.STAGING_ORIGIN
 EVENT = RESULT["event_key"]
-START = acceptance.fixture_start("2026-11-24T16:00:00Z")
+START = acceptance.fixture_start(PLAN["fixture_start"])
+
+
+def plan_for_observation(observed):
+    use = observed["lifecycle"]["use"]
+    return {**PLAN, "lease": {field: use[field] for field in PLAN["lease"]}}
+
+
+def signed_receipt(phase, plan):
+    return {"schema": "two-bot-attendance-signed-probe.v1", "phase": phase, "event_key": plan["event_key"],
+            "fixture_start": plan["fixture_start"], "lease": deepcopy(plan["lease"]),
+            **{field: ROLLOUT[field] for field in ("worker_version", "revision", "build_id", "deploy_id")}}
 
 
 def observed_at(moment):
@@ -67,7 +80,42 @@ class AcceptanceTests(unittest.TestCase):
         with self.assertRaises(acceptance.Refused):
             check("cleanup", ORIGIN, ROLLOUT, {**observed, "fixture_rows": 1})
 
-    def signed_peer(self, phase, *, wrong_result=False, drift=False):
+    def test_rehearsal_requires_boolean_attendance_flags_in_every_phase(self):
+        observations = self.observations(PLAN, START)
+
+        no_traffic = Mock(side_effect=AssertionError("unexpected staging request"))
+        with (TemporaryDirectory() as directory,
+              patch.object(acceptance, "credentials", side_effect=AssertionError("unexpected credentials")) as credentials):
+            rollout_path = Path(directory) / "rollout.json"
+            observed_path = Path(directory) / "observed.json"
+            plan_path = Path(directory) / "plan.json"
+            rollout_path.write_text(json.dumps(ROLLOUT), encoding="utf-8")
+            plan_path.write_text(json.dumps(PLAN), encoding="utf-8")
+            args = ["rehearsal", "--rollout", str(rollout_path), "--observed", str(observed_path)]
+            args.extend(["--plan", str(plan_path)])
+
+            def run(rows):
+                observed_path.write_text(json.dumps(rows), encoding="utf-8")
+                with (patch("sys.stdout", new_callable=StringIO) as stdout,
+                      patch("sys.stderr", new_callable=StringIO) as stderr):
+                    status = acceptance.main(args, env={}, check=no_traffic)
+                return status, stdout.getvalue(), stderr.getvalue()
+
+            self.assertEqual(run(observations), (0, "PASS: attendance rehearsal\n", ""))
+            for phase, row in observations.items():
+                for flag in ("attendance_read", "attendance_capture"):
+                    missing = row.copy()
+                    expected = missing.pop(flag)
+                    for case, invalid in (("missing", missing), ("number", {**row, flag: int(expected)}),
+                                          ("string", {**row, flag: json.dumps(expected)})):
+                        with self.subTest(phase=phase, flag=flag, case=case):
+                            self.assertEqual(run({**observations, phase: invalid}),
+                                             (1, "", "FAIL: attendance flags differ from the phase\n"))
+
+        credentials.assert_not_called()
+        no_traffic.assert_not_called()
+
+    def signed_peer(self, phase, *, wrong_result=False, drift=False, truncated_denial=False):
         requests, readies = [], []
 
         def check(request):
@@ -91,11 +139,14 @@ class AcceptanceTests(unittest.TestCase):
                 return 200, headers, dict(envelope, ok=True, result=result)
             status, code = (403, "action_not_allowed") if phase == "off" else (404, "not_found")
             envelope.update(ok=False, error={"code": code, "message": "request refused", "retryable": False})
-            media = Message()
-            media["content-type"], media["cache-control"] = "application/json", "no-store"
-            raw = BytesIO(json.dumps(envelope).encode("ascii"))
+            body = json.dumps(envelope).encode("ascii")
+            length = len(body) + int(truncated_denial)
+            wire = (f"HTTP/1.1 {status} {code}\r\nContent-Type: application/json\r\n"
+                    f"Cache-Control: no-store\r\nContent-Length: {length}\r\n\r\n").encode("ascii") + body
+            response = HTTPResponse(Mock(makefile=Mock(return_value=BytesIO(wire))), method="POST")
+            response.begin()
             with patch.object(acceptance, "no_redirect_opener") as opener:
-                opener.return_value.open.side_effect = HTTPError(request.full_url, status, code, media, raw)
+                opener.return_value.open.side_effect = HTTPError(request.full_url, status, code, response.headers, response)
                 return acceptance.send(request)
 
         return check, requests, readies
@@ -104,15 +155,15 @@ class AcceptanceTests(unittest.TestCase):
         signer = ("synthetic-key", b"x" * 64)
         for phase, keys in [("pending", [EVENT]), ("finalized", [EVENT, EVENT + ":foreign"]), ("off", [EVENT])]:
             check, requests, readies = self.signed_peer(phase)
-            acceptance.probe(phase, ORIGIN, IDENTITY, START, signer, check)
+            acceptance.probe(phase, ORIGIN, IDENTITY, EVENT, START, signer, check)
             self.assertEqual(requests, keys)
             self.assertEqual(len(readies), len(keys) + 1)
         for check in (self.signed_peer("finalized", wrong_result=True)[0], self.signed_peer("finalized", drift=True)[0]):
             with self.assertRaises(acceptance.Refused):
-                acceptance.probe("finalized", ORIGIN, IDENTITY, START, signer, check)
+                acceptance.probe("finalized", ORIGIN, IDENTITY, EVENT, START, signer, check)
         check, _, _ = self.signed_peer("pending")
         with patch.object(acceptance.time, "monotonic", side_effect=[0, 2.5]), self.assertRaisesRegex(acceptance.Refused, "Web deadline"):
-            acceptance.probe("pending", ORIGIN, IDENTITY, START, signer, check)
+            acceptance.probe("pending", ORIGIN, IDENTITY, EVENT, START, signer, check)
 
     def test_capture_off_does_not_extend_the_signed_probe_window(self):
         observed = active_observation()
@@ -134,11 +185,10 @@ class AcceptanceTests(unittest.TestCase):
             return peer(request)
 
         check = Mock(side_effect=authenticated_peer)
-        args = ["finalized", "--rollout", "rollout", "--observed", "observed",
-                "--fixture-start", START.strftime("%Y-%m-%dT%H:%M:%SZ"), "--execute"]
+        args = ["finalized", "--rollout", "rollout", "--observed", "observed", "--plan", "plan", "--execute"]
 
         def run(at):
-            with (patch.object(acceptance, "read_object", side_effect=[ROLLOUT, observed]),
+            with (patch.object(acceptance, "read_object", side_effect=[plan_for_observation(observed), ROLLOUT, observed]),
                   patch.object(acceptance.time, "time", return_value=at),
                   patch.object(acceptance.time, "monotonic", return_value=0),
                   patch("sys.stdout", new_callable=StringIO),
@@ -158,6 +208,32 @@ class AcceptanceTests(unittest.TestCase):
         check.reset_mock()
         self.assertEqual(run(boundary), (1, "FAIL: staging lease did not cover the probe\n"))
         check.assert_not_called()
+
+    def test_signed_denial_requires_a_complete_http_body(self):
+        env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
+               "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
+        for phase, active, minutes in (("pending", True, 10), ("off", False, 47)):
+            now = START + timedelta(minutes=minutes)
+            observed = active_observation()
+            observed.update(attendance_read=active, primary_fixture="pending" if active else "finalized")
+            observed["lifecycle"]["observedAt"] = observed_at(now)
+            plan = plan_for_observation(observed)
+            args = [phase, "--rollout", "rollout", "--observed", "observed", "--plan", "plan", "--execute"]
+            receipt = json.dumps(signed_receipt(phase, plan), sort_keys=True)
+            for truncated in (False, True):
+                with self.subTest(phase=phase, truncated=truncated):
+                    check, requests, readies = self.signed_peer(phase, truncated_denial=truncated)
+                    with (patch.object(acceptance, "read_object", side_effect=[plan, ROLLOUT, observed]),
+                          patch.object(acceptance.time, "time", return_value=now.timestamp()),
+                          patch.object(acceptance.time, "monotonic", return_value=0),
+                          patch("sys.stdout", new_callable=StringIO) as stdout,
+                          patch("sys.stderr", new_callable=StringIO) as stderr):
+                        status = acceptance.main(args, env=env, check=check)
+                    expected = (1, "", "FAIL: attendance acceptance input or transport refused\n") if truncated else (
+                        0, f"{receipt}\nPASS: attendance {phase}\n", "")
+                    self.assertEqual((status, stdout.getvalue(), stderr.getvalue()), expected)
+                    self.assertEqual(requests, [EVENT])
+                    self.assertEqual(len(readies), 1 if truncated else 2)
 
     def test_finalized_probe_stops_on_signed_read_refusal_after_preflight(self):
         observed = active_observation()
@@ -186,9 +262,8 @@ class AcceptanceTests(unittest.TestCase):
                 "error": {"code": "discord_unavailable", "message": "synthetic diagnostic", "retryable": True},
             }
 
-        args = ["finalized", "--rollout", "rollout", "--observed", "observed",
-                "--fixture-start", START.strftime("%Y-%m-%dT%H:%M:%SZ"), "--execute"]
-        with (patch.object(acceptance, "read_object", side_effect=[ROLLOUT, observed]),
+        args = ["finalized", "--rollout", "rollout", "--observed", "observed", "--plan", "plan", "--execute"]
+        with (patch.object(acceptance, "read_object", side_effect=[plan_for_observation(observed), ROLLOUT, observed]),
               patch.object(acceptance.time, "time", return_value=now),
               patch.object(acceptance.time, "monotonic", return_value=0),
               patch("sys.stdout", new_callable=StringIO) as stdout,
@@ -199,6 +274,93 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "FAIL: signed attendance response did not match the expected envelope\n")
         self.assertEqual(calls, [("GET", ORIGIN + "/readyz"), ("POST", ORIGIN + "/internal/actions")])
 
+    def test_finalized_receipt_refuses_nested_duplicate_keys(self):
+        observed = active_observation()
+        now = int(START.timestamp()) + 3600
+        observed["lifecycle"]["use"]["expiresAt"] = (now + 60) * 1000
+        plan = plan_for_observation(observed)
+        env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
+               "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
+        args = ["finalized", "--rollout", "rollout", "--observed", "observed",
+                "--plan", "plan", "--execute"]
+
+        def run(duplicate):
+            calls = []
+
+            def open_response(request, *, timeout):
+                headers = Message()
+                headers["content-type"] = "application/json"
+                if request.get_method() == "GET":
+                    self.assertEqual(request.full_url, ORIGIN + "/readyz")
+                    calls.append("readyz")
+                    headers["x-two-worker-version"] = ROLLOUT["worker_version"]
+                    return addinfourl(BytesIO(json.dumps(READY).encode()), headers, request.full_url, 200)
+                self.assertEqual(request.get_method(), "POST")
+                self.assertEqual(request.full_url, ORIGIN + "/internal/actions")
+                event_key = decode_json(request.data)["event_key"]
+                calls.append(event_key)
+                headers["cache-control"] = "no-store"
+                envelope = {"request_id": request.get_header("X-request-id")}
+                if event_key == EVENT:
+                    envelope.update(ok=True, result=RESULT)
+                    body = json.dumps(envelope).encode()
+                    if duplicate:
+                        # A last-wins decoder would still see the valid result.
+                        body = body.replace(b'"starts_at":',
+                                            b'"starts_at":"synthetic-private-response-text","starts_at":', 1)
+                    return addinfourl(BytesIO(body), headers, request.full_url, 200)
+                self.assertEqual(event_key, EVENT + ":foreign")
+                envelope.update(ok=False, error={"code": "not_found", "message": "request refused", "retryable": False})
+                raise HTTPError(request.full_url, 404, "not_found", headers, BytesIO(json.dumps(envelope).encode()))
+
+            with (patch.object(acceptance, "no_redirect_opener") as opener,
+                  patch.object(acceptance, "read_object", side_effect=[plan, ROLLOUT, observed]),
+                  patch.object(acceptance.time, "time", return_value=now),
+                  patch.object(acceptance.time, "monotonic", return_value=0),
+                  patch("sys.stdout", new_callable=StringIO) as stdout,
+                  patch("sys.stderr", new_callable=StringIO) as stderr):
+                opener.return_value.open.side_effect = open_response
+                status = acceptance.main(args, env=env)
+            return status, stdout.getvalue(), stderr.getvalue(), calls
+
+        receipt = json.dumps(signed_receipt("finalized", plan), sort_keys=True)
+        self.assertEqual(run(duplicate=False), (0, f"{receipt}\nPASS: attendance finalized\n", "",
+                                               ["readyz", EVENT, "readyz", EVENT + ":foreign", "readyz"]))
+        self.assertEqual(run(duplicate=True),
+                         (1, "", "FAIL: attendance acceptance input or transport refused\n", ["readyz", EVENT]))
+
+    def test_finalized_probe_stops_when_serving_build_switches(self):
+        args = ["finalized", "--rollout", "rollout", "--observed", "observed", "--plan", "plan", "--execute"]
+        env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
+               "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
+        ready = ("GET", ORIGIN + "/readyz")
+        signed = ("POST", ORIGIN + "/internal/actions")
+        for drift in (False, True):
+            with self.subTest(build_switch=drift):
+                observed = active_observation()
+                plan = plan_for_observation(observed)
+                peer, keys, _ = self.signed_peer("finalized", drift=drift)
+                check = Mock(side_effect=peer)
+                with (patch.object(acceptance, "read_object", side_effect=[plan, ROLLOUT, observed]),
+                      patch.object(acceptance.time, "time", return_value=START.timestamp() + 2760),
+                      patch.object(acceptance.time, "monotonic", return_value=0),
+                      patch("sys.stdout", new_callable=StringIO) as stdout,
+                      patch("sys.stderr", new_callable=StringIO) as stderr):
+                    status = acceptance.main(args, env=env, check=check)
+
+                verdict = status, stdout.getvalue(), stderr.getvalue()
+                requests = [entry.args[0] for entry in check.call_args_list]
+                traffic = [(request.get_method(), request.full_url) for request in requests]
+                if drift:
+                    self.assertEqual(traffic, [ready, signed, ready])
+                    self.assertEqual(keys, [EVENT])
+                    self.assertEqual(verdict, (1, "", "FAIL: serving build did not match the staging rollout\n"))
+                else:
+                    receipt = json.dumps(signed_receipt("finalized", plan), sort_keys=True)
+                    self.assertEqual(traffic, [ready, signed, ready, signed, ready])
+                    self.assertEqual(keys, [EVENT, EVENT + ":foreign"])
+                    self.assertEqual(verdict, (0, f"{receipt}\nPASS: attendance finalized\n", ""))
+
     def test_execute_requires_a_coherent_lease_that_covers_the_armed_probe(self):
         expires = START.timestamp() + 3600
         latest_start = expires - acceptance.RUN_BUDGET
@@ -206,8 +368,7 @@ class AcceptanceTests(unittest.TestCase):
         env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
                "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
         signer = acceptance.credentials(env)
-        args = ["finalized", "--rollout", "rollout", "--observed", "observed",
-                "--fixture-start", START.strftime("%Y-%m-%dT%H:%M:%SZ"), "--execute"]
+        args = ["finalized", "--rollout", "rollout", "--observed", "observed", "--plan", "plan", "--execute"]
         refused = (1, "", "FAIL: staging lease did not cover the probe\n")
         future_readback = START + timedelta(seconds=admitted_at - START.timestamp() + 0.25)
         stale_expiry = int((START.timestamp() + 1800) * 1000)
@@ -231,6 +392,7 @@ class AcceptanceTests(unittest.TestCase):
                 observed = active_observation()
                 observed["lifecycle"].update(receipt_fields)
                 observed["lifecycle"]["use"].update(lease_fields)
+                plan = plan_for_observation(observed)
                 now = admitted_at
                 peer, reads, readies = self.signed_peer("finalized")
 
@@ -255,7 +417,7 @@ class AcceptanceTests(unittest.TestCase):
                     return peer(request)
 
                 check = Mock(side_effect=authenticated_peer)
-                with (patch.object(acceptance, "read_object", side_effect=[ROLLOUT, observed]),
+                with (patch.object(acceptance, "read_object", side_effect=[plan, ROLLOUT, observed]),
                       patch.object(acceptance.time, "time", side_effect=lambda: now),
                       patch.object(acceptance.time, "monotonic", side_effect=lambda: now - admitted_at),
                       patch.object(acceptance, "credentials", side_effect=delayed_credentials),
@@ -268,7 +430,8 @@ class AcceptanceTests(unittest.TestCase):
                 if arm_delay:
                     self.assertEqual(alarm.call_args_list, [call(acceptance.RUN_BUDGET), call(0)])
                 if passes:
-                    self.assertEqual(verdict, (0, "PASS: attendance finalized\n", ""))
+                    receipt = json.dumps(signed_receipt("finalized", plan), sort_keys=True)
+                    self.assertEqual(verdict, (0, f"{receipt}\nPASS: attendance finalized\n", ""))
                     self.assertEqual(reads, [EVENT, EVENT + ":foreign"])
                     self.assertEqual(len(readies), 3)
                 else:
@@ -286,13 +449,15 @@ class AcceptanceTests(unittest.TestCase):
               patch.object(acceptance.time, "monotonic", return_value=0)):
             rollout_path = Path(directory) / "rollout.json"
             observed_path = Path(directory) / "observed.json"
+            plan_path = Path(directory) / "plan.json"
             rollout_path.write_text(json.dumps(ROLLOUT), encoding="utf-8")
 
-            def run(phase, observed, check):
+            def run(phase, observed, check, plan):
                 observed_path.write_text(json.dumps(observed), encoding="utf-8")
-                args = [phase, "--rollout", str(rollout_path), "--observed", str(observed_path)]
+                plan_path.write_text(json.dumps(plan), encoding="utf-8")
+                args = [phase, "--rollout", str(rollout_path), "--observed", str(observed_path), "--plan", str(plan_path)]
                 if phase != "cleanup":
-                    args.extend(["--execute", "--fixture-start", START.strftime("%Y-%m-%dT%H:%M:%SZ")])
+                    args.append("--execute")
                 with (patch("sys.stdout", new_callable=StringIO) as stdout,
                       patch("sys.stderr", new_callable=StringIO) as stderr):
                     status = acceptance.main(args, env=env if phase != "cleanup" else {}, check=check)
@@ -308,6 +473,7 @@ class AcceptanceTests(unittest.TestCase):
                                     primary_fixture="pending" if phase == "pending" else "finalized")
                     lifecycle = observed["lifecycle"]
                     lifecycle["use"]["expiresAt"] = int((START.timestamp() + 7200) * 1000)
+                    plan = plan_for_observation(observed)
                     if phase == "cleanup":
                         lifecycle.update(action="release", running=False)
                         lifecycle["use"]["phase"] = "released"
@@ -324,60 +490,99 @@ class AcceptanceTests(unittest.TestCase):
                             record.update(deploymentId=other_rollout["worker_version"], sha=other_rollout["revision"])
                         # The substitute is internally valid under its own receipt.
                         acceptance.validate_configuration(phase, ORIGIN, other_rollout, other_observed)
-                        self.assertEqual(run(phase, other_observed, no_traffic),
+                        self.assertEqual(run(phase, other_observed, no_traffic, plan),
                                          (1, "", "FAIL: configuration is for a different staging build\n"))
 
+                    stale_fixture = {**observed, "fixture_event_key": "attendance-acceptance:earlier"}
+                    self.assertEqual(run(phase, stale_fixture, no_traffic, plan),
+                                     (1, "", "FAIL: synthetic fixture event did not match the rehearsal plan\n"))
+
                     check, reads, readies = self.signed_peer(phase) if expected_reads else (no_traffic, [], [])
-                    self.assertEqual(run(phase, observed, check), (0, f"PASS: attendance {phase}\n", ""))
+                    status, stdout, stderr = run(phase, observed, check, plan)
+                    lines = stdout.splitlines()
+                    self.assertEqual((status, lines[-1], stderr), (0, f"PASS: attendance {phase}", ""))
+                    if expected_reads:
+                        self.assertEqual([decode_json(line) for line in lines[:-1]], [signed_receipt(phase, plan)])
+                    else:
+                        self.assertEqual(lines, ["PASS: attendance cleanup"])
                     self.assertEqual(reads, expected_reads)
                     self.assertEqual(len(readies), len(expected_reads) + 1 if expected_reads else 0)
 
         no_traffic.assert_not_called()
 
-    def test_rehearsal_evidence_requires_the_originating_lease(self):
-        def observations(acquired, attempt):
-            rows = {}
-            for phase, minutes in zip(acceptance.PHASES, (10, 46, 47, 48)):
-                row = deepcopy(FIXTURE["observed"])
-                row.update(attendance_read=phase in ("pending", "finalized"),
-                           primary_fixture="pending" if phase == "pending" else "finalized")
-                lifecycle = row["lifecycle"]
-                lifecycle["observedAt"] = (acquired + timedelta(minutes=minutes)).isoformat(
-                    timespec="milliseconds").replace("+00:00", "Z")
-                lifecycle["use"].update(environment="staging", runId="1234", runAttempt=attempt,
-                                        acquiredAt=int(acquired.timestamp()) * 1000,
-                                        expiresAt=int((acquired + timedelta(hours=1)).timestamp()) * 1000)
-                if phase == "cleanup":
-                    lifecycle.update(action="release", running=False)
-                    lifecycle["use"]["phase"] = "released"
-                    del row["primary_fixture"], row["foreign_fixture"]
-                    row["fixture_rows"] = 0
-                rows[phase] = row
-            return rows
+    @staticmethod
+    def observations(plan, acquired):
+        rows = {}
+        for phase, minutes in zip(acceptance.PHASES, (10, 46, 47, 48)):
+            row = deepcopy(FIXTURE["observed"])
+            row.update(attendance_read=phase in ("pending", "finalized"),
+                       primary_fixture="pending" if phase == "pending" else "finalized",
+                       fixture_event_key=plan["event_key"])
+            lifecycle = row["lifecycle"]
+            lifecycle["observedAt"] = (acquired + timedelta(minutes=minutes)).isoformat(
+                timespec="milliseconds").replace("+00:00", "Z")
+            lifecycle["use"].update(plan["lease"])
+            if phase == "cleanup":
+                lifecycle.update(action="release", running=False)
+                lifecycle["use"]["phase"] = "released"
+                del row["primary_fixture"], row["foreign_fixture"]
+                row["fixture_rows"] = 0
+            else:
+                row["signed_receipt"] = signed_receipt(phase, plan)
+            rows[phase] = row
+        return rows
 
-        first = observations(START, 1)
-        second = observations(START + timedelta(hours=1), 2)
+    def offline(self, plan, rows, phase="rehearsal", extra=()):
         no_traffic = Mock(side_effect=AssertionError("unexpected staging request"))
         with (TemporaryDirectory() as directory,
               patch.object(acceptance, "credentials", side_effect=AssertionError("unexpected credentials")),
               patch.object(acceptance.time, "time", return_value=START.timestamp() + 86400)):
             rollout_path = Path(directory) / "rollout.json"
             observed_path = Path(directory) / "observed.json"
+            plan_path = Path(directory) / "plan.json"
+            rollout_path.write_text(json.dumps(ROLLOUT), encoding="utf-8")
+            observed_path.write_text(json.dumps(rows), encoding="utf-8")
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            args = [phase, "--rollout", str(rollout_path), "--observed", str(observed_path),
+                    "--plan", str(plan_path), *extra]
+            with (patch("sys.stdout", new_callable=StringIO) as stdout,
+                  patch("sys.stderr", new_callable=StringIO) as stderr):
+                status = acceptance.main(args, env={}, check=no_traffic)
+        no_traffic.assert_not_called()
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_rehearsal_requires_ordered_observations_from_one_lease(self):
+        first = self.observations(PLAN, START)
+        second_plan = deepcopy(PLAN)
+        second_plan["lease"].update(runAttempt=2,
+                                    acquiredAt=PLAN["lease"]["expiresAt"],
+                                    expiresAt=PLAN["lease"]["expiresAt"] + 3600000)
+        second = self.observations(second_plan, START + timedelta(hours=1))
+        no_traffic = Mock(side_effect=AssertionError("unexpected staging request"))
+        with (TemporaryDirectory() as directory,
+              patch.object(acceptance, "credentials", side_effect=AssertionError("unexpected credentials")),
+              patch.object(acceptance.time, "time", return_value=START.timestamp() + 86400)):
+            rollout_path = Path(directory) / "rollout.json"
+            observed_path = Path(directory) / "observed.json"
+            plan_path = Path(directory) / "plan.json"
             rollout_path.write_text(json.dumps(ROLLOUT), encoding="utf-8")
 
-            def run(rows, phase="rehearsal", extra=()):
+            def run(rows, phase="rehearsal", extra=(), plan=PLAN):
                 observed_path.write_text(json.dumps(rows), encoding="utf-8")
-                args = [phase, "--rollout", str(rollout_path), "--observed", str(observed_path), *extra]
+                plan_path.write_text(json.dumps(plan), encoding="utf-8")
+                args = [phase, "--rollout", str(rollout_path), "--observed", str(observed_path),
+                        "--plan", str(plan_path), *extra]
                 with (patch("sys.stdout", new_callable=StringIO) as stdout,
                       patch("sys.stderr", new_callable=StringIO) as stderr):
                     status = acceptance.main(args, env={}, check=no_traffic)
                 return status, stdout.getvalue(), stderr.getvalue()
 
             passed = (0, "PASS: attendance rehearsal\n", "")
-            mismatch = (1, "", "FAIL: staging lease identity did not match\n")
+            mismatch = (1, "", "FAIL: staging lease identity did not match the rehearsal plan\n")
             self.assertEqual(run(first), passed)
-            self.assertEqual(run(second), passed)
-            self.assertEqual(run(second["cleanup"], "cleanup"), (0, "PASS: attendance cleanup\n", ""))
+            self.assertEqual(run(second, plan=second_plan), passed)
+            self.assertEqual(run(second["cleanup"], "cleanup", plan=second_plan), (0, "PASS: attendance cleanup\n", ""))
+            self.assertEqual(run(first, plan=second_plan), mismatch)
             for phase in acceptance.PHASES:
                 with self.subTest(phase=phase):
                     self.assertEqual(run({**first, phase: second[phase]}), mismatch)
@@ -391,11 +596,72 @@ class AcceptanceTests(unittest.TestCase):
             last_start = START + timedelta(hours=1, seconds=-acceptance.RUN_BUDGET)
             late["lifecycle"]["observedAt"] = last_start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
             self.assertEqual(run({**first, "off": late}), (1, "", "FAIL: staging lease did not cover the probe\n"))
+
+            for earlier, later in zip(acceptance.PHASES, acceptance.PHASES[1:]):
+                earlier_stamp = first[earlier]["lifecycle"]["observedAt"]
+                later_stamp = first[later]["lifecycle"]["observedAt"]
+                reason = "cleanup readback is incomplete" if later == "cleanup" else "staging lease did not cover the probe"
+                for order, stamp in (("reversed", earlier_stamp), ("tied", later_stamp)):
+                    with self.subTest(earlier=earlier, later=later, order=order):
+                        unordered = deepcopy(first)
+                        unordered[earlier]["lifecycle"]["observedAt"] = later_stamp
+                        unordered[later]["lifecycle"]["observedAt"] = stamp
+                        self.assertEqual(run(unordered), (1, "", f"FAIL: {reason}\n"))
+
+            cleanup = deepcopy(first["cleanup"])
+            del cleanup["lifecycle"]["observedAt"]
+            incomplete = (1, "", "FAIL: cleanup readback is incomplete\n")
+            with self.subTest(cleanup="missing timestamp"):
+                self.assertEqual(run({**first, "cleanup": cleanup}), incomplete)
+            for invalid in (1234, "2026-11-24T16:48:00Z", "2026-11-31T16:48:00.000Z"):
+                with self.subTest(cleanup=invalid):
+                    cleanup["lifecycle"]["observedAt"] = invalid
+                    self.assertEqual(run({**first, "cleanup": cleanup}), incomplete)
+
+            for offset in (timedelta(minutes=47, milliseconds=1), timedelta(hours=1, minutes=5)):
+                with self.subTest(cleanup=offset):
+                    cleanup["lifecycle"]["observedAt"] = (START + offset).isoformat(
+                        timespec="milliseconds").replace("+00:00", "Z")
+                    self.assertEqual(run({**first, "cleanup": cleanup}), passed)
+
             self.assertEqual(run({phase: row for phase, row in first.items() if phase != "cleanup"}),
                              (1, "", "FAIL: rehearsal requires all four observations\n"))
             self.assertEqual(run(first, extra=("--execute",)),
                              (1, "", "FAIL: rehearsal only accepts offline readback\n"))
         no_traffic.assert_not_called()
+
+    def test_rehearsal_refuses_an_earlier_signed_observation_on_the_same_rollout(self):
+        previous_start = START - timedelta(hours=1)
+        previous_plan = {**PLAN, "event_key": "attendance-acceptance:earlier",
+                         "fixture_start": previous_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                         "lease": {**PLAN["lease"], "runId": "1234",
+                                   "acquiredAt": PLAN["lease"]["acquiredAt"] - 3600000,
+                                   "expiresAt": PLAN["lease"]["acquiredAt"]}}
+        previous = self.observations(previous_plan, previous_start)
+        current = self.observations(PLAN, START)
+        passed = (0, "PASS: attendance rehearsal\n", "")
+        mismatch = (1, "", "FAIL: signed attendance receipt did not match the rehearsal plan\n")
+        self.assertEqual(self.offline(previous_plan, previous), passed)
+        self.assertEqual(self.offline(PLAN, current), passed)
+        for phase in ("pending", "finalized", "off"):
+            with self.subTest(phase=phase):
+                old_receipt = previous[phase]["signed_receipt"]
+                self.assertEqual(self.offline(PLAN, {**current, phase: {
+                    **current[phase], "signed_receipt": old_receipt,
+                }}), mismatch)
+
+        finalized = current["finalized"]["signed_receipt"]
+        for field, value in (("event_key", previous_plan["event_key"]), ("fixture_start", previous_plan["fixture_start"]),
+                             ("phase", "pending"), ("worker_version", "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"),
+                             ("lease", {**PLAN["lease"], "runId": "1234"}),
+                             ("lease", {**PLAN["lease"], "runAttempt": 2}),
+                             ("lease", {**PLAN["lease"], "runAttempt": True}),
+                             ("lease", {**PLAN["lease"], "acquiredAt": PLAN["lease"]["acquiredAt"] - 1})):
+            with self.subTest(field=field, value=value):
+                changed = {**current["finalized"], "signed_receipt": {**finalized, field: value}}
+                self.assertEqual(self.offline(PLAN, {**current, "finalized": changed}), mismatch)
+        missing = {key: value for key, value in current["finalized"].items() if key != "signed_receipt"}
+        self.assertEqual(self.offline(PLAN, {**current, "finalized": missing}), mismatch)
 
     def test_signature_matches_shared_wire_vectors(self):
         path = Path(__file__).resolve().parents[2] / "crates/core/tests/fixtures/internal-action-signing.json"
@@ -404,9 +670,24 @@ class AcceptanceTests(unittest.TestCase):
                                                  vector["nonce"], vector["body"].encode())
             self.assertEqual(headers["x-two-signature"], vector["signature"])
 
+    def test_rehearsal_plan_requires_exact_fields_and_a_bounded_key(self):
+        prefix = "attendance-acceptance:"
+        longest_plan = {**PLAN, "event_key": prefix + "a" * 34}
+        observations = self.observations(longest_plan, START)
+        self.assertEqual(self.offline(longest_plan, observations), (0, "PASS: attendance rehearsal\n", ""))
+        invalid_plans = (
+            {**longest_plan, "event_key": longest_plan["event_key"] + "a"},
+            {**longest_plan, "unknown": "unexpected"},
+            {**longest_plan, "lease": {**PLAN["lease"], "unknown": 0}},
+        )
+        for invalid in invalid_plans:
+            with self.subTest(plan=invalid):
+                self.assertEqual(self.offline(invalid, observations), (1, "", "FAIL: invalid synthetic fixture plan\n"))
+
     def test_without_execute_sends_nothing(self):
-        args = ["pending", "--rollout", "rollout", "--observed", "observed"]
-        with patch.object(acceptance, "read_object"), patch.object(acceptance, "validate_configuration"):
+        args = ["pending", "--rollout", "rollout", "--observed", "observed", "--plan", "plan"]
+        with (patch.object(acceptance, "read_object", return_value=PLAN),
+              patch.object(acceptance, "validate_configuration"), patch.object(acceptance, "validate_planned_fixture")):
             self.assertEqual(acceptance.main(args, env={}, check=lambda _: self.fail("network call")), 2)
             args[0] = "cleanup"
-            self.assertEqual(acceptance.main([*args, "--fixture-start", "2026-11-24T16:00:00Z"]), 1)
+            self.assertEqual(acceptance.main([*args, "--execute"]), 1)

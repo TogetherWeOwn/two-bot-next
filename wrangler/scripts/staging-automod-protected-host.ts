@@ -6,7 +6,7 @@ type Inventory = NonNullable<Awaited<ReturnType<Providers["readInventory"]>>>;
 type InventorySource = Readonly<{ workflowSha: string; runId: number }>;
 type InventoryReadback = Inventory & Readonly<{ workflow_sha: string; workflow_run_id: number }>;
 type Options = Entry[0] & Readonly<{ inventorySource?: InventorySource }>;
-type Host = Pick<Providers, "authority" | "readWorker"> & Readonly<{
+type Host = Pick<Providers, "authority" | "readWorker" | "prepareLease"> & Readonly<{
   readRun: Entry[1];
   readAuthenticatedInventory: (source: InventorySource, signal: AbortSignal) => Promise<InventoryReadback | undefined>;
   invokePrivate: Providers["invoke"];
@@ -27,7 +27,9 @@ export async function runStagingAutomodProtectedHost(options: Options = {}, host
     return { verdict: "failed", code: "context_unconfirmed" } as const;
   }
   const source = Object.freeze({ workflowSha, runId });
+  const { prepareLease } = host;
   return runStagingAutomodOperatorEntry(options, (id, signal) => host.readRun(id, signal), {
+    ...(prepareLease && { prepareLease }),
     authority: {
       readIssuedLease: (context, signal) => host.authority.readIssuedLease(context, signal),
       readApproval: (action, lease, signal) => host.authority.readApproval(action, lease, signal),

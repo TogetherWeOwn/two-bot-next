@@ -13,6 +13,9 @@ from container_stdout_read import (
 from script_intake import decode_json, read_with_overflow
 
 MAX_PACKET_BYTES = 4 * 1024 * 1024
+SUMMARY_SCHEMA = "passive_gateway_summary.v1"
+DENIAL_SUMMARY_SCHEMA = "passive_gateway_summary.v2"
+POLICY_REFUSAL = "gateway_resume_endpoint_policy_refused"
 PACKET_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z")
 SIGNALS = {
     "gateway_connecting": "two_bot",
@@ -20,6 +23,7 @@ SIGNALS = {
     "gateway_resumed": "two_bot::gateway",
     "shard_closed": "two_bot::logging",
     "gateway_reconnect_failed": "two_bot::gateway",
+    POLICY_REFUSAL: "two_bot::gateway",
 }
 
 
@@ -67,12 +71,17 @@ def summarize(packet, *, service, sha, start, end):
 
     signals = dict.fromkeys(("ready", "gateway_resumed", "shard_closed", "gateway_reconnect_failed",
                              "identify_planned", "resume_planned"), 0)
+    refused_at = None
     for event in events:
         name = event.get("msg")
         if not isinstance(name, str) or name not in SIGNALS or event.get("target") != SIGNALS[name]:
             continue
         if event.get("build_sha") != sha:
             return {"verdict": "unbound_build"}
+        if name == POLICY_REFUSAL:
+            stamp = event["ts"]  # All timestamps have been validated in the same UTC format.
+            refused_at = stamp if refused_at is None else min(refused_at, stamp)
+            continue
         if name == "gateway_connecting":
             resume = event.get("resume")
             if type(resume) is not bool:
@@ -81,8 +90,11 @@ def summarize(packet, *, service, sha, start, end):
         signals[name] += 1
     if not builds:
         return {"verdict": "no_build_events"}
-    verdict = "observed" if any(signals.values()) else "not_observed"
-    return {"verdict": verdict, "build_sha": sha, "signals": signals}
+    summary = {"schema": SUMMARY_SCHEMA, "verdict": "observed" if any(signals.values()) else "not_observed",
+               "build_sha": sha, "window": {"start": window["start"], "end": window["end"]}, "signals": signals}
+    if refused_at is not None:
+        summary.update(schema=DENIAL_SUMMARY_SCHEMA, verdict="observed", endpoint_policy_refused_at=refused_at)
+    return summary
 
 
 def main(argv=None, *, stdin=None, stdout=None):

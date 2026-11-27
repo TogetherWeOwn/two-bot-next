@@ -153,6 +153,13 @@ The window bounds are UTC seconds ending in `Z`, matching the readback's
 built from the same commit, the release watch must establish which image served
 throughout the supplied window before those logs can be attributed to it.
 
+Successful `passive_gateway_summary.v1` output retains the verified capture
+`window.start` and `window.end`, the source SHA, the verdict and signal counts.
+The bounds use the packet's millisecond format with a zero fraction. Keep the
+independent application and serving-image readback with the handoff. The
+summary carries no application or image identity, and matching bounds cannot
+distinguish different images that share the same revision and bounds.
+
 `ready` records a committed READY after IDENTIFY. `gateway_resumed` records a
 committed RESUMED that published readiness. These are historical gateway
 readiness observations. `gateway_connecting.resume` records the planned boot
@@ -187,6 +194,21 @@ synthetic. Each row can be recorded as its evidence becomes available.
 
 Keep endpoint values, session IDs and raw logs out of the execution card. Use
 the existing release watch and reviewer process for these entries.
+
+The boot receipt source is off by default. It emits a fixed event only when
+`TWO_GATEWAY_RESUME_DENIAL_EVIDENCE=1` and an otherwise eligible saved session
+with a nonempty endpoint was refused by the admission policy and discarded.
+An empty endpoint, missing or expired checkpoint, forced IDENTIFY, and
+transport or protocol failure do not produce this receipt. Only the JSON log
+format carries it, with a constant message and the existing unscoped envelope.
+Received endpoint decisions outside this boot path remain unavailable from
+this receipt.
+
+The same passive summarizer writes `passive_gateway_summary.v2` when it finds
+that stamped event, with the earliest matching UTC event time at millisecond
+precision in `endpoint_policy_refused_at`. It otherwise writes the existing
+summary. The saved summary contains no endpoint, payload, token or member
+identifier. Keep the source disabled until separate authorization to use it.
 
 ## Verification (test containers only)
 

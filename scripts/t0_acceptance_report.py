@@ -9,7 +9,9 @@ from pathlib import Path
 import re
 
 from build_identity import is_build_id_shape, is_build_revision_shape, is_deploy_id_shape
-from container_stdout_read import MAX_LIMIT, UUID_RE
+from container_stdout_read import MAX_LIMIT, MAX_MINUTES, UUID_RE
+from passive_gateway_evidence import DENIAL_SUMMARY_SCHEMA, PACKET_TIMESTAMP
+from passive_gateway_evidence import SUMMARY_SCHEMA as GATEWAY_SUMMARY_SCHEMA
 from script_intake import decode_json, read_with_overflow
 from staging_help_embed_smoke import EMBED_KEYS, SCHEMA as HELP_SCHEMA
 
@@ -19,6 +21,7 @@ UTC_INSTANT = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2
                          r"(?:\.([0-9]+))?(?:Z|[+-]00:?00)")
 WINDOW_FIELDS = ("environment", "build_revision", "build_id", "deploy_id", "image_digest",
                  "worker_version", "application_id", "start", "end")
+IDENTITY_FIELDS = WINDOW_FIELDS[:-2]
 SIGNALS = ("ready", "gateway_resumed", "shard_closed", "gateway_reconnect_failed",
            "identify_planned", "resume_planned")
 GATEWAY_MISMATCHES = ("service_mismatch", "stale_evidence", "mixed_build", "build_mismatch")
@@ -73,6 +76,23 @@ def serving_window(value):
             or env not in ("staging", "production") or start >= end):
         raise ValueError
     return {**{key: value[key] for key in WINDOW_FIELDS}, "start": format_utc(start), "end": format_utc(end)}
+
+
+def serving_window_interrupted(readbacks, expected):
+    if not isinstance(readbacks, list):
+        raise ValueError
+    start, end = utc_instant(expected["start"]), utc_instant(expected["end"])
+    fields = {*IDENTITY_FIELDS, "utc"}
+    interrupted = False
+    for readback in readbacks:
+        if not isinstance(readback, dict) or readback.keys() != fields:
+            raise ValueError
+        if readback["environment"] != expected["environment"] or not start <= utc_instant(readback["utc"]) <= end:
+            raise ValueError
+        observed = serving_window(dict(readback, start=expected["start"], end=expected["end"]))
+        if observed != expected:
+            interrupted = True
+    return interrupted
 
 
 def help_observation(report):
@@ -161,16 +181,37 @@ def production_watch_observation(kind, report, window):
 
 def gateway_observation(report):
     counts = report.get("signals")
+    has_receipt = report.get("schema") == DENIAL_SUMMARY_SCHEMA
     if (not is_build_revision_shape(report.get("build_sha")) or not isinstance(counts, dict)
             or counts.keys() != set(SIGNALS) or not all(type(n) is int and 0 <= n <= MAX_LIMIT
                                                        for n in counts.values())
-            or sum(counts.values()) > MAX_LIMIT):
+            or sum(counts.values()) + int(has_receipt) > MAX_LIMIT):
         raise ValueError
-    verdict = "observed" if any(counts.values()) else "not_observed"
+    verdict = "observed" if has_receipt or any(counts.values()) else "not_observed"
     if report.get("verdict") != verdict:
         raise ValueError
     readiness = "observed" if counts["ready"] or counts["gateway_resumed"] else "not_observed"
     return {"result": verdict, "readiness": readiness, "signals": {key: counts[key] for key in SIGNALS}}
+
+
+def gateway_summary_window(report):
+    if report.keys() == {"verdict", "build_sha", "signals"}:
+        return None  # Legacy successful summaries carry no capture bounds.
+    fields = {"schema", "verdict", "build_sha", "window", "signals"}
+    schema = report.get("schema")
+    if schema == DENIAL_SUMMARY_SCHEMA:
+        fields.add("endpoint_policy_refused_at")
+    elif schema != GATEWAY_SUMMARY_SCHEMA:
+        raise ValueError
+    if report.keys() != fields:
+        raise ValueError
+    window = report["window"]
+    if not isinstance(window, dict) or window.keys() != {"start", "end"}:
+        raise ValueError
+    start, end = utc_instant(window["start"]), utc_instant(window["end"])
+    if start[1] or end[1] or not 0 < (end[0] - start[0]).total_seconds() <= MAX_MINUTES * 60:
+        raise ValueError
+    return {"start": format_utc(start), "end": format_utc(end)}
 
 
 def observation(kind, parse, path, binding, expected):
@@ -219,6 +260,22 @@ def observation(kind, parse, path, binding, expected):
                            fields=differing)
         else:
             outcome = parse(report)
+        if kind == "gateway":
+            bounds = gateway_summary_window(report)
+            if bounds is None and expected["environment"] == "production":
+                return gap("unverified", "legacy gateway summary lacks capture window bounds")
+            if bounds is not None:
+                differing = [key for key in bounds if bounds[key] != recorded[key]]
+                if differing:
+                    return gap("mismatched", "gateway summary capture window differs from the serving window",
+                               fields=differing)
+            if report.get("schema") == DENIAL_SUMMARY_SCHEMA:
+                stamp = report["endpoint_policy_refused_at"]
+                if not token(PACKET_TIMESTAMP, stamp):
+                    raise ValueError
+                if not utc_instant(recorded["start"]) <= utc_instant(stamp) <= utc_instant(recorded["end"]):
+                    return gap("mismatched", "gateway endpoint-policy refusal falls outside the capture window")
+                outcome.update(endpoint_denial="observed", endpoint_denial_at=stamp)
     except ValueError:
         return gap("unverified", "saved probe output is invalid or refused")
     row = {"status": "attributed", "window": recorded, **outcome}
@@ -245,14 +302,32 @@ def main(argv=None):
     except (OSError, RecursionError, ValueError):
         print(json.dumps({"error": "handoff unreadable or missing a complete expected serving window"}))
         return 2
+    try:
+        interrupted = serving_window_interrupted(handoff.get("serving_readbacks", []), expected)
+    except ValueError:
+        print(json.dumps({"error": "handoff contains invalid serving readbacks"}))
+        return 2
 
-    rows = {kind: observation(kind, parse, path, bindings.get(kind), expected) for kind, parse, path in (
+    sources = (
         ("help", help_observation, args.help_report), ("naming", naming_observation, args.naming_report),
         ("gateway", gateway_observation, args.gateway_report),
-    )}
-    rows["gateway"]["endpoint_denial"] = "unverified"
-    rows["gateway"]["endpoint_denial_needed"] = "Explicit passive evidence of gateway endpoint rejection."
-    print(json.dumps({"expected": expected, "observations": rows}, indent=2))
+    )
+    rows = {}
+    for kind, parse, path in sources:
+        if interrupted and path is not None:
+            rows[kind] = {"status": "mismatched", "reason": "serving identity changed during the expected window",
+                          "needed": NEEDED[kind]}
+        else:
+            rows[kind] = observation(kind, parse, path, bindings.get(kind), expected)
+    if "endpoint_denial" not in rows["gateway"]:
+        rows["gateway"].update(
+            endpoint_denial="unverified",
+            endpoint_denial_needed="Explicit passive evidence of gateway endpoint rejection.",
+        )
+    report = {"expected": expected, "observations": rows}
+    if interrupted:
+        report["window_status"] = "interrupted"
+    print(json.dumps(report, indent=2))
     return 0
 
 

@@ -113,6 +113,7 @@ draining state is observable via `/readyz` and `shutdown_started/completed`.
 | `log_level_invalid` | Present, nonempty, unparsable `LOG_LEVEL` while no valid `RUST_LOG` wins; defaults to `info` |
 | `gateway_parked` | Missing prerequisite; `missing`, `status` |
 | `gateway_connecting` | Durable store loaded, before connecting; `resume` |
+| `gateway_resume_endpoint_policy_refused` | Optional JSON-only saved-session boot receipt after the admission-policy refusal and checkpoint discard. Constant message and unscoped log envelope |
 | `gateway_started` | Gateway loop begins; `shard` |
 | `ready` | READY processed and checkpoint committed; `shard` |
 | `gateway_resumed` | RESUMED processed and checkpoint committed; `shard` |

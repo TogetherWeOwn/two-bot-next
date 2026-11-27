@@ -14,8 +14,8 @@ from enum import Enum
 from typing import Protocol
 from uuid import UUID
 
-from pre_target import Target, TargetError, require
-from staging_health_contract_probe import BODY_CAP
+from pre_target import ProtectedRouteReadback, Target, TargetError, check_clock, confirm_protected_route, require
+from staging_health_contract_probe import BODY_CAP, TIMEOUT_SECONDS
 
 
 class Operation(Enum):
@@ -27,6 +27,24 @@ class Operation(Enum):
 class Endpoint(Enum):
     HEALTH = "/health"
     READINESS = "/readyz"
+
+
+@dataclass(frozen=True)
+class EffectWindow:
+    """The protected caller binds the authenticated lease cutoff to its Target."""
+
+    target: Target
+    cutoff: int
+
+    def __post_init__(self):
+        require(type(self.target) is Target and type(self.cutoff) is int
+                and self.target.started_at < self.cutoff <= self.target.expires_at,
+                "invalid_pre_effect_window")
+
+    def require_open(self, now: int) -> None:
+        """Check with trusted, nondecreasing authority time at the effect boundary."""
+        check_clock(self.target, now)
+        require(now < self.cutoff, "pre_effect_window_expired")
 
 
 class StartupAdmission(Protocol):
@@ -52,6 +70,10 @@ class WorkerUpload(Protocol):
     def content_type(self) -> str: ...
     @property
     def body(self) -> bytes: ...
+    @property
+    def supports_discord_fixture_overrides(self) -> bool:
+        """Whether the verified Worker can forward both synthetic endpoints."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -71,30 +93,67 @@ class ProbeReply:
     body: bytes = field(repr=False)
 
 
+@dataclass(frozen=True)
+class ProbeBindingIdentity:
+    worker_id: str
+    deployment: Deployment
+
+
+@dataclass(frozen=True)
+class PrivateHttpReply:
+    status: int
+    worker_versions: tuple[str, ...] = field(repr=False)
+    body: bytes = field(repr=False)
+
+
+class PrivateProbeBinding(Protocol):
+    """Authenticated handle to one private service, with no alternate destination.
+
+    At send time, the adapter checks the current reservation, exact binding
+    destination, authorization and stop fence. It checks the durably armed
+    window for the exact Target and start ID with trusted current time. The
+    adapter must enforce the total timeout and cap the response read, without
+    redirects or retries. Return every x-two-worker-version field value,
+    regardless of header case.
+    """
+
+    @property
+    def identity(self) -> ProbeBindingIdentity: ...
+
+    def request(self, method: str, path: str, *, expected: ProbeBindingIdentity,
+                follow_redirects: bool, timeout_seconds: int, max_body_bytes: int) -> PrivateHttpReply: ...
+
+
 class PrivateRuntime(Protocol):
     """Enforce authorization, exact operation, deadline and stop at effect time.
 
     Return a deployment only after verifying the exact artifact and isolated
     app identity, private ingress from first create, current unrouted readback
     and an authenticated service binding restricted to this exact Worker.
+    Before starting any process, require the effective synthetic Discord
+    gateway and REST settings and enforce a block on public egress.
     Resolve and compare the deployment against the authoritative identity for
-    the full reservation on each bounded GET without following redirects.
+    the full reservation on each bounded GET using the `probe_private_get` contract.
     Controller instances can span different runners, so retain that identity
-    outside the controller. Refuse effects outside the admission window,
-    after a fence, or for unverified identities. Treat a lost reply as uncertain.
+    outside the controller. At each effect, including delayed create and probe,
+    verify ownership and the fence and call `require_open` on the durably armed
+    window using trusted current time. Create must match the exact armed
+    window for this Target and start ID. Enforce these checks at the point the
+    effect can commit. Treat a lost reply as uncertain.
     """
 
-    def create_private(self, target: Target, start_id: UUID, upload: WorkerUpload) -> Deployment: ...
+    def create_private(self, window: EffectWindow, start_id: UUID, upload: WorkerUpload) -> Deployment: ...
     def probe(self, deployment: Deployment, endpoint: Endpoint) -> ProbeReply: ...
 
 
 class ExternalStop(Protocol):
     """Independent of the calling workflow and the historical Worker.
 
-    Arm before create and enforce the deadline in Target even after runner
-    loss. Arm is bound to the admitted start ID and cannot reopen a fenced or
-    expired reservation. Arm must atomically reserve the exact provider names
-    in their account and refuse a collision with any other reservation. Two
+    Arm before create and independently enforce the armed window's cutoff even
+    after runner loss. At arm commit, check `require_open` with authority time,
+    durably bind the window to the admitted start ID and atomically reserve the
+    exact provider names in their account. Refuse a cutoff change, a fenced or
+    expired reservation, or a collision with any other reservation. Two
     full Targets can have the same names. Key ownership and stop by the full
     Target. The runtime checks ownership and the fence at the effect boundary,
     including for delayed requests. Fence persists even if create never
@@ -103,8 +162,18 @@ class ExternalStop(Protocol):
     The admission settlement observer verifies drain and no restart separately.
     """
 
-    def arm(self, target: Target, start_id: UUID) -> bool: ...
+    def arm(self, window: EffectWindow, start_id: UUID) -> bool: ...
     def fence(self, target: Target) -> bool: ...
+
+    def confirm_probe_active(self, target: Target, start_id: UUID) -> bool:
+        """Confirm acceptance against the current fence and trusted authority time.
+
+        Use one authoritative observation without network I/O. Return True only
+        for the exact armed Target and start ID while unfenced, at or after
+        target.started_at and before both target.expires_at and any earlier
+        enclosing cutoff. Refuse if any of that state is unknown or stale.
+        """
+        ...
 
 
 def _call(operation, *args, failure):
@@ -115,25 +184,62 @@ def _call(operation, *args, failure):
     raise TargetError(failure) from None
 
 
+def _valid_deployment(deployment):
+    return (type(deployment) is Deployment and type(deployment.target) is Target
+            and all(type(value) is UUID and value.int for value in
+                    (deployment.start_id, deployment.worker_version, deployment.container_id)))
+
+
+def probe_private_get(deployment: Deployment, endpoint: Endpoint, *, pinned_deployment: Deployment,
+                      pinned_route: ProtectedRouteReadback, binding: PrivateProbeBinding) -> ProbeReply:
+    """Verify the outbound probe against independent protected pins.
+
+    The caller supplies the authoritative deployment and pinned route from the
+    reservation independently of the binding. This helper has no provider client.
+    """
+    require(type(endpoint) is Endpoint, "invalid_pre_probe")
+    require(_valid_deployment(pinned_deployment) and _valid_deployment(deployment)
+            and deployment == pinned_deployment, "pre_deployment_unconfirmed")
+    confirm_protected_route(deployment.target, pinned_app_id=str(pinned_deployment.container_id),
+                            readback=pinned_route)
+    expected = ProbeBindingIdentity(pinned_route.worker_id, pinned_deployment)
+    identity = _call(lambda: binding.identity, failure="pre_probe_binding_unconfirmed")
+    require(type(identity) is ProbeBindingIdentity and type(identity.worker_id) is str
+            and _valid_deployment(identity.deployment) and identity == expected, "pre_probe_binding_unconfirmed")
+
+    reply = _call(lambda: binding.request("GET", endpoint.value, expected=expected, follow_redirects=False,
+                                          timeout_seconds=TIMEOUT_SECONDS, max_body_bytes=BODY_CAP + 1),
+                  failure="pre_probe_unconfirmed")
+    require(type(reply) is PrivateHttpReply and type(reply.status) is int
+            and 200 <= reply.status <= 599, "pre_probe_unconfirmed")
+    require(not 300 <= reply.status <= 399, "pre_probe_redirect")
+    stamp = reply.worker_versions
+    require(type(stamp) is tuple and len(stamp) == 1 and type(stamp[0]) is str
+            and stamp[0] == str(deployment.worker_version), "pre_probe_version_unconfirmed")
+    require(type(reply.body) is bytes and len(reply.body) <= BODY_CAP, "pre_probe_unconfirmed")
+    return ProbeReply(reply.status, deployment.worker_version, reply.body)
+
+
 class ProtectedPre:
+    """Construct START with the original authenticated window and STOP with the Target."""
+
     def __init__(self, target: Target, *, authorize: Callable[[Target, Operation], bool],
-                 admission: StartupAdmission, runtime: PrivateRuntime, external_stop: ExternalStop):
+                 admission: StartupAdmission, runtime: PrivateRuntime, external_stop: ExternalStop,
+                 effect_window: EffectWindow | None = None):
         require(type(target) is Target, "invalid_pre_target")
         self._target = target
         self._authorize = authorize
         self._admission = admission
         self._runtime = runtime
         self._external_stop = external_stop
+        self._effect_window = effect_window
 
     def _allow(self, operation):
         allowed = _call(self._authorize, self._target, operation, failure="pre_operation_denied")
         require(allowed is True, "pre_operation_denied")
 
     def _require_deployment(self, deployment):
-        require(type(deployment) is Deployment and type(deployment.target) is Target
-                and deployment.target == self._target
-                and all(type(value) is UUID and value.int for value in
-                        (deployment.start_id, deployment.worker_version, deployment.container_id)),
+        require(_valid_deployment(deployment) and deployment.target == self._target,
                 "pre_deployment_unconfirmed")
 
     def start(self, upload: WorkerUpload) -> Deployment:
@@ -148,11 +254,15 @@ class ProtectedPre:
         target = self._target
         upload_target = getattr(upload, "target", None)
         require(type(upload_target) is Target and upload_target == target, "wrong_pre_upload_target")
+        window = self._effect_window
+        require(type(window) is EffectWindow and window.target == target, "wrong_pre_effect_window")
+        require(getattr(upload, "supports_discord_fixture_overrides", None) is True,
+                "pre_discord_fixture_overrides_unavailable")
         start_id = _call(self._admission.admit_start, target, failure="pre_start_unconfirmed")
         require(type(start_id) is UUID and start_id.int, "pre_start_not_admitted")
-        armed = _call(self._external_stop.arm, target, start_id, failure="pre_external_stop_unarmed")
+        armed = _call(self._external_stop.arm, window, start_id, failure="pre_external_stop_unarmed")
         require(armed is True, "pre_external_stop_unarmed")
-        deployment = _call(self._runtime.create_private, target, start_id, upload, failure="pre_create_unconfirmed")
+        deployment = _call(self._runtime.create_private, window, start_id, upload, failure="pre_create_unconfirmed")
         self._require_deployment(deployment)
         require(deployment.start_id == start_id, "pre_deployment_unconfirmed")
         return deployment
@@ -165,6 +275,9 @@ class ProtectedPre:
         require(type(reply) is ProbeReply and type(reply.status) is int and 200 <= reply.status <= 599
                 and type(reply.worker_version) is UUID and reply.worker_version == deployment.worker_version
                 and type(reply.body) is bytes and len(reply.body) <= BODY_CAP, "pre_probe_unconfirmed")
+        active = _call(lambda: self._external_stop.confirm_probe_active(self._target, deployment.start_id),
+                       failure="pre_probe_unconfirmed")
+        require(active is True, "pre_probe_unconfirmed")
         return reply
 
     def stop(self) -> bool:

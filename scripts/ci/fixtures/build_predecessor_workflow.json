@@ -28,6 +28,13 @@
           }
         },
         {
+          "name": "Verify the protected input and export the reviewed tree",
+          "env": {
+            "GH_TOKEN": "${{ github.token }}"
+          },
+          "run": "# Limit the inherited worktree checkout while keeping all Git objects for the export.\ngit sparse-checkout set --cone scripts\npython3 scripts/build_predecessor.py prepare\n"
+        },
+        {
           "uses": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
           "with": {
             "node-version": "22",
@@ -36,13 +43,6 @@
         },
         {
           "uses": "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
-        },
-        {
-          "name": "Verify the protected input and export the reviewed tree",
-          "env": {
-            "GH_TOKEN": "${{ github.token }}"
-          },
-          "run": "python3 scripts/build_predecessor.py prepare"
         },
         {
           "name": "Install the archived locked Worker dependencies",
