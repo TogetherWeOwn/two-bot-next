@@ -68,6 +68,14 @@ class FixtureManifestTest(unittest.TestCase):
                 self.assertNotIn("hasInstallScript", entry)
                 self.assertNotIn("link", entry)
 
+    def test_locked_minimatch_versions_are_outside_advisory_range(self):
+        packages = load("package-lock.json")["packages"]
+        for path, entry in packages.items():
+            if path.endswith("/minimatch"):
+                version = tuple(int(part) for part in entry["version"].split("."))
+                with self.subTest(package=path, version=entry["version"]):
+                    self.assertFalse((7, 0, 0) <= version < (11, 0, 1))
+
 
 class WorkflowInstallTest(unittest.TestCase):
     def test_pr_lint_sparse_checkout_includes_both_fixture_files(self):
