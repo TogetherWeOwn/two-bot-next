@@ -1,5 +1,3 @@
-"""Exercise the paired readiness contract without a provider or network."""
-
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -14,22 +12,19 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.p
     from pre_target import Target, TargetError
 
 
-def digest(char):
-    return "sha256:" + char * 64
-
-
-BUILD = Build("a" * 40, "123-1", "pre-deploy", digest("b"))
+DIGEST_PREFIX = "sha256:"
+BUILD = Build("a" * 40, "123-1", "pre-deploy", DIGEST_PREFIX + "b" * 64)
 ORIGINAL = Reservation(
     Runtime(Target("pre-fixture-original", 1, 1_800_000_000, "0473/0465"),
             "10000000-0000-0000-0000-000000000001", "process-one"),
     "20000000-0000-0000-0000-000000000001", BUILD, Writer("db-one", "writer-one", True, True, True),
-    Ledger(digest("a"), digest("c"), (115, 473), (20, 465), False, None), "ready-one",
+    Ledger(DIGEST_PREFIX + "a" * 64, DIGEST_PREFIX + "c" * 64, (115, 473), (20, 465), False, None), "ready-one",
 )
 RETAINED = Reservation(
     Runtime(Target("pre-fixture-retained", 2, 1_800_000_000, "0475/0465"),
             "10000000-0000-0000-0000-000000000002", "process-two"),
     "20000000-0000-0000-0000-000000000002", BUILD, Writer("db-two", "writer-two", True, True, True),
-    Ledger(digest("d"), digest("c"), (116, 475), (20, 465), True, 1_800_000_000_000_001), "ready-two",
+    Ledger(DIGEST_PREFIX + "d" * 64, DIGEST_PREFIX + "c" * 64, (116, 475), (20, 465), True, 1_800_000_000_000_001), "ready-two",
 )
 PINS = {pin.runtime.target: pin for pin in (ORIGINAL, RETAINED)}
 
@@ -123,7 +118,7 @@ class PairedReadinessTests(unittest.TestCase):
             cases = [({stamp: "x"}, "runtime_stamps") for stamp in ("build_revision", "build_id", "deploy_id")]
             cases += [({"components": value}, "readiness_components") for value in (
                 pairs + [pairs[-1]], [pairs[0], ["database", "down"], pairs[2]],
-                [*pairs[:2], ["gateway", "down" if after else "ready"]],
+                [["process", "down"], *pairs[1:]], [*pairs[:2], ["gateway", "down" if after else "ready"]],
             )]
             for changes, error in cases:
                 with self.subTest(after=after, changes=changes):
@@ -135,10 +130,11 @@ class PairedReadinessTests(unittest.TestCase):
     def test_refuses_wrong_effective_writer_ledger_digest_or_reservation(self):
         for changes, error in (
             ({"runtime": ORIGINAL.runtime}, "readback_runtime"),
-            ({"running_digest": digest("f")}, "running_digest"),
+            ({"request": object()}, "readback_runtime"),
+            ({"running_digest": DIGEST_PREFIX + "f" * 64}, "running_digest"),
             ({"writer": replace(RETAINED.writer, writer_id="other")}, "wrong_pre_writer"),
             ({"writer": replace(RETAINED.writer, isolated=False)}, "unconfirmed_pre_writer"),
-            ({"ledger": replace(RETAINED.ledger, cutover_fingerprint=digest("f"))}, "wrong_pre_ledger"),
+            ({"ledger": replace(RETAINED.ledger, cutover_fingerprint=DIGEST_PREFIX + "f" * 64)}, "wrong_pre_ledger"),
             ({"ledger": replace(RETAINED.ledger, installed_0475_at=None)}, "retained_timestamp"),
             ({"ledger": replace(RETAINED.ledger, installed_0475_at=1_800_000_000_000_000)}, "wrong_pre_ledger"),
         ):
@@ -155,7 +151,7 @@ class PairedReadinessTests(unittest.TestCase):
         self.assertNotIn(("0473/0465", "/readyz", True), fixture.calls)
         session = ORIGINAL.mock_session
         for after, activity in (
-            (False, MockActivity(ready_session=session)),
+            (False, MockActivity(ready_session=ANY)),
             (True, MockActivity(session, (session, 1), session, 0)),
             (True, MockActivity(session, (ANY, 1), session, 2)),
             (True, MockActivity(session, (session, 1), RETAINED.mock_session, 2)),
@@ -168,9 +164,13 @@ class PairedReadinessTests(unittest.TestCase):
                     fixture.verify()
 
     def test_refuses_shared_scope_or_provider_names_before_probing(self):
-        for changes in ({"scope": ORIGINAL.runtime.target.scope}, {"run_id": ORIGINAL.runtime.target.run_id}):
-            target = replace(RETAINED.runtime.target, **changes)
+        first = ORIGINAL.runtime.target
+        crossed_targets = (replace(RETAINED.runtime.target, scope=first.scope),
+                           replace(RETAINED.runtime.target, run_id=first.run_id))
+        crossed = [replace(RETAINED, runtime=replace(RETAINED.runtime, target=target)) for target in crossed_targets]
+        crossed.append(replace(RETAINED, writer=replace(RETAINED.writer, writer_id=ORIGINAL.writer.writer_id)))
+        for retained in crossed:
             fixture = Fixture()
             with self.assertRaisesRegex(TargetError, "reservations_not_separate"):
-                fixture.verify(retained=replace(RETAINED, runtime=replace(RETAINED.runtime, target=target)))
+                fixture.verify(retained=retained)
             self.assertEqual(fixture.calls, [])
