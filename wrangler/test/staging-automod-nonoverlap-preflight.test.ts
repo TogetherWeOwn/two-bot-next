@@ -25,9 +25,10 @@ const lease = Object.freeze({
 } as const);
 const plan = { ...STAGING_AUTOMOD_PLAN, enabled: true, notAfter: now + 20_000 };
 const promotion = { observedAt: now, PRODUCTION_AUTO_PROMOTE_DISABLED: true };
+const requestedAttempt = { runId: run.runId, runAttempt: reservation.runAttempt, usedUntil: null };
 const ownership = {
   observedAt: now, owner: { deploymentId: pin.deploymentId, epoch: pin.epoch, phase: "active" },
-  sha: pin.sha, use: null, runtimeState: "stopped", stopVerified: true, cleanupPending: false,
+  sha: pin.sha, use: null, runtimeState: "stopped", stopVerified: true, cleanupPending: false, requestedAttempt,
 } as const;
 const inventory = {
   ...pin, observedAt: now, ownerPhase: "active", trafficPercent: 100, runtimePolicy: "bounded", rolloutStatus: "completed",
@@ -77,7 +78,6 @@ test("refuses competing uses and unresolved stop or expiry", () => {
     { use: { ...generic, voiceMove: true } },
     { use: { ...generic, phase: "preparing" } },
     { use: { ...generic, expiresAt: now - 1 } },
-    { use: { ...generic, phase: "released", runId: "67890" } },
     { use: { ...lease, phase: "preparing" } },
     { use: { ...lease, purpose: "pre-rollback" } },
     { use: { ...lease, voiceMove: true } },
@@ -99,7 +99,8 @@ test("refuses competing uses and unresolved stop or expiry", () => {
 });
 
 test("requires independent exact evidence for an active AutoMod reservation", () => {
-  const snapshot = { ...ownership, use: lease };
+  const activeAttempt = { ...requestedAttempt, usedUntil: lease.expiresAt };
+  const snapshot = { ...ownership, use: lease, requestedAttempt: activeAttempt };
   assert.equal(evaluate({ ...input, ownership: snapshot, expectedLease: lease }).admitted, true);
   refuses({ ...input, ownership: snapshot }, "staging_nonoverlap_unconfirmed");
   refuses({ ...input, expectedLease: lease }, "staging_nonoverlap_unconfirmed");
@@ -107,11 +108,13 @@ test("requires independent exact evidence for an active AutoMod reservation", ()
     const other = { ...lease, ...wrong };
     refuses({ ...input, ownership: snapshot, expectedLease: other }, "staging_nonoverlap_unconfirmed");
     if (wrong.acquiredAt === undefined) {
-      refuses({ ...input, ownership: { ...ownership, use: other }, expectedLease: other }, "staging_nonoverlap_unconfirmed");
+      refuses({ ...input, ownership: { ...snapshot, use: other, requestedAttempt: { ...activeAttempt, usedUntil: other.expiresAt } },
+        expectedLease: other }, "staging_nonoverlap_unconfirmed");
     }
   }
   refuses({ ...input, ownership: { ...snapshot, observedAt: lease.acquiredAt - 1 }, expectedLease: lease },
     "staging_nonoverlap_unconfirmed");
+  refuses({ ...input, ownership: { ...snapshot, requestedAttempt }, expectedLease: lease }, "staging_nonoverlap_unconfirmed");
 });
 
 test("requires confirmed stop and cleanup after a release and denies replay", () => {
@@ -122,6 +125,29 @@ test("requires confirmed stop and cleanup after a release and denies replay", ()
   refuses({ ...input, ownership: { ...snapshot, cleanupPending: true } }, "staging_nonoverlap_unconfirmed");
   refuses({ ...input, ownership: { ...snapshot, use: { ...released, runId: run.runId } } }, "staging_nonoverlap_unconfirmed");
   refuses({ ...input, ownership: { ...snapshot, use: { ...released, acquiredAt: NaN } } }, "staging_nonoverlap_unconfirmed");
+});
+
+test("admits an unused attempt after a confirmed non-AutoMod release", () => {
+  const { purpose: _purpose, ...generic } = lease;
+  const released = { ...generic, phase: "released", runId: "67890", epoch: pin.epoch - 1, sha: "d".repeat(40),
+    deploymentId: pin.workerDeploymentId } as const;
+  const snapshot = { ...ownership, use: released };
+  assert.equal(evaluate({ ...input, ownership: snapshot }).admitted, true);
+  refuses({ ...input, ownership: { ...snapshot, stopVerified: false } }, "staging_nonoverlap_unconfirmed");
+  refuses({ ...input, ownership: { ...snapshot, use: { ...released, purpose: "pre-rollback" } } } as unknown as Input,
+    "staging_nonoverlap_unconfirmed");
+});
+
+test("rejects replay after another release replaces the attempt tombstone", () => {
+  const released = { ...lease, phase: "released", runId: "67890" } as const;
+  const marker = { ...requestedAttempt, usedUntil: now - 100 };
+  for (const use of [null, released]) {
+    refuses({ ...input, ownership: { ...ownership, use, requestedAttempt: marker } } as Input, "staging_nonoverlap_unconfirmed");
+  }
+  for (const attempt of [undefined, { ...requestedAttempt, runId: "67890" }, { ...requestedAttempt, runAttempt: 2 },
+    { ...requestedAttempt, usedUntil: undefined }]) {
+    refuses({ ...input, ownership: { ...ownership, requestedAttempt: attempt } } as Input, "staging_nonoverlap_unconfirmed");
+  }
 });
 
 test("requires an enabled matching plan and a valid acquisition for the pinned run", () => {

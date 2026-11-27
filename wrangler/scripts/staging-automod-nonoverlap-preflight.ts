@@ -25,6 +25,12 @@ type OwnershipReadback = Readonly<{
   runtimeState: "stopped" | "starting" | "running" | "unknown";
   stopVerified: boolean;
   cleanupPending: boolean;
+  requestedAttempt: Readonly<{
+    runId: string;
+    runAttempt: number;
+    /** The lifecycle's per-attempt marker, or null for verified absence. */
+    usedUntil: number | null;
+  }>;
 }>;
 
 type InventoryReadback = ServingPin & Readonly<{
@@ -87,26 +93,28 @@ function inventoryMatches(inventory: InventoryReadback, pin: ServingPin): boolea
     && inventory.trafficPercent === 100 && inventory.runtimePolicy === "bounded" && inventory.rolloutStatus === "completed";
 }
 
-function nonoverlapping(ownership: OwnershipReadback, expected: Lease | null, request: StagingUseChange, now: number): boolean {
+function nonoverlapping(ownership: OwnershipReadback, expected: Lease | null, request: StagingUseChange): boolean {
   if (ownership.runtimeState !== "stopped" || ownership.stopVerified !== true || ownership.cleanupPending !== false
-    || !["runtimeState", "stopVerified", "cleanupPending", "use"].every(key => Object.hasOwn(ownership, key))) return false;
-  const { use } = ownership;
-  if (use === null) return expected === null;
-  if (!record(use) || !Object.hasOwn(use, "purpose") || use.purpose !== AUTOMOD_STAGING_PURPOSE
-    || use.deploymentId !== request.deploymentId || use.sha !== request.sha || use.epoch !== request.expectedEpoch
-    || use.acquiredAt > ownership.observedAt || "voiceMove" in use) return false;
+    || !["runtimeState", "stopVerified", "cleanupPending", "use", "requestedAttempt"].every(key => Object.hasOwn(ownership, key))) return false;
+  const { use, requestedAttempt } = ownership;
+  if (!record(requestedAttempt) || requestedAttempt.runId !== request.runId || requestedAttempt.runAttempt !== request.runAttempt
+    || !["runId", "runAttempt", "usedUntil"].every(key => Object.hasOwn(requestedAttempt, key))) return false;
+  const unused = expected === null && requestedAttempt.usedUntil === null;
+  if (use === null) return unused;
+  if (!record(use) || use.acquiredAt > ownership.observedAt || "voiceMove" in use) return false;
 
   if (use.phase === "released") {
     // A release tombstone alone does not prove stop. The native stop and
     // cleanup readbacks above must confirm that the old use is over.
     const original = { ...use, phase: "active" as const };
-    return expected === null && sameLease(original, original)
+    return unused && (!("purpose" in use) || use.purpose === AUTOMOD_STAGING_PURPOSE) && sameLease(original, original)
       && (use.runId !== request.runId || use.runAttempt !== request.runAttempt);
   }
-  return expected?.purpose === AUTOMOD_STAGING_PURPOSE && sameLease(expected, expected)
-    && sameLease(expected, use)
+  return Object.hasOwn(use, "purpose") && use.purpose === AUTOMOD_STAGING_PURPOSE
+    && expected?.purpose === AUTOMOD_STAGING_PURPOSE && sameLease(expected, expected) && sameLease(expected, use)
+    && use.deploymentId === request.deploymentId && use.sha === request.sha && use.epoch === request.expectedEpoch
     && use.runId === request.runId && use.runAttempt === request.runAttempt && use.expiresAt === request.expiresAt
-    && now < use.expiresAt;
+    && requestedAttempt.usedUntil === request.expiresAt;
 }
 
 function denied(reason: string): Verdict {
@@ -114,8 +122,8 @@ function denied(reason: string): Verdict {
 }
 
 /** Evaluate authenticated, plain-data snapshots supplied by a trusted caller.
- * Ownership, staging use, native stop and cleanup must come from one coherent
- * observation. Admission is a preflight verdict. Issuance remains in the lifecycle gate.
+ * Ownership, staging use, the requested attempt marker, native stop and cleanup
+ * must come from one coherent observation. Issuance remains in the lifecycle gate.
  */
 export function evaluateStagingAutomodNonoverlapPreflight(input: StagingAutomodNonoverlapPreflightInput): Verdict {
   if (!input || !Number.isSafeInteger(input.now) || input.now < 0) return denied("invalid_clock");
@@ -136,7 +144,7 @@ export function evaluateStagingAutomodNonoverlapPreflight(input: StagingAutomodN
     || ownership.owner.epoch !== pin.epoch || ownership.sha !== pin.sha || !inventoryMatches(inventory, pin)) {
     return denied("staging_serving_pin_mismatch");
   }
-  if (!nonoverlapping(ownership, input.expectedLease, request, now)) return denied("staging_nonoverlap_unconfirmed");
+  if (!nonoverlapping(ownership, input.expectedLease, request)) return denied("staging_nonoverlap_unconfirmed");
 
   return { admitted: true, target: STAGING_AUTOMOD_TARGET, purpose: AUTOMOD_STAGING_PURPOSE, reservation: Object.freeze(request) };
 }
