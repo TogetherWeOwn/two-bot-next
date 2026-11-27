@@ -8,7 +8,7 @@ from pre_start_stop import Deployment, EffectWindow, _valid_deployment
 from pre_target import Target, require
 
 
-STALE_EPOCH_REFUSAL = "stale_epoch"
+STALE_EPOCH_REFUSAL = "epoch_conflict"  # Worker ownership control's epoch mismatch reason.
 
 
 @dataclass(frozen=True)
@@ -64,10 +64,11 @@ def verify_native_pre_epoch_fence(
 ) -> EpochFenceVerdict:
     """Check caller-authenticated pins and an immutable transcript in observation order.
 
-    Each transition records the resulting fence epoch. Each probe records the
-    presented writer epoch and the observed number of state mutations. Probes
-    can follow any transition and are checked against the latest fence at that
-    point. Invalid evidence raises TargetError with a fixed reason.
+    Each transition records the resulting fence epoch. A probe records the
+    writer epoch presented to ownership control, the Worker refusal reason,
+    and the observed number of state mutations. Probes can follow any
+    transition and use the latest fence at that point. Invalid evidence
+    raises TargetError with a fixed reason.
     """
     if enabled is not True:
         return _DISABLED

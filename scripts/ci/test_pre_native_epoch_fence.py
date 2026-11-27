@@ -28,7 +28,7 @@ class FenceFixture:
         self.create = FenceTransition("original_create", self.window, self.original, 7)
         self.takeover = FenceTransition("replacement_takeover", self.window, self.replacement, 8)
         self.stop = FenceTransition("original_stop", self.window, self.original, 9)
-        self.probe = StaleWriteProbe(self.window, self.original, 7, False, "stale_epoch", 0)
+        self.probe = StaleWriteProbe(self.window, self.original, 7, False, "epoch_conflict", 0)
 
     def verify(self, *observations, **overrides):
         inputs = dict(enabled=True, target=self.target, window=self.window, start_id=self.start_id,
@@ -113,7 +113,7 @@ class TestNativePreEpochFence(unittest.TestCase):
     def test_refuses_stale_writes_without_exact_zero_mutation_refusal(self):
         f = self.f
         for changes in ({"accepted": True}, {"accepted": 0}, {"refusal_code": ""},
-                        {"refusal_code": "other"}, {"refusal_code": TextAlias("stale_epoch")},
+                        {"refusal_code": "stale_epoch"}, {"refusal_code": TextAlias("epoch_conflict")},
                         {"mutations": 1}, {"mutations": False}, {"mutations": -1}):
             with self.subTest(field=next(iter(changes))):
                 with self.assertRaisesRegex(TargetError, "stale_write_unconfirmed"):
