@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   sealStagingAutomodQualificationArchive as seal,
@@ -168,4 +169,11 @@ test("rejects changes to any envelope field or its exact schema", () => {
   assert.equal(verify(missing), false);
   const rejection = seal({ ...fixture(), promotionDisabled: false }, now);
   assert.equal(verify({ ...rejection, reasons: ["receipt_invalid"] }), false);
+});
+
+test("rejects a schema-invalid epoch even with its matching checksum", () => {
+  const { deploymentId, runId, sha } = lease;
+  const summary = { deploymentId, epoch: 0, reasons: [], runId, sha, verdict: "qualified" };
+  const archiveDigest = createHash("sha256").update(JSON.stringify(summary)).digest("hex");
+  assert.equal(verify({ ...summary, archiveDigest }), false);
 });
