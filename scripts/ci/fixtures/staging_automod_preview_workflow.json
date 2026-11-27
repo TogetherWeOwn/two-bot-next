@@ -20,7 +20,13 @@
       "steps": [
         {
           "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-          "with": {"ref": "${{ github.sha }}", "persist-credentials": "false", "fetch-depth": "1"}
+          "with": {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": "false",
+            "fetch-depth": "1",
+            "sparse-checkout-cone-mode": "false",
+            "sparse-checkout": "/wrangler/package.json\n/wrangler/scripts/is-direct-invocation.mjs\n/wrangler/scripts/staging-automod-deployment-transport.ts\n/wrangler/scripts/staging-automod-dispatch.ts\n/wrangler/scripts/staging-automod-inventory-verifier.ts\n/wrangler/scripts/staging-automod-operator-entry.ts\n/wrangler/scripts/staging-automod-private-job.ts\n/wrangler/scripts/staging-automod-protected-host.ts\n/wrangler/scripts/staging-automod-rehearsal-caller.ts\n/wrangler/scripts/staging-automod-workflow.ts\n/wrangler/src/alert-rules.ts\n/wrangler/src/container-env.ts\n/wrangler/src/error-events.ts\n/wrangler/src/internal-actions.ts\n/wrangler/src/ownership.ts\n/wrangler/src/redirect.ts\n/wrangler/src/request-id.ts\n/wrangler/src/security-headers.ts\n/wrangler/src/staging-automod-bounded-authority.ts\n/wrangler/src/staging-automod-caller.ts\n/wrangler/src/staging-automod-entry.ts\n/wrangler/src/staging-automod-inputs.ts\n/wrangler/src/staging-automod-job.ts\n/wrangler/src/staging-automod-lifecycle.ts\n/wrangler/src/staging-automod-publication.ts\n/wrangler/src/staging-automod-recovery.ts\n/wrangler/src/staging-automod.ts\n/wrangler/src/staging-lifecycle.ts\n/wrangler/src/staging-preview.ts\n/wrangler/src/staging-use-window.ts\n/wrangler/src/unique-json.ts\n/wrangler/test/fixtures/staging-automod-publication.json\n/wrangler/test/fixtures/staging-automod-recovery.ts\n/wrangler/test/staging-automod-operator-entry.test.ts\n/wrangler/test/staging-automod-workflow-binding.test.ts\n/wrangler/test/staging-automod-workflow.test.ts\n"
+          }
         },
         {
           "uses": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
