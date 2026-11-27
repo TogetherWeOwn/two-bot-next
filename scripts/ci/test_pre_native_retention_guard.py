@@ -38,7 +38,7 @@ class NativeRetentionGuardTests(unittest.TestCase):
             window=EffectWindow(target, target.started_at + 50), now=target.started_at,
             promotion_disabled=True, predecessor=Deployment(target, UUID(int=4), old, UUID(int=5)),
             inventory=RetainedVersionInventory(*destination, old, new, (old, new, extra), True, True),
-            initial=InitialDeployment(*destination, new, False, False, True, (), (), True, (), True),
+            initial=InitialDeployment(*destination, new, False, False, True, (), (), True, (old,), True),
             binding=PrivateBindingPin(*destination, UUID(int=6), new),
             serving=PrivateBindingReadback(*destination, UUID(int=6), new, True, True),
         )
@@ -94,6 +94,8 @@ class NativeRetentionGuardTests(unittest.TestCase):
         cases = (
             ({"retained_versions": (new, extra)}, "predecessor_missing"),
             ({"retained_versions": ()}, "predecessor_missing"),
+            ({"retained_versions": (old, extra)}, "replacement_missing"),
+            ({"retained_versions": (old, new, old)}, "invalid_pre_native_retained_versions"),
             ({"inventory_complete": False}, "retention_unconfirmed"),
             ({"inventory_complete": 1}, "retention_unconfirmed"),
             ({"predecessor_untouched": False}, "retention_unconfirmed"),
@@ -111,6 +113,15 @@ class NativeRetentionGuardTests(unittest.TestCase):
                 self.verify(inventory=replace(inventory, **changes))
         with self.assertRaisesRegex(TargetError, "invalid_pre_native_replacement_version"):
             self.verify(initial=replace(self.evidence["initial"], version=old))
+
+    def test_requires_complete_distinct_pre_replacement_history(self):
+        initial = self.evidence["initial"]
+        old, new, extra = self.evidence["inventory"].retained_versions
+        for changes in ({"history_complete": False}, {"history_complete": 1}, {"prior_versions": ()},
+                        {"prior_versions": (extra,)}, {"prior_versions": (old, new)},
+                        {"prior_versions": (old, old)}, {"prior_versions": [old]}, {"prior_versions": (str(old),)}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(TargetError, "replacement_history_unconfirmed"):
+                self.verify(initial=replace(initial, **changes))
 
     def test_refuses_public_or_unconfirmed_ingress(self):
         initial = self.evidence["initial"]
@@ -164,6 +175,7 @@ class NativeRetentionGuardTests(unittest.TestCase):
             ("window", replace(self.evidence["window"], target=other)),
             ("predecessor", replace(self.evidence["predecessor"], worker_version=malformed_uuid)),
             ("predecessor", replace(self.evidence["predecessor"], worker_version=UUID(int=0))),
+            ("predecessor", object.__new__(Deployment)),
             ("initial", replace(self.evidence["initial"], version=synthetic_marker)),
             ("binding", replace(self.evidence["binding"], worker_service=TextSubclass(target.worker_name))),
             ("serving", replace(self.evidence["serving"], binding_id=str(self.evidence["binding"].binding_id))),
