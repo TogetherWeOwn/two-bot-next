@@ -36,7 +36,9 @@
           "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
           "with": {
             "persist-credentials": "false",
-            "fetch-depth": "1"
+            "fetch-depth": "1",
+            "sparse-checkout-cone-mode": "false",
+            "sparse-checkout": "/wrangler/package.json\n/wrangler/scripts/is-direct-invocation.mjs\n/wrangler/scripts/ownership-control-response.mjs\n/wrangler/scripts/staging-use-pipeline.mjs\n/wrangler/scripts/staging-use.mjs\n/wrangler/scripts/staging-voice-move-acceptance.mjs\n/wrangler/scripts/staging-voice-move-caller.mjs\n/wrangler/scripts/staging-voice-move-entry.mjs\n/wrangler/scripts/staging-voice-move-job.mjs\n/wrangler/scripts/staging-voice-session.mjs\n/wrangler/scripts/staging-voice-web-handoff.mjs\n/wrangler/src/request-id.ts\n"
           }
         },
         {

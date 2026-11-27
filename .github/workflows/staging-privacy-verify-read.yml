@@ -58,6 +58,12 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          # The reader imports the guild fence, which in turn imports script_intake.
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/staging_privacy_verify_read.py
+            /scripts/staging_automation_read_smoke.py
+            /scripts/script_intake.py
       - name: Read the fixture pair's privacy verification counts
         env:
           # Must already exist as staging-privacy-verify-read environment secrets;

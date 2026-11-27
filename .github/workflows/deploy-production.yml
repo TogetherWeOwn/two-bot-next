@@ -43,12 +43,11 @@ name: deploy-production
 # deploy-production run. A deploy always takes over ownership (only the
 # explicit `cutover_hold` input keeps the fence held). Fault switches have no
 # input or execution path here; daily recovery proofs run only on staging.
-# The 30-minute
-# soak sleeps in its own `soak` job OUTSIDE the deploy-production lane, and a
-# `recheck` job re-reads the disable, the hold and the live revision
-# immediately before the deploy: a disable set, a hold set, or a target gone
-# stale, while the gates built or
-# the soak slept skips green instead of deploying through the incident. A
+# The 30-minute automatic promotion soak runs outside the deploy-production
+# lane. The schema and role gates start after soak evidence and release-apply
+# resolve, even when ordinary deploys skip release-apply. The `recheck` job
+# reads the disable, the hold and the live revision after those gates and
+# skips green if any of them now rule out promotion. A
 # regression gate (`staging-soak-evidence` plus a step in `production`)
 # compares the soaked candidate on staging with production before any
 # mutation: no journey that passes on production may fail on staging, and
@@ -99,9 +98,20 @@ on:
         type: boolean
         default: false
 
+      release_plan_run_id:
+        description: "Protected attendance release only: attempt-one reviewed production plan run ID"
+        type: string
+        default: ""
+      release_pins:
+        description: "Protected attendance release only: exact archive, image, prior pair and restore proof digest as JSON"
+        type: string
+        default: ""
+
 permissions: {}
 
-# No workflow-level concurrency: only the `production` job below holds the
+# The protected manual release holds the lane through every protected job.
+# Ordinary workflows use a run-local group here;
+# only the `production` job below holds the
 # `deploy-production` lane (through its post-deploy watch). The guard, gates, soak and recheck jobs run outside it, so a sleeping automatic promotion can never queue an
 # operator rollback behind it. The lane keeps more than one pending
 # slot, so the `recheck` job skips an automatic run while an operator
@@ -109,6 +119,11 @@ permissions: {}
 # the lane alongside queued recovery work. A
 # dispatch queued in the seconds between the recheck and the lane entry is
 # covered by the in-lane recheck.
+
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.run_attempt == 1 && inputs.release_plan_run_id != '' && 'deploy-production' || format('deploy-production-run-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   guard:
@@ -133,6 +148,7 @@ jobs:
       green_at: ${{ steps.guard.outputs.green_at }}
       staging_run_id: ${{ steps.guard.outputs.staging_run_id }}
       staging_attempt: ${{ steps.guard.outputs.staging_attempt }}
+      protected_release: ${{ steps.guard.outputs.protected_release }}
     steps:
       - name: Refuse unverified SHA or unprotected Environment
         id: guard
@@ -143,6 +159,8 @@ jobs:
           # every dispatch input below evaluates to empty and the script
           # applies the automatic-promotion defaults instead.
           SHA: ${{ inputs.sha }}
+          RELEASE_PLAN_ID: ${{ inputs.release_plan_run_id }}
+          RELEASE_PINS: ${{ inputs.release_pins }}
           ROLLBACK: ${{ inputs.rollback }}
           IMAGE: ${{ inputs.image }}
           ALLOW_UNSTAGED: ${{ inputs.allow_unstaged }}
@@ -253,6 +271,20 @@ jobs:
           def refuse(reason):
               print(f"::error::Refusing production {mode}: {reason}")
               sys.exit(1)
+
+          release_plan = os.environ.get("RELEASE_PLAN_ID", "")
+          release_pins = os.environ.get("RELEASE_PINS", "")
+          if release_plan or release_pins:
+              if (event != "workflow_dispatch" or os.environ.get("GITHUB_RUN_ATTEMPT") != "1"
+                      or not re.fullmatch(r"[1-9][0-9]{0,19}", release_plan)
+                      or not release_pins or len(release_pins) > 2048
+                      or not re.fullmatch(r"[0-9a-f]{40}", os.environ.get("SHA", ""))
+                      or mode != "deploy" or allow_unstaged != "false" or takeover != "true"
+                      or cutover_hold != "false"):
+                  refuse("protected release requires a fresh manual exact-SHA staged takeover with both release inputs")
+              if os.environ.get("AUTO_DISABLED") != "true":
+                  refuse("protected release requires automatic production promotion to be disabled")
+              refuse("protected release requires the activation follow-up")
 
           def api(path, what, **query):
               args = ["gh", "api", "--method", "GET", path]
@@ -874,6 +906,7 @@ jobs:
                         f"takeover={takeover}\nallow_unstaged={allow_unstaged}\n"
                         f"skip={skip}\nsoak_seconds={soak_seconds}\n"
                         f"auto={'true' if auto else 'false'}\ngreen_at={green_at_out}\n"
+                        f"protected_release={'true' if release_plan else 'false'}\n"
                         f"staging_run_id={staging_run['id'] if staging_run else ''}\n"
                         f"staging_attempt={staging_run.get('run_attempt', '') if staging_run else ''}\n")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
@@ -931,8 +964,8 @@ jobs:
   # modes, while ordinary deploys require this gate to succeed.
   schema-gate:
     name: prod schema drift gate (production-migrate plan)
-    needs: guard
-    if: needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && needs.guard.outputs.skip == ''
+    needs: [guard, release-apply]
+    if: "!cancelled() && needs.guard.result == 'success' && (needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && needs.guard.outputs.skip == ''"
     permissions:
       contents: read
     environment: production-migrate-plan
@@ -957,6 +990,12 @@ jobs:
           path: tooling
           persist-credentials: false
           fetch-depth: 1
+          # The schema gate imports schema_gate_common, which imports script_intake.
+          sparse-checkout: |
+            /scripts/ci/production_schema_gate.py
+            /scripts/ci/schema_gate_common.py
+            /scripts/script_intake.py
+          sparse-checkout-cone-mode: false
       - name: Deploy SHA must be exact
         env:
           SOURCE_SHA: ${{ needs.guard.outputs.sha }}
@@ -1009,8 +1048,8 @@ jobs:
   # this gate to succeed.
   roles-gate:
     name: prod role drift gate (two-bot db roles verify)
-    needs: guard
-    if: needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && needs.guard.outputs.skip == ''
+    needs: [guard, release-apply]
+    if: "!cancelled() && needs.guard.result == 'success' && (needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && needs.guard.outputs.skip == ''"
     permissions:
       contents: read
     environment: production-migrate-plan
@@ -1035,6 +1074,14 @@ jobs:
           path: tooling
           persist-credentials: false
           fetch-depth: 1
+          # Keep the role verifier and its local Python imports together.
+          sparse-checkout: |
+            /scripts/ci/roles_gate.py
+            /scripts/ci/production_schema_gate.py
+            /scripts/ci/staging_schema_gate.py
+            /scripts/ci/schema_gate_common.py
+            /scripts/script_intake.py
+          sparse-checkout-cone-mode: false
       - name: Deploy SHA must be exact
         env:
           SOURCE_SHA: ${{ needs.guard.outputs.sha }}
@@ -1127,9 +1174,8 @@ jobs:
               output.write(f"skip={skip}\nevidence={evidence}\n")
 
   # Pre-deploy recheck for automatic runs: the guard's hold and live checks
-  # go stale while the gates build, the Environment approval waits and the
-  # soak sleeps. It waits for the soak AND both gates, so the fresh read
-  # happens after the last long build, immediately before the deploy: a hold
+  # can go stale during the soak and subsequent gate builds. It waits for
+  # the soak and both gates, so the fresh read happens before the deploy: a hold
   # set mid-run, an already-live target, a target the live build already
   # contains, or an active operator dispatch skips green instead of deploying
   # through the incident.
@@ -1380,15 +1426,200 @@ jobs:
           retention-days: 14
           compression-level: 0
 
+  release-plan:
+    name: Production release / Read the fresh production plan
+    needs: [guard, staging-soak-evidence]
+    if: github.repository_id == '1396224242' && github.ref_protected && github.run_attempt == 1 && inputs.release_plan_run_id != '' && needs.guard.outputs.skip == '' && needs.staging-soak-evidence.outputs.skip == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production-migrate-plan
+    permissions: &release-permissions
+      contents: read
+      actions: read
+      checks: read
+    env: &release-env
+      RELEASE_SHA: ${{ needs.guard.outputs.sha }}
+      RELEASE_PLAN_ID: ${{ inputs.release_plan_run_id }}
+      RELEASE_PINS: ${{ inputs.release_pins }}
+      PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
+      PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
+      PRODUCTION_BRANCH_ID: ${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}
+    outputs:
+      runner-artifact-id: ${{ steps.release-runner.outputs.artifact-id }}
+      runner-sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: "${{ github.sha }}", persist-credentials: false, fetch-depth: 0}
+      - name: Compare the candidate migrations and role policy and build the trusted runner
+        id: build
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$RELEASE_SHA" HEAD
+          git diff --exit-code "$RELEASE_SHA" HEAD -- crates/cutover/migrations crates/store/migrations \
+            sql/database_role_matrix.sql sql/verify_database_roles.sql sql/web_v1.sql crates/store/sql/web_v1.sql >/dev/null
+          cargo build -p two-bot-cutover --bin staging-migrate --locked
+          checksum=$(sha256sum target/debug/staging-migrate)
+          printf 'sha256=%s\n' "${checksum%% *}" >> "$GITHUB_OUTPUT"
+      - name: Retain the forward runner before stopping the writer
+        id: release-runner
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-release-runner-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/debug/staging-migrate
+          if-no-files-found: error
+          retention-days: 14
+      - name: Read both production migration ledgers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUNNER: ${{ github.workspace }}/target/debug/staging-migrate
+          TWO_BOT_PRODUCTION_PLAN_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_PLAN_DATABASE_URL }}
+        run: python3 scripts/production_release.py plan
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-release-fresh-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-release/fresh-plan.json
+          if-no-files-found: error
+          retention-days: 14
+
+  release-prepare:
+    name: Production release / Prepare and stop the prior pair
+    needs: [guard, release-plan, staging-soak-evidence]
+    if: github.run_attempt == 1 && success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: {name: production, deployment: false}
+    permissions: *release-permissions
+    env: *release-env
+    outputs:
+      epoch: ${{ steps.preflight.outputs.epoch }}
+      stopped: ${{ steps.release-stop.outputs.ack }}
+    steps:
+      - &release-checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: "${{ github.sha }}", persist-credentials: false, fetch-depth: 1}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: {node-version: 22, package-manager-cache: false}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: production-release-fresh-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-release
+      - name: Verify forward release preflight
+        id: preflight
+        env: &release-provider-env
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
+        run: python3 scripts/production_release.py prepare
+      - name: Verify the approved staging archive without copying the image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          STAGING_RUN_ID: ${{ needs.guard.outputs.staging_run_id }}
+          STAGING_ATTEMPT: ${{ needs.guard.outputs.staging_attempt }}
+          APPROVED_ARCHIVE: ${{ steps.preflight.outputs.archive }}
+          APPROVED_IMAGE: ${{ steps.preflight.outputs.image }}
+        run: |
+          set -euo pipefail
+          python3 scripts/bot_promotion.py admit --sha "$RELEASE_SHA" \
+            --run-id "$STAGING_RUN_ID" --attempt "$STAGING_ATTEMPT" --account-id "$CLOUDFLARE_ACCOUNT_ID" \
+            --out "$RUNNER_TEMP/bot-promotion" --verify-only \
+            --approved-archive "$APPROVED_ARCHIVE" --approved-image "$APPROVED_IMAGE"
+      - name: Gate the protected release on regression against the live baseline
+        env:
+          PROD_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}
+          STAGING_EVIDENCE: ${{ needs.staging-soak-evidence.outputs.evidence }}
+        run: |
+          set -euo pipefail
+          probe=0
+          python3 scripts/prod_passive_probe.py --evidence "$RUNNER_TEMP/production-release/baseline-probe.json" || probe=$?
+          test "$probe" -le 1
+          node wrangler/scripts/rest-5xx-counters.mjs --metrics-url "$PRODUCTION_WORKER_URL" \
+            --user-agent "two-bot-next-production-rollout/1.0" --out "$RUNNER_TEMP/production-release/baseline-counters.json"
+          python3 scripts/promotion_regression_gate.py compare --staging-evidence "$STAGING_EVIDENCE" \
+            --probe "$RUNNER_TEMP/production-release/baseline-probe.json" \
+            --counters "$RUNNER_TEMP/production-release/baseline-counters.json" \
+            --sha "$RELEASE_SHA" --out "$RUNNER_TEMP/production-release/regression-gate.json"
+      - name: Confirm the exact stopped writer
+        id: release-stop
+        env: *release-provider-env
+        run: python3 scripts/production_release.py stop
+      - name: Retain the protected preflight and stopped-writer evidence
+        if: always() && steps.preflight.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-release-prepare-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/production-release/preflight.json
+            ${{ runner.temp }}/production-release/stopped.json
+            ${{ runner.temp }}/production-release/regression-gate.json
+          if-no-files-found: error
+          retention-days: 14
+
+  release-apply:
+    name: Production release / Apply the approved schema
+    needs: [guard, release-plan, release-prepare]
+    if: github.run_attempt == 1 && success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production-migrate-apply
+    permissions: *release-permissions
+    env: *release-env
+    outputs:
+      artifact-id: ${{ steps.release-forward.outputs.artifact-id }}
+      archive-sha256: ${{ steps.release-forward.outputs.artifact-digest }}
+    steps:
+      - *release-checkout
+      - name: Validate the protected forward runner pins
+        env:
+          ARTIFACT_ID: ${{ needs.release-plan.outputs.runner-artifact-id }}
+          RUNNER_SHA256: ${{ needs.release-plan.outputs.runner-sha256 }}
+        run: |
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]{0,19}$ && "$RUNNER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+      - name: Download the prebuilt protected forward runner
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.release-plan.outputs.runner-artifact-id }}
+          path: ${{ runner.temp }}/production-release-runner
+          merge-multiple: true
+      - name: Verify the prebuilt forward runner checksum
+        env:
+          RUNNER_SHA256: ${{ needs.release-plan.outputs.runner-sha256 }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/production-release-runner"
+          test -f staging-migrate && test ! -L staging-migrate
+          printf '%s  staging-migrate\n' "$RUNNER_SHA256" | sha256sum --check --strict
+          chmod u+x staging-migrate
+      - name: Apply the protected forward transaction
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PREFLIGHT_EPOCH: ${{ needs.release-prepare.outputs.epoch }}
+          RELEASE_STOPPED: ${{ needs.release-prepare.outputs.stopped }}
+          RELEASE_RUNNER: ${{ runner.temp }}/production-release-runner/staging-migrate
+          TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}
+        run: python3 scripts/production_release.py apply
+      - name: Upload the verified forward result
+        id: release-forward
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-release-forward-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-release/production-release-forward.json
+          if-no-files-found: error
+          retention-days: 14
+
   production:
     name: wrangler ${{ needs.guard.outputs.mode }} + readyz gate
-    needs: [guard, soak, recheck, schema-gate, roles-gate, staging-soak-evidence]
+    needs: [guard, soak, recheck, schema-gate, roles-gate, staging-soak-evidence, release-prepare, release-apply]
     # `!cancelled()` (not `always()`): a cancelled run must never deploy, while
     # skipped gates still bypass for rollback and live-SHA redeploys. The soak
     # must have succeeded or been skipped (a failed soak fails closed: no bake,
     # no deploy), and a skipped recheck counts only for manual runs — an
     # automatic run always needs a fresh recheck pass with no skip.
-    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
+    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
     # The protected status read shares the deploy-production lane.
     # Outside this job, the guard, gates, soak and recheck
     # jobs carry no concurrency, so recovery
@@ -1397,7 +1628,7 @@ jobs:
     # so automatic runs recheck for an active operator dispatch first and skip
     # instead of entering the lane behind one.
     concurrency:
-      group: ${{ github.run_attempt != 1 && needs.guard.outputs.mode != 'rollback' && needs.guard.outputs.allow_unstaged != 'true' && format('deploy-production-refused-{0}-{1}', github.run_id, github.run_attempt) || 'deploy-production' }}
+      group: ${{ inputs.release_plan_run_id != '' && format('deploy-production-release-job-{0}', github.run_id) || github.run_attempt != 1 && needs.guard.outputs.mode != 'rollback' && needs.guard.outputs.allow_unstaged != 'true' && format('deploy-production-refused-{0}-{1}', github.run_id, github.run_attempt) || 'deploy-production' }}
       cancel-in-progress: false
       queue: max
     # Runner routing: see the note on `check` in check.yml.

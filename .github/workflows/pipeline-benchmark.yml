@@ -6,6 +6,7 @@ on:
   workflow_call:
   pull_request:
     paths:
+      - 'Cargo.lock'
       - '.github/workflows/pipeline-benchmark.yml'
       - 'crates/discord/examples/pipeline_bench.rs'
       - 'crates/testsupport/src/pipeline_integrity.rs'
@@ -59,8 +60,11 @@ jobs:
           # the runner-owned checkout, so Git refuses it as dubious ownership
           # (same fix as check.yml prerequisites).
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends python3 >/dev/null
+          # The pinned image ships Python. Probe the standard library in isolation.
+          if ! python3 -IB -c 'import argparse, json.tool, unittest.mock, urllib.request'; then
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends python3 >/dev/null
+          fi
       - name: Install Rust toolchain
         shell: bash
         env:
