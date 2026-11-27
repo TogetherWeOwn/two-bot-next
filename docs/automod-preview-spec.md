@@ -816,42 +816,31 @@ Live use still requires an authenticated provider for those readbacks.
 
 ### Protected AutoMod bridge
 
-`POST /internal/staging-automod` lets the protected job reach the in-process
-`bindProtectedAutomodInstance` members. It does not exist outside bounded
-staging. The Worker requires the existing staging ownership control bearer and
-stamps its own version before it forwards to the singleton Container. The
-Container repeats those checks. It then verifies a fresh GitHub Actions OIDC
-token. The token must be RS256 from GitHub's JWKS, for the audience
-`two-bot-staging-automod`, within 60 seconds of clock skew, and for this
-repository's protected `main` ref. It must also name the direct
-`workflow_dispatch` of `staging-automod-preview.yml`, attempt 1, the `staging`
-environment, and a `sha` equal to `CONTAINER_RELEASE`. A failed check returns a
-fixed refusal before any storage, lease, plan or Container read.
+In bounded staging, `POST /internal/staging-automod` reaches the in-process
+`bindProtectedAutomodInstance`. The Worker checks the staging control bearer and
+stamps its version. The Container repeats those checks and verifies the job's
+RS256 GitHub Actions OIDC token against GitHub's JWKS with up to 60 seconds of
+skew. The audience is `two-bot-staging-automod`. Claims pin the repository ID,
+protected `main`, direct `workflow_dispatch` of `staging-automod-preview.yml`,
+attempt 1, the `staging` environment and `sha === CONTAINER_RELEASE`.
+Authentication failures precede any storage, lease, plan or runtime read.
 
-The strict bounded body names one operation: `acquire`, `read-lease`,
-`read-approval` (start or recover), or `invoke` (start or recover). Any other
-operation returns 404. The run ID, attempt and build in the body must equal the
-token's claims. The Container reads reservations and approvals only from the
-plan compiled into the build (`wrangler/src/staging-automod-plan.ts`). That plan
-is off by default. A reservation and a start each need the enabled plan, its
-window and the plan's start permission. Recovery on the original lease
-of the verified run is allowed whatever the plan says. Before it invokes, the
-Container rereads its own approval. Serving checks compare the Worker version,
-build and owner epoch with local identity. They compare the rest of the pin
-with the runner's freshly authenticated inventory. This build supplies no
-dry-run launch adapter, so start stays refused even with an enabled plan.
-Recovery retires an unused reservation after a confirmed native stop. Native
-expiry recovery for an interrupted active journal, or an equivalent protected
-operator path, must exist before enabling because a new attempt or release
-cannot recover the original run-bound lease.
+The strict 4 KiB JSON body allows `acquire`, `read-lease`, `read-approval` and
+`invoke`. Approval and invocation accept `start` and `recover`. The body's run,
+attempt and SHA must match the token. The default-off compiled plan authorizes
+reservation and start within its approved window. Recovery uses the verified
+run's original lease even when the plan is off. The DO rereads approval before
+invoking and checks the local Worker version, build and owner epoch. The other
+serving fields come from the runner's fresh authenticated inventory.
 
-`wrangler/scripts/staging-automod-instance-client.ts` implements the protected
-host and instance shapes over the bridge. It uses a fixed staging Worker URL
-and mints a new OIDC token for each call. The workflow job adds only
-`id-token: write` and the staging control bearer for its last step. Enabling
-the plan is a separate reviewed change and deploy-staging run. It also needs
-the post-deploy selection resolver and a GitHub read credential for the
-inventory verifier, which today runs with an empty environment.
+The runner client mints a token per call to a fixed staging Worker URL. The
+workflow grants job-level `id-token: write` and supplies the bearer to dispatch
+only. The checked-in sparse checkout supports the unbound, fail-closed command.
+Enabling needs a separate reviewed change and protected staging deploy, an
+authenticated post-deploy selection and its client imports, a GitHub read
+credential for the inventory verifier, and a dry-run launch adapter. It also
+needs DO expiry or equivalent protected recovery after interruption because a
+later attempt or release cannot recover the original lease through the bridge.
 
 ## 10. Spec self-check (doctest)
 

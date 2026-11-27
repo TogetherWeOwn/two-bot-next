@@ -1,3 +1,4 @@
+import { readReceiverBytes, releaseUpstream } from "./internal-actions.ts";
 import { sameLease, STAGING_AUTOMOD_TARGET } from "./staging-automod-recovery.ts";
 import { AUTOMOD_STAGING_PURPOSE, parseStagingUseChange, type StagingUse, type StagingUseChange } from "./staging-lifecycle.ts";
 import { parseUniqueJson } from "./unique-json.ts";
@@ -152,27 +153,12 @@ function decodeJson(segment: string): Record<string, unknown> | undefined {
 
 async function readJwks(signal: AbortSignal): Promise<unknown> {
   const response = await fetch(JWKS_URL, { method: "GET", redirect: "error", signal });
-  if (response.status !== 200 || !response.body) {
-    await response.body?.cancel().catch(() => {});
+  if (response.status !== 200) {
+    releaseUpstream(response);
     return;
   }
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  for (;;) {
-    const step = await reader.read();
-    if (step.done) break;
-    size += step.value.byteLength;
-    if (size > MAX_JWKS_BYTES) {
-      await reader.cancel().catch(() => {});
-      return;
-    }
-    chunks.push(step.value);
-  }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  return parseUniqueJson(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+  const bytes = await readReceiverBytes(response, MAX_JWKS_BYTES, signal);
+  if (bytes) return parseUniqueJson(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
 }
 
 function numericDate(value: unknown): value is number {

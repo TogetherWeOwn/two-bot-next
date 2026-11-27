@@ -1,5 +1,5 @@
 import { isDirectInvocation } from "./is-direct-invocation.mjs";
-import { bindStagingAutomodInstanceClient } from "./staging-automod-instance-client.ts";
+import type { bindStagingAutomodInstanceClient } from "./staging-automod-instance-client.ts";
 import { runStagingAutomodProtectedHost } from "./staging-automod-protected-host.ts";
 
 type ProtectedHost = Parameters<typeof runStagingAutomodProtectedHost>;
@@ -29,16 +29,19 @@ export async function runStagingAutomodDispatch(env: DispatchEnv = {}, binding?:
  * dispatch SHA, never from source or input. The checked-in command has no
  * such resolver yet, so it keeps its fixed host_unavailable failure.
  */
-export function bindStagingAutomodDispatch(env: DispatchEnv,
-  selection?: Pick<Binding, "serving" | "inventorySource">): Binding | undefined {
+export async function bindStagingAutomodDispatch(env: DispatchEnv,
+  selection?: Pick<Binding, "serving" | "inventorySource">): Promise<Binding | undefined> {
   const { serving, inventorySource } = selection ?? {};
-  if (env.STAGING_AUTOMOD_REHEARSAL !== "true" || !serving || !inventorySource) return;
+  if (env.STAGING_AUTOMOD_REHEARSAL !== "true" || !serving || !inventorySource
+    || !env.ACTIONS_ID_TOKEN_REQUEST_URL || !env.ACTIONS_ID_TOKEN_REQUEST_TOKEN) return;
+  const { bindStagingAutomodInstanceClient } = await import("./staging-automod-instance-client.ts");
   const client = bindStagingAutomodInstanceClient(env, serving);
   return client && { serving, inventorySource, host: client.host };
 }
 
 if (isDirectInvocation(process.argv[1], import.meta.url)) {
-  const result = await runStagingAutomodDispatch(process.env, bindStagingAutomodDispatch(process.env))
+  const result = await bindStagingAutomodDispatch(process.env)
+    .then(binding => runStagingAutomodDispatch(process.env, binding))
     .catch(() => ({ verdict: "failed" } as const));
   if (result.verdict === "passed") console.log("staging_automod_rehearsal_passed");
   if (result.verdict === "failed") {

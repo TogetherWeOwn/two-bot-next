@@ -4353,11 +4353,9 @@ async function bridgeHarness(t: TestContext, env: Partial<Env> = BRIDGE_ENV, ver
   t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
   const h = await harness(t, env, { owner: { ...ACTIVE_OWNER, deploymentId: version } });
   const jwk = { ...BRIDGE_KEY.publicKey.export({ format: "jwk" }), kid: BRIDGE_KID, alg: "RS256", use: "sig" };
-  let onJwks = () => {};
   const jwks = t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
     assert.equal(String(input instanceof Request ? input.url : input), BRIDGE_JWKS_URL);
     assert.equal(init?.redirect, "error");
-    onJwks();
     return Response.json({ keys: [jwk] });
   });
   const reads = { get: t.mock.method(h.ctx.storage, "get"), put: t.mock.method(h.ctx.storage, "put"),
@@ -4393,8 +4391,7 @@ async function bridgeHarness(t: TestContext, env: Partial<Env> = BRIDGE_ENV, ver
     const response = await h.bot.fetch(request(body, options));
     return { status: response.status, body: await response.json().catch(() => null) as { value?: unknown } | null };
   };
-  return { ...h, jwks, storageCalls, planReads, setPlan, enabledPlan, pin, change, context, request, send,
-    onJwks: (hook: () => void) => { onJwks = hook; } };
+  return { ...h, jwks, storageCalls, planReads, setPlan, enabledPlan, pin, change, context, request, send };
 }
 
 const BRIDGE_REFUSED = { status: 403, body: { error: "staging_automod_refused" } };
@@ -4444,6 +4441,9 @@ test("AutoMod bridge: every unverified Actions token is refused before storage, 
     ["unprotected ref", actionsToken({ ref_protected: "false" })],
     ["other workflow", actionsToken({ workflow_ref: BRIDGE_CLAIMS.workflow_ref.replace("staging-automod-preview", "other") })],
     ["other environment", actionsToken({ environment: "production" })],
+    ["other repository", actionsToken({ repository_id: "1" })],
+    ["other event", actionsToken({ event_name: "push" })],
+    ["other issuer", actionsToken({ iss: "https://issuer.invalid" })],
     ["expired", actionsToken({ iat: now - 600, nbf: now - 600, exp: now - 61 })],
     ["not yet valid", actionsToken({ nbf: now + 120 })],
     ["other build", actionsToken({ sha: "c".repeat(40) })],
@@ -4570,20 +4570,46 @@ test("AutoMod bridge: an aborted start leaves the original lease for recovery an
   assert.equal(issued.purpose, AUTOMOD_STAGING_PURPOSE);
 
   const runner = new AbortController();
-  h.onJwks(() => runner.abort());
+  const journal = new StagingAutomodRecovery(h.ctx.storage as unknown as DurableObjectStorage);
+  const publishBefore = issued.expiresAt - 5_000;
+  const intent = { lease: issued, target: STAGING_AUTOMOD_TARGET, publishBefore, baseline: "b".repeat(64) };
+  const { id, version } = automodPublication.replies.preview;
+  await journal.persistIntent(intent, async () => ({ lease: issued, baselineAbsent: true, publishBefore }));
+  await journal.recordCreated({ intent, id, version });
+  await journal.confirmPublication({ intent, id, version });
+  const policy = { memberIntake: false, enforcement: false, resume: false, registrySync: false,
+    interactionDispatch: false, dedicatedIntents: true };
+  const effects: ProtectedAutomodEffects = {
+    enabled: true,
+    dryRun: { policy, start: async () => { h.runtime.running = true; runner.abort(); } },
+    readRuntime: async lease => ({ lease, running: h.runtime.running, policy }),
+    readCleanupGrant: async lease => ({ lease, before: lease.expiresAt + 5_000 }),
+    fenceAndDrain: async lease => ({ lease, publicationDrained: true, startupDrained: true }),
+    stop: async () => { await h.runtime.destroy(); return true; },
+    request: async (url, init) => {
+      assert.equal(init.method, "GET");
+      assert.equal(h.runtime.running, false);
+      if (url.endsWith("/users/@me")) return Response.json(automodPublication.identity);
+      if (url.endsWith("/commands?with_localizations=true")) return Response.json([]);
+      assert.ok(url.endsWith(`/commands/${id}`));
+      return Response.json({ code: 10063 }, { status: 404 });
+    },
+  };
+  (h.bot as unknown as { automodEffects: ProtectedAutomodEffects }).automodEffects = effects;
   assert.deepEqual(await h.send({ op: "invoke", pin: h.pin, call: { action: "start", issuedLease: issued } },
     { signal: runner.signal }), BRIDGE_REFUSED);
-  h.onJwks(() => {});
-  assert.deepEqual(h.starts, []);
+  assert.equal(runner.signal.aborted, true);
+  assert.equal(h.runtime.running, true);
+  assert.equal((h.values.get(AUTOMOD_JOURNAL_KEY) as { phase: string }).phase, "starting");
   assert.deepEqual(h.values.get(STAGING_USE_KEY), issued);
 
   assert.deepEqual(await h.send({ op: "invoke", pin: h.pin, call: { action: "recover", issuedLease: issued } }),
     { status: 200, body: { value: null } });
   assert.deepEqual(h.values.get(STAGING_USE_KEY), { ...issued, phase: "released" });
-  assert.equal(await new StagingAutomodRecovery(h.ctx.storage as unknown as DurableObjectStorage).pending(), undefined);
+  assert.equal(await journal.completedFor(issued), true);
   assert.deepEqual(await h.send({ op: "acquire", pin: h.pin, change: h.change }), BRIDGE_REFUSED);
   assert.deepEqual(h.values.get(STAGING_USE_KEY), { ...issued, phase: "released" });
-  assert.deepEqual(h.starts, []);
+  assert.equal(h.runtime.running, false);
 });
 
 test("AutoMod bridge: only the closed operation set with a strict bounded body is admitted", async t => {
@@ -4598,6 +4624,11 @@ test("AutoMod bridge: only the closed operation set with a strict bounded body i
   assert.deepEqual(await h.send(`{"op":"read-lease","context":${context},"context":${context}}`), invalid);
   assert.deepEqual(await h.send(`{"op":"read-lease","op":"read-lease","context":${context}}`), invalid);
   assert.deepEqual(await h.send({ op: "read-lease", context: h.context, padding: "x".repeat(5_000) }), invalid);
+  assert.deepEqual(await h.send({ op: "read-lease", context: h.context, extra: true }), invalid);
+  assert.deepEqual(await h.send({ op: "read-lease", context: { ...h.context, extra: true } }), invalid);
+  for (const extra of [{ voiceMove: true }, { purpose: AUTOMOD_STAGING_PURPOSE }]) {
+    assert.deepEqual(await h.send({ op: "acquire", pin: h.pin, change: { ...h.change, ...extra } }), invalid);
+  }
   assert.deepEqual(await h.send({ op: "read-approval", action: "publish", issuedLease: {} }), invalid);
   assert.deepEqual(await h.send("[]"), invalid);
   assert.deepEqual(await h.send("not json"), invalid);

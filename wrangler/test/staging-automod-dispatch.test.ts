@@ -40,12 +40,12 @@ test("the bridge binding needs an explicit selection and the OIDC request variab
   const oidc = { ACTIONS_ID_TOKEN_REQUEST_URL: "https://pipelines.actions.githubusercontent.com/token",
     ACTIONS_ID_TOKEN_REQUEST_TOKEN: "synthetic-request-token", OWNERSHIP_CONTROL_TOKEN: "c".repeat(43) };
   const fetch = t.mock.method(globalThis, "fetch", unexpected);
-  assert.equal(bindStagingAutomodDispatch({ ...runner, ...oidc }), undefined);
+  assert.equal(await bindStagingAutomodDispatch({ ...runner, ...oidc }), undefined);
   const plan = { serving, inventorySource };
-  assert.equal(bindStagingAutomodDispatch({ ...runner, ...oidc, STAGING_AUTOMOD_REHEARSAL: "false" }, plan), undefined);
-  assert.equal(bindStagingAutomodDispatch(runner, plan), undefined);
-  assert.equal(bindStagingAutomodDispatch({ ...runner, ...oidc, ACTIONS_ID_TOKEN_REQUEST_TOKEN: "" }, plan), undefined);
-  const binding = bindStagingAutomodDispatch({ ...runner, ...oidc }, plan);
+  assert.equal(await bindStagingAutomodDispatch({ ...runner, ...oidc, STAGING_AUTOMOD_REHEARSAL: "false" }, plan), undefined);
+  assert.equal(await bindStagingAutomodDispatch(runner, plan), undefined);
+  assert.equal(await bindStagingAutomodDispatch({ ...runner, ...oidc, ACTIONS_ID_TOKEN_REQUEST_TOKEN: "" }, plan), undefined);
+  const binding = await bindStagingAutomodDispatch({ ...runner, ...oidc }, plan);
   assert.deepEqual([binding?.serving, binding?.inventorySource], [serving, inventorySource]);
   assert.equal(typeof binding?.host.invokePrivate, "function");
   assert.equal(fetch.mock.callCount(), 0);

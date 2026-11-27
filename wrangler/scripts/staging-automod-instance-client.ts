@@ -1,4 +1,5 @@
 import type { TwoBotContainer } from "../src/index.ts";
+import { readReceiverBytes, releaseUpstream } from "../src/internal-actions.ts";
 import {
   STAGING_AUTOMOD_AUDIENCE, STAGING_AUTOMOD_BODY_BYTES, STAGING_AUTOMOD_OIDC_HEADER, STAGING_AUTOMOD_PATH,
 } from "../src/staging-automod-bridge.ts";
@@ -24,25 +25,10 @@ const RUNS_URL = "https://api.github.com/repos/TogetherWeOwn/two-bot-next/action
 const MAX_TOKEN_LENGTH = 8_192;
 const MAX_RUN_BYTES = 1_048_576;
 
-async function boundedText(response: Response, limit: number): Promise<string> {
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error("AutoMod bridge response missing");
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  for (;;) {
-    const step = await reader.read();
-    if (step.done) break;
-    size += step.value.byteLength;
-    if (size > limit) {
-      await reader.cancel().catch(() => {});
-      throw new Error("AutoMod bridge response too large");
-    }
-    chunks.push(step.value);
-  }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
+async function boundedJson(response: Response, limit: number, signal: AbortSignal): Promise<unknown> {
+  const bytes = await readReceiverBytes(response, limit, signal);
+  if (!bytes) throw new Error("AutoMod bridge response unavailable");
+  return parseUniqueJson(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -69,10 +55,10 @@ export function bindStagingAutomodInstanceClient(env: ClientEnv, serving: Servin
     const response = await fetcher(idTokenUrl, { method: "GET", redirect: "error", signal,
       headers: { authorization: `Bearer ${requestToken}`, accept: "application/json" } });
     if (response.status !== 200) {
-      await response.body?.cancel().catch(() => {});
+      releaseUpstream(response);
       throw new Error("Actions OIDC token unavailable");
     }
-    const body: unknown = parseUniqueJson(await boundedText(response, MAX_TOKEN_LENGTH * 2));
+    const body = await boundedJson(response, MAX_TOKEN_LENGTH * 2, signal);
     const value = record(body) ? body.value : undefined;
     if (typeof value !== "string" || value.length > MAX_TOKEN_LENGTH) throw new Error("Actions OIDC token unavailable");
     return value;
@@ -87,10 +73,10 @@ export function bindStagingAutomodInstanceClient(env: ClientEnv, serving: Servin
       headers: { authorization: `Bearer ${controlBearer}`, [STAGING_AUTOMOD_OIDC_HEADER]: token,
         "content-type": "application/json" } });
     if (response.status !== 200) {
-      await response.body?.cancel().catch(() => {});
+      releaseUpstream(response);
       throw new Error("AutoMod bridge refused");
     }
-    const reply: unknown = parseUniqueJson(await boundedText(response, STAGING_AUTOMOD_BODY_BYTES));
+    const reply = await boundedJson(response, STAGING_AUTOMOD_BODY_BYTES, signal);
     if (!record(reply) || Object.keys(reply).length !== 1 || !Object.hasOwn(reply, "value")) {
       throw new Error("AutoMod bridge reply invalid");
     }
@@ -130,10 +116,10 @@ export function bindStagingAutomodInstanceClient(env: ClientEnv, serving: Servin
       const response = await fetcher(`${RUNS_URL}${runId}`, { method: "GET", redirect: "error", signal,
         headers: { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28" } });
       if (response.status !== 200) {
-        await response.body?.cancel().catch(() => {});
+        releaseUpstream(response);
         return;
       }
-      return parseUniqueJson(await boundedText(response, MAX_RUN_BYTES));
+      return boundedJson(response, MAX_RUN_BYTES, signal);
     },
     // Local mirror for the job-side admission checks. The DO enforces the
     // authoritative environment, bearer, build and ownership again.
