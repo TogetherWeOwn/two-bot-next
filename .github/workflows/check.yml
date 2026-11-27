@@ -3044,6 +3044,8 @@ jobs:
         env:
           RUST_TOOLCHAIN: "1.100.0" # Match rust-toolchain.toml; floating stable can drift.
           RUST_COMPONENTS: ''
+          # The digest-pinned job image already contains this exact toolchain.
+          TWO_RUSTUP_NO_UPDATE: '1'
         run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
