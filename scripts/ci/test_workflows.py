@@ -12491,8 +12491,10 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                         # Read-only fetch of the producing plan
                         # run's manifest artifact for the provenance gate.
                         expected = {"contents": "read", "actions": "read"}
+                    elif name == "deploy-production-recovery.yml":
+                        # Recovery authenticates the committed forward receipt and its plan.
+                        expected["actions"] = "read"
                     elif (name == "production-migrate.yml" and job_id in ("claim", "apply")
-                          or name == "deploy-production-recovery.yml"
                           or name == "deploy-production-interrupted.yml"
                           or (name == "deploy-production.yml" and job_id.startswith("release-"))):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
