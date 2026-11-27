@@ -70,7 +70,8 @@ JOB_INVENTORY = {
                   "nextest", "db-compatibility"},
     STAGING_SOAK: {"begin", "voice", "finish"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
-                              "promotion-skipped", "production", "release-plan", "release-prepare", "release-apply"},
+                              "promotion-skipped", "production", "release-plan", "release-prepare", "release-apply", "release-recover",
+                              "release-reconcile"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "help-embed-synthetic",
                            "user-flow-synthetic", "pinned-history-guard", "certify-promotion",
                            "staging-use-release"},
@@ -165,6 +166,8 @@ JOB_INVENTORY = {
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
 REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
                    ("deploy-production.yml", "soak"): "$/.github/workflows/staging-soak.yml",
+                   ("deploy-production.yml", "release-recover"): "./.github/workflows/deploy-production-recovery.yml",
+                   ("deploy-production.yml", "release-reconcile"): "./.github/workflows/deploy-production-interrupted.yml",
                    (STAGING_SOAK, "voice"): "$/.github/workflows/voice-synthetic.yml",
                    ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
                    ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
@@ -729,7 +732,8 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
     """
     errors = []
     inputs = (((workflow.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {})
-    if set(inputs) != {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold", "release_plan_run_id", "release_pins"}:
+    if set(inputs) != {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold",
+                       "release_plan_run_id", "release_pins", "release_recovery_run_id"}:
         errors.append(f"{name}: production inputs must contain only the reviewed deploy/restore controls")
     jobs = workflow.get("jobs", {}) or {}
     steps = ((jobs.get("production") or {}).get("steps") or [])
@@ -769,7 +773,8 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
                 < steps.index(step) < steps.index(rollback)):
             errors.append(f"{name}: snapshot must precede deploy and both gates must precede rollback")
     if rollback.get("if") != ("failure() && env.MODE == 'deploy' && env.TAKEOVER == 'true' "
-                              "&& steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success'"):
+                              "&& steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success' "
+                              "&& inputs.release_plan_run_id == ''"):
         errors.append(f"{name}: auto_rollback must retain the failure/deploy/takeover/snapshot chain")
     restore = str(rollback.get("run") or "")
     for required in ("../tooling/scripts/worker_container_rollback.py rollback",
@@ -3312,7 +3317,8 @@ def production_errors(workflow):
     needs = production.get("needs")
     needs = [needs] if isinstance(needs, str) else (needs or [])
     expected_production_if = (
-        "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
+        "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.mode != 'interrupted-recovery' "
+        "&& needs.guard.outputs.skip == '' && "
         "(needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') && "
         "(needs.soak.result == 'success' || needs.soak.result == 'skipped') && "
         "((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || "
@@ -3323,12 +3329,16 @@ def production_errors(workflow):
     )
     if production.get("environment") != "production" \
             or set(needs) != {"guard", "soak", "recheck", "schema-gate", "roles-gate", "staging-soak-evidence",
-                                "release-prepare", "release-apply"}:
+                                "release-plan", "release-prepare", "release-apply"}:
         errors.append(f"{name}:production: must wait for the guard, the soak, the recheck, "
                       "the schema gate, the roles gate, the staging soak evidence and the protected Environment")
     if production.get("if") != expected_production_if:
         errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates, "
                       "a completed soak, a fresh recheck and no skip; cancelled runs never deploy")
+    recovery = jobs.get("release-reconcile", {})
+    if (recovery.get("needs") != "guard" or recovery.get("if") != "needs.guard.outputs.mode == 'interrupted-recovery'"
+            or recovery.get("with") != {"origin-run-id": "${{ inputs.release_recovery_run_id }}"}):
+        errors.append(f"{name}: interrupted recovery must run only from the protected recovery guard")
     # The production job shares its lane with the protected status read. The guard, gates,
     # soak and recheck run outside it, so a sleeping automatic promotion can
     # never delay an operator rollback.
@@ -5520,7 +5530,10 @@ class ProductionPromotionSkipTests(unittest.TestCase):
 
     def expression(self, text, context):
         text = text.strip().removeprefix("${{").removesuffix("}}").strip()
-        text = re.sub(r"\b(?:needs|github|steps|runner)\.[\w.-]+",
+        booleans = {"true": "True", "false": "False"}
+        text = re.sub(r"'[^']*'|\b(?:true|false)\b",
+                      lambda match: booleans.get(match[0], match[0]), text)
+        text = re.sub(r"\b(?:needs|github|steps|runner|inputs)\.[\w.-]+",
                       lambda match: repr(context.get(match[0], "")), text)
         statuses = {
             "always": True, "cancelled": context.get("workflow.cancelled", False),
@@ -5529,8 +5542,6 @@ class ProductionPromotionSkipTests(unittest.TestCase):
         }
         for name, result in statuses.items():
             text = re.sub(rf"\b{name}\s*\(\s*\)", repr(result), text)
-        text = re.sub(r"\btrue\b", "True", text)
-        text = re.sub(r"\bfalse\b", "False", text)
         text = text.replace("&&", " and ").replace("||", " or ")
         text = re.sub(r"!(?!=)", " not ", text).strip()
         tree = ast.parse(text, mode="eval")
@@ -5543,11 +5554,12 @@ class ProductionPromotionSkipTests(unittest.TestCase):
         return re.sub(r"\$\{\{(.*?)\}\}",
                       lambda match: str(self.expression(match[1], context)), str(text))
 
-    def job_runs(self, context):
-        condition = self.job.get("if", "success()")
+    def job_runs(self, context, *, job=None):
+        job = self.job if job is None else job
+        condition = job.get("if", "success()")
         # GitHub implicitly adds success() unless a status function overrides
         # it. Early deferrals have skipped dependencies, not successful ones.
-        needs = self.job.get("needs", [])
+        needs = job.get("needs", [])
         needs = [needs] if isinstance(needs, str) else needs
         results = [context.get(f"needs.{name}.result", "skipped") for name in needs]
         context = {**context, "status.success": all(result == "success" for result in results),
@@ -5652,6 +5664,27 @@ class ProductionPromotionSkipTests(unittest.TestCase):
                 self.assertEqual(context["needs.guard.outputs.sha"], target)
                 self.assertEqual(context["needs.guard.outputs.skip"], reason)
                 self.report(context, reason)
+
+    def test_release_plan_requires_the_validated_guard_output(self):
+        jobs = self.workflow["jobs"]
+        plan, guard = jobs["release-plan"], jobs["guard"]
+        self.assertIn("guard", plan["needs"])
+        self.assertEqual(guard["steps"][0]["id"], "guard")
+        binding = guard["outputs"]["protected_release"]
+        self.assertEqual(binding, "${{ steps.guard.outputs.protected_release }}")
+        code, outputs, _, _, stdout = self.producers.GuardBehaviourTests().guard()
+        self.assertEqual(code, 0, stdout)
+        self.assertEqual(outputs["protected_release"], "false")
+        context = {f"needs.{name}.result": "success" for name in plan["needs"]}
+        context.update({"github.repository_id": "1396224242", "github.ref_protected": True,
+                        "github.run_attempt": 1, "inputs.release_plan_run_id": "123", "workflow.cancelled": False})
+        for emitted, expected in (({}, None), (outputs, None), ({**outputs, "protected_release": "true"}, "123")):
+            with self.subTest(guard_output=emitted.get("protected_release")):
+                step = {f"steps.guard.outputs.{key}": value for key, value in emitted.items()}
+                context["needs.guard.outputs.skip"] = self.render(guard["outputs"]["skip"], step)
+                context["needs.guard.outputs.protected_release"] = self.render(binding, step)
+                actual = self.render(plan["env"]["RELEASE_PLAN_ID"], context) if self.job_runs(context, job=plan) else None
+                self.assertEqual(actual, expected)
 
     def test_failed_recheck_retains_output_but_cannot_report_a_successful_skip(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
@@ -9645,6 +9678,8 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                                           ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                                           ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                                           ("deploy-production.yml", "soak"): "$/.github/workflows/staging-soak.yml",
+                                          ("deploy-production.yml", "release-recover"): "./.github/workflows/deploy-production-recovery.yml",
+                                          ("deploy-production.yml", "release-reconcile"): "./.github/workflows/deploy-production-interrupted.yml",
                                           (STAGING_SOAK, "voice"): "$/.github/workflows/voice-synthetic.yml",
                                           ("voice-rest-measurement.yml", "voice-first"): "./.github/workflows/voice-synthetic.yml",
                                           ("voice-rest-measurement.yml", "voice-second"): "./.github/workflows/voice-synthetic.yml",
@@ -9788,7 +9823,6 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                 without('origin.get("head_repository_id") != origin.get("repository_id")'),
         }
         self.assertIn("inputs.cutover_hold", str(guard_step))
-        self.assertIn('refuse("protected release requires the activation follow-up")', guard_step["run"])
         for label, change in mutations.items():
             with self.subTest(label):
                 workflow = deepcopy(production)
@@ -9805,6 +9839,13 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
         self.assertIn("release-prepare", apply["needs"])
         transaction = next(step for step in apply["steps"] if step.get("run") == "python3 scripts/production_release.py apply")
         self.assertEqual(transaction["env"].get("RELEASE_PREFLIGHT_EPOCH"), "${{ needs.release-prepare.outputs.epoch }}")
+
+    def test_attendance_dispatch_title_identifies_the_plan_producer(self):
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production.get("run-name"),
+                         "${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
+                         "&& github.ref_protected && inputs.release_plan_run_id != '' "
+                         "&& format('attendance release plan {0}', inputs.release_plan_run_id) || 'deploy-production' }}")
 
     def test_soak_rejects_unsafe_handoffs(self):
         self.assertTrue(admitted_soak(self.workflows))
@@ -12679,7 +12720,7 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                     elif (name, job_id) == ("deploy-production.yml", "production"):
                         # Reads immutable staging artifacts, then records this
                         # independent production Deployment event.
-                        expected = {"contents": "read", "actions": "read", "deployments": "write"}
+                        expected = {"contents": "read", "actions": "read", "checks": "read", "deployments": "write"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif name == "production-ownership-status.yml" or (name, job_id) == (

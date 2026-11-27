@@ -8,7 +8,7 @@ import sys
 from production_ownership_status import environment_policy, read_status
 from production_recovery_artifact import (FORWARD_JOB, FORWARD_STEPS, attempt_job, authentic_document,
                                           protected_job)
-from production_recovery_takeover import RecoveryPin
+from production_recovery_takeover import RecoveryPin, verify_inverse
 from production_recovery_workflow import (interrupted_classification, interrupted_pair_phase, pair_matches,
                                           reconcile_interrupted, restore_under_fence, run_inverse,
                                           run_recovery_database)
@@ -114,6 +114,14 @@ def execute(argv, env, api):
     require(argv == ["restart"], "production_interrupted_operation_invalid")
     decision = packet(env, run, DATABASE_JOB, (CLASSIFY_STEP, DECISION_STEP), DECISION, "DECISION", api)
     classification = verified_decision(decision, admission)
+    post = classification["state"] == "post"
+    if post:
+        proof = packet(env, run, DATABASE_JOB, (CLASSIFY_STEP, DECISION_STEP, *INVERSE_STEPS),
+                       INVERSE, "INVERSE", api)
+        require(set(proof) == {"decision_sha256", "result"} and proof["decision_sha256"] == digest_json(decision),
+                "production_interrupted_inverse_decision_changed")
+        recovery = recovery_pin(pin, origin_id, epoch, plan, classification["attendance_fence_sha256"])
+        verify_inverse(recovery, proof["result"])
     environment_policy(env.get("AUTO_APPROVE"), api)
     url = check_url("production", env["PRODUCTION_WORKER_URL"])
     token = env["OWNERSHIP_CONTROL_TOKEN"]
@@ -125,12 +133,7 @@ def execute(argv, env, api):
     rollback = Rollback(client, control, url, "production", worker, application,
                         pin.application_id, pin.rollback_sha, origin_id)
 
-    def recover_post(stamp):
-        proof = packet(env, run, DATABASE_JOB, (CLASSIFY_STEP, DECISION_STEP, *INVERSE_STEPS),
-                       INVERSE, "INVERSE", api)
-        require(set(proof) == {"decision_sha256", "result"} and proof["decision_sha256"] == digest_json(decision),
-                "production_interrupted_inverse_decision_changed")
-        recovery = recovery_pin(pin, origin_id, epoch, plan, stamp)
+    def recover_post(_stamp):
         post_control = control_client("production", token, url, "", recovery.actor)
         # The interrupted-apply route proves the prior pair still serves. An
         # unproved deployment or image must never trigger a provider restore.
@@ -141,10 +144,10 @@ def execute(argv, env, api):
 
     outcome = reconcile_interrupted(pin, origin_id, epoch, classification, observe, control, recover_post)
     expected_actor = actor
-    if classification["state"] == "pre":
-        rollback.wait_stable(pin.rollback_worker, rollback.now())
+    if post:
+        expected_actor = recovery.actor
     else:
-        expected_actor = recovery_pin(pin, origin_id, epoch, plan, classification["attendance_fence_sha256"]).actor
+        rollback.wait_stable(pin.rollback_worker, rollback.now())
     state = observe()
     require(pair_matches(state, pin, pin.rollback_worker, pin.rollback_sha, pin.rollback_image)
             and state["ownership"] == {"phase": "active", "epoch": epoch + 1,
