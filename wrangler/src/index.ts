@@ -931,13 +931,13 @@ export class TwoBotContainer extends Container<Env> {
       try {
         if (this.boundedStaging()) {
           use = await this.stagingUse.read();
-          const [pending] = await this.listSchedules<boolean>("stagingExpiry");
+          const [pending] = await this.listSchedules<true | typeof AUTOMOD_STAGING_PURPOSE>("stagingExpiry");
           if (pending?.payload === true) {
             this.recoveryFailed = true;
             return;
           }
           if (use?.purpose === AUTOMOD_STAGING_PURPOSE && use.phase === "active") {
-            await this.scheduleStagingExpiry(use.expiresAt);
+            await this.scheduleStagingExpiry(use.expiresAt, AUTOMOD_STAGING_PURPOSE);
             return;
           }
           if (await this.deferStagingTeardown(use)) {
@@ -961,7 +961,7 @@ export class TwoBotContainer extends Container<Env> {
         try {
           await this.destroyInactive();
           if (use?.purpose === AUTOMOD_STAGING_PURPOSE && use.phase === "preparing") {
-            await this.scheduleStagingExpiry(Math.max(Date.now(), use.expiresAt));
+            await this.scheduleStagingExpiry(Math.max(Date.now(), use.expiresAt), AUTOMOD_STAGING_PURPOSE);
           }
         }
         catch {
@@ -1158,7 +1158,8 @@ export class TwoBotContainer extends Container<Env> {
           if (!sameAutomodServingPin(servingPin, observed)) throw new OwnershipRefused("staging_use_conflict");
           deadline.throwIfAborted();
           return bot.stagingUse.acquire(change, { deploymentId: change.deploymentId, sha: change.sha, owner },
-            () => bot.stopStagingUse(), expiry => bot.scheduleStagingExpiry(expiry), Date.now(), AUTOMOD_STAGING_PURPOSE);
+            () => bot.stopStagingUse(), expiry => bot.scheduleStagingExpiry(expiry, AUTOMOD_STAGING_PURPOSE),
+            Date.now(), AUTOMOD_STAGING_PURPOSE);
         });
       },
     };
@@ -1233,14 +1234,14 @@ export class TwoBotContainer extends Container<Env> {
     }
   }
 
-  private async scheduleStagingExpiry(expiresAt: number, stopOnly = false): Promise<void> {
-    const [pending] = await this.listSchedules<boolean>("stagingExpiry");
+  private async scheduleStagingExpiry(expiresAt: number, mode: true | typeof AUTOMOD_STAGING_PURPOSE | null = null): Promise<void> {
+    const [pending] = await this.listSchedules<typeof mode>("stagingExpiry");
     // The pinned SDK persists schedule times in whole seconds. Ceil, never
     // floor an expiry: an early callback must not discard the only deadline.
     const when = Math.ceil(expiresAt / 1000);
-    if (pending?.time === when && (pending.payload === true) === stopOnly) return;
+    if (pending?.time === when && pending.payload === mode) return;
     this.deleteSchedules("stagingExpiry");
-    await this.schedule(new Date(when * 1000), "stagingExpiry", stopOnly ? true : null);
+    await this.schedule(new Date(when * 1000), "stagingExpiry", mode);
   }
 
   private async stopStagingUse(): Promise<void> {
@@ -1281,7 +1282,7 @@ export class TwoBotContainer extends Container<Env> {
         const pending = automod?.phase === "active" ? undefined : await this.automodRecovery.pending();
         if (pending && (!automod || automod.phase === "preparing")) throw new OwnershipRefused("staging_use_conflict");
         if (use?.phase === "active" && use.expiresAt > Date.now() && !this.recoveryFailed) {
-          await this.scheduleStagingExpiry(use.expiresAt);
+          await this.scheduleStagingExpiry(use.expiresAt, automod?.purpose ?? null);
           return;
         }
         if (automod && (automod.phase === "active" || pending)) {
@@ -1301,7 +1302,7 @@ export class TwoBotContainer extends Container<Env> {
         }
         if (use?.purpose === AUTOMOD_STAGING_PURPOSE && use.phase === "preparing") {
           if (use.expiresAt > Date.now()) {
-            await this.scheduleStagingExpiry(use.expiresAt);
+            await this.scheduleStagingExpiry(use.expiresAt, AUTOMOD_STAGING_PURPOSE);
             this.recoveryFailed = false;
             return;
           }
@@ -1321,8 +1322,9 @@ export class TwoBotContainer extends Container<Env> {
           if (held) throw new OwnershipRefused("staging_use_conflict");
           if (this.ctx.container?.running) await super.destroy();
           if (this.ctx.container?.running) throw new OwnershipRefused("shutdown_unconfirmed");
-          // Shutdown alone cannot retire a reservation or clear an unread hold.
-          if (!readUse || use?.purpose === AUTOMOD_STAGING_PURPOSE) {
+          // A protected expiry or stop retry retains its schedule while the lease is unreadable.
+          const [scheduled] = readUse ? [] : await this.listSchedules<true | typeof AUTOMOD_STAGING_PURPOSE>("stagingExpiry");
+          if (scheduled?.payload || use?.purpose === AUTOMOD_STAGING_PURPOSE) {
             throw new OwnershipRefused("staging_use_conflict");
           }
           this.deleteSchedules("keepalive");

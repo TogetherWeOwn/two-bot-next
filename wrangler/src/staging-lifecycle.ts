@@ -214,9 +214,9 @@ export class StagingLifecycle {
     };
     const active = { ...pending, phase: "active" as const };
     const reservation = purpose === undefined ? {} : await new StagingAutomodRecovery(this.storage).reservation(active);
-    // Arm AutoMod expiry before writing its preparation so a crash during
-    // teardown cannot strand a hold. Both grant types persist denial before
-    // teardown and arm expiry before issuance. The used marker bars replay.
+    // Arm AutoMod expiry before persisting preparation so a crash cannot strand it.
+    // An active grant always has its expiry alarm. End markers prevent a
+    // delayed acquire retry from resurrecting a released workflow attempt.
     if (purpose !== undefined) await scheduleExpiry(pending.expiresAt);
     await this.write(pending, { [`${USED_PREFIX}${pending.runId}:${pending.runAttempt}`]: pending.expiresAt });
     await stop();

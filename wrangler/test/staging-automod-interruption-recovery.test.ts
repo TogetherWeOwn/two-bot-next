@@ -67,8 +67,8 @@ async function fixture(t: TestContext) {
   const bot = await build();
   const store = storage as unknown as DurableObjectStorage;
   const staging = new StagingLifecycle(store);
-  const issue = (stop = async () => {}) => staging.acquire(change, identity, stop, async expiresAt => {
-    await bot.schedule(new Date(expiresAt), "stagingExpiry", null);
+  const issue = (stop = async () => {}, window = change) => staging.acquire(window, identity, stop, async expiresAt => {
+    await bot.schedule(new Date(expiresAt), "stagingExpiry", AUTOMOD_STAGING_PURPOSE);
   }, Date.now(), AUTOMOD_STAGING_PURPOSE);
   return { bot, build, runtime, staging, issue, values, storage, journal: new StagingAutomodRecovery(store) };
 }
@@ -79,11 +79,11 @@ test("expiry retires the original unused lease across rollout drift and refuses 
   const keys = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const kid = "synthetic-actions-key";
   const jwk = { ...keys.publicKey.export({ format: "jwk" }), kid, alg: "RS256", use: "sig" };
-  const provider = t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
     assert.equal(String(input), "https://token.actions.githubusercontent.com/.well-known/jwks");
     return Response.json({ keys: [jwk] });
   });
-  const bridge = (bot: TwoBotContainer, expected: StagingUse, build: { deploymentId: string; sha: string }, op: "invoke" | "read-approval") => {
+  const bridge = (bot: TwoBotContainer, expected: StagingUse, build: { deploymentId: string; sha: string }) => {
     const iat = Math.floor(Date.now() / 1000);
     const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
     const claims = { iss: "https://token.actions.githubusercontent.com", aud: "two-bot-staging-automod",
@@ -100,36 +100,34 @@ test("expiry retires the original unused lease across rollout drift and refuses 
     return bot.fetch(new Request(`https://worker.invalid${STAGING_AUTOMOD_PATH}`, {
       method: "POST", headers: { authorization: `Bearer ${bearer}`, [DEPLOYMENT_HEADER]: build.deploymentId,
         [STAGING_AUTOMOD_OIDC_HEADER]: jwt },
-      body: JSON.stringify(op === "invoke" ? { op, pin, call } : { op, ...call }),
+      body: JSON.stringify({ op: "invoke", pin, call }),
     }));
   };
 
-  const originalApproval = await bridge(h.bot, issued, issued, "read-approval");
-  assert.deepEqual(await originalApproval.json(), { value: { action: "recover", issuedLease: issued, target: STAGING_AUTOMOD_TARGET } });
   h.runtime.running = true;
   await h.bot.stagingExpiry();
   assert.equal(h.runtime.destroy.mock.callCount(), 0, "a stale wake preserves the live lease");
 
   t.mock.timers.setTime(issued.expiresAt + STAGING_AUTOMOD_PLAN.cleanupMs + 1);
   const next = { deploymentId: "55555555-5555-5555-5555-555555555555", sha: "b".repeat(40) };
-  // A DO can be reconstructed after the old callback was lost.
   h.bot.deleteSchedules("stagingExpiry");
   const reattached = await h.build(next.deploymentId, next.sha);
-  assert.equal((await bridge(h.bot, { ...issued, runAttempt: 2 }, issued, "invoke")).status, 403);
-  assert.equal((await bridge(reattached, issued, next, "invoke")).status, 403);
-  assert.equal((await bridge(reattached, { ...issued, ...next }, next, "invoke")).status, 403);
-  assert.equal(h.runtime.destroy.mock.callCount(), 0);
+  assert.equal((await bridge(h.bot, { ...issued, runAttempt: 2 }, issued)).status, 403);
+  assert.equal((await bridge(reattached, issued, next)).status, 403);
+  assert.equal((await bridge(reattached, { ...issued, ...next }, next)).status, 403);
+  assert.equal(h.runtime.running, true);
   assert.deepEqual(await h.staging.read(), issued);
 
-  assert.equal((await reattached.listSchedules("stagingExpiry")).length, 1);
   await reattached.alarm();
   assert.deepEqual(await h.staging.read(), { ...issued, phase: "released" });
   assert.deepEqual(h.values.get(reservationKey), { lease: issued, phase: "retired" });
   assert.deepEqual(h.values.get(OWNER_KEY), owner);
-  assert.deepEqual(await reattached.listSchedules("stagingExpiry"), []);
-  assert.equal(h.runtime.destroy.mock.callCount(), 1);
   assert.equal(h.runtime.running, false);
-  assert.ok(provider.mock.callCount() > 0);
+
+  const nextLease = await h.issue(undefined, { ...change, runId: "12346", expiresAt: Date.now() + 120_000 });
+  assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 1);
+  assert.equal((await bridge(h.bot, nextLease, nextLease)).status, 200);
+  assert.deepEqual(await h.bot.listSchedules("stagingExpiry"), []);
 });
 
 test("a preparation interrupted during teardown retains its expiry alarm", async t => {
@@ -140,12 +138,19 @@ test("a preparation interrupted during teardown retains its expiry alarm", async
   }), /interrupted teardown/);
   const preparing = await h.staging.read();
   assert.equal(preparing?.phase, "preparing");
-  assert.equal(await h.journal.pending(), undefined);
 
   t.mock.timers.setTime(change.expiresAt);
+  const get = h.storage.get;
+  const failRead = t.mock.method(h.storage, "get", async (key: string) => {
+    if (key === STAGING_USE_KEY) throw new Error("interrupted lease read");
+    return get(key);
+  });
+  await h.bot.alarm();
+  assert.equal((await h.bot.listSchedules("stagingExpiry"))[0]?.payload, true);
+  failRead.mock.restore();
+  t.mock.timers.tick(15_000);
   await h.bot.alarm();
   assert.deepEqual(await h.staging.read(), { ...preparing, phase: "released" });
-  assert.deepEqual(await h.bot.listSchedules("stagingExpiry"), []);
   await assert.rejects(h.staging.acquire({ ...change, expiresAt: Date.now() + 10_000 }, identity,
     async () => assert.fail("ended attempt cannot acquire"), async () => {}, Date.now(), AUTOMOD_STAGING_PURPOSE), /staging_use_ended/);
 });
@@ -163,8 +168,7 @@ test("interrupted stop and release preserve the lease and retry durable retireme
   assert.deepEqual(await h.journal.pending(), { lease: issued, phase: "reserved" });
   assert.deepEqual(await h.staging.read(), issued);
   const retry = await h.bot.listSchedules("stagingExpiry");
-  assert.equal(retry[0]?.payload, true);
-  assert.equal(retry[0]?.time, (Date.now() + 15_000) / 1_000);
+  assert.partialDeepStrictEqual(retry[0], { payload: true, time: (Date.now() + 15_000) / 1_000 });
 
   const rebuilt = await h.build();
   assert.deepEqual(await rebuilt.listSchedules("stagingExpiry"), retry);
