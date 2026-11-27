@@ -21,6 +21,7 @@ import production_release as release
 import production_release_preflight as preflight
 from production_migrate_approval import stable_plan
 from production_release_ledgers import CUTOVER, STORE
+from staging_migrate_approval import digest_json
 from staging_migrate_reviewed import APP_ID
 from staging_rollout import GateError
 
@@ -191,7 +192,7 @@ class AttendancePreflightOrderTests(unittest.TestCase):
             "GITHUB_WORKFLOW_REF": f"{REPO['full_name']}/{RELEASE_WORKFLOW}@refs/heads/main",
             "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "GITHUB_REF_PROTECTED": "true",
             "RELEASE_SHA": self.pin.candidate_sha, "RELEASE_PLAN_ID": str(PLAN_ID), "RELEASE_PINS": json.dumps(pins),
-            **{f"PRODUCTION_{key.upper()}": value for key, value in self.plan["target"].items()},
+            "RELEASE_TARGET_FINGERPRINT": digest_json(self.plan["target"]),
             "PRODUCTION_WORKER_URL": "https://worker.example.invalid", "CLOUDFLARE_ACCOUNT_ID": "synthetic-account",
             "CLOUDFLARE_API_TOKEN": "synthetic", "OWNERSHIP_CONTROL_TOKEN": "synthetic",
         }
@@ -223,7 +224,7 @@ class AttendancePreflightOrderTests(unittest.TestCase):
                            image_in_registry=effect("registry"), read_status=effect("observe", result=self.provider.state),
                            control_client=self.provider.control_client, stop_prior_pair=effect("stop", forbidden=True),
                            database=effect("database", forbidden=True),
-                           apply_under_prepared_fence=effect("apply", forbidden=True)),
+                           apply_under_bound_fence=effect("apply", forbidden=True)),
             patch("subprocess.Popen", side_effect=effect("process", forbidden=True)),
             patch("socket.socket", side_effect=effect("socket", forbidden=True)),
             patch("socket.getaddrinfo", side_effect=effect("DNS", forbidden=True)),
@@ -278,9 +279,10 @@ class AttendancePreflightOrderTests(unittest.TestCase):
                                                     "observe", "control takeover-capability", "observe"])
         ownership_reads = [event for event in self.provider.calls if event in ("observe", "control takeover-capability")]
         self.assertEqual(ownership_reads, ["observe", "control takeover-capability", "observe"])
-        proof = json.loads((self.directory / "preflight.json").read_text(encoding="utf-8"))
+        intent_name = f"{preflight.STOP_INTENT_ARTIFACT}.json"
+        proof = json.loads((self.directory / intent_name).read_text(encoding="utf-8"))
         self.assertEqual(proof["epoch"], 17)
         self.assertEqual(proof["plan_archive_sha256"], source.digest)
         self.assertEqual(self.output.read_text(encoding="utf-8").splitlines(),
                          ["epoch=17", f"archive={self.pin.candidate_archive}", f"image={self.pin.candidate_image}"])
-        self.assertCountEqual((path.name for path in self.directory.iterdir()), ["fresh-plan.json", "preflight.json"])
+        self.assertCountEqual((path.name for path in self.directory.iterdir()), ["fresh-plan.json", intent_name])
