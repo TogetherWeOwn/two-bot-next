@@ -75,46 +75,47 @@ async function fixture(t: TestContext) {
 
 test("expiry retires the original unused lease across rollout drift and refuses bridge takeover", async t => {
   const h = await fixture(t);
-  const issued = await h.issue();
   const keys = generateKeyPairSync("rsa", { modulusLength: 2048 });
-  const kid = "synthetic-actions-key";
-  const jwk = { ...keys.publicKey.export({ format: "jwk" }), kid, alg: "RS256", use: "sig" };
+  const jwk = { ...keys.publicKey.export({ format: "jwk" }), kid: "synthetic-actions-key", alg: "RS256", use: "sig" };
   t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
     assert.equal(String(input), "https://token.actions.githubusercontent.com/.well-known/jwks");
     return Response.json({ keys: [jwk] });
   });
-  const bridge = (bot: TwoBotContainer, expected: StagingUse, build: { deploymentId: string; sha: string }) => {
+  const bridge = (bot: TwoBotContainer, scope: StagingUse | typeof change, build = scope) => {
     const iat = Math.floor(Date.now() / 1000);
     const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
     const claims = { iss: "https://token.actions.githubusercontent.com", aud: "two-bot-staging-automod",
       repository: "TogetherWeOwn/two-bot-next", repository_id: "1396224242", ref: "refs/heads/main", ref_protected: "true",
-      event_name: "workflow_dispatch", run_id: expected.runId, run_attempt: String(expected.runAttempt), environment: "staging",
+      event_name: "workflow_dispatch", run_id: scope.runId, run_attempt: String(scope.runAttempt), environment: "staging",
       workflow_ref: "TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main",
       sha: build.sha, iat, nbf: iat, exp: iat + 300 };
-    const signed = `${encode({ alg: "RS256", typ: "JWT", kid })}.${encode(claims)}`;
+    const signed = `${encode({ alg: "RS256", typ: "JWT", kid: jwk.kid })}.${encode(claims)}`;
     const jwt = `${signed}.${sign("sha256", Buffer.from(signed), keys.privateKey).toString("base64url")}`;
-    const call = { action: "recover", issuedLease: expected };
     const pin = { workerVersionId: build.deploymentId, sourceSha: build.sha, namespaceId: "a".repeat(32),
       workerDeploymentId: "22222222-2222-2222-2222-222222222222", applicationId: "33333333-3333-3333-3333-333333333333",
       rolloutId: "44444444-4444-4444-4444-444444444444", imageDigest: `sha256:${"b".repeat(64)}` };
     return bot.fetch(new Request(`https://worker.invalid${STAGING_AUTOMOD_PATH}`, {
       method: "POST", headers: { authorization: `Bearer ${bearer}`, [DEPLOYMENT_HEADER]: build.deploymentId,
         [STAGING_AUTOMOD_OIDC_HEADER]: jwt },
-      body: JSON.stringify({ op: "invoke", pin, call }),
+      body: JSON.stringify("action" in scope ? { op: "acquire", pin, change: scope }
+        : { op: "invoke", pin, call: { action: "recover", issuedLease: scope } }),
     }));
   };
-
+  Object.assign(h.bot, { automodPlan: { ...STAGING_AUTOMOD_PLAN, enabled: true, allowStart: true, notAfter: change.expiresAt } });
+  const acquired = await bridge(h.bot, change);
+  assert.equal(acquired.status, 200);
+  const { value: issued } = await acquired.json() as { value: StagingUse };
+  assert.equal((await h.bot.listSchedules("stagingExpiry"))[0]?.payload, AUTOMOD_STAGING_PURPOSE);
   h.runtime.running = true;
   await h.bot.stagingExpiry();
   assert.equal(h.runtime.destroy.mock.callCount(), 0, "a stale wake preserves the live lease");
-
   t.mock.timers.setTime(issued.expiresAt + STAGING_AUTOMOD_PLAN.cleanupMs + 1);
   const next = { deploymentId: "55555555-5555-5555-5555-555555555555", sha: "b".repeat(40) };
   h.bot.deleteSchedules("stagingExpiry");
   const reattached = await h.build(next.deploymentId, next.sha);
-  assert.equal((await bridge(h.bot, { ...issued, runAttempt: 2 }, issued)).status, 403);
+  assert.equal((await bridge(h.bot, { ...issued, runAttempt: 2 })).status, 403);
   assert.equal((await bridge(reattached, issued, next)).status, 403);
-  assert.equal((await bridge(reattached, { ...issued, ...next }, next)).status, 403);
+  assert.equal((await bridge(reattached, { ...issued, ...next })).status, 403);
   assert.equal(h.runtime.running, true);
   assert.deepEqual(await h.staging.read(), issued);
 
@@ -126,7 +127,7 @@ test("expiry retires the original unused lease across rollout drift and refuses 
 
   const nextLease = await h.issue(undefined, { ...change, runId: "12346", expiresAt: Date.now() + 120_000 });
   assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 1);
-  assert.equal((await bridge(h.bot, nextLease, nextLease)).status, 200);
+  assert.equal((await bridge(h.bot, nextLease)).status, 200);
   assert.deepEqual(await h.bot.listSchedules("stagingExpiry"), []);
 });
 
