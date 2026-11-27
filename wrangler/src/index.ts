@@ -1783,12 +1783,7 @@ export class TwoBotContainer extends Container<Env> {
     }
   }
 
-  /** Fetch-only bridge for the protected staging AutoMod job. The Worker
-   * requires bounded staging and the control bearer and stamps this version.
-   * This entry repeats those checks, then verifies the Actions OIDC token
-   * before any storage, lease or Container read. One closed operation then
-   * reaches the matching in-process bindProtectedAutomodInstance member.
-   */
+  /** Fetch-only bridge. Verify Worker stamps, bearer and OIDC before any state reads. */
   private async stagingAutomodBridge(request: Request): Promise<Response> {
     if (!this.boundedStaging() || request.method !== "POST") return notFound();
     if (!await authenticated(request, this.env.OWNERSHIP_CONTROL_TOKEN)) {

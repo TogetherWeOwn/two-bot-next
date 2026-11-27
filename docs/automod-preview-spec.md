@@ -829,9 +829,8 @@ authenticated inventory supplies the remaining serving fields.
 
 The default-off compiled plan gates reservation and start. Recovery uses the
 original lease even when the plan is off. The DO rereads approval at invocation.
-The workflow grants `id-token: write` to the job and gives only dispatch the
-bearer. The client mints a token per bridge call to a fixed staging URL. The
-sparse checkout supports the unbound command and its fail-closed outcome.
+The client mints an OIDC token per call to a fixed staging URL. The workflow's
+job-level `id-token: write` and dispatch-only bearer support that client.
 
 Enabling requires a reviewed change and protected staging deploy, an
 authenticated post-deploy selection with the client imports, a GitHub read

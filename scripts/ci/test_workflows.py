@@ -8071,19 +8071,27 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
 
     def test_staging_automod_dispatch_runs_from_sparse_checkout(self):
         steps = self.workflows["staging-automod-preview.yml"]["jobs"]["dry-run"]["steps"]
+        probe = """
+import assert from "node:assert/strict";
+globalThis.fetch = () => assert.fail("Unexpected network access during dispatch binding");
+const { bindStagingAutomodDispatch } = await import("./" + process.argv[1]);
+for (const optIn of ["false", "true"]) {
+  const binding = await bindStagingAutomodDispatch({ STAGING_AUTOMOD_REHEARSAL: optIn,
+    ACTIONS_ID_TOKEN_REQUEST_URL: "https://pipelines.actions.githubusercontent.com/token",
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: "synthetic-oidc-request", OWNERSHIP_CONTROL_TOKEN: "synthetic".repeat(5) });
+  assert.equal(binding, undefined);
+}
+"""
         with tempfile.TemporaryDirectory(prefix="staging-automod-checkout-") as directory:
             for pattern in steps[0]["with"]["sparse-checkout"].splitlines():
                 self.assertRegex(pattern, r"\A/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+\.(?:mjs|ts|json)\Z")
-                path = pattern[1:]
-                target = Path(directory) / path
+                target = Path(directory) / pattern[1:]
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes((ROOT / path).read_bytes())
-            for opt_in, status, stderr in (("false", 0, ""), ("true", 1, "staging_automod_rehearsal_failed\n")):
-                with self.subTest(opt_in=opt_in):
-                    result = subprocess.run(shlex.split(steps[-1]["run"]), cwd=directory, timeout=10,
-                                            env={"PATH": os.environ["PATH"], "STAGING_AUTOMOD_REHEARSAL": opt_in},
-                                            capture_output=True, text=True)
-                    self.assertEqual((result.returncode, result.stdout, result.stderr), (status, "", stderr))
+                target.write_bytes((ROOT / pattern[1:]).read_bytes())
+            result = subprocess.run(["node", "--input-type=module", "-e", probe, shlex.split(steps[-1]["run"])[1]],
+                                    cwd=directory, env={"PATH": os.environ["PATH"]}, capture_output=True,
+                                    text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_staging_automod_preview_requires_protected_opt_in(self):
         name = "staging-automod-preview.yml"
