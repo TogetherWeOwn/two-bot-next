@@ -125,7 +125,14 @@ The [replacement Worker](../wrangler/src/pre-qualification.ts) separates private
 It arms a durable cutoff alarm for the exact actor and persists stop and retry intent before calling `destroy()`.
 Preserve the original actor pin, class and namespace through independent provider settlement.
 A returned destroy request and local `inspect()` absence leave placement settlement to the cleanup caller.
-The pinned fixture image receives the loopback settings and must enforce the original cutoff throughout startup and execution.
+Build the Linux amd64 [fixture image](../scripts/ci/Dockerfile.pre-fixture) with the verified
+OCI layout as the `predecessor` build context pinned by manifest digest. The
+[PID 1 supervisor](../scripts/ci/pre_fixture_supervisor.py) seeds and verifies the requested
+disposable PostgreSQL snapshot and binds the Discord loopback mock before
+starting the archived bot binary. At cutoff it exits the container's PID
+namespace. The private qualification binding exposes fixture evidence and
+releases mock READY after a 503 from the pinned bot. The protected caller
+still needs to verify runtime stamps and components on both readiness reads.
 
 For native scheduling, Get Application reports observed `active` and
 `starting` counts. The [cleanup projection](../scripts/pre_inventory.py)
@@ -133,10 +140,11 @@ requires `active` and `assigned`. A zero `starting` count cannot satisfy the
 assigned count check. Keep admission closed until a provider-supported cleanup
 adapter can prove zero active and assigned instances for the exact app before
 deletion, including settlement of any in-flight starts. Preserve the existing
-cleanup refusal while this proof is unavailable. The instance API reports a
-latest known state and newly started instances can take time to appear. A
-cleanup adapter could use positive terminal observations for the exact actors
-after confirmed stop and settlement. An empty listing alone gives no proof.
+cleanup refusal while this proof is unavailable. The
+[instance reader](../scripts/pre_native_instance.py) requires a positive terminal
+observation for the exact actor after stop was requested. Its result is the
+provider's latest reported state. Cleanup also requires independent settlement
+of pending starts and authoritative assignment evidence before deletion.
 [Get Application API](https://developers.cloudflare.com/api/resources/containers/subresources/applications/methods/get/) · [Instance API](https://developers.cloudflare.com/api/resources/containers/subresources/applications/subresources/instances/methods/list/) · [Listing delay](https://developers.cloudflare.com/sandbox/manage/list-sandboxes/#list-sandboxes-across-the-account)
 
 Qualification requires protected evidence of private first create, the exact

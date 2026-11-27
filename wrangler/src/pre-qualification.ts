@@ -64,9 +64,19 @@ export class PreQualification extends WorkerEntrypoint<Env> {
     return this.env.TWO_BOT.get(id).start(expected);
   }
 
-  probe(expected: Actor, path: string) {
+  async probe(expected: Actor, path: string) {
     const { id } = binding(this.env);
     return this.env.TWO_BOT.get(id).probe(expected, path);
+  }
+
+  fixture(expected: Actor) {
+    const { id } = binding(this.env);
+    return this.env.TWO_BOT.get(id).fixture(expected);
+  }
+
+  releaseReady(expected: Actor) {
+    const { id } = binding(this.env);
+    return this.env.TWO_BOT.get(id).releaseReady(expected);
   }
 }
 
@@ -158,6 +168,28 @@ export class PreQualificationContainer extends DurableObject<Env> {
 
   async probe(expected: Actor, path: string) {
     if (path !== "/health" && path !== "/readyz" && path !== "/version") throw refused();
+    return this.#request(expected, 8080, path);
+  }
+
+  fixture(expected: Actor) {
+    return this.#request(expected, 8082, "/fixture");
+  }
+
+  async releaseReady(expected: Actor) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const ready = await this.probe(expected, "/readyz");
+      releaseUpstream(ready);
+      if (ready.status !== 503) throw refused();
+      const reply = await this.#request(expected, 8082, "/release", "POST");
+      if (reply.status !== 204) {
+        releaseUpstream(reply);
+        throw refused();
+      }
+      return this.#configuration(expected).actor;
+    });
+  }
+
+  async #request(expected: Actor, port: 8080 | 8082, path: string, method = "GET") {
     const { actor, cutoff } = this.#configuration(expected);
     const container = this.ctx.container;
     if (!container || (await this.#read(actor, cutoff))?.phase !== "issued" || Date.now() >= cutoff) throw refused();
@@ -166,7 +198,10 @@ export class PreQualificationContainer extends DurableObject<Env> {
       const running = await boundRead(container.inspect(), signal);
       if (!running || running.image !== this.env.PRE_IMAGE || running.labels?.pre_start_id !== actor.startId
           || (await this.#read(actor, cutoff))?.phase !== "issued" || Date.now() >= cutoff) throw refused();
-      const request = container.getTcpPort(8080).fetch(`http://127.0.0.1:8080${path}`, { redirect: "manual", signal });
+      const request = container.getTcpPort(port).fetch(`http://127.0.0.1:${port}${path}`, {
+        method, redirect: "manual", signal,
+        ...(port === 8082 && { headers: { "x-pre-start-id": actor.startId } }),
+      });
       const reply = await boundRead(request.then(response => {
         if (signal.aborted || (response.status >= 300 && response.status < 400)) {
           releaseUpstream(response);
@@ -174,10 +209,12 @@ export class PreQualificationContainer extends DurableObject<Env> {
         }
         return response;
       }), signal);
-      const body = await readControlBody(reply, bytes => new Blob([bytes]), PROBE_BODY_CAP, signal);
-      if (!(body instanceof Blob) || (await this.#read(actor, cutoff))?.phase !== "issued"
+      const empty = method === "POST" && reply.status === 204;
+      const body = empty ? null : await readControlBody(reply, bytes => new Blob([bytes]), PROBE_BODY_CAP, signal);
+      if ((!empty && !(body instanceof Blob))
+          || (await this.#read(actor, cutoff))?.phase !== "issued"
           || Date.now() >= cutoff) throw refused();
-      return new Response(body, {
+      return new Response(body instanceof Blob ? body : null, {
         status: reply.status,
         headers: { "content-type": "application/json", "x-two-worker-version": actor.version },
       });
