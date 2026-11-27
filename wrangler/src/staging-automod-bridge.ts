@@ -165,11 +165,7 @@ function numericDate(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
-/** Verify a GitHub Actions OIDC token for the protected staging AutoMod run.
- * RS256 against GitHub's JWKS, the fixed audience, a bounded clock skew and
- * the exact protected workflow claims. The token's sha must be this build.
- * Returns the bound run scope, or undefined for any failure.
- */
+/** Return the authenticated workflow and release scope, or undefined on refusal. */
 export async function verifyStagingAutomodOidc(token: string | null, release: string | undefined,
   signal: AbortSignal, now = Date.now()): Promise<StagingAutomodRun | undefined> {
   try {

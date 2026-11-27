@@ -8073,13 +8073,17 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
         steps = self.workflows["staging-automod-preview.yml"]["jobs"]["dry-run"]["steps"]
         probe = """
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 globalThis.fetch = () => assert.fail("Unexpected network access during dispatch binding");
-const { bindStagingAutomodDispatch } = await import("./" + process.argv[1]);
+const [node, entry, ...args] = process.argv.slice(1);
+const { bindStagingAutomodDispatch } = await import("./" + entry);
 for (const optIn of ["false", "true"]) {
-  const binding = await bindStagingAutomodDispatch({ STAGING_AUTOMOD_REHEARSAL: optIn,
+  const env = { PATH: process.env.PATH, STAGING_AUTOMOD_REHEARSAL: optIn,
     ACTIONS_ID_TOKEN_REQUEST_URL: "https://pipelines.actions.githubusercontent.com/token",
-    ACTIONS_ID_TOKEN_REQUEST_TOKEN: "synthetic-oidc-request", OWNERSHIP_CONTROL_TOKEN: "synthetic".repeat(5) });
-  assert.equal(binding, undefined);
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: "synthetic-oidc-request", OWNERSHIP_CONTROL_TOKEN: "synthetic".repeat(5) };
+  assert.equal(await bindStagingAutomodDispatch(env), undefined);
+  const { status, stdout, stderr } = spawnSync(node, [entry, ...args], { env, encoding: "utf8", timeout: 5_000 });
+  assert.deepEqual([status, stdout, stderr], optIn === "true" ? [1, "", "staging_automod_rehearsal_failed\\n"] : [0, "", ""]);
 }
 """
         with tempfile.TemporaryDirectory(prefix="staging-automod-checkout-") as directory:
@@ -8088,9 +8092,9 @@ for (const optIn of ["false", "true"]) {
                 target = Path(directory) / pattern[1:]
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((ROOT / pattern[1:]).read_bytes())
-            result = subprocess.run(["node", "--input-type=module", "-e", probe, shlex.split(steps[-1]["run"])[1]],
+            result = subprocess.run(["node", "--input-type=module", "-e", probe, *shlex.split(steps[-1]["run"])],
                                     cwd=directory, env={"PATH": os.environ["PATH"]}, capture_output=True,
-                                    text=True, timeout=10)
+                                    text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_staging_automod_preview_requires_protected_opt_in(self):
