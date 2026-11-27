@@ -21,7 +21,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from pre_target import Inventory, Target, TargetError, check_inventory
 from script_intake import decode_legacy_json, unique_object
 
-from fixtures.predecessor_discord import GATEWAY, REST, TOKEN
+from fixtures.predecessor_discord import APP, GATEWAY, REST, TOKEN
+
 from fixtures.predecessor_snapshots import GUILD, schema_check, snapshot_sql
 
 
@@ -35,6 +36,7 @@ STAMPS = dict(zip(
     ("org.opencontainers.image.revision", "com.togetherweown.build-id",
      "com.togetherweown.deploy-id"),
 ))
+
 
 
 class Refused(Exception):
@@ -189,8 +191,11 @@ def run_endpoint(docker, image, postgres, mock_image, stamps, tip):
         env = {
             "DISCORD_GATEWAY_URL": GATEWAY,
             "DISCORD_API_BASE": REST,
+
             "LISTEN_ADDR": "127.0.0.1:8080",
             "DISCORD_TOKEN": TOKEN,
+            "DISCORD_APPLICATION_ID": APP,
+            "TWO_COMMANDS_PUBLISH_ON_BOOT": "1",
             "GUILD_ID": GUILD,
             "DATABASE_URL": "postgres://offline_bot:offline-fixture@127.0.0.1/postgres",
             "TWO_DATABASE_TLS": "local-only",
@@ -227,14 +232,18 @@ def run_endpoint(docker, image, postgres, mock_image, stamps, tip):
                                                        for name in ("database", "gateway"))
 
         wait_for(ready, "database and mock gateway did not become ready")
-        require(probe("mock", "/fixture") == [200, {"ready_sent": True}], "mock READY was not sent")
+        observed = probe("mock", "/fixture")
+        require(type(observed) is list and len(observed) == 2 and observed[0] == 200
+                and type(observed[1]) is dict
+                and observed[1].get("ready_sent") is True, "mock READY was not sent")
+        require(observed[1].get("rest_synced") is True, "mock REST command sync was not observed")
         require(sql("SELECT count(*) FROM gateway_sessions WHERE "
                     f"guild_id = '{GUILD}' AND shard_id = 0 "
                     "AND session_id = 'offline-fixture-session' AND seq = 1;") == "1",
                 "mock gateway checkpoint missing from the running database")
         require(sql(check) == "t", "PRE snapshot changed during startup")
     return {"cutover": tip, "store": 465, "process": "live", "database": "ready",
-            "mock_gateway": "checkpointed", "pre_ready_status": 503, "ready_status": 200}
+            "mock_gateway": "checkpointed", "mock_rest": "synced", "pre_ready_status": 503, "ready_status": 200}
 
 
 def main():

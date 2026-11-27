@@ -189,6 +189,14 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Opt-in direct-container rehearsal", result.stdout)
 
+
+    def test_mock_refuses_non_loopback_namespace_before_listening(self):
+        with (patch.object(socket, "if_nameindex", return_value=[(1, "lo"), (2, "eth0")]),
+              patch.object(discord, "ThreadingHTTPServer") as server,
+              self.assertRaisesRegex(SystemExit, "loopback-only network namespace")):
+            discord.serve()
+        server.assert_not_called()
+
     def test_mock_gateway_accepts_twilight_identify(self):
         for token in (f"Bot {fixture.TOKEN}", fixture.TOKEN, "Bot foreign"):
             client, server = socket.socketpair()
@@ -225,19 +233,23 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                     READY_SENT.clear()
 
     def test_mock_command_publication(self):
+        self.addCleanup(discord.REST_SYNCED.clear)
         for token, body, status in [(fixture.TOKEN, b'[{"name":"help"}]', b"200"),
+                                    (fixture.TOKEN, b"[]", b"200"),
                                     ("foreign", b"[]", b"401"), (fixture.TOKEN, b"{}", b"400"),
                                     (fixture.TOKEN, b'[{"k":1,"k":2}]', b"400"),
                                     (fixture.TOKEN, b'[{"k":NaN}]', b"400"),
                                     (fixture.TOKEN, b'[{"k":1e400}]', b"400")]:
             client, server = socket.socketpair()
             with self.subTest(status=status), client, server:
+                discord.REST_SYNCED.clear()
                 request = (f"PUT {COMMANDS} HTTP/1.1\r\nConnection: close\r\n"
                            f"Authorization: Bot {token}\r\nContent-Length: {len(body)}\r\n\r\n").encode()
                 client.sendall(request + body)
                 Discord(server, None, None)
                 response = client.recv(4096)
                 self.assertEqual(response.split(b" ", 2)[1], status)
+                self.assertEqual(discord.REST_SYNCED.is_set(), status == b"200" and body != b"[]")
                 if status == b"200":
                     self.assertEqual(json.loads(response.split(b"\r\n\r\n")[1]), json.loads(body))
 
@@ -357,6 +369,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
             (473, 473, "setup", "pre-fixture-test"),
             (473, 473, "gateway peer", "pre-fixture-test"),
             (475, 475, "REST peer", "pre-fixture-test"),
+            (475, 475, "rest", "pre-fixture-test"),
             (475, 475, "premature", "pre-fixture-test"),
             (473, 473, "cancel", "pre-fixture-test"),
         ]:
@@ -397,6 +410,9 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                         self.assertIn(f"DISCORD_API_BASE={discord.REST}", args)
                         self.assertEqual([arg for arg in args if arg.startswith("DATABASE_URL=")],
                                          ["DATABASE_URL=postgres://offline_bot:offline-fixture@127.0.0.1/postgres"])
+                        self.assertIn("DISCORD_APPLICATION_ID=1111", args)
+                        self.assertIn("DISCORD_TOKEN=offline-predecessor-fixture", args)
+                        self.assertIn("TWO_COMMANDS_PUBLISH_ON_BOOT=1", args)
                         if failure in ("gateway peer", "REST peer"):
                             self.fail("bot spawn reached with an unconfirmed Discord peer")
                         if failure == "cancel":
@@ -443,7 +459,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                     if path == "/release":
                         released = True
                     status, body = {
-                        "/fixture": (200, {"ready_sent": released}),
+                        "/fixture": (200, {"ready_sent": released, "rest_synced": failure != "rest"}),
                         "/release": (200, {}),
                         "/health": (200, {"status": "ok"}),
                         "/version": (200, {"sha": fixture.SOURCE, "build_id": "test-1", "deploy_id": "test.1"}),
@@ -474,12 +490,13 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                                 "retained_timestamp": "^PRE snapshot changed during startup$",
                                 "stamp": "stamp mismatch", "checkpoint": "checkpoint missing",
                                 "premature": "pre-READY state invalid", "setup": "snapshot readback failed",
-                                "gateway peer": "gateway fixture unconfirmed", "REST peer": "REST fixture unconfirmed"}
+                                "gateway peer": "gateway fixture unconfirmed", "REST peer": "REST fixture unconfirmed",
+                                "rest": "mock REST command sync was not observed"}
                     with self.assertRaisesRegex(fixture.Refused, expected[failure]):
                         rehearse()
                 else:
                     self.assertEqual(rehearse(), {"cutover": tip, "store": 465, "process": "live",
-                                                "database": "ready", "mock_gateway": "checkpointed",
+                                                "database": "ready", "mock_gateway": "checkpointed", "mock_rest": "synced",
                                                 "pre_ready_status": 503, "ready_status": 200})
                 if failure in (None, "ledger", "ledger_query", "retained_timestamp"):
                     self.assertEqual([(event, app) for event, app, *_ in trace],
