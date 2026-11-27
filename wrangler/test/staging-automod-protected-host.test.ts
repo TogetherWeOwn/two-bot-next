@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
+import { runStagingAutomodDispatch } from "../scripts/staging-automod-dispatch.ts";
+import { bindStagingAutomodInventoryReader } from "../scripts/staging-automod-inventory-reader.ts";
 import { runStagingAutomodProtectedHost } from "../scripts/staging-automod-protected-host.ts";
 import { runProtectedAutomod, type ProtectedAutomodEffects } from "../src/staging-automod-caller.ts";
 import { StagingAutomodLifecycle } from "../src/staging-automod-lifecycle.ts";
@@ -95,6 +97,51 @@ test("the protected host composes both actions on one authenticated serving pin"
   const calls = invokePrivate.mock.calls.map(({ arguments: [pin, call] }) => ({ pin, call }));
   assert.deepEqual(calls, [{ pin, call: { action: "start", issuedLease } }, { pin, call: { action: "recover", issuedLease } }]);
   assert.equal(calls[0]?.pin, calls[1]?.pin);
+  assert.equal(network.mock.callCount(), 0);
+});
+
+test("dispatch preserves producer observation age through inventory verification and delivery", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now });
+  const network = t.mock.method(globalThis, "fetch", async () => assert.fail("unexpected network access"));
+  const env = { ...runner, STAGING_AUTOMOD_REHEARSAL: "true" };
+  const verificationMs = 100;
+  const handoffMs = 101;
+  const deliveryMs = verificationMs + handoffMs;
+  const cases = [
+    { label: "expired in handoff", age: 59_800, readTimes: [now, now + deliveryMs], result: noActions, calls: [] },
+    { label: "fresh at delivery", age: 1_000, readTimes: [now],
+      result: { verdict: "passed", start: true, recover: true },
+      calls: [[pin, { action: "start", issuedLease }], [pin, { action: "recover", issuedLease }]] },
+  ];
+
+  for (const { label, age, readTimes, result, calls } of cases) {
+    t.mock.timers.setTime(now);
+    const { host, invokePrivate } = fixture(t);
+    const receipt = { ...inventory, observed_at: new Date(now - age).toISOString() };
+    const verify = t.mock.fn(async (_sha: string, _runId: string) => {
+      t.mock.timers.setTime(Date.now() + verificationMs);
+      return JSON.stringify(receipt) + "\n";
+    });
+    const read = bindStagingAutomodInventoryReader(verify);
+    const handoffs: { acceptedAt: number; deliveredAt: number; readback: Inventory | undefined }[] = [];
+    const readAuthenticatedInventory: Host["readAuthenticatedInventory"] = async (source, signal) => {
+      const readback = await read(source, signal);
+      const acceptedAt = Date.now();
+      // The first old receipt is 59,900 ms old after verification and 60,001 ms old at delivery.
+      t.mock.timers.setTime(acceptedAt + handoffMs);
+      handoffs.push({ acceptedAt, deliveredAt: Date.now(), readback });
+      return readback;
+    };
+
+    assert.deepEqual(await runStagingAutomodDispatch(env, { serving, inventorySource,
+      host: { ...host, readAuthenticatedInventory } }), result, label);
+    assert.deepEqual(verify.mock.calls.map(({ arguments: [workflowSha, runId] }) => [workflowSha, runId]),
+      readTimes.map(() => [inventorySource.workflowSha, String(inventorySource.runId)]), label);
+    assert.deepEqual(handoffs, readTimes.map(at => ({
+      acceptedAt: at + verificationMs, deliveredAt: at + deliveryMs, readback: receipt,
+    })), label);
+    assert.deepEqual(invokePrivate.mock.calls.map(({ arguments: [pin, call] }) => [pin, call]), calls, label);
+  }
   assert.equal(network.mock.callCount(), 0);
 });
 

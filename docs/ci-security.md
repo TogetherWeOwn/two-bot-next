@@ -98,7 +98,11 @@ membership at check time.
 [Merged PR metadata][archived-pr]
 
 The advisory `pr-evidence` workflow subscribes to PR events and pushes to
-`main`. Its verifier refuses `merge_group` in verify mode before publishing
+`main`. Main pushes share one group that keeps the running verifier replay and
+only the most recently queued push. Each replay that runs checks out its push SHA.
+PR events continue to use per-PR concurrency.
+
+The verifier refuses `merge_group` in verify mode before publishing
 evidence. A future adapter needs a supported source that binds the exact
 group to every PR number and queued PR head SHA. Confirm each PR's
 current base ref matches the protected target. Pass the target repository
@@ -157,6 +161,42 @@ edit procedure in force.
 [archived-pr]: https://api.github.com/repos/TogetherWeOwn/two-bot-next/pulls/1861
 [merge-api]: https://docs.github.com/en/rest/pulls/pulls?apiVersion=2022-11-28#merge-a-pull-request
 [draft-prs]: https://docs.github.com/en/pull-requests/reference/pull-requests#draft-pull-requests
+
+## Recover a missing SBOM handoff on a Check retry
+
+GitHub can retain the image job's earlier success while retrying the verifier.
+The verifier requires `sbom-partial-<run>-<attempt>` from its own attempt.
+**Re-run failed jobs** can repeat this failure. Retry **PR SBOM dry-run / image
+scan and SBOM** to regenerate the handoff and run the verifier, `ci-ok` and
+`ci-evidence` together.
+
+1. The PR maintainer records one retry owner on the PR. The owner confirms
+   the missing handoff in the verifier log and records the PR number, full
+   head SHA, Check run ID and attempt. Save complete single-page responses
+   outside the repo from these GET routes under `repos/TogetherWeOwn/two-bot-next`.
+
+   | File | GET route |
+   | --- | --- |
+   | `pr.json` | `pulls/<pr>` |
+   | `runs.json` | `actions/workflows/check.yml/runs?event=pull_request&head_sha=<sha>&per_page=100` |
+   | `jobs.json` | `actions/runs/<run>/attempts/<attempt>/jobs?per_page=100` |
+   | `artifacts.json` | `actions/runs/<run>/artifacts?per_page=100` |
+
+2. Generate the read-only plan. Resolve other failed or cancelled Check lanes
+   and recapture stale or incomplete responses before using it.
+
+   ```sh
+   python3 -B scripts/plan_sbom_retry.py --pr "$pr" --head "$sha" \
+     --run "$run" --attempt "$attempt" "$snapshot_dir"
+   ```
+
+3. Just before retrying, the retry owner regenerates the plan from fresh
+   responses. Both the branch tip and `refs/pull/<pr>/head` must equal the
+   plan's `head_sha`. Stop on any change or refusal. Open `producer_job_url`,
+   confirm the job name and use **Re-run job** once.
+4. Confirm the producer uploaded `expected_artifact`, the verifier downloaded
+   it and `ci-ok` passed on the pinned head. Record the run, attempt and job
+   links and follow the usual protected merge process.
 
 ## Recover a failed default CodeQL upload
 
