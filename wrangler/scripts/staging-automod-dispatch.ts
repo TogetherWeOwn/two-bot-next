@@ -23,12 +23,8 @@ export async function runStagingAutomodDispatch(env: DispatchEnv = {}, binding?:
     serving: binding.serving, inventorySource: binding.inventorySource }, binding.host);
 }
 
-/** Assemble the bridge binding. Only an explicit opt in, the Actions OIDC
- * request variables and a serving and inventory selection produce one. The
- * selection must come from authenticated post-deploy evidence for the
- * dispatch SHA, never from source or input. The checked-in command has no
- * such resolver yet, so it keeps its fixed host_unavailable failure.
- */
+/** Assemble a bridge binding from authenticated post-deploy evidence.
+ * Keep the client import lazy because the unbound job uses a sparse checkout. */
 export async function bindStagingAutomodDispatch(env: DispatchEnv,
   selection?: Pick<Binding, "serving" | "inventorySource">): Promise<Binding | undefined> {
   const { serving, inventorySource } = selection ?? {};

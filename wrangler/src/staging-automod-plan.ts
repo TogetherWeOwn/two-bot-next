@@ -1,11 +1,7 @@
 import { STAGING_AUTOMOD_TARGET } from "./staging-automod-recovery.ts";
 import type { StagingUse, StagingUseChange } from "./staging-lifecycle.ts";
 
-/** One reviewed AutoMod staging rehearsal, compiled into the Worker build.
- * No request, input or environment variable selects or widens it. Turning it
- * on is a separate reviewed change plus a deploy-staging run. The plan names
- * no serving build or inventory run: the token's sha must equal the deployed
- * release, so source cannot name its own commit's deployment. */
+/** Reviewed authorization policy. Serving identity is resolved after deploy. */
 export type StagingAutomodPlan = Readonly<{
   enabled: boolean;
   target: typeof STAGING_AUTOMOD_TARGET;

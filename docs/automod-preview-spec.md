@@ -817,30 +817,27 @@ Live use still requires an authenticated provider for those readbacks.
 ### Protected AutoMod bridge
 
 In bounded staging, `POST /internal/staging-automod` reaches the in-process
-`bindProtectedAutomodInstance`. The Worker checks the staging control bearer and
-stamps its version. The Container repeats those checks and verifies the job's
-RS256 GitHub Actions OIDC token against GitHub's JWKS with up to 60 seconds of
-skew. The audience is `two-bot-staging-automod`. Claims pin the repository ID,
-protected `main`, direct `workflow_dispatch` of `staging-automod-preview.yml`,
-attempt 1, the `staging` environment and `sha === CONTAINER_RELEASE`.
-Authentication failures precede any storage, lease, plan or runtime read.
+`bindProtectedAutomodInstance`. The Worker checks the staging control bearer
+and stamps its version. Before reading state, the DO verifies both and checks
+the RS256 GitHub Actions token against GitHub's JWKS, with 60 seconds of clock
+skew and audience `two-bot-staging-automod`. Claims pin the repository ID,
+protected `main`, direct preview workflow dispatch, attempt 1, `staging` and
+`CONTAINER_RELEASE`. The strict 4 KiB request binds run, attempt and SHA to
+those claims and allows `acquire`, `read-lease`, `read-approval` and `invoke`.
+The DO checks the local Worker version, build and owner epoch. The runner's
+authenticated inventory supplies the remaining serving fields.
 
-The strict 4 KiB JSON body allows `acquire`, `read-lease`, `read-approval` and
-`invoke`. Approval and invocation accept `start` and `recover`. The body's run,
-attempt and SHA must match the token. The default-off compiled plan authorizes
-reservation and start within its approved window. Recovery uses the verified
-run's original lease even when the plan is off. The DO rereads approval before
-invoking and checks the local Worker version, build and owner epoch. The other
-serving fields come from the runner's fresh authenticated inventory.
+The default-off compiled plan gates reservation and start. Recovery uses the
+original lease even when the plan is off. The DO rereads approval at invocation.
+The workflow grants `id-token: write` to the job and gives only dispatch the
+bearer. The client mints a token per bridge call to a fixed staging URL. The
+sparse checkout supports the unbound command and its fail-closed outcome.
 
-The runner client mints a token per call to a fixed staging Worker URL. The
-workflow grants job-level `id-token: write` and supplies the bearer to dispatch
-only. The checked-in sparse checkout supports the unbound, fail-closed command.
-Enabling needs a separate reviewed change and protected staging deploy, an
-authenticated post-deploy selection and its client imports, a GitHub read
-credential for the inventory verifier, and a dry-run launch adapter. It also
-needs DO expiry or equivalent protected recovery after interruption because a
-later attempt or release cannot recover the original lease through the bridge.
+Enabling requires a reviewed change and protected staging deploy, an
+authenticated post-deploy selection with the client imports, a GitHub read
+credential for inventory verification, a dry-run launch adapter, and protected
+interruption recovery. A later attempt or release cannot recover the original
+lease through the bridge.
 
 ## 10. Spec self-check (doctest)
 
