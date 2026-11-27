@@ -10996,6 +10996,30 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
+    def test_staging_inventory_sparse_checkout_is_pinned(self):
+        workflow = self.workflows["staging-ownership-status.yml"]
+        checkout = workflow["jobs"]["inventory"]["steps"][0]["with"]
+        self.assertEqual(checkout.get("sparse-checkout-cone-mode"), "false")
+        patterns = checkout["sparse-checkout"]
+        dependency = "/scripts/build_identity.py\n"
+        self.assertIn(dependency, patterns)
+        self.assertEqual(staging_ownership_status_errors(workflow), [])
+
+        for label, replacement in (
+            ("full tree", {}),
+            ("cone mode", {"sparse-checkout": patterns, "sparse-checkout-cone-mode": "true"}),
+            ("extra path", {"sparse-checkout": patterns + "/wrangler/\n", "sparse-checkout-cone-mode": "false"}),
+            ("missing transitive import", {"sparse-checkout": patterns.replace(dependency, ""),
+                                           "sparse-checkout-cone-mode": "false"}),
+        ):
+            with self.subTest(change=label):
+                mutant = deepcopy(workflow)
+                mutant_checkout = mutant["jobs"]["inventory"]["steps"][0]["with"]
+                mutant_checkout.pop("sparse-checkout")
+                mutant_checkout.pop("sparse-checkout-cone-mode")
+                mutant_checkout.update(replacement)
+                self.assertTrue(staging_ownership_status_errors(mutant))
+
     def test_slow_burn_tracker_reads_staging_bearer_and_isolates_fixtures(self):
         workflows = self.workflows
         tracker = workflows["slow-burn-tracker.yml"]

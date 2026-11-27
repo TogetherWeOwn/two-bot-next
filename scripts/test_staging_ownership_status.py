@@ -61,8 +61,16 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertIn("node scripts/staging-ownership-status.mjs", self.text)
         self.assertIn("node scripts/ownership-control.mjs preflight", self.text)
         for forbidden in ("deployment-takeover", "wrangler deploy", "staging_rollback_drill",
-                          "staging_container_drill", "worker_container_rollback"):
+                          "staging_container_drill"):
             self.assertNotIn(forbidden, self.code)
+        # The inventory imports this module. Allow its exact sparse checkout
+        # entry and reject every other reference in the workflow.
+        inventory = self.code.split("\n  inventory:\n", 1)[1]
+        checkout = inventory.split("\n      - ", 2)[1]
+        patterns = checkout.partition("\n          sparse-checkout: |\n")[2]
+        patterns = patterns.split("\n          sparse-checkout-cone-mode:", 1)[0]
+        self.assertEqual(self.code.count("worker_container_rollback"),
+                         patterns.splitlines().count("            /scripts/worker_container_rollback.py"))
         # No POST, takeover, fence or transition verbs in executable lines.
         for verb in (re.compile(r"\bPOST\b"), re.compile(r"\btakeover\b", re.I),
                      re.compile(r"\bfence\b", re.I), re.compile(r"\btransition\b", re.I)):
