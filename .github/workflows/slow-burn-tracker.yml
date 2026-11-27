@@ -62,6 +62,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Both jobs use ubuntu-latest's Python, gh and Node.js. The evaluator
+  # imports .ts files directly and needs Node with default type stripping.
   # Scheduled runs and live dispatches only: fire/clear proofs run in
   # `fixture`, so the staging bearer never reaches a fixture run.
   tracker:
@@ -80,9 +82,6 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: '24'
       # Restore-only: a full actions/cache step would save the stale ring in
       # its post phase and could restore over the tracker's fresh ring.
       - name: Restore the burn ring and coverage
@@ -163,9 +162,6 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: '24'
       - name: Run the slow-burn fixture proof
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

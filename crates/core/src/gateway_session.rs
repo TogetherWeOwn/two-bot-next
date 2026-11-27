@@ -20,6 +20,12 @@ pub enum BootAction {
     DiscardAndIdentify,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootDecision {
+    pub action: BootAction,
+    pub resume_endpoint_policy_refused: bool,
+}
+
 // Twilight 0.17.1 appends this query before tokio-websockets parses an HTTP
 // URI (http 1.x caps it at u16::MAX - 1 bytes). zstd uses the same suffix length;
 // reserving compression space is also safe for builds without compression.
@@ -92,26 +98,7 @@ pub fn is_loopback_gateway(url: &str) -> bool {
 }
 
 pub fn boot_action(saved: Option<&GatewaySession>, now_ms: i64) -> BootAction {
-    boot_action_for(saved, now_ms, ResumePolicy::default())
-}
-
-fn boot_action_for(
-    saved: Option<&GatewaySession>,
-    now_ms: i64,
-    policy: ResumePolicy,
-) -> BootAction {
-    let Some(saved) = saved else {
-        return BootAction::Identify;
-    };
-    let age = now_ms.checked_sub(saved.updated_at_ms);
-    if saved.session_id.is_empty()
-        || policy.normalize(&saved.resume_url).is_empty()
-        || !matches!(age, Some(0..=SESSION_MAX_AGE_MS))
-    {
-        BootAction::DiscardAndIdentify
-    } else {
-        BootAction::Resume
-    }
+    boot_action_with(saved, BootDirective::None, now_ms)
 }
 
 /// One-shot operator input read with the checkpoint at boot. `None` keeps the
@@ -137,9 +124,39 @@ pub fn boot_action_with_policy(
     now_ms: i64,
     policy: ResumePolicy,
 ) -> BootAction {
-    match directive {
-        BootDirective::ForceIdentify => BootAction::DiscardAndIdentify,
-        BootDirective::None => boot_action_for(saved, now_ms, policy),
+    boot_decision_with_policy(saved, directive, now_ms, policy).action
+}
+
+pub fn boot_decision_with_policy(
+    saved: Option<&GatewaySession>,
+    directive: BootDirective,
+    now_ms: i64,
+    policy: ResumePolicy,
+) -> BootDecision {
+    use BootAction::{DiscardAndIdentify, Identify, Resume};
+    let (action, resume_endpoint_policy_refused) = match (directive, saved) {
+        (BootDirective::ForceIdentify, _) => (DiscardAndIdentify, false),
+        (BootDirective::None, None) => (Identify, false),
+        // An empty endpoint may already have been normalized during persistence.
+        // Missing, stale and future-dated checkpoints cannot establish a refusal.
+        (BootDirective::None, Some(saved))
+            if saved.session_id.is_empty()
+                || saved.resume_url.is_empty()
+                || !matches!(
+                    now_ms.checked_sub(saved.updated_at_ms),
+                    Some(0..=SESSION_MAX_AGE_MS)
+                ) =>
+        {
+            (DiscardAndIdentify, false)
+        }
+        (BootDirective::None, Some(saved)) if policy.normalize(&saved.resume_url).is_empty() => {
+            (DiscardAndIdentify, true)
+        }
+        (BootDirective::None, Some(_)) => (Resume, false),
+    };
+    BootDecision {
+        action,
+        resume_endpoint_policy_refused,
     }
 }
 
@@ -351,6 +368,50 @@ mod tests {
             );
         }
         assert_eq!(BootDirective::default(), BootDirective::None);
+    }
+
+    #[test]
+    fn only_a_present_endpoint_rejected_for_an_eligible_boot_is_policy_evidence() {
+        let blocked = GatewaySession {
+            resume_url: "wss://example.invalid".into(),
+            ..saved()
+        };
+        let missing_endpoint = GatewaySession {
+            resume_url: String::new(),
+            ..blocked.clone()
+        };
+        let missing_session = GatewaySession {
+            session_id: String::new(),
+            ..blocked.clone()
+        };
+        let admitted = saved();
+        let (none, forced) = (BootDirective::None, BootDirective::ForceIdentify);
+        let (strict, discard) = (ResumePolicy::default(), BootAction::DiscardAndIdentify);
+
+        for (saved, directive, now, action, refused) in [
+            (Some(&blocked), none, 1000, discard, true),
+            (Some(&blocked), forced, 1000, discard, false),
+            (Some(&blocked), none, 999, discard, false),
+            (
+                Some(&blocked),
+                none,
+                1001 + SESSION_MAX_AGE_MS,
+                discard,
+                false,
+            ),
+            (Some(&missing_endpoint), none, 1000, discard, false),
+            (Some(&missing_session), none, 1000, discard, false),
+            (Some(&admitted), none, 1000, BootAction::Resume, false),
+            (None, none, 1000, BootAction::Identify, false),
+        ] {
+            assert_eq!(
+                boot_decision_with_policy(saved, directive, now, strict),
+                BootDecision {
+                    action,
+                    resume_endpoint_policy_refused: refused,
+                }
+            );
+        }
     }
 
     #[test]

@@ -19,7 +19,29 @@ jobs:
     outputs: {expires_at: "${{ steps.staging-use-begin.outputs.expires_at }}", deployment_id: "${{ steps.staging-use-begin.outputs.deployment_id }}", baseline_id: "${{ steps.baseline.outputs.artifact-id }}"}
     steps:
       - &admission {id: admission, if: always(), run: "test \"$GITHUB_RUN_ATTEMPT:$GITHUB_REF:$GITHUB_REF_PROTECTED\" = '1:refs/heads/main:true'"}
-      - &checkout {uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1, with: {ref: "${{ github.sha }}", persist-credentials: false, fetch-depth: 1}} # v7.0.1
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          # Both jobs use the lifecycle and metrics clients. Finish also runs the window and judge.
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/build_identity.py
+            /scripts/promotion_regression_gate.py
+            /scripts/script_intake.py
+            /scripts/staging_health_contract_probe.py
+            /wrangler/package.json
+            /wrangler/scripts/is-direct-invocation.mjs
+            /wrangler/scripts/ownership-control-response.mjs
+            /wrangler/scripts/promotion-error-gate.mjs
+            /wrangler/scripts/rest-5xx-counters.mjs
+            /wrangler/scripts/staging-soak-window.mjs
+            /wrangler/scripts/staging-use-pipeline.mjs
+            /wrangler/scripts/staging-use.mjs
+            /wrangler/src/alert-rules.ts
+            /wrangler/src/metrics-scrape.ts
       - &node {uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1, with: {node-version: 22, package-manager-cache: false}} # v7.1.0
       - name: Acquire and ready the guarded staging candidate
         id: staging-use-begin

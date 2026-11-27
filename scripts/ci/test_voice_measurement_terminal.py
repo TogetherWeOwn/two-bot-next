@@ -9,9 +9,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml
+
+from voice_measurement_policy import WORKFLOW
 from voice_measurement_terminal import JOBS, candidate_verified, main, terminal_verdict
 
 
+ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = """
 import { buildReceipt } from './wrangler/scripts/voice-rest-receipt.mjs';
 import { firstIntervalDecision, combinedDecision } from './wrangler/scripts/voice-measurement-decision.mjs';
@@ -38,18 +42,42 @@ def outcomes(second):
 
 
 class VoiceMeasurementTerminalTests(unittest.TestCase):
-    def test_real_artifacts_on_both_paths(self):
-        fixture = json.loads(subprocess.check_output(["node", "--input-type=module", "-e", FIXTURE], timeout=10))
-        for second in ("false", "true"):
-            with self.subTest(second=second), tempfile.TemporaryDirectory() as directory:
-                self.check_branch(Path(directory), fixture, second)
+    def test_sparse_checkout_runs_both_terminal_paths(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows" / WORKFLOW).read_text(encoding="utf-8"))
+        options = workflow["jobs"]["measurement-terminal"]["steps"][0]["with"]
+        self.assertIs(options["persist-credentials"], False)
+        self.assertEqual(options["fetch-depth"], 1)
+        self.assertIs(options.get("sparse-checkout-cone-mode"), False)
+        patterns = options["sparse-checkout"]
+        fixture = json.loads(subprocess.check_output(
+            ["node", "--input-type=module", "-e", FIXTURE], cwd=ROOT, timeout=10,
+        ))
+        source = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, timeout=10).strip()
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "source"
+            subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", ROOT, checkout],
+                           check=True, timeout=20)
+            subprocess.run(["git", "sparse-checkout", "set", "--no-cone", "--stdin"], cwd=checkout,
+                           input=patterns, text=True, check=True, timeout=10)
+            subprocess.run(["git", "checkout", "--quiet", "--detach", source], cwd=checkout,
+                           check=True, timeout=20)
+            paths = [pattern.removeprefix("/") for pattern in patterns.splitlines()]
+            expected = subprocess.check_output(
+                ["git", "ls-tree", "-r", "--name-only", "HEAD", "--", *paths], cwd=checkout, text=True, timeout=10,
+            )
+            entries = subprocess.check_output(["git", "ls-files", "-t"], cwd=checkout, text=True, timeout=10)
+            self.assertEqual({entry[2:] for entry in entries.splitlines() if entry.startswith("H ")},
+                             set(expected.splitlines()))
+            for second in ("false", "true"):
+                with self.subTest(second=second), tempfile.TemporaryDirectory(dir=directory) as evidence:
+                    self.check_branch(Path(evidence), fixture, second, checkout)
 
-    def check_branch(self, root, f, second):
+    def check_branch(self, root, f, second, checkout):
         two = second == "true"
         before = "candidate/voice-before/voice-before.json"
         final = "candidate/voice-final.json" if two else "candidate/voice-after.json"
         decision = "candidate/voice-combined.json" if two else "candidate/voice-decision.json"
-        evidence = {"grant.json": f["metadata"], before: f["before"], final: f["after"],
+        evidence = {before: f["before"], final: f["after"],
                     decision: f["two" if two else "one"]}
         if two:
             evidence["candidate/voice-middle/voice-after.json"] = f["middle"]
@@ -82,22 +110,44 @@ class VoiceMeasurementTerminalTests(unittest.TestCase):
             cleanup.write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
 
         output = root / "terminal.json"
-        env = {"PATH": os.environ.get("PATH", ""), "EVIDENCE_DIR": str(root), "SECOND_REQUIRED": second,
+        env = {"PATH": os.environ.get("PATH", ""), "PYTHONDONTWRITEBYTECODE": "1",
+               "EVIDENCE_DIR": str(root), "SECOND_REQUIRED": second,
                "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "STAGING_USE_SHA": binding["sha"],
                "STAGING_USE_DEPLOYMENT": "deploy", "STAGING_USE_EXPIRES_AT": str(f["expires"])}
         env.update({"RESULT_" + job.upper().replace("-", "_"): state for job, state in outcomes(second).items()})
 
+        def run_terminal():
+            result = subprocess.run([sys.executable, "scripts/ci/voice_measurement_terminal.py", output],
+                                    cwd=checkout, capture_output=True, timeout=5)
+            self.assertEqual((result.stdout, result.stderr), (b"", b""))
+            return result.returncode
+
         def assert_verdict(verdict, command=main):
             self.assertEqual(command(), 0 if verdict == "accepted" else 1)
-            self.assertEqual(json.loads(output.read_text()),
-                             {"schema": "voice-measurement-terminal.v1", "verdict": verdict})
+            expected = (json.dumps({"schema": "voice-measurement-terminal.v1", "verdict": verdict}) + "\n").encode()
+            self.assertEqual(output.read_bytes(), expected)
             if verdict == "accepted":
-                self.assertEqual(main(), 1)  # Never overwrite existing evidence.
+                self.assertEqual(command(), 1)  # Never overwrite existing evidence.
+                self.assertEqual(output.read_bytes(), expected)
             output.unlink()
 
         with patch("sys.argv", ["terminal", str(output)]), patch.dict("os.environ", env, clear=True):
             write_cleanup()  # Exact equality at acquisition and finish boundaries.
-            assert_verdict("accepted")
+            grant = root / "grant.json"
+            grant_command = ["node", "wrangler/scripts/voice-measurement-metadata.mjs", grant]
+            invalid = subprocess.run(grant_command, cwd=checkout, env=dict(env, STAGING_USE_SHA="bad"),
+                                     capture_output=True, timeout=10)
+            self.assertEqual((invalid.returncode, invalid.stdout, invalid.stderr),
+                             (1, b"", b"voice measurement metadata refused\n"))
+            self.assertFalse(grant.exists())
+            with patch.dict("os.environ", {"SECOND_REQUIRED": ""}):
+                assert_verdict("refused", run_terminal)
+            valid = subprocess.run(grant_command, cwd=checkout, capture_output=True, timeout=10)
+            self.assertEqual((valid.returncode, valid.stdout, valid.stderr), (0, b"", b""))
+            metadata = json.dumps(f["metadata"], separators=(",", ":")) + "\n"
+            self.assertEqual(grant.read_bytes(), metadata.encode())
+            evidence["grant.json"] = f["metadata"]
+            assert_verdict("accepted", run_terminal)
             for changes in ({"acquired": 500}, dict.fromkeys(("start", "status", "release"), f["early"]),
                             {"status": f["early"]}, {"release": f["early"]}, {"start": ""},
                             *({"omit": field} for field in ((0, "observedAt"), (1, "runId"), (2, "runId")))):
@@ -106,7 +156,7 @@ class VoiceMeasurementTerminalTests(unittest.TestCase):
                     assert_verdict("refused")
             write_cleanup()
             with patch.dict("os.environ", {"RESULT_VOICE_FIRST": "failure"}):
-                assert_verdict("refused")
+                assert_verdict("refused", run_terminal)
             for name in (None, *evidence):
                 path = root / name if name else cleanup
                 with self.subTest(artifact=name):
@@ -126,7 +176,7 @@ class VoiceMeasurementTerminalTests(unittest.TestCase):
                                  else data.replace(b": {", b': {"restTotalDelta":null,', 1))
                     self.assertEqual(json.loads(duplicate), json.loads(data))
                     path.write_bytes(duplicate)
-                    assert_verdict("refused")
+                    assert_verdict("refused", run_terminal)
                     path.write_bytes(data.ljust(65536))
                     assert_verdict("accepted")
                     path.write_bytes(data.ljust(65537))
@@ -141,9 +191,7 @@ class VoiceMeasurementTerminalTests(unittest.TestCase):
                     assert_verdict("refused")
                     path.rmdir()
                     os.mkfifo(path)
-                    assert_verdict("refused", lambda: subprocess.run(
-                        [sys.executable, "scripts/ci/voice_measurement_terminal.py", output], timeout=5,
-                    ).returncode)
+                    assert_verdict("refused", run_terminal)
                     path.unlink()
                     path.write_bytes(data)
 

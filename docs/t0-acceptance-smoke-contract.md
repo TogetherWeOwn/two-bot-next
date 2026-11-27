@@ -185,6 +185,20 @@ The offline report prints advisory JSON. Exit 0 confirms output. In `handoff.jso
 Optional `observations` entries keyed by `help`, `naming`, or `gateway` hold `window` (same fields as `expected`) and `sha256` (64 lowercase hex digits for the exact file bytes).
 Include an entry only when existing evidence independently ties those bytes to that window. Keep the original provenance in the handoff.
 
+Include any independently verified in-window serving identity readbacks in the
+optional `serving_readbacks` array. Each object uses the seven identity fields
+from `expected` (everything except `start` and `end`) plus `utc`, the readback
+time in the same UTC format. Use readbacks of the same environment. An invalid
+readback or one outside the inclusive bounds gives exit 2.
+
+A differing identity anywhere inside the window sets `window_status` to
+`interrupted` and marks every supplied observation `mismatched`, withholding
+Help, naming and gateway results. This includes a different deploy or Worker
+version at the same source revision, even if the original identity serves again
+by the end. Retain the interrupted watch as evidence and report against a new,
+independently verified single-deploy window. Matching or absent readbacks add
+no continuity proof. The verified window and per-file attribution are still required.
+
 ```sh
 python3 scripts/t0_acceptance_report.py --handoff handoff.json \
   --help-report help.json --naming-report staging-voice-naming-evidence.json \
@@ -302,8 +316,13 @@ A gateway summary can flag an existing mismatch before its hash is bound.
 The capture bounds catch a summary attached to the wrong time window. The
 hash binds the saved bytes, and the independent readback still supplies the
 application and serving identity even when revision and bounds coincide.
-Endpoint denial stays `unverified` in the report. Record explicit passive
-rejection evidence separately on the card per
+The report marks endpoint denial `observed` only for a v2 passive receipt
+with an in-window UTC timestamp after the exact file hash, revision, capture
+bounds and independent serving attribution match. The report prints the
+receipt time as `endpoint_denial_at`. A v1 or absent, invalid or mismatched
+receipt leaves endpoint denial `unverified`. Readiness and generic gateway
+failures carry no endpoint-policy credit. Retain the approved source and
+independent serving readback with the execution card per
 [gateway recovery](gateway-recovery.md#recording-endpoint-policy-evidence).
 
 ```sh

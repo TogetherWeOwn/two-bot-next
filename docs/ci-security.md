@@ -98,7 +98,11 @@ membership at check time.
 [Merged PR metadata][archived-pr]
 
 The advisory `pr-evidence` workflow subscribes to PR events and pushes to
-`main`. Its verifier refuses `merge_group` in verify mode before publishing
+`main`. Main pushes share one group that keeps the running verifier replay and
+only the most recently queued push. Each replay that runs checks out its push SHA.
+PR events continue to use per-PR concurrency.
+
+The verifier refuses `merge_group` in verify mode before publishing
 evidence. A future adapter needs a supported source that binds the exact
 group to every PR number and queued PR head SHA. Confirm each PR's
 current base ref matches the protected target. Pass the target repository
@@ -510,8 +514,9 @@ environment, the `ubuntu-latest` runner for job `fixture-census`,
 `contents: read`, exactly two unconditional steps, log only with no
 artifact, and no `set -x`, wrangler, apply, seed or purge route. The
 only deliberate differences are its own non-cancelling concurrency
-group, a 10-minute timeout (no in-job sleep), and the exact `fixture-scope`
-command. Both fixture query groups share one psql session and one
+group, a 10-minute timeout (no in-job sleep), a sparse checkout of
+`scripts/staging_retention_census.py` at the dispatch commit, and the exact
+`fixture-scope` command. Both fixture query groups share one psql session and one
 `REPEATABLE READ, READ ONLY` transaction, so the evidence has a single
 database snapshot despite concurrent staging writes. The report timestamp
 records runner-clock capture completion. The identity, role, timeout and

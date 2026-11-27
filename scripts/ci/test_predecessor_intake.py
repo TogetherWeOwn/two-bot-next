@@ -50,14 +50,16 @@ class PredecessorIntakeTests(unittest.TestCase):
         options = {"now": self.target.started_at} | candidate | overrides
         return admit_predecessor(self.target, **options)
 
-    def start(self, runtime, **database):
+    def assemble(self, **database):
         candidate = self.first
         plan = self.admit(candidate)
-        upload = assemble_worker_upload(self.target, now=self.target.started_at, receipt=candidate["verified_receipt"],
-                                        material_root=candidate["material_root"], config=plan, **database)
-        return runtime.controller(runtime.authorize).start(upload)
+        return assemble_worker_upload(self.target, now=self.target.started_at, receipt=candidate["verified_receipt"],
+                                      material_root=candidate["material_root"], config=plan, **database)
 
-    def test_starts_exact_archive_with_one_disposable_database_secret(self):
+    def start(self, runtime, **database):
+        return runtime.controller(runtime.authorize).start(self.assemble(**database))
+
+    def test_exact_archive_keeps_disposable_database_secret_and_refuses_discord_start(self):
         candidate = self.first
         root, receipt = candidate["material_root"], candidate["verified_receipt"]
         image = root / IMAGE
@@ -65,9 +67,8 @@ class PredecessorIntakeTests(unittest.TestCase):
         runtime = PreFixture(self.target)
         database = database_fixture(self.target)
 
-        self.assertEqual(self.start(runtime, **database), runtime.deployment)
-        target, start_id, upload = runtime.effects.create.call_args.args
-        self.assertEqual((target, start_id, upload.target), (self.target, runtime.deployment.start_id, self.target))
+        upload = self.assemble(**database)
+        self.assertEqual(upload.target, self.target)
         parts = receive_multipart(upload.content_type, upload.body)
         metadata = decode_json(parts[0][3])
         self.assertEqual([binding for binding in metadata["bindings"] if binding["name"] == "DATABASE_URL"],
@@ -83,6 +84,10 @@ class PredecessorIntakeTests(unittest.TestCase):
                          receipt["image_manifest_digest"])
         self.assertTrue(candidate["plan"]["containers"][0]["image"].endswith("@" + receipt["image_manifest_digest"]))
         self.assertEqual({path: path.read_bytes() for path in original_files}, original_files)
+
+        with self.assertRaisesRegex(TargetError, "^pre_discord_fixture_overrides_unavailable$"):
+            runtime.controller(runtime.authorize).start(upload)
+        self.assertEqual(runtime.effects.mock_calls, [])
 
     def test_refuses_missing_shared_and_foreign_database_before_start(self):
         database = database_fixture(self.target)
