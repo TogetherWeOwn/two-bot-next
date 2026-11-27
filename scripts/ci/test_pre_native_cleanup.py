@@ -8,14 +8,14 @@ from unittest.mock import patch
 
 SCRIPTS = str(Path(__file__).resolve().parents[1])
 with patch.object(sys, "path", [SCRIPTS, *sys.path]):
-    from pre_native_cleanup import (AbsenceReadback, AppCounts, FenceCheck, RegistryReadback,
+    from pre_native_cleanup import (AbsenceReadback, AppCounts, FenceCheck, NativeRegistryReadback,
                                     Reservation, StopEvidence, verify_cleanup)
     from pre_registry_cleanup import RegistryReservation
     from pre_target import Target, TargetError
 
 
 class Readers:
-    def __init__(self, shape="0473/0465", *, never_created=False, lease_cutoff=None):
+    def __init__(self, shape="0473/0465", *, never_created=False, lease_cutoff=None, early_stop=False):
         retained = shape == "0475/0465"
         target = Target("pre-fixture-retained" if retained else "pre-fixture-original",
                         475 if retained else 473, 1_800_000_000, shape)
@@ -25,19 +25,21 @@ class Readers:
         app_id = None if never_created else "5cb771af-3421-4223-8a06-39e061f06400"
         self.reservation = Reservation(registry, "b" * 32, app_id, lease_cutoff)
         cutoff = self.reservation.cutoff
+        settled_at = cutoff - 10 if early_stop else cutoff + 3
         self.stop = StopEvidence(
             reservation=self.reservation, fence_id="independent-fence", armed_at=target.started_at + 1,
             armed_cutoff=cutoff, first_create_at=None if never_created else target.started_at + 2,
             independent=True, runner_loss=FenceCheck("runner_loss", "independent-fence", cutoff, cutoff, True),
+            runner_fenced_at=min(cutoff, settled_at),
             delayed_create=FenceCheck("delayed_create", "independent-fence", cutoff, cutoff + 1, True),
             legacy_keepalive=FenceCheck("legacy_keepalive", "independent-fence", cutoff, cutoff + 2, True),
-            settled_at=cutoff + 3, startup_settled=True, write_access=False, worker_removed_at=cutoff + 4,
-            app_deleted_at=None if never_created else cutoff + 6, app_never_created=never_created,
+            settled_at=settled_at, startup_settled=True, write_access=False, worker_removed_at=settled_at + 1,
+            app_deleted_at=None if never_created else settled_at + 3, app_never_created=never_created,
             publication_settled_at=cutoff + 4,
         )
-        self.counts = AppCounts(self.reservation, cutoff + 5, 0, 0)
-        self.absence = AbsenceReadback(self.reservation, cutoff + 7, False, False, False, False, False, False)
-        self.registry = RegistryReadback(self.reservation, cutoff + 8, False)
+        self.counts = AppCounts(self.reservation, settled_at + 2, 0, 0)
+        self.absence = AbsenceReadback(self.reservation, cutoff + 7, False, False, False, False, False, False, False)
+        self.registry = NativeRegistryReadback(self.reservation, cutoff + 8, False)
         self.calls = []
 
     def read_stop(self, reservation):
@@ -56,17 +58,23 @@ class Readers:
         self.calls.append(("registry", reservation))
         return self.registry
 
-    def verify(self):
+    def verify(self, *, readback_offset=7):
         verify_cleanup(self.reservation, authority=self, transport=self,
-                       readback_not_before=self.reservation.cutoff + 7, now=self.reservation.cutoff + 9)
+                       readback_not_before=self.reservation.cutoff + readback_offset, now=self.reservation.cutoff + 9)
 
 
 class NativeCleanupTests(unittest.TestCase):
+    def assert_rejected(self, readers, field, reason, **updates):
+        receipt = replace(getattr(readers, field), **updates)
+        with self.subTest(field=field, updates=updates), patch.object(readers, field, receipt):
+            with self.assertRaisesRegex(TargetError, f"^{reason}$"):
+                readers.verify()
+
     def test_both_reservations_verify_created_and_never_created(self):
         for shape in ("0473/0465", "0475/0465"):
             for never_created in (False, True):
                 with self.subTest(shape=shape, never_created=never_created):
-                    readers = Readers(shape, never_created=never_created)
+                    readers = Readers(shape, never_created=never_created, early_stop=shape == "0475/0465")
                     readers.verify()
                     stages = ("stop", "absence", "registry") if never_created else (
                         "stop", "counts", "absence", "registry",
@@ -78,12 +86,13 @@ class NativeCleanupTests(unittest.TestCase):
         for updates, reason in (
             ({"independent": False}, "unconfirmed_pre_independent_fence"),
             ({"armed_cutoff": readers.reservation.cutoff + 1}, "unconfirmed_pre_independent_fence"),
+            ({"armed_at": readers.reservation.registry.target.started_at - 1}, "invalid_pre_fence_arm_time"),
             ({"armed_at": readers.stop.first_create_at}, "pre_create_outside_fence"),
             ({"first_create_at": readers.reservation.cutoff}, "pre_create_outside_fence"),
         ):
-            with self.subTest(updates=updates), patch.object(readers, "stop", replace(readers.stop, **updates)):
-                with self.assertRaisesRegex(TargetError, reason):
-                    readers.verify()
+            self.assert_rejected(readers, "stop", reason, **updates)
+        with self.assertRaisesRegex(TargetError, "invalid_pre_lease_cutoff"):
+            Readers(lease_cutoff=readers.reservation.registry.target.started_at)
 
     def test_original_earlier_cutoff_survives_all_three_disruptions(self):
         readers = Readers(lease_cutoff=1_800_000_060)
@@ -94,22 +103,26 @@ class NativeCleanupTests(unittest.TestCase):
                 {"fence_id": "replacement-fence"}, {"cutoff": readers.reservation.registry.target.expires_at},
                 {"blocked": False}, {"observed_at": readers.reservation.cutoff - 1}, {"disruption": "other"},
             ):
-                stop = replace(readers.stop, **{disruption: replace(original, **updates)})
-                with self.subTest(disruption=disruption, updates=updates), patch.object(readers, "stop", stop):
-                    with self.assertRaisesRegex(TargetError, "pre_cutoff_fence_unconfirmed"):
-                        readers.verify()
+                self.assert_rejected(readers, "stop", "pre_cutoff_fence_unconfirmed",
+                                     **{disruption: replace(original, **updates)})
 
-    def test_rejects_unsettled_start_or_effective_writer(self):
+    def test_stop_requires_ordered_settlement_revocation_and_deletion(self):
+        readers = Readers()
         for updates, reason in (
             ({"startup_settled": False}, "pre_startup_unsettled"),
+            ({"settled_at": readers.reservation.cutoff - 1}, "pre_runner_stop_unconfirmed"),
+            ({"runner_fenced_at": readers.reservation.cutoff + 1}, "pre_runner_stop_unconfirmed"),
             ({"write_access": True}, "pre_writer_revocation_unconfirmed"),
             ({"write_access": None}, "pre_writer_revocation_unconfirmed"),
+            ({"worker_removed_at": readers.stop.settled_at - 1}, "pre_worker_removal_unconfirmed"),
+            ({"app_deleted_at": readers.stop.worker_removed_at - 1}, "pre_app_deletion_unconfirmed"),
+            ({"app_never_created": True}, "pre_app_deletion_unconfirmed"),
+            ({"first_create_at": None}, "pre_app_deletion_unconfirmed"),
         ):
-            readers = Readers()
-            readers.stop = replace(readers.stop, **updates)
-            with self.subTest(updates=updates), self.assertRaisesRegex(TargetError, reason):
-                readers.verify()
-            self.assertEqual(readers.calls, [("stop", readers.reservation)])
+            self.assert_rejected(readers, "stop", reason, **updates)
+        self.assertEqual(set(readers.calls), {("stop", readers.reservation)})
+        self.assert_rejected(Readers(never_created=True), "stop", "pre_app_never_created_unconfirmed",
+                             app_deleted_at=readers.stop.app_deleted_at)
 
     def test_empty_listing_cannot_prove_stop_or_never_created(self):
         for never_created in (False, True):
@@ -126,9 +139,7 @@ class NativeCleanupTests(unittest.TestCase):
         for updates in ({"active": 1}, {"assigned": 1}, {"assigned": None}, {"active": False},
                         {"observed_at": readers.stop.app_deleted_at},
                         {"observed_at": readers.stop.worker_removed_at - 1}):
-            with self.subTest(updates=updates), patch.object(readers, "counts", replace(readers.counts, **updates)):
-                with self.assertRaisesRegex(TargetError, "pre_app_stop_unconfirmed"):
-                    readers.verify()
+            self.assert_rejected(readers, "counts", "pre_app_stop_unconfirmed", **updates)
 
     def test_all_evidence_is_exact_scope(self):
         readers = Readers()
@@ -144,37 +155,29 @@ class NativeCleanupTests(unittest.TestCase):
                                                                reference=reservation.registry.reference[:-1] + "b")),
              "wrong_pre_registry_readback"),
         ):
-            receipt = replace(getattr(readers, field), reservation=foreign)
-            with self.subTest(field=field), patch.object(readers, field, receipt):
-                with self.assertRaisesRegex(TargetError, reason):
-                    readers.verify()
+            self.assert_rejected(readers, field, reason, reservation=foreign)
 
     def test_post_delete_absence_must_be_fresh_and_complete(self):
         readers = Readers()
         for observed_at in (readers.stop.app_deleted_at, readers.reservation.cutoff + 10):
-            with self.subTest(observed_at=observed_at), patch.object(
-                readers, "absence", replace(readers.absence, observed_at=observed_at),
-            ):
-                with self.assertRaisesRegex(TargetError, "stale_pre_absence_readback"):
-                    readers.verify()
+            self.assert_rejected(readers, "absence", "stale_pre_absence_readback", observed_at=observed_at)
         with self.assertRaisesRegex(TargetError, "stale_pre_absence_readback"):
-            verify_cleanup(readers.reservation, authority=readers, transport=readers,
-                           readback_not_before=readers.absence.observed_at + 1, now=readers.registry.observed_at)
+            readers.verify(readback_offset=8)
+        with self.assertRaisesRegex(TargetError, "invalid_pre_readback_window"):
+            readers.verify(readback_offset=10)
         for field in ("worker_present", "subdomain_present", "preview_present", "routes_present",
                       "custom_domains_present", "app_present"):
-            with self.subTest(field=field), patch.object(readers, "absence", replace(readers.absence, **{field: True})):
-                with self.assertRaisesRegex(TargetError, "pre_absence_unconfirmed"):
-                    readers.verify()
+            self.assert_rejected(readers, "absence", "pre_absence_unconfirmed", **{field: True})
+        for write_access in (True, None):
+            self.assert_rejected(readers, "absence", "pre_writer_revocation_unconfirmed", write_access=write_access)
 
     def test_registry_must_be_settled_before_handback(self):
         readers = Readers()
-        with patch.object(readers, "stop", replace(readers.stop, publication_settled_at=None)):
-            with self.assertRaisesRegex(TargetError, "pre_publication_unsettled"):
-                readers.verify()
-        for updates in ({"present": True}, {"present": None}, {"observed_at": readers.stop.publication_settled_at}):
-            with self.subTest(updates=updates), patch.object(readers, "registry", replace(readers.registry, **updates)):
-                with self.assertRaisesRegex(TargetError, "pre_registry_disposition_unsettled"):
-                    readers.verify()
+        for settled_at in (None, readers.reservation.registry.target.started_at - 1, readers.reservation.cutoff + 10):
+            self.assert_rejected(readers, "stop", "pre_publication_unsettled", publication_settled_at=settled_at)
+        for updates in ({"present": True}, {"present": None}, {"observed_at": readers.stop.publication_settled_at},
+                        {"observed_at": readers.absence.observed_at - 1}):
+            self.assert_rejected(readers, "registry", "pre_registry_disposition_unsettled", **updates)
 
     def test_read_failure_returns_bounded_error(self):
         readers = Readers()

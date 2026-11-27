@@ -1,8 +1,4 @@
-"""Offline acceptance evidence for independent PRE stop and cleanup.
-
-The injected readers authenticate their receipts for the original first-attempt
-reservation. This verifier grants no authority to start, stop or delete.
-"""
+"""Verify authenticated stop and cleanup receipts for one first-attempt PRE reservation."""
 
 from dataclasses import dataclass
 import re
@@ -50,17 +46,14 @@ class FenceCheck:
 class StopEvidence:
     """Authenticated lifecycle and settlement for one reservation.
 
-    The independent authority attributes each check to its named disruption.
-    Runner loss verifies enforced stop without the runner. Delayed create and
-    legacy keepalive verify effect-boundary denial. The fence ID identifies the
-    original arm event, and a changed generation requires a different ID.
-    first_create_at is the earliest operation allowed to create resources, or
-    None if the authority can prove none crossed the effect boundary.
-    startup_settled means admission closed and all pending creates and starts
-    disposed. write_access covers all effective disposable writer access,
-    including delegated roles and open connections, at settled_at.
-    worker_removed_at records completed removal or confirmed absence after
-    settlement. app_never_created requires affirmative lifecycle evidence.
+    The fence ID identifies its arm event and generation. runner_fenced_at is
+    when the fence stopped the runtime or prevented startup under runner loss.
+    first_create_at is the first operation allowed past the fence, or None on
+    proof none was allowed. The two other checks confirm effect-boundary denial.
+    startup_settled confirms closed admission and settled pending creates and
+    starts. write_access covers effective access, including delegated roles and
+    open connections. worker_removed_at records removal or confirmed absence
+    after settlement. app_never_created requires affirmative lifecycle proof.
     """
 
     reservation: Reservation
@@ -70,6 +63,7 @@ class StopEvidence:
     first_create_at: int | None
     independent: bool
     runner_loss: FenceCheck
+    runner_fenced_at: int
     delayed_create: FenceCheck
     legacy_keepalive: FenceCheck
     settled_at: int
@@ -97,7 +91,7 @@ class AppCounts:
 
 @dataclass(frozen=True)
 class AbsenceReadback:
-    """Complete absence checks for the reserved Worker, ingress and app."""
+    """Complete handback readback for the Worker, ingress, app and disposable writer."""
 
     reservation: Reservation
     observed_at: int
@@ -107,10 +101,11 @@ class AbsenceReadback:
     routes_present: bool
     custom_domains_present: bool
     app_present: bool
+    write_access: bool
 
 
 @dataclass(frozen=True)
-class RegistryReadback:
+class NativeRegistryReadback:
     """Authoritative presence read for the exact reserved digest reference."""
 
     reservation: Reservation
@@ -125,7 +120,7 @@ class Authority(Protocol):
 class Transport(Protocol):
     def read_app_counts(self, reservation: Reservation) -> AppCounts: ...
     def read_absence(self, reservation: Reservation) -> AbsenceReadback: ...
-    def read_registry(self, reservation: Reservation) -> RegistryReadback: ...
+    def read_registry(self, reservation: Reservation) -> NativeRegistryReadback: ...
 
 
 def _read(reader, reservation, receipt_type, reason):
@@ -138,7 +133,7 @@ def _read(reader, reservation, receipt_type, reason):
     return receipt
 
 
-def _verify_fence(reservation, stop):
+def _verify_fence(reservation, stop, now):
     target = reservation.registry.target
     cutoff = reservation.cutoff
     require(stop.independent is True and type(stop.fence_id) is str
@@ -149,13 +144,16 @@ def _verify_fence(reservation, stop):
     if stop.first_create_at is not None:
         require(type(stop.first_create_at) is int and stop.armed_at < stop.first_create_at < cutoff,
                 "pre_create_outside_fence")
+    require(type(stop.runner_fenced_at) is int
+            and (stop.first_create_at or stop.armed_at) <= stop.runner_fenced_at <= min(cutoff, stop.settled_at),
+            "pre_runner_stop_unconfirmed")
     for disruption, check in (("runner_loss", stop.runner_loss), ("delayed_create", stop.delayed_create),
                               ("legacy_keepalive", stop.legacy_keepalive)):
         require(type(check) is FenceCheck and check.blocked is True
                 and type(check.disruption) is str and check.disruption == disruption
                 and type(check.fence_id) is str and check.fence_id == stop.fence_id
                 and type(check.cutoff) is int and check.cutoff == cutoff
-                and type(check.observed_at) is int and cutoff <= check.observed_at <= stop.settled_at,
+                and type(check.observed_at) is int and cutoff <= check.observed_at <= now,
                 "pre_cutoff_fence_unconfirmed")
 
 
@@ -166,6 +164,7 @@ def verify_cleanup(reservation: Reservation, *, authority: Authority, transport:
     The caller obtains the pins, current time and readback freshness floor
     from trusted context. Readers derive scope from the authenticated evidence
     for each observation and use the same clock for all evidence timestamps.
+    Both writer checks cover the disposable database pinned to the Target.
     A settled publication can no longer create the exact registry reference,
     including after a lost copy reply. A still-present reference is unresolved.
     """
@@ -176,9 +175,9 @@ def verify_cleanup(reservation: Reservation, *, authority: Authority, transport:
     require(readback_not_before <= now, "invalid_pre_readback_window")
 
     stop = _read(authority.read_stop, reservation, StopEvidence, "wrong_pre_stop_evidence")
-    require(type(stop.settled_at) is int and reservation.cutoff <= stop.settled_at <= now
-            and stop.startup_settled is True, "pre_startup_unsettled")
-    _verify_fence(reservation, stop)
+    require(type(stop.settled_at) is int and stop.settled_at <= now and stop.startup_settled is True,
+            "pre_startup_unsettled")
+    _verify_fence(reservation, stop, now)
     require(stop.write_access is False, "pre_writer_revocation_unconfirmed")
     require(type(stop.worker_removed_at) is int and stop.settled_at < stop.worker_removed_at <= now,
             "pre_worker_removal_unconfirmed")
@@ -200,6 +199,7 @@ def verify_cleanup(reservation: Reservation, *, authority: Authority, transport:
     absence = _read(transport.read_absence, reservation, AbsenceReadback, "wrong_pre_absence_readback")
     require(type(absence.observed_at) is int and cleanup_at < absence.observed_at <= now
             and readback_not_before <= absence.observed_at, "stale_pre_absence_readback")
+    require(absence.write_access is False, "pre_writer_revocation_unconfirmed")
     require(all(present is False for present in (
         absence.worker_present, absence.subdomain_present, absence.preview_present,
         absence.routes_present, absence.custom_domains_present, absence.app_present,
@@ -207,7 +207,7 @@ def verify_cleanup(reservation: Reservation, *, authority: Authority, transport:
 
     require(type(stop.publication_settled_at) is int
             and target.started_at <= stop.publication_settled_at <= now, "pre_publication_unsettled")
-    registry = _read(transport.read_registry, reservation, RegistryReadback, "wrong_pre_registry_readback")
+    registry = _read(transport.read_registry, reservation, NativeRegistryReadback, "wrong_pre_registry_readback")
     require(type(registry.observed_at) is int and stop.publication_settled_at < registry.observed_at <= now
             and absence.observed_at <= registry.observed_at and registry.present is False,
             "pre_registry_disposition_unsettled")
