@@ -931,15 +931,22 @@ export class TwoBotContainer extends Container<Env> {
       try {
         if (this.boundedStaging()) {
           use = await this.stagingUse.read();
-          if (await this.deferStagingTeardown(use)) return;
-        }
-        const owner = await this.ownership.require(this.id());
-        if (this.boundedStaging()) {
           const [pending] = await this.listSchedules<boolean>("stagingExpiry");
           if (pending?.payload === true) {
             this.recoveryFailed = true;
             return;
           }
+          if (use?.purpose === AUTOMOD_STAGING_PURPOSE && use.phase === "active") {
+            await this.scheduleStagingExpiry(use.expiresAt);
+            return;
+          }
+          if (await this.deferStagingTeardown(use)) {
+            if (!pending) await this.scheduleStagingExpiry(Date.now(), true);
+            return;
+          }
+        }
+        const owner = await this.ownership.require(this.id());
+        if (this.boundedStaging()) {
           await this.requireRecoveryDatabase();
           const active = await this.stagingUse.require({ deploymentId: this.id(), sha: this.env.CONTAINER_RELEASE ?? "", owner });
           await this.scheduleStagingExpiry(active.expiresAt);
@@ -948,6 +955,7 @@ export class TwoBotContainer extends Container<Env> {
         refused(error);
         if (this.boundedStaging() && await this.confirmedTeardownHold()) {
           this.recoveryFailed = true;
+          await this.scheduleStagingExpiry(Date.now() + 15_000, true);
           return;
         }
         try {
@@ -1035,30 +1043,43 @@ export class TwoBotContainer extends Container<Env> {
   /** Internal composition for a future authenticated caller. Static methods
    * are not exposed through the Durable Object instance or Worker routes. */
   static runProtectedAutomod(bot: TwoBotContainer, call: ProtectedAutomodCall, effects: ProtectedAutomodEffects): Promise<void> {
-    const { dryRun } = effects;
-    return runProtectedAutomod(call, {
-      staging: bot.stagingUse, storage: bot.ctx.storage, env: bot.env,
-      exclusive: operation => bot.gated(operation),
+    return bot.callProtectedAutomod(call, effects, {
+      exclusive: operation => bot.gated(async () => {
+        const result = await operation();
+        if (call.action === "recover" && bot.ctx.container?.running === false) {
+          bot.deleteSchedules("stagingExpiry");
+          bot.recoveryFailed = false;
+        }
+        return result;
+      }),
       identity: async () => {
         const deploymentId = bot.id();
         return { deploymentId, sha: bot.env.CONTAINER_RELEASE ?? "", owner: await bot.ownership.require(deploymentId) };
       },
+    });
+  }
+
+  private callProtectedAutomod(call: ProtectedAutomodCall, effects: ProtectedAutomodEffects,
+    authority: Pick<Parameters<typeof runProtectedAutomod>[1], "exclusive" | "identity">): Promise<void> {
+    const { dryRun } = effects;
+    return runProtectedAutomod(call, {
+      ...authority, staging: this.stagingUse, storage: this.ctx.storage, env: this.env,
     }, {
       ...effects,
       ...(dryRun === undefined ? {} : { dryRun: {
         policy: dryRun.policy,
         start: async (lease, policy, before) => {
-          if (bot.recoveryFailed || bot.ctx.container?.running !== false) {
+          if (this.recoveryFailed || this.ctx.container?.running !== false) {
             throw new OwnershipRefused("shutdown_unconfirmed");
           }
-          await bot.requireRecoveryDatabase();
+          await this.requireRecoveryDatabase();
           if (!(Date.now() < before)) throw new OwnershipRefused("staging_expiry_invalid");
           await dryRun.start(lease, policy, before);
         },
       } }),
       readRuntime: async lease => {
         const runtime = await effects.readRuntime(lease);
-        return runtime?.running === bot.ctx.container?.running ? runtime : undefined;
+        return runtime?.running === this.ctx.container?.running ? runtime : undefined;
       },
     });
   }
@@ -1246,14 +1267,32 @@ export class TwoBotContainer extends Container<Env> {
     if (!this.boundedStaging()) return;
     await this.gated(async () => {
       let use: StagingUse | undefined;
+      let readUse = false;
       try {
+        await this.ctx.storage.sync();
         use = await this.stagingUse.read();
-        if (await this.deferStagingTeardown(use)) return;
+        readUse = true;
+        const automod = use?.purpose === AUTOMOD_STAGING_PURPOSE ? use : undefined;
+        const pending = automod?.phase === "active" ? undefined : await this.automodRecovery.pending();
+        if (pending && (!automod || automod.phase === "preparing")) throw new OwnershipRefused("staging_use_conflict");
         if (use?.phase === "active" && use.expiresAt > Date.now() && !this.recoveryFailed) {
           await this.scheduleStagingExpiry(use.expiresAt);
           return;
         }
-        await this.destroyInactive();
+        if (automod && (automod.phase === "active" || pending)) {
+          const { deploymentId, sha } = automod;
+          // The alarm is internal authority for the persisted lease, even
+          // after rollout drift. Bridge requests remain bound to the serving build.
+          const effects = this.automodEffects ?? this.nativeAutomodEffects(STAGING_AUTOMOD_PLAN,
+            Date.now() + STAGING_AUTOMOD_PLAN.cleanupMs);
+          await this.callProtectedAutomod({ action: "recover", issuedLease: { ...automod, phase: "active" } }, effects, {
+            exclusive: operation => operation(), // Already inside the shared DO gate.
+            identity: async () => ({ deploymentId, sha, owner: await this.ownership.require(deploymentId) }),
+          });
+          use = { ...automod, phase: "released" };
+        } else {
+          await this.destroyInactive();
+        }
         if (use?.purpose === AUTOMOD_STAGING_PURPOSE && use.phase === "preparing") {
           if (use.expiresAt > Date.now()) {
             await this.scheduleStagingExpiry(use.expiresAt);
@@ -1261,23 +1300,23 @@ export class TwoBotContainer extends Container<Env> {
             return;
           }
           if (this.ctx.container?.running !== false) throw new OwnershipRefused("shutdown_unconfirmed");
-          const deploymentId = this.id();
+          const { deploymentId, sha } = use;
           const owner = await this.ownership.require(deploymentId);
-          use = await this.stagingUse.retireExpiredAutomodPreparation({ deploymentId, owner, sha: this.env.CONTAINER_RELEASE ?? "" });
+          use = await this.stagingUse.retireExpiredAutomodPreparation({ deploymentId, owner, sha });
         }
         this.deleteSchedules("stagingExpiry");
         this.recoveryFailed = false;
         this.stagingReceipt("expiry", use, "stopped");
       } catch {
-        // A storage failure is denial too. Do not keep a healthy gateway or
-        // an idle retry loop alive just because authority could not be read.
-        if (await this.confirmedTeardownHold()) return;
+        // A readable hold needs protected recovery. Without one, emergency
+        // teardown can still stop the process when storage is unavailable.
+        const held = await this.confirmedTeardownHold();
         try {
+          if (held) throw new OwnershipRefused("staging_use_conflict");
           if (this.ctx.container?.running) await super.destroy();
           if (this.ctx.container?.running) throw new OwnershipRefused("shutdown_unconfirmed");
-          // A native stop alone cannot retire a preparation whose storage or
-          // ownership check failed. Keep its hold and retry through the gate.
-          if (use?.purpose === AUTOMOD_STAGING_PURPOSE && use.phase === "preparing") {
+          // Shutdown alone cannot retire a reservation or clear an unread hold.
+          if (!readUse || use?.purpose === AUTOMOD_STAGING_PURPOSE) {
             throw new OwnershipRefused("staging_use_conflict");
           }
           this.deleteSchedules("keepalive");
@@ -1287,7 +1326,7 @@ export class TwoBotContainer extends Container<Env> {
         } catch {
           // SDK 0.3.7 consumes a scheduled row even when its callback throws.
           // Persist a successor before returning; never revive the gateway.
-          this.recoveryFailed = true;
+          if (!held) this.recoveryFailed = true;
           await this.scheduleStagingExpiry(Date.now() + 15_000, true);
           console.error(JSON.stringify({ event: "staging_stop_unconfirmed" }));
           this.stagingReceipt("expiry", use, "stop_unconfirmed");
@@ -1850,17 +1889,17 @@ export class TwoBotContainer extends Container<Env> {
     }
   }
 
-  /** In-DO effects for the bridge. This build has no dry-run launch adapter,
+  /** In-DO effects for the bridge and alarm. This build has no dry-run launch adapter,
    * so start stays refused even with an enabled plan. Recovery can retire an
    * unused reservation with a confirmed native stop. */
-  private nativeAutomodEffects(plan: StagingAutomodPlan): ProtectedAutomodEffects {
+  private nativeAutomodEffects(plan: StagingAutomodPlan, recoveryBefore?: number): ProtectedAutomodEffects {
     return {
       enabled: plan.enabled === true && plan.allowStart === true,
       readRuntime: async lease => {
         const running = this.ctx.container?.running;
         return typeof running === "boolean" ? { lease, running } : undefined;
       },
-      readCleanupGrant: async lease => ({ lease, before: lease.expiresAt + plan.cleanupMs }),
+      readCleanupGrant: async lease => ({ lease, before: recoveryBefore ?? lease.expiresAt + plan.cleanupMs }),
       fenceAndDrain: async () => undefined,
       stop: async () => {
         await this.stopStagingUse();
