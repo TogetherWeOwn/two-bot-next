@@ -85,15 +85,24 @@ def verify_image(docker, pin, synthetic):
             and (synthetic or stamps["build_revision"] == SOURCE)
             and all(re.fullmatch(r"[A-Za-z0-9.+_-]{1,128}", value) and value != "unknown"
                     for value in stamps.values()), "invalid predecessor stamp pin")
-    image, = decode_json(docker("image", "inspect", pin["image_id"]))
+    inspected = docker("image", "inspect", pin["image_id"], missing_ok=True)
+    image_ref = pin["image_id"]
+    if not inspected:
+        # The containerd-backed Docker store addresses an OCI image by its
+        # manifest digest. The admitted manifest already binds the config.
+        image_ref = pin["manifest_digest"]
+        inspected = docker("image", "inspect", image_ref)
+    image, = decode_json(inspected)
     config = image["Config"]
     labels = config.get("Labels") or {}
-    require(image["Id"] == pin["image_id"] and image["Os"] == "linux"
+    descriptor = image.get("Descriptor") or {}
+    require(image["Id"] == image_ref and image["Os"] == "linux"
+            and (image_ref == pin["image_id"] or descriptor.get("digest") == image_ref)
             and image["Architecture"] == "amd64" and not config.get("Volumes")
             and (synthetic or config["Entrypoint"] == ["/home/nonroot/two-bot"])
             and all(labels.get(label) == stamps[key] for key, label in STAMPS.items()),
             "local image identity or stamps differ from the admitted pin")
-    return stamps
+    return image_ref, stamps
 
 
 def verify_support(docker, postgres, mock):
@@ -232,7 +241,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
         "Provide a private JSON pin from the protected admission handoff with image_id "
         "(the admitted OCI config digest), manifest_digest, build_revision, build_id and deploy_id. "
-        "Load the admitted image unchanged on the local Docker daemon first. Supply trusted local "
+        "Load the admitted image unchanged on the local Docker daemon first. The daemon can "
+        "address it by the admitted config ID or the admitted OCI manifest digest. Supply trusted local "
         "image IDs for PostgreSQL 17 and a support image with Python 3. Use --synthetic only "
         "with a test double. The historical Worker cannot forward the loopback overrides."))
     parser.add_argument("--pin", type=Path, required=True)
@@ -263,16 +273,18 @@ def main():
                     return result.stdout
                 if missing_ok and (command[0] == "exec"
                                    or "No such container" in result.stderr
+                                   or (command[:2] == ("image", "inspect") and "No such image" in result.stderr)
                                    or "removal of container" in result.stderr):
                     return ""
                 raise Refused(f"Docker {command[0]} failed")
 
-            stamps = verify_image(docker, pin, args.synthetic)
+            image, stamps = verify_image(docker, pin, args.synthetic)
             verify_support(docker, args.postgres, args.mock_image)
-            endpoints = [run_endpoint(docker, pin["image_id"], args.postgres, args.mock_image,
+            endpoints = [run_endpoint(docker, image, args.postgres, args.mock_image,
                                       stamps, tip) for tip in (473, 475)]
         print(json.dumps({"scope": "direct-container-only", "synthetic_image": args.synthetic,
-                          "image_id": pin["image_id"], "admitted_manifest_digest": pin["manifest_digest"],
+                          "image_id": pin["image_id"], "docker_image_id": image,
+                          "admitted_manifest_digest": pin["manifest_digest"],
                           **stamps, "endpoints": endpoints}))
     except Refused as error:
         parser.exit(1, f"Fixture refused: {error}\n")
