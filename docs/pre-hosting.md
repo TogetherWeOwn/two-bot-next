@@ -121,6 +121,12 @@ so they can bind loopback before the bot starts. Cloudflare's HTTP intercepts
 cannot carry raw PostgreSQL with Internet access disabled.
 [Native Container API](https://developers.cloudflare.com/containers/api/durable-object-container/) · [Non-HTTP egress](https://developers.cloudflare.com/containers/configuration/outbound-traffic/#non-http-traffic)
 
+The [replacement Worker](../wrangler/src/pre-qualification.ts) separates private qualification and stop entrypoints.
+It arms a durable cutoff alarm for the exact actor and persists stop and retry intent before calling `destroy()`.
+Preserve the original actor pin, class and namespace through independent provider settlement.
+A returned destroy request and local `inspect()` absence leave placement settlement to the cleanup caller.
+The pinned fixture image receives the loopback settings and must enforce the original cutoff throughout startup and execution.
+
 For native scheduling, Get Application reports observed `active` and
 `starting` counts. The [cleanup projection](../scripts/pre_inventory.py)
 requires `active` and `assigned`. A zero `starting` count cannot satisfy the
