@@ -8700,6 +8700,22 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                 self.assertTrue(cloudflare_environment_errors(changed), label)
                 self.assertTrue(workflow_policy_errors(changed), label)
 
+    def test_predecessor_checkout_keeps_history_and_limits_worktree(self):
+        name = "build-predecessor.yml"
+        rejection = f"{name}: expected the pinned protected workflow"
+        self.assertNotIn(rejection, workflow_policy_errors(self.workflows))
+        steps = self.workflows[name]["jobs"]["build"]["steps"]
+        checkout = steps[0]["with"]
+        self.assertEqual(checkout["fetch-depth"], "0")
+        self.assertNotIn("filter", checkout)
+        self.assertNotIn("sparse-checkout", checkout)
+        prepare = next(step for step in steps if step.get("name") ==
+                       "Verify the protected input and export the reviewed tree")
+        self.assertEqual(prepare["run"].splitlines()[-2:], [
+            "git sparse-checkout set --cone scripts",
+            "python3 scripts/build_predecessor.py prepare",
+        ])
+
     def test_pinned_sha_is_dispatch_only_and_ancestor_checked(self):
         workflows = self.workflows
         staging = workflows["deploy-staging.yml"]
