@@ -27,11 +27,11 @@ function input() {
     promotion: { observedAt: now - 1_000, PRODUCTION_AUTO_PROMOTE_DISABLED: true },
     ownership: {
       observedAt: now - 1_000,
-      owner: { deploymentId: scope.deploymentId, epoch: scope.epoch },
-      requestedAttempt: { runId: scope.runId, runAttempt: scope.runAttempt },
+      owner: { deploymentId: scope.deploymentId, epoch: scope.epoch, phase: "active" },
+      requestedAttempt: { runId: scope.runId, runAttempt: scope.runAttempt, usedUntil: null },
       sha, use: null, runtimeState: "stopped", stopVerified: true, cleanupPending: false,
     },
-    publication: { ...scope, recordedAt: now - 1_000, disposition: "not_published", target, command },
+    publication: { ...scope, recordedAt: now - 1_000, disposition: "not_published", publicationDrained: true, target, command },
   } satisfies StagingAutomodRollbackGuardInput;
 }
 
@@ -66,7 +66,8 @@ test("accepts affirmative absence or reversion and a stopped absent or matching 
   const value = input();
   for (const use of [null, lease, { ...lease, phase: "released" }]) {
     for (const disposition of ["not_published", "reverted"]) {
-      const result = evaluate({ ...value, ownership: { ...value.ownership, use },
+      const requestedAttempt = { ...value.ownership.requestedAttempt, usedUntil: use?.expiresAt ?? null };
+      const result = evaluate({ ...value, ownership: { ...value.ownership, use, requestedAttempt },
         publication: { ...value.publication, disposition } });
       assert.deepEqual(result, { ...common, verdict: "passed" });
       assert.ok(Object.isFrozen(result));
@@ -98,14 +99,18 @@ test("requires literal production disable and independently bound staging readba
       "production_auto_promotion_unconfirmed");
   }
   for (const patch of [{ runId: "67890" }, { runAttempt: 1 }]) {
-    expectFailure({ ...value, ownership: { ...value.ownership, requestedAttempt: { ...scope, ...patch } } },
+    expectFailure({ ...value, ownership: { ...value.ownership, requestedAttempt: { ...value.ownership.requestedAttempt, ...patch } } },
       "staging_ownership_unconfirmed");
     expectFailure({ ...value, publication: { ...value.publication, ...patch } }, "staging_publication_unconfirmed");
   }
   for (const patch of [{ deploymentId: "other-worker-version" }, { epoch: 18 }]) {
-    expectFailure({ ...value, ownership: { ...value.ownership, owner: { ...scope, ...patch } } },
+    expectFailure({ ...value, ownership: { ...value.ownership, owner: { ...value.ownership.owner, ...patch } } },
       "staging_ownership_unconfirmed");
     expectFailure({ ...value, publication: { ...value.publication, ...patch } }, "staging_publication_unconfirmed");
+  }
+  for (const phase of ["fenced", undefined]) {
+    expectFailure({ ...value, ownership: { ...value.ownership, owner: { ...value.ownership.owner, phase } } },
+      "staging_ownership_unconfirmed");
   }
   for (const patch of [{ applicationId: command.id }, { guildId: command.id }, { name: "other-command" }]) {
     expectFailure({ ...value, pin: { ...value.pin, target: { ...target, ...patch } } }, "staging_pin_invalid");
@@ -114,7 +119,7 @@ test("requires literal production disable and independently bound staging readba
   }
   expectFailure({ ...value, ownership: { ...value.ownership, sha: "b".repeat(40) } }, "staging_ownership_unconfirmed");
   for (const patch of [{ runId: "012345" }, { runAttempt: 0 }, { epoch: Infinity }, { sha: "" },
-    { command: { ...command, id: "18446744073709551616" } }]) {
+    { command: { ...command, id: "18446744073709551616" } }, { command: { ...command, token: "extra" } }]) {
     expectFailure({ ...value, pin: { ...value.pin, ...patch } }, "staging_pin_invalid");
   }
 });
@@ -124,7 +129,8 @@ test("requires verified stop, completed cleanup and matching expiry at observati
   for (const patch of [{ stopVerified: false }, { cleanupPending: true }, { runtimeState: "running" },
     { stopVerified: undefined }, { cleanupPending: 0 }, { runtimeState: "unknown" }]) {
     for (const use of [null, lease]) {
-      expectFailure({ ...value, ownership: { ...value.ownership, use, ...patch } }, "staging_lease_unconfirmed");
+      const requestedAttempt = { ...value.ownership.requestedAttempt, usedUntil: use?.expiresAt ?? null };
+      expectFailure({ ...value, ownership: { ...value.ownership, use, requestedAttempt, ...patch } }, "staging_lease_unconfirmed");
     }
   }
   expectFailure({ ...value, ownership: { ...value.ownership, use: undefined } }, "staging_lease_unconfirmed");
@@ -132,13 +138,20 @@ test("requires verified stop, completed cleanup and matching expiry at observati
     { epoch: 18 }, { sha: "b".repeat(40) }, { environment: "production" }, { purpose: undefined },
     { phase: "preparing" }, { voiceMove: true }, { expiresAt: now - 999 }, { expiresAt: Infinity },
     { acquiredAt: lease.expiresAt }, { acquiredAt: lease.expiresAt - MAX_STAGING_USE_MS - 1 }]) {
-    expectFailure({ ...value, ownership: { ...value.ownership, use: { ...lease, ...patch } } }, "staging_lease_unconfirmed");
+    const use = { ...lease, ...patch };
+    const requestedAttempt = { ...value.ownership.requestedAttempt, usedUntil: use.expiresAt };
+    expectFailure({ ...value, ownership: { ...value.ownership, use, requestedAttempt } }, "staging_lease_unconfirmed");
+  }
+  for (const [use, usedUntil] of [[null, lease.expiresAt], [lease, null], [lease, lease.expiresAt + 1]] as const) {
+    const requestedAttempt = { ...value.ownership.requestedAttempt, usedUntil };
+    expectFailure({ ...value, ownership: { ...value.ownership, use, requestedAttempt } }, "staging_lease_unconfirmed");
   }
 });
 
 test("rejects unconfirmed publication and extra disposition or command state", () => {
   const value = input();
   for (const patch of [{ disposition: "published" }, { disposition: "unknown" }, { disposition: undefined },
+    { publicationDrained: false }, { publicationDrained: "true" }, { publicationDrained: undefined },
     { command: { ...command, id: command.version } }, { command: { ...command, version: command.id } },
     { command: { ...command, disposition: "published" } }, { command: null },
     { extra: [{ disposition: "published" }] }, { [Symbol("publication")]: "published" }]) {
@@ -147,6 +160,16 @@ test("rejects unconfirmed publication and extra disposition or command state", (
   const hidden = Object.defineProperty({ ...value.publication }, "otherCommand", { value: "published" });
   expectFailure({ ...value, publication: hidden }, "staging_publication_unconfirmed");
   expectFailure({ ...value, publication: null }, "staging_publication_unconfirmed");
+});
+
+test("requires publication evidence after the stopped ownership observation", () => {
+  const value = input();
+  const requestedAttempt = { ...value.ownership.requestedAttempt, usedUntil: lease.expiresAt };
+  const ownership = { ...value.ownership, observedAt: now - 500, use: lease, requestedAttempt };
+  for (const recordedAt of [now - 59_000, lease.expiresAt, ownership.observedAt - 1]) {
+    expectFailure({ ...value, ownership, publication: { ...value.publication, recordedAt } }, "staging_publication_unconfirmed");
+  }
+  assert.equal(evaluate({ ...value, ownership, publication: { ...value.publication, recordedAt: now - 500 } }).verdict, "passed");
 });
 
 test("rejects malformed evidence and never returns or evaluates private data", () => {
@@ -165,12 +188,18 @@ test("rejects malformed evidence and never returns or evaluates private data", (
   for (const owner of malformed(value.ownership.owner, "epoch")) {
     expectFailure({ ...value, ownership: { ...value.ownership, owner } }, "staging_ownership_unconfirmed");
   }
+  for (const requestedAttempt of malformed(value.ownership.requestedAttempt, "runAttempt")) {
+    expectFailure({ ...value, ownership: { ...value.ownership, requestedAttempt } }, "staging_ownership_unconfirmed");
+  }
   for (const use of malformed(lease, "expiresAt")) {
-    expectFailure({ ...value, ownership: { ...value.ownership, use } }, "staging_lease_unconfirmed");
+    const requestedAttempt = { ...value.ownership.requestedAttempt, usedUntil: lease.expiresAt };
+    expectFailure({ ...value, ownership: { ...value.ownership, use, requestedAttempt } }, "staging_lease_unconfirmed");
   }
   for (const command of malformed(value.publication.command, "version")) {
     expectFailure({ ...value, publication: { ...value.publication, command } }, "staging_publication_unconfirmed");
   }
+  expectFailure({ ...value, publication: { ...value.publication, get disposition() { return trap(); } } },
+    "staging_publication_unconfirmed");
   expectFailure({ ...value, get now() { return trap(); } }, "invalid_clock");
   expectFailure(Object.assign(Object.create(new Proxy(value, { get: trap })), { enabled: true }), "invalid_clock");
   expectFailure({ ...value, pin: { ...value.pin, deploymentId: sentinel } }, "staging_pin_invalid");

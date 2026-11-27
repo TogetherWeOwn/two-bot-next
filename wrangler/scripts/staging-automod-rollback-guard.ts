@@ -16,8 +16,8 @@ export type StagingAutomodRollbackGuardInput = Readonly<{
   promotion: Readonly<{ observedAt: number; PRODUCTION_AUTO_PROMOTE_DISABLED: boolean }>;
   ownership: Readonly<{
     observedAt: number;
-    owner: Pick<Scope, "deploymentId" | "epoch">;
-    requestedAttempt: Pick<Scope, "runId" | "runAttempt">;
+    owner: Pick<Scope, "deploymentId" | "epoch"> & Readonly<{ phase: "active" | "fenced" }>;
+    requestedAttempt: Pick<Scope, "runId" | "runAttempt"> & Readonly<{ usedUntil: number | null }>;
     sha: string;
     use: Readonly<StagingUse> | null;
     runtimeState: "stopped" | "starting" | "running" | "unknown";
@@ -27,6 +27,7 @@ export type StagingAutomodRollbackGuardInput = Readonly<{
   publication: Scope & Readonly<{
     recordedAt: number;
     disposition: "not_published" | "reverted";
+    publicationDrained: boolean;
     target: Target;
     command: CommandRevision;
   }>;
@@ -37,7 +38,9 @@ const disabled = Object.freeze({ ...common, verdict: "disabled" } as const);
 const passed = Object.freeze({ ...common, verdict: "passed" } as const);
 const MAX_AGE_MS = 60_000;
 const MAX_TIME_MS = 8_640_000_000_000_000;
-const PUBLICATION_KEYS = ["recordedAt", "disposition", "target", "command", "runId", "runAttempt", "deploymentId", "epoch"];
+const PUBLICATION_KEYS = [
+  "recordedAt", "disposition", "publicationDrained", "target", "command", "runId", "runAttempt", "deploymentId", "epoch",
+];
 
 type FailureCode = "invalid_clock" | "staging_pin_invalid" | "production_auto_promotion_unconfirmed"
   | "staging_ownership_unconfirmed" | "staging_lease_unconfirmed" | "staging_publication_unconfirmed";
@@ -117,30 +120,34 @@ function sameDeployment(value: unknown, pin: Scope): boolean {
   return field(value, "deploymentId") === pin.deploymentId && field(value, "epoch") === pin.epoch;
 }
 
-function expiredLease(value: unknown, pin: VerifiedPin, observedAt: number): boolean {
+function expiredLease(value: unknown, pin: VerifiedPin, observedAt: number, usedUntil: unknown): boolean {
   const acquiredAt = field(value, "acquiredAt");
   const expiresAt = field(value, "expiresAt");
   const phase = field(value, "phase");
   return record(value) && !Object.hasOwn(value, "voiceMove") && field(value, "environment") === "staging"
     && field(value, "purpose") === AUTOMOD_STAGING_PURPOSE && (phase === "active" || phase === "released")
     && sameAttempt(value, pin) && sameDeployment(value, pin) && field(value, "sha") === pin.sha
-    && time(acquiredAt) && time(expiresAt) && acquiredAt < expiresAt && expiresAt <= observedAt
+    && time(acquiredAt) && time(expiresAt) && expiresAt === usedUntil && acquiredAt < expiresAt && expiresAt <= observedAt
     && expiresAt - acquiredAt <= MAX_STAGING_USE_MS;
 }
 
-function publicationMatches(value: unknown, pin: VerifiedPin, now: number): boolean {
+function publicationMatches(value: unknown, pin: VerifiedPin, now: number, observedAt: number): boolean {
   if (!exactRecord(value, PUBLICATION_KEYS)) return false;
   const disposition = field(value, "disposition");
   const command = field(value, "command");
+  const recordedAt = field(value, "recordedAt");
   return (disposition === "not_published" || disposition === "reverted")
-    && fresh(field(value, "recordedAt"), now) && sameAttempt(value, pin) && sameDeployment(value, pin)
+    && field(value, "publicationDrained") === true && fresh(recordedAt, now) && recordedAt >= observedAt
+    && sameAttempt(value, pin) && sameDeployment(value, pin)
     && targetMatches(field(value, "target")) && exactRecord(command, ["id", "version"])
     && field(command, "id") === pin.command.id && field(command, "version") === pin.command.version;
 }
 
 /** The caller authenticates the pin and supplies coherent readbacks from under
- * the existing staging writer fence. Publication is a complete scoped
- * disposition for the pinned command revision, including when absent. */
+ * the existing staging writer fence. Read the complete scoped publication
+ * disposition after the ownership observation. Drain proof must rule out
+ * in-flight writes that could still land remotely. Early release still
+ * requires the original expiry to have passed. */
 export function evaluateStagingAutomodRollbackGuard(input?: unknown) {
   if (ownData(input, "enabled") !== true) return disabled;
 
@@ -156,15 +163,22 @@ export function evaluateStagingAutomodRollbackGuard(input?: unknown) {
 
   const ownership = field(input, "ownership");
   const observedAt = field(ownership, "observedAt");
-  if (!fresh(observedAt, now) || !sameDeployment(field(ownership, "owner"), pin)
-    || !sameAttempt(field(ownership, "requestedAttempt"), pin) || field(ownership, "sha") !== pin.sha) {
+  const owner = field(ownership, "owner");
+  const attempt = field(ownership, "requestedAttempt");
+  if (!fresh(observedAt, now) || !exactRecord(owner, ["deploymentId", "epoch", "phase"])
+    || !sameDeployment(owner, pin) || field(owner, "phase") !== "active"
+    || !exactRecord(attempt, ["runId", "runAttempt", "usedUntil"]) || !sameAttempt(attempt, pin)
+    || field(ownership, "sha") !== pin.sha) {
     return failed("staging_ownership_unconfirmed");
   }
   const use = field(ownership, "use");
+  const usedUntil = field(attempt, "usedUntil");
   if (field(ownership, "stopVerified") !== true || field(ownership, "cleanupPending") !== false
-    || field(ownership, "runtimeState") !== "stopped" || (use !== null && !expiredLease(use, pin, observedAt))) {
+    || field(ownership, "runtimeState") !== "stopped"
+    || (use === null ? usedUntil !== null : !expiredLease(use, pin, observedAt, usedUntil))) {
     return failed("staging_lease_unconfirmed");
   }
 
-  return publicationMatches(field(input, "publication"), pin, now) ? passed : failed("staging_publication_unconfirmed");
+  return publicationMatches(field(input, "publication"), pin, now, observedAt)
+    ? passed : failed("staging_publication_unconfirmed");
 }
