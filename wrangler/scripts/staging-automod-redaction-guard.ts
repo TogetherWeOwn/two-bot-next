@@ -8,7 +8,7 @@ type Result = Readonly<{ verdict: "disabled" }> | Readonly<{ verdict: "passed" }
   | Readonly<{ verdict: "failed"; code: StagingAutomodRedactionFailureCode }>;
 type Input = Readonly<{ enabled?: unknown; evidence?: unknown }>;
 
-type Metadata = "integer" | "boolean" | RegExp | Fields | readonly [Fields];
+type Metadata = "integer" | "boolean" | "bundle_time" | RegExp | Fields | readonly [Fields];
 type Fields = { readonly [key: string]: Metadata };
 
 const MAX_DEPTH = 12;
@@ -59,7 +59,7 @@ const receipt = {
   },
 } as const satisfies Fields;
 const bundle = {
-  schema, environment, observedAt: isoTime, verdict: /^(?:disabled|passed|failed)$/,
+  schema, environment, observedAt: "bundle_time", verdict: /^(?:disabled|passed|failed)$/,
   code: /^(?:receipt_unverified|rehearsal_unconfirmed)$/, runId, sha, ...serving, command,
 } as const satisfies Fields;
 const evidenceFields = {
@@ -113,14 +113,15 @@ function inspect(value: unknown, rule: Metadata | undefined, scan: Scan, depth: 
     case "string":
       if (value.length > MAX_STRING_LENGTH) return "string_limit";
       if (hasSecret(value, rule)) return "secret_value";
-      return rule instanceof RegExp && rule.test(value) ? undefined : "invalid_metadata";
+      const pattern = rule === "bundle_time" ? isoTime : rule;
+      return pattern instanceof RegExp && pattern.test(value) ? undefined : "invalid_metadata";
     case "number":
       if (!Number.isFinite(value)) return "non_json_value";
       return rule === "integer" && Number.isSafeInteger(value) && value >= 0 ? undefined : "invalid_metadata";
     case "boolean":
       return rule === "boolean" ? undefined : "invalid_metadata";
     case "object":
-      if (value === null) return "invalid_metadata";
+      if (value === null) return rule === "bundle_time" ? undefined : "invalid_metadata";
       break;
     default:
       return "non_json_value";

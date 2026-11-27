@@ -69,11 +69,15 @@ test("defaults to disabled without touching evidence or invoking accessors", () 
 });
 
 test("accepts the existing qualification receipt and composed evidence bundle", () => {
-  const bundle = composeStagingAutomodQualificationBundle({
+  const input = {
     enabled: true, pin: { runId: scope.runId, lease: scope.lease, serving, command }, receipt, rehearsal,
-  }, now);
+  };
+  const bundle = composeStagingAutomodQualificationBundle(input, now);
+  const diagnostic = composeStagingAutomodQualificationBundle(input, NaN);
   assert.equal(bundle.verdict, "passed");
-  for (const evidence of [receipt, bundle, { receipt, bundle, rehearsal },
+  assert.equal(diagnostic.verdict, "failed");
+  assert.equal(diagnostic.observedAt, null);
+  for (const evidence of [receipt, bundle, diagnostic, { receipt, bundle, rehearsal },
     JSON.parse(JSON.stringify({ receipt, bundle, rehearsal }))]) {
     const result = verify({ enabled: true, evidence });
     assert.deepEqual(result, { verdict: "passed" });
