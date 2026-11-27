@@ -1,6 +1,7 @@
 """Exercise dormant PRE orchestration with synthetic authorities and runtime."""
 
 from dataclasses import dataclass, replace
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from test_pre_admission import Store
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_admission import AdmissionRecord, SettlementEvidence, SettlementSource, StartupAdmission
+    from pre_ownership import OwnershipReply, bootstrap_fresh_ownership
     from pre_start_stop import Deployment, EffectWindow, Endpoint, Operation, ProbeReply, ProtectedPre
     from pre_start_stop import StartupAdmission as AdmissionProtocol
     from pre_target import Inventory, Target, TargetError, verify_cleanup
@@ -20,6 +22,35 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.p
 PRE_SHAPES = ("0473/0465", "0475/0465")
 TARGET = Target("pre-fixture-test", 123, 1_800_000_000, PRE_SHAPES[0])
 START = UUID(int=1)
+ACTOR = "fixture:pre-start"
+OWNERSHIP_PATH = "/internal/ownership"
+
+
+def ownership_reply(deployment, owner, *, running=False, exact_takeover=None):
+    return OwnershipReply(200, json.dumps({
+        "deploymentId": str(deployment.worker_version), "owner": owner, "running": running,
+    }).encode(), exact_takeover)
+
+
+def ownership_replies(deployment):
+    fenced = {
+        "deploymentId": None, "epoch": 1, "phase": "fenced", "actor": ACTOR,
+        "timestamp": "2026-11-25T00:00:00.000Z", "oldEpoch": 0, "oldDeploymentId": None,
+    }
+    active = dict(fenced, deploymentId=str(deployment.worker_version), epoch=2, phase="active", oldEpoch=1)
+    return (ownership_reply(deployment, None, exact_takeover="1"),
+            ownership_reply(deployment, fenced), ownership_reply(deployment, active))
+
+
+def ownership_calls(deployment):
+    return [
+        call.ownership(deployment, "GET", OWNERSHIP_PATH, None),
+        call.ownership(deployment, "POST", OWNERSHIP_PATH, {"action": "fence", "expectedEpoch": 0, "actor": ACTOR}),
+        call.ownership(deployment, "POST", OWNERSHIP_PATH, {
+            "action": "takeover-exact", "expectedEpoch": 1, "actor": ACTOR,
+            "expectedDeploymentId": str(deployment.worker_version),
+        }),
+    ]
 
 
 @dataclass(frozen=True)
@@ -47,6 +78,7 @@ class PreFixture:
         self.armed = None
         self.fenced = False
         self.created = None
+        self.verified = None
         self.before_create = Mock()
         self.after_create = Mock()
         self.before_probe_reply = Mock()
@@ -101,16 +133,31 @@ class PreFixture:
         self.effects.create(target, start_id, upload)
         self.created = replace(self.deployment, start_id=start_id)
         self.after_create()
-        return self.created
+        self.verified = self.created
+        return self.verified
 
     def probe(self, deployment, endpoint):
         self.allow_effect(deployment.target, deployment.start_id)
-        if deployment != self.created:
+        if deployment != self.verified:
             raise OSError("unbound deployment")
         self.effects.probe(deployment, endpoint)
         reply = self.reply
         self.before_probe_reply()
         return reply
+
+    def inject_ownership(self, replies):
+        replies = iter(replies)
+
+        def exchange(deployment, method, path, payload):
+            self.allow_effect(deployment.target, deployment.start_id)
+            self.effects.ownership(deployment, method, path, payload)
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        self.after_create.side_effect = lambda: bootstrap_fresh_ownership(
+            self.created, actor=ACTOR, exchange=exchange)
 
 
 class ProtectedPreTests(unittest.TestCase):
@@ -365,6 +412,74 @@ class ProtectedPreTests(unittest.TestCase):
                     TARGET: replace(closed, settled_by=SettlementSource.RUNTIME if settled else None),
                 })
                 self.assertIs(resumed_admission.startup_settled(TARGET), settled)
+
+    def test_bootstraps_archived_worker_before_owned_readiness(self):
+        for shape in PRE_SHAPES:
+            with self.subTest(shape=shape):
+                target = replace(TARGET, shape=shape)
+                fixture = PreFixture(target)
+                fixture.inject_ownership(ownership_replies(fixture.deployment))
+                controller = fixture.controller(fixture.authorize)
+                deployment = controller.start(fixture.upload)
+                self.assertEqual(deployment, fixture.deployment)
+                self.assertEqual(controller.probe(deployment, Endpoint.READINESS), fixture.reply)
+                self.assertEqual(fixture.effects.mock_calls, [
+                    call.admission.admit_start(target), call.arm(fixture.window, START),
+                    call.create(target, START, fixture.upload), *ownership_calls(deployment),
+                    call.probe(deployment, Endpoint.READINESS),
+                ])
+
+    def test_uncertain_archived_ownership_hands_off_to_independent_stop(self):
+        deployment = self.fixture.deployment
+        fresh, fenced, active = ownership_replies(deployment)
+        foreign = replace(deployment, worker_version=UUID(int=42))
+        ownerless = json.loads(fenced.body)["owner"]
+        owned = json.loads(active.body)["owner"]
+        cases = (
+            ("wrong Worker on GET", 0, ownership_reply(foreign, None, exact_takeover="1")),
+            ("redirected GET", 0, replace(fresh, status=302)),
+            ("missing exact capability", 0, replace(fresh, exact_takeover=None)),
+            ("missing owner", 0, replace(fresh, body=json.dumps({
+                "deploymentId": str(deployment.worker_version), "running": False,
+            }).encode())),
+            ("existing fence", 0, replace(fenced, exact_takeover="1")),
+            ("already running", 0, ownership_reply(deployment, None, running=True, exact_takeover="1")),
+            ("lost fence", 1, TimeoutError("synthetic fence reply lost")),
+            ("wrong Worker on fence", 1, ownership_reply(foreign, ownerless)),
+            ("wrong fence epoch", 1, ownership_reply(deployment, dict(ownerless, epoch=True))),
+            ("wrong previous fence epoch", 1, ownership_reply(deployment, dict(ownerless, oldEpoch=1))),
+            ("wrong fence actor", 1, ownership_reply(deployment, dict(ownerless, actor="fixture:other"))),
+            ("previous fence owner", 1, ownership_reply(
+                deployment, dict(ownerless, oldDeploymentId=str(foreign.worker_version)))),
+            ("duplicate fence fields", 1, replace(fenced, body=fenced.body.replace(
+                b'"epoch": 1', b'"epoch": 7, "epoch": 1'))),
+            ("lost takeover", 2, TimeoutError("synthetic takeover reply lost")),
+            ("takeover conflict", 2, replace(active, status=409)),
+            ("wrong Worker on takeover", 2, ownership_reply(foreign, owned)),
+            ("wrong active owner", 2, ownership_reply(deployment, dict(owned, deploymentId=str(foreign.worker_version)))),
+            ("uncommitted takeover", 2, ownership_reply(deployment, dict(owned, phase="fenced"))),
+            ("takeover already running", 2, ownership_reply(deployment, owned, running=True)),
+            ("oversized takeover", 2, replace(active, body=active.body + b" " * 4096)),
+        )
+        replies = (fresh, fenced, active)
+        for label, index, refusal in cases:
+            with self.subTest(label=label):
+                fixture = PreFixture()
+                fixture.inject_ownership((*replies[:index], refusal))
+                start = fixture.controller(lambda t, op: (t, op) == (TARGET, Operation.START))
+                probe = fixture.controller(lambda t, op: (t, op) == (TARGET, Operation.PROBE))
+                stop = fixture.controller(lambda t, op: (t, op) == (TARGET, Operation.STOP))
+                self.assert_refuses("pre_create_unconfirmed", start.start, fixture.upload)
+                self.assert_refuses("pre_probe_unconfirmed", probe.probe, deployment, Endpoint.READINESS)
+                self.assert_refuses("pre_start_not_admitted", start.start, fixture.upload)
+                self.assert_refuses("pre_operation_denied", start.stop)
+                self.assertTrue(stop.stop())
+                self.assertEqual(fixture.effects.mock_calls, [
+                    call.admission.admit_start(TARGET), call.arm(fixture.window, START),
+                    call.create(TARGET, START, fixture.upload), *ownership_calls(deployment)[:index + 1],
+                    call.admission.admit_start(TARGET), call.fence(TARGET), call.admission.close(TARGET),
+                    call.admission.settle(TARGET),
+                ])
 
     def test_lost_start_reply_requires_affirmative_exact_stop_evidence(self):
         cases = (
