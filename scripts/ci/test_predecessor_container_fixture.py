@@ -192,19 +192,23 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
         server.assert_not_called()
 
     def test_mock_command_publication(self):
+        self.addCleanup(discord.REST_SYNCED.clear)
         for token, body, status in [(fixture.TOKEN, b'[{"name":"help"}]', b"200"),
+                                    (fixture.TOKEN, b"[]", b"200"),
                                     ("foreign", b"[]", b"401"), (fixture.TOKEN, b"{}", b"400"),
                                     (fixture.TOKEN, b'[{"k":1,"k":2}]', b"400"),
                                     (fixture.TOKEN, b'[{"k":NaN}]', b"400"),
                                     (fixture.TOKEN, b'[{"k":1e400}]', b"400")]:
             client, server = socket.socketpair()
             with self.subTest(status=status), client, server:
+                discord.REST_SYNCED.clear()
                 request = (f"PUT {COMMANDS} HTTP/1.1\r\nConnection: close\r\n"
                            f"Authorization: Bot {token}\r\nContent-Length: {len(body)}\r\n\r\n").encode()
                 client.sendall(request + body)
                 Discord(server, None, None)
                 response = client.recv(4096)
                 self.assertEqual(response.split(b" ", 2)[1], status)
+                self.assertEqual(discord.REST_SYNCED.is_set(), status == b"200" and body != b"[]")
                 if status == b"200":
                     self.assertEqual(json.loads(response.split(b"\r\n\r\n")[1]), json.loads(body))
 
