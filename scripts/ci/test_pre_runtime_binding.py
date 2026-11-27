@@ -107,21 +107,27 @@ class RuntimeBindingTests(unittest.TestCase):
 
     def test_refusal_after_arm_preserves_independent_stop(self):
         fixture = Fixture()
+        observe = Mock()
+        recheck = Mock(return_value=True)
         launch = Mock()
 
-        def create(target, start_id, upload):
-            self.assertEqual(fixture.arm_pin, (target, start_id))
+        def create(window, start_id, upload):
+            target = window.target
+            self.assertEqual(fixture.arm_pin, (window, start_id))
             app = UUID(fixture.provisioned.container.id)
             expected = binding_for(Deployment(target, start_id, UUID(int=target.run_id), app))
 
             def read(_, *, request):
                 return replace(readback_for(expected, request), can_write=False)
 
-            return launch_with_verified_binding(expected, observe=read, recheck=lambda _: True, launch=launch)
+            observe.side_effect = read
+            return launch_with_verified_binding(expected, observe=observe, recheck=recheck, launch=launch)
 
         fixture.create_private = create
         with self.assertRaisesRegex(TargetError, "^pre_create_unconfirmed$"):
             fixture.caller(Operation.START).start(Upload(fixture.target))
+        observe.assert_called_once()
+        recheck.assert_not_called()
         launch.assert_not_called()
         with self.assertRaisesRegex(TargetError, "^pre_start_not_admitted$"):
             fixture.caller(Operation.START).start(Upload(fixture.target))
@@ -137,8 +143,9 @@ class RuntimeBindingTests(unittest.TestCase):
                 launch = Mock()
                 timeline = []
 
-                def create(target, start_id, upload):
+                def create(window, start_id, upload):
                     # The isolated app and writer can exist before process launch.
+                    target = window.target
                     fixture.snapshot = replace(fixture.provisioned, startup_settled=False,
                                                instance_count=0, assigned_count=0)
                     app = UUID(fixture.provisioned.container.id)
@@ -162,8 +169,8 @@ class RuntimeBindingTests(unittest.TestCase):
                             stop()
                         timeline.append("recheck")
                         rechecked(actual)
-                        return (actual == deployment and fixture.arm_pin == (target, start_id)
-                                and not fixture.fenced and fixture.now < target.expires_at)
+                        return (actual == deployment and fixture.arm_pin == (window, start_id)
+                                and not fixture.fenced and fixture.now < window.cutoff)
 
                     def effect(checked):
                         timeline.append("effect")
@@ -172,7 +179,7 @@ class RuntimeBindingTests(unittest.TestCase):
                         else:
                             fixture.now = target.expires_at
                         pinned = checked.deployment
-                        return create_process(pinned.target, pinned.start_id, upload)
+                        return create_process(replace(window, target=pinned.target), pinned.start_id, upload)
 
                     launch.side_effect = effect
                     return launch_with_verified_binding(binding, observe=read, recheck=recheck, launch=launch)
@@ -221,7 +228,8 @@ class RuntimeBindingTests(unittest.TestCase):
                 fixture = Fixture()
                 launch_process = fixture.create_private
 
-                def create(target, start_id, upload):
+                def create(window, start_id, upload):
+                    target = window.target
                     app = UUID(fixture.provisioned.container.id)
                     binding = binding_for(Deployment(target, start_id, UUID(int=target.run_id), app))
 
@@ -230,7 +238,7 @@ class RuntimeBindingTests(unittest.TestCase):
 
                     def launch(checked):
                         deployment = checked.deployment
-                        actual = launch_process(deployment.target, deployment.start_id, upload)
+                        actual = launch_process(replace(window, target=deployment.target), deployment.start_id, upload)
                         return replace(actual, **{identity: UUID(int=999)})
 
                     return launch_with_verified_binding(binding, observe=read, recheck=lambda _: True, launch=launch)
