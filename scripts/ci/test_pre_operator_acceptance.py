@@ -265,7 +265,8 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
             store, lambda closed: SettlementEvidence(closed, SettlementSource.PROVIDER, True, True),
         )
         controller = ProtectedPre(target, authorize=runtime.authorize, admission=admission,
-                                  runtime=runtime, external_stop=runtime)
+                                  runtime=runtime, external_stop=runtime,
+                                  effect_window=runtime.window)
         with patch("pre_admission.uuid4", return_value=START):
             deployment = controller.start(runtime.upload)
         self.version = str(deployment.worker_version)
