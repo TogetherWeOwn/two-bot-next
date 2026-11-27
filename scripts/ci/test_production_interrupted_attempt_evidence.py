@@ -115,6 +115,15 @@ class InterruptedAttemptEvidenceTests(unittest.TestCase):
                 self.database.assert_not_called()
                 self.assertFalse(self.receipt.exists())
 
+    def test_admission_refuses_missing_origin_stop_intent_before_provider_access(self):
+        self.routes["actions/runs/456/artifacts?per_page=30"] = {"total_count": 0, "artifacts": []}
+        with redirect_stderr(StringIO()):
+            self.assertEqual(interrupted.main(["admit"], self.env, self.api), 1)
+        self.observe.assert_not_called()
+        self.control.assert_not_called()
+        self.database.assert_not_called()
+        self.assertFalse((self.receipt.parent / f"{interrupted.ADMISSION}.json").exists())
+
     def test_original_attempt_can_restart_and_reconcile_a_lost_reply(self):
         def commit_then_lose_reply(*_args, **_kwargs):
             self.commit_takeover()

@@ -86,17 +86,44 @@ class RecoveryWiringTests(unittest.TestCase):
         guard = jobs["guard"]["steps"][0]
         self.assertEqual(guard["env"].get("RELEASE_RECOVERY_RUN_ID"), "${{ inputs.release_recovery_run_id }}")
         env = {"GITHUB_REPOSITORY": "TogetherWeOwn/two-bot-next", "EVENT_NAME": "workflow_dispatch",
+               "GITHUB_REPOSITORY_ID": "1396224242", "GITHUB_REF_PROTECTED": "true",
                "GITHUB_REF": "refs/heads/main", "GITHUB_RUN_ATTEMPT": "1", "AUTO_DISABLED": "true",
                "TAKEOVER": "true", "ALLOW_UNSTAGED": "false", "CUTOVER_HOLD": "false", "RELEASE_RECOVERY_RUN_ID": "41"}
-        with (patch.dict(os.environ, env, clear=True), redirect_stdout(StringIO()) as stdout,
-              patch("subprocess.check_output", side_effect=AssertionError("unexpected GitHub call")),
-              patch("urllib.request.urlopen", side_effect=AssertionError("unexpected provider call")),
-              self.assertRaises(SystemExit) as refused):
-            exec(compile(guard["run"], "deploy-production guard", "exec"), {})
-        self.assertEqual(refused.exception.code, 1)
-        self.assertIn("interrupted recovery requires the activation follow-up", stdout.getvalue())
+        script = compile(guard["run"], "deploy-production guard", "exec")
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "output"
+            cases = (
+                ({}, 0), ({"EVENT_NAME": "workflow_run", "WORKFLOW_RUN_SHA": "a" * 40}, 1),
+                ({"EVENT_NAME": "schedule"}, 1), ({"GITHUB_REPOSITORY": "fork/two-bot-next"}, 1),
+                ({"GITHUB_REPOSITORY_ID": "1"}, 1), ({"GITHUB_REF": "refs/heads/other"}, 1),
+                ({"GITHUB_REF_PROTECTED": "false"}, 1), ({"GITHUB_RUN_ATTEMPT": "2"}, 1),
+                ({"AUTO_DISABLED": "false"}, 1), ({"AUTO_DISABLED": ""}, 1),
+                ({"RELEASE_RECOVERY_RUN_ID": "041"}, 1), ({"RELEASE_RECOVERY_RUN_ID": "41\nmode=deploy"}, 1),
+                ({"SHA": "a" * 40}, 1), ({"ROLLBACK": "a" * 36}, 1), ({"IMAGE": "image"}, 1),
+                ({"RELEASE_PLAN_ID": "123"}, 1), ({"RELEASE_PINS": "{}"}, 1),
+                ({"TAKEOVER": "false"}, 1), ({"ALLOW_UNSTAGED": "true"}, 1), ({"CUTOVER_HOLD": "true"}, 1),
+            )
+            for changes, code in cases:
+                output.write_text("")
+                with (self.subTest(changes=changes), redirect_stdout(StringIO()) as stdout,
+                      patch.dict(os.environ, {**env, **changes, "GITHUB_OUTPUT": str(output)}, clear=True),
+                      patch("subprocess.check_output", side_effect=AssertionError("unexpected GitHub call")),
+                      patch("urllib.request.urlopen", side_effect=AssertionError("unexpected provider call")),
+                      self.assertRaises(SystemExit) as result):
+                    exec(script, {})
+                self.assertEqual(result.exception.code, code)
+                self.assertEqual(output.read_text(), "mode=interrupted-recovery\n" if code == 0 else "")
+                if code:
+                    self.assertIn("interrupted recovery requires", stdout.getvalue())
+
+        self.assertEqual(jobs["guard"]["outputs"]["mode"], "${{ steps.guard.outputs.mode }}")
         self.assertIn("needs.guard.outputs.mode != 'interrupted-recovery'", jobs["production"]["if"])
-        self.assertEqual(jobs["release-reconcile"]["name"], "Production release / Reconcile interrupted apply")
+        self.assertIn("needs.guard.outputs.protected_release == 'true'", jobs["release-plan"]["if"])
+        reconcile = jobs["release-reconcile"]
+        self.assertEqual(reconcile["name"], "Production release / Reconcile interrupted apply")
+        self.assertEqual(reconcile["needs"], "guard")
+        self.assertEqual(reconcile["if"], "needs.guard.outputs.mode == 'interrupted-recovery'")
+        self.assertEqual(reconcile["with"], {"origin-run-id": "${{ inputs.release_recovery_run_id }}"})
 
     def test_interrupted_recovery_isolates_database_and_authenticates_restart(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production-interrupted.yml").read_text())

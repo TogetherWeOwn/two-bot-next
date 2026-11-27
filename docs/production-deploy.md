@@ -540,11 +540,12 @@ keep the handoff open and the release held.
 
 ### Recovery after the protected workflow ships
 
-Use these paths only after the corresponding protected interrupted-release
-workflow ships and its dispatch is documented. The design uses a fresh
-protected dispatch in the same production lane. It authenticates the terminal,
+Use a fresh protected dispatch in the same production lane after an eligible
+attendance release attempt. The recovery workflow authenticates the terminal,
 first-attempt origin, its stop intent and reviewed plan, and the exact serving
 predecessor and ownership epoch before using the database classification.
+Forward attendance releases remain held pending qualification of the recovery
+pair.
 
 - **Confirmed PRE.** The protected job checks both migration ledgers, schema
   and grants under the migration locks. Exact original PRE permits one
@@ -583,11 +584,11 @@ and archive, candidate SHA, release reference, target fingerprint, stopped
 epoch, expanded and restored ledger digests, and 0475 timestamp digest. A log,
 saved copy or hand-built receipt is audit evidence only.
 
-Once the interrupted-release workflow ships and its dispatch is documented,
-the release operator can use it under the production release gate above.
-With automatic promotion disabled, start a fresh protected `deploy-production`
-dispatch on `main` in the same production lane. Supply only the original run
-ID as the recovery input. Both runs must be attempt 1. The origin must be a
+The release operator can reconcile an eligible attempt under the production
+release gate above. With automatic promotion disabled, start a fresh protected
+`deploy-production` dispatch on `main` in the same production lane. Set
+`release_recovery_run_id` to the original run ID and leave all other inputs at
+their defaults. Both runs must be attempt 1. The origin must be a
 completed protected dispatch on `main` that failed or was cancelled, at the
 same workflow SHA or an ancestor of the recovery workflow SHA. Its workflow
 must have retained the stop intent before STOP.
