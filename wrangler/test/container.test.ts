@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
 import { Container } from "@cloudflare/containers";
+import { runStagingAutomodProtectedHost } from "../scripts/staging-automod-protected-host.ts";
 import { bindStagingAutomodDeploymentTransport } from "../scripts/staging-automod-deployment-transport.ts";
 import { runStagingAutomodInstanceHost } from "../scripts/staging-automod-instance-host.ts";
 import { bindStagingAutomodInventoryReader } from "../scripts/staging-automod-inventory-reader.ts";
@@ -891,6 +892,166 @@ test("protected AutoMod publication intent spends unused reservation evidence be
   await assert.rejects(recover(), /staging_use_conflict/);
   assert.deepEqual(calls, ["post", "drain"]);
   assert.deepEqual(await staging.read(), issued);
+});
+
+test("the protected AutoMod host keeps a lost publication attributable across recovery lease rollover", async t => {
+  for (const rollLease of [false, true]) {
+    await t.test(rollLease ? "replacement lease keeps cleanup held" : "original lease completes handback", async t => {
+      t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+      const network = t.mock.method(globalThis, "fetch", async () => assert.fail("unexpected network access"));
+      const deploymentId = "11111111-1111-1111-1111-111111111111";
+      const { help, preview } = automodPublication.replies;
+      const env = { ...BOUNDED_STAGING_ENV, ...automodPublication.env, CF_VERSION_METADATA: { id: deploymentId },
+        TWO_MODERATION: "1", TWO_OWEN_USER_ID: preview.id };
+      const sha = env.CONTAINER_RELEASE;
+      const owner = { ...ACTIVE_OWNER, deploymentId, phase: "active" as const };
+      const target = STAGING_AUTOMOD_TARGET;
+      const h = await harness(t, env, { owner });
+      const storage = h.ctx.storage as unknown as DurableObjectStorage;
+      const staging = new StagingLifecycle(storage);
+      const journal = new StagingAutomodRecovery(storage);
+      const pin = { workerVersionId: deploymentId, sourceSha: sha, namespaceId: "a".repeat(32),
+        workerDeploymentId: "22222222-2222-2222-2222-222222222222", applicationId: "33333333-3333-3333-3333-333333333333",
+        rolloutId: "44444444-4444-4444-4444-444444444444", imageDigest: `sha256:${"b".repeat(64)}` };
+      const change = { ...stagingWindow(), action: "acquire" as const, deploymentId, sha, expectedEpoch: owner.epoch };
+      const registry = new Map<string, typeof help | typeof preview>([[help.id, help]]);
+      const botIdentity = "https://discord.com/api/v10/users/@me";
+      const commands = `https://discord.com/api/v10/applications/${target.applicationId}/guilds/${target.guildId}/commands`;
+      const list = `${commands}?with_localizations=true`;
+      const effectsTrace: string[] = [];
+      const effects: ProtectedAutomodEffects = {
+        enabled: true,
+        readRuntime: async lease => ({ lease, running: h.runtime.running }),
+        readCleanupGrant: async lease => ({ lease, before: lease.expiresAt + 5_000 }),
+        fenceAndDrain: async lease => {
+          assert.deepEqual(lease, issued);
+          effectsTrace.push("drain");
+          return { lease, publicationDrained: true, startupDrained: true };
+        },
+        stop: async lease => {
+          assert.deepEqual(lease, issued);
+          effectsTrace.push("stop");
+          return !h.runtime.running;
+        },
+        request: async (url, init) => {
+          effectsTrace.push(`${init.method} ${url}`);
+          if (init.method === "POST" && url === commands) {
+            assert.deepEqual(JSON.parse(String(init.body)), automodPublication.definition);
+            registry.set(preview.id, preview);
+            throw new Error("synthetic acknowledgement lost after registry write");
+          }
+          assert.equal(init.method, "GET");
+          if (url === botIdentity) return Response.json(automodPublication.identity);
+          assert.equal(url, list);
+          return Response.json([...registry.values()]);
+        },
+      };
+      const request = new Request("https://worker.invalid", { headers: { authorization: `Bearer ${CONTROL_TOKEN}` } });
+      const approvals: { lease: StagingUse; readIndex: number }[] = [];
+      const readback: unknown[] = [];
+      const instance = TwoBotContainer.bindProtectedAutomodInstance(h.bot, request, {
+        readReservation: async () => ({ change, pin, target }),
+        readServing: async () => pin,
+        readApproval: async (action, issuedLease) => {
+          assert.equal(action, "recover");
+          assert.deepEqual(issuedLease, issued);
+          approvals.push({ lease: issuedLease, readIndex: readback.length });
+          if (rollLease) {
+            // The replacement resolves for the same run after the external approval lookup.
+            h.values.set(OWNER_KEY, { ...owner, epoch: replacement.epoch, oldEpoch: owner.epoch });
+            h.values.set(STAGING_USE_KEY, replacement);
+          }
+          return { action, issuedLease, target };
+        },
+        effects,
+      });
+      const issued = await instance.acquireLease(pin, change, new AbortController().signal);
+      const replacement = { ...issued, epoch: issued.epoch + 1 };
+      const { purpose, ...publicationLease } = issued;
+      assert.equal(purpose, AUTOMOD_STAGING_PURPOSE);
+      const publisher = new StagingAutomodLifecycle({ ...effects, storage, env,
+        exclusive: operation => h.ctx.blockConcurrencyWhile(operation),
+        observe: async () => ({ ...await staging.automodBinding(issued, { deploymentId, sha, owner }, Date.now()),
+          purpose, running: h.runtime.running }),
+        get: async url => {
+          if (url === botIdentity) return automodPublication.identity;
+          assert.equal(url, commands);
+          return [...registry.values()];
+        },
+      });
+      await assert.rejects(publisher.publish({ lease: publicationLease, purposes: [purpose],
+        origin: "https://two-bot-next-staging.example.workers.dev", cleanupReserveMs: 5_000,
+        verifiedRecoveryPair: true, verifiedRuntimeDatabase: true, verifiedGatewayIntents: true }),
+      { message: "staging_automod_publication_uncertain" });
+      assert.deepEqual(effectsTrace.splice(0), [`GET ${botIdentity}`, `GET ${list}`, `GET ${list}`, `POST ${commands}`]);
+      assert.deepEqual(registry.get(preview.id), preview);
+      const intent = await journal.pending();
+      assert.ok(intent && "target" in intent);
+      assert.deepEqual(intent.lease, publicationLease);
+      assert.deepEqual(intent.target, target);
+      const pending = structuredClone(h.values.get(AUTOMOD_JOURNAL_KEY));
+      assert.deepEqual(pending, { phase: "publishing", intent, created: null });
+
+      // Give both paths the same independently reconciled registry.
+      assert.equal(registry.delete(preview.id), true);
+      t.mock.timers.setTime(issued.expiresAt);
+      const workflow = ".github/workflows/staging-automod-preview.yml";
+      const workflowSha = "e".repeat(40);
+      const repository = { id: 1396224242 };
+      const inventorySource = { workflowSha: "c".repeat(40), runId: Number(issued.runId) + 1 };
+      const runner = { GITHUB_REPOSITORY_ID: String(repository.id), GITHUB_REF: "refs/heads/main", GITHUB_REF_PROTECTED: "true",
+        GITHUB_WORKFLOW_REF: `TogetherWeOwn/two-bot-next/${workflow}@refs/heads/main`, GITHUB_EVENT_NAME: "workflow_dispatch",
+        GITHUB_RUN_ID: issued.runId, GITHUB_RUN_ATTEMPT: "1", GITHUB_SHA: workflowSha, GITHUB_WORKFLOW_SHA: workflowSha };
+      const readInventory = t.mock.fn(async () => ({ schema_version: 1 as const, workflow_sha: inventorySource.workflowSha,
+        workflow_run_id: inventorySource.runId, observed_at: new Date().toISOString(),
+        worker: { deployment_id: pin.workerDeploymentId, version_id: deploymentId, source_sha: sha,
+          traffic_percent: 100 as const, runtime_policy: "bounded" as const },
+        container: { application_id: pin.applicationId, namespace_id: pin.namespaceId, rollout_id: pin.rolloutId,
+          rollout_status: "completed" as const, image_digest: pin.imageDigest },
+        ownership: { phase: "active" as const, epoch: issued.epoch },
+      }));
+      const invokePrivate = t.mock.fn(instance.invokePrivate);
+      const get = h.ctx.storage.get;
+      t.mock.method(h.ctx.storage, "get", async (key: string) => {
+        const value = await get(key);
+        if (key === STAGING_USE_KEY) readback.push(structuredClone(value));
+        return value;
+      });
+      const result = await runStagingAutomodProtectedHost({ enabled: true, serving: { deploymentId, sha }, runner, inventorySource }, {
+        authority: instance.authority, invokePrivate, readWorker: () => ({ env, controlBearer: CONTROL_TOKEN }),
+        readAuthenticatedInventory: readInventory,
+        readRun: async () => ({ id: Number(issued.runId), run_attempt: 1, event: "workflow_dispatch", status: "in_progress",
+          path: workflow, head_branch: "main", head_sha: workflowSha, repository, head_repository: repository }),
+      });
+      assert.deepEqual(approvals.map(({ lease }) => lease), [issued]);
+      const { readIndex } = approvals[0]!;
+      assert.deepEqual(readback[0], issued);
+      assert.deepEqual(readback.slice(readIndex - 1, readIndex + 1), [issued, rollLease ? replacement : issued]);
+      assert.deepEqual(result, { verdict: "failed", start: false, recover: !rollLease });
+      if (rollLease) {
+        assert.equal(readInventory.mock.callCount(), 0);
+        assert.equal(invokePrivate.mock.callCount(), 0);
+        assert.deepEqual(effectsTrace, []);
+        assert.deepEqual(await staging.read(), replacement);
+        assert.deepEqual(h.values.get(AUTOMOD_JOURNAL_KEY), pending);
+        assert.equal(await journal.completedFor(issued), false);
+        assert.equal(await journal.completedFor(replacement), false);
+        await assert.rejects(publisher.otherUse(async () => assert.fail("competing use ran")), /staging_automod_lifecycle_refused/);
+      } else {
+        assert.equal(readInventory.mock.callCount(), 1);
+        assert.deepEqual(invokePrivate.mock.calls.map(({ arguments: [pin, call] }) => [pin, call]),
+          [[pin, { action: "recover", issuedLease: issued }]]);
+        assert.deepEqual(effectsTrace, ["drain", "stop", `GET ${botIdentity}`, `GET ${list}`]);
+        assert.equal(await journal.pending(), undefined);
+        assert.equal(await journal.completedFor(issued), true);
+        assert.deepEqual(await staging.read(), { ...issued, phase: "released" });
+      }
+      assert.deepEqual([...registry.values()], [help]);
+      assert.deepEqual(h.starts, []);
+      assert.deepEqual(h.requests, []);
+      assert.equal(network.mock.callCount(), 0);
+    });
+  }
 });
 
 test("protected AutoMod scopes startup and cleanup to the exact exclusive staging purpose", async (t) => {

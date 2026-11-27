@@ -3326,10 +3326,23 @@ jobs:
     env:
       IMAGE: two-bot-next:smoke-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The image's COPY . . needs the full tree. Only an explicit skip can
+      # use the smaller checkout for the scripts and their workflow assertions.
+      - name: Check out full image context
+        if: needs.container-inputs.outputs.build != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
+      - name: Check out smoke test inputs only
+        if: needs.container-inputs.outputs.build == 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+            .github/workflows
       - name: Offline smoke-test regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke.py' -v
       - name: Offline smoke cleanup-failure acceptance
