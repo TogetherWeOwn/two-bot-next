@@ -32,7 +32,7 @@
           "env": {
             "GH_TOKEN": "${{ github.token }}"
           },
-          "run": "python3 scripts/build_predecessor.py prepare"
+          "run": "# Limit the inherited worktree checkout while keeping all Git objects for the export.\ngit sparse-checkout set --cone scripts\npython3 scripts/build_predecessor.py prepare\n"
         },
         {
           "uses": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",

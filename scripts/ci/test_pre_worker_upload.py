@@ -9,12 +9,17 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from zipfile import ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bot_promotion import MAX_MEMBER_BYTES, MAX_TOTAL_BYTES
-from pre_target import Target, TargetError, make_config
+from predecessor_bundle import IMAGE, verify_predecessor_bundle
+from pre_target import ProtectedRouteReadback, Resource, Target, TargetError, confirm_protected_route, make_config
 from pre_worker_upload import DatabaseEndpoint, assemble_worker_upload
 from script_intake import decode_json
+from test_pre_start_stop import PRE_SHAPES, PreFixture
+from test_pre_target import APP_ID
+from test_predecessor_bundle import fixture as predecessor_fixture, metadata, pack
 
 
 MODULES = {
@@ -221,6 +226,39 @@ class PreWorkerUploadTests(unittest.TestCase):
         other = replace(self.target, scope="pre-fixture-other")
         with self.assertRaisesRegex(TargetError, "^wrong_pre_ingress_target$"):
             upload.require_unrouted(**{**offline, "observed_target": other})
+
+    def test_archived_upload_cannot_start_even_with_private_route(self):
+        members, receipt = predecessor_fixture(self.root, self.target.run_id, MODULES["index.js"][1])
+        archive = pack(members, receipt)
+        receipt = verify_predecessor_bundle(archive, **metadata(archive, self.target.run_id, 457))
+        root = self.root / "material"
+        (root / "worker/assets").mkdir(parents=True)
+        with ZipFile(archive) as bundle:
+            for name in members:  # Only the known fixture paths.
+                (root / name).write_bytes(bundle.read(name))
+        overrides = {"DISCORD_GATEWAY_URL": "ws://127.0.0.1:8081", "DISCORD_API_BASE": "http://127.0.0.1:8081"}
+        for shape in PRE_SHAPES:
+            with self.subTest(shape=shape):
+                target = replace(self.target, shape=shape)
+                args = dict(target=target, now=target.started_at, receipt=receipt, material_root=root)
+                config = make_config(**args, synthetic_service=target.service_name)
+                database = database_fixture(target)
+                upload = assemble_worker_upload(**args, config=config, **database)
+                parts = receive_multipart(upload.content_type, upload.body)
+                self.assertEqual({name: data for name, _, _, data in parts[1:]},
+                                 {name.removeprefix("worker/"): data for name, data in members.items() if name != IMAGE})
+                self.assertEqual((root / IMAGE).read_bytes(), members[IMAGE])
+                with self.assertRaisesRegex(TargetError, "^wrong_pre_worker_config$"):
+                    assemble_worker_upload(**args, config={**config, "vars": {**config["vars"], **overrides}},
+                                           **database)
+                upload.require_unrouted(observed_target=target, complete=True, workers_dev=False,
+                                        preview_urls=False, routes=(), custom_domains=())
+                route = ProtectedRouteReadback(target, target.worker_name, Resource(target.container_name, APP_ID))
+                confirm_protected_route(target, pinned_app_id=APP_ID, readback=route)
+                runtime = PreFixture(target)
+                with self.assertRaisesRegex(TargetError, "^pre_discord_fixture_overrides_unavailable$"):
+                    runtime.controller(runtime.authorize).start(upload)
+                self.assertEqual(runtime.effects.mock_calls, [])
 
 
 if __name__ == "__main__":

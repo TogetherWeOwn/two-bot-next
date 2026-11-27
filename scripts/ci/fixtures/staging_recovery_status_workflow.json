@@ -17,7 +17,9 @@
       "with": {
         "ref": "${{ github.sha }}",
         "persist-credentials": "false",
-        "fetch-depth": "1"
+        "fetch-depth": "1",
+        "sparse-checkout": "/scripts/build_identity.py\n/scripts/ci/staging_migrate_claim.py\n/scripts/rollback_proof.py\n/scripts/script_intake.py\n/scripts/staging_recovery_status.py\n/scripts/staging_rollout.py\n/scripts/worker_container_rollback.py\n",
+        "sparse-checkout-cone-mode": "false"
       }
     },
     {
