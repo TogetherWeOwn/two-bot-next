@@ -116,9 +116,11 @@ class InterruptedAttemptEvidenceTests(unittest.TestCase):
                 self.assertFalse(self.receipt.exists())
 
     def test_admission_refuses_missing_origin_stop_intent_before_provider_access(self):
-        self.routes["actions/runs/456/artifacts?per_page=30"] = {"total_count": 0, "artifacts": []}
+        inventory = "actions/runs/456/artifacts?per_page=30"
+        self.routes[inventory] = {"total_count": 0, "artifacts": []}
         with redirect_stderr(StringIO()):
             self.assertEqual(interrupted.main(["admit"], self.env, self.api), 1)
+        self.api.assert_any_call(inventory)
         self.observe.assert_not_called()
         self.control.assert_not_called()
         self.database.assert_not_called()
