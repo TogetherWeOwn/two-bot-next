@@ -13,7 +13,9 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.p
     from ci.test_pre_start_stop import PRE_SHAPES, START, TARGET, PreFixture
     from ci.test_staging_pre_reaper_fixture import SyntheticStaging
     from pre_admission import AdmissionRecord, SettlementEvidence, SettlementSource, StartupAdmission
-    from pre_registry_cleanup import RegistryDisposition, RegistryReadback, registry_cleanup_disposition
+    from pre_registry_cleanup import (
+        PublicationSettlement, RegistryDisposition, RegistryReadback, registry_cleanup_disposition,
+    )
     from pre_start_stop import Operation, ProtectedPre
     from pre_sweep import SweepError, sweep_target
     from pre_target import Resource, TargetError
@@ -68,14 +70,14 @@ class PreRunnerLossHandbackTests(unittest.TestCase):
                             external_stop=runtime)
         reservation = replace(RESERVATION, target=target)
         manifests = set()
-        publication_settled = False
+        publication_settlement = None
 
         def handback():
             inventory = reaper.inventory(target)
             readback = RegistryReadback(target, reservation.reference, reservation.reference in manifests)
             return registry_cleanup_disposition(
                 reservation, inventory, readback, run_status=reaper.run_status(target),
-                now=store.now, publication_settled=publication_settled,
+                now=store.now, publication_settlement=publication_settlement,
             )
 
         store.now = target.expires_at - 1
@@ -84,7 +86,7 @@ class PreRunnerLossHandbackTests(unittest.TestCase):
         self.assertIsNone(handback())
 
         manifests.add(reservation.reference)
-        publication_settled = True
+        publication_settlement = PublicationSettlement(reservation)
         store.now = target.expires_at
         reaper.events.clear()
         self.assertFalse(stop.stop())

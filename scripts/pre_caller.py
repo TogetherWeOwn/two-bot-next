@@ -6,13 +6,13 @@ from typing import Literal, Protocol
 from build_identity import is_build_id_shape, is_build_revision_shape, is_deploy_id_shape
 from pre_admission import AdmissionRecord, AdmissionStore, SettlementEvidence, StartupAdmission
 from pre_registry_cleanup import (
-    RegistryDisposition, RegistryReadback, RegistryReservation, registry_cleanup_disposition,
+    PublicationSettlement, RegistryDisposition, RegistryReadback, RegistryReservation, registry_cleanup_disposition,
 )
 from pre_start_stop import (
     Deployment, EffectWindow, Endpoint, ExternalStop, Operation, PrivateRuntime, ProbeReply,
     ProtectedPre, WorkerUpload,
 )
-from pre_sweep import SweepError, sweep_target
+from pre_sweep import CleanupReadback, SweepError, sweep_target
 from pre_target import Action, Inventory, Target, TargetError, require, verify_cleanup
 from staging_rollout import GateError, decode, runtime_ready
 from worker_container_rollback import gateway_state
@@ -74,15 +74,18 @@ class FinalizerAdapter(Protocol):
 
     Inventory uses durable startup settlement and preserves the exact app's
     zero-count proof or affirmative never-created evidence across reads.
-    Registry methods resolve the reservation recorded before publication.
+    Cleanup inventory is observed afresh under the held cleanup claim.
+    Registry methods resolve the original reservation and authenticate the
+    publisher's settlement independently of registry presence.
     """
 
     def run_status(self, target: Target) -> str: ...
     def inventory(self, target: Target) -> Inventory: ...
+    def cleanup_inventory(self, target: Target, *, request: object) -> CleanupReadback: ...
     def apply(self, target: Target, action: Action) -> bool: ...
     def stop_container(self, target: Target, action: Action) -> Inventory: ...
     def registry_reservation(self, target: Target) -> RegistryReservation: ...
-    def publication_settled(self, reservation: RegistryReservation) -> bool: ...
+    def publication_settlement(self, reservation: RegistryReservation) -> PublicationSettlement | None: ...
     def read_registry(self, reservation: RegistryReservation) -> RegistryReadback: ...
 
 
@@ -103,17 +106,23 @@ def finalize_pre(
         return "spared"
 
     try:
-        inventory = adapter.inventory(target)
+        request = object()
+        readback = adapter.cleanup_inventory(target, request=request)
+        require(type(readback) is CleanupReadback and readback.request is request,
+                "wrong_pre_cleanup_readback")
+        inventory = readback.inventory
         verify_cleanup(target, inventory)
         reservation = adapter.registry_reservation(target)
         require(type(reservation) is RegistryReservation and reservation.target == target,
                 "wrong_pre_registry_scope")
-        settled = adapter.publication_settled(reservation)
-        require(settled is True, "pre_registry_publication_unsettled")
+        settlement = adapter.publication_settlement(reservation)
+        require(type(settlement) is PublicationSettlement, "pre_registry_publication_unsettled")
+        require(type(settlement.reservation) is RegistryReservation and settlement.reservation == reservation,
+                "wrong_pre_registry_publication_scope")
         status = adapter.run_status(target)
         disposition = registry_cleanup_disposition(
             reservation, inventory, adapter.read_registry(reservation),
-            now=trusted_now(), run_status=status, publication_settled=settled,
+            now=trusted_now(), run_status=status, publication_settlement=settlement,
         )
         require(disposition is not None, "pre_registry_cleanup_unconfirmed")
     except Exception:
