@@ -24,7 +24,10 @@ from runner_policy import (
     PUBLIC_RUNNER, RUST_TESTS_RUNNER, SUPPLY_CHAIN_PR_GATES, expected_runner,
 )
 from staging_pre_reaper_policy import PRE_REAPER, PRE_REAPER_QUEUE, dormant_pre_reaper_errors
-from staging_soak_policy import PRODUCTION_GROUP, PRODUCTION_RELEASE_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
+from staging_soak_policy import (
+    BEGIN_CHECKOUT as SOAK_BEGIN_CHECKOUT, PRODUCTION_GROUP, PRODUCTION_RELEASE_GROUP,
+    SOAK as STAGING_SOAK, admitted_soak, soak_view,
+)
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, GUARDS as MEASUREMENT_GUARDS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
     TARGET as MEASUREMENT_TARGET, WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
@@ -703,9 +706,10 @@ def staging_gateway_injection_errors(workflows):
 
 
 ERROR_RATE_EXPRESSION = "${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'true' || 'false' }}"
+ERROR_RATE_GATE_SCRIPT = "promotion-error-gate.mjs"
 ERROR_RATE_MARKERS = (
     "inject_error_rate_spike", "INJECT_ERROR_RATE_SPIKE",
-    "promotion-error-gate.mjs", "error-rate-gate.json",
+    ERROR_RATE_GATE_SCRIPT, "error-rate-gate.json",
 )
 
 
@@ -801,9 +805,17 @@ def staging_error_rate_gate_errors(workflows):
     for name, workflow in workflows.items():
         if name in ("deploy-staging.yml", "deploy-production.yml"):
             continue
+        dependency_mentions = 0
+        if name == STAGING_SOAK and admitted_soak(workflows):
+            # The metrics client imports this file. Only count its exact checkout entries.
+            for job in ("begin", "finish"):
+                checkout = workflow["jobs"][job]["steps"][1]["with"]
+                if f"/wrangler/scripts/{ERROR_RATE_GATE_SCRIPT}" in checkout.get("sparse-checkout", "").splitlines():
+                    dependency_mentions += 1
         text = str(workflow)
         for marker in ERROR_RATE_MARKERS:
-            if marker in text:
+            allowed_mentions = dependency_mentions if marker == ERROR_RATE_GATE_SCRIPT else 0
+            if text.count(marker) > allowed_mentions:
                 errors.append(f"{name}: error-rate gate marker {marker} outside deploy-staging/deploy-production")
     staging = workflows.get("deploy-staging.yml") or {}
     text = str(staging)
@@ -1594,7 +1606,7 @@ def reviewed_migrate_errors(workflow):
     # Pin the reviewed trigger, checkouts, containers, job order, shells and secret scopes.
     encoded = json.dumps(workflow, sort_keys=True, separators=(",", ":")).encode()
     digest = hashlib.sha256(encoded).hexdigest()
-    return [] if digest == "b7ea9bfd21484f7a8c6dc0d49ea703ab8c25c68b18affeab45f2ec4a04fa7ab2" else [
+    return [] if digest == "1ae7e3b5c9fa8aa270218aec8905f4011ce16d347f8cb322e0b7d7fe6aed48d3" else [
         "reviewed staging migration workflow contract changed"]
 
 
@@ -2352,6 +2364,11 @@ PRIVACY_VERIFY_READ_ENV = {
 }
 PRIVACY_VERIFY_READ_COMMAND = ('python3 scripts/staging_privacy_verify_read.py --guild "$GUILD" '
                                '--output "staging-privacy-verify-read-$RUN_ID.json"')
+PRIVACY_VERIFY_READ_PATHS = (
+    "/scripts/staging_privacy_verify_read.py",
+    "/scripts/staging_automation_read_smoke.py",
+    "/scripts/script_intake.py",
+)
 
 
 def staging_privacy_verify_read_errors(workflow):
@@ -2427,11 +2444,12 @@ def staging_privacy_verify_read_errors(workflow):
         errors.append(f"{name}:read: must run exactly checkout, the read and the upload, unconditionally")
         return errors
     checkout, run, upload = steps
-    # Checkout defaults to this workflow's immutable head. No ref, repository,
-    # path or other override may replace the reviewed code before secrets bind.
-    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or checkout.get("with") != {"persist-credentials": "false", "fetch-depth": "1"}:
-        errors.append(f"{name}:read: checkout must be shallow, non-persisting and use the workflow head")
+    # Pin the exact sparse paths at the immutable workflow head before secrets bind.
+    if checkout.get("uses") != STAGING_CHECKOUT_USES or checkout.get("with") != {
+            "persist-credentials": "false", "fetch-depth": "1", "sparse-checkout-cone-mode": "false",
+            "sparse-checkout": "\n".join(PRIVACY_VERIFY_READ_PATHS) + "\n"}:
+        errors.append(f"{name}:read: checkout must be shallow, non-persisting and use the workflow head "
+                      "with only the reader's files")
     if run.get("env") != PRIVACY_VERIFY_READ_ENV:
         errors.append(f"{name}:read: Run step must bind exactly the four secrets, the guild and the run id")
     if run.get("run") != PRIVACY_VERIFY_READ_COMMAND or "uses" in run or "shell" in run:
@@ -3283,8 +3301,13 @@ def production_errors(workflow):
     if [step.get("name") for step in soak_steps] != expected_names:
         errors.append(f"{name}:soak: must keep startup/baseline/measurement/sample/recheck/release/artifact order")
     else:
-        checkout = soak_steps[0]
-        if checkout.get("with") != {"ref": "${{ github.sha }}", "persist-credentials": "false", "fetch-depth": "1"}:
+        # Match the reviewed begin checkout and independently pin its source and credential settings.
+        expected_checkout = {
+            **SOAK_BEGIN_CHECKOUT,
+            "with": {**SOAK_BEGIN_CHECKOUT["with"], "ref": "${{ github.sha }}",
+                     "persist-credentials": "false", "fetch-depth": "1"},
+        }
+        if soak_steps[0] != expected_checkout:
             errors.append(f"{name}:soak: tooling must come from the workflow head without persisted credentials")
         receipt = "${{ runner.temp }}/staging-soak-use.ndjson"
         control = {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
@@ -3628,8 +3651,19 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
     if tooling != {"uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
                    "if": "${{ inputs.reviewed_plan != '' }}",
                    "with": {"ref": "${{ github.sha }}", "path": "tooling", "persist-credentials": "false",
-                            "fetch-depth": "1"}}:
-        errors.append(f"{name}:schema-gate: reviewed plan proof must use the credentialless workflow checkout")
+                            "fetch-depth": "1", "sparse-checkout-cone-mode": "false",
+                            "sparse-checkout": (
+                                "/scripts/build_identity.py\n"
+                                "/scripts/ci/staging_migrate_claim.py\n"
+                                "/scripts/ci/staging_rollback_compatibility.py\n"
+                                "/scripts/rollback_proof.py\n"
+                                "/scripts/script_intake.py\n"
+                                "/scripts/staging_bootstrap.py\n"
+                                "/scripts/staging_recovery_status.py\n"
+                                "/scripts/staging_rollout.py\n"
+                                "/scripts/worker_container_rollback.py\n"
+                            )}}:
+        errors.append(f"{name}:schema-gate: reviewed plan proof must use the credentialless sparse workflow checkout")
     if proof != {"name": "Verify the recovery plan and both ledgers", "id": "recovery-plan",
                  "if": "${{ inputs.recovery_mode != 'standard' }}",
                  "env": {"RECOVERY_PLAN_SOURCE": "${{ inputs.sha }}", "REVIEWED_PLAN": "${{ inputs.reviewed_plan }}",
@@ -3696,8 +3730,9 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:schema-gate: must use the explicit ubuntu-latest runner for job 'schema-gate'")
     if gate.get("timeout-minutes") != "30":
         errors.append(f"{name}:schema-gate: timeout must stay 30 minutes")
-    if (gate.get("container") or {}).get("image") != SCHEMA_GATE_IMAGE:
-        errors.append(f"{name}:schema-gate: must build on the pinned plan-job image")
+    # Container env/options would reach every step, so the container is pinned whole.
+    if gate.get("container") != {"image": SCHEMA_GATE_IMAGE}:
+        errors.append(f"{name}:schema-gate: must build on the pinned plan-job image with no container env or options")
     production = jobs.get("production", {})
     needs = production.get("needs")
     needs = [needs] if isinstance(needs, str) else (needs or [])
@@ -3708,27 +3743,73 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:schema-gate: must run exactly checkout, tooling checkout, SHA check, build and the gate")
         return errors
     checkout, tooling, sha_check, build, run = steps
-    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
-            or (checkout.get("with") or {}).get("fetch-depth") != "0" \
-            or "needs.guard.outputs.sha" not in str((checkout.get("with") or {}).get("ref", "")):
+    # Every step is pinned whole: no step may append to $GITHUB_ENV or
+    # $GITHUB_PATH, add env, or overwrite the trusted tooling copy before the
+    # gate reads the plan secret.
+    if checkout != {
+        "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "with": {
+            "ref": "${{ needs.guard.outputs.sha }}",
+            "persist-credentials": "false",
+            "fetch-depth": "0",
+        },
+    }:
         errors.append(f"{name}:schema-gate: checkout must be pinned, credentialless, full-depth and on the guarded SHA")
-    if not str(tooling.get("uses", "")).startswith("actions/checkout@") \
-            or (tooling.get("with") or {}).get("persist-credentials") != "false" \
-            or (tooling.get("with") or {}).get("path") != "tooling" \
-            or "github.sha" not in str((tooling.get("with") or {}).get("ref", "")):
-        errors.append(f"{name}:schema-gate: tooling checkout must be pinned, credentialless and on the workflow commit")
-    if ("needs.guard.outputs.sha" not in str(sha_check.get("env", ""))
-            or "git rev-parse HEAD" not in str(sha_check.get("run", ""))):
+    if tooling != {
+        "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "with": {
+            "ref": "${{ github.sha }}",
+            "path": "tooling",
+            "persist-credentials": "false",
+            "fetch-depth": "1",
+            "sparse-checkout": "/scripts/ci/production_schema_gate.py\n"
+                               "/scripts/ci/schema_gate_common.py\n"
+                               "/scripts/script_intake.py\n",
+            "sparse-checkout-cone-mode": "false",
+        },
+    }:
+        errors.append(f"{name}:schema-gate: tooling checkout must use only the reviewed schema gate files")
+    if ({key: value for key, value in sha_check.items() if key != "run"} != {
+            "name": "Deploy SHA must be exact",
+            "env": {"SOURCE_SHA": "${{ needs.guard.outputs.sha }}"},
+        }
+            or shell_logical_lines(str(sha_check.get("run", ""))) != [
+                'git config --global --add safe.directory "$GITHUB_WORKSPACE"',
+                'test "$(git rev-parse HEAD)" = "$SOURCE_SHA"',
+            ]):
         errors.append(f"{name}:schema-gate: SHA check must pin the step to the guarded SHA")
-    if "cargo build -p two-bot-cutover --bin staging-migrate --locked" not in str(build.get("run", "")):
+    if build != {"name": "Build runner",
+                 "run": "cargo build -p two-bot-cutover --bin staging-migrate --locked"}:
         errors.append(f"{name}:schema-gate: build must compile the reviewed staging-migrate binary locked")
-    if (run.get("shell") != "bash" or "set -o pipefail" not in str(run.get("run", ""))
-            or "scripts/ci/production_schema_gate.py" not in str(run.get("run", ""))
-            or "--source-sha" not in str(run.get("run", ""))
-            or "--mode" not in str(run.get("run", ""))
-            or "--allow-unstaged" not in str(run.get("run", ""))
-            or "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL" not in str(run.get("env", ""))):
+    # The gate step is pinned whole: only the trusted tooling copy runs, over
+    # pipefail, with exactly the plan binding, identity pins and guard outputs.
+    # No other env key (PYTHONPATH, BASH_ENV, PATH, LD_PRELOAD), working
+    # directory, `if` or `continue-on-error` can slip in beside the secret,
+    # and no job- or workflow-level env/defaults can reach the step.
+    if (gate.keys() - {"name", "needs", "if", "runs-on", "timeout-minutes", "environment",
+                       "permissions", "container", "steps"}
+            or workflow.keys() & {"env", "defaults"}):
+        errors.append(f"{name}:schema-gate: job and workflow must not set env, defaults, continue-on-error "
+                      "or any other job key")
+    if ({key: value for key, value in run.items() if key != "run"} != {
+            "name": "Fail closed on schema drift",
+            "env": {
+                "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL": "${{ secrets.TWO_BOT_PRODUCTION_PLAN_DATABASE_URL }}",
+                "TWO_BOT_PRODUCTION_HOST": "${{ vars.TWO_BOT_PRODUCTION_HOST }}",
+                "TWO_BOT_PRODUCTION_DATABASE": "${{ vars.TWO_BOT_PRODUCTION_DATABASE }}",
+                "TWO_BOT_PRODUCTION_BRANCH_ID": "${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}",
+                "SOURCE_SHA": "${{ needs.guard.outputs.sha }}",
+                "MODE": "${{ needs.guard.outputs.mode }}",
+                "ALLOW_UNSTAGED": "${{ needs.guard.outputs.allow_unstaged }}",
+            },
+            "shell": "bash",
+        }
+            or shell_logical_lines(str(run.get("run", ""))) != [
+                "set -o pipefail",
+                'python3 tooling/scripts/ci/production_schema_gate.py'
+                ' --binary ./target/debug/staging-migrate --source-sha "$SOURCE_SHA"'
+                ' --mode "$MODE" --allow-unstaged "$ALLOW_UNSTAGED"',
+            ]):
         errors.append(f"{name}:schema-gate: gate step must run the reviewed script over pipefail "
                       "with the plan binding, the guarded SHA and the guard-verified waive flags")
     # The expected production identity is pinned independently of the secret
@@ -3883,11 +3964,22 @@ def production_roles_gate_errors(workflow, name="deploy-production.yml"):
             or (checkout.get("with") or {}).get("fetch-depth") != "0" \
             or "needs.guard.outputs.sha" not in str((checkout.get("with") or {}).get("ref", "")):
         errors.append(f"{name}:roles-gate: checkout must be pinned, credentialless, full-depth and on the guarded SHA")
-    if not str(tooling.get("uses", "")).startswith("actions/checkout@") \
-            or (tooling.get("with") or {}).get("persist-credentials") != "false" \
-            or (tooling.get("with") or {}).get("path") != "tooling" \
-            or "github.sha" not in str((tooling.get("with") or {}).get("ref", "")):
-        errors.append(f"{name}:roles-gate: tooling checkout must be pinned, credentialless and on the workflow commit")
+    expected_tooling = {
+        "ref": "${{ github.sha }}",
+        "path": "tooling",
+        "persist-credentials": "false",
+        "fetch-depth": "1",
+        "sparse-checkout": (
+            "/scripts/ci/roles_gate.py\n"
+            "/scripts/ci/production_schema_gate.py\n"
+            "/scripts/ci/staging_schema_gate.py\n"
+            "/scripts/ci/schema_gate_common.py\n"
+            "/scripts/script_intake.py\n"
+        ),
+        "sparse-checkout-cone-mode": "false",
+    }
+    if not str(tooling.get("uses", "")).startswith("actions/checkout@") or tooling.get("with") != expected_tooling:
+        errors.append(f"{name}:roles-gate: tooling checkout must use only the reviewed paths at the workflow commit")
     if ("needs.guard.outputs.sha" not in str(sha_check.get("env", ""))
             or "git rev-parse HEAD" not in str(sha_check.get("run", ""))):
         errors.append(f"{name}:roles-gate: SHA check must pin the step to the guarded SHA")
@@ -7838,6 +7930,29 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(file=file_name, mutation=label):
                     self.assertNotEqual(check(changed), [])
 
+    def test_staging_voice_move_sparse_checkout_loads_entry_points(self):
+        steps = self.workflows["staging-voice-move.yml"]["jobs"]["verify-lease"]["steps"]
+        paths = steps[0]["with"]["sparse-checkout"].splitlines()
+        entries = {shlex.split(step["run"])[1] for step in steps if step.get("run", "").startswith("node ")}
+        self.assertTrue(entries)
+        # Import each entry from just the checkout's files. Importing the
+        # modules bypasses their direct-invocation lease commands.
+        load = """
+globalThis.fetch = () => { throw new Error("Unexpected fetch during voice lease import"); };
+for (const entry of process.argv.slice(2)) await import("./" + entry);
+"""
+        with tempfile.TemporaryDirectory(prefix="staging-voice-move-checkout-") as directory:
+            for pattern in paths:
+                self.assertRegex(pattern, r"\A/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.(?:mjs|ts|json)\Z")
+                path = pattern[1:]
+                target = Path(directory) / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / path).read_bytes())
+            result = subprocess.run(["node", "--input-type=module", "-e", load, "sparse-checkout-probe", *sorted(entries)],
+                                    cwd=directory, env={"PATH": os.environ["PATH"]},
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_staging_automod_preview_requires_protected_opt_in(self):
         name = "staging-automod-preview.yml"
         self.assertEqual(workflow_policy_errors(self.workflows), [])
@@ -7872,6 +7987,27 @@ class WorkflowTests(unittest.TestCase):
         lock = workflows[name]["concurrency"]
         lock["group"] = lock["group"].replace("staging-automod-refused-{0}-{1}", PRE_REAPER_QUEUE)
         self.assertIn(f"{name}: the PRE sweep queue must remain exclusive", staging_pre_reaper_errors(workflows))
+
+    def test_reviewed_staging_authorize_checkout(self):
+        workflow = self.workflows["staging-migrate-reviewed.yml"]
+        checkout = workflow["jobs"]["authorize"]["steps"][0]
+        self.assertEqual(checkout["with"], {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": "false",
+            "fetch-depth": "0",
+            "sparse-checkout": "scripts\n.github/staging-apply\n",
+        })
+        self.assertEqual(reviewed_migrate_errors(workflow), [])
+        for key, value in (
+                ("fetch-depth", "1"),
+                ("sparse-checkout", "scripts\n"),
+                ("sparse-checkout", ".github/staging-apply\n"),
+                ("sparse-checkout", "scripts\n.github/staging-apply\ndocs\n")):
+            with self.subTest(key=key, value=value):
+                changed = deepcopy(workflow)
+                changed["jobs"]["authorize"]["steps"][0]["with"][key] = value
+                self.assertEqual(reviewed_migrate_errors(changed),
+                                 ["reviewed staging migration workflow contract changed"])
 
     def test_staging_pre_reaper_is_dormant(self):
         self.assertEqual(staging_pre_reaper_errors(self.workflows), [])
@@ -8458,8 +8594,7 @@ class WorkflowTests(unittest.TestCase):
                     label,
                 )
                 self.assertTrue(workflow_policy_errors(changed), label)
-        # Any other workflow mentioning the gate at all is a forwarding
-        # route, whatever the surrounding shape.
+        # Rehearsal inputs must never be forwarded to other workflows.
         for name in ("check.yml",):
             with self.subTest(forwarded=name):
                 changed = deepcopy(workflows)
@@ -8467,6 +8602,22 @@ class WorkflowTests(unittest.TestCase):
                 job.setdefault("env", {})["FORWARD"] = "${{ inputs.inject_error_rate_spike }}"
                 self.assertTrue(staging_error_rate_gate_errors(changed))
                 self.assertTrue(workflow_policy_errors(changed))
+
+    def test_soak_checkout_import_does_not_allow_error_rate_gate_execution(self):
+        self.assertEqual(staging_error_rate_gate_errors(self.workflows), [])
+        diagnostic = (f"{STAGING_SOAK}: error-rate gate marker {ERROR_RATE_GATE_SCRIPT} "
+                      "outside deploy-staging/deploy-production")
+        for job in ("begin", "finish"):
+            with self.subTest(job=job):
+                changed = deepcopy(self.workflows)
+                steps = changed[STAGING_SOAK]["jobs"][job]["steps"]
+                steps.append({"run": f"node wrangler/scripts/{ERROR_RATE_GATE_SCRIPT}"})
+                self.assertIn(diagnostic, staging_error_rate_gate_errors(changed))
+
+        changed = deepcopy(self.workflows)
+        checkout = changed[STAGING_SOAK]["jobs"]["begin"]["steps"][1]["with"]
+        checkout["sparse-checkout"] += f"/wrangler/scripts/{ERROR_RATE_GATE_SCRIPT}\n"
+        self.assertIn(diagnostic, staging_error_rate_gate_errors(changed))
 
     def test_production_fault_inputs_absent_and_recovery_chain_stays_red(self):
         text = (ROOT / ".github/workflows/deploy-production.yml").read_text()
@@ -9444,6 +9595,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(transaction["env"].get("RELEASE_PREFLIGHT_EPOCH"), "${{ needs.release-prepare.outputs.epoch }}")
 
     def test_soak_rejects_unsafe_handoffs(self):
+        self.assertTrue(admitted_soak(self.workflows))
         for mutate in (
             lambda w: w["deploy-production.yml"]["jobs"]["soak"]["secrets"].pop("STAGING_METRICS_SCRAPE_TOKEN"),
             lambda w: w[STAGING_SOAK]["jobs"]["finish"]["needs"].remove("voice"),
@@ -9456,6 +9608,19 @@ class WorkflowTests(unittest.TestCase):
             self.assertFalse(admitted_soak(changed))
         start_upload = self.workflows[STAGING_SOAK]["jobs"]["begin"]["steps"][-1]
         self.assertEqual(start_upload["if"], "always() && steps.staging-use-begin.outcome != 'skipped'")
+
+    def test_soak_rejects_checkout_missing_a_transitive_import(self):
+        self.assertTrue(admitted_soak(self.workflows))
+        for job in ("begin", "finish"):
+            with self.subTest(job=job):
+                changed = deepcopy(self.workflows)
+                steps = changed[STAGING_SOAK]["jobs"][job]["steps"]
+                checkout = deepcopy(steps[1])  # Break the YAML alias to mutate only this job.
+                paths = checkout["with"]["sparse-checkout"].splitlines(keepends=True)
+                paths.remove("/wrangler/src/metrics-scrape.ts\n")
+                checkout["with"]["sparse-checkout"] = "".join(paths)
+                steps[1] = checkout
+                self.assertFalse(admitted_soak(changed))
 
     def test_production_route_is_automatic_or_dispatch_and_gated(self):
         production = self.workflows["deploy-production.yml"]
@@ -9470,6 +9635,17 @@ class WorkflowTests(unittest.TestCase):
             workflow["jobs"]["soak"] = soak_view(self.workflows)
             change(workflow)
             return production_errors(workflow)
+
+        self.assertEqual(mutated(lambda w: None), [])
+        checkout_error = "deploy-production.yml:soak: tooling must come from the workflow head without persisted credentials"
+        for option, value in (("ref", "refs/heads/main"), ("persist-credentials", "true"),
+                              ("fetch-depth", "2"), ("sparse-checkout-cone-mode", "true"),
+                              ("sparse-checkout", "/wrangler/scripts/staging-use-pipeline.mjs\n")):
+            with self.subTest(checkout_option=option):
+                self.assertIn(checkout_error, mutated(
+                    lambda w: w["jobs"]["soak"]["steps"][0]["with"].update({option: value})))
+        self.assertIn(checkout_error, mutated(
+            lambda w: w["jobs"]["soak"]["steps"][0].update({"uses": "actions/checkout@main"})))
 
         for trigger in ("push", "pull_request", "schedule", "workflow_run", "workflow_call"):
             with self.subTest(trigger=trigger):
@@ -9556,9 +9732,46 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["schema-gate"].__setitem__("environment", "production-migrate-apply"),
             lambda w: w["jobs"]["schema-gate"].__setitem__("if", "github.ref == 'refs/heads/main'"),
             lambda w: w["jobs"]["schema-gate"].__setitem__("needs", "production"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][1]["with"].pop("sparse-checkout"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][1]["with"].__setitem__(
+                "sparse-checkout-cone-mode", "true"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][1]["with"].__setitem__(
+                "ref", "${{ needs.guard.outputs.sha }}"),
             lambda w: w["jobs"]["production"].__setitem__("needs", "guard"),
             lambda w: w["jobs"]["production"].__setitem__("needs", ["schema-gate"]),
             lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__(
+                "run", w["jobs"]["schema-gate"]["steps"][4]["run"].replace(
+                    "python3 tooling/scripts/", "python3 scripts/")),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__(
+                "run", w["jobs"]["schema-gate"]["steps"][4]["run"].replace(
+                    "python3 tooling/", "PYTHONPATH=scripts python3 tooling/")),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
+                "PYTHONPATH", "scripts"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4]["env"].__setitem__('BASH_ENV', 'scripts/evil.sh'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4]["env"].__setitem__('PATH', './bin:/usr/bin'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4]["env"].__setitem__('LD_PRELOAD', './evil.so'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__('if', 'false'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__('continue-on-error', True),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__('working-directory', 'scripts'),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("env", {"PYTHONPATH": "scripts"}),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("continue-on-error", True),
+            lambda w: w["jobs"]["schema-gate"].__setitem__(
+                "defaults", {"run": {"working-directory": "scripts"}}),
+            lambda w: w.__setitem__("env", {"PYTHONPATH": "scripts"}),
+            lambda w: w.__setitem__("defaults", {"run": {"shell": "sh"}}),
+            lambda w: w["jobs"]["schema-gate"]["steps"][3].__setitem__(
+                "run", w["jobs"]["schema-gate"]["steps"][3]["run"] + '\necho "BASH_ENV=$PWD/evil.sh" >> "$GITHUB_ENV"'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][2].__setitem__(
+                "run", w["jobs"]["schema-gate"]["steps"][2]["run"] + "cp scripts/ci/production_schema_gate.py tooling/scripts/ci/\n"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][3].__setitem__("env", {"RUSTFLAGS": "-C link-arg=x"}),
+            lambda w: w["jobs"]["schema-gate"]["steps"][0]["with"].__setitem__("persist-credentials", "true"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][0].__setitem__("uses", "actions/checkout@v7"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][1].__setitem__("uses", "actions/checkout@v7"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][0]["with"].__setitem__("ref", "${{ github.sha }}"),
+            lambda w: w["jobs"]["schema-gate"]["container"].__setitem__("env", {"PYTHONPATH": "scripts"}),
+            lambda w: w["jobs"]["schema-gate"]["container"].__setitem__("options", "--env BASH_ENV=x"),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("services", {"db": {"image": "x"}}),
             lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
                 "LEAK", "${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}"),
             lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
@@ -9609,6 +9822,35 @@ class WorkflowTests(unittest.TestCase):
             changed = copy.deepcopy(production)
             mutate(changed)
             self.assertNotEqual(production_roles_gate_errors(changed), [])
+
+    def test_production_roles_gate_tooling_checkout_is_exact(self):
+        import copy
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_roles_gate_errors(production), [])
+        tooling = production["jobs"]["roles-gate"]["steps"][1]["with"]
+        sparse_paths = tooling["sparse-checkout"]
+        for key, value in (
+            ("ref", "${{ needs.guard.outputs.sha }}"),
+            ("path", "source"),
+            ("persist-credentials", "true"),
+            ("fetch-depth", "0"),
+            ("sparse-checkout", None),
+            ("sparse-checkout", sparse_paths.replace("/scripts/script_intake.py\n", "")),
+            ("sparse-checkout", sparse_paths + "/scripts/\n"),
+            ("sparse-checkout-cone-mode", "true"),
+            ("filter", "tree:0"),
+        ):
+            with self.subTest(key=key, value=value):
+                changed = copy.deepcopy(production)
+                changed_tooling = changed["jobs"]["roles-gate"]["steps"][1]["with"]
+                if value is None:
+                    del changed_tooling[key]
+                else:
+                    changed_tooling[key] = value
+                self.assertEqual(production_roles_gate_errors(changed), [
+                    "deploy-production.yml:roles-gate: tooling checkout must use only the reviewed paths "
+                    "at the workflow commit",
+                ])
 
     def test_production_deploy_needs_prod_roles_gate(self):
         production = self.workflows["deploy-production.yml"]
@@ -10003,6 +10245,23 @@ class WorkflowTests(unittest.TestCase):
                 prod_job, stag_job = migrate["jobs"][job_id], staging["jobs"][job_id]
                 self.assertEqual(prod_job["if"], stag_job["if"])
                 self.assertEqual(prod_job.get("runs-on"), stag_job.get("runs-on"))
+
+    def test_staging_rollback_proof_and_alert_checkout_only_their_scripts(self):
+        jobs = self.workflows["staging-rollback-drill.yml"]["jobs"]
+        for job_id in ("proof", "alert"):
+            with self.subTest(job=job_id):
+                options = deepcopy(jobs[job_id]["steps"][0]["with"])
+                patterns = options.pop("sparse-checkout", "").splitlines()
+                self.assertEqual(patterns, [
+                    "/scripts/rollback_proof.py",
+                    "/scripts/script_intake.py",
+                    "/scripts/incident_issue.py",
+                ])
+                self.assertEqual(options, {
+                    "persist-credentials": "false",
+                    "fetch-depth": "1",
+                    "sparse-checkout-cone-mode": "false",
+                })
 
     def test_staging_rollback_drill_shape_is_pinned(self):
         workflows = self.workflows
@@ -10500,6 +10759,13 @@ class WorkflowTests(unittest.TestCase):
             "extra step": lambda w: job(w)["steps"].append({"run": "echo done"}),
             "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
                 {"persist-credentials": "true"}),
+            "changed checkout pin": lambda w: job(w)["steps"][0].update({"uses": "actions/checkout@v7"}),
+            "fetch filter override": lambda w: job(w)["steps"][0]["with"].update({"filter": "blob:none"}),
+            "cone mode": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout-cone-mode": "true"}),
+            "full checkout": lambda w: job(w)["steps"][0]["with"].pop("sparse-checkout"),
+            "broader checkout": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout": "/scripts/\n"}),
+            "missing transitive import": lambda w: job(w)["steps"][0]["with"].update(
+                {"sparse-checkout": "\n".join(PRIVACY_VERIFY_READ_PATHS[:-1]) + "\n"}),
             "extra secret": lambda w: job(w)["steps"][1]["env"].update(
                 {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
             "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
@@ -10536,6 +10802,34 @@ class WorkflowTests(unittest.TestCase):
         del missing["staging-privacy-verify-read.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_privacy_verify_read_starts_with_only_checkout_files(self):
+        checkout = self.workflows["staging-privacy-verify-read.yml"]["jobs"]["read"]["steps"][0]["with"]
+        self.assertEqual(checkout["sparse-checkout-cone-mode"], "false")
+        git_env = {"PATH": os.environ.get("PATH", os.defpath), "GIT_ALLOW_PROTOCOL": "file",
+                   "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        with tempfile.TemporaryDirectory(prefix="privacy-read-checkout-") as directory:
+            root = Path(directory) / "checkout"
+
+            def git(*args, stdin=None):
+                result = subprocess.run(
+                    ["git", "-c", f"safe.directory={ROOT}", *args], env=git_env,
+                    input=stdin, capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout
+
+            git("clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(root))
+            git("-C", root, "sparse-checkout", "set", "--no-cone", "--stdin", stdin=checkout["sparse-checkout"])
+            git("-C", root, "checkout", "--quiet", "--detach", "HEAD")
+            tracked = git("-C", root, "ls-files", "-z").split("\0")
+            materialized = {path for path in tracked if path and (root / path).is_file()}
+            self.assertEqual(materialized, {pattern[1:] for pattern in PRIVACY_VERIFY_READ_PATHS})
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", "scripts/staging_privacy_verify_read.py", "--help"],
+                cwd=root, env={}, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_staging_retention_census_shape_is_pinned(self):
         workflows = self.workflows
@@ -10757,6 +11051,30 @@ class WorkflowTests(unittest.TestCase):
         del missing["staging-ownership-status.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_inventory_sparse_checkout_is_pinned(self):
+        workflow = self.workflows["staging-ownership-status.yml"]
+        checkout = workflow["jobs"]["inventory"]["steps"][0]["with"]
+        self.assertEqual(checkout.get("sparse-checkout-cone-mode"), "false")
+        patterns = checkout["sparse-checkout"]
+        dependency = "/scripts/build_identity.py\n"
+        self.assertIn(dependency, patterns)
+        self.assertEqual(staging_ownership_status_errors(workflow), [])
+
+        for label, replacement in (
+            ("full tree", {}),
+            ("cone mode", {"sparse-checkout": patterns, "sparse-checkout-cone-mode": "true"}),
+            ("extra path", {"sparse-checkout": patterns + "/wrangler/\n", "sparse-checkout-cone-mode": "false"}),
+            ("missing transitive import", {"sparse-checkout": patterns.replace(dependency, ""),
+                                           "sparse-checkout-cone-mode": "false"}),
+        ):
+            with self.subTest(change=label):
+                mutant = deepcopy(workflow)
+                mutant_checkout = mutant["jobs"]["inventory"]["steps"][0]["with"]
+                mutant_checkout.pop("sparse-checkout")
+                mutant_checkout.pop("sparse-checkout-cone-mode")
+                mutant_checkout.update(replacement)
+                self.assertTrue(staging_ownership_status_errors(mutant))
 
     def test_slow_burn_tracker_reads_staging_bearer_and_isolates_fixtures(self):
         workflows = self.workflows

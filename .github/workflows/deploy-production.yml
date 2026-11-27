@@ -990,6 +990,12 @@ jobs:
           path: tooling
           persist-credentials: false
           fetch-depth: 1
+          # The schema gate imports schema_gate_common, which imports script_intake.
+          sparse-checkout: |
+            /scripts/ci/production_schema_gate.py
+            /scripts/ci/schema_gate_common.py
+            /scripts/script_intake.py
+          sparse-checkout-cone-mode: false
       - name: Deploy SHA must be exact
         env:
           SOURCE_SHA: ${{ needs.guard.outputs.sha }}
@@ -1068,6 +1074,14 @@ jobs:
           path: tooling
           persist-credentials: false
           fetch-depth: 1
+          # Keep the role verifier and its local Python imports together.
+          sparse-checkout: |
+            /scripts/ci/roles_gate.py
+            /scripts/ci/production_schema_gate.py
+            /scripts/ci/staging_schema_gate.py
+            /scripts/ci/schema_gate_common.py
+            /scripts/script_intake.py
+          sparse-checkout-cone-mode: false
       - name: Deploy SHA must be exact
         env:
           SOURCE_SHA: ${{ needs.guard.outputs.sha }}
