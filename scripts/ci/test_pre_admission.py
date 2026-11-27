@@ -10,7 +10,8 @@ from uuid import UUID
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_admission import AdmissionRecord, SettlementEvidence, SettlementSource, StartupAdmission
-    from pre_start_stop import Deployment, ExternalStop, Operation, PrivateRuntime, ProtectedPre, WorkerUpload
+    from pre_start_stop import (Deployment, EffectWindow, ExternalStop, Operation, PrivateRuntime,
+                                ProtectedPre, WorkerUpload)
     from pre_target import Inventory, Target, TargetError, verify_cleanup
 
 
@@ -139,16 +140,19 @@ class StartupAdmissionTests(unittest.TestCase):
         external_stop = Mock(spec_set=ExternalStop)
         external_stop.arm.return_value = True
         external_stop.fence.return_value = True
+        window = EffectWindow(TARGET, TARGET.expires_at)
         start = ProtectedPre(TARGET, authorize=lambda t, op: (t, op) == (TARGET, Operation.START),
-                             admission=self.authority, runtime=runtime, external_stop=external_stop)
+                             admission=self.authority, runtime=runtime, external_stop=external_stop,
+                             effect_window=window)
         stop = ProtectedPre(TARGET, authorize=lambda t, op: (t, op) == (TARGET, Operation.STOP),
                             admission=StartupAdmission(self.store, self.observe),
                             runtime=runtime, external_stop=external_stop)
 
-        def reply_after_close(target, start_id, _upload):
-            deployment = Deployment(target, start_id, UUID(int=2), UUID(int=3))
+        def reply_after_close(effect_window, start_id, _upload):
+            self.assertEqual(effect_window, window)
+            deployment = Deployment(effect_window.target, start_id, UUID(int=2), UUID(int=3))
             self.assertFalse(stop.stop())
-            self.assertEqual(self.store.read(target), AdmissionRecord(target, start_id, closed=True))
+            self.assertEqual(self.store.read(TARGET), AdmissionRecord(TARGET, start_id, closed=True))
             return deployment
 
         upload = Mock(spec_set=WorkerUpload, target=TARGET)
@@ -171,7 +175,7 @@ class StartupAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(TargetError, "^pre_start_not_admitted$"):
             start.start(upload)
         verify_cleanup(TARGET, replace(inventory, startup_settled=self.authority.startup_settled(TARGET)))
-        runtime.create_private.assert_called_once_with(TARGET, reply.start_id, upload)
+        runtime.create_private.assert_called_once_with(window, reply.start_id, upload)
 
     def test_only_affirmative_exact_post_close_evidence_settles(self):
         self.authority.admit_start(TARGET)
