@@ -68,6 +68,12 @@ class WorkerUpload:
     content_type: str
     body: bytes = field(repr=False)
 
+    @property
+    def supports_discord_fixture_overrides(self) -> bool:
+        # The verified predecessor's Worker drops both DISCORD_GATEWAY_URL and
+        # DISCORD_API_BASE from the default Container environment.
+        return False
+
     def require_unrouted(self, *, observed_target, complete, workers_dev, preview_urls, routes, custom_domains):
         """Check fresh, authenticated ingress observations for this reservation.
 

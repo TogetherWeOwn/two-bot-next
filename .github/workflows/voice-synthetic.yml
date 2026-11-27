@@ -199,6 +199,10 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          sparse-checkout: |
+            /scripts/staging_voice_synthetic.py
+            /scripts/script_intake.py
+          sparse-checkout-cone-mode: false
       - name: Run the staging voice synthetic
         id: voice
         env:

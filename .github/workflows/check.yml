@@ -3044,6 +3044,8 @@ jobs:
         env:
           RUST_TOOLCHAIN: "1.100.0" # Match rust-toolchain.toml; floating stable can drift.
           RUST_COMPONENTS: ''
+          # The digest-pinned job image already contains this exact toolchain.
+          TWO_RUSTUP_NO_UPDATE: '1'
         run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -4163,7 +4165,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: .github/scripts
+          # Publish needs only the script. Include Git's root metadata in the
+          # same blob fetch to avoid separate lazy fetches during checkout.
+          sparse-checkout: |
+            /.gitattributes
+            /.gitignore
+            /.github/scripts/pr_evidence.py
+          sparse-checkout-cone-mode: false
           persist-credentials: false
       - env:
           GH_TOKEN: ${{ github.token }}
