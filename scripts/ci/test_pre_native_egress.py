@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_native_egress import (
-        API, COLD, FAULTS, GATEWAY, KEEPALIVE, PATHS, Endpoint, EgressObservation,
+        API, COLD, FAULTS, GATEWAY, KEEPALIVE, Endpoint, EgressObservation,
         LaunchObservation, Listener, Policy, PolicyObservation, Process,
         Reservation, verify_effective_launch_controls,
     )
@@ -33,9 +33,9 @@ class Trace:
         reservation = FIRST if attempt.target == FIRST.target else RETAINED
         replacement = attempt.path == KEEPALIVE
         namespace = f"net:{reservation.target.run_id}:{int(replacement)}"
-        fault = FAULTS.index(attempt.fault) + 1 if attempt.fault else 0
-        offset = 100 * (fault + 2 * replacement) if fault else 0
-        event = offset + (20 if replacement else 10)
+        fault = attempt.fault or attempt.baseline_for
+        offset = 100 * (FAULTS.index(fault) + 1) if fault else 0
+        event = offset + (20 if replacement else 15 if attempt.fault else 10)
         return reservation.postgres, namespace, 2 if replacement else 1, event
 
     def policy(self, attempt):
@@ -71,11 +71,11 @@ class EffectiveLaunchControlsTests(unittest.TestCase):
             first, retained, digest=digest, observe_policy=self.trace.policy, probe=self.trace.probe,
         )
 
-    def rejects(self, reason, *, policy=None, launch=None, path=COLD, fault=None, target=RETAINED.target):
+    def rejects(self, reason, *, policy=None, launch=None, path=COLD, fault=None):
         def only_trial(mutate):
             def change(reading):
                 attempt = reading.attempt
-                if mutate and (attempt.target, attempt.path, attempt.fault) == (target, path, fault):
+                if mutate and (attempt.target, attempt.path, attempt.fault) == (RETAINED.target, path, fault):
                     return mutate(reading)
                 return reading
             return change
@@ -87,21 +87,23 @@ class EffectiveLaunchControlsTests(unittest.TestCase):
 
     def test_requires_each_reservation_path_and_fault(self):
         self.assertIsNone(self.verify())
-        self.assertEqual(
-            [(attempt.target, attempt.path, attempt.fault) for attempt in self.trace.attempts],
-            [(reservation.target, path, fault)
-             for reservation in (FIRST, RETAINED) for path in PATHS for fault in (None, *FAULTS)],
-        )
+        scenarios = [(COLD, None, None), (KEEPALIVE, None, None)]
+        for fault in FAULTS:
+            scenarios.extend([(COLD, None, fault), (COLD, fault, None), (KEEPALIVE, fault, None)])
+        self.assertEqual([(a.target, a.path, a.fault, a.baseline_for) for a in self.trace.attempts],
+                         [(r.target, *scenario) for r in (FIRST, RETAINED) for scenario in scenarios])
 
     def test_rejects_invalid_pins_and_reservation_collisions(self):
-        for collision in (replace(RETAINED, target=replace(FIRST.target, shape=RETAINED.target.shape)),
-                          replace(RETAINED, postgres=FIRST.postgres)):
-            with self.assertRaisesRegex(TargetError, "^pre_egress_reservation_collision$"):
-                self.verify(retained=collision)
-        with self.assertRaisesRegex(TargetError, "^pre_egress_invalid_digest_pin$"):
-            self.verify(digest="latest")
-        with self.assertRaisesRegex(TargetError, "^pre_egress_invalid_reservation$"):
-            self.verify(retained=FIRST)
+        colliding = replace(FIRST.target, shape=RETAINED.target.shape)
+        for args, reason in (
+            ({"retained": replace(RETAINED, target=colliding)}, "reservation_collision"),
+            ({"retained": replace(RETAINED, postgres=FIRST.postgres)}, "reservation_collision"),
+            ({"retained": replace(RETAINED, postgres=Endpoint("tcp", "169.254.169.254", 80))}, "invalid_reservation"),
+            ({"retained": replace(RETAINED, postgres=Endpoint("tcp", "127.0.0.1", 8081))}, "invalid_reservation"),
+            ({"retained": FIRST}, "invalid_reservation"), ({"digest": "latest"}, "invalid_digest_pin"),
+        ):
+            with self.assertRaisesRegex(TargetError, f"^pre_egress_{reason}$"):
+                self.verify(**args)
 
     def test_rejects_wrong_effective_settings_and_digest(self):
         for field, value, reason in (
@@ -122,16 +124,16 @@ class EffectiveLaunchControlsTests(unittest.TestCase):
             (lambda r: replace(r, listener=replace(r.listener, namespace="other")), "listener_not_ready"),
             (lambda r: replace(r, listener=replace(r.listener, ready_at=r.event)), "listener_not_ready"),
             (lambda r: replace(r, forced_from=None), "keepalive_trigger_unconfirmed"),
-            (lambda r: replace(r, forced_from=9), "stale_keepalive_restart"),
+            (lambda r: replace(r, forced_from=9), "keepalive_trigger_unconfirmed"),
             (lambda r: replace(r, path=COLD), "launch_unconfirmed"),
             (lambda r: replace(r, refusal="missing_policy"), "process_unconfirmed"),
         ):
             with self.subTest(reason=reason):
                 self.rejects(reason, path=KEEPALIVE, launch=mutate)
         self.rejects("stale_keepalive_restart", path=KEEPALIVE,
-                     policy=lambda r: replace(r, policy=replace(r.policy, generation=1)),
-                     launch=lambda r: replace(r, process=replace(r.process, generation=1),
-                                              egress=replace(r.egress, generation=1)))
+                     policy=lambda r: replace(r, policy=replace(r.policy, generation=1)))
+        self.rejects("stale_keepalive_restart", path=KEEPALIVE,
+                     policy=lambda r: replace(r, policy=replace(r.policy, enforced_at=8)))
 
     def test_rejects_unenforced_policy_and_broad_or_cross_reservation_rules(self):
         for fields, reason in (
@@ -158,9 +160,12 @@ class EffectiveLaunchControlsTests(unittest.TestCase):
         self.rejects("public_traffic_unconfirmed", launch=lambda r: replace(r, public_discord_packets=1))
 
     def test_refusal_must_affirm_zero_starts_on_each_path(self):
-        for path in PATHS:
+        for path in (COLD, KEEPALIVE):
             for fault in FAULTS:
                 with self.subTest(path=path, fault=fault):
+                    if path == KEEPALIVE:
+                        self.rejects("keepalive_trigger_unconfirmed", path=path, fault=fault,
+                                     launch=lambda r: replace(r, forced_from=1))
                     for fields in ({"process_starts": 1}, {"refusal": "other"},
                                    {"process": object()}, {"egress": object()}):
                         self.rejects("refusal_unconfirmed", path=path, fault=fault,
