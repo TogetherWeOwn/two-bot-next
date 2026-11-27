@@ -168,7 +168,8 @@ class OperatorRehearsalTests(unittest.TestCase):
         self.assertIn("edited", trigger["types"], "A description-only edit needs a fresh run without a push.")
         self.assertFalse({"paths", "paths-ignore"} & trigger.keys())
         self.assertEqual(workflow["concurrency"], {
-            "group": "pr-evidence-${{ github.event.pull_request.number || github.sha }}",
+            "group": "pr-evidence-${{ github.event_name == 'push' && 'main' || "
+                     "github.event.pull_request.number || github.sha }}",
             "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
         })
         job = workflow["jobs"]["pr-evidence"]
