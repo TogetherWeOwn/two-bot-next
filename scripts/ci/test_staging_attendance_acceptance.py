@@ -371,13 +371,17 @@ class AcceptanceTests(unittest.TestCase):
         args = ["finalized", "--rollout", "rollout", "--observed", "observed", "--plan", "plan", "--execute"]
         refused = (1, "", "FAIL: staging lease did not cover the probe\n")
         future_readback = START + timedelta(seconds=admitted_at - START.timestamp() + 0.25)
+        stale_expiry = int((START.timestamp() + 1800) * 1000)
 
         cases = [
-            ("coherent", latest_start - 0.75, 0.25, {}, {}, True),
+            # Both cases have half a second of slack before arming the alarm.
+            ("one millisecond inside after arming", latest_start - 0.5, 0.499, {}, {}, True),
+            ("cutoff reached while arming", latest_start - 0.5, 0.5, {}, {}, False),
+            # The receipt covered a probe when observed, but the lease expired before entry.
+            ("stale readback at entry", admitted_at, 0, {}, {"expiresAt": stale_expiry}, False),
             ("deadline equals expiry", latest_start, 0, {}, {}, False),
             ("active but too short", latest_start + 0.5, 0, {}, {}, False),
             ("expired during setup", expires + 1, 0, {}, {}, False),
-            ("cutoff crossed while arming", latest_start - 0.5, 0.5, {}, {}, False),
             ("observation after local time", latest_start - 0.5, 0,
              {"observedAt": observed_at(future_readback)}, {}, False),
             ("acquisition after observation", admitted_at, 0, {},
@@ -439,6 +443,7 @@ class AcceptanceTests(unittest.TestCase):
         other_rollout = {**ROLLOUT, "worker_version": "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
                          "revision": "b" * 40, "build_id": "1234-2", "deploy_id": "2026.11.24.2+bbbbbbb"}
         no_traffic = Mock(side_effect=AssertionError("unexpected staging request"))
+        rehearsal = {}
 
         with (TemporaryDirectory() as directory,
               patch.object(acceptance.time, "time") as clock,
@@ -447,10 +452,10 @@ class AcceptanceTests(unittest.TestCase):
             observed_path = Path(directory) / "observed.json"
             plan_path = Path(directory) / "plan.json"
             rollout_path.write_text(json.dumps(ROLLOUT), encoding="utf-8")
+            plan_path.write_text(json.dumps(PLAN), encoding="utf-8")
 
-            def run(phase, observed, check, plan):
+            def run(phase, observed, check):
                 observed_path.write_text(json.dumps(observed), encoding="utf-8")
-                plan_path.write_text(json.dumps(plan), encoding="utf-8")
                 args = [phase, "--rollout", str(rollout_path), "--observed", str(observed_path), "--plan", str(plan_path)]
                 if phase != "cleanup":
                     args.append("--execute")
@@ -468,8 +473,8 @@ class AcceptanceTests(unittest.TestCase):
                     observed.update(attendance_read=phase in ("pending", "finalized"),
                                     primary_fixture="pending" if phase == "pending" else "finalized")
                     lifecycle = observed["lifecycle"]
-                    lifecycle["use"]["expiresAt"] = int((START.timestamp() + 7200) * 1000)
-                    plan = plan_for_observation(observed)
+                    lifecycle["observedAt"] = (START + timedelta(minutes=minutes_after_start)).isoformat(
+                        timespec="milliseconds").replace("+00:00", "Z")
                     if phase == "cleanup":
                         lifecycle.update(action="release", running=False)
                         lifecycle["use"]["phase"] = "released"
@@ -486,25 +491,34 @@ class AcceptanceTests(unittest.TestCase):
                             record.update(deploymentId=other_rollout["worker_version"], sha=other_rollout["revision"])
                         # The substitute is internally valid under its own receipt.
                         acceptance.validate_configuration(phase, ORIGIN, other_rollout, other_observed)
-                        self.assertEqual(run(phase, other_observed, no_traffic, plan),
+                        self.assertEqual(run(phase, other_observed, no_traffic),
                                          (1, "", "FAIL: configuration is for a different staging build\n"))
 
                     stale_fixture = {**observed, "fixture_event_key": "attendance-acceptance:earlier"}
-                    self.assertEqual(run(phase, stale_fixture, no_traffic, plan),
+                    self.assertEqual(run(phase, stale_fixture, no_traffic),
                                      (1, "", "FAIL: synthetic fixture event did not match the rehearsal plan\n"))
 
                     check, reads, readies = self.signed_peer(phase) if expected_reads else (no_traffic, [], [])
-                    status, stdout, stderr = run(phase, observed, check, plan)
+                    status, stdout, stderr = run(phase, observed, check)
                     lines = stdout.splitlines()
                     self.assertEqual((status, lines[-1], stderr), (0, f"PASS: attendance {phase}", ""))
                     if expected_reads:
-                        self.assertEqual([decode_json(line) for line in lines[:-1]], [signed_receipt(phase, plan)])
+                        receipts = [decode_json(line) for line in lines[:-1]]
+                        self.assertEqual(receipts, [signed_receipt(phase, PLAN)])
+                        observed["signed_receipt"] = receipts[0]
                     else:
                         self.assertEqual(lines, ["PASS: attendance cleanup"])
                     self.assertEqual(reads, expected_reads)
                     self.assertEqual(len(readies), len(expected_reads) + 1 if expected_reads else 0)
+                    rehearsal[phase] = observed
 
         no_traffic.assert_not_called()
+        self.assertEqual(self.offline(PLAN, rehearsal), (0, "PASS: attendance rehearsal\n", ""))
+        for fixture_rows in (1, -1, 0.0, False, "0", None):
+            with self.subTest(fixture_rows=fixture_rows):
+                cleanup = {**rehearsal["cleanup"], "fixture_rows": fixture_rows}
+                self.assertEqual(self.offline(PLAN, {**rehearsal, "cleanup": cleanup}),
+                                 (1, "", "FAIL: cleanup readback is incomplete\n"))
 
     @staticmethod
     def observations(plan, acquired):
