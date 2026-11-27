@@ -10,9 +10,18 @@ jobs:
     permissions: &read_permissions {contents: read, actions: read}
     outputs: {policy: "${{ steps.guard.outputs.policy }}"}
     steps:
-      - &checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with: {ref: "${{ github.sha }}", persist-credentials: false, fetch-depth: 1}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: "${{ github.sha }}"
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/build_identity.py
+            /scripts/production_ownership_status.py
+            /scripts/script_intake.py
+            /scripts/staging_rollout.py
+            /scripts/worker_container_rollback.py
       - name: Verify dispatch and production Environment before admission
         id: guard
         env:
@@ -32,7 +41,8 @@ jobs:
     timeout-minutes: 4
     permissions: *read_permissions
     steps:
-      - *checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: "${{ github.sha }}", persist-credentials: false, fetch-depth: 1}
       - name: Recheck current main and production Environment
         env:
           GH_TOKEN: ${{ github.token }}
