@@ -20,6 +20,7 @@ UTC_INSTANT = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2
                          r"(?:\.([0-9]+))?(?:Z|[+-]00:?00)")
 WINDOW_FIELDS = ("environment", "build_revision", "build_id", "deploy_id", "image_digest",
                  "worker_version", "application_id", "start", "end")
+IDENTITY_FIELDS = WINDOW_FIELDS[:-2]
 SIGNALS = ("ready", "gateway_resumed", "shard_closed", "gateway_reconnect_failed",
            "identify_planned", "resume_planned")
 GATEWAY_MISMATCHES = ("service_mismatch", "stale_evidence", "mixed_build", "build_mismatch")
@@ -74,6 +75,23 @@ def serving_window(value):
             or env not in ("staging", "production") or start >= end):
         raise ValueError
     return {**{key: value[key] for key in WINDOW_FIELDS}, "start": format_utc(start), "end": format_utc(end)}
+
+
+def serving_window_interrupted(readbacks, expected):
+    if not isinstance(readbacks, list):
+        raise ValueError
+    start, end = utc_instant(expected["start"]), utc_instant(expected["end"])
+    fields = {*IDENTITY_FIELDS, "utc"}
+    interrupted = False
+    for readback in readbacks:
+        if not isinstance(readback, dict) or readback.keys() != fields:
+            raise ValueError
+        if readback["environment"] != expected["environment"] or not start <= utc_instant(readback["utc"]) <= end:
+            raise ValueError
+        observed = serving_window(dict(readback, start=expected["start"], end=expected["end"]))
+        if observed != expected:
+            interrupted = True
+    return interrupted
 
 
 def help_observation(report):
@@ -270,14 +288,29 @@ def main(argv=None):
     except (OSError, RecursionError, ValueError):
         print(json.dumps({"error": "handoff unreadable or missing a complete expected serving window"}))
         return 2
+    try:
+        interrupted = serving_window_interrupted(handoff.get("serving_readbacks", []), expected)
+    except ValueError:
+        print(json.dumps({"error": "handoff contains invalid serving readbacks"}))
+        return 2
 
-    rows = {kind: observation(kind, parse, path, bindings.get(kind), expected) for kind, parse, path in (
+    sources = (
         ("help", help_observation, args.help_report), ("naming", naming_observation, args.naming_report),
         ("gateway", gateway_observation, args.gateway_report),
-    )}
+    )
+    rows = {}
+    for kind, parse, path in sources:
+        if interrupted and path is not None:
+            rows[kind] = {"status": "mismatched", "reason": "serving identity changed during the expected window",
+                          "needed": NEEDED[kind]}
+        else:
+            rows[kind] = observation(kind, parse, path, bindings.get(kind), expected)
     rows["gateway"]["endpoint_denial"] = "unverified"
     rows["gateway"]["endpoint_denial_needed"] = "Explicit passive evidence of gateway endpoint rejection."
-    print(json.dumps({"expected": expected, "observations": rows}, indent=2))
+    report = {"expected": expected, "observations": rows}
+    if interrupted:
+        report["window_status"] = "interrupted"
+    print(json.dumps(report, indent=2))
     return 0
 
 
