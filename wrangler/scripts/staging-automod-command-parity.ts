@@ -7,7 +7,7 @@ const DISABLED = Object.freeze({ verdict: "disabled" } as const);
 const PASS = Object.freeze({ verdict: "pass" } as const);
 const FAIL = Object.freeze({ verdict: "fail" } as const);
 
-// Pin the same wire schema as staging-automod-publication.ts and the preview spec.
+// Pin the same wire schema as ../src/staging-automod-publication.ts and the preview spec.
 const description = "Preview which automod filter fires on text. Smallest synthetic phrase; do not paste personal data.";
 type Option = Readonly<{
   name: string;
@@ -63,20 +63,14 @@ function matchesOption(value: unknown, expected: Option): boolean {
     && emptyLocalizations(value.name_localizations) && emptyLocalizations(value.description_localizations);
 }
 
-function guildOnly(row: Record<string, unknown>): boolean {
-  const { dm_permission: dm, contexts, integration_types: installations } = row;
-  const guildContext = Array.isArray(contexts) && contexts.length === 1 && contexts[0] === 0;
-  return (dm === undefined || dm === false) && (contexts === undefined || guildContext)
-    && (dm === false || guildContext)
-    && (installations === undefined || (Array.isArray(installations) && installations.length === 1 && installations[0] === 0));
-}
-
 function matchesCommand(row: Record<string, unknown>, pin: CommandRevision): boolean {
   const readOptions = row.options;
+  const installations = row.integration_types;
   return row.id === pin.id && row.version === pin.version && row.name === target.name && row.type === target.type
     && row.description === description && row.default_member_permissions === "32"
     && (row.default_permission === undefined || row.default_permission === true)
-    && guildOnly(row) && (row.nsfw === undefined || row.nsfw === false) && row.handler == null
+    && (installations == null || (Array.isArray(installations) && installations.length === 1 && installations[0] === 0))
+    && (row.nsfw === undefined || row.nsfw === false) && row.handler == null
     && emptyLocalizations(row.name_localizations) && emptyLocalizations(row.description_localizations)
     && Array.isArray(readOptions) && readOptions.length === options.length
     && options.every((expected, index) => matchesOption(readOptions[index], expected));
@@ -88,6 +82,8 @@ function matchesRegistry(value: unknown, pin: CommandRevision): boolean {
   const names = new Set<string>();
   let matched = false;
   for (const row of value) {
+    // The authenticated guild endpoint and exact row IDs establish the only
+    // effective context. Discord applies dm_permission and contexts to global commands.
     if (!record(row) || row.application_id !== target.applicationId || row.guild_id !== target.guildId
       || !snowflake(row.id) || !snowflake(row.version) || typeof row.name !== "string"
       || row.name.length === 0 || row.name.length > 32 || row.name.trim() !== row.name

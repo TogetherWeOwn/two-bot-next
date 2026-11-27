@@ -7,14 +7,7 @@ const target = {
   applicationId: "1469137636663758888", guildId: "1545644954272137297", name: "automod-preview", type: 1,
 };
 const pin = { id: "123456789012345678", version: "223456789012345678" };
-const command = {
-  ...fixture.replies.preview,
-  ...pin,
-  application_id: target.applicationId,
-  guild_id: target.guildId,
-  dm_permission: false,
-  contexts: [0],
-};
+const command = fixture.replies.preview;
 
 function verify(readback: unknown) {
   return verifyStagingAutomodCommandParity({ enabled: true, pin, readGuildCommands: async () => readback });
@@ -44,8 +37,18 @@ test("passes one exact pinned command in the complete guild list", async () => {
   assert.equal(reads, 1);
   assert.deepEqual(result, { verdict: "pass" });
   assert.ok(Object.isFrozen(result));
-  assert.deepEqual(await verify([{ ...command, contexts: undefined }]), result);
-  assert.deepEqual(await verify([{ ...command, dm_permission: undefined }]), result);
+});
+
+test("uses the authenticated guild scope for effective guild-only contexts", async () => {
+  for (const globalFields of [
+    { dm_permission: undefined, contexts: undefined },
+    { dm_permission: true, contexts: null },
+    { dm_permission: false, contexts: [0] },
+  ]) {
+    assert.deepEqual(await verify([{ ...command, ...globalFields }]), { verdict: "pass" });
+    assert.deepEqual(await verify([{ ...command, ...globalFields, guild_id: undefined }]), { verdict: "fail" });
+    assert.deepEqual(await verify([{ ...command, ...globalFields, guild_id: pin.id }]), { verdict: "fail" });
+  }
 });
 
 test("refuses malformed, absent and ambiguous command sets", async () => {
@@ -86,11 +89,6 @@ test("refuses target, revision, description and permission drift", async () => {
     ["ordinary moderator default", { default_member_permissions: "8192" }],
     ["administrator-only default", { default_member_permissions: "0" }],
     ["legacy default overridden", { default_permission: false }],
-    ["legacy DM use", { dm_permission: true }],
-    ["bot DM context", { contexts: [0, 1] }],
-    ["private channel context", { contexts: [0, 2] }],
-    ["duplicate guild context", { contexts: [0, 0] }],
-    ["missing guild-only evidence", { dm_permission: undefined, contexts: undefined }],
     ["user installation", { integration_types: [0, 1] }],
     ["changed localization", { description_localizations: { en: "Preview automod" } }],
   ];
