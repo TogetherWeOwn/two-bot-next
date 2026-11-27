@@ -13,7 +13,7 @@ from scripts.ci.test_staging_pre_reaper_fixture import OPERATIONS, SyntheticStag
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_reaper_caller import CleanupClaim, ReaperReservation, reap_pre
     from pre_registry_cleanup import (
-        RegistryDisposition, RegistryReadback, RegistryReservation, registry_cleanup_disposition,
+        PublicationSettlement, RegistryDisposition, RegistryReadback, RegistryReservation, registry_cleanup_disposition,
     )
     from pre_sweep import SweepError, sweep_target
     from pre_target import Target
@@ -64,7 +64,8 @@ class SyntheticAuthority:
         return registry_cleanup_disposition(
             self.registry, adapter.inventory(target),
             RegistryReadback(target, self.registry.reference, self.registry_present),
-            now=trusted_now(), run_status=adapter.run_status(target), publication_settled=True,
+            now=trusted_now(), run_status=adapter.run_status(target),
+            publication_settlement=PublicationSettlement(self.registry),
         )
 
 

@@ -1,18 +1,23 @@
 """Exercise dormant PRE orchestration with synthetic authorities and runtime."""
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+import json
 from pathlib import Path
 import sys
+from threading import Barrier
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import MagicMock, Mock, call, patch
 from uuid import UUID
 
 from test_pre_admission import Store
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_admission import AdmissionRecord, SettlementEvidence, SettlementSource, StartupAdmission
-    from pre_start_stop import Deployment, EffectWindow, Endpoint, Operation, ProbeReply, ProtectedPre
+    from pre_ownership import OwnershipReply, bootstrap_fresh_ownership
+    from pre_start_stop import (Deployment, EffectWindow, Endpoint, OfflineExternalStop, Operation,
+                                ProbeReply, ProtectedPre)
     from pre_start_stop import StartupAdmission as AdmissionProtocol
     from pre_target import Inventory, Target, TargetError, verify_cleanup
 
@@ -20,6 +25,39 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.p
 PRE_SHAPES = ("0473/0465", "0475/0465")
 TARGET = Target("pre-fixture-test", 123, 1_800_000_000, PRE_SHAPES[0])
 START = UUID(int=1)
+ACTOR = "fixture:pre-start"
+OWNERSHIP_PATH = "/internal/ownership"
+
+
+def ownership_reply(deployment, owner, *, running=False, exact_takeover=None):
+    return OwnershipReply(200, json.dumps({
+        "deploymentId": str(deployment.worker_version), "owner": owner, "running": running,
+    }).encode(), exact_takeover)
+
+
+def ownership_replies(deployment):
+    fenced = {
+        "deploymentId": None, "epoch": 1, "phase": "fenced", "actor": ACTOR,
+        "timestamp": "2026-11-25T00:00:00.000Z", "oldEpoch": 0, "oldDeploymentId": None,
+    }
+    active = dict(fenced, deploymentId=str(deployment.worker_version), epoch=2, phase="active", oldEpoch=1)
+    return (ownership_reply(deployment, None, exact_takeover="1"),
+            ownership_reply(deployment, fenced), ownership_reply(deployment, active))
+
+
+def ownership_calls(deployment):
+    return [
+        call.ownership(deployment, "GET", OWNERSHIP_PATH, None),
+        call.ownership(deployment, "POST", OWNERSHIP_PATH, {"action": "fence", "expectedEpoch": 0, "actor": ACTOR}),
+        call.ownership(deployment, "POST", OWNERSHIP_PATH, {
+            "action": "takeover-exact", "expectedEpoch": 1, "actor": ACTOR,
+            "expectedDeploymentId": str(deployment.worker_version),
+        }),
+    ]
+
+
+def cleared(target):
+    return Inventory(target, None, None, 0, False, True, startup_settled=True, assigned_count=0)
 
 
 @dataclass(frozen=True)
@@ -31,7 +69,7 @@ class Upload:
 
 
 class PreFixture:
-    def __init__(self, target=TARGET):
+    def __init__(self, target=TARGET, *, external_stop=None):
         self.target = target
         self.window = EffectWindow(target, target.expires_at)
         self.deployment = Deployment(target, START, UUID(int=2), UUID(int=3))
@@ -44,9 +82,11 @@ class PreFixture:
         self.effects = Mock(admission=self.admission)
         self.now = target.started_at
         self.enclosing_cutoff = target.expires_at
+        self.external_stop = external_stop if external_stop is not None else OfflineExternalStop(lambda: self.now)
         self.armed = None
         self.fenced = False
         self.created = None
+        self.verified = None
         self.before_create = Mock()
         self.after_create = Mock()
         self.before_probe_reply = Mock()
@@ -58,39 +98,24 @@ class PreFixture:
 
     def arm(self, window, start_id):
         self.effects.arm(window, start_id)
-        if self.fenced or self.armed is not None:
-            return False
-        try:
-            window.require_open(self.now)
-        except TargetError:
-            return False
-        self.armed = (window, start_id)
-        return True
+        armed = self.external_stop.arm(window, start_id)
+        if armed:
+            self.armed = (window, start_id)
+        return armed
 
     def fence(self, target):
         self.effects.fence(target)
-        self.fenced = True
-        return True
+        confirmed = self.external_stop.fence(target)
+        if confirmed and target == self.target:
+            self.fenced = True
+        return confirmed
 
     def confirm_probe_active(self, target, start_id):
-        if self.armed is None or self.fenced:
-            return False
-        window, armed_start_id = self.armed
-        if window.target != target or armed_start_id != start_id:
-            return False
-        try:
-            window.require_open(self.now)
-        except TargetError:
-            return False
-        return self.now < min(window.cutoff, self.enclosing_cutoff)
+        return self.external_stop.confirm_probe_active(target, start_id) and self.now < self.enclosing_cutoff
 
     def allow_effect(self, target, start_id):
-        if self.fenced or self.armed is None:
+        if not self.external_stop.allows_effect(target, start_id):
             raise OSError("effect refused")
-        window, armed_start_id = self.armed
-        if window.target != target or armed_start_id != start_id:
-            raise OSError("effect refused")
-        window.require_open(self.now)
 
     def create_private(self, window, start_id, upload):
         self.before_create()
@@ -101,16 +126,31 @@ class PreFixture:
         self.effects.create(target, start_id, upload)
         self.created = replace(self.deployment, start_id=start_id)
         self.after_create()
-        return self.created
+        self.verified = self.created
+        return self.verified
 
     def probe(self, deployment, endpoint):
         self.allow_effect(deployment.target, deployment.start_id)
-        if deployment != self.created:
+        if deployment != self.verified:
             raise OSError("unbound deployment")
         self.effects.probe(deployment, endpoint)
         reply = self.reply
         self.before_probe_reply()
         return reply
+
+    def inject_ownership(self, replies):
+        replies = iter(replies)
+
+        def exchange(deployment, method, path, payload):
+            self.allow_effect(deployment.target, deployment.start_id)
+            self.effects.ownership(deployment, method, path, payload)
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        self.after_create.side_effect = lambda: bootstrap_fresh_ownership(
+            self.created, actor=ACTOR, exchange=exchange)
 
 
 class ProtectedPreTests(unittest.TestCase):
@@ -153,6 +193,93 @@ class ProtectedPreTests(unittest.TestCase):
         fixture.before_create.assert_not_called()
         self.assertEqual(fixture.effects.mock_calls,
                          [call.admission.admit_start(TARGET), call.arm(fixture.window, START)])
+
+    def test_claim_lookup_and_insert_share_one_critical_section(self):
+        authority = self.fixture.external_stop
+        events = Mock(lock=MagicMock(), claims=MagicMock(spec_set=dict), clock=Mock(return_value=TARGET.started_at))
+        window = self.fixture.window
+        events.claims.get.return_value = None
+        with (patch.object(authority, "_lock", events.lock), patch.object(authority, "_claims", events.claims),
+              patch.object(authority, "_clock", events.clock)):
+            self.assertTrue(authority.arm(window, START))
+        self.assertEqual(events.mock_calls, [call.lock.__enter__(), call.clock(),
+                         call.claims.get(TARGET.provider_names),
+                         call.claims.__setitem__(TARGET.provider_names, (window, START)),
+                         call.lock.__exit__(None, None, None)])
+
+    def test_colliding_scope_or_shape_cannot_create_fence_or_release_the_winner(self):
+        neighbors = (replace(TARGET, scope="pre-fixture-neighbor"), replace(TARGET, shape=PRE_SHAPES[1]))
+        for neighbor in neighbors:
+            with self.subTest(neighbor=neighbor):
+                self.assertEqual(neighbor.provider_names, TARGET.provider_names)
+                authority = OfflineExternalStop(lambda: TARGET.started_at)
+                rendezvous = Barrier(2, timeout=5)
+                fixtures = [PreFixture(target, external_stop=authority) for target in (TARGET, neighbor)]
+                with ThreadPoolExecutor(max_workers=2) as runners:
+                    starts = []
+                    for fixture in fixtures:
+                        fixture.effects.arm.side_effect = lambda *_: rendezvous.wait()
+                        controller = fixture.controller(fixture.authorize)
+                        starts.append(runners.submit(controller.start, fixture.upload))
+                    outcomes = [(fixture, start.exception()) for fixture, start in zip(fixtures, starts, strict=True)]
+                winners = [fixture for fixture, error in outcomes if error is None]
+                self.assertEqual(len(winners), 1)
+                winner = winners[0]
+                loser, refusal = next((fixture, error) for fixture, error in outcomes if fixture is not winner)
+                self.assertIsInstance(refusal, TargetError)
+                self.assertEqual(str(refusal), "pre_external_stop_unarmed")
+                loser.effects.create.assert_not_called()
+                loser_stop = loser.controller(lambda t, op: (t, op) == (loser.target, Operation.STOP))
+                self.assertFalse(loser_stop.stop())
+                loser.admission.close.assert_called_once_with(loser.target)
+                loser.admission.settle.assert_not_called()
+                self.assertFalse(authority.release(loser.target, START, inventory=cleared(loser.target)))
+                self.assertFalse(authority.allows_effect(loser.target, START))
+                winner_probe = winner.controller(winner.authorize)
+                self.assertEqual(winner_probe.probe(winner.deployment, Endpoint.HEALTH), winner.reply)
+
+    def test_release_requires_exact_fenced_claim_and_target_cleanup(self):
+        authority = self.fixture.external_stop
+        self.controller.start(self.fixture.upload)
+        self.assertFalse(authority.arm(self.fixture.window, START))
+        self.assertFalse(authority.arm(self.fixture.window, UUID(int=4)))
+        shortened = replace(self.fixture.window, cutoff=TARGET.started_at + 1)
+        self.assertFalse(authority.arm(shortened, START))
+        self.fixture.now = shortened.cutoff
+        self.assertTrue(authority.allows_effect(TARGET, START))
+        self.assertFalse(authority.allows_effect(TARGET, UUID(int=4)))
+        self.assertFalse(authority.release(TARGET, START, inventory=cleared(TARGET)))
+        self.assertTrue(self.controller.stop())
+        self.assertTrue(self.controller.stop())
+        self.assertFalse(authority.allows_effect(TARGET, START))
+        foreign = replace(TARGET, shape=PRE_SHAPES[1])
+        self.assertFalse(authority.arm(EffectWindow(foreign, foreign.expires_at), START))
+        self.assertFalse(authority.fence(foreign))
+        self.assertFalse(authority.release(foreign, START, inventory=cleared(foreign)))
+        self.assertFalse(authority.release(TARGET, UUID(int=4), inventory=cleared(TARGET)))
+        self.assert_refuses("pre_startup_unsettled", lambda: authority.release(
+            TARGET, START, inventory=replace(cleared(TARGET), startup_settled=False)))
+        successor = replace(TARGET, scope="pre-fixture-successor")
+        self.assert_refuses("wrong_pre_inventory_target", lambda: authority.release(
+            TARGET, START, inventory=cleared(successor)))
+        self.assertTrue(authority.release(TARGET, START, inventory=cleared(TARGET)))
+        self.assertFalse(authority.arm(self.fixture.window, START))
+        self.assertFalse(authority.arm(EffectWindow(foreign, foreign.expires_at), START))
+        self.assertTrue(authority.arm(EffectWindow(successor, successor.expires_at), START))
+        self.assertFalse(authority.fence(TARGET))
+        self.assertFalse(authority.release(TARGET, START, inventory=cleared(TARGET)))
+        self.assertTrue(authority.allows_effect(successor, START))
+
+    def test_pre_arm_fence_is_exact_and_distinct_names_can_be_claimed(self):
+        authority = self.fixture.external_stop
+        foreign = replace(TARGET, shape=PRE_SHAPES[1])
+        distinct = replace(TARGET, run_id=TARGET.run_id + 1)
+        self.assertFalse(authority.fence(foreign))
+        self.assertFalse(authority.arm(EffectWindow(foreign, foreign.expires_at), START))
+        self.assertEqual(self.controller.start(self.fixture.upload), self.fixture.deployment)
+        self.assertTrue(authority.arm(EffectWindow(distinct, distinct.expires_at), START))
+        self.assertTrue(authority.allows_effect(TARGET, START))
+        self.assertTrue(authority.allows_effect(distinct, START))
 
     def test_missing_or_unconfirmed_discord_overrides_refuse_before_admission(self):
         for capability in ({}, {"supports_discord_fixture_overrides": False}, {"supports_discord_fixture_overrides": 1}):
@@ -274,24 +401,28 @@ class ProtectedPreTests(unittest.TestCase):
         self.assert_refuses("pre_probe_unconfirmed", self.controller.probe, deployment, Endpoint.READINESS)
 
     def test_probe_acceptance_requires_active_reservation_at_reply(self):
-        for outcome in ("timely", "stopped", "expired", "enclosing_cutoff"):
+        for outcome in ("timely", "stopped", "expired", "armed_cutoff", "enclosing_cutoff"):
             with self.subTest(outcome=outcome):
                 fixture = PreFixture()
+                reply_cutoff = TARGET.expires_at
+                if outcome == "armed_cutoff":
+                    reply_cutoff -= 5
+                    fixture.window = EffectWindow(TARGET, reply_cutoff)
                 controller = fixture.controller(lambda t, op: t == TARGET and op in (Operation.START, Operation.PROBE))
                 stop = fixture.controller(lambda t, op: (t, op) == (TARGET, Operation.STOP))
                 deployment = controller.start(fixture.upload)
                 if outcome == "enclosing_cutoff":
-                    fixture.enclosing_cutoff = TARGET.expires_at - 5
-                    fixture.window = EffectWindow(TARGET, fixture.enclosing_cutoff)
-                fixture.now = fixture.enclosing_cutoff - 1
+                    reply_cutoff -= 5
+                    fixture.enclosing_cutoff = reply_cutoff
+                fixture.now = reply_cutoff - 1
                 fixture.reply = ProbeReply(200, deployment.worker_version, b'{"components":[["gateway","ready"]]}')
                 stop_results = []
 
                 def before_reply():
                     if outcome == "stopped":
                         stop_results.append(stop.stop())
-                    elif outcome in ("expired", "enclosing_cutoff"):
-                        fixture.now = fixture.enclosing_cutoff
+                    elif outcome in ("expired", "armed_cutoff", "enclosing_cutoff"):
+                        fixture.now = reply_cutoff
 
                 fixture.before_probe_reply.side_effect = before_reply
                 if outcome == "timely":
@@ -346,12 +477,13 @@ class ProtectedPreTests(unittest.TestCase):
                     deployment = start.start(fixture.upload)
                 self.assertEqual(deployment, fixture.deployment)
                 self.assertEqual(store.read(TARGET), AdmissionRecord(TARGET, deployment.start_id, closed=False))
-                self.assertFalse(fixture.fenced)
+                self.assertTrue(fixture.external_stop.allows_effect(deployment.target, deployment.start_id))
                 start_observer.assert_not_called()
 
                 proof_record = AdmissionRecord(deployment.target, proof_start_id, closed=True)
                 observe = Mock(side_effect=lambda _: SettlementEvidence(
-                    proof_record, SettlementSource.RUNTIME, startup_drained=True, restart_fenced=fixture.fenced))
+                    proof_record, SettlementSource.RUNTIME, startup_drained=True,
+                    restart_fenced=not fixture.external_stop.allows_effect(deployment.target, deployment.start_id)))
                 fixture.effects.attach_mock(observe, "observe")
                 resumed_admission = StartupAdmission(store, observe)
                 stop = ProtectedPre(TARGET, authorize=lambda t, op: (t, op) == (TARGET, Operation.STOP),
@@ -365,6 +497,74 @@ class ProtectedPreTests(unittest.TestCase):
                     TARGET: replace(closed, settled_by=SettlementSource.RUNTIME if settled else None),
                 })
                 self.assertIs(resumed_admission.startup_settled(TARGET), settled)
+
+    def test_bootstraps_archived_worker_before_owned_readiness(self):
+        for shape in PRE_SHAPES:
+            with self.subTest(shape=shape):
+                target = replace(TARGET, shape=shape)
+                fixture = PreFixture(target)
+                fixture.inject_ownership(ownership_replies(fixture.deployment))
+                controller = fixture.controller(fixture.authorize)
+                deployment = controller.start(fixture.upload)
+                self.assertEqual(deployment, fixture.deployment)
+                self.assertEqual(controller.probe(deployment, Endpoint.READINESS), fixture.reply)
+                self.assertEqual(fixture.effects.mock_calls, [
+                    call.admission.admit_start(target), call.arm(fixture.window, START),
+                    call.create(target, START, fixture.upload), *ownership_calls(deployment),
+                    call.probe(deployment, Endpoint.READINESS),
+                ])
+
+    def test_uncertain_archived_ownership_hands_off_to_independent_stop(self):
+        deployment = self.fixture.deployment
+        fresh, fenced, active = ownership_replies(deployment)
+        foreign = replace(deployment, worker_version=UUID(int=42))
+        ownerless = json.loads(fenced.body)["owner"]
+        owned = json.loads(active.body)["owner"]
+        cases = (
+            ("wrong Worker on GET", 0, ownership_reply(foreign, None, exact_takeover="1")),
+            ("redirected GET", 0, replace(fresh, status=302)),
+            ("missing exact capability", 0, replace(fresh, exact_takeover=None)),
+            ("missing owner", 0, replace(fresh, body=json.dumps({
+                "deploymentId": str(deployment.worker_version), "running": False,
+            }).encode())),
+            ("existing fence", 0, replace(fenced, exact_takeover="1")),
+            ("already running", 0, ownership_reply(deployment, None, running=True, exact_takeover="1")),
+            ("lost fence", 1, TimeoutError("synthetic fence reply lost")),
+            ("wrong Worker on fence", 1, ownership_reply(foreign, ownerless)),
+            ("wrong fence epoch", 1, ownership_reply(deployment, dict(ownerless, epoch=True))),
+            ("wrong previous fence epoch", 1, ownership_reply(deployment, dict(ownerless, oldEpoch=1))),
+            ("wrong fence actor", 1, ownership_reply(deployment, dict(ownerless, actor="fixture:other"))),
+            ("previous fence owner", 1, ownership_reply(
+                deployment, dict(ownerless, oldDeploymentId=str(foreign.worker_version)))),
+            ("duplicate fence fields", 1, replace(fenced, body=fenced.body.replace(
+                b'"epoch": 1', b'"epoch": 7, "epoch": 1'))),
+            ("lost takeover", 2, TimeoutError("synthetic takeover reply lost")),
+            ("takeover conflict", 2, replace(active, status=409)),
+            ("wrong Worker on takeover", 2, ownership_reply(foreign, owned)),
+            ("wrong active owner", 2, ownership_reply(deployment, dict(owned, deploymentId=str(foreign.worker_version)))),
+            ("uncommitted takeover", 2, ownership_reply(deployment, dict(owned, phase="fenced"))),
+            ("takeover already running", 2, ownership_reply(deployment, owned, running=True)),
+            ("oversized takeover", 2, replace(active, body=active.body + b" " * 4096)),
+        )
+        replies = (fresh, fenced, active)
+        for label, index, refusal in cases:
+            with self.subTest(label=label):
+                fixture = PreFixture()
+                fixture.inject_ownership((*replies[:index], refusal))
+                start = fixture.controller(lambda t, op: (t, op) == (TARGET, Operation.START))
+                probe = fixture.controller(lambda t, op: (t, op) == (TARGET, Operation.PROBE))
+                stop = fixture.controller(lambda t, op: (t, op) == (TARGET, Operation.STOP))
+                self.assert_refuses("pre_create_unconfirmed", start.start, fixture.upload)
+                self.assert_refuses("pre_probe_unconfirmed", probe.probe, deployment, Endpoint.READINESS)
+                self.assert_refuses("pre_start_not_admitted", start.start, fixture.upload)
+                self.assert_refuses("pre_operation_denied", start.stop)
+                self.assertTrue(stop.stop())
+                self.assertEqual(fixture.effects.mock_calls, [
+                    call.admission.admit_start(TARGET), call.arm(fixture.window, START),
+                    call.create(TARGET, START, fixture.upload), *ownership_calls(deployment)[:index + 1],
+                    call.admission.admit_start(TARGET), call.fence(TARGET), call.admission.close(TARGET),
+                    call.admission.settle(TARGET),
+                ])
 
     def test_lost_start_reply_requires_affirmative_exact_stop_evidence(self):
         cases = (

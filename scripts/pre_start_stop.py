@@ -11,10 +11,14 @@ provide that fence. There is no concrete provider adapter or workflow caller.
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from threading import Lock
 from typing import Protocol
 from uuid import UUID
 
-from pre_target import ProtectedRouteReadback, Target, TargetError, check_clock, confirm_protected_route, require
+from pre_target import (
+    Inventory, ProtectedRouteReadback, Target, TargetError, check_clock, confirm_protected_route,
+    require, verify_cleanup,
+)
 from staging_health_contract_probe import BODY_CAP, TIMEOUT_SECONDS
 
 
@@ -158,7 +162,8 @@ class ExternalStop(Protocol):
     Target. The runtime checks ownership and the fence at the effect boundary,
     including for delayed requests. Fence persists even if create never
     replied or never began. It prevents new effects and initiates stop of the
-    exact runtime, including internal keepalive. Repeating it is safe.
+    exact runtime, including internal keepalive, only for the claim holder.
+    Repeating it is safe. A conflicting reservation cannot release the names.
     The admission settlement observer verifies drain and no restart separately.
     """
 
@@ -174,6 +179,78 @@ class ExternalStop(Protocol):
         enclosing cutoff. Refuse if any of that state is unknown or stale.
         """
         ...
+
+
+class OfflineExternalStop:
+    """Model claims and fences for one fixed account in synthetic PRE tests.
+
+    Share one instance across the synthetic callers for that account. The
+    clock supplies trusted, nondecreasing time. Live adapters need durable
+    account-wide state and checks at the actual provider effect boundary.
+    """
+
+    def __init__(self, clock: Callable[[], int]):
+        self._clock = clock
+        self._lock = Lock()
+        self._claims: dict[tuple[str, str], tuple[EffectWindow, UUID]] = {}
+        self._fenced: set[Target] = set()
+
+    def _in_window(self, window: EffectWindow) -> bool:
+        now = self._clock()
+        try:
+            window.require_open(now)
+        except TargetError:
+            return False
+        return True
+
+    def arm(self, window: EffectWindow, start_id: UUID) -> bool:
+        if type(window) is not EffectWindow or type(start_id) is not UUID or not start_id.int:
+            return False
+        target = window.target
+        with self._lock:
+            if target in self._fenced or not self._in_window(window):
+                return False
+            names = target.provider_names
+            owner = self._claims.get(names)
+            if owner is not None:
+                if owner[0].target != target:
+                    self._fenced.add(target)
+                return False
+            self._claims[names] = (window, start_id)
+            return True
+
+    def fence(self, target: Target) -> bool:
+        if type(target) is not Target:
+            return False
+        with self._lock:
+            self._fenced.add(target)
+            owner = self._claims.get(target.provider_names)
+            return owner is not None and owner[0].target == target
+
+    def allows_effect(self, target: Target, start_id: UUID) -> bool:
+        """Model the check at a synchronous synthetic create or probe."""
+        if type(target) is not Target or type(start_id) is not UUID:
+            return False
+        with self._lock:
+            owner = self._claims.get(target.provider_names)
+            return (owner is not None and owner[0].target == target and owner[1] == start_id
+                    and target not in self._fenced and self._in_window(owner[0]))
+
+    def confirm_probe_active(self, target: Target, start_id: UUID) -> bool:
+        return self.allows_effect(target, start_id)
+
+    def release(self, target: Target, start_id: UUID, *, inventory: Inventory) -> bool:
+        """Release only the exact fenced claim after verified cleanup."""
+        if type(target) is not Target or type(start_id) is not UUID:
+            return False
+        with self._lock:
+            names = target.provider_names
+            owner = self._claims.get(names)
+            if owner is None or owner[0].target != target or owner[1] != start_id or target not in self._fenced:
+                return False
+            verify_cleanup(target, inventory)
+            del self._claims[names]
+            return True
 
 
 def _call(operation, *args, failure):

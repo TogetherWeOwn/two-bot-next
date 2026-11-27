@@ -99,6 +99,30 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertIn("DECISION_ARCHIVE_SHA256", restart["env"])
         self.assertIn("INVERSE_ARCHIVE_SHA256", restart["env"])
 
+    def test_release_plan_target_fingerprint_reaches_prepare_and_apply(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production.yml").read_text())
+        jobs = workflow["jobs"]
+        plan = jobs["release-plan"]
+        self.assertEqual(plan["outputs"].get("target-fingerprint"),
+                         "${{ steps.release-target.outputs.target-fingerprint }}")
+        producer = next(step for step in plan["steps"] if step.get("id") == "release-target")
+        self.assertEqual(producer["run"], "python3 scripts/production_release.py plan")
+        for phase in ("release-prepare", "release-apply"):
+            self.assertIn("release-plan", jobs[phase]["needs"], phase)
+            self.assertEqual(jobs[phase]["env"].get("RELEASE_TARGET_FINGERPRINT"),
+                             "${{ needs.release-plan.outputs.target-fingerprint }}", phase)
+
+    def test_release_retains_the_stop_intent_before_stopping(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production.yml").read_text())
+        prepare = workflow["jobs"]["release-prepare"]["steps"]
+        order = [step.get("name") for step in prepare]
+        retain = order.index("Retain the exact recovery stop intent")
+        self.assertLess(retain, order.index("Confirm the exact stopped writer"))
+        upload = prepare[retain]["with"]
+        self.assertEqual(upload["name"], "production-release-stop-intent-${{ github.run_id }}-${{ github.run_attempt }}")
+        self.assertEqual(upload["if-no-files-found"], "error")
+        self.assertTrue(upload["path"].endswith("/production-release-stop-intent.json"))
+
     def test_workflow_keeps_secrets_scoped_and_all_three_rollbacks_share_the_guard(self):
         path = ROOT / ".github/workflows"
         workflow = yaml.safe_load((path / "deploy-production-recovery.yml").read_text())
@@ -123,9 +147,7 @@ class RecoveryWiringTests(unittest.TestCase):
         pins = {"RELEASE_SHA": "candidate-sha", "RELEASE_PINS": "pins", "RELEASE_PLAN_ID": "plan-run-id",
                 "RELEASE_PREFLIGHT_EPOCH": "preflight-epoch", "RELEASE_STOPPED": "stopped",
                 "FORWARD_ARTIFACT_ID": "forward-artifact-id", "FORWARD_ARCHIVE_SHA256": "forward-archive-sha256",
-                "CANDIDATE_WORKER": "candidate-worker",
-                "PRODUCTION_HOST": "database-host", "PRODUCTION_DATABASE": "database-name",
-                "PRODUCTION_BRANCH_ID": "database-branch-id"}
+                "CANDIDATE_WORKER": "candidate-worker", "RELEASE_TARGET_FINGERPRINT": "target-fingerprint"}
         self.assertEqual(call["inputs"], {
             key: {"type": "string", "required": True} for key in pins.values()
         })
@@ -133,6 +155,8 @@ class RecoveryWiringTests(unittest.TestCase):
             variable: "${{ inputs." + pin + " }}" for variable, pin in pins.items()
         })
         jobs = callee["jobs"]
+        for job in jobs.values():
+            self.assertEqual(job["permissions"], {"contents": "read", "actions": "read"})
         prefix = "Production release / Recover production schema / "
         self.assertEqual(prefix + jobs["fence"]["name"], FENCE_JOB)
         self.assertEqual(prefix + jobs["inverse"]["name"], JOB)

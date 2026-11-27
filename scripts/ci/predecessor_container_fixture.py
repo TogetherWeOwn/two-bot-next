@@ -21,7 +21,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from pre_target import Inventory, Target, TargetError, check_inventory
 from script_intake import decode_legacy_json, unique_object
 
-from fixtures.predecessor_discord import GATEWAY, REST, TOKEN
+from fixtures.predecessor_discord import APP, GATEWAY, REST, TOKEN
+
 from fixtures.predecessor_snapshots import GUILD, schema_check, snapshot_sql
 
 
@@ -35,6 +36,7 @@ STAMPS = dict(zip(
     ("org.opencontainers.image.revision", "com.togetherweown.build-id",
      "com.togetherweown.deploy-id"),
 ))
+
 
 
 class Refused(Exception):
@@ -85,15 +87,24 @@ def verify_image(docker, pin, synthetic):
             and (synthetic or stamps["build_revision"] == SOURCE)
             and all(re.fullmatch(r"[A-Za-z0-9.+_-]{1,128}", value) and value != "unknown"
                     for value in stamps.values()), "invalid predecessor stamp pin")
-    image, = decode_json(docker("image", "inspect", pin["image_id"]))
+    inspected = docker("image", "inspect", pin["image_id"], missing_ok=True)
+    image_ref = pin["image_id"]
+    if not inspected:
+        # The containerd-backed Docker store addresses an OCI image by its
+        # manifest digest. The admitted manifest already binds the config.
+        image_ref = pin["manifest_digest"]
+        inspected = docker("image", "inspect", image_ref)
+    image, = decode_json(inspected)
     config = image["Config"]
     labels = config.get("Labels") or {}
-    require(image["Id"] == pin["image_id"] and image["Os"] == "linux"
+    descriptor = image.get("Descriptor") or {}
+    require(image["Id"] == image_ref and image["Os"] == "linux"
+            and (image_ref == pin["image_id"] or descriptor.get("digest") == image_ref)
             and image["Architecture"] == "amd64" and not config.get("Volumes")
             and (synthetic or config["Entrypoint"] == ["/home/nonroot/two-bot"])
             and all(labels.get(label) == stamps[key] for key, label in STAMPS.items()),
             "local image identity or stamps differ from the admitted pin")
-    return stamps
+    return image_ref, stamps
 
 
 def verify_support(docker, postgres, mock):
@@ -180,8 +191,11 @@ def run_endpoint(docker, image, postgres, mock_image, stamps, tip):
         env = {
             "DISCORD_GATEWAY_URL": GATEWAY,
             "DISCORD_API_BASE": REST,
+
             "LISTEN_ADDR": "127.0.0.1:8080",
             "DISCORD_TOKEN": TOKEN,
+            "DISCORD_APPLICATION_ID": APP,
+            "TWO_COMMANDS_PUBLISH_ON_BOOT": "1",
             "GUILD_ID": GUILD,
             "DATABASE_URL": "postgres://offline_bot:offline-fixture@127.0.0.1/postgres",
             "TWO_DATABASE_TLS": "local-only",
@@ -218,21 +232,26 @@ def run_endpoint(docker, image, postgres, mock_image, stamps, tip):
                                                        for name in ("database", "gateway"))
 
         wait_for(ready, "database and mock gateway did not become ready")
-        require(probe("mock", "/fixture") == [200, {"ready_sent": True}], "mock READY was not sent")
+        observed = probe("mock", "/fixture")
+        require(type(observed) is list and len(observed) == 2 and observed[0] == 200
+                and type(observed[1]) is dict
+                and observed[1].get("ready_sent") is True, "mock READY was not sent")
+        require(observed[1].get("rest_synced") is True, "mock REST command sync was not observed")
         require(sql("SELECT count(*) FROM gateway_sessions WHERE "
                     f"guild_id = '{GUILD}' AND shard_id = 0 "
                     "AND session_id = 'offline-fixture-session' AND seq = 1;") == "1",
                 "mock gateway checkpoint missing from the running database")
         require(sql(check) == "t", "PRE snapshot changed during startup")
     return {"cutover": tip, "store": 465, "process": "live", "database": "ready",
-            "mock_gateway": "checkpointed", "pre_ready_status": 503, "ready_status": 200}
+            "mock_gateway": "checkpointed", "mock_rest": "synced", "pre_ready_status": 503, "ready_status": 200}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
         "Provide a private JSON pin from the protected admission handoff with image_id "
         "(the admitted OCI config digest), manifest_digest, build_revision, build_id and deploy_id. "
-        "Load the admitted image unchanged on the local Docker daemon first. Supply trusted local "
+        "Load the admitted image unchanged on the local Docker daemon first. The daemon can "
+        "address it by the admitted config ID or the admitted OCI manifest digest. Supply trusted local "
         "image IDs for PostgreSQL 17 and a support image with Python 3. Use --synthetic only "
         "with a test double. The historical Worker cannot forward the loopback overrides."))
     parser.add_argument("--pin", type=Path, required=True)
@@ -263,16 +282,18 @@ def main():
                     return result.stdout
                 if missing_ok and (command[0] == "exec"
                                    or "No such container" in result.stderr
+                                   or (command[:2] == ("image", "inspect") and "No such image" in result.stderr)
                                    or "removal of container" in result.stderr):
                     return ""
                 raise Refused(f"Docker {command[0]} failed")
 
-            stamps = verify_image(docker, pin, args.synthetic)
+            image, stamps = verify_image(docker, pin, args.synthetic)
             verify_support(docker, args.postgres, args.mock_image)
-            endpoints = [run_endpoint(docker, pin["image_id"], args.postgres, args.mock_image,
+            endpoints = [run_endpoint(docker, image, args.postgres, args.mock_image,
                                       stamps, tip) for tip in (473, 475)]
         print(json.dumps({"scope": "direct-container-only", "synthetic_image": args.synthetic,
-                          "image_id": pin["image_id"], "admitted_manifest_digest": pin["manifest_digest"],
+                          "image_id": pin["image_id"], "docker_image_id": image,
+                          "admitted_manifest_digest": pin["manifest_digest"],
                           **stamps, "endpoints": endpoints}))
     except Refused as error:
         parser.exit(1, f"Fixture refused: {error}\n")

@@ -90,41 +90,46 @@ class RecoveryWorkflowTests(unittest.TestCase):
         stopped = {**self.ack, "deploymentId": self.pin.worker_version}
         env = {"RELEASE_STOPPED": json.dumps(stopped), "RELEASE_PREFLIGHT_EPOCH": "20",
                "FORWARD_ARTIFACT_ID": "789", "FORWARD_ARCHIVE_SHA256": "8" * 64, "CANDIDATE_WORKER": self.candidate[0],
-               "PRODUCTION_WORKER_URL": "https://fixture.invalid"}
+               "PRODUCTION_WORKER_URL": "https://fixture.invalid", "RELEASE_TARGET_FINGERPRINT": self.pin.database_fingerprint}
         return (release, run, plan_id, plan, artifact), document, env
 
     def test_admission_binds_the_rust_inverse_ledger_rows(self):
         case = self.case
         context, document, env = self.forward_fixture({**case["run"], "run_attempt": 1})
         release, run, plan_id, plan, artifact = context
-        with (patch.object(release_cli, "release_request", return_value=(release, run, plan_id, plan["target"])),
+        with (patch.object(release_cli, "release_request", return_value=(release, run, plan_id)),
               patch.multiple(preflight, authenticated_plan=Mock(return_value=(plan, artifact)), verify_environment=Mock()),
+              patch.object(preflight, "verify_check", side_effect=GateError("unapproved")) as check,
               patch.object(artifacts, "protected_job") as producer,
               patch.object(artifacts, "authentic_document", side_effect=GateError("unproved")) as authenticate,
               patch.object(recovery, "check_url") as provider_url):
-            with patch.object(preflight, "verify_check", side_effect=GateError("unapproved")) as check:
-                self.assertEqual(recovery.main(["fence"], env), 1)
-                check.assert_called_once()
-                self.assertEqual(check.call_args.args[2], "production-apply:321:" + "8" * 64)
-            with patch.object(release_cli, "approved_plan", return_value=(plan, artifact)):
-                self.assertEqual(recovery.main(["fence"], {**env, "RELEASE_PREFLIGHT_EPOCH": "19"}), 1)
-                producer.assert_not_called()
-                self.assertEqual(recovery.main(["fence"], env), 1)
-                authenticate.assert_called_once_with(run, artifacts.FORWARD_ARTIFACT, "789", "8" * 64, recovery.github)
-                provider_url.assert_not_called()
-                authenticate.side_effect, authenticate.return_value = None, document
-                pin, candidate, reviewed, approval, _ = recovery.release_admission(env)
-                self.assertEqual((pin, candidate, reviewed, approval["plan_archive_sha256"]),
-                                 (self.pin, self.candidate, plan, artifact["archive_digest"]))
-                for field, digest in case["source_ledger_digests"].items():
-                    authenticate.return_value = {**document, field: digest}
-                    with self.subTest(field=field), self.assertRaisesRegex(GateError, "production_forward_artifact_mismatch"):
-                        recovery.release_admission(env)
+            with self.assertRaisesRegex(GateError, "unapproved"):
+                release_cli.release_context(env)
+            check.assert_called_once()
+            self.assertEqual(check.call_args.args[2], "production-apply:321:" + "8" * 64)
+            check.reset_mock()
+
+            self.assertEqual(recovery.main(["fence"], {**env, "RELEASE_PREFLIGHT_EPOCH": "19"}), 1)
+            producer.assert_not_called()
+            authenticate.assert_not_called()
+            self.assertEqual(recovery.main(["fence"], env), 1)
+            producer.assert_called_once_with(run, recovery.github, artifacts.FORWARD_JOB, artifacts.FORWARD_STEPS)
+            authenticate.assert_called_once_with(run, artifacts.FORWARD_ARTIFACT, "789", "8" * 64, recovery.github)
+            provider_url.assert_not_called()
+            authenticate.side_effect, authenticate.return_value = None, document
+            pin, candidate, reviewed, approval, _ = recovery.release_admission(env)
+            self.assertEqual((pin, candidate, reviewed, approval["plan_archive_sha256"]),
+                             (self.pin, self.candidate, plan, artifact["archive_digest"]))
+            for field, digest in case["source_ledger_digests"].items():
+                authenticate.return_value = {**document, field: digest}
+                with self.subTest(field=field), self.assertRaisesRegex(GateError, "production_forward_artifact_mismatch"):
+                    recovery.release_admission(env)
+            check.assert_not_called()
 
     def test_restore_refuses_receipts_with_wrong_or_missing_ownership_epoch(self):
         run_env, run = release_run_fixture()
         context, forward, env = self.forward_fixture(run)
-        _, _, plan_id, plan, plan_artifact = context
+        release, _, plan_id, plan, plan_artifact = context
         jobs = [producer(run, artifacts.FORWARD_JOB, artifacts.FORWARD_STEPS),
                 producer(run, artifacts.JOB, (artifacts.WRITE_STEP, artifacts.UPLOAD_STEP))]
         bad_epoch = self.pin.fence_epoch + 2
@@ -161,8 +166,10 @@ class RecoveryWorkflowTests(unittest.TestCase):
                 boundary = Mock(side_effect=AssertionError("provider boundary reached"))
                 blocked = Mock(side_effect=AssertionError("unexpected provider, database or receipt operation"))
                 with (patch.object(staging_recovery_status, "gh", api),
-                      patch.multiple(recovery, release_context=Mock(return_value=context),
-                                     check_url=boundary, RollbackClient=blocked, read_status=blocked,
+                      patch.object(release_cli, "release_request", return_value=(release, run, plan_id)),
+                      patch.multiple(preflight, authenticated_plan=Mock(return_value=(plan, plan_artifact)),
+                                     verify_environment=Mock()),
+                      patch.multiple(recovery, check_url=boundary, RollbackClient=blocked, read_status=blocked,
                                      control_client=blocked, run_inverse=blocked, write_json=blocked),
                       redirect_stderr(StringIO())):
                     if admitted:
@@ -303,6 +310,78 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.rollback.restore_image.assert_called_once_with("test-image")
         self.control.assert_called_once_with("takeover-fenced", 21, expected_deployment=self.pin.worker_version)
         self.assertEqual(self.rollback.wait_stable.call_count, 2)
+
+    def test_restore_after_second_fence_refuses_the_old_handoff(self):
+        old_pin = replace(self.pin, fence_epoch=19)
+        old_ack = {**self.ack, "deploymentId": self.pin.worker_version,
+                   "owner": {**self.ack["owner"], "epoch": 19, "oldEpoch": 18}}
+        self.state["ownership"].update(epoch=20, phase="active", running=True)
+
+        def fence(*_args, **_kwargs):
+            self.state["ownership"].update(epoch=21, phase="fenced", running=False)
+            return self.ack
+
+        self.control.side_effect = fence
+        pin, ack = recovery.establish_fence(old_pin, self.candidate, self.observe, self.control)
+        self.assertEqual((pin, ack), (self.pin, self.ack))
+        self.control.assert_called_once_with("fence-exact", 20, expected_deployment=self.candidate[0])
+        self.control.reset_mock()
+        self.observe.reset_mock()
+
+        # Both handoffs have a matching inverse receipt. The live fence must
+        # still rule out the old handoff before any restore or takeover writes.
+        old_result = {**self.result, "fence_epoch": old_pin.fence_epoch}
+        inverse = Mock(side_effect=[old_result, self.result])
+        write_receipt = Mock()
+        approval = {"plan_run_id": self.case["admission"]["plan_run_id"]}
+        admission = (old_pin, self.candidate, self.case["plan"], approval, self.case["run"])
+        env = {"PRODUCTION_WORKER_URL": "https://fixture.invalid", "CLOUDFLARE_ACCOUNT_ID": "fixture",
+               "CLOUDFLARE_API_TOKEN": "fixture", "OWNERSHIP_CONTROL_TOKEN": "fixture", "RUNNER_TEMP": "fixture",
+               "ARTIFACT_ID": "987", "ARCHIVE_SHA256": "8" * 64}
+        application = recovery.APPLICATIONS["production"]
+        retained_image = f"registry.cloudflare.com/fixture/{application}@{pin.image_digest}"
+
+        def take_over(*_args, **_kwargs):
+            self.rollback.wait_stable.assert_not_called()
+            self.state["ownership"].update(epoch=22, phase="active", owner_actor=pin.actor)
+
+        def record_stable_polls(_version, _started_at):
+            self.rollback.evidence["stable_polls"] = 3
+
+        self.control.side_effect = take_over
+        self.rollback.post_worker_restore.side_effect = lambda version: self.state["worker"].update(
+            version_id=version, sha=pin.rollback_sha)
+        self.rollback.restore_image.side_effect = lambda image: self.state["container"].update(
+            image_digest=image.rsplit("@", 1)[-1])
+        self.rollback.evidence = {}
+        self.rollback.wait_stable.side_effect = record_stable_polls
+        with (patch.multiple(recovery, release_admission=Mock(return_value=admission),
+                             authenticated_inverse=inverse, write_json=write_receipt,
+                             read_status=Mock(side_effect=lambda *_args, **_kwargs: self.observe()),
+                             check_url=Mock(return_value=env["PRODUCTION_WORKER_URL"]), RollbackClient=Mock(),
+                             validate_receipt_against_live=Mock(), control_client=Mock(return_value=self.control),
+                             Rollback=Mock(return_value=self.rollback)), patch("sys.stderr")):
+            stale = {**env, "STOPPED_FENCE_ACK": json.dumps(old_ack), "ARTIFACT_ID": "986",
+                     "ARCHIVE_SHA256": "7" * 64}
+            self.assertEqual(recovery.main(["restore"], stale), 1)
+            inverse.assert_called_once_with(old_pin, approval, "986", "7" * 64, stale)
+            self.observe.assert_called_once_with()
+            self.assertEqual(self.rollback.mock_calls, [])
+            self.control.assert_not_called()
+            write_receipt.assert_not_called()
+
+            current = {**env, "STOPPED_FENCE_ACK": json.dumps(ack)}
+            self.assertEqual(recovery.main(["restore"], current), 0)
+            self.assertEqual(inverse.call_count, 2)
+            inverse.assert_called_with(pin, approval, "987", "8" * 64, current)
+
+        self.rollback.post_worker_restore.assert_called_once_with(pin.worker_version)
+        self.rollback.restore_image.assert_called_once_with(retained_image)
+        self.control.assert_called_once_with("takeover-fenced", 21, expected_deployment=pin.worker_version)
+        self.rollback.wait_stable.assert_called_once_with(pin.worker_version, self.rollback.now.return_value)
+        write_receipt.assert_called_once_with(Path(env["RUNNER_TEMP"]) / "production-release-restored.json",
+                                              {"approval": approval, "inverse": self.result, "provider": self.state,
+                                               "stable_polls": 3})
 
     def test_normal_paths_refuse_cross_schema_and_release_owned_fences(self):
         owner = {"owner": {"phase": "active", "actor": "fixture"}}

@@ -1,13 +1,19 @@
 """Test the dormant rehearsal without a Docker daemon or a predecessor image."""
 
-from contextlib import closing
+from base64 import b64encode
+from contextlib import closing, redirect_stdout
 from dataclasses import replace
 from http.server import ThreadingHTTPServer
+from io import StringIO
 import json
+from pathlib import Path
+from secrets import token_bytes
 import socket
 import sqlite3
 import subprocess
 import sys
+from subprocess import CompletedProcess
+from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
 from unittest.mock import Mock, patch
@@ -15,7 +21,7 @@ from uuid import UUID
 
 import predecessor_container_fixture as fixture
 from fixtures import predecessor_discord as discord
-from fixtures.predecessor_discord import COMMANDS, Discord
+from fixtures.predecessor_discord import COMMANDS, READY_SENT, RELEASE, Discord
 from fixtures.predecessor_snapshots import GUILD, PROJECTIONS
 from pre_target import Inventory, Resource, Target
 from test_pre_start_stop import Endpoint, PreFixture, ProbeReply
@@ -183,20 +189,67 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Opt-in direct-container rehearsal", result.stdout)
 
+
+    def test_mock_refuses_non_loopback_namespace_before_listening(self):
+        with (patch.object(socket, "if_nameindex", return_value=[(1, "lo"), (2, "eth0")]),
+              patch.object(discord, "ThreadingHTTPServer") as server,
+              self.assertRaisesRegex(SystemExit, "loopback-only network namespace")):
+            discord.serve()
+        server.assert_not_called()
+
+    def test_mock_gateway_accepts_twilight_identify(self):
+        for token in (f"Bot {fixture.TOKEN}", fixture.TOKEN, "Bot foreign"):
+            client, server = socket.socketpair()
+            with self.subTest(token=token), client, server, client.makefile("rb") as inbound:
+                worker = Thread(target=Discord, args=(server, None, None), daemon=True)
+                client.settimeout(2)
+                RELEASE.set()
+                worker.start()
+                try:
+                    nonce = b64encode(token_bytes(16))
+                    client.sendall(b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                                   b"Sec-WebSocket-Key: " + nonce + b"\r\n\r\n")
+                    self.assertIn(b"101", inbound.readline())
+                    while inbound.readline() not in (b"\r\n", b""):
+                        pass
+                    self.assertEqual(inbound.read(1), b"\x81")
+                    self.assertEqual(json.loads(inbound.read(inbound.read(1)[0]))["op"], 10)
+                    payload = json.dumps({"op": 2, "d": {"token": token}}).encode()
+                    client.sendall(bytes([0x81, 0x80 | len(payload)]) + b"\0" * 4 + payload)
+                    if token == f"Bot {fixture.TOKEN}":
+                        self.assertEqual(inbound.read(2), b"\x81\x7e")
+                        length = int.from_bytes(inbound.read(2), "big")
+                        self.assertEqual(json.loads(inbound.read(length))["t"], "READY")
+                    else:
+                        client.shutdown(socket.SHUT_WR)
+                        worker.join(2)
+                        self.assertFalse(worker.is_alive())
+                        self.assertFalse(READY_SENT.is_set())
+                finally:
+                    client.close()
+                    inbound.close()
+                    worker.join(2)
+                    RELEASE.clear()
+                    READY_SENT.clear()
+
     def test_mock_command_publication(self):
+        self.addCleanup(discord.REST_SYNCED.clear)
         for token, body, status in [(fixture.TOKEN, b'[{"name":"help"}]', b"200"),
+                                    (fixture.TOKEN, b"[]", b"200"),
                                     ("foreign", b"[]", b"401"), (fixture.TOKEN, b"{}", b"400"),
                                     (fixture.TOKEN, b'[{"k":1,"k":2}]', b"400"),
                                     (fixture.TOKEN, b'[{"k":NaN}]', b"400"),
                                     (fixture.TOKEN, b'[{"k":1e400}]', b"400")]:
             client, server = socket.socketpair()
             with self.subTest(status=status), client, server:
+                discord.REST_SYNCED.clear()
                 request = (f"PUT {COMMANDS} HTTP/1.1\r\nConnection: close\r\n"
                            f"Authorization: Bot {token}\r\nContent-Length: {len(body)}\r\n\r\n").encode()
                 client.sendall(request + body)
                 Discord(server, None, None)
                 response = client.recv(4096)
                 self.assertEqual(response.split(b" ", 2)[1], status)
+                self.assertEqual(discord.REST_SYNCED.is_set(), status == b"200" and body != b"[]")
                 if status == b"200":
                     self.assertEqual(json.loads(response.split(b"\r\n\r\n")[1]), json.loads(body))
 
@@ -204,8 +257,8 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
         config = {"Entrypoint": ["/home/nonroot/two-bot"],
                   "Labels": {label: STAMPS[key] for key, label in fixture.STAMPS.items()}}
         image = {"Id": IMAGE, "Os": "linux", "Architecture": "amd64", "Config": config}
-        docker = Mock(side_effect=lambda *_: json.dumps([image]))
-        self.assertEqual(fixture.verify_image(docker, PIN, False), STAMPS)
+        docker = Mock(side_effect=lambda *_, **__: json.dumps([image]))
+        self.assertEqual(fixture.verify_image(docker, PIN, False), (IMAGE, STAMPS))
         for stamp in (None, "foreign-build"):
             config["Labels"][fixture.STAMPS["build_id"]] = stamp
             with self.subTest(stamp=stamp), self.assertRaisesRegex(fixture.Refused, "identity or stamps"):
@@ -248,6 +301,61 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                                                expected_app_id=APP_ID, readback=observed)
                 docker.assert_not_called()
 
+    def test_requires_admitted_manifest_on_containerd(self):
+        config = {"Entrypoint": ["/home/nonroot/two-bot"],
+                  "Labels": {label: STAMPS[key] for key, label in fixture.STAMPS.items()}}
+        manifest = PIN["manifest_digest"]
+        image = {"Id": manifest, "Os": "linux", "Architecture": "amd64", "Config": config}
+        def inspect(_command, _action, reference, *, missing_ok=False):
+            if reference == IMAGE:
+                self.assertTrue(missing_ok)
+                return ""
+            self.assertEqual(reference, manifest)
+            return json.dumps([image])
+
+        docker = Mock(side_effect=inspect)
+        for descriptor in (None, IMAGE, manifest):
+            image["Descriptor"] = {"digest": descriptor}
+            with self.subTest(descriptor=descriptor):
+                if descriptor == manifest:
+                    self.assertEqual(fixture.verify_image(docker, PIN, False), (manifest, STAMPS))
+                else:
+                    with self.assertRaisesRegex(fixture.Refused, "identity or stamps"):
+                        fixture.verify_image(docker, PIN, False)
+
+    def test_cli_rehearses_the_admitted_manifest_when_config_id_is_unknown(self):
+        manifest = PIN["manifest_digest"]
+        image = {"Id": manifest, "Descriptor": {"digest": manifest}, "Os": "linux",
+                 "Architecture": "amd64", "Config": {"Entrypoint": ["/home/nonroot/two-bot"],
+                     "Labels": {label: STAMPS[key] for key, label in fixture.STAMPS.items()}}}
+        inspected = []
+
+        def docker(command, **_):
+            self.assertEqual(command[5:7], ["image", "inspect"])
+            reference, = command[7:]
+            inspected.append(reference)
+            if reference == IMAGE:
+                return CompletedProcess(command, 1, "", f"Error response from daemon: No such image: {IMAGE}")
+            self.assertEqual(reference, manifest)
+            return CompletedProcess(command, 0, json.dumps([image]), "")
+
+        with TemporaryDirectory() as directory:
+            pin = Path(directory) / "pin.json"
+            pin.write_text(json.dumps(PIN))
+            args = ["fixture", "--pin", str(pin), "--postgres", IMAGE, "--mock-image", IMAGE]
+            output = StringIO()
+            with (patch.object(fixture.sys, "argv", args), patch.object(fixture.signal, "signal"),
+                  patch.object(fixture.subprocess, "run", side_effect=docker),
+                  patch.object(fixture, "verify_support"), patch.object(fixture, "run_endpoint") as rehearse,
+                  redirect_stdout(output)):
+                rehearse.side_effect = [{"cutover": 473}, {"cutover": 475}]
+                fixture.main()
+
+        self.assertEqual(inspected, [IMAGE, manifest])
+        self.assertEqual([call.args[1:] for call in rehearse.call_args_list],
+                         [(manifest, IMAGE, IMAGE, STAMPS, tip) for tip in (473, 475)])
+        self.assertEqual(json.loads(output.getvalue())["docker_image_id"], manifest)
+
     def test_endpoints_and_failure_cleanup(self):
         prefixes = set()
         for tip, post_start_tip, failure, scope in [
@@ -261,6 +369,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
             (473, 473, "setup", "pre-fixture-test"),
             (473, 473, "gateway peer", "pre-fixture-test"),
             (475, 475, "REST peer", "pre-fixture-test"),
+            (475, 475, "rest", "pre-fixture-test"),
             (475, 475, "premature", "pre-fixture-test"),
             (473, 473, "cancel", "pre-fixture-test"),
         ]:
@@ -301,6 +410,9 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                         self.assertIn(f"DISCORD_API_BASE={discord.REST}", args)
                         self.assertEqual([arg for arg in args if arg.startswith("DATABASE_URL=")],
                                          ["DATABASE_URL=postgres://offline_bot:offline-fixture@127.0.0.1/postgres"])
+                        self.assertIn("DISCORD_APPLICATION_ID=1111", args)
+                        self.assertIn("DISCORD_TOKEN=offline-predecessor-fixture", args)
+                        self.assertIn("TWO_COMMANDS_PUBLISH_ON_BOOT=1", args)
                         if failure in ("gateway peer", "REST peer"):
                             self.fail("bot spawn reached with an unconfirmed Discord peer")
                         if failure == "cancel":
@@ -347,7 +459,7 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                     if path == "/release":
                         released = True
                     status, body = {
-                        "/fixture": (200, {"ready_sent": released}),
+                        "/fixture": (200, {"ready_sent": released, "rest_synced": failure != "rest"}),
                         "/release": (200, {}),
                         "/health": (200, {"status": "ok"}),
                         "/version": (200, {"sha": fixture.SOURCE, "build_id": "test-1", "deploy_id": "test.1"}),
@@ -378,12 +490,13 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                                 "retained_timestamp": "^PRE snapshot changed during startup$",
                                 "stamp": "stamp mismatch", "checkpoint": "checkpoint missing",
                                 "premature": "pre-READY state invalid", "setup": "snapshot readback failed",
-                                "gateway peer": "gateway fixture unconfirmed", "REST peer": "REST fixture unconfirmed"}
+                                "gateway peer": "gateway fixture unconfirmed", "REST peer": "REST fixture unconfirmed",
+                                "rest": "mock REST command sync was not observed"}
                     with self.assertRaisesRegex(fixture.Refused, expected[failure]):
                         rehearse()
                 else:
                     self.assertEqual(rehearse(), {"cutover": tip, "store": 465, "process": "live",
-                                                "database": "ready", "mock_gateway": "checkpointed",
+                                                "database": "ready", "mock_gateway": "checkpointed", "mock_rest": "synced",
                                                 "pre_ready_status": 503, "ready_status": 200})
                 if failure in (None, "ledger", "ledger_query", "retained_timestamp"):
                     self.assertEqual([(event, app) for event, app, *_ in trace],

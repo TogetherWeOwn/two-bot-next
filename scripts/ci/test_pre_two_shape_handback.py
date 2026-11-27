@@ -11,7 +11,7 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.p
         PRE_STATES, SAMPLE_BUILD, AcceptedRow, IngressReadback, RegistryCleanupEvidence, SweepEvidence, accept,
         sample_endpoint, verify_endpoint,
     )
-    from pre_registry_cleanup import RegistryReadback, RegistryReservation
+    from pre_registry_cleanup import PublicationSettlement, RegistryReadback, RegistryReservation
     from pre_start_stop import Operation, ProtectedPre
     from pre_sweep import CleanupReadback, SweepError, sweep_target
     from pre_target import Action, Inventory, ProtectedRouteReadback, Resource, Target, TargetError, require
@@ -31,7 +31,7 @@ class ShapeFixture:
         self.endpoint = sample_endpoint(target, PRE_STATES[target.shape], worker_version)
         self.registry = RegistryReservation(target, REFERENCE)
         self.read_registry = Mock(return_value=RegistryReadback(target, REFERENCE, present=False))
-        self.publication_settled = True
+        self.publication_settlement = PublicationSettlement(self.registry)
 
         app = Resource(target.container_name, app_id)
         self.app_id = app_id
@@ -72,11 +72,11 @@ class ShapeFixture:
         registry = None
         if outcome == "cleared":
             inventory = self.finalizer.inventory(self.target)
-            if self.publication_settled is not True:
+            if self.publication_settlement is None:
                 raise ProofError("pre_registry_publication_unsettled")
             registry = RegistryCleanupEvidence(
                 inventory, self.read_registry(self.registry), self.now,
-                self.finalizer.run_status(self.target), self.publication_settled,
+                self.finalizer.run_status(self.target), self.publication_settlement,
             )
         return accept(self.registry, SAMPLE_BUILD, **self.endpoint,
                       sweep=SweepEvidence(self.target, outcome), registry=registry,
@@ -126,7 +126,9 @@ class PreTwoShapeHandbackTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.first.read_registry.reset_mock()
                 self.first.read_registry.return_value = readback
-                self.first.publication_settled = settled
+                self.first.publication_settlement = (
+                    PublicationSettlement(self.first.registry) if settled else None
+                )
                 self.first.finalizer.inventory.side_effect = [self.first.before, self.first.absent]
                 with self.assertRaisesRegex(ProofError, f"^{reason}$"):
                     self.advance()
