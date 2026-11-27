@@ -16,9 +16,8 @@ with patch.object(sys, "path", [SCRIPTS, *sys.path]):
 
 class Readers:
     def __init__(self, shape="0473/0465", *, never_created=False, lease_cutoff=None, early_stop=False):
-        retained = shape == "0475/0465"
-        target = Target("pre-fixture-retained" if retained else "pre-fixture-original",
-                        475 if retained else 473, 1_800_000_000, shape)
+        run_id = 475 if shape == "0475/0465" else 473
+        target = Target(f"pre-fixture-{run_id}", run_id, 1_800_000_000, shape)
         registry = RegistryReservation(
             target, "registry.example.invalid/test/two-bot-next-attendance-predecessor-staging@sha256:" + "a" * 64,
         )
@@ -101,7 +100,8 @@ class NativeCleanupTests(unittest.TestCase):
             original = getattr(readers.stop, disruption)
             for updates in (
                 {"fence_id": "replacement-fence"}, {"cutoff": readers.reservation.registry.target.expires_at},
-                {"blocked": False}, {"observed_at": readers.reservation.cutoff - 1}, {"disruption": "other"},
+                {"blocked": False}, {"disruption": "other"},
+                {"observed_at": readers.reservation.cutoff - 1}, {"observed_at": readers.reservation.cutoff + 10},
             ):
                 self.assert_rejected(readers, "stop", "pre_cutoff_fence_unconfirmed",
                                      **{disruption: replace(original, **updates)})
@@ -111,6 +111,7 @@ class NativeCleanupTests(unittest.TestCase):
         for updates, reason in (
             ({"startup_settled": False}, "pre_startup_unsettled"),
             ({"settled_at": readers.reservation.cutoff - 1}, "pre_runner_stop_unconfirmed"),
+            ({"runner_fenced_at": readers.stop.armed_at}, "pre_runner_stop_unconfirmed"),
             ({"runner_fenced_at": readers.reservation.cutoff + 1}, "pre_runner_stop_unconfirmed"),
             ({"write_access": True}, "pre_writer_revocation_unconfirmed"),
             ({"write_access": None}, "pre_writer_revocation_unconfirmed"),
@@ -120,7 +121,8 @@ class NativeCleanupTests(unittest.TestCase):
             ({"first_create_at": None}, "pre_app_deletion_unconfirmed"),
         ):
             self.assert_rejected(readers, "stop", reason, **updates)
-        self.assertEqual(set(readers.calls), {("stop", readers.reservation)})
+            self.assertEqual(readers.calls, [("stop", readers.reservation)])
+            readers.calls.clear()
         self.assert_rejected(Readers(never_created=True), "stop", "pre_app_never_created_unconfirmed",
                              app_deleted_at=readers.stop.app_deleted_at)
 
@@ -129,9 +131,8 @@ class NativeCleanupTests(unittest.TestCase):
             readers = Readers(never_created=never_created)
             readers.counts = []
             readers.stop = replace(readers.stop, app_never_created=False)
-            with self.subTest(never_created=never_created), self.assertRaisesRegex(
-                TargetError, "pre_app_never_created_unconfirmed" if never_created else "pre_app_counts_unconfirmed",
-            ):
+            reason = "pre_app_never_created_unconfirmed" if never_created else "pre_app_counts_unconfirmed"
+            with self.subTest(never_created=never_created), self.assertRaisesRegex(TargetError, reason):
                 readers.verify()
 
     def test_counts_must_both_be_zero_and_observed_before_app_deletion(self):
@@ -145,14 +146,14 @@ class NativeCleanupTests(unittest.TestCase):
         readers = Readers()
         reservation = readers.reservation
         changed_scope = replace(reservation.registry.target, shape="0475/0465")
+        wrong_ref = reservation.registry.reference[:-1] + "b"
         for field, foreign, reason in (
             ("stop", replace(reservation, registry=replace(reservation.registry, target=changed_scope)),
              "wrong_pre_stop_evidence"),
             ("counts", replace(reservation, app_id="cccccccc-cccc-cccc-cccc-cccccccccccc"),
              "pre_app_counts_unconfirmed"),
             ("absence", replace(reservation, account_id="c" * 32), "wrong_pre_absence_readback"),
-            ("registry", replace(reservation, registry=replace(reservation.registry,
-                                                               reference=reservation.registry.reference[:-1] + "b")),
+            ("registry", replace(reservation, registry=replace(reservation.registry, reference=wrong_ref)),
              "wrong_pre_registry_readback"),
         ):
             self.assert_rejected(readers, field, reason, reservation=foreign)
