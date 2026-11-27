@@ -184,11 +184,21 @@ test("interrupted stop and release preserve the lease and retry durable retireme
   assert.equal((await rebuilt.listSchedules("stagingExpiry"))[0]?.payload, true);
 
   release.mock.restore();
+  h.runtime.running = true;
+  const reattached = await h.build();
+  const failReplayStop = t.mock.method(h.runtime, "destroy", async () => { throw new Error("reattached stop failed"); });
+  t.mock.timers.tick(15_000);
+  await reattached.stagingExpiry();
+  assert.deepEqual(await h.staging.read(), issued, "terminal journal cannot release a running container");
+  assert.equal((await h.bot.listSchedules("stagingExpiry"))[0]?.payload, true);
+  failReplayStop.mock.restore();
+
   t.mock.timers.tick(15_000);
   await (await h.build()).alarm();
   assert.deepEqual(await h.staging.read(), { ...issued, phase: "released" });
   assert.ok(Date.now() < issued.expiresAt, "a stop retry can retire before the original deadline");
-  assert.equal(h.runtime.destroy.mock.callCount(), 1, "terminal recovery replays only the release");
+  assert.equal(h.runtime.running, false);
+  assert.equal(h.runtime.destroy.mock.callCount(), 2, "terminal recovery stops a reattached process before releasing");
   assert.deepEqual(await rebuilt.listSchedules("stagingExpiry"), []);
 });
 

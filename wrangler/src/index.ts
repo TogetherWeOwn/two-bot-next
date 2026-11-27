@@ -1064,6 +1064,11 @@ export class TwoBotContainer extends Container<Env> {
     const { dryRun } = effects;
     return runProtectedAutomod(call, {
       ...authority, staging: this.stagingUse, storage: this.ctx.storage, env: this.env,
+      confirmStoppedBeforeRelease: async () => {
+        // A terminal journal can be replayed after the runtime reattaches.
+        if (this.ctx.container?.running) await this.stopStagingUse();
+        if (this.ctx.container?.running !== false) throw new OwnershipRefused("shutdown_unconfirmed");
+      },
     }, {
       ...effects,
       ...(dryRun === undefined ? {} : { dryRun: {
@@ -1262,7 +1267,7 @@ export class TwoBotContainer extends Container<Env> {
         deployment_id: use.deploymentId, sha: use.sha, epoch: use.epoch } : {}) }));
   }
 
-  /** The SDK owns alarm(); its persisted callback re-reads authority on every wake. */
+  /** SDK alarm callback. Keep it off the Worker routes and derive scope from storage. */
   public async stagingExpiry(): Promise<void> {
     if (!this.boundedStaging()) return;
     await this.gated(async () => {
@@ -1283,6 +1288,7 @@ export class TwoBotContainer extends Container<Env> {
           const { deploymentId, sha } = automod;
           // The alarm is internal authority for the persisted lease, even
           // after rollout drift. Bridge requests remain bound to the serving build.
+          // Only the native stop adapter gets a fresh local deadline.
           const effects = this.automodEffects ?? this.nativeAutomodEffects(STAGING_AUTOMOD_PLAN,
             Date.now() + STAGING_AUTOMOD_PLAN.cleanupMs);
           await this.callProtectedAutomod({ action: "recover", issuedLease: { ...automod, phase: "active" } }, effects, {
