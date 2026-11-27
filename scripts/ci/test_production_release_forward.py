@@ -431,18 +431,24 @@ class ReleaseForwardTests(unittest.TestCase):
                 release.produced_version(invalid)
         recovery = Mock(run_id="456", fence_epoch=18)
         foreign = {**state, "worker": {**state["worker"], "version_id": pin.rollback_worker}}
-        control = Mock(side_effect=GateError("lost_ack"))
+        status = call("status", expected_deployment=version)
+        exact_takeover = call("takeover-fenced", 18, expected_deployment=version)
+        control = Mock()
         with self.assertRaisesRegex(GateError, "production_release_candidate_pair_unproved"):
             release.take_over(pin, recovery, version, Mock(return_value=foreign), control)
-        control.assert_not_called()
+        self.assertEqual(control.call_args_list, [status])
         prior = {**foreign, "worker": {**foreign["worker"], "sha": pin.rollback_sha}}
         prior["container"] = {**state["container"], "image_digest": pin.rollback_image}
         provider[f"/containers/applications/{pin.application_id}/rollouts?limit=100"][0]["status"] = "progressing"
         progressing = {**provider_sample(client, account, allow_rollout=True), "ownership": state["ownership"]}
-        observe, pause = Mock(side_effect=[prior, progressing, state]), Mock()
+        effects, pause = Mock(), Mock()
+        effects.observe.side_effect = [prior, progressing, state]
+        effects.control.side_effect = [None, GateError("lost_ack")]
         with self.assertRaisesRegex(GateError, "lost_ack"):
-            release.take_over(pin, recovery, version, observe, control, pause=pause)
-        control.assert_called_once_with("takeover-fenced", 18, expected_deployment=version)
+            release.take_over(pin, recovery, version, effects.observe, effects.control, pause=pause)
+        self.assertEqual(effects.mock_calls, [call.control("status", expected_deployment=version),
+                         call.observe(), call.observe(), call.observe(),
+                         call.control("takeover-fenced", 18, expected_deployment=version)])
         self.assertEqual(pause.call_count, 2)
         owner = {**state["ownership"], "phase": "active", "epoch": 19}
         control = Mock()
@@ -450,4 +456,4 @@ class ReleaseForwardTests(unittest.TestCase):
         owner["running"] = True
         with self.assertRaisesRegex(GateError, "production_release_takeover_unconfirmed"):
             release.take_over(pin, recovery, version, Mock(side_effect=[state, {**state, "ownership": owner}]), control)
-        self.assertEqual(control.call_count, 2)
+        self.assertEqual(control.call_args_list, [status, exact_takeover] * 2)

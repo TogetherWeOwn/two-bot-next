@@ -202,6 +202,11 @@ class RecoveryWiringTests(unittest.TestCase):
         workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production.yml").read_text())
         prepare = workflow["jobs"]["release-prepare"]["steps"]
         order = [step.get("name") for step in prepare]
+        install = order.index("Install pinned Wrangler for the rollback image preflight")
+        self.assertLess(install, order.index("Verify forward release preflight"))
+        self.assertEqual(prepare[install]["working-directory"], "wrangler")
+        self.assertEqual(prepare[install]["run"], "npm ci")
+        self.assertNotIn("env", prepare[install])
         retain = order.index("Retain the exact recovery stop intent")
         self.assertLess(retain, order.index("Confirm the exact stopped writer"))
         upload = prepare[retain]["with"]

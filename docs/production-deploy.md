@@ -493,10 +493,12 @@ applicable. Keep credentials, raw responses and member data out of the record.
 
 ## Protected attendance release ownership
 
-A protected attendance release uses a manual attempt-one dispatch from
-protected `main` with the exact staged SHA, the reviewed plan run ID and
-release pins. Keep automatic production promotion disabled. The plan binds
-the database restore proof and the retained Worker and container image.
+Before dispatch, qualify recovery of the retained Worker and container image
+under the [production release gate](../CONTRIBUTING.md#production-release-gate).
+Match the retained container's runtime revision to the serving Worker's SHA.
+Use a manual attempt-one dispatch from protected `main` with the exact staged
+SHA, reviewed plan run ID and release pins. Keep automatic production promotion
+disabled. The plan binds the database restore proof and the retained pair.
 
 For the serving predecessor built from `d314f4c63ecbea263aa953bc8a649a444a97da7c`,
 the release uses the Worker's existing epoch-fenced `fence` and `takeover`.

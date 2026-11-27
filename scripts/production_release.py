@@ -127,6 +127,9 @@ def produced_version(output):
 
 def take_over(pin, recovery, version, observe, control, *, pause=sleep):
     require(UUID.fullmatch(version) and version != pin.rollback_worker, "production_release_worker_version_unproved")
+    # The provider can list the new Worker before its ownership DO updates.
+    # The version-pinned status call waits through that propagation without writing.
+    control("status", expected_deployment=version)
     actor = release_actor(recovery.run_id, pin.candidate_sha)
     for attempt in range(WORKER_RESTORE_READS):
         if attempt:
