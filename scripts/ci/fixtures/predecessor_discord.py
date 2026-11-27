@@ -23,12 +23,15 @@ APPLICATION = "/api/v10/applications/@me"
 COMMANDS = f"/api/v10/applications/{APP}/guilds/{GUILD}/commands"
 PORT = 8081
 REST = f"http://127.0.0.1:{PORT}"
+API_BASE = REST
 GATEWAY = f"ws://127.0.0.1:{PORT}"
 HELLO = {"op": 10, "d": {"heartbeat_interval": 45000}}
 RESERVATION_HEADER = "X-Offline-Pre-Reservation"
 RESERVATION = os.environ.get("OFFLINE_PRE_RESERVATION")
+
 RELEASE = Event()
 READY_SENT = Event()
+REST_SYNCED = Event()
 # Decode byte-capped inputs with the standard decoder's nesting limit.
 decode_json = partial(decode_legacy_json, object_pairs_hook=unique_object, parse_constant=int)
 
@@ -62,7 +65,7 @@ class Discord(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/fixture":
-            self.reply({"ready_sent": READY_SENT.is_set()})
+            self.reply({"ready_sent": READY_SENT.is_set(), "rest_synced": REST_SYNCED.is_set()})
         elif self.path == "/release":
             RELEASE.set()
             self.reply({})
@@ -102,6 +105,8 @@ class Discord(BaseHTTPRequestHandler):
             if not isinstance(commands, list) or any(not isinstance(item, dict) for item in commands):
                 raise ValueError
             self.reply(commands)
+            if commands:
+                REST_SYNCED.set()
         except (ValueError, RecursionError):
             self.reply({}, 400)
         except OSError:
@@ -212,14 +217,19 @@ def request(target, path):
         connection.close()
 
 
+def serve():
+    if {name for _, name in socket.if_nameindex()} != {"lo"}:
+        sys.exit("Discord fixture requires a loopback-only network namespace")
+    if not RESERVATION:
+        sys.exit("Discord fixture requires a reservation marker")
+    ThreadingHTTPServer(("127.0.0.1", PORT), Discord).serve_forever()
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 1:
-        if {name for _, name in socket.if_nameindex()} != {"lo"}:
-            sys.exit("Discord fixture requires a loopback-only network namespace")
-        if not RESERVATION:
-            sys.exit("Discord fixture requires a reservation marker")
-        ThreadingHTTPServer(("127.0.0.1", PORT), Discord).serve_forever()
+        serve()
     elif len(sys.argv) == 3 and sys.argv[1] == "--check-peers":
         print(json.dumps(check_peers(sys.argv[2])))
+
     else:
         print(json.dumps(request(*sys.argv[1:])))
