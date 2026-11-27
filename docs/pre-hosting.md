@@ -130,6 +130,9 @@ and schedules a retry before awaiting the provider. The startup entrypoint
 passes the original cutoff and loopback Discord settings to the pinned
 fixture image. The fixture supervisor must enforce that cutoff before
 launching the bot and throughout its lifetime.
+Retain the original actor pin and preserve the class and namespace through
+settlement. A returned destroy request and local `inspect()` absence leave
+provider placement settlement and deletion to the independent cleanup caller.
 
 For native scheduling, Get Application reports observed `active` and
 `starting` counts. The [cleanup projection](../scripts/pre_inventory.py)

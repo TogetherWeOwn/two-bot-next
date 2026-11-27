@@ -173,7 +173,7 @@ export async function readChange(request: Request): Promise<OwnershipChange | nu
 }
 
 /** Bound control input independently of the untrusted Content-Length header. */
-export async function readControlBody(request: Request,
+export async function readControlBody(request: Pick<Request, "body">,
   decode = (bytes: Uint8Array): unknown => JSON.parse(new TextDecoder().decode(bytes)),
   limit = 1024,
   signal?: AbortSignal,

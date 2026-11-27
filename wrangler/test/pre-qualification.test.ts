@@ -23,6 +23,7 @@ function fixture() {
     async setAlarm(next: number) { alarm = next; },
     async deleteAlarm() { alarm = null; },
     async transaction(fn: (txn: unknown) => Promise<void>) { await fn(storage); },
+    async sync() {},
   };
   const container = {
     running: false,
@@ -36,7 +37,8 @@ function fixture() {
       });
     },
     async destroy() { calls.push("destroy"); },
-    async inspect() { return { image, labels: { pre_start_id: actor.startId } }; },
+    async setInactivityTimeout(duration: number) { assert.ok(duration > 0 && duration <= 30_000); },
+    async inspect() { return calls.includes("destroy") ? null : { image, labels: { pre_start_id: actor.startId } }; },
     getTcpPort(port: number) {
       assert.equal(port, 8080);
       return { fetch: async () => new Response("{}", { status: 503 }) };
@@ -74,6 +76,7 @@ test("native starts once for each PRE shape through the private entrypoint", asy
     await assert.rejects(runtime.start({ ...actor, objectId: "b".repeat(64) }), refusal);
     assert.deepEqual(await runtime.start(actor), actor);
     await assert.rejects(runtime.start(actor), refusal);
+    assert.equal((await custody.status(actor)).phase, "issued");
     await assert.rejects(runtime.probe(actor, "/internal/ownership"), refusal);
     const response = await runtime.probe(actor, "/readyz");
     assert.equal(response.status, 503);
@@ -90,12 +93,13 @@ test("runner loss retains the exact fence across reconstruction and destroy fail
   container.destroy = async () => { throw new Error("upstream"); };
   t.mock.method(Date, "now", () => cutoff);
   env.CF_VERSION_METADATA.id = "30000000-0000-0000-0000-000000000003";
-  await assert.rejects(reconstruct().alarm(), refusal);
+  await reconstruct().alarm();
+  assert.equal((await reconstruct().status(actor)).phase, "closing");
   assert.ok(alarm() > cutoff);
   await assert.rejects(reconstruct().stop({ ...actor, version: env.CF_VERSION_METADATA.id }), refusal);
   container.destroy = destroy;
   await reconstruct().alarm();
-  assert.equal((await reconstruct().stop(actor)).phase, "destroyed");
+  assert.equal((await reconstruct().stop(actor)).phase, "stop-requested");
   assert.equal(alarm(), null);
   env.CF_VERSION_METADATA.id = actor.version;
   await assert.rejects(reconstruct().start(actor), refusal);
@@ -118,5 +122,13 @@ test("stop before arm and expiry during durable start intake both refuse delayed
     t.mock.method(Date, "now", () => cutoff);
   };
   await assert.rejects(instance.start(actor), refusal);
+  assert.deepEqual(calls, []);
+});
+
+test("a failed issuance commit prevents native startup", async () => {
+  const { instance, storage, calls } = fixture();
+  await instance.arm(actor);
+  storage.sync = async () => { throw new Error("uncommitted"); };
+  await assert.rejects(instance.start(actor), /uncommitted/);
   assert.deepEqual(calls, []);
 });
