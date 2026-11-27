@@ -44,7 +44,9 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -640,6 +642,82 @@ class AdmittedArtifactReadinessTests(unittest.TestCase):
 class ImmutablePromotionWorkflowTests(unittest.TestCase):
     def workflow(self, name):
         return yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
+
+    def test_certification_scopes_only_the_workflow_sha_checkout(self):
+        steps = self.workflow("deploy-staging.yml")["jobs"]["certify-promotion"]["steps"]
+        trusted, reviewed = [step for step in steps
+                             if step.get("uses", "").startswith("actions/checkout@")]
+        self.assertIs(steps[0], trusted)
+        self.assertNotIn("if", trusted)
+        self.assertEqual(trusted["with"], {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": "false",
+            "fetch-depth": "1",
+            "sparse-checkout-cone-mode": "false",
+            "sparse-checkout": (
+                "/scripts/bot_promotion.py\n"
+                "/scripts/build_identity.py\n"
+                "/scripts/script_intake.py\n"
+                "/wrangler/scripts/is-direct-invocation.mjs\n"
+                "/wrangler/scripts/ownership-control-response.mjs\n"
+                "/wrangler/scripts/staging-use.mjs\n"
+                "/wrangler/wrangler.toml\n"
+            ),
+        })
+        self.assertEqual(reviewed["if"], "${{ needs.deploy.outputs.reviewed_source != '' }}")
+        self.assertEqual(reviewed["with"], {
+            "ref": "${{ needs.deploy.outputs.reviewed_source }}",
+            "path": "reviewed-source",
+            "persist-credentials": "false",
+            "fetch-depth": "1",
+        })
+
+    def test_certification_tools_run_from_the_sparse_checkout(self):
+        job = self.workflow("deploy-staging.yml")["jobs"]["certify-promotion"]
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory)
+            paths = job["steps"][0]["with"]["sparse-checkout"].splitlines()
+            for pattern in paths:
+                path = pattern.removeprefix("/")
+                target = checkout / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / path, target)
+
+            env = {"PATH": os.environ.get("PATH", os.defpath),
+                   "STAGING_USE_RECEIPT": str(checkout / "readiness.jsonl")}
+            ready = subprocess.run(
+                ["node", "wrangler/scripts/staging-use.mjs", "ready"],
+                cwd=checkout, env=env, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(ready.returncode, 1, ready.stderr)
+            self.assertEqual(ready.stderr.strip(), "staging_origin_invalid", ready.stderr)
+            rows = (checkout / "readiness.jsonl").read_text().splitlines()
+            self.assertEqual([json.loads(row)["action"] for row in rows], ["attempt", "failed"])
+
+            # The certifier's only external read is answered by a local run fixture.
+            record = {**run_record(), "event": "workflow_dispatch", "status": "in_progress", "conclusion": None}
+            (checkout / "run.json").write_text(json.dumps(record))
+            gh = checkout / "gh"
+            gh.write_text(f'#!/bin/sh\n[ "$*" = "api --method GET {RUN_ROUTE}" ] || exit 1\nexec /bin/cat run.json\n')
+            gh.chmod(0o700)
+            (checkout / "modules").mkdir()
+            for name, data in MODULES.items():
+                (checkout / "modules" / name).write_bytes(data)
+            (checkout / "evidence.json").write_text(json.dumps(receipt()["staging"]))
+            certify = subprocess.run(
+                [sys.executable, "-B", "scripts/bot_promotion.py", "certify",
+                 "--modules", "modules", "--entrypoint", "index.js",
+                 "--evidence", "evidence.json", "--config", "wrangler/wrangler.toml",
+                 "--sha", SHA, "--run-id", str(STAGE_RUN), "--attempt", str(ATTEMPT),
+                 "--deploy-id", STAMP, "--readiness-result", "success",
+                 "--synthetic-result", "success", "--fault-mode", "none", "--out", "promotion.zip"],
+                cwd=checkout, env={"PATH": directory},
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(certify.returncode, 0, certify.stdout + certify.stderr)
+            with zipfile.ZipFile(checkout / "promotion.zip") as archive:
+                self.assertEqual(set(archive.namelist()),
+                                 {"promotion-receipt.json", *(f"modules/{name}" for name in MODULES)})
 
     def test_certification_is_downstream_of_every_staging_gate_and_not_diagnostics_upload(self):
         jobs = self.workflow("deploy-staging.yml")["jobs"]

@@ -7,7 +7,7 @@ from build_identity import is_build_revision_shape, is_deploy_id_shape
 from pre_registry_cleanup import (
     RegistryDisposition, RegistryReadback, RegistryReservation, registry_cleanup_disposition,
 )
-from pre_target import Inventory, Target, TargetError
+from pre_target import Inventory, ProtectedRouteReadback, Target, TargetError, confirm_protected_route
 from rollback_proof import DIGEST, ProofError, VERSION, require
 from staging_rollout import GateError, decode, runtime_ready
 from worker_container_rollback import gateway_state
@@ -93,6 +93,20 @@ class RegistryCleanupEvidence:
 
 
 @dataclass(frozen=True)
+class IngressReadback:
+    """Scope of a fresh authenticated lookup, with None for unknown presence.
+
+    The scope identifies the lookup even when the route itself is absent.
+    It comes from the reader's authenticated context, never from the request.
+    The reader binds the request token only to a new observation.
+    """
+
+    scope: ProtectedRouteReadback
+    present: bool | None
+    request: object
+
+
+@dataclass(frozen=True)
 class AcceptedRow:
     reservation: Target
     build: Build
@@ -101,13 +115,17 @@ class AcceptedRow:
     cleanup: str
 
 
-def accept(registry_reservation: RegistryReservation, build, *, receipt, schema, serving, worker, sweep, registry):
+def accept(registry_reservation: RegistryReservation, build, *, receipt, schema, serving, worker, sweep, registry,
+           pinned_route, pinned_app_id, read_ingress):
     """Compose a stubbed verified build receipt and scoped observations.
 
     The operator pins come from outside the observations. `receipt` stands in
     for #2558's verified #2556 build.json. The protected publication plan
     pins the registry reservation before the copy. Readback follows verified
     target cleanup and independent proof of publisher settlement.
+    The sweep outcome comes from the current cleanup attempt. After it clears
+    and registry absence is verified, read private ingress independently
+    using the original route and app pins.
     """
     reservation = registry_reservation.target
     verify_endpoint(reservation, build, receipt=receipt, schema=schema, serving=serving, worker=worker)
@@ -125,6 +143,15 @@ def accept(registry_reservation: RegistryReservation, build, *, receipt, schema,
     except TargetError as error:
         raise ProofError(str(error)) from None
     require(disposition is RegistryDisposition.ALREADY_ABSENT, "pre_registry_cleanup_unproved")
+    try:
+        confirm_protected_route(reservation, pinned_app_id=pinned_app_id, readback=pinned_route)
+        request = object()
+        ingress = read_ingress(pinned_route, request=request)
+        require(type(ingress) is IngressReadback and ingress.request is request
+                and ingress.present is False, "pre_ingress_unproved")
+        confirm_protected_route(reservation, pinned_app_id=pinned_app_id, readback=ingress.scope)
+    except Exception:
+        raise ProofError("pre_ingress_unproved") from None
     return AcceptedRow(reservation, build, schema.state, serving.worker_version, sweep.outcome)
 
 
@@ -141,7 +168,6 @@ def verify_endpoint(reservation, build, *, receipt, schema, serving, worker):
             and receipt.get("BOT_DEPLOY_ID") == build.deploy_id
             and receipt.get("image_manifest_digest") == build.image_digest,
             "pre_receipt_mismatch")
-
     require(schema is not None and serving is not None and worker is not None,
             "pre_endpoint_evidence_missing")
     require(all(evidence.reservation == reservation for evidence in (schema, serving, worker)),
@@ -151,7 +177,6 @@ def verify_endpoint(reservation, build, *, receipt, schema, serving, worker):
     require(isinstance(serving.worker_version, str) and VERSION.fullmatch(serving.worker_version)
             and serving.worker_message == build.revision
             and serving.image_digest == build.image_digest, "pre_serving_identity_mismatch")
-
     health, readyz = worker.health, worker.readyz
     require(health is not None and readyz is not None, "pre_endpoint_evidence_missing")
     require(health.status == 200 and health.worker_version == serving.worker_version,

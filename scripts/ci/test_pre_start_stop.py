@@ -3,6 +3,7 @@
 from dataclasses import dataclass, replace
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, call, patch
 from uuid import UUID
@@ -26,6 +27,7 @@ class Upload:
     target: Target
     content_type: str = "multipart/form-data; boundary=fixture"
     body: bytes = b"fixture"
+    supports_discord_fixture_overrides: bool = True
 
 
 class PreFixture:
@@ -151,6 +153,15 @@ class ProtectedPreTests(unittest.TestCase):
         fixture.before_create.assert_not_called()
         self.assertEqual(fixture.effects.mock_calls,
                          [call.admission.admit_start(TARGET), call.arm(fixture.window, START)])
+
+    def test_missing_or_unconfirmed_discord_overrides_refuse_before_admission(self):
+        for capability in ({}, {"supports_discord_fixture_overrides": False}, {"supports_discord_fixture_overrides": 1}):
+            with self.subTest(capability=capability):
+                fixture = PreFixture()
+                upload = SimpleNamespace(target=TARGET, **capability)
+                self.assert_refuses("pre_discord_fixture_overrides_unavailable",
+                                    fixture.controller(fixture.authorize).start, upload)
+                self.assertEqual(fixture.effects.mock_calls, [])
 
     def test_delayed_create_refused_when_stop_races_after_arm(self):
         fixture = self.fixture
