@@ -311,6 +311,78 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.control.assert_called_once_with("takeover-fenced", 21, expected_deployment=self.pin.worker_version)
         self.assertEqual(self.rollback.wait_stable.call_count, 2)
 
+    def test_restore_after_second_fence_refuses_the_old_handoff(self):
+        old_pin = replace(self.pin, fence_epoch=19)
+        old_ack = {**self.ack, "deploymentId": self.pin.worker_version,
+                   "owner": {**self.ack["owner"], "epoch": 19, "oldEpoch": 18}}
+        self.state["ownership"].update(epoch=20, phase="active", running=True)
+
+        def fence(*_args, **_kwargs):
+            self.state["ownership"].update(epoch=21, phase="fenced", running=False)
+            return self.ack
+
+        self.control.side_effect = fence
+        pin, ack = recovery.establish_fence(old_pin, self.candidate, self.observe, self.control)
+        self.assertEqual((pin, ack), (self.pin, self.ack))
+        self.control.assert_called_once_with("fence-exact", 20, expected_deployment=self.candidate[0])
+        self.control.reset_mock()
+        self.observe.reset_mock()
+
+        # Both handoffs have a matching inverse receipt. The live fence must
+        # still rule out the old handoff before any restore or takeover writes.
+        old_result = {**self.result, "fence_epoch": old_pin.fence_epoch}
+        inverse = Mock(side_effect=[old_result, self.result])
+        write_receipt = Mock()
+        approval = {"plan_run_id": self.case["admission"]["plan_run_id"]}
+        admission = (old_pin, self.candidate, self.case["plan"], approval, self.case["run"])
+        env = {"PRODUCTION_WORKER_URL": "https://fixture.invalid", "CLOUDFLARE_ACCOUNT_ID": "fixture",
+               "CLOUDFLARE_API_TOKEN": "fixture", "OWNERSHIP_CONTROL_TOKEN": "fixture", "RUNNER_TEMP": "fixture",
+               "ARTIFACT_ID": "987", "ARCHIVE_SHA256": "8" * 64}
+        application = recovery.APPLICATIONS["production"]
+        retained_image = f"registry.cloudflare.com/fixture/{application}@{pin.image_digest}"
+
+        def take_over(*_args, **_kwargs):
+            self.rollback.wait_stable.assert_not_called()
+            self.state["ownership"].update(epoch=22, phase="active", owner_actor=pin.actor)
+
+        def record_stable_polls(_version, _started_at):
+            self.rollback.evidence["stable_polls"] = 3
+
+        self.control.side_effect = take_over
+        self.rollback.post_worker_restore.side_effect = lambda version: self.state["worker"].update(
+            version_id=version, sha=pin.rollback_sha)
+        self.rollback.restore_image.side_effect = lambda image: self.state["container"].update(
+            image_digest=image.rsplit("@", 1)[-1])
+        self.rollback.evidence = {}
+        self.rollback.wait_stable.side_effect = record_stable_polls
+        with (patch.multiple(recovery, release_admission=Mock(return_value=admission),
+                             authenticated_inverse=inverse, write_json=write_receipt,
+                             read_status=Mock(side_effect=lambda *_args, **_kwargs: self.observe()),
+                             check_url=Mock(return_value=env["PRODUCTION_WORKER_URL"]), RollbackClient=Mock(),
+                             validate_receipt_against_live=Mock(), control_client=Mock(return_value=self.control),
+                             Rollback=Mock(return_value=self.rollback)), patch("sys.stderr")):
+            stale = {**env, "STOPPED_FENCE_ACK": json.dumps(old_ack), "ARTIFACT_ID": "986",
+                     "ARCHIVE_SHA256": "7" * 64}
+            self.assertEqual(recovery.main(["restore"], stale), 1)
+            inverse.assert_called_once_with(old_pin, approval, "986", "7" * 64, stale)
+            self.observe.assert_called_once_with()
+            self.assertEqual(self.rollback.mock_calls, [])
+            self.control.assert_not_called()
+            write_receipt.assert_not_called()
+
+            current = {**env, "STOPPED_FENCE_ACK": json.dumps(ack)}
+            self.assertEqual(recovery.main(["restore"], current), 0)
+            self.assertEqual(inverse.call_count, 2)
+            inverse.assert_called_with(pin, approval, "987", "8" * 64, current)
+
+        self.rollback.post_worker_restore.assert_called_once_with(pin.worker_version)
+        self.rollback.restore_image.assert_called_once_with(retained_image)
+        self.control.assert_called_once_with("takeover-fenced", 21, expected_deployment=pin.worker_version)
+        self.rollback.wait_stable.assert_called_once_with(pin.worker_version, self.rollback.now.return_value)
+        write_receipt.assert_called_once_with(Path(env["RUNNER_TEMP"]) / "production-release-restored.json",
+                                              {"approval": approval, "inverse": self.result, "provider": self.state,
+                                               "stable_polls": 3})
+
     def test_normal_paths_refuse_cross_schema_and_release_owned_fences(self):
         owner = {"owner": {"phase": "active", "actor": "fixture"}}
         has_schema = lambda sha: sha == self.pin.candidate_sha

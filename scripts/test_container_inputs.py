@@ -255,11 +255,36 @@ class WorkflowSurfaceTests(unittest.TestCase):
         head, steps = self.container.split("steps:", 1)
         self.assertNotRegex(head, r"(?m)^\s+if:\s",
                             "job-level if would hide the check; steps gate instead")
-        first_gated = min(self.container.index("container-inputs.outputs.build"),
-                          len(self.container))
-        preamble = self.container[:first_gated]
-        self.assertIn("actions/checkout", preamble)
-        self.assertIn("test_container_smoke.py", preamble)
+        full, sparse, *remaining = re.split(r"(?m)^      - ", steps)[1:]
+        setting = "needs.container-inputs.outputs.build"
+        pin = r"(?m)^        uses: (actions/checkout@[0-9a-f]{40})\b"
+        self.assertRegex(full, rf"(?m)^        if: {re.escape(setting)} != 'false'$")
+        self.assertRegex(sparse, rf"(?m)^        if: {re.escape(setting)} == 'false'$")
+        full_pin = re.findall(pin, full)
+        self.assertEqual(len(full_pin), 1)
+        self.assertEqual(re.findall(pin, sparse), full_pin)
+
+        checkout_inputs = ["          fetch-depth: 1", "          persist-credentials: false"]
+        self.assertEqual(full.partition("        with:\n")[2].splitlines(), checkout_inputs)
+        self.assertEqual(sparse.partition("        with:\n")[2].splitlines(), [
+            *checkout_inputs, "          sparse-checkout: |", "            scripts",
+            "            .github/workflows",
+        ])
+
+        offline_commands = (
+            "test_container_smoke.py",
+            "test_container_smoke_cleanup_acceptance.py",
+            "test_container_smoke_inspect_refusal_acceptance.py",
+            "test_container_smoke_budget_acceptance.py",
+            "test_container_smoke_fail_paths_acceptance.py",
+            "test_container_smoke_inspect_fields_regression.py",
+            "test_container_smoke_dry_run_acceptance.py",
+            "python3 scripts/test-logging-container.py --self-test",
+        )
+        for step, command in zip(remaining[:len(offline_commands)], offline_commands, strict=True):
+            with self.subTest(command=command):
+                self.assertRegex(step, rf"(?m)^        run: .*{re.escape(command)}")
+                self.assertNotRegex(step, r"(?m)^        if:\s")
 
     def test_skip_is_announced(self):
         self.assertIn("container-inputs.outputs.build", self.container)

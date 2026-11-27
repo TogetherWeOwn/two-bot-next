@@ -135,7 +135,8 @@ class Discord(BaseHTTPRequestHandler):
                 data = decode_json(bytes(byte ^ mask[i % 4] for i, byte in enumerate(self.rfile.read(size))))
                 if data["op"] == 1:
                     self.send_frame({"op": 11, "d": None})
-                elif data["op"] == 2 and data["d"]["token"] == TOKEN and RELEASE.wait(35):
+                # Twilight's ConfigBuilder prefixes the inert token for IDENTIFY.
+                elif data["op"] == 2 and data["d"]["token"] == f"Bot {TOKEN}" and RELEASE.wait(35):
                     self.send_frame({"op": 0, "s": 1, "t": "READY", "d": {
                         "v": 10, "user": {"id": "999", "username": "mock-bot",
                                           "discriminator": "0", "mfa_enabled": False},

@@ -165,6 +165,20 @@ jobs:
           # Transport runs at the workflow revision, not a potentially older
           # reviewed migration source. The claim binds those SHAs separately.
           ref: ${{ github.sha }}
+          # The approval verifier imports shared staging and rollback helpers.
+          sparse-checkout: |
+            /scripts/build_identity.py
+            /scripts/ci/production_migrate_claim.py
+            /scripts/ci/staging_migrate_claim.py
+            /scripts/production_migrate_approval.py
+            /scripts/rollback_proof.py
+            /scripts/script_intake.py
+            /scripts/staging_migrate_approval.py
+            /scripts/staging_migrate_reviewed.py
+            /scripts/staging_recovery_status.py
+            /scripts/staging_rollout.py
+            /scripts/worker_container_rollback.py
+          sparse-checkout-cone-mode: false
       - name: Fetch this dispatch's read-only plan
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:

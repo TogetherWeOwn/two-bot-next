@@ -17,7 +17,7 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.p
     from ci.test_pre_sweep_inventory_retry import APP_ID, EXPIRED, SIBLING, FakeProvider
     from ci.test_staging_pre_reaper_fixture import SyntheticStaging
     from pre_admission import SettlementEvidence, SettlementSource, StartupAdmission
-    from pre_registry_cleanup import RegistryReadback, RegistryReservation
+    from pre_registry_cleanup import PublicationSettlement, RegistryReadback, RegistryReservation
     from pre_start_stop import ProtectedPre
     from pre_sweep import SweepError, sweep_target
     from pre_target import Action, Inventory, ProtectedRouteReadback, Resource, Target
@@ -52,7 +52,8 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
             "sweep": SweepEvidence(target, "cleared"),
             "registry": RegistryCleanupEvidence(
                 Inventory(target, None, None, 0, False, True, startup_settled=True, assigned_count=0),
-                RegistryReadback(target, reference, False), target.expires_at, "active", True,
+                RegistryReadback(target, reference, False), target.expires_at, "active",
+                PublicationSettlement(self.registry_reservation(target)),
             ),
             "pinned_route": route,
             "pinned_app_id": app_id,
@@ -230,7 +231,7 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
         present_refs = frozenset({reservation.reference, sibling_reference})
         retained = RegistryReadback(EXPIRED, reservation.reference, reservation.reference in present_refs)
         registry = RegistryCleanupEvidence(provider.inventory(EXPIRED), retained, now + 1,
-                                           provider.run_status(EXPIRED), True)
+                                           provider.run_status(EXPIRED), PublicationSettlement(reservation))
         other_repository = reservation.reference.replace(f"/{EXPIRED.scope}/", "/retained/")
         for change, reason in (
             ({}, "pre_registry_cleanup_unproved"),
@@ -243,10 +244,15 @@ class PreOperatorAcceptanceTests(unittest.TestCase):
                 accept(reservation, self.build, **(evidence | {
                     "registry": replace(registry, readback=replace(retained, **change)),
                 }))
-        with self.assertRaisesRegex(ProofError, "^pre_registry_publication_unsettled$"):
-            accept(reservation, self.build, **(evidence | {
-                "registry": replace(registry, readback=replace(retained, present=False), publication_settled=False),
-            }))
+        for settlement, reason in (
+            (None, "pre_registry_publication_unsettled"),
+            (PublicationSettlement(replace(reservation, target=SIBLING)), "wrong_pre_registry_publication_scope"),
+        ):
+            with self.subTest(settlement=settlement), self.assertRaisesRegex(ProofError, f"^{reason}$"):
+                accept(reservation, self.build, **(evidence | {
+                    "registry": replace(registry, readback=replace(retained, present=False),
+                                        publication_settlement=settlement),
+                }))
 
         # The later lookup sees only the sibling's immutable reference.
         later_refs = frozenset({sibling_reference})

@@ -1562,6 +1562,23 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
             ),
             "sparse-checkout-cone-mode": "false",
         })
+    else:
+        checkout_options.update({
+            "sparse-checkout": (
+                "/scripts/build_identity.py\n"
+                "/scripts/ci/production_migrate_claim.py\n"
+                "/scripts/ci/staging_migrate_claim.py\n"
+                "/scripts/production_migrate_approval.py\n"
+                "/scripts/rollback_proof.py\n"
+                "/scripts/script_intake.py\n"
+                "/scripts/staging_migrate_approval.py\n"
+                "/scripts/staging_migrate_reviewed.py\n"
+                "/scripts/staging_recovery_status.py\n"
+                "/scripts/staging_rollout.py\n"
+                "/scripts/worker_container_rollback.py\n"
+            ),
+            "sparse-checkout-cone-mode": "false",
+        })
     if (not str(checkout.get("uses", "")).startswith("actions/checkout@")
             or checkout.get("with") != checkout_options):
         errors.append(f"{prefix} checkout must pin the workflow head and reviewed inputs without persisted credentials")
@@ -4354,14 +4371,13 @@ def help_embed_synthetic_errors(workflow):
     enters GitHub), on the public-hosted runner for job `help-embed-smoke`, with
     the called-disjoint / standalone-canonical non-cancelling group, the pinned
     `staging-window` / `staging-use-release` jobs and a 25 minute timeout (it
-    builds the payload example). Exactly six steps: pinned checkout
-    without persisted credentials, a binding gate (sees only whether the
-    token secret is set, never its value) so an unconfigured optional run
-    notice-passes before any toolchain/cargo step can fail it, the pinned
-    Rust toolchain, payload generation from the reviewed example, one
-    smoke step (the only holder of the token value) that runs the reviewed
-    script, and the evidence upload. The toolchain, payload and smoke
-    steps run only when the gate reports the smoke configured.
+    builds the payload example). Exactly six steps: a binding gate (sees only
+    whether the token secret is set, never its value), pinned checkout of the
+    triggering commit without persisted credentials, the pinned Rust toolchain,
+    payload generation from the reviewed example, one smoke step (the only
+    holder of the token value) that runs the reviewed script, and the evidence
+    upload. Checkout, toolchain, payload and smoke steps run only when the gate
+    reports the smoke configured.
     No wrangler, no production path, no staging Worker URL, no `set -x`.
     """
     name = "help-embed-synthetic.yml"
@@ -4393,8 +4409,10 @@ def help_embed_synthetic_errors(workflow):
             errors.append(f"{name}:help-embed-smoke: must not set {key}")
     steps = job.get("steps") or []
     runs = [step for step in steps if "run" in step]
-    gate = steps[1] if len(steps) > 1 else {}
+    gate = steps[0] if steps else {}
+    configured = "steps.gate.outputs.configured == 'true'"
     if len(steps) != 6 or len(runs) != 4 \
+            or set(gate) - {"name"} != {"id", "env", "run"} \
             or gate.get("id") != "gate" or "configured" not in str(gate.get("run") or "") \
             or steps[2].get("run") != "bash .github/scripts/install-rust-toolchain.sh" \
             or steps[2].get("shell") != "bash" \
@@ -4404,19 +4422,21 @@ def help_embed_synthetic_errors(workflow):
             } \
             or "help_embed_smoke_payloads" not in runs[2]["run"] \
             or "scripts/staging_help_embed_smoke.py" not in runs[-1]["run"]:
-        errors.append(f"{name}:help-embed-smoke: must be checkout, binding gate, toolchain, "
+        errors.append(f"{name}:help-embed-smoke: must be binding gate, checkout, toolchain, "
                       "payload generation, one smoke step of the reviewed script, evidence upload")
     else:
+        if steps[1] != {"uses": STAGING_CHECKOUT_USES, "if": configured,
+                        "with": {"persist-credentials": "false", "fetch-depth": "1"}}:
+            errors.append(f"{name}:help-embed-smoke: pinned checkout of the triggering commit "
+                          "must wait for the binding gate to report configured")
         if '"$status" = 3' not in runs[-1]["run"]:
             # Exit 3 is the script's cleanup-failed signal; the retry loop must
             # fail on it at once so a later clean attempt cannot read green
             # over a message an earlier attempt left in the test channel.
             errors.append(f"{name}:help-embed-smoke: retry loop must fail immediately on the "
                           "cleanup-failed exit status 3")
-        # Everything after the gate must be skippable so an unconfigured
-        # optional run can never fail on a toolchain/cargo step.
         for step in steps[2:5]:
-            if step.get("if") != "steps.gate.outputs.configured == 'true'":
+            if step.get("if") != configured:
                 errors.append(f"{name}:help-embed-smoke: toolchain, payload and smoke steps "
                               "must run only when the gate reports configured")
                 break
@@ -8374,10 +8394,15 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
         import copy
         synthetic = self.workflows["help-embed-synthetic.yml"]
         self.assertEqual(help_embed_synthetic_errors(synthetic), [])
+        steps = lambda w: w["jobs"]["help-embed-smoke"]["steps"]
         for mutate in (
             lambda w: w["jobs"]["help-embed-smoke"].pop("if"),
             lambda w: w["jobs"]["help-embed-smoke"].__setitem__("environment", "staging"),
             lambda w: w["on"].__setitem__("push", None),
+            lambda w: steps(w).insert(0, steps(w).pop(1)),
+            lambda w: steps(w)[0].update({"continue-on-error": "true"}),
+            lambda w: steps(w)[1].pop("if"),
+            lambda w: steps(w)[1]["with"].update(ref="refs/heads/main"),
             lambda w: w["jobs"]["help-embed-smoke"]["steps"][4].__setitem__("run", "wrangler deploy"),
             lambda w: w["jobs"]["help-embed-smoke"]["steps"][0].__setitem__("env", {"T": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}),
             lambda w: w["jobs"]["help-embed-smoke"]["steps"][3].__setitem__("run", "echo {} > payloads.json"),
@@ -8385,7 +8410,7 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                 "run", w["jobs"]["help-embed-smoke"]["steps"][4]["run"].replace('"$status" = 3', '"$status" = 9')),
             lambda w: w["jobs"]["help-embed-smoke"]["steps"][2].pop("if"),
             lambda w: w["jobs"]["help-embed-smoke"]["steps"][2]["env"].__setitem__("RUST_TOOLCHAIN", "1.0.0"),
-            lambda w: w["jobs"]["help-embed-smoke"]["steps"][1]["env"].__setitem__(
+            lambda w: w["jobs"]["help-embed-smoke"]["steps"][0]["env"].__setitem__(
                 "HAS_TOKEN", "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"),
         ):
             changed = copy.deepcopy(synthetic)
@@ -8399,6 +8424,8 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             '"help-embed-synthetic-$GITHUB_RUN_ID-rendered.json"',
             steps[3]["run"],
         )
+        self.assertEqual(steps[-1]["if"], "always()")
+        self.assertEqual(steps[-1]["with"]["if-no-files-found"], "ignore")
         self.assertEqual(steps[-1]["with"]["path"], "help-embed-synthetic-${{ github.run_id }}-*.json")
 
     def test_help_prepared_profile_and_consumer_diagnostics(self):
@@ -10305,6 +10332,32 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "staging migration approval evidence unavailable or malformed\n")
+
+    def test_production_claim_checkout_pins_exact_paths(self):
+        claim = self.workflows["production-migrate.yml"]["jobs"]["claim"]
+        self.assertEqual(production_claim_errors(claim), [])
+        paths = claim["steps"][0]["with"]["sparse-checkout"]
+        for key, value in (
+                ("ref", "${{ inputs.source_sha }}"),
+                ("persist-credentials", "true"),
+                ("sparse-checkout", "/scripts/\n"),
+                ("sparse-checkout", paths.replace("/scripts/worker_container_rollback.py\n", "")),
+                ("sparse-checkout", paths + "/scripts/incident_issue.py\n"),
+                ("sparse-checkout", None),
+                ("sparse-checkout-cone-mode", "true"),
+                ("sparse-checkout-cone-mode", None),
+                ("fetch-depth", "0")):
+            with self.subTest(key=key, value=value):
+                changed = deepcopy(claim)
+                options = changed["steps"][0]["with"]
+                if value is None:
+                    del options[key]
+                else:
+                    options[key] = value
+                self.assertEqual(production_claim_errors(changed), [
+                    "production-migrate.yml:claim: checkout must pin the "
+                    "workflow head and reviewed inputs without persisted credentials",
+                ])
 
     def test_production_migrate_runner_shape_is_pinned(self):
         # Production mirror of the staging runner: same three jobs, same pinned

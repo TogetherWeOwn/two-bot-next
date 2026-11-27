@@ -13,7 +13,7 @@ from scripts.ci.test_staging_pre_reaper_fixture import SyntheticStaging
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_admission import SettlementEvidence, SettlementSource, StartupAdmission
     from pre_caller import ProtectedPreCaller, finalize_pre
-    from pre_registry_cleanup import RegistryDisposition, RegistryReadback, RegistryReservation
+    from pre_registry_cleanup import PublicationSettlement, RegistryDisposition, RegistryReadback, RegistryReservation
     from pre_start_stop import Deployment, EffectWindow, Endpoint, Operation, ProbeReply
     from pre_sweep import SweepError
     from pre_target import Target, TargetError
@@ -152,9 +152,11 @@ class Fixture(SyntheticStaging):
         self.events.append(("registry_reservation", target))
         return self.reservation
 
-    def publication_settled(self, reservation):
+    def publication_settlement(self, reservation):
         self.events.append(("publication_settled", reservation.target))
-        return self.publisher_settled
+        if self.publisher_settled:
+            return PublicationSettlement(self.reservation)
+        return None
 
     def read_registry(self, reservation):
         self.events.append(("registry", reservation.target))
@@ -329,3 +331,93 @@ class PreCallerTests(unittest.TestCase):
             fixture.finalize()
         self.assertIs(fixture.finalize(), RegistryDisposition.ALREADY_ABSENT)
         self.assertEqual(fixture.steps().count("delete_container"), 1)
+
+
+    def test_registry_handback_requires_current_cleanup_and_publication_receipts(self):
+        fixture = Fixture()
+        fixture.now = fixture.target.expires_at
+        self.assertTrue(fixture.caller(Operation.STOP).stop())
+        prior_readback = fixture.cleanup_inventory(fixture.target, request=object())
+        observe = fixture.cleanup_inventory
+
+        def only_sweep_readback_is_current(target, *, request):
+            if fixture.cleanup_inventory.call_count == 1:
+                return observe(target, request=request)
+            return prior_readback
+
+        with patch.object(fixture, "cleanup_inventory", return_value=prior_readback):
+            with self.assertRaisesRegex(SweepError, "^PRE cleanup readback could not be verified$"):
+                fixture.finalize()
+        with patch.object(fixture, "cleanup_inventory", side_effect=only_sweep_readback_is_current):
+            with self.assertRaisesRegex(SweepError, "^PRE registry handback could not be verified$"):
+                fixture.finalize()
+        self.assertNotIn("registry_reservation", fixture.steps())
+
+        prior_reservation = replace(fixture.reservation, target=replace(fixture.target, run_id=70))
+        for settlement in (True, PublicationSettlement(prior_reservation)):
+            with self.subTest(settlement=settlement):
+                with patch.object(fixture, "publication_settlement", return_value=settlement):
+                    with self.assertRaisesRegex(SweepError, "^PRE registry handback could not be verified$"):
+                        fixture.finalize()
+                self.assertNotIn("registry", fixture.steps())
+        self.assertIs(fixture.finalize(), RegistryDisposition.ALREADY_ABSENT)
+        self.assertEqual(fixture.steps().count("registry"), 1)
+
+    def test_handback_requires_a_new_no_writer_read_and_independent_settlement(self):
+        for target in (ORIGINAL, RETAINED):
+            for case in ("exact", "unresolved digest", "replayed cleanup", "delegated writer",
+                         "foreign settlement", "legacy true", "missing settlement"):
+                with self.subTest(shape=target.shape, case=case):
+                    fixture = Fixture(target)
+                    fixture.caller(Operation.START).start(Upload(target))
+                    self.assertTrue(fixture.caller(Operation.STOP).stop())
+                    fixture.status = "terminal"
+                    fixture.registry_present = case == "unresolved digest"
+                    read_inventory = fixture.cleanup_inventory
+                    requests = []
+                    observations = []
+                    sibling = replace(target, run_id=target.run_id + 100)
+                    writers = {(sibling, sibling.service_name)}
+
+                    def observe(requested, *, request):
+                        self.assertEqual(requested, target)
+                        requests.append(request)
+                        current = read_inventory(requested, request=request)
+                        if len(requests) == 2 and case == "replayed cleanup":
+                            return observations[0]
+                        if len(requests) == 2 and case == "delegated writer":
+                            writers.add((target, "fixture-delegated-role"))
+                        current = replace(current, inventory=replace(
+                            current.inventory, write_access=any(database == requested for database, _ in writers),
+                        ))
+                        observations.append(current)
+                        return current
+
+                    settlement = PublicationSettlement(fixture.reservation)
+                    if case == "foreign settlement":
+                        settlement = PublicationSettlement(replace(fixture.reservation, target=sibling))
+                    elif case == "legacy true":
+                        settlement = True
+                    elif case == "missing settlement":
+                        settlement = None
+                    registry = fixture.read_registry
+                    with (patch.object(fixture, "cleanup_inventory", side_effect=observe),
+                          patch.object(fixture, "publication_settlement", return_value=settlement) as verify_settlement,
+                          patch.object(fixture, "read_registry", wraps=registry) as read_registry):
+                        if case in ("exact", "unresolved digest"):
+                            expected = (RegistryDisposition.ALREADY_ABSENT if case == "exact"
+                                        else RegistryDisposition.UNRESOLVED_DIGEST_REFERENCE)
+                            self.assertIs(fixture.finalize(), expected)
+                            verify_settlement.assert_called_once_with(fixture.reservation)
+                            read_registry.assert_called_once_with(fixture.reservation)
+                        else:
+                            with self.assertRaisesRegex(SweepError, "^PRE registry handback could not be verified$"):
+                                fixture.finalize()
+                            read_registry.assert_not_called()
+                            if case in ("foreign settlement", "legacy true", "missing settlement"):
+                                verify_settlement.assert_called_once_with(fixture.reservation)
+                            else:
+                                verify_settlement.assert_not_called()
+                    self.assertEqual(len(requests), 2)
+                    self.assertIsNot(requests[0], requests[1])
+                    self.assertIn((sibling, sibling.service_name), writers)
