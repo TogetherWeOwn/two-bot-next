@@ -121,6 +121,18 @@ so they can bind loopback before the bot starts. Cloudflare's HTTP intercepts
 cannot carry raw PostgreSQL with Internet access disabled.
 [Native Container API](https://developers.cloudflare.com/containers/api/durable-object-container/) · [Non-HTTP egress](https://developers.cloudflare.com/containers/configuration/outbound-traffic/#non-http-traffic)
 
+For native scheduling, Get Application reports observed `active` and
+`starting` counts. The [cleanup projection](../scripts/pre_inventory.py)
+requires `active` and `assigned`. A zero `starting` count cannot satisfy the
+assigned count check. Keep admission closed until a provider-supported cleanup
+adapter can prove zero active and assigned instances for the exact app before
+deletion, including settlement of any in-flight starts. Preserve the existing
+cleanup refusal while this proof is unavailable. The instance API reports a
+latest known state and newly started instances can take time to appear. A
+cleanup adapter could use positive terminal observations for the exact actors
+after confirmed stop and settlement. An empty listing alone gives no proof.
+[Get Application API](https://developers.cloudflare.com/api/resources/containers/subresources/applications/methods/get/) · [Instance API](https://developers.cloudflare.com/api/resources/containers/subresources/applications/subresources/instances/methods/list/) · [Listing delay](https://developers.cloudflare.com/sandbox/manage/list-sandboxes/#list-sandboxes-across-the-account)
+
 Qualification requires protected evidence of private first create, the exact
 fixture writer, version-bound takeover and readiness at both PRE endpoints,
 and independent stop and cleanup. Use the new class with a separately reviewed
