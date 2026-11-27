@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
@@ -25,6 +25,8 @@ import automodPublication from "./fixtures/staging-automod-publication.json" wit
 import type { ProtectedAutomodEffects } from "../src/staging-automod-caller.ts";
 import { StagingAutomodLifecycle } from "../src/staging-automod-lifecycle.ts";
 import { STAGING_AUTOMOD_TARGET, StagingAutomodRecovery } from "../src/staging-automod-recovery.ts";
+import { STAGING_AUTOMOD_OIDC_HEADER, STAGING_AUTOMOD_PATH } from "../src/staging-automod-bridge.ts";
+import { STAGING_AUTOMOD_PLAN, type StagingAutomodPlan } from "../src/staging-automod-plan.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
 import { PREVIEW_HEADER } from "../src/staging-preview.ts";
 import {
@@ -4686,4 +4688,270 @@ test("background metrics: metrics storage failure cannot notify and retains the 
   assert.equal(h.events().length, 0);
   assert.ok(h.logs.includes(SCRAPE_FAILURE));
   assert.equal(h.schedules.mock.callCount(), 1);
+});
+
+const BRIDGE_VERSION = "11111111-1111-1111-1111-111111111111";
+const BRIDGE_ENV = { ...BOUNDED_STAGING_ENV, ...automodPublication.env, CF_VERSION_METADATA: { id: BRIDGE_VERSION } };
+const BRIDGE_JWKS_URL = "https://token.actions.githubusercontent.com/.well-known/jwks";
+const BRIDGE_KID = "synthetic-actions-key";
+const BRIDGE_KEY = generateKeyPairSync("rsa", { modulusLength: 2048 });
+const OTHER_KEY = generateKeyPairSync("rsa", { modulusLength: 2048 });
+const BRIDGE_CLAIMS = {
+  iss: "https://token.actions.githubusercontent.com", aud: "two-bot-staging-automod",
+  repository: "TogetherWeOwn/two-bot-next", repository_id: "1396224242", ref: "refs/heads/main", ref_protected: "true",
+  event_name: "workflow_dispatch", run_id: "123456", run_attempt: "1", environment: "staging",
+  workflow_ref: "TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main",
+  sha: BOUNDED_STAGING_ENV.CONTAINER_RELEASE,
+};
+
+function actionsToken(overrides: Record<string, unknown> = {}, key = BRIDGE_KEY.privateKey): string {
+  const now = Math.floor(Date.now() / 1_000);
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  const signed = `${encode({ alg: "RS256", typ: "JWT", kid: BRIDGE_KID })}.${encode({
+    ...BRIDGE_CLAIMS, iat: now, nbf: now, exp: now + 300, ...overrides })}`;
+  return `${signed}.${sign("sha256", Buffer.from(signed), key).toString("base64url")}`;
+}
+
+async function bridgeHarness(t: TestContext, env: Partial<Env> = BRIDGE_ENV, version = BRIDGE_VERSION) {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const h = await harness(t, env, { owner: { ...ACTIVE_OWNER, deploymentId: version } });
+  const jwk = { ...BRIDGE_KEY.publicKey.export({ format: "jwk" }), kid: BRIDGE_KID, alg: "RS256", use: "sig" };
+  const jwks = t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    assert.equal(String(input instanceof Request ? input.url : input), BRIDGE_JWKS_URL);
+    assert.equal(init?.redirect, "error");
+    return Response.json({ keys: [jwk] });
+  });
+  const reads = { get: t.mock.method(h.ctx.storage, "get"), put: t.mock.method(h.ctx.storage, "put"),
+    delete: t.mock.method(h.ctx.storage, "delete") };
+  const storageCalls = () => reads.get.mock.callCount() + reads.put.mock.callCount() + reads.delete.mock.callCount();
+  const planReads: string[] = [];
+  const setPlan = (plan: StagingAutomodPlan) => {
+    (h.bot as unknown as { automodPlan: StagingAutomodPlan }).automodPlan = new Proxy(plan, {
+      get: (target, key, receiver) => { planReads.push(String(key)); return Reflect.get(target, key, receiver); },
+    });
+  };
+  const enabledPlan: StagingAutomodPlan = { ...STAGING_AUTOMOD_PLAN, enabled: true, allowStart: true,
+    notAfter: Date.now() + 600_000 };
+  const pin = { workerVersionId: BRIDGE_VERSION, sourceSha: BRIDGE_ENV.CONTAINER_RELEASE, namespaceId: "a".repeat(32),
+    workerDeploymentId: "22222222-2222-2222-2222-222222222222", applicationId: "33333333-3333-3333-3333-333333333333",
+    rolloutId: "44444444-4444-4444-4444-444444444444", imageDigest: `sha256:${"b".repeat(64)}` };
+  const change = { ...stagingWindow(), action: "acquire" as const, deploymentId: BRIDGE_VERSION, sha: pin.sourceSha,
+    expectedEpoch: ACTIVE_OWNER.epoch };
+  const context = { environment: "staging", deploymentId: BRIDGE_VERSION, sha: pin.sourceSha, runId: change.runId,
+    runAttempt: 1, target: STAGING_AUTOMOD_TARGET };
+  const request = (body: unknown, options: { token?: string | null; bearer?: string; deployment?: string;
+    signal?: AbortSignal; method?: string } = {}) => {
+    const headers = new Headers({ "content-type": "application/json", [DEPLOYMENT_HEADER]: options.deployment ?? version });
+    if (options.bearer !== "") headers.set("authorization", `Bearer ${options.bearer ?? CONTROL_TOKEN}`);
+    const token = options.token === undefined ? actionsToken() : options.token;
+    if (token !== null) headers.set(STAGING_AUTOMOD_OIDC_HEADER, token);
+    const method = options.method ?? "POST";
+    return new Request(`https://worker.invalid${STAGING_AUTOMOD_PATH}`, { method, headers,
+      ...(method === "POST" ? { body: typeof body === "string" ? body : JSON.stringify(body) } : {}),
+      ...(options.signal ? { signal: options.signal } : {}) });
+  };
+  const send = async (body: unknown, options: Parameters<typeof request>[1] = {}) => {
+    const response = await h.bot.fetch(request(body, options));
+    return { status: response.status, body: await response.json().catch(() => null) as { value?: unknown } | null };
+  };
+  return { ...h, jwks, storageCalls, planReads, setPlan, enabledPlan, pin, change, context, request, send };
+}
+
+const BRIDGE_REFUSED = { status: 403, body: { error: "staging_automod_refused" } };
+
+test("AutoMod bridge: the Worker route needs bounded staging, POST and the control bearer", async t => {
+  const h = await bridgeHarness(t);
+  h.setPlan(h.enabledPlan);
+  let routed = 0;
+  const edge = (env: Partial<Env> = BRIDGE_ENV) => ({ ...env, TWO_BOT: { getByName: () => {
+    routed++;
+    return h.bot;
+  } } }) as unknown as Env;
+  const body = { op: "read-lease", context: h.context };
+  for (const env of [{ ...BRIDGE_ENV, TWO_DEPLOY_ENV: "production" }, { ...BRIDGE_ENV, STAGING_RUNTIME_POLICY: "standard" }]) {
+    assert.equal((await worker.fetch(h.request(body), edge(env))).status, 404);
+  }
+  assert.equal((await worker.fetch(h.request(body, { method: "GET" }), edge())).status, 404);
+  assert.equal((await worker.fetch(h.request(body, { bearer: "" }), edge())).status, 401);
+  assert.equal((await worker.fetch(h.request(body, { bearer: "x".repeat(43) }), edge())).status, 401);
+  assert.equal(routed, 0);
+  assert.equal(h.jwks.mock.callCount(), 0);
+
+  const forged = h.request(body, { deployment: "forged-deployment" });
+  const routedResponse = await worker.fetch(forged, edge());
+  assert.equal(routedResponse.status, 200);
+  assert.deepEqual(await routedResponse.json(), { value: null });
+  assert.deepEqual(await h.send(body, { deployment: "forged-deployment" }), BRIDGE_REFUSED);
+  assert.equal(routed, 1);
+  assert.equal((await h.send(body, { bearer: "" })).status, 401);
+  assert.equal((await h.send(body, { bearer: "x".repeat(43) })).status, 401);
+  assert.equal((await h.send(body, { method: "GET" })).status, 404);
+  assert.equal(h.jwks.mock.callCount(), 1);
+});
+
+test("AutoMod bridge: every unverified Actions token is refused before storage, plan or Container", async t => {
+  const h = await bridgeHarness(t);
+  h.setPlan(h.enabledPlan);
+  const body = { op: "acquire", pin: h.pin, change: h.change };
+  const now = Math.floor(Date.now() / 1_000);
+  const cases: [string, string | null][] = [
+    ["missing", null],
+    ["malformed", "not-a-jwt"],
+    ["bad signature", actionsToken({}, OTHER_KEY.privateKey)],
+    ["wrong audience", actionsToken({ aud: "sts.amazonaws.com" })],
+    ["second attempt", actionsToken({ run_attempt: "2" })],
+    ["non-main ref", actionsToken({ ref: "refs/heads/feature" })],
+    ["unprotected ref", actionsToken({ ref_protected: "false" })],
+    ["other workflow", actionsToken({ workflow_ref: BRIDGE_CLAIMS.workflow_ref.replace("staging-automod-preview", "other") })],
+    ["other environment", actionsToken({ environment: "production" })],
+    ["other repository", actionsToken({ repository_id: "1" })],
+    ["other event", actionsToken({ event_name: "push" })],
+    ["other issuer", actionsToken({ iss: "https://issuer.invalid" })],
+    ["expired", actionsToken({ iat: now - 600, nbf: now - 600, exp: now - 61 })],
+    ["not yet valid", actionsToken({ nbf: now + 120 })],
+    ["other build", actionsToken({ sha: "c".repeat(40) })],
+  ];
+  for (const [label, token] of cases) assert.deepEqual(await h.send(body, { token }), BRIDGE_REFUSED, label);
+  assert.equal(h.storageCalls(), 0);
+  assert.deepEqual(h.planReads, []);
+  assert.deepEqual(h.starts, []);
+  assert.equal(h.runtime.destroys, 0);
+  assert.equal(h.values.has(STAGING_USE_KEY), false);
+
+  const skewed = actionsToken({ iat: now - 400, nbf: now - 400, exp: now - 30 });
+  const accepted = await h.send(body, { token: skewed });
+  assert.equal(accepted.status, 200);
+  assert.equal((accepted.body?.value as StagingUse).purpose, AUTOMOD_STAGING_PURPOSE);
+  assert.ok(h.storageCalls() > 0);
+});
+
+test("AutoMod bridge: a token for another run is refused before the reservation is read", async t => {
+  const h = await bridgeHarness(t);
+  h.setPlan(h.enabledPlan);
+  const token = actionsToken({ run_id: "654321" });
+  for (const body of [{ op: "acquire", pin: h.pin, change: h.change }, { op: "read-lease", context: h.context }]) {
+    assert.deepEqual(await h.send(body, { token }), BRIDGE_REFUSED);
+  }
+  assert.deepEqual(h.planReads, []);
+  assert.equal(h.storageCalls(), 0);
+  assert.equal(h.values.has(STAGING_USE_KEY), false);
+});
+
+test("AutoMod bridge: another version's instance refuses the pinned reservation", async t => {
+  const other = "66666666-6666-6666-6666-666666666666";
+  const h = await bridgeHarness(t, { ...BRIDGE_ENV, CF_VERSION_METADATA: { id: other } }, other);
+  h.setPlan(h.enabledPlan);
+  assert.deepEqual(await h.send({ op: "acquire", pin: h.pin, change: h.change }), BRIDGE_REFUSED);
+  assert.equal(h.planReads.includes("notAfter"), false, "the reservation gate must not be read");
+  assert.equal(h.values.has(STAGING_USE_KEY), false);
+  assert.deepEqual(h.starts, []);
+  assert.equal(h.runtime.destroys, 0);
+});
+
+test("AutoMod bridge: the default plan refuses start, and recover retires the original lease", async t => {
+  const h = await bridgeHarness(t);
+  assert.equal(STAGING_AUTOMOD_PLAN.enabled, false);
+  assert.equal(STAGING_AUTOMOD_PLAN.allowStart, false);
+  const disabled = [STAGING_AUTOMOD_PLAN, { ...h.enabledPlan, enabled: false }, { ...h.enabledPlan, allowStart: false },
+    { ...h.enabledPlan, notAfter: Date.now() }, { ...h.enabledPlan, notAfter: h.change.expiresAt - 1 },
+    { ...h.enabledPlan, leaseMs: 1_000 }];
+  for (const plan of disabled) {
+    h.setPlan(plan);
+    assert.deepEqual(await h.send({ op: "acquire", pin: h.pin, change: h.change }), BRIDGE_REFUSED);
+  }
+  assert.equal(h.values.has(STAGING_USE_KEY), false);
+
+  h.setPlan(h.enabledPlan);
+  const acquired = await h.send({ op: "acquire", pin: h.pin, change: h.change });
+  assert.equal(acquired.status, 200);
+  const issued = acquired.body?.value as StagingUse;
+  assert.deepEqual(await h.send({ op: "read-lease", context: h.context }), { status: 200, body: { value: issued } });
+  assert.deepEqual(await h.send({ op: "read-approval", action: "start", issuedLease: issued }),
+    { status: 200, body: { value: { action: "start", issuedLease: issued, target: STAGING_AUTOMOD_TARGET } } });
+
+  for (const plan of disabled.slice(0, 4)) {
+    h.setPlan(plan);
+    assert.deepEqual(await h.send({ op: "read-approval", action: "start", issuedLease: issued }),
+      { status: 200, body: { value: null } });
+    assert.deepEqual(await h.send({ op: "invoke", pin: h.pin, call: { action: "start", issuedLease: issued } }),
+      BRIDGE_REFUSED);
+  }
+  h.setPlan(STAGING_AUTOMOD_PLAN);
+  assert.deepEqual(h.starts, []);
+  assert.deepEqual(await new StagingAutomodRecovery(h.ctx.storage as unknown as DurableObjectStorage).pending(),
+    { lease: issued, phase: "reserved" });
+
+  const recover = { action: "recover", issuedLease: issued, target: STAGING_AUTOMOD_TARGET };
+  assert.deepEqual(await h.send({ op: "read-approval", action: "recover", issuedLease: issued }),
+    { status: 200, body: { value: recover } });
+  assert.deepEqual(await h.send({ op: "invoke", pin: h.pin, call: { action: "recover", issuedLease: issued } }),
+    { status: 200, body: { value: null } });
+  assert.deepEqual(h.values.get(STAGING_USE_KEY), { ...issued, phase: "released" });
+  assert.deepEqual(await h.send({ op: "read-lease", context: h.context }), { status: 200, body: { value: null } });
+  assert.deepEqual(h.starts, []);
+});
+
+test("AutoMod bridge: the plan gates refuse even when the in-DO effects would permit start", async t => {
+  const h = await bridgeHarness(t);
+  let policyReads = 0;
+  const policy = { memberIntake: false, enforcement: false, resume: false, registrySync: false,
+    interactionDispatch: false, dedicatedIntents: true };
+  const effects: ProtectedAutomodEffects = {
+    enabled: true,
+    dryRun: { get policy() { policyReads++; return policy; }, start: async () => assert.fail("start is not approved") },
+    readRuntime: async lease => ({ lease, running: h.runtime.running, policy }),
+    readCleanupGrant: async lease => ({ lease, before: lease.expiresAt + 5_000 }),
+    fenceAndDrain: async () => assert.fail("no work to drain"),
+    stop: async () => true,
+    request: async () => assert.fail("no registry access"),
+  };
+  (h.bot as unknown as { automodEffects: ProtectedAutomodEffects }).automodEffects = effects;
+  const disabled = [STAGING_AUTOMOD_PLAN, { ...h.enabledPlan, enabled: false }, { ...h.enabledPlan, notAfter: Date.now() }];
+  for (const plan of disabled) {
+    h.setPlan(plan);
+    assert.deepEqual(await h.send({ op: "acquire", pin: h.pin, change: h.change }), BRIDGE_REFUSED);
+  }
+  assert.equal(h.values.has(STAGING_USE_KEY), false);
+
+  h.setPlan(h.enabledPlan);
+  const issued = (await h.send({ op: "acquire", pin: h.pin, change: h.change })).body?.value as StagingUse;
+  assert.equal(issued.purpose, AUTOMOD_STAGING_PURPOSE);
+  for (const plan of [...disabled, { ...h.enabledPlan, allowStart: false }]) {
+    h.setPlan(plan);
+    assert.deepEqual(await h.send({ op: "invoke", pin: h.pin, call: { action: "start", issuedLease: issued } }),
+      BRIDGE_REFUSED);
+  }
+  assert.equal(policyReads, 0, "a refused approval must not reach the private invoker");
+  assert.deepEqual(h.starts, []);
+});
+
+test("AutoMod bridge: only the closed operation set with a strict bounded body is admitted", async t => {
+  const h = await bridgeHarness(t);
+  h.setPlan(h.enabledPlan);
+  const invalid = { status: 400, body: { error: "staging_automod_invalid" } };
+  for (const op of ["release", "publish", "constructor", "__proto__"]) {
+    assert.equal((await h.send({ op, context: h.context })).status, 404, op);
+  }
+  assert.equal((await h.send({ context: h.context })).status, 404);
+  const context = JSON.stringify(h.context);
+  assert.deepEqual(await h.send(`{"op":"read-lease","context":${context},"context":${context}}`), invalid);
+  assert.deepEqual(await h.send(`{"op":"read-lease","op":"read-lease","context":${context}}`), invalid);
+  assert.deepEqual(await h.send({ op: "read-lease", context: h.context, padding: "x".repeat(5_000) }), invalid);
+  assert.deepEqual(await h.send({ op: "read-lease", context: h.context, extra: true }), invalid);
+  assert.deepEqual(await h.send({ op: "read-lease", context: { ...h.context, extra: true } }), invalid);
+  for (const extra of [{ voiceMove: true }, { purpose: AUTOMOD_STAGING_PURPOSE }]) {
+    assert.deepEqual(await h.send({ op: "acquire", pin: h.pin, change: { ...h.change, ...extra } }), invalid);
+  }
+  assert.deepEqual(await h.send({ op: "read-approval", action: "publish", issuedLease: {} }), invalid);
+  assert.deepEqual(await h.send("[]"), invalid);
+  assert.deepEqual(await h.send("not json"), invalid);
+  const controller = new AbortController();
+  const cancel = t.mock.fn();
+  const stalled = new ReadableStream({ pull: () => controller.abort(), cancel }, { highWaterMark: 0 });
+  const request = new Request(h.request({}, { signal: controller.signal }), { body: stalled, duplex: "half" });
+  assert.equal((await h.bot.fetch(request)).status, 403);
+  assert.equal(cancel.mock.callCount(), 1);
+  assert.equal(h.storageCalls(), 0);
+  assert.equal(h.values.has(STAGING_USE_KEY), false);
+  assert.deepEqual(h.starts, []);
 });

@@ -1,3 +1,4 @@
+import { boundRead } from "./internal-actions.ts";
 import { withSecurityHeaders } from "./security-headers.ts";
 
 /** Persisted singleton ownership. Missing/corrupt/unreadable state never grants ownership. */
@@ -175,6 +176,7 @@ export async function readChange(request: Request): Promise<OwnershipChange | nu
 export async function readControlBody(request: Request,
   decode = (bytes: Uint8Array): unknown => JSON.parse(new TextDecoder().decode(bytes)),
   limit = 1024,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const reader = request.body?.getReader();
   if (!reader) return null;
@@ -186,8 +188,9 @@ export async function readControlBody(request: Request,
   });
   try {
     for (;;) {
-      const step = await Promise.race([reader.read(), timeout]);
-      if (step === "timeout") {
+      signal?.throwIfAborted();
+      const step = await boundRead(Promise.race([reader.read(), timeout]), signal);
+      if (step === "timeout" || signal?.aborted) {
         void reader.cancel().catch(() => {});
         return null;
       }
@@ -204,6 +207,7 @@ export async function readControlBody(request: Request,
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
     return decode(bytes);
   } catch {
+    void reader.cancel().catch(() => {});
     return null;
   } finally {
     clearTimeout(timer);
