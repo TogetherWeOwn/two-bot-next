@@ -12,7 +12,7 @@ from test_pre_admission import Store
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_admission import AdmissionRecord, SettlementEvidence, SettlementSource, StartupAdmission
-    from pre_start_stop import Deployment, Endpoint, Operation, ProbeReply, ProtectedPre
+    from pre_start_stop import Deployment, EffectWindow, Endpoint, Operation, ProbeReply, ProtectedPre
     from pre_start_stop import StartupAdmission as AdmissionProtocol
     from pre_target import Inventory, Target, TargetError, verify_cleanup
 
@@ -33,6 +33,7 @@ class Upload:
 class PreFixture:
     def __init__(self, target=TARGET):
         self.target = target
+        self.window = EffectWindow(target, target.expires_at)
         self.deployment = Deployment(target, START, UUID(int=2), UUID(int=3))
         self.upload = Upload(target)
         self.authorize = Mock(return_value=True)
@@ -53,13 +54,17 @@ class PreFixture:
 
     def controller(self, authorize):
         return ProtectedPre(self.target, authorize=authorize, admission=self.admission,
-                            runtime=self, external_stop=self)
+                            runtime=self, external_stop=self, effect_window=self.window)
 
-    def arm(self, target, start_id):
-        self.effects.arm(target, start_id)
-        if self.fenced or not target.started_at <= self.now < target.expires_at:
+    def arm(self, window, start_id):
+        self.effects.arm(window, start_id)
+        if self.fenced or self.armed is not None:
             return False
-        self.armed = (target, start_id)
+        try:
+            window.require_open(self.now)
+        except TargetError:
+            return False
+        self.armed = (window, start_id)
         return True
 
     def fence(self, target):
@@ -68,18 +73,33 @@ class PreFixture:
         return True
 
     def confirm_probe_active(self, target, start_id):
-        return (self.armed == (target, start_id) and not self.fenced
-                and target.started_at <= self.now < min(target.expires_at, self.enclosing_cutoff))
+        if self.armed is None or self.fenced:
+            return False
+        window, armed_start_id = self.armed
+        if window.target != target or armed_start_id != start_id:
+            return False
+        try:
+            window.require_open(self.now)
+        except TargetError:
+            return False
+        return self.now < min(window.cutoff, self.enclosing_cutoff)
 
     def allow_effect(self, target, start_id):
-        if self.fenced or self.armed != (target, start_id) or self.now >= target.expires_at:
+        if self.fenced or self.armed is None:
             raise OSError("effect refused")
+        window, armed_start_id = self.armed
+        if window.target != target or armed_start_id != start_id:
+            raise OSError("effect refused")
+        window.require_open(self.now)
 
-    def create_private(self, target, start_id, upload):
+    def create_private(self, window, start_id, upload):
         self.before_create()
+        if self.armed != (window, start_id):
+            raise OSError("unbound create")
+        target = window.target
         self.allow_effect(target, start_id)
         self.effects.create(target, start_id, upload)
-        self.created = self.deployment
+        self.created = replace(self.deployment, start_id=start_id)
         self.after_create()
         return self.created
 
@@ -119,7 +139,20 @@ class ProtectedPreTests(unittest.TestCase):
     def test_unarmed_deadline_refuses_create(self):
         self.fixture.now = TARGET.expires_at
         self.assert_refuses("pre_external_stop_unarmed", self.controller.start, self.fixture.upload)
-        self.assertEqual(self.fixture.effects.mock_calls, [call.admission.admit_start(TARGET), call.arm(TARGET, START)])
+        self.assertEqual(self.fixture.effects.mock_calls,
+                         [call.admission.admit_start(TARGET), call.arm(self.fixture.window, START)])
+
+    def test_arm_at_enclosing_lease_cutoff_refuses_create(self):
+        fixture = self.fixture
+        fixture.now = TARGET.started_at + 60
+        fixture.window = EffectWindow(TARGET, fixture.now)
+        controller = fixture.controller(fixture.authorize)
+        self.assert_refuses("pre_external_stop_unarmed", controller.start, fixture.upload)
+        self.assertLess(fixture.now, TARGET.expires_at)
+        self.assertIsNone(fixture.armed)
+        fixture.before_create.assert_not_called()
+        self.assertEqual(fixture.effects.mock_calls,
+                         [call.admission.admit_start(TARGET), call.arm(fixture.window, START)])
 
     def test_missing_or_unconfirmed_discord_overrides_refuse_before_admission(self):
         for capability in ({}, {"supports_discord_fixture_overrides": False}, {"supports_discord_fixture_overrides": 1}):
@@ -134,9 +167,74 @@ class ProtectedPreTests(unittest.TestCase):
         fixture = self.fixture
         fixture.before_create.side_effect = self.controller.stop
         self.assert_refuses("pre_create_unconfirmed", self.controller.start, fixture.upload)
-        self.assertEqual(fixture.effects.mock_calls, [call.admission.admit_start(TARGET), call.arm(TARGET, START),
+        self.assertEqual(fixture.effects.mock_calls, [call.admission.admit_start(TARGET), call.arm(fixture.window, START),
                          call.fence(TARGET), call.admission.close(TARGET), call.admission.settle(TARGET)])
         self.assertIsNone(fixture.created)
+
+    def test_refuses_missing_foreign_or_invalid_effect_window(self):
+        fixture = self.fixture
+        foreign = replace(TARGET, shape=PRE_SHAPES[1])
+        for window in (None, EffectWindow(foreign, fixture.window.cutoff)):
+            with self.subTest(window=window):
+                fixture.window = window
+                self.assert_refuses("wrong_pre_effect_window", fixture.controller(fixture.authorize).start,
+                                    fixture.upload)
+        self.assertEqual(fixture.effects.mock_calls, [])
+        for cutoff in (None, True, float(TARGET.expires_at), TARGET.started_at, TARGET.expires_at + 1):
+            with self.subTest(cutoff=cutoff):
+                self.assert_refuses("invalid_pre_effect_window", EffectWindow, TARGET, cutoff)
+
+    def test_delayed_create_respects_lease_cutoff_and_original_stop_settles(self):
+        cutoff = TARGET.started_at + 60
+        for delay in (0, 1):
+            with self.subTest(delay=delay):
+                fixture = PreFixture()
+                fixture.window = EffectWindow(TARGET, cutoff)
+                store = Store()
+                pending_observation = Mock(return_value=None)
+                fixture.admission = StartupAdmission(store, pending_observation)
+                fixture.before_create.side_effect = lambda: setattr(fixture, "now", cutoff + delay)
+                start = fixture.controller(lambda t, op: (t, op) == (TARGET, Operation.START))
+                self.assert_refuses("pre_create_unconfirmed", start.start, fixture.upload)
+                fixture.before_create.assert_called_once_with()
+                self.assertLess(fixture.now, TARGET.expires_at)
+                self.assertFalse(fixture.fenced)
+                fixture.effects.create.assert_not_called()
+                self.assertIsNone(fixture.created)
+
+                window, start_id = fixture.armed
+                self.assertEqual(window, EffectWindow(TARGET, cutoff))
+                self.assertEqual(store.read(TARGET), AdmissionRecord(TARGET, start_id, False))
+                self.assert_refuses("pre_start_not_admitted", start.start, fixture.upload)
+                self.assert_refuses("pre_operation_denied", start.stop)
+                pending_observation.assert_not_called()
+
+                original_closed = AdmissionRecord(TARGET, start_id, True)
+                proof = Mock(return_value=None)
+                admission = StartupAdmission(store, proof)
+                stop = ProtectedPre(TARGET, authorize=lambda t, op: (t, op) == (TARGET, Operation.STOP),
+                                    admission=admission, runtime=fixture, external_stop=fixture)
+                self.assertFalse(stop.stop())
+                fixture.effects.fence.assert_called_once_with(TARGET)
+                self.assertEqual(store.read(TARGET), original_closed)
+                proof.assert_called_once_with(original_closed)
+                self.assertFalse(admission.startup_settled(TARGET))
+                proof.return_value = SettlementEvidence(original_closed, SettlementSource.PROVIDER, True, True)
+                self.assertTrue(stop.stop())
+                self.assertEqual(store.read(TARGET), replace(original_closed, settled_by=SettlementSource.PROVIDER))
+
+    def test_create_before_lease_cutoff_succeeds_and_probe_at_cutoff_is_refused(self):
+        fixture = self.fixture
+        cutoff = TARGET.started_at + 60
+        fixture.window = EffectWindow(TARGET, cutoff)
+        fixture.before_create.side_effect = lambda: setattr(fixture, "now", cutoff - 1)
+        controller = fixture.controller(fixture.authorize)
+        deployment = controller.start(fixture.upload)
+        fixture.effects.create.assert_called_once_with(TARGET, START, fixture.upload)
+        self.assertEqual(controller.probe(deployment, Endpoint.HEALTH), fixture.reply)
+        fixture.now = cutoff
+        self.assert_refuses("pre_probe_unconfirmed", controller.probe, deployment, Endpoint.HEALTH)
+        fixture.effects.probe.assert_called_once_with(deployment, Endpoint.HEALTH)
 
     def test_stop_refuses_settlement_when_fence_or_close_returns_false(self):
         for fenced, closed in ((False, True), (True, False)):
@@ -184,6 +282,7 @@ class ProtectedPreTests(unittest.TestCase):
                 deployment = controller.start(fixture.upload)
                 if outcome == "enclosing_cutoff":
                     fixture.enclosing_cutoff = TARGET.expires_at - 5
+                    fixture.window = EffectWindow(TARGET, fixture.enclosing_cutoff)
                 fixture.now = fixture.enclosing_cutoff - 1
                 fixture.reply = ProbeReply(200, deployment.worker_version, b'{"components":[["gateway","ready"]]}')
                 stop_results = []
@@ -229,7 +328,7 @@ class ProtectedPreTests(unittest.TestCase):
                 fixture.now = target.expires_at
                 self.assert_refuses("pre_probe_unconfirmed", controller.probe, deployment, Endpoint.READINESS)
                 self.assertEqual(fixture.effects.mock_calls, [call.admission.admit_start(target),
-                                 call.arm(target, START), call.create(target, START, fixture.upload),
+                                 call.arm(fixture.window, START), call.create(target, START, fixture.upload),
                                  *(call.probe(deployment, endpoint) for endpoint, _, _ in probes)])
                 probe_permissions = [call(target, Operation.PROBE)] * (len(probes) + 1)
                 self.assertEqual(fixture.authorize.call_args_list, [call(target, Operation.START), *probe_permissions])
@@ -242,7 +341,7 @@ class ProtectedPreTests(unittest.TestCase):
                 start_observer = Mock(return_value=None)
                 start = ProtectedPre(TARGET, authorize=lambda t, op: (t, op) == (TARGET, Operation.START),
                                      admission=StartupAdmission(store, start_observer),
-                                     runtime=fixture, external_stop=fixture)
+                                     runtime=fixture, external_stop=fixture, effect_window=fixture.window)
                 with patch("pre_admission.uuid4", return_value=START):
                     deployment = start.start(fixture.upload)
                 self.assertEqual(deployment, fixture.deployment)
@@ -260,7 +359,7 @@ class ProtectedPreTests(unittest.TestCase):
                 self.assertIs(stop.stop(), settled)
 
                 closed = AdmissionRecord(TARGET, deployment.start_id, closed=True)
-                self.assertEqual(fixture.effects.mock_calls, [call.arm(TARGET, START),
+                self.assertEqual(fixture.effects.mock_calls, [call.arm(fixture.window, START),
                                  call.create(TARGET, START, fixture.upload), call.fence(TARGET), call.observe(closed)])
                 self.assertEqual(store.records, {
                     TARGET: replace(closed, settled_by=SettlementSource.RUNTIME if settled else None),
@@ -292,7 +391,7 @@ class ProtectedPreTests(unittest.TestCase):
         self.assert_refuses("pre_start_not_admitted", start.start, fixture.upload)
         self.assert_refuses("pre_operation_denied", start.stop)
         self.assertIs(stop.stop(), expected)
-        self.assertEqual(fixture.effects.mock_calls, [call.admission.admit_start(target), call.arm(target, START),
+        self.assertEqual(fixture.effects.mock_calls, [call.admission.admit_start(target), call.arm(fixture.window, START),
                          call.create(target, START, fixture.upload), call.admission.admit_start(target),
                          call.fence(target), call.admission.close(target), call.admission.settle(target)])
         probe = fixture.controller(lambda t, op: (t, op) == (target, Operation.PROBE))

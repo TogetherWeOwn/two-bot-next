@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Protocol
 from uuid import UUID
 
-from pre_target import ProtectedRouteReadback, Target, TargetError, confirm_protected_route, require
+from pre_target import ProtectedRouteReadback, Target, TargetError, check_clock, confirm_protected_route, require
 from staging_health_contract_probe import BODY_CAP, TIMEOUT_SECONDS
 
 
@@ -27,6 +27,24 @@ class Operation(Enum):
 class Endpoint(Enum):
     HEALTH = "/health"
     READINESS = "/readyz"
+
+
+@dataclass(frozen=True)
+class EffectWindow:
+    """The protected caller binds the authenticated lease cutoff to its Target."""
+
+    target: Target
+    cutoff: int
+
+    def __post_init__(self):
+        require(type(self.target) is Target and type(self.cutoff) is int
+                and self.target.started_at < self.cutoff <= self.target.expires_at,
+                "invalid_pre_effect_window")
+
+    def require_open(self, now: int) -> None:
+        """Check with trusted, nondecreasing authority time at the effect boundary."""
+        check_clock(self.target, now)
+        require(now < self.cutoff, "pre_effect_window_expired")
 
 
 class StartupAdmission(Protocol):
@@ -91,11 +109,12 @@ class PrivateHttpReply:
 class PrivateProbeBinding(Protocol):
     """Authenticated handle to one private service, with no alternate destination.
 
-    The adapter must check the current reservation, exact binding destination,
-    authorization, deadline and stop fence at send time. The adapter must
-    enforce the total timeout and cap the response read, without redirects or
-    retries. Return every x-two-worker-version field value, regardless of
-    header case.
+    At send time, the adapter checks the current reservation, exact binding
+    destination, authorization and stop fence. It checks the durably armed
+    window for the exact Target and start ID with trusted current time. The
+    adapter must enforce the total timeout and cap the response read, without
+    redirects or retries. Return every x-two-worker-version field value,
+    regardless of header case.
     """
 
     @property
@@ -116,21 +135,25 @@ class PrivateRuntime(Protocol):
     Resolve and compare the deployment against the authoritative identity for
     the full reservation on each bounded GET using the `probe_private_get` contract.
     Controller instances can span different runners, so retain that identity
-    outside the controller. Refuse effects outside the admission window,
-    after a fence, or for unverified identities. Treat a lost reply as uncertain.
+    outside the controller. At each effect, including delayed create and probe,
+    verify ownership and the fence and call `require_open` on the durably armed
+    window using trusted current time. Create must match the exact armed
+    window for this Target and start ID. Enforce these checks at the point the
+    effect can commit. Treat a lost reply as uncertain.
     """
 
-    def create_private(self, target: Target, start_id: UUID, upload: WorkerUpload) -> Deployment: ...
+    def create_private(self, window: EffectWindow, start_id: UUID, upload: WorkerUpload) -> Deployment: ...
     def probe(self, deployment: Deployment, endpoint: Endpoint) -> ProbeReply: ...
 
 
 class ExternalStop(Protocol):
     """Independent of the calling workflow and the historical Worker.
 
-    Arm before create and enforce the deadline in Target even after runner
-    loss. Arm is bound to the admitted start ID and cannot reopen a fenced or
-    expired reservation. Arm must atomically reserve the exact provider names
-    in their account and refuse a collision with any other reservation. Two
+    Arm before create and independently enforce the armed window's cutoff even
+    after runner loss. At arm commit, check `require_open` with authority time,
+    durably bind the window to the admitted start ID and atomically reserve the
+    exact provider names in their account. Refuse a cutoff change, a fenced or
+    expired reservation, or a collision with any other reservation. Two
     full Targets can have the same names. Key ownership and stop by the full
     Target. The runtime checks ownership and the fence at the effect boundary,
     including for delayed requests. Fence persists even if create never
@@ -139,7 +162,7 @@ class ExternalStop(Protocol):
     The admission settlement observer verifies drain and no restart separately.
     """
 
-    def arm(self, target: Target, start_id: UUID) -> bool: ...
+    def arm(self, window: EffectWindow, start_id: UUID) -> bool: ...
     def fence(self, target: Target) -> bool: ...
 
     def confirm_probe_active(self, target: Target, start_id: UUID) -> bool:
@@ -198,14 +221,18 @@ def probe_private_get(deployment: Deployment, endpoint: Endpoint, *, pinned_depl
 
 
 class ProtectedPre:
+    """Construct START with the original authenticated window and STOP with the Target."""
+
     def __init__(self, target: Target, *, authorize: Callable[[Target, Operation], bool],
-                 admission: StartupAdmission, runtime: PrivateRuntime, external_stop: ExternalStop):
+                 admission: StartupAdmission, runtime: PrivateRuntime, external_stop: ExternalStop,
+                 effect_window: EffectWindow | None = None):
         require(type(target) is Target, "invalid_pre_target")
         self._target = target
         self._authorize = authorize
         self._admission = admission
         self._runtime = runtime
         self._external_stop = external_stop
+        self._effect_window = effect_window
 
     def _allow(self, operation):
         allowed = _call(self._authorize, self._target, operation, failure="pre_operation_denied")
@@ -227,13 +254,15 @@ class ProtectedPre:
         target = self._target
         upload_target = getattr(upload, "target", None)
         require(type(upload_target) is Target and upload_target == target, "wrong_pre_upload_target")
+        window = self._effect_window
+        require(type(window) is EffectWindow and window.target == target, "wrong_pre_effect_window")
         require(getattr(upload, "supports_discord_fixture_overrides", None) is True,
                 "pre_discord_fixture_overrides_unavailable")
         start_id = _call(self._admission.admit_start, target, failure="pre_start_unconfirmed")
         require(type(start_id) is UUID and start_id.int, "pre_start_not_admitted")
-        armed = _call(self._external_stop.arm, target, start_id, failure="pre_external_stop_unarmed")
+        armed = _call(self._external_stop.arm, window, start_id, failure="pre_external_stop_unarmed")
         require(armed is True, "pre_external_stop_unarmed")
-        deployment = _call(self._runtime.create_private, target, start_id, upload, failure="pre_create_unconfirmed")
+        deployment = _call(self._runtime.create_private, window, start_id, upload, failure="pre_create_unconfirmed")
         self._require_deployment(deployment)
         require(deployment.start_id == start_id, "pre_deployment_unconfirmed")
         return deployment
