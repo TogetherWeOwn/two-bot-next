@@ -8,13 +8,17 @@ from unittest.mock import Mock, call
 from uuid import UUID
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from pre_container_lookup import ContainerAppReply, ContainerAppScope
 from pre_registry_cleanup import RegistryDisposition, RegistryReservation
-from pre_runtime_binding import RuntimeBinding, RuntimeBindingReadback, launch_with_verified_binding
+from pre_runtime_binding import (
+    RuntimeBinding, RuntimeBindingReadback, launch_with_durable_object_binding, launch_with_verified_binding,
+)
 from pre_start_stop import (
     Deployment, Endpoint, Operation, PrivateHttpReply, ProbeBindingIdentity, probe_private_get,
 )
 from staging_health_contract_probe import BODY_CAP, TIMEOUT_SECONDS
 from pre_target import ProtectedRouteReadback, Resource, Target, TargetError
+from pre_worker_lookup import WorkerVersionReply
 from test_pre_caller import ORIGINAL, RECEIPT, RETAINED, Fixture, Upload
 
 
@@ -41,6 +45,85 @@ def readback_for(binding, request):
 
 
 class RuntimeBindingTests(unittest.TestCase):
+    def test_native_launch_checks_exact_provider_version_and_app_before_runtime_read(self):
+        for shape in ("0473/0465", "0475/0465"):
+            target = Target("pre-fixture-runtime", 123, 1_800_000_000, shape)
+            deployment = Deployment(target, START, WORKER, APP)
+            binding = replace(binding_for(deployment), namespace_id="a" * 32)
+            account, source = "1" * 32, "c" * 40
+            worker_path = f"/accounts/{account}/workers/scripts/{target.worker_name}/versions/{WORKER}"
+            app_path = f"/accounts/{account}/containers/applications/{APP}"
+            scope = ContainerAppScope(target, account, str(APP))
+            native_binding = {"name": "TWO_BOT", "type": "durable_object_namespace",
+                              "namespace_id": binding.namespace_id, "class_name": "PreQualificationContainer"}
+            version = {"id": str(WORKER), "annotations": {"workers/message": source},
+                       "resources": {"bindings": [native_binding]}}
+            app = {"id": str(APP), "account_id": account, "name": target.container_name,
+                   "durable_objects": {"namespace_id": binding.namespace_id}, "scheduling_policy": "durable_object"}
+
+            def envelope(result):
+                return {"success": True, "errors": [], "messages": [], "result": result}
+
+            worker_reply = WorkerVersionReply(target, worker_path, 200, envelope(version))
+            app_reply = ContainerAppReply(scope, app_path, 200, envelope(app))
+            foreign_target = replace(target, started_at=target.started_at - 1)
+
+            def with_bindings(*bindings):
+                resources = {"bindings": list(bindings)}
+                return replace(worker_reply, body=envelope(version | {"resources": resources}))
+
+            cases = (
+                (worker_reply, app_reply, None, True),
+                (replace(worker_reply, target=foreign_target), app_reply, "wrong_pre_worker_version_reply", False),
+                (replace(worker_reply, path=worker_path.replace(account, "2" * 32)), app_reply,
+                 "wrong_pre_worker_version_reply", False),
+                (replace(worker_reply, body=envelope(version | {"id": str(START)})), app_reply,
+                 "wrong_pre_worker_version_detail", False),
+                (replace(worker_reply, body=envelope(version | {"annotations": {"workers/message": "d" * 40}})),
+                 app_reply, "wrong_pre_worker_version_detail", False),
+                (with_bindings(native_binding, native_binding), app_reply, "pre_worker_qualification_class_unbound", False),
+                (with_bindings(native_binding | {"class_name": "TwoBotContainer"}),
+                 app_reply, "pre_worker_qualification_class_unbound", False),
+                (with_bindings(native_binding | {"script_name": foreign_target.worker_name}),
+                 app_reply, "pre_worker_qualification_class_unbound", False),
+                (with_bindings(native_binding | {"namespace_id": "b" * 32}),
+                 app_reply, "wrong_pre_runtime_deployment", False),
+                (worker_reply, replace(app_reply, body=envelope(app | {"durable_objects": {"namespace_id": "b" * 32}})),
+                 "pre_container_namespace_mismatch", True),
+                (worker_reply, replace(app_reply, body=envelope(app | {"scheduling_policy": "default"})),
+                 "wrong_pre_container_scheduling_policy", True),
+                (worker_reply, replace(app_reply, scope=replace(scope, target=foreign_target)),
+                 "wrong_pre_container_reply", True),
+            )
+            for worker, container, error, read_application in cases:
+                with self.subTest(shape=shape, error=error):
+                    effects = Mock()
+                    effects.read_worker.return_value = worker
+                    effects.read_app.return_value = container
+                    effects.observe.side_effect = lambda _, *, request: readback_for(binding, request)
+                    effects.recheck.return_value = True
+                    effects.launch.return_value = deployment
+
+                    def run():
+                        return launch_with_durable_object_binding(
+                            binding, account_id=account, source_sha=source, read_worker=effects.read_worker,
+                            read_app=effects.read_app, observe=effects.observe, recheck=effects.recheck,
+                            launch=effects.launch,
+                        )
+
+                    expected = [call.read_worker(worker_path)]
+                    if read_application:
+                        expected.append(call.read_app(app_path))
+                    if error:
+                        with self.assertRaisesRegex(TargetError, f"^{error}$"):
+                            run()
+                    else:
+                        self.assertIs(run(), deployment)
+                        request = effects.observe.call_args.kwargs["request"]
+                        expected += [call.observe(deployment, request=request), call.recheck(deployment),
+                                     call.launch(binding)]
+                    self.assertEqual(effects.mock_calls, expected)
+
     def test_each_launch_requires_exact_image_and_effective_writer(self):
         for shape in ("0473/0465", "0475/0465"):
             target = Target("pre-fixture-runtime", 123, 1_800_000_000, shape)

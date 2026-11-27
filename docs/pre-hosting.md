@@ -101,3 +101,40 @@ evidence cover the full sequence. Any future caller integration requires the
 reviewed upload guard and hosted preflight on protected source. Until the
 provider boundary is proved, keep live admission closed. The two synthetic PRE
 receipts support the direct-container fallback and leave hosted qualification open.
+
+## Replacement artifact with native scheduling
+
+A replacement PRE artifact can use Cloudflare's `durable_object` scheduling
+policy with a dedicated `PreQualificationContainer` class and namespace. The
+[launch check](../scripts/pre_runtime_binding.py) reads the exact version and
+source annotation, then matches its `TWO_BOT` namespace against the reserved
+application's namespace and scheduling policy. The existing private-route
+and writer observation and independent fence recheck follow these reads.
+[Worker version API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/versions/methods/get/) · [Get Application API](https://developers.cloudflare.com/api/resources/containers/subresources/applications/methods/get/)
+
+Resolve the verified immutable image from the exact Durable Object's `images`
+map and pass the reference to `start`. Use `inspect` and readiness to verify
+the running image after each admitted start. Wire the dedicated class to
+reject starts outside the armed window and disable Internet access for every
+launch. Put synthetic Discord and PostgreSQL fixtures in the same container
+so they can bind loopback before the bot starts. Cloudflare's HTTP intercepts
+cannot carry raw PostgreSQL with Internet access disabled.
+[Native Container API](https://developers.cloudflare.com/containers/api/durable-object-container/) · [Non-HTTP egress](https://developers.cloudflare.com/containers/configuration/outbound-traffic/#non-http-traffic)
+
+For native scheduling, Get Application reports observed `active` and
+`starting` counts. The [cleanup projection](../scripts/pre_inventory.py)
+requires `active` and `assigned`. A zero `starting` count cannot satisfy the
+assigned count check. Keep admission closed until a provider-supported cleanup
+adapter can prove zero active and assigned instances for the exact app before
+deletion, including settlement of any in-flight starts. Preserve the existing
+cleanup refusal while this proof is unavailable. The instance API reports a
+latest known state and newly started instances can take time to appear. A
+cleanup adapter could use positive terminal observations for the exact actors
+after confirmed stop and settlement. An empty listing alone gives no proof.
+[Get Application API](https://developers.cloudflare.com/api/resources/containers/subresources/applications/methods/get/) · [Instance API](https://developers.cloudflare.com/api/resources/containers/subresources/applications/subresources/instances/methods/list/) · [Listing delay](https://developers.cloudflare.com/sandbox/manage/list-sandboxes/#list-sandboxes-across-the-account)
+
+Qualification requires protected evidence of private first create, the exact
+fixture writer, version-bound takeover and readiness at both PRE endpoints,
+and independent stop and cleanup. Use the new class with a separately reviewed
+build. The archived upload continues to refuse before provisioning.
+[Scheduling migration guide](https://developers.cloudflare.com/containers/guides/migrate-to-durable-object-scheduling-policy/)

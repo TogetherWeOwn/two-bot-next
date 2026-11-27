@@ -3,10 +3,12 @@
 from dataclasses import dataclass
 from uuid import UUID
 
+from pre_container_lookup import ContainerAppScope, confirm_reserved_durable_object_app
 from pre_inventory import RESOURCE_NAME
 from pre_registry_cleanup import RegistryReservation
 from pre_start_stop import Deployment
 from pre_target import ProtectedRouteReadback, Target, TargetError, confirm_protected_route, require
+from pre_worker_lookup import read_reserved_pre_qualification_namespace
 
 
 @dataclass(frozen=True)
@@ -94,3 +96,26 @@ def launch_with_verified_binding(binding, *, observe, recheck, launch):
     require(type(deployment) is Deployment and deployment == binding.deployment,
             "pre_runtime_launch_unconfirmed")
     return deployment
+
+
+def launch_with_durable_object_binding(binding, *, account_id, source_sha, read_worker, read_app,
+                                      observe, recheck, launch):
+    """Check provider configuration in the dedicated native scheduling lane.
+
+    The authenticated admission supplies the account and source SHA. The
+    runtime observer still proves the private route and effective writer, and
+    matches the image from the exact Durable Object version's image map. The
+    launch authority must enforce the reservation at effect time, start with
+    that exact image and Internet access disabled, and check the running image
+    independently after startup. These reads confer no launch authority.
+    """
+    _check_binding(binding)
+    deployment = binding.deployment
+    target = deployment.target
+    scope = ContainerAppScope(target, account_id, str(deployment.container_id))
+    namespace = read_reserved_pre_qualification_namespace(
+        target, account_id=account_id, version=deployment.worker_version, source_sha=source_sha, read=read_worker,
+    )
+    require(namespace == binding.namespace_id, "wrong_pre_runtime_deployment")
+    confirm_reserved_durable_object_app(scope, namespace_id=namespace, read=read_app)
+    return launch_with_verified_binding(binding, observe=observe, recheck=recheck, launch=launch)
