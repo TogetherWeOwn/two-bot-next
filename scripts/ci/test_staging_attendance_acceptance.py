@@ -3,6 +3,7 @@
 from copy import deepcopy
 from datetime import timedelta
 from email.message import Message
+from http.client import HTTPResponse
 from io import BytesIO, StringIO
 import json
 from pathlib import Path
@@ -118,7 +119,7 @@ class AcceptanceTests(unittest.TestCase):
         credentials.assert_not_called()
         no_traffic.assert_not_called()
 
-    def signed_peer(self, phase, *, wrong_result=False, drift=False):
+    def signed_peer(self, phase, *, wrong_result=False, drift=False, truncated_denial=False):
         requests, readies = [], []
 
         def check(request):
@@ -142,11 +143,14 @@ class AcceptanceTests(unittest.TestCase):
                 return 200, headers, dict(envelope, ok=True, result=result)
             status, code = (403, "action_not_allowed") if phase == "off" else (404, "not_found")
             envelope.update(ok=False, error={"code": code, "message": "request refused", "retryable": False})
-            media = Message()
-            media["content-type"], media["cache-control"] = "application/json", "no-store"
-            raw = BytesIO(json.dumps(envelope).encode("ascii"))
+            body = json.dumps(envelope).encode("ascii")
+            length = len(body) + int(truncated_denial)
+            wire = (f"HTTP/1.1 {status} {code}\r\nContent-Type: application/json\r\n"
+                    f"Cache-Control: no-store\r\nContent-Length: {length}\r\n\r\n").encode("ascii") + body
+            response = HTTPResponse(Mock(makefile=Mock(return_value=BytesIO(wire))), method="POST")
+            response.begin()
             with patch.object(acceptance, "no_redirect_opener") as opener:
-                opener.return_value.open.side_effect = HTTPError(request.full_url, status, code, media, raw)
+                opener.return_value.open.side_effect = HTTPError(request.full_url, status, code, response.headers, response)
                 return acceptance.send(request)
 
         return check, requests, readies
@@ -209,6 +213,30 @@ class AcceptanceTests(unittest.TestCase):
         check.reset_mock()
         self.assertEqual(run(boundary), (1, "FAIL: staging lease did not cover the probe\n"))
         check.assert_not_called()
+
+    def test_signed_denial_requires_a_complete_http_body(self):
+        env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
+               "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
+        for phase, active, minutes in (("pending", True, 10), ("off", False, 47)):
+            now = START + timedelta(minutes=minutes)
+            observed = active_observation()
+            observed.update(attendance_read=active, primary_fixture="pending" if active else "finalized")
+            observed["lifecycle"]["observedAt"] = observed_at(now)
+            args = [phase, "--rollout", "rollout", "--observed", "observed", "--execute"]
+            for truncated in (False, True):
+                with self.subTest(phase=phase, truncated=truncated):
+                    check, requests, readies = self.signed_peer(phase, truncated_denial=truncated)
+                    with (patch.object(acceptance, "read_object", side_effect=[ROLLOUT, observed]),
+                          patch.object(acceptance.time, "time", return_value=now.timestamp()),
+                          patch.object(acceptance.time, "monotonic", return_value=0),
+                          patch("sys.stdout", new_callable=StringIO) as stdout,
+                          patch("sys.stderr", new_callable=StringIO) as stderr):
+                        status = acceptance.main(args, env=env, check=check)
+                    expected = (1, "", "FAIL: attendance acceptance input or transport refused\n") if truncated else (
+                        0, f"PASS: attendance {phase}\n", "")
+                    self.assertEqual((status, stdout.getvalue(), stderr.getvalue()), expected)
+                    self.assertEqual(requests, [EVENT])
+                    self.assertEqual(len(readies), 1 if truncated else 2)
 
     def test_finalized_probe_stops_on_signed_read_refusal_after_preflight(self):
         observed = active_observation()
@@ -302,6 +330,36 @@ class AcceptanceTests(unittest.TestCase):
                          (0, "PASS: attendance finalized\n", "", ["readyz", EVENT, "readyz", EVENT + ":foreign", "readyz"]))
         self.assertEqual(run(duplicate=True),
                          (1, "", "FAIL: attendance acceptance input or transport refused\n", ["readyz", EVENT]))
+
+    def test_finalized_probe_stops_when_serving_build_switches(self):
+        args = ["finalized", "--rollout", "rollout", "--observed", "observed",
+                "--fixture-start", START.strftime("%Y-%m-%dT%H:%M:%SZ"), "--execute"]
+        env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
+               "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
+        ready = ("GET", ORIGIN + "/readyz")
+        signed = ("POST", ORIGIN + "/internal/actions")
+        for drift in (False, True):
+            with self.subTest(build_switch=drift):
+                peer, keys, _ = self.signed_peer("finalized", drift=drift)
+                check = Mock(side_effect=peer)
+                with (patch.object(acceptance, "read_object", side_effect=[ROLLOUT, active_observation()]),
+                      patch.object(acceptance.time, "time", return_value=START.timestamp() + 2760),
+                      patch.object(acceptance.time, "monotonic", return_value=0),
+                      patch("sys.stdout", new_callable=StringIO) as stdout,
+                      patch("sys.stderr", new_callable=StringIO) as stderr):
+                    status = acceptance.main(args, env=env, check=check)
+
+                verdict = status, stdout.getvalue(), stderr.getvalue()
+                requests = [entry.args[0] for entry in check.call_args_list]
+                traffic = [(request.get_method(), request.full_url) for request in requests]
+                if drift:
+                    self.assertEqual(traffic, [ready, signed, ready])
+                    self.assertEqual(keys, [EVENT])
+                    self.assertEqual(verdict, (1, "", "FAIL: serving build did not match the staging rollout\n"))
+                else:
+                    self.assertEqual(traffic, [ready, signed, ready, signed, ready])
+                    self.assertEqual(keys, [EVENT, EVENT + ":foreign"])
+                    self.assertEqual(verdict, (0, "PASS: attendance finalized\n", ""))
 
     def test_execute_requires_a_coherent_lease_that_covers_the_armed_probe(self):
         expires = START.timestamp() + 3600
@@ -434,7 +492,7 @@ class AcceptanceTests(unittest.TestCase):
 
         no_traffic.assert_not_called()
 
-    def test_rehearsal_evidence_requires_the_originating_lease(self):
+    def test_rehearsal_requires_ordered_observations_from_one_lease(self):
         def observations(acquired, attempt):
             rows = {}
             for phase, minutes in zip(acceptance.PHASES, (10, 46, 47, 48)):
@@ -491,6 +549,34 @@ class AcceptanceTests(unittest.TestCase):
             last_start = START + timedelta(hours=1, seconds=-acceptance.RUN_BUDGET)
             late["lifecycle"]["observedAt"] = last_start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
             self.assertEqual(run({**first, "off": late}), (1, "", "FAIL: staging lease did not cover the probe\n"))
+
+            for earlier, later in zip(acceptance.PHASES, acceptance.PHASES[1:]):
+                earlier_stamp = first[earlier]["lifecycle"]["observedAt"]
+                later_stamp = first[later]["lifecycle"]["observedAt"]
+                reason = "cleanup readback is incomplete" if later == "cleanup" else "staging lease did not cover the probe"
+                for order, stamp in (("reversed", earlier_stamp), ("tied", later_stamp)):
+                    with self.subTest(earlier=earlier, later=later, order=order):
+                        unordered = deepcopy(first)
+                        unordered[earlier]["lifecycle"]["observedAt"] = later_stamp
+                        unordered[later]["lifecycle"]["observedAt"] = stamp
+                        self.assertEqual(run(unordered), (1, "", f"FAIL: {reason}\n"))
+
+            cleanup = deepcopy(first["cleanup"])
+            del cleanup["lifecycle"]["observedAt"]
+            incomplete = (1, "", "FAIL: cleanup readback is incomplete\n")
+            with self.subTest(cleanup="missing timestamp"):
+                self.assertEqual(run({**first, "cleanup": cleanup}), incomplete)
+            for invalid in (1234, "2026-11-24T16:48:00Z", "2026-11-31T16:48:00.000Z"):
+                with self.subTest(cleanup=invalid):
+                    cleanup["lifecycle"]["observedAt"] = invalid
+                    self.assertEqual(run({**first, "cleanup": cleanup}), incomplete)
+
+            for offset in (timedelta(minutes=47, milliseconds=1), timedelta(hours=1, minutes=5)):
+                with self.subTest(cleanup=offset):
+                    cleanup["lifecycle"]["observedAt"] = (START + offset).isoformat(
+                        timespec="milliseconds").replace("+00:00", "Z")
+                    self.assertEqual(run({**first, "cleanup": cleanup}), passed)
+
             self.assertEqual(run({phase: row for phase, row in first.items() if phase != "cleanup"}),
                              (1, "", "FAIL: rehearsal requires all four observations\n"))
             self.assertEqual(run(first, extra=("--execute",)),

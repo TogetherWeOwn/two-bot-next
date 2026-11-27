@@ -2,16 +2,19 @@
 
 from contextlib import closing
 from dataclasses import replace
+from http.server import ThreadingHTTPServer
 import json
 import socket
 import sqlite3
 import subprocess
 import sys
+from threading import Thread
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from uuid import UUID
 
 import predecessor_container_fixture as fixture
+from fixtures import predecessor_discord as discord
 from fixtures.predecessor_discord import COMMANDS, Discord
 from fixtures.predecessor_snapshots import GUILD, PROJECTIONS
 from pre_target import Inventory, Resource, Target
@@ -68,6 +71,107 @@ def query_ledger(query, tip, *, recovery_timestamp):
 
 
 class PredecessorContainerFixtureTests(unittest.TestCase):
+    def test_restart_checks_both_fixture_peers_before_bot_spawn(self):
+        reservation = "offline-pre-" + "1" * 32
+        foreign_reservation = "offline-pre-" + "2" * 32
+        bad_peer, failure = None, None
+
+        class Peer(Discord):
+            def peer(self):
+                return "REST" if self.path == discord.APPLICATION else "gateway"
+
+            def do_GET(self):
+                if self.peer() == bad_peer and failure == "missing":
+                    self.close_connection = True
+                    self.reply({}, 404)
+                    return
+                super().do_GET()
+
+            def send_header(self, key, value):
+                if self.peer() == bad_peer:
+                    value = {
+                        ("wrong", discord.RESERVATION_HEADER): foreign_reservation,
+                        ("challenge", "Sec-WebSocket-Accept"): discord.websocket_accept("forged"),
+                        ("connection", "Connection"): "close",
+                    }.get((failure, key), value)
+                    if failure == "truncated" and key == "Content-Length":
+                        # Declare one byte more than is sent, then close.
+                        self.close_connection = True
+                        value = str(int(value) + 1)
+                    repeat = {("duplicate", "Content-Length"): "65536", ("duplicate", "Connection"): "close",
+                              ("duplicate upgrade", "Upgrade"): "h2c",
+                              ("duplicate accept", "Sec-WebSocket-Accept"): discord.websocket_accept("forged")}
+                    if (failure, key) in repeat:
+                        # Keep the valid copy first, then repeat it with a value a
+                        # joined or first-value read would still accept.
+                        super().send_header(key, value)
+                        value = repeat[failure, key]
+                    if failure == "unframed" and key == "Content-Length":
+                        # A complete body ended only by close has no declared length.
+                        self.close_connection = True
+                        return
+                super().send_header(key, value)
+
+            def reply(self, data, code=200):
+                if self.peer() == bad_peer == "REST" and code == 200 and failure in ("payload", "oversized"):
+                    if failure == "payload":
+                        data = {"id": "0"}
+                    else:
+                        # Correct JSON padded past the 4096-byte cap.
+                        body = json.dumps(data).encode() + b" " * 4096
+                        self.send_response(code)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                super().reply(data, code)
+
+            def send_frame(self, packet):
+                if self.peer() != bad_peer or packet != discord.HELLO:
+                    return super().send_frame(packet)
+                if failure == "payload":
+                    return super().send_frame({**packet, "d": {"heartbeat_interval": 1}})
+                if failure == "truncated":
+                    body = json.dumps(packet).encode()
+                    self.wfile.write(b"\x81" + bytes([len(body) + 1]) + body)
+                    raise OSError("close after a short frame")
+                return super().send_frame(packet)
+
+        effects = []
+        with patch.object(discord, "RESERVATION", reservation), ThreadingHTTPServer(("127.0.0.1", 0), Peer) as server:
+            thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                def docker(*args, **_):
+                    if args[0] == "exec":
+                        self.assertEqual(args[1:], ("fixture-mock", "python3", "-B", "/fixture.py",
+                                                    "--check-peers", reservation))
+                        return json.dumps(discord.check_peers(reservation, server.server_port))
+                    effects.append(args)
+
+                start = ("run", "fixture-bot")
+                fixture.start_fixture_bot(docker, "fixture-mock", reservation, *start)
+                stop = ("stop", "fixture-bot")
+                docker(*stop)
+                # Status and reservation stay valid in the later cases, so
+                # only protocol or payload validation can refuse them.
+                for bad_peer, failures in (("gateway", ("missing", "wrong", "challenge", "connection",
+                                                        "duplicate", "duplicate upgrade", "duplicate accept",
+                                                        "truncated", "payload")),
+                                           ("REST", ("missing", "wrong", "truncated", "unframed", "oversized",
+                                                     "duplicate", "payload"))):
+                    for failure in failures:
+                        with self.subTest(peer=bad_peer, failure=failure):
+                            with self.assertRaisesRegex(fixture.Refused, f"{bad_peer} fixture unconfirmed"):
+                                fixture.start_fixture_bot(docker, "fixture-mock", reservation, *start)
+                            self.assertEqual(effects, [start, stop])
+                bad_peer = None
+                fixture.start_fixture_bot(docker, "fixture-mock", reservation, *start)
+                self.assertEqual(effects, [start, stop, start])
+            finally:
+                server.shutdown()
+                thread.join()
+
     def test_cli_help_without_tomllib(self):
         result = subprocess.run(
             [sys.executable, "-B", "-c",
@@ -155,6 +259,8 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
             (473, 473, "stamp", "pre-fixture-test"),
             (475, 475, "checkpoint", "pre-fixture-test"),
             (473, 473, "setup", "pre-fixture-test"),
+            (473, 473, "gateway peer", "pre-fixture-test"),
+            (475, 475, "REST peer", "pre-fixture-test"),
             (475, 475, "premature", "pre-fixture-test"),
             (473, 473, "cancel", "pre-fixture-test"),
         ]:
@@ -190,8 +296,13 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                         self.assertIn(f"type=bind,src={decoder},dst=/script_intake.py,readonly", args)
                     if name.endswith("-bot"):
                         self.assertEqual(args[-1], IMAGE)
+                        self.assertIn("--restart=no", args)
+                        self.assertIn(f"DISCORD_GATEWAY_URL={discord.GATEWAY}", args)
+                        self.assertIn(f"DISCORD_API_BASE={discord.REST}", args)
                         self.assertEqual([arg for arg in args if arg.startswith("DATABASE_URL=")],
                                          ["DATABASE_URL=postgres://offline_bot:offline-fixture@127.0.0.1/postgres"])
+                        if failure in ("gateway peer", "REST peer"):
+                            self.fail("bot spawn reached with an unconfirmed Discord peer")
                         if failure == "cancel":
                             raise KeyboardInterrupt
                         # The private adapter stands in for completed scoped
@@ -228,6 +339,9 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                     except sqlite3.OperationalError as error:
                         self.assertEqual(str(error), "no such column: attendance_recovered_at")
                         raise fixture.Refused("Docker exec failed") from None
+                elif args[-2] == "--check-peers":
+                    self.assertIn(f"OFFLINE_PRE_RESERVATION={args[-1]}", containers[args[1]])
+                    return json.dumps({"gateway": failure != "gateway peer", "rest": failure != "REST peer"})
                 else:
                     path = args[-1]
                     if path == "/release":
@@ -263,7 +377,8 @@ class PredecessorContainerFixtureTests(unittest.TestCase):
                                 "ledger_query": "^Docker exec failed$",
                                 "retained_timestamp": "^PRE snapshot changed during startup$",
                                 "stamp": "stamp mismatch", "checkpoint": "checkpoint missing",
-                                "premature": "pre-READY state invalid", "setup": "snapshot readback failed"}
+                                "premature": "pre-READY state invalid", "setup": "snapshot readback failed",
+                                "gateway peer": "gateway fixture unconfirmed", "REST peer": "REST fixture unconfirmed"}
                     with self.assertRaisesRegex(fixture.Refused, expected[failure]):
                         rehearse()
                 else:

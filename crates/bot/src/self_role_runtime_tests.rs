@@ -462,6 +462,13 @@ async fn exercise(pool: &PgPool) -> TestResult {
         pool,
     ))
     .await?;
+    // The restart recovery scenario and the settlement checks below exercise
+    // the acknowledgement schema. Keep the earlier scenarios on the old shape.
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0449_self_role_ticket_acknowledgement.sql"
+    ))
+    .execute(pool)
+    .await?;
     Box::pin(service_continues_unknown_work_without_redelivery(pool)).await?;
     Box::pin(interrupted_exchange_cannot_settle(pool)).await?;
     Box::pin(unknown_target_is_not_empty(pool)).await?;
@@ -4269,14 +4276,8 @@ async fn legacy_start_latches_loss_for_unusable_claim_shapes() {
 /// Settlement wiring through the live send path: a journaled send with no
 /// received response records `timeout_no_response` without completing the
 /// ticket, and a received ambiguous status persists `response_ambiguous`
-/// through completion. Runs last: it applies migration 0449 to the shared
-/// exercise schema, which earlier scenarios must not observe.
+/// through completion.
 async fn settlement_timeout_note_and_ambiguous_class(pool: &PgPool) -> TestResult {
-    sqlx::raw_sql(include_str!(
-        "../../cutover/migrations/0449_self_role_ticket_acknowledgement.sql"
-    ))
-    .execute(pool)
-    .await?;
     // Timeout: the mutation overruns the 5 s moderation timeout, so no
     // response is received and the ticket stays pending with its timeout.
     let clock = Arc::new(AtomicI64::new(NOW));
