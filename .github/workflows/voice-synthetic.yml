@@ -90,6 +90,13 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          # Standalone begin and inherited ready share these local modules.
+          sparse-checkout: |
+            /wrangler/scripts/staging-use-pipeline.mjs
+            /wrangler/scripts/staging-use.mjs
+            /wrangler/scripts/is-direct-invocation.mjs
+            /wrangler/scripts/ownership-control-response.mjs
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
@@ -192,6 +199,10 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          sparse-checkout: |
+            /scripts/staging_voice_synthetic.py
+            /scripts/script_intake.py
+          sparse-checkout-cone-mode: false
       - name: Run the staging voice synthetic
         id: voice
         env:

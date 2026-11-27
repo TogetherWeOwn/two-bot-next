@@ -44,6 +44,8 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          sparse-checkout: /scripts/staging_retention_census.py
+          sparse-checkout-cone-mode: false
       - name: Run the read-only fixture census
         env:
           # Must already exist as staging-migrate-plan environment bindings;

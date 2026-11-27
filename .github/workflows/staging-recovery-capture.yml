@@ -23,6 +23,12 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/staging_recovery_capture.py
+            /scripts/staging_retention_census.py
+            /scripts/staging_recovery_inventory.sql
+            /sql/database_role_matrix.sql
       - run: python3 scripts/staging_recovery_capture.py
         env:
           TWO_BOT_STAGING_PLAN_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}

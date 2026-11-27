@@ -2617,7 +2617,10 @@ class ScriptedWorker:
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        # Each fixture shuts down a fresh server. Keep the idle shutdown poll short.
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True,
+        )
 
     def __enter__(self):
         self.thread.start()
@@ -2708,8 +2711,11 @@ class ShellStepTests(unittest.TestCase):
         return code, summary, worker
 
     def test_matching_revision_passes_only_when_gateway_ready_and_stable(self):
-        code, summary, worker = self.gate(
-            {"/health": [(200, "{}")], "/readyz": [(200, report())]})
+        with patch.object(ThreadingHTTPServer, "serve_forever", autospec=True,
+                          side_effect=ThreadingHTTPServer.serve_forever) as serve:
+            code, summary, worker = self.gate(
+                {"/health": [(200, "{}")], "/readyz": [(200, report())]})
+        serve.assert_called_once_with(worker.server, poll_interval=0.01)
         self.assertEqual(code, 0, summary)
         self.assertIn("stable 18/18 polls", summary)
         # One first pass plus 18 consecutive stability polls on each path.
