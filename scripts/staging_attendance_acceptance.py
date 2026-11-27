@@ -35,6 +35,8 @@ LEASE_FIELDS = ("epoch", "runId", "runAttempt", "acquiredAt", "expiresAt")
 READY_TIMEOUT = 5
 WEB_TIMEOUT = 2.5
 RUN_BUDGET = 25
+PROBE_LEASE_REFUSAL = "staging lease did not cover the probe"
+CLEANUP_REFUSAL = "cleanup readback is incomplete"
 
 
 class Refused(Exception):
@@ -58,18 +60,22 @@ def read_object(path):
         return json_object(read_with_overflow(stream, BODY_CAP))
 
 
-def validate_probe_window(lifecycle, *, recorded=False):
-    use = lifecycle["use"]
+def observation_ms(lifecycle, refusal):
     observed_at = lifecycle.get("observedAt")
     require(isinstance(observed_at, str) and re.fullmatch(
         r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z", observed_at),
-        "staging lease did not cover the probe")
+        refusal)
     since_epoch = datetime.fromisoformat(observed_at) - datetime(1970, 1, 1, tzinfo=timezone.utc)
-    observed_ms = since_epoch // timedelta(milliseconds=1)
+    return since_epoch // timedelta(milliseconds=1)
+
+
+def validate_probe_window(lifecycle, *, recorded=False):
+    use = lifecycle["use"]
+    observed_ms = observation_ms(lifecycle, PROBE_LEASE_REFUSAL)
     start_ms = observed_ms if recorded else time.time() * 1000
     require(type(use.get("acquiredAt")) is int and 0 <= use["acquiredAt"] <= observed_ms <= start_ms
             and type(use.get("expiresAt")) is int and start_ms + RUN_BUDGET * 1000 < use["expiresAt"],
-            "staging lease did not cover the probe")
+            PROBE_LEASE_REFUSAL)
 
 
 def validate_configuration(phase, origin, rollout, observed, *, recorded=False):
@@ -100,11 +106,11 @@ def validate_configuration(phase, origin, rollout, observed, *, recorded=False):
     if phase == "cleanup":
         require(lifecycle.get("action") == "release" and use.get("phase") == "released" and lifecycle.get("running") is False
                 and type(observed.get("fixture_rows")) is int
-                and observed["fixture_rows"] == 0, "cleanup readback is incomplete")
+                and observed["fixture_rows"] == 0, CLEANUP_REFUSAL)
     else:
         require(lifecycle.get("action") == "ready" and lifecycle.get("running") is True
                 and use.get("phase") == "active",
-                "staging lease did not cover the probe")
+                PROBE_LEASE_REFUSAL)
         validate_probe_window(lifecycle, recorded=recorded)
         expected_fixture = "pending" if phase == "pending" else "finalized"
         require(observed.get("signed_ingress") is True and observed.get("primary_fixture") == expected_fixture
@@ -143,10 +149,19 @@ def signed_probe_receipt(phase, identity, plan):
 def validate_rehearsal(rollout, observations, plan):
     require(set(observations) == set(PHASES) and all(isinstance(row, dict) for row in observations.values()),
             "rehearsal requires all four observations")
+    previous_ms = None
     for phase in PHASES:
         observed = observations[phase]
         identity = validate_configuration(phase, STAGING_ORIGIN, rollout, observed, recorded=True)
         validate_planned_fixture(observed, plan)
+        # Release can be recovered after expiry. Only ready records need probe admission.
+        refusal = CLEANUP_REFUSAL if phase == "cleanup" else PROBE_LEASE_REFUSAL
+        try:
+            observed_ms = observation_ms(observed["lifecycle"], refusal)
+        except ValueError:
+            raise Refused(refusal) from None
+        require(previous_ms is None or previous_ms < observed_ms, refusal)
+        previous_ms = observed_ms
         if phase != "cleanup":
             require(same_json(observed.get("signed_receipt"), signed_probe_receipt(phase, identity, plan)),
                     "signed attendance receipt did not match the rehearsal plan")

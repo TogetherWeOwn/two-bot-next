@@ -299,6 +299,38 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(run(duplicate=True),
                          (1, "", "FAIL: attendance acceptance input or transport refused\n", ["readyz", EVENT]))
 
+    def test_finalized_probe_stops_when_serving_build_switches(self):
+        args = ["finalized", "--rollout", "rollout", "--observed", "observed", "--plan", "plan", "--execute"]
+        env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
+               "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
+        ready = ("GET", ORIGIN + "/readyz")
+        signed = ("POST", ORIGIN + "/internal/actions")
+        for drift in (False, True):
+            with self.subTest(build_switch=drift):
+                observed = active_observation()
+                plan = plan_for_observation(observed)
+                peer, keys, _ = self.signed_peer("finalized", drift=drift)
+                check = Mock(side_effect=peer)
+                with (patch.object(acceptance, "read_object", side_effect=[plan, ROLLOUT, observed]),
+                      patch.object(acceptance.time, "time", return_value=START.timestamp() + 2760),
+                      patch.object(acceptance.time, "monotonic", return_value=0),
+                      patch("sys.stdout", new_callable=StringIO) as stdout,
+                      patch("sys.stderr", new_callable=StringIO) as stderr):
+                    status = acceptance.main(args, env=env, check=check)
+
+                verdict = status, stdout.getvalue(), stderr.getvalue()
+                requests = [entry.args[0] for entry in check.call_args_list]
+                traffic = [(request.get_method(), request.full_url) for request in requests]
+                if drift:
+                    self.assertEqual(traffic, [ready, signed, ready])
+                    self.assertEqual(keys, [EVENT])
+                    self.assertEqual(verdict, (1, "", "FAIL: serving build did not match the staging rollout\n"))
+                else:
+                    receipt = json.dumps(signed_receipt("finalized", plan), sort_keys=True)
+                    self.assertEqual(traffic, [ready, signed, ready, signed, ready])
+                    self.assertEqual(keys, [EVENT, EVENT + ":foreign"])
+                    self.assertEqual(verdict, (0, f"{receipt}\nPASS: attendance finalized\n", ""))
+
     def test_execute_requires_a_coherent_lease_that_covers_the_armed_probe(self):
         expires = START.timestamp() + 3600
         latest_start = expires - acceptance.RUN_BUDGET
@@ -485,41 +517,84 @@ class AcceptanceTests(unittest.TestCase):
         no_traffic.assert_not_called()
         return status, stdout.getvalue(), stderr.getvalue()
 
-    def test_rehearsal_evidence_requires_the_originating_lease(self):
-        def run(rows, phase="rehearsal", extra=()):
-            return self.offline(PLAN, rows, phase, extra)
-
+    def test_rehearsal_requires_ordered_observations_from_one_lease(self):
         first = self.observations(PLAN, START)
         second_plan = deepcopy(PLAN)
         second_plan["lease"].update(runAttempt=2,
                                     acquiredAt=PLAN["lease"]["expiresAt"],
                                     expiresAt=PLAN["lease"]["expiresAt"] + 3600000)
         second = self.observations(second_plan, START + timedelta(hours=1))
+        no_traffic = Mock(side_effect=AssertionError("unexpected staging request"))
+        with (TemporaryDirectory() as directory,
+              patch.object(acceptance, "credentials", side_effect=AssertionError("unexpected credentials")),
+              patch.object(acceptance.time, "time", return_value=START.timestamp() + 86400)):
+            rollout_path = Path(directory) / "rollout.json"
+            observed_path = Path(directory) / "observed.json"
+            plan_path = Path(directory) / "plan.json"
+            rollout_path.write_text(json.dumps(ROLLOUT), encoding="utf-8")
 
-        passed = (0, "PASS: attendance rehearsal\n", "")
-        mismatch = (1, "", "FAIL: staging lease identity did not match the rehearsal plan\n")
-        self.assertEqual(run(first), passed)
-        self.assertEqual(self.offline(second_plan, second), passed)
-        self.assertEqual(self.offline(second_plan, second["cleanup"], "cleanup"),
-                         (0, "PASS: attendance cleanup\n", ""))
-        self.assertEqual(self.offline(second_plan, first), mismatch)
-        for phase in acceptance.PHASES:
-            with self.subTest(phase=phase):
-                self.assertEqual(run({**first, phase: second[phase]}), mismatch)
+            def run(rows, phase="rehearsal", extra=(), plan=PLAN):
+                observed_path.write_text(json.dumps(rows), encoding="utf-8")
+                plan_path.write_text(json.dumps(plan), encoding="utf-8")
+                args = [phase, "--rollout", str(rollout_path), "--observed", str(observed_path),
+                        "--plan", str(plan_path), *extra]
+                with (patch("sys.stdout", new_callable=StringIO) as stdout,
+                      patch("sys.stderr", new_callable=StringIO) as stderr):
+                    status = acceptance.main(args, env={}, check=no_traffic)
+                return status, stdout.getvalue(), stderr.getvalue()
 
-        rebound = deepcopy(first["cleanup"])
-        rebound["lifecycle"]["epoch"] += 1
-        rebound["lifecycle"]["use"]["epoch"] += 1
-        self.assertEqual(run({**first, "cleanup": rebound}), mismatch)
+            passed = (0, "PASS: attendance rehearsal\n", "")
+            mismatch = (1, "", "FAIL: staging lease identity did not match the rehearsal plan\n")
+            self.assertEqual(run(first), passed)
+            self.assertEqual(run(second, plan=second_plan), passed)
+            self.assertEqual(run(second["cleanup"], "cleanup", plan=second_plan), (0, "PASS: attendance cleanup\n", ""))
+            self.assertEqual(run(first, plan=second_plan), mismatch)
+            for phase in acceptance.PHASES:
+                with self.subTest(phase=phase):
+                    self.assertEqual(run({**first, phase: second[phase]}), mismatch)
 
-        late = deepcopy(first["off"])
-        last_start = START + timedelta(hours=1, seconds=-acceptance.RUN_BUDGET)
-        late["lifecycle"]["observedAt"] = last_start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        self.assertEqual(run({**first, "off": late}), (1, "", "FAIL: staging lease did not cover the probe\n"))
-        self.assertEqual(run({phase: row for phase, row in first.items() if phase != "cleanup"}),
-                         (1, "", "FAIL: rehearsal requires all four observations\n"))
-        self.assertEqual(run(first, extra=("--execute",)),
-                         (1, "", "FAIL: rehearsal only accepts offline readback\n"))
+            rebound = deepcopy(first["cleanup"])
+            rebound["lifecycle"]["epoch"] += 1
+            rebound["lifecycle"]["use"]["epoch"] += 1
+            self.assertEqual(run({**first, "cleanup": rebound}), mismatch)
+
+            late = deepcopy(first["off"])
+            last_start = START + timedelta(hours=1, seconds=-acceptance.RUN_BUDGET)
+            late["lifecycle"]["observedAt"] = last_start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            self.assertEqual(run({**first, "off": late}), (1, "", "FAIL: staging lease did not cover the probe\n"))
+
+            for earlier, later in zip(acceptance.PHASES, acceptance.PHASES[1:]):
+                earlier_stamp = first[earlier]["lifecycle"]["observedAt"]
+                later_stamp = first[later]["lifecycle"]["observedAt"]
+                reason = "cleanup readback is incomplete" if later == "cleanup" else "staging lease did not cover the probe"
+                for order, stamp in (("reversed", earlier_stamp), ("tied", later_stamp)):
+                    with self.subTest(earlier=earlier, later=later, order=order):
+                        unordered = deepcopy(first)
+                        unordered[earlier]["lifecycle"]["observedAt"] = later_stamp
+                        unordered[later]["lifecycle"]["observedAt"] = stamp
+                        self.assertEqual(run(unordered), (1, "", f"FAIL: {reason}\n"))
+
+            cleanup = deepcopy(first["cleanup"])
+            del cleanup["lifecycle"]["observedAt"]
+            incomplete = (1, "", "FAIL: cleanup readback is incomplete\n")
+            with self.subTest(cleanup="missing timestamp"):
+                self.assertEqual(run({**first, "cleanup": cleanup}), incomplete)
+            for invalid in (1234, "2026-11-24T16:48:00Z", "2026-11-31T16:48:00.000Z"):
+                with self.subTest(cleanup=invalid):
+                    cleanup["lifecycle"]["observedAt"] = invalid
+                    self.assertEqual(run({**first, "cleanup": cleanup}), incomplete)
+
+            for offset in (timedelta(minutes=47, milliseconds=1), timedelta(hours=1, minutes=5)):
+                with self.subTest(cleanup=offset):
+                    cleanup["lifecycle"]["observedAt"] = (START + offset).isoformat(
+                        timespec="milliseconds").replace("+00:00", "Z")
+                    self.assertEqual(run({**first, "cleanup": cleanup}), passed)
+
+            self.assertEqual(run({phase: row for phase, row in first.items() if phase != "cleanup"}),
+                             (1, "", "FAIL: rehearsal requires all four observations\n"))
+            self.assertEqual(run(first, extra=("--execute",)),
+                             (1, "", "FAIL: rehearsal only accepts offline readback\n"))
+        no_traffic.assert_not_called()
 
     def test_rehearsal_refuses_an_earlier_signed_observation_on_the_same_rollout(self):
         previous_start = START - timedelta(hours=1)

@@ -49,10 +49,12 @@ import importlib.util
 import io
 import json
 import re
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 PLANNER_PATH = Path(__file__).with_name("plan-coverage-shards.py")
@@ -560,6 +562,107 @@ class FailClosedTests(unittest.TestCase):
             self.assertEqual(set(result["legs"]),
                              set(full_leg_ids(planner)))
             self.assertTrue(result["widened"])
+
+
+class CheckoutDepthTests(unittest.TestCase):
+    def git(self, repo, *args):
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def init_repo(self, repo):
+        repo.mkdir()
+        self.git(repo, "init", "--quiet", "--initial-branch=main")
+        self.git(repo, "config", "user.name", "Synthetic CI")
+        self.git(repo, "config", "user.email", "synthetic@example.invalid")
+        self.git(repo, "config", "commit.gpgsign", "false")
+
+    def commit(self, repo, message, paths):
+        for path in paths:
+            file = repo / path
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text(f"{message}: {path}\n")
+        self.git(repo, "add", ".")
+        self.git(repo, "commit", "--quiet", "-m", message)
+        return self.git(repo, "rev-parse", "HEAD")
+
+    def plan_at(self, repo, base, head, event="pull_request", ref="refs/pull/1/merge"):
+        planner = load_planner(self)
+        output = io.StringIO()
+        with (patch.object(planner, "ROOT", repo),
+              patch.object(planner, "_metadata_from_cargo", return_value=stub_metadata()),
+              redirect_stdout(output)):
+            self.assertEqual(planner.main([
+                "--base-ref", base, "--head-ref", head,
+                "--event", event, "--ref", ref,
+            ]), 0)
+        return json.loads(output.getvalue())
+
+    def test_two_deep_pr_checkout_matches_full_history_and_fails_closed(self):
+        all_legs = full_leg_ids(load_planner(self))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            self.init_repo(source)
+            older = self.commit(source, "root", ["README.md"])
+            self.git(source, "branch", "topic")
+            base = self.commit(source, "advance base", ["crates/core/src/base.rs"])
+            self.git(source, "checkout", "--quiet", "topic")
+            self.commit(source, "topic change", ["crates/store/src/topic.rs"])
+
+            for widened in (False, True):
+                with self.subTest(widened=widened):
+                    if widened:
+                        # Put the widening path past 1,000 changed paths.
+                        paths = [f"docs/note-{i}.md" for i in range(1_001)]
+                        self.commit(source, "large change", [*paths, "rust-toolchain.toml"])
+                    self.git(source, "checkout", "--quiet", "--detach", base)
+                    self.git(source, "merge", "--quiet", "--no-ff", "topic", "-m", "merge PR")
+                    head = self.git(source, "rev-parse", "HEAD")
+                    self.git(source, "checkout", "--quiet", "topic")
+
+                    full = root / f"full-{widened}"
+                    shallow = root / f"shallow-{widened}"
+                    for repo in (full, shallow):
+                        self.init_repo(repo)
+                        refspec = f"+{head}:refs/remotes/pull/1/merge"
+                        fetch_args = ["--depth=2", "--no-tags"] if repo == shallow else []
+                        self.git(repo, "fetch", *fetch_args, source.as_uri(), refspec)
+                        self.git(repo, "checkout", "--quiet", "--detach", head)
+
+                    self.assertEqual(self.git(shallow, "rev-parse", f"{head}^1"), base)
+                    self.assertEqual(self.git(shallow, "rev-parse", "--is-shallow-repository"), "true")
+                    self.assertEqual(self.git(shallow, "rev-list", "--count", head), "3")
+                    expected = self.plan_at(full, f"{head}^1", head)
+                    self.assertEqual(expected["widened"], widened)
+                    if widened:
+                        self.assertEqual(expected["reason"],
+                                         "workspace-wide change fails closed: rust-toolchain.toml")
+                    else:
+                        self.assertIn("changed crates ['two-bot-store']", expected["reason"])
+                        self.assertLess(len(expected["legs"]), len(all_legs))
+                    self.assertEqual(self.plan_at(shallow, f"{head}^1", head), expected)
+
+                    missing = "f" * 40
+                    failure = self.plan_at(full, missing, head)
+                    self.assertEqual(failure["reason"], "unreadable diff fails closed to full set")
+                    self.assertEqual(failure["legs"], all_legs)
+                    self.assertEqual(self.plan_at(shallow, missing, head), failure)
+
+                    main_args = (older, head, "push", "refs/heads/main")
+                    push = self.plan_at(full, *main_args)
+                    self.assertEqual(push["reason"], "push to main always runs the full set")
+                    self.assertEqual(push["legs"], all_legs)
+                    group_args = (older, head, "merge_group", "refs/heads/gh-readonly-queue/main/test")
+                    group = self.plan_at(full, *group_args)
+                    self.assertEqual(group["widened"], widened)
+                    self.assertEqual(group["legs"], all_legs)
+                    # Pushes and merge groups can name an older base.
+                    self.assertEqual(self.plan_at(shallow, *main_args), failure)
+                    self.assertEqual(self.plan_at(shallow, *group_args), failure)
 
 
 class MergeParityTests(unittest.TestCase):

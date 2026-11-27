@@ -29,9 +29,9 @@ class SharedReferenceAnnotationTests(unittest.TestCase):
             text,
             re.MULTILINE,
         )
-        sha = "ac9ce8d63e0cebd19ede904ac79137190c329964"
+        sha = "649943c1ed8a1af8f8760e075f3923237dd72e50"
+        self.assertRegex(sha, r"\A[0-9a-f]{40}\Z")
         self.assertCountEqual(calls, [
-            ("pr-size.yml", sha),
             ("pr-size-gate.yml", sha),
             ("pr-size-weekly.yml", sha),
         ])
