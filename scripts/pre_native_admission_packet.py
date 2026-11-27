@@ -8,7 +8,9 @@ exact actor. Empty inventory cannot supply that evidence.
 
 Times are Unix seconds. Observations must fall within the past hour, no earlier
 than reservation start and no later than the supplied authority clock.
-Terminal evidence must be at least as recent as observations of actor activity.
+Terminal evidence must be at least as recent as the other five phase receipts.
+Each packet covers one reservation and shape. The caller checks any required
+pairing across reservations.
 """
 
 from hashlib import sha256
@@ -21,8 +23,7 @@ from pre_target import ADMISSION_SECONDS, DIGEST, LAST_UNIX_SECOND, SHA, Target
 from script_intake import decode_json
 
 
-ACTOR_PHASES = ("first_create", "rehearsal", "takeover", "readiness")
-PHASES = (*ACTOR_PHASES, "cleanup", "egress")
+PHASES = ("first_create", "rehearsal", "takeover", "readiness", "cleanup", "egress")
 MAX_PACKET_BYTES = 16 * 1024
 PROMOTION_SETTING = "PRODUCTION_AUTO_PROMOTE_DISABLED"
 TARGET_FIELDS = {"scope", "run_id", "started_at", "shape"}
@@ -102,8 +103,9 @@ def _admission_reasons(packet, *, target, predecessor_digest, predecessor_commit
     reasons = []
     if _target(packet["target"]) != target:
         reasons.append("target_mismatch")
+    receipts = packet["receipts"]
     for phase in PHASES:
-        receipt = packet["receipts"][phase]
+        receipt = receipts[phase]
         if _target(receipt["target"]) != target:
             reasons.append(f"{phase}_target_mismatch")
         if (receipt["predecessor_digest"], receipt["predecessor_commit"]) != (predecessor_digest, predecessor_commit):
@@ -113,13 +115,13 @@ def _admission_reasons(packet, *, target, predecessor_digest, predecessor_commit
         if not earliest <= receipt["observed_at"] <= now:
             reasons.append(f"{phase}_outside_freshness_window")
 
-    cleanup = packet["receipts"]["cleanup"]
+    cleanup = receipts["cleanup"]
     observation = cleanup["terminal_observation"]
     if observation["start_id"] != str(start_id) or not observation["terminal"]:
         reasons.append("cleanup_actor_not_confirmed_terminal")
     if not earliest <= observation["observed_at"] <= cleanup["observed_at"]:
         reasons.append("cleanup_observation_outside_freshness_window")
-    if any(observation["observed_at"] < packet["receipts"][phase]["observed_at"] for phase in ACTOR_PHASES):
+    if any(observation["observed_at"] < receipts[phase]["observed_at"] for phase in PHASES if phase != "cleanup"):
         reasons.append("cleanup_observation_precedes_activity")
 
     setting = packet["production_auto_promote_disabled"]
@@ -135,8 +137,9 @@ def evaluate_packet(raw: bytes, *, target: Target, predecessor_digest: str, pred
     """Grade a UTF-8 JSON packet at one authority time without effects.
 
     Hash schema-valid packets as sorted, compact JSON, including on a denied
-    verdict. Malformed packets have no canonical digest. Reasons use stable
-    codes and never echo packet data.
+    verdict. Re-evaluate with the current pins and time for each decision.
+    Malformed packets have no canonical digest. Reasons use stable codes and
+    never echo packet data.
     """
     if type(raw) is not bytes or len(raw) > MAX_PACKET_BYTES:
         return {"admitted": False, "reasons": ["invalid_packet_size_or_type"], "packet_digest": None}

@@ -129,14 +129,11 @@ class NativeAdmissionPacketTests(unittest.TestCase):
         self.assert_denied(evaluate(packet), "invalid_cleanup_observation")
 
     def test_cleanup_observation_must_cover_later_actor_activity(self):
-        for phase in ("first_create", "rehearsal", "takeover", "readiness"):
+        for phase in ("first_create", "rehearsal", "takeover", "readiness", "egress"):
             with self.subTest(phase=phase):
                 packet = fixture()
                 packet["receipts"][phase]["observed_at"] = NOW - 19
                 self.assert_denied(evaluate(packet), "cleanup_observation_precedes_activity")
-        packet = fixture()
-        packet["receipts"]["egress"]["observed_at"] = NOW
-        self.assertTrue(evaluate(packet)["admitted"])
 
     def test_promotion_readback_exact_and_fresh(self):
         changes = (
