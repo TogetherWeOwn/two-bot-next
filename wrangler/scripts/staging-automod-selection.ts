@@ -70,9 +70,12 @@ export async function resolveStagingAutomodSelection(dispatch: Dispatch, readers
     || !Number.isSafeInteger(plan.leaseMs) || plan.leaseMs <= 0 || plan.leaseMs > STAGING_AUTOMOD_PLAN.leaseMs) return;
 
   const deadline = performance.now() + READ_BUDGET_MS;
-  const readSignal = AbortSignal.any([signal, AbortSignal.timeout(READ_BUDGET_MS)]);
-  const outOfTime = () => readSignal.aborted || performance.now() >= deadline;
+  const timeout = new AbortController();
+  // Keep Node alive until the resolver settles, even if the read owns no handle.
+  const timer = setTimeout(() => timeout.abort(), READ_BUDGET_MS);
   try {
+    const readSignal = AbortSignal.any([signal, timeout.signal]);
+    const outOfTime = () => readSignal.aborted || performance.now() >= deadline;
     const runs = await boundRead(readers.readPostDeployRuns(Object.freeze({ sha, runId, runAttempt }), readSignal), readSignal);
     if (outOfTime() || !Array.isArray(runs) || runs.length !== 1) return;
     const run: PostDeployRun | undefined = runs[0];
@@ -116,5 +119,7 @@ export async function resolveStagingAutomodSelection(dispatch: Dispatch, readers
     return Object.freeze({ serving, inventorySource, reservation: Object.freeze({ pin, change: Object.freeze(change) }) });
   } catch {
     return;
+  } finally {
+    clearTimeout(timer);
   }
 }

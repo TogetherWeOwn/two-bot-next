@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { test, type TestContext } from "node:test";
 import { resolveStagingAutomodSelection } from "../scripts/staging-automod-selection.ts";
 import type { bindStagingAutomodDispatch } from "../scripts/staging-automod-dispatch.ts";
@@ -75,6 +76,9 @@ test("refuses dormant policy, invalid dispatch or cancellation before reading", 
   for (const change of [{ sha: "main" }, { runId: "01" }, { runId: "9007199254740992" }, { runAttempt: 2 }]) {
     assert.equal(await resolveStagingAutomodSelection({ ...dispatch, ...change }, readers, signal, plan), undefined);
   }
+  for (const policy of [{ notAfter: now }, { notAfter: plan.notAfter + 0.5 }, { leaseMs: dormant.leaseMs + 1 }]) {
+    assert.equal(await resolveStagingAutomodSelection(dispatch, readers, signal, { ...plan, ...policy }), undefined);
+  }
   assert.equal(await resolveStagingAutomodSelection(dispatch, readers, AbortSignal.abort(), plan), undefined);
   assert.equal(readRuns.mock.callCount(), 0);
 });
@@ -93,6 +97,8 @@ test("refuses absent, ambiguous or out-of-scope run evidence before inventory ac
     ["fractional inventory run", { inventoryRun: { ...run.inventoryRun, runId: 1.5 } }],
     ["aliased inventory run", { inventoryRun: { ...run.inventoryRun, runId: Number(dispatch.runId) } }],
     ["wrong Discord app", { target: { ...target, applicationId: "1234567890123456789" } }],
+    ["wrong Discord guild", { target: { ...target, guildId: "1234567890123456789" } }],
+    ["wrong command", { target: { ...target, name: "other" } }],
     ["different serving build", { pin: { ...pin, sourceSha: wrongSha } }],
     ["invalid pin", { pin: { ...pin, namespaceId: " " } }],
     ["voice move", { voiceMove: true }],
@@ -121,16 +127,20 @@ test("refuses absent, ambiguous or out-of-scope run evidence before inventory ac
 
 test("refuses conflicting, stale or malformed authenticated inventory", async t => {
   const { signal } = setup(t);
-  const changes: [string, Partial<Inventory>][] = [
+  const changes: [string, Partial<Record<keyof Inventory, unknown>>][] = [
     ["workflow SHA", { workflow_sha: "b".repeat(40) }],
     ["producer run", { workflow_run_id: source.runId + 1 }],
     ["Worker deployment", { worker: { ...inventory.worker, deployment_id: pin.workerVersionId } }],
     ["Worker version", { worker: { ...inventory.worker, version_id: pin.workerDeploymentId } }],
     ["Worker build", { worker: { ...inventory.worker, source_sha: "b".repeat(40) } }],
+    ["split traffic", { worker: { ...inventory.worker, traffic_percent: 50 } }],
+    ["unbounded runtime", { worker: { ...inventory.worker, runtime_policy: "unbounded" } }],
     ["Container app", { container: { ...inventory.container, application_id: pin.workerVersionId } }],
     ["namespace", { container: { ...inventory.container, namespace_id: "f".repeat(32) } }],
     ["rollout", { container: { ...inventory.container, rollout_id: pin.workerVersionId } }],
     ["image", { container: { ...inventory.container, image_digest: `sha256:${"f".repeat(64)}` } }],
+    ["incomplete rollout", { container: { ...inventory.container, rollout_status: "pending" } }],
+    ["inactive owner", { ownership: { ...inventory.ownership, phase: "released" } }],
     ["fractional owner epoch", { ownership: { phase: "active", epoch: 1.5 } }],
     ["nonpositive owner epoch", { ownership: { phase: "active", epoch: 0 } }],
     ["unsafe owner epoch", { ownership: { phase: "active", epoch: Number.MAX_SAFE_INTEGER + 1 } }],
@@ -140,7 +150,7 @@ test("refuses conflicting, stale or malformed authenticated inventory", async t 
   ];
   for (const [label, change] of changes) {
     assert.equal(await resolveStagingAutomodSelection(dispatch, {
-      ...readbacks, readAuthenticatedInventory: async () => ({ ...inventory, ...change }),
+      ...readbacks, readAuthenticatedInventory: async () => ({ ...inventory, ...change }) as Inventory,
     }, signal, plan), undefined, label);
   }
   for (const readAuthenticatedInventory of [async () => undefined, async () => { throw new Error("unavailable"); }]) {
@@ -191,19 +201,26 @@ test("the shared deadline refuses a readback that completes before the abort eve
   }, signal, plan), undefined);
 });
 
-test("the internal timeout cancels a stalled reader", { timeout: 500 }, async t => {
-  const caller = setup(t);
-  const timer = new AbortController();
-  const timeout = t.mock.method(AbortSignal, "timeout", () => timer.signal);
-  const readPostDeployRuns = t.mock.fn((_scope: unknown, _signal: AbortSignal) => {
-    timer.abort();
-    return new Promise<never>(() => {});
-  });
-  assert.equal(await resolveStagingAutomodSelection(dispatch, { ...readbacks, readPostDeployRuns }, caller.signal, plan),
-    undefined);
-  assert.equal(caller.signal.aborted, false);
-  assert.equal(timeout.mock.callCount(), 1);
-  assert.deepEqual(timeout.mock.calls[0]?.arguments, [2_000]);
-  assert.equal(readPostDeployRuns.mock.callCount(), 1);
-  assert.equal(readPostDeployRuns.mock.calls[0]?.arguments[1].aborted, true);
+test("the real internal timeout settles a standalone Node process with a stalled reader", () => {
+  const moduleUrl = new URL("../scripts/staging-automod-selection.ts", import.meta.url).href;
+  // A Node test runner can keep the process alive and mask an unref'ed timer.
+  const child = spawnSync(process.execPath, ["--input-type=module", "--eval", `
+    import assert from "node:assert/strict";
+    const { resolveStagingAutomodSelection } = await import(process.argv[1]);
+    const { dispatch, plan } = JSON.parse(process.argv[2]);
+    const caller = new AbortController();
+    let readSignal;
+    const result = await resolveStagingAutomodSelection(dispatch, {
+      readPostDeployRuns: (_scope, signal) => {
+        readSignal = signal;
+        return new Promise(() => {});
+      },
+      readAuthenticatedInventory: assert.fail,
+    }, caller.signal, { ...plan, notAfter: Date.now() + plan.leaseMs });
+    assert.equal(result, undefined);
+    assert.equal(readSignal.aborted, true);
+    assert.equal(caller.signal.aborted, false);
+  `, moduleUrl, JSON.stringify({ dispatch, plan })], { encoding: "utf8", timeout: 5_000 });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
 });
