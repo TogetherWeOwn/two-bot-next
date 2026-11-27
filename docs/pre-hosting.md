@@ -121,6 +121,16 @@ so they can bind loopback before the bot starts. Cloudflare's HTTP intercepts
 cannot carry raw PostgreSQL with Internet access disabled.
 [Native Container API](https://developers.cloudflare.com/containers/api/durable-object-container/) · [Non-HTTP egress](https://developers.cloudflare.com/containers/configuration/outbound-traffic/#non-http-traffic)
 
+The [replacement Worker](../wrangler/src/pre-qualification.ts) uses separate
+private Service Binding entrypoints for qualification and stop. It schedules
+a Durable Object alarm in the same storage transaction that arms the actor.
+The alarm uses the persisted actor identity across runner loss and Worker
+version changes. Stop closes admission before calling native `destroy()`
+and schedules a retry before awaiting the provider. The startup entrypoint
+passes the original cutoff and loopback Discord settings to the pinned
+fixture image. The fixture supervisor must enforce that cutoff before
+launching the bot and throughout its lifetime.
+
 For native scheduling, Get Application reports observed `active` and
 `starting` counts. The [cleanup projection](../scripts/pre_inventory.py)
 requires `active` and `assigned`. A zero `starting` count cannot satisfy the
