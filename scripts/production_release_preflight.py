@@ -9,7 +9,7 @@ from production_migrate_approval import ARTIFACT, stable_plan, verify_check, ver
 from rollback_proof import moment
 from production_recovery_artifact import (STOP_INTENT_ARTIFACT, artifact_entries, attempt_job, authentic_document,
                                           current_run, interrupted_origin, protected_job)
-from production_recovery_takeover import HEX, RUN_ID, SHA, UUID
+from production_recovery_takeover import HEX, LEGACY_RELEASE_WORKER_SHA, RUN_ID, SHA, UUID
 from production_release_forward import forward_receipt
 from production_release_ledgers import ledger_endpoints
 from staging_migrate_approval import digest_json
@@ -51,7 +51,7 @@ class ReleasePreflight:
 
 
 def verify_preflight(pin, target, plan, fresh, observe, control):
-    """Verify a fresh PRE plan and the exact live pair's read-only takeover capability."""
+    """Verify a fresh PRE plan and bind the live pair to its supported takeover protocol."""
     reference = pin.recovery_reference()
     require(plan.get("mode") == "plan" and plan.get("role") == "two_bot_migrator_ro"
             and plan.get("migration_target") == "production" and plan.get("target") == target
@@ -66,9 +66,12 @@ def verify_preflight(pin, target, plan, fresh, observe, control):
             and image.get("rollout_status") == "completed" and owner.get("phase") == "active"
             and owner.get("running") is True and type(owner.get("epoch")) is int and 0 < owner["epoch"] < 2**53 - 4,
             "production_release_retained_pair_changed")
-    capability = control("takeover-capability", expected_deployment=pin.rollback_worker)
-    require(capability == {"deploymentId": pin.rollback_worker, "exactTakeover": True}
-            and capability["exactTakeover"] is True, "production_release_retained_takeover_unproved")
+    # The authenticated plan and provider annotation bind the known legacy contract.
+    # Every other predecessor must advertise the exact takeover protocol over GET.
+    if pin.rollback_sha != LEGACY_RELEASE_WORKER_SHA:
+        capability = control("takeover-capability", expected_deployment=pin.rollback_worker)
+        require(capability == {"deploymentId": pin.rollback_worker, "exactTakeover": True}
+                and capability["exactTakeover"] is True, "production_release_retained_takeover_unproved")
     after = observe()
     require(all(after.get(key) == state[key] for key in ("worker", "container", "ownership")),
             "production_release_retained_pair_changed")

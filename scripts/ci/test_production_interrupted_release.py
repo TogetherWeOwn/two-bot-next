@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stderr
 from copy import deepcopy
+from dataclasses import replace
 from hashlib import sha256
 from io import BytesIO, StringIO
 import json
@@ -17,6 +18,7 @@ import production_recovery_workflow as recovery
 import production_release_interrupted as interrupted
 import production_release_preflight as preflight
 from ci.production_migrate_claim import projection_hash, store_projection_hash
+from production_recovery_takeover import LEGACY_RELEASE_WORKER_SHA
 from staging_rollout import GateError
 
 
@@ -308,6 +310,22 @@ class InterruptedReleaseTests(unittest.TestCase):
             self.reconcile({"state": "pre"})
         self.control.assert_called_once_with(
             "takeover-fenced", self.epoch, expected_deployment=self.pin.rollback_worker,
+        )
+        self.recover_post.assert_not_called()
+
+    def test_interrupted_pre_restarts_the_legacy_writer_once_without_an_inverse(self):
+        self.pin = replace(self.pin, rollback_sha=LEGACY_RELEASE_WORKER_SHA)
+        self.live["worker"]["sha"] = self.pin.rollback_sha
+
+        def commit(*_args, **_kwargs):
+            self.live["ownership"].update(epoch=self.epoch + 1, running=True, phase="active")
+
+        self.control.side_effect = commit
+        expected = {"state": "pre", "worker": self.pin.rollback_worker, "epoch": self.epoch + 1}
+        self.assertEqual(self.reconcile({"state": "pre"}), expected)
+        self.assertEqual(self.reconcile({"state": "pre"}), expected)
+        self.control.assert_called_once_with(
+            "takeover-legacy-fenced", self.epoch, expected_deployment=self.pin.rollback_worker,
         )
         self.recover_post.assert_not_called()
 

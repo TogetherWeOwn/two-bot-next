@@ -12,7 +12,7 @@ from time import sleep
 import production_recovery_artifact as artifacts
 from production_attendance_plan import validate_attendance_plan
 from production_ownership_status import read_status
-from production_recovery_takeover import HEX, UUID, RecoveryPin
+from production_recovery_takeover import HEX, LEGACY_RELEASE_WORKER_SHA, UUID, RecoveryPin
 from production_release_approval import require_unused_attendance_plan
 from production_release_ledgers import CUTOVER, STORE, ledger_endpoints
 from production_release_preflight import (ReleasePreflight, approved_bound_plan, approved_plan,
@@ -105,10 +105,11 @@ def stop_prior_pair(pin, run_id, epoch, observe, control):
     actor = release_actor(run_id, pin.candidate_sha)
     before = observe()
     owner = mapping(before.get("ownership"))
-    require(matches_pair(before, pin, pin.rollback_worker, pin.rollback_sha, pin.rollback_image)
-            and owner.get("phase") == "active" and owner.get("epoch") == epoch
+    require(matches_pair(before, pin, pin.rollback_worker, pin.rollback_sha, pin.rollback_image, completed=True)
+            and owner.get("phase") == "active" and type(owner.get("epoch")) is int and owner["epoch"] == epoch
             and owner.get("running") is True, "production_release_retained_pair_changed")
-    ack = stopped_ack(control("fence-exact", epoch, expected_deployment=pin.rollback_worker),
+    action = "fence-legacy" if pin.rollback_sha == LEGACY_RELEASE_WORKER_SHA else "fence-exact"
+    ack = stopped_ack(control(action, epoch, expected_deployment=pin.rollback_worker),
                       epoch + 1, actor, pin.rollback_worker)
     state = observe()
     require(state.get("worker") == before["worker"] and state.get("container") == before["container"]

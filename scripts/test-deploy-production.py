@@ -1032,7 +1032,8 @@ class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
               ref="refs/heads/main", auto="", resolved_sha=None, event="workflow_dispatch",
               run_sha="", run_conclusion="", run_updated="", hold="", auto_disabled="", spike="",
-              run_path="", run_event="", cutover_hold="", release_plan="", release_pins="", **responses):
+              run_path="", run_event="", cutover_hold="", release_plan="", release_pins="",
+              repository_id="1396224242", ref_protected="true", run_attempt="1", **responses):
         if image is None:
             image = IMAGE if rollback else ""
         api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]},
@@ -1153,9 +1154,10 @@ class GuardBehaviourTests(unittest.TestCase):
             output, summary = Path(tmp) / "output", Path(tmp) / "summary"
             env = {
                 "GITHUB_REPOSITORY": REPO, "GITHUB_REF": ref, "SHA": sha, "ROLLBACK": rollback,
+                "GITHUB_REPOSITORY_ID": repository_id, "GITHUB_REF_PROTECTED": ref_protected,
                 "IMAGE": image, "TAKEOVER": takeover, "ALLOW_UNSTAGED": allow_unstaged,
                 "EVENT_NAME": event,
-                "GITHUB_RUN_ATTEMPT": "1", "RELEASE_PLAN_ID": release_plan, "RELEASE_PINS": release_pins,
+                "GITHUB_RUN_ATTEMPT": run_attempt, "RELEASE_PLAN_ID": release_plan, "RELEASE_PINS": release_pins,
                 "WORKFLOW_RUN_SHA": run_sha, "WORKFLOW_RUN_CONCLUSION": run_conclusion,
                 "WORKFLOW_RUN_UPDATED_AT": run_updated, "HOLD_UNTIL": hold,
                 "AUTO_DISABLED": auto_disabled,
@@ -1512,18 +1514,30 @@ class GuardBehaviourTests(unittest.TestCase):
                 self.assertRefused(result, "from main only")
                 self.assertEqual(result[3], [])
 
-    def test_dormant_protected_dispatch_refuses_before_api_calls(self):
-        for plan, pins, reason in (
-            ("123", "{}", "protected release requires the activation follow-up"),
-            ("001", "{}", "with both release inputs"),
-            ("123", "", "with both release inputs"),
-            ("", "{}", "with both release inputs"),
-        ):
-            with self.subTest(plan=plan, pins=pins):
-                result = self.guard(takeover="true", cutover_hold="false", auto_disabled="true",
-                                    release_plan=plan, release_pins=pins)
-                self.assertRefused(result, reason)
+    def test_protected_dispatch_reaches_standard_promotion_gates(self):
+        dispatch = dict(takeover="true", cutover_hold="false", auto_disabled="true",
+                        release_plan="123", release_pins="{}")
+        code, outputs, _, _, _ = self.guard(**dispatch)
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["protected_release"], "true")
+        self.assertEqual(outputs["staging_run_id"], "501")
+        self.assertRefused(self.guard(**dispatch, **{"staging-jobs": {"total_count": 0, "jobs": []}}),
+                           "user-flow synthetic")
+
+    def test_invalid_protected_dispatch_refuses_before_api_calls(self):
+        dispatch = dict(takeover="true", cutover_hold="false", auto_disabled="true",
+                        release_plan="123", release_pins="{}")
+        for overrides in (dict(release_plan="001"), dict(release_pins=""), dict(release_plan=""),
+                          dict(repository_id="1"), dict(ref_protected="false"),
+                          dict(ref="refs/heads/feature"), dict(run_attempt="2"),
+                          dict(allow_unstaged="true"), dict(sha=SHA[:12])):
+            with self.subTest(overrides=overrides):
+                result = self.guard(**{**dispatch, **overrides})
+                self.assertRefused(result, "with both release inputs")
                 self.assertEqual(result[3], [])
+        result = self.guard(**{**dispatch, "auto_disabled": ""})
+        self.assertRefused(result, "requires automatic production promotion to be disabled")
+        self.assertEqual(result[3], [])
 
     def test_sha_not_on_main_is_refused(self):
         for status in ("diverged", "behind", None):

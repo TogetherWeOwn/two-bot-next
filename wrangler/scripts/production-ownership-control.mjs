@@ -41,6 +41,8 @@ export const REFUSAL_REASONS = new Set([
   "staging_use_conflict", "staging_use_ended",
 ]);
 const MAX_REFUSAL_BODY_BYTES = 1024;
+const RELEASE_ACTOR = /^production-schema-release:[1-9][0-9]{0,19}:[0-9a-f]{40}$/;
+const RECOVERY_ACTOR = /^github-actions:[1-9][0-9]{0,19}:[0-9a-f]{40}$/;
 
 // The staging origin shape this client always refuses. Production origins are
 // pinned by equality with PRODUCTION_WORKER_URL (see control()), not by a
@@ -141,7 +143,8 @@ async function observationJson(response) {
 export async function control({ action, url, productionUrl = process.env.PRODUCTION_WORKER_URL ?? "", stagingUrl = process.env.STAGING_WORKER_URL ?? "", token, actor, expectedEpoch, expectedDeploymentId, releaseFence = false, takeoverAttempts = 34, takeoverRetryDelayMs = 10000, takeoverWindowMs = 330000, statusAttempts = 34, statusRetryDelayMs = 10000, statusWindowMs = 330000 }, send = fetch, wait = sleep, now = Date.now) {
   const origin = checkOrigin(url, productionUrl, stagingUrl);
   if (!token || token.length < 32) throw new ControlError("OWNERSHIP_CONTROL_TOKEN is missing or invalid; stop before deployment");
-  if (!["preflight", "status", "observe", "unreserved", "takeover", "takeover-fenced", "takeover-capability", "fence", "fence-exact"].includes(action)) {
+  const legacyRelease = action === "fence-legacy" || action === "takeover-legacy-fenced";
+  if (!legacyRelease && !["preflight", "status", "observe", "unreserved", "takeover", "takeover-fenced", "takeover-capability", "fence", "fence-exact"].includes(action)) {
     throw new ControlError("Unknown action");
   }
   if (action === "preflight") return { configured: true };
@@ -174,9 +177,12 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
         response.headers.get("x-two-bot-exact-takeover") !== "1") {
       throw new ControlError("Production deployment does not support exact takeover; stop before posting");
     }
+    if (init.method === "GET" && legacyRelease && response.headers.has("x-two-bot-exact-takeover")) {
+      throw new ControlError("Production deployment advertises exact takeover; stop before legacy posting");
+    }
     let raw;
     try {
-      raw = action === "observe" ? await observationJson(response) : await response.json();
+      raw = action === "observe" || legacyRelease ? await observationJson(response) : await response.json();
     } catch {
       throw new TransientFailure(`Ownership control invalid response attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`);
     }
@@ -214,19 +220,24 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
     }
     return { deploymentId: current.deploymentId, exactTakeover: true };
   }
-  if (action === "fence-exact") {
-    if (!expectedDeploymentId || !/^production-schema-release:[1-9][0-9]{0,19}:[0-9a-f]{40}$/.test(actor) ||
+  if (action === "fence-exact" || action === "fence-legacy") {
+    if (!expectedDeploymentId || !RELEASE_ACTOR.test(actor) ||
         !Number.isSafeInteger(expectedEpoch) || expectedEpoch < 1 || !Number.isSafeInteger(expectedEpoch + 1)) {
-      throw new ControlError("Exact production fence requires the serving deployment, epoch and release actor");
+      throw new ControlError("Protected production fence requires the serving deployment, epoch and release actor");
     }
     attempts = 1;
     const current = await read({ method: "GET" });
     if (current.deploymentId !== expectedDeploymentId || current.owner?.epoch !== expectedEpoch ||
-        (current.owner.phase === "active" && current.owner.deploymentId !== expectedDeploymentId)) {
-      throw new ControlError("Exact production fence refused; ownership changed");
+        (current.owner.phase === "active" && current.owner.deploymentId !== expectedDeploymentId) ||
+        (legacyRelease && (current.owner.phase !== "active" || !current.running))) {
+      throw new ControlError("Protected production fence refused; ownership changed");
     }
+    // The protected caller brackets this one epoch-fenced legacy POST with
+    // provider reads. The legacy Worker does not accept a deployment pin in the POST.
+    const change = legacyRelease ? { action: "fence", actor, expectedEpoch }
+      : { action: "fence-exact", actor, expectedEpoch, expectedDeploymentId };
     const result = await read({ method: "POST",
-      body: JSON.stringify({ action: "fence-exact", actor, expectedEpoch, expectedDeploymentId }) });
+      body: JSON.stringify(change) });
     if (result.deploymentId !== expectedDeploymentId || result.running || result.owner?.phase !== "fenced" ||
         result.owner.deploymentId !== null || result.owner.actor !== actor || result.owner.epoch !== expectedEpoch + 1 ||
         result.owner.oldEpoch !== expectedEpoch) {
@@ -234,27 +245,28 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
     }
     return result;
   }
-  if (action === "takeover-fenced") {
+  if (action === "takeover-fenced" || action === "takeover-legacy-fenced") {
     if (!releaseFence || !expectedDeploymentId || !actor || !/^[a-zA-Z0-9_.:@/-]{1,128}$/.test(actor) ||
+        (legacyRelease && !RELEASE_ACTOR.test(actor) && !RECOVERY_ACTOR.test(actor)) ||
         !Number.isSafeInteger(expectedEpoch) || expectedEpoch < 1 ||
         !Number.isSafeInteger(expectedEpoch + 1)) {
-      throw new ControlError("Exact fenced takeover requires the deployment, fence epoch and actor");
+      throw new ControlError("Protected fenced takeover requires the deployment, fence epoch and actor");
     }
     attempts = 1;
     const current = await readState();
     if (current.owner?.phase !== "fenced" || current.owner.deploymentId !== null ||
-        current.owner.epoch !== expectedEpoch) {
-      throw new ControlError("Exact fenced takeover refused; ownership changed");
+        current.owner.epoch !== expectedEpoch || (legacyRelease && !RELEASE_ACTOR.test(current.owner.actor))) {
+      throw new ControlError("Protected fenced takeover refused; ownership changed");
     }
     // Never retry at a newly observed epoch. The caller reconciles a lost
     // acknowledgement against the same protected recovery evidence.
-    const result = await read({
-      method: "POST",
-      body: JSON.stringify({ action: "takeover-exact", actor, expectedEpoch, expectedDeploymentId }),
-    });
+    const change = legacyRelease ? { action: "takeover", actor, expectedEpoch }
+      : { action: "takeover-exact", actor, expectedEpoch, expectedDeploymentId };
+    const result = await read({ method: "POST", body: JSON.stringify(change) });
     if (result.deploymentId !== expectedDeploymentId || result.running ||
         result.owner?.phase !== "active" || result.owner.deploymentId !== expectedDeploymentId ||
-        result.owner.epoch !== expectedEpoch + 1 || result.owner.actor !== actor) {
+        result.owner.epoch !== expectedEpoch + 1 || result.owner.actor !== actor ||
+        (legacyRelease && result.owner.oldEpoch !== expectedEpoch)) {
       throw new ControlError("Ownership transition not confirmed; reconcile the fenced takeover");
     }
     return result;

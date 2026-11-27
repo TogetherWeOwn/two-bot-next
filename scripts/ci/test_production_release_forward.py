@@ -102,6 +102,47 @@ class ReleaseForwardTests(unittest.TestCase):
         with self.assertRaisesRegex(GateError, "production_release_retained_pair_changed"):
             preflight.verify_preflight(pin, plan["target"], plan, plan, Mock(side_effect=[state, shifted]), control)
 
+    def test_known_legacy_predecessor_fences_only_the_observed_pair_at_the_preflight_epoch(self):
+        pin, plan = self.preflight_fixture()
+        pin = replace(pin, rollback_sha="d314f4c63ecbea263aa953bc8a649a444a97da7c")
+        plan["recovery_evidence_ref"] = pin.recovery_reference()
+        actor = release.release_actor("456", pin.candidate_sha)
+        before = {"worker": {"version_id": pin.rollback_worker, "sha": pin.rollback_sha, "traffic_percent": 100},
+                  "container": {"image_digest": pin.rollback_image, "application_id": pin.application_id,
+                                "namespace_id": pin.namespace_id, "rollout_status": "completed"},
+                  "ownership": {"phase": "active", "running": True, "epoch": 17}}
+        observe = Mock(return_value=before)
+        control = Mock()
+        self.assertEqual(preflight.verify_preflight(pin, plan["target"], plan, deepcopy(plan), observe, control), 17)
+        self.assertEqual(observe.call_count, 2)
+        control.assert_not_called()
+
+        for section, field, changed in (("worker", "version_id", "unknown"), ("worker", "traffic_percent", 99),
+                                        ("container", "image_digest", pin.candidate_image),
+                                        ("ownership", "epoch", 18)):
+            with self.subTest(section=section, field=field):
+                drifted = deepcopy(before)
+                drifted[section][field] = changed
+                with self.assertRaisesRegex(GateError, "production_release_retained_pair_changed"):
+                    release.stop_prior_pair(pin, "456", 17, Mock(return_value=drifted), control)
+                control.assert_not_called()
+
+        stopped = {**before, "ownership": {"phase": "fenced", "running": False, "epoch": 18, "owner_actor": actor}}
+        ack = {"deploymentId": pin.rollback_worker, "running": False,
+               "owner": {"phase": "fenced", "deploymentId": None, "epoch": 18, "oldEpoch": 17, "actor": actor}}
+        timeline = Mock()
+        timeline.control.return_value = ack
+        timeline.observe.side_effect = [before, stopped]
+        self.assertEqual(release.stop_prior_pair(pin, "456", 17, timeline.observe, timeline.control), ack)
+        self.assertEqual(timeline.mock_calls, [call.observe(),
+                         call.control("fence-legacy", 17, expected_deployment=pin.rollback_worker), call.observe()])
+
+        changed = {**stopped, "container": {**stopped["container"], "image_digest": pin.candidate_image}}
+        control.return_value = ack
+        with self.assertRaisesRegex(GateError, "production_stopped_fence_unproved"):
+            release.stop_prior_pair(pin, "456", 17, Mock(side_effect=[before, changed]), control)
+        control.assert_called_once_with("fence-legacy", 17, expected_deployment=pin.rollback_worker)
+
     def test_prepare_rejects_agreeing_invalid_pre_plans_before_reading_provider(self):
         pin, plan = self.preflight_fixture()
         # The read-only shape is valid, but the required PRE audit findings are absent.

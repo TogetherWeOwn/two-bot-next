@@ -337,17 +337,19 @@ jobs:
               sys.exit(0)
 
           if release_plan or release_pins:
-              if (event != "workflow_dispatch" or os.environ.get("GITHUB_RUN_ATTEMPT") != "1"
+              if (event != "workflow_dispatch" or repo != "TogetherWeOwn/two-bot-next"
+                      or os.environ.get("GITHUB_REPOSITORY_ID") != "1396224242"
+                      or os.environ.get("GITHUB_REF") != "refs/heads/main"
+                      or os.environ.get("GITHUB_REF_PROTECTED") != "true"
+                      or os.environ.get("GITHUB_RUN_ATTEMPT") != "1"
                       or not re.fullmatch(r"[1-9][0-9]{0,19}", release_plan)
                       or not release_pins or len(release_pins) > 2048
                       or not re.fullmatch(r"[0-9a-f]{40}", os.environ.get("SHA", ""))
                       or mode != "deploy" or allow_unstaged != "false" or takeover != "true"
                       or cutover_hold != "false"):
-                  refuse("protected release requires a fresh manual exact-SHA staged takeover with both release inputs")
+                  refuse("protected release requires a fresh manual exact-SHA staged takeover from protected main with both release inputs")
               if os.environ.get("AUTO_DISABLED") != "true":
                   refuse("protected release requires automatic production promotion to be disabled")
-
-              refuse("protected release requires the activation follow-up")
 
           def staged_source(run):
               title = run.get("display_title")

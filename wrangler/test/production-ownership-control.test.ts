@@ -160,6 +160,49 @@ test("fenced recovery never retries an interrupted takeover at a new epoch", asy
   }
 });
 
+test("protected legacy transitions use one pinned GET and one epoch-fenced POST", async () => {
+  const fenceActor = `production-schema-release:123:${"a".repeat(40)}`;
+  const recoveryActor = `github-actions:123:${"b".repeat(40)}`;
+  const active = { deploymentId: "B", epoch: 3, phase: "active", actor: recoveryActor };
+  const fenced = { deploymentId: null, epoch: 4, oldEpoch: 3, phase: "fenced", actor: fenceActor };
+  for (const [action, wireAction, owner, actor, running, next] of [
+    ["fence-legacy", "fence", active, fenceActor, true, fenced],
+    ["takeover-legacy-fenced", "takeover", fenced, recoveryActor, false, { ...active, epoch: 5, oldEpoch: 4 }],
+  ] as const) {
+    for (const outcome of ["committed", "lost-reply", "version-changed"]) {
+      const calls: string[] = [];
+      const operation = control({ ...args, action, expectedEpoch: owner.epoch, actor, releaseFence: true },
+        async (_url: URL, init: RequestInit) => {
+          calls.push(String(init.method));
+          if (init.method === "GET") return Response.json({ deploymentId: "B", running, owner });
+          assert.deepEqual(JSON.parse(String(init.body)), { action: wireAction, expectedEpoch: owner.epoch, actor });
+          if (outcome === "lost-reply") return Response.json({ reason: "operation_failed" }, { status: 503 });
+          return Response.json({ deploymentId: outcome === "version-changed" ? "C" : "B", running: false, owner: next });
+        }, async () => { assert.fail("protected legacy transitions must never retry"); });
+      if (outcome === "committed") assert.deepEqual((await operation).owner, next);
+      else await assert.rejects(operation);
+      assert.deepEqual(calls, ["GET", "POST"]);
+    }
+  }
+});
+
+test("protected legacy takeover refuses the wrong version, protocol or stopped epoch before posting", async () => {
+  const actor = `production-schema-release:123:${"a".repeat(40)}`;
+  const recovery = { ...args, action: "takeover-legacy-fenced", expectedEpoch: 3, actor, releaseFence: true };
+  const owner = { deploymentId: null, epoch: 3, phase: "fenced", actor };
+  const stopped = { deploymentId: "B", running: false, owner };
+  for (const state of [{ ...stopped, deploymentId: "C" }, { ...stopped, running: true },
+    { ...stopped, owner: { ...owner, epoch: 4 } }, { ...stopped, owner: { ...owner, deploymentId: "B" } },
+    { ...stopped, owner: { ...owner, actor: "ordinary-rollback" } }, stopped]) {
+    const calls: string[] = [];
+    await assert.rejects(control(recovery, async (_url: URL, init: RequestInit) => {
+      calls.push(String(init.method));
+      return Response.json(state, state === stopped ? { headers: { "x-two-bot-exact-takeover": "1" } } : {});
+    }));
+    assert.deepEqual(calls, ["GET"]);
+  }
+});
+
 test("routine takeover refuses to unpark a fenced/pristine singleton", async () => {
   for (const owner of [null, { epoch: 2, deploymentId: null, phase: "fenced" }]) {
     const s = sender(owner);
