@@ -31,7 +31,7 @@ def fixture():
         for phase in PHASES
     }
     receipts["cleanup"]["terminal_observation"] = dict(
-        start_id=str(START_ID), source="runtime", terminal=True, observed_at=NOW - 21,
+        start_id=str(START_ID), source="runtime", terminal=True, observed_at=NOW - 20,
     )
     return dict(target=asdict(TARGET), receipts=receipts, production_auto_promote_disabled=dict(
         name="PRODUCTION_AUTO_PROMOTE_DISABLED", value="true", observed_at=NOW,
@@ -127,6 +127,16 @@ class NativeAdmissionPacketTests(unittest.TestCase):
         packet = fixture()
         packet["receipts"]["cleanup"]["terminal_observation"] = {"inventory": [], "absent": True}
         self.assert_denied(evaluate(packet), "invalid_cleanup_observation")
+
+    def test_cleanup_observation_must_cover_later_actor_activity(self):
+        for phase in ("first_create", "rehearsal", "takeover", "readiness"):
+            with self.subTest(phase=phase):
+                packet = fixture()
+                packet["receipts"][phase]["observed_at"] = NOW - 19
+                self.assert_denied(evaluate(packet), "cleanup_observation_precedes_activity")
+        packet = fixture()
+        packet["receipts"]["egress"]["observed_at"] = NOW
+        self.assertTrue(evaluate(packet)["admitted"])
 
     def test_promotion_readback_exact_and_fresh(self):
         changes = (

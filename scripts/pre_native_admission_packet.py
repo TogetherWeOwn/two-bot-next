@@ -8,6 +8,7 @@ exact actor. Empty inventory cannot supply that evidence.
 
 Times are Unix seconds. Observations must fall within the past hour, no earlier
 than reservation start and no later than the supplied authority clock.
+Terminal evidence must be at least as recent as observations of actor activity.
 """
 
 from hashlib import sha256
@@ -20,7 +21,8 @@ from pre_target import ADMISSION_SECONDS, DIGEST, LAST_UNIX_SECOND, SHA, Target
 from script_intake import decode_json
 
 
-PHASES = ("first_create", "rehearsal", "takeover", "readiness", "cleanup", "egress")
+ACTOR_PHASES = ("first_create", "rehearsal", "takeover", "readiness")
+PHASES = (*ACTOR_PHASES, "cleanup", "egress")
 MAX_PACKET_BYTES = 16 * 1024
 PROMOTION_SETTING = "PRODUCTION_AUTO_PROMOTE_DISABLED"
 TARGET_FIELDS = {"scope", "run_id", "started_at", "shape"}
@@ -117,6 +119,8 @@ def _admission_reasons(packet, *, target, predecessor_digest, predecessor_commit
         reasons.append("cleanup_actor_not_confirmed_terminal")
     if not earliest <= observation["observed_at"] <= cleanup["observed_at"]:
         reasons.append("cleanup_observation_outside_freshness_window")
+    if any(observation["observed_at"] < packet["receipts"][phase]["observed_at"] for phase in ACTOR_PHASES):
+        reasons.append("cleanup_observation_precedes_activity")
 
     setting = packet["production_auto_promote_disabled"]
     if setting["value"] != "true":
