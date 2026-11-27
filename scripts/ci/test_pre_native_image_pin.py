@@ -140,16 +140,27 @@ class NativeImagePinTests(unittest.TestCase):
 
     def test_checks_window_before_start_and_through_inspect(self):
         cutoff = BEGIN + 10
-        for ticks, starts, inspections in (([cutoff], 0, 0), ([BEGIN, cutoff], 0, 0),
-                                           ([BEGIN, BEGIN + 1, cutoff], 1, 0),
-                                           ([BEGIN, BEGIN + 1, BEGIN + 3, cutoff], 1, 1)):
+        expired = "effect_window_expired$"
+        for ticks, starts, inspections, reason in (
+            ([cutoff], 0, 0, expired), ([BEGIN, cutoff], 0, 0, expired),
+            ([BEGIN, BEGIN + 1, cutoff], 1, 0, expired), ([BEGIN, BEGIN + 1, BEGIN + 3, cutoff], 1, 1, expired),
+            ([BEGIN + 1, BEGIN], 0, 0, "clock_regressed$"), ([OSError()], 0, 0, "clock_unconfirmed$"),
+        ):
             with self.subTest(ticks=ticks):
                 f = Fixture()
                 f.adapter.clock.side_effect = ticks
-                with self.assertRaisesRegex(TargetError, "effect_window_expired$"):
+                with self.assertRaisesRegex(TargetError, reason):
                     f.verify()
                 self.assertEqual(f.adapter.start.call_count, starts)
                 self.assertEqual(f.adapter.inspect.call_count, inspections)
+
+    def test_refuses_window_from_another_reservation(self):
+        f = Fixture()
+        other_window = replace(f.admission.window, target=replace(f.scope.deployment.target, run_id=124))
+        f.admission = replace(f.admission, window=other_window)
+        with self.assertRaisesRegex(TargetError, "admission_invalid$"):
+            f.verify()
+        self.assertEqual(f.adapter.mock_calls, [])
 
     def test_refuses_stale_future_or_unbound_start_receipt(self):
         for change in (dict(started_at=BEGIN), dict(started_at=BEGIN + 10),

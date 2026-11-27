@@ -67,7 +67,7 @@ class ImageMapReadback:
 @dataclass(frozen=True)
 class NativeStart:
     scope: NativeScope
-    container_id: str  # Running instance ID, distinct from the reserved app ID.
+    container_id: str  # Provider ID of the running instance.
     started_at: int
 
 
@@ -156,18 +156,15 @@ def verify_native_image_pin(
 ) -> NativeImagePinResult:
     """Verify one explicitly enabled native start under an armed PRE reservation.
 
-    The protected caller pins admission independently from all readbacks.
-    Read the complete images map from the exact object and verify the referenced
-    OCI manifest and config bytes without redirects or tag fallback. Adapters
-    return fresh, bounded observations with scope derived from authenticated
-    runtime context and use the same trusted clock.
-    The start adapter must atomically enforce the original armed window, stop
-    fence and one-use start ID at the effect, and report its actual start time.
-    It passes the selected reference and applies the validated options to the
-    effective bot config, with both fixtures bound locally before the bot boots.
-    Inspect must observe the running instance and fixture readiness directly
-    on that object. Independent stop custody remains with the caller on every
-    outcome, including a lost or unconfirmed result after start.
+    Pin admission independently from readbacks. Adapters use fresh, bounded
+    observations from the authenticated object and share trusted time.
+    Read the object's complete images map. Resolve the selected reference's
+    OCI manifest and config bytes without redirects or tag fallback.
+    Start atomically enforces the original armed window, stop fence and one-use
+    start ID, applies the selected image and effective bot and egress options,
+    binds both fixtures before bot boot and reports the actual start time.
+    Inspect directly observes the running instance and fixture readiness.
+    The caller retains independent stop custody, including after a lost start.
     """
     if enabled is not True:
         return _DISABLED
