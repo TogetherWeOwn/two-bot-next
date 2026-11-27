@@ -64,7 +64,7 @@ function fixture() {
 
 test("native starts once for each PRE shape through the private entrypoint", async () => {
   for (const shape of ["0473/0465", "0475/0465"]) {
-    const { env, calls, cutoff, alarm } = fixture();
+    const { env, calls, cutoff, alarm, container } = fixture();
     env.PRE_SHAPE = shape;
     const runtime = new PreQualification({}, env);
     const custody = new PreStop({}, env);
@@ -81,6 +81,10 @@ test("native starts once for each PRE shape through the private entrypoint", asy
     const response = await runtime.probe(actor, "/readyz");
     assert.equal(response.status, 503);
     assert.equal(response.headers.get("x-two-worker-version"), actor.version);
+    for (const rejected of [new Response(null, { status: 302 }), new Response("a".repeat(65_537))]) {
+      container.getTcpPort = () => ({ fetch: async () => rejected });
+      await assert.rejects(runtime.probe(actor, "/readyz"), refusal);
+    }
     assert.deepEqual(calls, ["start"]);
   }
 });
@@ -98,13 +102,18 @@ test("runner loss retains the exact fence across reconstruction and destroy fail
   assert.ok(alarm() > cutoff);
   await assert.rejects(reconstruct().stop({ ...actor, version: env.CF_VERSION_METADATA.id }), refusal);
   container.destroy = destroy;
+  const inspect = container.inspect;
+  container.inspect = async () => ({ image, labels: { pre_start_id: actor.startId } });
+  await reconstruct().alarm();
+  assert.equal((await reconstruct().status(actor)).phase, "closing");
+  container.inspect = inspect;
   await reconstruct().alarm();
   assert.equal((await reconstruct().stop(actor)).phase, "stop-requested");
   assert.equal(alarm(), null);
   env.CF_VERSION_METADATA.id = actor.version;
   await assert.rejects(reconstruct().start(actor), refusal);
   await assert.rejects(reconstruct().probe(actor, "/health"), refusal);
-  assert.deepEqual(calls, ["start", "destroy"]);
+  assert.deepEqual(calls, ["start", "destroy", "destroy"]);
 });
 
 test("stop before arm and expiry during durable start intake both refuse delayed starts", async t => {
