@@ -9,7 +9,8 @@ from pre_registry_cleanup import (
     RegistryDisposition, RegistryReadback, RegistryReservation, registry_cleanup_disposition,
 )
 from pre_start_stop import (
-    Deployment, Endpoint, ExternalStop, Operation, PrivateRuntime, ProbeReply, ProtectedPre, WorkerUpload,
+    Deployment, EffectWindow, Endpoint, ExternalStop, Operation, PrivateRuntime, ProbeReply,
+    ProtectedPre, WorkerUpload,
 )
 from pre_sweep import SweepError, sweep_target
 from pre_target import Action, Inventory, Target, TargetError, require, verify_cleanup
@@ -21,22 +22,21 @@ class ProtectedPreCaller:
     """Use the full Target from the authenticated reservation on each runner.
 
     The host authenticates the protected run and grants only its operations.
-    Pass the checked Worker upload and runtime stamps from the pinned build
-    handoff. The admission store, runtime and external stop enforce any
-    earlier enclosing lease cutoff. The runtime owns private provisioning
-    and effect-time checks. A separately authorized
-    runner can stop with only the original reservation and the same durable
-    authority, including after a refusal or lost reply.
+    For start, the host supplies the original authenticated effect window
+    alongside the checked upload from the pinned build handoff. The runtime
+    and external stop enforce the armed cutoff at the effect boundary. A
+    separately authorized runner can stop with the original reservation and
+    the same durable authority, including after a refusal or lost reply.
     """
 
     def __init__(
         self, target: Target, *, authorize: Callable[[Target, Operation], bool], store: AdmissionStore,
         observe_settlement: Callable[[AdmissionRecord], SettlementEvidence | None],
-        runtime: PrivateRuntime, external_stop: ExternalStop,
+        runtime: PrivateRuntime, external_stop: ExternalStop, effect_window: EffectWindow | None = None,
     ):
         self._controller = ProtectedPre(
             target, authorize=authorize, admission=StartupAdmission(store, observe_settlement),
-            runtime=runtime, external_stop=external_stop,
+            runtime=runtime, external_stop=external_stop, effect_window=effect_window,
         )
 
     def start(self, upload: WorkerUpload) -> Deployment:

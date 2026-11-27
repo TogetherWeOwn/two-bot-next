@@ -33,6 +33,19 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
+          sparse-checkout: |
+            /scripts/build_identity.py
+            /scripts/ci/staging_migrate_claim.py
+            /scripts/ci/test_staging_pre_reaper_fixture.py
+            /scripts/pre_cleanup_run.py
+            /scripts/pre_sweep.py
+            /scripts/pre_target.py
+            /scripts/rollback_proof.py
+            /scripts/script_intake.py
+            /scripts/staging_recovery_status.py
+            /scripts/staging_rollout.py
+            /scripts/worker_container_rollback.py
+          sparse-checkout-cone-mode: false
       - name: Exercise the PRE sweep against synthetic inventory
         run: python3 -B -m unittest scripts.ci.test_staging_pre_reaper_fixture
       - name: Signal unverified PRE cleanup
