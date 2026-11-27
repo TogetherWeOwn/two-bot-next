@@ -3,6 +3,7 @@
 from copy import deepcopy
 from datetime import timedelta
 from email.message import Message
+from http.client import HTTPResponse
 from io import BytesIO, StringIO
 import json
 from pathlib import Path
@@ -118,7 +119,7 @@ class AcceptanceTests(unittest.TestCase):
         credentials.assert_not_called()
         no_traffic.assert_not_called()
 
-    def signed_peer(self, phase, *, wrong_result=False, drift=False):
+    def signed_peer(self, phase, *, wrong_result=False, drift=False, truncated_denial=False):
         requests, readies = [], []
 
         def check(request):
@@ -142,11 +143,14 @@ class AcceptanceTests(unittest.TestCase):
                 return 200, headers, dict(envelope, ok=True, result=result)
             status, code = (403, "action_not_allowed") if phase == "off" else (404, "not_found")
             envelope.update(ok=False, error={"code": code, "message": "request refused", "retryable": False})
-            media = Message()
-            media["content-type"], media["cache-control"] = "application/json", "no-store"
-            raw = BytesIO(json.dumps(envelope).encode("ascii"))
+            body = json.dumps(envelope).encode("ascii")
+            length = len(body) + int(truncated_denial)
+            wire = (f"HTTP/1.1 {status} {code}\r\nContent-Type: application/json\r\n"
+                    f"Cache-Control: no-store\r\nContent-Length: {length}\r\n\r\n").encode("ascii") + body
+            response = HTTPResponse(Mock(makefile=Mock(return_value=BytesIO(wire))), method="POST")
+            response.begin()
             with patch.object(acceptance, "no_redirect_opener") as opener:
-                opener.return_value.open.side_effect = HTTPError(request.full_url, status, code, media, raw)
+                opener.return_value.open.side_effect = HTTPError(request.full_url, status, code, response.headers, response)
                 return acceptance.send(request)
 
         return check, requests, readies
@@ -209,6 +213,30 @@ class AcceptanceTests(unittest.TestCase):
         check.reset_mock()
         self.assertEqual(run(boundary), (1, "FAIL: staging lease did not cover the probe\n"))
         check.assert_not_called()
+
+    def test_signed_denial_requires_a_complete_http_body(self):
+        env = {"STAGING_ATTENDANCE_KEY_ID": "synthetic-key",
+               "STAGING_ATTENDANCE_SIGNING_SECRET": "a" * 64}
+        for phase, active, minutes in (("pending", True, 10), ("off", False, 47)):
+            now = START + timedelta(minutes=minutes)
+            observed = active_observation()
+            observed.update(attendance_read=active, primary_fixture="pending" if active else "finalized")
+            observed["lifecycle"]["observedAt"] = observed_at(now)
+            args = [phase, "--rollout", "rollout", "--observed", "observed", "--execute"]
+            for truncated in (False, True):
+                with self.subTest(phase=phase, truncated=truncated):
+                    check, requests, readies = self.signed_peer(phase, truncated_denial=truncated)
+                    with (patch.object(acceptance, "read_object", side_effect=[ROLLOUT, observed]),
+                          patch.object(acceptance.time, "time", return_value=now.timestamp()),
+                          patch.object(acceptance.time, "monotonic", return_value=0),
+                          patch("sys.stdout", new_callable=StringIO) as stdout,
+                          patch("sys.stderr", new_callable=StringIO) as stderr):
+                        status = acceptance.main(args, env=env, check=check)
+                    expected = (1, "", "FAIL: attendance acceptance input or transport refused\n") if truncated else (
+                        0, f"PASS: attendance {phase}\n", "")
+                    self.assertEqual((status, stdout.getvalue(), stderr.getvalue()), expected)
+                    self.assertEqual(requests, [EVENT])
+                    self.assertEqual(len(readies), 1 if truncated else 2)
 
     def test_finalized_probe_stops_on_signed_read_refusal_after_preflight(self):
         observed = active_observation()
