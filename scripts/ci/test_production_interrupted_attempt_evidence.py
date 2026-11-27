@@ -30,15 +30,11 @@ class InterruptedAttemptEvidenceTests(unittest.TestCase):
         plan_artifact = {"archive_digest": "sha256:" + "9" * 64}
         self.epoch = 21
 
-        fixture = artifact_fixture.RecoveryArtifactTests()
-        fixture.setUp()
-        env, _, routes = fixture.artifact_fixture()
+        env, current = artifact_fixture.release_run_fixture()
         self.current_route = f"actions/runs/{env['GITHUB_RUN_ID']}"
-        current = routes[self.current_route]
         origin = {**current, "id": 456, "status": "completed", "conclusion": "cancelled"}
         self.routes = {self.current_route: current, "actions/runs/456": origin}
-        prepare = fixture.producer(preflight.PREPARE_JOB, preflight.STOP_INTENT_STEPS)
-        prepare["run_id"] = origin["id"]
+        prepare = artifact_fixture.producer(origin, preflight.PREPARE_JOB, preflight.STOP_INTENT_STEPS)
         self.routes["actions/runs/456/attempts/1/jobs?per_page=30"] = {"total_count": 1, "jobs": [prepare]}
 
         intent = preflight.stop_intent(self.pin, origin, "789", plan, plan_artifact, self.epoch - 1)
@@ -48,8 +44,9 @@ class InterruptedAttemptEvidenceTests(unittest.TestCase):
         decision = {"admission": admission, "classification": {"state": "pre"}}
         self.decision_digest = digest_json(decision)
         self.routes[f"{self.current_route}/attempts/1/jobs?per_page=30"] = {"total_count": 2, "jobs": [
-            fixture.producer(interrupted.ADMISSION_JOB, interrupted.ADMISSION_STEPS),
-            fixture.producer(interrupted.DATABASE_JOB, (interrupted.CLASSIFY_STEP, interrupted.DECISION_STEP)),
+            artifact_fixture.producer(current, interrupted.ADMISSION_JOB, interrupted.ADMISSION_STEPS),
+            artifact_fixture.producer(current, interrupted.DATABASE_JOB,
+                                      (interrupted.CLASSIFY_STEP, interrupted.DECISION_STEP)),
         ]}
         admission_digest = self.publish(current, 701, interrupted.ADMISSION, admission)
         decision_digest = self.publish(current, 702, interrupted.DECISION, decision)
