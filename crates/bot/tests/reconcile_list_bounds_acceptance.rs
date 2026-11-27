@@ -285,6 +285,43 @@ async fn member_list_capped_prints_fixed_truncation_receipt() {
 }
 
 #[tokio::test]
+async fn member_list_redacts_request_ids_that_contain_member_ids() {
+    let Some(bootstrap) = bootstrap_url("member list imported requests") else {
+        return;
+    };
+    let db = fixture(&bootstrap).await;
+    for (i, prefix) in [(0, ""), (1, "legacy-")] {
+        let user = member_user(i);
+        sqlx::query(
+            "INSERT INTO moderation_scheduled_unbans
+             (request_id, guild_id, user_id, execute_at, reason, state, created_at)
+             VALUES ($1, $2, $3, $4::text::timestamptz, 'imported expiry', 'quarantined',
+                     $5::text::timestamptz)",
+        )
+        .bind(format!("{prefix}{user}"))
+        .bind(GUILD)
+        .bind(user)
+        .bind(DUE)
+        .bind(NOW)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    let url = child_url(&db);
+    let output = cli(
+        &["reconcile-member", "--guild", GUILD, "--list"],
+        Some(&url),
+    )
+    .await;
+    let lines = stdout_lines(&output);
+    assert_eq!(lines.len(), 2);
+    assert!(lines.iter().all(|line| {
+        line.starts_with("quarantined_unban\t[redacted]\t[redacted]\texecute_at=")
+    }));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn member_list_at_or_under_limit_prints_no_receipt() {
     let Some(bootstrap) = bootstrap_url("member uncapped list") else {
         return;

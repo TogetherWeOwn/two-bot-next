@@ -26,7 +26,8 @@ pub(crate) const USAGE: &str = "\
   two-bot reconcile-member --guild <id> --list [--limit <n>]
       List fenced rows: prepared ban intents, running dispatches and
       quarantined imports. Read-only; member IDs are redacted and claim tokens
-      never print. Look up a member ID by guild and request in the ledger.
+      never print. A request ID containing the member ID is also redacted.
+      Use the ledger for exact identifiers.
       Shows 25 rows by default, at most 100; a capped listing ends with
       `showing <shown> of <total> rows (truncated; rerun with --limit <total>)`.
       Past 100 rows no rerun converges: resolve shown rows and re-list.
@@ -299,11 +300,13 @@ async fn run(
                             format!("execute_at={}", row.execute_at.as_deref().unwrap_or(""))
                         }
                     };
-                    println!(
-                        "{}\t{}\t[redacted]\t{detail}",
-                        row.kind.as_str(),
-                        row.request_id
-                    );
+                    // Imported rows can contain the member ID in the request ID.
+                    let request = if row.request_id.contains(row.user_id.as_str()) {
+                        "[redacted]"
+                    } else {
+                        row.request_id.as_str()
+                    };
+                    println!("{}\t{request}\t[redacted]\t{detail}", row.kind.as_str());
                 }
                 // The store pages before counting, so a listing that ends
                 // exactly at the cap prints no receipt; only a capped one
