@@ -6,8 +6,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-SCRIPTS = str(Path(__file__).resolve().parents[1])
-with patch.object(sys, "path", [SCRIPTS, *sys.path]):
+with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_native_cleanup import (AbsenceReadback, AppCounts, FenceCheck, NativeRegistryReadback,
                                     Reservation, StopEvidence, verify_cleanup)
     from pre_registry_cleanup import RegistryReservation
@@ -18,9 +17,8 @@ class Readers:
     def __init__(self, shape="0473/0465", *, never_created=False, lease_cutoff=None, early_stop=False):
         run_id = 475 if shape == "0475/0465" else 473
         target = Target(f"pre-fixture-{run_id}", run_id, 1_800_000_000, shape)
-        registry = RegistryReservation(
-            target, "registry.example.invalid/test/two-bot-next-attendance-predecessor-staging@sha256:" + "a" * 64,
-        )
+        reference = "registry.example.invalid/test/two-bot-next-attendance-predecessor-staging@sha256:" + "a" * 64
+        registry = RegistryReservation(target, reference)
         app_id = None if never_created else "5cb771af-3421-4223-8a06-39e061f06400"
         self.reservation = Reservation(registry, "b" * 32, app_id, lease_cutoff)
         cutoff = self.reservation.cutoff
@@ -63,11 +61,11 @@ class Readers:
 
 
 class NativeCleanupTests(unittest.TestCase):
-    def assert_rejected(self, readers, field, reason, **updates):
+    def assert_rejected(self, readers, field, reason, *, readback_offset=7, **updates):
         receipt = replace(getattr(readers, field), **updates)
         with self.subTest(field=field, updates=updates), patch.object(readers, field, receipt):
             with self.assertRaisesRegex(TargetError, f"^{reason}$"):
-                readers.verify()
+                readers.verify(readback_offset=readback_offset)
 
     def test_both_reservations_verify_created_and_never_created(self):
         for shape in ("0473/0465", "0475/0465"):
@@ -123,8 +121,9 @@ class NativeCleanupTests(unittest.TestCase):
             self.assert_rejected(readers, "stop", reason, **updates)
             self.assertEqual(readers.calls, [("stop", readers.reservation)])
             readers.calls.clear()
-        self.assert_rejected(Readers(never_created=True), "stop", "pre_app_never_created_unconfirmed",
-                             app_deleted_at=readers.stop.app_deleted_at)
+        no_app = Readers(never_created=True)
+        self.assert_rejected(no_app, "stop", "pre_app_never_created_unconfirmed", app_deleted_at=readers.stop.app_deleted_at)
+        self.assert_rejected(no_app, "stop", "invalid_pre_fence_arm_time", armed_at=no_app.reservation.cutoff)
 
     def test_empty_listing_cannot_prove_stop_or_never_created(self):
         for never_created in (False, True):
@@ -160,12 +159,13 @@ class NativeCleanupTests(unittest.TestCase):
 
     def test_post_delete_absence_must_be_fresh_and_complete(self):
         readers = Readers()
-        for observed_at in (readers.stop.app_deleted_at, readers.reservation.cutoff + 10):
-            self.assert_rejected(readers, "absence", "stale_pre_absence_readback", observed_at=observed_at)
-        with self.assertRaisesRegex(TargetError, "stale_pre_absence_readback"):
-            readers.verify(readback_offset=8)
-        with self.assertRaisesRegex(TargetError, "invalid_pre_readback_window"):
-            readers.verify(readback_offset=10)
+        for attempt in (readers, Readers(never_created=True)):
+            cleanup_at = attempt.stop.app_deleted_at or attempt.stop.worker_removed_at
+            self.assert_rejected(attempt, "absence", "stale_pre_absence_readback",
+                                 observed_at=cleanup_at, readback_offset=4)
+        self.assert_rejected(readers, "absence", "stale_pre_absence_readback", observed_at=readers.reservation.cutoff + 10)
+        for offset, reason in ((8, "stale_pre_absence_readback"), (10, "invalid_pre_readback_window")):
+            self.assert_rejected(readers, "absence", reason, readback_offset=offset)
         for field in ("worker_present", "subdomain_present", "preview_present", "routes_present",
                       "custom_domains_present", "app_present"):
             self.assert_rejected(readers, "absence", "pre_absence_unconfirmed", **{field: True})
@@ -176,9 +176,11 @@ class NativeCleanupTests(unittest.TestCase):
         readers = Readers()
         for settled_at in (None, readers.reservation.registry.target.started_at - 1, readers.reservation.cutoff + 10):
             self.assert_rejected(readers, "stop", "pre_publication_unsettled", publication_settled_at=settled_at)
-        for updates in ({"present": True}, {"present": None}, {"observed_at": readers.stop.publication_settled_at},
-                        {"observed_at": readers.absence.observed_at - 1}):
+        for updates in ({"present": True}, {"present": None},
+                        {"observed_at": readers.absence.observed_at - 1}, {"observed_at": readers.reservation.cutoff + 10}):
             self.assert_rejected(readers, "registry", "pre_registry_disposition_unsettled", **updates)
+        readers.stop = replace(readers.stop, publication_settled_at=readers.registry.observed_at)
+        self.assert_rejected(readers, "registry", "pre_registry_disposition_unsettled")
 
     def test_read_failure_returns_bounded_error(self):
         readers = Readers()

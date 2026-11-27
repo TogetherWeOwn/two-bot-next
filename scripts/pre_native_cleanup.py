@@ -79,8 +79,7 @@ class StopEvidence:
 class AppCounts:
     """Direct active and assigned counts while the pinned app is readable.
 
-    Cloudflare instance listings may lag. An empty listing supplies neither
-    count and must never be converted to this receipt.
+    An empty Cloudflare instance listing can lag and cannot supply either count.
     """
 
     reservation: Reservation
@@ -161,9 +160,8 @@ def verify_cleanup(reservation: Reservation, *, authority: Authority, transport:
                    readback_not_before: int, now: int) -> None:
     """Verify one reservation, including fresh absence before handback.
 
-    The caller obtains the pins, current time and readback freshness floor
-    from trusted context. Readers derive scope from the authenticated evidence
-    for each observation and use the same clock for all evidence timestamps.
+    The caller supplies trusted pins, time and a readback freshness floor.
+    Readers derive scope from authenticated receipts and use a common clock.
     Both writer checks cover the disposable database pinned to the Target.
     A settled publication can no longer create the exact registry reference,
     including after a lost copy reply. A still-present reference is unresolved.
