@@ -8,7 +8,7 @@ from unittest.mock import Mock, call, patch
 from uuid import UUID
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
-    from pre_native_rehearsal import LaunchPolicy, RuntimeIdentity, StopReadback, rehearse_native
+    from pre_native_rehearsal import LaunchPolicy, RuntimeIdentity, RuntimeReadback, StopReadback, rehearse_native
     from pre_start_stop import Deployment, EffectWindow
     from pre_target import Target, TargetError
     from pre_worker_upload import DatabaseEndpoint
@@ -29,13 +29,17 @@ class RehearsalFixture:
         self.expected = RuntimeIdentity(self.deployment, DIGEST, self.database)
         self.policy = LaunchPolicy("durable-object", "ws://127.0.0.1:8081/gateway?encoding=json",
                                    "http://[::1]:8082", True, False, self.database)
-        self.stopped = StopReadback(self.deployment, 0, 0, True, True)
+        if shape == SHAPES[1]:
+            self.policy = replace(self.policy, discord_gateway_url="wss://[::1]:8443/gateway",
+                                  discord_api_base="https://localhost:8443/api")
+        self.readback = RuntimeReadback(replace(self.expected), replace(self.policy))
+        self.stopped = StopReadback(self.deployment, UUID(int=4), 0, 0, True, True)
         self.calls = Mock()
         self.calls.clock.side_effect = [START, START, START + 59]
         self.calls.custody.arm.return_value = True
-        self.calls.custody.stop.return_value = True
+        self.calls.custody.stop.return_value = self.stopped.stop_id
         self.calls.launch.return_value = replace(self.deployment)
-        self.calls.read_runtime.return_value = replace(self.expected)
+        self.calls.read_runtime.return_value = self.readback
         self.calls.read_stop.return_value = replace(self.stopped)
 
     def run(self):
@@ -50,13 +54,15 @@ class RehearsalFixture:
 
 
 class NativeRehearsalTests(unittest.TestCase):
+    def assert_refused(self, fixture, reason, calls):
+        with self.assertRaisesRegex(TargetError, f"^{reason}$"):
+            fixture.run()
+        self.assertEqual(fixture.calls.mock_calls, calls)
+
     def test_both_layouts_launch_read_and_stop_in_order(self):
         for shape in SHAPES:
             with self.subTest(shape=shape):
                 fixture = RehearsalFixture(shape)
-                if shape == SHAPES[1]:
-                    fixture.policy = replace(fixture.policy, discord_gateway_url="wss://[::1]:8443/gateway",
-                                             discord_api_base="https://localhost:8443/api")
                 self.assertEqual(fixture.run(), fixture.stopped)
                 self.assertEqual(fixture.calls.mock_calls, fixture.full_sequence())
 
@@ -91,9 +97,7 @@ class NativeRehearsalTests(unittest.TestCase):
             with self.subTest(field=field, value=value):
                 trial = RehearsalFixture()
                 trial.policy = replace(trial.policy, **{field: value})
-                with self.assertRaisesRegex(TargetError, f"^pre_native_{error}$"):
-                    trial.run()
-                self.assertEqual(trial.calls.mock_calls, [])
+                self.assert_refused(trial, f"pre_native_{error}", [])
 
     def test_invalid_pins_and_window_refuse_before_custody(self):
         fixture = RehearsalFixture()
@@ -106,22 +110,17 @@ class NativeRehearsalTests(unittest.TestCase):
                      replace(expected, deployment=replace(fixture.deployment, start_id="not-a-uuid"))):
             with self.subTest(pins=pins):
                 fixture.expected = pins
-                with self.assertRaisesRegex(TargetError, "^invalid_pre_native_pins$"):
-                    fixture.run()
+                self.assert_refused(fixture, "invalid_pre_native_pins", [])
         fixture.expected = expected
         fixture.window = None
-        with self.assertRaisesRegex(TargetError, "^invalid_pre_native_window$"):
-            fixture.run()
-        self.assertEqual(fixture.calls.mock_calls, [])
+        self.assert_refused(fixture, "invalid_pre_native_window", [])
 
     def test_unconfirmed_arm_never_launches_or_stops_another_claim(self):
         for reply in (None, False, 1, OSError("private arm reply")):
             with self.subTest(reply=reply):
                 fixture = RehearsalFixture()
                 fixture.calls.custody.arm.side_effect = [reply]
-                with self.assertRaisesRegex(TargetError, "^pre_native_stop_unarmed$"):
-                    fixture.run()
-                self.assertEqual(fixture.calls.mock_calls, fixture.full_sequence()[:2])
+                self.assert_refused(fixture, "pre_native_stop_unarmed", fixture.full_sequence()[:2])
 
     def test_lost_arm_acknowledgment_keeps_custody_and_denies_replay(self):
         fixture = RehearsalFixture()
@@ -135,23 +134,18 @@ class NativeRehearsalTests(unittest.TestCase):
 
         fixture.calls.custody.arm.side_effect = arm
         fixture.calls.clock.side_effect = [START, START]
-        for _ in range(2):
-            with self.assertRaisesRegex(TargetError, "^pre_native_stop_unarmed$"):
-                fixture.run()
+        for attempt in (1, 2):
+            self.assert_refused(fixture, "pre_native_stop_unarmed", fixture.full_sequence()[:2] * attempt)
         self.assertEqual(claims, [(fixture.window, fixture.deployment)])
-        self.assertEqual(fixture.calls.mock_calls, fixture.full_sequence()[:2] * 2)
 
     def test_lost_or_mismatched_launch_reply_still_stops_exact_pin(self):
-        for reply in (None, OSError("private start reply"), UUID(int=4)):
+        mismatch = replace(RehearsalFixture().deployment, start_id=UUID(int=4))
+        for reply in (None, OSError("private start reply"), mismatch):
             with self.subTest(reply=reply):
                 fixture = RehearsalFixture()
-                if type(reply) is UUID:
-                    reply = replace(fixture.deployment, start_id=reply)
                 fixture.calls.launch.side_effect = [reply]
-                with self.assertRaisesRegex(TargetError, "^pre_native_launch_unconfirmed$"):
-                    fixture.run()
                 sequence = fixture.full_sequence()
-                self.assertEqual(fixture.calls.mock_calls, sequence[:4] + sequence[5:])
+                self.assert_refused(fixture, "pre_native_launch_unconfirmed", sequence[:4] + sequence[5:])
 
     def test_runtime_requires_exact_independently_observed_writer_and_build(self):
         fixture = RehearsalFixture(SHAPES[1])
@@ -166,24 +160,39 @@ class NativeRehearsalTests(unittest.TestCase):
         for reply in inconsistent:
             with self.subTest(reply=reply):
                 trial = RehearsalFixture(SHAPES[1])
-                trial.calls.read_runtime.side_effect = [reply]
-                with self.assertRaisesRegex(TargetError, "^pre_native_runtime_unconfirmed$"):
-                    trial.run()
-                self.assertEqual(trial.calls.mock_calls, trial.full_sequence())
+                trial.calls.read_runtime.side_effect = [replace(trial.readback, identity=reply)
+                                                        if type(reply) is RuntimeIdentity else reply]
+                self.assert_refused(trial, "pre_native_runtime_unconfirmed", trial.full_sequence())
 
-    def test_stop_command_and_observation_are_both_required(self):
-        for reply in (None, False, 1, OSError("private stop reply")):
+    def test_effective_runtime_policy_must_match(self):
+        for field, value, error in (
+            ("scheduling_policy", "auto-start", "scheduling_required"),
+            ("enable_internet", True, "public_egress_unconfirmed"), ("enable_internet", 0, "public_egress_unconfirmed"),
+            ("discord_gateway_url", None, "discord_fixture_unconfirmed"),
+            ("discord_api_base", "https://discord.com", "discord_fixture_unconfirmed"),
+            ("discord_api_base", None, "discord_fixture_unconfirmed"),
+            ("fixtures_ready_in_namespace", False, "discord_fixture_unconfirmed"),
+            ("discord_gateway_url", "ws://localhost:8081", "runtime_policy_mismatch"),
+            ("discord_api_base", "http://localhost:8082", "runtime_policy_mismatch"),
+        ):
+            with self.subTest(field=field, value=value):
+                trial = RehearsalFixture()
+                observed = replace(trial.policy, **{field: value})
+                trial.calls.read_runtime.return_value = replace(trial.readback, policy=observed)
+                self.assert_refused(trial, f"pre_native_{error}", trial.full_sequence())
+
+    def test_stop_requires_a_current_receipt(self):
+        for reply in (None, False, True, UUID(int=0), OSError("private stop reply")):
             with self.subTest(reply=reply):
                 fixture = RehearsalFixture()
                 fixture.calls.custody.stop.side_effect = [reply]
-                with self.assertRaisesRegex(TargetError, "^pre_native_stop_unconfirmed$"):
-                    fixture.run()
-                self.assertEqual(fixture.calls.mock_calls, fixture.full_sequence()[:6])
+                self.assert_refused(fixture, "pre_native_stop_unconfirmed", fixture.full_sequence()[:6])
 
     def test_stop_readback_requires_exact_identity_zero_counts_drain_and_fence(self):
         fixture = RehearsalFixture()
         failures = [None, OSError("private drain reply")]
         for field, value in (("deployment", replace(fixture.deployment, container_id=UUID(int=9))),
+                             ("stop_id", UUID(int=9)), ("stop_id", str(fixture.stopped.stop_id)),
                              ("active_instances", 1), ("active_instances", False), ("active_instances", None),
                              ("assigned_instances", 1), ("assigned_instances", False), ("assigned_instances", -1),
                              ("startup_drained", False), ("startup_drained", 1), ("restart_fenced", False),
@@ -193,9 +202,7 @@ class NativeRehearsalTests(unittest.TestCase):
             with self.subTest(reply=reply):
                 trial = RehearsalFixture()
                 trial.calls.read_stop.side_effect = [reply]
-                with self.assertRaisesRegex(TargetError, "^pre_native_stop_unconfirmed$"):
-                    trial.run()
-                self.assertEqual(trial.calls.mock_calls, trial.full_sequence()[:7])
+                self.assert_refused(trial, "pre_native_stop_unconfirmed", trial.full_sequence()[:7])
 
     def test_cutoff_clock_failure_and_regression_preserve_armed_stop(self):
         cases = [([START - 1], "invalid_pre_clock", 1),
@@ -211,12 +218,5 @@ class NativeRehearsalTests(unittest.TestCase):
             with self.subTest(readings=readings, error=error):
                 fixture = RehearsalFixture()
                 fixture.calls.clock.side_effect = readings
-                with self.assertRaisesRegex(TargetError, f"^{error}$"):
-                    fixture.run()
                 sequence = fixture.full_sequence()
-                self.assertEqual(fixture.calls.mock_calls, sequence[:3] + sequence[5:] if count == 6
-                                 else sequence[:count])
-
-
-if __name__ == "__main__":
-    unittest.main()
+                self.assert_refused(fixture, error, sequence[:3] + sequence[5:] if count == 6 else sequence[:count])

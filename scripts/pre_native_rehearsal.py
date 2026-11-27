@@ -18,11 +18,10 @@ DATABASE_HOST = re.compile(rf"{DNS_LABEL}(?:\.{DNS_LABEL})*")
 
 @dataclass(frozen=True)
 class LaunchPolicy:
-    """Effective options for native start(), with a pre-start fixture observation.
+    """Native start() options and listener readiness in the bot namespace.
 
-    The protected adapter verifies both listeners are ready in the bot's
-    network namespace and applies the two URLs as DISCORD_GATEWAY_URL and
-    DISCORD_API_BASE in the process environment at the effect boundary.
+    Apply DISCORD_GATEWAY_URL and DISCORD_API_BASE at start(). Any localhost
+    override must resolve only to loopback in that namespace.
     """
 
     scheduling_policy: str
@@ -35,12 +34,7 @@ class LaunchPolicy:
 
 @dataclass(frozen=True)
 class RuntimeIdentity:
-    """Pins or independently inspected running identity and effective writer.
-
-    Readback must identify the running process's image and actual database
-    write destination and user. Configuration or an echoed start reply alone
-    cannot establish that identity.
-    """
+    """Pins for the deployment, its image, and the actual database writer."""
 
     deployment: Deployment
     image_digest: str
@@ -48,10 +42,23 @@ class RuntimeIdentity:
 
 
 @dataclass(frozen=True)
+class RuntimeReadback:
+    """Independent inspection of the running process and effective policy.
+
+    Observe applied egress, process overrides, listener readiness and resolution
+    in this deployment's namespace, plus its actual image and database writer.
+    """
+
+    identity: RuntimeIdentity
+    policy: LaunchPolicy
+
+
+@dataclass(frozen=True)
 class StopReadback:
     """Direct, fresh post-stop observation of the exact rehearsal deployment."""
 
     deployment: Deployment
+    stop_id: UUID
     active_instances: int
     assigned_instances: int
     startup_drained: bool
@@ -61,15 +68,14 @@ class StopReadback:
 class StopCustody(Protocol):
     """Independent authority that stays responsible if the runner disappears.
 
-    Arm atomically claims the exact reservation and deployment once and
-    durably schedules stop at the original cutoff before acknowledging.
-    Stop closes admission, fences pending effects and requests stop for only
-    the owned deployment, including after cutoff or loss of a start reply.
-    Custody and the restart fence persist through independent reconciliation.
+    Arm atomically claims the exact deployment once and durably schedules stop
+    at the original cutoff before acknowledging.
+    Stop closes admission, requests shutdown and records a unique receipt ID on
+    the durable fence for independent readback, even after cutoff or lost start.
     """
 
     def arm(self, window: EffectWindow, deployment: Deployment) -> bool: ...
-    def stop(self, deployment: Deployment) -> bool: ...
+    def stop(self, deployment: Deployment) -> UUID: ...
 
 
 def _call(operation, *args, failure):
@@ -121,33 +127,30 @@ def _check_time(window, clock, previous=None):
     return now
 
 
-def rehearse_native(
-    window: EffectWindow, expected: RuntimeIdentity, policy: LaunchPolicy, *,
-    clock: Callable[[], int], custody: StopCustody,
-    launch: Callable[[EffectWindow, Deployment, LaunchPolicy], Deployment],
-    read_runtime: Callable[[Deployment], RuntimeIdentity],
-    read_stop: Callable[[Deployment], StopReadback],
-) -> StopReadback:
-    """Launch once, verify independently, and stop under retained custody.
-
-    The protected caller supplies separately authenticated pins, a trusted
-    authority clock and independent runtime and stop observations. Launch
-    must recheck the exact armed claim, cutoff, fence and effective policy at
-    native start() itself. Readbacks inspect the exact deployment directly.
-    Stop runs even after expiry or a failed launch. This function never
-    releases the reservation or disarms the independent stop authority.
-    """
-    require(type(window) is EffectWindow, "invalid_pre_native_window")
-    target = window.target
-    require(_runtime(expected, target), "invalid_pre_native_pins")
+def _check_policy(policy, target, database):
     require(type(policy) is LaunchPolicy and type(policy.scheduling_policy) is str
             and policy.scheduling_policy == "durable-object", "pre_native_scheduling_required")
     require(policy.enable_internet is False, "pre_native_public_egress_unconfirmed")
     require(policy.fixtures_ready_in_namespace is True
             and _loopback(policy.discord_gateway_url, ("ws", "wss"))
             and _loopback(policy.discord_api_base, ("http", "https")), "pre_native_discord_fixture_unconfirmed")
-    require(_database(policy.database, target) and policy.database == expected.database_writer,
-            "pre_native_database_mismatch")
+    require(_database(policy.database, target) and policy.database == database, "pre_native_database_mismatch")
+
+
+def rehearse_native(
+    window: EffectWindow, expected: RuntimeIdentity, policy: LaunchPolicy, *,
+    clock: Callable[[], int], custody: StopCustody,
+    launch: Callable[[EffectWindow, Deployment, LaunchPolicy], Deployment],
+    read_runtime: Callable[[Deployment], RuntimeReadback],
+    read_stop: Callable[[Deployment], StopReadback],
+) -> StopReadback:
+    """With authenticated pins and trusted time, launch once and retain custody.
+    Enforce the armed claim, cutoff, fence and policy at native start() itself.
+    """
+    require(type(window) is EffectWindow, "invalid_pre_native_window")
+    target = window.target
+    require(_runtime(expected, target), "invalid_pre_native_pins")
+    _check_policy(policy, target, expected.database_writer)
 
     deployment = expected.deployment
     now = _check_time(window, clock)
@@ -158,13 +161,17 @@ def rehearse_native(
         reply = _call(launch, window, deployment, policy, failure="pre_native_launch_unconfirmed")
         require(_deployment(reply, target) and reply == deployment, "pre_native_launch_unconfirmed")
         observed = _call(read_runtime, deployment, failure="pre_native_runtime_unconfirmed")
-        require(_runtime(observed, target) and observed == expected, "pre_native_runtime_unconfirmed")
+        require(type(observed) is RuntimeReadback and _runtime(observed.identity, target)
+                and observed.identity == expected, "pre_native_runtime_unconfirmed")
+        _check_policy(observed.policy, target, expected.database_writer)
+        require(observed.policy == policy, "pre_native_runtime_policy_mismatch")
     finally:
-        stopped = _call(lambda: custody.stop(deployment), failure="pre_native_stop_unconfirmed")
-        require(stopped is True, "pre_native_stop_unconfirmed")
+        stop_id = _call(lambda: custody.stop(deployment), failure="pre_native_stop_unconfirmed")
+        require(type(stop_id) is UUID and stop_id.int, "pre_native_stop_unconfirmed")
         stop = _call(read_stop, deployment, failure="pre_native_stop_unconfirmed")
         require(type(stop) is StopReadback and _deployment(stop.deployment, target)
-                and stop.deployment == deployment and type(stop.active_instances) is int
+                and stop.deployment == deployment and type(stop.stop_id) is UUID and stop.stop_id == stop_id
+                and type(stop.active_instances) is int
                 and type(stop.assigned_instances) is int and stop.active_instances == stop.assigned_instances == 0
                 and stop.startup_drained is True and stop.restart_fenced is True, "pre_native_stop_unconfirmed")
         _check_time(window, clock, now)
