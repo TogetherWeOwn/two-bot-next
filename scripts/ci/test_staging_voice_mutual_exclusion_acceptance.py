@@ -60,7 +60,7 @@ from unittest import mock
 import yaml
 
 from staging_pre_reaper_policy import PRE_REAPER, dormant_pre_reaper_errors
-from staging_soak_policy import PRODUCTION_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
+from staging_soak_policy import PRODUCTION_GROUP, PRODUCTION_RELEASE_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
     WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
@@ -107,7 +107,8 @@ EXPLICIT_INHERITED_GUARD = "(inputs.deploy_staging_call || " + INHERITED_GUARD +
 MAIN_ONLY = "github.ref == 'refs/heads/main'"
 VOICE_MOVE_GUARD = f"inputs.verify_lease && {MAIN_ONLY} && github.ref_protected && github.run_attempt == 1"
 AUTOMOD_GUARD = (
-    "github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main'"
+    f"inputs.rehearse && github.repository_id == '1396224242' && {MAIN_ONLY}"
+    " && github.workflow_ref == 'TogetherWeOwn/two-bot-next/.github/workflows/staging-automod-preview.yml@refs/heads/main'"
     " && github.event_name == 'workflow_dispatch' && github.ref_protected && github.run_attempt == 1"
 )
 # (workflow, job) that must hold the canonical group when run standalone,
@@ -221,7 +222,10 @@ def group_values(raw, context, triggers):
     if EXPRESSION not in raw:
         return frozenset({("lit", raw.casefold())})
     if context == "standalone" and raw == PRODUCTION_GROUP:
-        return frozenset({("lit", "deploy-production"), ("attempt", "deploy-production-refused-")})
+        return frozenset({("lit", "deploy-production"), ("attempt", "deploy-production-refused-"),
+                          ("run", "deploy-production-release-job-")})
+    if context == "standalone" and raw == PRODUCTION_RELEASE_GROUP:
+        return frozenset({("lit", "deploy-production"), ("attempt", "deploy-production-run-")})
     called = CALLED_FORM.fullmatch(raw.strip())
     if called:
         prefix, fallback = called.groups()
@@ -627,10 +631,9 @@ def repository_errors(wfs, canonical):
                 errors.append(f"{file}: dispatch must hold the guarded canonical lifecycle lock")
         if file == AUTOMOD:
             job = (workflow.get("jobs") or {}).get("dry-run") or {}
-            if (events(workflow) != ("workflow_call",) or job.get("if") != AUTOMOD_GUARD
-                    or "concurrency" in job or workflow.get("concurrency") != {
-                        "group": canonical, "cancel-in-progress": "false", "queue": "max"}):
-                errors.append(f"{file}: the dormant job must reserve the full canonical lifecycle window")
+            if (events(workflow) != ("workflow_dispatch",) or job.get("if") != AUTOMOD_GUARD
+                    or "concurrency" in job or workflow.get("concurrency") != automod_queue(canonical)):
+                errors.append(f"{file}: dispatch must hold the guarded canonical lifecycle lock")
         triggers = tuple(t for t in events(workflow) if t != "workflow_call")
         nodes = [("workflow", workflow)] + list((workflow.get("jobs") or {}).items())
         for name, node in nodes:
@@ -677,6 +680,13 @@ def voice_move_queue(canonical):
     return {"group": expr(f"{VOICE_MOVE_GUARD} && '{canonical}' || "
                           "format('staging-voice-move-refused-{0}-{1}', github.run_id, github.run_attempt)"),
             "cancel-in-progress": "false", "queue": "max"}
+
+
+def automod_queue(canonical):
+    return {"group": expr(f"{AUTOMOD_GUARD} && '{canonical}' || "
+                          "format('staging-automod-refused-{0}-{1}', github.run_id, github.run_attempt)"),
+            "cancel-in-progress": "false", "queue": "max"}
+
 
 GUARD_SHA = expr("needs.guard.outputs.sha")
 # Ordinary guarded deploy only: rollback and the live-SHA cure never queue on
@@ -912,7 +922,7 @@ def target_fixture(group=FIXTURE_GROUP):
     deploy["concurrency"] = dict(lock)
     wfs[MEASUREMENT]["concurrency"] = measurement_queue(group)
     wfs[VOICE_MOVE]["concurrency"] = voice_move_queue(group)
-    wfs[AUTOMOD]["concurrency"] = dict(lock)
+    wfs[AUTOMOD]["concurrency"] = automod_queue(group)
     jobs = deploy["jobs"]
     for workflow in (deploy, wfs[VOICE], wfs[HELP]):
         strip_staging_use(workflow)
@@ -1612,8 +1622,8 @@ class LockOracleControls(unittest.TestCase):
             yaml.load("concurrency:\n  group: one\n  group: two\n", Loader=UniqueKeyLoader)
 
 
-def step_index(job, needle):
-    return next(i for i, step in enumerate(job["steps"]) if needle in str(step))
+def step_index(job, needle, *, field="run"):
+    return next(i for i, step in enumerate(job["steps"]) if needle in step.get(field, ""))
 
 
 class PromotionSoakControls(unittest.TestCase):
@@ -1783,9 +1793,10 @@ class PromotionSoakControls(unittest.TestCase):
             "reads staging outside the held grant")
 
     def test_control_credential_stays_in_lifecycle_only_steps(self):
-        for needle in (BASELINE, FINAL_PROBE, "upload-artifact"):
-            def leak(w, j, s, p, n=needle):
-                s["steps"][step_index(s, n)].setdefault("env", {})["OWNERSHIP_CONTROL_TOKEN"] = OWNERSHIP_TOKEN
+        for needle, field in ((BASELINE, "run"), (FINAL_PROBE, "run"), ("upload-artifact", "uses")):
+            def leak(w, j, s, p, needle=needle, field=field):
+                env = s["steps"][step_index(s, needle, field=field)].setdefault("env", {})
+                env["OWNERSHIP_CONTROL_TOKEN"] = OWNERSHIP_TOKEN
             self.assert_mutation_rejected(leak, "mixes the staging control credential")
         self.assert_mutation_rejected(
             lambda w, j, s, p: s.update(env={"OWNERSHIP_CONTROL_TOKEN": OWNERSHIP_TOKEN}),
@@ -1797,7 +1808,7 @@ class PromotionSoakControls(unittest.TestCase):
 
     def test_lifecycle_evidence_is_retained_per_attempt(self):
         def artifact(s):
-            return s["steps"][step_index(s, "upload-artifact")]
+            return s["steps"][step_index(s, "upload-artifact", field="uses")]
         self.assert_mutation_rejected(lambda w, j, s, p: s["steps"].remove(artifact(s)),
                                       "always be retained per run attempt")
         self.assert_mutation_rejected(lambda w, j, s, p: artifact(s).pop("if"),

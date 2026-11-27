@@ -6,6 +6,7 @@ import os
 import re
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 
 import pr_standards as ps
 
@@ -270,6 +271,32 @@ risk_tier: T0
 class AttestationFloor(unittest.TestCase):
     T0_FILES = ".github/workflows/deploy-production.yml"
 
+    def test_organization_app_author_matches_maintainer_on_ordinary_branch(self):
+        body = ("## Linked Issues or Issue Description\n\n"
+                "- Refresh the signing key on a failed signature check.\n\n"
+                "## Verification\n\n"
+                "- Signing key rotation fixture passed.\n")
+        valid = env(BODY=body + FULL_ATTESTATION, CHANGED_FILES=self.T0_FILES,
+                    AUTHOR="maintainer", REPO_PRIVATE="false", REQUIRE_CARD_REF="false",
+                    PR_STANDARDS_MODE="warn")
+        cases = (
+            ({}, []),
+            ({"TITLE": "Refresh the signing key"}, [("error", "PR title")]),
+            ({"BODY": ""}, [("error", "Attestation"), ("error", "PR body")]),
+            ({"BODY": body}, [("error", "Attestation")]),
+            ({"BODY": valid["BODY"].replace("## Verification", "## Notes")},
+             [("warning", "PR template")]),
+            ({"BODY": body + "\n- See /DEMO/issues/example.\n" + FULL_ATTESTATION},
+             [("error", "Internal reference")]),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=tuple(overrides), expected=expected):
+                inputs = dict(valid, **overrides)
+                maintainer = ps.evaluate(inputs)
+                app = ps.evaluate(dict(inputs, AUTHOR="togetherweown[bot]"))
+                self.assertEqual(expected, levels(maintainer))
+                self.assertEqual(maintainer, app)
+
     def test_t0_path_without_attestation_fails(self):
         f = ps.evaluate(env(BODY=GOOD_BODY, CHANGED_FILES=self.T0_FILES))
         self.assertIn(("error", "Attestation"), levels(f))
@@ -417,16 +444,17 @@ class AttestationFloor(unittest.TestCase):
         f = ps.evaluate(env(BODY=prose_tests, CHANGED_FILES=self.T0_FILES))
         self.assertIn(("error", "Attestation"), levels(f))
 
-    def test_generated_exemption_needs_a_bot_author(self):
-        # A human branch wearing the release-please-- prefix still hits the gate.
-        f = ps.evaluate(env(BODY=GOOD_BODY, HEAD_REF="release-please--branches--main",
-                            CHANGED_FILES=self.T0_FILES))
-        self.assertIn(("error", "Attestation"), levels(f))
-        # Automation-authored release PRs stay exempt.
-        f = ps.evaluate(env(BODY=GOOD_BODY, AUTHOR="release-please[bot]",
-                            HEAD_REF="release-please--branches--main",
-                            CHANGED_FILES=self.T0_FILES))
-        self.assertEqual([], f)
+    def test_legacy_release_branch_t0_path_requires_attestation_for_both_authors(self):
+        body = GOOD_BODY.replace("Refs: TOG-1234", "Describe the signing key rotation.")
+        for author in ("togetherweown[bot]", "maintainer"):
+            inputs = env(AUTHOR=author, HEAD_REF="release-please--branches--main",
+                         CHANGED_FILES=self.T0_FILES, REPO_PRIVATE="false",
+                         PR_STANDARDS_MODE="warn")
+            with self.subTest(author=author, attestation="missing"):
+                self.assertEqual([("error", "Attestation")],
+                                 levels(ps.evaluate(dict(inputs, BODY=body))))
+            with self.subTest(author=author, attestation="complete"):
+                self.assertEqual([], ps.evaluate(dict(inputs, BODY=body + FULL_ATTESTATION)))
 
     def test_dependency_bot_t0_path_still_needs_attestation(self):
         f = ps.evaluate(env(BODY=GOOD_BODY, AUTHOR="dependabot[bot]",
@@ -535,6 +563,27 @@ class Template(unittest.TestCase):
         sections = ps.parse_sections(self.text)
         for heading, _, _ in ps.REQUIRED_SECTIONS:
             self.assertIn(heading.lower(), sections, heading)
+
+    def test_generated_footer_stays_outside_attestation(self):
+        headings = [line for line in self.text.splitlines() if line.startswith("## ")]
+        self.assertEqual("## Notes for reviewers", headings[-1])
+        footer = Path(HERE, "fixtures", "cubic-pr-footer.txt").read_text(encoding="utf-8")
+        intro = GOOD_BODY.replace("Refs: TOG-1234", "Synthetic regression fixture.")
+        notes = f"\n{headings[-1]}\n\n"
+
+        def findings(attestation, suffix):
+            return ps.evaluate(env(BODY=intro + attestation + suffix, REPO_PRIVATE="false",
+                                   CHANGED_FILES=AttestationFloor.T0_FILES))
+
+        self.assertEqual([], findings(FULL_ATTESTATION, notes + footer))
+        for attestation, suffix in (
+                (FULL_ATTESTATION, "\n" + footer),
+                (FULL_ATTESTATION + "\n" + footer, notes),
+                (FULL_ATTESTATION + "\n<div>Unexpected evidence</div>\n", notes + footer),
+                (FULL_ATTESTATION.replace("[x] D8", "[ ] D8"), notes + footer),
+                ("", notes + footer)):
+            with self.subTest(attestation=attestation[-70:], suffix=suffix[:30]):
+                self.assertIn(("error", "Attestation"), levels(findings(attestation, suffix)))
 
     def test_unfilled_template_fails_in_error_mode(self):
         f = ps.evaluate(env(BODY=self.text, PR_STANDARDS_MODE="error"))

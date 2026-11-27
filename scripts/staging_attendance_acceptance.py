@@ -34,6 +34,8 @@ PHASES = ("pending", "finalized", "off", "cleanup")
 READY_TIMEOUT = 5
 WEB_TIMEOUT = 2.5
 RUN_BUDGET = 25
+PROBE_LEASE_REFUSAL = "staging lease did not cover the probe"
+CLEANUP_REFUSAL = "cleanup readback is incomplete"
 
 
 class Refused(Exception):
@@ -57,16 +59,22 @@ def read_object(path):
         return json_object(read_with_overflow(stream, BODY_CAP))
 
 
-def recorded_probe_deadline(lifecycle, use):
+def observation_ms(lifecycle, refusal):
     observed_at = lifecycle.get("observedAt")
     require(isinstance(observed_at, str) and re.fullmatch(
         r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z", observed_at),
-        "staging lease did not cover the probe")
+        refusal)
     since_epoch = datetime.fromisoformat(observed_at) - datetime(1970, 1, 1, tzinfo=timezone.utc)
-    observed_ms = since_epoch // timedelta(milliseconds=1)
-    require(type(use.get("acquiredAt")) is int and 0 <= use["acquiredAt"] <= observed_ms,
-            "staging lease did not cover the probe")
-    return observed_ms + RUN_BUDGET * 1000
+    return since_epoch // timedelta(milliseconds=1)
+
+
+def validate_probe_window(lifecycle, *, recorded=False):
+    use = lifecycle["use"]
+    observed_ms = observation_ms(lifecycle, PROBE_LEASE_REFUSAL)
+    start_ms = observed_ms if recorded else time.time() * 1000
+    require(type(use.get("acquiredAt")) is int and 0 <= use["acquiredAt"] <= observed_ms <= start_ms
+            and type(use.get("expiresAt")) is int and start_ms + RUN_BUDGET * 1000 < use["expiresAt"],
+            PROBE_LEASE_REFUSAL)
 
 
 def validate_configuration(phase, origin, rollout, observed, *, recorded=False):
@@ -97,13 +105,12 @@ def validate_configuration(phase, origin, rollout, observed, *, recorded=False):
     if phase == "cleanup":
         require(lifecycle.get("action") == "release" and use.get("phase") == "released" and lifecycle.get("running") is False
                 and type(observed.get("fixture_rows")) is int
-                and observed["fixture_rows"] == 0, "cleanup readback is incomplete")
+                and observed["fixture_rows"] == 0, CLEANUP_REFUSAL)
     else:
-        probe_deadline = recorded_probe_deadline(lifecycle, use) if recorded else (time.time() + RUN_BUDGET) * 1000
         require(lifecycle.get("action") == "ready" and lifecycle.get("running") is True
-                and use.get("phase") == "active"
-                and type(use.get("expiresAt")) is int and use["expiresAt"] > probe_deadline,
-                "staging lease did not cover the probe")
+                and use.get("phase") == "active",
+                PROBE_LEASE_REFUSAL)
+        validate_probe_window(lifecycle, recorded=recorded)
         expected_fixture = "pending" if phase == "pending" else "finalized"
         require(observed.get("signed_ingress") is True and observed.get("primary_fixture") == expected_fixture
                 and (phase != "finalized" or observed.get("foreign_fixture") == "foreign-only"),
@@ -115,6 +122,7 @@ def validate_rehearsal(rollout, observations):
     require(set(observations) == set(PHASES) and all(isinstance(row, dict) for row in observations.values()),
             "rehearsal requires all four observations")
     original_lease = None
+    previous_ms = None
     for phase in PHASES:
         observed = observations[phase]
         validate_configuration(phase, STAGING_ORIGIN, rollout, observed, recorded=True)
@@ -132,6 +140,14 @@ def validate_rehearsal(rollout, observations):
         if phase == "pending":
             original_lease = lease
         require(lease == original_lease, "staging lease identity did not match")
+        # Release can be recovered after expiry. Only ready records need probe admission.
+        refusal = CLEANUP_REFUSAL if phase == "cleanup" else PROBE_LEASE_REFUSAL
+        try:
+            observed_ms = observation_ms(lifecycle, refusal)
+        except ValueError:
+            raise Refused(refusal) from None
+        require(previous_ms is None or previous_ms < observed_ms, refusal)
+        previous_ms = observed_ms
 
 
 def fixture_result(event_key, start):
@@ -185,7 +201,12 @@ def send(request):
                 "expected application/json response")
         for single in ("x-two-worker-version", "cache-control"):
             require(len(headers.get_all(single, [])) <= 1, "ambiguous response headers")
-        return response.code, headers, json_object(read_with_overflow(response, BODY_CAP))
+        raw = read_with_overflow(response, BODY_CAP)
+        # A bounded HTTPResponse.read can return valid JSON after premature EOF.
+        remaining = getattr(response, "length", None)
+        if len(raw) <= BODY_CAP and remaining:
+            raise http.client.IncompleteRead(b"", remaining)
+        return response.code, headers, json_object(raw)
 
 
 def ready(check, origin, identity):
@@ -246,7 +267,8 @@ def main(argv=None, *, env=None, check=send):
             require(not args.execute and args.fixture_start is None, "rehearsal only accepts offline readback")
             validate_rehearsal(read_object(args.rollout), read_object(args.observed))
         else:
-            identity = validate_configuration(args.phase, STAGING_ORIGIN, read_object(args.rollout), read_object(args.observed))
+            rollout, observed = read_object(args.rollout), read_object(args.observed)
+            identity = validate_configuration(args.phase, STAGING_ORIGIN, rollout, observed)
             if args.phase == "cleanup":
                 require(not args.execute and args.fixture_start is None, "cleanup only accepts offline readback")
             elif not args.execute:
@@ -258,6 +280,8 @@ def main(argv=None, *, env=None, check=send):
                 old_handler = signal.signal(signal.SIGALRM, deadline)
                 try:
                     signal.alarm(RUN_BUDGET)
+                    # Use a wall-clock sample after arming to cover the whole alarm.
+                    validate_probe_window(observed["lifecycle"])
                     probe(args.phase, STAGING_ORIGIN, identity, start, signer, check)
                 finally:
                     signal.alarm(0)

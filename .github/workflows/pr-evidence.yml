@@ -4,7 +4,8 @@ on:
   push: {branches: [main]}
 permissions: {}
 concurrency:
-  group: pr-evidence-${{ github.event.pull_request.number || github.sha }}
+  # Main keeps the running advisory replay and only the most recently queued push.
+  group: pr-evidence-${{ github.event_name == 'push' && 'main' || github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   pr-evidence:
