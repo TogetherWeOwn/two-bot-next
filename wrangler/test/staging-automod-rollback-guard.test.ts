@@ -169,7 +169,9 @@ test("requires publication evidence after the stopped ownership observation", ()
   for (const recordedAt of [now - 59_000, lease.expiresAt, ownership.observedAt - 1]) {
     expectFailure({ ...value, ownership, publication: { ...value.publication, recordedAt } }, "staging_publication_unconfirmed");
   }
-  assert.equal(evaluate({ ...value, ownership, publication: { ...value.publication, recordedAt: now - 500 } }).verdict, "passed");
+  for (const recordedAt of [ownership.observedAt, ownership.observedAt + 1]) {
+    assert.equal(evaluate({ ...value, ownership, publication: { ...value.publication, recordedAt } }).verdict, "passed");
+  }
 });
 
 test("rejects malformed evidence and never returns or evaluates private data", () => {
