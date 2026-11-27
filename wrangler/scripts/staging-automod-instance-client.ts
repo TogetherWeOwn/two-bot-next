@@ -40,11 +40,10 @@ function record(value: unknown): value is Record<string, unknown> {
  * mints a fresh Actions OIDC token for the fixed audience. The Worker and DO
  * authenticate the bearer and token, and the DO applies its compiled plan.
  * Requires the OIDC request variables and control bearer. An optional scoped
- * GitHub read token authenticates the Actions run lookup.
+ * GitHub read token authenticates the Actions run lookup and inventory verifier.
  */
 export function bindStagingAutomodInstanceClient(env: ClientEnv, serving: Serving, fetcher: Fetch = fetch,
-  readAuthenticatedInventory: Host["readAuthenticatedInventory"] =
-  bindStagingAutomodInventoryReader(bindStagingAutomodInventoryVerifier())) {
+  readAuthenticatedInventory?: Host["readAuthenticatedInventory"]) {
   const requestUrl = env.ACTIONS_ID_TOKEN_REQUEST_URL, requestToken = env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
   const controlBearer = env.OWNERSHIP_CONTROL_TOKEN;
   const githubReadToken = env.GITHUB_TOKEN;
@@ -54,6 +53,13 @@ export function bindStagingAutomodInstanceClient(env: ClientEnv, serving: Servin
   try { idTokenUrl = new URL(requestUrl); } catch { return; }
   if (idTokenUrl.protocol !== "https:" || !idTokenUrl.hostname.endsWith(".actions.githubusercontent.com")) return;
   idTokenUrl.searchParams.set("audience", STAGING_AUTOMOD_AUDIENCE);
+
+  if (readAuthenticatedInventory === undefined) {
+    const verifier = githubReadToken === undefined
+      ? bindStagingAutomodInventoryVerifier()
+      : bindStagingAutomodInventoryVerifier(undefined, { githubReadToken });
+    readAuthenticatedInventory = bindStagingAutomodInventoryReader(verifier);
+  }
 
   async function mint(signal: AbortSignal): Promise<string> {
     const response = await fetcher(idTokenUrl, { method: "GET", redirect: "error", signal,

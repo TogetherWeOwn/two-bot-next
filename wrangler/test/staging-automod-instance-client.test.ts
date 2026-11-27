@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { beforeEach, test } from "node:test";
 import {
   bindStagingAutomodInstanceClient, STAGING_AUTOMOD_BRIDGE_URL,
@@ -17,6 +19,7 @@ const env = {
 const serving = { deploymentId: lease.deploymentId, sha: lease.sha };
 const minted = "synthetic-minted-oidc";
 const runUrl = `https://api.github.com/repos/TogetherWeOwn/two-bot-next/actions/runs/${lease.runId}`;
+const inventorySource = { workflowSha: lease.sha, runId: Number(lease.runId) };
 const signal = new AbortController().signal;
 const maxRunBytes = 1_048_576;
 
@@ -77,6 +80,40 @@ test("Actions run reads accept an omitted token and both valid token length limi
   }
 });
 
+test("the default inventory verifier receives only the scoped GitHub token when supplied", async t => {
+  const spawn = t.mock.method(childProcess, "spawn", () => { throw new Error("synthetic launch refusal"); });
+  syncBuiltinESMExports();
+  t.after(() => {
+    spawn.mock.restore();
+    syncBuiltinESMExports();
+  });
+
+  const { GITHUB_TOKEN: _, ...withoutGitHubToken } = env;
+  const scoped = bindStagingAutomodInstanceClient(env, serving, unexpectedFetch);
+  const unscoped = bindStagingAutomodInstanceClient(withoutGitHubToken, serving, unexpectedFetch);
+  assert.ok(scoped);
+  assert.ok(unscoped);
+  await scoped.host.readAuthenticatedInventory(inventorySource, signal);
+  await unscoped.host.readAuthenticatedInventory(inventorySource, signal);
+  const childEnvironments = spawn.mock.calls.map(({ arguments: [, , options] }) => options?.env);
+  assert.equal(childEnvironments.length, 2);
+  const [scopedEnv, unscopedEnv] = childEnvironments;
+  assert.ok(scopedEnv);
+  assert.ok(unscopedEnv);
+  assert.deepEqual(Object.keys(scopedEnv), ["GH_TOKEN"]);
+  assert.ok(scopedEnv.GH_TOKEN === env.GITHUB_TOKEN, "verifier must receive the scoped GitHub token");
+  assert.deepEqual(Object.keys(unscopedEnv), []);
+});
+
+test("the instance client preserves an injected inventory reader", async t => {
+  const reader = t.mock.fn(async (..._args: [typeof inventorySource, AbortSignal]) => undefined);
+  const client = bindStagingAutomodInstanceClient(env, serving, unexpectedFetch, reader);
+  assert.ok(client);
+  assert.equal(client.host.readAuthenticatedInventory, reader);
+  await client.host.readAuthenticatedInventory(inventorySource, signal);
+  assert.deepEqual(reader.mock.calls.map(call => call.arguments), [[inventorySource, signal]]);
+});
+
 test("invalid OIDC endpoints and invalid bearers refuse the binding without fetching", t => {
   const fetcher = t.mock.fn(unexpectedFetch);
   for (const url of ["not a URL", "http://pipelines.actions.githubusercontent.com/token",
@@ -85,7 +122,7 @@ test("invalid OIDC endpoints and invalid bearers refuse the binding without fetc
     assert.equal(bindStagingAutomodInstanceClient({ ...env, ACTIONS_ID_TOKEN_REQUEST_URL: url }, serving, fetcher), undefined);
   }
   assert.equal(bindStagingAutomodInstanceClient({ ...env, OWNERSHIP_CONTROL_TOKEN: "c".repeat(31) }, serving, fetcher), undefined);
-  for (const token of ["", " leading", "trailing ", "internal space", "tab\tinside", "line\n", "cr\r\n",
+  for (const token of [42 as unknown as string, "", " leading", "trailing ", "internal space", "tab\tinside", "line\n", "cr\r\n",
     "nul\0byte", "del\x7f", "nonascii-é", "a".repeat(4097)]) {
     assert.equal(bindStagingAutomodInstanceClient({ ...env, GITHUB_TOKEN: token }, serving, fetcher), undefined);
   }
