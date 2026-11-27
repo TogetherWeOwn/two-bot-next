@@ -166,14 +166,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 1
       # Binding gate first: while unconfigured (and not required) the run
-      # notice-passes here, before any toolchain or cargo step can fail the
-      # optional job and block certify-promotion. This step sees only
-      # whether the token secret is set, never its value.
+      # notice-passes before checkout or Rust setup can fail the optional
+      # job and block certify-promotion. The gate receives a boolean
+      # indicating whether the token secret is set.
       - name: Decide whether the smoke is configured
         id: gate
         env:
@@ -192,6 +188,11 @@ jobs:
             exit 0
           fi
           echo "configured=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.configured == 'true'
+        with:
+          persist-credentials: false
+          fetch-depth: 1
       - name: Install pinned Rust toolchain
         if: steps.gate.outputs.configured == 'true'
         shell: bash
