@@ -54,8 +54,7 @@ class Fixture:
         return self.probes.get((target.shape, path, after), lambda value: value)(reply)
 
     def readback(self, target, *, request):
-        pin = PINS[target]
-        after = target in self.released
+        pin, after = PINS[target], target in self.released
         self.calls.append((target.shape, "readback", after))
         session = pin.mock_session
         activity = MockActivity(session, (session, 1), session, 2) if after else MockActivity()
@@ -73,12 +72,14 @@ class Fixture:
 
 
 def change_body(reply, **changes):
-    body = json.loads(reply.body)
-    body.update(changes)
-    return replace(reply, body=json.dumps(body).encode())
+    return replace(reply, body=json.dumps({**json.loads(reply.body), **changes}).encode())
 
 
 class PairedReadinessTests(unittest.TestCase):
+    def assert_refused(self, fixture, error, **pins):
+        with self.assertRaisesRegex(TargetError, error):
+            fixture.verify(**pins)
+
     def test_both_layouts_use_separate_private_bindings_and_ordered_evidence(self):
         fixture = Fixture()
         calls = []
@@ -108,8 +109,7 @@ class PairedReadinessTests(unittest.TestCase):
             with self.subTest(path=path, after=after, changes=changes):
                 fixture = Fixture()
                 fixture.probes[("0473/0465", path, after)] = lambda reply: replace(reply, **changes)
-                with self.assertRaisesRegex(TargetError, error):
-                    fixture.verify()
+                self.assert_refused(fixture, error)
 
     def test_refuses_malformed_or_incorrect_readiness_components(self):
         for after in (False, True):
@@ -124,8 +124,7 @@ class PairedReadinessTests(unittest.TestCase):
                 with self.subTest(after=after, changes=changes):
                     fixture = Fixture()
                     fixture.probes[("0473/0465", "/readyz", after)] = lambda reply: change_body(reply, **changes)
-                    with self.assertRaisesRegex(TargetError, error):
-                        fixture.verify()
+                    self.assert_refused(fixture, error)
 
     def test_refuses_wrong_effective_writer_ledger_digest_or_reservation(self):
         for changes, error in (
@@ -141,17 +140,18 @@ class PairedReadinessTests(unittest.TestCase):
             with self.subTest(changes=changes):
                 fixture = Fixture()
                 fixture.reads[("0475/0465", True)] = lambda observed: replace(observed, **changes)
-                with self.assertRaisesRegex(TargetError, error):
-                    fixture.verify()
+                self.assert_refused(fixture, error)
 
     def test_refuses_unconfirmed_ready_checkpoint_or_nonempty_rest_sync(self):
-        fixture = Fixture()
-        with patch.object(fixture, "release", return_value=False), self.assertRaisesRegex(TargetError, "mock_ready_unconfirmed"):
-            fixture.verify()
-        self.assertNotIn(("0473/0465", "/readyz", True), fixture.calls)
+        for refused in (False, 1):
+            fixture = Fixture()
+            with patch.object(fixture, "release", return_value=refused):
+                self.assert_refused(fixture, "mock_ready_unconfirmed")
+            self.assertEqual([path for _, path, _ in fixture.calls].count("/readyz"), 1)
         session = ORIGINAL.mock_session
         for after, activity in (
             (False, MockActivity(ready_session=ANY)),
+            (False, MockActivity(ready_session=session)),
             (True, MockActivity(session, (session, 1), session, 0)),
             (True, MockActivity(session, (ANY, 1), session, 2)),
             (True, MockActivity(session, (session, 1), RETAINED.mock_session, 2)),
@@ -160,17 +160,17 @@ class PairedReadinessTests(unittest.TestCase):
             with self.subTest(after=after, activity=activity):
                 fixture = Fixture()
                 fixture.reads[("0473/0465", after)] = lambda observed: replace(observed, activity=activity)
-                with self.assertRaisesRegex(TargetError, "mock_activity"):
-                    fixture.verify()
+                self.assert_refused(fixture, "mock_activity")
 
     def test_refuses_shared_scope_or_provider_names_before_probing(self):
-        first = ORIGINAL.runtime.target
-        crossed_targets = (replace(RETAINED.runtime.target, scope=first.scope),
-                           replace(RETAINED.runtime.target, run_id=first.run_id))
+        first, target = ORIGINAL.runtime.target, RETAINED.runtime.target
+        crossed_targets = (replace(target, scope=first.scope), replace(target, run_id=first.run_id))
         crossed = [replace(RETAINED, runtime=replace(RETAINED.runtime, target=target)) for target in crossed_targets]
-        crossed.append(replace(RETAINED, writer=replace(RETAINED.writer, writer_id=ORIGINAL.writer.writer_id)))
+        crossed += [replace(RETAINED, writer=replace(RETAINED.writer, **{field: getattr(ORIGINAL.writer, field)}))
+                    for field in ("database_id", "writer_id")]
+        crossed += [replace(RETAINED, **{field: getattr(ORIGINAL, field)}) for field in ("worker_version", "mock_session")]
+        crossed.append(replace(RETAINED, runtime=replace(RETAINED.runtime, app_id=ORIGINAL.runtime.app_id)))
+        fixture = Fixture()
         for retained in crossed:
-            fixture = Fixture()
-            with self.assertRaisesRegex(TargetError, "reservations_not_separate"):
-                fixture.verify(retained=retained)
-            self.assertEqual(fixture.calls, [])
+            self.assert_refused(fixture, "reservations_not_separate", retained=retained)
+        self.assertEqual(fixture.calls, [])
