@@ -28,7 +28,6 @@ jobs:
     environment: {name: staging, deployment: false}
     permissions:
       contents: read
-      id-token: write
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -88,5 +87,4 @@ jobs:
       - name: Run the guarded AutoMod rehearsal entry
         env:
           STAGING_AUTOMOD_REHEARSAL: ${{ inputs.rehearse }}
-          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
         run: node wrangler/scripts/staging-automod-dispatch.ts

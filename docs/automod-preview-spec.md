@@ -773,12 +773,8 @@ Live qualification uses the sole staging writer's exclusive window.
 
 The AutoMod preview workflow accepts a direct dispatch of its own protected
 main ref on attempt 1. The rehearsal input defaults to off. An eligible
-opt-in holds the shared staging lifecycle queue. A host binding needs the
-job's Actions OIDC request variables and a serving and inventory selection.
-That selection must come from authenticated post-deploy evidence for the
-dispatch SHA, because source cannot name its own commit's deployment. The
-checked-in command has no such resolver yet, so an opted-in rehearsal still
-fails with `host_unavailable`. The host must
+opt-in holds the shared staging lifecycle queue. The checked-in command has
+no protected host binding and refuses an opted-in rehearsal. The host must
 prepare the approved serving and inventory selection and verified staging
 fixture before supplying the existing authority and private adapters.
 The offline fixture passes the issued AutoMod lease and pinned run, attempt
@@ -813,30 +809,6 @@ attempt against the lease, then checks each approval against the fixed target,
 its own action and the full issued lease. If one approval is unavailable, the
 other stays usable. The offline test supplies protected readbacks in memory.
 Live use still requires an authenticated provider for those readbacks.
-
-### Protected AutoMod bridge
-
-In bounded staging, `POST /internal/staging-automod` reaches the in-process
-`bindProtectedAutomodInstance`. The Worker checks the staging control bearer
-and stamps its version. Before reading state, the DO verifies both and checks
-the RS256 GitHub Actions token against GitHub's JWKS, with 60 seconds of clock
-skew and audience `two-bot-staging-automod`. Claims pin the repository ID,
-protected `main`, direct preview workflow dispatch, attempt 1, `staging` and
-`CONTAINER_RELEASE`. The strict 4 KiB request binds run, attempt and SHA to
-those claims and allows `acquire`, `read-lease`, `read-approval` and `invoke`.
-The DO checks the local Worker version, build and owner epoch. The runner's
-authenticated inventory supplies the remaining serving fields.
-
-The default-off compiled plan gates reservation and start. Recovery uses the
-original lease even when the plan is off. The DO rereads approval at invocation.
-The client mints an OIDC token per call to a fixed staging URL. The workflow's
-job-level `id-token: write` and dispatch-only bearer support that client.
-
-Enabling requires a reviewed change and protected staging deploy, an
-authenticated post-deploy selection with the client imports, a GitHub read
-credential for inventory verification, a dry-run launch adapter, and protected
-interruption recovery. A later attempt or release cannot recover the original
-lease through the bridge.
 
 ## 10. Spec self-check (doctest)
 

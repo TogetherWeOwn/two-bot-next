@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { URL, fileURLToPath } from "node:url";
-import { bindStagingAutomodDispatch, runStagingAutomodDispatch } from "../scripts/staging-automod-dispatch.ts";
+import { runStagingAutomodDispatch } from "../scripts/staging-automod-dispatch.ts";
 import { STAGING_AUTOMOD_TARGET as target } from "../src/staging-automod-recovery.ts";
 import { AUTOMOD_STAGING_PURPOSE } from "../src/staging-use-window.ts";
 import { lease } from "./fixtures/staging-automod-recovery.ts";
@@ -34,28 +34,6 @@ test("the rehearsal dispatch requires explicit opt in and an approved host bindi
   }
   assert.deepEqual(await runStagingAutomodDispatch({}, unused), { verdict: "disabled" });
   assert.deepEqual(await runStagingAutomodDispatch(runner), { verdict: "failed", code: "host_unavailable" });
-});
-
-test("the bridge binding needs an explicit selection and the OIDC request variables", async t => {
-  const oidc = { ACTIONS_ID_TOKEN_REQUEST_URL: "https://pipelines.actions.githubusercontent.com/token",
-    ACTIONS_ID_TOKEN_REQUEST_TOKEN: "synthetic-request-token", OWNERSHIP_CONTROL_TOKEN: "c".repeat(43) };
-  const fetch = t.mock.method(globalThis, "fetch", unexpected);
-  assert.equal(await bindStagingAutomodDispatch({ ...runner, ...oidc }), undefined);
-  const plan = { serving, inventorySource };
-  assert.equal(await bindStagingAutomodDispatch({ ...runner, ...oidc, STAGING_AUTOMOD_REHEARSAL: "false" }, plan), undefined);
-  assert.equal(await bindStagingAutomodDispatch(runner, plan), undefined);
-  assert.equal(await bindStagingAutomodDispatch({ ...runner, ...oidc, ACTIONS_ID_TOKEN_REQUEST_TOKEN: "" }, plan), undefined);
-  const binding = await bindStagingAutomodDispatch({ ...runner, ...oidc }, plan);
-  assert.deepEqual([binding?.serving, binding?.inventorySource], [serving, inventorySource]);
-  assert.equal(typeof binding?.host.invokePrivate, "function");
-  assert.equal(fetch.mock.callCount(), 0);
-
-  // A fetch-only stub is not an in-process host.
-  const stub = { fetch: t.mock.fn(unexpected) };
-  const result = await runStagingAutomodDispatch(runner, { serving, inventorySource,
-    host: stub as unknown as Binding["host"] });
-  assert.equal(result.verdict, "failed");
-  assert.equal(stub.fetch.mock.callCount(), 0);
 });
 
 test("indirect or unprotected dispatch never reads the Actions run or rehearsal authority", async t => {
