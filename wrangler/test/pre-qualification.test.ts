@@ -81,7 +81,7 @@ test("native starts once for each PRE shape through the private entrypoint", asy
     const response = await runtime.probe(actor, "/readyz");
     assert.equal(response.status, 503);
     assert.equal(response.headers.get("x-two-worker-version"), actor.version);
-    for (const rejected of [new Response(null, { status: 302 }), new Response("a".repeat(65_537))]) {
+    for (const rejected of [new Response("{}", { status: 302 }), new Response("a".repeat(65_537))]) {
       container.getTcpPort = () => ({ fetch: async () => rejected });
       await assert.rejects(runtime.probe(actor, "/readyz"), refusal);
     }
