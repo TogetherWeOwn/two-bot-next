@@ -9820,6 +9820,7 @@ for (const optIn of ["false", "true"]) {
             "group": PR_SIZE_CONCURRENCY_GROUP,
             "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
         })
+        self.assertNotIn("queue", workflow["concurrency"])
         self.assertEqual(workflow["jobs"]["pr-size-gate"]["name"], "pr-size-gate")
 
     def test_pr_size_gate_rechecks_on_grants_and_revocations(self):
