@@ -39,6 +39,13 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          # The preflight and status scripts run directly in Node with these local imports.
+          sparse-checkout: |
+            /wrangler/scripts/is-direct-invocation.mjs
+            /wrangler/scripts/ownership-control-response.mjs
+            /wrangler/scripts/ownership-control.mjs
+            /wrangler/scripts/staging-ownership-status.mjs
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22

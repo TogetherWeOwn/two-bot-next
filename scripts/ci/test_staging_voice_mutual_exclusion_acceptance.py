@@ -1622,8 +1622,8 @@ class LockOracleControls(unittest.TestCase):
             yaml.load("concurrency:\n  group: one\n  group: two\n", Loader=UniqueKeyLoader)
 
 
-def step_index(job, needle):
-    return next(i for i, step in enumerate(job["steps"]) if needle in str(step))
+def step_index(job, needle, *, field="run"):
+    return next(i for i, step in enumerate(job["steps"]) if needle in step.get(field, ""))
 
 
 class PromotionSoakControls(unittest.TestCase):
@@ -1793,9 +1793,10 @@ class PromotionSoakControls(unittest.TestCase):
             "reads staging outside the held grant")
 
     def test_control_credential_stays_in_lifecycle_only_steps(self):
-        for needle in (BASELINE, FINAL_PROBE, "upload-artifact"):
-            def leak(w, j, s, p, n=needle):
-                s["steps"][step_index(s, n)].setdefault("env", {})["OWNERSHIP_CONTROL_TOKEN"] = OWNERSHIP_TOKEN
+        for needle, field in ((BASELINE, "run"), (FINAL_PROBE, "run"), ("upload-artifact", "uses")):
+            def leak(w, j, s, p, needle=needle, field=field):
+                env = s["steps"][step_index(s, needle, field=field)].setdefault("env", {})
+                env["OWNERSHIP_CONTROL_TOKEN"] = OWNERSHIP_TOKEN
             self.assert_mutation_rejected(leak, "mixes the staging control credential")
         self.assert_mutation_rejected(
             lambda w, j, s, p: s.update(env={"OWNERSHIP_CONTROL_TOKEN": OWNERSHIP_TOKEN}),
@@ -1807,7 +1808,7 @@ class PromotionSoakControls(unittest.TestCase):
 
     def test_lifecycle_evidence_is_retained_per_attempt(self):
         def artifact(s):
-            return s["steps"][step_index(s, "upload-artifact")]
+            return s["steps"][step_index(s, "upload-artifact", field="uses")]
         self.assert_mutation_rejected(lambda w, j, s, p: s["steps"].remove(artifact(s)),
                                       "always be retained per run attempt")
         self.assert_mutation_rejected(lambda w, j, s, p: artifact(s).pop("if"),

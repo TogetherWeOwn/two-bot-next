@@ -64,7 +64,8 @@
 // gradual deployments) or a separate non-DO fixture Worker.
 // Production wiring is passive (see docs/gradual-promote-caller.md); never
 // claim unwired stages as proof.
-import { isDirectInvocation } from "../wrangler/scripts/is-direct-invocation.mjs";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 export const OVERRIDE_HEADER = "Cloudflare-Workers-Version-Overrides";
 export const VERSION_HEADER = "x-two-worker-version";
@@ -496,6 +497,17 @@ export async function smoke(
 
   log(`smoke: ${routes.length} probes, ${state.failures} failed assertions`);
   return state.failures === 0;
+}
+
+// The proof job checks out this file by itself. Resolve both paths so direct
+// invocations through symlinks and escaped file URLs still work.
+function isDirectInvocation(argv1, moduleUrl) {
+  try {
+    if (typeof argv1 !== "string" || argv1 === "") return false;
+    return realpathSync(argv1) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
 }
 
 if (isDirectInvocation(process.argv[1], import.meta.url)) {
