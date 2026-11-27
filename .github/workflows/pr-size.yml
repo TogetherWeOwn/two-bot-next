@@ -28,6 +28,7 @@ permissions:
   contents: read
 
 concurrency:
+  # Previous policy:
   # One group per PR head commit for push, label and review events: the newest
   # event cancels the older run on the same commit (each run reads live PR
   # state), so verdicts for one commit never overlap. A new push is a new
@@ -35,8 +36,10 @@ concurrency:
   # (a queue held #2708's gate for over an hour on 2026-11-26), and a late
   # review on an old commit cannot cancel it. Manual dispatch has its own
   # group and never cancels.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}-${{ github.event.pull_request.head.sha || 'manual' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_review' }}
+  # Separate event types so a review cannot replace a queued pull_request run.
+  # Only pull_request events cancel in-progress runs within their group.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   pr-size-gate:
