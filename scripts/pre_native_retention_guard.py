@@ -14,14 +14,18 @@ from pre_target import Target, require
 class RetainedVersionInventory:
     """Authenticated version inventory for the exact reserved predecessor.
 
-    The protected caller supplies a fresh, complete inventory in the reserved
-    account and independent history for `predecessor_version`. Set
-    `predecessor_untouched` only if that history excludes pruning and overwrite
-    through the observation. Current UUID membership alone cannot prove this.
+    The protected caller reads the complete inventory in the reserved account,
+    service and environment after independently observing `after_serving_version`
+    through the exact private binding. It pins the serving version to that
+    inventory observation. Set `predecessor_untouched` only with independent
+    history that excludes pruning and overwrite through the observation.
     """
 
     target: Target
+    worker_service: str
+    environment: str
     predecessor_version: UUID
+    after_serving_version: UUID
     retained_versions: tuple[UUID, ...]
     inventory_complete: bool
     predecessor_untouched: bool
@@ -64,6 +68,8 @@ def verify_native_pre_retention_guard(
     The protected caller supplies the reservation, clock, promotion hold and
     authenticated observations. The receipt carries no authority for a provider
     effect. The caller still enforces ownership, isolation and the stop fence.
+    The caller separately validates first-create version history when required.
+    Here the inventory supplies post-replacement retention history.
     """
     require(promotion_disabled is True, "pre_native_promotion_not_disabled")
     require(_exact_target(target), "invalid_pre_native_target")
@@ -74,22 +80,12 @@ def verify_native_pre_retention_guard(
     window = EffectWindow(target, window.cutoff)
     window.require_open(now)
 
+    require(type(reserved_environment) is str and reserved_environment and reserved_environment.isprintable()
+            and reserved_environment == reserved_environment.strip(), "invalid_pre_native_environment")
     require(type(predecessor) is Deployment and _matches_target(predecessor.target, target)
             and all(_valid_uuid(value) for value in
                     (predecessor.start_id, predecessor.worker_version, predecessor.container_id)),
             "invalid_pre_native_predecessor")
-    require(type(inventory) is RetainedVersionInventory and _matches_target(inventory.target, target)
-            and _valid_uuid(inventory.predecessor_version)
-            and inventory.predecessor_version == predecessor.worker_version
-            and inventory.inventory_complete is True and inventory.predecessor_untouched is True,
-            "pre_native_retention_unconfirmed")
-    versions = inventory.retained_versions
-    require(type(versions) is tuple and all(_valid_uuid(version) for version in versions),
-            "invalid_pre_native_retained_versions")
-    require(predecessor.worker_version in versions, "pre_native_predecessor_missing")
-
-    require(type(reserved_environment) is str and reserved_environment.isprintable()
-            and reserved_environment == reserved_environment.strip(), "invalid_pre_native_environment")
     require(type(initial) is InitialDeployment and _matches_destination(initial, target, reserved_environment),
             "wrong_pre_native_create_target")
     require(_valid_uuid(initial.version) and initial.version != predecessor.worker_version,
@@ -106,6 +102,17 @@ def verify_native_pre_retention_guard(
             and _valid_uuid(serving.version) and serving.version == initial.version
             and serving.via_private_binding is True and serving.independent is True,
             "pre_native_dispatch_unconfirmed")
+    require(type(inventory) is RetainedVersionInventory
+            and _matches_destination(inventory, target, reserved_environment)
+            and _valid_uuid(inventory.predecessor_version)
+            and inventory.predecessor_version == predecessor.worker_version
+            and _valid_uuid(inventory.after_serving_version) and inventory.after_serving_version == serving.version
+            and inventory.inventory_complete is True and inventory.predecessor_untouched is True,
+            "pre_native_retention_unconfirmed")
+    versions = inventory.retained_versions
+    require(type(versions) is tuple and all(_valid_uuid(version) for version in versions),
+            "invalid_pre_native_retained_versions")
+    require(predecessor.worker_version in versions, "pre_native_predecessor_missing")
 
     pins = {
         "schema": "pre-native-retention-v1",

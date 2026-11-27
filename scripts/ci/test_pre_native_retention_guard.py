@@ -37,7 +37,7 @@ class NativeRetentionGuardTests(unittest.TestCase):
             target=target, reserved_environment=destination[2],
             window=EffectWindow(target, target.started_at + 50), now=target.started_at,
             promotion_disabled=True, predecessor=Deployment(target, UUID(int=4), old, UUID(int=5)),
-            inventory=RetainedVersionInventory(target, old, (old, new, extra), True, True),
+            inventory=RetainedVersionInventory(*destination, old, new, (old, new, extra), True, True),
             initial=InitialDeployment(*destination, new, False, False, True, (), (), True, (), True),
             binding=PrivateBindingPin(*destination, UUID(int=6), new),
             serving=PrivateBindingReadback(*destination, UUID(int=6), new, True, True),
@@ -99,6 +99,9 @@ class NativeRetentionGuardTests(unittest.TestCase):
             ({"predecessor_untouched": False}, "retention_unconfirmed"),
             ({"predecessor_untouched": 1}, "retention_unconfirmed"),
             ({"predecessor_version": new}, "retention_unconfirmed"),
+            ({"after_serving_version": old}, "retention_unconfirmed"),
+            ({"after_serving_version": None}, "retention_unconfirmed"),
+            ({"after_serving_version": str(new)}, "retention_unconfirmed"),
             ({"retained_versions": (old, str(new))}, "invalid_pre_native_retained_versions"),
             ({"retained_versions": (str(old),)}, "invalid_pre_native_retained_versions"),
             ({"retained_versions": [old, new, extra]}, "invalid_pre_native_retained_versions"),
@@ -129,6 +132,9 @@ class NativeRetentionGuardTests(unittest.TestCase):
         for evidence in ("window", "predecessor", "inventory", "initial", "binding", "serving"):
             with self.subTest(evidence=evidence), self.assertRaises(TargetError):
                 self.verify(**{evidence: replace(self.evidence[evidence], target=other_shape)})
+        for field in ("worker_service", "environment"):
+            with self.subTest(field=field), self.assertRaisesRegex(TargetError, "retention_unconfirmed"):
+                self.verify(inventory=replace(self.evidence["inventory"], **{field: "other"}))
         for evidence in ("initial", "binding", "serving"):
             for field, value in (("worker_service", "other-worker"), ("environment", "other-environment"),
                                  ("version", UUID(int=7))):
@@ -139,6 +145,12 @@ class NativeRetentionGuardTests(unittest.TestCase):
                              ("via_private_binding", 1), ("independent", 1)):
             with self.subTest(field=field, value=value), self.assertRaisesRegex(TargetError, "dispatch_unconfirmed"):
                 self.verify(serving=replace(serving, **{field: value}))
+
+    def test_refuses_blank_environment_even_when_all_pins_agree(self):
+        exact_blanks = {field: replace(self.evidence[field], environment="")
+                        for field in ("initial", "binding", "serving", "inventory")}
+        with self.assertRaisesRegex(TargetError, "invalid_pre_native_environment"):
+            self.verify(reserved_environment="", **exact_blanks)
 
     def test_rejects_tampered_types_without_echo(self):
         target = self.evidence["target"]
@@ -157,7 +169,6 @@ class NativeRetentionGuardTests(unittest.TestCase):
             ("serving", replace(self.evidence["serving"], binding_id=str(self.evidence["binding"].binding_id))),
             ("serving", {"binding_id": self.evidence["binding"].binding_id}),
             ("reserved_environment", TextSubclass("pre-reserved")),
-            ("reserved_environment", ""),
         ):
             with self.subTest(argument=argument):
                 with self.assertRaises(TargetError) as rejected:
