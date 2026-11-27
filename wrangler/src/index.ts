@@ -1799,7 +1799,8 @@ export class TwoBotContainer extends Container<Env> {
     if (!run || signal.aborted) return refusal();
     const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
     const body = await readControlBody(request, bytes => parseUniqueJson(decoder.decode(bytes)),
-      STAGING_AUTOMOD_BODY_BYTES).catch(() => null);
+      STAGING_AUTOMOD_BODY_BYTES, signal);
+    if (signal.aborted) return refusal();
     const operation = parseStagingAutomodOperation(body);
     if (operation === "unknown") return notFound();
     if (!operation) return Response.json({ error: "staging_automod_invalid" }, { status: 400, headers });

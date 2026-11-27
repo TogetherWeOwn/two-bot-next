@@ -4945,6 +4945,13 @@ test("AutoMod bridge: only the closed operation set with a strict bounded body i
   assert.deepEqual(await h.send({ op: "read-approval", action: "publish", issuedLease: {} }), invalid);
   assert.deepEqual(await h.send("[]"), invalid);
   assert.deepEqual(await h.send("not json"), invalid);
+  const controller = new AbortController();
+  const cancel = t.mock.fn();
+  const stalled = new ReadableStream({ pull: () => controller.abort(), cancel }, { highWaterMark: 0 });
+  const request = new Request(h.request({}, { signal: controller.signal }), { body: stalled, duplex: "half" });
+  assert.equal((await h.bot.fetch(request)).status, 403);
+  assert.equal(cancel.mock.callCount(), 1);
+  assert.equal(h.storageCalls(), 0);
   assert.equal(h.values.has(STAGING_USE_KEY), false);
   assert.deepEqual(h.starts, []);
 });
