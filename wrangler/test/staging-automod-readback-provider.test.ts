@@ -9,7 +9,7 @@ const deploymentId = "12345678-abcd-abcd-abcd-123456789012";
 const sourceSha = "a".repeat(40);
 const pins = { deploymentId, sourceSha, ownerEpoch: 7, runId: "42", runAttempt: 1 } as const;
 const stagingControlBearer = "fixture-staging-control-".repeat(2);
-const githubReadToken = "fixture-actions-read";
+const githubReadToken = "github_pat_fixture_only";
 const oidc = "fixture.oidc.token";
 const credentials = { stagingControlBearer, githubReadToken };
 const scope = { environment: "staging", deploymentId, sha: sourceSha, runId: "42", runAttempt: 1, target } as const;
@@ -113,7 +113,8 @@ test("refuses invalid pins, wrong input scope and credential reuse before dispat
 
 test("refuses mismatched GitHub run identity and staging lease or active ownership", async () => {
   for (const change of [{ id: 43 }, { run_attempt: 2 }, { head_sha: "b".repeat(40) }, { repository: { id: 1 } },
-    { head_repository: { id: 1 } }, { path: "other.yml" }, { status: "completed" }]) {
+    { head_repository: { id: 1 } }, { path: "other.yml" }, { status: "completed" },
+    { event: "push" }, { head_branch: "feature" }]) {
     const provider = fixture(({ url }) => url === runUrl ? Response.json({ ...run, ...change }) : undefined);
     assert.equal(await provider.authority.readIssuedLease(scope, signal()), undefined, JSON.stringify(change));
     assert.deepEqual(provider.calls.map(({ url }) => url), [runUrl]);
@@ -142,6 +143,19 @@ test("refuses a mismatched approval without granting or withholding the other ac
     assert.deepEqual(await provider.authority.readApproval("recover", issuedLease, signal()),
       { action: "recover", issuedLease, target });
   }
+});
+
+test("expired leases allow recovery only while the same owner and lease remain active", async () => {
+  const expired = { ...issuedLease, expiresAt: acquiredAt + 1 };
+  let epoch: number = pins.ownerEpoch;
+  const provider = fixture(({ url, init }) => url === bridgeUrl
+    ? Response.json({ value: { action: JSON.parse(String(init.body)).action, issuedLease: expired, target } })
+    : url === statusUrl ? Response.json({ ...status, owner: { ...status.owner, epoch }, use: expired }) : undefined);
+  assert.equal(await provider.authority.readApproval("start", expired, signal()), undefined);
+  assert.deepEqual(await provider.authority.readApproval("recover", expired, signal()),
+    { action: "recover", issuedLease: expired, target });
+  epoch++;
+  assert.equal(await provider.authority.readApproval("recover", expired, signal()), undefined);
 });
 
 test("rejects redirects and non-200 replies on every endpoint without reading or forwarding them", async () => {
