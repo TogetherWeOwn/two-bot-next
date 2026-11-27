@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from ipaddress import ip_address
 import re
 from unicodedata import category, normalize
+from urllib.parse import unquote
 from uuid import UUID
 
 from pre_target import SHA, Target, TargetError, check_clock
@@ -14,11 +15,15 @@ MAX_DEPTH = 64
 MAX_ITEMS = 10_000
 PROMOTION_READBACK_SECONDS = 60
 
-_SECRET_KEYS = frozenset({
-    "authorization", "token", "secret", "password", "apikey", "dsn",
-    "cookie", "privatekey", "bearer", "webhookurl",
-})
-_URL_CREDENTIALS = re.compile(r"://[^:/@\s?#]*:[^/@\s?#]*@")
+_SECRET_KEY = re.compile(
+    r"authorization|token|secret|password|passwd|apikey|dsn|cookie|privatekey|bearer"
+    r"|webhook|databaseurl|credential"
+)
+_URL_CREDENTIALS = re.compile(
+    r"://[^/@\s?#<>\x22]+@"
+    r"|[?&](?:access[_-]?token|api[_-]?key|token|key|secret|sig|signature|passw(?:ord|d))=[^&#\s]",
+    re.I,
+)
 _PRIVATE_KEY = re.compile(r"-----BEGIN (?:[A-Z0-9-]+ )*PRIVATE KEY(?: BLOCK)?-----", re.I)
 _PROVIDER_TOKEN = re.compile(
     r"(?:gh[pousr]_|github_pat_|cf[auro]t_)[A-Za-z0-9_-]{16,}"
@@ -26,10 +31,17 @@ _PROVIDER_TOKEN = re.compile(
     r"|[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}"
     r"|discord(?:app)?\.com/api/(?:v[0-9]+/)?webhooks/[0-9]+/[A-Za-z0-9_-]+"
     r"|v1\.0-[a-fA-F0-9]{20,}"
+    r"|(?i:\bbearer +)[A-Za-z0-9_./+=-]+"
+    r"|sk-(?:ant-|proj-|svcacct-)[A-Za-z0-9_-]{12,}"
     r"|(?<![A-Za-z0-9_-])(?:[A-Za-z0-9_-]{40}|[a-fA-F0-9]{37})(?![A-Za-z0-9_-])"
 )
-_IPV4 = re.compile(r"(?<![0-9])[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?![0-9])")
+_IPV4 = re.compile(r"(?<![0-9])(?=([0-9]{1,3}(?:\.[0-9]{1,3}){3})(?![0-9]))")
+_NUMERIC_URL_HOST = re.compile(
+    r"://((?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+)){0,3})\.?(?=[:/?#\s<>\x22']|$)",
+    re.I,
+)
 _HEX_RUN = re.compile(r"[0-9a-f:.]+", re.I)
+_IDENTIFIER_CHAR = re.compile(r"\w")
 
 
 @dataclass(frozen=True, repr=False)
@@ -85,13 +97,25 @@ def _bound_metadata(pin, artifact):
 
 def _has_nonloopback_ip(text):
     for match in _IPV4.finditer(text):
-        octets = tuple(int(part) for part in match.group().split("."))
+        octets = tuple(int(part) for part in match[1].split("."))
         if max(octets) <= 255 and octets[0] != 127:
+            return True
+    for match in _NUMERIC_URL_HOST.finditer(text):
+        try:
+            if not ip_address(match[1]).is_loopback:
+                return True
+        except ValueError:
+            # Refuse browser-dependent numeric host spellings.
             return True
     for match in _HEX_RUN.finditer(text):
         candidate = match.group().strip(".")
         # Capture compressed and expanded IPv6 without treating times as addresses.
         if "::" not in candidate and candidate.count(":") < 7:
+            continue
+        # A letter-only fragment between identifier characters can be a Rust path.
+        if (match.start() > 0 and _IDENTIFIER_CHAR.match(text, match.start() - 1)
+                and _IDENTIFIER_CHAR.match(text, match.end())
+                and not any(char.isdigit() for char in candidate)):
             continue
         try:
             address = ip_address(candidate)
@@ -103,21 +127,30 @@ def _has_nonloopback_ip(text):
     return False
 
 
-def _text_refusal(text, *, is_key):
+def _scan_text(text, *, is_key):
     if any(category(char) in ("Cc", "Cf", "Cs") for char in text):
         return "pre_native_evidence_control_byte"
     text = normalize("NFKC", text)
-    if is_key and re.sub(r"[^a-z0-9]", "", text.casefold()) in _SECRET_KEYS:
-        return "pre_native_evidence_secret_key"
     if _URL_CREDENTIALS.search(text):
         return "pre_native_evidence_url_credentials"
     if _PRIVATE_KEY.search(text):
         return "pre_native_evidence_private_key"
     if _PROVIDER_TOKEN.search(text):
         return "pre_native_evidence_provider_token"
+    if is_key and _SECRET_KEY.search(re.sub(r"[^a-z0-9]", "", text.casefold())):
+        return "pre_native_evidence_secret_key"
     if _has_nonloopback_ip(text):
         return "pre_native_evidence_nonloopback_ip"
     return None
+
+
+def _text_refusal(text, *, is_key, pinned_sha):
+    if text == pinned_sha:
+        return None
+    code = _scan_text(text, is_key=is_key)
+    if code is None and "%" in text:
+        return _scan_text(unquote(text), is_key=is_key)
+    return code
 
 
 def _fields(value, path="$", *, is_key=False):
@@ -137,10 +170,14 @@ def verify_native_pre_evidence_redaction(
 ) -> RedactionVerdict:
     """Verify the exact UTF-8 JSON bytes after the caller authenticates their source.
 
-    The caller supplies authoritative time and the independent promotion readback.
-    The readback must be within 60 seconds and obtained during this reservation.
+    The caller authenticates the metadata and bytes as belonging to one artifact
+    and supplies authoritative time and the independent promotion readback. The
+    readback must be within 60 seconds and at or after the reservation start.
+    Verification remains available for post-cleanup evidence after the admission cutoff.
     Depth counts nested JSON containers. Items count the root, array elements,
     object keys and object values. Paths identify entries by position in JSON order.
+    Control characters inside fields are refused, including escaped tabs and newlines.
+    A complete field equal to the independently pinned source SHA is safe to share.
     """
     if enabled is not True:
         return _DISABLED
@@ -179,6 +216,6 @@ def verify_native_pre_evidence_redaction(
     for count, (field, path, is_key) in enumerate(_fields(value), start=1):
         if count > max_items:
             return RedactionVerdict("pre_native_evidence_item_limit", path, max_items)
-        if type(field) is str and (code := _text_refusal(field, is_key=is_key)):
+        if type(field) is str and (code := _text_refusal(field, is_key=is_key, pinned_sha=pin.sha)):
             return RedactionVerdict(code, path, count)
     return RedactionVerdict("pre_native_evidence_redacted", inspected_items=count)
