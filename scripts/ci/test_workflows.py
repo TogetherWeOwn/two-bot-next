@@ -6509,6 +6509,31 @@ class WorkflowTests(unittest.TestCase):
             r"--test lfg_interactions(?: --test \S+)* -- --ignored --test-threads=1",
         )
 
+    def test_community_db_bootstrap_is_ready_before_cargo(self):
+        job = self.workflows["check.yml"]["jobs"]["community-db"]
+        service = job["services"]["agent-testdb"]
+        self.assertNotIn("ports", service)
+        self.assertEqual(service["env"], {
+            "POSTGRES_USER": "agent_test",
+            "POSTGRES_DB": "two_bot_test_ci",
+            "POSTGRES_HOST_AUTH_METHOD": "trust",
+        })
+        self.assertEqual(
+            job["env"]["TWO_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        # TCP excludes the entrypoint's temporary socket-only server. A SQL
+        # connection also proves that the actual bootstrap database exists.
+        self.assertIn(
+            '--health-cmd "psql -X -w -h 127.0.0.1 -U agent_test '
+            '-d two_bot_test_ci -Atqc \'SELECT 1\'"',
+            service["options"],
+        )
+        self.assertNotRegex(
+            "\n".join(step.get("run", "") for step in job["steps"]),
+            r"\b(?:apt-get|createdb)\b",
+        )
+
     def test_tickets_postgres_acceptance_receives_disposable_database_url(self):
         job = self.workflows["check.yml"]["jobs"]["tickets-postgres"]
         prepare = next(
