@@ -16,6 +16,7 @@ type Fetch = (input: string | URL, init: RequestInit) => Promise<Response>;
 type ClientEnv = Readonly<{
   ACTIONS_ID_TOKEN_REQUEST_URL?: string;
   ACTIONS_ID_TOKEN_REQUEST_TOKEN?: string;
+  GITHUB_TOKEN?: string;
   OWNERSHIP_CONTROL_TOKEN?: string;
 }>;
 
@@ -38,18 +39,27 @@ function record(value: unknown): value is Record<string, unknown> {
 /** Bind the protected job to the staging Worker's AutoMod bridge. Every call
  * mints a fresh Actions OIDC token for the fixed audience. The Worker and DO
  * authenticate the bearer and token, and the DO applies its compiled plan.
- * Returns undefined unless the OIDC request variables and bearer exist.
+ * Requires the OIDC request variables and control bearer. An optional scoped
+ * GitHub read token authenticates the Actions run lookup and inventory verifier.
  */
 export function bindStagingAutomodInstanceClient(env: ClientEnv, serving: Serving, fetcher: Fetch = fetch,
-  readAuthenticatedInventory: Host["readAuthenticatedInventory"] =
-  bindStagingAutomodInventoryReader(bindStagingAutomodInventoryVerifier())) {
+  readAuthenticatedInventory?: Host["readAuthenticatedInventory"]) {
   const requestUrl = env.ACTIONS_ID_TOKEN_REQUEST_URL, requestToken = env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
   const controlBearer = env.OWNERSHIP_CONTROL_TOKEN;
+  const githubReadToken = env.GITHUB_TOKEN;
   if (!requestUrl || !requestToken || !controlBearer || controlBearer.length < 32) return;
+  if (githubReadToken !== undefined && (typeof githubReadToken !== "string" || !/^[!-~]{1,4096}$/.test(githubReadToken))) return;
   let idTokenUrl: URL;
   try { idTokenUrl = new URL(requestUrl); } catch { return; }
   if (idTokenUrl.protocol !== "https:" || !idTokenUrl.hostname.endsWith(".actions.githubusercontent.com")) return;
   idTokenUrl.searchParams.set("audience", STAGING_AUTOMOD_AUDIENCE);
+
+  if (readAuthenticatedInventory === undefined) {
+    const verifier = githubReadToken === undefined
+      ? bindStagingAutomodInventoryVerifier()
+      : bindStagingAutomodInventoryVerifier(undefined, { githubReadToken });
+    readAuthenticatedInventory = bindStagingAutomodInventoryReader(verifier);
+  }
 
   async function mint(signal: AbortSignal): Promise<string> {
     const response = await fetcher(idTokenUrl, { method: "GET", redirect: "error", signal,
@@ -113,8 +123,10 @@ export function bindStagingAutomodInstanceClient(env: ClientEnv, serving: Servin
     authority,
     readRun: async (runId, signal) => {
       if (!/^[1-9][0-9]{0,19}$/.test(runId)) return;
+      const headers: Record<string, string> = { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28" };
+      if (githubReadToken !== undefined) headers.authorization = `Bearer ${githubReadToken}`;
       const response = await fetcher(`${RUNS_URL}${runId}`, { method: "GET", redirect: "error", signal,
-        headers: { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28" } });
+        headers });
       if (response.status !== 200) {
         releaseUpstream(response);
         return;

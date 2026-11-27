@@ -7,11 +7,17 @@ import type { bindStagingAutomodInventoryReader } from "./staging-automod-invent
 type Launch = (
   file: string,
   args: string[],
-  options: { env: Record<string, never>; stdio: "pipe"; detached: true },
+  options: { env: { GH_TOKEN?: string }; stdio: "pipe"; detached: true },
 ) => ChildProcessByStdio<Writable, Readable, Readable>;
+
+type VerifierOptions = {
+  /** Caller-supplied credential scoped to repository and Actions reads. */
+  githubReadToken: string;
+};
 
 const SUPERVISOR = fileURLToPath(new URL("../../scripts/staging_automod_verifier_supervisor.py", import.meta.url));
 const VERIFIER = fileURLToPath(new URL("../../scripts/staging_automod_inventory_reader.py", import.meta.url));
+const MAX_GITHUB_TOKEN_BYTES = 4_096;
 const MAX_OUTPUT_BYTES = 4_096;
 const active = new WeakMap<AbortSignal, Set<Promise<string>>>();
 
@@ -27,6 +33,7 @@ export async function boundStagingAutomodInventoryRead<T>(work: Promise<T>, sign
 /** The trusted launcher supplies piped stdio. The reader supplies validated pins. */
 export function bindStagingAutomodInventoryVerifier(
   launch: Launch = spawn,
+  options?: VerifierOptions,
 ): Parameters<typeof bindStagingAutomodInventoryReader>[0] {
   return (workflowSha, runId, signal) => {
     const work = new Promise<string>((resolve, reject) => {
@@ -34,8 +41,22 @@ export function bindStagingAutomodInventoryVerifier(
       if (signal.aborted) return reject(refusal);
       let child: ReturnType<Launch>;
       try {
+        const env: { GH_TOKEN?: string } = {};
+        if (options !== undefined) {
+          const { githubReadToken } = options;
+          // Accept only visible ASCII, so the length bound also caps bytes.
+          if (typeof githubReadToken !== "string" || githubReadToken.length === 0
+            || githubReadToken.length > MAX_GITHUB_TOKEN_BYTES || /[^!-~]/.test(githubReadToken)) {
+            return reject(refusal);
+          }
+          env.GH_TOKEN = githubReadToken;
+        }
+        // Node otherwise copies this parent variable even with an explicit env.
+        if (process.env.NODE_V8_COVERAGE) {
+          Object.defineProperty(env, "NODE_V8_COVERAGE", { value: undefined });
+        }
         child = launch("python3", [SUPERVISOR, "python3", VERIFIER, workflowSha, runId],
-          { env: {}, stdio: "pipe", detached: true });
+          { env, stdio: "pipe", detached: true });
       } catch {
         return reject(refusal);
       }

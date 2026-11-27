@@ -218,6 +218,9 @@ as a staging incident. Keep admission closed and qualification pending,
 reconcile the exact reservation, and repeat cleanup with fresh inventory until
 verification passes.
 
+See [native Durable Object qualification](pre-hosting.md#replacement-artifact-with-native-scheduling) for
+the provider checks for a replacement PRE artifact.
+
 ##### Startup refusal handoff
 
 This handoff describes the dormant PRE contract. Keep rehearsal admission and
