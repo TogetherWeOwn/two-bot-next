@@ -49,6 +49,8 @@ test("refuses stale or oversized lease and deadline budgets", () => {
   expectDenied(input, lease.expiresAt, "expired lease");
   expectDenied({ ...input, plan: { ...plan, notAfter: lease.expiresAt - 1 } }, now, "lease exceeds plan window");
   expectDenied({ ...input, plan: { ...plan, leaseMs: lease.expiresAt - now - 1 } }, now, "reservation exceeds plan budget");
+  expectDenied({ ...input, plan: { ...plan, leaseMs: lease.expiresAt - now } }, now,
+    "remaining time fits the plan but the issued lease exceeds its duration");
   const acquiredAt = 0;
   const expiresAt = MAX_STAGING_USE_MS + 1;
   expectDenied({ ...input, lease: { ...lease, acquiredAt, expiresAt }, change: { ...change, expiresAt },

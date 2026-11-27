@@ -96,9 +96,12 @@ export function evaluateStagingAutomodWindowBudget(input: unknown, now: number):
   const { publishBefore } = intent;
   const { removeBefore } = window;
   const { acquiredAt, expiresAt } = lease;
+  const leaseDuration = expiresAt - acquiredAt;
+  // The budget includes lease expiry as the outer publication bound. The
+  // publication and journal adapters enforce their own earlier cutoff.
   // Compare durations so adding cleanupMs cannot overflow the safe timestamp range.
   if (now < acquiredAt || publishBefore <= now || publishBefore > expiresAt || expiresAt > policy.notAfter
-    || expiresAt - acquiredAt > MAX_STAGING_USE_MS || removeBefore <= publishBefore
+    || leaseDuration > Math.min(policy.leaseMs, MAX_STAGING_USE_MS) || removeBefore <= publishBefore
     || removeBefore - expiresAt > policy.cleanupMs) return deny("deadline_outside_window");
 
   return Object.freeze({ admitted: true, runId: lease.runId, sha: lease.sha, epoch: lease.epoch,
