@@ -129,10 +129,10 @@ class EffectiveLaunchControlsTests(unittest.TestCase):
         ):
             with self.subTest(reason=reason):
                 self.rejects(reason, path=KEEPALIVE, launch=mutate)
-        self.rejects("stale_keepalive_restart", path=KEEPALIVE,
-                     policy=lambda r: replace(r, policy=replace(r.policy, generation=1)))
-        self.rejects("stale_keepalive_restart", path=KEEPALIVE,
-                     policy=lambda r: replace(r, policy=replace(r.policy, enforced_at=8)))
+        for fields in ({"generation": 1}, {"enforced_at": 8}):
+            for fault in (None, "missing_listener"):
+                self.rejects("stale_keepalive_restart", path=KEEPALIVE, fault=fault,
+                             policy=lambda r: replace(r, policy=replace(r.policy, **fields)))
 
     def test_rejects_unenforced_policy_and_broad_or_cross_reservation_rules(self):
         for fields, reason in (
