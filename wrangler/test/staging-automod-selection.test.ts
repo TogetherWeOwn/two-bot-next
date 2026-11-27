@@ -209,6 +209,12 @@ test("the real internal timeout settles a standalone Node process with a stalled
     const { resolveStagingAutomodSelection } = await import(process.argv[1]);
     const { dispatch, plan } = JSON.parse(process.argv[2]);
     const caller = new AbortController();
+    const schedule = globalThis.setTimeout;
+    const delays = [];
+    globalThis.setTimeout = (callback, delay, ...args) => {
+      delays.push(delay);
+      return schedule(callback, delay, ...args);
+    };
     let readSignal;
     const result = await resolveStagingAutomodSelection(dispatch, {
       readPostDeployRuns: (_scope, signal) => {
@@ -217,6 +223,7 @@ test("the real internal timeout settles a standalone Node process with a stalled
       },
       readAuthenticatedInventory: assert.fail,
     }, caller.signal, { ...plan, notAfter: Date.now() + plan.leaseMs });
+    assert.deepEqual(delays, [2_000]);
     assert.equal(result, undefined);
     assert.equal(readSignal.aborted, true);
     assert.equal(caller.signal.aborted, false);
