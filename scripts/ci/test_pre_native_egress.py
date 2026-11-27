@@ -26,7 +26,7 @@ class Trace:
     def fields(self, attempt, *, namespace=None):
         reservation = FIRST if attempt.target == FIRST.target else RETAINED
         replacement = attempt.path == KEEPALIVE
-        namespace = namespace or f"net:{reservation.target.run_id}:{int(replacement)}"
+        namespace = namespace or f"net:{reservation.target.run_id}"
         fault = attempt.fault or attempt.baseline_for
         offset = 100 * (FAULTS.index(fault) + 1) if fault else 0
         event = offset + (20 if replacement else 5 if attempt.fault else 10)
@@ -34,16 +34,12 @@ class Trace:
 
     def policy(self, attempt):
         postgres, namespace, generation, event = self.fields(attempt)
-        policy = None
-        if attempt.fault != "missing_policy":
-            policy = Policy(namespace, generation, event - 2, True, (postgres,))
+        policy = Policy(namespace, generation, event - 2, True, (postgres,)) if attempt.fault != "missing_policy" else None
         return PolicyObservation(attempt, policy)
 
     def probe(self, attempt):
         postgres, namespace, generation, event = self.fields(attempt)
-        listener = None
-        if attempt.fault != "missing_listener":
-            listener = Listener(namespace, "127.0.0.1:8081", event - 1)
+        listener = Listener(namespace, "127.0.0.1:8081", event - 1) if attempt.fault != "missing_listener" else None
         forced_from = event - 10 if attempt.path == KEEPALIVE else None
         process, egress = None, None
         if attempt.fault is None:
@@ -61,17 +57,16 @@ class EffectiveLaunchControlsTests(unittest.TestCase):
         return verify_effective_launch_controls(FIRST, retained, digest=digest,
                                                 observe_policy=self.trace.policy, probe=self.trace.probe)
 
-    def rejects(self, reason, *, policy=None, launch=None, path=COLD, fault=None):
-        def only_trial(read, mutate):
-            def change(attempt):
-                reading = read(attempt)
-                matches = (attempt.target, attempt.path, attempt.fault) == (target, path, fault)
-                return mutate(reading) if matches and mutate else reading
-            return change
-
+    def rejects(self, reason, *, policy=None, launch=None, path=COLD, fault=None, baseline_for=None):
+        def change(mutate, reading):
+            a = reading.attempt
+            matches = (a.target, a.path, a.fault, a.baseline_for) == trial
+            return mutate(reading) if matches and mutate else reading
+        read_policy, read_launch = self.trace.policy, self.trace.probe
         for target in (FIRST.target, RETAINED.target):
-            with (self.subTest(target=target), patch.object(self.trace, "policy", only_trial(self.trace.policy, policy)),
-                  patch.object(self.trace, "probe", only_trial(self.trace.probe, launch)),
+            trial = (target, path, fault, baseline_for)
+            with (self.subTest(target=target), patch.object(self.trace, "policy", lambda a: change(policy, read_policy(a))),
+                  patch.object(self.trace, "probe", lambda a: change(launch, read_launch(a))),
                   self.assertRaisesRegex(TargetError, f"^pre_egress_{reason}$")):
                 self.verify()
 
@@ -93,7 +88,7 @@ class EffectiveLaunchControlsTests(unittest.TestCase):
             *[({"retained": replace(RETAINED, postgres=Endpoint("tcp", address, port))}, "invalid_reservation")
               for address, port in (("169.254.169.254", 80), ("127.0.0.1", 8080), ("127.0.0.1", 8081),
                                     ("100.100.100.200", 80), ("fd00:ec2::254", 80), ("::102:304", 5432),
-                                    ("64:ff9b::a29f:87e8", 5432))],
+                                    ("64:ff9b::a29f:87e8", 5432), ("2002:c000:201::", 5432), ("2001::2", 5432))],
         ):
             with self.assertRaisesRegex(TargetError, f"^pre_egress_{reason}$"):
                 self.verify(**args)
@@ -125,6 +120,14 @@ class EffectiveLaunchControlsTests(unittest.TestCase):
                              policy=lambda r: replace(r, policy=replace(r.policy, **fields)))
         self.rejects("stale_namespace_policy", fault="missing_listener",
                      policy=lambda r: replace(r, policy=replace(r.policy, generation=1)))
+        self.rejects("stale_namespace_policy", path=KEEPALIVE,
+                     policy=lambda r: replace(r, policy=replace(r.policy, enforced_at=9)))
+        self.rejects("stale_namespace_policy", baseline_for="missing_policy",
+                     policy=lambda r: replace(r, policy=replace(r.policy, generation=12, enforced_at=18)),
+                     launch=lambda r: replace(r, process=replace(r.process, generation=12),
+                                              egress=replace(r.egress, generation=12)))
+        self.rejects("listener_not_ready", baseline_for="missing_listener",
+                     launch=lambda r: replace(r, listener=replace(r.listener, ready_at=119)))
 
     def test_rejects_unenforced_policy_and_broad_or_cross_reservation_rules(self):
         for fields, reason in (

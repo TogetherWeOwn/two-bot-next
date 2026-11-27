@@ -17,7 +17,7 @@ VECTORS = frozenset(("dns", "direct_ipv4", "direct_ipv6", "https_wss"))
 GATEWAY = "ws://127.0.0.1:8081"
 API = "http://127.0.0.1:8081"
 NAMESPACE = re.compile(r"[a-zA-Z0-9:_-]{1,128}")
-TRANSLATION_NETWORKS = tuple(map(ip_network, ("::/96", "64:ff9b::/96", "64:ff9b:1::/48")))
+TRANSLATION_NETWORKS = tuple(map(ip_network, ("::/96", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16", "2001::/32")))
 
 
 @dataclass(frozen=True, repr=False)
@@ -117,6 +117,10 @@ def _positive(value):
     return type(value) is int and 0 < value < 2**64
 
 
+def _matches(value, expected):
+    return type(value) is type(expected) and value == expected
+
+
 def _observe(adapter, attempt):
     try:
         return adapter(attempt)
@@ -124,16 +128,15 @@ def _observe(adapter, attempt):
         return None
 
 
-def _check_attempt(reservation, attempt, digest, observe_policy, probe, events, owners, previous=None):
+def _check_attempt(reservation, attempt, digest, observe_policy, probe, events, namespaces, previous=None):
     readback = _observe(observe_policy, attempt)
     require(type(readback) is PolicyObservation and readback.attempt is attempt, "pre_egress_policy_unconfirmed")
     launch = _observe(probe, attempt)
-    require(type(launch) is LaunchObservation and launch.attempt is attempt
-            and type(launch.path) is str and launch.path == attempt.path
+    require(type(launch) is LaunchObservation and launch.attempt is attempt and _matches(launch.path, attempt.path)
             and type(launch.namespace) is str and NAMESPACE.fullmatch(launch.namespace) and _positive(launch.event),
             "pre_egress_launch_unconfirmed")
     require(launch.event > events.get(attempt.target, 0), "pre_egress_stale_launch_event")
-    owner, last_policy = owners.setdefault(launch.namespace, (attempt.target, (0, 0)))
+    owner, last_event, last_policy, last_ready = namespaces.get(launch.namespace, (attempt.target, 0, (0, None), None))
     require(owner == attempt.target, "pre_egress_shared_namespace")
     events[attempt.target] = launch.event
     if previous is not None:
@@ -142,13 +145,13 @@ def _check_attempt(reservation, attempt, digest, observe_policy, probe, events, 
                 "pre_egress_keepalive_trigger_unconfirmed")
     else:
         require(launch.forced_from is None, "pre_egress_not_cold_start")
-    require(type(launch.public_discord_packets) is int and launch.public_discord_packets == 0,
-            "pre_egress_public_traffic_unconfirmed")
+    require(_matches(launch.public_discord_packets, 0), "pre_egress_public_traffic_unconfirmed")
     policy, listener = readback.policy, launch.listener
     if attempt.fault == "missing_policy":
         require(policy is None, "pre_egress_policy_not_missing")
+        epoch = (last_policy[0], None)
     else:
-        require(type(policy) is Policy and type(policy.namespace) is str and policy.namespace == launch.namespace
+        require(type(policy) is Policy and _matches(policy.namespace, launch.namespace)
                 and _positive(policy.generation) and _positive(policy.enforced_at)
                 and policy.enforced_at < launch.event and policy.default_deny is True,
                 "pre_egress_policy_not_enforced")
@@ -159,41 +162,36 @@ def _check_attempt(reservation, attempt, digest, observe_policy, probe, events, 
             require(policy.generation > generation and policy.enforced_at > enforced_at,
                     "pre_egress_stale_keepalive_restart")
         epoch = (policy.generation, policy.enforced_at)
-        require(epoch == last_policy or (epoch[0] > last_policy[0] and epoch[1] > last_policy[1]),
+        require(epoch == last_policy or (policy.generation > last_policy[0] and policy.enforced_at > last_event),
                 "pre_egress_stale_namespace_policy")
-        owners[launch.namespace] = (owner, epoch)
     if attempt.fault == "missing_listener":
         require(listener is None, "pre_egress_listener_not_missing")
     else:
-        require(type(listener) is Listener and type(listener.namespace) is str and listener.namespace == launch.namespace
-                and type(listener.address) is str and listener.address == "127.0.0.1:8081"
-                and _positive(listener.ready_at) and listener.ready_at < launch.event,
+        require(type(listener) is Listener and _matches(listener.namespace, launch.namespace)
+                and _matches(listener.address, "127.0.0.1:8081")
+                and _positive(listener.ready_at) and listener.ready_at < launch.event
+                and (listener.ready_at == last_ready or listener.ready_at > last_event),
                 "pre_egress_listener_not_ready")
+    namespaces[launch.namespace] = (owner, launch.event, epoch, None if listener is None else listener.ready_at)
 
     if attempt.fault is not None:
-        require(type(launch.refusal) is str and launch.refusal == attempt.fault
-                and type(launch.process_starts) is int and launch.process_starts == 0
+        require(_matches(launch.refusal, attempt.fault) and _matches(launch.process_starts, 0)
                 and launch.process is None and launch.egress is None, "pre_egress_refusal_unconfirmed")
         return
 
     process, egress = launch.process, launch.egress
-    require(type(process) is Process and launch.refusal is None
-            and type(launch.process_starts) is int and launch.process_starts == 1, "pre_egress_process_unconfirmed")
-    require(type(process.namespace) is str and process.namespace == launch.namespace
-            and _positive(process.generation) and process.generation == policy.generation,
+    require(type(process) is Process and launch.refusal is None and _matches(launch.process_starts, 1),
+            "pre_egress_process_unconfirmed")
+    require(_matches(process.namespace, launch.namespace) and _matches(process.generation, policy.generation),
             "pre_egress_process_policy_mismatch")
-    require(type(process.gateway_url) is str and process.gateway_url == GATEWAY
-            and type(process.api_base) is str and process.api_base == API,
-            "pre_egress_wrong_process_settings")
-    require(type(process.digest) is str and process.digest == digest, "pre_egress_wrong_digest")
-    require(type(egress) is EgressObservation and type(egress.namespace) is str
-            and egress.namespace == process.namespace and _positive(egress.generation)
-            and egress.generation == process.generation
+    require(_matches(process.gateway_url, GATEWAY) and _matches(process.api_base, API), "pre_egress_wrong_process_settings")
+    require(_matches(process.digest, digest), "pre_egress_wrong_digest")
+    require(type(egress) is EgressObservation and _matches(egress.namespace, process.namespace)
+            and _matches(egress.generation, process.generation)
             and type(egress.denied) is frozenset and len(egress.denied) == len(VECTORS)
             and all(type(vector) is str for vector in egress.denied) and egress.denied == VECTORS,
             "pre_egress_denial_unconfirmed")
-    require(_endpoint(egress.postgres_allowed) and egress.postgres_allowed == reservation.postgres,
-            "pre_egress_postgres_unconfirmed")
+    require(_endpoint(egress.postgres_allowed) and egress.postgres_allowed == reservation.postgres, "pre_egress_postgres_unconfirmed")
     return launch.event, policy.generation, policy.enforced_at
 
 
@@ -206,12 +204,11 @@ def verify_effective_launch_controls(first, retained, *, digest, observe_policy,
                 "pre_egress_invalid_reservation")
     require(first.target.provider_names != retained.target.provider_names and first.postgres != retained.postgres,
             "pre_egress_reservation_collision")
-    events, owners = {}, {}
+    events, namespaces = {}, {}
     for reservation in (first, retained):
         def check(path, fault, *, baseline_for=None, previous=None):
             attempt = Attempt(reservation.target, path, fault, baseline_for)
-            return _check_attempt(reservation, attempt, digest, observe_policy, probe, events, owners, previous)
-
+            return _check_attempt(reservation, attempt, digest, observe_policy, probe, events, namespaces, previous)
         for fault in (None, *FAULTS):
             if fault is not None:
                 check(COLD, fault)
