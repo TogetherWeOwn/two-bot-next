@@ -26,16 +26,26 @@ class RecoveryWiringTests(unittest.TestCase):
         plan = jobs["release-plan"]
         self.assertEqual(plan["outputs"]["runner-artifact-id"], "${{ steps.release-runner.outputs.artifact-id }}")
         self.assertEqual(plan["outputs"]["runner-sha256"], "${{ steps.build.outputs.sha256 }}")
-        self.assertIn("cargo build", next(step["run"] for step in plan["steps"] if step.get("id") == "build"))
+        build_run = next(step["run"] for step in plan["steps"] if step.get("id") == "build")
+        self.assertIn("cargo build", build_run)
+        self.assertIn("sha256sum target/debug/staging-migrate", build_run)
+        self.assertIn('printf \'sha256=%s\\n\' "${checksum%% *}" >> "$GITHUB_OUTPUT"', build_run)
         upload = next(step for step in plan["steps"] if step.get("id") == "release-runner")
         self.assertEqual(upload["with"]["retention-days"], 14)
         steps = jobs["release-apply"]["steps"]
         self.assertFalse(any("cargo build" in step.get("run", "") for step in steps))
         pins = next(step for step in steps if step.get("name") == "Validate the protected forward runner pins")
+        self.assertEqual(pins["env"], {
+            "ARTIFACT_ID": "${{ needs.release-plan.outputs.runner-artifact-id }}",
+            "RUNNER_SHA256": "${{ needs.release-plan.outputs.runner-sha256 }}",
+        })
         download = next(step for step in steps if step.get("name") == "Download the prebuilt protected forward runner")
         self.assertEqual(download["with"]["artifact-ids"], "${{ needs.release-plan.outputs.runner-artifact-id }}")
         self.assertEqual(download["with"]["path"], "${{ runner.temp }}/production-release-runner")
         verify = next(step for step in steps if step.get("name") == "Verify the prebuilt forward runner checksum")
+        self.assertEqual(verify["env"], {
+            "RUNNER_SHA256": "${{ needs.release-plan.outputs.runner-sha256 }}",
+        })
         apply = next(step for step in steps if step.get("name") == "Apply the protected forward transaction")
         self.assertLess(steps.index(pins), steps.index(download))
         self.assertLess(steps.index(download), steps.index(verify))
