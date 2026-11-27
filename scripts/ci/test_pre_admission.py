@@ -155,7 +155,7 @@ class StartupAdmissionTests(unittest.TestCase):
             self.assertEqual(self.store.read(TARGET), AdmissionRecord(TARGET, start_id, closed=True))
             return deployment
 
-        upload = Mock(spec_set=WorkerUpload, target=TARGET)
+        upload = Mock(spec_set=WorkerUpload, target=TARGET, supports_discord_fixture_overrides=True)
         runtime.create_private.side_effect = reply_after_close
         reply = start.start(upload)
         closed = AdmissionRecord(TARGET, reply.start_id, closed=True)
