@@ -593,7 +593,15 @@ async function exerciseAutomodInstanceHost(t: TestContext, loseRecovery: boolean
     GITHUB_WORKFLOW_REF: `TogetherWeOwn/two-bot-next/${path}@refs/heads/main`, GITHUB_REF: "refs/heads/main",
     GITHUB_REF_PROTECTED: "true", GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_RUN_ID: window.runId,
     GITHUB_RUN_ATTEMPT: "1", GITHUB_SHA: workflowSha, GITHUB_WORKFLOW_SHA: workflowSha };
-  const inventorySource = { workflowSha: "d".repeat(40), runId: Number(window.runId) + 1 };
+  const workflowInventorySha = "d".repeat(40);
+  const inventoryRun = Number(window.runId) + 1;
+  const snapshots = new Map([
+    [inventoryRun, { observedAt: now - 59_999, rolloutId: pin.rolloutId }],
+    [inventoryRun + 1, { observedAt: now, rolloutId: "55555555-5555-5555-5555-555555555555" }],
+    [inventoryRun + 2, { observedAt: now + 2, rolloutId: pin.rolloutId }],
+    [inventoryRun + 3, { observedAt: issued.expiresAt + 1, rolloutId: pin.rolloutId }],
+  ]);
+  const optionsFor = (runId: number) => ({ enabled: true, runner, serving, inventorySource: { workflowSha: workflowInventorySha, runId } });
   const run = { id: Number(window.runId), event: "workflow_dispatch", run_attempt: 1, status: "in_progress",
     path, head_branch: "main", head_sha: workflowSha, repository: repo, head_repository: repo };
   let runEvidence = { ...run, head_sha: serving.sha };
@@ -605,8 +613,6 @@ async function exerciseAutomodInstanceHost(t: TestContext, loseRecovery: boolean
   const detail = `${commands}/${preview.id}`;
   const steps: string[] = [];
   let command: typeof preview | undefined;
-  const driftedRollout = "55555555-5555-5555-5555-555555555555";
-  let inventoryRollout = driftedRollout;
   let recoveryReachable = !loseRecovery;
   let acquisitionSignal: AbortSignal | undefined;
   const instance = TwoBotContainer.bindProtectedAutomodInstance(h.bot, control, {
@@ -644,7 +650,7 @@ async function exerciseAutomodInstanceHost(t: TestContext, loseRecovery: boolean
       },
     },
   });
-  const options = { enabled: true, runner, serving, inventorySource };
+  const options = optionsFor(inventoryRun);
   const readWorker = t.mock.fn(() => ({ env: stage, controlBearer: CONTROL_TOKEN }));
   const readIssuedLease = t.mock.fn(instance.authority.readIssuedLease);
   const wiring: NonNullable<Parameters<typeof runStagingAutomodInstanceHost>[1]> = {
@@ -652,15 +658,16 @@ async function exerciseAutomodInstanceHost(t: TestContext, loseRecovery: boolean
     readRun: async id => { assert.equal(id, window.runId); steps.push("run"); return runEvidence; },
     readWorker,
     readAuthenticatedInventory: bindStagingAutomodInventoryReader(async (sha, id, signal) => {
-      assert.equal(sha, inventorySource.workflowSha);
-      assert.equal(id, String(inventorySource.runId));
+      assert.equal(sha, workflowInventorySha);
+      const snapshot = snapshots.get(Number(id));
+      assert.ok(snapshot);
       assert.equal(signal.aborted, false);
       steps.push("inventory");
       return JSON.stringify({ schema_version: 1, workflow_sha: sha, workflow_run_id: Number(id),
-        observed_at: new Date(Date.now()).toISOString(),
+        observed_at: new Date(snapshot.observedAt).toISOString(),
         worker: { deployment_id: pin.workerDeploymentId, version_id: version, source_sha: serving.sha,
           traffic_percent: 100, runtime_policy: "bounded" },
-        container: { application_id: pin.applicationId, namespace_id: pin.namespaceId, rollout_id: inventoryRollout,
+        container: { application_id: pin.applicationId, namespace_id: pin.namespaceId, rollout_id: snapshot.rolloutId,
           rollout_status: "completed", image_digest: pin.imageDigest },
         ownership: { phase: "active", epoch: issued.epoch } });
     }),
@@ -673,7 +680,8 @@ async function exerciseAutomodInstanceHost(t: TestContext, loseRecovery: boolean
         assert.ok(deadline);
         assert.deepEqual(await instance.acquireLease(...scope), issued);
         assert.deepEqual(h.values.get(STAGING_USE_KEY), issued);
-        inventoryRollout = driftedRollout;
+        // The original artifact ages out before the first action reads it.
+        t.mock.timers.setTime(now + 2);
         deadline.abort(new DOMException("synthetic acquisition deadline expired after issuance", "TimeoutError"));
         steps.push("lost-acquire-reply");
         acquisitionSignal.throwIfAborted();
@@ -718,13 +726,12 @@ async function exerciseAutomodInstanceHost(t: TestContext, loseRecovery: boolean
   assert.equal(h.values.has(STAGING_USE_KEY), false);
   runEvidence = run;
   steps.length = 0;
-  assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), unconfirmed);
+  assert.deepEqual(await runStagingAutomodInstanceHost(optionsFor(inventoryRun + 1), wiring), unconfirmed);
   assert.deepEqual(steps, ["run", "inventory"]);
   assert.equal(acquisitionSignal, undefined);
   assert.equal(h.values.has(STAGING_USE_KEY), false);
   assert.equal(await journal.pending(), undefined);
 
-  inventoryRollout = pin.rolloutId;
   steps.length = 0;
   readIssuedLease.mock.resetCalls();
   assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), { verdict: "failed", start: false, recover: false });
@@ -738,13 +745,11 @@ async function exerciseAutomodInstanceHost(t: TestContext, loseRecovery: boolean
   assert.deepEqual(await journal.pending(), { lease: issued, phase: "reserved" });
   assert.deepEqual(steps.slice(0, 4), ["run", "inventory", "acquire", "lost-acquire-reply"]);
   assert.deepEqual(steps.slice(4, 6).sort(), ["approve:recover", "approve:start"]);
-  assert.deepEqual(steps.slice(6), ["inventory"]);
+  assert.deepEqual(steps.slice(6), ["inventory", "inventory"]);
 
-  // Continue the same synthetic run with the original rollout. The host must
-  // use the held tuple without acquiring a replacement or repeating acquisition.
-  inventoryRollout = pin.rolloutId;
+  // Continue the same rehearsal run with a fresh observation of the original rollout.
   steps.length = 0;
-  assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), {
+  assert.deepEqual(await runStagingAutomodInstanceHost(optionsFor(inventoryRun + 2), wiring), {
     verdict: loseRecovery ? "failed" : "passed", start: true, recover: !loseRecovery,
   });
   assert.equal(steps[0], "run");
@@ -757,7 +762,8 @@ async function exerciseAutomodInstanceHost(t: TestContext, loseRecovery: boolean
     assert.ok(await journal.pending());
     recoveryReachable = true;
     steps.length = 0;
-    assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), { verdict: "failed", start: false, recover: true });
+    assert.deepEqual(await runStagingAutomodInstanceHost(optionsFor(inventoryRun + 3), wiring),
+      { verdict: "failed", start: false, recover: true });
     assert.deepEqual(steps, ["run", "approve:recover", "inventory", "invoke:recover", "drain", "stop", "delete"]);
   }
   assert.equal(h.runtime.running, false);
@@ -5028,6 +5034,7 @@ test("AutoMod bridge: the runner client reaches the in-process instance with a f
   const edge = { ...BRIDGE_ENV, TWO_BOT: { getByName: () => h.bot } } as unknown as Env;
   const minted = new Set<string>();
   const operations: string[] = [];
+  let recoveryUnavailable = false;
   const fetcher = t.mock.fn(async (input: string | URL, init: RequestInit) => {
     const url = String(input);
     assert.equal(init.redirect, "error");
@@ -5046,7 +5053,11 @@ test("AutoMod bridge: the runner client reaches the in-process instance with a f
     }
     assert.equal(url, STAGING_AUTOMOD_BRIDGE_URL);
     assert.ok(minted.delete(new Headers(init.headers).get(STAGING_AUTOMOD_OIDC_HEADER) ?? ""));
-    operations.push((JSON.parse(String(init.body)) as { op: string }).op);
+    const operation = JSON.parse(String(init.body)) as { op: string; call?: { action: string } };
+    operations.push(operation.op);
+    if (recoveryUnavailable && operation.op === "invoke" && operation.call?.action === "recover") {
+      return new Response(null, { status: 503 });
+    }
     return worker.fetch(new Request(`https://worker.invalid${STAGING_AUTOMOD_PATH}`, init), edge);
   });
   const env = { STAGING_AUTOMOD_REHEARSAL: "true", GITHUB_REPOSITORY_ID: BRIDGE_CLAIMS.repository_id,
@@ -5064,14 +5075,16 @@ test("AutoMod bridge: the runner client reaches the in-process instance with a f
   const inventorySource = { workflowSha: change.sha, runId: Number(change.runId) + 1 };
   const selection = { serving, inventorySource, reservation: { pin, change } };
   const driftedRollout = "55555555-5555-5555-5555-555555555555";
-  const bind = (rolloutId: string, reservation = selection.reservation, driftAfterAcquire = false) =>
-    bindStagingAutomodDispatch(env, { ...selection, reservation }, fetcher, async source => ({
+  const driftedSource = { ...inventorySource, runId: inventorySource.runId + 1 };
+  const observedAt = new Date().toISOString();
+  const bind = (rolloutId: string, reservation = selection.reservation) =>
+    bindStagingAutomodDispatch(env, { ...selection, reservation,
+      inventorySource: rolloutId === pin.rolloutId ? inventorySource : driftedSource }, fetcher, async source => ({
       schema_version: 1, workflow_sha: source.workflowSha, workflow_run_id: source.runId,
-      observed_at: new Date().toISOString(), ownership: { phase: "active", epoch: change.expectedEpoch },
+      observed_at: observedAt, ownership: { phase: "active", epoch: change.expectedEpoch },
       worker: { deployment_id: pin.workerDeploymentId, version_id: pin.workerVersionId, source_sha: pin.sourceSha,
         traffic_percent: 100, runtime_policy: "bounded" },
-      container: { application_id: pin.applicationId, namespace_id: pin.namespaceId,
-        rollout_id: driftAfterAcquire && operations.includes("acquire") ? driftedRollout : rolloutId,
+      container: { application_id: pin.applicationId, namespace_id: pin.namespaceId, rollout_id: rolloutId,
         image_digest: pin.imageDigest, rollout_status: "completed" },
     }));
   const wrongRun = { pin, change: { ...change, runId: "654321" } };
@@ -5084,17 +5097,19 @@ test("AutoMod bridge: the runner client reaches the in-process instance with a f
   assert.equal(h.values.has(STAGING_USE_KEY), false);
 
   operations.length = 0;
-  assert.deepEqual(await runStagingAutomodDispatch(env, await bind(pin.rolloutId, selection.reservation, true)),
+  recoveryUnavailable = true;
+  assert.deepEqual(await runStagingAutomodDispatch(env, await bind(pin.rolloutId)),
     { verdict: "failed", start: false, recover: false });
-  assert.deepEqual(operations, ["read-lease", "acquire", "read-lease", "read-approval", "read-approval"]);
+  assert.deepEqual(operations, ["read-lease", "acquire", "read-lease", "read-approval", "read-approval", "invoke", "invoke"]);
   const issued = h.values.get(STAGING_USE_KEY) as StagingUse;
   assert.equal(issued.purpose, AUTOMOD_STAGING_PURPOSE);
+  recoveryUnavailable = false;
   const binding = await bind(pin.rolloutId);
   assert.deepEqual(await runStagingAutomodDispatch(env, binding), { verdict: "failed", start: false, recover: true });
   assert.deepEqual(h.values.get(STAGING_USE_KEY), { ...issued, phase: "released" });
   assert.ok(binding?.wiring);
   await assert.rejects(binding.wiring.instance.acquireLease(pin, change, new AbortController().signal), /AutoMod bridge refused/);
-  assert.deepEqual(operations.slice(5), ["read-lease", "read-lease", "read-approval", "read-approval", "invoke", "invoke", "acquire"]);
+  assert.deepEqual(operations.slice(7), ["read-lease", "read-lease", "read-approval", "read-approval", "invoke", "invoke", "acquire"]);
   assert.equal(minted.size, 0);
   assert.deepEqual(h.starts, []);
 });

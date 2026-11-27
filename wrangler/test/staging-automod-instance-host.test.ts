@@ -224,7 +224,7 @@ test("the instance host confirms a durable lease after an interrupted acquisitio
   assert.equal(acquireLease.mock.callCount(), 1);
 });
 
-test("the instance host rechecks inventory drift after acquiring a lease", async t => {
+test("the instance host refuses a conflicting readback returned after acquisition", async t => {
   const { wiring, acquireLease, invokePrivate } = fixture(t);
   const readAuthenticatedInventory = t.mock.fn<Wiring["readAuthenticatedInventory"]>(async () => {
     if (!acquireLease.mock.callCount()) return inventory;
