@@ -380,6 +380,17 @@ class NightlyPartitionWorkflow(unittest.TestCase):
         self.assertEqual(job["outputs"], SELECTOR_OUTPUTS)
         self.assertEqual(job["steps"][1]["run"], SELECTOR_RUN)
 
+    def test_changes_checkout_is_shallow_only_for_schedule_and_dispatch(self):
+        checkout = self.job("changes")["steps"][0]
+        self.assertRegex(checkout["uses"], r"^actions/checkout@[0-9a-f]{40}$")
+        self.assertEqual(
+            checkout["with"],
+            {
+                "fetch-depth": "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '0' }}",
+                "persist-credentials": "false",
+            },
+        )
+
     # --- topology -----------------------------------------------------
     def test_job_needs(self):
         self.assertEqual(self.needs("sweep-plan"), {"changes"})

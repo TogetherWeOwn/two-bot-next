@@ -990,6 +990,12 @@ jobs:
           path: tooling
           persist-credentials: false
           fetch-depth: 1
+          # The schema gate imports schema_gate_common, which imports script_intake.
+          sparse-checkout: |
+            /scripts/ci/production_schema_gate.py
+            /scripts/ci/schema_gate_common.py
+            /scripts/script_intake.py
+          sparse-checkout-cone-mode: false
       - name: Deploy SHA must be exact
         env:
           SOURCE_SHA: ${{ needs.guard.outputs.sha }}
@@ -1068,6 +1074,14 @@ jobs:
           path: tooling
           persist-credentials: false
           fetch-depth: 1
+          # Keep the role verifier and its local Python imports together.
+          sparse-checkout: |
+            /scripts/ci/roles_gate.py
+            /scripts/ci/production_schema_gate.py
+            /scripts/ci/staging_schema_gate.py
+            /scripts/ci/schema_gate_common.py
+            /scripts/script_intake.py
+          sparse-checkout-cone-mode: false
       - name: Deploy SHA must be exact
         env:
           SOURCE_SHA: ${{ needs.guard.outputs.sha }}
@@ -1415,7 +1429,7 @@ jobs:
   release-plan:
     name: Production release / Read the fresh production plan
     needs: [guard, staging-soak-evidence]
-    if: github.repository_id == '1396224242' && github.ref_protected && inputs.release_plan_run_id != '' && needs.guard.outputs.skip == '' && needs.staging-soak-evidence.outputs.skip == ''
+    if: github.repository_id == '1396224242' && github.ref_protected && github.run_attempt == 1 && inputs.release_plan_run_id != '' && needs.guard.outputs.skip == '' && needs.staging-soak-evidence.outputs.skip == ''
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production-migrate-plan
@@ -1430,16 +1444,30 @@ jobs:
       PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
       PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
       PRODUCTION_BRANCH_ID: ${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}
+    outputs:
+      runner-artifact-id: ${{ steps.release-runner.outputs.artifact-id }}
+      runner-sha256: ${{ steps.build.outputs.sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {ref: "${{ github.sha }}", persist-credentials: false, fetch-depth: 0}
-      - name: Compare the candidate migrations and role policy with the trusted runner
+      - name: Compare the candidate migrations and role policy and build the trusted runner
+        id: build
         run: |
           set -euo pipefail
           git merge-base --is-ancestor "$RELEASE_SHA" HEAD
           git diff --exit-code "$RELEASE_SHA" HEAD -- crates/cutover/migrations crates/store/migrations \
             sql/database_role_matrix.sql sql/verify_database_roles.sql sql/web_v1.sql crates/store/sql/web_v1.sql >/dev/null
           cargo build -p two-bot-cutover --bin staging-migrate --locked
+          checksum=$(sha256sum target/debug/staging-migrate)
+          printf 'sha256=%s\n' "${checksum%% *}" >> "$GITHUB_OUTPUT"
+      - name: Retain the forward runner before stopping the writer
+        id: release-runner
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-release-runner-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/debug/staging-migrate
+          if-no-files-found: error
+          retention-days: 14
       - name: Read both production migration ledgers
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1456,6 +1484,7 @@ jobs:
   release-prepare:
     name: Production release / Prepare and stop the prior pair
     needs: [guard, release-plan, staging-soak-evidence]
+    if: github.run_attempt == 1 && success()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: {name: production, deployment: false}
@@ -1532,7 +1561,8 @@ jobs:
 
   release-apply:
     name: Production release / Apply the approved schema
-    needs: [guard, release-prepare]
+    needs: [guard, release-plan, release-prepare]
+    if: github.run_attempt == 1 && success()
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production-migrate-apply
@@ -1543,14 +1573,33 @@ jobs:
       archive-sha256: ${{ steps.release-forward.outputs.artifact-digest }}
     steps:
       - *release-checkout
-      - name: Build the protected forward runner
-        run: cargo build -p two-bot-cutover --bin staging-migrate --locked
+      - name: Validate the protected forward runner pins
+        env:
+          ARTIFACT_ID: ${{ needs.release-plan.outputs.runner-artifact-id }}
+          RUNNER_SHA256: ${{ needs.release-plan.outputs.runner-sha256 }}
+        run: |
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]{0,19}$ && "$RUNNER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+      - name: Download the prebuilt protected forward runner
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.release-plan.outputs.runner-artifact-id }}
+          path: ${{ runner.temp }}/production-release-runner
+          merge-multiple: true
+      - name: Verify the prebuilt forward runner checksum
+        env:
+          RUNNER_SHA256: ${{ needs.release-plan.outputs.runner-sha256 }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/production-release-runner"
+          test -f staging-migrate && test ! -L staging-migrate
+          printf '%s  staging-migrate\n' "$RUNNER_SHA256" | sha256sum --check --strict
+          chmod u+x staging-migrate
       - name: Apply the protected forward transaction
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_PREFLIGHT_EPOCH: ${{ needs.release-prepare.outputs.epoch }}
           RELEASE_STOPPED: ${{ needs.release-prepare.outputs.stopped }}
-          RELEASE_RUNNER: ${{ github.workspace }}/target/debug/staging-migrate
+          RELEASE_RUNNER: ${{ runner.temp }}/production-release-runner/staging-migrate
           TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}
         run: python3 scripts/production_release.py apply
       - name: Upload the verified forward result

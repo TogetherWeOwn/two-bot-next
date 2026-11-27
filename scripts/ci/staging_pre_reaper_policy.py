@@ -7,7 +7,7 @@ PRE_REAPER = "staging-pre-reaper.yml"
 PRE_REAPER_QUEUE = "staging-pre-reaper"
 
 # Pin the parsed trigger, caller, job, queue, grants and fixture command together.
-DORMANT_GRAPH = "b2d7d1cea879725f7b21c93555cee7c297c76e02880895889bc7c3ab53455795"
+DORMANT_GRAPH = "53d6d2e794272df2c5d44aef3d653789b20cf79e358e20ad26ad40a1612b58d0"
 
 
 def dormant_pre_reaper_errors(workflows):

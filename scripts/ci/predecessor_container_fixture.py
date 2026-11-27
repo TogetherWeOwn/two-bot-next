@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from pre_target import Inventory, Target, TargetError, check_inventory
 from script_intake import decode_legacy_json, unique_object
 
+from fixtures.predecessor_discord import GATEWAY, REST, TOKEN
 from fixtures.predecessor_snapshots import GUILD, schema_check, snapshot_sql
 
 
@@ -34,7 +35,6 @@ STAMPS = dict(zip(
     ("org.opencontainers.image.revision", "com.togetherweown.build-id",
      "com.togetherweown.deploy-id"),
 ))
-TOKEN = "offline-predecessor-fixture"
 
 
 class Refused(Exception):
@@ -131,6 +131,15 @@ def disposable(docker, prefix):
                  "fixture container teardown unverified", seconds=5)
 
 
+def start_fixture_bot(docker, mock, reservation, *command):
+    readback = docker("exec", mock, "python3", "-B", "/fixture.py", "--check-peers", reservation,
+                      missing_ok=True)
+    peers = decode_json(readback or "{}")
+    require(type(peers) is dict and peers.get("gateway") is True, "isolated Discord gateway fixture unconfirmed")
+    require(peers.get("rest") is True, "isolated Discord REST fixture unconfirmed")
+    docker(*command)
+
+
 def run_endpoint(docker, image, postgres, mock_image, stamps, tip):
     setup = snapshot_sql(tip)
     prefix = "offline-pre-" + uuid.uuid4().hex
@@ -159,6 +168,7 @@ def run_endpoint(docker, image, postgres, mock_image, stamps, tip):
         require(sql("SELECT NOT EXISTS (SELECT FROM gateway_sessions);") == "t",
                 "new PRE snapshot already has a gateway checkpoint")
         docker(*common, *joined, "--name", mock, "--user=1000:1000",
+               "-e", f"OFFLINE_PRE_RESERVATION={prefix}",
                "--mount", f"type=bind,src={MOCK},dst=/fixture.py,readonly",
                "--mount", f"type=bind,src={ROOT / 'scripts/script_intake.py'},dst=/script_intake.py,readonly",
                "--entrypoint", "python3", mock_image, "-B", "/fixture.py")
@@ -168,16 +178,16 @@ def run_endpoint(docker, image, postgres, mock_image, stamps, tip):
 
         wait_for(lambda: probe("mock", "/fixture"), "mock did not start")
         env = {
-            "DISCORD_GATEWAY_URL": "ws://127.0.0.1:8081",
-            "DISCORD_API_BASE": "http://127.0.0.1:8081",
+            "DISCORD_GATEWAY_URL": GATEWAY,
+            "DISCORD_API_BASE": REST,
             "LISTEN_ADDR": "127.0.0.1:8080",
             "DISCORD_TOKEN": TOKEN,
             "GUILD_ID": GUILD,
             "DATABASE_URL": "postgres://offline_bot:offline-fixture@127.0.0.1/postgres",
             "TWO_DATABASE_TLS": "local-only",
         }
-        docker(*common, *joined, "--name", bot, "--user=65532:65532",
-               *(arg for key, value in env.items() for arg in ("-e", f"{key}={value}")), image)
+        start_fixture_bot(docker, mock, prefix, *common, *joined, "--restart=no", "--name", bot, "--user=65532:65532",
+                          *(arg for key, value in env.items() for arg in ("-e", f"{key}={value}")), image)
         health = wait_for(lambda: probe("bot", "/health"), "process did not answer")
         require(health == [200, {"status": "ok"}], "process liveness response invalid")
         version = probe("bot", "/version")

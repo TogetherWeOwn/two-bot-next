@@ -22,6 +22,9 @@ read -r -a components <<< "${components_input//,/ }"
 for component in "${components[@]}"; do
   flags+=(--component "$component")
 done
+if [[ ${TWO_RUSTUP_NO_UPDATE:-} == 1 && ${#components[@]} -eq 0 ]]; then
+  flags+=(--no-update)
+fi
 export RUSTUP_PERMIT_COPY_RENAME=1
 # Match the pinned rust-toolchain action's bounded release-server retry policy.
 log=$(mktemp)

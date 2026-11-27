@@ -16,9 +16,10 @@ use std::collections::BTreeSet;
 // them to. The message string (last argument to the `tracing` macro) is the
 // event name; fields such as `sequence` or `guild_id` are context, not names.
 
-/// `crates/bot/src/gateway.rs`: all twenty-five traced in the file are cataloged.
-const GATEWAY_RS_EVENTS: [&str; 25] = [
+/// Cataloged lifecycle messages in `crates/bot/src/gateway.rs`.
+const GATEWAY_RS_EVENTS: [&str; 26] = [
     "cold resume committed; requesting voice snapshot via identify",
+    "saved gateway resume endpoint refused by admission policy",
     "gateway reconnect failed; Twilight will retry",
     "gateway shard loop started",
     "gateway leveling dispatch failed",
@@ -239,10 +240,12 @@ const VOICE_RS_ADJACENT: [&str; 26] = [
 // Test-only emissions inside the scanned files' `#[cfg(test)]` modules. They
 // never run in production, but `include_str!` sees the whole file, so they
 // join the known set explicitly instead of failing the scan.
-const TEST_ONLY_EMISSIONS: [&str; 1] = [
+const TEST_ONLY_EMISSIONS: [&str; 2] = [
     // `server.rs` capture-subscriber self-check: proves the test recorder
     // observes events; asserts on the text, ships no behavior.
     "capture remains active",
+    // `gateway.rs` control event for the pretty receipt suppression fixture.
+    "synthetic_pretty_control",
 ];
 
 /// The six catalog-scoped source files, read at compile time so the suite is

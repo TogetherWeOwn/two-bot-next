@@ -32,7 +32,7 @@ function leaseFromJob(window, ready, at) {
   return lease;
 }
 
-function fixturePin(fixture) {
+export function stagingVoiceFixturePin(fixture) {
   const { environment, guildId, discordId, channelIds } = fixture ?? {};
   if (environment !== "staging" || !snowflake(guildId) || !Array.isArray(channelIds)
     || channelIds.length !== 2) return null;
@@ -45,7 +45,7 @@ function fixturePin(fixture) {
 // Compose only approved in-process inputs. The job supplies the lease separately.
 function provideStagingVoiceMoveInputs(options) {
   const { fixture, previousReady, previousOff, webSession, expectedRevision, observer, control, now = Date.now } = options;
-  const pinnedFixture = fixturePin(fixture);
+  const pinnedFixture = stagingVoiceFixturePin(fixture);
   if (!pinnedFixture || webSession?.environment !== "staging" || webSession.discordId !== pinnedFixture.discordId) {
     return { verdict: "failed", code: "fixture_unconfirmed" };
   }

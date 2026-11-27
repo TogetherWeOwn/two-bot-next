@@ -31,9 +31,12 @@ MEMBER = "300000000000000001"
 ROOM = "400000000000000001"
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 PHASES = ("pending", "finalized", "off", "cleanup")
+LEASE_FIELDS = ("epoch", "runId", "runAttempt", "acquiredAt", "expiresAt")
 READY_TIMEOUT = 5
 WEB_TIMEOUT = 2.5
 RUN_BUDGET = 25
+PROBE_LEASE_REFUSAL = "staging lease did not cover the probe"
+CLEANUP_REFUSAL = "cleanup readback is incomplete"
 
 
 class Refused(Exception):
@@ -57,18 +60,22 @@ def read_object(path):
         return json_object(read_with_overflow(stream, BODY_CAP))
 
 
-def validate_probe_window(lifecycle, *, recorded=False):
-    use = lifecycle["use"]
+def observation_ms(lifecycle, refusal):
     observed_at = lifecycle.get("observedAt")
     require(isinstance(observed_at, str) and re.fullmatch(
         r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z", observed_at),
-        "staging lease did not cover the probe")
+        refusal)
     since_epoch = datetime.fromisoformat(observed_at) - datetime(1970, 1, 1, tzinfo=timezone.utc)
-    observed_ms = since_epoch // timedelta(milliseconds=1)
+    return since_epoch // timedelta(milliseconds=1)
+
+
+def validate_probe_window(lifecycle, *, recorded=False):
+    use = lifecycle["use"]
+    observed_ms = observation_ms(lifecycle, PROBE_LEASE_REFUSAL)
     start_ms = observed_ms if recorded else time.time() * 1000
     require(type(use.get("acquiredAt")) is int and 0 <= use["acquiredAt"] <= observed_ms <= start_ms
             and type(use.get("expiresAt")) is int and start_ms + RUN_BUDGET * 1000 < use["expiresAt"],
-            "staging lease did not cover the probe")
+            PROBE_LEASE_REFUSAL)
 
 
 def validate_configuration(phase, origin, rollout, observed, *, recorded=False):
@@ -99,11 +106,11 @@ def validate_configuration(phase, origin, rollout, observed, *, recorded=False):
     if phase == "cleanup":
         require(lifecycle.get("action") == "release" and use.get("phase") == "released" and lifecycle.get("running") is False
                 and type(observed.get("fixture_rows")) is int
-                and observed["fixture_rows"] == 0, "cleanup readback is incomplete")
+                and observed["fixture_rows"] == 0, CLEANUP_REFUSAL)
     else:
         require(lifecycle.get("action") == "ready" and lifecycle.get("running") is True
                 and use.get("phase") == "active",
-                "staging lease did not cover the probe")
+                PROBE_LEASE_REFUSAL)
         validate_probe_window(lifecycle, recorded=recorded)
         expected_fixture = "pending" if phase == "pending" else "finalized"
         require(observed.get("signed_ingress") is True and observed.get("primary_fixture") == expected_fixture
@@ -112,27 +119,52 @@ def validate_configuration(phase, origin, rollout, observed, *, recorded=False):
     return version, sha, build, deploy
 
 
-def validate_rehearsal(rollout, observations):
+def same_json(left, right):
+    # Preserve JSON types (Python bool/int equality does not).
+    return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
+
+
+def validate_planned_fixture(observed, plan):
+    require(observed.get("fixture_event_key") == plan["event_key"],
+            "synthetic fixture event did not match the rehearsal plan")
+    lifecycle = observed["lifecycle"]
+    use = lifecycle["use"]
+    lease = {field: use.get(field) for field in LEASE_FIELDS}
+    epoch, run_id, attempt, acquired, expires = (lease[field] for field in LEASE_FIELDS)
+    require(use.get("environment") == "staging" and type(lifecycle.get("epoch")) is int
+            and type(epoch) is int and epoch > 0
+            and isinstance(run_id, str) and re.fullmatch(r"[1-9][0-9]{0,19}", run_id)
+            and type(attempt) is int and attempt > 0
+            and type(acquired) is int and type(expires) is int and 0 <= acquired < expires
+            and same_json(lease, plan["lease"]), "staging lease identity did not match the rehearsal plan")
+
+
+def signed_probe_receipt(phase, identity, plan):
+    version, revision, build, deploy = identity
+    return {"schema": "two-bot-attendance-signed-probe.v1", "phase": phase,
+            "worker_version": version, "revision": revision, "build_id": build, "deploy_id": deploy,
+            "event_key": plan["event_key"], "fixture_start": plan["fixture_start"], "lease": plan["lease"]}
+
+
+def validate_rehearsal(rollout, observations, plan):
     require(set(observations) == set(PHASES) and all(isinstance(row, dict) for row in observations.values()),
             "rehearsal requires all four observations")
-    original_lease = None
+    previous_ms = None
     for phase in PHASES:
         observed = observations[phase]
-        validate_configuration(phase, STAGING_ORIGIN, rollout, observed, recorded=True)
-        lifecycle = observed["lifecycle"]
-        use = lifecycle["use"]
-        run_id, attempt, acquired, expires = (use.get(field) for field in
-                                             ("runId", "runAttempt", "acquiredAt", "expiresAt"))
-        require(use.get("environment") == "staging" and type(lifecycle.get("epoch")) is int
-                and isinstance(run_id, str) and re.fullmatch(r"[1-9][0-9]{0,19}", run_id)
-                and type(attempt) is int and attempt > 0
-                and type(acquired) is int and type(expires) is int and 0 <= acquired < expires,
-                "staging lease identity did not match")
-        # The owner epoch can remain unchanged when a second window is acquired.
-        lease = (use["epoch"], run_id, attempt, acquired, expires)
-        if phase == "pending":
-            original_lease = lease
-        require(lease == original_lease, "staging lease identity did not match")
+        identity = validate_configuration(phase, STAGING_ORIGIN, rollout, observed, recorded=True)
+        validate_planned_fixture(observed, plan)
+        # Release can be recovered after expiry. Only ready records need probe admission.
+        refusal = CLEANUP_REFUSAL if phase == "cleanup" else PROBE_LEASE_REFUSAL
+        try:
+            observed_ms = observation_ms(observed["lifecycle"], refusal)
+        except ValueError:
+            raise Refused(refusal) from None
+        require(previous_ms is None or previous_ms < observed_ms, refusal)
+        previous_ms = observed_ms
+        if phase != "cleanup":
+            require(same_json(observed.get("signed_receipt"), signed_probe_receipt(phase, identity, plan)),
+                    "signed attendance receipt did not match the rehearsal plan")
 
 
 def fixture_result(event_key, start):
@@ -151,6 +183,17 @@ def fixture_start(value):
     require(isinstance(value, str) and re.fullmatch(r"20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:00Z", value),
             "invalid synthetic fixture start")
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def read_plan(path):
+    plan = read_object(path)
+    require(set(plan) == {"event_key", "fixture_start", "lease"}
+            and isinstance(plan["lease"], dict) and set(plan["lease"]) == set(LEASE_FIELDS),
+            "invalid synthetic fixture plan")
+    event_key = plan.get("event_key")
+    require(isinstance(event_key, str) and re.fullmatch(r"attendance-acceptance:[A-Za-z0-9._-]{1,34}", event_key),
+            "invalid synthetic fixture plan")
+    return plan, fixture_start(plan["fixture_start"])
 
 
 def signing_headers(key_id, secret, timestamp, nonce, body):
@@ -186,7 +229,12 @@ def send(request):
                 "expected application/json response")
         for single in ("x-two-worker-version", "cache-control"):
             require(len(headers.get_all(single, [])) <= 1, "ambiguous response headers")
-        return response.code, headers, json_object(read_with_overflow(response, BODY_CAP))
+        raw = read_with_overflow(response, BODY_CAP)
+        # A bounded HTTPResponse.read can return valid JSON after premature EOF.
+        remaining = getattr(response, "length", None)
+        if len(raw) <= BODY_CAP and remaining:
+            raise http.client.IncompleteRead(b"", remaining)
+        return response.code, headers, json_object(raw)
 
 
 def ready(check, origin, identity):
@@ -207,14 +255,12 @@ def signed_read(check, origin, signer, event_key, expected_status, expected):
     status, response_headers, result = check(Request(origin + ACTION_PATH, data=body, headers={**HTTP_HEADERS, **headers}))
     require(time.monotonic() - started < WEB_TIMEOUT, "signed read exceeded the Web deadline")
     envelope = {"ok": expected_status == 200, "request_id": request_id, **expected}
-    # Canonical JSON equality preserves JSON types (Python bool/int equality does not).
     require(status == expected_status and response_headers.get("cache-control") == "no-store"
-            and json.dumps(result, sort_keys=True) == json.dumps(envelope, sort_keys=True),
+            and same_json(result, envelope),
             "signed attendance response did not match the expected envelope")
 
 
-def probe(phase, origin, identity, start, signer, check):
-    event_key = f"attendance-acceptance:{identity[2]}"
+def probe(phase, origin, identity, event_key, start, signer, check):
     not_found = {"error": {"code": "not_found", "message": "request refused", "retryable": False}}
     denied = {"error": {"code": "action_not_allowed", "message": "request refused", "retryable": False}}
     if phase == "finalized":
@@ -239,33 +285,35 @@ def main(argv=None, *, env=None, check=send):
     parser.add_argument("phase", choices=(*PHASES, "rehearsal"))
     parser.add_argument("--rollout", required=True, type=Path)
     parser.add_argument("--observed", required=True, type=Path, help="phase observation or rehearsal object keyed by phase")
-    parser.add_argument("--fixture-start")
+    parser.add_argument("--plan", required=True, type=Path, help="trusted rehearsal fixture and lease plan")
     parser.add_argument("--execute", action="store_true", help="enable signed HTTPS reads")
     args = parser.parse_args(argv)
     try:
+        plan, start = read_plan(args.plan)
+        rollout, observed = read_object(args.rollout), read_object(args.observed)
         if args.phase == "rehearsal":
-            require(not args.execute and args.fixture_start is None, "rehearsal only accepts offline readback")
-            validate_rehearsal(read_object(args.rollout), read_object(args.observed))
+            require(not args.execute, "rehearsal only accepts offline readback")
+            validate_rehearsal(rollout, observed, plan)
         else:
-            rollout, observed = read_object(args.rollout), read_object(args.observed)
             identity = validate_configuration(args.phase, STAGING_ORIGIN, rollout, observed)
+            validate_planned_fixture(observed, plan)
             if args.phase == "cleanup":
-                require(not args.execute and args.fixture_start is None, "cleanup only accepts offline readback")
+                require(not args.execute, "cleanup only accepts offline readback")
             elif not args.execute:
                 print("DRY RUN: attendance configuration matched, no signed check performed")
                 return 2
             else:
-                start = fixture_start(args.fixture_start) if args.phase == "finalized" else None
                 signer = credentials(os.environ if env is None else env)
                 old_handler = signal.signal(signal.SIGALRM, deadline)
                 try:
                     signal.alarm(RUN_BUDGET)
                     # Use a wall-clock sample after arming to cover the whole alarm.
                     validate_probe_window(observed["lifecycle"])
-                    probe(args.phase, STAGING_ORIGIN, identity, start, signer, check)
+                    probe(args.phase, STAGING_ORIGIN, identity, plan["event_key"], start, signer, check)
                 finally:
                     signal.alarm(0)
                     signal.signal(signal.SIGALRM, old_handler)
+                print(json.dumps(signed_probe_receipt(args.phase, identity, plan), sort_keys=True))
     except (Refused, OSError, ValueError, RecursionError, http.client.HTTPException, ProbeError, SmokeError) as error:
         reason = str(error) if isinstance(error, Refused) else "attendance acceptance input or transport refused"
         print(f"FAIL: {reason}", file=sys.stderr)
