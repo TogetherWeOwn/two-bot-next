@@ -250,6 +250,9 @@ in `scripts/ci/test_required_checks.py`. Advisory `container smoke` is exempt
 because the SBOM job gates image security. `ci-evidence` is exempt because
 it publishes links after the aggregate verdict.
 
+When an SBOM retry cannot find its own attempt's handoff, use the
+[producer-rooted retry plan](docs/ci-security.md#recover-a-missing-sbom-handoff-on-a-check-retry).
+
 The PR-only `prior revision database compatibility` job gates `ci-ok` for
 schema, migration, grant and lane inputs. It upgrades a disposable copy of
 the merge-base database with both candidate migration chains, the web
@@ -419,6 +422,35 @@ and any authorized manual Actions run also stay on GitHub.
 
 ### Exact-head CI evidence
 
+Before opening a PR or editing its description, preflight the draft from the
+repository root on the PR branch with the proposed source and tests committed
+to `HEAD`.
+
+```sh
+python3 scripts/ci/pr_verification_preflight.py \
+  --title 'fix(scope): describe the change' --body-file /path/to/pr.md
+```
+
+The command runs offline and loads the standards checker from the local target
+commit. Use `--base` to select a trusted local ref other than `origin/main` and
+`--pr-number` when editing an existing PR. The evidence and squash checks use
+the parsers in your checkout.
+
+For setup on x86-64 Linux, install the
+[pinned evidence wheels](.github/scripts/pr-evidence-requirements.txt) in a
+CPython 3.12 virtual environment with
+`python3 -m pip --isolated install --no-deps --only-binary=:all: --require-hashes -r .github/scripts/pr-evidence-requirements.txt`.
+Set `PYTHONPATH` to the `.github/scripts` directory from the `TogetherWeOwn/.github`
+revision pinned in the [evidence workflow](.github/workflows/pr-evidence.yml).
+Copy the [squash parser manifests](scripts/fixtures/commit-parser) to a scratch
+directory, run `npm ci --prefix "$parser_dir" --ignore-scripts --no-audit --no-fund`
+with `parser_dir` set to that directory, and set `NODE_PATH` to its `node_modules`.
+
+Use the job summary for Actions URLs. Write Verification commands as bullets
+with inline code and record the complete focused test results, including skips
+or omissions. Local preflight checks metadata and test declarations. The hosted
+checks and review requirements below still apply.
+
 Record commands and results in Verification. Follow the Actions summary links
 to confirm attested tests and report skips or omissions. `pr-evidence` resolves
 Python and Rust declarations and literal `.ts`, `.js`, `.mjs`, and `.cjs` titles.
@@ -451,6 +483,27 @@ using the intended policy and call `matches_current` with fresh PR metadata
 before use. The synthetic `pull_request.edited` fixture re-evaluates current
 evidence at the same head. The live advisory workflow does not consume these
 helpers.
+
+The dormant [description receipt contract](.github/scripts/pr_evidence_receipt.py)
+binds a passing verifier snapshot to the repository, PR, base and head SHAs,
+protected workflow revision, run, attempt and verification job. It reuses the
+verifier's digest of exactly the UTF-8 description passed to validation and
+rechecked afterward. Line endings, whitespace and Unicode code points are
+preserved. A null description is read as empty. The receipt contains no body text.
+
+For offline matching, obtain the expected snapshot from a fresh PR read and the
+run and jobs from GitHub's attempt-specific endpoints. Authenticate the protected
+workflow revision and the receipt's origin in the exact verification job
+independently of the receipt. Supply those identities to `matches_receipt` with
+the receipt decoded as a JSON object with unique keys. The run must state its
+attempt explicitly. A job may omit `run_attempt` only when its authoritative run
+identifies attempt 1 and the job comes from that attempt's jobs endpoint. Every
+rerun must state the matching attempt on the job. Missing or unmatched provenance,
+PR association, attempt identity or successful verification yields no
+authoritative result.
+The advisory run metadata does not prove a protected workflow revision or the
+origin of a receipt. Its workflow therefore leaves receipt issuance dormant.
+Matching a receipt establishes what that attempt verified at its last read.
 
 Keep `pr-evidence` advisory until a supported registration path binds the required
 verdict to the protected workflow, exact head and current PR description. It must

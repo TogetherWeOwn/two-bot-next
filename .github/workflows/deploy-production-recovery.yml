@@ -47,9 +47,15 @@ jobs:
     outputs:
       stopped: ${{ steps.stop.outputs.ack }}
     steps:
-      - &checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with: {ref: "${{ github.sha }}", persist-credentials: false, fetch-depth: 1}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: "${{ github.sha }}"
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout: |
+            scripts
+            wrangler/scripts
+          sparse-checkout-cone-mode: true
       - &node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: {node-version: 22, package-manager-cache: false}
@@ -81,7 +87,9 @@ jobs:
       artifact_id: ${{ steps.result.outputs.artifact-id }}
       archive_sha256: ${{ steps.result.outputs.artifact-digest }}
     steps:
-      - *checkout
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: "${{ github.sha }}", persist-credentials: false, fetch-depth: 1}
       - name: Build the inverse runner from the trusted workflow commit
         run: cargo build -p two-bot-cutover --bin staging-migrate --locked
       - name: Verify the stopped fence and run the inverse

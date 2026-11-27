@@ -1,11 +1,13 @@
 """Small loopback Discord double based on the startup exchange in alive.rs."""
 
 import base64
+from contextlib import closing
 from functools import partial
 import hashlib
-from http.client import HTTPConnection, RemoteDisconnected
+from http.client import HTTPConnection, HTTPException, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import socket
 import struct
 from threading import Event
@@ -17,12 +19,25 @@ from script_intake import decode_legacy_json, unique_object
 GUILD = "222200000000000001"
 APP = "1111"
 TOKEN = "offline-predecessor-fixture"
+APPLICATION = "/api/v10/applications/@me"
 COMMANDS = f"/api/v10/applications/{APP}/guilds/{GUILD}/commands"
-GATEWAY = "ws://127.0.0.1:8081"
+PORT = 8081
+REST = f"http://127.0.0.1:{PORT}"
+GATEWAY = f"ws://127.0.0.1:{PORT}"
+HELLO = {"op": 10, "d": {"heartbeat_interval": 45000}}
+RESERVATION_HEADER = "X-Offline-Pre-Reservation"
+RESERVATION = os.environ.get("OFFLINE_PRE_RESERVATION")
 RELEASE = Event()
 READY_SENT = Event()
 # Decode byte-capped inputs with the standard decoder's nesting limit.
 decode_json = partial(decode_legacy_json, object_pairs_hook=unique_object, parse_constant=int)
+
+
+def websocket_accept(key):
+    # SHA-1 is the WebSocket handshake protocol constant.
+    digest = hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode(),
+                          usedforsecurity=False).digest()
+    return base64.b64encode(digest).decode()
 
 
 class Discord(BaseHTTPRequestHandler):
@@ -31,6 +46,11 @@ class Discord(BaseHTTPRequestHandler):
 
     def log_message(self, *_):
         pass
+
+    def end_headers(self):
+        if RESERVATION is not None:
+            self.send_header(RESERVATION_HEADER, RESERVATION)
+        super().end_headers()
 
     def reply(self, data, code=200):
         body = json.dumps(data, allow_nan=False).encode()
@@ -51,7 +71,7 @@ class Discord(BaseHTTPRequestHandler):
         else:
             routes = {
                 "/api/v10/users/@me": {"id": "999", "bot": True},
-                "/api/v10/applications/@me": {"id": APP},
+                APPLICATION: {"id": APP},
                 f"/api/v10/guilds/{GUILD}": {"id": GUILD, "name": "Offline fixture"},
                 f"/api/v10/guilds/{GUILD}/scheduled-events": [],
                 COMMANDS: [],
@@ -98,17 +118,14 @@ class Discord(BaseHTTPRequestHandler):
         if not key:
             self.reply({}, 400)
             return
-        # SHA-1 is the WebSocket handshake protocol constant.
-        digest = hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode(),
-                              usedforsecurity=False).digest()
         self.send_response_only(101)
         self.send_header("Connection", "Upgrade")
         self.send_header("Upgrade", "websocket")
-        self.send_header("Sec-WebSocket-Accept", base64.b64encode(digest).decode())
+        self.send_header("Sec-WebSocket-Accept", websocket_accept(key))
         self.end_headers()
         self.connection.settimeout(45)
         try:
-            self.send_frame({"op": 10, "d": {"heartbeat_interval": 45000}})
+            self.send_frame(HELLO)
             while header := self.rfile.read(2):
                 opcode, size = header
                 if opcode != 0x81 or not size & 0x80 or size == 0xff:
@@ -133,8 +150,54 @@ class Discord(BaseHTTPRequestHandler):
             return
 
 
+def check_peers(reservation, port=PORT):
+    """Exercise both protocol listeners without releasing Gateway READY."""
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    upgrade = {"Connection": "Upgrade", "Upgrade": "websocket", "Sec-WebSocket-Key": key,
+               "Sec-WebSocket-Version": "13"}
+
+    def observe(path, headers, status, payload_matches):
+        try:
+            with closing(HTTPConnection("127.0.0.1", port, timeout=3)) as connection:
+                connection.request("GET", path, headers=headers)
+                with connection.getresponse() as response:
+                    return (response.status == status
+                            and response.headers.get_all(RESERVATION_HEADER) == [reservation]
+                            and payload_matches(response))
+        except (HTTPException, OSError, ValueError, RecursionError):
+            return False
+
+    def single(response, name):
+        # Refuse a repeated security-sensitive header instead of picking one copy.
+        values = response.headers.get_all(name) or []
+        return values[0] if len(values) == 1 else None
+
+    def gateway_hello(response):
+        connection_tokens = {token.strip().lower() for token in (single(response, "Connection") or "").split(",")}
+        if ("upgrade" not in connection_tokens
+                or (single(response, "Upgrade") or "").lower() != "websocket"
+                or single(response, "Sec-WebSocket-Accept") != websocket_accept(key)):
+            return False
+        frame = response.fp.read(2)
+        if len(frame) != 2 or frame[0] != 0x81 or not 0 < frame[1] <= 125:
+            return False
+        payload = response.fp.read(frame[1])
+        return len(payload) == frame[1] and decode_json(payload) == HELLO
+
+    def rest_application(response):
+        # One declared length lets read() refuse a truncated body (IncompleteRead).
+        if (single(response, "Content-Length") is None or response.length is None
+                or response.length > 4096):
+            return False
+        return decode_json(response.read()) == {"id": APP}
+
+    return {"gateway": observe("/?v=10&encoding=json", upgrade, 101, gateway_hello),
+            "rest": observe(APPLICATION, {"Authorization": f"Bot {TOKEN}", "Connection": "close"},
+                            200, rest_application)}
+
+
 def request(target, path):
-    port = {"mock": 8081, "bot": 8080}[target]
+    port = {"mock": PORT, "bot": 8080}[target]
     connection = HTTPConnection("127.0.0.1", port, timeout=3)
     try:
         connection.request("GET", path)
@@ -153,6 +216,10 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:
         if {name for _, name in socket.if_nameindex()} != {"lo"}:
             sys.exit("Discord fixture requires a loopback-only network namespace")
-        ThreadingHTTPServer(("127.0.0.1", 8081), Discord).serve_forever()
+        if not RESERVATION:
+            sys.exit("Discord fixture requires a reservation marker")
+        ThreadingHTTPServer(("127.0.0.1", PORT), Discord).serve_forever()
+    elif len(sys.argv) == 3 and sys.argv[1] == "--check-peers":
+        print(json.dumps(check_peers(sys.argv[2])))
     else:
         print(json.dumps(request(*sys.argv[1:])))

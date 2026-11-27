@@ -10,6 +10,7 @@ PRODUCTION_RELEASE_GROUP = (
 )
 PRODUCTION_GROUP = "${{ inputs.release_plan_run_id != '' && format('deploy-production-release-job-{0}', github.run_id) || github.run_attempt != 1 && needs.guard.outputs.mode != 'rollback' && needs.guard.outputs.allow_unstaged != 'true' && format('deploy-production-refused-{0}-{1}', github.run_id, github.run_attempt) || 'deploy-production' }}"
 CONTRACT = json.loads((Path(__file__).parent / "fixtures/staging_soak_contract.json").read_text())
+BEGIN_CHECKOUT = CONTRACT["reusable"]["jobs"]["begin"]["steps"][1]
 
 
 def admitted_soak(workflows):
