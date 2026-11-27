@@ -24,7 +24,10 @@ from runner_policy import (
     PUBLIC_RUNNER, RUST_TESTS_RUNNER, SUPPLY_CHAIN_PR_GATES, expected_runner,
 )
 from staging_pre_reaper_policy import PRE_REAPER, PRE_REAPER_QUEUE, dormant_pre_reaper_errors
-from staging_soak_policy import PRODUCTION_GROUP, PRODUCTION_RELEASE_GROUP, SOAK as STAGING_SOAK, admitted_soak, soak_view
+from staging_soak_policy import (
+    BEGIN_CHECKOUT as SOAK_BEGIN_CHECKOUT, PRODUCTION_GROUP, PRODUCTION_RELEASE_GROUP,
+    SOAK as STAGING_SOAK, admitted_soak, soak_view,
+)
 from voice_measurement_policy import (
     CALLS as MEASUREMENT_CALLS, GUARDS as MEASUREMENT_GUARDS, STAGING_JOBS as MEASUREMENT_STAGING_JOBS,
     TARGET as MEASUREMENT_TARGET, WORKFLOW as MEASUREMENT, is_measurement_caller, measurement_queue,
@@ -703,9 +706,10 @@ def staging_gateway_injection_errors(workflows):
 
 
 ERROR_RATE_EXPRESSION = "${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'true' || 'false' }}"
+ERROR_RATE_GATE_SCRIPT = "promotion-error-gate.mjs"
 ERROR_RATE_MARKERS = (
     "inject_error_rate_spike", "INJECT_ERROR_RATE_SPIKE",
-    "promotion-error-gate.mjs", "error-rate-gate.json",
+    ERROR_RATE_GATE_SCRIPT, "error-rate-gate.json",
 )
 
 
@@ -801,9 +805,17 @@ def staging_error_rate_gate_errors(workflows):
     for name, workflow in workflows.items():
         if name in ("deploy-staging.yml", "deploy-production.yml"):
             continue
+        dependency_mentions = 0
+        if name == STAGING_SOAK and admitted_soak(workflows):
+            # The metrics client imports this file. Only count its exact checkout entries.
+            for job in ("begin", "finish"):
+                checkout = workflow["jobs"][job]["steps"][1]["with"]
+                if f"/wrangler/scripts/{ERROR_RATE_GATE_SCRIPT}" in checkout.get("sparse-checkout", "").splitlines():
+                    dependency_mentions += 1
         text = str(workflow)
         for marker in ERROR_RATE_MARKERS:
-            if marker in text:
+            allowed_mentions = dependency_mentions if marker == ERROR_RATE_GATE_SCRIPT else 0
+            if text.count(marker) > allowed_mentions:
                 errors.append(f"{name}: error-rate gate marker {marker} outside deploy-staging/deploy-production")
     staging = workflows.get("deploy-staging.yml") or {}
     text = str(staging)
@@ -3276,8 +3288,13 @@ def production_errors(workflow):
     if [step.get("name") for step in soak_steps] != expected_names:
         errors.append(f"{name}:soak: must keep startup/baseline/measurement/sample/recheck/release/artifact order")
     else:
-        checkout = soak_steps[0]
-        if checkout.get("with") != {"ref": "${{ github.sha }}", "persist-credentials": "false", "fetch-depth": "1"}:
+        # Match the reviewed begin checkout and independently pin its source and credential settings.
+        expected_checkout = {
+            **SOAK_BEGIN_CHECKOUT,
+            "with": {**SOAK_BEGIN_CHECKOUT["with"], "ref": "${{ github.sha }}",
+                     "persist-credentials": "false", "fetch-depth": "1"},
+        }
+        if soak_steps[0] != expected_checkout:
             errors.append(f"{name}:soak: tooling must come from the workflow head without persisted credentials")
         receipt = "${{ runner.temp }}/staging-soak-use.ndjson"
         control = {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
@@ -8483,8 +8500,7 @@ class WorkflowTests(unittest.TestCase):
                     label,
                 )
                 self.assertTrue(workflow_policy_errors(changed), label)
-        # Any other workflow mentioning the gate at all is a forwarding
-        # route, whatever the surrounding shape.
+        # Rehearsal inputs must never be forwarded to other workflows.
         for name in ("check.yml",):
             with self.subTest(forwarded=name):
                 changed = deepcopy(workflows)
@@ -8492,6 +8508,22 @@ class WorkflowTests(unittest.TestCase):
                 job.setdefault("env", {})["FORWARD"] = "${{ inputs.inject_error_rate_spike }}"
                 self.assertTrue(staging_error_rate_gate_errors(changed))
                 self.assertTrue(workflow_policy_errors(changed))
+
+    def test_soak_checkout_import_does_not_allow_error_rate_gate_execution(self):
+        self.assertEqual(staging_error_rate_gate_errors(self.workflows), [])
+        diagnostic = (f"{STAGING_SOAK}: error-rate gate marker {ERROR_RATE_GATE_SCRIPT} "
+                      "outside deploy-staging/deploy-production")
+        for job in ("begin", "finish"):
+            with self.subTest(job=job):
+                changed = deepcopy(self.workflows)
+                steps = changed[STAGING_SOAK]["jobs"][job]["steps"]
+                steps.append({"run": f"node wrangler/scripts/{ERROR_RATE_GATE_SCRIPT}"})
+                self.assertIn(diagnostic, staging_error_rate_gate_errors(changed))
+
+        changed = deepcopy(self.workflows)
+        checkout = changed[STAGING_SOAK]["jobs"]["begin"]["steps"][1]["with"]
+        checkout["sparse-checkout"] += f"/wrangler/scripts/{ERROR_RATE_GATE_SCRIPT}\n"
+        self.assertIn(diagnostic, staging_error_rate_gate_errors(changed))
 
     def test_production_fault_inputs_absent_and_recovery_chain_stays_red(self):
         text = (ROOT / ".github/workflows/deploy-production.yml").read_text()
@@ -9469,6 +9501,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(transaction["env"].get("RELEASE_PREFLIGHT_EPOCH"), "${{ needs.release-prepare.outputs.epoch }}")
 
     def test_soak_rejects_unsafe_handoffs(self):
+        self.assertTrue(admitted_soak(self.workflows))
         for mutate in (
             lambda w: w["deploy-production.yml"]["jobs"]["soak"]["secrets"].pop("STAGING_METRICS_SCRAPE_TOKEN"),
             lambda w: w[STAGING_SOAK]["jobs"]["finish"]["needs"].remove("voice"),
@@ -9481,6 +9514,19 @@ class WorkflowTests(unittest.TestCase):
             self.assertFalse(admitted_soak(changed))
         start_upload = self.workflows[STAGING_SOAK]["jobs"]["begin"]["steps"][-1]
         self.assertEqual(start_upload["if"], "always() && steps.staging-use-begin.outcome != 'skipped'")
+
+    def test_soak_rejects_checkout_missing_a_transitive_import(self):
+        self.assertTrue(admitted_soak(self.workflows))
+        for job in ("begin", "finish"):
+            with self.subTest(job=job):
+                changed = deepcopy(self.workflows)
+                steps = changed[STAGING_SOAK]["jobs"][job]["steps"]
+                checkout = deepcopy(steps[1])  # Break the YAML alias to mutate only this job.
+                paths = checkout["with"]["sparse-checkout"].splitlines(keepends=True)
+                paths.remove("/wrangler/src/metrics-scrape.ts\n")
+                checkout["with"]["sparse-checkout"] = "".join(paths)
+                steps[1] = checkout
+                self.assertFalse(admitted_soak(changed))
 
     def test_production_route_is_automatic_or_dispatch_and_gated(self):
         production = self.workflows["deploy-production.yml"]
@@ -9495,6 +9541,17 @@ class WorkflowTests(unittest.TestCase):
             workflow["jobs"]["soak"] = soak_view(self.workflows)
             change(workflow)
             return production_errors(workflow)
+
+        self.assertEqual(mutated(lambda w: None), [])
+        checkout_error = "deploy-production.yml:soak: tooling must come from the workflow head without persisted credentials"
+        for option, value in (("ref", "refs/heads/main"), ("persist-credentials", "true"),
+                              ("fetch-depth", "2"), ("sparse-checkout-cone-mode", "true"),
+                              ("sparse-checkout", "/wrangler/scripts/staging-use-pipeline.mjs\n")):
+            with self.subTest(checkout_option=option):
+                self.assertIn(checkout_error, mutated(
+                    lambda w: w["jobs"]["soak"]["steps"][0]["with"].update({option: value})))
+        self.assertIn(checkout_error, mutated(
+            lambda w: w["jobs"]["soak"]["steps"][0].update({"uses": "actions/checkout@main"})))
 
         for trigger in ("push", "pull_request", "schedule", "workflow_run", "workflow_call"):
             with self.subTest(trigger=trigger):
