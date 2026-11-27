@@ -17,9 +17,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import production_recovery_artifact as artifacts
 import production_recovery_workflow as recovery
 import production_release as release_cli
+import production_release_interrupted as interrupted
 import production_release_preflight as preflight
 import staging_recovery_status
 from production_recovery_takeover import RecoveryPin
+from staging_migrate_approval import digest_json
 from staging_rollout import GateError
 from test_production_recovery_artifact import artifact_archive, producer, release_run_fixture
 from worker_container_rollback import require_ordinary_production_rollback, source_has_attendance_schema
@@ -45,6 +47,38 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.observe = Mock(side_effect=lambda: deepcopy(self.state))
         self.control = Mock()
         self.rollback = Mock()
+
+    def test_interrupted_restore_planning_requires_current_exact_inverse(self):
+        pin, plan = self.pin, self.case["plan"]
+        release = Mock(candidate_sha=pin.candidate_sha, rollback_sha=pin.rollback_sha, rollback_worker=pin.worker_version,
+                       rollback_image=pin.image_digest, application_id=pin.application_id, namespace_id=pin.namespace_id)
+        intent = {"epoch": pin.fence_epoch - 1}
+        admission = {"binding": {"run_id": "456", "workflow_sha": "d" * 40, "stop_intent": intent}, "phase": "stopped"}
+        decision = {"admission": admission, "classification": {
+            "state": "post", "attendance_fence_sha256": pin.attendance_fence_sha256}}
+        exact = interrupted.recovery_pin(release, pin.run_id, pin.fence_epoch, plan, pin.attendance_fence_sha256)
+        result = {"state": "restored", **asdict(exact)}
+        proof = {"decision_sha256": digest_json(decision), "result": result}
+        for inverse, refusal, may_plan in (
+            (GateError("unavailable"), "unavailable", False),
+            ({**proof, "result": {**result, "worker_version": self.candidate[0]}}, "production_inverse_readback_mismatch", False),
+            ({**proof, "decision_sha256": "0" * 64}, "production_interrupted_inverse_decision_changed", False),
+            (proof, "fixture reached provider planning", True),
+        ):
+            planner = Mock(side_effect=GateError("fixture reached provider planning"))
+            context = (release, {"id": int(pin.run_id)}, "121", plan, {}, pin.fence_epoch)
+            with (self.subTest(refusal=refusal), TemporaryDirectory() as temp,
+                  patch.multiple(interrupted, interrupted_release_context=Mock(return_value=context),
+                                 stop_intent=Mock(return_value=intent), packet=Mock(side_effect=[admission, decision, inverse]),
+                                 environment_policy=planner)):
+                env = dict(GITHUB_RUN_ID="456", GITHUB_SHA="d" * 40, RUNNER_TEMP=temp)
+                with self.assertRaisesRegex(GateError, f"^{refusal}$"):
+                    interrupted.execute(["restart"], env, Mock())
+                self.assertEqual(planner.call_count, int(may_plan))
+                self.assertFalse((Path(temp) / "interrupted-production-release/production-release-interrupted-restored.json").exists())
+                self.assertEqual(interrupted.packet.call_args.args[3:6], (
+                    (interrupted.CLASSIFY_STEP, interrupted.DECISION_STEP, *interrupted.INVERSE_STEPS),
+                    interrupted.INVERSE, "INVERSE"))
 
     def test_inverse_requires_exact_durable_stop_and_protected_job_success(self):
         run = self.case["run"]

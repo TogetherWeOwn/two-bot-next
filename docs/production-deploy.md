@@ -326,9 +326,9 @@ fail closed, retain evidence and safely release or expire; hold and route the
 missing proof rather than renew or promote. This holder does not authorize B2.
 Lifecycle NDJSON and available
 measurement JSON are always retained as
-`staging-soak[-start]-<run_id>-<run_attempt>` for seven days. The soak runs outside the
-`deploy-production` lane — only the `production` job holds it in this workflow —
-so a staging wait never queues an operator production rollback behind it. A `recheck`
+`staging-soak[-start]-<run_id>-<run_attempt>` for seven days. Automatic soak runs
+outside `deploy-production`. Protected attendance dispatch holds that lane
+through soak and recovery, so operator rollbacks queue behind it. A `recheck`
 job waits for the soak and both gates, then re-reads the disable, the hold,
 the live revision and the active dispatches immediately before the deploy: a
 disable set, a hold set, a target gone live or stale, or an operator dispatch queued, waiting or in
@@ -1028,17 +1028,14 @@ policy pins this ordering, condition, local snapshot command and red outcome.
 Without a takeover or a successful deploy/snapshot the run fails for the
 operator; a failed restore is never a reason to wait for the next deployment.
 
-The reusable `deploy-production-recovery.yml` provides the recovery phase for
-the protected attendance release. Its parent must hold the production lane
-and supply the approved candidate and prior pair, both ledger digests and
-the original 0475 timestamp digest. It passes the approved PlanetScale host,
-database and branch as call inputs, which recovery matches to the authenticated
-plan and target fingerprint in every job. The production job
-confirms the stopped writer at the pinned epoch. The migration apply job
-authenticates that job before running the inverse with its scoped binding.
-The restore job authenticates the inverse artifact and rereads the stopped
-epoch before releasing ownership. The attendance expansion remains unavailable
-through the standalone production migration dispatch.
+### Protected attendance release
+
+Both protected dispatches refuse until activation. The caller binds the
+approved plan and staged artifact to the exact stopped writer and retains the
+runner artifact for 14 days. Standalone apply refuses attendance expansion.
+After activation, use an attempt-one protected main dispatch. Keep the writer
+fenced until classification and any required inverse are authenticated.
+Preserve the original attempt and evidence. [Recovery guide](#recovery-after-the-protected-workflow-ships)
 
 After the production rollback script posts a Worker restore once,
 it checks the current deployment immediately. A valid but nonmatching serving

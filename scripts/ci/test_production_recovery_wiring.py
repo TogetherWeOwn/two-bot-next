@@ -1,12 +1,15 @@
 """Pin the protected workflow and legacy rollback entry points."""
 
+from contextlib import redirect_stdout
 from hashlib import sha256
+from io import StringIO
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import yaml
 
@@ -78,6 +81,23 @@ class RecoveryWiringTests(unittest.TestCase):
                     self.assertEqual(result.returncode, expected, result.stderr)
                     self.assertEqual(bool(runner.stat().st_mode & 0o100), expected == 0)
 
+    def test_interrupted_dispatch_never_enters_ordinary_or_forward_deploy(self):
+        jobs = yaml.safe_load((ROOT / ".github/workflows/deploy-production.yml").read_text())["jobs"]
+        guard = jobs["guard"]["steps"][0]
+        self.assertEqual(guard["env"].get("RELEASE_RECOVERY_RUN_ID"), "${{ inputs.release_recovery_run_id }}")
+        env = {"GITHUB_REPOSITORY": "TogetherWeOwn/two-bot-next", "EVENT_NAME": "workflow_dispatch",
+               "GITHUB_REF": "refs/heads/main", "GITHUB_RUN_ATTEMPT": "1", "AUTO_DISABLED": "true",
+               "TAKEOVER": "true", "ALLOW_UNSTAGED": "false", "CUTOVER_HOLD": "false", "RELEASE_RECOVERY_RUN_ID": "41"}
+        with (patch.dict(os.environ, env, clear=True), redirect_stdout(StringIO()) as stdout,
+              patch("subprocess.check_output", side_effect=AssertionError("unexpected GitHub call")),
+              patch("urllib.request.urlopen", side_effect=AssertionError("unexpected provider call")),
+              self.assertRaises(SystemExit) as refused):
+            exec(compile(guard["run"], "deploy-production guard", "exec"), {})
+        self.assertEqual(refused.exception.code, 1)
+        self.assertIn("interrupted recovery requires the activation follow-up", stdout.getvalue())
+        self.assertIn("needs.guard.outputs.mode != 'interrupted-recovery'", jobs["production"]["if"])
+        self.assertEqual(jobs["release-reconcile"]["name"], "Production release / Reconcile interrupted apply")
+
     def test_interrupted_recovery_isolates_database_and_authenticates_restart(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production-interrupted.yml").read_text())
         self.assertEqual(set(workflow[True]), {"workflow_call"})
@@ -99,7 +119,7 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertIn("DECISION_ARCHIVE_SHA256", restart["env"])
         self.assertIn("INVERSE_ARCHIVE_SHA256", restart["env"])
 
-    def test_release_plan_target_fingerprint_reaches_prepare_and_apply(self):
+    def test_release_plan_target_fingerprint_reaches_each_consumer(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production.yml").read_text())
         jobs = workflow["jobs"]
         plan = jobs["release-plan"]
@@ -107,10 +127,24 @@ class RecoveryWiringTests(unittest.TestCase):
                          "${{ steps.release-target.outputs.target-fingerprint }}")
         producer = next(step for step in plan["steps"] if step.get("id") == "release-target")
         self.assertEqual(producer["run"], "python3 scripts/production_release.py plan")
-        for phase in ("release-prepare", "release-apply"):
+        fingerprint = "${{ needs.release-plan.outputs.target-fingerprint }}"
+        for phase in ("release-prepare", "release-apply", "production", "release-recover"):
             self.assertIn("release-plan", jobs[phase]["needs"], phase)
-            self.assertEqual(jobs[phase]["env"].get("RELEASE_TARGET_FINGERPRINT"),
-                             "${{ needs.release-plan.outputs.target-fingerprint }}", phase)
+        for phase in ("release-prepare", "release-apply"):
+            self.assertEqual(jobs[phase]["env"].get("RELEASE_TARGET_FINGERPRINT"), fingerprint, phase)
+        self.assertEqual(jobs["release-prepare"]["outputs"].get("epoch"), "${{ steps.preflight.outputs.epoch }}")
+        epoch = "${{ needs.release-prepare.outputs.epoch }}"
+        for phase in ("production", "release-recover"):
+            self.assertIn("release-prepare", jobs[phase]["needs"], phase)
+        commands = {"python3 scripts/production_release.py authorize-deploy",
+                    "python3 scripts/production_release.py takeover"}
+        consumers = [step for step in jobs["production"]["steps"] if step.get("run") in commands]
+        self.assertEqual(len(consumers), 3)
+        for step in consumers:
+            self.assertEqual(step["env"].get("RELEASE_TARGET_FINGERPRINT"), fingerprint, step["name"])
+            self.assertEqual(step["env"].get("RELEASE_PREFLIGHT_EPOCH"), epoch, step["name"])
+        self.assertEqual(jobs["release-recover"]["with"].get("target-fingerprint"), fingerprint)
+        self.assertEqual(jobs["release-recover"]["with"].get("preflight-epoch"), epoch)
 
     def test_release_retains_the_stop_intent_before_stopping(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production.yml").read_text())
@@ -122,6 +156,14 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertEqual(upload["name"], "production-release-stop-intent-${{ github.run_id }}-${{ github.run_attempt }}")
         self.assertEqual(upload["if-no-files-found"], "error")
         self.assertTrue(upload["path"].endswith("/production-release-stop-intent.json"))
+
+    def test_protected_rollout_verifies_identity_before_takeover(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/deploy-production.yml").read_text())
+        jobs = workflow["jobs"]
+        steps = jobs["production"]["steps"]
+        names = [step.get("name") for step in steps]
+        self.assertLess(names.index("Verify the exact protected Worker and configured image before takeover"),
+                        names.index("Take over only the Worker produced by this protected upload"))
 
     def test_workflow_keeps_secrets_scoped_and_all_three_rollbacks_share_the_guard(self):
         path = ROOT / ".github/workflows"

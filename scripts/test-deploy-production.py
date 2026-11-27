@@ -48,6 +48,10 @@ AUTO_ROLLBACK_STEP = "Auto-roll back Worker version and container image"
 SNAPSHOT_STEP = "Snapshot the pre-deploy rollback state"
 IMAGE = "registry.cloudflare.com/acct/two-bot-next-twobotcontainer-production@sha256:" + "c" * 64
 WRANGLER_ACTION = "cloudflare/wrangler-action@"
+RECOVERY_WORKFLOWS = {
+    "release-recover": "./.github/workflows/deploy-production-recovery.yml",
+    "release-reconcile": "./.github/workflows/deploy-production-interrupted.yml",
+}
 # R1 short-SHA fixtures (TOG-28737 acceptance; builder TOG-28741 must not edit
 # these). SHORT_UNAMBIGUOUS is a 12-char prefix of SHA that resolves uniquely;
 # AMBIGUOUS_PREFIX is a 7-char prefix shared with COLLIDING_SHA and must refuse.
@@ -343,7 +347,7 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual(value(unstaged["default"]), "false")
         # Unknown inputs are rejected by GitHub before a production run.
         self.assertEqual(set(inputs), {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold",
-                                       "release_plan_run_id", "release_pins"})
+                                       "release_plan_run_id", "release_pins", "release_recovery_run_id"})
         self.assertNotIn("inject_error_rate_spike", "\n".join(LINES))
         self.assertNotIn("INJECT_ERROR_RATE_SPIKE", "\n".join(LINES))
         self.assertNotIn("inject_gateway_failure", "\n".join(LINES))
@@ -360,7 +364,7 @@ class StaticGuardTests(unittest.TestCase):
         # new schema and waives the ledger check inside the reviewed gate
         # script, never here.
         self.assertEqual(value(production["needs"]), "[guard, soak, recheck, schema-gate, roles-gate, "
-                         "staging-soak-evidence, release-prepare, release-apply]")
+                         "staging-soak-evidence, release-plan, release-prepare, release-apply]")
         for gate in ("schema-gate", "roles-gate"):
             condition = value(children(JOBS[gate][1:], 4)["if"])
             self.assertEqual(condition, '"!cancelled() && needs.guard.result == \'success\' '
@@ -369,6 +373,7 @@ class StaticGuardTests(unittest.TestCase):
                 "&& needs.guard.outputs.skip == ''\"")
         production_if = value(children(JOBS["production"][1:], 4)["if"])
         self.assertIn("needs.guard.outputs.mode == 'rollback'", production_if)
+        self.assertIn("needs.guard.outputs.mode != 'interrupted-recovery'", production_if)
         self.assertIn("needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'", production_if)
         guard = children(JOBS["guard"][1:], 4)
         self.assertNotIn("environment", guard)
@@ -387,7 +392,7 @@ class StaticGuardTests(unittest.TestCase):
         global_lane = children(TOP["concurrency"][1:], 2)
         self.assertEqual(value(global_lane["group"]),
             "${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
-            "&& github.run_attempt == 1 && inputs.release_plan_run_id != '' "
+            "&& github.run_attempt == 1 && (inputs.release_plan_run_id != '' || inputs.release_recovery_run_id != '') "
             "&& 'deploy-production' || format('deploy-production-run-{0}-{1}', github.run_id, github.run_attempt) }}")
         self.assertEqual(value(global_lane["cancel-in-progress"]), "false")
         self.assertEqual(value(global_lane["queue"]), "max")
@@ -411,10 +416,17 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "soak",
                                       "staging-soak-evidence", "recheck",
                                       "promotion-skipped", "release-plan", "release-prepare", "release-apply",
-                                      "production"])
+                                      "production", "release-recover", "release-reconcile"])
         for name, job in JOBS.items():
-            runs_on = value(children(job[1:], 4)["runs-on"])
-            self.assertEqual(runs_on, "ubuntu-latest", name)
+            fields = children(job[1:], 4)
+            if name in RECOVERY_WORKFLOWS:
+                path = RECOVERY_WORKFLOWS[name]
+                self.assertEqual(value(fields["uses"]), path)
+                called = children((ROOT / path).read_text().splitlines(), 0)
+                for label, definition in children(called["jobs"][1:], 2).items():
+                    self.assertEqual(value(children(definition[1:], 4)["runs-on"]), "ubuntu-latest", label)
+            else:
+                self.assertEqual(value(fields["runs-on"]), "ubuntu-latest", name)
 
     def test_permissions_are_least_privilege(self):
         self.assertEqual(value(TOP["permissions"]), "{}")
@@ -423,7 +435,7 @@ class StaticGuardTests(unittest.TestCase):
         for name, job in JOBS.items():
             block = children(job[1:], 4)["permissions"]
             if value(block) == "*release-permissions":
-                self.assertIn(name, {"release-prepare", "release-apply"})
+                self.assertIn(name, {"release-prepare", "release-apply", *RECOVERY_WORKFLOWS})
                 block = release_permissions
             granted = {
                 key: value(permission)
@@ -440,21 +452,23 @@ class StaticGuardTests(unittest.TestCase):
                 # production Deployments for N, then record this one; plus
                 # read-only runs access to fetch the exact immutable staging
                 # artifact by ID for same-SHA promotion.
-                self.assertEqual(granted, {"contents": "read", "actions": "read", "deployments": "write"})
+                self.assertEqual(granted, {"contents": "read", "actions": "read", "checks": "read", "deployments": "write"})
                 continue
             if name.startswith("release-"):
                 self.assertEqual(granted, {"contents": "read", "actions": "read", "checks": "read"})
             self.assertEqual(set(granted.values()), {"read"}, name)
         self.assertEqual(
             set(children(children(JOBS["production"][1:], 4)["permissions"][1:], 6)),
-            {"contents", "actions", "deployments"},
+            {"contents", "actions", "checks", "deployments"},
         )
 
     def test_actions_are_pinned_and_wrangler_matches_staging(self):
-        uses = [line.split("uses:", 1)[1].strip() for line in LINES if "uses:" in line]
+        uses = [line.split("uses:", 1)[1].split(" #", 1)[0].strip() for line in LINES if "uses:" in line]
         self.assertTrue(uses)
+        self.assertCountEqual([ref for ref in uses if ref.startswith("./")], RECOVERY_WORKFLOWS.values())
         for ref in uses:
-            self.assertRegex(ref, r"^(?:\$/\.github/workflows/staging-soak\.yml$|[\w.-]+/[\w.-]+@[0-9a-f]{40}(?:,?\s|$))", ref)
+            if ref not in RECOVERY_WORKFLOWS.values():
+                self.assertRegex(ref, r"^(?:\$/\.github/workflows/staging-soak\.yml$|[\w.-]+/[\w.-]+@[0-9a-f]{40}(?:,?\s|$))", ref)
         staging = {
             line.split("uses:", 1)[1].split()[0]
             for line in STAGING.read_text().splitlines() if WRANGLER_ACTION in line
@@ -487,8 +501,8 @@ class StaticGuardTests(unittest.TestCase):
                                        "TAKEOVER: ${{ inputs.takeover }}",
                                        "CUTOVER_HOLD: ${{ inputs.cutover_hold }}"])
         production = "\n".join(JOBS["production"])
-        # The plan ID selects the protected lane; deploy steps use only validated inputs.
-        self.assertEqual(set(re.findall(r"inputs\.(\w+)", production)), {"release_plan_run_id"})
+        # Only the protected producer's plan ID and manifest pins can reach the production job.
+        self.assertEqual(set(re.findall(r"inputs\.(\w+)", production)), {"release_plan_run_id", "release_pins"})
         self.assertNotIn("INJECT_ERROR_RATE_SPIKE", production)
         self.assertNotIn("--rehearsal-firing", production)
         self.assertIn("ref: ${{ needs.guard.outputs.sha }}", production)
@@ -537,7 +551,7 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual(
             conditions[f"      - name: {AUTO_ROLLBACK_STEP}"],
             ["if: failure() && env.MODE == 'deploy' && env.TAKEOVER == 'true' "
-             "&& steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success'"],
+             "&& steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success' && inputs.release_plan_run_id == ''"],
         )
         production = "\n".join(JOBS["production"])
         self.assertIn("production-rollback-snapshot.json", production)
@@ -563,7 +577,7 @@ class StaticGuardTests(unittest.TestCase):
         # Ordinary promotions only, never tolerated: recovery never waits on it.
         self.assertEqual(
             conditions["      - name: Preflight the rollback target before production mutation"],
-            ["if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'"],
+            ["if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true' && inputs.release_plan_run_id == ''"],
         )
 
     def test_post_deploy_watch_runs_inside_the_lane_and_rolls_back_on_a_breach(self):
@@ -581,7 +595,7 @@ class StaticGuardTests(unittest.TestCase):
                           "&& env.TAKEOVER == 'true'"])
         self.assertEqual(
             conditions["      - name: Auto-roll back Worker version and container image after a watch breach"],
-            ["if: failure() && steps.watch.outputs.verdict == 'breach'"])
+            ["if: failure() && steps.watch.outputs.verdict == 'breach' && inputs.release_plan_run_id == ''"])
         watch_script = inline_script("Watch production for 30 minutes after the promotion")
         for needle in ("set -euo pipefail", "../tooling/scripts/post_deploy_watch.py",
                        '--sha "$SHA" --version "$NEW_VERSION"'):
@@ -675,12 +689,16 @@ class StaticGuardTests(unittest.TestCase):
         by_name = {step[0].strip(): step for step in steps(JOBS["production"])}
         for name in (preflight, status, reread, confirm):
             conditions = [line.strip() for line in by_name[name] if line.strip().startswith("if:")]
-            self.assertEqual(conditions, ["if: env.TAKEOVER == 'true'"], name)
+            expected = "if: env.TAKEOVER == 'true'"
+            if name == status:
+                expected += " && inputs.release_plan_run_id == ''"
+            self.assertEqual(conditions, [expected], name)
         # The mutating takeover POST runs in deploy mode only: rollback mode
         # already fenced, restored and handed ownership over in its own step.
         conditions = [line.strip() for line in by_name[takeover]
                       if line.strip().startswith("if:")]
-        self.assertEqual(conditions, ["if: env.TAKEOVER == 'true' && env.MODE == 'deploy'"], takeover)
+        self.assertEqual(conditions, ["if: env.TAKEOVER == 'true' && env.MODE == 'deploy' && inputs.release_plan_run_id == ''"],
+                         takeover)
         text = "\n".join(sum((by_name[name] for name in (preflight, status, takeover)), []))
         # Production bindings only: the control token comes from the
         # production Environment secret, the URL from its variable.
@@ -921,7 +939,7 @@ class StaticGuardTests(unittest.TestCase):
                                 if line.strip().startswith(("if:", "continue-on-error"))]
                       for step in steps(JOBS["production"])}
         self.assertEqual(conditions["      - name: Gate on regression against the production baseline"],
-                         ["if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'"])
+                         ["if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true' && inputs.release_plan_run_id == ''"])
         compare = inline_script("Gate on regression against the production baseline")
         for needle in ("set -euo pipefail", "../tooling/scripts/prod_passive_probe.py",
                        'if [ "$probe" -gt 1 ]', "../tooling/wrangler/scripts/rest-5xx-counters.mjs",
@@ -1497,6 +1515,7 @@ class GuardBehaviourTests(unittest.TestCase):
     def test_dormant_protected_dispatch_refuses_before_api_calls(self):
         for plan, pins, reason in (
             ("123", "{}", "protected release requires the activation follow-up"),
+            ("001", "{}", "with both release inputs"),
             ("123", "", "with both release inputs"),
             ("", "{}", "with both release inputs"),
         ):
