@@ -29,6 +29,20 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /wrangler/package.json
+            /wrangler/scripts/is-direct-invocation.mjs
+            /wrangler/scripts/ownership-control-response.mjs
+            /wrangler/scripts/staging-use-pipeline.mjs
+            /wrangler/scripts/staging-use.mjs
+            /wrangler/scripts/staging-voice-move-acceptance.mjs
+            /wrangler/scripts/staging-voice-move-caller.mjs
+            /wrangler/scripts/staging-voice-move-entry.mjs
+            /wrangler/scripts/staging-voice-move-job.mjs
+            /wrangler/scripts/staging-voice-session.mjs
+            /wrangler/scripts/staging-voice-web-handoff.mjs
+            /wrangler/src/request-id.ts
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22

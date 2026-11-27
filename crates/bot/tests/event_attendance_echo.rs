@@ -6,7 +6,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 use time::{Duration, OffsetDateTime};
 use two_bot::event_attendance::{
     planning::{OpenCapture, VoiceObservation},
@@ -153,6 +153,26 @@ async fn mapped_observation_through_recovery_to_signed_echo_read() {
     result.unwrap();
 }
 
+async fn stored_attendance<'e>(executor: impl PgExecutor<'e>, guild: &str) -> Value {
+    // Each limit is one row above the fixture's expected cardinality.
+    sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+            'keys', ARRAY(SELECT to_jsonb(k) FROM internal_event_keys k
+                          WHERE guild_id = $1 ORDER BY event_key LIMIT 3),
+            'instances', ARRAY(SELECT to_jsonb(w) FROM event_instance_windows w
+                               WHERE guild_id = $1 ORDER BY event_id, instance_starts_at LIMIT 3),
+            'windows', ARRAY(SELECT to_jsonb(w) FROM event_attendance_windows w
+                             WHERE guild_id = $1 ORDER BY event_key LIMIT 2),
+            'spans', ARRAY(SELECT to_jsonb(s) FROM event_voice_sessions s
+                           WHERE guild_id = $1 ORDER BY id LIMIT 2)
+        )",
+    )
+    .bind(guild)
+    .fetch_one(executor)
+    .await
+    .unwrap()
+}
+
 async fn exercise_echo(pool: PgPool) {
     let pool = &pool;
     // The read adapter binds this guild internally. The pool contains only fixture data.
@@ -287,8 +307,23 @@ async fn exercise_echo(pool: PgPool) {
     };
     let final_nonce = random_nonce();
     let successful = signed.issue(READ_BODY, now_secs, &final_nonce);
+    // Keep capture off after seeding. Only the signed reader runs between
+    // these snapshots. Its nonce burn is outside attendance storage.
+    let before_read = stored_attendance(pool, guild).await;
+    for (table, rows) in [("keys", 2), ("instances", 2), ("windows", 1), ("spans", 1)] {
+        assert_eq!(
+            before_read[table].as_array().unwrap().len(),
+            rows,
+            "{table}"
+        );
+    }
     // Web Echo can freeze this v1 result. A real but short visit has zero whole minutes.
     let finalized = pull_signed(&enabled, &successful).await.unwrap();
+    assert_eq!(
+        stored_attendance(pool, guild).await,
+        before_read,
+        "the finalized signed read must preserve stored attendance"
+    );
     assert_eq!(
         finalized,
         json!({
@@ -307,6 +342,26 @@ async fn exercise_echo(pool: PgPool) {
             "final": true,
         })
     );
+    // A timestamp outside the response projection still changes stored state.
+    let mut control = pool.begin().await.unwrap();
+    let changed = sqlx::query(
+        "UPDATE event_voice_sessions SET changed_at = changed_at + INTERVAL '1 second'
+         WHERE guild_id = $1 AND member_id = $2",
+    )
+    .bind(guild)
+    .bind(&member)
+    .execute(&mut *control)
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    assert_ne!(
+        stored_attendance(&mut *control, guild).await,
+        before_read,
+        "the snapshot must detect a stored change outside the read response"
+    );
+    control.rollback().await.unwrap();
+    assert_eq!(stored_attendance(pool, guild).await, before_read);
+
     assert_eq!(
         echo(PRE_ENABLE_BODY, &random_nonce()).await,
         Err(ReadRefusal::NotFound),
