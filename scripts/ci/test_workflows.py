@@ -2364,6 +2364,11 @@ PRIVACY_VERIFY_READ_ENV = {
 }
 PRIVACY_VERIFY_READ_COMMAND = ('python3 scripts/staging_privacy_verify_read.py --guild "$GUILD" '
                                '--output "staging-privacy-verify-read-$RUN_ID.json"')
+PRIVACY_VERIFY_READ_PATHS = (
+    "/scripts/staging_privacy_verify_read.py",
+    "/scripts/staging_automation_read_smoke.py",
+    "/scripts/script_intake.py",
+)
 
 
 def staging_privacy_verify_read_errors(workflow):
@@ -2439,11 +2444,12 @@ def staging_privacy_verify_read_errors(workflow):
         errors.append(f"{name}:read: must run exactly checkout, the read and the upload, unconditionally")
         return errors
     checkout, run, upload = steps
-    # Checkout defaults to this workflow's immutable head. No ref, repository,
-    # path or other override may replace the reviewed code before secrets bind.
-    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or checkout.get("with") != {"persist-credentials": "false", "fetch-depth": "1"}:
-        errors.append(f"{name}:read: checkout must be shallow, non-persisting and use the workflow head")
+    # Pin the exact sparse paths at the immutable workflow head before secrets bind.
+    if checkout.get("uses") != STAGING_CHECKOUT_USES or checkout.get("with") != {
+            "persist-credentials": "false", "fetch-depth": "1", "sparse-checkout-cone-mode": "false",
+            "sparse-checkout": "\n".join(PRIVACY_VERIFY_READ_PATHS) + "\n"}:
+        errors.append(f"{name}:read: checkout must be shallow, non-persisting and use the workflow head "
+                      "with only the reader's files")
     if run.get("env") != PRIVACY_VERIFY_READ_ENV:
         errors.append(f"{name}:read: Run step must bind exactly the four secrets, the guild and the run id")
     if run.get("run") != PRIVACY_VERIFY_READ_COMMAND or "uses" in run or "shell" in run:
@@ -6503,6 +6509,31 @@ class WorkflowTests(unittest.TestCase):
             r"--test lfg_interactions(?: --test \S+)* -- --ignored --test-threads=1",
         )
 
+    def test_community_db_bootstrap_is_ready_before_cargo(self):
+        job = self.workflows["check.yml"]["jobs"]["community-db"]
+        service = job["services"]["agent-testdb"]
+        self.assertNotIn("ports", service)
+        self.assertEqual(service["env"], {
+            "POSTGRES_USER": "agent_test",
+            "POSTGRES_DB": "two_bot_test_ci",
+            "POSTGRES_HOST_AUTH_METHOD": "trust",
+        })
+        self.assertEqual(
+            job["env"]["TWO_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        # TCP excludes the entrypoint's temporary socket-only server. A SQL
+        # connection also proves that the actual bootstrap database exists.
+        self.assertIn(
+            '--health-cmd "psql -X -w -h 127.0.0.1 -U agent_test '
+            '-d two_bot_test_ci -Atqc \'SELECT 1\'"',
+            service["options"],
+        )
+        self.assertNotRegex(
+            "\n".join(step.get("run", "") for step in job["steps"]),
+            r"\b(?:apt-get|createdb)\b",
+        )
+
     def test_tickets_postgres_acceptance_receives_disposable_database_url(self):
         job = self.workflows["check.yml"]["jobs"]["tickets-postgres"]
         prepare = next(
@@ -8694,6 +8725,22 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                 self.assertTrue(cloudflare_environment_errors(changed), label)
                 self.assertTrue(workflow_policy_errors(changed), label)
 
+    def test_predecessor_checkout_keeps_history_and_limits_worktree(self):
+        name = "build-predecessor.yml"
+        rejection = f"{name}: expected the pinned protected workflow"
+        self.assertNotIn(rejection, workflow_policy_errors(self.workflows))
+        steps = self.workflows[name]["jobs"]["build"]["steps"]
+        checkout = steps[0]["with"]
+        self.assertEqual(checkout["fetch-depth"], "0")
+        self.assertNotIn("filter", checkout)
+        self.assertNotIn("sparse-checkout", checkout)
+        prepare = next(step for step in steps if step.get("name") ==
+                       "Verify the protected input and export the reviewed tree")
+        self.assertEqual(prepare["run"].splitlines()[-2:], [
+            "git sparse-checkout set --cone scripts",
+            "python3 scripts/build_predecessor.py prepare",
+        ])
+
     def test_pinned_sha_is_dispatch_only_and_ancestor_checked(self):
         workflows = self.workflows
         staging = workflows["deploy-staging.yml"]
@@ -10746,6 +10793,13 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             "extra step": lambda w: job(w)["steps"].append({"run": "echo done"}),
             "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
                 {"persist-credentials": "true"}),
+            "changed checkout pin": lambda w: job(w)["steps"][0].update({"uses": "actions/checkout@v7"}),
+            "fetch filter override": lambda w: job(w)["steps"][0]["with"].update({"filter": "blob:none"}),
+            "cone mode": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout-cone-mode": "true"}),
+            "full checkout": lambda w: job(w)["steps"][0]["with"].pop("sparse-checkout"),
+            "broader checkout": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout": "/scripts/\n"}),
+            "missing transitive import": lambda w: job(w)["steps"][0]["with"].update(
+                {"sparse-checkout": "\n".join(PRIVACY_VERIFY_READ_PATHS[:-1]) + "\n"}),
             "extra secret": lambda w: job(w)["steps"][1]["env"].update(
                 {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
             "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
@@ -10782,6 +10836,34 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
         del missing["staging-privacy-verify-read.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_privacy_verify_read_starts_with_only_checkout_files(self):
+        checkout = self.workflows["staging-privacy-verify-read.yml"]["jobs"]["read"]["steps"][0]["with"]
+        self.assertEqual(checkout["sparse-checkout-cone-mode"], "false")
+        git_env = {"PATH": os.environ.get("PATH", os.defpath), "GIT_ALLOW_PROTOCOL": "file",
+                   "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        with tempfile.TemporaryDirectory(prefix="privacy-read-checkout-") as directory:
+            root = Path(directory) / "checkout"
+
+            def git(*args, stdin=None):
+                result = subprocess.run(
+                    ["git", "-c", f"safe.directory={ROOT}", *args], env=git_env,
+                    input=stdin, capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout
+
+            git("clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(root))
+            git("-C", root, "sparse-checkout", "set", "--no-cone", "--stdin", stdin=checkout["sparse-checkout"])
+            git("-C", root, "checkout", "--quiet", "--detach", "HEAD")
+            tracked = git("-C", root, "ls-files", "-z").split("\0")
+            materialized = {path for path in tracked if path and (root / path).is_file()}
+            self.assertEqual(materialized, {pattern[1:] for pattern in PRIVACY_VERIFY_READ_PATHS})
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", "scripts/staging_privacy_verify_read.py", "--help"],
+                cwd=root, env={}, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_staging_retention_census_shape_is_pinned(self):
         workflows = self.workflows
@@ -10995,6 +11077,30 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
         del missing["staging-ownership-status.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_inventory_sparse_checkout_is_pinned(self):
+        workflow = self.workflows["staging-ownership-status.yml"]
+        checkout = workflow["jobs"]["inventory"]["steps"][0]["with"]
+        self.assertEqual(checkout.get("sparse-checkout-cone-mode"), "false")
+        patterns = checkout["sparse-checkout"]
+        dependency = "/scripts/build_identity.py\n"
+        self.assertIn(dependency, patterns)
+        self.assertEqual(staging_ownership_status_errors(workflow), [])
+
+        for label, replacement in (
+            ("full tree", {}),
+            ("cone mode", {"sparse-checkout": patterns, "sparse-checkout-cone-mode": "true"}),
+            ("extra path", {"sparse-checkout": patterns + "/wrangler/\n", "sparse-checkout-cone-mode": "false"}),
+            ("missing transitive import", {"sparse-checkout": patterns.replace(dependency, ""),
+                                           "sparse-checkout-cone-mode": "false"}),
+        ):
+            with self.subTest(change=label):
+                mutant = deepcopy(workflow)
+                mutant_checkout = mutant["jobs"]["inventory"]["steps"][0]["with"]
+                mutant_checkout.pop("sparse-checkout")
+                mutant_checkout.pop("sparse-checkout-cone-mode")
+                mutant_checkout.update(replacement)
+                self.assertTrue(staging_ownership_status_errors(mutant))
 
     def test_slow_burn_tracker_reads_staging_bearer_and_isolates_fixtures(self):
         workflows = self.workflows
