@@ -101,7 +101,9 @@
             "with": {
               "ref": "${{ github.sha }}",
               "persist-credentials": "false",
-              "fetch-depth": "1"
+              "fetch-depth": "1",
+              "sparse-checkout-cone-mode": "false",
+              "sparse-checkout": "/scripts/build_identity.py\n/scripts/promotion_regression_gate.py\n/scripts/script_intake.py\n/scripts/staging_health_contract_probe.py\n/wrangler/package.json\n/wrangler/scripts/is-direct-invocation.mjs\n/wrangler/scripts/ownership-control-response.mjs\n/wrangler/scripts/promotion-error-gate.mjs\n/wrangler/scripts/rest-5xx-counters.mjs\n/wrangler/scripts/staging-soak-window.mjs\n/wrangler/scripts/staging-use-pipeline.mjs\n/wrangler/scripts/staging-use.mjs\n/wrangler/src/alert-rules.ts\n/wrangler/src/metrics-scrape.ts\n"
             }
           },
           {
@@ -193,7 +195,9 @@
             "with": {
               "ref": "${{ github.sha }}",
               "persist-credentials": "false",
-              "fetch-depth": "1"
+              "fetch-depth": "1",
+              "sparse-checkout-cone-mode": "false",
+              "sparse-checkout": "/scripts/build_identity.py\n/scripts/promotion_regression_gate.py\n/scripts/script_intake.py\n/scripts/staging_health_contract_probe.py\n/wrangler/package.json\n/wrangler/scripts/is-direct-invocation.mjs\n/wrangler/scripts/ownership-control-response.mjs\n/wrangler/scripts/promotion-error-gate.mjs\n/wrangler/scripts/rest-5xx-counters.mjs\n/wrangler/scripts/staging-soak-window.mjs\n/wrangler/scripts/staging-use-pipeline.mjs\n/wrangler/scripts/staging-use.mjs\n/wrangler/src/alert-rules.ts\n/wrangler/src/metrics-scrape.ts\n"
             }
           },
           {
