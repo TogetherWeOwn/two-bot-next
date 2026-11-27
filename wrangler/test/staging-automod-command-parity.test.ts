@@ -51,6 +51,15 @@ test("uses the authenticated guild scope for effective guild-only contexts", asy
   }
 });
 
+test("normalizes optional metadata on unrelated guild rows", async () => {
+  const { help, ping } = fixture.replies;
+  const unrelated = { ...help, guild_id: undefined, type: undefined };
+  assert.deepEqual(await verify([command, unrelated, ping]), { verdict: "pass" });
+  assert.deepEqual(await verify([command, unrelated, { ...help, id: ping.id }]), { verdict: "fail" });
+  assert.deepEqual(await verify([command, { ...unrelated, type: 4 }]), { verdict: "fail" });
+  assert.deepEqual(await verify([{ ...command, type: undefined }, unrelated]), { verdict: "fail" });
+});
+
 test("refuses malformed, absent and ambiguous command sets", async () => {
   const cases: [string, unknown][] = [
     ["non-list", command],

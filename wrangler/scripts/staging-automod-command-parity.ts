@@ -66,7 +66,10 @@ function matchesOption(value: unknown, expected: Option): boolean {
 function matchesCommand(row: Record<string, unknown>, pin: CommandRevision): boolean {
   const readOptions = row.options;
   const installations = row.integration_types;
-  return row.id === pin.id && row.version === pin.version && row.name === target.name && row.type === target.type
+  // The authenticated guild endpoint and explicit guild ID establish the
+  // effective context. Discord applies dm_permission and contexts to global commands.
+  return row.guild_id === target.guildId && row.id === pin.id && row.version === pin.version
+    && row.name === target.name && row.type === target.type
     && row.description === description && row.default_member_permissions === "32"
     && (row.default_permission === undefined || row.default_permission === true)
     && (installations == null || (Array.isArray(installations) && installations.length === 1 && installations[0] === 0))
@@ -82,13 +85,14 @@ function matchesRegistry(value: unknown, pin: CommandRevision): boolean {
   const names = new Set<string>();
   let matched = false;
   for (const row of value) {
-    // The authenticated guild endpoint and exact row IDs establish the only
-    // effective context. Discord applies dm_permission and contexts to global commands.
-    if (!record(row) || row.application_id !== target.applicationId || row.guild_id !== target.guildId
+    if (!record(row) || row.application_id !== target.applicationId
+      || (row.guild_id !== undefined && row.guild_id !== target.guildId)
       || !snowflake(row.id) || !snowflake(row.version) || typeof row.name !== "string"
-      || row.name.length === 0 || row.name.length > 32 || row.name.trim() !== row.name
-      || (row.type !== 1 && row.type !== 2 && row.type !== 3)) return false;
-    const key = `${row.type}:${row.name}`;
+      || !row.name.trim()) return false;
+    // The registry defaults an omitted type to slash for duplicate detection.
+    const type = row.type === undefined ? target.type : row.type;
+    if (type !== 1 && type !== 2 && type !== 3) return false;
+    const key = `${type}:${row.name}`;
     if (ids.has(row.id) || names.has(key)) return false;
     ids.add(row.id);
     names.add(key);
