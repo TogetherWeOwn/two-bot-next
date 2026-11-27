@@ -19,6 +19,18 @@ def workflow(name):
 
 
 class WorkflowHardeningTests(unittest.TestCase):
+    def test_pr_evidence_groups_only_main_pushes(self):
+        evidence = workflow("pr-evidence.yml")
+        self.assertEqual(evidence["concurrency"], {
+            "group": "pr-evidence-${{ github.event_name == 'push' && 'main' || "
+                     "github.event.pull_request.number || github.sha }}",
+            "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+        })
+        self.assertEqual(evidence["on"], {
+            "pull_request": {"types": ["opened", "edited", "synchronize", "reopened", "ready_for_review"]},
+            "push": {"branches": ["main"]},
+        })
+
     def test_setup_python_uses_github_distribution_with_reviewed_versions(self):
         pin = "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
         callers = (
