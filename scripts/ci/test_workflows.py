@@ -2580,7 +2580,17 @@ def staging_recovery_capture_errors(workflow):
         "runs-on": PUBLIC_RUNNER,
         "timeout-minutes": "5",
         "steps": [
-            {"uses": STAGING_CHECKOUT_USES, "with": {"persist-credentials": "false", "fetch-depth": "1"}},
+            {"uses": STAGING_CHECKOUT_USES, "with": {
+                "persist-credentials": "false",
+                "fetch-depth": "1",
+                "sparse-checkout-cone-mode": "false",
+                "sparse-checkout": (
+                    "/scripts/staging_recovery_capture.py\n"
+                    "/scripts/staging_retention_census.py\n"
+                    "/scripts/staging_recovery_inventory.sql\n"
+                    "/sql/database_role_matrix.sql\n"
+                ),
+            }},
             {"env": {**CENSUS_ENV, "RECOVERY_RECIPIENT": "${{ inputs.recipient_certificate }}"},
              "run": "python3 scripts/staging_recovery_capture.py"},
             {"uses": STAGING_UPLOAD_USES,
