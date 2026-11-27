@@ -230,3 +230,20 @@ test("stop acknowledgement alone cannot prove a stopped runtime", async () => {
   transport.readRuntime = async () => { time(cleanupBefore); return stopped; };
   assert.equal(await adapter.stop(lease, cleanupBefore), false);
 });
+
+test("the standalone runtime read refuses when its deadline fires", async t => {
+  const { adapter, transport } = fixture();
+  const controller = new AbortController();
+  const timeout = t.mock.method(AbortSignal, "timeout", () => controller.signal);
+  let requestSignal: AbortSignal | undefined;
+  transport.readRuntime = async (_issued, signal) => {
+    requestSignal = signal;
+    return new Promise(() => {});
+  };
+  const observation = adapter.readRuntime(lease);
+  assert.equal(requestSignal, controller.signal);
+  assert.equal(timeout.mock.callCount(), 1);
+  controller.abort();
+  const pending = new Promise(resolve => setImmediate(() => resolve("still pending")));
+  assert.equal(await Promise.race([observation, pending]), undefined);
+});
