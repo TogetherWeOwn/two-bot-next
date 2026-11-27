@@ -2671,10 +2671,15 @@ def staging_fixture_census_errors(workflow):
                                                                    "two_bot_staging_database",
                                                                    "two_bot_staging_branch_id"}:
         errors.append(f"{name}:fixture-census: Run step may reference only the three staging pins")
-    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
-            or (checkout.get("with") or {}).get("fetch-depth") != "1":
-        errors.append(f"{name}:fixture-census: checkout must be pinned, shallow and must not persist credentials")
+    checkout_inputs = {
+        "persist-credentials": "false",
+        "fetch-depth": "1",
+        "sparse-checkout": "/scripts/staging_retention_census.py",
+        "sparse-checkout-cone-mode": "false",
+    }
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") or checkout.get("with") != checkout_inputs:
+        errors.append(f"{name}:fixture-census: checkout must be pinned, shallow, limited to the census script, "
+                      "and must not persist credentials")
     if run.get("env") != CENSUS_ENV:
         errors.append(f"{name}:fixture-census: Run step must bind exactly the plan secret and the three pins")
     if run.get("run") != FIXTURE_CENSUS_COMMAND or "uses" in run or run.get("shell") != "bash":
@@ -11074,6 +11079,12 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             "shell trace": lambda w: job(w)["steps"][1].update({"run": "set -x\n" + FIXTURE_CENSUS_COMMAND}),
             "other script": lambda w: job(w)["steps"][1].update(
                 {"run": FIXTURE_CENSUS_COMMAND.replace("staging_retention_census", "other")}),
+            "full worktree": lambda w: job(w)["steps"][0]["with"].pop("sparse-checkout"),
+            "extra checkout path": lambda w: job(w)["steps"][0]["with"].update(
+                {"sparse-checkout": "/scripts/staging_retention_census.py\n/README.md"}),
+            "cone checkout": lambda w: job(w)["steps"][0]["with"].update(
+                {"sparse-checkout-cone-mode": "true"}),
+            "checkout ref override": lambda w: job(w)["steps"][0]["with"].update({"ref": "main"}),
             "wrangler action": lambda w: job(w)["steps"].insert(
                 1, {"uses": "cloudflare/wrangler-action@pinned"}),
         }
