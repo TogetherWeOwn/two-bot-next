@@ -1644,9 +1644,13 @@ jobs:
     # no deploy), and a skipped recheck counts only for manual runs — an
     # automatic run always needs a fresh recheck pass with no skip.
     if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.mode != 'interrupted-recovery' && needs.guard.outputs.skip == '' && (needs.guard.outputs.protected_release != 'true' || needs.release-apply.result == 'success') && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
-    # The protected status read shares the deploy-production lane. A
-    # protected release already holds it at workflow level. Ordinary
-    # automatic runs yield to an active operator dispatch before lane entry.
+    # The protected status read shares the deploy-production lane.
+    # Outside this job, the guard, gates, soak and recheck
+    # jobs carry no concurrency, so recovery
+    # dispatches are never queued behind a sleeping promotion. The lane keeps
+    # pending recoveries, preserving their place,
+    # so automatic runs recheck for an active operator dispatch first and skip
+    # instead of entering the lane behind one.
     concurrency:
       group: ${{ inputs.release_plan_run_id != '' && format('deploy-production-release-job-{0}', github.run_id) || github.run_attempt != 1 && needs.guard.outputs.mode != 'rollback' && needs.guard.outputs.allow_unstaged != 'true' && format('deploy-production-refused-{0}-{1}', github.run_id, github.run_attempt) || 'deploy-production' }}
       cancel-in-progress: false

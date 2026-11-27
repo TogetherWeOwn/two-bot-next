@@ -1030,16 +1030,12 @@ operator; a failed restore is never a reason to wait for the next deployment.
 
 ### Protected attendance release
 
-Forward and interrupted dispatches refuse until activation. The protected
-caller holds the production lane, retains the runner for 14 days and binds
-the approved staged artifact and plan to the exact stopped writer. The
-standalone migration dispatch refuses attendance expansion.
-
-After activation, use an attempt-one protected main dispatch. A post-apply
-failure authenticates the forward result and exact inverse before restoring
-the prior pair. If apply was interrupted, preserve the original attempt one
-and all evidence. See [the recovery guide](#recovery-after-the-protected-workflow-ships).
-Keep the writer fenced when classification or the inverse is unproved.
+Both protected dispatches refuse until activation. The caller binds the
+approved plan and staged artifact to the exact stopped writer and retains the
+runner artifact for 14 days. Standalone apply refuses attendance expansion.
+After activation, use an attempt-one protected main dispatch. Keep the writer
+fenced until classification and any required inverse are authenticated.
+Preserve the original attempt and evidence. [Recovery guide](#recovery-after-the-protected-workflow-ships)
 
 After the production rollback script posts a Worker restore once,
 it checks the current deployment immediately. A valid but nonmatching serving

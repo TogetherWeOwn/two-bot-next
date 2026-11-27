@@ -100,7 +100,8 @@ def require_unused_attendance_plan(api, producer, release_attempt):
         if run_id == current_id:
             require(run_created == created and run["head_sha"] == release_attempt["head_sha"]
                     and run["run_attempt"] == 1 and run.get("status") == "in_progress" and run_title == title, INVALID)
-        elif run_title == LEGACY_TITLE:
+        elif run_title == LEGACY_TITLE or (isinstance(run_title, str) and run_title.startswith(ATTENDANCE_TITLE)
+                                         and not matches(RUN_ID, run_title.removeprefix(ATTENDANCE_TITLE))):
             require_legacy_non_attempt(api, run)
         else:
             require(isinstance(run_title, str) and run_title.startswith(ATTENDANCE_TITLE)

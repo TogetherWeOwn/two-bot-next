@@ -50,12 +50,18 @@ class AttendanceApprovalHistoryTests(unittest.TestCase):
         return require_unused_attendance_plan(self.api, producer, self.current if current is None else current)
 
     def test_fresh_attempt_accepts_explicit_other_producer_and_ordinary_history(self):
+        legacy = run(202, 5, display_title="deploy-production", status="completed")
         self.history(run(201, 4, display_title="attendance release plan 100", status="completed", conclusion="failure"),
-                     self.current, run(202, 5, display_title="deploy-production", status="completed"))
+                     self.current, legacy)
         self.api_rows[JOBS] = {"total_count": 2, "jobs": [
             job(501, "guard", "success"), job(502, "Production release / Prepare and stop the prior pair", "skipped"),
         ]}
         self.assertIsNone(self.verify())
+        legacy["display_title"] = "attendance release plan 0101"
+        self.assertIsNone(self.verify())
+        self.api_rows[JOBS]["jobs"][-1]["conclusion"] = "success"
+        with self.assertRaisesRegex(GateError, "superseded_by_release_attempt"):
+            self.verify()
 
     def test_same_producer_is_consumed_even_by_failed_or_uncertain_attempt(self):
         for status, conclusion, attempt, minute in (("completed", "success", 1, 5), ("completed", "failure", 2, 5),
@@ -129,7 +135,7 @@ class AttendanceApprovalHistoryTests(unittest.TestCase):
                 self.verify()
 
     def test_refuses_unverified_history(self):
-        for fields in ({"display_title": None}, {"display_title": "attendance release plan 0101"},
+        for fields in ({"display_title": None}, {"display_title": "different title"},
                        {"head_repository": {**REPO, "full_name": "another/repo"}},
                        {"path": ".github/workflows/another.yml"}, {"event": "push"}):
             with self.subTest(prior=fields), self.assertRaises(GateError):

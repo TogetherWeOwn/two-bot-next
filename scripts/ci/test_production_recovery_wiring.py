@@ -83,7 +83,8 @@ class RecoveryWiringTests(unittest.TestCase):
 
     def test_interrupted_dispatch_never_enters_ordinary_or_forward_deploy(self):
         jobs = yaml.safe_load((ROOT / ".github/workflows/deploy-production.yml").read_text())["jobs"]
-        script = jobs["guard"]["steps"][0]["run"]
+        guard = jobs["guard"]["steps"][0]
+        self.assertEqual(guard["env"].get("RELEASE_RECOVERY_RUN_ID"), "${{ inputs.release_recovery_run_id }}")
         env = {"GITHUB_REPOSITORY": "TogetherWeOwn/two-bot-next", "EVENT_NAME": "workflow_dispatch",
                "GITHUB_REF": "refs/heads/main", "GITHUB_RUN_ATTEMPT": "1", "AUTO_DISABLED": "true",
                "TAKEOVER": "true", "ALLOW_UNSTAGED": "false", "CUTOVER_HOLD": "false", "RELEASE_RECOVERY_RUN_ID": "41"}
@@ -91,7 +92,7 @@ class RecoveryWiringTests(unittest.TestCase):
               patch("subprocess.check_output", side_effect=AssertionError("unexpected GitHub call")),
               patch("urllib.request.urlopen", side_effect=AssertionError("unexpected provider call")),
               self.assertRaises(SystemExit) as refused):
-            exec(compile(script, "deploy-production guard", "exec"), {})
+            exec(compile(guard["run"], "deploy-production guard", "exec"), {})
         self.assertEqual(refused.exception.code, 1)
         self.assertIn("interrupted recovery requires the activation follow-up", stdout.getvalue())
         self.assertIn("needs.guard.outputs.mode != 'interrupted-recovery'", jobs["production"]["if"])
