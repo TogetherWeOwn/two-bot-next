@@ -229,7 +229,12 @@ def send(request):
                 "expected application/json response")
         for single in ("x-two-worker-version", "cache-control"):
             require(len(headers.get_all(single, [])) <= 1, "ambiguous response headers")
-        return response.code, headers, json_object(read_with_overflow(response, BODY_CAP))
+        raw = read_with_overflow(response, BODY_CAP)
+        # A bounded HTTPResponse.read can return valid JSON after premature EOF.
+        remaining = getattr(response, "length", None)
+        if len(raw) <= BODY_CAP and remaining:
+            raise http.client.IncompleteRead(b"", remaining)
+        return response.code, headers, json_object(raw)
 
 
 def ready(check, origin, identity):

@@ -2364,6 +2364,11 @@ PRIVACY_VERIFY_READ_ENV = {
 }
 PRIVACY_VERIFY_READ_COMMAND = ('python3 scripts/staging_privacy_verify_read.py --guild "$GUILD" '
                                '--output "staging-privacy-verify-read-$RUN_ID.json"')
+PRIVACY_VERIFY_READ_PATHS = (
+    "/scripts/staging_privacy_verify_read.py",
+    "/scripts/staging_automation_read_smoke.py",
+    "/scripts/script_intake.py",
+)
 
 
 def staging_privacy_verify_read_errors(workflow):
@@ -2439,11 +2444,12 @@ def staging_privacy_verify_read_errors(workflow):
         errors.append(f"{name}:read: must run exactly checkout, the read and the upload, unconditionally")
         return errors
     checkout, run, upload = steps
-    # Checkout defaults to this workflow's immutable head. No ref, repository,
-    # path or other override may replace the reviewed code before secrets bind.
-    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or checkout.get("with") != {"persist-credentials": "false", "fetch-depth": "1"}:
-        errors.append(f"{name}:read: checkout must be shallow, non-persisting and use the workflow head")
+    # Pin the exact sparse paths at the immutable workflow head before secrets bind.
+    if checkout.get("uses") != STAGING_CHECKOUT_USES or checkout.get("with") != {
+            "persist-credentials": "false", "fetch-depth": "1", "sparse-checkout-cone-mode": "false",
+            "sparse-checkout": "\n".join(PRIVACY_VERIFY_READ_PATHS) + "\n"}:
+        errors.append(f"{name}:read: checkout must be shallow, non-persisting and use the workflow head "
+                      "with only the reader's files")
     if run.get("env") != PRIVACY_VERIFY_READ_ENV:
         errors.append(f"{name}:read: Run step must bind exactly the four secrets, the guild and the run id")
     if run.get("run") != PRIVACY_VERIFY_READ_COMMAND or "uses" in run or "shell" in run:
@@ -3638,8 +3644,19 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
     if tooling != {"uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
                    "if": "${{ inputs.reviewed_plan != '' }}",
                    "with": {"ref": "${{ github.sha }}", "path": "tooling", "persist-credentials": "false",
-                            "fetch-depth": "1"}}:
-        errors.append(f"{name}:schema-gate: reviewed plan proof must use the credentialless workflow checkout")
+                            "fetch-depth": "1", "sparse-checkout-cone-mode": "false",
+                            "sparse-checkout": (
+                                "/scripts/build_identity.py\n"
+                                "/scripts/ci/staging_migrate_claim.py\n"
+                                "/scripts/ci/staging_rollback_compatibility.py\n"
+                                "/scripts/rollback_proof.py\n"
+                                "/scripts/script_intake.py\n"
+                                "/scripts/staging_bootstrap.py\n"
+                                "/scripts/staging_recovery_status.py\n"
+                                "/scripts/staging_rollout.py\n"
+                                "/scripts/worker_container_rollback.py\n"
+                            )}}:
+        errors.append(f"{name}:schema-gate: reviewed plan proof must use the credentialless sparse workflow checkout")
     if proof != {"name": "Verify the recovery plan and both ledgers", "id": "recovery-plan",
                  "if": "${{ inputs.recovery_mode != 'standard' }}",
                  "env": {"RECOVERY_PLAN_SOURCE": "${{ inputs.sha }}", "REVIEWED_PLAN": "${{ inputs.reviewed_plan }}",
@@ -7906,6 +7923,29 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(file=file_name, mutation=label):
                     self.assertNotEqual(check(changed), [])
 
+    def test_staging_voice_move_sparse_checkout_loads_entry_points(self):
+        steps = self.workflows["staging-voice-move.yml"]["jobs"]["verify-lease"]["steps"]
+        paths = steps[0]["with"]["sparse-checkout"].splitlines()
+        entries = {shlex.split(step["run"])[1] for step in steps if step.get("run", "").startswith("node ")}
+        self.assertTrue(entries)
+        # Import each entry from just the checkout's files. Importing the
+        # modules bypasses their direct-invocation lease commands.
+        load = """
+globalThis.fetch = () => { throw new Error("Unexpected fetch during voice lease import"); };
+for (const entry of process.argv.slice(2)) await import("./" + entry);
+"""
+        with tempfile.TemporaryDirectory(prefix="staging-voice-move-checkout-") as directory:
+            for pattern in paths:
+                self.assertRegex(pattern, r"\A/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.(?:mjs|ts|json)\Z")
+                path = pattern[1:]
+                target = Path(directory) / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / path).read_bytes())
+            result = subprocess.run(["node", "--input-type=module", "-e", load, "sparse-checkout-probe", *sorted(entries)],
+                                    cwd=directory, env={"PATH": os.environ["PATH"]},
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_staging_automod_preview_requires_protected_opt_in(self):
         name = "staging-automod-preview.yml"
         self.assertEqual(workflow_policy_errors(self.workflows), [])
@@ -10712,6 +10752,13 @@ class WorkflowTests(unittest.TestCase):
             "extra step": lambda w: job(w)["steps"].append({"run": "echo done"}),
             "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
                 {"persist-credentials": "true"}),
+            "changed checkout pin": lambda w: job(w)["steps"][0].update({"uses": "actions/checkout@v7"}),
+            "fetch filter override": lambda w: job(w)["steps"][0]["with"].update({"filter": "blob:none"}),
+            "cone mode": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout-cone-mode": "true"}),
+            "full checkout": lambda w: job(w)["steps"][0]["with"].pop("sparse-checkout"),
+            "broader checkout": lambda w: job(w)["steps"][0]["with"].update({"sparse-checkout": "/scripts/\n"}),
+            "missing transitive import": lambda w: job(w)["steps"][0]["with"].update(
+                {"sparse-checkout": "\n".join(PRIVACY_VERIFY_READ_PATHS[:-1]) + "\n"}),
             "extra secret": lambda w: job(w)["steps"][1]["env"].update(
                 {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
             "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
@@ -10748,6 +10795,34 @@ class WorkflowTests(unittest.TestCase):
         del missing["staging-privacy-verify-read.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_privacy_verify_read_starts_with_only_checkout_files(self):
+        checkout = self.workflows["staging-privacy-verify-read.yml"]["jobs"]["read"]["steps"][0]["with"]
+        self.assertEqual(checkout["sparse-checkout-cone-mode"], "false")
+        git_env = {"PATH": os.environ.get("PATH", os.defpath), "GIT_ALLOW_PROTOCOL": "file",
+                   "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        with tempfile.TemporaryDirectory(prefix="privacy-read-checkout-") as directory:
+            root = Path(directory) / "checkout"
+
+            def git(*args, stdin=None):
+                result = subprocess.run(
+                    ["git", "-c", f"safe.directory={ROOT}", *args], env=git_env,
+                    input=stdin, capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout
+
+            git("clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(root))
+            git("-C", root, "sparse-checkout", "set", "--no-cone", "--stdin", stdin=checkout["sparse-checkout"])
+            git("-C", root, "checkout", "--quiet", "--detach", "HEAD")
+            tracked = git("-C", root, "ls-files", "-z").split("\0")
+            materialized = {path for path in tracked if path and (root / path).is_file()}
+            self.assertEqual(materialized, {pattern[1:] for pattern in PRIVACY_VERIFY_READ_PATHS})
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", "scripts/staging_privacy_verify_read.py", "--help"],
+                cwd=root, env={}, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_staging_retention_census_shape_is_pinned(self):
         workflows = self.workflows
@@ -10961,6 +11036,30 @@ class WorkflowTests(unittest.TestCase):
         del missing["staging-ownership-status.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_inventory_sparse_checkout_is_pinned(self):
+        workflow = self.workflows["staging-ownership-status.yml"]
+        checkout = workflow["jobs"]["inventory"]["steps"][0]["with"]
+        self.assertEqual(checkout.get("sparse-checkout-cone-mode"), "false")
+        patterns = checkout["sparse-checkout"]
+        dependency = "/scripts/build_identity.py\n"
+        self.assertIn(dependency, patterns)
+        self.assertEqual(staging_ownership_status_errors(workflow), [])
+
+        for label, replacement in (
+            ("full tree", {}),
+            ("cone mode", {"sparse-checkout": patterns, "sparse-checkout-cone-mode": "true"}),
+            ("extra path", {"sparse-checkout": patterns + "/wrangler/\n", "sparse-checkout-cone-mode": "false"}),
+            ("missing transitive import", {"sparse-checkout": patterns.replace(dependency, ""),
+                                           "sparse-checkout-cone-mode": "false"}),
+        ):
+            with self.subTest(change=label):
+                mutant = deepcopy(workflow)
+                mutant_checkout = mutant["jobs"]["inventory"]["steps"][0]["with"]
+                mutant_checkout.pop("sparse-checkout")
+                mutant_checkout.pop("sparse-checkout-cone-mode")
+                mutant_checkout.update(replacement)
+                self.assertTrue(staging_ownership_status_errors(mutant))
 
     def test_slow_burn_tracker_reads_staging_bearer_and_isolates_fixtures(self):
         workflows = self.workflows
