@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
 import test from "node:test";
 import {
   evaluateStagingAutomodHandoffGate as evaluate,
@@ -152,6 +153,27 @@ test("requires lease clearance and explicit staging use release", () => {
 test("requires literal confirmation that production auto-promotion is disabled", () => {
   for (const productionAutoPromoteDisabled of [undefined, false, "true"]) {
     fails({ ...input, productionAutoPromoteDisabled }, "production_auto_promote_not_disabled");
+  }
+});
+
+test("refuses handoff if the repository staging plan is enabled", async () => {
+  const gateUrl = new URL("../scripts/staging-automod-handoff-gate.ts?enabled-plan", import.meta.url).href;
+  const hooks = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (context.parentURL === gateUrl && specifier === "../src/staging-automod-plan.ts") {
+        const source = "export const STAGING_AUTOMOD_PLAN = Object.freeze({ enabled: true });";
+        return { url: `data:text/javascript,${encodeURIComponent(source)}`, shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    },
+  });
+  try {
+    const gate: typeof import("../scripts/staging-automod-handoff-gate.ts") = await import(gateUrl);
+    const result = gate.evaluateStagingAutomodHandoffGate(input);
+    assert.deepEqual(result, { verdict: "failed", code: "staging_automod_plan_enabled" });
+    assert.ok(Object.isFrozen(result));
+  } finally {
+    hooks.deregister();
   }
 });
 
