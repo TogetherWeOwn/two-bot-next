@@ -40,8 +40,7 @@ export type StagingAutomodHandoffVerdict =
   | Readonly<{ verdict: "passed" }>
   | Readonly<{ verdict: "failed"; code: StagingAutomodHandoffFailureCode }>;
 
-// The handoff schema is pinned independently of the composer at this boundary.
-const SCHEMA = "two-bot.staging-automod-qualification.v1";
+const SCHEMA: PassedBundle["schema"] = "two-bot-staging-automod-qualification.v1";
 const MAX_AGE_MS = 60_000;
 const MAX_UTC_MS = 8_640_000_000_000_000;
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;

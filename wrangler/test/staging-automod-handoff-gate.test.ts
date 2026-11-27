@@ -6,6 +6,8 @@ import {
   type StagingAutomodHandoffFailureCode,
   type StagingAutomodHandoffGateInput,
 } from "../scripts/staging-automod-handoff-gate.ts";
+import { composeStagingAutomodQualificationBundle } from "../scripts/staging-automod-qualification-bundle.ts";
+import { STAGING_AUTOMOD_TARGET } from "../src/staging-automod-recovery.ts";
 
 const now = 1_800_000_000_000;
 const observedAt = now - 100;
@@ -24,7 +26,7 @@ const pin = {
 };
 const bundle = {
   ...pin,
-  schema: "two-bot.staging-automod-qualification.v1",
+  schema: "two-bot-staging-automod-qualification.v1",
   environment: "staging",
   verdict: "passed",
   observedAt: new Date(observedAt).toISOString(),
@@ -70,14 +72,51 @@ test("defaults to disabled and reads only explicit enablement", () => {
   assert.deepEqual(evaluate(Object.create(input)), result);
 });
 
-test("passes a pinned qualification bundle and confirmed restoration", () => {
-  const result = evaluate(input);
+test("passes the composed qualification bundle and confirmed restoration", () => {
+  const { runId, sha, command, ...deployment } = pin;
+  const deploymentId = pin.workerVersionId;
+  const lease = { environment: "staging", purpose: "automod-preview", phase: "active", runId, runAttempt: 1,
+    deploymentId, sha, epoch: pin.ownerEpoch, acquiredAt: observedAt - 500, expiresAt: observedAt + 120_000 } as const;
+  const scope = { runId, runAttempt: 1, lease };
+  const serving = { ...deployment, sourceSha: sha };
+  const identity = { ...serving, ownerPhase: "active", trafficPercent: 100, runtimePolicy: "bounded",
+    rolloutStatus: "completed" };
+  const stopped = { lease: "absent", container: "stopped" };
+  const receipt = {
+    schema: bundle.schema,
+    before: { scope, identity, observedAt: observedAt - 400 },
+    registry: {
+      scope, startedAt: observedAt - 300, completedAt: observedAt - 200,
+      command: { ...command, ...STAGING_AUTOMOD_TARGET, type: 1, default_member_permissions: "32", options: [
+        { name: "text", type: 3, required: true, autocomplete: false, choiceCount: 0, min_length: 1, max_length: 2000 },
+        { name: "mentions", type: 4, required: false, autocomplete: false, choiceCount: 0, min_value: 0, max_value: 100 },
+        { name: "attachments", type: 3, required: false, autocomplete: false, choiceCount: 0, max_length: 1000 },
+      ] },
+    },
+    after: { scope, identity, observedAt: observedAt - 100 },
+    router: { sourceSha: sha, name: STAGING_AUTOMOD_TARGET.name, requiredPermission: 32,
+      withManageGuild: "admitted", withoutManageGuild: "denied" },
+    coldStartRefusal: {
+      scope, action: "start", startedAt: observedAt - 700, completedAt: observedAt - 600,
+      response: { schema: "two-bot-staging-automod-job.v1", environment: "staging",
+        observedAt: new Date(observedAt - 650).toISOString(), verdict: "failed", code: "request_refused" },
+      before: stopped, after: stopped,
+      effects: { leaseWrites: 0, containerAcquisitions: 0, containerInvocations: 0,
+        containerStarts: 0, containerStops: 0, containerWrites: 0 },
+    },
+  };
+  const rehearsal = { verdict: "passed", start: true, recover: true, runId, sha, deploymentId };
+  const composed = composeStagingAutomodQualificationBundle({
+    enabled: true, pin: { runId, lease, serving, command }, receipt, rehearsal,
+  }, observedAt);
+  assert.equal(composed.verdict, "passed");
+  const result = evaluate({ ...input, bundle: composed });
   assert.deepEqual(result, { verdict: "passed" });
   assert.ok(Object.isFrozen(result));
 });
 
 test("requires the pinned schema, staging environment and passed verdict", () => {
-  for (const patch of [{ schema: "two-bot-staging-automod-qualification.v1" }, { environment: "production" },
+  for (const patch of [{ schema: "two-bot.staging-automod-qualification.v1" }, { environment: "production" },
     { verdict: "failed" }, { verdict: "disabled" }]) {
     fails({ ...input, bundle: { ...bundle, ...patch } }, "qualification_unconfirmed");
   }
