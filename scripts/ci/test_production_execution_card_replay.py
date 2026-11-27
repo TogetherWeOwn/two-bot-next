@@ -9,8 +9,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from unittest.mock import Mock
 
+from test_production_recovery_artifact import producer, release_run_fixture
 from test_t0_acceptance_report import PRODUCTION, SCRIPTS, WATCH_EMPTY, WATCH_HEADER, WATCH_HELP, WATCH_RETURN
 
 sys.path.insert(0, str(SCRIPTS))
@@ -18,6 +20,7 @@ from production_recovery_artifact import FORWARD_JOB, FORWARD_STEPS, protected_j
 from production_recovery_takeover import RecoveryPin
 from production_recovery_workflow import fence_actor, restore_under_fence
 from staging_rollout import GateError
+from test_staging_help_embed_smoke import CHANNEL, STAGING_GUILD, TOKEN, FakeDiscord, payloads, smoke
 
 
 class ProductionExecutionCardReplayTests(unittest.TestCase):
@@ -59,17 +62,83 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
         return summary
 
     def replay(self, expected, reports):
+        report = self.replay_report(expected, reports)
+        self.assertEqual(set(report), {"expected", "observations"})
+        return report["observations"]
+
+    def replay_report(self, expected, reports, **handoff_fields):
         handoff = self.root / "handoff.json"
         bindings = {}
         args = ["--handoff", str(handoff)]
         for signal, (path, window) in reports.items():
             bindings[signal] = {"window": window, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
             args.extend((f"--{signal}-report", str(path)))
-        handoff.write_text(json.dumps({"expected": expected, "observations": bindings}), encoding="utf-8")
+        handoff.write_text(json.dumps({"expected": expected, "observations": bindings, **handoff_fields}),
+                           encoding="utf-8")
         report = json.loads(self.invoke("t0_acceptance_report.py", *args))
-        self.assertEqual(set(report), {"expected", "observations"})
         self.assertEqual(report["expected"], expected)
-        return report["observations"]
+        return report
+
+    def test_serving_change_interrupts_passing_help_and_gateway_window(self):
+        window_path = self.root / "window.json"
+        window_path.write_text(json.dumps(PRODUCTION), encoding="utf-8")
+        help_report = self.assemble_watch("help", WATCH_HELP, window_path)
+        naming = self.assemble_watch("naming", WATCH_EMPTY + WATCH_RETURN, window_path)
+        gateway = self.summarize_gateway(PRODUCTION, "ready", "2026-11-25T02:04:00.000Z", "gateway.json")
+        reports = {"help": (help_report, PRODUCTION), "naming": (naming, PRODUCTION),
+                   "gateway": (gateway, PRODUCTION)}
+
+        identity = {key: value for key, value in PRODUCTION.items() if key not in ("start", "end")}
+        readbacks = [dict(identity, utc=at) for at in (
+            PRODUCTION["start"], "2026-11-25T02:02:00.000000001+00:00", PRODUCTION["end"],
+        )]
+        same_build = self.replay_report(PRODUCTION, reports, serving_readbacks=readbacks)
+        self.assertEqual(same_build, self.replay_report(PRODUCTION, reports))
+        help_row, naming_row, gateway_row = (same_build["observations"][kind] for kind in reports)
+        self.assertEqual((help_row["status"], help_row["result"]), ("attributed", "readbacks_and_deletions_recorded"))
+        self.assertEqual((naming_row["status"], naming_row["result"]), ("attributed", "transitions_recorded"))
+        self.assertEqual((gateway_row["status"], gateway_row["readiness"]), ("attributed", "observed"))
+
+        # Receipts, hashes, the expected SHA, and opening and closing readbacks stay fixed.
+        for change in (
+            {"deploy_id": "2026.11.25.2+aaaaaaa"},
+            {"worker_version": "44444444-4444-4444-8444-444444444444"},
+            {"build_id": "901-1"},
+            {"image_digest": "sha256:" + "c" * 64},
+            {"application_id": "55555555-5555-4555-8555-555555555555"},
+            {"build_revision": "c" * 40, "deploy_id": "2026.11.25.2+ccccccc"},
+        ):
+            with self.subTest(change=change):
+                interrupted = self.replay_report(PRODUCTION, reports, serving_readbacks=[
+                    readbacks[0], readbacks[1] | change, readbacks[2],
+                ])
+                self.assertEqual(interrupted.get("window_status"), "interrupted")
+                for kind in reports:
+                    row = interrupted["observations"][kind]
+                    self.assertEqual(row["status"], "mismatched")
+                    self.assertTrue({"result", "signals", "readiness"}.isdisjoint(row))
+
+        without_naming = {"help": reports["help"], "gateway": reports["gateway"]}
+        interrupted = self.replay_report(PRODUCTION, without_naming, serving_readbacks=[
+            dict(readbacks[1], deploy_id="2026.11.25.2+aaaaaaa"),
+        ])
+        self.assertEqual(interrupted["observations"]["naming"]["status"], "missing")
+
+    def test_invalid_serving_readbacks_refuse_the_handoff_without_echo(self):
+        handoff = self.root / "invalid.json"
+        identity = {key: value for key, value in PRODUCTION.items() if key not in ("start", "end")}
+        observed = dict(identity, utc=PRODUCTION["end"])
+        for readbacks in (None, [dict(observed, utc="2026-11-25T01:59:59.999999999Z")],
+                          [dict(observed, utc="2026-11-25T02:05:00.000000001Z")],
+                          [dict(observed, environment="staging")],
+                          [dict(observed, deploy_id="2026.11.25.2+aaaaaaa"), dict(observed, note="sentinel")]):
+            with self.subTest(readbacks=readbacks):
+                handoff.write_text(json.dumps({"expected": PRODUCTION, "serving_readbacks": readbacks}),
+                                   encoding="utf-8")
+                run = subprocess.run([sys.executable, "-B", str(SCRIPTS / "t0_acceptance_report.py"),
+                                      "--handoff", str(handoff)], capture_output=True, env={}, timeout=10)
+                self.assertEqual((run.returncode, run.stderr), (2, b""))
+                self.assertEqual(json.loads(run.stdout), {"error": "handoff contains invalid serving readbacks"})
 
     def recover_predecessor(self, pin, candidate, before):
         inverse = {"state": "restored", **asdict(pin)}
@@ -77,7 +146,8 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
         serving = {
             "worker": {"version_id": version, "sha": sha, "traffic_percent": 100},
             "container": {"application_id": pin.application_id, "namespace_id": pin.namespace_id,
-                          "image_digest": digest, "rollout_status": "completed"},
+                          "image_digest": digest, "rollout_id": "00000000-0000-4000-8000-000000000001",
+                          "rollout_status": "completed"},
             "ownership": {"phase": "fenced", "running": False, "epoch": pin.fence_epoch,
                           "owner_actor": fence_actor(pin)},
         }
@@ -101,7 +171,9 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
             serving["worker"].update(version_id=version, sha=pin.rollback_sha)
 
         rollback.wait_worker_restore.side_effect = wait_worker_restore
-        rollback.restore_image.side_effect = lambda _image: serving["container"].update(image_digest=pin.image_digest)
+        rollback.restore_image.side_effect = lambda _image: serving["container"].update(
+            image_digest=pin.image_digest, rollout_id="00000000-0000-4000-8000-000000000002",
+        )
         rollback.wait_stable.side_effect = wait_stable
         observe = Mock(side_effect=lambda: deepcopy(serving))
         restore_under_fence(pin, inverse, observe, control, rollback, "fixture-image", candidate)
@@ -126,14 +198,14 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
         predecessor = (pin.worker_version, pin.rollback_sha, pin.image_digest)
         intended = dict(PRODUCTION, worker_version=candidate[0], build_revision=candidate[1],
                         image_digest=candidate[2], application_id=pin.application_id)
-        origin = dict(case["run"], id=456)
+        _, origin = release_run_fixture()
+        origin["id"] = 456
         for conclusion, before in (("cancelled", predecessor), ("success", candidate)):
             with self.subTest(forward_job=conclusion):
                 # Applying the schema can finish before the run is interrupted at receipt upload.
-                steps = [{"name": name, "status": "completed", "conclusion": result}
-                         for name, result in zip(FORWARD_STEPS, ("success", conclusion))]
-                job = dict(case["fence_job"], name=FORWARD_JOB, run_id=origin["id"],
-                           conclusion=conclusion, steps=steps)
+                job = producer(origin, FORWARD_JOB, FORWARD_STEPS)
+                job["conclusion"] = conclusion
+                job["steps"][-1]["conclusion"] = conclusion
                 api = Mock(return_value={"total_count": 1, "jobs": [job]})
                 if conclusion == "cancelled":
                     with self.assertRaisesRegex(GateError, "^production_inverse_job_invalid$"):
@@ -168,6 +240,51 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
                     row = refused[signal]
                     self.assertEqual(row["status"], "mismatched")
                     self.assertTrue({"result", "readiness", "signals"}.isdisjoint(row))
+
+    def test_help_watch_distinguishes_failed_cleanup_from_unavailable_observation(self):
+        payload_path = self.root / "help-payloads.json"
+        payload_path.write_text(json.dumps(payloads()), encoding="utf-8")
+        window_path = self.root / "window.json"
+        window_path.write_text(json.dumps(PRODUCTION), encoding="utf-8")
+        cases = (
+            (204, "pass", "readbacks_and_deletions_recorded"),
+            (403, "fail", "probe_failed"),
+            (None, "not_observed", "not_observed"),
+        )
+        for delete_status, expected_disposition, result in cases:
+            with self.subTest(disposition=expected_disposition):
+                disposition = "not_observed"
+                if delete_status is not None:
+                    discord = FakeDiscord(delete_status=delete_status)
+                    with mock.patch.object(smoke, "make_transport", side_effect=AssertionError("network access")):
+                        smoke_report = smoke.run(payload_path, STAGING_GUILD, TOKEN, CHANNEL, transport=discord)
+                    receipt = smoke_report.evidence()
+                    disposition = receipt["verdict"].lower()
+                    self.assertEqual(disposition, expected_disposition)
+                    first_row = receipt["rows"][0]
+                    self.assertEqual(first_row["name"], "help")
+                    message_path = f"/channels/{CHANNEL}/messages/{first_row['message_id']}"
+                    self.assertEqual([method for method, path, _ in discord.calls if path == message_path],
+                                     ["GET", "DELETE"])
+                    if disposition == "fail":
+                        self.assertEqual(smoke_report.exit_code(), 3)
+                        self.assertEqual(len(receipt["rows"]), 1)
+                        self.assertIs(first_row["cleanup_failed"], True)
+                        self.assertTrue(first_row["actual"].startswith("cleanup delete failed ("))
+                        self.assertEqual(set(discord.messages), {first_row["message_id"]})
+                    else:
+                        self.assertEqual(smoke_report.exit_code(), 0)
+                        self.assertEqual(len(receipt["rows"]), len(smoke.EMBED_KEYS))
+                        self.assertFalse(discord.messages)
+
+                # The operator transcribes the approved card row. An unavailable
+                # observation has no cleanup verdict to transcribe.
+                source = WATCH_HELP.replace(b"\tpass\n", b"\t" + disposition.encode() + b"\n")
+                report = self.assemble_watch("help", source, window_path)
+                row = self.replay(PRODUCTION, {"help": (report, PRODUCTION)})["help"]
+                self.assertEqual((row["status"], row["window"], row["result"]),
+                                 ("attributed", PRODUCTION, result))
+                self.assertEqual("needed" in row, disposition != "pass")
 
     def test_rollback_window_rejects_pre_rollback_readiness_with_exact_digest(self):
         # The restored image came from the same source revision. Its serving identity is distinct.

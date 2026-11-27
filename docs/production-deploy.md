@@ -611,6 +611,32 @@ the original stop intent and plan, the recovery admission and classification,
 and the inverse result for POST. Preserve the fence and the run's evidence.
 Leave any uncertain restart to the exact readback described above.
 
+### Offline recovery report
+
+Use Python 3.11 or later to run `scripts/production_recovery_report.py` on saved
+`production-release-restored.json` receipts against one independent,
+bracketed `production-ownership-status` observation. Use the latest verified
+observation from the protected status path. For each receipt, preserve its
+original producer and authenticated archive provenance, and record the
+SHA-256 of the extracted JSON bytes at verification. Supply that recorded
+digest with the saved JSON file.
+
+```sh
+python3 scripts/production_recovery_report.py --status ownership-status.json \
+  --receipt "$prior_receipt_sha256" prior-restored.json \
+  --receipt "$current_receipt_sha256" current-restored.json
+```
+
+`current_as_of_observation` requires a later observation of the same Worker,
+deployment, image, rollout, and running owner at the receipt's active epoch.
+A greater ownership epoch for the same application and namespace gives
+`superseded`, including when a second fence still holds the writer. A receipt
+with missing, mismatched, or unreadable evidence gives `unverified` and leaves
+the other rows available. The timestamp limits the report to the supplied
+observation. Use the protected workflow for recovery decisions and keep the
+original receipts for audit. Exit 0 means the report was generated. Exit 2
+means the report could not be generated.
+
 ## Attendance predecessor identity at both PRE endpoints
 
 Use the same Worker and container identity check at both database endpoints.
@@ -634,6 +660,11 @@ Dispatch `build-predecessor` from protected main to build the reviewed export.
 It emits the Worker modules, OCI image and their recorded identities. This
 receipt covers packaging. Staging qualification at either PRE endpoint requires
 a compatible isolated target that stops the exact runtime when its use window expires.
+Keep rehearsal admission pending until the protected workflow caller and
+provider adapter are available. For an existing reservation with a startup
+refusal or unresolved cleanup, follow the staging release operator's
+[startup refusal handoff](staging-rollout-gate.md#startup-refusal-handoff),
+including when protected stop is unavailable.
 
 Before handing the bundle to a staging caller, use
 [`verify_predecessor_bundle`](../scripts/predecessor_bundle.py) with the reviewed
