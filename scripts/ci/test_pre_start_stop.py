@@ -354,24 +354,28 @@ class ProtectedPreTests(unittest.TestCase):
         self.assert_refuses("pre_probe_unconfirmed", self.controller.probe, deployment, Endpoint.READINESS)
 
     def test_probe_acceptance_requires_active_reservation_at_reply(self):
-        for outcome in ("timely", "stopped", "expired", "enclosing_cutoff"):
+        for outcome in ("timely", "stopped", "expired", "armed_cutoff", "enclosing_cutoff"):
             with self.subTest(outcome=outcome):
                 fixture = PreFixture()
+                reply_cutoff = TARGET.expires_at
+                if outcome == "armed_cutoff":
+                    reply_cutoff -= 5
+                    fixture.window = EffectWindow(TARGET, reply_cutoff)
                 controller = fixture.controller(lambda t, op: t == TARGET and op in (Operation.START, Operation.PROBE))
                 stop = fixture.controller(lambda t, op: (t, op) == (TARGET, Operation.STOP))
                 deployment = controller.start(fixture.upload)
                 if outcome == "enclosing_cutoff":
-                    fixture.enclosing_cutoff = TARGET.expires_at - 5
-                    fixture.window = EffectWindow(TARGET, fixture.enclosing_cutoff)
-                fixture.now = fixture.enclosing_cutoff - 1
+                    reply_cutoff -= 5
+                    fixture.enclosing_cutoff = reply_cutoff
+                fixture.now = reply_cutoff - 1
                 fixture.reply = ProbeReply(200, deployment.worker_version, b'{"components":[["gateway","ready"]]}')
                 stop_results = []
 
                 def before_reply():
                     if outcome == "stopped":
                         stop_results.append(stop.stop())
-                    elif outcome in ("expired", "enclosing_cutoff"):
-                        fixture.now = fixture.enclosing_cutoff
+                    elif outcome in ("expired", "armed_cutoff", "enclosing_cutoff"):
+                        fixture.now = reply_cutoff
 
                 fixture.before_probe_reply.side_effect = before_reply
                 if outcome == "timely":
@@ -426,12 +430,13 @@ class ProtectedPreTests(unittest.TestCase):
                     deployment = start.start(fixture.upload)
                 self.assertEqual(deployment, fixture.deployment)
                 self.assertEqual(store.read(TARGET), AdmissionRecord(TARGET, deployment.start_id, closed=False))
-                self.assertFalse(fixture.fenced)
+                self.assertTrue(fixture.external_stop.allows_effect(deployment.target, deployment.start_id))
                 start_observer.assert_not_called()
 
                 proof_record = AdmissionRecord(deployment.target, proof_start_id, closed=True)
                 observe = Mock(side_effect=lambda _: SettlementEvidence(
-                    proof_record, SettlementSource.RUNTIME, startup_drained=True, restart_fenced=fixture.fenced))
+                    proof_record, SettlementSource.RUNTIME, startup_drained=True,
+                    restart_fenced=not fixture.external_stop.allows_effect(deployment.target, deployment.start_id)))
                 fixture.effects.attach_mock(observe, "observe")
                 resumed_admission = StartupAdmission(store, observe)
                 stop = ProtectedPre(TARGET, authorize=lambda t, op: (t, op) == (TARGET, Operation.STOP),
