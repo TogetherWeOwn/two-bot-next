@@ -1594,7 +1594,7 @@ def reviewed_migrate_errors(workflow):
     # Pin the reviewed trigger, checkouts, containers, job order, shells and secret scopes.
     encoded = json.dumps(workflow, sort_keys=True, separators=(",", ":")).encode()
     digest = hashlib.sha256(encoded).hexdigest()
-    return [] if digest == "b7ea9bfd21484f7a8c6dc0d49ea703ab8c25c68b18affeab45f2ec4a04fa7ab2" else [
+    return [] if digest == "1ae7e3b5c9fa8aa270218aec8905f4011ce16d347f8cb322e0b7d7fe6aed48d3" else [
         "reviewed staging migration workflow contract changed"]
 
 
@@ -3876,11 +3876,22 @@ def production_roles_gate_errors(workflow, name="deploy-production.yml"):
             or (checkout.get("with") or {}).get("fetch-depth") != "0" \
             or "needs.guard.outputs.sha" not in str((checkout.get("with") or {}).get("ref", "")):
         errors.append(f"{name}:roles-gate: checkout must be pinned, credentialless, full-depth and on the guarded SHA")
-    if not str(tooling.get("uses", "")).startswith("actions/checkout@") \
-            or (tooling.get("with") or {}).get("persist-credentials") != "false" \
-            or (tooling.get("with") or {}).get("path") != "tooling" \
-            or "github.sha" not in str((tooling.get("with") or {}).get("ref", "")):
-        errors.append(f"{name}:roles-gate: tooling checkout must be pinned, credentialless and on the workflow commit")
+    expected_tooling = {
+        "ref": "${{ github.sha }}",
+        "path": "tooling",
+        "persist-credentials": "false",
+        "fetch-depth": "1",
+        "sparse-checkout": (
+            "/scripts/ci/roles_gate.py\n"
+            "/scripts/ci/production_schema_gate.py\n"
+            "/scripts/ci/staging_schema_gate.py\n"
+            "/scripts/ci/schema_gate_common.py\n"
+            "/scripts/script_intake.py\n"
+        ),
+        "sparse-checkout-cone-mode": "false",
+    }
+    if not str(tooling.get("uses", "")).startswith("actions/checkout@") or tooling.get("with") != expected_tooling:
+        errors.append(f"{name}:roles-gate: tooling checkout must use only the reviewed paths at the workflow commit")
     if ("needs.guard.outputs.sha" not in str(sha_check.get("env", ""))
             or "git rev-parse HEAD" not in str(sha_check.get("run", ""))):
         errors.append(f"{name}:roles-gate: SHA check must pin the step to the guarded SHA")
@@ -7866,6 +7877,27 @@ class WorkflowTests(unittest.TestCase):
         lock["group"] = lock["group"].replace("staging-automod-refused-{0}-{1}", PRE_REAPER_QUEUE)
         self.assertIn(f"{name}: the PRE sweep queue must remain exclusive", staging_pre_reaper_errors(workflows))
 
+    def test_reviewed_staging_authorize_checkout(self):
+        workflow = self.workflows["staging-migrate-reviewed.yml"]
+        checkout = workflow["jobs"]["authorize"]["steps"][0]
+        self.assertEqual(checkout["with"], {
+            "ref": "${{ github.sha }}",
+            "persist-credentials": "false",
+            "fetch-depth": "0",
+            "sparse-checkout": "scripts\n.github/staging-apply\n",
+        })
+        self.assertEqual(reviewed_migrate_errors(workflow), [])
+        for key, value in (
+                ("fetch-depth", "1"),
+                ("sparse-checkout", "scripts\n"),
+                ("sparse-checkout", ".github/staging-apply\n"),
+                ("sparse-checkout", "scripts\n.github/staging-apply\ndocs\n")):
+            with self.subTest(key=key, value=value):
+                changed = deepcopy(workflow)
+                changed["jobs"]["authorize"]["steps"][0]["with"][key] = value
+                self.assertEqual(reviewed_migrate_errors(changed),
+                                 ["reviewed staging migration workflow contract changed"])
+
     def test_staging_pre_reaper_is_dormant(self):
         self.assertEqual(staging_pre_reaper_errors(self.workflows), [])
         for keys, change in (
@@ -9602,6 +9634,35 @@ class WorkflowTests(unittest.TestCase):
             changed = copy.deepcopy(production)
             mutate(changed)
             self.assertNotEqual(production_roles_gate_errors(changed), [])
+
+    def test_production_roles_gate_tooling_checkout_is_exact(self):
+        import copy
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_roles_gate_errors(production), [])
+        tooling = production["jobs"]["roles-gate"]["steps"][1]["with"]
+        sparse_paths = tooling["sparse-checkout"]
+        for key, value in (
+            ("ref", "${{ needs.guard.outputs.sha }}"),
+            ("path", "source"),
+            ("persist-credentials", "true"),
+            ("fetch-depth", "0"),
+            ("sparse-checkout", None),
+            ("sparse-checkout", sparse_paths.replace("/scripts/script_intake.py\n", "")),
+            ("sparse-checkout", sparse_paths + "/scripts/\n"),
+            ("sparse-checkout-cone-mode", "true"),
+            ("filter", "tree:0"),
+        ):
+            with self.subTest(key=key, value=value):
+                changed = copy.deepcopy(production)
+                changed_tooling = changed["jobs"]["roles-gate"]["steps"][1]["with"]
+                if value is None:
+                    del changed_tooling[key]
+                else:
+                    changed_tooling[key] = value
+                self.assertEqual(production_roles_gate_errors(changed), [
+                    "deploy-production.yml:roles-gate: tooling checkout must use only the reviewed paths "
+                    "at the workflow commit",
+                ])
 
     def test_production_deploy_needs_prod_roles_gate(self):
         production = self.workflows["deploy-production.yml"]
