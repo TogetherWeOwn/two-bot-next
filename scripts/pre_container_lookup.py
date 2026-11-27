@@ -5,7 +5,7 @@ import re
 
 from pre_inventory import RESOURCE_NAME
 from pre_registry_cleanup import RegistryReservation
-from pre_target import APP_ID, Resource, Target, TargetError, require
+from pre_target import APP_ID, NAMESPACE_ID, Resource, Target, TargetError, require
 
 
 ACCOUNT_ID = re.compile(r"[0-9a-f]{32}")
@@ -71,13 +71,31 @@ def confirm_reserved_container_configuration(scope, *, namespace_id, image, read
             "invalid_pre_container_namespace")
     require(type(image) is RegistryReservation and image.target == scope.target,
             "wrong_pre_container_image_scope")
-    result = _read_reserved_container_app(scope, read=read)
-    require(result is not None, "pre_container_configuration_unconfirmed")
-    namespace, config = result.get("durable_objects"), result.get("configuration")
-    require(type(namespace) is dict and type(namespace.get("namespace_id")) is str
-            and namespace["namespace_id"] == namespace_id, "pre_container_namespace_mismatch")
+    result = _read_configured_namespace(scope, namespace_id, read=read)
+    config = result.get("configuration")
     require(type(config) is dict and type(config.get("image")) is str
             and config["image"] == image.reference, "pre_container_image_mismatch")
+
+
+def confirm_reserved_durable_object_app(scope, *, namespace_id, read) -> None:
+    """Confirm the namespace and native scheduler of one reserved Container app.
+
+    This scheduler chooses the image in the Durable Object's start call. Get
+    Application supplies no image pin for this policy.
+    """
+    require(type(namespace_id) is str and NAMESPACE_ID.fullmatch(namespace_id),
+            "invalid_pre_container_namespace")
+    result = _read_configured_namespace(scope, namespace_id, read=read)
+    require(result.get("scheduling_policy") == "durable_object", "wrong_pre_container_scheduling_policy")
+
+
+def _read_configured_namespace(scope, namespace_id, *, read):
+    result = _read_reserved_container_app(scope, read=read)
+    require(result is not None, "pre_container_configuration_unconfirmed")
+    namespace = result.get("durable_objects")
+    require(type(namespace) is dict and type(namespace.get("namespace_id")) is str
+            and namespace["namespace_id"] == namespace_id, "pre_container_namespace_mismatch")
+    return result
 
 
 def _read_reserved_container_app(scope, *, read):

@@ -14,6 +14,7 @@ ADMISSION_SECONDS = 3600
 LAST_UNIX_SECOND = 9_999_999_999
 SCOPE = re.compile(r"pre-fixture-[a-z0-9]{1,32}")
 APP_ID = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}")
+NAMESPACE_ID = re.compile(r"[0-9a-f]{32}")
 SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
