@@ -9,6 +9,7 @@ use std::{
 };
 use tokio::time::Instant;
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
+use two_bot_core::audit::delivery_nonce;
 use two_bot_discord::{
     ratelimit_guard::{GuardConfig, GuardError, RateLimitGuard},
     ActionExecutor, DiscordError,
@@ -34,6 +35,7 @@ async fn audit_global_admission_precedes_the_late_authorization() {
     .await;
     let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
     let exec = executor(&mock, &guard);
+    let nonce = delivery_nonce(&mock.origin());
     // Anchor before observing the pause: the guard sets its deadline at
     // observation time plus 0.4 s and the 250 ms pad, and admission only
     // returns at or after that deadline, so authorization (which runs after
@@ -45,7 +47,7 @@ async fn audit_global_admission_precedes_the_late_authorization() {
     let started = Instant::now();
     guard.observe_global(Some(0.4));
     let result = exec
-        .post_mirror_checked("4444", "audit test", "oa_fixture", async {
+        .post_mirror_checked("4444", "audit test", &nonce, async {
             assert!(started.elapsed() >= Duration::from_millis(600));
             assert_eq!(guard.snapshot().global_pause_remaining, Duration::ZERO);
             Ok::<(), ()>(())
@@ -70,9 +72,10 @@ async fn audit_guard_closure_during_authorization_refuses_without_waiting_or_dis
             .unwrap(),
         );
         let exec = executor(&mock, &guard);
+        let nonce = delivery_nonce(&mock.origin());
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            exec.post_mirror_checked("4444", "audit test", "oa_fixture", async {
+            exec.post_mirror_checked("4444", "audit test", &nonce, async {
                 match restriction {
                     "global" => guard.observe_global(Some(600.0)),
                     "breaker" => guard.observe_status(403, true),

@@ -141,7 +141,9 @@ ban intents, running dispatches and quarantined imports via the read-only
 bounded `surface_uncertain_limited` store seam (25 rows by default, at most
 100; a capped listing ends with a `showing <shown> of <total> rows`
 truncation receipt, naming the ceiling past 100 rows since no `--limit`
-rerun converges there); `--confirm-ban`, `--reject-ban`,
+rerun converges there). The listing redacts member IDs. Look up the member ID
+in the ledger by guild and the listed request ID when needed for resolution.
+`--confirm-ban`, `--reject-ban`,
 `--resolve-unban` and `--accept-historical` resolve one exact attempt with
 authoritative exact-intent evidence. Mutations are dry-run by default
 (`--execute` writes), staging-guild only, and claim tokens never print.

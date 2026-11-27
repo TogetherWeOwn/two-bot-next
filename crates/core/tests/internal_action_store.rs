@@ -1647,13 +1647,13 @@ async fn proven_unsent_release_retains_binding_and_allows_one_new_owner() {
     let store = db.store();
     let id = identity("unsent-key:123", "role.assign", b"payload");
     let subject = subject();
-    let nonce = "0123456789abcdef0123456789abcdef";
+    let nonce = hex::encode(rand::random::<[u8; 16]>());
     let timestamp = db_now_secs(&db.pool).await.to_string();
-    assert!(store.burn_nonce(nonce, &timestamp).await.unwrap());
+    assert!(store.burn_nonce(&nonce, &timestamp).await.unwrap());
     let first = claimed(store.claim(&id, &subject).await.unwrap());
     let intent_id = first.intent_id();
     store.release_proven_not_sent(first).await.unwrap();
-    assert!(!store.burn_nonce(nonce, &timestamp).await.unwrap());
+    assert!(!store.burn_nonce(&nonce, &timestamp).await.unwrap());
     for changed in [
         identity("unsent-key:123", "role.assign", b"changed"),
         identity("unsent-key:123", "guild.add_member", b"payload"),
