@@ -4,7 +4,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 import re
 from typing import Protocol
-from urllib.parse import urlsplit
 from uuid import UUID
 
 from pre_start_stop import Deployment, EffectWindow
@@ -12,7 +11,10 @@ from pre_target import DIGEST, Target, TargetError, require
 from pre_worker_upload import DATABASE_NAME, DNS_LABEL, DatabaseEndpoint
 
 
-LOOPBACK_AUTHORITY = re.compile(r"(?:127\.0\.0\.1|\[::1\]|localhost)(?::[1-9][0-9]{0,4})?")
+LOOPBACK_IP = r"127\.0\.0\.1|\[::1\]"
+PORT = r"(?P<port>[1-9][0-9]{0,4})"
+GATEWAY_URL = re.compile(rf"ws://(?P<host>{LOOPBACK_IP}):{PORT}")
+REST_URL = re.compile(rf"http://(?P<host>{LOOPBACK_IP}|localhost)(?::{PORT})?/?")
 DATABASE_HOST = re.compile(rf"{DNS_LABEL}(?:\.{DNS_LABEL})*")
 
 
@@ -20,8 +22,8 @@ DATABASE_HOST = re.compile(rf"{DNS_LABEL}(?:\.{DNS_LABEL})*")
 class LaunchPolicy:
     """Native start() options and listener readiness in the bot namespace.
 
-    Apply DISCORD_GATEWAY_URL and DISCORD_API_BASE at start(). Any localhost
-    override must resolve only to loopback in that namespace.
+    Apply DISCORD_GATEWAY_URL and DISCORD_API_BASE at start(). Supply all
+    addresses resolved in that namespace when the REST origin uses localhost.
     """
 
     scheduling_policy: str
@@ -30,6 +32,7 @@ class LaunchPolicy:
     fixtures_ready_in_namespace: bool
     enable_internet: bool
     database: DatabaseEndpoint
+    localhost_addresses: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -43,11 +46,7 @@ class RuntimeIdentity:
 
 @dataclass(frozen=True)
 class RuntimeReadback:
-    """Independent inspection of the running process and effective policy.
-
-    Observe applied egress, process overrides, listener readiness and resolution
-    in this deployment's namespace, plus its actual image and database writer.
-    """
+    """Independent observation of actual image, writer and namespace policy."""
 
     identity: RuntimeIdentity
     policy: LaunchPolicy
@@ -86,16 +85,12 @@ def _call(operation, *args, failure):
     raise TargetError(failure)
 
 
-def _loopback(url, schemes):
-    if (type(url) is not str or not 0 < len(url) <= 2048
-            or any(not "!" <= char <= "~" or char in "\\#" for char in url)):
-        return False
-    try:
-        parsed = urlsplit(url)
-        return (parsed.scheme in schemes and LOOPBACK_AUTHORITY.fullmatch(parsed.netloc)
-                and (parsed.port is None or parsed.port <= 65535))
-    except ValueError:
-        return False
+def _loopback(url, pattern, addresses=frozenset()):
+    match = pattern.fullmatch(url) if type(url) is str else None
+    return (match is not None and (match["port"] is None or int(match["port"]) <= 65535)
+            and type(addresses) is frozenset and len(addresses) <= 2
+            and bool(addresses) == (match["host"] == "localhost")
+            and all(type(address) is str and address in ("127.0.0.1", "::1") for address in addresses))
 
 
 def _deployment(value, target):
@@ -132,8 +127,8 @@ def _check_policy(policy, target, database):
             and policy.scheduling_policy == "durable-object", "pre_native_scheduling_required")
     require(policy.enable_internet is False, "pre_native_public_egress_unconfirmed")
     require(policy.fixtures_ready_in_namespace is True
-            and _loopback(policy.discord_gateway_url, ("ws", "wss"))
-            and _loopback(policy.discord_api_base, ("http", "https")), "pre_native_discord_fixture_unconfirmed")
+            and _loopback(policy.discord_gateway_url, GATEWAY_URL)
+            and _loopback(policy.discord_api_base, REST_URL, policy.localhost_addresses), "pre_native_discord_fixture_unconfirmed")
     require(_database(policy.database, target) and policy.database == database, "pre_native_database_mismatch")
 
 

@@ -27,11 +27,12 @@ class RehearsalFixture:
         self.database = DatabaseEndpoint(self.target, self.target.service_name, "db.invalid", 5432,
                                          "fixture", "fixture_writer", True)
         self.expected = RuntimeIdentity(self.deployment, DIGEST, self.database)
-        self.policy = LaunchPolicy("durable-object", "ws://127.0.0.1:8081/gateway?encoding=json",
+        self.policy = LaunchPolicy("durable-object", "ws://127.0.0.1:8081",
                                    "http://[::1]:8082", True, False, self.database)
         if shape == SHAPES[1]:
-            self.policy = replace(self.policy, discord_gateway_url="wss://[::1]:8443/gateway",
-                                  discord_api_base="https://localhost:8443/api")
+            self.policy = replace(self.policy, discord_gateway_url="ws://[::1]:8443",
+                                  discord_api_base="http://localhost:8443/",
+                                  localhost_addresses=frozenset({"127.0.0.1", "::1"}))
         self.readback = RuntimeReadback(replace(self.expected), replace(self.policy))
         self.stopped = StopReadback(self.deployment, UUID(int=4), 0, 0, True, True)
         self.calls = Mock()
@@ -74,19 +75,20 @@ class NativeRehearsalTests(unittest.TestCase):
         invalid += [("enable_internet", value, "public_egress_unconfirmed") for value in (True, None, 0)]
         invalid += [("fixtures_ready_in_namespace", value, "discord_fixture_unconfirmed")
                     for value in (False, None, 1)]
-        for field, public_url in (("discord_gateway_url", "wss://gateway.discord.gg"),
-                                  ("discord_api_base", "https://discord.com/api")):
-            scheme = public_url.split(":", 1)[0]
+        for field, scheme in (("discord_gateway_url", "ws"), ("discord_api_base", "http")):
             invalid += [(field, value, "discord_fixture_unconfirmed") for value in (
-                None, "", public_url, "file://localhost", f"{scheme}://127.0.0.2",
-                f"{scheme}://localhost.", f"{scheme}://2130706433", f"{scheme}://[::ffff:127.0.0.1]",
-                f"{scheme}://localhost.evil.invalid", f"{scheme}://localhost@evil.invalid",
-                f"{scheme}://evil.invalid@localhost", f"{scheme}://localhost\\@evil.invalid",
-                f"{scheme}://localhost:0", f"{scheme}://localhost:65536", f"{scheme}://localhost:",
-                f"{scheme}://[::1", f"\n{scheme}://localhost", f"{scheme}://local\thost",
-                f"{scheme}://localhｏst", f"{scheme}://%6cocalhost", f"{scheme}://localhost/#fragment",
-                f"{scheme}://localhost/" + "a" * 2048,
+                None, "", f"{scheme}://discord.com:8080", f"{scheme}s://127.0.0.1:8080",
+                f"{scheme}://127.0.0.2:8080", f"{scheme}://2130706433:8080", f"{scheme}://[::ffff:127.0.0.1]:8080",
+                f"{scheme}://localhost.:8080", f"{scheme}://localhost.evil.invalid:8080",
+                f"{scheme}://evil@127.0.0.1:8080", f"{scheme}://127.0.0.1\\@evil.invalid:8080",
+                f"{scheme}://127.0.0.1:0", f"{scheme}://127.0.0.1:65536", f"{scheme}://127.0.0.1:",
+                f"{scheme}://[::1", f"\n{scheme}://127.0.0.1:8080", f"{scheme}://local\thost:8080",
+                f"{scheme}://localhｏst:8080", f"{scheme}://%6cocalhost:8080", f"{scheme}://127.0.0.1:8080#f",
+                f"{scheme}://127.0.0.1:8080/api", f"{scheme}://127.0.0.1:8080?encoding=json",
             )]
+        invalid += [("discord_gateway_url", value, "discord_fixture_unconfirmed")
+                    for value in ("ws://127.0.0.1", "ws://localhost:8080", "ws://127.0.0.1:8080/")]
+        invalid.append(("discord_api_base", "http://localhost:8080", "discord_fixture_unconfirmed"))
         invalid += [("database", value, "database_mismatch") for value in (
             None, replace(fixture.database, target=wrong_target), replace(fixture.database, service="other"),
             replace(fixture.database, disposable=False), replace(fixture.database, disposable=1),
@@ -165,18 +167,21 @@ class NativeRehearsalTests(unittest.TestCase):
                 self.assert_refused(trial, "pre_native_runtime_unconfirmed", trial.full_sequence())
 
     def test_effective_runtime_policy_must_match(self):
-        for field, value, error in (
+        invalid = [
             ("scheduling_policy", "auto-start", "scheduling_required"),
             ("enable_internet", True, "public_egress_unconfirmed"), ("enable_internet", 0, "public_egress_unconfirmed"),
             ("discord_gateway_url", None, "discord_fixture_unconfirmed"),
             ("discord_api_base", "https://discord.com", "discord_fixture_unconfirmed"),
             ("discord_api_base", None, "discord_fixture_unconfirmed"),
             ("fixtures_ready_in_namespace", False, "discord_fixture_unconfirmed"),
-            ("discord_gateway_url", "ws://localhost:8081", "runtime_policy_mismatch"),
-            ("discord_api_base", "http://localhost:8082", "runtime_policy_mismatch"),
-        ):
+            ("discord_gateway_url", "ws://127.0.0.1:9999", "runtime_policy_mismatch"),
+            ("discord_api_base", "http://[::1]:9999", "runtime_policy_mismatch"),
+        ]
+        invalid += [("localhost_addresses", value, "discord_fixture_unconfirmed")
+                    for value in (None, frozenset(), frozenset({"::1", "192.0.2.1"}), ("::1",))]
+        for field, value, error in invalid:
             with self.subTest(field=field, value=value):
-                trial = RehearsalFixture()
+                trial = RehearsalFixture(SHAPES[1] if field == "localhost_addresses" else SHAPES[0])
                 observed = replace(trial.policy, **{field: value})
                 trial.calls.read_runtime.return_value = replace(trial.readback, policy=observed)
                 self.assert_refused(trial, f"pre_native_{error}", trial.full_sequence())
