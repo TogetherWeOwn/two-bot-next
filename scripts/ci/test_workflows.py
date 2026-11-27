@@ -1535,9 +1535,24 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
         errors.append(f"{prefix} must execute four fail-closed transport steps")
         return errors
     checkout, fetch, publish, upload = steps
+    checkout_options = {"persist-credentials": "false", "ref": "${{ github.sha }}"}
+    if staging:
+        checkout_options.update({
+            "sparse-checkout": (
+                "/scripts/build_identity.py\n"
+                "/scripts/ci/staging_migrate_claim.py\n"
+                "/scripts/rollback_proof.py\n"
+                "/scripts/script_intake.py\n"
+                "/scripts/staging_migrate_approval.py\n"
+                "/scripts/staging_recovery_status.py\n"
+                "/scripts/staging_rollout.py\n"
+                "/scripts/worker_container_rollback.py\n"
+            ),
+            "sparse-checkout-cone-mode": "false",
+        })
     if (not str(checkout.get("uses", "")).startswith("actions/checkout@")
-            or checkout.get("with") != {"persist-credentials": "false", "ref": "${{ github.sha }}"}):
-        errors.append(f"{prefix} checkout must pin the workflow head without persisted credentials")
+            or checkout.get("with") != checkout_options):
+        errors.append(f"{prefix} checkout must pin the workflow head and reviewed inputs without persisted credentials")
     if (not str(fetch.get("uses", "")).startswith("actions/download-artifact@")
             or fetch.get("with") != {"name": manifest, "path": "current-plan"}):
         errors.append(f"{prefix} must read this dispatch's plan artifact, not an arbitrary run")
@@ -9942,6 +9957,14 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             workflow = deepcopy(migrate)
             change(workflow)
             return staging_migrate_errors(workflow)
+
+        for option, value in (("sparse-checkout", "/scripts/\n"),
+                              ("sparse-checkout", "/scripts/ci/staging_migrate_claim.py\n"),
+                              ("sparse-checkout-cone-mode", "true")):
+            with self.subTest(checkout={option: value}):
+                def change_checkout(w):
+                    w["jobs"]["claim"]["steps"][0]["with"][option] = value
+                self.assertTrue(mutated(change_checkout))
 
         for trigger in ("push", "pull_request", "schedule", "workflow_call"):
             with self.subTest(trigger=trigger):
