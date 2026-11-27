@@ -86,6 +86,7 @@ JOB_INVENTORY = {
     "staging-migrate-reviewed.yml": {"authorize", "plan", "apply"},
     "production-migrate.yml": {"plan", "claim", "apply"},
     "deploy-production-recovery.yml": {"fence", "inverse", "restore"},
+    "deploy-production-interrupted.yml": {"admit", "database", "restart"},
     # On-demand staging automatic recovery proof plus the manual Worker-only drill.
     "staging-rollback-drill.yml": {"drill", "proof", "alert"},
     # Container-image backout/restore drill: manual, staging-only, pinned shape below.
@@ -242,6 +243,7 @@ DEPLOY_MARKERS = (
 # Canonical parsed graph for the protected recovery callee. This pins the
 # caller guard, Environment split, exact commands, permissions, and handoffs.
 PRODUCTION_RECOVERY_GRAPH = "2fd050ea4e2f4ca60328d2c54c077a7219cc3c29269c96313b52d7fbcc69b3a2"
+PRODUCTION_INTERRUPTED_GRAPH = "924989beeaa9bbc3ccb03608d183f33b8894eb65f29d5f1cb331191db59ce48d"
 
 
 class UniqueKeyLoader(yaml.BaseLoader):
@@ -1535,9 +1537,24 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
         errors.append(f"{prefix} must execute four fail-closed transport steps")
         return errors
     checkout, fetch, publish, upload = steps
+    checkout_options = {"persist-credentials": "false", "ref": "${{ github.sha }}"}
+    if staging:
+        checkout_options.update({
+            "sparse-checkout": (
+                "/scripts/build_identity.py\n"
+                "/scripts/ci/staging_migrate_claim.py\n"
+                "/scripts/rollback_proof.py\n"
+                "/scripts/script_intake.py\n"
+                "/scripts/staging_migrate_approval.py\n"
+                "/scripts/staging_recovery_status.py\n"
+                "/scripts/staging_rollout.py\n"
+                "/scripts/worker_container_rollback.py\n"
+            ),
+            "sparse-checkout-cone-mode": "false",
+        })
     if (not str(checkout.get("uses", "")).startswith("actions/checkout@")
-            or checkout.get("with") != {"persist-credentials": "false", "ref": "${{ github.sha }}"}):
-        errors.append(f"{prefix} checkout must pin the workflow head without persisted credentials")
+            or checkout.get("with") != checkout_options):
+        errors.append(f"{prefix} checkout must pin the workflow head and reviewed inputs without persisted credentials")
     if (not str(fetch.get("uses", "")).startswith("actions/download-artifact@")
             or fetch.get("with") != {"name": manifest, "path": "current-plan"}):
         errors.append(f"{prefix} must read this dispatch's plan artifact, not an arbitrary run")
@@ -4108,9 +4125,17 @@ def staging_callee_window_errors(name, workflow, consumer):
         if {key: value for key, value in upload.items() if key != "name"} != expected_upload:
             errors.append(f"{name}:staging-window: must always upload the start receipt for 14 days, "
                           "failing on a missing file")
-        if checkout != {"uses": STAGING_CHECKOUT_USES,
-                        "with": {"persist-credentials": "false", "fetch-depth": "1"}}:
-            errors.append(f"{name}:staging-window: checkout must be the pinned action without persisted credentials")
+        checkout_inputs = {"persist-credentials": "false", "fetch-depth": "1"}
+        if name == "voice-synthetic.yml":
+            checkout_inputs.update({
+                "sparse-checkout": "/wrangler/scripts/staging-use-pipeline.mjs\n"
+                                   "/wrangler/scripts/staging-use.mjs\n"
+                                   "/wrangler/scripts/is-direct-invocation.mjs\n"
+                                   "/wrangler/scripts/ownership-control-response.mjs\n",
+                "sparse-checkout-cone-mode": "false",
+            })
+        if checkout != {"uses": STAGING_CHECKOUT_USES, "with": checkout_inputs}:
+            errors.append(f"{name}:staging-window: checkout must match the pinned action and exact inputs")
         if node != {"uses": STAGING_SETUP_NODE_USES,
                     "with": {"node-version": "22", "package-manager-cache": "false"}}:
             errors.append(f"{name}:staging-window: second step must be the pinned setup-node on Node 22")
@@ -4258,8 +4283,11 @@ def voice_synthetic_errors(workflow):
         if "GITHUB_" in budget.get("run", ""):
             errors.append(f"{name}:synthetic: budget check must not access Actions command files")
         if checkout != {"uses": STAGING_CHECKOUT_USES,
-                        "with": {"persist-credentials": "false", "fetch-depth": "1"}}:
-            errors.append(f"{name}:synthetic: checkout must be pinned and wait for the budget check")
+                        "with": {"persist-credentials": "false", "fetch-depth": "1",
+                                 "sparse-checkout": "/scripts/staging_voice_synthetic.py\n"
+                                                    "/scripts/script_intake.py\n",
+                                 "sparse-checkout-cone-mode": "false"}}:
+            errors.append(f"{name}:synthetic: checkout must be pinned, sparse and wait for the budget check")
         if any(voice.get("env", {}).get(k) != v for k, v in bindings.items()):
             errors.append(f"{name}:synthetic: must use the original grant and predecessor clock")
         run = voice.get("run", "")
@@ -4648,14 +4676,14 @@ SLOW_BURN_FIXTURE_RUN = ('set -euo pipefail\n'
 def slow_burn_observer_errors(job):
     """A periodic scrape may observe authority but must never acquire it."""
     steps = job.get("steps") or []
-    if len(steps) != 7 or steps[3] != SLOW_BURN_OBSERVER_STEP:
+    if len(steps) != 6 or steps[2] != SLOW_BURN_OBSERVER_STEP:
         return ["slow-burn-tracker.yml:tracker: must unconditionally observe with the exact isolated control step"]
     errors = []
-    if steps[4].get("if") != SLOW_BURN_SAMPLE_IF:
+    if steps[3].get("if") != SLOW_BURN_SAMPLE_IF:
         errors.append("slow-burn-tracker.yml:tracker: scrape must require a validated active window")
-    if steps[5].get("if") != "${{ !cancelled() && steps.window.outputs.sample == 'true' }}":
+    if steps[4].get("if") != "${{ !cancelled() && steps.window.outputs.sample == 'true' }}":
         errors.append("slow-burn-tracker.yml:tracker: idle must not save a fresh burn cache")
-    upload = steps[6]
+    upload = steps[5]
     if upload.get("with") != {
             "name": "slow-burn-tracker-${{ github.run_id }}",
             "path": "slow-burn-tracker-evidence.json\nslow-burn-exposition.prom\n${{ runner.temp }}/staging-use-observer.jsonl\n",
@@ -4716,8 +4744,8 @@ def slow_burn_tracker_errors(workflow):
     if set(jobs) != {"tracker", "fixture"}:
         errors.append(f"{name}: jobs must be exactly tracker and fixture")
         return errors
-    shapes = (("tracker", "slow-burn tracker", SLOW_BURN_LIVE_IF, SLOW_BURN_LIVE_RUN, 7, 4),
-              ("fixture", "slow-burn fixture proof", SLOW_BURN_FIXTURE_IF, SLOW_BURN_FIXTURE_RUN, 4, 2))
+    shapes = (("tracker", "slow-burn tracker", SLOW_BURN_LIVE_IF, SLOW_BURN_LIVE_RUN, 6, 3),
+              ("fixture", "slow-burn fixture proof", SLOW_BURN_FIXTURE_IF, SLOW_BURN_FIXTURE_RUN, 3, 1))
     for job_id, title, condition, command, step_count, run_index in shapes:
         job = jobs[job_id]
         if job.get("name") != title:
@@ -4746,14 +4774,11 @@ def slow_burn_tracker_errors(workflow):
         if len(steps) != step_count:
             errors.append(f"{name}:{job_id}: must keep exactly {step_count} steps")
             continue
-        checkout, setup_node, run_step, upload = steps[0], steps[1], steps[run_index], steps[-1]
+        checkout, run_step, upload = steps[0], steps[run_index], steps[-1]
         if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
                 or checkout.get("with") != {"persist-credentials": "false", "fetch-depth": "1"}:
             errors.append(f"{name}:{job_id}: checkout must be pinned, must not persist credentials, "
                           "and must not set ref or repository")
-        if not str(setup_node.get("uses", "")).startswith("actions/setup-node@") \
-                or (setup_node.get("with") or {}).get("node-version") != "24":
-            errors.append(f"{name}:{job_id}: setup-node must be pinned at node 24 for the verdict driver")
         if run_step.get("run") != command or "uses" in run_step:
             errors.append(f"{name}:{job_id}: run step must run exactly the reviewed tracker command, "
                           "with inputs passed via env only")
@@ -4783,8 +4808,8 @@ def slow_burn_tracker_errors(workflow):
     if live_secrets != {"staging_metrics_scrape_token", "staging_ownership_control_token", "github_token"}:
         errors.append(f"{name}:tracker: must read only the staging scrape/control bearers and the GitHub token")
     live_steps = live.get("steps") or []
-    if len(live_steps) == 7:
-        restore, track, save = live_steps[2], live_steps[4], live_steps[5]
+    if len(live_steps) == 6:
+        restore, track, save = live_steps[1], live_steps[3], live_steps[4]
         # Split restore/save: a full actions/cache step restores in its main
         # phase, so the save step would overwrite the tracker's fresh ring with
         # the stale cached copy before saving it back.
@@ -4817,7 +4842,7 @@ def slow_burn_tracker_errors(workflow):
     if set(re.findall(r"secrets\.([a-z0-9_]+)", fixture_text)) != {"github_token"}:
         errors.append(f"{name}:fixture: must read only the GitHub token")
     fixture_steps = fixture.get("steps") or []
-    if len(fixture_steps) == 4 and fixture_steps[2].get("env") != SLOW_BURN_FIXTURE_ENV:
+    if len(fixture_steps) == 3 and fixture_steps[1].get("env") != SLOW_BURN_FIXTURE_ENV:
         errors.append(f"{name}:fixture: proof step must take only the GitHub token and the "
                       "dispatch inputs via env")
     return errors
@@ -5238,9 +5263,11 @@ def workflow_policy_errors(workflows):
             # below would flag its production-migrate Environment binding.
             errors.extend(production_migrate_errors(workflow))
             continue
-        if name == "deploy-production-recovery.yml":
+        if name in ("deploy-production-recovery.yml", "deploy-production-interrupted.yml"):
+            expected = (PRODUCTION_RECOVERY_GRAPH if name == "deploy-production-recovery.yml"
+                        else PRODUCTION_INTERRUPTED_GRAPH)
             graph = hashlib.sha256(json.dumps(workflow, sort_keys=True).encode()).hexdigest()
-            if graph != PRODUCTION_RECOVERY_GRAPH:
+            if graph != expected:
                 errors.append(f"{name}: protected recovery graph changed")
             continue
         if name == "staging-ownership-status.yml":
@@ -6512,6 +6539,31 @@ class WorkflowTests(unittest.TestCase):
             r"--test lfg_interactions(?: --test \S+)* -- --ignored --test-threads=1",
         )
 
+    def test_community_db_bootstrap_is_ready_before_cargo(self):
+        job = self.workflows["check.yml"]["jobs"]["community-db"]
+        service = job["services"]["agent-testdb"]
+        self.assertNotIn("ports", service)
+        self.assertEqual(service["env"], {
+            "POSTGRES_USER": "agent_test",
+            "POSTGRES_DB": "two_bot_test_ci",
+            "POSTGRES_HOST_AUTH_METHOD": "trust",
+        })
+        self.assertEqual(
+            job["env"]["TWO_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        # TCP excludes the entrypoint's temporary socket-only server. A SQL
+        # connection also proves that the actual bootstrap database exists.
+        self.assertIn(
+            '--health-cmd "psql -X -w -h 127.0.0.1 -U agent_test '
+            '-d two_bot_test_ci -Atqc \'SELECT 1\'"',
+            service["options"],
+        )
+        self.assertNotRegex(
+            "\n".join(step.get("run", "") for step in job["steps"]),
+            r"\b(?:apt-get|createdb)\b",
+        )
+
     def test_tickets_postgres_acceptance_receives_disposable_database_url(self):
         job = self.workflows["check.yml"]["jobs"]["tickets-postgres"]
         prepare = next(
@@ -7777,6 +7829,10 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["synthetic"]["steps"][-2].__setitem__("run", "wrangler deploy"),
             lambda w: w["jobs"]["staging-window"]["steps"][-1].update(run="true"),
             lambda w: w["jobs"]["synthetic"]["steps"][0].__setitem__("env", {"T": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}),
+            lambda w: w["jobs"]["synthetic"]["steps"][1]["with"].pop("sparse-checkout"),
+            lambda w: w["jobs"]["synthetic"]["steps"][1]["with"].update({
+                "sparse-checkout": "/scripts/staging_voice_synthetic.py\n"}),
+            lambda w: w["jobs"]["synthetic"]["steps"][1]["with"].pop("sparse-checkout-cone-mode"),
             lambda w: w["on"]["workflow_call"]["inputs"].pop("artifact_invocation"),
             lambda w: w["on"]["workflow_call"]["inputs"]["artifact_invocation"].update({"required": "true"}),
             lambda w: w["jobs"]["staging-window"]["steps"][4]["with"].update({"name": "collision"}),
@@ -7807,6 +7863,29 @@ class WorkflowTests(unittest.TestCase):
             mutate(changed)
             errors = voice_synthetic_errors(changed)
             self.assertTrue(any(diagnostic in error for error in errors), errors)
+
+    def test_voice_staging_window_checkout_rejects_input_drift(self):
+        workflow = self.workflows["voice-synthetic.yml"]
+        self.assertEqual(voice_synthetic_errors(workflow), [])
+        checkout = workflow["jobs"]["staging-window"]["steps"][0]
+        inputs = checkout["with"]
+        paths = inputs["sparse-checkout"].splitlines(keepends=True)
+        mutations = {
+            "full checkout": {key: inputs[key] for key in ("persist-credentials", "fetch-depth")},
+            "wider checkout": {**inputs, "sparse-checkout": "/wrangler/scripts/\n"},
+            "cone mode": {**inputs, "sparse-checkout-cone-mode": "true"},
+            "ref override": {**inputs, "ref": "main"},
+            "filter override": {**inputs, "filter": "blob:none"},
+            **{f"missing {path.strip()}": {**inputs, "sparse-checkout": "".join(p for p in paths if p != path)}
+               for path in paths},
+        }
+        for label, changed_inputs in mutations.items():
+            with self.subTest(label=label):
+                changed = deepcopy(workflow)
+                changed["jobs"]["staging-window"]["steps"][0]["with"] = changed_inputs
+                self.assertEqual(voice_synthetic_errors(changed), [
+                    "voice-synthetic.yml:staging-window: checkout must match the pinned action and exact inputs",
+                ])
 
     def test_consumer_checks_survive_unexpected_job_inventory(self):
         import copy
@@ -8709,6 +8788,22 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                 mutate(changed)
                 self.assertTrue(cloudflare_environment_errors(changed), label)
                 self.assertTrue(workflow_policy_errors(changed), label)
+
+    def test_predecessor_checkout_keeps_history_and_limits_worktree(self):
+        name = "build-predecessor.yml"
+        rejection = f"{name}: expected the pinned protected workflow"
+        self.assertNotIn(rejection, workflow_policy_errors(self.workflows))
+        steps = self.workflows[name]["jobs"]["build"]["steps"]
+        checkout = steps[0]["with"]
+        self.assertEqual(checkout["fetch-depth"], "0")
+        self.assertNotIn("filter", checkout)
+        self.assertNotIn("sparse-checkout", checkout)
+        prepare = next(step for step in steps if step.get("name") ==
+                       "Verify the protected input and export the reviewed tree")
+        self.assertEqual(prepare["run"].splitlines()[-2:], [
+            "git sparse-checkout set --cone scripts",
+            "python3 scripts/build_predecessor.py prepare",
+        ])
 
     def test_pinned_sha_is_dispatch_only_and_ancestor_checked(self):
         workflows = self.workflows
@@ -9880,6 +9975,14 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             workflow = deepcopy(migrate)
             change(workflow)
             return staging_migrate_errors(workflow)
+
+        for option, value in (("sparse-checkout", "/scripts/\n"),
+                              ("sparse-checkout", "/scripts/ci/staging_migrate_claim.py\n"),
+                              ("sparse-checkout-cone-mode", "true")):
+            with self.subTest(checkout={option: value}):
+                def change_checkout(w):
+                    w["jobs"]["claim"]["steps"][0]["with"][option] = value
+                self.assertTrue(mutated(change_checkout))
 
         for trigger in ("push", "pull_request", "schedule", "workflow_call"):
             with self.subTest(trigger=trigger):
@@ -11079,7 +11182,7 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
         # deployment: false form keeps the five-minute scrape out of the
         # staging deployment history.
         self.assertEqual(live.get("environment"), {"name": "staging", "deployment": "false"})
-        self.assertEqual(live["steps"][4]["env"]["METRICS_SCRAPE_TOKEN"],
+        self.assertEqual(live["steps"][3]["env"]["METRICS_SCRAPE_TOKEN"],
                          "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}")
         # Fixture proofs run in their own job: no Environment, only the job token.
         self.assertIn("fixture", tracker["jobs"])
@@ -11100,10 +11203,10 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             return copy["jobs"]["fixture"]
 
         def live_run(copy, text):
-            live_job(copy)["steps"][4]["run"] = text(live_job(copy)["steps"][4]["run"])
+            live_job(copy)["steps"][3]["run"] = text(live_job(copy)["steps"][3]["run"])
 
         def fixture_run(copy, text):
-            fixture_job(copy)["steps"][2]["run"] = text(fixture_job(copy)["steps"][2]["run"])
+            fixture_job(copy)["steps"][1]["run"] = text(fixture_job(copy)["steps"][1]["run"])
 
         bearer = "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"
         staging = {"name": "staging", "deployment": "false"}
@@ -11118,9 +11221,9 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                 {"defaults": {"run": {"shell": "echo {0}"}}}),
             "fixture job shell default": lambda w: fixture_job(w).update(
                 {"defaults": {"run": {"shell": "echo {0}"}}}),
-            "live run step shell override": lambda w: live_job(w)["steps"][4].update(
+            "live run step shell override": lambda w: live_job(w)["steps"][3].update(
                 {"shell": "echo {0}"}),
-            "fixture run step shell override": lambda w: fixture_job(w)["steps"][2].update(
+            "fixture run step shell override": lambda w: fixture_job(w)["steps"][1].update(
                 {"shell": "echo {0}"}),
             "third job": lambda w: w["jobs"].update({"again": deepcopy(live_job(w))}),
             "fixture job dropped": lambda w: w["jobs"].pop("fixture"),
@@ -11132,21 +11235,21 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             "production environment": lambda w: live_job(w).update(
                 {"environment": {"name": "production", "deployment": "false"}}),
             "no live environment": lambda w: live_job(w).pop("environment"),
-            "unbound secret name": lambda w: live_job(w)["steps"][4]["env"].update(
+            "unbound secret name": lambda w: live_job(w)["steps"][3]["env"].update(
                 {"METRICS_SCRAPE_TOKEN": "${{ secrets.METRICS_SCRAPE_TOKEN }}"}),
-            "production bearer": lambda w: live_job(w)["steps"][4]["env"].update(
+            "production bearer": lambda w: live_job(w)["steps"][3]["env"].update(
                 {"METRICS_SCRAPE_TOKEN": "${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}"}),
-            "dropped bearer": lambda w: live_job(w)["steps"][4]["env"].pop("METRICS_SCRAPE_TOKEN"),
+            "dropped bearer": lambda w: live_job(w)["steps"][3]["env"].pop("METRICS_SCRAPE_TOKEN"),
             # The script reads METRICS_SCRAPE_TOKEN: the bearer must keep that name.
-            "bearer under another name": lambda w: live_job(w)["steps"][4]["env"].update(
-                {"SCRAPE_TOKEN": live_job(w)["steps"][4]["env"].pop("METRICS_SCRAPE_TOKEN")}),
-            "dropped worker url": lambda w: live_job(w)["steps"][4]["env"].pop("STAGING_WORKER_URL"),
+            "bearer under another name": lambda w: live_job(w)["steps"][3]["env"].update(
+                {"SCRAPE_TOKEN": live_job(w)["steps"][3]["env"].pop("METRICS_SCRAPE_TOKEN")}),
+            "dropped worker url": lambda w: live_job(w)["steps"][3]["env"].pop("STAGING_WORKER_URL"),
             "bearer on the job": lambda w: live_job(w).update({"env": {"METRICS_SCRAPE_TOKEN": bearer}}),
-            "bearer on the restore": lambda w: live_job(w)["steps"][2].update(
+            "bearer on the restore": lambda w: live_job(w)["steps"][1].update(
                 {"env": {"METRICS_SCRAPE_TOKEN": bearer}}),
-            "extra staging secret": lambda w: live_job(w)["steps"][4]["env"].update(
+            "extra staging secret": lambda w: live_job(w)["steps"][3]["env"].update(
                 {"X": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
-            "blanket secrets": lambda w: live_job(w)["steps"][4]["env"].update(
+            "blanket secrets": lambda w: live_job(w)["steps"][3]["env"].update(
                 {"ALL": "${{ toJSON(secrets) }}"}),
             "live any branch": lambda w: live_job(w).update(
                 {"if": "(github.event.inputs.fixture || 'live') == 'live'"}),
@@ -11166,30 +11269,30 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                 {"ref": "evil-branch"}),
             "live checkout repository swap": lambda w: live_job(w)["steps"][0]["with"].update(
                 {"repository": "evil/repo"}),
-            "live save only on success": lambda w: live_job(w)["steps"][5].update({"if": "success()"}),
-            "idle scrape allowed": lambda w: live_job(w)["steps"][4].pop("if"),
-            "idle cache refreshed": lambda w: live_job(w)["steps"][5].update({"if": "${{ !cancelled() }}"}),
-            "observer acquires": lambda w: live_job(w)["steps"][3].update(
+            "live save only on success": lambda w: live_job(w)["steps"][4].update({"if": "success()"}),
+            "idle scrape allowed": lambda w: live_job(w)["steps"][3].pop("if"),
+            "idle cache refreshed": lambda w: live_job(w)["steps"][4].update({"if": "${{ !cancelled() }}"}),
+            "observer acquires": lambda w: live_job(w)["steps"][2].update(
                 {"run": SLOW_BURN_OBSERVER_STEP["run"].replace(" observe", " acquire")}),
-            "observer tolerates refusal": lambda w: live_job(w)["steps"][3].update({"continue-on-error": "true"}),
-            "observer gated off": lambda w: live_job(w)["steps"][3].update({"if": "false"}),
-            "observer missing scrape preflight": lambda w: live_job(w)["steps"][3]["env"].pop("METRICS_CONFIGURED"),
-            "observer secret leaked to scrape": lambda w: live_job(w)["steps"][4]["env"].update(
+            "observer tolerates refusal": lambda w: live_job(w)["steps"][2].update({"continue-on-error": "true"}),
+            "observer gated off": lambda w: live_job(w)["steps"][2].update({"if": "false"}),
+            "observer missing scrape preflight": lambda w: live_job(w)["steps"][2]["env"].pop("METRICS_CONFIGURED"),
+            "observer secret leaked to scrape": lambda w: live_job(w)["steps"][3]["env"].update(
                 {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
-            "idle receipt dropped": lambda w: live_job(w)["steps"][6]["with"].update(
+            "idle receipt dropped": lambda w: live_job(w)["steps"][5]["with"].update(
                 {"path": "slow-burn-tracker-evidence.json\nslow-burn-exposition.prom\n"}),
             # Fixture job: proof runs never reach the staging Environment.
             "fixture binds staging": lambda w: fixture_job(w).update({"environment": deepcopy(staging)}),
             "fixture binds deployment staging": lambda w: fixture_job(w).update({"environment": "staging"}),
             "fixture binds tracker environment": lambda w: fixture_job(w).update(
                 {"environment": "slow-burn-tracker"}),
-            "fixture reads the bearer": lambda w: fixture_job(w)["steps"][2]["env"].update(
+            "fixture reads the bearer": lambda w: fixture_job(w)["steps"][1]["env"].update(
                 {"METRICS_SCRAPE_TOKEN": bearer}),
-            "fixture reads the old secret": lambda w: fixture_job(w)["steps"][2]["env"].update(
+            "fixture reads the old secret": lambda w: fixture_job(w)["steps"][1]["env"].update(
                 {"METRICS_SCRAPE_TOKEN": "${{ secrets.METRICS_SCRAPE_TOKEN }}"}),
-            "fixture reads the staging url": lambda w: fixture_job(w)["steps"][2]["env"].update(
+            "fixture reads the staging url": lambda w: fixture_job(w)["steps"][1]["env"].update(
                 {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"}),
-            "fixture blanket secrets": lambda w: fixture_job(w)["steps"][2]["env"].update(
+            "fixture blanket secrets": lambda w: fixture_job(w)["steps"][1]["env"].update(
                 {"ALL": "${{ toJSON(secrets) }}"}),
             "fixture job-level secret": lambda w: fixture_job(w).update({"env": {"T": bearer}}),
             "fixture runs live": lambda w: fixture_job(w).update({"if": "github.ref == 'refs/heads/main'"}),
@@ -11207,9 +11310,9 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             "fixture inline input": lambda w: fixture_run(w, lambda run: run.replace(
                 '"$TRACKER_FIXTURE"', '"${{ github.event.inputs.fixture }}"')),
             "fixture restores the ring": lambda w: fixture_job(w)["steps"].insert(
-                2, deepcopy(live_job(w)["steps"][2])),
+                1, deepcopy(live_job(w)["steps"][1])),
             "fixture saves the ring": lambda w: fixture_job(w)["steps"].insert(
-                3, deepcopy(live_job(w)["steps"][5])),
+                2, deepcopy(live_job(w)["steps"][4])),
             "fixture write grant": lambda w: fixture_job(w).update(
                 {"permissions": {"contents": "write", "issues": "write"}}),
             "fixture persisted credentials": lambda w: fixture_job(w)["steps"][0]["with"].update(
@@ -11222,6 +11325,11 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
             "fixture on tracker routing": lambda w: fixture_job(w).update(
                 {"runs-on": LEGACY_ROUTED_RUNNER.format(job="tracker")}),
         }
+        for job_id in ("tracker", "fixture"):
+            with self.subTest(job=job_id, change="redundant node setup"):
+                self.assertTrue(mutate(lambda w: w["jobs"][job_id]["steps"].insert(1, {
+                    "uses": "actions/setup-node@" + "a" * 40, "with": {"node-version": "24"},
+                })))
         for label, change in changes.items():
             with self.subTest(change=label):
                 self.assertTrue(mutate(change))
@@ -12397,6 +12505,7 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
                         expected = {"contents": "read", "actions": "read"}
                     elif (name == "production-migrate.yml" and job_id in ("claim", "apply")
                           or name == "deploy-production-recovery.yml"
+                          or name == "deploy-production-interrupted.yml"
                           or (name == "deploy-production.yml" and job_id.startswith("release-"))):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-staging.yml", "deploy"):
@@ -12600,6 +12709,7 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
         # deploy-side workflows below serialize at the lane jobs on purpose
         # (a top-level group would queue work that must stay unqueued).
         pure_callees = {
+            "deploy-production-interrupted.yml",
             "deploy-production-recovery.yml",
             "reusable-rust-nextest.yml",
             "sbom.yml",
