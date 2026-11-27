@@ -108,7 +108,7 @@ on:
         type: string
         default: ""
       release_recovery_run_id:
-        description: "Interrupted attendance apply only: terminal originating attempt-one run ID"
+        description: "Interrupted attendance apply only: supply just the terminal originating attempt-one run ID"
         type: string
         default: ""
 
@@ -278,10 +278,63 @@ jobs:
               print(f"::error::Refusing production {mode}: {reason}")
               sys.exit(1)
 
+          def api(path, what, **query):
+              args = ["gh", "api", "--method", "GET", path]
+              for key, value in query.items():
+                  args += ["-f", f"{key}={value}"]
+              try:
+                  return json.loads(subprocess.check_output(args, text=True))
+              except (subprocess.CalledProcessError, ValueError):
+                  refuse(f"could not read {what} from the GitHub API; failing closed")
+
+          def production_environment():
+              settings = api(f"repos/{repo}/environments/production", "the production Environment")
+              reviewers = sum(
+                  len(rule.get("reviewers") or [])
+                  for rule in settings.get("protection_rules") or []
+                  if rule.get("type") == "required_reviewers"
+              )
+              if not reviewers and not auto_approve:
+                  refuse("the production Environment has no required reviewers")
+              return settings, reviewers
+
+          def require_production_main_policy(settings):
+              policy = settings.get("deployment_branch_policy") or {}
+              if not policy.get("custom_branch_policies"):
+                  refuse("the production Environment must restrict deployments to main")
+              branches = api(
+                  f"repos/{repo}/environments/production/deployment-branch-policies",
+                  "the production deployment branch policies",
+              ).get("branch_policies", [])
+              if [(b.get("type", "branch"), b.get("name")) for b in branches] != [("branch", "main")]:
+                  refuse("the production Environment must allow deployments from main only")
+
           release_plan = os.environ.get("RELEASE_PLAN_ID", "")
           release_pins = os.environ.get("RELEASE_PINS", "")
-          if os.environ.get("RELEASE_RECOVERY_RUN_ID"):
-              refuse("interrupted recovery requires the activation follow-up")
+          recovery_run = os.environ.get("RELEASE_RECOVERY_RUN_ID", "")
+          if recovery_run:
+              mode = "interrupted-recovery"
+              if (event != "workflow_dispatch" or repo != "TogetherWeOwn/two-bot-next"
+                      or os.environ.get("GITHUB_REPOSITORY_ID") != "1396224242"
+                      or os.environ.get("GITHUB_REF") != "refs/heads/main"
+                      or os.environ.get("GITHUB_REF_PROTECTED") != "true"
+                      or os.environ.get("GITHUB_RUN_ATTEMPT") != "1"
+                      or not re.fullmatch(r"[1-9][0-9]{0,19}", recovery_run)
+                      or any(os.environ.get(key) for key in ("SHA", "ROLLBACK", "IMAGE"))
+                      or release_plan or release_pins or takeover != "true"
+                      or allow_unstaged != "false" or cutover_hold != "false"):
+                  refuse("interrupted recovery requires a fresh protected main dispatch with only the original run ID")
+              if os.environ.get("AUTO_DISABLED") != "true":
+                  refuse("interrupted recovery requires automatic production promotion to be disabled")
+              # Verify protection before GitHub can create a missing Environment
+              # for the first job of the reusable workflow.
+              settings, _ = production_environment()
+              require_production_main_policy(settings)
+              # The reusable workflow authenticates the terminal origin and
+              # bound stop intent before any provider or database access.
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write("mode=interrupted-recovery\n")
+              sys.exit(0)
 
           if release_plan or release_pins:
               if (event != "workflow_dispatch" or os.environ.get("GITHUB_RUN_ATTEMPT") != "1"
@@ -295,15 +348,6 @@ jobs:
                   refuse("protected release requires automatic production promotion to be disabled")
 
               refuse("protected release requires the activation follow-up")
-
-          def api(path, what, **query):
-              args = ["gh", "api", "--method", "GET", path]
-              for key, value in query.items():
-                  args += ["-f", f"{key}={value}"]
-              try:
-                  return json.loads(subprocess.check_output(args, text=True))
-              except (subprocess.CalledProcessError, ValueError):
-                  refuse(f"could not read {what} from the GitHub API; failing closed")
 
           def staged_source(run):
               title = run.get("display_title")
@@ -757,14 +801,7 @@ jobs:
                       return run_id
               return None
 
-          env = api(f"repos/{repo}/environments/production", "the production Environment")
-          reviewers = sum(
-              len(rule.get("reviewers") or [])
-              for rule in env.get("protection_rules") or []
-              if rule.get("type") == "required_reviewers"
-          )
-          if not reviewers and not auto_approve:
-              refuse("the production Environment has no required reviewers")
+          settings, reviewers = production_environment()
           # 10-20 13:31Z: with no reviewers the designed rollback dispatch was
           # refused while production stayed fenced. A rollback whose target is
           # a verified production snapshot needs no human (see above).
@@ -780,15 +817,7 @@ jobs:
               # Environment reviewers even with auto-approve on.
               refuse("the production Environment has no required reviewers for a staging-history waiver "
                      "(add a required reviewer; auto-approve does not cover the live-SHA cure)")
-          policy = env.get("deployment_branch_policy") or {}
-          if not policy.get("custom_branch_policies"):
-              refuse("the production Environment must restrict deployments to main")
-          branches = api(
-              f"repos/{repo}/environments/production/deployment-branch-policies",
-              "the production deployment branch policies",
-          ).get("branch_policies", [])
-          if [(b.get("type", "branch"), b.get("name")) for b in branches] != [("branch", "main")]:
-              refuse("the production Environment must allow deployments from main only")
+          require_production_main_policy(settings)
 
           # Refuse a new run/rerun that appeared while the other guards were read.
           fresh = latest_ci()
