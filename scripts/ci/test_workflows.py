@@ -3706,8 +3706,9 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:schema-gate: must use the explicit ubuntu-latest runner for job 'schema-gate'")
     if gate.get("timeout-minutes") != "30":
         errors.append(f"{name}:schema-gate: timeout must stay 30 minutes")
-    if (gate.get("container") or {}).get("image") != SCHEMA_GATE_IMAGE:
-        errors.append(f"{name}:schema-gate: must build on the pinned plan-job image")
+    # Container env/options would reach every step, so the container is pinned whole.
+    if gate.get("container") != {"image": SCHEMA_GATE_IMAGE}:
+        errors.append(f"{name}:schema-gate: must build on the pinned plan-job image with no container env or options")
     production = jobs.get("production", {})
     needs = production.get("needs")
     needs = [needs] if isinstance(needs, str) else (needs or [])
@@ -3718,27 +3719,73 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:schema-gate: must run exactly checkout, tooling checkout, SHA check, build and the gate")
         return errors
     checkout, tooling, sha_check, build, run = steps
-    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
-            or (checkout.get("with") or {}).get("fetch-depth") != "0" \
-            or "needs.guard.outputs.sha" not in str((checkout.get("with") or {}).get("ref", "")):
+    # Every step is pinned whole: no step may append to $GITHUB_ENV or
+    # $GITHUB_PATH, add env, or overwrite the trusted tooling copy before the
+    # gate reads the plan secret.
+    if checkout != {
+        "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "with": {
+            "ref": "${{ needs.guard.outputs.sha }}",
+            "persist-credentials": "false",
+            "fetch-depth": "0",
+        },
+    }:
         errors.append(f"{name}:schema-gate: checkout must be pinned, credentialless, full-depth and on the guarded SHA")
-    if not str(tooling.get("uses", "")).startswith("actions/checkout@") \
-            or (tooling.get("with") or {}).get("persist-credentials") != "false" \
-            or (tooling.get("with") or {}).get("path") != "tooling" \
-            or "github.sha" not in str((tooling.get("with") or {}).get("ref", "")):
-        errors.append(f"{name}:schema-gate: tooling checkout must be pinned, credentialless and on the workflow commit")
-    if ("needs.guard.outputs.sha" not in str(sha_check.get("env", ""))
-            or "git rev-parse HEAD" not in str(sha_check.get("run", ""))):
+    if tooling != {
+        "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "with": {
+            "ref": "${{ github.sha }}",
+            "path": "tooling",
+            "persist-credentials": "false",
+            "fetch-depth": "1",
+            "sparse-checkout": "/scripts/ci/production_schema_gate.py\n"
+                               "/scripts/ci/schema_gate_common.py\n"
+                               "/scripts/script_intake.py\n",
+            "sparse-checkout-cone-mode": "false",
+        },
+    }:
+        errors.append(f"{name}:schema-gate: tooling checkout must use only the reviewed schema gate files")
+    if ({key: value for key, value in sha_check.items() if key != "run"} != {
+            "name": "Deploy SHA must be exact",
+            "env": {"SOURCE_SHA": "${{ needs.guard.outputs.sha }}"},
+        }
+            or shell_logical_lines(str(sha_check.get("run", ""))) != [
+                'git config --global --add safe.directory "$GITHUB_WORKSPACE"',
+                'test "$(git rev-parse HEAD)" = "$SOURCE_SHA"',
+            ]):
         errors.append(f"{name}:schema-gate: SHA check must pin the step to the guarded SHA")
-    if "cargo build -p two-bot-cutover --bin staging-migrate --locked" not in str(build.get("run", "")):
+    if build != {"name": "Build runner",
+                 "run": "cargo build -p two-bot-cutover --bin staging-migrate --locked"}:
         errors.append(f"{name}:schema-gate: build must compile the reviewed staging-migrate binary locked")
-    if (run.get("shell") != "bash" or "set -o pipefail" not in str(run.get("run", ""))
-            or "scripts/ci/production_schema_gate.py" not in str(run.get("run", ""))
-            or "--source-sha" not in str(run.get("run", ""))
-            or "--mode" not in str(run.get("run", ""))
-            or "--allow-unstaged" not in str(run.get("run", ""))
-            or "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL" not in str(run.get("env", ""))):
+    # The gate step is pinned whole: only the trusted tooling copy runs, over
+    # pipefail, with exactly the plan binding, identity pins and guard outputs.
+    # No other env key (PYTHONPATH, BASH_ENV, PATH, LD_PRELOAD), working
+    # directory, `if` or `continue-on-error` can slip in beside the secret,
+    # and no job- or workflow-level env/defaults can reach the step.
+    if (gate.keys() - {"name", "needs", "if", "runs-on", "timeout-minutes", "environment",
+                       "permissions", "container", "steps"}
+            or workflow.keys() & {"env", "defaults"}):
+        errors.append(f"{name}:schema-gate: job and workflow must not set env, defaults, continue-on-error "
+                      "or any other job key")
+    if ({key: value for key, value in run.items() if key != "run"} != {
+            "name": "Fail closed on schema drift",
+            "env": {
+                "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL": "${{ secrets.TWO_BOT_PRODUCTION_PLAN_DATABASE_URL }}",
+                "TWO_BOT_PRODUCTION_HOST": "${{ vars.TWO_BOT_PRODUCTION_HOST }}",
+                "TWO_BOT_PRODUCTION_DATABASE": "${{ vars.TWO_BOT_PRODUCTION_DATABASE }}",
+                "TWO_BOT_PRODUCTION_BRANCH_ID": "${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}",
+                "SOURCE_SHA": "${{ needs.guard.outputs.sha }}",
+                "MODE": "${{ needs.guard.outputs.mode }}",
+                "ALLOW_UNSTAGED": "${{ needs.guard.outputs.allow_unstaged }}",
+            },
+            "shell": "bash",
+        }
+            or shell_logical_lines(str(run.get("run", ""))) != [
+                "set -o pipefail",
+                'python3 tooling/scripts/ci/production_schema_gate.py'
+                ' --binary ./target/debug/staging-migrate --source-sha "$SOURCE_SHA"'
+                ' --mode "$MODE" --allow-unstaged "$ALLOW_UNSTAGED"',
+            ]):
         errors.append(f"{name}:schema-gate: gate step must run the reviewed script over pipefail "
                       "with the plan binding, the guarded SHA and the guard-verified waive flags")
     # The expected production identity is pinned independently of the secret
@@ -9638,9 +9685,46 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["schema-gate"].__setitem__("environment", "production-migrate-apply"),
             lambda w: w["jobs"]["schema-gate"].__setitem__("if", "github.ref == 'refs/heads/main'"),
             lambda w: w["jobs"]["schema-gate"].__setitem__("needs", "production"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][1]["with"].pop("sparse-checkout"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][1]["with"].__setitem__(
+                "sparse-checkout-cone-mode", "true"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][1]["with"].__setitem__(
+                "ref", "${{ needs.guard.outputs.sha }}"),
             lambda w: w["jobs"]["production"].__setitem__("needs", "guard"),
             lambda w: w["jobs"]["production"].__setitem__("needs", ["schema-gate"]),
             lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__(
+                "run", w["jobs"]["schema-gate"]["steps"][4]["run"].replace(
+                    "python3 tooling/scripts/", "python3 scripts/")),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__(
+                "run", w["jobs"]["schema-gate"]["steps"][4]["run"].replace(
+                    "python3 tooling/", "PYTHONPATH=scripts python3 tooling/")),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
+                "PYTHONPATH", "scripts"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4]["env"].__setitem__('BASH_ENV', 'scripts/evil.sh'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4]["env"].__setitem__('PATH', './bin:/usr/bin'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4]["env"].__setitem__('LD_PRELOAD', './evil.so'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__('if', 'false'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__('continue-on-error', True),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__('working-directory', 'scripts'),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("env", {"PYTHONPATH": "scripts"}),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("continue-on-error", True),
+            lambda w: w["jobs"]["schema-gate"].__setitem__(
+                "defaults", {"run": {"working-directory": "scripts"}}),
+            lambda w: w.__setitem__("env", {"PYTHONPATH": "scripts"}),
+            lambda w: w.__setitem__("defaults", {"run": {"shell": "sh"}}),
+            lambda w: w["jobs"]["schema-gate"]["steps"][3].__setitem__(
+                "run", w["jobs"]["schema-gate"]["steps"][3]["run"] + '\necho "BASH_ENV=$PWD/evil.sh" >> "$GITHUB_ENV"'),
+            lambda w: w["jobs"]["schema-gate"]["steps"][2].__setitem__(
+                "run", w["jobs"]["schema-gate"]["steps"][2]["run"] + "cp scripts/ci/production_schema_gate.py tooling/scripts/ci/\n"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][3].__setitem__("env", {"RUSTFLAGS": "-C link-arg=x"}),
+            lambda w: w["jobs"]["schema-gate"]["steps"][0]["with"].__setitem__("persist-credentials", "true"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][0].__setitem__("uses", "actions/checkout@v7"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][1].__setitem__("uses", "actions/checkout@v7"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][0]["with"].__setitem__("ref", "${{ github.sha }}"),
+            lambda w: w["jobs"]["schema-gate"]["container"].__setitem__("env", {"PYTHONPATH": "scripts"}),
+            lambda w: w["jobs"]["schema-gate"]["container"].__setitem__("options", "--env BASH_ENV=x"),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("services", {"db": {"image": "x"}}),
             lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
                 "LEAK", "${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}"),
             lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
