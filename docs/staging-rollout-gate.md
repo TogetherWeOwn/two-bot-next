@@ -211,7 +211,7 @@ as a staging incident. Keep admission closed and qualification pending,
 reconcile the exact reservation, and repeat cleanup with fresh inventory until
 verification passes.
 
-#### Startup refusal handoff
+##### Startup refusal handoff
 
 This handoff describes the dormant PRE contract. Keep rehearsal admission and
 qualification pending until the protected workflow caller and provider adapter
@@ -257,8 +257,7 @@ record the unresolved step and last confirmed observation there and track the
 open cleanup as a staging incident under the same operator until fresh
 verification passes.
 
-
-#### Discord fixture transport
+##### Discord fixture transport
 
 Run `python3 scripts/pre_discord_transport.py` as an operator preflight before
 any hosted qualification create. It currently exits nonzero. The archived
