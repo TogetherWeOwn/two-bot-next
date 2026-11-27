@@ -24,6 +24,7 @@ REPOSITORY = "registry.example.invalid/pre/replacement"
 REFERENCE = f"{REPOSITORY}@{MANIFEST}"
 ALIAS = "pre-replacement"
 INSTANCE = "fixture-instance"
+SUBCLASS_SCOPE = type("ScopeText", (str,), {})("pre-fixture-test")
 
 
 class Fixture:
@@ -90,12 +91,11 @@ class NativeImagePinTests(unittest.TestCase):
                 f.adapter.resolve_image.assert_not_called()
                 f.adapter.start.assert_not_called()
 
-    def test_refuses_invalid_build_pin_even_when_the_map_agrees(self):
+    def test_refuses_invalid_build_pin_before_adapters(self):
         for reference in (f"{REPOSITORY}:latest", f"{REPOSITORY}:latest@{MANIFEST}", f"repo@{MANIFEST}"):
             with self.subTest(reference=reference):
                 f = Fixture()
                 f.admission = replace(f.admission, image=replace(f.image, reference=reference))
-                f.adapter.read_images.return_value = ImageMapReadback(f.scope, {ALIAS: reference})
                 with self.assertRaisesRegex(TargetError, "admission_invalid$"):
                     f.verify()
                 self.assertEqual(f.adapter.mock_calls, [])
@@ -106,6 +106,7 @@ class NativeImagePinTests(unittest.TestCase):
         for change in (dict(environment="other"), dict(object_id="d" * 64), dict(account_id="e" * 32),
                        dict(namespace_id="f" * 32), dict(deployment=replace(deployment, worker_version=UUID(int=4))),
                        dict(deployment=replace(deployment, target=replace(deployment.target, run_id=124))),
+                       dict(deployment=replace(deployment, target=replace(deployment.target, scope=SUBCLASS_SCOPE))),
                        dict(deployment=replace(deployment, target=replace(deployment.target, shape=ANY)))):
             with self.subTest(change=change):
                 f = Fixture()
@@ -141,8 +142,7 @@ class NativeImagePinTests(unittest.TestCase):
                 self.assertEqual(f.adapter.mock_calls, [])
 
     def test_checks_window_before_start_and_through_inspect(self):
-        cutoff = BEGIN + 10
-        expired = "effect_window_expired$"
+        cutoff, expired = BEGIN + 10, "effect_window_expired$"
         for ticks, starts, inspections, reason in (
             ([cutoff], 0, 0, expired), ([BEGIN, cutoff], 0, 0, expired),
             ([BEGIN, BEGIN + 1, cutoff], 1, 0, expired), ([BEGIN, BEGIN + 1, BEGIN + 3, cutoff], 1, 1, expired),
@@ -157,7 +157,7 @@ class NativeImagePinTests(unittest.TestCase):
                 self.assertEqual(f.adapter.inspect.call_count, inspections)
 
     def test_refuses_window_from_another_reservation(self):
-        for change in (dict(run_id=124), dict(shape=ANY)):
+        for change in (dict(run_id=124), dict(scope=SUBCLASS_SCOPE), dict(shape=ANY)):
             with self.subTest(change=change):
                 f = Fixture()
                 window = replace(f.admission.window, target=replace(f.scope.deployment.target, **change))
