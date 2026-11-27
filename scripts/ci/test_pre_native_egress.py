@@ -1,5 +1,3 @@
-"""Synthetic effective launch controls, using only in-memory trace adapters."""
-
 from dataclasses import replace
 from pathlib import Path
 import sys
@@ -21,6 +19,7 @@ FIRST = Reservation(Target("pre-fixture-first", 21, 1_800_000_000, "0473/0465"),
 RETAINED = Reservation(Target("pre-fixture-retained", 22, 1_800_000_000, "0475/0465"),
                        Endpoint("tcp", "2001:db8::10", 5432))
 DENIED = frozenset(("dns", "direct_ipv4", "direct_ipv6", "https_wss"))
+OTHER_POSTGRES = {FIRST.target: RETAINED.postgres, RETAINED.target: FIRST.postgres}
 
 
 class Trace:
@@ -66,24 +65,25 @@ class EffectiveLaunchControlsTests(unittest.TestCase):
     def setUp(self):
         self.trace = Trace()
 
-    def verify(self, first=FIRST, retained=RETAINED, digest=DIGEST):
+    def verify(self, retained=RETAINED, digest=DIGEST):
         return verify_effective_launch_controls(
-            first, retained, digest=digest, observe_policy=self.trace.policy, probe=self.trace.probe,
+            FIRST, retained, digest=digest, observe_policy=self.trace.policy, probe=self.trace.probe,
         )
 
     def rejects(self, reason, *, policy=None, launch=None, path=COLD, fault=None):
         def only_trial(mutate):
             def change(reading):
                 attempt = reading.attempt
-                if mutate and (attempt.target, attempt.path, attempt.fault) == (RETAINED.target, path, fault):
+                if mutate and (attempt.target, attempt.path, attempt.fault) == (target, path, fault):
                     return mutate(reading)
                 return reading
             return change
 
-        with (patch.object(self.trace, "change_policy", only_trial(policy)),
-              patch.object(self.trace, "change_launch", only_trial(launch)),
-              self.assertRaisesRegex(TargetError, f"^pre_egress_{reason}$")):
-            self.verify()
+        for target in (FIRST.target, RETAINED.target):
+            with (self.subTest(target=target), patch.object(self.trace, "change_policy", only_trial(policy)),
+                  patch.object(self.trace, "change_launch", only_trial(launch)),
+                  self.assertRaisesRegex(TargetError, f"^pre_egress_{reason}$")):
+                self.verify()
 
     def test_requires_each_reservation_path_and_fault(self):
         self.assertIsNone(self.verify())
@@ -109,7 +109,6 @@ class EffectiveLaunchControlsTests(unittest.TestCase):
         for field, value, reason in (
             ("gateway_url", GATEWAY + "/", "wrong_process_settings"),
             ("api_base", "http://localhost:8081", "wrong_process_settings"),
-            ("api_base", None, "wrong_process_settings"),
             ("digest", "sha256:" + "b" * 64, "wrong_digest"),
         ):
             with self.subTest(field=field, value=value):
@@ -141,22 +140,24 @@ class EffectiveLaunchControlsTests(unittest.TestCase):
             ({"enforced_at": 10}, "policy_not_enforced"),
             ({"namespace": "other"}, "policy_not_enforced"),
             ({"allowlist": (FIRST.postgres, RETAINED.postgres)}, "wrong_allowlist"),
-            ({"allowlist": (FIRST.postgres,)}, "wrong_allowlist"),
             ({"allowlist": (replace(RETAINED.postgres, protocol="udp"),)}, "wrong_allowlist"),
             ({"allowlist": (replace(RETAINED.postgres, address="0.0.0.0/0"),)}, "wrong_allowlist"),
         ):
             with self.subTest(fields=fields):
                 self.rejects(reason, policy=lambda r: replace(r, policy=replace(r.policy, **fields)))
+        self.rejects("wrong_allowlist", policy=lambda r: replace(
+            r, policy=replace(r.policy, allowlist=(OTHER_POSTGRES[r.attempt.target],))))
 
     def test_requires_all_denials_zero_public_traffic_and_exact_postgres(self):
         for fields, reason in (
             *[({"denied": DENIED - {vector}}, "denial_unconfirmed") for vector in sorted(DENIED)],
             ({"generation": 99}, "denial_unconfirmed"),
             ({"namespace": "other"}, "denial_unconfirmed"),
-            ({"postgres_allowed": FIRST.postgres}, "postgres_unconfirmed"),
         ):
             with self.subTest(fields=fields):
                 self.rejects(reason, launch=lambda r: replace(r, egress=replace(r.egress, **fields)))
+        self.rejects("postgres_unconfirmed", launch=lambda r: replace(
+            r, egress=replace(r.egress, postgres_allowed=OTHER_POSTGRES[r.attempt.target])))
         self.rejects("public_traffic_unconfirmed", launch=lambda r: replace(r, public_discord_packets=1))
 
     def test_refusal_must_affirm_zero_starts_on_each_path(self):

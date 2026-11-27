@@ -90,9 +90,8 @@ class LaunchObservation:
     listener: Listener | None
     process: Process | None
     refusal: str | None
-    # Complete trace counts for the attempt, including on refusal.
-    process_starts: int
-    public_discord_packets: int
+    process_starts: int  # Complete count, including on refusal.
+    public_discord_packets: int  # Complete count, including on refusal.
     egress: EgressObservation | None = None
 
 
