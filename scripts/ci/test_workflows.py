@@ -8071,14 +8071,14 @@ for (const entry of process.argv.slice(2)) await import("./" + entry);
 
     def test_staging_automod_dispatch_runs_from_sparse_checkout(self):
         steps = self.workflows["staging-automod-preview.yml"]["jobs"]["dry-run"]["steps"]
+        deny_fetch = "--import=data:text/javascript,globalThis.fetch=()=>process.exit(70)"
         probe = """
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-globalThis.fetch = () => assert.fail("Unexpected network access during dispatch binding");
 const [node, entry, ...args] = process.argv.slice(1);
 const { bindStagingAutomodDispatch } = await import("./" + entry);
 for (const optIn of ["false", "true"]) {
-  const env = { PATH: process.env.PATH, STAGING_AUTOMOD_REHEARSAL: optIn,
+  const env = { ...process.env, STAGING_AUTOMOD_REHEARSAL: optIn,
     ACTIONS_ID_TOKEN_REQUEST_URL: "https://pipelines.actions.githubusercontent.com/token",
     ACTIONS_ID_TOKEN_REQUEST_TOKEN: "synthetic-oidc-request", OWNERSHIP_CONTROL_TOKEN: "synthetic".repeat(5) };
   assert.equal(await bindStagingAutomodDispatch(env), undefined);
@@ -8093,8 +8093,8 @@ for (const optIn of ["false", "true"]) {
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((ROOT / pattern[1:]).read_bytes())
             result = subprocess.run(["node", "--input-type=module", "-e", probe, *shlex.split(steps[-1]["run"])],
-                                    cwd=directory, env={"PATH": os.environ["PATH"]}, capture_output=True,
-                                    text=True, timeout=15)
+                                    cwd=directory, env={"PATH": os.environ["PATH"], "NODE_OPTIONS": deny_fetch},
+                                    capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_staging_automod_preview_requires_protected_opt_in(self):
