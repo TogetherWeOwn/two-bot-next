@@ -3,7 +3,7 @@ import contract from "../../../crates/core/tests/fixtures/bot-site-contract-v2.j
 
 const wire = contract.verbs["voice.move_member"];
 
-export function mockVoiceMoveWindow(elapsedMs = 1000, { acquiredAt = 1_800_000_000_000, runId = "12345" } = {}) {
+export function mockVoiceMoveWindow(elapsedMs = 1000, scope?: { acquiredAt?: number; runId?: string; deploymentId?: string }) {
   const fixture = {
     environment: "staging",
     guildId: "100",
@@ -12,13 +12,14 @@ export function mockVoiceMoveWindow(elapsedMs = 1000, { acquiredAt = 1_800_000_0
   };
   const [source, destination] = fixture.channelIds;
   const session = { discordId: fixture.discordId };
+  const { acquiredAt = 1_800_000_000_000, runId = "12345", deploymentId = "synthetic-deployment" } = scope ?? {};
   const now = () => acquiredAt + elapsedMs;
   const lease = {
     runId,
     runAttempt: 1,
     expiresAt: acquiredAt + 15 * 60_000,
     sha: "a".repeat(40),
-    deploymentId: "synthetic-deployment",
+    deploymentId,
     epoch: 2,
   };
   let connectedChannelId: string | null = source;

@@ -316,8 +316,13 @@ A gateway summary can flag an existing mismatch before its hash is bound.
 The capture bounds catch a summary attached to the wrong time window. The
 hash binds the saved bytes, and the independent readback still supplies the
 application and serving identity even when revision and bounds coincide.
-Endpoint denial stays `unverified` in the report. Record explicit passive
-rejection evidence separately on the card per
+The report marks endpoint denial `observed` only for a v2 passive receipt
+with an in-window UTC timestamp after the exact file hash, revision, capture
+bounds and independent serving attribution match. The report prints the
+receipt time as `endpoint_denial_at`. A v1 or absent, invalid or mismatched
+receipt leaves endpoint denial `unverified`. Readiness and generic gateway
+failures carry no endpoint-policy credit. Retain the approved source and
+independent serving readback with the execution card per
 [gateway recovery](gateway-recovery.md#recording-endpoint-policy-evidence).
 
 ```sh
