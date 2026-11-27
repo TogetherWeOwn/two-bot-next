@@ -63,7 +63,8 @@ function refused(reason: string): CleanupVerdict {
 
 /** Verify decoded evidence from an authenticated collector and a trusted clock.
  * `ownedCommand: null` is a positive never-created pin. `registry: "absent"`
- * attests a complete guild read after the stop and remote publication drain.
+ * attests a complete guild read after confirming the stop. The collector
+ * confirms the stop after fencing and draining remote startup and publication.
  * The collector must authenticate the run, original lease, ownership pin and
  * observations, including the exact revision removed when a command existed.
  * Times are UTC epoch milliseconds. Recovery may use the original expired lease.
@@ -83,20 +84,20 @@ export function verifyStagingAutomodCleanup(input: unknown, now: number): Cleanu
       return refused("recovery_not_authorized");
     }
 
-    const stop = readRecord(evidence.runtimeStop, ["lease", "observedAt", "running"]);
-    if (!stop || stop.running !== false || !sameLease(lease, leaseFields(stop.lease))
-      || !fresh(stop.observedAt, lease, now)) return refused("runtime_stop_unverified");
-
-    const fence = readRecord(evidence.publicationFence, ["lease", "target", "observedAt", "publicationDrained"]);
-    if (!fence || fence.publicationDrained !== true || !fixedTarget(fence.target)
+    const fence = readRecord(evidence.publicationFence, ["lease", "target", "observedAt", "publicationDrained", "startupDrained"]);
+    if (!fence || fence.publicationDrained !== true || fence.startupDrained !== true || !fixedTarget(fence.target)
       || !sameLease(lease, leaseFields(fence.lease)) || !fresh(fence.observedAt, lease, now)) {
       return refused("publication_drain_unverified");
     }
 
+    const stop = readRecord(evidence.runtimeStop, ["lease", "observedAt", "running"]);
+    if (!stop || stop.running !== false || !sameLease(lease, leaseFields(stop.lease))
+      || !fresh(stop.observedAt, lease, now) || stop.observedAt < fence.observedAt) return refused("runtime_stop_unverified");
+
     const registry = readRecord(evidence.discordRegistry, ["lease", "target", "observedAt", "registry", "deletedCommand"]);
     if (!registry || registry.registry !== "absent" || !fixedTarget(registry.target)
       || !sameLease(lease, leaseFields(registry.lease)) || !fresh(registry.observedAt, lease, now)
-      || registry.observedAt < Math.max(stop.observedAt, fence.observedAt)) return refused("registry_absence_unverified");
+      || registry.observedAt < stop.observedAt) return refused("registry_absence_unverified");
 
     if (evidence.ownedCommand !== null || registry.deletedCommand !== null) {
       const owned = revision(evidence.ownedCommand);

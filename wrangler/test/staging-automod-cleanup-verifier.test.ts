@@ -25,9 +25,10 @@ function evidence(ownedCommand: typeof command | null = null) {
     run,
     expectedLease,
     ownedCommand,
-    runtimeStop: { lease: { ...expectedLease }, observedAt: now - 60_000, running: false },
+    runtimeStop: { lease: { ...expectedLease }, observedAt: now - 59_999, running: false },
     publicationFence: {
-      lease: { ...expectedLease }, target: { ...STAGING_AUTOMOD_TARGET }, observedAt: now - 100, publicationDrained: true,
+      lease: { ...expectedLease }, target: { ...STAGING_AUTOMOD_TARGET }, observedAt: now - 60_000,
+      publicationDrained: true, startupDrained: true,
     },
     discordRegistry: {
       lease: { ...expectedLease }, target: { ...STAGING_AUTOMOD_TARGET }, observedAt: now,
@@ -74,13 +75,22 @@ test("rejects stale, future and invalid observation times and clocks", () => {
   }
 });
 
-test("rejects a registry read taken before the stop or publication drain", () => {
+test("rejects a registry read taken before the confirmed stop", () => {
   const input = evidence();
   const earlyRegistry = { ...input.discordRegistry, observedAt: now - 1 };
   assertRefused({ ...input, discordRegistry: earlyRegistry, runtimeStop: { ...input.runtimeStop, observedAt: now } },
     "registry_absence_unverified");
-  assertRefused({ ...input, discordRegistry: earlyRegistry,
-    publicationFence: { ...input.publicationFence, observedAt: now } }, "registry_absence_unverified");
+});
+
+test("requires remote startup drain before confirming the runtime stop", () => {
+  const input = evidence();
+  const { startupDrained, ...missingStartupDrain } = input.publicationFence;
+  assertRefused({ ...input, publicationFence: missingStartupDrain }, "publication_drain_unverified");
+  for (const startupDrained of [false, null, "true"]) {
+    assertRefused({ ...input, publicationFence: { ...input.publicationFence, startupDrained } },
+      "publication_drain_unverified");
+  }
+  assertRefused({ ...input, publicationFence: { ...input.publicationFence, observedAt: now } }, "runtime_stop_unverified");
 });
 
 test("binds all readbacks to the full original AutoMod lease", () => {
