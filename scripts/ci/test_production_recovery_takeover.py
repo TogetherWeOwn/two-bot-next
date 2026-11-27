@@ -1,13 +1,14 @@
 """Synthetic production recovery without GitHub, Cloudflare or a database."""
 
-from dataclasses import asdict
+from copy import deepcopy
+from dataclasses import asdict, replace
 from pathlib import Path
 import sys
 import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from production_recovery_takeover import GateError, RecoveryPin, complete_legacy_takeover
+from production_recovery_takeover import GateError, LEGACY_RELEASE_WORKER_SHA, RecoveryPin, complete_legacy_takeover
 import worker_container_rollback as rollback
 
 
@@ -69,8 +70,7 @@ class ProductionRecoveryTakeoverTests(unittest.TestCase):
             raise GateError("ownership_control_unavailable")
 
         self.control.side_effect = commit_then_lose_acknowledgement
-        with self.assertRaisesRegex(GateError, "^ownership_control_unavailable$"):
-            self.complete()
+        self.assertEqual(self.complete(), "resumed")
         self.state["ownership"]["running"] = True
         self.assertEqual(self.complete(), "resumed")
         self.control.assert_called_once_with("takeover-fenced", 21, expected_deployment=self.pin.worker_version)
@@ -95,12 +95,31 @@ class ProductionRecoveryTakeoverTests(unittest.TestCase):
             self.complete()
         self.control.assert_not_called()
 
+    def test_legacy_restore_reconciles_one_post_only_for_the_same_provider_pair(self):
+        self.pin = replace(self.pin, rollback_sha=LEGACY_RELEASE_WORKER_SHA)
+        self.readback = {"state": "restored", **asdict(self.pin)}
+        self.state["worker"].update(sha=self.pin.rollback_sha, deployment_id="initial")
+        self.observe.side_effect = lambda: deepcopy(self.state)
+
+        def commit_then_lose_acknowledgement(*args, **kwargs):
+            self.commit_takeover()
+            self.state["worker"]["deployment_id"] = "changed"
+            raise GateError("ownership_control_unavailable")
+
+        self.control.side_effect = commit_then_lose_acknowledgement
+        with self.assertRaisesRegex(GateError, "^production_recovery_pair_changed$"):
+            self.complete()
+        self.control.assert_called_once_with("takeover-legacy-fenced", 21, expected_deployment=self.pin.worker_version)
+        self.assertEqual(self.observe.call_count, 2)
+
     def test_recovery_adapter_pins_release_flag_epoch_and_deployment(self):
         control = rollback.control_client("production", "synthetic-token", "https://fixture.invalid", "", self.pin.actor)
-        with patch.object(rollback.subprocess, "run", return_value=Mock(returncode=0, stdout="{}")) as run:
-            control("takeover-fenced", 21, expected_deployment=self.pin.worker_version)
-        args, options = run.call_args
-        self.assertEqual(args[0][-2:], ["takeover-fenced", "21"])
-        self.assertEqual(options["env"]["OWNERSHIP_RELEASE_FENCE"], "true")
-        self.assertEqual(options["env"]["OWNERSHIP_EXPECTED_DEPLOYMENT"], self.pin.worker_version)
-        self.assertEqual(options["env"]["OWNERSHIP_ACTOR"], self.pin.actor)
+        for action in ("takeover-fenced", "takeover-legacy-fenced"):
+            with self.subTest(action=action), patch.object(
+                    rollback.subprocess, "run", return_value=Mock(returncode=0, stdout="{}")) as run:
+                control(action, 21, expected_deployment=self.pin.worker_version)
+            args, options = run.call_args
+            self.assertEqual(args[0][-2:], [action, "21"])
+            self.assertEqual(options["env"]["OWNERSHIP_RELEASE_FENCE"], "true")
+            self.assertEqual(options["env"]["OWNERSHIP_EXPECTED_DEPLOYMENT"], self.pin.worker_version)
+            self.assertEqual(options["env"]["OWNERSHIP_ACTOR"], self.pin.actor)

@@ -325,6 +325,9 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.control.assert_not_called()
 
     def test_one_time_takeover_reconciles_lost_reply_before_readiness(self):
+        self.pin = replace(self.pin, rollback_sha="d314f4c63ecbea263aa953bc8a649a444a97da7c")
+        self.result = {"state": "restored", **asdict(self.pin)}
+
         def worker(version):
             self.state["worker"].update(version_id=version, sha=self.pin.rollback_sha)
 
@@ -342,7 +345,7 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.restore()
         self.rollback.post_worker_restore.assert_called_once_with(self.pin.worker_version)
         self.rollback.restore_image.assert_called_once_with("test-image")
-        self.control.assert_called_once_with("takeover-fenced", 21, expected_deployment=self.pin.worker_version)
+        self.control.assert_called_once_with("takeover-legacy-fenced", 21, expected_deployment=self.pin.worker_version)
         self.assertEqual(self.rollback.wait_stable.call_count, 2)
 
     def test_restore_after_second_fence_refuses_the_old_handoff(self):

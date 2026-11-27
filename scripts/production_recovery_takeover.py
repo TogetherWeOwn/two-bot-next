@@ -14,6 +14,17 @@ HEX = re.compile(r"[0-9a-f]{64}")
 SHA = re.compile(r"[0-9a-f]{40}")
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 RUN_ID = re.compile(r"[1-9][0-9]{0,19}")
+# This reviewed predecessor has epoch-fenced control but predates version-bound POSTs.
+LEGACY_RELEASE_WORKER_SHA = "d314f4c63ecbea263aa953bc8a649a444a97da7c"
+
+
+def retained_takeover_action(rollback_sha):
+    return "takeover-legacy-fenced" if rollback_sha == LEGACY_RELEASE_WORKER_SHA else "takeover-fenced"
+
+
+def require_same_provider_pair(before, after):
+    require(all(after.get(key) == before[key] for key in ("worker", "container")),
+            "production_recovery_pair_changed")
 
 
 @dataclass(frozen=True)
@@ -95,8 +106,21 @@ def complete_legacy_takeover(pin, authenticated_readback, observe, control):
     provider mutation or readiness probe takes place on a failed readback.
     """
     verify_inverse(pin, authenticated_readback)
-    if observed_phase(pin, observe) == "active":
+    before = observe()
+    if observed_phase(pin, lambda: before) == "active":
         return "resumed"
-    control("takeover-fenced", pin.fence_epoch, expected_deployment=pin.worker_version)
-    require(observed_phase(pin, observe) == "active", "production_recovery_takeover_unconfirmed")
+
+    def confirmed():
+        after = observe()
+        require_same_provider_pair(before, after)
+        return observed_phase(pin, lambda: after) == "active"
+
+    try:
+        control(retained_takeover_action(pin.rollback_sha), pin.fence_epoch, expected_deployment=pin.worker_version)
+    except GateError:
+        # A lost reply can commit. Confirm the same pair and next epoch without another POST.
+        if not confirmed():
+            raise
+        return "resumed"
+    require(confirmed(), "production_recovery_takeover_unconfirmed")
     return "taken-over"

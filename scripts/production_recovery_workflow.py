@@ -9,7 +9,8 @@ import sys
 
 from production_ownership_status import read_status
 from production_recovery_artifact import FENCE_JOB, FENCE_STEP, authenticated_inverse, protected_job
-from production_recovery_takeover import HEX, RUN_ID, UUID, complete_legacy_takeover, observed_phase, verify_inverse
+from production_recovery_takeover import (HEX, RUN_ID, UUID, complete_legacy_takeover, observed_phase,
+                                          require_same_provider_pair, retained_takeover_action, verify_inverse)
 from production_release import applied_release, is_stopped, matches_pair, release_actor, stopped_ack, write_json
 from production_release_ledgers import CUTOVER, STORE
 from rollback_proof import ProofError
@@ -109,24 +110,27 @@ def reconcile_interrupted(pin, origin_run_id, epoch, classification, observe, co
     """Resume only from authenticated attempt, stop and database evidence."""
     state = interrupted_classification(classification)
 
-    def phase():
-        return interrupted_pair_phase(pin, origin_run_id, epoch, observe())
-
-    before = phase()
+    before = observe()
+    phase = interrupted_pair_phase(pin, origin_run_id, epoch, before)
     if state == "post":
-        require(before == "stopped", "production_interrupted_stop_unproved")
+        require(phase == "stopped", "production_interrupted_stop_unproved")
         return recover_post(classification["attendance_fence_sha256"])
 
-    if before == "stopped":
+    if phase == "stopped":
+        def resumed():
+            after = observe()
+            require_same_provider_pair(before, after)
+            return interrupted_pair_phase(pin, origin_run_id, epoch, after) == "resumed"
+
         try:
-            control("takeover-fenced", epoch, expected_deployment=pin.rollback_worker)
+            control(retained_takeover_action(pin.rollback_sha), epoch, expected_deployment=pin.rollback_worker)
         except GateError:
             # The POST might have committed. An exact active readback can
             # confirm it, but a pending fence cannot authorize another POST.
-            if phase() != "resumed":
+            if not resumed():
                 raise
         else:
-            require(phase() == "resumed", "production_interrupted_takeover_unconfirmed")
+            require(resumed(), "production_interrupted_takeover_unconfirmed")
     return {"state": "pre", "worker": pin.rollback_worker, "epoch": epoch + 1}
 
 
@@ -183,13 +187,7 @@ def restore_under_fence(pin, result, observe, control, rollback, image, candidat
             stopped_fence(observed, pin)
         return observed
 
-    try:
-        complete_legacy_takeover(pin, result, observe_restored, control)
-    except GateError:
-        # A lost reply may have committed. Reconcile the exact actor and
-        # single epoch increment without submitting another POST.
-        if observed_phase(pin, observe_restored) != "active":
-            raise
+    complete_legacy_takeover(pin, result, observe_restored, control)
     rollback.wait_stable(pin.worker_version, rollback.now())
 
 

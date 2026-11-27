@@ -491,6 +491,27 @@ applicable. Keep credentials, raw responses and member data out of the record.
   dispatch for an authorized staged Bot promotion. After dispatch, use that
   rollout's smoke and [watch results](#post-deploy-watch) before returning custody.
 
+## Protected attendance release ownership
+
+Before dispatch, qualify recovery of the retained Worker and container image
+under the [production release gate](../CONTRIBUTING.md#production-release-gate).
+Match the retained container's runtime revision to the serving Worker's SHA.
+Use a manual attempt-one dispatch from protected `main` with the exact staged
+SHA, reviewed plan run ID and release pins. Keep automatic production promotion
+disabled. The plan binds the database restore proof and the retained pair.
+
+For the serving predecessor built from `d314f4c63ecbea263aa953bc8a649a444a97da7c`,
+the release uses the Worker's existing epoch-fenced `fence` and `takeover`.
+Cloudflare readbacks before and after each change must agree on the pinned
+Worker at 100% traffic and its completed, pinned image rollout. The
+authenticated ownership read must show the expected actor and next epoch
+before the workflow proceeds. Recovery only releases ownership after it
+proves the original database state or authenticates the completed inverse.
+The candidate and other retained Worker revisions use the exact protocol.
+The release gate uses exact-SHA staging qualification and the database
+restore rehearsal on a temporary copy. Any isolated PRE work below is a
+separate staging procedure.
+
 ## Interrupted protected release
 
 If a protected attendance release fails or is cancelled after it may have
@@ -692,8 +713,8 @@ Staging still needs the serving proof below.
    demonstrate that identity comparison on the expanded schema.
 3. For authenticated serving readback, match the protected provider evidence
    to the endpoint. Before apply, preflight verifies the exact serving pair,
-   takeover capability and original plan. After inverse, match the
-   authenticated inverse to the restored pair and stable-readiness result.
+   its supported ownership protocol and the original plan. After inverse,
+   match the authenticated inverse to the restored pair and stable-readiness result.
    Record the production Worker UUID separately from the staged UUID.
    Preflight records pins and an epoch. The recovery result records the
    provider state and stable poll count. Use a separate authenticated runtime
