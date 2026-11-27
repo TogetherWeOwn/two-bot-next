@@ -63,7 +63,10 @@ jobs:
         run: |
           mkdir -p sbom "$RUNNER_TEMP/rust-workspace"
           cp source/Cargo.lock sbom/Cargo.lock
-          cp source/Cargo.lock "$RUNNER_TEMP/rust-workspace/Cargo.lock"
+          # Keep a regular lockfile in Trivy's isolated scan directory.
+          # Copy on runners where the workspace and scratch cannot share a hard link.
+          ln -T -- sbom/Cargo.lock "$RUNNER_TEMP/rust-workspace/Cargo.lock" 2>/dev/null ||
+            cp source/Cargo.lock "$RUNNER_TEMP/rust-workspace/Cargo.lock"
           git -C source rev-parse HEAD > sbom/source-sha.txt
           docker image inspect "$IMAGE" --format '{{.Id}}' > sbom/image-id.txt
       - name: Rust workspace CycloneDX SBOM

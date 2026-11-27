@@ -716,7 +716,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Job-container prerequisites (loopback forward to agent-testdb)
         shell: bash
@@ -3911,30 +3911,31 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_envelope_duplicate_key_acceptance.py -v
       - name: Verify staging container drill dry-run plan (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_dryrun_acceptance.py -v
-      - name: Verify staging ownership-takeover retry (offline fixtures)
-        run: node --test scripts/test-ownership-control.mjs
-      - name: Verify ownership control response validation (offline fixtures)
-        run: node --test scripts/test-ownership-control-response-validation.mjs
-      - name: Verify ownership response audit fields and CLI projection (offline fixtures)
-        run: node --test scripts/test-ownership-control-response.mjs
-      - name: Verify production ownership-status retry (offline fixtures)
-        run: node --test scripts/test-production-ownership-control.mjs
-      - name: Verify staging ownership status read (offline fixtures)
-        run: node --test scripts/test-staging-ownership-status.mjs
-      - name: Verify voice REST receipt construction (offline fixtures)
-        run: node --test scripts/test-voice-rest-receipt.mjs
-      - name: Verify voice REST measurement adapter (offline fixtures)
-        run: node --test scripts/test-voice-rest-measurement.mjs
-      - name: Verify voice measurement grant metadata (offline fixtures)
-        run: node --test scripts/test-voice-measurement-metadata.mjs
-      - name: Verify voice measurement interval decisions (offline fixtures)
-        run: node --test scripts/test-voice-measurement-decision.mjs
-      - name: Verify voice measurement candidate (offline fixtures)
-        run: node --test scripts/test-voice-measurement-candidate.mjs
-      - name: Verify promotion-gate intake cap (offline fixtures)
-        run: node --test scripts/test-promotion-gate-intake-cap.mjs
-      - name: Verify slow-burn decide intake cap (offline fixtures)
-        run: node --test scripts/test-slow-burn-decide-intake-cap.mjs
+      - name: Verify ownership, voice and release intake (offline Node fixtures)
+        # Node's test runner still gives each file its own process. Keep the
+        # files serial and explicit so the fast pass runs the same fixtures.
+        run: |
+          set -- \
+            scripts/test-ownership-control.mjs \
+            scripts/test-ownership-control-response-validation.mjs \
+            scripts/test-ownership-control-response.mjs \
+            scripts/test-production-ownership-control.mjs \
+            scripts/test-staging-ownership-status.mjs \
+            scripts/test-voice-rest-receipt.mjs \
+            scripts/test-voice-rest-measurement.mjs \
+            scripts/test-voice-measurement-metadata.mjs \
+            scripts/test-voice-measurement-decision.mjs \
+            scripts/test-voice-measurement-candidate.mjs \
+            scripts/test-promotion-gate-intake-cap.mjs \
+            scripts/test-slow-burn-decide-intake-cap.mjs
+          # A multi-file Node invocation can ignore a missing path.
+          for fixture in "$@"; do
+            if [ ! -f "$fixture" ]; then
+              printf 'Missing offline Node fixture: %s\n' "$fixture" >&2
+              exit 1
+            fi
+          done
+          node --test --test-concurrency=1 "$@"
       - name: Verify staging ownership status workflow (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_ownership_status.py -v
       - name: Verify staging redirect smoke (offline fixtures)

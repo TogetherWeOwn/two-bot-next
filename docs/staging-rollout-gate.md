@@ -176,8 +176,11 @@ offline configuration and validates cleanup evidence.
    database. Keep ingress private from first create, with no shared staging app,
    production routes, public preview, or access to shared writers. Arm the
    independent stop fence before startup. The reservation expires 60 minutes
-   after its original start, including on retry. The fence must stop the runtime
-   and block delayed creates and keepalives even if the workflow disappears.
+   after its original start. If the authenticated enclosing lease ends sooner,
+   bind its original cutoff to the admitted start and enforce it at the effect
+   boundary. The fence must stop the runtime and block delayed creates and
+   keepalives even if the workflow disappears. Use the original reservation for
+   stop and reconciliation after either cutoff.
 3. For each PRE shape, record the exact Worker version UUID and annotation,
    Container app ID and running image digest, and health and readiness with
    the matching runtime stamps. Read back the exact app's effective synthetic
