@@ -34,7 +34,9 @@ name: supply-chain
 
 on:
   pull_request:
-    types: [opened, edited, synchronize, reopened, ready_for_review]
+    # Both checks already run on drafts. Edits can change lint input at the
+    # same head, so they still need a fresh verdict.
+    types: [opened, edited, synchronize, reopened]
   merge_group:
     types: [checks_requested]
   push:
@@ -74,7 +76,11 @@ jobs:
       contents: read # Resolve stored overflow notes through the Contents API.
       pull-requests: read # Fetch and validate the dispatched release PR metadata.
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -465,7 +471,11 @@ jobs:
     permissions:
       contents: read
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.CI_BLACKSMITH_2VCPU == 'blacksmith-2vcpu-ubuntu-2404'
+      && vars.CI_BLACKSMITH_2VCPU || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
