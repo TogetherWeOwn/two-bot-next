@@ -8,7 +8,7 @@ from unittest.mock import patch
 from uuid import UUID
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
-    from pre_admission import AdmissionRecord, SettlementEvidence, SettlementSource
+    from pre_admission import AdmissionRecord, SettlementEvidence, SettlementSource, StartupAdmission
     from pre_cleanup_run import WORKFLOW
     from pre_native_handback import (HandbackEvidence, HandbackReceipt, PredecessorPin,
                                      PredecessorReadback, verify_native_pre_handback)
@@ -97,6 +97,42 @@ class NativePreHandbackTests(unittest.TestCase):
         receipt = verify_native_pre_handback(TARGET, **fixture(source=SettlementSource.PROVIDER, start_id=None))
         self.assertIsNone(receipt.start_id)
         self.assertIs(receipt.settlement_source, SettlementSource.PROVIDER)
+
+    def test_handback_reobserves_settlement_after_durable_commit(self):
+        class Store:
+            record = None
+
+            def read(self, target):
+                return self.record
+
+            def compare_and_swap(self, target, expected, replacement, *, start_window=None):
+                if expected != self.record:
+                    return False
+                self.record = replacement
+                return True
+
+        observations = []
+        runtime = {"startup_drained": True, "restart_fenced": True}
+
+        def observe(closed):
+            proof = SettlementEvidence(closed, SettlementSource.RUNTIME, **runtime)
+            observations.append(proof)
+            return proof
+
+        store = Store()
+        admission = StartupAdmission(store, observe)
+        start_id = admission.admit_start(TARGET)
+        self.assertTrue(admission.close(TARGET))
+        self.assertTrue(admission.settle(TARGET))
+        record = store.read(TARGET)
+        self.assertIsNone(observations[0].closed.settled_by)
+        self.refuse("pre_native_handback_settlement_mismatch", record=record, settlement=observations[0])
+
+        runtime["restart_fenced"] = False
+        self.refuse("pre_native_handback_restart_not_fenced", record=record, settlement=observe(record))
+        runtime["restart_fenced"] = True
+        receipt = verify_native_pre_handback(TARGET, **(fixture() | {"record": record, "settlement": observe(record)}))
+        self.assertEqual(receipt.start_id, start_id)
 
     def test_target_must_be_exact_type(self):
         subclass = TargetSubclass(TARGET.scope, TARGET.run_id, TARGET.started_at, TARGET.shape)

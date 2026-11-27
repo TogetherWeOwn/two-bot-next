@@ -33,8 +33,9 @@ class HandbackEvidence:
 
     The adapter confirms PRODUCTION_AUTO_PROMOTE_DISABLED=true and directly
     verifies zero active bindings and containers for the exact disposable
-    actor after startup settlement. An empty listing can lag Cloudflare state
-    and cannot attest drain.
+    actor after startup settlement, using the target-derived resource names
+    and the verified initial version. An empty listing can lag Cloudflare
+    state and cannot attest drain.
     """
 
     target: Target
@@ -93,11 +94,13 @@ def verify_native_pre_handback(
 ) -> HandbackReceipt:
     """Verify the supplied facts or raise TargetError with a refusal code.
 
-    The caller supplies the current durable record, independent settlement,
-    strictly decoded fresh run detail and provider observations. Take workflow
-    pins and predecessor identity from protected context and the disposable
-    version from verified first creation. The receipt commits to those claims
-    and grants no operational authority.
+    After settle() commits, read the durable record and independently observe
+    startup drain and restart fencing against that record. The proof consumed
+    by settle() describes the earlier record and cannot be reused or relabeled.
+    Supply strictly decoded fresh run detail and provider observations. Take
+    workflow pins and predecessor identity from protected context and the
+    disposable version from verified first creation. The receipt commits to
+    those claims and grants no operational authority.
     """
     require(_is_target(target), "invalid_pre_native_handback_target")
     require(_closed_for(record, target), "pre_native_handback_admission_unconfirmed")
