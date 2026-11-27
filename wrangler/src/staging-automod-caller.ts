@@ -21,6 +21,7 @@ export type ProtectedAutomodEffects = Pick<Lifecycle, "enabled" | "dryRun" | "fe
 type Authority = Pick<Lifecycle, "storage" | "env" | "exclusive"> & {
   staging: StagingLifecycle;
   identity(): Promise<StagingIdentity>;
+  confirmStoppedBeforeRelease?(): Promise<void>;
 };
 
 function refused(): OwnershipRefused {
@@ -66,6 +67,7 @@ export async function runProtectedAutomod(call: ProtectedAutomodCall, authority:
         // Require durable same-lease completion for both publication cleanup
         // and unused retirement, including retry after an interrupted release.
         if (!await journal.completedFor(issued)) throw refused();
+        await authority.confirmStoppedBeforeRelease?.();
         await staging.releaseAutomod(issued, await authority.identity());
       }
       return result;
