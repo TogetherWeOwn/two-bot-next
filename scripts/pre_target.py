@@ -165,6 +165,9 @@ class Inventory:
     None for a resource means confirmed absence. The active and assigned counts
     must come from direct proof while the exact app is readable, or affirmative
     evidence that it was never created. App deletion alone cannot supply them.
+    `write_access` reports effective write access to the exact disposable
+    database, including access through other rehearsal roles or delegated
+    connections. Absence of the admitted role alone cannot prove it false.
     `startup_settled` requires independent proof that admission is closed and
     no in-flight operation or keepalive can create or restart resources. Time
     and workflow status do not prove this.
