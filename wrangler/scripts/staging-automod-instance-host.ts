@@ -93,7 +93,6 @@ export async function runStagingAutomodInstanceHost(options: ProtectedHost[0] = 
 
       preparationUnconfirmed = true;
       const deadline = AbortSignal.timeout(2_000);
-      deadline.throwIfAborted();
       const inventory = await boundStagingAutomodInventoryRead(wiring.readAuthenticatedInventory(inventorySource, deadline), deadline);
       deadline.throwIfAborted();
       const { env, controlBearer } = wiring.readWorker() ?? {};

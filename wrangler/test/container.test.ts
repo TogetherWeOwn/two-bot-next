@@ -605,7 +605,8 @@ async function exerciseAutomodInstanceHost(t: TestContext, loseRecovery: boolean
   const detail = `${commands}/${preview.id}`;
   const steps: string[] = [];
   let command: typeof preview | undefined;
-  let inventoryRollout = "55555555-5555-5555-5555-555555555555";
+  const driftedRollout = "55555555-5555-5555-5555-555555555555";
+  let inventoryRollout = driftedRollout;
   let recoveryReachable = !loseRecovery;
   let acquisitionSignal: AbortSignal | undefined;
   const instance = TwoBotContainer.bindProtectedAutomodInstance(h.bot, control, {
@@ -672,6 +673,7 @@ async function exerciseAutomodInstanceHost(t: TestContext, loseRecovery: boolean
         assert.ok(deadline);
         assert.deepEqual(await instance.acquireLease(...scope), issued);
         assert.deepEqual(h.values.get(STAGING_USE_KEY), issued);
+        inventoryRollout = driftedRollout;
         deadline.abort(new DOMException("synthetic acquisition deadline expired after issuance", "TimeoutError"));
         steps.push("lost-acquire-reply");
         acquisitionSignal.throwIfAborted();
@@ -715,6 +717,16 @@ async function exerciseAutomodInstanceHost(t: TestContext, loseRecovery: boolean
   assert.equal(readWorker.mock.callCount(), 0);
   assert.equal(h.values.has(STAGING_USE_KEY), false);
   runEvidence = run;
+  steps.length = 0;
+  assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), unconfirmed);
+  assert.deepEqual(steps, ["run", "inventory"]);
+  assert.equal(acquisitionSignal, undefined);
+  assert.equal(h.values.has(STAGING_USE_KEY), false);
+  assert.equal(await journal.pending(), undefined);
+
+  inventoryRollout = pin.rolloutId;
+  steps.length = 0;
+  readIssuedLease.mock.resetCalls();
   assert.deepEqual(await runStagingAutomodInstanceHost(options, wiring), { verdict: "failed", start: false, recover: false });
   assert.equal(acquisitionSignal?.aborted, true);
   assert.equal(readIssuedLease.mock.callCount(), 2);
@@ -724,7 +736,7 @@ async function exerciseAutomodInstanceHost(t: TestContext, loseRecovery: boolean
   assert.equal(confirmingSignal.aborted, false);
   assert.deepEqual(h.values.get(STAGING_USE_KEY), issued);
   assert.deepEqual(await journal.pending(), { lease: issued, phase: "reserved" });
-  assert.deepEqual(steps.slice(1, 4), ["run", "acquire", "lost-acquire-reply"]);
+  assert.deepEqual(steps.slice(0, 4), ["run", "inventory", "acquire", "lost-acquire-reply"]);
   assert.deepEqual(steps.slice(4, 6).sort(), ["approve:recover", "approve:start"]);
   assert.deepEqual(steps.slice(6), ["inventory"]);
 
@@ -5051,20 +5063,28 @@ test("AutoMod bridge: the runner client reaches the in-process instance with a f
   }
   const inventorySource = { workflowSha: change.sha, runId: Number(change.runId) + 1 };
   const selection = { serving, inventorySource, reservation: { pin, change } };
-  const bind = (rolloutId: string, reservation = selection.reservation) =>
+  const driftedRollout = "55555555-5555-5555-5555-555555555555";
+  const bind = (rolloutId: string, reservation = selection.reservation, driftAfterAcquire = false) =>
     bindStagingAutomodDispatch(env, { ...selection, reservation }, fetcher, async source => ({
       schema_version: 1, workflow_sha: source.workflowSha, workflow_run_id: source.runId,
       observed_at: new Date().toISOString(), ownership: { phase: "active", epoch: change.expectedEpoch },
       worker: { deployment_id: pin.workerDeploymentId, version_id: pin.workerVersionId, source_sha: pin.sourceSha,
         traffic_percent: 100, runtime_policy: "bounded" },
-      container: { application_id: pin.applicationId, namespace_id: pin.namespaceId, rollout_id: rolloutId,
+      container: { application_id: pin.applicationId, namespace_id: pin.namespaceId,
+        rollout_id: driftAfterAcquire && operations.includes("acquire") ? driftedRollout : rolloutId,
         image_digest: pin.imageDigest, rollout_status: "completed" },
     }));
   const wrongRun = { pin, change: { ...change, runId: "654321" } };
   assert.deepEqual(await runStagingAutomodDispatch(env, await bind(pin.rolloutId, wrongRun)),
     { verdict: "failed", code: "lease_unconfirmed" });
   assert.deepEqual(operations, []);
-  assert.deepEqual(await runStagingAutomodDispatch(env, await bind("55555555-5555-5555-5555-555555555555")),
+  assert.deepEqual(await runStagingAutomodDispatch(env, await bind(driftedRollout)),
+    { verdict: "failed", code: "context_unconfirmed" });
+  assert.deepEqual(operations, ["read-lease", "read-lease"]);
+  assert.equal(h.values.has(STAGING_USE_KEY), false);
+
+  operations.length = 0;
+  assert.deepEqual(await runStagingAutomodDispatch(env, await bind(pin.rolloutId, selection.reservation, true)),
     { verdict: "failed", start: false, recover: false });
   assert.deepEqual(operations, ["read-lease", "acquire", "read-lease", "read-approval", "read-approval"]);
   const issued = h.values.get(STAGING_USE_KEY) as StagingUse;
