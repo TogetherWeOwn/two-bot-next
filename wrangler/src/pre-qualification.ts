@@ -64,7 +64,7 @@ export class PreQualification extends WorkerEntrypoint<Env> {
     return this.env.TWO_BOT.get(id).start(expected);
   }
 
-  async probe(expected: Actor, path: string) {
+  probe(expected: Actor, path: string) {
     const { id } = binding(this.env);
     return this.env.TWO_BOT.get(id).probe(expected, path);
   }
@@ -176,17 +176,22 @@ export class PreQualificationContainer extends DurableObject<Env> {
   }
 
   async releaseReady(expected: Actor) {
-    return this.ctx.blockConcurrencyWhile(async () => {
-      const ready = await this.probe(expected, "/readyz");
-      releaseUpstream(ready);
-      if (ready.status !== 503) throw refused();
-      const reply = await this.#request(expected, 8082, "/release", "POST");
-      if (reply.status !== 204) {
+    const { actor } = this.#configuration(expected);
+    const released = await this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        const ready = await this.probe(actor, "/readyz");
+        releaseUpstream(ready);
+        if (ready.status !== 503) return false;
+        const reply = await this.#request(actor, 8082, "/release", "POST");
         releaseUpstream(reply);
-        throw refused();
+        return reply.status === 204;
+      } catch {
+        // A rejected concurrency callback resets the Durable Object.
+        return false;
       }
-      return this.#configuration(expected).actor;
     });
+    if (!released) throw refused();
+    return actor;
   }
 
   async #request(expected: Actor, port: 8080 | 8082, path: string, method = "GET") {

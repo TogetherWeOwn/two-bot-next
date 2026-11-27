@@ -21,12 +21,7 @@ class TerminalInstance:
 
 
 def read_terminal_instance(scope: NativeScope, *, stop_requested_ms: int, token: str) -> TerminalInstance:
-    """Use independent account credentials and the original admitted actor pin.
-
-    The result describes the latest reported instance state. Its consumer
-    still needs startup settlement and authoritative app assignment evidence
-    before deletion or handback.
-    """
+    """Read latest reported state with independent credentials and the admitted actor pin."""
     require(_scope_valid(scope) and type(stop_requested_ms) is int
             and scope.deployment.target.started_at * 1000 <= stop_requested_ms <= time.time_ns() // 1_000_000,
             "invalid_pre_instance_scope")

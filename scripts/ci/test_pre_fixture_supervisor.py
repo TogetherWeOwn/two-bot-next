@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 import json
 from pathlib import Path
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -29,6 +30,20 @@ class NativeFixtureTests(unittest.TestCase):
                              ("DISCORD_API_BASE", "http://127.0.0.1:8082")):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, "invalid PRE fixture lease"):
                 lease(dict(env, **{field: value}), 110000)
+
+    def test_cutoff_exits_while_fixture_startup_is_blocked(self):
+        code = """import os, signal, time
+from ci import pre_fixture_supervisor as fixture
+fixture.os.getpid = lambda: 1
+os.environ["PRE_CUTOFF_MS"] = str(time.time_ns() // 1_000_000 + 200)
+fixture.run = lambda *_: signal.pause()
+fixture.main()
+raise SystemExit(8)
+"""
+        env = {"PYTHONPATH": str(Path(__file__).resolve().parents[1]), "PRE_SHAPE": "0473/0465",
+               "PRE_START_ID": str(UUID(int=1)), "DISCORD_GATEWAY_URL": "ws://127.0.0.1:8081",
+               "DISCORD_API_BASE": "http://127.0.0.1:8081"}
+        self.assertEqual(subprocess.run([sys.executable, "-Bc", code], env=env, timeout=5).returncode, 0)
 
     def test_provider_terminal_read_requires_pinned_actor_and_fresh_stop(self):
         target = Target("pre-fixture-test", 123, 1800000000, "0473/0465")

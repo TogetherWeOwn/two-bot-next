@@ -48,7 +48,7 @@ function fixture() {
     id, storage, container,
     blockConcurrencyWhile<T>(fn: () => Promise<T>) {
       const next = lock.then(fn);
-      lock = next.catch(() => undefined);
+      lock = next.catch(() => { calls.push("reset"); });
       return next;
     },
   };
@@ -139,11 +139,11 @@ test("a failed issuance commit prevents native startup", async () => {
   await instance.arm(actor);
   storage.sync = async () => { throw new Error("uncommitted"); };
   await assert.rejects(instance.start(actor), /uncommitted/);
-  assert.deepEqual(calls, []);
+  assert.deepEqual(calls, ["reset"]);
 });
 
 test("private fixture controls pin the actor, port, method and pre-READY state", async t => {
-  const { instance, env, container, cutoff } = fixture();
+  const { instance, env, container, cutoff, calls } = fixture();
   const runtime = new PreQualification({}, env);
   const requests: unknown[][] = [];
   let readiness = 200;
@@ -168,4 +168,5 @@ test("private fixture controls pin the actor, port, method and pre-READY state",
   t.mock.method(Date, "now", () => cutoff);
   await assert.rejects(runtime.releaseReady(actor), refusal);
   assert.equal(requests.length, 4);
+  assert.deepEqual(calls, ["start"]);
 });

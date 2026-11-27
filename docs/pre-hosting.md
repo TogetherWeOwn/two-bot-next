@@ -125,14 +125,10 @@ The [replacement Worker](../wrangler/src/pre-qualification.ts) separates private
 It arms a durable cutoff alarm for the exact actor and persists stop and retry intent before calling `destroy()`.
 Preserve the original actor pin, class and namespace through independent provider settlement.
 A returned destroy request and local `inspect()` absence leave placement settlement to the cleanup caller.
-Build the Linux amd64 [fixture image](../scripts/ci/Dockerfile.pre-fixture) with the verified
-OCI layout as the `predecessor` build context pinned by manifest digest. The
-[PID 1 supervisor](../scripts/ci/pre_fixture_supervisor.py) seeds and verifies the requested
-disposable PostgreSQL snapshot and binds the Discord loopback mock before
-starting the archived bot binary. At cutoff it exits the container's PID
-namespace. The private qualification binding exposes fixture evidence and
-releases mock READY after a 503 from the pinned bot. The protected caller
-still needs to verify runtime stamps and components on both readiness reads.
+Build the Linux amd64 [fixture image](../scripts/ci/Dockerfile.pre-fixture)
+with the verified `predecessor` OCI context pinned by manifest digest.
+The [supervisor](../scripts/ci/pre_fixture_supervisor.py) seeds loopback PostgreSQL,
+binds the Discord mock before bot startup and exits PID 1 at the original cutoff.
 
 For native scheduling, Get Application reports observed `active` and
 `starting` counts. The [cleanup projection](../scripts/pre_inventory.py)
