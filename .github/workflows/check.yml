@@ -113,10 +113,30 @@ jobs:
       CARGO_PROFILE_TEST_INCREMENTAL: 'false'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.job-inputs.result == 'success'
         with:
           persist-credentials: false
-          # The migration guard reads PR base/push-before blobs, including the lock.
+          # Policy checks use merge bases and pinned historical fixtures.
           fetch-depth: 0
+
+      - name: Selection note (dependency-aware skip)
+        env:
+          SEL_RUST: ${{ needs.job-inputs.outputs.rust }}
+          SEL_WORKER: ${{ needs.job-inputs.outputs.worker }}
+          SEL_PARITY: ${{ needs.job-inputs.outputs.parity }}
+          SEL_SUPPLY: ${{ needs.job-inputs.outputs.supply }}
+          SEL_DOCS: ${{ needs.job-inputs.outputs.docs }}
+          SEL_MIGRATIONS: ${{ needs.job-inputs.outputs.migrations }}
+          SEL_WORKFLOW_FIXTURES: ${{ needs.job-inputs.outputs.workflow-fixtures }}
+        run: |
+          printf 'job-inputs: rust=%s worker=%s parity=%s supply=%s docs=%s migrations=%s workflow-fixtures=%s\n' \
+            "$SEL_RUST" "$SEL_WORKER" "$SEL_PARITY" "$SEL_SUPPLY" "$SEL_DOCS" "$SEL_MIGRATIONS" "$SEL_WORKFLOW_FIXTURES"
+
+      # A skipped checkout must still produce a failure verdict. Stop
+      # before Python setup when the input selector did not succeed.
+      - name: require job inputs selection to pass
+        if: needs.job-inputs.result != 'success'
+        run: exit 1
 
       - name: Job-container prerequisites (python only)
         run: |
@@ -157,36 +177,15 @@ jobs:
             fi
           done
 
-      - name: Selection note (dependency-aware skip)
-        env:
-          SEL_RUST: ${{ needs.job-inputs.outputs.rust }}
-          SEL_WORKER: ${{ needs.job-inputs.outputs.worker }}
-          SEL_PARITY: ${{ needs.job-inputs.outputs.parity }}
-          SEL_SUPPLY: ${{ needs.job-inputs.outputs.supply }}
-          SEL_DOCS: ${{ needs.job-inputs.outputs.docs }}
-          SEL_MIGRATIONS: ${{ needs.job-inputs.outputs.migrations }}
-          SEL_WORKFLOW_FIXTURES: ${{ needs.job-inputs.outputs.workflow-fixtures }}
-        run: |
-          printf 'job-inputs: rust=%s worker=%s parity=%s supply=%s docs=%s migrations=%s workflow-fixtures=%s\n' \
-            "$SEL_RUST" "$SEL_WORKER" "$SEL_PARITY" "$SEL_SUPPLY" "$SEL_DOCS" "$SEL_MIGRATIONS" "$SEL_WORKFLOW_FIXTURES"
-
-      # The database jobs skip when `job inputs changed` fails (they are not
-      # required checks); `worker check` always runs and fails closed on a
-      # broken selector via its own guard step. Failing here keeps a broken
-      # selector from turning skips into false greens.
-      - name: require job inputs selection to pass
-        if: needs.job-inputs.result != 'success'
-        run: exit 1
-
-      # Finish the pinned toolchain before the first pip run. The image ships
-      # the pinned Rust version without rustfmt or clippy, and rust-toolchain.toml
-      # asks for both. pip 23 (Debian bookworm) probes `rustc --version` from the
-      # workspace with a 0.5 s timeout, which makes the rustup proxy start that
-      # component install; the timeout then kills it half-way and leaves
-      # untracked bin/cargo-fmt and bin/rustfmt in the toolchain. The later
-      # `cargo fmt` fails with "detected conflict: 'bin/cargo-fmt'" in roughly
-      # half the runs. With the components in place the probe returns at once.
       - name: Install pinned Rust toolchain components
+        # Finish the pinned toolchain before the first pip run. The image ships
+        # the pinned Rust version without rustfmt or clippy, and rust-toolchain.toml
+        # asks for both. pip 23 (Debian bookworm) probes `rustc --version` from the
+        # workspace with a 0.5 s timeout, which makes the rustup proxy start that
+        # component install; the timeout then kills it half-way and leaves
+        # untracked bin/cargo-fmt and bin/rustfmt in the toolchain. The later
+        # `cargo fmt` fails with "detected conflict: 'bin/cargo-fmt'" in roughly
+        # half the runs. With the components in place the probe returns at once.
         id: pinned_components
         if: needs.job-inputs.outputs.rust != 'false'
         run: rustup toolchain install --no-self-update
@@ -242,6 +241,14 @@ jobs:
           result = unittest.TextTestRunner(verbosity=2).run(suite)
           raise SystemExit(0 if result.wasSuccessful() and not loader.errors else 1)
           PY
+
+      - name: Verify review reply examples against the required workflow
+        run: |
+          curl --fail --silent --show-error --proto '=https' --connect-timeout 5 \
+            --max-time 20 --retry 2 --retry-max-time 40 \
+            --output "$RUNNER_TEMP/pr-standards-required.yml" \
+            'https://raw.githubusercontent.com/TogetherWeOwn/.github/97fc0e24038021dfaa1fc9da754c6c5d6429130f/.github/workflows/pr-standards-required.yml'
+          PR_STANDARDS_WORKFLOW="$RUNNER_TEMP/pr-standards-required.yml" python3 scripts/test_pr_review_reply_examples.py -v
 
       - name: Ratchet Python script intake (HARD)
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
@@ -709,7 +716,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Job-container prerequisites (loopback forward to agent-testdb)
         shell: bash
@@ -1115,8 +1122,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # The planner diffs base/head blobs for crate selection.
-          fetch-depth: 0
+          # A PR's base is the checked-out merge commit's first parent.
+          # Keep full history for event bases that can be older than a parent.
+          fetch-depth: ${{ !github.event.merge_group.base_sha && github.event.pull_request && 2 || 0 }}
 
       - name: Install Rust toolchain
         id: toolchain
@@ -1272,10 +1280,11 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     steps:
+      # Build and measure the event tree with a single-commit fetch.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Job-container prerequisites (loopback forward to agent-testdb)
         shell: bash
@@ -2013,7 +2022,7 @@ jobs:
           # runner-owned checkout, so Git refuses it as dubious ownership.
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
+          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
           # Disk hygiene for hosted overflow runners (TOG-12134): the package
           # lists stay on the job-container overlay otherwise.
           rm -rf /var/lib/apt/lists/*
@@ -2493,7 +2502,7 @@ jobs:
           # runner-owned checkout, so Git refuses it as dubious ownership.
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
+          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
           # Disk hygiene for hosted overflow runners (TOG-12134): the package
           # lists stay on the job-container overlay otherwise.
           rm -rf /var/lib/apt/lists/*
@@ -3035,6 +3044,8 @@ jobs:
         env:
           RUST_TOOLCHAIN: "1.100.0" # Match rust-toolchain.toml; floating stable can drift.
           RUST_COMPONENTS: ''
+          # The digest-pinned job image already contains this exact toolchain.
+          TWO_RUSTUP_NO_UPDATE: '1'
         run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -3217,18 +3228,35 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
-      - name: Install disposable database client
+      - name: Fetch candidate ancestry and install disposable database client
+        shell: bash
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # Both event tips are parents of the exact candidate. Fetch their
+          # complete history without transferring historical file contents.
+          [[ $GITHUB_SHA =~ ^[0-9a-f]{40}$ ]]
+          git -c protocol.version=2 fetch --unshallow --no-tags --no-recurse-submodules \
+            --filter=blob:none origin "$GITHUB_SHA"
+          [[ $(git rev-parse --is-shallow-repository) == false ]]
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends postgresql-client
       - name: Verify the merge-base CLI and stores on candidate migrations and grants
+        shell: bash
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: bash scripts/ci/db_compatibility.sh
+        run: |
+          # Require the event's merge-base inputs to be present locally. A
+          # partial checkout can otherwise fetch a missing commit on demand.
+          if [[ $PR_BASE_SHA =~ ^[0-9a-f]{40}$ && $PR_HEAD_SHA =~ ^[0-9a-f]{40}$ ]]; then
+            for tip in "$PR_BASE_SHA" "$PR_HEAD_SHA"; do
+              local_tip=$(git rev-list --missing=allow-promisor --max-count=1 "$tip" --)
+              [[ $local_tip == "$tip" ]]
+            done
+          fi
+          bash scripts/ci/db_compatibility.sh
 
   # Dependency-aware selector for the container job (TOG-12056): PRs that
   # touch only docs, worker UI or unrelated CI tooling skip the ~15-minute
@@ -3255,9 +3283,16 @@ jobs:
       build: ${{ steps.select.outputs.build }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
         with:
-          # The base/head SHAs must resolve locally for the diff below.
+          # PR selection needs the base and head commits for its diff.
           fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'pull_request'
+        with:
+          # Non-PR selection always builds and the regressions create their own history.
+          fetch-depth: 1
           persist-credentials: false
       - name: Offline container-inputs regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_inputs.py' -v
@@ -3399,10 +3434,12 @@ jobs:
         image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
         env:
           POSTGRES_USER: agent_test
-          POSTGRES_DB: postgres
+          POSTGRES_DB: two_bot_test_ci
           POSTGRES_HOST_AUTH_METHOD: trust
+        # The entrypoint creates the guarded bootstrap before starting TCP.
+        # Connect to that database so both readiness and existence are checked.
         options: >-
-          --health-cmd "pg_isready -U agent_test -d postgres"
+          --health-cmd "psql -X -w -h 127.0.0.1 -U agent_test -d two_bot_test_ci -Atqc 'SELECT 1'"
           --health-interval 10s --health-timeout 5s --health-retries 5
     env:
       TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
@@ -3445,19 +3482,6 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
-      # The presence fixtures now route through the shared disposable-database
-      # guard, which accepts only the explicit-empty-password bootstrap URL
-      # naming a two_bot_test_* database. Create that bootstrap here; the
-      # legacy bespoke helpers in the sibling stores accept the same URL
-      # (they check host and principal only), so one URL serves all four
-      # suites below. The rust:bookworm job container ships no PostgreSQL
-      # client, so install it first like the other DB jobs do.
-      - name: Prepare isolated test database
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
-          rm -rf /var/lib/apt/lists/*
-          createdb -h agent-testdb -U agent_test two_bot_test_ci
       - name: Check feature-gated community stores
         run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - name: Test presence, scorecard and inactivity ledgers on ephemeral Postgres
@@ -3679,12 +3703,14 @@ jobs:
           RUST_TOOLCHAIN: "nightly-2026-10-01" # Pinned nightly for libFuzzer; stable pin stays in rust-toolchain.toml.
           RUST_COMPONENTS: rust-src
         run: bash .github/scripts/install-rust-toolchain.sh
-      # Per-job dependency cache: the key includes the job id (no
-      # shared-key), so this job keeps its own entry; saved on pushes only.
+      # Key and prune the per-job cache using the separate fuzz workspace.
+      # Keep the installed tool and registry data, and compile from source.
       - name: Restore cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
+          workspaces: fuzz
+          cache-targets: 'false'
           save-if: ${{ github.event_name == 'push' }}
       - name: Install pinned cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
@@ -3883,30 +3909,31 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_envelope_duplicate_key_acceptance.py -v
       - name: Verify staging container drill dry-run plan (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_dryrun_acceptance.py -v
-      - name: Verify staging ownership-takeover retry (offline fixtures)
-        run: node --test scripts/test-ownership-control.mjs
-      - name: Verify ownership control response validation (offline fixtures)
-        run: node --test scripts/test-ownership-control-response-validation.mjs
-      - name: Verify ownership response audit fields and CLI projection (offline fixtures)
-        run: node --test scripts/test-ownership-control-response.mjs
-      - name: Verify production ownership-status retry (offline fixtures)
-        run: node --test scripts/test-production-ownership-control.mjs
-      - name: Verify staging ownership status read (offline fixtures)
-        run: node --test scripts/test-staging-ownership-status.mjs
-      - name: Verify voice REST receipt construction (offline fixtures)
-        run: node --test scripts/test-voice-rest-receipt.mjs
-      - name: Verify voice REST measurement adapter (offline fixtures)
-        run: node --test scripts/test-voice-rest-measurement.mjs
-      - name: Verify voice measurement grant metadata (offline fixtures)
-        run: node --test scripts/test-voice-measurement-metadata.mjs
-      - name: Verify voice measurement interval decisions (offline fixtures)
-        run: node --test scripts/test-voice-measurement-decision.mjs
-      - name: Verify voice measurement candidate (offline fixtures)
-        run: node --test scripts/test-voice-measurement-candidate.mjs
-      - name: Verify promotion-gate intake cap (offline fixtures)
-        run: node --test scripts/test-promotion-gate-intake-cap.mjs
-      - name: Verify slow-burn decide intake cap (offline fixtures)
-        run: node --test scripts/test-slow-burn-decide-intake-cap.mjs
+      - name: Verify ownership, voice and release intake (offline Node fixtures)
+        # Node's test runner still gives each file its own process. Keep the
+        # files serial and explicit so the fast pass runs the same fixtures.
+        run: |
+          set -- \
+            scripts/test-ownership-control.mjs \
+            scripts/test-ownership-control-response-validation.mjs \
+            scripts/test-ownership-control-response.mjs \
+            scripts/test-production-ownership-control.mjs \
+            scripts/test-staging-ownership-status.mjs \
+            scripts/test-voice-rest-receipt.mjs \
+            scripts/test-voice-rest-measurement.mjs \
+            scripts/test-voice-measurement-metadata.mjs \
+            scripts/test-voice-measurement-decision.mjs \
+            scripts/test-voice-measurement-candidate.mjs \
+            scripts/test-promotion-gate-intake-cap.mjs \
+            scripts/test-slow-burn-decide-intake-cap.mjs
+          # A multi-file Node invocation can ignore a missing path.
+          for fixture in "$@"; do
+            if [ ! -f "$fixture" ]; then
+              printf 'Missing offline Node fixture: %s\n' "$fixture" >&2
+              exit 1
+            fi
+          done
+          node --test --test-concurrency=1 "$@"
       - name: Verify staging ownership status workflow (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_ownership_status.py -v
       - name: Verify staging redirect smoke (offline fixtures)
@@ -4138,7 +4165,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: .github/scripts
+          # Publish needs only the script. Include Git's root metadata in the
+          # same blob fetch to avoid separate lazy fetches during checkout.
+          sparse-checkout: |
+            /.gitattributes
+            /.gitignore
+            /.github/scripts/pr_evidence.py
+          sparse-checkout-cone-mode: false
           persist-credentials: false
       - env:
           GH_TOKEN: ${{ github.token }}

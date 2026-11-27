@@ -6,7 +6,7 @@ import { runProtectedAutomod, type ProtectedAutomodEffects } from "../src/stagin
 import { STAGING_AUTOMOD_TARGET as target, StagingAutomodRecovery } from "../src/staging-automod-recovery.ts";
 import { AUTOMOD_STAGING_PURPOSE, StagingLifecycle, type StagingIdentity } from "../src/staging-lifecycle.ts";
 import publication from "./fixtures/staging-automod-publication.json" with { type: "json" };
-import { intent, lease } from "./fixtures/staging-automod-recovery.ts";
+import { intent, lease, other } from "./fixtures/staging-automod-recovery.ts";
 
 type Providers = Parameters<typeof runStagingAutomodRehearsal>[1];
 type Inventory = NonNullable<Awaited<ReturnType<Providers["readInventory"]>>>;
@@ -19,6 +19,7 @@ const policy = { memberIntake: false, enforcement: false, resume: false, registr
   interactionDispatch: false, dedicatedIntents: true };
 const { help, preview } = publication.replies;
 const commands = `https://discord.com/api/v10/applications/${target.applicationId}/guilds/${target.guildId}/commands`;
+const list = `${commands}?with_localizations=true`;
 const detail = `${commands}/${preview.id}`;
 
 async function rehearsal(t: TestContext, acknowledgeStartup?: () => Promise<void>) {
@@ -85,7 +86,7 @@ async function rehearsal(t: TestContext, acknowledgeStartup?: () => Promise<void
       }
       assert.equal(init.method, "GET");
       if (url === "https://discord.com/api/v10/users/@me") return Response.json(publication.identity);
-      if (url === `${commands}?with_localizations=true`) return Response.json(command ? [help, command] : [help]);
+      if (url === list) return Response.json(command ? [help, command] : [help]);
       assert.equal(url, detail);
       if (command) return Response.json(command);
       effectsTaken.push("absent");
@@ -152,7 +153,8 @@ async function rehearsal(t: TestContext, acknowledgeStartup?: () => Promise<void
     await assertHeld();
     invoke.mock.resetCalls();
   };
-  return { issuedLease, pin, run, observe, invoke, assertOriginalCalls, assertHeld, assertReleased, loseStartupAndHold };
+  return { issuedLease, pin, run, observe, invoke, assertOriginalCalls, assertHeld, assertReleased, loseStartupAndHold,
+    effects, effectsTaken, publicationHold, journal, staging, network };
 }
 
 test("startup approved before expiry cannot reach the private invoker at expiry", async t => {
@@ -270,4 +272,50 @@ test("the original deployment reconciles and releases the original lease after s
   assert.equal(readInventory.mock.callCount(), 1);
   h.assertOriginalCalls();
   await h.assertReleased();
+});
+
+test("protected AutoMod requires terminal readback of the exact rehearsed command", async t => {
+  for (const terminal of [
+    { name: "alternate command in the registry", rows: [help, { ...preview, ...other }], recover: false },
+    { name: "no exact command absence", detailCode: 10004, recover: false },
+    { name: "clean original command absence", recover: true },
+  ]) {
+    await t.test(terminal.name, async t => {
+      const h = await rehearsal(t, async () => {});
+      const originalRequest = h.effects.request;
+      const terminalReads: string[] = [];
+      const request = t.mock.method(h.effects, "request", async (url: string, init: RequestInit) => {
+        // The delete and its own verification have already succeeded. Vary
+        // only the journal's separate terminal read of the scoped registry.
+        if (init.method === "GET" && h.effectsTaken.includes("absent")) {
+          if (url === list) {
+            terminalReads.push(url);
+            if (terminal.rows) return Response.json(terminal.rows);
+          }
+          if (url === detail) {
+            terminalReads.push(url);
+            if (terminal.detailCode) return Response.json({ code: terminal.detailCode }, { status: 404 });
+          }
+        }
+        return originalRequest(url, init);
+      });
+
+      assert.deepEqual(await h.run(true), {
+        verdict: terminal.recover ? "passed" : "failed", start: true, recover: terminal.recover,
+      });
+      h.assertOriginalCalls();
+      assert.deepEqual(terminalReads, terminal.rows ? [list] : [list, detail]);
+      assert.deepEqual(request.mock.calls.filter(({ arguments: [, init] }) => init.method !== "GET")
+        .map(({ arguments: [url, init] }) => [init.method, url]), [["DELETE", detail]]);
+      if (terminal.recover) {
+        await h.assertReleased();
+      } else {
+        assert.deepEqual(h.effectsTaken, ["start", "drain", "stop", "delete", "absent"]);
+        assert.deepEqual(await h.journal.pending(), h.publicationHold);
+        assert.equal(await h.journal.completedFor(h.issuedLease), false);
+        assert.deepEqual(await h.staging.read(), h.issuedLease);
+        assert.equal(h.network.mock.callCount(), 0);
+      }
+    });
+  }
 });

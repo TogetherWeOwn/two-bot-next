@@ -103,8 +103,22 @@ class NativeRustToolchainTest(unittest.TestCase):
         self.assertIn("--profile minimal", calls[0])
 
     def test_tickets_postgres_reuses_pinned_image_toolchain(self):
+        self.assert_reuses_pinned_image_toolchain("tickets-postgres")
+
+    def test_self_role_store_reuses_pinned_image_toolchain(self):
+        self.assert_reuses_pinned_image_toolchain("self-role-store")
+
+    def test_no_update_opt_in_does_not_skip_component_updates(self):
+        proc, calls, _, _ = self.run_script(
+            env={"TWO_RUSTUP_NO_UPDATE": "1", "RUST_COMPONENTS": "rustfmt,clippy"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--component rustfmt --component clippy", calls[0])
+        self.assertNotIn("--no-update", calls[0])
+
+    def assert_reuses_pinned_image_toolchain(self, job):
         workflow = yaml.safe_load((ROOT / ".github/workflows/check.yml").read_text())
-        steps = workflow["jobs"]["tickets-postgres"]["steps"]
+        steps = workflow["jobs"][job]["steps"]
         setup = next(step for step in steps if step.get("id") == "toolchain")
         retry = steps[steps.index(setup) + 1]
         self.assertEqual(setup["run"], "bash .github/scripts/install-rust-toolchain.sh")
@@ -279,11 +293,6 @@ class NativeRustToolchainTest(unittest.TestCase):
         self.assertEqual(actual, expected)
 
     def test_rust_action_inventory_is_closed(self):
-        # Preserve the pinned one-off writer's historical provenance without
-        # permitting another Rust action caller or an unreviewed pin change.
-        expected = [("configuration-reference.yml", "configuration-reference",
-                     "dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8")]
-
         def inventory(workflows):
             return sorted((name, job_id, step["uses"])
                           for name, doc in workflows.items()
@@ -294,10 +303,11 @@ class NativeRustToolchainTest(unittest.TestCase):
         workflows = {path.name: yaml.safe_load(path.read_text()) or {}
                      for pattern in ("*.yml", "*.yaml")
                      for path in (ROOT / ".github/workflows").glob(pattern)}
-        self.assertEqual(inventory(workflows), expected)
-        extra = {"new.yml": {"jobs": {"new": {"steps": [{"uses": expected[0][2]}]}}}}
-        self.assertNotEqual(inventory(workflows | extra), expected)
-        self.assertNotEqual(inventory({}), expected)
+        self.assertTrue(workflows)
+        self.assertEqual(inventory(workflows), [])
+        action = "dtolnay/rust-toolchain@stable"
+        extra = {"new.yml": {"jobs": {"new": {"steps": [{"uses": action}]}}}}
+        self.assertEqual(inventory(workflows | extra), [("new.yml", "new", action)])
 
     def test_no_workflow_consumes_installer_outputs(self):
         # The action exposed cachekey/name/... outputs; the native installer

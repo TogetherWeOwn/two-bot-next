@@ -37,6 +37,44 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /wrangler/package.json
+            /wrangler/scripts/is-direct-invocation.mjs
+            /wrangler/scripts/staging-automod-deployment-transport.ts
+            /wrangler/scripts/staging-automod-dispatch.ts
+            /wrangler/scripts/staging-automod-inventory-verifier.ts
+            /wrangler/scripts/staging-automod-operator-entry.ts
+            /wrangler/scripts/staging-automod-private-job.ts
+            /wrangler/scripts/staging-automod-protected-host.ts
+            /wrangler/scripts/staging-automod-rehearsal-caller.ts
+            /wrangler/scripts/staging-automod-workflow.ts
+            /wrangler/src/alert-rules.ts
+            /wrangler/src/container-env.ts
+            /wrangler/src/error-events.ts
+            /wrangler/src/internal-actions.ts
+            /wrangler/src/ownership.ts
+            /wrangler/src/redirect.ts
+            /wrangler/src/request-id.ts
+            /wrangler/src/security-headers.ts
+            /wrangler/src/staging-automod-bounded-authority.ts
+            /wrangler/src/staging-automod-caller.ts
+            /wrangler/src/staging-automod-entry.ts
+            /wrangler/src/staging-automod-inputs.ts
+            /wrangler/src/staging-automod-job.ts
+            /wrangler/src/staging-automod-lifecycle.ts
+            /wrangler/src/staging-automod-publication.ts
+            /wrangler/src/staging-automod-recovery.ts
+            /wrangler/src/staging-automod.ts
+            /wrangler/src/staging-lifecycle.ts
+            /wrangler/src/staging-preview.ts
+            /wrangler/src/staging-use-window.ts
+            /wrangler/src/unique-json.ts
+            /wrangler/test/fixtures/staging-automod-publication.json
+            /wrangler/test/fixtures/staging-automod-recovery.ts
+            /wrangler/test/staging-automod-operator-entry.test.ts
+            /wrangler/test/staging-automod-workflow-binding.test.ts
+            /wrangler/test/staging-automod-workflow.test.ts
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22

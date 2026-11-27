@@ -9,12 +9,12 @@ import sys
 
 from production_ownership_status import read_status
 from production_recovery_artifact import FENCE_JOB, FENCE_STEP, authenticated_inverse, protected_job
-from production_recovery_takeover import UUID, complete_legacy_takeover, observed_phase, verify_inverse
+from production_recovery_takeover import HEX, RUN_ID, UUID, complete_legacy_takeover, observed_phase, verify_inverse
 from production_release import forward_document, is_stopped, matches_pair, release_actor, release_context, stopped_ack, write_json
 from production_release_ledgers import CUTOVER, STORE
 from rollback_proof import ProofError
 from staging_migrate_approval import digest_json
-from staging_recovery_status import github
+from staging_recovery_status import github, matches
 from staging_rollout import GateError, decode, mapping, require
 from worker_container_rollback import APPLICATIONS, WORKERS, ProvenanceReceipt, Rollback, RollbackClient
 from worker_container_rollback import WORKER_RESTORE_POLL_SECONDS, WORKER_RESTORE_READS
@@ -78,6 +78,56 @@ def inverse_under_fence(pin, candidate, ack, run, api, inverse):
     verify_fence_ack(ack, pin, candidate[0])
     protected_job(run, api, FENCE_JOB, (FENCE_STEP,))
     return inverse()
+
+
+def interrupted_classification(classification):
+    classification = mapping(classification)
+    state = classification.get("state")
+    stamp = classification.get("attendance_fence_sha256")
+    require((state == "pre" and set(classification) == {"state"})
+            or (state == "post" and set(classification) == {"state", "attendance_fence_sha256"}
+                and matches(HEX, stamp)), "production_interrupted_database_unproved")
+    return state
+
+
+def interrupted_pair_phase(pin, origin_run_id, epoch, observed):
+    require(matches(RUN_ID, origin_run_id) and type(epoch) is int and 1 < epoch < 2**53 - 1,
+            "production_interrupted_origin_invalid")
+    require(pair_matches(observed, pin, pin.rollback_worker, pin.rollback_sha, pin.rollback_image),
+            "production_interrupted_prior_pair_changed")
+    actor = release_actor(origin_run_id, pin.candidate_sha)
+    if is_stopped(observed, epoch, actor):
+        return "stopped"
+    owner = mapping(observed.get("ownership"))
+    require(owner.get("phase") == "active" and type(owner.get("epoch")) is int
+            and owner["epoch"] == epoch + 1 and owner.get("owner_actor") == actor,
+            "production_interrupted_stop_unproved")
+    return "resumed"
+
+
+def reconcile_interrupted(pin, origin_run_id, epoch, classification, observe, control, recover_post):
+    """Resume only from authenticated attempt, stop and database evidence."""
+    state = interrupted_classification(classification)
+
+    def phase():
+        return interrupted_pair_phase(pin, origin_run_id, epoch, observe())
+
+    before = phase()
+    if state == "post":
+        require(before == "stopped", "production_interrupted_stop_unproved")
+        return recover_post(classification["attendance_fence_sha256"])
+
+    if before == "stopped":
+        try:
+            control("takeover-fenced", epoch, expected_deployment=pin.rollback_worker)
+        except GateError:
+            # The POST might have committed. An exact active readback can
+            # confirm it, but a pending fence cannot authorize another POST.
+            if phase() != "resumed":
+                raise
+        else:
+            require(phase() == "resumed", "production_interrupted_takeover_unconfirmed")
+    return {"state": "pre", "worker": pin.rollback_worker, "epoch": epoch + 1}
 
 
 def wait_for_restore_rollout(pin, candidate, observe, pause):
@@ -156,23 +206,37 @@ def release_admission(env):
     return pin, (version, pin.candidate_sha, release.candidate_image), plan, approval, run
 
 
-def run_inverse(binary, directory, pin, plan, approval, env):
+def _run_recovery_database(binary, directory, plan_id, plan, env, *operation, source_sha, recovery_ref,
+                           errors=("production_inverse_binding_missing", "production_inverse_failed_reconcile_under_fence")):
     plan_path = directory / "reviewed-plan.json"
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
     target = plan["target"]
-    args = [binary, "--target", "production", "--apply", "--source-sha", pin.candidate_sha,
+    args = [binary, "--target", "production", "--apply", "--source-sha", source_sha,
             "--production-host", target["host"], "--production-database", target["database"],
-            "--production-branch-id", target["branch_id"], "--recovery-evidence-ref", approval["recovery_ref"],
+            "--production-branch-id", target["branch_id"], "--recovery-evidence-ref", recovery_ref,
             "--acl-plan-ref", plan["acl_plan_ref"], "--expected-pending", ",".join(map(str, CUTOVER)),
             "--expected-store-pending", ",".join(map(str, STORE)), "--plan-manifest-sha256", plan["plan_manifest_sha256"],
-            "--store-plan-manifest-sha256", plan["store_plan_manifest_sha256"], "--plan-run-id", approval["plan_run_id"],
-            "--plan-manifest-path", str(plan_path), "--inverse-attendance-fence-sha256", pin.attendance_fence_sha256]
+            "--store-plan-manifest-sha256", plan["store_plan_manifest_sha256"], "--plan-run-id", plan_id,
+            "--plan-manifest-path", str(plan_path), *operation]
     binding = "TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL"
-    require(bool(env.get(binding)), "production_inverse_binding_missing")
+    require(bool(env.get(binding)), errors[0])
     result = subprocess.run(args, env={binding: env[binding], "TWO_DATABASE_TLS": "required"},
                             capture_output=True, timeout=120, check=False)
-    require(result.returncode == 0, "production_inverse_failed_reconcile_under_fence")
-    outcome = mapping(decode(result.stdout))
+    require(result.returncode == 0, errors[1])
+    return mapping(decode(result.stdout))
+
+
+def run_recovery_database(binary, directory, plan_id, plan, env, *operation):
+    return _run_recovery_database(binary, directory, plan_id, plan, env, *operation,
+                                  source_sha=plan["source_sha"], recovery_ref=plan["recovery_evidence_ref"],
+                                  errors=("production_recovery_binding_missing",
+                                          "production_recovery_database_refused_or_uncertain"))
+
+
+def run_inverse(binary, directory, pin, plan, approval, env):
+    outcome = _run_recovery_database(binary, directory, approval["plan_run_id"], plan, env,
+                                     "--inverse-attendance-fence-sha256", pin.attendance_fence_sha256,
+                                     source_sha=pin.candidate_sha, recovery_ref=approval["recovery_ref"])
     require(outcome.get("state") == "restored" and outcome.get("attendance_fence_sha256") == pin.attendance_fence_sha256
             and digest_json(outcome.get("expanded")) == pin.expanded_ledgers_sha256
             and digest_json(outcome.get("restored")) == pin.restored_ledgers_sha256,
