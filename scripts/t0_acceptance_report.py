@@ -10,6 +10,7 @@ import re
 
 from build_identity import is_build_id_shape, is_build_revision_shape, is_deploy_id_shape
 from container_stdout_read import MAX_LIMIT, MAX_MINUTES, UUID_RE
+from passive_gateway_evidence import DENIAL_SUMMARY_SCHEMA, PACKET_TIMESTAMP
 from passive_gateway_evidence import SUMMARY_SCHEMA as GATEWAY_SUMMARY_SCHEMA
 from script_intake import decode_json, read_with_overflow
 from staging_help_embed_smoke import EMBED_KEYS, SCHEMA as HELP_SCHEMA
@@ -180,12 +181,13 @@ def production_watch_observation(kind, report, window):
 
 def gateway_observation(report):
     counts = report.get("signals")
+    has_receipt = report.get("schema") == DENIAL_SUMMARY_SCHEMA
     if (not is_build_revision_shape(report.get("build_sha")) or not isinstance(counts, dict)
             or counts.keys() != set(SIGNALS) or not all(type(n) is int and 0 <= n <= MAX_LIMIT
                                                        for n in counts.values())
-            or sum(counts.values()) > MAX_LIMIT):
+            or sum(counts.values()) + int(has_receipt) > MAX_LIMIT):
         raise ValueError
-    verdict = "observed" if any(counts.values()) else "not_observed"
+    verdict = "observed" if has_receipt or any(counts.values()) else "not_observed"
     if report.get("verdict") != verdict:
         raise ValueError
     readiness = "observed" if counts["ready"] or counts["gateway_resumed"] else "not_observed"
@@ -195,8 +197,13 @@ def gateway_observation(report):
 def gateway_summary_window(report):
     if report.keys() == {"verdict", "build_sha", "signals"}:
         return None  # Legacy successful summaries carry no capture bounds.
-    if (report.keys() != {"schema", "verdict", "build_sha", "window", "signals"}
-            or report["schema"] != GATEWAY_SUMMARY_SCHEMA):
+    fields = {"schema", "verdict", "build_sha", "window", "signals"}
+    schema = report.get("schema")
+    if schema == DENIAL_SUMMARY_SCHEMA:
+        fields.add("endpoint_policy_refused_at")
+    elif schema != GATEWAY_SUMMARY_SCHEMA:
+        raise ValueError
+    if report.keys() != fields:
         raise ValueError
     window = report["window"]
     if not isinstance(window, dict) or window.keys() != {"start", "end"}:
@@ -262,6 +269,13 @@ def observation(kind, parse, path, binding, expected):
                 if differing:
                     return gap("mismatched", "gateway summary capture window differs from the serving window",
                                fields=differing)
+            if report.get("schema") == DENIAL_SUMMARY_SCHEMA:
+                stamp = report["endpoint_policy_refused_at"]
+                if not token(PACKET_TIMESTAMP, stamp):
+                    raise ValueError
+                if not utc_instant(recorded["start"]) <= utc_instant(stamp) <= utc_instant(recorded["end"]):
+                    return gap("mismatched", "gateway endpoint-policy refusal falls outside the capture window")
+                outcome.update(endpoint_denial="observed", endpoint_denial_at=stamp)
     except ValueError:
         return gap("unverified", "saved probe output is invalid or refused")
     row = {"status": "attributed", "window": recorded, **outcome}
@@ -305,8 +319,11 @@ def main(argv=None):
                           "needed": NEEDED[kind]}
         else:
             rows[kind] = observation(kind, parse, path, bindings.get(kind), expected)
-    rows["gateway"]["endpoint_denial"] = "unverified"
-    rows["gateway"]["endpoint_denial_needed"] = "Explicit passive evidence of gateway endpoint rejection."
+    if "endpoint_denial" not in rows["gateway"]:
+        rows["gateway"].update(
+            endpoint_denial="unverified",
+            endpoint_denial_needed="Explicit passive evidence of gateway endpoint rejection.",
+        )
     report = {"expected": expected, "observations": rows}
     if interrupted:
         report["window_status"] = "interrupted"

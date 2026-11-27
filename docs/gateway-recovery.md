@@ -195,6 +195,21 @@ synthetic. Each row can be recorded as its evidence becomes available.
 Keep endpoint values, session IDs and raw logs out of the execution card. Use
 the existing release watch and reviewer process for these entries.
 
+The boot receipt source is off by default. It emits a fixed event only when
+`TWO_GATEWAY_RESUME_DENIAL_EVIDENCE=1` and an otherwise eligible saved session
+with a nonempty endpoint was refused by the admission policy and discarded.
+An empty endpoint, missing or expired checkpoint, forced IDENTIFY, and
+transport or protocol failure do not produce this receipt. Only the JSON log
+format carries it, with a constant message and the existing unscoped envelope.
+Received endpoint decisions outside this boot path remain unavailable from
+this receipt.
+
+The same passive summarizer writes `passive_gateway_summary.v2` when it finds
+that stamped event, with the earliest matching UTC event time at millisecond
+precision in `endpoint_policy_refused_at`. It otherwise writes the existing
+summary. The saved summary contains no endpoint, payload, token or member
+identifier. Keep the source disabled until separate authorization to use it.
+
 ## Verification (test containers only)
 
 The full suite and CI gates are GitHub Actions-owned. Push the PR branch and
