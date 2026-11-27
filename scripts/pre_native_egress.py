@@ -89,7 +89,7 @@ class LaunchObservation:
     path: str  # Observed entry point, including the actual keepalive trigger.
     namespace: str  # Network namespace of the launch boundary, even on refusal.
     event: int  # Effective start or refusal at the launch boundary.
-    forced_from: int | None  # Start event of the process forced out in this trial.
+    forced_from: int | None  # Adapter-authenticated prior start stopped to trigger this trial.
     listener: Listener | None
     process: Process | None
     refusal: str | None
@@ -210,7 +210,7 @@ def verify_effective_launch_controls(first, retained, *, digest, observe_policy,
         require(type(reservation) is Reservation and type(reservation.target) is Target
                 and reservation.target.shape == shape and _endpoint(reservation.postgres),
                 "pre_egress_invalid_reservation")
-    require(first.target.provider_names != retained.target.provider_names,
+    require(first.target.provider_names != retained.target.provider_names and first.postgres != retained.postgres,
             "pre_egress_reservation_collision")
     for reservation in (first, retained):
         previous = None
