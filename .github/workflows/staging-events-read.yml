@@ -55,6 +55,12 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+          # The reader imports the smoke module for the guild fence. That module imports script_intake.
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/staging_events_read.py
+            /scripts/staging_automation_read_smoke.py
+            /scripts/script_intake.py
       - name: Read the fixture member's committed events
         env:
           # Must already exist as staging-events-read environment secrets;

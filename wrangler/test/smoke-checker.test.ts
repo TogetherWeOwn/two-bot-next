@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
@@ -257,18 +257,20 @@ test("smoke rejects non-origin base URLs", async () => {
   }
 });
 
-test("smoke CLI refuses an invalid URL through symlinks and spaced paths", (t) => {
+test("smoke CLI refuses an invalid URL from a standalone file and through symlinks", (t) => {
   const root = mkdtempSync(join(tmpdir(), "smoke link "));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const real = fileURLToPath(new URL("../../bin/smoke.mjs", import.meta.url));
   const link = join(root, "smoke.mjs");
   const spacedDir = join(root, "spaced dir");
   const spaced = join(spacedDir, "smoke.mjs");
+  const standalone = join(spacedDir, "standalone % #.mjs");
   mkdirSync(spacedDir);
   symlinkSync(real, link);
   symlinkSync(real, spaced);
+  copyFileSync(real, standalone);
 
-  for (const argv1 of [real, link, spaced, relative(process.cwd(), link)]) {
+  for (const argv1 of [real, link, spaced, relative(process.cwd(), link), standalone]) {
     const executed = spawnSync(process.execPath, [argv1, "not-a-url"], {
       env: {},
       encoding: "utf8",
@@ -281,14 +283,16 @@ test("smoke CLI refuses an invalid URL through symlinks and spaced paths", (t) =
     assert.equal(executed.stderr, "smoke: Invalid URL\n", argv1);
   }
 
-  const imported = spawnSync(
-    process.execPath,
-    ["--input-type=module", "--eval", `await import(${JSON.stringify(pathToFileURL(link).href)})`],
-    { env: {}, encoding: "utf8", timeout: 15_000 },
-  );
-  assert.equal(imported.error, undefined);
-  assert.equal(imported.signal, null);
-  assert.equal(imported.status, 0);
-  assert.equal(imported.stdout, "");
-  assert.equal(imported.stderr, "");
+  for (const path of [link, standalone]) {
+    const imported = spawnSync(
+      process.execPath,
+      ["--input-type=module", "--eval", `await import(${JSON.stringify(pathToFileURL(path).href)})`],
+      { env: {}, encoding: "utf8", timeout: 15_000 },
+    );
+    assert.equal(imported.error, undefined, path);
+    assert.equal(imported.signal, null, path);
+    assert.equal(imported.status, 0, `${path}\n${imported.stderr}`);
+    assert.equal(imported.stdout, "", path);
+    assert.equal(imported.stderr, "", path);
+  }
 });

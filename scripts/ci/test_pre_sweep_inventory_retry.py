@@ -8,7 +8,7 @@ from unittest.mock import DEFAULT, call, patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_inventory import normalize_inventory
-    from pre_sweep import SweepError, sweep_target
+    from pre_sweep import CleanupReadback, SweepError, sweep_target
     from pre_target import Action, Inventory, Target
 
 
@@ -54,6 +54,9 @@ class FakeProvider:
             write_access=target.service_name in self.writers, complete=projection.complete,
             startup_settled=True,  # The fixture assumes independently closed admission and settled startup.
         )
+
+    def cleanup_inventory(self, target, *, request):
+        return CleanupReadback(self.inventory(target), request)
 
     def stop_container(self, target, action):
         app = self.apps[action.id]

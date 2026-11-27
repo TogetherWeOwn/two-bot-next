@@ -7,7 +7,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
-    from pre_container_lookup import ContainerAppReply, ContainerAppScope, read_reserved_container_app
+    from pre_container_lookup import (
+        ContainerAppReply, ContainerAppScope, confirm_reserved_container_configuration, read_reserved_container_app,
+    )
+    from pre_registry_cleanup import RegistryReservation
     from pre_target import Inventory, Resource, Target, TargetError, verify_cleanup
 
 
@@ -17,6 +20,13 @@ SIBLING_APP_ID = "87654321-4321-4321-8321-cba987654321"
 PATH = f"/accounts/{SCOPE.account_id}/containers/applications/{SCOPE.app_id}"
 APP = {"account_id": SCOPE.account_id, "id": SCOPE.app_id, "name": TARGET.container_name}
 PRESENT = ContainerAppReply(SCOPE, PATH, 200, {"success": True, "errors": [], "messages": [], "result": APP})
+NAMESPACE_ID = "ab" * 16
+REPOSITORY = "registry.invalid/staging/two-bot-next-attendance-predecessor-staging"
+IMAGE = RegistryReservation(TARGET, f"{REPOSITORY}@sha256:" + "c" * 64)
+CONFIGURED = APP | {
+    "durable_objects": {"namespace_id": NAMESPACE_ID},
+    "configuration": {"image": IMAGE.reference},
+}
 # The fixture attests application-handler provenance independently of this invented error code.
 ABSENT = ContainerAppReply(SCOPE, PATH, 404, {
     "success": False, "errors": [{"code": 19001, "message": "synthetic app missing"}],
@@ -29,6 +39,15 @@ class PreContainerLookupTests(unittest.TestCase):
         reader = Mock(return_value=reply)
         try:
             return read_reserved_container_app(SCOPE, read=reader)
+        finally:
+            reader.assert_called_once_with(PATH)
+
+    def confirm_configuration(self, reply):
+        reader = Mock(return_value=reply)
+        try:
+            return confirm_reserved_container_configuration(
+                SCOPE, namespace_id=NAMESPACE_ID, image=IMAGE, read=reader,
+            )
         finally:
             reader.assert_called_once_with(PATH)
 
@@ -110,3 +129,41 @@ class PreContainerLookupTests(unittest.TestCase):
 
     def test_readback_representation_omits_provider_body(self):
         self.assertNotIn("synthetic app missing", repr(ABSENT))
+
+    def test_confirms_exact_configured_namespace_and_image(self):
+        reply = replace(PRESENT, body=PRESENT.body | {"result": CONFIGURED})
+        self.assertIsNone(self.confirm_configuration(reply))
+
+    def test_refuses_missing_or_mismatched_configuration(self):
+        for result, reason in (
+            (APP, "pre_container_namespace_mismatch"),
+            (CONFIGURED | {"durable_objects": {"namespace_id": "bd" * 16}}, "pre_container_namespace_mismatch"),
+            (CONFIGURED | {"durable_objects": None}, "pre_container_namespace_mismatch"),
+            (CONFIGURED | {"configuration": {}}, "pre_container_image_mismatch"),
+            (CONFIGURED | {"configuration": None}, "pre_container_image_mismatch"),
+            (CONFIGURED | {"configuration": {"image": IMAGE.reference.replace("registry.", "foreign.", 1)}},
+             "pre_container_image_mismatch"),
+            (CONFIGURED | {"configuration": {"image": REPOSITORY + ":latest"}}, "pre_container_image_mismatch"),
+            (CONFIGURED | {"configuration": {"image": IMAGE.reference[:-1] + "d"}}, "pre_container_image_mismatch"),
+        ):
+            reply = replace(PRESENT, body=PRESENT.body | {"result": result})
+            with self.subTest(result=result), self.assertRaisesRegex(TargetError, f"^{reason}$"):
+                self.confirm_configuration(reply)
+
+    def test_absent_app_cannot_confirm_configuration(self):
+        with self.assertRaisesRegex(TargetError, "^pre_container_configuration_unconfirmed$"):
+            self.confirm_configuration(ABSENT)
+
+    def test_configuration_refuses_foreign_target_and_app(self):
+        foreign = replace(TARGET, shape="0475/0465")
+        reply = replace(PRESENT, body=PRESENT.body | {"result": CONFIGURED})
+        reader = Mock(return_value=reply)
+        with self.assertRaisesRegex(TargetError, "^wrong_pre_container_image_scope$"):
+            confirm_reserved_container_configuration(
+                SCOPE, namespace_id=NAMESPACE_ID, image=replace(IMAGE, target=foreign), read=reader,
+            )
+        reader.assert_not_called()
+        with self.assertRaisesRegex(TargetError, "^wrong_pre_container_reply$"):
+            self.confirm_configuration(replace(reply, scope=replace(SCOPE, target=foreign)))
+        with self.assertRaisesRegex(TargetError, "^wrong_pre_app_detail$"):
+            self.confirm_configuration(replace(reply, body=reply.body | {"result": CONFIGURED | {"id": SIBLING_APP_ID}}))

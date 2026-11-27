@@ -185,6 +185,20 @@ The offline report prints advisory JSON. Exit 0 confirms output. In `handoff.jso
 Optional `observations` entries keyed by `help`, `naming`, or `gateway` hold `window` (same fields as `expected`) and `sha256` (64 lowercase hex digits for the exact file bytes).
 Include an entry only when existing evidence independently ties those bytes to that window. Keep the original provenance in the handoff.
 
+Include any independently verified in-window serving identity readbacks in the
+optional `serving_readbacks` array. Each object uses the seven identity fields
+from `expected` (everything except `start` and `end`) plus `utc`, the readback
+time in the same UTC format. Use readbacks of the same environment. An invalid
+readback or one outside the inclusive bounds gives exit 2.
+
+A differing identity anywhere inside the window sets `window_status` to
+`interrupted` and marks every supplied observation `mismatched`, withholding
+Help, naming and gateway results. This includes a different deploy or Worker
+version at the same source revision, even if the original identity serves again
+by the end. Retain the interrupted watch as evidence and report against a new,
+independently verified single-deploy window. Matching or absent readbacks add
+no continuity proof. The verified window and per-file attribution are still required.
+
 ```sh
 python3 scripts/t0_acceptance_report.py --handoff handoff.json \
   --help-report help.json --naming-report staging-voice-naming-evidence.json \
@@ -193,7 +207,15 @@ python3 scripts/t0_acceptance_report.py --handoff handoff.json \
 
 - **Help.** Use the saved Help report and #2463's staging-window check for branding readbacks and deletions.
 - **Naming.** Use the #2464 fixture report for same-room occupied, empty before cleanup, and occupied-again readbacks. Record creator-rename HTTP 403 separately.
-- **Gateway.** Use #2467's passive summary with its verified application and single-image window. Only committed READY or RESUMED indicates observed readiness. Endpoint denial needs explicit passive evidence. See #2075 for separate hosted checkpoint coverage.
+- **Gateway.** Use the saved `passive_gateway_summary.v1` with its verified application and single-image window. The report compares both capture bounds to the attributed serving bounds at full precision. Only committed READY or RESUMED indicates observed readiness. Endpoint denial needs explicit passive evidence. See #2075 for separate hosted checkpoint coverage.
+
+Legacy successful gateway summaries contain only the verdict, build SHA and
+signal counts. The report still accepts this format for staging with the
+existing independent attribution. Production marks it `unverified` when the
+other checks match. To use a legacy capture for production, regenerate the
+summary offline from its retained valid packet and verified bounds, then bind
+the new file's exact hash. Omit the report if that packet is unavailable.
+Unknown or malformed summary formats earn no observation credit.
 
 ### Production execution card handoff
 
@@ -286,11 +308,14 @@ python3 scripts/t0_acceptance_report.py --handoff handoff.json \
 | Help | `attributed`, `result: readbacks_and_deletions_recorded` | `attributed`, `result: probe_failed` | `missing` file or `attributed`, `result: not_observed` |
 | Naming | `attributed`, `result: transitions_recorded` | `attributed`, `result: probe_failed` with `missing_transitions` if another readback is unavailable | `missing` file or `attributed`, `result: not_observed` with `missing_transitions` |
 | Serving identity | `attributed` requires matching window and file hash | `mismatched` for another build, window, file hash, or row timestamp outside the window | `unverified` for missing attribution or invalid input. An incomplete `expected` is a handoff error (exit 2) |
-| Gateway | `attributed`, `readiness: observed` for a committed READY or RESUMED | `mismatched` for a reported service, window or build conflict. A recorded close or failed reconnect appears in `signals` | `missing` file, `unverified` invalid or unusable summary, or `attributed`, `readiness: not_observed` without committed readiness |
+| Gateway | `attributed`, `readiness: observed` for a committed READY or RESUMED | `mismatched` for a service or build conflict or differing capture bounds. A recorded close or failed reconnect appears in `signals` | `missing` file, `unverified` invalid or unusable summary, or `attributed`, `readiness: not_observed` without committed readiness |
 
 Exit 0 confirms that the report was printed. Read each row's `status` and
 `result` and consult the card for observations outside the verified window.
 A gateway summary can flag an existing mismatch before its hash is bound.
+The capture bounds catch a summary attached to the wrong time window. The
+hash binds the saved bytes, and the independent readback still supplies the
+application and serving identity even when revision and bounds coincide.
 Endpoint denial stays `unverified` in the report. Record explicit passive
 rejection evidence separately on the card per
 [gateway recovery](gateway-recovery.md#recording-endpoint-policy-evidence).
