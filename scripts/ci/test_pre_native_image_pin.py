@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 from uuid import UUID
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
@@ -102,9 +102,11 @@ class NativeImagePinTests(unittest.TestCase):
 
     def test_refuses_images_from_another_object_environment_or_deployment(self):
         scope = Fixture().scope
+        deployment = scope.deployment
         for change in (dict(environment="other"), dict(object_id="d" * 64), dict(account_id="e" * 32),
-                       dict(namespace_id="f" * 32), dict(deployment=replace(scope.deployment, worker_version=UUID(int=4))),
-                       dict(deployment=replace(scope.deployment, target=replace(scope.deployment.target, run_id=124)))):
+                       dict(namespace_id="f" * 32), dict(deployment=replace(deployment, worker_version=UUID(int=4))),
+                       dict(deployment=replace(deployment, target=replace(deployment.target, run_id=124))),
+                       dict(deployment=replace(deployment, target=replace(deployment.target, shape=ANY)))):
             with self.subTest(change=change):
                 f = Fixture()
                 f.adapter.read_images.return_value = ImageMapReadback(replace(scope, **change), {ALIAS: REFERENCE})
@@ -155,12 +157,14 @@ class NativeImagePinTests(unittest.TestCase):
                 self.assertEqual(f.adapter.inspect.call_count, inspections)
 
     def test_refuses_window_from_another_reservation(self):
-        f = Fixture()
-        other_window = replace(f.admission.window, target=replace(f.scope.deployment.target, run_id=124))
-        f.admission = replace(f.admission, window=other_window)
-        with self.assertRaisesRegex(TargetError, "admission_invalid$"):
-            f.verify()
-        self.assertEqual(f.adapter.mock_calls, [])
+        for change in (dict(run_id=124), dict(shape=ANY)):
+            with self.subTest(change=change):
+                f = Fixture()
+                window = replace(f.admission.window, target=replace(f.scope.deployment.target, **change))
+                f.admission = replace(f.admission, window=window)
+                with self.assertRaisesRegex(TargetError, "admission_invalid$"):
+                    f.verify()
+                self.assertEqual(f.adapter.mock_calls, [])
 
     def test_refuses_stale_future_or_unbound_start_receipt(self):
         for change in (dict(started_at=BEGIN), dict(started_at=BEGIN + 10),

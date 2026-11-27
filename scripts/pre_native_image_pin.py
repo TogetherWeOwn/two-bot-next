@@ -16,8 +16,6 @@ _OBJECT_ID = re.compile(r"[0-9a-f]{64}")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _CONTAINER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 _DISCORD_ORIGIN = r"://(?:127\.0\.0\.1|\[::1\])(?::(?P<port>[1-9][0-9]{0,4}))?/?"
-_DISCORD_GATEWAY = re.compile(r"ws" + _DISCORD_ORIGIN)
-_DISCORD_REST = re.compile(r"http" + _DISCORD_ORIGIN)
 
 
 @dataclass(frozen=True)
@@ -97,8 +95,8 @@ def _matches(pattern, value):
 def _scope_valid(scope):
     if type(scope) is not NativeScope or type(scope.deployment) is not Deployment:
         return False
-    deployment = scope.deployment
-    return (type(deployment.target) is Target
+    deployment, target = scope.deployment, scope.deployment.target
+    return (type(target) is Target and type(target.scope) is type(target.shape) is str
             and all(type(value) is UUID and value.int for value in (
                 deployment.start_id, deployment.worker_version, deployment.container_id))
             and _matches(NAMESPACE_ID, scope.account_id) and _matches(_NAME, scope.environment)
@@ -115,16 +113,16 @@ def _image_valid(image):
             and type(image.platform) is str and image.platform == "linux/amd64")
 
 
-def _loopback(pattern, url):
-    match = _matches(pattern, url)
+def _loopback(scheme, url):
+    match = type(url) is str and re.fullmatch(scheme + _DISCORD_ORIGIN, url)
     return match and (match["port"] is None or int(match["port"]) <= 65535)
 
 
 def _check_fixtures(fixtures):
     require(type(fixtures) is LoopbackFixtures and fixtures.enable_internet is False,
             "pre_native_image_internet_unconfirmed")
-    require(fixtures.in_container is True and _loopback(_DISCORD_GATEWAY, fixtures.discord_gateway_url)
-            and _loopback(_DISCORD_REST, fixtures.discord_api_base), "pre_native_image_discord_unconfirmed")
+    require(fixtures.in_container is True and _loopback("ws", fixtures.discord_gateway_url)
+            and _loopback("http", fixtures.discord_api_base), "pre_native_image_discord_unconfirmed")
     require(type(fixtures.postgres_host) is str and fixtures.postgres_host in ("127.0.0.1", "::1")
             and type(fixtures.postgres_port) is int and 0 < fixtures.postgres_port <= 65535
             and fixtures.postgres_disposable is True and fixtures.postgres_http_intercept is False,
@@ -156,21 +154,19 @@ def verify_native_image_pin(
 ) -> NativeImagePinResult:
     """Verify one explicitly enabled native start under an armed PRE reservation.
 
-    Pin admission independently from readbacks. Adapters use fresh, bounded
-    observations from the authenticated object and share trusted time.
-    Read the object's complete images map. Resolve the selected reference's
-    OCI manifest and config bytes without redirects or tag fallback.
-    Start atomically enforces the original armed window, stop fence and one-use
-    start ID, applies the selected image and effective bot and egress options,
-    binds both fixtures before bot boot and reports the actual start time.
-    Inspect directly observes the running instance and fixture readiness.
-    The caller retains independent stop custody, including after a lost start.
+    Pin admission independently of fresh, bounded readbacks. Read the exact
+    object's complete images map and verify OCI bytes without redirects or tag fallback.
+    Start atomically enforces the armed window, stop fence and one-use start ID.
+    It applies the image and effective bot and egress options, binds fixtures before
+    bot boot and reports actual effect time. Inspect reads running image and readiness.
+    Adapters share trusted time. The caller retains independent stop custody after lost starts.
     """
     if enabled is not True:
         return _DISABLED
 
     require(type(admission) is NativeImageAdmission and _scope_valid(admission.scope)
             and type(admission.window) is EffectWindow
+            and type(admission.window.target.scope) is type(admission.window.target.shape) is str
             and admission.window.target == admission.scope.deployment.target
             and _matches(_NAME, admission.image_alias) and _image_valid(admission.image),
             "pre_native_image_admission_invalid")
