@@ -40,6 +40,8 @@ export function createProtectedAutomodEffects({
       try {
         const lease = Object.freeze({ ...expected });
         if (lease.purpose !== AUTOMOD_STAGING_PURPOSE || !sameLease(lease, lease)) return;
+        // Recovery can outlive startup enablement, but it still needs the
+        // issued plan's cleanup window. The zero-cutoff default is dormant.
         const limit = Math.min(lease.expiresAt + cleanupMs, notAfter + cleanupMs);
         if (!Number.isSafeInteger(limit)) return;
         const { lease: grantedLease, before } = await readAuthenticatedCleanupGrant(lease) ?? {};

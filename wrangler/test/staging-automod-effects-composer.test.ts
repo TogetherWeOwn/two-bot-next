@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { runProtectedAutomod } from "../src/staging-automod-caller.ts";
 import { createProtectedAutomodEffects } from "../src/staging-automod-effects-composer.ts";
-import { STAGING_AUTOMOD_PLAN, type StagingAutomodPlan } from "../src/staging-automod-plan.ts";
+import { automodStartAllowed, STAGING_AUTOMOD_PLAN, type StagingAutomodPlan } from "../src/staging-automod-plan.ts";
 import { STAGING_AUTOMOD_TARGET, StagingAutomodRecovery } from "../src/staging-automod-recovery.ts";
 import { AUTOMOD_STAGING_PURPOSE, type StagingUse } from "../src/staging-lifecycle.ts";
 import { admission, intent, lease as fixtureLease, Storage } from "./fixtures/staging-automod-recovery.ts";
@@ -13,7 +13,8 @@ type Dependencies = Parameters<typeof createProtectedAutomodEffects>[0];
 type Grant = NonNullable<Awaited<ReturnType<Dependencies["readAuthenticatedCleanupGrant"]>>>;
 type Authority = Parameters<typeof runProtectedAutomod>[1];
 
-const lease = Object.freeze({ ...fixtureLease, purpose: AUTOMOD_STAGING_PURPOSE });
+const ordinaryLease = { ...fixtureLease, runAttempt: 1 };
+const lease = Object.freeze({ ...ordinaryLease, purpose: AUTOMOD_STAGING_PURPOSE });
 const policy = Object.freeze({
   memberIntake: false, enforcement: false, resume: false, registrySync: false,
   interactionDispatch: false, dedicatedIntents: true,
@@ -47,15 +48,18 @@ function fixture() {
 }
 
 test("the frozen default effects omit startup", async () => {
-  const { deps, grantsRead, setTime } = fixture();
+  const { deps, grantsRead, setTime, setGrant } = fixture();
+  const at = Date.UTC(2026, 10, 27);
+  const issued = { ...lease, acquiredAt: at - 60_000, expiresAt: at - 1 };
+  setTime(at);
+  setGrant({ lease: issued, before: at + 1 });
   const effects = createProtectedAutomodEffects(deps);
   assert.equal(STAGING_AUTOMOD_PLAN.enabled, false);
   assert.ok(Object.isFrozen(effects));
   assert.equal(effects.enabled, false);
   assert.equal(Object.hasOwn(effects, "dryRun"), false);
-  setTime(lease.expiresAt + 1);
-  assert.deepEqual(await effects.readCleanupGrant(lease), { lease, before: cleanupBefore });
-  assert.deepEqual(grantsRead, [lease]);
+  assert.equal(await effects.readCleanupGrant(issued), undefined);
+  assert.deepEqual(grantsRead, [issued]);
 });
 
 test("startup requires the exact configured target and an open plan window", async () => {
@@ -116,7 +120,7 @@ test("cleanup accepts only a fresh authenticated grant bounded by both deadlines
   assert.deepEqual(await effects.readCleanupGrant(lease), { lease, before: cleanupBefore });
   for (const grant of [
     undefined, { lease: { ...lease, epoch: lease.epoch + 1 }, before: cleanupBefore },
-    { lease: fixtureLease, before: cleanupBefore },
+    { lease: ordinaryLease, before: cleanupBefore },
     ...[lease.expiresAt, lease.expiresAt + 1, cleanupBefore + 1, 69_000.5, NaN, Infinity].map(before => ({ lease, before })),
   ]) {
     setGrant(grant);
@@ -144,6 +148,7 @@ test("cleanup fails closed on provider failure or a grant that expires during th
 
 test("the protected caller starts once and recovers the expired lease with startup disabled", async t => {
   t.mock.timers.enable({ apis: ["Date"], now: 2_000 });
+  assert.equal(automodStartAllowed(plan, { runId: lease.runId, sha: lease.sha }, lease, Date.now()), true);
   const storage = new Storage();
   const journal = new StagingAutomodRecovery(storage);
   const pending = { ...intent, lease, baseline: createHash("sha256").update("[]").digest("hex") };
