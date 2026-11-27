@@ -26,7 +26,8 @@ def evidence(shape="0473/0465", host="pre-db.example.invalid"):
     )
     pre = GrantReadback(
         identity, "pre_migration", shape, complete=True,
-        restricted_database_grants=0, restricted_schema_grants=0, restricted_role_grants=0, parameter_grants=0,
+        restricted_database_grants=0, restricted_schema_grants=0, restricted_role_grants=0,
+        privileged_role_memberships=0, parameter_grants=0,
         superuser=False, bypassrls=False, createrole=False, createdb=False, replication=False, cross_schema_write=False,
     )
     cutoff = reservation.cutoff
@@ -131,11 +132,12 @@ class NativeDatabaseGrantGuardTests(unittest.TestCase):
                         rows = list(inputs["grant_rows"])
                         rows[index] = replace(row, **{field: count})
                         self.assert_refused("pre_db_restricted_grants", inputs, grant_rows=tuple(rows))
-            for count in (1, -1, False, 0.0, None):
-                with self.subTest(mode=row.schema_mode, field="parameter_grants", count=count):
-                    rows = list(inputs["grant_rows"])
-                    rows[index] = replace(row, parameter_grants=count)
-                    self.assert_refused("pre_db_privileged_grants", inputs, grant_rows=tuple(rows))
+            for field in ("privileged_role_memberships", "parameter_grants"):
+                for count in (1, -1, False, 0.0, None):
+                    with self.subTest(mode=row.schema_mode, field=field, count=count):
+                        rows = list(inputs["grant_rows"])
+                        rows[index] = replace(row, **{field: count})
+                        self.assert_refused("pre_db_privileged_grants", inputs, grant_rows=tuple(rows))
             for field in ("superuser", "bypassrls", "createrole", "createdb", "replication", "cross_schema_write"):
                 for flag in (True, 0, None):
                     with self.subTest(mode=row.schema_mode, field=field, flag=flag):

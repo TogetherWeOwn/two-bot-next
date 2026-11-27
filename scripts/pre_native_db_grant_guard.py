@@ -29,8 +29,10 @@ class GrantReadback:
     the observed catalog. The restricted counts cover all production or shared
     grants, including effective privileges through membership, ownership and
     PUBLIC. Cover inherited and assumable authority when assessing flags and
-    cross-schema writes. Count explicit parameter SET and ALTER SYSTEM grants,
-    including grants through PUBLIC. Incomplete inventory fails verification.
+    cross-schema writes. Count memberships in privileged roles, including
+    predefined roles with cluster-wide access or server-side capabilities.
+    Count explicit parameter SET and ALTER SYSTEM grants, including grants
+    through PUBLIC. Incomplete inventory fails verification.
     """
 
     identity: DatabaseIdentity
@@ -40,6 +42,7 @@ class GrantReadback:
     restricted_database_grants: int
     restricted_schema_grants: int
     restricted_role_grants: int
+    privileged_role_memberships: int
     parameter_grants: int
     superuser: bool
     bypassrls: bool
@@ -97,7 +100,8 @@ def verify_native_pre_db_grants(*, enabled=False, reservation: Reservation | Non
 
     The protected caller authenticates the reservation and independently
     obtains its database pin, both catalog/grant observations, the stop time
-    and the post-stop database readback. Use a common Unix-second clock.
+    and the database readback taken after stop and revocation. Establish that
+    order independently when events share a timestamp on the Unix-second clock.
     Success verifies supplied evidence and confers no operation authority.
     """
     if enabled is not True:
@@ -124,7 +128,7 @@ def verify_native_pre_db_grants(*, enabled=False, reservation: Reservation | Non
         modes.add(row.schema_mode)
         require(all(_zero(count) for count in (row.restricted_database_grants, row.restricted_schema_grants,
                                                row.restricted_role_grants)), "pre_db_restricted_grants")
-        require(_zero(row.parameter_grants)
+        require(_zero(row.privileged_role_memberships) and _zero(row.parameter_grants)
                 and all(flag is False for flag in (row.superuser, row.bypassrls, row.createrole, row.createdb,
                                                    row.replication, row.cross_schema_write)),
                 "pre_db_privileged_grants")
