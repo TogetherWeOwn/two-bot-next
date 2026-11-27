@@ -2690,7 +2690,6 @@ mod tests {
             event["message"],
             "saved gateway resume endpoint refused by admission policy"
         );
-        println!("gateway_policy_receipt_fixture={event}");
     }
 
     #[test]
