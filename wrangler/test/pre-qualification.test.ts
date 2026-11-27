@@ -48,7 +48,7 @@ function fixture() {
     id, storage, container,
     blockConcurrencyWhile<T>(fn: () => Promise<T>) {
       const next = lock.then(fn);
-      lock = next.catch(() => undefined);
+      lock = next.catch(() => { calls.push("reset"); });
       return next;
     },
   };
@@ -139,5 +139,34 @@ test("a failed issuance commit prevents native startup", async () => {
   await instance.arm(actor);
   storage.sync = async () => { throw new Error("uncommitted"); };
   await assert.rejects(instance.start(actor), /uncommitted/);
-  assert.deepEqual(calls, []);
+  assert.deepEqual(calls, ["reset"]);
+});
+
+test("private fixture controls pin the actor, port, method and pre-READY state", async t => {
+  const { instance, env, container, cutoff, calls } = fixture();
+  const runtime = new PreQualification({}, env);
+  const requests: unknown[][] = [];
+  let readiness = 200;
+  container.getTcpPort = (port: number) => ({ fetch: async (url?: string, init?: RequestInit) => {
+    requests.push([port, url, init?.method, init?.headers, init?.redirect]);
+    if (port === 8080) return new Response("{}", { status: readiness });
+    return init?.method === "POST" ? new Response(null, { status: 204 }) : new Response("{}");
+  } });
+  await assert.rejects(runtime.fixture(actor), refusal);
+  await instance.arm(actor);
+  await instance.start(actor);
+  await assert.rejects(runtime.fixture({ ...actor, version: "wrong" }), refusal);
+  await assert.rejects(runtime.releaseReady(actor), refusal);
+  assert.equal(requests.length, 1);
+  readiness = 503;
+  assert.equal((await runtime.fixture(actor)).headers.get("x-two-worker-version"), actor.version);
+  assert.deepEqual(await runtime.releaseReady(actor), actor);
+  assert.deepEqual(requests.filter(r => r[0] === 8082), [
+    [8082, "http://127.0.0.1:8082/fixture", "GET", { "x-pre-start-id": actor.startId }, "manual"],
+    [8082, "http://127.0.0.1:8082/release", "POST", { "x-pre-start-id": actor.startId }, "manual"],
+  ]);
+  t.mock.method(Date, "now", () => cutoff);
+  await assert.rejects(runtime.releaseReady(actor), refusal);
+  assert.equal(requests.length, 4);
+  assert.deepEqual(calls, ["start"]);
 });
