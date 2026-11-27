@@ -7906,6 +7906,29 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(file=file_name, mutation=label):
                     self.assertNotEqual(check(changed), [])
 
+    def test_staging_voice_move_sparse_checkout_loads_entry_points(self):
+        steps = self.workflows["staging-voice-move.yml"]["jobs"]["verify-lease"]["steps"]
+        paths = steps[0]["with"]["sparse-checkout"].splitlines()
+        entries = {shlex.split(step["run"])[1] for step in steps if step.get("run", "").startswith("node ")}
+        self.assertTrue(entries)
+        # Import each entry from just the checkout's files. Importing the
+        # modules bypasses their direct-invocation lease commands.
+        load = """
+globalThis.fetch = () => { throw new Error("Unexpected fetch during voice lease import"); };
+for (const entry of process.argv.slice(2)) await import("./" + entry);
+"""
+        with tempfile.TemporaryDirectory(prefix="staging-voice-move-checkout-") as directory:
+            for pattern in paths:
+                self.assertRegex(pattern, r"\A/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.(?:mjs|ts|json)\Z")
+                path = pattern[1:]
+                target = Path(directory) / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / path).read_bytes())
+            result = subprocess.run(["node", "--input-type=module", "-e", load, "sparse-checkout-probe", *sorted(entries)],
+                                    cwd=directory, env={"PATH": os.environ["PATH"]},
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_staging_automod_preview_requires_protected_opt_in(self):
         name = "staging-automod-preview.yml"
         self.assertEqual(workflow_policy_errors(self.workflows), [])
