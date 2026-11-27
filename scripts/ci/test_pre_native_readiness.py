@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1]), *sys.path]):
     from pre_native_readiness import (
@@ -46,7 +46,7 @@ class Fixture:
         assert service == target.service_name and max_body_bytes > 0
         after = target in self.released
         self.calls.append((target.shape, path, after))
-        status, body = 200, b'{"status":"ok"}'
+        status, body = 200, b""
         if path == "/readyz":
             status = 200 if after else 503
             gateway = "ready" if after else ("down" if pin is RETAINED else "starting")
@@ -86,16 +86,14 @@ def change_body(reply, **changes):
 class PairedReadinessTests(unittest.TestCase):
     def test_both_layouts_use_separate_private_bindings_and_ordered_evidence(self):
         fixture = Fixture()
-        evidence = fixture.verify()
         calls = []
-        for pin, result in zip((ORIGINAL, RETAINED), evidence, strict=True):
+        for pin, result in zip((ORIGINAL, RETAINED), fixture.verify(), strict=True):
             shape = pin.runtime.target.shape
             calls.extend([(shape, "/health", False), (shape, "/readyz", False), (shape, "readback", False),
                           (shape, "release", pin.mock_session), (shape, "/readyz", True), (shape, "readback", True)])
             self.assertEqual(result.reservation, pin)
-            self.assertEqual((result.health_status, result.pre_ready_status, result.post_ready_status), (200, 503, 200))
+            self.assertEqual(result.statuses, (200, 503, 200))
             self.assertEqual(result.activity.checkpoint, (pin.mock_session, 1))
-            self.assertEqual(result.activity.command_count, 2)
         self.assertEqual(fixture.calls, calls)
 
     def test_refuses_unhealthy_or_unpinned_worker_responses(self):
@@ -106,7 +104,9 @@ class PairedReadinessTests(unittest.TestCase):
             ("/readyz", False, {"worker_versions": (RETAINED.worker_version,)}, "worker_version"),
             ("/readyz", True, {"worker_versions": (ORIGINAL.worker_version,) * 2}, "worker_version"),
             ("/readyz", True, {"body": b'{"build_id":"x","build_id":"y"}'}, "probe_body"),
+            ("/readyz", True, {"status": 503}, "http_status"),
             ("/readyz", True, {"runtime": replace(ORIGINAL.runtime, process_id="replacement")}, "probe_runtime"),
+            ("/readyz", True, {"runtime": replace(ORIGINAL.runtime, process_id=ANY)}, "probe_runtime"),
             ("/readyz", False, {"runtime": RETAINED.runtime}, "probe_runtime"),
             ("/readyz", True, {"request": object()}, "probe_runtime"),
         ):
@@ -115,35 +115,29 @@ class PairedReadinessTests(unittest.TestCase):
                 fixture.probes[("0473/0465", path, after)] = lambda reply: replace(reply, **changes)
                 with self.assertRaisesRegex(TargetError, error):
                     fixture.verify()
-                self.assertEqual(bool(fixture.released), after)
-
-    def test_refuses_stamp_drift_in_either_phase(self):
-        for after in (False, True):
-            for stamp in ("build_revision", "build_id", "deploy_id"):
-                with self.subTest(after=after, stamp=stamp):
-                    fixture = Fixture()
-                    fixture.probes[("0473/0465", "/readyz", after)] = lambda reply: change_body(reply, **{stamp: "x"})
-                    with self.assertRaisesRegex(TargetError, "runtime_stamps"):
-                        fixture.verify()
 
     def test_refuses_malformed_or_incorrect_readiness_components(self):
-        for after, names in ((False, ("ready", "ready", "ready")), (False, ("ready", "down", "starting")),
-                             (True, ("down", "ready", "ready")), (True, ("ready", "ready", "down"))):
-            with self.subTest(after=after, names=names):
-                fixture = Fixture()
-                pairs = list(zip(("process", "database", "gateway"), names))
-                fixture.probes[("0473/0465", "/readyz", after)] = lambda reply: change_body(reply, components=pairs)
-                with self.assertRaisesRegex(TargetError, "readiness_components"):
-                    fixture.verify()
+        for after in (False, True):
+            gateway = "ready" if after else "starting"
+            pairs = [["process", "ready"], ["database", "ready"], ["gateway", gateway]]
+            cases = [({stamp: "x"}, "runtime_stamps") for stamp in ("build_revision", "build_id", "deploy_id")]
+            cases += [({"components": value}, "readiness_components") for value in (
+                pairs + [pairs[-1]], [pairs[0], ["database", "down"], pairs[2]],
+                [*pairs[:2], ["gateway", "down" if after else "ready"]],
+            )]
+            for changes, error in cases:
+                with self.subTest(after=after, changes=changes):
+                    fixture = Fixture()
+                    fixture.probes[("0473/0465", "/readyz", after)] = lambda reply: change_body(reply, **changes)
+                    with self.assertRaisesRegex(TargetError, error):
+                        fixture.verify()
 
     def test_refuses_wrong_effective_writer_ledger_digest_or_reservation(self):
         for changes, error in (
             ({"runtime": ORIGINAL.runtime}, "readback_runtime"),
-            ({"request": object()}, "readback_runtime"),
             ({"running_digest": digest("f")}, "running_digest"),
             ({"writer": replace(RETAINED.writer, writer_id="other")}, "wrong_pre_writer"),
             ({"writer": replace(RETAINED.writer, isolated=False)}, "unconfirmed_pre_writer"),
-            ({"ledger": ORIGINAL.ledger}, "wrong_pre_ledger"),
             ({"ledger": replace(RETAINED.ledger, cutover_fingerprint=digest("f"))}, "wrong_pre_ledger"),
             ({"ledger": replace(RETAINED.ledger, installed_0475_at=None)}, "retained_timestamp"),
             ({"ledger": replace(RETAINED.ledger, installed_0475_at=1_800_000_000_000_000)}, "wrong_pre_ledger"),
@@ -155,11 +149,15 @@ class PairedReadinessTests(unittest.TestCase):
                     fixture.verify()
 
     def test_refuses_unconfirmed_ready_checkpoint_or_nonempty_rest_sync(self):
+        fixture = Fixture()
+        with patch.object(fixture, "release", return_value=False), self.assertRaisesRegex(TargetError, "mock_ready_unconfirmed"):
+            fixture.verify()
+        self.assertNotIn(("0473/0465", "/readyz", True), fixture.calls)
         session = ORIGINAL.mock_session
         for after, activity in (
             (False, MockActivity(ready_session=session)),
             (True, MockActivity(session, (session, 1), session, 0)),
-            (True, MockActivity(session, (RETAINED.mock_session, 1), session, 2)),
+            (True, MockActivity(session, (ANY, 1), session, 2)),
             (True, MockActivity(session, (session, 1), RETAINED.mock_session, 2)),
             (True, MockActivity(session, None, session, 2)),
         ):

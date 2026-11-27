@@ -47,9 +47,7 @@ class Writer:
 
 @dataclass(frozen=True)
 class Reservation:
-    """Pins from the admitted runtime, verified archive and approved PRE snapshot."""
-
-    runtime: Runtime
+    runtime: Runtime  # Pins come from the admitted runtime and verified archive.
     worker_version: str
     build: Build
     writer: Writer
@@ -87,9 +85,7 @@ class Readback:
 @dataclass(frozen=True)
 class Evidence:
     reservation: Reservation
-    health_status: int
-    pre_ready_status: int
-    post_ready_status: int
+    statuses: tuple[int, int, int]  # Health, pre-READY and post-READY.
     activity: MockActivity
 
 
@@ -99,6 +95,12 @@ def _matches(pattern, value):
 
 def _identifier(value):
     return _matches(IDENTIFIER, value) and value != "unknown"
+
+
+def _valid_runtime(runtime):
+    return (type(runtime) is Runtime and type(runtime.target) is Target
+            and type(runtime.target.scope) is str and type(runtime.target.shape) is str
+            and _matches(APP_ID, runtime.app_id) and _identifier(runtime.process_id))
 
 
 def _check_writer(writer):
@@ -120,8 +122,7 @@ def _check_ledger(ledger, shape):
 
 
 def _check_pin(pin):
-    require(type(pin) is Reservation and type(pin.runtime) is Runtime and type(pin.runtime.target) is Target
-            and _matches(APP_ID, pin.runtime.app_id) and _identifier(pin.runtime.process_id)
+    require(type(pin) is Reservation and _valid_runtime(pin.runtime)
             and _matches(APP_ID, pin.worker_version) and _identifier(pin.mock_session), "invalid_pre_reservation")
     build = pin.build
     require(type(build) is Build and _matches(SHA, build.build_revision) and _matches(DIGEST, build.image_digest)
@@ -141,8 +142,7 @@ def _probe(binding, pin, path, status):
     request = object()
     reply = _observe(binding, pin.runtime.target, pin.runtime.target.service_name, path,
                      request=request, max_body_bytes=MAX_BODY_BYTES)
-    require(type(reply) is Probe and reply.request is request and type(reply.runtime) is Runtime
-            and type(reply.runtime.target) is Target
+    require(type(reply) is Probe and reply.request is request and _valid_runtime(reply.runtime)
             and reply.runtime == pin.runtime, "wrong_pre_probe_runtime")
     require(type(reply.worker_versions) is tuple and len(reply.worker_versions) == 1
             and type(reply.worker_versions[0]) is str and reply.worker_versions[0] == pin.worker_version,
@@ -171,7 +171,7 @@ def _check_components(reply, build, gateway_states):
 def _readback(reader, pin, reply):
     observed = _observe(reader, pin.runtime.target, request=reply.request)
     require(type(observed) is Readback and observed.request is reply.request
-            and type(observed.runtime) is Runtime and type(observed.runtime.target) is Target
+            and _valid_runtime(observed.runtime)
             and observed.runtime == pin.runtime, "wrong_pre_readback_runtime")
     require(type(observed.running_digest) is str and observed.running_digest == pin.build.image_digest,
             "wrong_pre_running_digest")
@@ -187,11 +187,10 @@ def _readback(reader, pin, reply):
 def verify_paired_readiness(original, retained, *, private_get, readback, release_ready):
     """Return evidence for both PRE layouts after all checks pass.
 
-    Private GET uses the exact Service Binding, with a bounded read and no redirects
-    or retries. Adapters independently authenticate scope and serving process, and
-    bind fresh process, database and mock readback to the probe token. Release READY
-    for the exact target and session and return True on confirmation. The caller
-    owns the admission window, fencing and cleanup.
+    Private GET takes one bounded observation through the exact Service Binding.
+    Adapters authenticate the scope and serving process and bind fresh readback
+    to the probe token. Confirm READY release for the supplied target and session
+    with True. The caller owns timing, fencing and cleanup.
     """
     for pin in (original, retained):
         _check_pin(pin)
@@ -200,7 +199,7 @@ def verify_paired_readiness(original, retained, *, private_get, readback, releas
             and first.provider_names != second.provider_names
             and original.runtime.app_id != retained.runtime.app_id
             and original.worker_version != retained.worker_version
-            and original.writer.database_id != retained.writer.database_id
+            and original.writer.database_id != retained.writer.database_id and original.writer.writer_id != retained.writer.writer_id
             and original.mock_session != retained.mock_session, "pre_reservations_not_separate")
     require(original.build == retained.build, "wrong_pre_archive_pair")
 
@@ -209,14 +208,17 @@ def verify_paired_readiness(original, retained, *, private_get, readback, releas
         health = _probe(private_get, pin, "/health", 200)
         pre = _probe(private_get, pin, "/readyz", 503)
         _check_components(pre, pin.build, ("starting", "down"))
-        require(_readback(readback, pin, pre) == MockActivity(), "premature_pre_mock_activity")
+        baseline = _readback(readback, pin, pre)
+        require(baseline.ready_session is baseline.rest_session is baseline.checkpoint is None
+                and baseline.command_count == 0, "premature_pre_mock_activity")
         require(_observe(release_ready, pin.runtime.target, pin.mock_session) is True, "pre_mock_ready_unconfirmed")
         post = _probe(private_get, pin, "/readyz", 200)
         _check_components(post, pin.build, ("ready",))
         activity = _readback(readback, pin, post)
-        require(activity.ready_session == pin.mock_session and activity.rest_session == pin.mock_session
-                and type(activity.checkpoint) is tuple and len(activity.checkpoint) == 2
-                and activity.checkpoint[0] == pin.mock_session and type(activity.checkpoint[1]) is int
+        require(type(activity.checkpoint) is tuple and len(activity.checkpoint) == 2
+                and all(type(session) is str and session == pin.mock_session
+                        for session in (activity.ready_session, activity.rest_session, activity.checkpoint[0]))
+                and type(activity.checkpoint[1]) is int
                 and activity.checkpoint[1] > 0 and activity.command_count > 0, "unconfirmed_pre_mock_activity")
-        evidence.append(Evidence(pin, health.status, pre.status, post.status, activity))
+        evidence.append(Evidence(pin, (health.status, pre.status, post.status), activity))
     return tuple(evidence)
