@@ -573,9 +573,12 @@ reusable workflows. The existing protected Environments supply the values
 to the provider and migration steps that use them.
 
 - **Confirmed PRE.** The protected job checks both migration ledgers, schema
-  and grants under the migration locks. The exact baseline in the origin plan permits one
+  and grants under the migration locks. Exact original PRE permits one
   takeover of the pinned predecessor from the proved stopped epoch, followed
   by stable readiness.
+- **Confirmed retained baseline.** An authenticated locked readback of the origin
+  plan's exact 0475 timestamp, ledgers, schema and grants permits restart after
+  a lost inverse receipt.
 - **Confirmed POST.** The protected job checks the exact expanded state under
   the same locks and requires evidence that the original apply step ran.
   Keep the writer fenced until the protected inverse succeeds and its result
@@ -584,9 +587,7 @@ to the provider and migration steps that use them.
 - **Ambiguous.** Mixed ledgers, mismatched serving identity, unproved stop,
   an uncertain inverse, or missing or mismatched required evidence stop
   recovery.
-  The restored endpoint that retains 0475 requires protected reconciliation
-  with verified inverse evidence. Keep the fence and escalate to the release
-  operator without starting a writer or sending another takeover.
+  Keep the fence and escalate to the release operator.
 
 In either takeover path, a lost reply can be confirmed only by readback of the
 exact active predecessor at the next epoch under the expected actor. A pending
@@ -682,12 +683,12 @@ at the pinned release revision.
 
 | Endpoint | Cutover | Store | Schema marker |
 | --- | --- | --- | --- |
-| Original baseline | 115 rows through `0473` | 20 rows through `0465` | `attendance_recovered_at` absent. |
-| Retained baseline | 116 rows through `0475` | 20 rows through `0465` | `attendance_recovered_at` and the original `0475` ledger timestamp retained. |
+| Before apply | 115 rows through `0473` | 20 rows through `0465` | `attendance_recovered_at` absent. |
+| After guarded inverse | 116 rows through `0475` | 20 rows through `0465` | `attendance_recovered_at` and the original `0475` ledger timestamp retained. |
 
-For a retained baseline, the plan and forward receipt bind the same `0475`
-timestamp digest. The runner verifies the column and timestamp under lock.
-Use the separate [planner receipt checks](https://github.com/TogetherWeOwn/two-bot-next/pull/2478)
+For a retained baseline, the plan and forward receipt bind the same `0475` timestamp digest.
+Use the separate
+[planner receipt checks](https://github.com/TogetherWeOwn/two-bot-next/pull/2478)
 for the full ledgers and retained timestamp.
 
 ### Check the shared rollback SHA

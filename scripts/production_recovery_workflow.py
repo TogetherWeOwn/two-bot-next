@@ -12,6 +12,7 @@ from production_recovery_artifact import FENCE_JOB, FENCE_STEP, authenticated_in
 from production_recovery_takeover import (HEX, RUN_ID, UUID, complete_legacy_takeover, observed_phase,
                                           require_same_provider_pair, retained_takeover_action, verify_inverse)
 from production_release import applied_release, is_stopped, matches_pair, release_actor, stopped_ack, write_json
+from production_release_ledgers import STORE
 from rollback_proof import ProofError
 from staging_migrate_approval import digest_json
 from staging_recovery_status import github, matches
@@ -85,7 +86,7 @@ def interrupted_classification(classification):
     state = classification.get("state")
     stamp = classification.get("attendance_fence_sha256")
     require((state == "pre" and set(classification) == {"state"})
-            or (state == "post" and set(classification) == {"state", "attendance_fence_sha256"}
+            or (state in ("post", "retained") and set(classification) == {"state", "attendance_fence_sha256"}
                 and matches(HEX, stamp)), "production_interrupted_database_unproved")
     return state
 
@@ -135,7 +136,7 @@ def reconcile_interrupted(pin, origin_run_id, epoch, classification, observe, co
                 raise
         else:
             require(resumed(), "production_interrupted_takeover_unconfirmed")
-    return {"state": "pre", "worker": pin.rollback_worker, "epoch": epoch + 1}
+    return {"state": state, "worker": pin.rollback_worker, "epoch": epoch + 1}
 
 
 def wait_for_restore_rollout(pin, candidate, observe, pause):
@@ -216,8 +217,7 @@ def _run_recovery_database(binary, directory, plan_id, plan, env, *operation, so
             "--production-host", target["host"], "--production-database", target["database"],
             "--production-branch-id", target["branch_id"], "--recovery-evidence-ref", recovery_ref,
             "--acl-plan-ref", plan["acl_plan_ref"], "--expected-pending", ",".join(map(str, plan["pending_before"])),
-            "--expected-store-pending", ",".join(map(str, plan["pending_store_before"])),
-            "--plan-manifest-sha256", plan["plan_manifest_sha256"],
+            "--expected-store-pending", ",".join(map(str, STORE)), "--plan-manifest-sha256", plan["plan_manifest_sha256"],
             "--store-plan-manifest-sha256", plan["store_plan_manifest_sha256"], "--plan-run-id", plan_id,
             "--plan-manifest-path", str(plan_path), *operation]
     binding = "TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL"

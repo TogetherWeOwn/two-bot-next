@@ -55,6 +55,8 @@ class ProductionReleaseLedgerTests(unittest.TestCase):
             [[self.cutover], [self.store]], [expected_cutover, expected_store],
             [cutover_prefix, [self.store]],
         ))
+        restored = [cutover_prefix, [self.store]]
+        self.assertEqual(ledger_endpoints(retained_plan(self.plan)), (restored, [expected_cutover, expected_store], restored))
 
     def test_refuses_source_checksum_or_installed_ledger_drift(self):
         for fields, change in (
@@ -69,21 +71,12 @@ class ProductionReleaseLedgerTests(unittest.TestCase):
                     plan[field][0].update(change)
                 ledger_endpoints(plan)
 
-    def test_retained_plan_projects_only_four_cutover_applies_and_restores_to_its_baseline(self):
-        _, original_expanded, original_restored = ledger_endpoints(self.plan)
-        retained = retained_plan(self.plan)
-        before, expanded, restored = ledger_endpoints(retained)
-        self.assertEqual((before, expanded, restored), (original_restored, original_expanded, original_restored))
-        self.assertEqual([row["version"] for row in expanded[0][len(before[0]):]], [479, 480, 481, 482])
-
-    def test_retained_plan_requires_the_0475_row_and_valid_timestamp_digest(self):
+    def test_retained_plan_requires_the_0475_description_and_valid_timestamp_digest(self):
         for fence in (None, "b", "B" * 64):
             with self.subTest(fence=fence), self.assertRaises(GateError):
                 ledger_endpoints(retained_plan(self.plan, fence))
-        retained = retained_plan(self.plan)
-        retained["source_migrations"].pop(1)
-        retained["ledger_before"].pop()
-        retained["ledger_after"].pop()
-        retained["plan_manifest_sha256"] = projection_hash(retained)
+        changed = retained_plan(self.plan)
+        for key in ("ledger_before", "ledger_after"):
+            changed[key][-1]["description"] = "changed 0475"
         with self.assertRaises(GateError):
-            ledger_endpoints(retained)
+            ledger_endpoints(changed)

@@ -2865,8 +2865,8 @@ rechecks approval immediately before DDL. After an intervening apply,
 reconcile both ledgers and use a fresh plan and approval.
 
 The ordinary production migration workflow refuses plans that apply
-Cutover 0480. Rehearsal runs Cutover 0479–0482, Store 0478 and any pending
-0475 as one transaction across both migration
+Cutover 0480, including the exact Cutover 0475/0479–0482 and Store 0478
+bundle. Rehearsal runs that bundle as one transaction across both migration
 chains, the voice heat contract and the new-object grants. If the commit
 outcome is uncertain, reconcile both ledgers and role state before retrying.
 The database inverse verifies both ledgers and role state and retains 0475.

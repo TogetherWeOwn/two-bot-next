@@ -470,11 +470,11 @@ pub fn check_plan_provenance(
     req: &Request,
     computed_hash: &str,
     computed_store_hash: &str,
-) -> Result<(), RunError> {
+) -> Result<Option<Value>, RunError> {
     if !req.apply {
-        return Ok(());
+        return Ok(None);
     }
-    bound_plan_artifact(req, computed_hash, computed_store_hash).map(|_| ())
+    bound_plan_artifact(req, computed_hash, computed_store_hash).map(Some)
 }
 
 fn bound_plan_artifact(
@@ -984,11 +984,7 @@ fn ledger_json(rows: &[LedgerRow]) -> Value {
     )
 }
 
-fn check_release_ledgers(
-    plan: &Value,
-    cutover: &[LedgerRow],
-    store: &[LedgerRow],
-) -> Result<(), RunError> {
+fn check_ledgers(plan: &Value, cutover: &[LedgerRow], store: &[LedgerRow]) -> Result<(), RunError> {
     if plan.get("ledger_before") != Some(&ledger_json(cutover))
         || plan.get("ledger_store_before") != Some(&ledger_json(store))
     {
@@ -1001,13 +997,10 @@ fn valid_fence(fence: &str) -> bool {
     fence.len() == 64
         && fence
             .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-fn release_fence_from_plan<'a>(
-    plan: &'a Value,
-    pending: &[i64],
-) -> Result<Option<&'a str>, RunError> {
+fn plan_fence<'a>(plan: &'a Value, pending: &[i64]) -> Result<Option<&'a str>, RunError> {
     match plan.get("attendance_fence_sha256") {
         None if pending == cutover_pending(false) => Ok(None),
         Some(Value::String(fence)) if pending == cutover_pending(true) && valid_fence(fence) => {
@@ -1510,7 +1503,7 @@ async fn run_release_recovery(
     let cutover_hash = check_plan_binding(req, &cutover_pending, &cutover)?;
     let store_hash = check_store_binding(req, &store_pending, &store)?;
     let plan = bound_plan_artifact(req, &cutover_hash, &store_hash)?;
-    let retained = release_fence_from_plan(&plan, &cutover_pending)?;
+    let retained = plan_fence(&plan, &cutover_pending)?;
     if fence_sha256.is_some_and(|fence| retained.is_some_and(|expected| expected != fence)) {
         return refuse("release inverse attendance timestamp differs from producing plan");
     }
@@ -1641,13 +1634,9 @@ async fn run_on_pool(
         .map_err(|_| failed("store ledger read failed"))?;
     let pending = reconcile(&before, &cutover).map_err(RunError::Refused)?;
     let store_pending = reconcile(&store_before, &store).map_err(RunError::Refused)?;
-    let protected_bundle =
-        req.target == Target::Production && release_pending(&pending, &store_pending);
-    if req.apply && req.target == Target::Production && pending.contains(&480) && !protected_bundle
-    {
-        return refuse("production attendance requires the exact protected release bundle");
-    }
-    let mut release_fence = if !req.apply && protected_bundle && pending == cutover_pending(true) {
+    let bundle = release_pending(&pending, &store_pending);
+    let protected_bundle = req.target == Target::Production && bundle;
+    let mut release_fence = if !req.apply && bundle && pending == cutover_pending(true) {
         Some(retained_fence(&mut conn).await?)
     } else {
         None
@@ -1674,10 +1663,7 @@ async fn run_on_pool(
     let computed_store_hash = check_store_binding(req, &store_pending, &store)?;
     // Provenance follows exactness: each bound hash must additionally be the
     // hash the named producing plan run uploaded. All refuse before any DDL.
-    let producing_plan = req
-        .apply
-        .then(|| bound_plan_artifact(req, &computed_hash, &computed_store_hash))
-        .transpose()?;
+    let producing_plan = check_plan_provenance(req, &computed_hash, &computed_store_hash)?;
 
     // Plan-only readout inside one READ ONLY transaction. Apply skips it: that
     // login is the migrator, not the read-only readout. A saturated staging
@@ -1698,8 +1684,8 @@ async fn run_on_pool(
     let mut store_applied = 0usize;
     let mut store_after = store_before.clone();
     if let Some(plan) = producing_plan.as_ref().filter(|_| protected_bundle) {
-        check_release_ledgers(plan, &before, &store_before)?;
-        let retained = release_fence_from_plan(plan, &pending)?;
+        check_ledgers(plan, &before, &store_before)?;
+        let retained = plan_fence(plan, &pending)?;
         let release = apply_release_schema(pool, &before, &store_before, retained).await?;
         after = release.cutover;
         store_after = release.store;
@@ -1746,10 +1732,10 @@ async fn run_on_pool(
         "expected_store_pending": expected_store,
         "store_plan_manifest_sha256": computed_store_hash,
         "plan_run_id": req.plan_run_id.clone().unwrap_or_default(),
-        // True only for apply, and only because `bound_plan_artifact`
+        // True only for apply, and only because `check_plan_provenance`
         // passed above: reaching this manifest means both bound hashes were
         // proven to come from the named producing plan run.
-        "plan_provenance_verified": producing_plan.is_some(),
+        "plan_provenance_verified": req.apply,
         "applied_count": applied,
         "applied_store_count": store_applied,
         // Plan-only readout (null for apply): ledger owners and counts,
@@ -2275,11 +2261,14 @@ mod tests {
     async fn release_inverse_refuses_either_mismatched_pending_list() {
         let cutover = [475, 479, 480, 481, 482];
         let retained = json!({"attendance_fence_sha256": "b".repeat(64)});
-        assert!(release_fence_from_plan(&retained, &cutover[1..])
-            .unwrap()
-            .is_some());
-        assert!(release_fence_from_plan(&retained, &cutover).is_err());
-        assert!(release_fence_from_plan(&json!({}), &cutover[1..]).is_err());
+        assert!(matches!(plan_fence(&retained, &cutover[1..]), Ok(Some(_))));
+        assert!(plan_fence(&retained, &cutover).is_err());
+        assert!(plan_fence(&json!({}), &cutover[1..]).is_err());
+        for invalid in [Value::Null, json!("B".repeat(64)), json!("b")] {
+            assert!(
+                plan_fence(&json!({"attendance_fence_sha256": invalid}), &cutover[1..]).is_err()
+            );
+        }
         let refusal = "refused: release inverse pending lists do not match the protected bundle";
         for (pending, store) in [
             (cutover.as_slice(), "479"),
@@ -2498,9 +2487,9 @@ mod tests {
             }]
         });
         let plan = json!({"ledger_before": ledger_json(&cutover), "ledger_store_before": ledger_json(&store)});
-        let exact = check_release_ledgers(&plan, &cutover, &store);
-        let cutover_drift = check_release_ledgers(&plan, &store, &store);
-        let store_drift = check_release_ledgers(&plan, &cutover, &cutover);
+        let exact = check_ledgers(&plan, &cutover, &store);
+        let cutover_drift = check_ledgers(&plan, &store, &store);
+        let store_drift = check_ledgers(&plan, &cutover, &cutover);
         assert!(exact.is_ok());
         for error in [cutover_drift, store_drift] {
             assert_eq!(

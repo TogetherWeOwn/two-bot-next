@@ -174,10 +174,9 @@ class InterruptedReleaseTests(unittest.TestCase):
                  for row in plan[chain]] for chain in ("source_migrations", "source_store_migrations")]
 
     def test_cancelled_apply_routes_locked_db_outcomes_to_the_pinned_predecessor(self):
-        for retained in (False, True):
-            for state in ("pre", "post", "uncertain"):
-                with self.subTest(state=state, retained=retained), TemporaryDirectory() as temp:
-                    self.check_cancelled_apply(state, Path(temp), retained)
+        for state, retained in (("pre", False), ("retained", True), ("post", True), ("uncertain", False)):
+            with self.subTest(state=state), TemporaryDirectory() as temp:
+                self.check_cancelled_apply(state, Path(temp), retained)
 
     def check_cancelled_apply(self, state, temp, retained):
         env, routes, plan, plan_artifact = self.recovery_admission()
@@ -210,7 +209,9 @@ class InterruptedReleaseTests(unittest.TestCase):
                 self.live["ownership"].update(epoch=self.epoch + 1, phase="active", owner_actor=actor, running=True)
             return takeover
 
-        classification = {"state": "post", "attendance_fence_sha256": stamp} if state == "post" else {"state": "pre"}
+        classification = {"state": state}
+        if state in ("post", "retained"):
+            classification["attendance_fence_sha256"] = stamp
         cutover, store = self.db_ledgers(plan)
         inverse = {"state": "restored", "attendance_fence_sha256": stamp, "expanded": [cutover, store],
                    "restored": [cutover[:2], store[:1]]}
@@ -244,6 +245,12 @@ class InterruptedReleaseTests(unittest.TestCase):
                 upload(interrupted.DECISION, 702, "DECISION")
                 steps = (interrupted.CLASSIFY_STEP, interrupted.DECISION_STEP)
                 producer(interrupted.DATABASE_JOB, steps)
+                if state == "retained":
+                    decision = json.loads((directory / f"{interrupted.DECISION}.json").read_bytes())
+                    for changed in ({"state": "pre"}, {**classification, "attendance_fence_sha256": "0" * 64}):
+                        with self.assertRaisesRegex(GateError, "production_interrupted_retained_stamp_changed"):
+                            interrupted.verified_decision({**decision, "classification": changed},
+                                                          decision["admission"], stamp)
                 if state == "post":
                     self.assertEqual(interrupted.main(["inverse", "fixture-migrator"], env, api), 0)
                     self.assertEqual(process.call_args.args[0][-2:], ["--inverse-attendance-fence-sha256", stamp])
@@ -257,10 +264,8 @@ class InterruptedReleaseTests(unittest.TestCase):
                 self.assertEqual(interrupted.main(["restart"], env, api), 0)
 
         self.assertEqual(process.call_count, 2 if state == "post" else 1)
-        expected_pending = "479,480,481,482" if retained else "475,479,480,481,482"
-        for invocation in process.call_args_list:
-            args = invocation.args[0]
-            self.assertEqual(args[args.index("--expected-pending") + 1], expected_pending)
+        args = process.call_args.args[0]
+        self.assertEqual(args[args.index("--expected-pending") + 1], ",".join(map(str, plan["pending_before"])))
         self.assertEqual([call.kwargs["timeout"] for call in process.call_args_list], [120] * process.call_count)
         if state == "uncertain":
             self.control.assert_not_called()

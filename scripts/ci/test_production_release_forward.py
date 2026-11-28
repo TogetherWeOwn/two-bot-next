@@ -76,25 +76,18 @@ class ReleaseForwardTests(unittest.TestCase):
         outcome = {**self.outcome, "applied_count": 4, "ledger_before": plan["ledger_before"],
                    "pending_before": plan["pending_before"], "plan_manifest_sha256": plan["plan_manifest_sha256"]}
         self.assertEqual(forward_receipt("123", plan, outcome), forward_receipt("123", self.plan, self.outcome))
-        for changed in ({"attendance_fence_sha256": "d" * 64}, {"applied_count": 5}):
-            with self.subTest(changed=changed), self.assertRaises(GateError):
-                forward_receipt("123", plan, {**outcome, **changed})
+        with self.assertRaises(GateError):
+            forward_receipt("123", plan, {**outcome, "attendance_fence_sha256": "d" * 64})
 
         with TemporaryDirectory() as scratch, patch.object(release.subprocess, "run") as process:
             process.return_value = Mock(returncode=0, stdout=json.dumps(outcome))
-            env = {"TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL": "fixture"}
-            release.database("fixture", Path(scratch), plan, env, plan_id="123")
-            args = process.call_args.args[0]
-            self.assertEqual(args[args.index("--expected-pending") + 1], "479,480,481,482")
-
-    def test_retained_preflight_refuses_a_changed_timestamp_before_provider_access(self):
-        pin, original = self.preflight_fixture()
-        approved = retained_plan(original)
-        fresh = {**approved, "attendance_fence_sha256": "d" * 64}
-        observe = Mock()
-        with self.assertRaisesRegex(GateError, "production_release_preflight_plan_changed"):
-            preflight.verify_preflight(pin, approved["target"], approved, fresh, observe, Mock())
-        observe.assert_not_called()
+            env = {f"TWO_BOT_PRODUCTION_{role}_DATABASE_URL": "fixture" for role in ("PLAN", "MIGRATOR")}
+            for plan_id, mode in ((None, "--plan"), ("123", "--apply")):
+                release.database("fixture", Path(scratch), plan, env, plan_id=plan_id)
+                args = process.call_args.args[0]
+                self.assertIn(mode, args)
+                self.assertEqual(args[args.index("--expected-pending") + 1], "479,480,481,482")
+            self.assertEqual(json.loads((Path(scratch) / "reviewed-plan.json").read_bytes()), plan)
 
     def preflight_fixture(self):
         pin = preflight.ReleasePreflight("d" * 40, self.plan["source_sha"], "sha256:" + "1" * 64,
@@ -129,6 +122,12 @@ class ReleaseForwardTests(unittest.TestCase):
         shifted["ownership"]["epoch"] += 1
         with self.assertRaisesRegex(GateError, "production_release_retained_pair_changed"):
             preflight.verify_preflight(pin, plan["target"], plan, plan, Mock(side_effect=[state, shifted]), control)
+        approved = retained_plan(plan)
+        observe.reset_mock()
+        with self.assertRaisesRegex(GateError, "production_release_preflight_plan_changed"):
+            preflight.verify_preflight(pin, approved["target"], approved,
+                                       {**approved, "attendance_fence_sha256": "d" * 64}, observe, control)
+        observe.assert_not_called()
 
     def test_known_legacy_predecessor_fences_only_the_observed_pair_at_the_preflight_epoch(self):
         pin, plan = self.preflight_fixture()

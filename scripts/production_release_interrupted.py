@@ -56,16 +56,19 @@ def verified_admission(document, binding):
             "production_interrupted_admission_changed")
 
 
-def verified_decision(document, admission):
+def verified_decision(document, admission, retained=None):
     require(set(document) == {"admission", "classification"} and document["admission"] == admission,
             "production_interrupted_decision_changed")
     classification = mapping(document["classification"])
     state = interrupted_classification(classification)
+    require((state != "retained" or retained is not None)
+            and (retained is None or classification.get("attendance_fence_sha256") == retained),
+            "production_interrupted_retained_stamp_changed")
     incident_stamp = admission["binding"].get("forward_fence_sha256")
     require(not incident_stamp or (
         state == "post" and classification["attendance_fence_sha256"] == incident_stamp),
         "production_interrupted_forward_classification_changed")
-    require(state == "pre" or admission["phase"] in ("stopped", "candidate-stopped"),
+    require(state != "post" or admission["phase"] in ("stopped", "candidate-stopped"),
             "production_interrupted_stop_unproved")
     return classification
 
@@ -80,7 +83,6 @@ def require_forward_attempt(origin, api):
 
 def recovery_pin(pin, origin_id, epoch, plan, stamp):
     _, expanded, restored = ledger_endpoints(plan)
-    require(stamp == plan.get("attendance_fence_sha256", stamp), "production_interrupted_retained_stamp_changed")
     return RecoveryPin(origin_id, 1, pin.candidate_sha, pin.rollback_sha, pin.rollback_worker,
                        pin.rollback_image, pin.application_id, pin.namespace_id, digest_json(plan["target"]),
                        digest_json(expanded), digest_json(restored), stamp, epoch)
@@ -123,12 +125,13 @@ def execute(argv, env, api):
 
     admission = packet(env, run, ADMISSION_JOB, ADMISSION_STEPS, ADMISSION, "ADMISSION", api)
     verified_admission(admission, binding)
+    retained = plan.get("attendance_fence_sha256")
     decision_path = directory / f"{DECISION}.json"
     if len(argv) == 2 and argv[0] == "classify":
         classification = run_recovery_database(argv[1], directory, plan_id, plan, env,
                                                "--classify-interrupted-release")
         decision = {"admission": admission, "classification": classification}
-        verified_decision(decision, admission)
+        verified_decision(decision, admission, retained)
         if classification["state"] == "post":
             require_forward_attempt(origin, api)
         write_json(decision_path, decision)
@@ -136,7 +139,7 @@ def execute(argv, env, api):
         return
     if len(argv) == 2 and argv[0] == "inverse":
         decision = mapping(decode(decision_path.read_bytes()))
-        classification = verified_decision(decision, admission)
+        classification = verified_decision(decision, admission, retained)
         require(classification["state"] == "post", "production_interrupted_inverse_without_post")
         recovery = recovery_pin(pin, origin_id, epoch, plan, classification["attendance_fence_sha256"])
         approval = {"plan_run_id": plan_id, "recovery_ref": plan["recovery_evidence_ref"]}
@@ -145,7 +148,7 @@ def execute(argv, env, api):
         return
     require(argv == ["restart"], "production_interrupted_operation_invalid")
     decision = packet(env, run, DATABASE_JOB, (CLASSIFY_STEP, DECISION_STEP), DECISION, "DECISION", api)
-    classification = verified_decision(decision, admission)
+    classification = verified_decision(decision, admission, retained)
     post = classification["state"] == "post"
     if post:
         proof = packet(env, run, DATABASE_JOB, (CLASSIFY_STEP, DECISION_STEP, *INVERSE_STEPS),

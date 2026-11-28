@@ -223,7 +223,7 @@ class RecoveryWorkflowTests(unittest.TestCase):
     def test_inverse_refuses_incomplete_database_readback(self):
         plan = dict(target=dict(host="db", database="fixture", branch_id="branch"),
                     acl_plan_ref="acl", plan_manifest_sha256="plan", store_plan_manifest_sha256="store",
-                    pending_before=[479, 480, 481, 482], pending_store_before=[478])
+                    pending_before=[479, 480, 481, 482])
         approval = {"recovery_ref": "ref", "plan_run_id": "321"}
         env = {"TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL": "fixture"}
         with TemporaryDirectory() as scratch, patch.object(recovery.subprocess, "run") as run:

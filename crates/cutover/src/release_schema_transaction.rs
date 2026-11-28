@@ -1,5 +1,4 @@
 //! Atomic expansion for the 0475/0479–0482 and Store 0478 bundle.
-//! Applies 0475 only if it is absent.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -140,21 +139,17 @@ async fn release_ledger_owner(conn: &mut PgConnection) -> Result<bool, RunError>
 }
 
 pub(super) async fn retained_fence(conn: &mut PgConnection) -> Result<String, RunError> {
-    if !retained_attendance_schema(conn).await? {
-        return Err(RunError::Refused(
-            "release retained attendance schema changed".to_owned(),
-        ));
+    if retained_attendance_schema(conn).await? {
+        return Ok(hex::encode(Sha256::digest(attendance_fence(conn).await?)));
     }
-    Ok(hex::encode(Sha256::digest(attendance_fence(conn).await?)))
+    Err(failure("release attendance schema changed"))
 }
 
-async fn pre_schema(conn: &mut PgConnection, retained: Option<&str>) -> Result<bool, RunError> {
-    Ok(legacy_schema(conn, retained.is_none()).await?
-        && release_roles_clean(conn, legacy_verifier()).await?
-        && match retained {
-            Some(expected) => retained_fence(conn).await? == expected,
-            None => true,
-        })
+async fn pre_schema(conn: &mut PgConnection, original: bool) -> Result<bool, RunError> {
+    Ok(
+        legacy_schema(conn, original).await?
+            && release_roles_clean(conn, legacy_verifier()).await?,
+    )
 }
 
 async fn expanded_schema(conn: &mut PgConnection) -> Result<bool, RunError> {
@@ -251,7 +246,7 @@ pub async fn confirm_release_pre(
         || !reconcile(&actual_cutover, &cutover).is_ok_and(|pending| pending == CUTOVER)
         || !reconcile(&actual_store, &store).is_ok_and(|pending| pending == STORE)
         || !release_ledger_owner(&mut tx).await?
-        || !pre_schema(&mut tx, None).await?
+        || !pre_schema(&mut tx, true).await?
     {
         return Err(RunError::Refused("release PRE state unproved".to_owned()));
     }
@@ -260,12 +255,13 @@ pub async fn confirm_release_pre(
         .map_err(|_| failure("release PRE readback failed"))
 }
 
-/// The two database endpoints that can be proved without a forward receipt.
+/// Database endpoints that can be proved without a forward receipt.
 #[doc(hidden)]
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum InterruptedRelease {
     Pre,
+    Retained { attendance_fence_sha256: String },
     Post { attendance_fence_sha256: String },
 }
 
@@ -294,14 +290,20 @@ pub async fn classify_interrupted_release(
             .iter()
             .filter(|row| !pending.contains(&row.version)))
     };
-    let state = if pre_matches(
-        &actual_cutover,
-        expected_cutover,
-        cutover_pending(retained.is_some()),
-    ) && pre_matches(&actual_store, expected_store, &STORE)
-        && pre_schema(&mut tx, retained).await?
+    let pending = cutover_pending(retained.is_some());
+    let state = if pre_matches(&actual_cutover, expected_cutover, pending)
+        && pre_matches(&actual_store, expected_store, &STORE)
+        && pre_schema(&mut tx, retained.is_none()).await?
     {
-        InterruptedRelease::Pre
+        match retained {
+            Some(fence) if retained_fence(&mut tx).await? == fence => {
+                InterruptedRelease::Retained {
+                    attendance_fence_sha256: fence.to_owned(),
+                }
+            }
+            Some(_) => return Err(unproved()),
+            None => InterruptedRelease::Pre,
+        }
     } else if actual_cutover == expected_cutover
         && actual_store == expected_store
         && expanded_schema(&mut tx).await?
@@ -370,7 +372,7 @@ pub async fn recover_release_schema(
             .collect()
     };
     let expected_restored = (
-        retained(expected_cutover, cutover_pending(true)),
+        retained(expected_cutover, &CUTOVER[1..]),
         retained(expected_store, &STORE),
     );
     if !migrator
@@ -464,7 +466,8 @@ pub async fn apply_release_schema(
         .map_err(|_| failure("release migration lock unavailable"))?;
     sqlx::raw_sql(
         "LOCK TABLE public._sqlx_migrations, public._two_bot_migrations,
-           public.web_contract_meta IN SHARE ROW EXCLUSIVE MODE NOWAIT",
+           public.web_contract_meta IN SHARE ROW EXCLUSIVE MODE NOWAIT;
+         LOCK TABLE ONLY public.event_instance_windows IN ACCESS SHARE MODE NOWAIT",
     )
     .execute(&mut *tx)
     .await
@@ -498,14 +501,8 @@ pub async fn apply_release_schema(
     }
 
     if let Some(expected) = retained {
-        sqlx::raw_sql("LOCK TABLE ONLY public.event_instance_windows IN ACCESS SHARE MODE NOWAIT")
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| failure("release retained attendance table busy or unavailable"))?;
         if retained_fence(&mut tx).await? != expected {
-            return Err(RunError::Refused(
-                "release retained attendance timestamp changed".to_owned(),
-            ));
+            return Err(failure("release retained attendance timestamp changed"));
         }
     }
 
@@ -547,7 +544,7 @@ pub async fn apply_release_schema(
     {
         return Err(failure("release schema or role readback refused"));
     }
-    let attendance_fence_sha256 = retained_fence(&mut tx).await?;
+    let attendance_fence_sha256 = hex::encode(Sha256::digest(attendance_fence(&mut tx).await?));
     if retained.is_some_and(|expected| expected != attendance_fence_sha256) {
         return Err(failure(
             "release retained attendance timestamp changed during apply",
