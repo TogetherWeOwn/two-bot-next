@@ -246,7 +246,7 @@ DEPLOY_MARKERS = (
 # Canonical parsed graph for the protected recovery callee. This pins the
 # caller guard, Environment split, exact commands, permissions, and handoffs.
 PRODUCTION_RECOVERY_GRAPH = "ab704b3add3f417e074d3dfefc9756fcc16e69f7a937d33f08038434337a3f51"
-PRODUCTION_INTERRUPTED_GRAPH = "924989beeaa9bbc3ccb03608d183f33b8894eb65f29d5f1cb331191db59ce48d"
+PRODUCTION_INTERRUPTED_GRAPH = "0a65e60f6a5e026d8938c30985752c4379b587fd30f92d6d5cc77d3562605d92"
 
 
 class UniqueKeyLoader(yaml.BaseLoader):

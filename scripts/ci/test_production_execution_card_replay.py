@@ -171,16 +171,21 @@ class ProductionExecutionCardReplayTests(unittest.TestCase):
             serving["worker"].update(version_id=version, sha=pin.rollback_sha)
 
         rollback.wait_worker_restore.side_effect = wait_worker_restore
-        rollback.restore_image.side_effect = lambda _image: serving["container"].update(
-            image_digest=pin.image_digest, rollout_id="00000000-0000-4000-8000-000000000002",
-        )
+        def restore_image(_image, *, writer_stopped):
+            self.assertIs(writer_stopped, True)
+            self.assertEqual(serving["ownership"]["phase"], "fenced")
+            serving["container"].update(
+                image_digest=pin.image_digest, rollout_id="00000000-0000-4000-8000-000000000002",
+            )
+
+        rollback.restore_image.side_effect = restore_image
         rollback.wait_stable.side_effect = wait_stable
         observe = Mock(side_effect=lambda: deepcopy(serving))
         restore_under_fence(pin, inverse, observe, control, rollback, "fixture-image", candidate)
         if before == candidate:
             rollback.post_worker_restore.assert_called_once_with(pin.worker_version)
             rollback.wait_worker_restore.assert_called_once_with(pin.worker_version)
-            rollback.restore_image.assert_called_once_with("fixture-image")
+            rollback.restore_image.assert_called_once_with("fixture-image", writer_stopped=True)
         else:
             rollback.post_worker_restore.assert_not_called()
             rollback.wait_worker_restore.assert_not_called()

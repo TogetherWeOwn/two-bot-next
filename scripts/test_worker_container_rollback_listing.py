@@ -72,7 +72,14 @@ class ImageRestoreListingTests(unittest.TestCase):
 
     def test_fenced_production_restore_accepts_applied_image_before_runtime_exists(self):
         row = self.row()
-        row["health"]["instances"].update(active=0, healthy=0)
+        # The completed rollout of the stopped production writer reported
+        # active=0, healthy=1 and progress 1/1. Also cover a cold health report.
+        row["health"]["instances"].update(active=0, healthy=1)
+        self.assertEqual((row["progress"]["total_instances"], row["progress"]["updated_instances"]), (1, 1))
+        rb, _, _ = fixtures.make_rollback(self.routes(row), variant="production")
+        self.assertEqual(rb.restore_image(fixtures.good_image(), writer_stopped=True), ("r-new", 9))
+
+        row["health"]["instances"]["healthy"] = 0
         rb, client, _ = fixtures.make_rollback(self.routes(row), variant="production")
         self.assertEqual(rb.restore_image(fixtures.good_image(), writer_stopped=True), ("r-new", 9))
         self.assertFalse(any(call[0] == "PROBE" for call in client.calls))
