@@ -5,6 +5,11 @@ on:
   workflow_call:
     inputs:
       origin-run-id: {type: string, required: true}
+    secrets:
+      CLOUDFLARE_ACCOUNT_ID: {required: true}
+      CLOUDFLARE_API_TOKEN: {required: true}
+      PRODUCTION_OWNERSHIP_CONTROL_TOKEN: {required: true}
+      TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL: {required: true}
 
 permissions: {}
 
