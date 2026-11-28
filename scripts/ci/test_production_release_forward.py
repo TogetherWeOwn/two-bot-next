@@ -71,13 +71,13 @@ class ReleaseForwardTests(unittest.TestCase):
             forward_receipt("123", bad_source, self.outcome)
 
     def test_retained_forward_passes_the_reviewed_pending_list_and_requires_the_original_digest(self):
-        fence = self.outcome["attendance_fence_sha256"]
-        plan = retained_plan(self.plan, fence)
+        plan = retained_plan(self.plan, self.outcome["attendance_fence_sha256"])
         outcome = {**self.outcome, "applied_count": 4, "ledger_before": plan["ledger_before"],
                    "pending_before": plan["pending_before"], "plan_manifest_sha256": plan["plan_manifest_sha256"]}
         self.assertEqual(forward_receipt("123", plan, outcome), forward_receipt("123", self.plan, self.outcome))
-        with self.assertRaises(GateError):
-            forward_receipt("123", plan, {**outcome, "attendance_fence_sha256": "d" * 64})
+        for changed in ({"attendance_fence_sha256": "d" * 64}, {"applied_count": 5}):
+            with self.assertRaises(GateError):
+                forward_receipt("123", plan, {**outcome, **changed})
 
         with TemporaryDirectory() as scratch, patch.object(release.subprocess, "run") as process:
             process.return_value = Mock(returncode=0, stdout=json.dumps(outcome))

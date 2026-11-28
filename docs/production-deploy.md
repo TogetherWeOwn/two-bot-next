@@ -576,9 +576,8 @@ to the provider and migration steps that use them.
   and grants under the migration locks. Exact original PRE permits one
   takeover of the pinned predecessor from the proved stopped epoch, followed
   by stable readiness.
-- **Confirmed retained baseline.** An authenticated locked readback of the origin
-  plan's exact 0475 timestamp, ledgers, schema and grants permits restart after
-  a lost inverse receipt.
+- **Confirmed retained baseline.** An authenticated, locked readback of the origin
+  plan's 0475 timestamp, ledgers, schema and grants permits restart after a lost inverse receipt.
 - **Confirmed POST.** The protected job checks the exact expanded state under
   the same locks and requires evidence that the original apply step ran.
   Keep the writer fenced until the protected inverse succeeds and its result

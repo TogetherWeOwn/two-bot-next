@@ -264,8 +264,9 @@ class InterruptedReleaseTests(unittest.TestCase):
                 self.assertEqual(interrupted.main(["restart"], env, api), 0)
 
         self.assertEqual(process.call_count, 2 if state == "post" else 1)
-        args = process.call_args.args[0]
-        self.assertEqual(args[args.index("--expected-pending") + 1], ",".join(map(str, plan["pending_before"])))
+        for request in process.call_args_list:
+            args = request.args[0]
+            self.assertEqual(args[args.index("--expected-pending") + 1], ",".join(map(str, plan["pending_before"])))
         self.assertEqual([call.kwargs["timeout"] for call in process.call_args_list], [120] * process.call_count)
         if state == "uncertain":
             self.control.assert_not_called()
