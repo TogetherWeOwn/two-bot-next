@@ -541,6 +541,8 @@ class RollbackRunTests(unittest.TestCase):
             ("GET", f"/containers/applications/{APP_ID}/rollouts/r-new"):
                 envelope(lambda: cloudflare.rollout_detail("r-new")),
             ("GET", "/containers/applications"): envelope(cloudflare.application_listing),
+            ("GET", f"/containers/applications/{APP_ID}"): envelope(
+                lambda: {**app, "version": 9, "configuration": {"image": good_image()}}),
             ("PROBE", "readyz"): readyz,
             ("PROBE", "health"): ready_probe(GOOD_VERSION)[1],
         }
@@ -586,6 +588,12 @@ class RollbackRunTests(unittest.TestCase):
         self.assertEqual(calls.count(("POST", path)), 1)
         self.assertEqual(evidence["restored_version"], GOOD_VERSION)
         self.assertEqual(evidence["gate"], "stable-200-gateway-ready")
+
+    def test_production_restore_uses_application_detail_with_stale_list_configuration(self):
+        routes, _ = self.routes(listing_lag=True)
+        rb, client, _ = make_rollback(routes, variant="production")
+        self.assertEqual(rb.restore_image(good_image()), ("r-new", 9))
+        self.assertIn(("GET", f"/containers/applications/{APP_ID}"), [call[:2] for call in client.calls])
 
     def test_production_worker_restore_exhausts_readback_without_continuing(self):
         routes, _ = self.routes(stale_reads=100)

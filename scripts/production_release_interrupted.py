@@ -12,7 +12,7 @@ from production_recovery_takeover import RecoveryPin, verify_inverse
 from production_recovery_workflow import (interrupted_classification, interrupted_pair_phase, pair_matches,
                                           reconcile_interrupted, restore_under_fence, run_inverse,
                                           run_recovery_database)
-from production_release import output, release_actor, write_json
+from production_release import authenticated_forward, output, release_actor, write_json
 from production_release_ledgers import ledger_endpoints
 from production_release_preflight import interrupted_release_context, stop_intent
 from rollback_proof import ProofError
@@ -33,6 +33,15 @@ ADMISSION = "production-release-interrupted-admission"
 DECISION = "production-release-interrupted-classification"
 INVERSE = "production-release-interrupted-inverse"
 
+# The original attempt recorded its upload in the protected deploy job log.
+# This reviewed pin binds that exact version to the original apply artifact.
+INCIDENT_RUN = 46099587335
+INCIDENT_SHA = "0e7e535edc23d311e6ec89682e17d9e1f9210399"
+INCIDENT_DEPLOY_JOB = 140848122080
+INCIDENT_WORKER = "7d32d4bb-1bc4-400c-b590-86fd5d5549a8"
+INCIDENT_FORWARD = "15246556056"
+INCIDENT_FORWARD_DIGEST = "sha256:e5149056179d064e2974e5820c08067e00e458568b5c38306982a84e090916a3"
+
 
 def packet(env, run, job, steps, name, prefix, api):
     protected_job(run, api, job, steps)
@@ -42,7 +51,9 @@ def packet(env, run, job, steps, name, prefix, api):
 
 def verified_admission(document, binding):
     require(set(document) == {"binding", "phase"} and document["binding"] == binding
-            and document["phase"] in ("stopped", "resumed"), "production_interrupted_admission_changed")
+            and (document["phase"] in ("stopped", "resumed")
+                 or (document["phase"] == "candidate-stopped" and "candidate_worker" in binding)),
+            "production_interrupted_admission_changed")
 
 
 def verified_decision(document, admission):
@@ -50,7 +61,12 @@ def verified_decision(document, admission):
             "production_interrupted_decision_changed")
     classification = mapping(document["classification"])
     state = interrupted_classification(classification)
-    require(state == "pre" or admission["phase"] == "stopped", "production_interrupted_stop_unproved")
+    incident_stamp = admission["binding"].get("forward_fence_sha256")
+    require(not incident_stamp or (
+        state == "post" and classification["attendance_fence_sha256"] == incident_stamp),
+        "production_interrupted_forward_classification_changed")
+    require(state == "pre" or admission["phase"] in ("stopped", "candidate-stopped"),
+            "production_interrupted_stop_unproved")
     return classification
 
 
@@ -77,6 +93,21 @@ def execute(argv, env, api):
     run = {"id": int(env["GITHUB_RUN_ID"]), "head_sha": env["GITHUB_SHA"]}
     binding = {"run_id": str(run["id"]), "workflow_sha": run["head_sha"],
                "stop_intent": stop_intent(pin, origin, plan_id, plan, artifact, epoch - 1)}
+    if origin["id"] == INCIDENT_RUN:
+        require(origin["head_sha"] == pin.candidate_sha == INCIDENT_SHA and origin["conclusion"] == "failure",
+                "production_interrupted_incident_origin_changed")
+        deployment = attempt_job(origin, api, "wrangler deploy + readyz gate")
+        steps = {step["name"]: step["conclusion"] for step in sequence(deployment.get("steps"))}
+        require(deployment["id"] == INCIDENT_DEPLOY_JOB and deployment["conclusion"] == "failure"
+                and steps.get("Deploy to production") == "success"
+                and steps.get("Record the exact Worker version produced by this upload") == "success"
+                and steps.get("Verify the exact protected Worker and configured image before takeover") == "failure"
+                and steps.get("Take over only the Worker produced by this protected upload") == "skipped",
+                "production_interrupted_incident_deploy_changed")
+        forward = authenticated_forward(pin, origin, plan_id, plan, artifact, epoch,
+                                        INCIDENT_FORWARD, INCIDENT_FORWARD_DIGEST, api)
+        binding.update(candidate_worker=INCIDENT_WORKER, forward_fence_sha256=forward.attendance_fence_sha256)
+    candidate = binding.get("candidate_worker")
     directory = Path(env["RUNNER_TEMP"]) / "interrupted-production-release"
     directory.mkdir(mode=0o700, exist_ok=True)
 
@@ -85,7 +116,7 @@ def execute(argv, env, api):
 
     if argv == ["admit"]:
         environment_policy(env.get("AUTO_APPROVE"), api)
-        phase = interrupted_pair_phase(pin, origin_id, epoch, observe())
+        phase = interrupted_pair_phase(pin, origin_id, epoch, observe(), candidate)
         write_json(directory / f"{ADMISSION}.json", {"binding": binding, "phase": phase})
         return
 
@@ -135,14 +166,13 @@ def execute(argv, env, api):
 
     def recover_post(_stamp):
         post_control = control_client("production", token, url, "", recovery.actor)
-        # The interrupted-apply route proves the prior pair still serves. An
-        # unproved deployment or image must never trigger a provider restore.
-        prior_only = ("", pin.candidate_sha, pin.rollback_image)
+        allowed = (candidate or "", pin.candidate_sha, pin.candidate_image if candidate else pin.rollback_image)
         image = f"registry.cloudflare.com/{account}/{application}@{pin.rollback_image}"
-        restore_under_fence(recovery, proof["result"], observe, post_control, rollback, image, prior_only)
+        restore_under_fence(recovery, proof["result"], observe, post_control, rollback, image, allowed)
         return {"state": "post", "worker": pin.rollback_worker, "epoch": epoch + 1}
 
-    outcome = reconcile_interrupted(pin, origin_id, epoch, classification, observe, control, recover_post)
+    outcome = reconcile_interrupted(pin, origin_id, epoch, classification, observe, control, recover_post,
+                                    candidate_worker=candidate)
     expected_actor = actor
     if post:
         expected_actor = recovery.actor

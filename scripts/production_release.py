@@ -44,9 +44,14 @@ def release_context(env, api=github):
 def forward_document(env, pin, run, plan_id, plan, artifact, api=github):
     stopped = mapping(decode(env["RELEASE_STOPPED"].encode()))
     epoch = prepared_epoch(pin, run, plan_id, stopped, preflight_epoch=decode(env["RELEASE_PREFLIGHT_EPOCH"].encode()))
+    return authenticated_forward(pin, run, plan_id, plan, artifact, epoch, env["FORWARD_ARTIFACT_ID"],
+                                 env["FORWARD_ARCHIVE_SHA256"], api)
+
+
+def authenticated_forward(pin, run, plan_id, plan, artifact, epoch, forward_id, forward_digest, api):
+    """Authenticate the original apply result against an independently verified stop epoch."""
     artifacts.protected_job(run, api, artifacts.FORWARD_JOB, artifacts.FORWARD_STEPS)
-    document = artifacts.authentic_document(run, artifacts.FORWARD_ARTIFACT, env["FORWARD_ARTIFACT_ID"],
-                                           env["FORWARD_ARCHIVE_SHA256"], api)
+    document = artifacts.authentic_document(run, artifacts.FORWARD_ARTIFACT, forward_id, forward_digest, api)
     _, expanded, restored = ledger_endpoints(plan)
     expected = {"plan_run_id": plan_id, "source_sha": pin.candidate_sha, "run_id": str(run["id"]),
                 "run_attempt": 1, "database_fingerprint": digest_json(plan["target"]),

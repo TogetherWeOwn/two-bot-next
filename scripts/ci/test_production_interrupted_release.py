@@ -19,6 +19,8 @@ import production_release_interrupted as interrupted
 import production_release_preflight as preflight
 from ci.production_migrate_claim import projection_hash, store_projection_hash
 from production_recovery_takeover import LEGACY_RELEASE_WORKER_SHA
+from production_release_ledgers import ledger_endpoints
+from staging_migrate_approval import digest_json
 from staging_rollout import GateError
 
 
@@ -358,6 +360,91 @@ class InterruptedReleaseTests(unittest.TestCase):
                         self.reconcile(classification)
         self.control.assert_not_called()
         self.recover_post.assert_not_called()
+
+    def test_incident_admit_authenticates_original_forward_receipt(self):
+        self.pin = replace(self.pin, candidate_sha=self.pin.workflow_sha)
+        env, routes, plan, plan_artifact = self.recovery_admission()
+        origin_route = f"actions/runs/{self.origin}"
+        origin = routes[origin_route]
+        origin["conclusion"] = "failure"
+        jobs = routes[f"{origin_route}/attempts/1/jobs?per_page=30"]
+        forward = jobs["jobs"][1]
+        forward["conclusion"] = "success"
+        for step in forward["steps"]:
+            step["conclusion"] = "success"
+        deploy_steps = (
+            ("Deploy to production", "success"),
+            ("Record the exact Worker version produced by this upload", "success"),
+            ("Verify the exact protected Worker and configured image before takeover", "failure"),
+            ("Take over only the Worker produced by this protected upload", "skipped"),
+        )
+        jobs["jobs"].append({**forward, "id": 321, "name": "wrangler deploy + readyz gate",
+                             "conclusion": "failure", "steps": [
+                                 {"name": name, "conclusion": state} for name, state in deploy_steps]})
+        jobs["total_count"] = len(jobs["jobs"])
+        _, expanded, restored = ledger_endpoints(plan)
+        stamp = "d" * 64
+        receipt = {"plan_run_id": "789", "source_sha": self.pin.candidate_sha,
+                   "run_id": self.origin, "run_attempt": 1, "stopped_epoch": self.epoch,
+                   "database_fingerprint": digest_json(plan["target"]), "expanded_ledgers_sha256": digest_json(expanded),
+                   "restored_ledgers_sha256": digest_json(restored), "plan_archive_sha256": plan_artifact["archive_digest"],
+                   "release_reference": plan["recovery_evidence_ref"], "attendance_fence_sha256": stamp}
+        digest = self.publish(routes, origin, 655, "production-release-forward", json.dumps(receipt).encode())
+        self.live["worker"].update(version_id=interrupted.INCIDENT_WORKER, sha=self.pin.candidate_sha)
+        self.live["container"]["image_digest"] = self.pin.candidate_image
+        self.live["ownership"]["owner_actor"] = f"production-schema-release:{self.origin}:{self.pin.candidate_sha}"
+
+        for valid in (True, False):
+            with self.subTest(valid=valid), TemporaryDirectory() as temp:
+                responses = dict(routes)
+                if not valid:
+                    responses["actions/artifacts/655/zip"] = b"foreign archive"
+                observe = Mock(return_value=self.live)
+                with (patch.object(preflight, "bound_plan", return_value=(plan, plan_artifact)),
+                      patch.multiple(interrupted, INCIDENT_RUN=123, INCIDENT_SHA=self.pin.candidate_sha,
+                                     INCIDENT_DEPLOY_JOB=321, INCIDENT_FORWARD="655", INCIDENT_FORWARD_DIGEST=digest,
+                                     environment_policy=Mock(), read_status=observe)):
+                    args = {**env, "RUNNER_TEMP": temp}
+                    if valid:
+                        interrupted.execute(["admit"], args, lambda path, **_: responses[path])
+                    else:
+                        with self.assertRaisesRegex(GateError, "production_inverse_archive_invalid"):
+                            interrupted.execute(["admit"], args, lambda path, **_: responses[path])
+                path = Path(temp) / "interrupted-production-release" / f"{interrupted.ADMISSION}.json"
+                if valid:
+                    admission = json.loads(path.read_bytes())
+                    self.assertEqual(admission["phase"], "candidate-stopped")
+                    self.assertEqual(admission["binding"]["forward_fence_sha256"], stamp)
+                    self.assertEqual(admission["binding"]["candidate_worker"], interrupted.INCIDENT_WORKER)
+                else:
+                    self.assertFalse(path.exists())
+                    observe.assert_not_called()
+
+    def test_exact_fenced_candidate_requires_matching_committed_forward_proof(self):
+        self.live["worker"].update(version_id=interrupted.INCIDENT_WORKER, sha=self.pin.candidate_sha)
+        self.live["container"]["image_digest"] = self.pin.candidate_image
+        candidate = interrupted.INCIDENT_WORKER
+        self.assertEqual(recovery.interrupted_pair_phase(
+            self.pin, self.origin, self.epoch, self.live, candidate), "candidate-stopped")
+        for unbound in (None, self.pin.rollback_worker):
+            with self.assertRaises(GateError):
+                recovery.interrupted_pair_phase(self.pin, self.origin, self.epoch, self.live, unbound)
+        binding = {"candidate_worker": candidate, "forward_fence_sha256": "d" * 64}
+        admission = {"binding": binding, "phase": "candidate-stopped"}
+        for state in ({"state": "pre"}, {"state": "post", "attendance_fence_sha256": "e" * 64}):
+            with self.assertRaises(GateError):
+                interrupted.verified_decision({"admission": admission, "classification": state}, admission)
+        post = {"state": "post", "attendance_fence_sha256": "d" * 64}
+        decision = {"admission": admission, "classification": post}
+        self.assertEqual(interrupted.verified_decision(decision, admission), post)
+        with self.assertRaises(GateError):
+            recovery.reconcile_interrupted(self.pin, self.origin, self.epoch, {"state": "pre"},
+                                           self.observe, self.control, self.recover_post, candidate_worker=candidate)
+        self.recover_post.assert_not_called()
+        recovery.reconcile_interrupted(self.pin, self.origin, self.epoch, post, self.observe, self.control,
+                                       self.recover_post, candidate_worker=candidate)
+        self.recover_post.assert_called_once_with("d" * 64)
+        self.control.assert_not_called()
 
     def test_lost_pre_reply_does_not_retry_at_pending_or_foreign_active_epoch(self):
         for phase, actor, running in (("fenced", self.actor, False), ("active", self.foreign_actor, True)):

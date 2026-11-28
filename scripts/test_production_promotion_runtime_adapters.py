@@ -226,6 +226,7 @@ class ServingTests(unittest.TestCase):
             f"/workers/scripts/{PROD_WORKER}/deployments": deployments,
             "/containers/applications": lambda: app_answer(app_image,
                                                            app_version),
+            f"/containers/applications/{APP_ID}": lambda: app_answer(app_image, app_version)[0],
             f"/containers/applications/{APP_ID}/rollouts?limit=100":
                 lambda: [dict(row, id=row["id"])] if isinstance(row, dict)
                 else [dict(candidate) for candidate in row],
@@ -263,6 +264,20 @@ class ServingTests(unittest.TestCase):
         self.assertTrue(all(path.startswith("/containers/applications")
                             or path.startswith("/workers/scripts")
                             for path in calls))
+
+    def test_current_application_detail_overrides_stale_list_configuration(self):
+        routes = self.live_routes(converged_row(ROLL_ID, PROD_IMAGE))
+        routes["/containers/applications"] = lambda: app_answer(OLD_IMAGE, TARGET_VERSION - 1)
+        code, message, proof, _, _ = self.run_serving(routes)
+        self.assertEqual(code, 0, message)
+        self.assertEqual(proof["production_image"], PROD_IMAGE)
+        self.out.unlink()
+
+        routes[f"/containers/applications/{APP_ID}"] = lambda: {
+            **app_answer()[0], "durable_objects": {"namespace_id": "b" * 32},
+        }
+        code, message, proof, _, _ = self.run_serving(routes)
+        self.assert_refused_without_proof(code, message, proof)
 
     def test_wrong_or_new_worker_version_refuses_without_proof(self):
         for versions in ([OTHER_VERSION], [PROD_VERSION, OTHER_VERSION]):
@@ -325,6 +340,7 @@ class ServingTests(unittest.TestCase):
             f"/workers/scripts/{PROD_WORKER}/deployments":
                 lambda: deployments_answer(PROD_VERSION),
             "/containers/applications": lambda: app_answer(),
+            f"/containers/applications/{APP_ID}": lambda: app_answer()[0],
             f"/containers/applications/{APP_ID}/rollouts?limit=100":
                 lambda: [dict(old), dict(new)],
             f"/containers/applications/{APP_ID}/rollouts/roll-new":

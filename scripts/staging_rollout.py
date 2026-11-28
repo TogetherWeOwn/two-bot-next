@@ -518,6 +518,15 @@ def active_lag(row, image, target_version):
     return counts in LAG_COUNTS and progress_ok
 
 
+def stopped_rollout_configured(row, image, target_version):
+    """A fully applied configuration with no live instance behind the fence."""
+    shape = _rollout_shape(row, image, target_version)
+    if shape is None:
+        return False
+    counts, progress_ok = shape
+    return progress_ok and all(count == 0 for count in counts.values())
+
+
 def worker_namespace(client, version):
     data = mapping(client.api(f"/workers/scripts/{WORKER}/versions/{identifier(version)}"))
     bindings = sequence(mapping(data.get("resources")).get("bindings"))

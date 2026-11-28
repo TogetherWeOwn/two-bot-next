@@ -246,7 +246,7 @@ DEPLOY_MARKERS = (
 # Canonical parsed graph for the protected recovery callee. This pins the
 # caller guard, Environment split, exact commands, permissions, and handoffs.
 PRODUCTION_RECOVERY_GRAPH = "ab704b3add3f417e074d3dfefc9756fcc16e69f7a937d33f08038434337a3f51"
-PRODUCTION_INTERRUPTED_GRAPH = "924989beeaa9bbc3ccb03608d183f33b8894eb65f29d5f1cb331191db59ce48d"
+PRODUCTION_INTERRUPTED_GRAPH = "0a65e60f6a5e026d8938c30985752c4379b587fd30f92d6d5cc77d3562605d92"
 
 
 class UniqueKeyLoader(yaml.BaseLoader):
@@ -5405,6 +5405,18 @@ class ProductionStatusTests(unittest.TestCase):
             import production_ownership_status as status
         self.status = status
         self.fixture = json.loads((Path(__file__).parent / "fixtures/production_ownership_status_provider.json").read_text())
+
+    def test_production_status_uses_current_detail_after_a_stale_application_list(self):
+        provider = self.fixture["provider"]
+        listing = provider["/containers/applications"][0]
+        detail = provider[f"/containers/applications/{listing['id']}"]
+        expected = detail["configuration"]["image"].split("@")[1]
+        listing["configuration"]["image"] = listing["configuration"]["image"].replace("d" * 64, "e" * 64)
+        client = Mock(api=provider.__getitem__)
+        self.assertEqual(self.status.provider_sample(client, "c" * 32)["container"]["image_digest"], expected)
+        detail["durable_objects"]["namespace_id"] = "f" * 32
+        with self.assertRaisesRegex(self.status.GateError, "application_identity_drift"):
+            self.status.provider_sample(client, "c" * 32)
 
     def test_recovery_projection_preserves_unfinished_rollout_status(self):
         status = self.status

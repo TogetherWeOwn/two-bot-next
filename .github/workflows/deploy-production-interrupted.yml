@@ -100,7 +100,7 @@ jobs:
     name: Restart only the confirmed prior pair
     needs: [admit, database]
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     environment: production
     permissions: *read_permissions
     steps:

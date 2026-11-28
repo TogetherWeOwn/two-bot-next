@@ -276,7 +276,7 @@ class RecoveryWorkflowTests(unittest.TestCase):
                     self.state["container"]["rollout_status"] = "completed"
 
                 self.rollback.sleep.side_effect = finish_rollout
-                self.rollback.restore_image.side_effect = lambda _image: self.state["container"].update(
+                self.rollback.restore_image.side_effect = lambda _image, **_: self.state["container"].update(
                     image_digest=self.pin.image_digest)
                 self.control.side_effect = lambda *_args, **_kwargs: self.state["ownership"].update(
                     epoch=22, phase="active", owner_actor=self.pin.actor)
@@ -331,7 +331,8 @@ class RecoveryWorkflowTests(unittest.TestCase):
         def worker(version):
             self.state["worker"].update(version_id=version, sha=self.pin.rollback_sha)
 
-        def image(_):
+        def image(_, *, writer_stopped):
+            self.assertTrue(writer_stopped)
             self.state["container"]["image_digest"] = self.pin.image_digest
 
         def lost_reply(*_args, **_kwargs):
@@ -344,7 +345,7 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.restore()
         self.restore()
         self.rollback.post_worker_restore.assert_called_once_with(self.pin.worker_version)
-        self.rollback.restore_image.assert_called_once_with("test-image")
+        self.rollback.restore_image.assert_called_once_with("test-image", writer_stopped=True)
         self.control.assert_called_once_with("takeover-legacy-fenced", 21, expected_deployment=self.pin.worker_version)
         self.assertEqual(self.rollback.wait_stable.call_count, 2)
 
@@ -388,7 +389,7 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.control.side_effect = take_over
         self.rollback.post_worker_restore.side_effect = lambda version: self.state["worker"].update(
             version_id=version, sha=pin.rollback_sha)
-        self.rollback.restore_image.side_effect = lambda image: self.state["container"].update(
+        self.rollback.restore_image.side_effect = lambda image, **_: self.state["container"].update(
             image_digest=image.rsplit("@", 1)[-1])
         self.rollback.evidence = {}
         self.rollback.wait_stable.side_effect = record_stable_polls
@@ -413,7 +414,7 @@ class RecoveryWorkflowTests(unittest.TestCase):
             inverse.assert_called_with(pin, approval, "987", "8" * 64, current)
 
         self.rollback.post_worker_restore.assert_called_once_with(pin.worker_version)
-        self.rollback.restore_image.assert_called_once_with(retained_image)
+        self.rollback.restore_image.assert_called_once_with(retained_image, writer_stopped=True)
         self.control.assert_called_once_with("takeover-fenced", 21, expected_deployment=pin.worker_version)
         self.rollback.wait_stable.assert_called_once_with(pin.worker_version, self.rollback.now.return_value)
         write_receipt.assert_called_once_with(Path(env["RUNNER_TEMP"]) / "production-release-restored.json",
