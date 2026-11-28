@@ -632,6 +632,9 @@ completed image under the original stopped epoch. It authenticates the
 successful forward artifact and requires the locked POST classification to
 match its 0475 timestamp digest before running the inverse. The workflow
 then restores the retained pair and verifies stable readiness before handoff.
+While the writer is fenced, the image check accepts a fully applied rollout
+and matching application configuration with zero running instances.
+The restored bot starts only after the protected takeover.
 
 Keep the release held and escalate to the release operator if the workflow
 is unavailable, the serving pair or stopped epoch has drifted, or any required

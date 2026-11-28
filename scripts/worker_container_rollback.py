@@ -620,8 +620,9 @@ class Rollback:
                 require(base.timestamp(item.get("created_at")) < created, "application_image_drift")
         return listed == image
 
-    def restore_image(self, image):
+    def restore_image(self, image, *, writer_stopped=False):
         """Roll the image back with a single 100% step and return the rollout pin."""
+        require(not writer_stopped or self.variant == "production", "stopped_restore_requires_production")
         started = self.now()
         before = {base.identifier(base.mapping(row).get("id")) for row in
                   app_rollouts(self.client, self.app_id)}
@@ -643,7 +644,8 @@ class Rollback:
                 except GateError:
                     target_version = None
             ready = (target_version is not None
-                     and self.image_rollout_ready(row, image, target_version))
+                     and (self.image_rollout_ready(row, image, target_version)
+                          or (writer_stopped and base.stopped_rollout_configured(row, image, target_version))))
             if target_version is None:
                 waiting_for = "target_version"
             elif status != "completed":

@@ -53,12 +53,37 @@ class ImageRestoreListingTests(unittest.TestCase):
         self.assertEqual(rb.evidence["restored_rollout_id"], "r-new")
         self.assertNotIn("gate", rb.evidence)
 
-    def test_production_still_requires_listing_digest(self):
-        rb, _, _ = fixtures.make_rollback(self.routes(self.row()), variant="production")
+    def test_production_requires_current_application_detail(self):
+        routes = self.routes(self.row())
+        key = ("GET", f"/containers/applications/{fixtures.APP_ID}")
+        read_detail = routes[key]
+
+        def stale_detail():
+            envelope = read_detail()
+            envelope["result"]["version"] -= 1
+            return envelope
+
+        routes[key] = stale_detail
+        rb, _, _ = fixtures.make_rollback(routes, variant="production")
         with self.assertRaises(rollback.GateError) as caught:
             rb.restore_image(fixtures.good_image())
         self.assertEqual(str(caught.exception), "image_rollout_timeout")
         self.assertIn("waiting_for=application_image", caught.exception.detail)
+
+    def test_fenced_production_restore_accepts_applied_image_before_runtime_exists(self):
+        row = self.row()
+        row["health"]["instances"].update(active=0, healthy=0)
+        rb, client, _ = fixtures.make_rollback(self.routes(row), variant="production")
+        self.assertEqual(rb.restore_image(fixtures.good_image(), writer_stopped=True), ("r-new", 9))
+        self.assertFalse(any(call[0] == "PROBE" for call in client.calls))
+
+        for stopped, unhealthy, updated in ((False, 0, 1), (True, 1, 1), (True, 0, 0)):
+            with self.subTest(stopped=stopped, unhealthy=unhealthy, updated=updated):
+                row["health"]["instances"]["failed"] = unhealthy
+                row["progress"]["updated_instances"] = updated
+                rb, _, _ = fixtures.make_rollback(self.routes(row), variant="production")
+                with self.assertRaisesRegex(rollback.GateError, "image_rollout_timeout"):
+                    rb.restore_image(fixtures.good_image(), writer_stopped=stopped)
 
     def test_replaced_reverted_wrong_image_and_identity_fail_closed(self):
         for field, value, expected in (

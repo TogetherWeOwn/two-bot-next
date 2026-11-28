@@ -180,7 +180,7 @@ def restore_under_fence(pin, result, observe, control, rollback, image, candidat
         state = wait_for_restore_rollout(pin, candidate, observe, rollback.sleep)
         if not pair_matches(state, pin, *restored):
             try:
-                rollback.restore_image(image)
+                rollback.restore_image(image, writer_stopped=True)
             except GateError:
                 state = wait_for_restore_rollout(pin, candidate, observe, rollback.sleep)
                 if not pair_matches(state, pin, *restored):
