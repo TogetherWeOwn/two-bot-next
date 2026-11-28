@@ -232,7 +232,7 @@ class ProductionApprovalTests(unittest.TestCase):
             fresh.write_text("{}", encoding="utf-8")
             args = ["authorize", str(fresh), str(claim)]
             env = {"GITHUB_OUTPUT": str(output)}
-            for pending in (["480"], ["475", "479", "480", "481", "482"]):
+            for pending in (["480"], ["475", "479", "480", "481", "482"], ["479", "480", "481", "482"]):
                 claim.write_text(json.dumps({"expected_pending": pending}), encoding="utf-8")
                 with (self.subTest(pending=pending),
                       patch.object(approval, "authorize", return_value={"atomic_release": "true"}),

@@ -80,6 +80,7 @@ def require_forward_attempt(origin, api):
 
 def recovery_pin(pin, origin_id, epoch, plan, stamp):
     _, expanded, restored = ledger_endpoints(plan)
+    require(stamp == plan.get("attendance_fence_sha256", stamp), "production_interrupted_retained_stamp_changed")
     return RecoveryPin(origin_id, 1, pin.candidate_sha, pin.rollback_sha, pin.rollback_worker,
                        pin.rollback_image, pin.application_id, pin.namespace_id, digest_json(plan["target"]),
                        digest_json(expanded), digest_json(restored), stamp, epoch)

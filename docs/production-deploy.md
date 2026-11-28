@@ -573,7 +573,7 @@ reusable workflows. The existing protected Environments supply the values
 to the provider and migration steps that use them.
 
 - **Confirmed PRE.** The protected job checks both migration ledgers, schema
-  and grants under the migration locks. Exact original PRE permits one
+  and grants under the migration locks. The exact baseline in the origin plan permits one
   takeover of the pinned predecessor from the proved stopped epoch, followed
   by stable readiness.
 - **Confirmed POST.** The protected job checks the exact expanded state under
@@ -682,11 +682,16 @@ at the pinned release revision.
 
 | Endpoint | Cutover | Store | Schema marker |
 | --- | --- | --- | --- |
-| Before apply | 115 rows through `0473` | 20 rows through `0465` | `attendance_recovered_at` absent. |
-| After guarded inverse | 116 rows through `0475` | 20 rows through `0465` | `attendance_recovered_at` and the original `0475` ledger timestamp retained. |
+| Original baseline | 115 rows through `0473` | 20 rows through `0465` | `attendance_recovered_at` absent. |
+| Retained baseline | 116 rows through `0475` | 20 rows through `0465` | `attendance_recovered_at` and the original `0475` ledger timestamp retained. |
 
-Match the original endpoint to the authenticated forward plan and the
-restored endpoint to the authenticated inverse result. Use the separate
+Use a fresh approved plan for either baseline. On the retained baseline the
+plan records the SHA-256 digest of the binary `0475` ledger timestamp. The
+runner checks the retained column and timestamp under lock, applies Cutover
+`0479`–`0482` and Store `0478`, and binds the same timestamp digest to the
+forward receipt. The guarded inverse returns to the retained baseline from
+either starting point. Match that endpoint to the authenticated inverse
+result when recovering a committed apply. Use the separate
 [planner receipt checks](https://github.com/TogetherWeOwn/two-bot-next/pull/2478)
 for the full ledgers and retained timestamp.
 

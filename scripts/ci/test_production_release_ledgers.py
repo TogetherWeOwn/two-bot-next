@@ -22,6 +22,18 @@ def source_row(version):
             "sha384_recomputed": checksum}
 
 
+def retained_plan(plan, fence="b" * 64):
+    retained = deepcopy(plan)
+    row = next(row for row in plan["source_migrations"] if row["version"] == 475)
+    for key in ("ledger_before", "ledger_after"):
+        retained[key].append({**{field: row[field] for field in ("version", "description", "sha384")},
+                              "success": True})
+    retained["pending_before"].remove(475)
+    retained["attendance_fence_sha256"] = fence
+    retained["plan_manifest_sha256"] = projection_hash(retained)
+    return retained
+
+
 class ProductionReleaseLedgerTests(unittest.TestCase):
     def setUp(self):
         self.cutover = ledger_row(474, "original cutover description")
@@ -56,3 +68,33 @@ class ProductionReleaseLedgerTests(unittest.TestCase):
                 for field in fields:
                     plan[field][0].update(change)
                 ledger_endpoints(plan)
+
+    def test_retained_plan_projects_only_four_cutover_applies_and_restores_to_its_baseline(self):
+        _, original_expanded, original_restored = ledger_endpoints(self.plan)
+        retained = retained_plan(self.plan)
+        before, expanded, restored = ledger_endpoints(retained)
+        self.assertEqual((before, expanded, restored), (original_restored, original_expanded, original_restored))
+        self.assertEqual([row["version"] for row in expanded[0][len(before[0]):]], [479, 480, 481, 482])
+
+    def test_retained_plan_requires_the_0475_row_and_valid_timestamp_digest(self):
+        for fence in (None, "b", "B" * 64):
+            with self.subTest(fence=fence), self.assertRaises(GateError):
+                ledger_endpoints(retained_plan(self.plan, fence))
+        retained = retained_plan(self.plan)
+        del retained["attendance_fence_sha256"]
+        with self.assertRaises(GateError):
+            ledger_endpoints(retained)
+
+        retained = retained_plan(self.plan)
+        retained["source_migrations"].pop(1)
+        retained["ledger_before"].pop()
+        retained["ledger_after"].pop()
+        retained["plan_manifest_sha256"] = projection_hash(retained)
+        with self.assertRaises(GateError):
+            ledger_endpoints(retained)
+
+        retained = retained_plan(self.plan)
+        for ledger in ("ledger_before", "ledger_after"):
+            retained[ledger][-1]["description"] = "drifted 0475"
+        with self.assertRaises(GateError):
+            ledger_endpoints(retained)

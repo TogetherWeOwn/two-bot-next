@@ -20,6 +20,7 @@ import production_release_preflight as preflight
 from ci.production_migrate_claim import projection_hash, store_projection_hash
 from production_recovery_takeover import LEGACY_RELEASE_WORKER_SHA
 from production_release_ledgers import ledger_endpoints
+from ci.test_production_release_ledgers import retained_plan
 from staging_migrate_approval import digest_json
 from staging_rollout import GateError
 
@@ -173,12 +174,16 @@ class InterruptedReleaseTests(unittest.TestCase):
                  for row in plan[chain]] for chain in ("source_migrations", "source_store_migrations")]
 
     def test_cancelled_apply_routes_locked_db_outcomes_to_the_pinned_predecessor(self):
-        for state in ("pre", "post", "uncertain"):
-            with self.subTest(state=state), TemporaryDirectory() as temp:
-                self.check_cancelled_apply(state, Path(temp))
+        for retained in (False, True):
+            for state in ("pre", "post", "uncertain"):
+                with self.subTest(state=state, retained=retained), TemporaryDirectory() as temp:
+                    self.check_cancelled_apply(state, Path(temp), retained)
 
-    def check_cancelled_apply(self, state, temp):
+    def check_cancelled_apply(self, state, temp, retained):
         env, routes, plan, plan_artifact = self.recovery_admission()
+        stamp = "d" * 64
+        if retained:
+            plan = retained_plan(plan, stamp)
         current = routes["actions/runs/456"]
         jobs = []
         routes["actions/runs/456/attempts/1/jobs?per_page=30"] = {"jobs": jobs}
@@ -205,7 +210,6 @@ class InterruptedReleaseTests(unittest.TestCase):
                 self.live["ownership"].update(epoch=self.epoch + 1, phase="active", owner_actor=actor, running=True)
             return takeover
 
-        stamp = "d" * 64
         classification = {"state": "post", "attendance_fence_sha256": stamp} if state == "post" else {"state": "pre"}
         cutover, store = self.db_ledgers(plan)
         inverse = {"state": "restored", "attendance_fence_sha256": stamp, "expanded": [cutover, store],
@@ -253,6 +257,10 @@ class InterruptedReleaseTests(unittest.TestCase):
                 self.assertEqual(interrupted.main(["restart"], env, api), 0)
 
         self.assertEqual(process.call_count, 2 if state == "post" else 1)
+        expected_pending = "479,480,481,482" if retained else "475,479,480,481,482"
+        for invocation in process.call_args_list:
+            args = invocation.args[0]
+            self.assertEqual(args[args.index("--expected-pending") + 1], expected_pending)
         self.assertEqual([call.kwargs["timeout"] for call in process.call_args_list], [120] * process.call_count)
         if state == "uncertain":
             self.control.assert_not_called()

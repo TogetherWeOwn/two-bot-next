@@ -14,7 +14,7 @@ from production_attendance_plan import validate_attendance_plan
 from production_ownership_status import read_status
 from production_recovery_takeover import HEX, LEGACY_RELEASE_WORKER_SHA, UUID, RecoveryPin
 from production_release_approval import require_unused_attendance_plan
-from production_release_ledgers import CUTOVER, STORE, ledger_endpoints
+from production_release_ledgers import ledger_endpoints
 from production_release_preflight import (ReleasePreflight, approved_bound_plan, approved_plan,
                                           apply_under_bound_fence, bound_plan, prepared_epoch, stop_intent,
                                           verify_preflight)
@@ -60,6 +60,8 @@ def authenticated_forward(pin, run, plan_id, plan, artifact, epoch, forward_id, 
                 "release_reference": pin.recovery_reference()}
     require(set(document) == set(expected) | {"attendance_fence_sha256"}
             and matches(HEX, document["attendance_fence_sha256"])
+            and document["attendance_fence_sha256"] == plan.get(
+                "attendance_fence_sha256", document["attendance_fence_sha256"])
             and all(type(document[key]) is type(value) and document[key] == value for key, value in expected.items()),
             "production_forward_artifact_mismatch")
     return RecoveryPin(str(run["id"]), 1, pin.candidate_sha, pin.rollback_sha, pin.rollback_worker,
@@ -159,18 +161,19 @@ def take_over(pin, recovery, version, observe, control, *, pause=sleep):
 
 
 def database(binary, directory, plan, env, *, plan_id=None):
+    ledger_endpoints(plan)
     target = plan["target"]
     args = [binary, "--target", "production", "--source-sha", plan["source_sha"],
             "--production-host", target["host"], "--production-database", target["database"],
             "--production-branch-id", target["branch_id"], "--recovery-evidence-ref", plan["recovery_evidence_ref"],
-            "--acl-plan-ref", plan["acl_plan_ref"], "--expected-pending", ",".join(map(str, CUTOVER))]
+            "--acl-plan-ref", plan["acl_plan_ref"], "--expected-pending", ",".join(map(str, plan["pending_before"]))]
     if plan_id is None:
         args.append("--plan")
         binding = "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL"
     else:
         plan_path = directory / "reviewed-plan.json"
         plan_path.write_text(json.dumps(plan), encoding="utf-8")
-        args.extend(["--apply", "--expected-store-pending", ",".join(map(str, STORE)),
+        args.extend(["--apply", "--expected-store-pending", ",".join(map(str, plan["pending_store_before"])),
                      "--plan-manifest-sha256", plan["plan_manifest_sha256"],
                      "--store-plan-manifest-sha256", plan["store_plan_manifest_sha256"],
                      "--plan-run-id", plan_id, "--plan-manifest-path", str(plan_path)])

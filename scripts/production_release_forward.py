@@ -1,7 +1,7 @@
 """Verify the atomic forward transaction before allowing a production takeover."""
 
 from production_recovery_takeover import HEX, RUN_ID
-from production_release_ledgers import CUTOVER, STORE, ledger_endpoints
+from production_release_ledgers import ledger_endpoints
 from staging_migrate_approval import digest_json
 from staging_recovery_status import matches
 from staging_rollout import mapping, require
@@ -13,6 +13,7 @@ def forward_receipt(plan_id, plan, outcome):
     receipt = mapping(outcome)
     fence = receipt.get("attendance_fence_sha256")
     require(matches(RUN_ID, plan_id) and matches(HEX, fence)
+            and fence == plan.get("attendance_fence_sha256", fence)
             and type(receipt.get("runner_version")) is int and receipt["runner_version"] == 1
             and receipt.get("mode") == "apply" and receipt.get("migration_target") == "production"
             and receipt.get("role") == "two_bot_migrator" and receipt.get("plan_run_id") == plan_id
@@ -24,8 +25,9 @@ def forward_receipt(plan_id, plan, outcome):
     )), "production_release_forward_plan_changed")
     require([receipt.get("ledger_before"), receipt.get("ledger_store_before")] == before
             and [receipt.get("ledger_after"), receipt.get("ledger_store_after")] == expanded
-            and type(receipt.get("applied_count")) is int and receipt["applied_count"] == len(CUTOVER)
-            and type(receipt.get("applied_store_count")) is int and receipt["applied_store_count"] == len(STORE),
+            and type(receipt.get("applied_count")) is int and receipt["applied_count"] == len(plan["pending_before"])
+            and type(receipt.get("applied_store_count")) is int
+            and receipt["applied_store_count"] == len(plan["pending_store_before"]),
             "production_release_forward_ledgers_changed")
     return {"plan_run_id": plan_id, "source_sha": plan["source_sha"],
             "database_fingerprint": digest_json(plan["target"]),

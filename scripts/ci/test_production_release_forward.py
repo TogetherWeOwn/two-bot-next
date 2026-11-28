@@ -11,12 +11,14 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from production_release_forward import CUTOVER, STORE, forward_receipt
+from production_release_forward import forward_receipt
+from production_release_ledgers import CUTOVER, STORE
 from production_ownership_status import provider_sample
 import production_release as release
 import production_recovery_workflow as recovery_workflow
 import production_release_preflight as preflight
 from ci.production_migrate_claim import projection_hash, store_projection_hash
+from ci.test_production_release_ledgers import retained_plan
 from staging_migrate_approval import digest_json
 from staging_rollout import GateError
 
@@ -67,6 +69,38 @@ class ReleaseForwardTests(unittest.TestCase):
         bad_source["source_migrations"][0]["sha384_recomputed"] = "c" * 96
         with self.assertRaisesRegex(GateError, "production_release_plan_checksum_invalid"):
             forward_receipt("123", bad_source, self.outcome)
+
+    def test_retained_forward_passes_the_reviewed_pending_list_and_requires_the_original_digest(self):
+        fence = self.outcome["attendance_fence_sha256"]
+        plan = retained_plan(self.plan, fence)
+        outcome = {**self.outcome, "applied_count": 4, "ledger_before": plan["ledger_before"],
+                   "pending_before": plan["pending_before"], "plan_manifest_sha256": plan["plan_manifest_sha256"]}
+        self.assertEqual(forward_receipt("123", plan, outcome), forward_receipt("123", self.plan, self.outcome))
+        for changed in ({"attendance_fence_sha256": "d" * 64}, {"applied_count": 5}):
+            with self.subTest(changed=changed), self.assertRaises(GateError):
+                forward_receipt("123", plan, {**outcome, **changed})
+
+        with TemporaryDirectory() as scratch, patch.object(release.subprocess, "run") as process:
+            process.return_value = Mock(returncode=0, stdout=json.dumps(outcome))
+            for plan_id, binding, mode in (
+                (None, "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL", "--plan"),
+                ("123", "TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL", "--apply"),
+            ):
+                self.assertEqual(release.database("fixture", Path(scratch), plan, {binding: "fixture"},
+                                                  plan_id=plan_id), outcome)
+                args = process.call_args.args[0]
+                self.assertIn(mode, args)
+                self.assertEqual(args[args.index("--expected-pending") + 1], "479,480,481,482")
+            self.assertEqual(json.loads((Path(scratch) / "reviewed-plan.json").read_bytes()), plan)
+
+    def test_retained_preflight_refuses_a_changed_timestamp_before_provider_access(self):
+        pin, original = self.preflight_fixture()
+        approved = retained_plan(original)
+        fresh = {**approved, "attendance_fence_sha256": "d" * 64}
+        observe = Mock()
+        with self.assertRaisesRegex(GateError, "production_release_preflight_plan_changed"):
+            preflight.verify_preflight(pin, approved["target"], approved, fresh, observe, Mock())
+        observe.assert_not_called()
 
     def preflight_fixture(self):
         pin = preflight.ReleasePreflight("d" * 40, self.plan["source_sha"], "sha256:" + "1" * 64,

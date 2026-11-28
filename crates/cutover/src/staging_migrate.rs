@@ -45,6 +45,7 @@ pub use release_schema_transaction::{
     apply_release_schema, classify_interrupted_release, confirm_release_pre,
     recover_release_schema, undo_release_schema, AppliedRelease, InterruptedRelease,
 };
+use release_schema_transaction::{cutover_pending, release_pending, retained_fence};
 
 /// Fixed binding names; each value is a secret and is never echoed.
 /// Plan reads only the RO binding; apply reads only the migrator binding.
@@ -984,20 +985,36 @@ fn ledger_json(rows: &[LedgerRow]) -> Value {
 }
 
 fn check_release_ledgers(
-    path: &str,
+    plan: &Value,
     cutover: &[LedgerRow],
     store: &[LedgerRow],
 ) -> Result<(), RunError> {
-    let plan: Value = read_bytes_capped(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .ok_or_else(|| RunError::Refused("release plan unavailable".to_owned()))?;
     if plan.get("ledger_before") != Some(&ledger_json(cutover))
         || plan.get("ledger_store_before") != Some(&ledger_json(store))
     {
         return refuse("release ledgers differ from the producing plan");
     }
     Ok(())
+}
+
+fn valid_fence(fence: &str) -> bool {
+    fence.len() == 64
+        && fence
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn release_fence_from_plan<'a>(
+    plan: &'a Value,
+    pending: &[i64],
+) -> Result<Option<&'a str>, RunError> {
+    match plan.get("attendance_fence_sha256") {
+        None if pending == cutover_pending(false) => Ok(None),
+        Some(Value::String(fence)) if pending == cutover_pending(true) && valid_fence(fence) => {
+            Ok(Some(fence))
+        }
+        _ => refuse("release plan attendance timestamp evidence invalid"),
+    }
 }
 
 /// Recorded in place of a ledger that could not be read after a run. Never an
@@ -1470,39 +1487,38 @@ async fn run_release_recovery(
     req: &Request,
     fence_sha256: Option<&str>,
 ) -> Result<Value, RunError> {
-    const CUTOVER: &[i64] = &[475, 479, 480, 481, 482];
-    const STORE: &[i64] = &[478];
     validate_request(req)?;
     if req.target != Target::Production
         || !req.apply
-        || fence_sha256.is_some_and(|fence| {
-            fence.len() != 64
-                || !fence
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
+        || fence_sha256.is_some_and(|fence| !valid_fence(fence))
     {
         return refuse(
             "release inverse requires the production apply binding and attendance fence",
         );
     }
-    for (raw, expected) in [
-        (req.expected_pending.as_deref(), CUTOVER),
-        (req.expected_store_pending.as_deref(), STORE),
-    ] {
-        let pending = parse_expected_pending(raw.unwrap_or_default()).map_err(RunError::Refused)?;
-        if pending.as_slice() != expected {
-            return refuse("release inverse pending lists do not match the protected bundle");
-        }
+    let cutover_pending =
+        parse_expected_pending(req.expected_pending.as_deref().unwrap_or_default())
+            .map_err(RunError::Refused)?;
+    let store_pending =
+        parse_expected_pending(req.expected_store_pending.as_deref().unwrap_or_default())
+            .map_err(RunError::Refused)?;
+    if !release_pending(&cutover_pending, &store_pending) {
+        return refuse("release inverse pending lists do not match the protected bundle");
     }
     let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
     let store = Chain::Store.migrator().map_err(RunError::Refused)?;
-    let cutover_hash = check_plan_binding(req, CUTOVER, &cutover)?;
-    let store_hash = check_store_binding(req, STORE, &store)?;
+    let cutover_hash = check_plan_binding(req, &cutover_pending, &cutover)?;
+    let store_hash = check_store_binding(req, &store_pending, &store)?;
     let plan = bound_plan_artifact(req, &cutover_hash, &store_hash)?;
+    let retained = release_fence_from_plan(&plan, &cutover_pending)?;
+    if let (Some(expected), Some(fence)) = (retained, fence_sha256) {
+        if expected != fence {
+            return refuse("release inverse attendance timestamp differs from producing plan");
+        }
+    }
     let expected = (
-        project_release_ledger(&plan["ledger_before"], CUTOVER, &cutover)?,
-        project_release_ledger(&plan["ledger_store_before"], STORE, &store)?,
+        project_release_ledger(&plan["ledger_before"], &cutover_pending, &cutover)?,
+        project_release_ledger(&plan["ledger_store_before"], &store_pending, &store)?,
     );
     let options = verify_target(req, tls_policy_from_env()?)?;
     let pool = connect(options, MIGRATOR_ROLE, Arc::new(AtomicUsize::new(0))).await?;
@@ -1515,7 +1531,7 @@ async fn run_release_recovery(
                 "restored": [ledger_json(&after.0), ledger_json(&after.1)]})
             })
     } else {
-        classify_interrupted_release(&pool, &expected.0, &expected.1)
+        classify_interrupted_release(&pool, &expected.0, &expected.1, retained)
             .await
             .map(|state| json!(state))
     };
@@ -1625,9 +1641,20 @@ async fn run_on_pool(
     let store_before = read_store_ledger(&mut conn)
         .await
         .map_err(|_| failed("store ledger read failed"))?;
-    drop(conn);
     let pending = reconcile(&before, &cutover).map_err(RunError::Refused)?;
     let store_pending = reconcile(&store_before, &store).map_err(RunError::Refused)?;
+    let protected_bundle =
+        req.target == Target::Production && release_pending(&pending, &store_pending);
+    if req.apply && req.target == Target::Production && pending.contains(&480) && !protected_bundle
+    {
+        return refuse("production attendance requires the exact protected release bundle");
+    }
+    let mut release_fence = if !req.apply && protected_bundle && pending == cutover_pending(true) {
+        Some(retained_fence(&mut conn).await?)
+    } else {
+        None
+    };
+    drop(conn);
     // Plan binding: apply runs only the exact pending lists the reviewed plan
     // showed, one per chain. Validated in `validate_request`; compared here,
     // before any DDL.
@@ -1649,7 +1676,10 @@ async fn run_on_pool(
     let computed_store_hash = check_store_binding(req, &store_pending, &store)?;
     // Provenance follows exactness: each bound hash must additionally be the
     // hash the named producing plan run uploaded. All refuse before any DDL.
-    check_plan_provenance(req, &computed_hash, &computed_store_hash)?;
+    let producing_plan = req
+        .apply
+        .then(|| bound_plan_artifact(req, &computed_hash, &computed_store_hash))
+        .transpose()?;
 
     // Plan-only readout inside one READ ONLY transaction. Apply skips it: that
     // login is the migrator, not the read-only readout. A saturated staging
@@ -1669,15 +1699,10 @@ async fn run_on_pool(
     let mut after = before.clone();
     let mut store_applied = 0usize;
     let mut store_after = store_before.clone();
-    let mut release_fence = None;
-    if req.apply
-        && req.target == Target::Production
-        && pending == [475, 479, 480, 481, 482]
-        && store_pending == [478]
-    {
-        let path = req.plan_manifest_path.as_deref().unwrap_or_default().trim();
-        check_release_ledgers(path, &before, &store_before)?;
-        let release = apply_release_schema(pool, &before, &store_before).await?;
+    if let Some(plan) = producing_plan.as_ref().filter(|_| protected_bundle) {
+        check_release_ledgers(plan, &before, &store_before)?;
+        let retained = release_fence_from_plan(plan, &pending)?;
+        let release = apply_release_schema(pool, &before, &store_before, retained).await?;
         after = release.cutover;
         store_after = release.store;
         release_fence = Some(release.attendance_fence_sha256);
@@ -1723,10 +1748,10 @@ async fn run_on_pool(
         "expected_store_pending": expected_store,
         "store_plan_manifest_sha256": computed_store_hash,
         "plan_run_id": req.plan_run_id.clone().unwrap_or_default(),
-        // True only for apply, and only because `check_plan_provenance`
+        // True only for apply, and only because `bound_plan_artifact`
         // passed above: reaching this manifest means both bound hashes were
         // proven to come from the named producing plan run.
-        "plan_provenance_verified": req.apply,
+        "plan_provenance_verified": producing_plan.is_some(),
         "applied_count": applied,
         "applied_store_count": store_applied,
         // Plan-only readout (null for apply): ledger owners and counts,
@@ -2252,7 +2277,11 @@ mod tests {
     async fn release_inverse_refuses_either_mismatched_pending_list() {
         let cutover = [475, 479, 480, 481, 482];
         let refusal = "refused: release inverse pending lists do not match the protected bundle";
-        for (pending, store) in [(cutover.as_slice(), "479"), (&cutover[1..], "478")] {
+        for (pending, store) in [
+            (cutover.as_slice(), "479"),
+            (&cutover[1..], "479"),
+            (&cutover[2..], "478"),
+        ] {
             let mut req = bound_production_apply(pending, &"a".repeat(40));
             req.expected_store_pending = Some(store.to_owned());
             let result = run_release_inverse(&req, &"a".repeat(64)).await;
@@ -2465,12 +2494,9 @@ mod tests {
             }]
         });
         let plan = json!({"ledger_before": ledger_json(&cutover), "ledger_store_before": ledger_json(&store)});
-        let path = temp_manifest(&plan.to_string());
-        let name = path.to_str().unwrap();
-        let exact = check_release_ledgers(name, &cutover, &store);
-        let cutover_drift = check_release_ledgers(name, &store, &store);
-        let store_drift = check_release_ledgers(name, &cutover, &cutover);
-        std::fs::remove_file(&path).unwrap();
+        let exact = check_release_ledgers(&plan, &cutover, &store);
+        let cutover_drift = check_release_ledgers(&plan, &store, &store);
+        let store_drift = check_release_ledgers(&plan, &cutover, &cutover);
         assert!(exact.is_ok());
         for error in [cutover_drift, store_drift] {
             assert_eq!(
@@ -2479,11 +2505,35 @@ mod tests {
             );
         }
         assert_eq!(
-            check_release_ledgers(name, &cutover, &store)
+            check_release_ledgers(&Value::Null, &cutover, &store)
                 .unwrap_err()
                 .to_string(),
-            "refused: release plan unavailable"
+            "refused: release ledgers differ from the producing plan"
         );
+    }
+
+    #[test]
+    fn release_plan_requires_a_digest_only_for_the_retained_bundle() {
+        let stamp = "b".repeat(64);
+        let empty = json!({});
+        let retained = json!({"attendance_fence_sha256": stamp});
+        assert_eq!(
+            release_fence_from_plan(&empty, cutover_pending(false)).unwrap(),
+            None
+        );
+        assert_eq!(
+            release_fence_from_plan(&retained, cutover_pending(true)).unwrap(),
+            Some(stamp.as_str())
+        );
+        assert!(release_fence_from_plan(&retained, cutover_pending(false)).is_err());
+        for plan in [
+            empty,
+            json!({"attendance_fence_sha256": null}),
+            json!({"attendance_fence_sha256": stamp.to_uppercase()}),
+            json!({"attendance_fence_sha256": "b"}),
+        ] {
+            assert!(release_fence_from_plan(&plan, cutover_pending(true)).is_err());
+        }
     }
 
     /// A producing-run manifest artifact carrying `hash` and `store_hash` in

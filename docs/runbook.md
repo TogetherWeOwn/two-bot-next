@@ -2865,8 +2865,10 @@ rechecks approval immediately before DDL. After an intervening apply,
 reconcile both ledgers and use a fresh plan and approval.
 
 The ordinary production migration workflow refuses plans that apply
-Cutover 0480, including the exact Cutover 0475/0479–0482 and Store 0478
-bundle. Rehearsal runs that bundle as one transaction across both migration
+Cutover 0480. The protected release runs Cutover 0479–0482 and Store 0478
+as one transaction, including Cutover 0475 if the approved baseline ends
+at 0473. For an approved retained baseline, the transaction checks the 0475
+timestamp digest under lock and preserves it. Rehearse across both migration
 chains, the voice heat contract and the new-object grants. If the commit
 outcome is uncertain, reconcile both ledgers and role state before retrying.
 The database inverse verifies both ledgers and role state and retains 0475.

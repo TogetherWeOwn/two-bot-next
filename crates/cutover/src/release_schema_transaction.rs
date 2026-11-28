@@ -1,4 +1,4 @@
-//! Atomic expansion for the 0475/0479–0482 and Store 0478 bundle.
+//! Atomic expansion for Cutover 0479–0482 and Store 0478, with 0475 applied if absent.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -22,6 +22,18 @@ const GRANTS: &str = "
 
 fn failure(stage: &str) -> RunError {
     RunError::Failed(stage.to_owned(), Value::Null)
+}
+
+pub(super) fn cutover_pending(retained: bool) -> &'static [i64] {
+    if retained {
+        &CUTOVER[1..]
+    } else {
+        &CUTOVER
+    }
+}
+
+pub(super) fn release_pending(cutover: &[i64], store: &[i64]) -> bool {
+    store == STORE && (cutover == cutover_pending(false) || cutover == cutover_pending(true))
 }
 
 async fn ledgers(conn: &mut PgConnection) -> Result<(Vec<LedgerRow>, Vec<LedgerRow>), RunError> {
@@ -87,7 +99,8 @@ async fn legacy_schema(conn: &mut PgConnection, require_pre: bool) -> Result<boo
 async fn attendance_fence(conn: &mut PgConnection) -> Result<Vec<u8>, RunError> {
     sqlx::query_scalar(
         "SELECT timestamptz_send(installed_on) FROM public._sqlx_migrations
-         WHERE version = 475 AND success",
+         WHERE version = 475 AND description = 'attendance recovery boundary'
+           AND success AND isfinite(installed_on)",
     )
     .fetch_one(conn)
     .await
@@ -125,8 +138,22 @@ async fn release_ledger_owner(conn: &mut PgConnection) -> Result<bool, RunError>
     .map_err(|_| failure("release ledger ownership read failed"))
 }
 
-async fn original_schema(conn: &mut PgConnection) -> Result<bool, RunError> {
-    Ok(legacy_schema(conn, true).await? && release_roles_clean(conn, legacy_verifier()).await?)
+pub(super) async fn retained_fence(conn: &mut PgConnection) -> Result<String, RunError> {
+    if !retained_attendance_schema(conn).await? {
+        return Err(RunError::Refused(
+            "release retained attendance schema changed".to_owned(),
+        ));
+    }
+    Ok(hex::encode(Sha256::digest(attendance_fence(conn).await?)))
+}
+
+async fn pre_schema(conn: &mut PgConnection, retained: Option<&str>) -> Result<bool, RunError> {
+    Ok(legacy_schema(conn, retained.is_none()).await?
+        && release_roles_clean(conn, legacy_verifier()).await?
+        && match retained {
+            Some(expected) => retained_fence(conn).await? == expected,
+            None => true,
+        })
 }
 
 async fn expanded_schema(conn: &mut PgConnection) -> Result<bool, RunError> {
@@ -213,6 +240,7 @@ pub async fn confirm_release_pre(
     pool: &PgPool,
     expected_cutover: &[LedgerRow],
     expected_store: &[LedgerRow],
+    retained: Option<&str>,
 ) -> Result<(), RunError> {
     let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
     let store = Chain::Store.migrator().map_err(RunError::Refused)?;
@@ -220,10 +248,11 @@ pub async fn confirm_release_pre(
     let (actual_cutover, actual_store) = ledgers(&mut tx).await?;
     if actual_cutover != expected_cutover
         || actual_store != expected_store
-        || !reconcile(&actual_cutover, &cutover).is_ok_and(|pending| pending == CUTOVER)
+        || !reconcile(&actual_cutover, &cutover)
+            .is_ok_and(|pending| pending == cutover_pending(retained.is_some()))
         || !reconcile(&actual_store, &store).is_ok_and(|pending| pending == STORE)
         || !release_ledger_owner(&mut tx).await?
-        || !original_schema(&mut tx).await?
+        || !pre_schema(&mut tx, retained).await?
     {
         return Err(RunError::Refused("release PRE state unproved".to_owned()));
     }
@@ -248,6 +277,7 @@ pub async fn classify_interrupted_release(
     pool: &PgPool,
     expected_cutover: &[LedgerRow],
     expected_store: &[LedgerRow],
+    retained: Option<&str>,
 ) -> Result<InterruptedRelease, RunError> {
     let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
     let store = Chain::Store.migrator().map_err(RunError::Refused)?;
@@ -265,18 +295,24 @@ pub async fn classify_interrupted_release(
             .iter()
             .filter(|row| !pending.contains(&row.version)))
     };
-    let state = if pre_matches(&actual_cutover, expected_cutover, &CUTOVER)
-        && pre_matches(&actual_store, expected_store, &STORE)
-        && original_schema(&mut tx).await?
+    let state = if pre_matches(
+        &actual_cutover,
+        expected_cutover,
+        cutover_pending(retained.is_some()),
+    ) && pre_matches(&actual_store, expected_store, &STORE)
+        && pre_schema(&mut tx, retained).await?
     {
         InterruptedRelease::Pre
     } else if actual_cutover == expected_cutover
         && actual_store == expected_store
         && expanded_schema(&mut tx).await?
     {
-        let fence = attendance_fence(&mut tx).await?;
+        let fence = hex::encode(Sha256::digest(attendance_fence(&mut tx).await?));
+        if retained.is_some_and(|expected| expected != fence) {
+            return Err(unproved());
+        }
         InterruptedRelease::Post {
-            attendance_fence_sha256: hex::encode(Sha256::digest(fence)),
+            attendance_fence_sha256: fence,
         }
     } else {
         return Err(unproved());
@@ -335,7 +371,7 @@ pub async fn recover_release_schema(
             .collect()
     };
     let expected_restored = (
-        retained(expected_cutover, &CUTOVER[1..]),
+        retained(expected_cutover, cutover_pending(true)),
         retained(expected_store, &STORE),
     );
     if !migrator
@@ -402,6 +438,7 @@ pub async fn apply_release_schema(
     pool: &PgPool,
     expected_cutover: &[LedgerRow],
     expected_store: &[LedgerRow],
+    retained: Option<&str>,
 ) -> Result<AppliedRelease, RunError> {
     let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
     let store = Chain::Store.migrator().map_err(RunError::Refused)?;
@@ -435,6 +472,7 @@ pub async fn apply_release_schema(
     .map_err(|_| failure("release schema tables busy or unavailable"))?;
 
     let (before_cutover, before_store) = ledgers(&mut tx).await?;
+    let pending_cutover = cutover_pending(retained.is_some());
     let eligible: bool = sqlx::query_scalar(
         "SELECT current_user::text = $1
            AND (SELECT pg_get_userbyid(relowner)::text = $1 FROM pg_class
@@ -452,7 +490,7 @@ pub async fn apply_release_schema(
     if !eligible
         || before_cutover != expected_cutover
         || before_store != expected_store
-        || reconcile(&before_cutover, &cutover).ok().as_deref() != Some(CUTOVER.as_slice())
+        || reconcile(&before_cutover, &cutover).ok().as_deref() != Some(pending_cutover)
         || reconcile(&before_store, &store).ok().as_deref() != Some(STORE.as_slice())
     {
         return Err(RunError::Refused(
@@ -460,8 +498,20 @@ pub async fn apply_release_schema(
         ));
     }
 
+    if let Some(expected) = retained {
+        sqlx::raw_sql("LOCK TABLE ONLY public.event_instance_windows IN ACCESS SHARE MODE NOWAIT")
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| failure("release retained attendance table busy or unavailable"))?;
+        if retained_fence(&mut tx).await? != expected {
+            return Err(RunError::Refused(
+                "release retained attendance timestamp changed".to_owned(),
+            ));
+        }
+    }
+
     for (migrator, table, versions) in [
-        (&cutover, "public._sqlx_migrations", CUTOVER.as_slice()),
+        (&cutover, "public._sqlx_migrations", pending_cutover),
         (&store, "public._two_bot_migrations", STORE.as_slice()),
     ] {
         for migration in migrator
@@ -498,7 +548,12 @@ pub async fn apply_release_schema(
     {
         return Err(failure("release schema or role readback refused"));
     }
-    let attendance_fence_sha256 = hex::encode(Sha256::digest(attendance_fence(&mut tx).await?));
+    let attendance_fence_sha256 = retained_fence(&mut tx).await?;
+    if retained.is_some_and(|expected| expected != attendance_fence_sha256) {
+        return Err(failure(
+            "release retained attendance timestamp changed during apply",
+        ));
+    }
     tx.commit()
         .await
         .map_err(|_| failure("release commit outcome unknown; reconcile both ledgers"))?;
