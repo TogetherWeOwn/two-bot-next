@@ -621,7 +621,7 @@ async fn locked_release_pre_ledger_drift_refuses_before_ddl_and_grants() -> Test
             .await?;
             assert_eq!(changed.rows_affected(), 1, "{table}: {change}");
 
-            let error = apply_release_schema(&pool, cutover, store)
+            let error = apply_release_schema(&pool, cutover, store, None)
                 .await
                 .expect_err("changed PRE ledger was applied");
             assert_eq!(
@@ -654,7 +654,7 @@ async fn locked_release_pre_ledger_drift_refuses_before_ddl_and_grants() -> Test
             .await?;
         }
     }
-    apply_release_schema(&pool, cutover, store).await?;
+    apply_release_schema(&pool, cutover, store, None).await?;
     assert_eq!(
         release_apply_observations(&mut admin).await?,
         (true, true, true, true),
@@ -768,14 +768,14 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
         expanded,
     } = seed_release_pre(&mut admin, &pool).await?;
     let confirm_pre = || confirm_release_pre(&pool, &expected[0], &expected[1]);
-    let classify = || classify_interrupted_release(&pool, &expanded[0], &expanded[1]);
+    let classify = || classify_interrupted_release(&pool, &expanded[0], &expanded[1], None);
     confirm_pre().await?;
     assert_eq!(json!(classify().await?), json!({"state": "pre"}));
 
     sqlx::raw_sql("BEGIN; LOCK TABLE public.web_contract_meta IN SHARE ROW EXCLUSIVE MODE")
         .execute(&mut admin)
         .await?;
-    let busy = apply_release_schema(&pool, &expected[0], &expected[1]).await;
+    let busy = apply_release_schema(&pool, &expected[0], &expected[1], None).await;
     let classified = classify().await;
     admin.execute("ROLLBACK").await?;
     assert_eq!(
@@ -792,7 +792,7 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     admin
         .execute("GRANT CREATE ON SCHEMA public TO two_bot_runtime")
         .await?;
-    let error = apply_release_schema(&pool, &expected[0], &expected[1])
+    let error = apply_release_schema(&pool, &expected[0], &expected[1], None)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -815,7 +815,7 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     admin
         .execute("REVOKE CREATE ON SCHEMA public FROM two_bot_runtime")
         .await?;
-    let applied = apply_release_schema(&pool, &expected[0], &expected[1]).await?;
+    let applied = apply_release_schema(&pool, &expected[0], &expected[1], None).await?;
     let (cutover, store) = (applied.cutover, applied.store);
     // The inverse locks these new tables too. Set the options while the
     // tables are still empty, before exercising the watermark guard.
@@ -839,9 +839,11 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     .fetch_one(&mut admin)
     .await?;
     assert!(installed);
-    assert!(apply_release_schema(&pool, &expected[0], &expected[1])
-        .await
-        .is_err());
+    assert!(
+        apply_release_schema(&pool, &expected[0], &expected[1], None)
+            .await
+            .is_err()
+    );
     assert_eq!(
         undo_release_schema(&pool, &cutover, &expected[1])
             .await
@@ -972,6 +974,40 @@ async fn release_schema_is_atomic_across_migrations_contract_and_grants() -> Tes
     .fetch_one(&mut admin)
     .await?;
     assert!(prior_contract);
+    let retained = Some(expected_fence.as_str());
+    let apply_retained =
+        |fence| apply_release_schema(&pool, &restored_cutover, &restored_store, fence);
+    assert!(apply_retained(retained).await.is_err());
+    admin
+        .execute("ALTER TABLE public.event_instance_windows ALTER COLUMN attendance_recovered_at SET DEFAULT CURRENT_TIMESTAMP")
+        .await?;
+    let ro = Some(fx.url(&fx.rologin, &fx.database));
+    let (code, plan, stderr) = fx
+        .run("--plan", ro, &fx.host, &fx.database, Default::default())
+        .await;
+    assert_eq!(code, 0, "{stderr}");
+    let plan: Value = serde_json::from_str(&plan)?;
+    assert_eq!(plan["attendance_fence_sha256"], expected_fence);
+    let classify_retained =
+        |fence| classify_interrupted_release(&pool, &expanded[0], &expanded[1], fence);
+    let wrong = "0".repeat(64);
+    assert!(apply_retained(Some(&wrong)).await.is_err());
+    let reapplied = apply_retained(retained).await?;
+    assert_eq!(reapplied.cutover.len() - restored_cutover.len(), 4);
+    assert_eq!(reapplied.attendance_fence_sha256, expected_fence);
+    assert_eq!(
+        json!(classify_retained(retained).await?),
+        json!({"state": "post", "attendance_fence_sha256": expected_fence})
+    );
+    assert!(classify_retained(Some(&wrong)).await.is_err());
+    assert_eq!(
+        recover_release_schema(&pool, &reapplied.cutover, &reapplied.store, retained).await?,
+        (restored_cutover, restored_store),
+    );
+    assert_eq!(
+        json!(classify_retained(retained).await?),
+        json!({"state": "retained", "attendance_fence_sha256": expected_fence})
+    );
     pool.close().await;
     admin.close().await?;
     fx.finish().await

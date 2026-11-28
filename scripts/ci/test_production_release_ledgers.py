@@ -22,6 +22,18 @@ def source_row(version):
             "sha384_recomputed": checksum}
 
 
+def retained_plan(plan, fence="b" * 64):
+    retained = deepcopy(plan)
+    row = next(row for row in plan["source_migrations"] if row["version"] == 475)
+    for key in ("ledger_before", "ledger_after"):
+        retained[key].append({**{field: row[field] for field in ("version", "description", "sha384")},
+                              "success": True})
+    retained["pending_before"].remove(475)
+    retained["attendance_fence_sha256"] = fence
+    retained["plan_manifest_sha256"] = projection_hash(retained)
+    return retained
+
+
 class ProductionReleaseLedgerTests(unittest.TestCase):
     def setUp(self):
         self.cutover = ledger_row(474, "original cutover description")
@@ -43,6 +55,8 @@ class ProductionReleaseLedgerTests(unittest.TestCase):
             [[self.cutover], [self.store]], [expected_cutover, expected_store],
             [cutover_prefix, [self.store]],
         ))
+        restored = [cutover_prefix, [self.store]]
+        self.assertEqual(ledger_endpoints(retained_plan(self.plan)), (restored, [expected_cutover, expected_store], restored))
 
     def test_refuses_source_checksum_or_installed_ledger_drift(self):
         for fields, change in (
@@ -56,3 +70,13 @@ class ProductionReleaseLedgerTests(unittest.TestCase):
                 for field in fields:
                     plan[field][0].update(change)
                 ledger_endpoints(plan)
+
+    def test_retained_plan_requires_the_0475_description_and_valid_timestamp_digest(self):
+        for fence in (None, "b", "B" * 64):
+            with self.subTest(fence=fence), self.assertRaises(GateError):
+                ledger_endpoints(retained_plan(self.plan, fence))
+        changed = retained_plan(self.plan)
+        for key in ("ledger_before", "ledger_after"):
+            changed[key][-1]["description"] = "changed 0475"
+        with self.assertRaises(GateError):
+            ledger_endpoints(changed)
