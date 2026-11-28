@@ -2521,6 +2521,11 @@ jobs:
     if: "!cancelled() && inputs.release_plan_run_id != '' && needs.release-apply.result == 'success' && needs.production.result != 'success'"
     permissions: *release-permissions
     uses: ./.github/workflows/deploy-production-recovery.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    secrets: &release-recovery-secrets
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      PRODUCTION_OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
+      TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}
     with:
       candidate-sha: ${{ needs.guard.outputs.sha }}
       pins: ${{ inputs.release_pins }}
@@ -2538,5 +2543,6 @@ jobs:
     if: needs.guard.outputs.mode == 'interrupted-recovery'
     permissions: *release-permissions
     uses: ./.github/workflows/deploy-production-interrupted.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    secrets: *release-recovery-secrets
     with:
       origin-run-id: ${{ inputs.release_recovery_run_id }}

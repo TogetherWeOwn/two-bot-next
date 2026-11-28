@@ -245,8 +245,15 @@ DEPLOY_MARKERS = (
 )
 # Canonical parsed graph for the protected recovery callee. This pins the
 # caller guard, Environment split, exact commands, permissions, and handoffs.
-PRODUCTION_RECOVERY_GRAPH = "ab704b3add3f417e074d3dfefc9756fcc16e69f7a937d33f08038434337a3f51"
-PRODUCTION_INTERRUPTED_GRAPH = "0a65e60f6a5e026d8938c30985752c4379b587fd30f92d6d5cc77d3562605d92"
+PRODUCTION_RECOVERY_GRAPH = "21e0c934d0cb40745d6753f336080b8e91f1f5497b83410906883d5c5f5371f1"
+PRODUCTION_INTERRUPTED_GRAPH = "e1d6eaeb8149e6a183834eff3a26e19b9aca0434feb9942fddc2a1e356e5e53d"
+PRODUCTION_RECOVERY_CALL_JOBS = ("release-recover", "release-reconcile")
+PRODUCTION_RECOVERY_SECRET_BINDINGS = {
+    secret: f"${{{{ secrets.{secret} }}}}" for secret in (
+        "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN", "PRODUCTION_OWNERSHIP_CONTROL_TOKEN",
+        "TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL",
+    )
+}
 
 
 class UniqueKeyLoader(yaml.BaseLoader):
@@ -3339,6 +3346,9 @@ def production_errors(workflow):
     if (recovery.get("needs") != "guard" or recovery.get("if") != "needs.guard.outputs.mode == 'interrupted-recovery'"
             or recovery.get("with") != {"origin-run-id": "${{ inputs.release_recovery_run_id }}"}):
         errors.append(f"{name}: interrupted recovery must run only from the protected recovery guard")
+    for job_id in PRODUCTION_RECOVERY_CALL_JOBS:
+        if jobs.get(job_id, {}).get("secrets") != PRODUCTION_RECOVERY_SECRET_BINDINGS:
+            errors.append(f"{name}:{job_id}: must pass only the four named recovery Environment secrets")
     # The production job shares its lane with the protected status read. The guard, gates,
     # soak and recheck run outside it, so a sleeping automatic promotion can
     # never delay an operator rollback.
@@ -5033,16 +5043,20 @@ def cloudflare_environment_errors(workflows):
     and `production` Environment secret stores and nowhere else: a job that
     references either secret without declaring one of those Environments
     could only have read it at repository scope, the placement this pin
-    keeps retired. The check is on the job's own `environment:`, so a future
-    reusable-workflow caller that forwards the pair needs an explicit
-    policy change rather than a silent new reader.
+    keeps retired. The two pinned recovery calls must pass the secret names.
+    Their callee graph pins constrain the actual reads to the protected jobs.
     """
     errors = []
     for name, workflow in workflows.items():
         for job_id, job in (workflow.get("jobs") or {}).items():
             if not isinstance(job, dict):
                 continue
-            text = str(job)
+            references = job
+            if (name == "deploy-production.yml" and job_id in PRODUCTION_RECOVERY_CALL_JOBS
+                    and job.get("uses") == REUSABLE_CALLS[name, job_id]
+                    and job.get("secrets") == PRODUCTION_RECOVERY_SECRET_BINDINGS):
+                references = {key: value for key, value in job.items() if key != "secrets"}
+            text = str(references)
             if "secrets.CLOUDFLARE_API_TOKEN" not in text \
                     and "secrets.CLOUDFLARE_ACCOUNT_ID" not in text:
                 continue
@@ -9883,6 +9897,34 @@ for (const optIn of ["false", "true"]) {
                 workflow = deepcopy(production)
                 change(workflow)
                 self.assertTrue(production_errors(workflow), label)
+
+    def test_production_recovery_callers_bind_only_required_environment_secrets(self):
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_errors(production), [])
+        self.assertEqual(cloudflare_environment_errors(self.workflows), [])
+        for job_id, callee in (("release-recover", "deploy-production-recovery.yml"),
+                               ("release-reconcile", "deploy-production-interrupted.yml")):
+            job = production["jobs"][job_id]
+            binding = job["secrets"]
+            self.assertEqual(self.workflows[callee]["on"]["workflow_call"]["secrets"],
+                             {name: {"required": "true"} for name in binding})
+            for replacement in ({**binding, "EXTRA": "${{ secrets.EXTRA }}"}, "inherit", {}):
+                with self.subTest(job=job_id, replacement=replacement):
+                    workflow = deepcopy(production)
+                    workflow["jobs"][job_id]["secrets"] = replacement
+                    self.assertIn(
+                        f"deploy-production.yml:{job_id}: must pass only the four named recovery Environment secrets",
+                        production_errors(workflow))
+            rejected = (
+                ("foreign-copy", job),
+                (job_id, {**job, "uses": "./.github/workflows/foreign.yml"}),
+                (job_id, {**job, "secrets": {**binding, "EXTRA": "${{ secrets.EXTRA }}"}}),
+                (job_id, {**job, "env": {"TOKEN": "${{ secrets.CLOUDFLARE_API_TOKEN }}"}}),
+            )
+            for changed_id, changed_job in rejected:
+                with self.subTest(job=changed_id, changed=changed_job):
+                    workflows = {"deploy-production.yml": {"jobs": {changed_id: changed_job}}}
+                    self.assertTrue(cloudflare_environment_errors(workflows))
 
     def test_production_apply_uses_the_protected_preflight_epoch(self):
         jobs = self.workflows["deploy-production.yml"]["jobs"]

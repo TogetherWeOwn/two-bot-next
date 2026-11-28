@@ -568,6 +568,10 @@ predecessor and ownership epoch before using the database classification.
 Forward attendance releases remain held pending qualification of the recovery
 pair.
 
+The production caller passes the required recovery secret names to both
+reusable workflows. The existing protected Environments supply the values
+to the provider and migration steps that use them.
+
 - **Confirmed PRE.** The protected job checks both migration ledgers, schema
   and grants under the migration locks. Exact original PRE permits one
   takeover of the pinned predecessor from the proved stopped epoch, followed
