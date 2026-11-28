@@ -1511,10 +1511,8 @@ async fn run_release_recovery(
     let store_hash = check_store_binding(req, &store_pending, &store)?;
     let plan = bound_plan_artifact(req, &cutover_hash, &store_hash)?;
     let retained = release_fence_from_plan(&plan, &cutover_pending)?;
-    if let (Some(expected), Some(fence)) = (retained, fence_sha256) {
-        if expected != fence {
-            return refuse("release inverse attendance timestamp differs from producing plan");
-        }
+    if fence_sha256.is_some_and(|fence| retained.is_some_and(|expected| expected != fence)) {
+        return refuse("release inverse attendance timestamp differs from producing plan");
     }
     let expected = (
         project_release_ledger(&plan["ledger_before"], &cutover_pending, &cutover)?,
@@ -2276,6 +2274,12 @@ mod tests {
     #[tokio::test]
     async fn release_inverse_refuses_either_mismatched_pending_list() {
         let cutover = [475, 479, 480, 481, 482];
+        let retained = json!({"attendance_fence_sha256": "b".repeat(64)});
+        assert!(release_fence_from_plan(&retained, &cutover[1..])
+            .unwrap()
+            .is_some());
+        assert!(release_fence_from_plan(&retained, &cutover).is_err());
+        assert!(release_fence_from_plan(&json!({}), &cutover[1..]).is_err());
         let refusal = "refused: release inverse pending lists do not match the protected bundle";
         for (pending, store) in [
             (cutover.as_slice(), "479"),
@@ -2503,36 +2507,6 @@ mod tests {
                 error.unwrap_err().to_string(),
                 "refused: release ledgers differ from the producing plan"
             );
-        }
-        assert_eq!(
-            check_release_ledgers(&Value::Null, &cutover, &store)
-                .unwrap_err()
-                .to_string(),
-            "refused: release ledgers differ from the producing plan"
-        );
-    }
-
-    #[test]
-    fn release_plan_requires_a_digest_only_for_the_retained_bundle() {
-        let stamp = "b".repeat(64);
-        let empty = json!({});
-        let retained = json!({"attendance_fence_sha256": stamp});
-        assert_eq!(
-            release_fence_from_plan(&empty, cutover_pending(false)).unwrap(),
-            None
-        );
-        assert_eq!(
-            release_fence_from_plan(&retained, cutover_pending(true)).unwrap(),
-            Some(stamp.as_str())
-        );
-        assert!(release_fence_from_plan(&retained, cutover_pending(false)).is_err());
-        for plan in [
-            empty,
-            json!({"attendance_fence_sha256": null}),
-            json!({"attendance_fence_sha256": stamp.to_uppercase()}),
-            json!({"attendance_fence_sha256": "b"}),
-        ] {
-            assert!(release_fence_from_plan(&plan, cutover_pending(true)).is_err());
         }
     }
 

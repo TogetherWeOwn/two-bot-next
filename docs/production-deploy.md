@@ -685,14 +685,9 @@ at the pinned release revision.
 | Original baseline | 115 rows through `0473` | 20 rows through `0465` | `attendance_recovered_at` absent. |
 | Retained baseline | 116 rows through `0475` | 20 rows through `0465` | `attendance_recovered_at` and the original `0475` ledger timestamp retained. |
 
-Use a fresh approved plan for either baseline. On the retained baseline the
-plan records the SHA-256 digest of the binary `0475` ledger timestamp. The
-runner checks the retained column and timestamp under lock, applies Cutover
-`0479`–`0482` and Store `0478`, and binds the same timestamp digest to the
-forward receipt. The guarded inverse returns to the retained baseline from
-either starting point. Match that endpoint to the authenticated inverse
-result when recovering a committed apply. Use the separate
-[planner receipt checks](https://github.com/TogetherWeOwn/two-bot-next/pull/2478)
+For a retained baseline, the plan and forward receipt bind the same `0475`
+timestamp digest. The runner verifies the column and timestamp under lock.
+Use the separate [planner receipt checks](https://github.com/TogetherWeOwn/two-bot-next/pull/2478)
 for the full ledgers and retained timestamp.
 
 ### Check the shared rollback SHA

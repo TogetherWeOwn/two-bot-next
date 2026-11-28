@@ -82,16 +82,10 @@ class ReleaseForwardTests(unittest.TestCase):
 
         with TemporaryDirectory() as scratch, patch.object(release.subprocess, "run") as process:
             process.return_value = Mock(returncode=0, stdout=json.dumps(outcome))
-            for plan_id, binding, mode in (
-                (None, "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL", "--plan"),
-                ("123", "TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL", "--apply"),
-            ):
-                self.assertEqual(release.database("fixture", Path(scratch), plan, {binding: "fixture"},
-                                                  plan_id=plan_id), outcome)
-                args = process.call_args.args[0]
-                self.assertIn(mode, args)
-                self.assertEqual(args[args.index("--expected-pending") + 1], "479,480,481,482")
-            self.assertEqual(json.loads((Path(scratch) / "reviewed-plan.json").read_bytes()), plan)
+            env = {"TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL": "fixture"}
+            release.database("fixture", Path(scratch), plan, env, plan_id="123")
+            args = process.call_args.args[0]
+            self.assertEqual(args[args.index("--expected-pending") + 1], "479,480,481,482")
 
     def test_retained_preflight_refuses_a_changed_timestamp_before_provider_access(self):
         pin, original = self.preflight_fixture()

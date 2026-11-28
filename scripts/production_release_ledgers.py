@@ -3,8 +3,8 @@
 from ci.production_migrate_claim import SHA256, projection_hash, store_projection_hash
 from staging_rollout import mapping, require, sequence
 
-RETAINED_CUTOVER = (479, 480, 481, 482)
-CUTOVER = (475, *RETAINED_CUTOVER)
+CUTOVER = (475, 479, 480, 481, 482)
+RETAINED_CUTOVER = CUTOVER[1:]
 STORE = (478,)
 LEDGER_FIELDS = {"version", "description", "sha384", "success"}
 
@@ -41,8 +41,8 @@ def ledger_endpoints(plan):
     cutover, expanded_cutover = _project(plan["source_migrations"], plan.get("ledger_before"),
                                          plan.get("ledger_after"), pending)
     if pending == list(RETAINED_CUTOVER):
-        source_fence = next((row for row in plan["source_migrations"] if row["version"] == 475), {})
-        require(any(row["version"] == 475 and row["description"] == source_fence["description"] for row in cutover),
+        description = next((row["description"] for row in plan["source_migrations"] if row["version"] == 475), None)
+        require(any(row["version"] == 475 and row["description"] == description for row in cutover),
                 "production_release_plan_ledgers_invalid")
     store, expanded_store = _project(plan["source_store_migrations"], plan.get("ledger_store_before"),
                                      plan.get("ledger_store_after"), STORE)

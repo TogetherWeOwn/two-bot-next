@@ -221,10 +221,10 @@ class RecoveryWorkflowTests(unittest.TestCase):
                 blocked.assert_not_called()
 
     def test_inverse_refuses_incomplete_database_readback(self):
-        _, run = release_run_fixture()
-        (_, _, plan_id, plan, _), _, _ = self.forward_fixture(run)
-        plan = {**plan, "acl_plan_ref": "fixture"}
-        approval = {"recovery_ref": plan["recovery_evidence_ref"], "plan_run_id": plan_id}
+        plan = dict(target=dict(host="db", database="fixture", branch_id="branch"),
+                    acl_plan_ref="acl", plan_manifest_sha256="plan", store_plan_manifest_sha256="store",
+                    pending_before=[479, 480, 481, 482], pending_store_before=[478])
+        approval = {"recovery_ref": "ref", "plan_run_id": "321"}
         env = {"TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL": "fixture"}
         with TemporaryDirectory() as scratch, patch.object(recovery.subprocess, "run") as run:
             run.return_value = Mock(returncode=0, stdout=b'{"state":"restored"}')

@@ -1,4 +1,5 @@
-//! Atomic expansion for Cutover 0479–0482 and Store 0478, with 0475 applied if absent.
+//! Atomic expansion for the 0475/0479–0482 and Store 0478 bundle.
+//! Applies 0475 only if it is absent.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -240,7 +241,6 @@ pub async fn confirm_release_pre(
     pool: &PgPool,
     expected_cutover: &[LedgerRow],
     expected_store: &[LedgerRow],
-    retained: Option<&str>,
 ) -> Result<(), RunError> {
     let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
     let store = Chain::Store.migrator().map_err(RunError::Refused)?;
@@ -248,11 +248,10 @@ pub async fn confirm_release_pre(
     let (actual_cutover, actual_store) = ledgers(&mut tx).await?;
     if actual_cutover != expected_cutover
         || actual_store != expected_store
-        || !reconcile(&actual_cutover, &cutover)
-            .is_ok_and(|pending| pending == cutover_pending(retained.is_some()))
+        || !reconcile(&actual_cutover, &cutover).is_ok_and(|pending| pending == CUTOVER)
         || !reconcile(&actual_store, &store).is_ok_and(|pending| pending == STORE)
         || !release_ledger_owner(&mut tx).await?
-        || !pre_schema(&mut tx, retained).await?
+        || !pre_schema(&mut tx, None).await?
     {
         return Err(RunError::Refused("release PRE state unproved".to_owned()));
     }

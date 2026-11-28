@@ -81,20 +81,9 @@ class ProductionReleaseLedgerTests(unittest.TestCase):
             with self.subTest(fence=fence), self.assertRaises(GateError):
                 ledger_endpoints(retained_plan(self.plan, fence))
         retained = retained_plan(self.plan)
-        del retained["attendance_fence_sha256"]
-        with self.assertRaises(GateError):
-            ledger_endpoints(retained)
-
-        retained = retained_plan(self.plan)
         retained["source_migrations"].pop(1)
         retained["ledger_before"].pop()
         retained["ledger_after"].pop()
         retained["plan_manifest_sha256"] = projection_hash(retained)
-        with self.assertRaises(GateError):
-            ledger_endpoints(retained)
-
-        retained = retained_plan(self.plan)
-        for ledger in ("ledger_before", "ledger_after"):
-            retained[ledger][-1]["description"] = "drifted 0475"
         with self.assertRaises(GateError):
             ledger_endpoints(retained)

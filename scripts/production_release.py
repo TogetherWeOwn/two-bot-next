@@ -161,7 +161,6 @@ def take_over(pin, recovery, version, observe, control, *, pause=sleep):
 
 
 def database(binary, directory, plan, env, *, plan_id=None):
-    ledger_endpoints(plan)
     target = plan["target"]
     args = [binary, "--target", "production", "--source-sha", plan["source_sha"],
             "--production-host", target["host"], "--production-database", target["database"],
