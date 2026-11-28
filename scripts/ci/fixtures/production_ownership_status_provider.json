@@ -98,6 +98,18 @@
         }
       }
     ],
+    "/containers/applications/33333333-3333-3333-3333-333333333333": {
+      "name": "two-bot-next-twobotcontainer-production",
+      "id": "33333333-3333-3333-3333-333333333333",
+      "configuration": {
+        "image": "registry.cloudflare.com/cccccccccccccccccccccccccccccccc/two-bot-next-twobotcontainer-production@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "instances": 1,
+      "version": 11,
+      "durable_objects": {
+        "namespace_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    },
     "/containers/applications/33333333-3333-3333-3333-333333333333/rollouts?limit=100": [
       {
         "id": "44444444-4444-4444-4444-444444444444",

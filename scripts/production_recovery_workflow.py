@@ -91,12 +91,15 @@ def interrupted_classification(classification):
     return state
 
 
-def interrupted_pair_phase(pin, origin_run_id, epoch, observed):
+def interrupted_pair_phase(pin, origin_run_id, epoch, observed, candidate_worker=None):
     require(matches(RUN_ID, origin_run_id) and type(epoch) is int and 1 < epoch < 2**53 - 1,
             "production_interrupted_origin_invalid")
+    actor = release_actor(origin_run_id, pin.candidate_sha)
+    if candidate_worker and pair_matches(observed, pin, candidate_worker, pin.candidate_sha, pin.candidate_image):
+        require(is_stopped(observed, epoch, actor), "production_interrupted_stop_unproved")
+        return "candidate-stopped"
     require(pair_matches(observed, pin, pin.rollback_worker, pin.rollback_sha, pin.rollback_image),
             "production_interrupted_prior_pair_changed")
-    actor = release_actor(origin_run_id, pin.candidate_sha)
     if is_stopped(observed, epoch, actor):
         return "stopped"
     owner = mapping(observed.get("ownership"))
@@ -106,16 +109,18 @@ def interrupted_pair_phase(pin, origin_run_id, epoch, observed):
     return "resumed"
 
 
-def reconcile_interrupted(pin, origin_run_id, epoch, classification, observe, control, recover_post):
+def reconcile_interrupted(pin, origin_run_id, epoch, classification, observe, control, recover_post,
+                          *, candidate_worker=None):
     """Resume only from authenticated attempt, stop and database evidence."""
     state = interrupted_classification(classification)
 
     before = observe()
-    phase = interrupted_pair_phase(pin, origin_run_id, epoch, before)
+    phase = interrupted_pair_phase(pin, origin_run_id, epoch, before, candidate_worker)
     if state == "post":
-        require(phase == "stopped", "production_interrupted_stop_unproved")
+        require(phase in ("stopped", "candidate-stopped"), "production_interrupted_stop_unproved")
         return recover_post(classification["attendance_fence_sha256"])
 
+    require(phase != "candidate-stopped", "production_interrupted_pre_candidate_unproved")
     if phase == "stopped":
         def resumed():
             after = observe()

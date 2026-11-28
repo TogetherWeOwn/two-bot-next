@@ -12,7 +12,8 @@ from time import monotonic
 
 import staging_rollout as provider
 from staging_rollout import GateError, decode, mapping, number, require, sequence
-from worker_container_rollback import APPLICATIONS, SHA, WORKERS, app_rollouts, application_by_name, rollout_image
+from worker_container_rollback import (APPLICATIONS, SHA, WORKERS, app_rollouts,
+                                       application_by_name, application_detail, rollout_image)
 from worker_container_rollback import VERSION_ID as UUID
 
 REPO = "TogetherWeOwn/two-bot-next"
@@ -86,7 +87,7 @@ def provider_sample(client, account, *, allow_rollout=False):
             and bot[0].get("class_name") == provider.CLASS, "worker_namespace_unbound")
     namespace = bot[0].get("namespace_id")
     require(matches(NAMESPACE, namespace), "invalid_namespace_id")
-    app = application_by_name(client, APPLICATION)
+    app = application_detail(client, application_by_name(client, APPLICATION))
     app_id = app["id"]
     require(matches(UUID, app_id) and app["durable_objects"]["namespace_id"] == namespace,
             "application_namespace_mismatch")

@@ -626,6 +626,13 @@ step must have reached a terminal conclusion of success, failure or
 cancellation. Restart after POST requires an authenticated inverse bound to
 that classification.
 
+For [release attempt 46099587335](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/46099587335),
+the interrupted workflow also accepts the reviewed candidate Worker and
+completed image under the original stopped epoch. It authenticates the
+successful forward artifact and requires the locked POST classification to
+match its 0475 timestamp digest before running the inverse. The workflow
+then restores the retained pair and verifies stable readiness before handoff.
+
 Keep the release held and escalate to the release operator if the workflow
 is unavailable, the serving pair or stopped epoch has drifted, or any required
 evidence is missing, expired or mismatched. For this path, that evidence includes

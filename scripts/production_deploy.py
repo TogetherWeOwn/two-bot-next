@@ -363,7 +363,8 @@ def serving(args):
             version = rollback.serving_version(client, rollback.WORKERS["production"])
             if version != args.expected_worker_version:
                 raise ValueError("production Worker drift")
-            app = rollback.application_by_name(client, rollback.APPLICATIONS["production"])
+            app = rollback.application_detail(
+                client, rollback.application_by_name(client, rollback.APPLICATIONS["production"]))
             if previous and previous["has_previous"] and previous.get("application_id") != app["id"]:
                 raise ValueError("production application drift")
             rows = rollback.app_rollouts(client, app["id"])

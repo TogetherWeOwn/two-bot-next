@@ -181,6 +181,17 @@ def application_by_name(client, name):
     return app
 
 
+def application_detail(client, app):
+    """Read current configuration from the detail endpoint for the listed identity."""
+    app_id = base.identifier(app.get("id"))
+    detail = base.mapping(client.api(f"/containers/applications/{app_id}"))
+    require(detail.get("id") == app_id and detail.get("name") == app.get("name")
+            and base.mapping(detail.get("durable_objects")).get("namespace_id")
+            == base.mapping(app.get("durable_objects")).get("namespace_id"),
+            "application_identity_drift")
+    return detail
+
+
 def app_rollouts(client, app_id):
     rows = base.sequence(
         client.api(f"/containers/applications/{base.identifier(app_id)}/rollouts?limit={base.LIMIT}")
@@ -640,8 +651,11 @@ class Rollback:
             else:
                 waiting_for = "counters_or_progress"
             if ready and self.variant != "staging":
-                ready = base.mapping(application_by_name(
-                    self.client, self.application).get("configuration")).get("image") == image
+                app = application_by_name(self.client, self.application)
+                require(app["id"] == self.app_id, "application_identity_drift")
+                detail = application_detail(self.client, app)
+                ready = (base.mapping(detail.get("configuration")).get("image") == image
+                         and detail.get("version") == target_version)
                 waiting_for = "application_image"
             if ready:
                 self.log(f"image rollout {status}")

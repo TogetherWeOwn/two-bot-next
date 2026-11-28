@@ -359,6 +359,32 @@ class InterruptedReleaseTests(unittest.TestCase):
         self.control.assert_not_called()
         self.recover_post.assert_not_called()
 
+    def test_exact_fenced_candidate_requires_matching_committed_forward_proof(self):
+        self.live["worker"].update(version_id=interrupted.INCIDENT_WORKER, sha=self.pin.candidate_sha)
+        self.live["container"]["image_digest"] = self.pin.candidate_image
+        candidate = interrupted.INCIDENT_WORKER
+        self.assertEqual(recovery.interrupted_pair_phase(
+            self.pin, self.origin, self.epoch, self.live, candidate), "candidate-stopped")
+        for unbound in (None, self.pin.rollback_worker):
+            with self.assertRaises(GateError):
+                recovery.interrupted_pair_phase(self.pin, self.origin, self.epoch, self.live, unbound)
+        binding = {"candidate_worker": candidate, "forward_fence_sha256": "d" * 64}
+        admission = {"binding": binding, "phase": "candidate-stopped"}
+        for state in ({"state": "pre"}, {"state": "post", "attendance_fence_sha256": "e" * 64}):
+            with self.assertRaises(GateError):
+                interrupted.verified_decision({"admission": admission, "classification": state}, admission)
+        post = {"state": "post", "attendance_fence_sha256": "d" * 64}
+        decision = {"admission": admission, "classification": post}
+        self.assertEqual(interrupted.verified_decision(decision, admission), post)
+        with self.assertRaises(GateError):
+            recovery.reconcile_interrupted(self.pin, self.origin, self.epoch, {"state": "pre"},
+                                           self.observe, self.control, self.recover_post, candidate_worker=candidate)
+        self.recover_post.assert_not_called()
+        recovery.reconcile_interrupted(self.pin, self.origin, self.epoch, post, self.observe, self.control,
+                                       self.recover_post, candidate_worker=candidate)
+        self.recover_post.assert_called_once_with("d" * 64)
+        self.control.assert_not_called()
+
     def test_lost_pre_reply_does_not_retry_at_pending_or_foreign_active_epoch(self):
         for phase, actor, running in (("fenced", self.actor, False), ("active", self.foreign_actor, True)):
             with self.subTest(phase=phase):
